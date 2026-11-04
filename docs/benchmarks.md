@@ -545,38 +545,24 @@ memory, OS, kernel, rustc, C compiler, linker, LLVM version and the load average
 started (below and in the JSON). The platforms, their runners' labels and how a result is
 filed are `harness/benchplatforms.py`.
 
-Each platform is meant to run on a dedicated machine that runs nothing else, registered as a
-self-hosted GitHub Actions runner. A shared runner is no use: GitHub's hosted macOS arm64 runner
-(`macos-15`) is a 3-core VM with 7 GB of memory, less than nushell's daemon holds, with
-neighbours that move the numbers. The three:
+This fork uses GitHub-hosted runners for optional benchmark jobs:
 
-| Platform | Runner labels | Machine | Why |
-|---|---|---|---|
-| Linux x86-64 | `self-hosted, linux, x64, bench-x86` | `dev-aws-bench-x86` (i-01666717f0de39201, us-west-2a), resized to m8a.4xlarge: 16 AMD EPYC 9R45 (Zen 5) cores, one thread per core, 64 GiB | already launched for it, on demand, ttl a year, tagged `ix-dev-purpose=ra-jit-bench`; launched as a c8a.4xlarge (32 GiB), too little for nushell's daemon (15 GB) beside cargo |
-| Linux aarch64 | `self-hosted, linux, ARM64, bench-arm64` | a new `dev-aws-bench-arm64`, m8g.4xlarge: 16 Graviton4 (Neoverse V2) cores, 64 GiB, on demand | the same core count and memory as the x86 machine; a cloud VM is not bare metal, but its cores are not shared with other tenants |
-| macOS arm64 | `self-hosted, macOS, ARM64, bench-macos` | a Mac mini M4 Pro (14 cores, 64 GB) kept for it, plugged in, not sleeping (`sudo pmset -a sleep 0`), or an EC2 mac-m4pro.metal host if it has to be in AWS | bare metal, and the only way to measure macOS: a MacBook in use is busy with other work |
+| Platform | Runner label |
+|---|---|
+| Linux x86-64 | `ubuntu-24.04` |
+| Linux aarch64 | `ubuntu-24.04-arm` |
+| macOS arm64 | `macos-15` |
 
-`harness/benchrunner.sh PLATFORM MACHINE` sets a runner up: it checks the platform is the
-machine's, installs the runner in `~/actions-runner`, registers it with the platform's labels and
-runs it at boot (on Linux as user `andrew` from a user systemd unit,
-`ra-jit-bench-runner.service`, lingering; on macOS as the runner's launchd service), and its
-`.env` names the machine for the results. It needs Nix with flakes on the machine:
+Select platforms with the repository variable `BENCH_RUNNERS`, using the comma-separated
+slugs `linux-x86-64,linux-aarch64,macos-arm64`. An unset variable leaves these optional
+jobs disabled. `BENCH_RUNNER=true` retains the legacy Linux x86-64 selection.
 
-```
-scp harness/benchrunner.sh HOST:
-gh api -X POST repos/indexable-inc/blaze/actions/runners/registration-token --jq .token \
-  | ssh HOST bash benchrunner.sh linux-aarch64 "'AWS m8g.4xlarge (dev-aws-bench-arm64)'"
-```
+Hosted timings can vary with contention and have less memory than the historical
+dedicated machines. Keep each result's machine metadata; do not treat a change of
+host as evidence of a compiler regression or improvement.
 
-Then name the platform in the repository variable `BENCH_RUNNERS`, comma-separated, which turns
-its jobs on: `gh variable set BENCH_RUNNERS -R indexable-inc/blaze -b linux-x86-64,linux-aarch64,macos-arm64`.
-A platform it does not name is skipped by every run rather than left waiting for a runner that
-is not there, and the tables keep its last numbers, under their machine, date and commit.
-(`BENCH_RUNNER=true`, from before there were platforms, still means Linux x86-64.)
-
-Until the runners exist the numbers are measured by hand with the same harness, pinned to 16
-cores with `taskset` so that cargo and the daemon have the 16 cores of the machines above. The
-edits: on 2026-10-22, Linux x86-64 on `dev-aws-8` (a c7a.48xlarge, AMD EPYC 9R14, idle and
+Historical numbers were measured by hand with the same harness, pinned to 16
+cores with `taskset`. The edits: on 2026-10-22, Linux x86-64 on `dev-aws-8` (a c7a.48xlarge, AMD EPYC 9R14, idle and
 claimed for the run) and Linux aarch64 on a c8g.16xlarge (Graviton4, Neoverse-V2) launched for
 it; macOS arm64's are the MacBook Pro (M5 Max) run of 2026-10-21, made while it was busy with
 other work (its load average is under the tables), so its times are noisier than the others'. The
