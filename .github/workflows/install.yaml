@@ -67,7 +67,12 @@ jobs:
           cargo blaze --help | head -n 3
           # A release from before blaze had its own Rust has rustup install 1.99.0 instead.
           if [ -x "$CARGO_HOME/bin/blaze" ]; then
-            blaze toolchain | tee /dev/stderr | grep -F "blaze builds with Rust 1.99.0"
+            # Published releases choose their own pinned toolchain, which may
+            # differ from this source tree. Verify its identity and installed path.
+            toolchain_info=$(blaze toolchain)
+            printf '%s\n' "$toolchain_info" | tee /dev/stderr | grep -F "blaze's toolchain ("
+            toolchain_dir=${toolchain_info##* at }
+            test "$toolchain_dir" != "$toolchain_info" && test -d "$toolchain_dir"
           else
             rustup run 1.99.0 rustc --version
             rustup component list --toolchain 1.99.0 --installed | grep -q '^rust-src'
