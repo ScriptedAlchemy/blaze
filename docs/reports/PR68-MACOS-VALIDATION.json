@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "pull_request": "https://github.com/ScriptedAlchemy/blaze/pull/68",
+  "status": "in_progress",
+  "tested_head": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+  "host": {
+    "os": "macOS-26.6.2-arm64-arm-64bit",
+    "architecture": "arm64",
+    "rust": "1.99.0",
+    "nix": "2.35.4",
+    "llvm": "20.1.8 (flake pinned)"
+  },
+  "scope_note": "The difference between the two tested commits is limited to harness/dist/buildspec.py and harness/dist/test_buildspec_cleanup.py. Compiler and runtime sources are identical. Earlier-head results are labelled explicitly.",
+  "checks": [
+    {
+      "name": "remote keeper recovery",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "RUST_BACKTRACE=0 cargo +1.99.0 test --locked -p ra-jit --bin ra-jit remote::keeper::recovery_tests -- --nocapture",
+      "result": "passed",
+      "details": "11 passed, 0 failed",
+      "log_sha256": "098af01eef4ae3ee20309899485f51126dfc3fcdbd1528b3d30928bdf63a9991"
+    },
+    {
+      "name": "remote keeper shutdown",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "RUST_BACKTRACE=0 cargo +1.99.0 test --locked -p ra-jit --bin ra-jit remote::keeper::shutdown_tests -- --nocapture",
+      "result": "passed",
+      "details": "6 passed, 0 failed",
+      "log_sha256": "1ad2306621a99722b39a3708a1288c2fc002036b6032fb882263a94d8476ff1a"
+    },
+    {
+      "name": "source identity",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "BLAZE_BUILD_SCRIPT=<compiled crates/ra-jit/build.rs> python3 harness/source_identity_test.py -v",
+      "result": "passed",
+      "details": "26 passed, 1 skipped: the filesystem refuses non-UTF-8 filenames; rerun on the tested head also passed",
+      "log_sha256": "9f99dc32ed3f856f525f052acc758b54895d5ed4e015b43fc104ca00446a55c9"
+    },
+    {
+      "name": "LLVM-enabled release build",
+      "tested_commit": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+      "command": "RUST_BACKTRACE=0 CARGO_INCREMENTAL=0 nix develop --command cargo build -p ra-jit --release --features llvm --locked",
+      "result": "passed",
+      "details": "Build passed with the pinned LLVM environment",
+      "log_sha256": "5212594a406c00f41ac8bcd45ac4d025c46f9db5d556c636b61e12d4dcf00b65"
+    },
+    {
+      "name": "Cranelift Mach-O unwind",
+      "tested_commit": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+      "command": "RUST_BACKTRACE=0 RA_JIT_BACKEND=cranelift RA_JIT_OPT=2 RA_JIT_EMIT=fast RA_JIT_BIN=<built ra-jit> python3 harness/nocompact.py",
+      "result": "passed",
+      "details": "6/6: original link, four edits, and 1000 added functions",
+      "log_sha256": "51e503a8ba62300bf857f7f82462b85e33424a05b1fe871d49aa95e659fccd76"
+    },
+    {
+      "name": "LLVM Mach-O unwind",
+      "tested_commit": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+      "command": "RUST_BACKTRACE=0 RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast RA_JIT_BIN=<built ra-jit> python3 harness/nocompact.py",
+      "result": "passed",
+      "details": "6/6: original link, four edits, and 1000 added functions",
+      "log_sha256": "336f5e04298d96f7507ab7fa957e96a718a189ec3727d4fc6fbb3f63d0f9cc29"
+    },
+    {
+      "name": "live edits",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "RA_JIT_BIN=<built ra-jit> RA_JIT_HOME=<short temporary path> python3.13 harness/live_e2e.py",
+      "result": "passed",
+      "details": "Five live patches, independent second program, restart, and panic unwind passed. Earlier local attempts hit a long socket path and a host swap guard; the isolated rerun passed.",
+      "log_sha256": "0e86d7dedfc75219ff23aad8738b9e0a94ff713adc01d3dd4b36198eab59a3a0"
+    },
+    {
+      "name": "live runtime unit tests",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "RUST_BACKTRACE=0 cargo +1.99.0 test --locked --release -p ra-jit-live",
+      "result": "passed",
+      "details": "2 passed, 0 failed; doctests: 0",
+      "log_sha256": "cd1099d9880c6c495a3582818380fcfa8dda4bdc874f8f5f3a82cc31802988ae"
+    },
+    {
+      "name": "macOS demo build",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "cargo +1.99.0 build --locked --manifest-path demo/life/Cargo.toml",
+      "result": "passed",
+      "details": "Build passed",
+      "log_sha256": "5f4b8a9adeceb8f97ce86dc2087a87f769facbfd97e06ab6fa97f10abbaaddea"
+    }
+  ],
+  "nix_evaluation": {
+    "tested_commit": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+    "result": "passed",
+    "attributes": [
+      "daemon",
+      "run",
+      "life",
+      "daemon-units",
+      "life-bin"
+    ],
+    "command": "nix eval --raw .#packages.aarch64-darwin.<attribute>.drvPath"
+  },
+  "nix_package_build": {
+    "tested_commit": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+    "result": "running",
+    "command": "nix build --print-build-logs --no-link .#daemon-units .#run"
+  },
+  "local_cache_configuration": {
+    "setting": "NIX_CACHE_HOME=$HOME/code/.cache/nix",
+    "persistent_shell_files": [
+      "~/.zshenv",
+      "~/.bash_profile",
+      "~/.profile"
+    ],
+    "verified": "A fetcher-cache-v4.sqlite database was created in the requested directory; fresh bash and zsh shells export the setting.",
+    "package_store": "/nix/store",
+    "symlinks_added": false,
+    "defender_exclusions_changed": false,
+    "note": "The user chose to retain the standard package store and finish the checks."
+  },
+  "merge_readiness": {
+    "ready": false,
+    "pending": [
+      "Darwin Nix package build",
+      "All remaining CI environments and functional tests"
+    ],
+    "unit_gate_note": "The parallel validation lane reported 17 failures accepted by harness/unittests.py on the earlier head. Compiler sources are unchanged on this tested head, so that gate result must not be described as every test passing. A separate lane is working on removing the exceptions.",
+    "landing_note": "dist/main requires ci and C2 runtime checks. Its merge queue is not configured. No merge or bypass has been performed."
+  }
+}
