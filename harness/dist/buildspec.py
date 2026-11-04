@@ -2060,6 +2060,15 @@ class Ctx:
                     if os.path.isdir(path) and not os.path.islink(path)} if outputs else set()
         before = replays()
         run = self.blaze.run(args, copy_root, env, merge=True)
+        if self.args.json:
+            evidence = os.path.abspath(self.args.json) + ".runs"
+            os.makedirs(evidence, exist_ok=True)
+            name = (case.full if case else "run").replace("/", "__") + "-" + label.replace(" ", "-")
+            with open(os.path.join(evidence, name + ".json"), "w") as report:
+                json.dump({"argv": run.argv, "cwd": copy_root, "code": run.code,
+                           "stdout": run.out, "stderr": run.err, "seconds": run.seconds,
+                           "timed_out": run.timed_out, "watchdog": run.watchdog,
+                           "external_execs": run.external_execs}, report, indent=2)
         if self.audit and not run.watchdog:
             norustc.settle(self.audit[0], limit=60)
         self.blaze.stop(home, copy_root, env)
