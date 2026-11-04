@@ -1,5 +1,7 @@
 //! Object-free export of the compiler's local requests. No Salsa identity is an artifact.
 
+pub mod dist;
+
 #[cfg(test)]
 mod tests;
 
@@ -769,46 +771,98 @@ pub fn import_batch(
         }
         store.refresh();
         validate_receipt(context, &store, receipt)?;
-        validate_closure(&store, receipt)
+        admitted_closure(context, &store, receipt)
     })();
-    if let Err(why) = admitted {
-        drop(store);
-        let cleanup = std::fs::remove_dir_all(directory);
-        return Err(match cleanup {
-            Ok(()) => why,
-            Err(e) => format!("{why}; staging cleanup: {e}"),
-        });
-    }
-    Ok(Imported { store: std::sync::Arc::new(store), receipt: receipt.clone() })
+    let admitted = match admitted {
+        Ok(admitted) => admitted,
+        Err(why) => {
+            drop(store);
+            let cleanup = std::fs::remove_dir_all(directory);
+            return Err(match cleanup {
+                Ok(()) => why,
+                Err(e) => format!("{why}; staging cleanup: {e}"),
+            });
+        }
+    };
+    Ok(Imported { store: std::sync::Arc::new(store), receipt: receipt.clone(), admitted })
 }
 
-/// Raw batch receipts may name work held by another batch. Admission, unlike export,
-/// requires a closed set: both Named and Root edges are checked, including cycles.
-fn validate_closure(store: &store::Store, receipt: &Receipt) -> std::result::Result<(), String> {
-    let names: FxHashSet<_> = receipt.entries.iter().map(|it| it.work.name.as_str()).collect();
-    for exported in &receipt.entries {
-        let bytes = store.get_installed(&exported.key).ok_or("closure entry missing")?;
+/// The key a name's entry is kept under in this context, as `validate_receipt`
+/// recomputes it: what the name says it was told of, else the build's own.
+pub(super) fn entry_key_of(
+    context: &ExportContext<'_, '_>,
+    name: &str,
+) -> std::result::Result<Digest256, String> {
+    let told = stable::told_in(name)
+        .unwrap_or(cached::Told::of(context.policy.debug, context.policy.variables));
+    cached::Entry::key(name, told, context.policy.program.as_ref())
+        .ok_or_else(|| "entry key settings unavailable".to_owned())
+}
+
+/// The admitted closure of a receipt over a store: its entries, and every entry
+/// their `Named` and `Root` edges reach that the store holds installed, cycles
+/// included. A `FromStore` item's closure lives in the packs exactly like this
+/// (docs/distributed.md, section 4: "the execution's pinned packs hold its whole
+/// usable closure"), so admission is reachability from the receipt over verified
+/// packs, and the returned `(name, key)` list — never the packs at large — is
+/// what the lead's assembly may read. An edge to an entry no pack holds refuses
+/// the whole import, as a missing debug type blob of a reached entry does.
+pub(super) fn admitted_closure(
+    context: &ExportContext<'_, '_>,
+    store: &store::Store,
+    receipt: &Receipt,
+) -> std::result::Result<Vec<(String, Digest256)>, String> {
+    let mut admitted: Vec<(String, Digest256)> =
+        receipt.entries.iter().map(|it| (it.work.name.clone(), it.key)).collect();
+    let mut seen: FxHashSet<Digest256> = admitted.iter().map(|(_, key)| *key).collect();
+    let mut stack: Vec<Digest256> = seen.iter().copied().collect();
+    while let Some(key) = stack.pop() {
+        let bytes = store.get_installed(&key).ok_or("closure entry missing")?;
         let entry = cached::Entry::decode(&bytes).ok_or("closure entry invalid")?;
-        for function in &entry.funcs {
-            match &function.target {
-                cached::CachedTarget::Named(name) | cached::CachedTarget::Root(name)
-                    if !names.contains(name.as_str()) =>
-                {
-                    return Err(format!("receipt closure lacks `{name}`"));
-                }
-                _ => {}
-            }
-        }
         if entry.datas.iter().any(|it| matches!(it, cached::CachedData::OwnStatic(_))) {
             return Err("receipt closure requires the owned-static batch exporter".into());
         }
+        if let Some(debug) = &entry.debug {
+            for types in &debug.stored_types {
+                // A reachable entry may be absent from receipt.entries (FromStore).
+                // validate_receipt checks only listed entries, so transitive blobs
+                // must be checked here too, not merely found by their store key.
+                let bytes =
+                    store.get_installed(types).ok_or("receipt closure lacks a debug type blob")?;
+                if digest_types(&bytes) != *types {
+                    return Err("receipt closure debug type digest mismatch".into());
+                }
+                let set: Vec<debuginfo::DebugType> =
+                    postcard::from_bytes(&bytes).map_err(|e| e.to_string())?;
+                validate_types(&set)?;
+            }
+        }
+        for function in &entry.funcs {
+            let (cached::CachedTarget::Named(name) | cached::CachedTarget::Root(name)) =
+                &function.target
+            else {
+                continue;
+            };
+            let target = entry_key_of(context, name)?;
+            if !seen.insert(target) {
+                continue;
+            }
+            if store.get_installed(&target).is_none() {
+                return Err(format!("receipt closure lacks `{name}`"));
+            }
+            admitted.push((name.clone(), target));
+            stack.push(target);
+        }
     }
-    Ok(())
+    Ok(admitted)
 }
 
 pub struct Imported {
     store: std::sync::Arc<store::Store>,
     receipt: Receipt,
+    /// The admitted closure: receipt entries first, then what their edges reach
+    /// in the imported packs. The only entries this import exposes.
+    admitted: Vec<(String, Digest256)>,
 }
 
 impl Imported {
@@ -818,10 +872,9 @@ impl Imported {
 
     /// Only admitted entries are exposed, never arbitrary keys in a received pack.
     pub fn entry_bytes(&self, key: &Digest256) -> Option<Vec<u8>> {
-        self.receipt
-            .entries
+        self.admitted
             .iter()
-            .any(|it| &it.key == key)
+            .any(|(_, admitted)| admitted == key)
             .then(|| self.store.get_installed(key))
             .flatten()
     }
@@ -836,16 +889,12 @@ impl Imported {
         if context.digest != self.receipt.context {
             return Err("imported entry requested under a different context".into());
         }
-        let exported = self
-            .receipt
-            .entries
+        let (name, _) = self
+            .admitted
             .iter()
-            .find(|it| &it.key == key)
+            .find(|(_, admitted)| admitted == key)
             .ok_or("entry is not in the admitted set")?;
-        let entry = self
-            .entries(context)?
-            .get(&exported.work.name)
-            .ok_or("admitted entry cannot be rebound")?;
+        let entry = self.entries(context)?.get(name).ok_or("admitted entry cannot be rebound")?;
         entry.encode().ok_or("rebound entry encoding failed".into())
     }
 
@@ -859,7 +908,7 @@ impl Imported {
         context.check_settings()?;
         Ok(cached::Entries::owned(
             self.store.clone(),
-            self.receipt.entries.iter().map(|it| (it.work.name.clone(), it.key)).collect(),
+            self.admitted.iter().cloned().collect(),
             cached::Told::of(context.policy.debug, context.policy.variables),
             context.policy.program,
             context.symbols.cargo_home(),

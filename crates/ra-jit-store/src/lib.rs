@@ -1441,6 +1441,11 @@ impl Store {
         self.identity.0
     }
 
+    /// The names of this store's sealed packs, as [`pack`](Self::pack) reads them.
+    pub fn packs(&self) -> io::Result<Vec<String>> {
+        self.dir.packs()
+    }
+
     /// Publication barrier after every compiler writer has joined. Errors remain
     /// errors, and collection cannot evict what is being prepared for publication.
     pub fn seal_checked(&self) -> io::Result<Vec<String>> {

@@ -514,13 +514,91 @@ fn real_queries_export_roots_generics_consts_bounds_closure_paths_and_debug() {
             incomplete.entries.retain(|it| {
                 cached::Entry::decode(&store.get(&it.key).unwrap()).unwrap().label != "helper"
             });
-            let refused_dir = scratch("root-closure");
-            let refused =
-                import_batch(&context, &incomplete, &refused_dir, |name| store.pack(name))
-                    .err()
-                    .unwrap();
+            // Admission is reachability from the receipt over the packs: with
+            // `helper` gone from the entries but present in the packs, it is
+            // admitted through the closure (a `FromStore` item's shape). Gone
+            // from the packs as well, the same receipt is refused whole.
+            let closure_dir = scratch("root-closure");
+            let via_closure =
+                import_batch(&context, &incomplete, &closure_dir, |name| store.pack(name)).unwrap();
+            let helper = batch
+                .receipt
+                .entries
+                .iter()
+                .find(|it| {
+                    cached::Entry::decode(&store.get(&it.key).unwrap()).unwrap().label == "helper"
+                })
+                .unwrap();
+            assert_eq!(via_closure.entry_bytes(&helper.key), store.get(&helper.key));
+            drop(via_closure);
+            std::fs::remove_dir_all(closure_dir).unwrap();
+            if debug {
+                // The helper is reachable through root but absent from the receipt.
+                // A sealed pack can contain a value under a debug-type key whose
+                // actual bytes do not have that key's semantic digest. Only closure
+                // admission, not the receipt-entry validator, can catch it.
+                let bad_type = [0x77; 32];
+                let mut changed_helper =
+                    cached::Entry::decode(&store.get(&helper.key).unwrap()).unwrap();
+                changed_helper.debug.as_mut().unwrap().stored_types.push(bad_type);
+                let corrupted_dir = scratch("transitive-debug-type");
+                let corrupted_store = store::Store::owned(&corrupted_dir).unwrap();
+                for exported in &batch.receipt.entries {
+                    let bytes = if exported.key == helper.key {
+                        changed_helper.encode().unwrap()
+                    } else {
+                        store.get(&exported.key).unwrap()
+                    };
+                    corrupted_store.insert(&exported.key, &bytes);
+                    let entry = cached::Entry::decode(&bytes).unwrap();
+                    if let Some(debug) = &entry.debug {
+                        for key in &debug.stored_types {
+                            let value = if *key == bad_type {
+                                b"not a debug type".to_vec()
+                            } else {
+                                store.get(key).unwrap()
+                            };
+                            corrupted_store.insert(key, &value);
+                        }
+                    }
+                }
+                let mut corrupted = incomplete.clone();
+                corrupted.packs = corrupted_store.seal_checked().unwrap();
+                let refused_dir = scratch("transitive-debug-type-refused");
+                let refused = import_batch(&context, &corrupted, &refused_dir, |name| {
+                    corrupted_store.pack(name)
+                })
+                .err()
+                .expect("corrupt transitive debug blob was admitted");
+                assert!(refused.contains("closure debug type digest mismatch"), "{refused}");
+                assert!(!refused_dir.exists());
+                drop(corrupted_store);
+                std::fs::remove_dir_all(corrupted_dir).unwrap();
+            }
+            let partial_dir = scratch("root-closure-partial");
+            let partial = store::Store::owned(&partial_dir).unwrap();
+            for entry in &incomplete.entries {
+                let bytes = store.get(&entry.key).unwrap();
+                partial.insert(&entry.key, &bytes);
+                // Its debug type blobs too, so receipt validation passes and
+                // only the closure walk can refuse, on `helper` itself.
+                let decoded = cached::Entry::decode(&bytes).unwrap();
+                if let Some(debug) = &decoded.debug {
+                    for types in &debug.stored_types {
+                        partial.insert(types, &store.get(types).unwrap());
+                    }
+                }
+            }
+            let mut lacking = incomplete.clone();
+            lacking.packs = partial.seal_checked().unwrap();
+            let refused_dir = scratch("root-closure-refused");
+            let refused = import_batch(&context, &lacking, &refused_dir, |name| partial.pack(name))
+                .err()
+                .unwrap();
             assert!(refused.contains("closure lacks"), "{refused}");
             assert!(!refused_dir.exists());
+            drop(partial);
+            std::fs::remove_dir_all(partial_dir).unwrap();
             let imported =
                 import_batch(&context, &batch.receipt, &imported_dir, |name| store.pack(name))
                     .unwrap();
@@ -1454,4 +1532,631 @@ fn a_crate_built_without_debug_info_is_described_to_no_debugger() {
         assert!(of(&quiet, "plain").1.contains(".d0:"), "{}", of(&quiet, "plain").1);
         assert_ne!(of(&quiet, "plain").3, of(&alike, "plain").3);
     });
+}
+
+/// Two holders over the real Unix carrier compile one fixture build between
+/// them: each loads its own front end, both join one execution, their batches
+/// are granted from the one work set, and the lead imports the merged receipt,
+/// assembles it with no compile query of its own, links and runs it. The
+/// entries are the solo build's, digest for digest, and each worker sealed at
+/// least one of them: the split is proved, not assumed from the grants.
+#[cfg(unix)]
+#[test]
+fn two_holders_compile_one_build_over_the_socket() {
+    use blaze_dist::admission::{Admission, AdmissionConfig};
+    use blaze_dist::holder::{Holder, HolderConfig, StopWhy};
+    use blaze_dist::jobs::{ExecutionConfig, Jobs};
+    use blaze_dist::work::WorkConfig;
+    use blaze_dist_local::client::Client;
+    use blaze_dist_local::coordinator::Config as CarrierConfig;
+    use blaze_dist_local::driver::{DriverConfig, run_holder};
+    use blaze_dist_local::protocol as carrier;
+    use blaze_dist_local::server::{MonotonicClock, Server, random_id};
+    use blaze_wire::{
+        DoneEvent, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome, Reservation, Stage,
+        WorkName as WireWorkName, WorkersEventsRequest,
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    store::compiles_against("1.99.0");
+    // The solo oracle: every request of the fixture closure, one process.
+    let solo_dir = scratch("dist-solo");
+    let solo_entries = {
+        let (db, roots, _) = fixture();
+        hir::attach_db(&db, || {
+            let symbols = Symbols { db: &db, debug: true };
+            let context = ExportContext::resolved(
+                &db,
+                &symbols,
+                base_db::all_crates(&db).iter().copied(),
+                &roots,
+                policy(true),
+            )
+            .unwrap();
+            let store = store::Store::owned(&solo_dir).unwrap();
+            let requests = all_requests(&context, &roots, &store);
+            let batch = compile_batch(&context, context.digest(), &requests, &store).unwrap();
+            require_exported(&batch, requests.len());
+            let mut entries = batch.receipt.entries.clone();
+            entries.sort_by(|a, b| a.work.cmp(&b.work));
+            entries
+        })
+    };
+
+    let need = Reservation { memory: 4, cpus: 1, disk: 4 };
+    let mut admission = Admission::new(AdmissionConfig::default());
+    admission.add_machine("machine", [1; 32], Reservation { memory: 64, cpus: 16, disk: 64 });
+    let executors: Vec<String> =
+        (0..2).map(|_| admission.add_builder(0, "machine", need.clone()).unwrap()).collect();
+    let jobs = Jobs::new(
+        admission,
+        ExecutionConfig {
+            work: WorkConfig { grant_roots: 1, ..Default::default() },
+            ..Default::default()
+        },
+    );
+    let tag: String = random_id().unwrap()[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let socket = std::path::PathBuf::from(format!("/tmp/blaze-d0-dist-{tag}.sock"));
+    let server = Server::bind(
+        &socket,
+        jobs,
+        CarrierConfig::default(),
+        Arc::new(MonotonicClock::default()),
+        |_| {},
+    )
+    .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = stop.clone();
+    let server_thread = std::thread::spawn(move || server.run(signal).unwrap());
+
+    let mut submitter = Client::connect(&socket, random_id().unwrap()).unwrap();
+    let mut spec =
+        <blaze_wire::BuildSpec as blaze_wire::Sample>::sample(&mut blaze_wire::Gen::new(1));
+    spec.platform = [1; 32];
+    let request = JobRequest {
+        spec,
+        namespace: Namespace::Main,
+        deadline_ms: submitter.welcome.now_ms + 600_000,
+        local: LocalPolicy::Fallback,
+        test_timeout_ms: None,
+    };
+    let carrier::Answer::Binding(binding) =
+        submitter.call(carrier::Command::Submit(carrier::submission(&request, need))).unwrap()
+    else {
+        panic!("submit refused")
+    };
+    let content = binding.subscription.content;
+
+    let packs_dir = scratch("dist-packs");
+    std::fs::create_dir_all(&packs_dir).unwrap();
+    // Each worker's first compile waits for the other's first lease, so the
+    // split this test asserts cannot be lost to a scheduling race.
+    let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut threads = Vec::new();
+    let mut shared_receipts = Vec::new();
+    for (slot, executor) in executors.iter().enumerate() {
+        let receipts = Arc::new(Mutex::new(Vec::<Receipt>::new()));
+        shared_receipts.push(receipts.clone());
+        let (socket, executor, binding) = (socket.clone(), executor.clone(), binding.clone());
+        let packs_dir = packs_dir.clone();
+        let entered = entered.clone();
+        threads.push(std::thread::spawn(move || {
+            let (db, roots, _) = fixture();
+            hir::attach_db(&db, || {
+                let symbols = Symbols { db: &db, debug: true };
+                let context = ExportContext::resolved(
+                    &db,
+                    &symbols,
+                    base_db::all_crates(&db).iter().copied(),
+                    &roots,
+                    policy(true),
+                )
+                .unwrap();
+                let directory = scratch(&format!("dist-worker-{slot}"));
+                let store = store::Store::owned(&directory).unwrap();
+                let upload_dir = packs_dir.clone();
+                let mut worker = dist::Worker::new(
+                    &context,
+                    &store,
+                    roots.iter().copied().map(LocalRequest::root).collect(),
+                    context.digest(),
+                    [0; 32],
+                    move |name, bytes| {
+                        std::fs::write(upload_dir.join(name), bytes).map_err(|e| e.to_string())
+                    },
+                )
+                .unwrap();
+                let mut holder = Holder::new(
+                    &executor,
+                    binding.subscription.execution,
+                    binding.attempt,
+                    worker.root_set(),
+                    blaze_wire::Set::new(Vec::new()),
+                    worker.pre_index(),
+                    HolderConfig { heartbeat_ms: 100, retry_ms: 500, idle_ms: 25 },
+                );
+                let mut client = Client::connect(&socket, random_id().unwrap()).unwrap();
+                let started = std::time::Instant::now();
+                // The real worker, plus the test's first-lease barrier and its
+                // publishing of sealed receipts for the lead to merge.
+                struct Batch<'a, 'db> {
+                    worker: dist::Worker<'a, 'db>,
+                    first: bool,
+                    entered: Arc<std::sync::atomic::AtomicUsize>,
+                    receipts: Arc<Mutex<Vec<Receipt>>>,
+                }
+                impl blaze_dist::holder::BatchCompiler for Batch<'_, '_> {
+                    fn compile(
+                        &mut self,
+                        plan: &blaze_dist::holder::Plan,
+                    ) -> std::result::Result<blaze_dist::holder::Compiled, String>
+                    {
+                        if self.first {
+                            self.first = false;
+                            self.entered.fetch_add(1, Ordering::SeqCst);
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(120);
+                            while self.entered.load(Ordering::SeqCst) < 2 {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "the other worker never leased a batch"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                        }
+                        let compiled =
+                            blaze_dist::holder::BatchCompiler::compile(&mut self.worker, plan)?;
+                        *self.receipts.lock().unwrap() = self.worker.receipts().to_vec();
+                        Ok(compiled)
+                    }
+                    fn release(&mut self, names: &[WireWorkName]) {
+                        blaze_dist::holder::BatchCompiler::release(&mut self.worker, names);
+                    }
+                }
+                let stopped = {
+                    let mut batch = Batch { worker, first: true, entered, receipts };
+                    run_holder(
+                        &mut client,
+                        &socket,
+                        &mut holder,
+                        content,
+                        &executor,
+                        &DriverConfig::default(),
+                        || started.elapsed().as_millis() as u64,
+                        &mut batch,
+                    )
+                    .unwrap()
+                };
+                drop(store);
+                std::fs::remove_dir_all(&directory).unwrap();
+                stopped
+            })
+        }));
+    }
+
+    // The lead assembles when the stream says the compile phase is done.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut from = 0u64;
+    'poll: loop {
+        assert!(std::time::Instant::now() < deadline, "the compile phase never finished");
+        let carrier::Answer::Events(page) = submitter
+            .call(carrier::Command::Events(carrier::Events {
+                binding: binding.clone(),
+                from,
+                limit: 64,
+            }))
+            .unwrap()
+        else {
+            panic!("events refused")
+        };
+        from = page.next;
+        for item in &page.events {
+            if matches!(item.event, JobEvent::Stage(ref stage) if stage.stage == Stage::Compiled) {
+                break 'poll;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    let mut all_receipts: Vec<Receipt> = Vec::new();
+    let mut per_worker_entries: Vec<usize> = Vec::new();
+    for receipts in &shared_receipts {
+        let mine = receipts.lock().unwrap().clone();
+        per_worker_entries.push(mine.iter().map(|r| r.entries.len()).sum());
+        all_receipts.extend(mine);
+    }
+    assert!(
+        per_worker_entries.iter().all(|&n| n > 0),
+        "one worker sealed nothing: {per_worker_entries:?}"
+    );
+    let merged = dist::merged_receipt(&all_receipts).unwrap();
+    let mut merged_entries = merged.entries.clone();
+    merged_entries.sort_by(|a, b| a.work.cmp(&b.work));
+    assert_eq!(
+        postcard::to_allocvec(&merged_entries).unwrap(),
+        postcard::to_allocvec(&solo_entries).unwrap(),
+        "the distributed entries are not the solo build's"
+    );
+
+    // Import at a fresh generation and assemble exactly as the solo import
+    // test does: no function may be compiled by the lead.
+    let staging = scratch("dist-import");
+    let (db, roots, krate) = fixture();
+    hir::attach_db(&db, || {
+        let symbols = Symbols { db: &db, debug: true };
+        let context = ExportContext::resolved(
+            &db,
+            &symbols,
+            base_db::all_crates(&db).iter().copied(),
+            &roots,
+            policy(true),
+        )
+        .unwrap();
+        let imported =
+            import_batch(&context, &merged, &staging, |name| std::fs::read(packs_dir.join(name)))
+                .unwrap();
+        let rejected = FxHashMap::default();
+        let on_demand = roots.iter().copied().collect();
+        let owned = OwnStatics::new(
+            &db,
+            &symbols,
+            [krate].into_iter().collect(),
+            Default::default(),
+            Default::default(),
+            true,
+        );
+        let mut object =
+            ObjectCodegen::new(&db, &symbols, &rejected, owned, &on_demand, None, true).unwrap();
+        object.entries = Some(std::sync::Arc::new(imported.entries(&context).unwrap()));
+        object.root_names = context.roots.clone();
+        for root in &roots {
+            let work = context.work_name(&LocalRequest::root(*root)).unwrap();
+            object.stored_roots.insert(*root, Some(StableName::from(work.name)));
+            object.define_function(*root).unwrap();
+        }
+        assert!(object.define_instances().unwrap().is_empty());
+        assert!(object.later.is_empty(), "the lead compiled a function of the accepted set");
+        let (bytes, _) = object.finish().unwrap();
+        std::fs::write(staging.join("imported.o"), bytes).unwrap();
+        std::fs::write(
+            staging.join("main.c"),
+            "#include <stdio.h>\nextern int case_root(void);\nextern int case_vtable_root(void);\nint rust_eh_personality(void) { return 0; }\nint main(void) { printf(\"%d %d\\n\", case_root(), case_vtable_root()); }\n",
+        )
+        .unwrap();
+        let linked = std::process::Command::new("cc")
+            .args([staging.join("main.c"), staging.join("imported.o")])
+            .arg("-o")
+            .arg(staging.join("imported-program"))
+            .output()
+            .unwrap();
+        assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
+        let program =
+            std::process::Command::new(staging.join("imported-program")).output().unwrap();
+        assert!(program.status.success());
+        assert_eq!(program.stdout, b"12 9\n");
+        drop(imported);
+    });
+
+    // The lead reports the verdict; both holders are then cancelled.
+    let done = carrier::Command::WorkerEvents(carrier::WorkerEvents {
+        content,
+        executor: executors[0].clone(),
+        request: WorkersEventsRequest {
+            execution: binding.subscription.execution,
+            attempt: binding.attempt,
+            events: vec![JobEvent::Done(DoneEvent {
+                outcome: Outcome::Passed,
+                counters: Vec::new(),
+            })],
+        },
+    });
+    assert!(matches!(submitter.call(done).unwrap(), carrier::Answer::WorkerEvents(_)));
+    let carrier::Answer::Terminal(terminal) =
+        submitter.call(carrier::Command::Terminal(binding.subscription.clone())).unwrap()
+    else {
+        panic!("no terminal")
+    };
+    assert_eq!(terminal.value.as_ref().unwrap().termination.outcome, Outcome::Passed);
+    for thread in threads {
+        // Whichever the holder met first: the heartbeat's CANCEL, or `ended`
+        // on its next lease. Both are the execution being over.
+        assert!(matches!(thread.join().unwrap(), StopWhy::Cancelled | StopWhy::Ended));
+    }
+    stop.store(true, Ordering::Release);
+    server_thread.join().unwrap();
+    assert!(!socket.exists());
+    for path in [solo_dir, packs_dir, staging] {
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+/// Cross-build reuse: a first build seals its entries into a shared pack
+/// directory (the remote's layout, content-addressed); a later build — a
+/// fresh front end and a fresh store that only imported those packs, as the
+/// next push of a pull request or another pull request of the same
+/// configuration would — answers every granted root `FromStore` and compiles
+/// nothing. Entry keys name code, not a branch or a job, which is what makes
+/// the reuse cross-PR rather than per-build.
+#[test]
+fn a_later_build_takes_every_granted_entry_from_the_shared_store() {
+    use blaze_dist::holder::Plan;
+    use blaze_wire::{Attempt, ExecutionId, Grant, ItemOutcome, Lease, Set};
+
+    store::compiles_against("1.99.0");
+    let shared = scratch("from-store-shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    let first_dir = scratch("from-store-first");
+    {
+        let (db, roots, _) = fixture();
+        hir::attach_db(&db, || {
+            let symbols = Symbols { db: &db, debug: true };
+            let context = ExportContext::resolved(
+                &db,
+                &symbols,
+                base_db::all_crates(&db).iter().copied(),
+                &roots,
+                policy(true),
+            )
+            .unwrap();
+            let store = store::Store::owned(&first_dir).unwrap();
+            let requests = all_requests(&context, &roots, &store);
+            let batch = compile_batch(&context, context.digest(), &requests, &store).unwrap();
+            require_exported(&batch, requests.len());
+            for pack in &batch.receipt.packs {
+                std::fs::write(shared.join(pack), store.pack(pack).unwrap()).unwrap();
+            }
+        });
+    }
+
+    let second_dir = scratch("from-store-second");
+    let staging = scratch("from-store-import");
+    let (db, roots, krate) = fixture();
+    hir::attach_db(&db, || {
+        let symbols = Symbols { db: &db, debug: true };
+        let context = ExportContext::resolved(
+            &db,
+            &symbols,
+            base_db::all_crates(&db).iter().copied(),
+            &roots,
+            policy(true),
+        )
+        .unwrap();
+        let store = store::Store::owned(&second_dir).unwrap();
+        for entry in std::fs::read_dir(&shared).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            store.import_pack(&name, &std::fs::read(entry.path()).unwrap()).unwrap();
+        }
+        store.refresh();
+        let upload_dir = shared.clone();
+        let mut worker = dist::Worker::new(
+            &context,
+            &store,
+            roots.iter().copied().map(LocalRequest::root).collect(),
+            context.digest(),
+            [0; 32],
+            move |name, bytes| {
+                std::fs::write(upload_dir.join(name), bytes).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        let count = worker.root_set().count;
+        let plan = Plan {
+            grant: Grant {
+                lease: Lease {
+                    execution: ExecutionId(1),
+                    attempt: Attempt(1),
+                    holder: "second-build".to_owned(),
+                    generation: 1,
+                },
+                roots: Set::new(vec![(0, count)]),
+                names: Set::new(Vec::new()),
+            },
+            compile: Vec::new(),
+        };
+        let compiled = worker.compile(&plan).unwrap();
+        assert_eq!(compiled.roots.len() as u64, count);
+        assert!(
+            compiled.roots.iter().all(|item| matches!(item.outcome, ItemOutcome::FromStore(_))),
+            "the later build recompiled: {:?}",
+            compiled.roots.iter().map(|item| &item.outcome).collect::<Vec<_>>()
+        );
+        let merged = dist::merged_receipt(worker.receipts()).unwrap();
+        drop(worker);
+        let imported =
+            import_batch(&context, &merged, &staging, |name| std::fs::read(shared.join(name)))
+                .unwrap();
+        let rejected = FxHashMap::default();
+        let on_demand = roots.iter().copied().collect();
+        let owned = OwnStatics::new(
+            &db,
+            &symbols,
+            [krate].into_iter().collect(),
+            Default::default(),
+            Default::default(),
+            true,
+        );
+        let mut object =
+            ObjectCodegen::new(&db, &symbols, &rejected, owned, &on_demand, None, true).unwrap();
+        object.entries = Some(std::sync::Arc::new(imported.entries(&context).unwrap()));
+        object.root_names = context.roots.clone();
+        for root in &roots {
+            let work = context.work_name(&LocalRequest::root(*root)).unwrap();
+            object.stored_roots.insert(*root, Some(StableName::from(work.name)));
+            object.define_function(*root).unwrap();
+        }
+        assert!(object.define_instances().unwrap().is_empty());
+        assert!(object.later.is_empty(), "the later build compiled an accepted function");
+        let (bytes, _) = object.finish().unwrap();
+        std::fs::write(staging.join("imported.o"), bytes).unwrap();
+        std::fs::write(
+            staging.join("main.c"),
+            "#include <stdio.h>\nextern int case_root(void);\nextern int case_vtable_root(void);\nint rust_eh_personality(void) { return 0; }\nint main(void) { printf(\"%d %d\\n\", case_root(), case_vtable_root()); }\n",
+        )
+        .unwrap();
+        let linked = std::process::Command::new("cc")
+            .args([staging.join("main.c"), staging.join("imported.o")])
+            .arg("-o")
+            .arg(staging.join("imported-program"))
+            .output()
+            .unwrap();
+        assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
+        let program =
+            std::process::Command::new(staging.join("imported-program")).output().unwrap();
+        assert!(program.status.success());
+        assert_eq!(program.stdout, b"12 9\n");
+        drop(imported);
+        drop(store);
+    });
+    for path in [shared, first_dir, second_dir, staging] {
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+fn disappeared_or_corrupt_installed_closure_is_a_cache_miss() {
+    store::compiles_against("1.99.0");
+    let directory = scratch("vanished-closure");
+    let store = store::Store::owned(&directory).unwrap();
+    let key = [0x42; 32];
+    let admitted = vec![("cached function".to_owned(), key)];
+    // A verified entry may disappear between admission and publication.
+    assert!(dist::installed_closure_keys(&store, &admitted).is_none());
+    // An unreadable installed entry must not crash the worker either.
+    store.insert(&key, b"not an encoded compiled entry");
+    store.seal_checked().unwrap();
+    assert!(dist::installed_closure_keys(&store, &admitted).is_none());
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn unrelated_evicted_pack_does_not_mask_a_valid_cache_hit() {
+    store::compiles_against("1.99.0");
+    let directory = scratch("unrelated-evicted-pack");
+    let store = store::Store::owned(&directory).unwrap();
+    let keys = [[0x51_u8; 32], [0x52_u8; 32]];
+
+    // Two separately sealed packs. Choose the key from the SECOND pack in
+    // iteration order, regardless of filesystem directory enumeration order.
+    store.insert(&keys[0], b"first cached object");
+    assert!(!store.seal_checked().unwrap().is_empty());
+    store.insert(&keys[1], b"second cached object");
+    assert!(!store.seal_checked().unwrap().is_empty());
+    let names = store.packs().unwrap();
+    assert_eq!(names.len(), 2, "the fixture needs independent sealed packs");
+    let first_keys = store::pack_keys(&names[0], &store.pack(&names[0]).unwrap()).unwrap();
+    let second_keys = store::pack_keys(&names[1], &store.pack(&names[1]).unwrap()).unwrap();
+    let needed = keys.into_iter().find(|key| second_keys.contains(&store.disk_key(key))).unwrap();
+    assert!(!first_keys.contains(&store.disk_key(&needed)));
+
+    let mut visited = Vec::new();
+    let holding = dist::holding_packs(&store, &[needed], |name| {
+        visited.push(name.to_owned());
+        if name == names[0] {
+            Err("unrelated pack was evicted".to_owned())
+        } else {
+            store.pack(name).map_err(|error| error.to_string())
+        }
+    })
+    .unwrap()
+    .expect("a later intact pack covers the entire requested closure");
+    assert_eq!(visited, names);
+    assert_eq!(holding.len(), 1);
+    assert_eq!(holding[0].0, names[1]);
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn disappeared_or_corrupt_sealed_pack_is_a_cache_miss() {
+    store::compiles_against("1.99.0");
+    let directory = scratch("vanished-pack");
+    let store = store::Store::owned(&directory).unwrap();
+    let key = [0x43; 32];
+    store.insert(&key, b"sealed entry");
+    assert!(!store.seal_checked().unwrap().is_empty());
+
+    // The intact sealed pack covers the same installed key. Failure injection
+    // must not turn an otherwise valid cache hit into a fabricated success.
+    assert!(
+        dist::holding_packs(&store, &[key], |name| {
+            store.pack(name).map_err(|error| error.to_string())
+        })
+        .unwrap()
+        .is_some()
+    );
+
+    // Collection may unlink a pack after the store lists its name.
+    assert!(
+        dist::holding_packs(&store, &[key], |_| Err("pack evicted".to_owned())).unwrap().is_none()
+    );
+
+    // Corruption after the earlier installed-entry read is also a cache miss,
+    // before publishing any part of the closure.
+    assert!(
+        dist::holding_packs(&store, &[key], |name| {
+            let mut bytes = store.pack(name).map_err(|error| error.to_string())?;
+            bytes[0] ^= 1;
+            Ok(bytes)
+        })
+        .unwrap()
+        .is_none()
+    );
+
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn merged_receipt_checks_duplicates_in_its_first_batch() {
+    let entry = Exported {
+        work: WorkName { name: "fixture".to_owned(), home: [3; 32], tuple: [4; 32] },
+        key: [5; 32],
+        entry_digest: [6; 32],
+    };
+    let first = Receipt {
+        context: [1; 32],
+        producer: [2; 32],
+        entries: vec![entry.clone(), entry.clone()],
+        packs: vec!["pack-one".to_owned(), "pack-one".to_owned()],
+    };
+    // Equal duplicates are idempotent even inside the first sealed batch.
+    let merged = dist::merged_receipt(&[first.clone(), first.clone()]).unwrap();
+    assert_eq!(merged.entries.len(), 1);
+    assert_eq!(merged.entries[0].entry_digest, entry.entry_digest);
+    assert_eq!(merged.packs, vec!["pack-one".to_owned()]);
+
+    // The same key with conflicting bytes in the FIRST batch must be refused,
+    // not silently overwritten when that batch seeds the deduplication map.
+    let mut conflict = first.clone();
+    conflict.entries[1].entry_digest[0] ^= 1;
+    assert!(dist::merged_receipt(&[conflict]).unwrap_err().contains("two different digests"));
+
+    // Equal digests are not enough: the name, home and tuple bind the result
+    // to a particular request. Deduplicating by key must not hide a forged
+    // second identity from the downstream receipt validator.
+    let mut different_work = first.clone();
+    different_work.entries[1].work.name.push_str("-other");
+    let error = dist::merged_receipt(&[different_work]).unwrap_err();
+    assert!(error.contains("two different work identities"));
+    let mut different_home = first.clone();
+    different_home.entries[0].work.home[0] ^= 1;
+    let error = dist::merged_receipt(&[first.clone(), different_home]).unwrap_err();
+    assert!(error.contains("two different work identities"));
+
+    // Mismatched later batches and later conflicting duplicates are refused too.
+    let mut different_context = first.clone();
+    different_context.context[0] ^= 1;
+    assert!(dist::merged_receipt(&[first.clone(), different_context]).is_err());
+    let mut conflicting_later = first.clone();
+    conflicting_later.entries[0].entry_digest[0] ^= 1;
+    assert!(
+        dist::merged_receipt(&[first, conflicting_later])
+            .unwrap_err()
+            .contains("two different digests")
+    );
 }
