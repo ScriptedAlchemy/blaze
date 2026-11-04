@@ -827,9 +827,8 @@ pub(super) fn admitted_closure(
                 // A reachable entry may be absent from receipt.entries (FromStore).
                 // validate_receipt checks only listed entries, so transitive blobs
                 // must be checked here too, not merely found by their store key.
-                let bytes = store
-                    .get_installed(types)
-                    .ok_or("receipt closure lacks a debug type blob")?;
+                let bytes =
+                    store.get_installed(types).ok_or("receipt closure lacks a debug type blob")?;
                 if digest_types(&bytes) != *types {
                     return Err("receipt closure debug type digest mismatch".into());
                 }
