@@ -577,6 +577,14 @@ impl World {
                 }
                 jobs::Effect::NeedLead => self.summary.reassigned += 1,
                 jobs::Effect::Work(_) => {}
+                // This world models `NoCompileWork` executions only, which never take
+                // helpers; `sim::work` is where helper assignment is simulated.
+                jobs::Effect::HelperAssigned { .. } => {
+                    return Err(self.violation(
+                        "helpers",
+                        "a helper was assigned to a no-compile-work execution".to_owned(),
+                    ));
+                }
             }
         }
         Ok(())

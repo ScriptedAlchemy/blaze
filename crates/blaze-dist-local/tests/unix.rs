@@ -36,6 +36,7 @@ struct Fixture {
     effects: Arc<Mutex<Vec<(ExecutionId, Effect)>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     executor: String,
+    executors: Vec<String>,
 }
 
 impl Fixture {
@@ -80,7 +81,41 @@ impl Fixture {
         .unwrap();
         let signal = stop.clone();
         let thread = std::thread::spawn(move || server.run(signal).unwrap());
-        Self { path, stop, clock, effects, thread: Some(thread), executor }
+        let executors = if executor.is_empty() { Vec::new() } else { vec![executor.clone()] };
+        Self { path, stop, clock, effects, thread: Some(thread), executor, executors }
+    }
+
+    /// `builders` executors on one machine under a caller-chosen execution config, for
+    /// the two-worker tests: the first admitted builder leads, the rest are offered
+    /// as helpers by the registry itself.
+    fn with_workers(builders: usize, exec: ExecutionConfig) -> Self {
+        let id = random_id().unwrap();
+        let tag: String = id[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let path = PathBuf::from(format!("/tmp/blaze-dist-{tag}.sock"));
+        let mut admission = Admission::new(AdmissionConfig::default());
+        admission.add_machine("machine", [1; 32], Reservation { memory: 64, cpus: 16, disk: 64 });
+        let executors: Vec<String> =
+            (0..builders).map(|_| admission.add_builder(0, "machine", need()).unwrap()).collect();
+        let jobs = Jobs::new(admission, exec);
+        let clock = Arc::new(TestClock::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let effects = Arc::new(Mutex::new(Vec::new()));
+        let delivered = effects.clone();
+        let server = Server::bind(&path, jobs, Config::default(), clock.clone(), move |batch| {
+            delivered.lock().unwrap().extend(batch);
+        })
+        .unwrap();
+        let signal = stop.clone();
+        let thread = std::thread::spawn(move || server.run(signal).unwrap());
+        Self {
+            path,
+            stop,
+            clock,
+            effects,
+            thread: Some(thread),
+            executor: executors.first().cloned().unwrap_or_default(),
+            executors,
+        }
     }
 
     fn client(&self) -> Client {
@@ -1078,4 +1113,220 @@ fn production_cli_server_owns_and_removes_its_actual_socket() {
     writeln!(child.stdin.take().unwrap(), "stop").unwrap();
     assert!(child.wait().unwrap().success());
     assert!(!path.exists());
+}
+
+fn two_roots() -> RootSet {
+    RootSet { spec: [1; 32], roots: [2; 32], count: 2, index: [3; 32], inputs: [4; 32] }
+}
+
+fn join_as(c: &mut Client, content: blaze_wire::JobContent, b: &Binding, who: &str) {
+    let answer = c
+        .call(Command::Join(Join {
+            content,
+            executor: who.to_owned(),
+            request: WorkJoinRequest {
+                execution: b.subscription.execution,
+                attempt: b.attempt,
+                roots: two_roots(),
+                rejected: Set::new(Vec::new()),
+            },
+        }))
+        .unwrap();
+    assert!(matches!(answer, Answer::Join(_)), "{who} could not join: {answer:?}");
+}
+
+fn lease_as(
+    c: &mut Client,
+    content: blaze_wire::JobContent,
+    b: &Binding,
+    who: &str,
+) -> blaze_wire::Grant {
+    let Answer::Lease(answer) = c
+        .call(Command::Lease(Lease {
+            content,
+            executor: who.to_owned(),
+            request: WorkLeaseRequest { execution: b.subscription.execution, attempt: b.attempt },
+        }))
+        .unwrap()
+    else {
+        panic!("{who} got no lease answer")
+    };
+    answer.grant.unwrap_or_else(|| panic!("{who} got an empty grant"))
+}
+
+fn result_as(
+    c: &mut Client,
+    content: blaze_wire::JobContent,
+    who: &str,
+    grant: &blaze_wire::Grant,
+    tag: u8,
+) -> Answer {
+    c.call(Command::Result(BatchSubmission {
+        content,
+        executor: who.to_owned(),
+        request: BatchResult {
+            lease: grant.lease.clone(),
+            seq: 1,
+            items: vec![ItemResult {
+                name: WorkName([tag; 32]),
+                outcome: ItemOutcome::Local(Why { why: "fixture".to_owned() }),
+                found: Set::new(Vec::new()),
+                unnamed: Set::new(Vec::new()),
+            }],
+            packs: Vec::new(),
+            returned_roots: Set::new(Vec::new()),
+            returned_names: Set::new(Vec::new()),
+        },
+    }))
+    .unwrap()
+}
+
+fn heartbeat_as(c: &mut Client, content: blaze_wire::JobContent, b: &Binding, who: &str) {
+    let answer = c
+        .call(Command::WorkerEvents(WorkerEvents {
+            content,
+            executor: who.to_owned(),
+            request: WorkersEventsRequest {
+                execution: b.subscription.execution,
+                attempt: b.attempt,
+                events: Vec::new(),
+            },
+        }))
+        .unwrap();
+    assert!(matches!(answer, Answer::WorkerEvents(_)), "{answer:?}");
+}
+
+fn done_passed(c: &mut Client, content: blaze_wire::JobContent, b: &Binding, lead: &str) {
+    let answer = c
+        .call(Command::WorkerEvents(WorkerEvents {
+            content,
+            executor: lead.to_owned(),
+            request: WorkersEventsRequest {
+                execution: b.subscription.execution,
+                attempt: b.attempt,
+                events: vec![JobEvent::Done(DoneEvent {
+                    outcome: Outcome::Passed,
+                    counters: Vec::new(),
+                })],
+            },
+        }))
+        .unwrap();
+    assert!(matches!(answer, Answer::WorkerEvents(_)), "{answer:?}");
+    let Answer::Terminal(t) = c.call(Command::Terminal(b.subscription.clone())).unwrap() else {
+        panic!("no terminal")
+    };
+    assert_eq!(t.value.as_ref().unwrap().termination.outcome, Outcome::Passed);
+}
+
+/// Two builders, one build, over the real socket: the registry offers the second
+/// builder as a helper, both join the attempt, their grants are disjoint, both
+/// commit, and the job passes. Until the registry assigned helpers, the helper's
+/// join was refused `not-holder` and no build could split.
+#[test]
+fn two_workers_split_one_build_over_sockets() {
+    let f = Fixture::with_workers(
+        2,
+        ExecutionConfig {
+            work: blaze_dist::work::WorkConfig { grant_roots: 1, ..Default::default() },
+            ..Default::default()
+        },
+    );
+    let (lead, helper) = (f.executors[0].clone(), f.executors[1].clone());
+    let mut c = f.client();
+    let b = submit(&mut c, 1_000_000);
+    let content = b.subscription.content;
+    join_as(&mut c, content, &b, &lead);
+    join_as(&mut c, content, &b, &helper);
+    let first = lease_as(&mut c, content, &b, &lead);
+    let second = lease_as(&mut c, content, &b, &helper);
+    assert_eq!(first.roots.iter().copied().collect::<Vec<_>>(), vec![(0, 1)]);
+    assert_eq!(second.roots.iter().copied().collect::<Vec<_>>(), vec![(1, 2)]);
+    assert!(matches!(result_as(&mut c, content, &lead, &first, 9), Answer::Result(_)));
+    assert!(matches!(result_as(&mut c, content, &helper, &second, 10), Answer::Result(_)));
+    done_passed(&mut c, content, &b, &lead);
+
+    let effects = f.effects.lock().unwrap();
+    assert!(
+        effects.iter().any(|(_, effect)| matches!(
+            effect,
+            Effect::HelperAssigned { executor, .. } if executor == &helper
+        )),
+        "no helper assignment was delivered: {effects:?}"
+    );
+    let committed: Vec<&str> = effects
+        .iter()
+        .filter_map(|(_, effect)| match effect {
+            Effect::Work(blaze_dist::work::Effect::Committed { by, .. }) => {
+                Some(by.holder.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(committed.contains(&lead.as_str()), "{committed:?}");
+    assert!(committed.contains(&helper.as_str()), "{committed:?}");
+}
+
+/// A helper that takes a grant and goes silent is fenced by the clock: its root is
+/// re-granted to the lead at a higher generation, its late result is refused
+/// `dead-lease` whole, and the build still passes on the survivor alone.
+#[test]
+fn a_silent_helpers_lease_is_fenced_and_its_root_regranted() {
+    let f = Fixture::with_workers(
+        2,
+        ExecutionConfig {
+            work: blaze_dist::work::WorkConfig {
+                grant_roots: 1,
+                lease_ms: 20_000,
+                progress_first_ms: 3_600_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let (lead, helper) = (f.executors[0].clone(), f.executors[1].clone());
+    let mut c = f.client();
+    let b = submit(&mut c, 1_000_000);
+    let content = b.subscription.content;
+    join_as(&mut c, content, &b, &lead);
+    join_as(&mut c, content, &b, &helper);
+    let stale = lease_as(&mut c, content, &b, &helper);
+    assert_eq!(stale.roots.iter().copied().collect::<Vec<_>>(), vec![(0, 1)]);
+
+    // The helper never speaks again. The lead heartbeats inside its own 15 s
+    // lead-loss window while the clock passes the helper's 20 s lease.
+    for at in [10_000, 20_000, 25_000] {
+        f.at(at);
+        heartbeat_as(&mut c, content, &b, &lead);
+    }
+    let regranted = lease_as(&mut c, content, &b, &lead);
+    assert_eq!(regranted.roots.iter().copied().collect::<Vec<_>>(), vec![(0, 1)]);
+    assert!(regranted.lease.generation > stale.lease.generation, "{regranted:?} vs {stale:?}");
+
+    let late = result_as(&mut c, content, &helper, &stale, 10);
+    let Answer::Error(error) = late else { panic!("a fenced result was accepted: {late:?}") };
+    assert!(error.message.contains("dead-lease"), "{error:?}");
+
+    assert!(matches!(result_as(&mut c, content, &lead, &regranted, 9), Answer::Result(_)));
+    let rest = lease_as(&mut c, content, &b, &lead);
+    assert_eq!(rest.roots.iter().copied().collect::<Vec<_>>(), vec![(1, 2)]);
+    // The lead's second batch of the attempt carries its next sequence number.
+    let second = BatchSubmission {
+        content,
+        executor: lead.clone(),
+        request: BatchResult {
+            lease: rest.lease.clone(),
+            seq: 2,
+            items: vec![ItemResult {
+                name: WorkName([11; 32]),
+                outcome: ItemOutcome::Local(Why { why: "fixture".to_owned() }),
+                found: Set::new(Vec::new()),
+                unnamed: Set::new(Vec::new()),
+            }],
+            packs: Vec::new(),
+            returned_roots: Set::new(Vec::new()),
+            returned_names: Set::new(Vec::new()),
+        },
+    };
+    assert!(matches!(c.call(Command::Result(second)).unwrap(), Answer::Result(_)));
+    done_passed(&mut c, content, &b, &lead);
 }

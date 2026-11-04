@@ -96,7 +96,10 @@ fn error(code: ErrorCode, text: &str) -> WireError {
 
 impl Coordinator {
     /// Own the actual core registry. The caller sets admission/builders, not worker messages.
-    pub fn new(jobs: Jobs, config: Config, epoch: Digest) -> Self {
+    /// The registry's ids are seeded from this daemon's epoch, so a restarted daemon
+    /// never reissues an execution id a surviving executor's lease still names.
+    pub fn new(mut jobs: Jobs, config: Config, epoch: Digest) -> Self {
+        jobs.seed_ids(&epoch);
         Self {
             jobs,
             config,

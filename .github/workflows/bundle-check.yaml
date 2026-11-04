@@ -9,19 +9,9 @@ name: bundle check
 on:
   workflow_call:
     inputs:
-      source-repository:
-        type: string
-        default: ""
-      source-ref:
-        type: string
-        default: ""
       platform:
         type: string
         required: true
-      runner-label:
-        description: Additional label binding private jobs to their source run
-        type: string
-        default: ""
       os:
         type: string
         required: true
@@ -42,13 +32,11 @@ defaults:
 jobs:
   check:
     name: bundle (${{ inputs.platform }})
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       # The Nix store paths the binaries link against; the cache is the build job's, read only.
       - uses: ./.github/actions/toolchain
