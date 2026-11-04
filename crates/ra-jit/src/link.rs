@@ -684,8 +684,8 @@ fn native(db: &RootDatabase, program: &[Crate], target: &Target) -> anyhow::Resu
     Ok(native)
 }
 
-/// What the build script of `krate`'s package printed for the link, as cargo passes it to
-/// rustc: `rustc-link-lib`, `rustc-link-search`, `rustc-flags` and `rustc-link-arg`.
+/// The crate's configured native flags and what its package's build script printed for the
+/// link: `rustc-link-lib`, `rustc-link-search`, `rustc-flags` and `rustc-link-arg`.
 fn asked_by_script(
     db: &RootDatabase,
     krate: base_db::Crate,
@@ -694,7 +694,10 @@ fn asked_by_script(
     if let Some(unit) = crate::native_inputs::native_unit_for_crate(db, krate)? {
         return native_flags(&unit.flags, target);
     }
-    let mut asked = Native::default();
+    // Live builds carry their effective Rust flags in the crate graph. Replay units already
+    // bind those flags together with their producer output, so the branch above owns both.
+    let flags = krate.data(db).codegen_flags.iter().map(OsString::from).collect::<Vec<_>>();
+    let mut asked = native_flags(&flags, target)?;
     let Some(out_dir) = crate::cargo::script::out_dir_of(db, krate) else { return Ok(asked) };
     let printed = crate::cargo::script::printed(&out_dir);
     let Some(Ok(printed)) = printed.map(std::fs::read_to_string) else { return Ok(asked) };
@@ -1045,6 +1048,7 @@ mod tests {
         std::fs::write(
             run.path().join("output"),
             "cargo:rustc-link-search=native=/producer/lib\ncargo:rustc-link-lib=dylib=saved_dynamic\n\
+             cargo:rustc-link-arg=-Wl,-u,script_root\n\
              cargo:rustc-env=OUT_DIR=/native-script-marker\n",
         )
         .unwrap();
@@ -1069,6 +1073,7 @@ mod tests {
                 toolchain: None,
             }),
         );
+        graph.set_codegen_flags(krate, vec!["-C".into(), "link-arg=-Wl,-no_compact_unwind".into()]);
         graph.set_build_script_out_dir(krate, Some(paths::AbsPathBuf::assert_utf8(out)));
         let krate = graph.set_in_db(&mut db)[&krate];
         let target = Target { apple: false, arch: "x86_64".into(), shared: false };
@@ -1076,6 +1081,10 @@ mod tests {
         assert_eq!(asked.search, vec![OsString::from("-L/producer/lib")]);
         let libs: Vec<_> = asked.libs.iter().map(|it| target.lib(it)).collect();
         assert_eq!(libs, vec![vec!["-lsaved_dynamic".to_owned()]]);
+        assert_eq!(
+            asked.args,
+            [OsString::from("-Wl,-no_compact_unwind"), OsString::from("-Wl,-u,script_root")]
+        );
     }
 
     /// What rustc 1.99 does for each `-C strip`: a GNU-flavoured linker is told
