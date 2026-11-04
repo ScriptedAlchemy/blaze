@@ -97,6 +97,19 @@ pub struct Compiled {
     pub returned_names: Vec<WorkName>,
 }
 
+/// What a holder's driver compiles its plans with: the executor's batch
+/// compiler (the existing batch exporter), and where findings the
+/// coordinator no longer counts on are dropped. It lives with the holder,
+/// not with any carrier, so a compiler crate can implement it without
+/// depending on a transport (the local carrier is Unix-only; the compiler
+/// is not). A compile failure is the driver's to surface, named.
+pub trait BatchCompiler {
+    /// Compile one granted batch whole, its entries sealed and uploaded.
+    fn compile(&mut self, plan: &Plan) -> Result<Compiled, String>;
+    /// Drop retained findings of these names.
+    fn release(&mut self, names: &[WorkName]);
+}
+
 /// Why a holder left the execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopWhy {
