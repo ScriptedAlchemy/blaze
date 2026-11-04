@@ -7,8 +7,9 @@ use std::collections::BTreeSet;
 use blaze_dist::Ranges;
 use blaze_dist::holder::{Call, Compiled, Effect, Event, Holder, HolderConfig, Reply, StopWhy};
 use blaze_wire::{
-    Attempt, EntryKey, EntryRef, ExecutionId, Found, Grant, ItemOutcome, ItemResult, Lease,
-    RootSet, Set, WorkJoinAnswer, WorkLeaseAnswer, WorkName, WorkResultAnswer, WorkersEventsAnswer,
+    Attempt, EntryKey, EntryRef, ErrorCode, ExecutionId, Found, Grant, ItemOutcome, ItemResult,
+    Lease, RootSet, Set, WireError, WorkJoinAnswer, WorkLeaseAnswer, WorkName, WorkResultAnswer,
+    WorkersEventsAnswer,
 };
 
 const FOUND: WorkName = WorkName([7; 32]);
@@ -254,6 +255,84 @@ fn heartbeat_acknowledgement_allows_a_fresh_request_without_reusing_the_old_id()
         &mut effects,
     );
     assert!(holder.is_stopped());
+}
+
+/// A carrier `Busy` on a lease (a retention bound, answered with the bare code and no
+/// `busy:` token) is a wait: the holder asks again after `retry_after_ms` instead of
+/// stopping as a protocol fault.
+#[test]
+fn a_busy_lease_answer_waits_and_asks_again() {
+    let roots =
+        RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
+    let mut holder = Holder::new(
+        "helper",
+        ExecutionId(1),
+        Attempt(1),
+        roots.clone(),
+        Set::new(Vec::new()),
+        BTreeSet::new(),
+        HolderConfig::default(),
+    );
+    let mut effects = Vec::new();
+    holder.step(0, Event::Loaded, &mut effects);
+    let id = sent(&effects);
+    effects.clear();
+    holder.step(
+        1,
+        Event::Reply { id, reply: Reply::Join(Ok(WorkJoinAnswer { roots, fixed: true })) },
+        &mut effects,
+    );
+    let id = sent(&effects);
+    effects.clear();
+    let busy = WireError::new(ErrorCode::Busy, "grant-retention-capacity").retry_after(500);
+    holder.step(2, Event::Reply { id, reply: Reply::Lease(Err(busy)) }, &mut effects);
+    assert!(!holder.is_stopped(), "{effects:?}");
+    assert!(effects.is_empty(), "{effects:?}");
+    holder.step(501, Event::Tick, &mut effects);
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::Send { call: Call::Lease(_), .. })),
+        "asked again before the wait elapsed: {effects:?}"
+    );
+    effects.clear();
+    holder.step(502, Event::Tick, &mut effects);
+    assert!(
+        effects.iter().any(|effect| matches!(effect, Effect::Send { call: Call::Lease(_), .. })),
+        "{effects:?}"
+    );
+}
+
+/// A heartbeat refused with `attempt-moved` fences the holder at once: it does not
+/// keep compiling for the dead attempt until its next work call.
+#[test]
+fn a_heartbeat_that_names_a_moved_attempt_stops_the_holder() {
+    let roots =
+        RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
+    let mut holder = Holder::new(
+        "helper",
+        ExecutionId(1),
+        Attempt(1),
+        roots,
+        Set::new(Vec::new()),
+        BTreeSet::new(),
+        HolderConfig::default(),
+    );
+    let mut effects = Vec::new();
+    holder.start(0, &mut effects);
+    let beat = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Send { id, call: Call::Events(_) } => Some(*id),
+            _ => None,
+        })
+        .expect("a heartbeat was sent");
+    effects.clear();
+    let moved = blaze_dist::Refusal::AttemptMoved.to_wire(None);
+    holder.step(1, Event::Reply { id: beat, reply: Reply::Events(Err(moved)) }, &mut effects);
+    assert!(holder.is_stopped());
+    assert!(
+        effects.iter().any(|effect| matches!(effect, Effect::Stop(StopWhy::AttemptMoved))),
+        "{effects:?}"
+    );
 }
 
 #[test]
