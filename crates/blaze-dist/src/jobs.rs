@@ -374,7 +374,7 @@ impl Execution {
     /// Another helper for the current attempt: an idle executor of the right trust, platform
     /// and front end, as admission offers it (non-blocking: a lead never waits for one). Never
     /// a lead this execution lost.
-    pub fn add_helper(&mut self, now: Millis, executor: &str) -> Result<Attempt, Refusal> {
+    pub fn add_helper(&mut self, _now: Millis, executor: &str) -> Result<Attempt, Refusal> {
         if let ExecState::Ended(_) = self.state {
             return Err(Refusal::Ended);
         }
@@ -384,7 +384,9 @@ impl Execution {
         if self.lead.as_deref() != Some(executor) {
             self.helpers.insert(executor.to_owned());
         }
-        self.heard.insert(executor.to_owned(), now);
+        // Reserving an executor does not mean the worker has started or is alive.
+        // Only an accepted work call or heartbeat makes it eligible as a recently
+        // heard lead replacement. Unstarted helpers remain fallback candidates.
         Ok(self.attempt)
     }
 
