@@ -236,16 +236,11 @@ impl Worker<'_, '_> {
         let Ok(admitted) = super::admitted_closure(self.context, self.store, &probe) else {
             return Ok(None);
         };
-        // The lead's staging store must hold the closure too, debug type
-        // blobs included: name every pack that holds a needed key.
-        let mut needed: Vec<super::Digest256> = admitted.iter().map(|(_, k)| *k).collect();
-        for (_, admitted_key) in &admitted {
-            let bytes = self.store.get_installed(admitted_key).expect("closure checked");
-            let entry = crate::cached::Entry::decode(&bytes).expect("closure checked");
-            if let Some(debug) = &entry.debug {
-                needed.extend(debug.stored_types.iter().copied());
-            }
-        }
+        // An admitted closure may be evicted or damaged before the pack scan.
+        // Treat that as a cache miss, never a panic or a partial publication.
+        let Some(needed) = installed_closure_keys(self.store, &admitted) else {
+            return Ok(None);
+        };
         let Some(holding) = self.packs_holding(&needed)? else { return Ok(None) };
         let mut names = Vec::new();
         for (pack, bytes) in &holding {
@@ -293,6 +288,24 @@ impl Worker<'_, '_> {
         }
         Ok(uncovered.is_empty().then_some(holding))
     }
+}
+
+/// Re-read the admitted closure before publication: admission and packing are
+/// separate operations, and an installed entry can disappear or become unreadable
+/// between them. No incomplete closure may be offered as a cache hit.
+pub(super) fn installed_closure_keys(
+    store: &store::Store,
+    admitted: &[(String, super::Digest256)],
+) -> Option<Vec<super::Digest256>> {
+    let mut needed: Vec<super::Digest256> = admitted.iter().map(|(_, key)| *key).collect();
+    for (_, key) in admitted {
+        let bytes = store.get_installed(key)?;
+        let entry = crate::cached::Entry::decode(&bytes)?;
+        if let Some(debug) = &entry.debug {
+            needed.extend(debug.stored_types.iter().copied());
+        }
+    }
+    Some(needed)
 }
 
 /// The worker is a holder driver's batch compiler: the existing exporter,
