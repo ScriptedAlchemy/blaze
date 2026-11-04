@@ -85,11 +85,12 @@ def links(home):
 def symbol_address(listed, name):
     """Find one ra-jit function, not rustc's separate jump or another same-named symbol.
 
-    ra-jit's private names use either ra-jit/ra_jit, with an optional n before the number.
-    Both spellings are recognized by the tier reporter too.
+    ra-jit's private names use either ra-jit/ra_jit, may include a qualified
+    crate/module path, and have an optional n before the number. Resolve only
+    an unambiguous exact final function name, never an arbitrary nearby symbol.
     """
     found = re.findall(
-        rf"^([0-9a-fA-F]+)[ \t]+[tTsS][ \t]+_ra[-_]jit::{re.escape(name)}::n?\d+$",
+        rf"^([0-9a-fA-F]+)[ \t]+[tTsS][ \t]+_ra[-_]jit::(?:[A-Za-z0-9_$]+::)*{re.escape(name)}::n?\d+$",
         listed, re.M
     )
     return "0x" + found[0] if len(found) == 1 else None
@@ -104,10 +105,16 @@ def address_of(program, name):
     at = symbol_address(found.stdout, name)
     if at is None:
         lines = found.stdout.splitlines()
-        candidates = [line for line in lines if "ra-jit" in line or "ra_jit" in line
-                      or f"::{name}" in line]
+        named = [line for line in lines if f"::{name}::" in line]
+        # Constant data labels can crowd every useful name out of the first 24
+        # diagnostics. Show the relevant name rows first; failing that, the
+        # actual private code symbols instead of .Lra-jit.const.*.
+        code = [line for line in lines
+                if re.search(r"[ \t]+[tTsS][ \t]+_ra[-_]jit::", line)]
+        sample = named if named else code
         print(f"no unique {name} symbol in {program} ({len(lines)} nm rows, "
-              f"{len(candidates)} candidate rows):\n" + "\n".join(candidates[:24]), file=sys.stderr)
+              f"{len(named)} name rows, {len(code)} private code rows):\n"
+              + "\n".join(sample[:24]), file=sys.stderr)
     return at
 
 

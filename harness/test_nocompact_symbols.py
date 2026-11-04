@@ -19,6 +19,20 @@ class Symbols(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(symbol_address(f"0000f0af t {name}\n", "answer"), "0x0000f0af")
 
+    def test_qualified_private_names_keep_the_exact_final_function(self):
+        for symbol in ("_ra_jit::ncu::answer::n7",
+                       "_ra-jit::app::nested::answer::42"):
+            with self.subTest(symbol=symbol):
+                self.assertEqual(symbol_address(f"00aBcd09 t {symbol}\n", "answer"),
+                                 "0x00aBcd09")
+        self.assertIsNone(symbol_address(
+            "0000f0af t _ra_jit::app::answer_extra::n7\n", "answer"))
+        # Two matching functions in different modules are ambiguous, not a
+        # reason to guess the first function's unwind address.
+        self.assertIsNone(symbol_address(
+            "0000f0af t _ra_jit::app::answer::n7\n"
+            "0000f0ff t _ra_jit::other::answer::n8\n", "answer"))
+
     def test_global_text_and_tab_separated_nm_symbols(self):
         for kind in ("T", "S", "t", "s"):
             with self.subTest(kind=kind):
