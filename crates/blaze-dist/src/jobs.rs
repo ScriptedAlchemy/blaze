@@ -1138,29 +1138,39 @@ impl Jobs {
             })
             .map(|e| e.id)
             .collect();
-        for id in ids {
-            loop {
-                let Some((platform, need)) = self.platforms.get(&id).cloned() else { break };
+        // One offer per running execution per round. The previous nested loop gave
+        // every idle builder to the oldest execution before another running build
+        // could get even one helper, despite both having runnable work.
+        loop {
+            let mut offered = false;
+            for &id in &ids {
+                let Some((platform, need)) = self.platforms.get(&id).cloned() else {
+                    continue;
+                };
                 if self.admission.waiting(&platform) > 0 {
-                    break;
+                    continue;
                 }
                 let e = &self.executions[&id];
                 if e.work().is_none_or(|w| w.is_done()) {
-                    break;
+                    continue;
                 }
                 let namespace = e.namespace.clone();
                 let except: Vec<String> =
                     e.executors().map(str::to_owned).chain(e.lost.iter().cloned()).collect();
                 let Some(helper) = self.admission.idle_for(&namespace, &platform, &need, &except)
                 else {
-                    break;
+                    continue;
                 };
                 let e = self.executions.get_mut(&id).expect("present");
-                let Ok(attempt) = e.add_helper(now, &helper) else { break };
+                let Ok(attempt) = e.add_helper(now, &helper) else { continue };
                 let assignment = e.assignment();
                 self.admission.take(&helper, id, attempt);
                 self.assignments.insert(helper.clone(), (assignment, false));
                 out.push((id, Effect::HelperAssigned { executor: helper, assignment }));
+                offered = true;
+            }
+            if !offered {
+                break;
             }
         }
     }
