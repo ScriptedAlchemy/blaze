@@ -2092,9 +2092,7 @@ fn disappeared_or_corrupt_sealed_pack_is_a_cache_miss() {
 
     // Collection may unlink a pack after the store lists its name.
     assert!(
-        dist::holding_packs(&store, &[key], |_| Err("pack evicted".to_owned()))
-            .unwrap()
-            .is_none()
+        dist::holding_packs(&store, &[key], |_| Err("pack evicted".to_owned())).unwrap().is_none()
     );
 
     // Corruption after the earlier installed-entry read is also a cache miss,

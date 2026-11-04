@@ -272,9 +272,7 @@ impl Worker<'_, '_> {
         &self,
         needed: &[super::Digest256],
     ) -> Result<Option<Vec<(String, Vec<u8>)>>, String> {
-        holding_packs(self.store, needed, |name| {
-            self.store.pack(name).map_err(|e| e.to_string())
-        })
+        holding_packs(self.store, needed, |name| self.store.pack(name).map_err(|e| e.to_string()))
     }
 }
 
