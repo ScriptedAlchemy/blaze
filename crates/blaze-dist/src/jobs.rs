@@ -1096,9 +1096,21 @@ impl Jobs {
                 let namespace = e.namespace.clone();
                 // Helpers heard from inside the lead-loss window keep helping under the
                 // new attempt, and one of them leads first: it already holds this
-                // execution's front end. Only with none heard does admission's idle
-                // pool supply the lead, as the simulator's reassignment does.
-                let heard = e.heard_recently(now);
+                // execution's front end. A helper assigned but not yet heard from is
+                // still a candidate next: it holds this execution's reservation in
+                // admission, so the idle pool cannot offer it, and leaving it out
+                // would end a job whose replacement is already assigned to it. Only
+                // with no helper at all does admission's idle pool supply the lead,
+                // as the simulator's reassignment does.
+                let mut heard = e.heard_recently(now);
+                for helper in e.executors() {
+                    if Some(helper) != e.lead()
+                        && !except.iter().any(|lost| lost == helper)
+                        && !heard.iter().any(|candidate| candidate == helper)
+                    {
+                        heard.push(helper.to_owned());
+                    }
+                }
                 let lead = heard
                     .first()
                     .cloned()
