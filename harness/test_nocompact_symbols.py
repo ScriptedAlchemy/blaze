@@ -23,12 +23,26 @@ class Symbols(unittest.TestCase):
         self.assertEqual(expanded.count(
             '#[inline(never)]\n#[unsafe(export_name = "ncu_answer")]\nfn answer()'
         ), 1)
-        self.assertNotIn("#[inline(never)]\nfn f0", expanded)
+        self.assertIn("#[inline(never)]\nfn f0() -> u32", expanded)
         self.assertIn("fn f2() -> u32", expanded)
         self.assertIn("std::hint::black_box(f2 as fn() -> u32);", expanded)
         self.assertIn("let call = std::hint::black_box(answer as fn() -> u32);", expanded)
         with self.assertRaisesRegex(ValueError, "no unique no-inline answer"):
             expanded_source("fn answer() -> u32 {\n    1\n}\n", 3)
+
+    def test_growth_adds_frames_not_only_trivial_leaf_symbols(self):
+        # An address-taken constant-returning function can lack an unwind FDE
+        # on arm64, making the original 1000-function stress test vacuous.
+        expanded = expanded_source(FILES["src/main.rs"], 3)
+        for i in range(3):
+            with self.subTest(function=i):
+                code = (f"#[inline(never)]\nfn f{i}() -> u32 {{\n"
+                        "    let call = std::hint::black_box(answer as fn() -> u32);\n"
+                        f"    call().wrapping_add({i})\n"
+                        "}\n")
+                self.assertIn(code, expanded)
+                self.assertIn(f"std::hint::black_box(f{i} as fn() -> u32);", expanded)
+        self.assertEqual(expanded.count('export_name = "ncu_answer"'), 1)
 
     def test_exported_macho_symbol_variants(self):
         for kind in "TtSs":
