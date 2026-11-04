@@ -28,7 +28,10 @@ fn printed_summary_then(ending: &str) -> (std::process::ExitStatus, Option<Vec<S
     );
     let mut command = Command::new("/bin/sh");
     command.args(["-c", &script]);
-    super::listing_failures(&mut command, Command::spawn).unwrap()
+    let mut output = Vec::new();
+    let result = super::listing_failures(&mut command, Command::spawn, &mut output).unwrap();
+    assert_eq!(output, b"\nfailures:\n    flaky\n\ntest result: FAILED. 0 passed; 1 failed\n");
+    result
 }
 
 #[cfg(unix)]

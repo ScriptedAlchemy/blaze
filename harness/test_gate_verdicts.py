@@ -53,6 +53,11 @@ class UnitVerdictTests(unittest.TestCase):
     def test_real_pass_without_allowlisted_failures_is_allowed(self):
         self.assertFalse(errors(cargo_build() + suite("ok"), status=0, known=set()))
 
+    def test_ignored_reason_is_counted_without_hiding_fixed_known_failures(self):
+        text = cargo_build() + suite("ignored").replace("... ignored\n", "... ignored, requires a fixture\n")
+        self.assertFalse(errors(text, status=0, known=set()))
+        self.assertTrue(errors(text, status=0))
+
     def test_known_failures_do_not_hide_later_compiler_error(self):
         diagnostic = json.dumps({"reason": "compiler-message", "message": {
             "level": "error", "message": "cannot find value production_regression"}})

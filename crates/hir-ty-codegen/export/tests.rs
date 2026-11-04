@@ -1258,7 +1258,8 @@ fn independently_loaded_processes_produce_identical_entry_digests_and_import() {
         if reverse {
             child.env("BLAZE_D0_REVERSE", "1");
         }
-        assert!(child.status().unwrap().success(), "independent compiler process failed");
+        let output = child.output().unwrap();
+        assert!(output.status.success(), "independent compiler process failed: {output:?}");
     }
     let receipt = |dir: &Path| {
         postcard::from_bytes::<Receipt>(&std::fs::read(dir.join("receipt")).unwrap()).unwrap()

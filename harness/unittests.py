@@ -15,7 +15,6 @@ CRATES = ["hir-ty", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "s
 
 # crate::test, as libtest names it under the crate's test binary.
 OPEN = {
-    "hir_ide::tests::consteval::bit_op",
     "hir_ide::tests::display_source_code::render_dyn_ty_independent_of_order",
     "hir_ide::tests::display_source_code::render_dyn_ty_under_enclosing_binder",
     "hir_ide::tests::incremental::add_struct_invalidates_trait_solve",
@@ -38,7 +37,7 @@ OPEN = {
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
 RUNNING = re.compile(r"^\s+Running .*[/\\]deps[/\\](\w+?)-[0-9a-f]{16}")
 DOCTESTS = re.compile(r"^\s+Doc-tests (\w+)")
-RESULT = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored)(?:\s|$)")
+RESULT = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored)(?:\s|,|$)")
 
 
 SUMMARY = re.compile(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;")
