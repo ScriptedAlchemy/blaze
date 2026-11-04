@@ -826,18 +826,14 @@ fn idle_helpers_are_shared_round_robin_between_running_builds() {
     assert_ne!(helpers[0].1, helpers[1].1);
 }
 
-
 /// An assignment notification is not proof that a worker is alive. A helper that
 /// actually heartbeats must outrank another builder which was only reserved;
 /// otherwise a just-assigned but silent worker can be promoted on lead loss.
 #[test]
 fn assigning_an_unstarted_helper_does_not_forge_liveness() {
     let mut e = execution();
-    let heartbeat = WorkersEventsRequest {
-        execution: e.id,
-        attempt: e.attempt(),
-        events: Vec::new(),
-    };
+    let heartbeat =
+        WorkersEventsRequest { execution: e.id, attempt: e.attempt(), events: Vec::new() };
     e.worker_events(9, "helper", &heartbeat, &mut Vec::new()).unwrap();
     e.add_helper(10, "silent").unwrap();
     let recently_heard = e.heard_recently(11);
