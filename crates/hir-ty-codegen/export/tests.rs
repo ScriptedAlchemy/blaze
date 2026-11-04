@@ -2034,6 +2034,44 @@ fn disappeared_or_corrupt_installed_closure_is_a_cache_miss() {
 }
 
 #[test]
+fn unrelated_evicted_pack_does_not_mask_a_valid_cache_hit() {
+    store::compiles_against("1.99.0");
+    let directory = scratch("unrelated-evicted-pack");
+    let store = store::Store::owned(&directory).unwrap();
+    let keys = [[0x51_u8; 32], [0x52_u8; 32]];
+
+    // Two separately sealed packs. Choose the key from the SECOND pack in
+    // iteration order, regardless of filesystem directory enumeration order.
+    store.insert(&keys[0], b"first cached object");
+    assert!(!store.seal_checked().unwrap().is_empty());
+    store.insert(&keys[1], b"second cached object");
+    assert!(!store.seal_checked().unwrap().is_empty());
+    let names = store.packs().unwrap();
+    assert_eq!(names.len(), 2, "the fixture needs independent sealed packs");
+    let first_keys = store::pack_keys(&names[0], &store.pack(&names[0]).unwrap()).unwrap();
+    let second_keys = store::pack_keys(&names[1], &store.pack(&names[1]).unwrap()).unwrap();
+    let needed = keys.iter().find(|key| second_keys.contains(&store.disk_key(key))).unwrap();
+    assert!(!first_keys.contains(&store.disk_key(needed)));
+
+    let mut visited = Vec::new();
+    let holding = dist::holding_packs(&store, &[*needed], |name| {
+        visited.push(name.to_owned());
+        if name == names[0] {
+            Err("unrelated pack was evicted".to_owned())
+        } else {
+            store.pack(name).map_err(|error| error.to_string())
+        }
+    })
+    .unwrap()
+    .expect("a later intact pack covers the entire requested closure");
+    assert_eq!(visited, names);
+    assert_eq!(holding.len(), 1);
+    assert_eq!(holding[0].0, names[1]);
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn disappeared_or_corrupt_sealed_pack_is_a_cache_miss() {
     store::compiles_against("1.99.0");
     let directory = scratch("vanished-pack");

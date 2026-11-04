@@ -296,8 +296,11 @@ pub(super) fn holding_packs(
         }
         // Cache collection can remove a pack after the listing. A damaged pack
         // is similarly unusable even if its entries passed an earlier read.
-        let Ok(bytes) = read_pack(&name) else { return Ok(None) };
-        let Ok(keys) = store::pack_keys(&name, &bytes) else { return Ok(None) };
+        // A vanished or damaged *unrelated* pack must not poison an otherwise
+        // complete cache hit: later sealed packs can still cover every needed key.
+        // Missing required keys remain a miss once the entire scan is complete.
+        let Ok(bytes) = read_pack(&name) else { continue };
+        let Ok(keys) = store::pack_keys(&name, &bytes) else { continue };
         if keys.iter().any(|key| uncovered.contains(key)) {
             uncovered.retain(|key| !keys.contains(key));
             holding.push((name, bytes));
