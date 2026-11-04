@@ -1512,7 +1512,7 @@ fn object_lifetime_default<'db>(
         ObjectLifetimeDefault::Param(lifetime) => {
             let (index, late_bound) = generics.lifetime_param_idx(lifetime, false);
             let region = substs.get(index as usize)?.region()?;
-            (!late_bound && !region.is_error()).then_some(region)
+            (!late_bound).then_some(region)
         }
     }
 }

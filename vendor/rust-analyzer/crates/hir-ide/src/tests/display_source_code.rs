@@ -296,3 +296,25 @@ fn takes(value: &dyn A, mutable: &mut dyn A, explicit: &(dyn A + 'static)) {
 "#,
     );
 }
+
+#[test]
+fn object_defaults_in_generic_arguments_and_bodies() {
+    check_types_source_code(
+        r#"
+//- minicore: sized
+trait A {}
+struct Box<T: ?Sized>(*mut T);
+struct Ref<'a, T: ?Sized + 'a>(&'a T);
+fn takes(elided: Ref<'_, dyn A>) {
+    elided;
+  //^^^^^^ Ref<'?, dyn A>
+    let boxed: Box<dyn A> = loop {};
+    boxed;
+  //^^^^^ Box<dyn A>
+    let signature: fn(Box<dyn A>) = loop {};
+    signature;
+  //^^^^^^^^^ fn(Box<dyn A + 'static>)
+}
+"#,
+    );
+}

@@ -3290,13 +3290,13 @@ fn foo() {
             218..324 '{     ...&s); }': ()
             228..229 's': Option<i32>
             232..236 'None': Option<i32>
-            246..247 'f': Box<dyn FnOnce(&'?0.0 Option<i32>) + 'static>
-            281..310 'Box { ... {}) }': Box<dyn FnOnce(&'?0.0 Option<i32>) + 'static>
+            246..247 'f': Box<dyn FnOnce(&'?0.0 Option<i32>) + '?>
+            281..310 'Box { ... {}) }': Box<dyn FnOnce(&'?0.0 Option<i32>) + '?>
             294..308 '&mut (|ps| {})': &'? mut impl FnOnce(&'?0.0 Option<i32>)
             300..307 '|ps| {}': impl FnOnce(&'?0.0 Option<i32>)
             301..303 'ps': &'_ Option<i32>
             305..307 '{}': ()
-            316..317 'f': Box<dyn FnOnce(&'?0.0 Option<i32>) + 'static>
+            316..317 'f': Box<dyn FnOnce(&'?0.0 Option<i32>) + '?>
             316..321 'f(&s)': ()
             318..320 '&s': &'? Option<i32>
             319..320 's': Option<i32>

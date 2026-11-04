@@ -2919,7 +2919,7 @@ impl B for Astruct {}
             844..859 'box_new([1i32])': Box<[i32; 1], Global>
             852..858 '[1i32]': [i32; 1]
             853..857 '1i32': i32
-            870..871 'v': Vec<Box<dyn B + 'static, Global>, Global>
+            870..871 'v': Vec<Box<dyn B + '?, Global>, Global>
             891..908 '<[_]> ...to_vec': fn into_vec<Box<dyn B + '?, Global>, Global>(Box<[Box<dyn B + '?, Global>], Global>) -> Vec<Box<dyn B + '?, Global>, Global>
             891..937 '<[_]> ...ct)]))': Vec<Box<dyn B + '?, Global>, Global>
             909..916 'box_new': fn box_new<[Box<dyn B + '?, Global>; 1]>([Box<dyn B + '?, Global>; 1]) -> Box<[Box<dyn B + '?, Global>; 1], Global>

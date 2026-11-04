@@ -563,6 +563,14 @@ pub mod dynamic {
     pub fn borrowed(value: u32) -> u32 {
         call(&Borrowed(&value))
     }
+
+    pub fn borrowed_type_arguments(value: u32) -> u32 {
+        struct Ref<'a, T: ?Sized + 'a>(&'a T);
+        let inner = Borrowed(&value);
+        let borrowed: Ref<'_, dyn Speak> = Ref(&inner);
+        let boxed: Box<dyn Speak> = Box::new(Borrowed(&value));
+        borrowed.0.speak() + boxed.speak()
+    }
 }
 
 pub mod objects {

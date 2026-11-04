@@ -816,7 +816,18 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             }
             TypeRef::Placeholder => self.next_ty_var(type_ref_id.into()),
             TypeRef::Fn(fn_) => self.lower_fn_ptr(fn_),
-            TypeRef::DynTrait(bounds) => self.lower_dyn_trait(bounds, Region::new_static(interner)),
+            TypeRef::DynTrait(bounds) => {
+                // rustc's resolve_bound_vars infers an object default in a body, but an
+                // intervening function-signature elision scope restores the static default.
+                let default = if matches!(self.lifetime_elision, LifetimeElisionKind::Infer)
+                    && self.infer_vars.is_some()
+                {
+                    self.next_region_var(type_ref_id.into())
+                } else {
+                    Region::new_static(interner)
+                };
+                self.lower_dyn_trait(bounds, default)
+            }
             TypeRef::ImplTrait(bounds) => {
                 match self.impl_trait_mode.mode {
                     ImplTraitLoweringMode::Opaque => {

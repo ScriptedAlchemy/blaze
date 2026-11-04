@@ -119,7 +119,8 @@ fn main() {
         dynamic::call(&dynamic::Cat),
         dynamic::make(true),
         dynamic::make(false),
-        dynamic::borrowed(41)
+        dynamic::borrowed(41),
+        dynamic::borrowed_type_arguments(41)
     );
 
     {
