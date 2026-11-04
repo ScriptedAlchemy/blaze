@@ -368,7 +368,7 @@ pub fn merged_receipt(receipts: &[Receipt]) -> Result<Receipt, String> {
         entries: Vec::new(),
         packs: Vec::new(),
     };
-    let mut by_key: BTreeMap<super::Digest256, super::Digest256> = BTreeMap::new();
+    let mut by_key: BTreeMap<super::Digest256, super::Exported> = BTreeMap::new();
     // Check the first receipt too: collecting it into a map would silently
     // overwrite conflicting duplicates before later receipts are inspected.
     for receipt in receipts {
@@ -377,15 +377,21 @@ pub fn merged_receipt(receipts: &[Receipt]) -> Result<Receipt, String> {
         }
         for entry in &receipt.entries {
             match by_key.get(&entry.key) {
-                Some(previous) if previous != &entry.entry_digest => {
+                Some(previous) if previous.entry_digest != entry.entry_digest => {
                     return Err(format!(
                         "entry `{}` was exported with two different digests",
                         entry.work.name
                     ));
                 }
+                Some(previous) if previous.work != entry.work => {
+                    return Err(format!(
+                        "entry `{}` was exported with two different work identities",
+                        entry.work.name
+                    ));
+                }
                 Some(_) => {}
                 None => {
-                    by_key.insert(entry.key, entry.entry_digest);
+                    by_key.insert(entry.key, entry.clone());
                     merged.entries.push(entry.clone());
                 }
             }
