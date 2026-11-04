@@ -14,22 +14,12 @@
 use std::path::Path;
 use std::time::Duration;
 
-use blaze_dist::holder::{Call, Compiled, Effect, Event, Holder, Plan, Reply, StopWhy};
-use blaze_wire::{JobContent, WorkName};
+use blaze_dist::holder::{BatchCompiler, Call, Effect, Event, Holder, Reply, StopWhy};
+use blaze_wire::JobContent;
 
 use crate::Error;
 use crate::client::Client;
 use crate::protocol::*;
-
-/// The executor's batch compiler: what a [`Plan`] is compiled by, and where
-/// findings the coordinator no longer counts on are dropped. The compiler of
-/// record is the existing batch exporter; this carrier never compiles itself.
-pub trait BatchCompiler {
-    /// Compile one granted batch whole, its entries sealed and uploaded.
-    fn compile(&mut self, plan: &Plan) -> Result<Compiled, Error>;
-    /// Drop retained findings of these names.
-    fn release(&mut self, names: &[WorkName]);
-}
 
 /// How the driver paces an idle holder and bounds its reconnects.
 #[derive(Clone, Debug)]
@@ -76,7 +66,7 @@ pub fn run_holder(
                 Effect::Stop(why) => return Ok(why),
                 Effect::Release(names) => compiler.release(&names),
                 Effect::Compile(plan) => {
-                    let batch = compiler.compile(&plan)?;
+                    let batch = compiler.compile(&plan).map_err(Error::Protocol)?;
                     holder.step(now_ms(), Event::Compiled(batch), &mut effects);
                 }
                 Effect::Send { id, call } => {

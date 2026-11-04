@@ -1610,11 +1610,11 @@ fn two_holders_compile_one_build_over_the_socket() {
                     entered: Arc<std::sync::atomic::AtomicUsize>,
                     receipts: Arc<Mutex<Vec<Receipt>>>,
                 }
-                impl blaze_dist_local::driver::BatchCompiler for Batch<'_, '_> {
+                impl blaze_dist::holder::BatchCompiler for Batch<'_, '_> {
                     fn compile(
                         &mut self,
                         plan: &blaze_dist::holder::Plan,
-                    ) -> std::result::Result<blaze_dist::holder::Compiled, blaze_dist_local::Error>
+                    ) -> std::result::Result<blaze_dist::holder::Compiled, String>
                     {
                         if self.first {
                             self.first = false;
@@ -1629,15 +1629,13 @@ fn two_holders_compile_one_build_over_the_socket() {
                                 std::thread::sleep(std::time::Duration::from_millis(10));
                             }
                         }
-                        let compiled = blaze_dist_local::driver::BatchCompiler::compile(
-                            &mut self.worker,
-                            plan,
-                        )?;
+                        let compiled =
+                            blaze_dist::holder::BatchCompiler::compile(&mut self.worker, plan)?;
                         *self.receipts.lock().unwrap() = self.worker.receipts().to_vec();
                         Ok(compiled)
                     }
                     fn release(&mut self, names: &[WireWorkName]) {
-                        blaze_dist_local::driver::BatchCompiler::release(&mut self.worker, names);
+                        blaze_dist::holder::BatchCompiler::release(&mut self.worker, names);
                     }
                 }
                 let stopped = {

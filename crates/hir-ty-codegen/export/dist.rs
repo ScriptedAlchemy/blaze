@@ -205,11 +205,13 @@ impl<'a, 'db> Worker<'a, 'db> {
     }
 }
 
-/// The worker is the local carrier driver's batch compiler: the existing
-/// exporter, driven by the holder protocol, with no second pipeline.
-impl blaze_dist_local::driver::BatchCompiler for Worker<'_, '_> {
-    fn compile(&mut self, plan: &Plan) -> Result<Compiled, blaze_dist_local::Error> {
-        Worker::compile(self, plan).map_err(blaze_dist_local::Error::Protocol)
+/// The worker is a holder driver's batch compiler: the existing exporter,
+/// driven by the holder protocol, with no second pipeline. The trait is the
+/// holder's own, so this crate needs no carrier dependency (the local
+/// carrier is Unix-only; the compiler builds everywhere ra-jit does).
+impl blaze_dist::holder::BatchCompiler for Worker<'_, '_> {
+    fn compile(&mut self, plan: &Plan) -> Result<Compiled, String> {
+        Worker::compile(self, plan)
     }
 
     fn release(&mut self, names: &[blaze_wire::WorkName]) {
