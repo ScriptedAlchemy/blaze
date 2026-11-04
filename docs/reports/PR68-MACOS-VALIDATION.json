@@ -86,7 +86,7 @@
     }
   ],
   "nix_evaluation": {
-    "tested_commit": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+    "tested_commit": "12738507c4b842bd26c2fe54e246df9aea0c452c",
     "result": "passed",
     "attributes": [
       "daemon",
@@ -98,7 +98,7 @@
     "command": "nix eval --raw .#packages.aarch64-darwin.<attribute>.drvPath"
   },
   "nix_package_build": {
-    "tested_commit": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+    "tested_commit": "12738507c4b842bd26c2fe54e246df9aea0c452c",
     "result": "running",
     "command": "nix build --print-build-logs --no-link .#daemon-units .#run"
   },
@@ -119,9 +119,32 @@
     "ready": false,
     "pending": [
       "Darwin Nix package build",
-      "All remaining CI environments and functional tests"
+      "All remaining CI environments and functional tests",
+      "Resolve the missing fork nightly assets",
+      "Obtain and resolve the owned server bootstrap diagnostic from CI"
     ],
     "unit_gate_note": "The parallel validation lane reported 17 failures accepted by harness/unittests.py on the earlier head. Compiler sources are unchanged on this tested head, so that gate result must not be described as every test passing. A separate lane is working on removing the exceptions.",
     "landing_note": "dist/main requires ci and C2 runtime checks. Its merge queue is not configured. No merge or bypass has been performed."
+  },
+  "ci_blockers": [
+    {
+      "job": "ubuntu-24.04-arm",
+      "url": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41921616928/job/126896068453",
+      "failure": "The fork nightly SHA256SUMS release asset returns HTTP 404."
+    },
+    {
+      "job": "this commit's build",
+      "url": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41921616928/job/126896068187",
+      "failure": "The owned proc-macro server build exits nonzero. Its captured diagnostic was previously discarded; the release script now prints it and re-raises the original failure."
+    }
+  ],
+  "release_diagnostics_change": {
+    "behavior": "Print captured bootstrap stdout/stderr on subprocess failure, delete the partial executable, and preserve the original CalledProcessError and exit status. Successful bootstrap completeness checks are unchanged.",
+    "validation": [
+      "New regression cases failed before the change and passed afterward.",
+      "python3.13 -B .github/scripts/test_build_release.py: all cases passed.",
+      "python3.13 harness/imports.py: 147/147 scripts import.",
+      "git diff --check: passed."
+    ]
   }
 }
