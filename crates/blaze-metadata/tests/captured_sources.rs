@@ -3,7 +3,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use blaze_metadata::units::{Command, TargetFilter, UnitGraph, UnitsAsked, unit_graph_captured};
@@ -15,11 +15,17 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(label: &str) -> Self {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir()
-            .join(format!("blaze-captured-{label}-{}-{nonce}", std::process::id()));
-        std::fs::create_dir(&root).unwrap();
-        Self(root)
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("blaze-captured-{label}-{}-{nonce}", std::process::id()));
+            match std::fs::create_dir(&root) {
+                Ok(()) => return Self(root),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("creating {}: {error}", root.display()),
+            }
+        }
     }
 
     fn write(&self, relative: &str, text: &str) {
