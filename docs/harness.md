@@ -371,7 +371,10 @@ daemon's errors; ide-diagnostics adds about 15 s), and the `fmt`
 job checks formatting and has `harness/imports.py` import every script of the harness, so one
 that only a seldom tier or a person runs can't break unnoticed. It also runs
 `harness/rustcsites.py`, which fails when ra-jit's code gains a place that starts rustc, rustdoc
-or cargo ([no-rustc.md](no-rustc.md)). A script does nothing when
+or cargo ([no-rustc.md](no-rustc.md)), and `harness/check_runner_labels.py`, which fails when a
+workflow a pull request runs names a runner that is not GitHub-hosted: on a public repository a
+fork writes that workflow, and with it the `runs-on` ([benchmarks.md](benchmarks.md#the-machines)).
+A script does nothing when
 imported: its work is under `if __name__ == "__main__":`.
 
 The **full tier** runs nightly and by hand (`gh workflow run ra-jit.yaml --ref <branch> -f

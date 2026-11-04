@@ -3,6 +3,10 @@
 //! `harness/resolve.py --fixtures` with the runs of the case's `case.json` after its
 //! `CONFIG_RUNS`).
 
+#[path = "support/paths.rs"]
+#[allow(dead_code)]
+mod fixture_paths;
+
 use std::path::{Path, PathBuf};
 
 use blaze_manifest::config::get::main as config_main;
@@ -46,9 +50,7 @@ fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
         env.push((k.clone(), v.as_str().unwrap().replace("$ROOT", &root_text)));
     }
     let cwd = root.join(case["cwd"].as_str().unwrap_or(""));
-    let normalize = |text: String| {
-        text.replace(&home.display().to_string(), "$CARGO_HOME").replace(&root_text, "$ROOT")
-    };
+    let normalize = |text: String| fixture_paths::normalize(&text, &root, &home);
     let expected: Vec<serde_json::Value> =
         serde_json::from_str(&std::fs::read_to_string(fixture.join("expected.json")).unwrap())
             .unwrap();

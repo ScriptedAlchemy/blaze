@@ -306,6 +306,10 @@ mod tests {
 
     /// Each workspace of blaze-manifest's fixtures that cargo reads is, as `cargo_metadata`
     /// gives it to the rest of blaze, what cargo 1.99.0 printed for it.
+    mod fixture_paths {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../blaze-manifest/tests/support/paths.rs"));
+    }
+
     #[test]
     fn fixtures_are_what_cargo_metadata_gives() {
         let dir =
@@ -331,10 +335,9 @@ mod tests {
                 }
                 Err(_) => root.clone(),
             };
-            let expected = expected
-                .replace("$ROOT", &root.display().to_string())
-                .replace("$CARGO_HOME", &home.display().to_string());
-            let expected: Metadata = serde_json::from_str(&expected).unwrap();
+            let mut expected: serde_json::Value = serde_json::from_str(&expected).unwrap();
+            fixture_paths::expand(&mut expected, &root, &home);
+            let expected: Metadata = serde_json::from_value(expected).unwrap();
             let env = [("CARGO_HOME".to_owned(), home.display().to_string())];
             let config = blaze_manifest::Config::load(&cwd, env, &[]).unwrap();
             let got = super::read(config, None).unwrap();

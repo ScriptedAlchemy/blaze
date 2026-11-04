@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn replaces_as_cargo_does() {
-        let vendor = SourceId::for_directory(Path::new("/w/vendor")).unwrap();
+        let vendor = SourceId::for_directory(&std::env::temp_dir().join("w/vendor")).unwrap();
         let map = map(vec![
             ("crates-io", def(|it| it.replace_with = Some("mirror".to_owned()))),
             (
@@ -389,7 +389,7 @@ mod tests {
                     it.replace_with = Some("vendored".to_owned());
                 }),
             ),
-            ("vendored", def(|it| it.directory = Some("/w/vendor".into()))),
+            ("vendored", def(|it| it.directory = Some(std::env::temp_dir().join("w/vendor")))),
         ])
         .unwrap();
         assert_eq!(map.replacement(&SourceId::crates_io_git(), false).unwrap(), vendor);
@@ -415,7 +415,7 @@ mod tests {
                     it.replace_with = Some("vendored".to_owned());
                 }),
             ),
-            ("vendored", def(|it| it.directory = Some("/w/vendor".into()))),
+            ("vendored", def(|it| it.directory = Some(std::env::temp_dir().join("w/vendor")))),
         ])
         .unwrap();
         assert_eq!(map.replacement(&git, true).unwrap(), vendor);
@@ -467,8 +467,8 @@ mod tests {
             error(self::map(vec![(
                 "x",
                 def(|it| {
-                    it.directory = Some("/a".into());
-                    it.local_registry = Some("/b".into());
+                    it.directory = Some(std::env::temp_dir().join("a"));
+                    it.local_registry = Some(std::env::temp_dir().join("b"));
                 })
             )])),
             "more than one source location specified for `source.x`"
@@ -477,7 +477,7 @@ mod tests {
             error(self::map(vec![(
                 "x",
                 def(|it| {
-                    it.directory = Some("/a".into());
+                    it.directory = Some(std::env::temp_dir().join("a"));
                     it.tag = Some("v1".to_owned());
                 })
             )])),
@@ -486,12 +486,13 @@ mod tests {
         );
         assert!(
             error(self::map(vec![
-                ("x", def(|it| it.directory = Some("/a".into()))),
-                ("y", def(|it| it.directory = Some("/a".into()))),
+                ("x", def(|it| it.directory = Some(std::env::temp_dir().join("a")))),
+                ("y", def(|it| it.directory = Some(std::env::temp_dir().join("a")))),
             ]))
-            .starts_with(
-                "source `y` defines source dir /a, but that source is already defined by `x`"
-            )
+            .starts_with(&format!(
+                "source `y` defines source dir {}, but that source is already defined by `x`",
+                std::env::temp_dir().join("a").display()
+            ))
         );
     }
 }

@@ -18,6 +18,9 @@
 # require. The queue tests each pull request merged onto main and whatever is ahead of it, and
 # main moves only to what it tested (docs/harness.md, "CI").
 name: ra-jit
+run-name: >-
+  ra-jit ${{ github.ref_name }}
+  [tier=${{ inputs.tier || 'fast' }}]
 on:
   push:
     branches: ["main"]
@@ -50,6 +53,8 @@ jobs:
   # was at before it. Anything that cannot be told counts as code.
   changes:
     name: changes
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -96,6 +101,11 @@ jobs:
       - run: python3 harness/imports.py
       # No new place in ra-jit's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
       - run: python3 harness/rustcsites.py
+      # A workflow a pull request runs may not ask for a self-hosted runner: on a public
+      # repository a fork writes that workflow, and with it the `runs-on`
+      # (harness/check_runner_labels.py), and this runs its cases too.
+      - run: python3 harness/check_runner_labels.py
+      - run: python3 -m unittest discover --start-directory harness --pattern 'test_*.py'
       # vendor/ too: the forks' rustfmt.toml files are read for their code, and a fork's own
       # edits are held to them like ra-jit's.
       - run: cargo fmt --all -- --check
@@ -129,7 +139,7 @@ jobs:
   macos:
     name: macos arm64
     needs: changes
-    if: needs.changes.outputs.tier != 'none'
+    if: (needs.changes.outputs.tier != 'none')
     uses: ./.github/workflows/ra-jit-platform.yaml
     with:
       platform: macos-arm64
@@ -142,7 +152,7 @@ jobs:
   windows:
     name: windows x64
     needs: changes
-    if: needs.changes.outputs.tier == 'full'
+    if: (needs.changes.outputs.tier == 'full')
     uses: ./.github/workflows/ra-jit-platform.yaml
     with:
       platform: windows-x64

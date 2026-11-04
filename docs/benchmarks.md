@@ -542,7 +542,7 @@ patch, today Linux.
 Every result records its machine and platform: the name it was given (`RA_JIT_BENCH_MACHINE`),
 the CPU, the cores the run could use (it may be pinned with `taskset`) and the machine's total,
 memory, OS, kernel, rustc, C compiler, linker, LLVM version and the load average when it
-started (below and in the JSON). The platforms, their runners' labels and how a result is
+started (below and in the JSON). The platforms, their runners' label and how a result is
 filed are `harness/benchplatforms.py`.
 
 This fork uses GitHub-hosted runners for optional benchmark jobs:

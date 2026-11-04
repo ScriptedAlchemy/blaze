@@ -71,10 +71,13 @@ jobs:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
       # Caches are written by main alone: a pull request reads main's and writes none.
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           shared-key: tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: mozilla-actions/sccache-action@v0.0.9
@@ -93,11 +96,14 @@ jobs:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: build
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           shared-key: build
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: mozilla-actions/sccache-action@v0.0.9
@@ -116,12 +122,12 @@ jobs:
         env:
           RUSTC_WRAPPER: sccache
       - run: sccache --show-stats
-      # The four binaries run each other from next to themselves. A tar keeps them executable.
+      # The binaries run each other from next to themselves. A tar keeps them executable.
       - name: Pack
         working-directory: target/release
         run: |
           exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
-          tar -cf ra-jit.tar ra-jit$exe cargo-ra-jit$exe ra-jit-rustc$exe ra-jit-rustc-first$exe
+          tar -cf ra-jit.tar blaze$exe cargo-blaze$exe ra-jit$exe cargo-ra-jit$exe ra-jit-rustc$exe ra-jit-rustc-first$exe
       - uses: actions/upload-artifact@v7
         with:
           name: ra-jit-${{ inputs.platform }}
@@ -148,11 +154,13 @@ jobs:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
           # What `buildmodel.py` builds for besides the host.
-          targets: ${{ matrix.part == 'buildmodel' && inputs.os == 'ubuntu-24.04' && 'aarch64-unknown-linux-gnu x86_64-unknown-linux-musl' || '' }}
+          targets: ${{ matrix.part == 'buildmodel' && runner.os == 'Linux' && runner.arch == 'X64' && 'aarch64-unknown-linux-gnu x86_64-unknown-linux-musl' || '' }}
       - name: Linux tools
         if: runner.os == 'Linux' && (matrix.part == 'core' || matrix.part == 'quick-1' || (matrix.part == 'buildmodel' && runner.arch == 'X64'))
         uses: ./.github/actions/apt
@@ -221,6 +229,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
@@ -246,6 +256,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
@@ -290,6 +302,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
@@ -330,6 +344,8 @@ jobs:
       RA_JIT_EMIT: fast
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
@@ -382,6 +398,8 @@ jobs:
       RA_JIT_EMIT: fast
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
@@ -412,6 +430,8 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
