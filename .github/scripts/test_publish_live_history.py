@@ -9,7 +9,8 @@ SCRIPT = Path(__file__).with_name("publish_live_history.sh").read_text()
 
 
 class HistoryPublication(unittest.TestCase):
-    def run_publisher(self, *, existing_branch=False, existing_pr=False, clean=False, push_fail=False, lookup_fail=False):
+    def run_publisher(self, *, existing_branch=False, existing_pr=False, existing_state="OPEN", clean=False,
+                      push_fail=False, lookup_fail=False, pr_list_fail=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             git = root / "git"
@@ -29,7 +30,10 @@ esac
             gh.write_text('''#!/bin/sh
 printf '%s\\n' "$*" >> "$MOCK_GH_CALLS"
 case "$1:$2" in
-  pr:list) [ "$MOCK_PR_EXISTS" = 1 ] && echo https://github.com/ScriptedAlchemy/blaze/pull/99; exit 0 ;;
+  pr:list)
+    [ "$MOCK_PR_LIST_FAIL" = 1 ] && exit 128
+    [ "$MOCK_PR_EXISTS" = 1 ] && printf '%s\\t%s\\n' "$MOCK_PR_STATE" https://github.com/ScriptedAlchemy/blaze/pull/99
+    exit 0 ;;
   pr:create) echo https://github.com/ScriptedAlchemy/blaze/pull/100 ;;
   *) echo "unexpected gh request: $*" >&2; exit 10 ;;
 esac
@@ -38,7 +42,8 @@ esac
             env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", MOCK_GIT_CALLS=str(root / "git.log"),
                        MOCK_GH_CALLS=str(root / "gh.log"), MOCK_CLEAN="1" if clean else "0",
                        MOCK_BRANCH_EXISTS="1" if existing_branch else "0",
-                       MOCK_PR_EXISTS="1" if existing_pr else "0",
+                       MOCK_PR_EXISTS="1" if existing_pr else "0", MOCK_PR_STATE=existing_state,
+                       MOCK_PR_LIST_FAIL="1" if pr_list_fail else "0",
                        MOCK_PUSH_FAIL="1" if push_fail else "0",
                        MOCK_LOOKUP_FAIL="1" if lookup_fail else "0",
                        GITHUB_REPOSITORY="ScriptedAlchemy/blaze", GITHUB_RUN_ID="77",
@@ -98,6 +103,29 @@ esac
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("push ", git)
         self.assertEqual(gh, "")
+
+    def test_rerun_after_merge_does_not_duplicate_deleted_branch(self):
+        result, git, gh, summary = self.run_publisher(existing_pr=True, existing_state="MERGED")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ls-remote", git)
+        self.assertNotIn("push ", git)
+        self.assertNotIn("pr create", gh)
+        self.assertIn("already merged", summary)
+
+    def test_closed_without_merge_is_not_silently_republished(self):
+        result, git, gh, _ = self.run_publisher(existing_pr=True, existing_state="CLOSED", existing_branch=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("closed without merging", result.stderr)
+        self.assertNotIn("ls-remote", git)
+        self.assertNotIn("push ", git)
+        self.assertNotIn("pr create", gh)
+
+    def test_pr_lookup_failure_does_not_publish(self):
+        result, git, gh, _ = self.run_publisher(pr_list_fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("ls-remote", git)
+        self.assertNotIn("push ", git)
+        self.assertNotIn("pr create", gh)
 
 
 if __name__ == "__main__":
