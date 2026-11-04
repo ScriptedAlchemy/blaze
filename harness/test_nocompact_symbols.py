@@ -9,10 +9,20 @@ from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from nocompact import address_of, symbol_address
+from nocompact import FILES, address_of, expanded_source, symbol_address
 
 
 class Symbols(unittest.TestCase):
+    def test_growth_preserves_address_taken_noninline_answer(self):
+        expanded = expanded_source(FILES["src/main.rs"], 3)
+        self.assertEqual(expanded.count("#[inline(never)]\nfn answer() -> u32 {\n"), 1)
+        self.assertNotIn("#[inline(never)]\nfn f0", expanded)
+        self.assertIn("fn f2() -> u32", expanded)
+        self.assertIn("std::hint::black_box(f2 as fn() -> u32);", expanded)
+        self.assertIn("let call = std::hint::black_box(answer as fn() -> u32);", expanded)
+        with self.assertRaisesRegex(ValueError, "no unique no-inline answer"):
+            expanded_source("fn answer() -> u32 {\n    1\n}\n", 3)
+
     def test_legacy_and_current_private_names(self):
         for name in ("_ra-jit::answer::12", "_ra_jit::answer::12",
                      "_ra-jit::answer::n12", "_ra_jit::answer::n12"):

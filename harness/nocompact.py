@@ -156,6 +156,17 @@ def edit(ws, env, home, program, step, want):
     return verdict, how
 
 
+
+def expanded_source(source, count=MANY):
+    """Grow the frame section without moving answer's no-inline attribute to a new function."""
+    target = "#[inline(never)]\nfn answer() -> u32 {\n"
+    if source.count(target) != 1:
+        raise ValueError("no unique no-inline answer in the fixture")
+    many = "".join(f"fn f{i}() -> u32 {{\n    {i}\n}}\n\n" for i in range(count))
+    named = "".join(f"    std::hint::black_box(f{i} as fn() -> u32);\n" for i in range(count))
+    return source.replace(target, many + target + named, 1)
+
+
 def main():
     if sys.platform != "darwin":
         print("nocompact.py: only Apple's linker writes `__unwind_info`; nothing to do")
@@ -196,10 +207,7 @@ def main():
             wrong += verdict != "ok"
             print(f"{f'edit {n}':30} {verdict:12} {how[:110]}", flush=True)
         text = open(source).read()
-        many = "".join(f"fn f{i}() -> u32 {{\n    {i}\n}}\n\n" for i in range(MANY))
-        named = "".join(f"    std::hint::black_box(f{i} as fn() -> u32);\n" for i in range(MANY))
-        used = "fn answer() -> u32 {\n" + named
-        open(source, "w").write(text.replace("fn answer() -> u32 {\n", many + used, 1))
+        open(source, "w").write(expanded_source(text))
         verdict, how = edit(ws, env, home, program, f"{MANY} functions added", EDITS + 1)
         at = starts(program)
         if verdict == "ok" and not at.get("__eh_frame", 0) < at.get("__text", 0):
