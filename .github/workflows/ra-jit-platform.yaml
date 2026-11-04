@@ -6,22 +6,10 @@ name: ra-jit platform
 on:
   workflow_call:
     inputs:
-      source-repository:
-        description: Source checkout when called from a private CI repository
-        type: string
-        default: ""
-      source-ref:
-        description: Exact source commit when called from a private CI repository
-        type: string
-        default: ""
       platform:
         description: the name of the platform in artifacts and job names
         type: string
         required: true
-      runner-label:
-        description: Additional label binding private jobs to their source run
-        type: string
-        default: ""
       os:
         description: the hosted runner
         type: string
@@ -77,15 +65,13 @@ defaults:
 jobs:
   tests:
     name: tests
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 60
     steps:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
       # Caches are written by main alone: a pull request reads main's and writes none.
@@ -102,7 +88,7 @@ jobs:
 
   build:
     name: build
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 60
     outputs:
       parts: ${{ steps.parts.outputs.parts }}
@@ -111,8 +97,6 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
@@ -155,7 +139,7 @@ jobs:
   harness:
     name: harness (${{ matrix.backend }}, ${{ matrix.part }})
     needs: build
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -171,8 +155,6 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
@@ -243,13 +225,11 @@ jobs:
     name: Bun E2E fixtures
     if: inputs.bun-e2e
     needs: build
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
@@ -272,13 +252,11 @@ jobs:
     name: borrowck
     if: inputs.borrowck
     needs: build
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
@@ -320,13 +298,11 @@ jobs:
     name: pinned run-pass tests
     if: inputs.pinned-ui
     needs: build
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
@@ -355,7 +331,7 @@ jobs:
     name: cargo ra-jit (${{ matrix.backend }}, ${{ matrix.group }})
     if: inputs.cargo-ra-jit
     needs: build
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -369,8 +345,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
@@ -408,7 +382,7 @@ jobs:
     name: projects (${{ matrix.backend }}, ${{ matrix.projects }})
     if: inputs.projects
     needs: build
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 120
     # Known to fail until https://github.com/indexable-inc/blaze/issues/26 is fixed: a test of
     # axum's example-testing crashes in the test binary the daemon builds.
@@ -425,8 +399,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
@@ -453,14 +425,12 @@ jobs:
     name: bench (ripgrep)
     if: inputs.bench
     needs: build
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 60
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
