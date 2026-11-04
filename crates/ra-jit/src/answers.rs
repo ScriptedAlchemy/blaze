@@ -714,7 +714,7 @@ fn producer_source_toolchain(launcher: &Path) -> Option<PathBuf> {
         suffix.extend_from_slice(b"' producer-rustc \"$@\"\n");
         let quoted = bytes
             .strip_prefix(b"#!/bin/sh\nRUSTUP_TOOLCHAIN='")?
-            .strip_suffix(&suffix)?;
+            .strip_suffix(suffix.as_slice())?;
         let mut source = Vec::with_capacity(quoted.len());
         let mut at = 0;
         while at < quoted.len() {
@@ -1600,6 +1600,8 @@ pub(crate) mod tests {
         command.env("RUSTUP_TOOLCHAIN", &toolchain);
         let launcher = dir.path().join("owned-probe-launcher");
         producer_launcher(&launcher, &toolchain).unwrap();
+        command.env("RUSTUP_TOOLCHAIN", "1.99.0");
+        assert_eq!(cargo_query(&mut command, launcher.as_os_str()).unwrap().stdout, version.stdout);
         command.env_remove("RUSTUP_TOOLCHAIN");
         assert_eq!(cargo_query(&mut command, launcher.as_os_str()).unwrap().stdout, version.stdout);
         command.env("RUSTUP_TOOLCHAIN", dir.path().join("unrelated"));
@@ -1633,11 +1635,8 @@ pub(crate) mod tests {
         // Exercise the generated POSIX shell, including an apostrophe in the
         // source path, without running the actual compiler from a unit test.
         let mocked = dir.path().join("mock 'compiler");
-        std::fs::write(
-            &mocked,
-            b"#!/bin/sh\nprintf '%s\\n' \"$RUSTUP_TOOLCHAIN\" \"$1\" \"$2\"\n",
-        )
-        .unwrap();
+        std::fs::write(&mocked, b"#!/bin/sh\nprintf '%s\\n' \"$RUSTUP_TOOLCHAIN\" \"$1\" \"$2\"\n")
+            .unwrap();
         std::fs::set_permissions(&mocked, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mock_launcher = dir.path().join("mock launcher");
         std::fs::write(&mock_launcher, producer_shell_script(&mocked, &sysroot)).unwrap();
@@ -1657,6 +1656,39 @@ pub(crate) mod tests {
         tampered.extend_from_slice(b"echo injected\n");
         std::fs::write(&launcher, tampered).unwrap();
         assert_eq!(producer_source_toolchain(&launcher), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn producer_launcher_binds_source_toolchain_and_preserves_arguments() {
+        use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = dir.path().join("source 'toolchain with spaces");
+        let executable = dir.path().join("probe 'executable");
+        std::fs::write(&executable, b"#!/bin/sh\nprintf '%s\\000' \"$RUSTUP_TOOLCHAIN\" \"$@\"\n")
+            .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launcher = dir.path().join("launcher");
+        std::fs::write(&launcher, producer_shell_script(&executable, &sysroot)).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut expected = sysroot.as_os_str().as_bytes().to_vec();
+        expected.extend_from_slice(b"\0producer-rustc\0--version\0argument 'with spaces\0");
+        for inherited in [None, Some("1.99.0"), Some("/wrong/toolchain")] {
+            let mut command = Command::new(&launcher);
+            command.args(["--version", "argument 'with spaces"]);
+            if let Some(inherited) = inherited {
+                command.env("RUSTUP_TOOLCHAIN", inherited);
+            } else {
+                command.env_remove("RUSTUP_TOOLCHAIN");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, expected);
+        }
+        assert_eq!(
+            producer_launcher(&launcher, Path::new("1.99.0")).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+        );
     }
 
     #[test]

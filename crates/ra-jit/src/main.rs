@@ -3758,7 +3758,7 @@ fn workspace_at(
             let producer_dir = cargo.target_directory().join("blaze-owned-producers");
             std::fs::create_dir_all(&producer_dir)?;
             let probe = producer_dir.join("producer-rustc");
-            crate::answers::producer_launcher(probe.as_ref())?;
+            crate::answers::producer_launcher(probe.as_ref(), plan_asked.sysroot)?;
             env.insert("RUSTC".into(), probe.to_string());
             env.insert("RUSTDOC".into(), probe.to_string());
             env.remove("RUSTC_WRAPPER");
