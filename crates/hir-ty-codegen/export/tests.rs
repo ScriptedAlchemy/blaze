@@ -1794,3 +1794,45 @@ fn two_holders_compile_one_build_over_the_socket() {
         std::fs::remove_dir_all(path).unwrap();
     }
 }
+
+#[test]
+fn merged_receipt_checks_duplicates_in_its_first_batch() {
+    let entry = Exported {
+        work: WorkName {
+            name: "fixture".to_owned(),
+            home: [3; 32],
+            tuple: [4; 32],
+        },
+        key: [5; 32],
+        entry_digest: [6; 32],
+    };
+    let first = Receipt {
+        context: [1; 32],
+        producer: [2; 32],
+        entries: vec![entry.clone(), entry.clone()],
+        packs: vec!["pack-one".to_owned(), "pack-one".to_owned()],
+    };
+    // Equal duplicates are idempotent even inside the first sealed batch.
+    let merged = dist::merged_receipt(&[first.clone(), first.clone()]).unwrap();
+    assert_eq!(merged.entries.len(), 1);
+    assert_eq!(merged.entries[0].entry_digest, entry.entry_digest);
+    assert_eq!(merged.packs, ["pack-one"]);
+
+    // The same key with conflicting bytes in the FIRST batch must be refused,
+    // not silently overwritten when that batch seeds the deduplication map.
+    let mut conflict = first.clone();
+    conflict.entries[1].entry_digest[0] ^= 1;
+    assert!(dist::merged_receipt(&[conflict])
+        .unwrap_err()
+        .contains("two different digests"));
+
+    // Mismatched later batches and later conflicting duplicates are refused too.
+    let mut different_context = first.clone();
+    different_context.context[0] ^= 1;
+    assert!(dist::merged_receipt(&[first.clone(), different_context]).is_err());
+    let mut conflicting_later = first.clone();
+    conflicting_later.entries[0].entry_digest[0] ^= 1;
+    assert!(dist::merged_receipt(&[first, conflicting_later])
+        .unwrap_err()
+        .contains("two different digests"));
+}

@@ -242,23 +242,32 @@ fn pack_ref(name: &str, bytes: &[u8]) -> Result<PackRef, String> {
 /// closure check runs over the whole accepted set at the generation boundary.
 pub fn merged_receipt(receipts: &[Receipt]) -> Result<Receipt, String> {
     let first = receipts.first().ok_or("no batch receipts to merge")?;
-    let mut merged = first.clone();
-    let mut by_key: BTreeMap<super::Digest256, super::Digest256> =
-        merged.entries.iter().map(|e| (e.key, e.entry_digest)).collect();
-    for receipt in &receipts[1..] {
+    let mut merged = Receipt {
+        context: first.context,
+        producer: first.producer,
+        entries: Vec::new(),
+        packs: Vec::new(),
+    };
+    let mut by_key: BTreeMap<super::Digest256, super::Digest256> = BTreeMap::new();
+    // Check the first receipt too: collecting it into a map would silently
+    // overwrite conflicting duplicates before later receipts are inspected.
+    for receipt in receipts {
         if receipt.context != merged.context || receipt.producer != merged.producer {
             return Err("batch receipts of different contexts or producers".to_owned());
         }
         for entry in &receipt.entries {
-            match by_key.insert(entry.key, entry.entry_digest) {
-                Some(previous) if previous != entry.entry_digest => {
+            match by_key.get(&entry.key) {
+                Some(previous) if previous != &entry.entry_digest => {
                     return Err(format!(
                         "entry `{}` was exported with two different digests",
                         entry.work.name
                     ));
                 }
                 Some(_) => {}
-                None => merged.entries.push(entry.clone()),
+                None => {
+                    by_key.insert(entry.key, entry.entry_digest);
+                    merged.entries.push(entry.clone());
+                }
             }
         }
         for pack in &receipt.packs {
