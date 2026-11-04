@@ -1,14 +1,5 @@
-# bun (oven-sh/bun 1.4.3, its Rust port: 1.25M lines in 103 crates) built through ra-jit on each
-# platform's dedicated benchmark machine, nightly: the edits of harness/bench.py and the runtime
-# of harness/runbench.py, stored as docs/benchmarks/bun-<platform>.json and
-# runtime-bun-<platform>.json (`benchreport.py --name bun`) and shown as a project like the others
-# in the tables and charts of docs/benchmarks.md, which benchreport.py writes again from every stored result
-# (docs/research/bun.md says what it is). The platforms and their runners are bench-readme's
-# (harness/benchplatforms.py, BENCH_RUNNERS); one whose runner is not registered is skipped and
-# keeps its last numbers. Too slow for every push: bun's own build of its C and C++ (once per
-# revision, kept in BENCH_HOME), cargo's cold build and ra-jit's whole-program LLVM build each
-# take minutes. It shares bench-readme's concurrency group, so the two never run at once on the
-# machines.
+# Optional benchmark platforms run on standard GitHub-hosted images.
+# Select platforms with BENCH_RUNNERS; results retain their actual host metadata.
 name: bench-bun
 on:
   schedule:
@@ -33,7 +24,7 @@ defaults:
 
 jobs:
   platforms:
-    name: platforms with a registered runner
+    name: selected benchmark platforms
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -53,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
-    runs-on: ${{ matrix.labels }}
+    runs-on: ${{ matrix.label }}
     timeout-minutes: 360
     env:
       # Kept between runs, outside the checkout, as bench-readme's: ra-jit builds

@@ -17,20 +17,10 @@ name: distributed protocol regressions
 on:
   workflow_call:
     inputs:
-      source-repository:
-        type: string
-        default: ""
-      source-ref:
-        type: string
-        default: ""
       platform:
         description: linux-x64 or macos-arm64
         type: string
         required: true
-      runner-label:
-        description: Additional label binding private jobs to their source run
-        type: string
-        default: ""
       os:
         description: the runner label of that platform
         type: string
@@ -58,15 +48,13 @@ jobs:
   protocol:
     name: protocol
     if: inputs.platform == 'linux-x64'
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 30
     env:
       BLAZE_DIST_SEEDS: "10000"
     steps:
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
@@ -92,7 +80,7 @@ jobs:
       fail-fast: false
       matrix:
         lanes: ${{ fromJSON(inputs.lanes) }}
-    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
+    runs-on: ${{ inputs.os }}
     # At macOS's measured slowdown (up to 2.5x Linux) saved-llvm alone takes about 330
     # minutes and saved-cranelift past 180; 360 is a hosted runner's ceiling.
     timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 360 || 180 }}
@@ -104,8 +92,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.source-repository || github.repository }}
-          ref: ${{ inputs.source-ref || github.sha }}
           persist-credentials: false
       # The Nix store paths the bundle's binaries link against; the cache is the build job's, read only.
       - uses: ./.github/actions/toolchain
