@@ -173,6 +173,9 @@ impl<'a, 'db> Worker<'a, 'db> {
         request: &LocalRequest,
         packs: &mut Vec<PackRef>,
     ) -> Result<ItemResult, String> {
+        if let Some(item) = self.from_store(name, request, packs)? {
+            return Ok(item);
+        }
         let batch =
             compile_batch(self.context, self.context.digest(), &[request.clone()], self.store)?;
         let mut found = Vec::new();
@@ -204,6 +207,94 @@ impl<'a, 'db> Worker<'a, 'db> {
         Ok(ItemResult { name, outcome, found: Set::new(found), unnamed: Set::new(unnamed) })
     }
 }
+
+impl Worker<'_, '_> {
+    /// The store's answer to one granted request, when it holds the request's
+    /// entry with its whole closure installed: a `FromStore` item, neither
+    /// compiled nor followed (section 4). This is where a later build — the
+    /// next push of a pull request, another pull request of the same
+    /// configuration — takes an earlier build's distributed work: the entry
+    /// keys name no branch, job or execution, only code. Anything short of a
+    /// whole installed closure compiles instead, exactly as the one-process
+    /// build treats a store entry whose closure is not usable.
+    fn from_store(
+        &mut self,
+        name: blaze_wire::WorkName,
+        request: &LocalRequest,
+        packs: &mut Vec<PackRef>,
+    ) -> Result<Option<ItemResult>, String> {
+        let Ok(work) = self.context.work_name(request) else { return Ok(None) };
+        let Ok(key) = super::entry_key_of(self.context, &work.name) else { return Ok(None) };
+        let Some(bytes) = self.store.get_installed(&key) else { return Ok(None) };
+        let exported = super::Exported { work, key, entry_digest: Sha256::digest(&bytes).into() };
+        let probe = Receipt {
+            context: self.context.digest(),
+            producer: self.store.producer(),
+            entries: vec![exported.clone()],
+            packs: Vec::new(),
+        };
+        let Ok(admitted) = super::admitted_closure(self.context, self.store, &probe) else {
+            return Ok(None);
+        };
+        // The lead's staging store must hold the closure too, debug type
+        // blobs included: name every pack that holds a needed key.
+        let mut needed: Vec<super::Digest256> = admitted.iter().map(|(_, k)| *k).collect();
+        for (_, admitted_key) in &admitted {
+            let bytes = self.store.get_installed(admitted_key).expect("closure checked");
+            let entry = crate::cached::Entry::decode(&bytes).expect("closure checked");
+            if let Some(debug) = &entry.debug {
+                needed.extend(debug.stored_types.iter().copied());
+            }
+        }
+        let Some(holding) = self.packs_holding(&needed)? else { return Ok(None) };
+        let mut names = Vec::new();
+        for (pack, bytes) in &holding {
+            (self.upload)(pack, bytes)?;
+            let reference = pack_ref(pack, bytes)?;
+            if !packs.iter().any(|held| held.pack == reference.pack) {
+                packs.push(reference);
+            }
+            names.push(pack.clone());
+        }
+        self.receipts.push(Receipt {
+            context: self.context.digest(),
+            producer: self.store.producer(),
+            entries: vec![exported],
+            packs: names,
+        });
+        Ok(Some(ItemResult {
+            name,
+            outcome: ItemOutcome::FromStore(EntryRef { entry: EntryKey(key) }),
+            found: Set::new(Vec::new()),
+            unnamed: Set::new(Vec::new()),
+        }))
+    }
+
+    /// The sealed packs of this store that together hold every key in
+    /// `needed`, or `None` when one is held by no sealed pack (still open:
+    /// the caller compiles instead, which seals).
+    fn packs_holding(
+        &self,
+        needed: &[super::Digest256],
+    ) -> Result<Option<Vec<(String, Vec<u8>)>>, String> {
+        let mut uncovered: std::collections::BTreeSet<super::Digest256> =
+            needed.iter().map(|key| self.store.disk_key(key)).collect();
+        let mut holding = Vec::new();
+        for name in self.store.packs().map_err(|e| e.to_string())? {
+            if uncovered.is_empty() {
+                break;
+            }
+            let bytes = self.store.pack(&name).map_err(|e| e.to_string())?;
+            let keys = store::pack_keys(&name, &bytes).map_err(str::to_owned)?;
+            if keys.iter().any(|key| uncovered.contains(key)) {
+                uncovered.retain(|key| !keys.contains(key));
+                holding.push((name, bytes));
+            }
+        }
+        Ok(uncovered.is_empty().then_some(holding))
+    }
+}
+
 
 /// The worker is a holder driver's batch compiler: the existing exporter,
 /// driven by the holder protocol, with no second pipeline. The trait is the

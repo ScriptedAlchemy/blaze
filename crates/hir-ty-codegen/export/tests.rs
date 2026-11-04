@@ -514,13 +514,48 @@ fn real_queries_export_roots_generics_consts_bounds_closure_paths_and_debug() {
             incomplete.entries.retain(|it| {
                 cached::Entry::decode(&store.get(&it.key).unwrap()).unwrap().label != "helper"
             });
-            let refused_dir = scratch("root-closure");
-            let refused =
-                import_batch(&context, &incomplete, &refused_dir, |name| store.pack(name))
-                    .err()
-                    .unwrap();
+            // Admission is reachability from the receipt over the packs: with
+            // `helper` gone from the entries but present in the packs, it is
+            // admitted through the closure (a `FromStore` item's shape). Gone
+            // from the packs as well, the same receipt is refused whole.
+            let closure_dir = scratch("root-closure");
+            let via_closure =
+                import_batch(&context, &incomplete, &closure_dir, |name| store.pack(name)).unwrap();
+            let helper = batch
+                .receipt
+                .entries
+                .iter()
+                .find(|it| {
+                    cached::Entry::decode(&store.get(&it.key).unwrap()).unwrap().label == "helper"
+                })
+                .unwrap();
+            assert_eq!(via_closure.entry_bytes(&helper.key), store.get(&helper.key));
+            drop(via_closure);
+            std::fs::remove_dir_all(closure_dir).unwrap();
+            let partial_dir = scratch("root-closure-partial");
+            let partial = store::Store::owned(&partial_dir).unwrap();
+            for entry in &incomplete.entries {
+                let bytes = store.get(&entry.key).unwrap();
+                partial.insert(&entry.key, &bytes);
+                // Its debug type blobs too, so receipt validation passes and
+                // only the closure walk can refuse, on `helper` itself.
+                let decoded = cached::Entry::decode(&bytes).unwrap();
+                if let Some(debug) = &decoded.debug {
+                    for types in &debug.stored_types {
+                        partial.insert(types, &store.get(types).unwrap());
+                    }
+                }
+            }
+            let mut lacking = incomplete.clone();
+            lacking.packs = partial.seal_checked().unwrap();
+            let refused_dir = scratch("root-closure-refused");
+            let refused = import_batch(&context, &lacking, &refused_dir, |name| partial.pack(name))
+                .err()
+                .unwrap();
             assert!(refused.contains("closure lacks"), "{refused}");
             assert!(!refused_dir.exists());
+            drop(partial);
+            std::fs::remove_dir_all(partial_dir).unwrap();
             let imported =
                 import_batch(&context, &batch.receipt, &imported_dir, |name| store.pack(name))
                     .unwrap();
@@ -1791,6 +1826,149 @@ fn two_holders_compile_one_build_over_the_socket() {
     server_thread.join().unwrap();
     assert!(!socket.exists());
     for path in [solo_dir, packs_dir, staging] {
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+/// Cross-build reuse: a first build seals its entries into a shared pack
+/// directory (the remote's layout, content-addressed); a later build — a
+/// fresh front end and a fresh store that only imported those packs, as the
+/// next push of a pull request or another pull request of the same
+/// configuration would — answers every granted root `FromStore` and compiles
+/// nothing. Entry keys name code, not a branch or a job, which is what makes
+/// the reuse cross-PR rather than per-build.
+#[test]
+fn a_later_build_takes_every_granted_entry_from_the_shared_store() {
+    use blaze_dist::holder::Plan;
+    use blaze_wire::{Attempt, ExecutionId, Grant, ItemOutcome, Lease, Set};
+
+    store::compiles_against("1.99.0");
+    let shared = scratch("from-store-shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    let first_dir = scratch("from-store-first");
+    {
+        let (db, roots, _) = fixture();
+        hir::attach_db(&db, || {
+            let symbols = Symbols { db: &db, debug: true };
+            let context = ExportContext::resolved(
+                &db,
+                &symbols,
+                base_db::all_crates(&db).iter().copied(),
+                &roots,
+                policy(true),
+            )
+            .unwrap();
+            let store = store::Store::owned(&first_dir).unwrap();
+            let requests = all_requests(&context, &roots, &store);
+            let batch = compile_batch(&context, context.digest(), &requests, &store).unwrap();
+            require_exported(&batch, requests.len());
+            for pack in &batch.receipt.packs {
+                std::fs::write(shared.join(pack), store.pack(pack).unwrap()).unwrap();
+            }
+        });
+    }
+
+    let second_dir = scratch("from-store-second");
+    let staging = scratch("from-store-import");
+    let (db, roots, krate) = fixture();
+    hir::attach_db(&db, || {
+        let symbols = Symbols { db: &db, debug: true };
+        let context = ExportContext::resolved(
+            &db,
+            &symbols,
+            base_db::all_crates(&db).iter().copied(),
+            &roots,
+            policy(true),
+        )
+        .unwrap();
+        let store = store::Store::owned(&second_dir).unwrap();
+        for entry in std::fs::read_dir(&shared).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            store.import_pack(&name, &std::fs::read(entry.path()).unwrap()).unwrap();
+        }
+        store.refresh();
+        let upload_dir = shared.clone();
+        let mut worker = dist::Worker::new(
+            &context,
+            &store,
+            roots.iter().copied().map(LocalRequest::root).collect(),
+            context.digest(),
+            [0; 32],
+            move |name, bytes| {
+                std::fs::write(upload_dir.join(name), bytes).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        let count = worker.root_set().count;
+        let plan = Plan {
+            grant: Grant {
+                lease: Lease {
+                    execution: ExecutionId(1),
+                    attempt: Attempt(1),
+                    holder: "second-build".to_owned(),
+                    generation: 1,
+                },
+                roots: Set::new(vec![(0, count)]),
+                names: Set::new(Vec::new()),
+            },
+            compile: Vec::new(),
+        };
+        let compiled = worker.compile(&plan).unwrap();
+        assert_eq!(compiled.roots.len() as u64, count);
+        assert!(
+            compiled.roots.iter().all(|item| matches!(item.outcome, ItemOutcome::FromStore(_))),
+            "the later build recompiled: {:?}",
+            compiled.roots.iter().map(|item| &item.outcome).collect::<Vec<_>>()
+        );
+        let merged = dist::merged_receipt(worker.receipts()).unwrap();
+        drop(worker);
+        let imported =
+            import_batch(&context, &merged, &staging, |name| std::fs::read(shared.join(name)))
+                .unwrap();
+        let rejected = FxHashMap::default();
+        let on_demand = roots.iter().copied().collect();
+        let owned = OwnStatics::new(
+            &db,
+            &symbols,
+            [krate].into_iter().collect(),
+            Default::default(),
+            Default::default(),
+            true,
+        );
+        let mut object =
+            ObjectCodegen::new(&db, &symbols, &rejected, owned, &on_demand, None, true).unwrap();
+        object.entries = Some(std::sync::Arc::new(imported.entries(&context).unwrap()));
+        object.root_names = context.roots.clone();
+        for root in &roots {
+            let work = context.work_name(&LocalRequest::root(*root)).unwrap();
+            object.stored_roots.insert(*root, Some(StableName::from(work.name)));
+            object.define_function(*root).unwrap();
+        }
+        assert!(object.define_instances().unwrap().is_empty());
+        assert!(object.later.is_empty(), "the later build compiled an accepted function");
+        let (bytes, _) = object.finish().unwrap();
+        std::fs::write(staging.join("imported.o"), bytes).unwrap();
+        std::fs::write(
+            staging.join("main.c"),
+            "#include <stdio.h>\nextern int case_root(void);\nextern int case_vtable_root(void);\nint rust_eh_personality(void) { return 0; }\nint main(void) { printf(\"%d %d\\n\", case_root(), case_vtable_root()); }\n",
+        )
+        .unwrap();
+        let linked = std::process::Command::new("cc")
+            .args([staging.join("main.c"), staging.join("imported.o")])
+            .arg("-o")
+            .arg(staging.join("imported-program"))
+            .output()
+            .unwrap();
+        assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
+        let program =
+            std::process::Command::new(staging.join("imported-program")).output().unwrap();
+        assert!(program.status.success());
+        assert_eq!(program.stdout, b"12 9\n");
+        drop(imported);
+        drop(store);
+    });
+    for path in [shared, first_dir, second_dir, staging] {
         std::fs::remove_dir_all(path).unwrap();
     }
 }
