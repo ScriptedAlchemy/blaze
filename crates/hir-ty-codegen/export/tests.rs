@@ -2015,3 +2015,20 @@ fn a_later_build_takes_every_granted_entry_from_the_shared_store() {
         std::fs::remove_dir_all(path).unwrap();
     }
 }
+
+#[test]
+fn disappeared_or_corrupt_installed_closure_is_a_cache_miss() {
+    store::compiles_against("1.99.0");
+    let directory = scratch("vanished-closure");
+    let store = store::Store::owned(&directory).unwrap();
+    let key = [0x42; 32];
+    let admitted = vec![("cached function".to_owned(), key)];
+    // A verified entry may disappear between admission and publication.
+    assert!(dist::installed_closure_keys(&store, &admitted).is_none());
+    // An unreadable installed entry must not crash the worker either.
+    store.insert(&key, b"not an encoded compiled entry");
+    store.seal_checked().unwrap();
+    assert!(dist::installed_closure_keys(&store, &admitted).is_none());
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
