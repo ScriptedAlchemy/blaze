@@ -211,6 +211,14 @@ fn validate_answer(command: &Command, answer: &Answer) -> Result<(), Error> {
     if matched { Ok(()) } else { Err(Error::Protocol("answer-command-binding".to_owned())) }
 }
 
+// The requester applies the same transport-loss policy during Terminal and Resume.
+fn transport_lost(policy: &LocalPolicy, error: std::io::Error) -> Result<LocalAction, Error> {
+    match policy {
+        LocalPolicy::Never => Err(Error::Io(error)),
+        LocalPolicy::Fallback | LocalPolicy::Race => Ok(LocalAction::BuildLocally),
+    }
+}
+
 impl Client {
     /// Wait for this subscription's terminal and say what the requester does
     /// under `policy`: take the remote verdict, build locally, or fail.
@@ -237,12 +245,7 @@ impl Client {
         loop {
             let answer = match self.call(Command::Terminal(binding.subscription.clone())) {
                 Ok(answer) => answer,
-                Err(Error::Io(error)) => {
-                    return match policy {
-                        LocalPolicy::Never => Err(Error::Io(error)),
-                        LocalPolicy::Fallback | LocalPolicy::Race => Ok(LocalAction::BuildLocally),
-                    };
-                }
+                Err(Error::Io(error)) => return transport_lost(policy, error),
                 Err(error) => return Err(error),
             };
             let Answer::Terminal(terminal) = answer else {
@@ -253,11 +256,17 @@ impl Client {
             {
                 // The lead moved after this binding was issued: resume the
                 // subscription for the attempt its terminal now names.
-                let Answer::Binding(current) =
-                    self.call(Command::Resume(binding.subscription.clone()))?
-                else {
+                let resumed = match self.call(Command::Resume(binding.subscription.clone())) {
+                    Ok(answer) => answer,
+                    Err(Error::Io(error)) => return transport_lost(policy, error),
+                    Err(error) => return Err(error),
+                };
+                let Answer::Binding(current) = resumed else {
                     return Err(Error::Protocol("resume refused".to_owned()));
                 };
+                if current.attempt == binding.attempt {
+                    return Err(Error::Protocol("resume did not advance attempt".to_owned()));
+                }
                 binding = current;
                 continue;
             }
@@ -299,4 +308,23 @@ pub fn terminal_action(
     local_action(policy, &value.termination)
         .map(Some)
         .map_err(|e| Error::Protocol(format!("terminal-contract: {e:?}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requester_uses_the_same_io_policy_during_resume_and_terminal() {
+        for policy in [LocalPolicy::Fallback, LocalPolicy::Race] {
+            assert_eq!(
+                transport_lost(&policy, std::io::ErrorKind::ConnectionReset.into()).unwrap(),
+                LocalAction::BuildLocally
+            );
+        }
+        assert!(matches!(
+            transport_lost(&LocalPolicy::Never, std::io::ErrorKind::ConnectionReset.into()),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::ConnectionReset
+        ));
+    }
 }
