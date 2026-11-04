@@ -266,28 +266,44 @@ impl Worker<'_, '_> {
     }
 
     /// The sealed packs of this store that together hold every key in
-    /// `needed`, or `None` when one is held by no sealed pack (still open:
-    /// the caller compiles instead, which seals).
+    /// `needed`. A pack evicted or corrupted during the scan is a cache miss,
+    /// not a failed compilation; the caller owns the local compile instead.
     fn packs_holding(
         &self,
         needed: &[super::Digest256],
     ) -> Result<Option<Vec<(String, Vec<u8>)>>, String> {
-        let mut uncovered: std::collections::BTreeSet<super::Digest256> =
-            needed.iter().map(|key| self.store.disk_key(key)).collect();
-        let mut holding = Vec::new();
-        for name in self.store.packs().map_err(|e| e.to_string())? {
-            if uncovered.is_empty() {
-                break;
-            }
-            let bytes = self.store.pack(&name).map_err(|e| e.to_string())?;
-            let keys = store::pack_keys(&name, &bytes).map_err(str::to_owned)?;
-            if keys.iter().any(|key| uncovered.contains(key)) {
-                uncovered.retain(|key| !keys.contains(key));
-                holding.push((name, bytes));
-            }
-        }
-        Ok(uncovered.is_empty().then_some(holding))
+        holding_packs(self.store, needed, |name| {
+            self.store.pack(name).map_err(|e| e.to_string())
+        })
     }
+}
+
+/// Find sealed packs covering the closure. Pack listing errors remain real IO
+/// errors, but an individual pack can disappear between listing and reading or
+/// fail its validation. Treat either as an unusable cache entry, never as a
+/// worker failure or a partially published `FromStore` answer.
+pub(super) fn holding_packs(
+    store: &store::Store,
+    needed: &[super::Digest256],
+    mut read_pack: impl FnMut(&str) -> Result<Vec<u8>, String>,
+) -> Result<Option<Vec<(String, Vec<u8>)>>, String> {
+    let mut uncovered: std::collections::BTreeSet<super::Digest256> =
+        needed.iter().map(|key| store.disk_key(key)).collect();
+    let mut holding = Vec::new();
+    for name in store.packs().map_err(|e| e.to_string())? {
+        if uncovered.is_empty() {
+            break;
+        }
+        // Cache collection can remove a pack after the listing. A damaged pack
+        // is similarly unusable even if its entries passed an earlier read.
+        let Ok(bytes) = read_pack(&name) else { return Ok(None) };
+        let Ok(keys) = store::pack_keys(&name, &bytes) else { return Ok(None) };
+        if keys.iter().any(|key| uncovered.contains(key)) {
+            uncovered.retain(|key| !keys.contains(key));
+            holding.push((name, bytes));
+        }
+    }
+    Ok(uncovered.is_empty().then_some(holding))
 }
 
 /// Re-read the admitted closure before publication: admission and packing are

@@ -2032,3 +2032,45 @@ fn disappeared_or_corrupt_installed_closure_is_a_cache_miss() {
     drop(store);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn disappeared_or_corrupt_sealed_pack_is_a_cache_miss() {
+    store::compiles_against("1.99.0");
+    let directory = scratch("vanished-pack");
+    let store = store::Store::owned(&directory).unwrap();
+    let key = [0x43; 32];
+    store.insert(&key, b"sealed entry");
+    assert!(!store.seal_checked().unwrap().is_empty());
+
+    // The intact sealed pack covers the same installed key. Failure injection
+    // must not turn an otherwise valid cache hit into a fabricated success.
+    assert!(
+        dist::holding_packs(&store, &[key], |name| {
+            store.pack(name).map_err(|error| error.to_string())
+        })
+        .unwrap()
+        .is_some()
+    );
+
+    // Collection may unlink a pack after the store lists its name.
+    assert!(
+        dist::holding_packs(&store, &[key], |_| Err("pack evicted".to_owned()))
+            .unwrap()
+            .is_none()
+    );
+
+    // Corruption after the earlier installed-entry read is also a cache miss,
+    // before publishing any part of the closure.
+    assert!(
+        dist::holding_packs(&store, &[key], |name| {
+            let mut bytes = store.pack(name).map_err(|error| error.to_string())?;
+            bytes[0] ^= 1;
+            Ok(bytes)
+        })
+        .unwrap()
+        .is_none()
+    );
+
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
