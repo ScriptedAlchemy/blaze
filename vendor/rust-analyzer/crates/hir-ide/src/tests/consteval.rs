@@ -1,4 +1,4 @@
-use base_db::all_crates;
+use base_db::{SourceDatabase, all_crates};
 use hir_def::signatures::ConstSignature;
 use hir_expand::EditionedFileId;
 use rustc_apfloat::{
@@ -3311,5 +3311,32 @@ fn uninhabited_enum_discriminant_read() {
     };
     "#,
         |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_))),
+    );
+}
+
+#[test]
+fn caller_location_const_updates_after_source_moves() {
+    let source = "const GOAL: u32 = core::panic::Location::caller().line();";
+    let fixture = format!("//- minicore: panic_location\n{source}");
+    let (mut db, file_id) = TestDB::with_single_file(&fixture);
+    crate::attach_db(&db, || {
+        let value = eval_goal(&db, file_id).unwrap();
+        assert_eq!(&value.memory[..], &1u32.to_le_bytes());
+    });
+    db.set_file_text(file_id.file_id(&db), &format!("\n\n{source}"));
+    crate::attach_db(&db, || {
+        let value = eval_goal(&db, file_id).unwrap();
+        assert_eq!(&value.memory[..], &3u32.to_le_bytes());
+    });
+}
+
+#[test]
+fn caller_location_file_is_kept_in_the_constant_memory_map() {
+    check_str(
+        r#"
+//- minicore: panic_location
+const GOAL: &str = core::panic::Location::caller().file();
+"#,
+        "/main.rs",
     );
 }

@@ -806,10 +806,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     },
                 };
                 let inner_ty = match &self.store[ref_.ty] {
-                    // `&'a dyn Trait` is `&'a (dyn Trait + 'a)`.
-                    TypeRef::DynTrait(bounds) if !lifetime.is_error() || self.impl_header => {
-                        self.lower_dyn_trait(bounds, lifetime)
-                    }
+                    // A reference supplies the default object lifetime even when its
+                    // elided region is still an error/inference placeholder, as in rustc's
+                    // resolve_bound_vars object-lifetime-default rule.
+                    TypeRef::DynTrait(bounds) => self.lower_dyn_trait(bounds, lifetime),
                     _ => self.lower_ty(ref_.ty),
                 };
                 Ty::new_ref(interner, lifetime, inner_ty, lower_mutability(ref_.mutability))

@@ -118,7 +118,8 @@ fn main() {
         dynamic::call(&dynamic::Dog(4)),
         dynamic::call(&dynamic::Cat),
         dynamic::make(true),
-        dynamic::make(false)
+        dynamic::make(false),
+        dynamic::borrowed(41)
     );
 
     {

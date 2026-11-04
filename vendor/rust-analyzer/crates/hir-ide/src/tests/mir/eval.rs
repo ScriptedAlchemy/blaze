@@ -1292,10 +1292,68 @@ fn should_not_reach() {
 
 fn main() {
     let loc = core::panic::Location::caller();
-    if loc.line() != 1 || loc.column() != 1 {
+    if loc.line() != 6 || loc.column() != 15 {
         should_not_reach();
     }
 }
+"#,
+    );
+}
+
+#[test]
+fn caller_location_propagation_and_display_columns() {
+    // Expected positions are the output of this fixture's calls under rustc 1.99.0.
+    check_pass(
+        r#"
+//- minicore: panic_location
+type Loc = &'static core::panic::Location<'static>;
+#[track_caller] fn tracked() -> Loc { core::panic::Location::caller() }
+#[track_caller] fn forwarded() -> Loc { tracked() }
+fn untracked() -> Loc { forwarded() }
+trait Site { #[track_caller] fn site(&self) -> Loc; }
+struct Receiver;
+impl Site for Receiver { fn site(&self) -> Loc { forwarded() } }
+macro_rules! own { () => { core::panic::Location::caller() }; }
+macro_rules! passed { ($value:expr) => { $value }; }
+const CONSTANT: Loc = core::panic::Location::caller();
+fn main() {
+    let plain = core::panic::Location::caller();
+	let tab = core::panic::Location::caller();
+    let _ = "界"; let wide = core::panic::Location::caller();
+    let through = forwarded();
+    let stopped = untracked();
+    let from_own = own!();
+    let argument = passed!(core::panic::Location::caller());
+    let method = Receiver.site();
+    let pointer: fn() -> Loc = tracked;
+    let indirect = pointer();
+    let chain = { let r = &Receiver; r }.site();
+    if plain.line() != 12 || plain.column() != 17 { should_not_reach(); }
+    if tab.line() != 13 || tab.column() != 15 { should_not_reach(); }
+    if wide.line() != 14 || wide.column() != 30 { should_not_reach(); }
+    if through.line() != 15 || through.column() != 19 { should_not_reach(); }
+    if stopped.line() != 4 || stopped.column() != 25 { should_not_reach(); }
+    if from_own.line() != 17 || from_own.column() != 20 { should_not_reach(); }
+    if argument.line() != 18 || argument.column() != 28 { should_not_reach(); }
+    if method.line() != 19 || method.column() != 27 { should_not_reach(); }
+    if indirect.line() != 2 || indirect.column() != 17 { should_not_reach(); }
+    if chain.line() != 22 || chain.column() != 42 { should_not_reach(); }
+    if CONSTANT.line() != 10 || CONSTANT.column() != 23 { should_not_reach(); }
+    let mut left = CONSTANT;
+    let mut right = CONSTANT;
+    let mut index = 0;
+    while index < 2 {
+        let value = forwarded();
+        if index == 0 { left = value; } else { right = value; }
+        index += 1;
+    }
+    if left as *const _ != right as *const _ { should_not_reach(); }
+    if plain.file() as *const str as *const u8 != tab.file() as *const str as *const u8 {
+        should_not_reach();
+    }
+
+}
+fn should_not_reach() { panic!() }
 "#,
     );
 }

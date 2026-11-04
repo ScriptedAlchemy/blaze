@@ -85,7 +85,7 @@ pub use hir_ty::mir::location::name_sources;
 use hir_ty::mir::{
     AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirOptLevel,
     MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind,
-    StoredPlace, TerminatorKind, UnOp, interpret_mir, is_builtin_index,
+    StoredPlace, TerminatorKind, UnOp, interpret_mir,
     location::{
         ConcatPart, concat_parts, line_and_column, located_concats, location_macros, location_of,
         written_call, written_range,
@@ -4208,6 +4208,16 @@ fn source_location_in_file<'db>(
     span: MirSpan,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let (file_id, range) = source_range(db, owner, span)?;
+    hir_ty::mir::location::caller_location_of(db, file_id, range)
+}
+
+#[salsa::tracked]
+fn scalar_source_location_in_file<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+    span: MirSpan,
+) -> Option<(base_db::FileId, u32, u32)> {
+    let (file_id, range) = source_range(db, owner, span)?;
     location_of(db, file_id, range)
 }
 
@@ -4225,7 +4235,7 @@ fn row_location_in_file<'db>(
 ) -> Option<(base_db::FileId, u32, u32)> {
     let (file_id, range) = source_range(db, owner, span)?;
     if file_id.macro_file().is_none() {
-        return *source_location_in_file(db, owner, span);
+        return *scalar_source_location_in_file(db, owner, span);
     }
     let source_map = &Body::with_source_map(db, owner).1;
     let code = closure.unwrap_or_else(|| Body::of(db, owner).root_expr());
@@ -4234,7 +4244,7 @@ fn row_location_in_file<'db>(
             let start = TextRange::empty(body.value.syntax_node_ptr().text_range().start());
             body.file_id.span_map(db).span_for_range(start).ctx
         }
-        Err(_) => return *source_location_in_file(db, owner, span),
+        Err(_) => return *scalar_source_location_in_file(db, owner, span),
     };
     written_place(db, file_id, range, Some(within))
 }
@@ -4271,77 +4281,7 @@ fn source_range<'db>(
     owner: DefWithBodyId,
     span: MirSpan,
 ) -> Option<(HirFileId, TextRange)> {
-    let source_map = &Body::with_source_map(db, owner).1;
-    let source = match span {
-        MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
-        // The block an `async fn` is taken to wrap its body in is not written anywhere, and
-        // ends where the body does.
-        MirSpan::ExprEnd(expr) => {
-            match (source_map.expr_syntax(expr), &Body::of(db, owner)[expr]) {
-                (Ok(written), _) => written,
-                (Err(_), hir_def::hir::Expr::Block { tail: Some(tail), .. }) => {
-                    source_map.expr_syntax(*tail).ok()?
-                }
-                (Err(_), _) => return None,
-            }
-        }
-        MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
-        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
-    };
-    if let MirSpan::ExprEnd(_) = span {
-        // The brace that closes a block, which is where rustc has a scope left.
-        let range = source.value.syntax_node_ptr().text_range();
-        let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
-        return Some((source.file_id, TextRange::new(last?, range.end())));
-    }
-    let range = match span {
-        MirSpan::ExprId(expr) => {
-            let root = source.file_id.parse_or_expand(db);
-            let node = source.value.syntax_node_ptr().to_node(&root);
-            reported_range(db, owner, expr, source.file_id, &node)?
-        }
-        _ => source.value.syntax_node_ptr().text_range(),
-    };
-    Some((source.file_id, range))
-}
-
-/// The part of an expression that rustc's span of it covers where it panics: a method call
-/// from the method's name on, an index through `Index` from its bracket on, and any other
-/// expression together with the parentheses it is written in.
-fn reported_range(
-    db: &dyn HirDatabase,
-    owner: DefWithBodyId,
-    expr: ExprId,
-    file_id: HirFileId,
-    node: &SyntaxNode,
-) -> Option<TextRange> {
-    let end = node.text_range().end();
-    if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
-        return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
-    }
-    if let Some(written) = ast::IndexExpr::cast(node.clone())
-        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner)[expr]
-        && !is_builtin_index(InferenceResult::of(db, owner), base, index)
-    {
-        return Some(TextRange::new(written.l_brack_token()?.text_range().start(), end));
-    }
-    Some(parenthesized(db, file_id, node))
-}
-
-/// The range of an expression with the parentheses around it. rustc's span of an expression
-/// includes them when both are written in one place, and not when a macro put the
-/// parentheses around what it was passed.
-fn parenthesized(db: &dyn HirDatabase, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
-    let passed_in = |range: TextRange| {
-        file_id.macro_file().is_none()
-            || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
-    };
-    let inner = passed_in(node.text_range());
-    node.ancestors()
-        .skip(1)
-        .take_while(|it| it.kind() == SyntaxKind::PAREN_EXPR && passed_in(it.text_range()) == inner)
-        .last()
-        .map_or(node.text_range(), |it| it.text_range())
+    hir_ty::mir::location::source_range(db, owner.into(), span)
 }
 
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
@@ -4352,7 +4292,11 @@ fn declaration_location<'db>(
     func: FunctionId,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let source = func.lookup(db).source(db);
-    location_of(db, source.file_id, written_range(source.value.syntax()))
+    hir_ty::mir::location::caller_location_of(
+        db,
+        source.file_id,
+        written_range(source.value.syntax()),
+    )
 }
 
 /// File, line and column a debugger is told a function is declared on, and its code ahead of
@@ -4369,7 +4313,7 @@ fn debug_declaration_location<'db>(
 ) -> Option<(base_db::FileId, u32, u32)> {
     let source = func.lookup(db).source(db);
     if source.file_id.macro_file().is_none() {
-        return *declaration_location(db, func);
+        return location_of(db, source.file_id, written_range(source.value.syntax()));
     }
     written_place(db, source.file_id, written_range(source.value.syntax()), None)
 }
@@ -7659,19 +7603,7 @@ pub(crate) fn erase_regions<'db>(
 /// Whether calls to `func` pass a `&Location` after the declared arguments. A method of a trait
 /// impl inherits the attribute from the trait's declaration.
 fn track_caller(db: &dyn HirDatabase, func: FunctionId) -> bool {
-    let has =
-        |func: FunctionId| AttrFlags::query(db, func.into()).contains(AttrFlags::TRACK_CALLER);
-    if has(func) {
-        return true;
-    }
-    let ItemContainerId::ImplId(impl_id) = func.lookup(db).container else {
-        return false;
-    };
-    let Some(trait_ref) = db.impl_trait(impl_id) else {
-        return false;
-    };
-    let name = &FunctionSignature::of(db, func).name;
-    trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
+    hir_ty::mir::location::tracks_caller(db, func)
 }
 
 /// The integer an address is on the target.

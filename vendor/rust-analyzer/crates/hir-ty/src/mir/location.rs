@@ -3,13 +3,18 @@
 //! `#[track_caller]` and panics report. The evaluator of constants and the code generator
 //! both read them.
 
+use super::MirSpan;
+use crate::InferBodyId;
+use hir_def::expr_store::ExpressionStore;
 use hir_def::{DefWithBodyId, expr_store::Body, hir::ExprId};
 use hir_expand::{
     FileRange, HirFileId, InFile, MacroDefKind,
     builtin::{BuiltinFnLikeExpander, EagerExpander},
 };
 use rustc_hash::FxHashMap;
-use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, ast};
+use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, TextRange, ast};
+use syntax::{SyntaxNode, TextSize};
+use unicode_width::UnicodeWidthChar;
 
 use crate::db::HirDatabase;
 
@@ -77,6 +82,37 @@ pub fn located_concats<'db>(
 pub enum Placed {
     Number(u32),
     Text(String),
+}
+
+/// A trait implementation inherits `#[track_caller]` from its declaration, as rustc's
+/// `Instance::requires_caller_location` does.
+#[salsa::tracked(returns(copy))]
+pub fn tracks_caller<'db>(db: &'db dyn HirDatabase, function: hir_def::FunctionId) -> bool {
+    use hir_def::{ItemContainerId, Lookup, attrs::AttrFlags, signatures::FunctionSignature};
+    let has = |function: hir_def::FunctionId| {
+        AttrFlags::query(db, function.into()).contains(AttrFlags::TRACK_CALLER)
+    };
+    if has(function) {
+        return true;
+    }
+    let ItemContainerId::ImplId(implementation) = function.lookup(db).container else {
+        return false;
+    };
+    let Some(trait_ref) = db.impl_trait(implementation) else {
+        return false;
+    };
+    let name = &FunctionSignature::of(db, function).name;
+    trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
+}
+
+/// The build's remapped spelling takes precedence over the VFS's source name. Without a
+/// compiler embedding the interpreter, IDE fixtures and files keep their VFS names.
+pub(super) fn source_name(db: &dyn HirDatabase, file: base_db::FileId) -> Option<String> {
+    if let Some(paths) = SOURCE_PATHS.read().unwrap_or_else(|e| e.into_inner()).clone() {
+        return paths(db, file);
+    }
+    let root = db.file_source_root(file).source_root_id(db);
+    Some(db.source_root(root).source_root(db).path_for_file(&file)?.to_string())
 }
 
 type SourcePaths = dyn Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync;
@@ -218,6 +254,29 @@ pub fn location_of(
     file_id: HirFileId,
     range: TextRange,
 ) -> Option<(base_db::FileId, u32, u32)> {
+    line_and_column(db, original_location_range(db, file_id, range))
+}
+
+/// `Location` uses rustc's display columns; `column!()` uses Unicode scalar columns.
+pub fn caller_location_of(
+    db: &dyn HirDatabase,
+    file_id: HirFileId,
+    range: TextRange,
+) -> Option<(base_db::FileId, u32, u32)> {
+    let site = original_location_range(db, file_id, range);
+    let (file, line, _) = line_and_column(db, site)?;
+    let text = db.file_text(file);
+    let starts = line_starts(db, text);
+    let start = starts[line as usize - 1] as usize;
+    let prefix = text.text(db).get(start..u32::from(site.range.start()) as usize)?;
+    Some((file, line, caller_column(prefix)))
+}
+
+fn original_location_range(
+    db: &dyn HirDatabase,
+    file_id: HirFileId,
+    range: TextRange,
+) -> FileRange {
     // What a macro writes itself is reported from where the outermost macro is called;
     // what it is passed keeps its own place.
     let own_tokens = file_id.macro_file().is_some()
@@ -227,7 +286,25 @@ pub fn location_of(
             .original_node_file_range_rooted(db),
         _ => InFile::new(file_id, range).original_node_file_range_rooted(db),
     };
-    line_and_column(db, FileRange { file_id, range })
+    FileRange { file_id, range }
+}
+
+/// rustc_span::char_width: tabs occupy four columns, and bidi/control characters get a
+/// visible replacement. This intentionally differs from the scalar count of `column!()`.
+pub fn caller_column(prefix: &str) -> u32 {
+    prefix.chars().map(column_width).sum::<usize>() as u32 + 1
+}
+
+fn column_width(ch: char) -> usize {
+    match ch {
+        '\t' => 4,
+        '\0'..='\u{8}'
+        | '\u{b}'..='\u{1f}'
+        | '\u{7f}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2066}'..='\u{2069}' => 1,
+        _ => UnicodeWidthChar::width(ch).unwrap_or(1),
+    }
 }
 
 /// File, line and column of where a range of a file begins.
@@ -250,4 +327,92 @@ pub fn line_and_column(
 fn line_starts(db: &dyn HirDatabase, text: base_db::FileText) -> Vec<u32> {
     let ends = text.text(db).bytes().enumerate().filter(|&(_, byte)| byte == b'\n');
     std::iter::once(0).chain(ends.map(|(at, _)| at as u32 + 1)).collect()
+}
+
+pub fn source_range<'db>(
+    db: &'db dyn HirDatabase,
+    owner: InferBodyId<'db>,
+    span: MirSpan,
+) -> Option<(HirFileId, TextRange)> {
+    let source_map = match owner {
+        InferBodyId::DefWithBodyId(owner) => &*Body::with_source_map(db, owner).1,
+        InferBodyId::AnonConstId(owner) => {
+            ExpressionStore::with_source_map(db, owner.loc(db).owner).1
+        }
+    };
+    let source = match span {
+        MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
+        // The block an `async fn` is taken to wrap its body in is not written anywhere, and
+        // ends where the body does.
+        MirSpan::ExprEnd(expr) => match source_map.expr_syntax(expr) {
+            Ok(written) => written,
+            Err(_) => {
+                let InferBodyId::DefWithBodyId(owner) = owner else {
+                    return None;
+                };
+                let hir_def::hir::Expr::Block { tail: Some(tail), .. } = Body::of(db, owner)[expr]
+                else {
+                    return None;
+                };
+                source_map.expr_syntax(tail).ok()?
+            }
+        },
+        MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
+        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
+    };
+    if let MirSpan::ExprEnd(_) = span {
+        // The brace that closes a block, which is where rustc has a scope left.
+        let range = source.value.syntax_node_ptr().text_range();
+        let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
+        return Some((source.file_id, TextRange::new(last?, range.end())));
+    }
+    let range = match span {
+        MirSpan::ExprId(expr) => {
+            let root = source.file_id.parse_or_expand(db);
+            let node = source.value.syntax_node_ptr().to_node(&root);
+            reported_range(db, owner, expr, source.file_id, &node)?
+        }
+        _ => source.value.syntax_node_ptr().text_range(),
+    };
+    Some((source.file_id, range))
+}
+
+/// The part of an expression that rustc's span of it covers where it panics: a method call
+/// from the method's name on, an index through `Index` from its bracket on, and any other
+/// expression together with the parentheses it is written in.
+pub fn reported_range(
+    db: &dyn HirDatabase,
+    owner: InferBodyId<'_>,
+    expr: ExprId,
+    file_id: HirFileId,
+    node: &SyntaxNode,
+) -> Option<TextRange> {
+    let end = node.text_range().end();
+    if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
+        return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
+    }
+    if let Some(written) = ast::IndexExpr::cast(node.clone())
+        && let InferBodyId::DefWithBodyId(owner) = owner
+        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner)[expr]
+        && !crate::mir::is_builtin_index(crate::InferenceResult::of(db, owner), base, index)
+    {
+        return Some(TextRange::new(written.l_brack_token()?.text_range().start(), end));
+    }
+    Some(parenthesized(db, file_id, node))
+}
+
+/// The range of an expression with the parentheses around it. rustc's span of an expression
+/// includes them when both are written in one place, and not when a macro put the
+/// parentheses around what it was passed.
+fn parenthesized(db: &dyn HirDatabase, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
+    let passed_in = |range: TextRange| {
+        file_id.macro_file().is_none()
+            || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
+    };
+    let inner = passed_in(node.text_range());
+    node.ancestors()
+        .skip(1)
+        .take_while(|it| it.kind() == SyntaxKind::PAREN_EXPR && passed_in(it.text_range()) == inner)
+        .last()
+        .map_or(node.text_range(), |it| it.text_range())
 }

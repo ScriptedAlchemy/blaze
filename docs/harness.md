@@ -41,8 +41,8 @@ which hosts and under which backend.
 A part runs all of its harnesses even when one fails, then names the ones that failed and how
 long each took. Alongside the harnesses, CI runs `cargo fmt --all -- --check`,
 `python3 harness/imports.py`, which imports every script of the harness, and
-`python3 harness/unittests.py`, which runs the Rust unit tests and holds them to its `OPEN`
-list (below).
+`python3 harness/unittests.py`, which runs the Rust unit tests and fails on every test failure,
+failed build, crashed process or incomplete test transcript. It has no accepted-failure list.
 
 ### Under Cranelift
 
@@ -423,7 +423,6 @@ Rule insights what they refused.
 What is known to be wrong is written down, says why, and does not fail the run. Once it comes
 out right, it fails the run until it is taken off the list:
 
-- `OPEN` in `unittests.py`: Rust unit tests that fail;
 - `OPEN` and `LEFT` in `breakers.py`: breakers that differ from rustc or that ra-jit refuses;
 - `OPEN` in `debuginfo.py`: checks whose frames or variables are wrong;
 - `"open"` in a `buildmodel/*/case.json`: a case that comes out WRONG, on every host or by

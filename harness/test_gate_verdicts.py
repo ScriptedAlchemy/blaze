@@ -37,26 +37,25 @@ def suite(outcome="FAILED", name="known", crate="fixture"):
             f"{counts[0]} passed; {counts[1]} failed; {counts[2]} ignored; 0 measured; 0 filtered out\n")
 
 
-def errors(text, status=101, known=frozenset({"fixture::known"})):
+def errors(text, status=101):
     transcript = unittests.Transcript()
     for line in text.splitlines(keepends=True):
         transcript.feed(line)
-    return transcript.finish(status, set(known))
+    return transcript.finish(status)
 
 
 class UnitVerdictTests(unittest.TestCase):
-    def test_completed_known_assertion_failure_is_allowed(self):
-        self.assertFalse(errors(cargo_build() + suite() +
+    def test_completed_assertion_failure_is_rejected(self):
+        self.assertTrue(errors(cargo_build() + suite() +
                                 "error: test failed, to rerun pass `-p fixture --lib`\n"
                                 "error: 1 target failed:\n    `-p fixture --lib`\n"))
 
-    def test_real_pass_without_allowlisted_failures_is_allowed(self):
-        self.assertFalse(errors(cargo_build() + suite("ok"), status=0, known=set()))
+    def test_real_pass_is_allowed(self):
+        self.assertFalse(errors(cargo_build() + suite("ok"), status=0))
 
-    def test_ignored_reason_is_counted_without_hiding_fixed_known_failures(self):
+    def test_upstream_ignored_reason_is_counted(self):
         text = cargo_build() + suite("ignored").replace("... ignored\n", "... ignored, requires a fixture\n")
-        self.assertFalse(errors(text, status=0, known=set()))
-        self.assertTrue(errors(text, status=0))
+        self.assertFalse(errors(text, status=0))
 
     def test_known_failures_do_not_hide_later_compiler_error(self):
         diagnostic = json.dumps({"reason": "compiler-message", "message": {
@@ -91,37 +90,34 @@ class UnitVerdictTests(unittest.TestCase):
         self.assertTrue(errors(cargo_build(False) + suite()))
 
     def test_empty_run_is_rejected(self):
-        self.assertTrue(errors(cargo_build(), status=0, known=set()))
+        self.assertTrue(errors(cargo_build(), status=0))
 
-    def test_fixed_missing_and_ignored_known_failures_still_fail(self):
+    def test_complete_passing_and_ignored_suites_are_allowed(self):
         for text, status in ((suite("ok"), 0), (suite("ignored"), 0),
                              (suite("ok", "other"), 0)):
             with self.subTest(text=text):
-                self.assertTrue(errors(cargo_build() + text, status))
+                self.assertFalse(errors(cargo_build() + text, status))
 
-    def test_passing_doctests_and_empty_target_are_allowed_beside_known_failures(self):
-        text = (cargo_build() + suite() + "   Doc-tests other\n"
+    def test_passing_doctests_and_empty_target_are_allowed(self):
+        text = (cargo_build() + suite("ok") + "   Doc-tests other\n"
                 "test src/lib.rs - demo (line 1) ... ok\n"
                 "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
                 "     Running unittests (target/release/deps/empty-0123456789abcdef)\n"
                 "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
-        self.assertFalse(errors(text))
+        self.assertFalse(errors(text, status=0))
 
     def test_multiple_doctests_in_one_file_and_rustdoc_groups_are_distinct(self):
-        text = (cargo_build() + suite() + "   Doc-tests other\n"
+        text = (cargo_build() + suite("ok") + "   Doc-tests other\n"
                 "test src/lib.rs - first (line 1) ... ok\n"
                 "test src/lib.rs - second (line 5) ... ok\n"
                 "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
                 "test src/lib.rs - third (line 9) ... ok\n"
                 "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
-        self.assertFalse(errors(text))
+        self.assertFalse(errors(text, status=0))
 
-    def test_cli_rejects_a_compile_failure_after_all_known_failures(self):
+    def test_cli_rejects_a_compile_failure_after_assertion_failures(self):
         # Test the script's exit status, not just the parser in isolation.
-        text = cargo_build()
-        for name in sorted(unittests.OPEN):
-            crate, test = name.split("::", 1)
-            text += suite(name=test, crate=crate)
+        text = cargo_build() + suite()
         text += "error: could not compile `ra-jit` (bin test) due to 1 previous error\n"
         with tempfile.TemporaryDirectory() as directory:
             cargo = Path(directory) / "cargo"
@@ -149,7 +145,7 @@ class UnitVerdictTests(unittest.TestCase):
                                       "RUSTC_WRAPPER": "", "RUSTC_WORKSPACE_WRAPPER": "",
                                       "RUST_BACKTRACE": "0"})
             self.assertEqual(run.returncode, 101, run.stdout)
-            self.assertFalse(errors(run.stdout, run.returncode), run.stdout)
+            self.assertIn("fixture::known fails", errors(run.stdout, run.returncode), run.stdout)
 
 
 class UIVerdictTests(unittest.TestCase):

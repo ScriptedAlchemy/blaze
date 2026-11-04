@@ -552,6 +552,17 @@ pub mod dynamic {
         let s: &dyn Speak = if dog { &d } else { &Cat };
         s.speak()
     }
+
+    struct Borrowed<'a>(&'a u32);
+    impl Speak for Borrowed<'_> {
+        fn speak(&self) -> u32 {
+            *self.0
+        }
+    }
+    /// `&dyn Speak` inherits its reference's lifetime and accepts borrowed local data.
+    pub fn borrowed(value: u32) -> u32 {
+        call(&Borrowed(&value))
+    }
 }
 
 pub mod objects {

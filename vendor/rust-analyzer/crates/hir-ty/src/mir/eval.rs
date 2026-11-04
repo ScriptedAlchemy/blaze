@@ -19,7 +19,7 @@ use hir_def::{
     resolver::{HasResolver, ValueNs},
     signatures::{EnumSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
 };
-use hir_expand::{InFile, mod_path::path};
+use hir_expand::mod_path::path;
 use la_arena::ArenaMap;
 use macros::GenericTypeVisitable;
 use rustc_abi::{Size, TargetDataLayout};
@@ -34,9 +34,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind, Region as _, SliceLike, Ty as _},
 };
 use salsa::SalsaValue;
-use span::FileId;
 use stdx::never;
-use syntax::{SyntaxNodePtr, TextRange};
 use triomphe::Arc;
 
 use crate::{
@@ -62,7 +60,10 @@ use super::{
     StatementKind, StoredPlace, TerminatorKind, UnOp, return_slot,
 };
 
+mod caller_location;
 mod shim;
+
+use caller_location::CallerLocation;
 
 macro_rules! from_bytes {
     // A `usize` of the target, which is as wide as what holds it.
@@ -194,6 +195,8 @@ pub struct Evaluator<'db> {
     /// doesn't say how much memory it can reach, its allocation does.
     allocations: [Vec<Allocated>; 2],
     code_stack: Vec<StackFrame<'db>>,
+    caller_locations: FxHashMap<(String, u32, u32), Address>,
+    caller_location_files: FxHashMap<String, Address>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
     static_locations: FxHashMap<StaticId, Address>,
@@ -481,6 +484,7 @@ type Result<'db, T> = std::result::Result<T, MirEvalError<'db>>;
 struct Locals<'db> {
     ptr: ArenaMap<LocalId, Interval>,
     body: &'db MirBody<'db>,
+    caller_location: Option<CallerLocation<'db>>,
 }
 
 pub struct MirOutput {
@@ -532,10 +536,13 @@ const EXECUTION_LIMIT: usize = 10_000_000;
 impl<'db> Evaluator<'db> {
     /// Runs a body without arguments and takes its result out of the evaluator's memory.
     fn evaluate(&mut self, body: &'db MirBody<'db>, ty: Ty<'db>) -> Result<'db, Allocation<'db>> {
-        let interval = self.interpret_mir(body, None.into_iter())?;
+        let interval = self.interpret_mir(body, None.into_iter(), None)?;
         let bytes = interval.get(self)?;
-        let mut memory_map =
-            self.create_memory_map(bytes, ty, &Locals { ptr: ArenaMap::new(), body })?;
+        let mut memory_map = self.create_memory_map(
+            bytes,
+            ty,
+            &Locals { ptr: ArenaMap::new(), body, caller_location: None },
+        )?;
         // The ids made here are not rustc's hashes and mean nothing outside this evaluation,
         // so a constant that may hold one says what each is of. A `TypeId` is pointers to
         // const eval, which cannot read them as integers, so no other value is computed from
@@ -593,6 +600,8 @@ impl<'db> Evaluator<'db> {
             heap: vec![0],
             allocations: Default::default(),
             code_stack: vec![],
+            caller_locations: FxHashMap::default(),
+            caller_location_files: FxHashMap::default(),
             vtable_map: VTableMap::default(),
             thread_local_storage: TlsData::default(),
             static_locations: Default::default(),
@@ -655,37 +664,6 @@ impl<'db> Evaluator<'db> {
 
     fn ptr_size(&self) -> usize {
         self.cached_ptr_size
-    }
-
-    fn resolve_mir_span(
-        &self,
-        owner: InferBodyId<'db>,
-        span: MirSpan,
-    ) -> Option<(FileId, TextRange)> {
-        let (source_map, self_param_syntax) = match owner {
-            InferBodyId::DefWithBodyId(def) => {
-                let body = &Body::with_source_map(self.db, def).1;
-                (&**body, body.self_param_syntax())
-            }
-            InferBodyId::AnonConstId(def) => {
-                (ExpressionStore::with_source_map(self.db, def.loc(self.db).owner).1, None)
-            }
-        };
-        let span: InFile<SyntaxNodePtr> = match span {
-            MirSpan::ExprId(e) | MirSpan::ExprEnd(e) => {
-                source_map.expr_syntax(e).ok()?.map(|it| it.into())
-            }
-            MirSpan::PatId(p) => source_map.pat_syntax(p).ok()?.map(|it| it.syntax_node_ptr()),
-            MirSpan::BindingId(b) => source_map
-                .patterns_for_binding(b)
-                .iter()
-                .find_map(|p| source_map.pat_syntax(*p).ok())?
-                .map(|it| it.syntax_node_ptr()),
-            MirSpan::SelfParam => self_param_syntax?.map(|it| it.syntax_node_ptr()),
-            MirSpan::Unknown => return None,
-        };
-        let file_id = span.file_id.original_file(self.db);
-        Some((file_id.file_id(self.db), span.value.text_range()))
     }
 
     fn projected_ty(&self, ty: PlaceTy<'db>, proj: PlaceElem) -> PlaceTy<'db> {
@@ -867,6 +845,7 @@ impl<'db> Evaluator<'db> {
         &mut self,
         body: &'db MirBody<'db>,
         args: impl Iterator<Item = IntervalOrOwned>,
+        caller_location: Option<CallerLocation<'db>>,
     ) -> Result<'db, Interval> {
         if let Some(it) = self.stack_depth_limit.checked_sub(1) {
             self.stack_depth_limit = it;
@@ -876,6 +855,7 @@ impl<'db> Evaluator<'db> {
         let mut current_block_idx = body.start_block;
         let (mut locals, prev_stack_ptr) = self.create_locals_for_body(body, None)?;
         self.fill_locals_for_body(body, &mut locals, args)?;
+        locals.caller_location = caller_location;
         let prev_code_stack = mem::take(&mut self.code_stack);
         let span = (MirSpan::Unknown, body.owner);
         self.code_stack.push(StackFrame { locals, destination: None, prev_stack_ptr, span });
@@ -1067,9 +1047,10 @@ impl<'db> Evaluator<'db> {
         }
         let mut locals =
             match self.unused_locals_store.borrow_mut().entry(body.owner).or_default().pop() {
-                None => Locals { ptr: ArenaMap::new(), body },
+                None => Locals { ptr: ArenaMap::new(), body, caller_location: None },
                 Some(mut l) => {
                     l.body = body;
+                    l.caller_location = None;
                     l
                 }
             };
@@ -2267,7 +2248,7 @@ impl<'db> Evaluator<'db> {
             MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e.clone())))
         })?;
         let previous_context = std::mem::replace(&mut self.const_context, true);
-        let result = self.interpret_mir(body, iter::empty());
+        let result = self.interpret_mir(body, iter::empty(), None);
         self.const_context = previous_context;
         let result = result?;
         let ty = body.locals[return_slot()].ty.as_ref();
@@ -3185,6 +3166,21 @@ impl<'db> Evaluator<'db> {
         use rustc_type_ir::TyKind;
         match next_ty.kind() {
             TyKind::FnDef(def, generic_args) => {
+                let shim;
+                let locals = if let CallableDefId::FunctionId(function) = def.0
+                    && super::location::tracks_caller(self.db, function)
+                {
+                    // Reifying a tracked function creates rustc's untracked shim: calls through
+                    // the pointer report the function's declaration, not the indirect call site.
+                    shim = Locals {
+                        ptr: locals.ptr.clone(),
+                        body: locals.body,
+                        caller_location: Some(CallerLocation::Declaration(function)),
+                    };
+                    &shim
+                } else {
+                    locals
+                };
                 self.exec_fn_def(def.0, generic_args, destination, args, locals, target_bb, span)
             }
             TyKind::Closure(id, generic_args) => self.exec_closure(
@@ -3237,7 +3233,7 @@ impl<'db> Evaluator<'db> {
             .chain(args.iter().map(|it| Ok(it.get(self)?.to_owned())))
             .collect::<Result<'db, Vec<_>>>()?;
         let interval = self
-            .interpret_mir(mir_body, arg_bytes.into_iter().map(IntervalOrOwned::Owned))
+            .interpret_mir(mir_body, arg_bytes.into_iter().map(IntervalOrOwned::Owned), None)
             .map_err(|e| {
                 MirEvalError::InFunction(
                     Box::new(e),
@@ -3440,14 +3436,23 @@ impl<'db> Evaluator<'db> {
         destination: Interval,
         target_bb: Option<BasicBlockId>,
     ) -> Result<'db, Option<StackFrame<'db>>> {
+        let caller_location = super::location::tracks_caller(self.db, def).then(|| {
+            locals.caller_location.unwrap_or(CallerLocation::Call(locals.body.owner, span))
+        });
         if let Some(target_bb) = target_bb {
+            let site = (span, locals.body.owner);
             let (mut locals, prev_stack_ptr) =
                 self.create_locals_for_body(mir_body, Some(destination))?;
             self.fill_locals_for_body(mir_body, &mut locals, arg_bytes.into_iter())?;
-            let span = (span, locals.body.owner);
-            Ok(Some(StackFrame { locals, destination: Some(target_bb), prev_stack_ptr, span }))
+            locals.caller_location = caller_location;
+            Ok(Some(StackFrame {
+                locals,
+                destination: Some(target_bb),
+                prev_stack_ptr,
+                span: site,
+            }))
         } else {
-            let result = self.interpret_mir(mir_body, arg_bytes).map_err(|e| {
+            let result = self.interpret_mir(mir_body, arg_bytes, caller_location).map_err(|e| {
                 MirEvalError::InFunction(
                     Box::new(e),
                     vec![(Either::Left(def), span, locals.body.owner)],
@@ -3748,6 +3753,7 @@ pub fn render_const_using_debug_impl<'db>(
     let mut evaluator = Evaluator::new(db, owner, false, None)?;
     let locals = &Locals {
         ptr: ArenaMap::new(),
+        caller_location: None,
         body: db
             .runtime_mir_body(owner)
             .map_err(|_| MirEvalError::NotSupported("unreachable".to_owned()))?,
@@ -3796,6 +3802,7 @@ pub fn render_const_using_debug_impl<'db>(
         db.runtime_mir_body(format_fn.into())
             .map_err(|e| MirEvalError::MirLowerError(format_fn, e))?,
         [IntervalOrOwned::Borrowed(Interval { addr: arguments, size: ptr_size * 2 })].into_iter(),
+        None,
     )?;
     let message_string = interval.get(&evaluator)?;
     let words = [

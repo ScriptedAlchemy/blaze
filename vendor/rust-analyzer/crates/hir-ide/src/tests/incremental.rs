@@ -256,7 +256,7 @@ $0",
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 2)],
         expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -268,6 +268,14 @@ $0",
                 "TraitImpls < 'db >::for_crate_",
                 "lang_items",
                 "crate_lang_items",
+                "Body::of_",
+                "Body::relative_",
+                "body_syntax",
+                "AttrFlags::query_",
+                "Body::of_",
+                "Body::relative_",
+                "body_syntax",
+                "AttrFlags::query_",
             ]
         "#]],
     );
@@ -295,7 +303,7 @@ pub struct NewStruct {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -304,6 +312,11 @@ pub struct NewStruct {
                 "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls < 'db >::for_crate_",
+                "body_syntax",
+                "Body::relative_",
+                "AttrFlags::query_",
+                "body_syntax",
+                "AttrFlags::query_",
             ]
         "#]],
     );
@@ -330,7 +343,7 @@ $0",
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 2)],
         expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -342,6 +355,14 @@ $0",
                 "TraitImpls < 'db >::for_crate_",
                 "lang_items",
                 "crate_lang_items",
+                "Body::of_",
+                "Body::relative_",
+                "body_syntax",
+                "AttrFlags::query_",
+                "Body::of_",
+                "Body::relative_",
+                "body_syntax",
+                "AttrFlags::query_",
             ]
         "#]],
     );
@@ -370,7 +391,7 @@ pub enum SomeEnum {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -379,6 +400,11 @@ pub enum SomeEnum {
                 "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls < 'db >::for_crate_",
+                "body_syntax",
+                "Body::relative_",
+                "AttrFlags::query_",
+                "body_syntax",
+                "AttrFlags::query_",
             ]
         "#]],
     );
@@ -405,7 +431,7 @@ $0",
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 2)],
         expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -417,6 +443,14 @@ $0",
                 "TraitImpls < 'db >::for_crate_",
                 "lang_items",
                 "crate_lang_items",
+                "Body::of_",
+                "Body::relative_",
+                "body_syntax",
+                "AttrFlags::query_",
+                "Body::of_",
+                "Body::relative_",
+                "body_syntax",
+                "AttrFlags::query_",
             ]
         "#]],
     );
@@ -442,7 +476,7 @@ fn bar() -> f32 {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -452,6 +486,12 @@ fn bar() -> f32 {
                 "crate_local_def_map",
                 "TraitImpls < 'db >::for_crate_",
                 "crate_lang_items",
+                "body_syntax",
+                "Body::relative_",
+                "AttrFlags::query_",
+                "body_syntax",
+                "Body::relative_",
+                "AttrFlags::query_",
             ]
         "#]],
     );
@@ -482,7 +522,7 @@ $0",
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 2)],
         expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -494,6 +534,14 @@ $0",
                 "TraitImpls < 'db >::for_crate_",
                 "lang_items",
                 "crate_lang_items",
+                "Body::of_",
+                "Body::relative_",
+                "body_syntax",
+                "AttrFlags::query_",
+                "Body::of_",
+                "Body::relative_",
+                "body_syntax",
+                "AttrFlags::query_",
             ]
         "#]],
     );
@@ -527,7 +575,7 @@ impl SomeStruct {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 1)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -536,6 +584,19 @@ impl SomeStruct {
                 "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls < 'db >::for_crate_",
+                "ImplItems::of_",
+                "body_syntax",
+                "Body::relative_",
+                "AttrFlags::query_",
+                "body_syntax",
+                "AttrFlags::query_",
+                "Body::of_",
+                "Body::relative_",
+                "body_syntax",
+                "AttrFlags::query_",
+                "Modules < 'db >::module_",
+                "ModuleScope < 'db >::legacy_macro_",
+                "ModuleScope < 'db >::name_",
             ]
         "#]],
     );
@@ -595,7 +656,8 @@ fn main() {
                 "Modules < 'db >::module_",
                 "TraitItems::query_with_diagnostics_",
                 "Body::of_",
-                "Body::with_source_map_",
+                "Body::relative_",
+                "body_syntax",
                 "AttrFlags::query_",
                 "ModuleScope < 'db >::legacy_macro_",
                 "ModuleScope < 'db >::name_",
@@ -608,7 +670,8 @@ fn main() {
                 "FunctionSignature::with_source_map_",
                 "AttrFlags::query_",
                 "Body::of_",
-                "Body::with_source_map_",
+                "Body::relative_",
+                "body_syntax",
                 "trait_environment_query",
                 "lang_items",
                 "crate_lang_items",
@@ -634,6 +697,8 @@ fn main() {
                 "InherentImpls < 'db >::for_crate_",
                 "TraitImpls < 'db >::in_crate_and_deps_for_trait_and_self_ty_",
                 "TraitImpls < 'db >::for_crate_and_deps_",
+                "loaded_crates",
+                "include_macro_invoc",
                 "TraitImpls < 'db >::for_crate_",
                 "impl_trait_with_diagnostics",
                 "ImplSignature::of_",
@@ -702,7 +767,8 @@ fn main() {
                 "real_span_map",
                 "crate_local_def_map",
                 "TraitItems::query_with_diagnostics_",
-                "Body::with_source_map_",
+                "body_syntax",
+                "Body::relative_",
                 "AttrFlags::query_",
                 "ModuleScope < 'db >::legacy_macro_",
                 "ModuleScope < 'db >::name_",
@@ -713,8 +779,7 @@ fn main() {
                 "AttrFlags::query_",
                 "FunctionSignature::with_source_map_",
                 "FunctionSignature::of_",
-                "Body::with_source_map_",
-                "Body::of_",
+                "body_syntax",
                 "ModuleScope < 'db >::traits_",
                 "FunctionSignature::with_source_map_",
                 "InferenceResult < 'db >::for_body_",
@@ -724,6 +789,7 @@ fn main() {
                 "StructSignature::with_source_map_",
                 "AttrFlags::query_",
                 "InherentImpls < 'db >::for_crate_",
+                "include_macro_invoc",
                 "TraitImpls < 'db >::for_crate_",
                 "ImplSignature::with_source_map_",
                 "ImplSignature::of_",

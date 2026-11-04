@@ -31,6 +31,7 @@ rustc_apfloat = "0.2.3"
 salsa.workspace = true
 petgraph.workspace = true
 bitflags.workspace = true
+unicode-width.workspace = true
 
 ra-ap-rustc_abi.workspace = true
 ra-ap-rustc_index.workspace = true

@@ -2910,6 +2910,7 @@ impl B for Astruct {}
         expect![[r#"
             733..737 'self': Box<[T], A>
             766..798 '{     ...     }': Vec<T, A>
+            776..792 'unimpl...ted!()': Vec<T, A>
             812..940 '{     ...])); }': ()
             822..825 'vec': Vec<i32, Global>
             828..843 '<[_]>::into_vec': fn into_vec<i32, Global>(Box<[i32], Global>) -> Vec<i32, Global>
