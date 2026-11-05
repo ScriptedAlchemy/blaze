@@ -1,0 +1,24 @@
+# Exercise the actual composite action's shell logic on supported GitHub runners.
+name: Nightly issue reporting regressions
+on:
+  pull_request:
+    paths:
+      - .github/actions/nightly-issue/action.yml
+      - harness/test_nightly_issue.py
+      - .github/workflows/nightly-issue-regressions.yaml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: nightly-issue-tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  report:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify disabled, enabled, and unexpected issue states
+        run: python3 -m unittest discover -s harness -p test_nightly_issue.py -v
