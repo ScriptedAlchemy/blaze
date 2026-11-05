@@ -71,7 +71,7 @@ def gh(*args):
 def state(number):
     owner, name = repository().split("/", 1)
     query = f"""query($number: Int!) {{ repository(owner: "{owner}", name: "{name}") {{
-      pullRequest(number: $number) {{ state mergeable isInMergeQueue url headRefName
+      pullRequest(number: $number) {{ state mergeable isInMergeQueue id headRefOid baseRefName url headRefName
         mergeQueueEntry {{ position state }} autoMergeRequest {{ enabledAt }} mergeCommit {{ oid }} }} }} }}"""
     out = gh("api", "graphql", "-f", f"query={query}", "-F", f"number={number}")
     return json.loads(out)["data"]["repository"]["pullRequest"]
@@ -95,6 +95,43 @@ def queue_runs(number):
         return []
     runs = json.loads(out or "[]")
     return [r["url"] for r in runs if f"/pr-{number}-" in r["headBranch"] and r["conclusion"] == "failure"]
+
+
+
+def enqueue_with_head_guard(number, expected_head):
+    """Only enqueue through GitHub's merge queue, guarded by the exact PR head.
+
+    Never use a regular merge or repository auto-merge as a substitute. GitHub
+    rejects a moved head atomically via expectedHeadOid.
+    """
+    pr = state(number)
+    if (not pr or pr["state"] != "OPEN" or pr["baseRefName"] != "main"
+            or pr["headRefOid"] != expected_head):
+        raise GhFailed("PR state, base, or head changed before queue submission")
+    if pr["isInMergeQueue"]:
+        return
+    mutation = (
+        "mutation($pr: ID!, $head: GitObjectID!) { "
+        "enqueuePullRequest(input: {pullRequestId: $pr, expectedHeadOid: $head}) { "
+        "mergeQueueEntry { id } } }"
+    )
+    raw = gh("api", "graphql", "-f", f"query={mutation}", "-f", f"pr={pr['id']}",
+             "-f", f"head={expected_head}")
+    try:
+        entry = json.loads(raw)["data"]["enqueuePullRequest"]["mergeQueueEntry"]
+    except (ValueError, KeyError, TypeError) as error:
+        raise GhFailed("GitHub returned no verified merge queue entry") from error
+    if not entry or not entry.get("id"):
+        raise GhFailed("GitHub returned no verified merge queue entry")
+
+
+def queue_merge(number, expected_head):
+    """Enqueue only: gh pr merge may merge directly if protections change.
+
+    The explicit GraphQL enqueuePullRequest mutation cannot bypass the queue,
+    and verifies a matching head, open PR, main target, and queue receipt.
+    """
+    enqueue_with_head_guard(number, expected_head)
 
 
 def files(number):
@@ -264,15 +301,10 @@ def main():
                   "--title", f"Merge {branch}: {what}", "--body", body)
         number = int(url.rstrip("/").rsplit("/", 1)[1])
     print(f"{url}")
-    queued = subprocess.run(["gh", "pr", "merge", str(number), "--repo", repository(), "--merge", "--auto"],
-                            capture_output=True, text=True)
-    # Run again on a pull request already in the queue, `gh pr merge` may refuse; the queue has it.
     try:
-        in_queue = state(number)["isInMergeQueue"]
-    except GhFailed:
-        in_queue = False
-    if queued.returncode and not in_queue:
-        sys.exit(f"land.py: gh pr merge failed:\n{queued.stderr.strip()}")
+        queue_merge(number, run("git", "rev-parse", "HEAD"))
+    except GhFailed as error:
+        sys.exit(f"land.py: {error}")
     if not wait_for_it:
         print("queued; land.py does not wait (--no-wait)")
         return

@@ -57,5 +57,68 @@ class RepositoryTests(TestCase):
                 self.assertIn("ScriptedAlchemy/blaze", run.call_args.args)
 
 
+class MergeQueueTests(TestCase):
+    def test_queue_request_is_scoped_and_never_uses_direct_merge_cli(self):
+        current = dict(id="PR_node", state="OPEN", baseRefName="main",
+                       headRefOid="deadbeef", isInMergeQueue=False)
+        receipt = {"data": {"enqueuePullRequest": {"mergeQueueEntry": {"id": "MQ_node"}}}}
+        with mock.patch.object(land, "state", return_value=current), \
+             mock.patch.object(land, "gh", return_value=json.dumps(receipt)) as gh, \
+             mock.patch.object(land.subprocess, "run") as subprocess_run:
+            land.queue_merge(79, "deadbeef")
+            subprocess_run.assert_not_called()
+        graph = gh.call_args.args
+        self.assertIn("enqueuePullRequest", graph[3])
+        self.assertIn("expectedHeadOid", graph[3])
+        self.assertIn("pr=PR_node", graph)
+        self.assertIn("head=deadbeef", graph)
+
+    def test_changed_head_wrong_base_and_closed_pr_are_refused(self):
+        current = dict(id="PR_node", state="OPEN", baseRefName="main",
+                       headRefOid="deadbeef", isInMergeQueue=False)
+        for changed in ({"headRefOid": "another"}, {"baseRefName": "dist/main"},
+                        {"state": "CLOSED"}):
+            with self.subTest(changed=changed), \
+                 mock.patch.object(land, "state", return_value={**current, **changed}), \
+                 mock.patch.object(land, "gh") as gh:
+                with self.assertRaises(land.GhFailed):
+                    land.enqueue_with_head_guard(79, "deadbeef")
+                gh.assert_not_called()
+
+    def test_invalid_enqueue_receipt_is_not_a_success(self):
+        current = dict(id="PR_node", state="OPEN", baseRefName="main",
+                       headRefOid="deadbeef", isInMergeQueue=False)
+        with mock.patch.object(land, "state", return_value=current), \
+             mock.patch.object(land, "gh", return_value=json.dumps({
+                 "data": {"enqueuePullRequest": {"mergeQueueEntry": None}}})), \
+             self.assertRaises(land.GhFailed):
+            land.enqueue_with_head_guard(79, "deadbeef")
+
+    def test_already_queued_head_does_not_reenqueue(self):
+        current = dict(id="PR_node", state="OPEN", baseRefName="main",
+                       headRefOid="deadbeef", isInMergeQueue=True)
+        with mock.patch.object(land, "state", return_value=current), \
+             mock.patch.object(land, "gh") as gh, \
+             mock.patch.object(land.subprocess, "run") as subprocess_run:
+            land.queue_merge(79, "deadbeef")
+            gh.assert_not_called()
+            subprocess_run.assert_not_called()
+
+    def test_already_queued_moved_head_is_refused(self):
+        current = dict(id="PR_node", state="OPEN", baseRefName="main",
+                       headRefOid="another", isInMergeQueue=True)
+        with mock.patch.object(land, "state", return_value=current), \
+             mock.patch.object(land, "gh") as gh, \
+             self.assertRaises(land.GhFailed):
+            land.queue_merge(79, "deadbeef")
+            gh.assert_not_called()
+
+    def test_unavailable_queue_state_fails_closed(self):
+        with mock.patch.object(land, "state", side_effect=land.GhFailed("API unavailable")), \
+             mock.patch.object(land, "gh") as gh, \
+             self.assertRaises(land.GhFailed):
+            land.queue_merge(79, "deadbeef")
+            gh.assert_not_called()
+
 if __name__ == "__main__":
     main()

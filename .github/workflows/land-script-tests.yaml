@@ -8,6 +8,12 @@ on:
       - .github/scripts/test_cancel_pr_runs.py
       - .github/workflows/cancel-pr-runs.yaml
       - .github/workflows/land-script-tests.yaml
+  push:
+    branches: [main]
+    paths:
+      - .github/scripts/land.py
+      - .github/scripts/test_land.py
+      - .github/workflows/land-script-tests.yaml
   workflow_dispatch:
 permissions:
   contents: read
