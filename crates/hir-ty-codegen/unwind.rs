@@ -571,7 +571,7 @@ mod llvm_tests {
     use crate::{
         backend::{Optimization, Passes, Selection},
         fragment::{FuncTarget, Wants},
-        llvm::emit,
+        llvm::{Member, emit, emit_unit},
     };
     use cranelift_codegen::ir::{self, InstBuilder, UserFuncName};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -625,8 +625,23 @@ mod llvm_tests {
         builder.finalize(isa.frontend_config());
 
         let optimization = Optimization { passes: Passes::None, selection: Selection::Fast };
-        let code = emit(&mut wants, &[], &function, optimization, None, &[]).unwrap();
-        let Frame::Rows(frame) = code.unwind.unwrap().frame else { panic!("LLVM DWARF rows") };
+        let mut codes = vec![emit(&mut wants, &[], &function, optimization, None, &[]).unwrap()];
+        let requests = ["first_cleanup", "second_cleanup"]
+            .map(|name| wants.func(FuncTarget::Symbol(name.into()), &function.signature).as_u32());
+        let members =
+            requests.map(|request| Member { func: &function, named: &[], pointees: &[], request });
+        let unit = emit_unit(&mut wants, &members, optimization, &[]).unwrap();
+        codes.extend(unit.members.into_iter().map(Result::unwrap));
+        for code in codes {
+            check_calls(&code);
+        }
+    }
+
+    fn check_calls(code: &crate::fragment::Code) {
+        let unwind = code.unwind.as_ref().expect("unwind information");
+        assert!(unwind.landing_pads.as_ref().is_some_and(|table| !table.is_empty()));
+        let Frame::Rows(frame) = &unwind.frame else { panic!("LLVM DWARF rows") };
+        assert!(frame.len > 0 && frame.len as usize <= code.bytes.len());
         let mut rules = frame.rows.iter().peekable();
         let mut saved = false;
         let mut states = Vec::new();

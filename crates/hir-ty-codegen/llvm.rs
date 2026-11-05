@@ -239,9 +239,12 @@ fn compiled(
                     }
                 }
             }
-            // Each function of a unit is a section of its own, which `emitted` reads as the
-            // code of that function.
-            if alone.is_none() {
+            // ELF and COFF group each function's section with its constants. Mach-O has
+            // symbol-delimited atoms instead; asking LLVM for COMDATs there aborts.
+            if alone.is_none()
+                && super::Target::selected().map_err(Unhandled::Llvm)?.object_format
+                    != super::ObjectFormat::MachO
+            {
                 for (function, name) in std::iter::zip(&functions, &names) {
                     if let Some(function) = function {
                         function.as_global_value().set_comdat(module.get_or_insert_comdat(name));
@@ -377,7 +380,11 @@ fn compiled(
                     continue;
                 }
                 body.set_linkage(Linkage::External);
-                body.as_global_value().set_comdat(module.get_or_insert_comdat(&name));
+                if super::Target::selected().map_err(Unhandled::Llvm)?.object_format
+                    != super::ObjectFormat::MachO
+                {
+                    body.as_global_value().set_comdat(module.get_or_insert_comdat(&name));
+                }
                 kept.push((name, import));
             }
         }
@@ -1459,14 +1466,18 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         let mut codes: Vec<Code> = unit.members.into_iter().map(Result::unwrap).collect();
         let named = |code: &Code, wanted| -> Vec<u32> {
             let names = code.relocs.iter().map(|it| &it.name);
-            names
+            let mut targets: Vec<_> = names
                 .filter_map(|it| match *it {
                     ModuleRelocTarget::User { namespace, index } if namespace == wanted => {
                         Some(index)
                     }
                     _ => None,
                 })
-                .collect()
+                .collect();
+            // AArch64's page and page-offset relocations name the same constant twice.
+            targets.sort_unstable();
+            targets.dedup();
+            targets
         };
         assert_eq!(named(&codes[0], 0), [callee.as_u32()]);
         assert_eq!(named(&codes[1], 0), Vec::<u32>::new());
