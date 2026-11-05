@@ -1355,10 +1355,20 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             }
             InstructionData::Brif { arg, blocks: [then, otherwise], .. } => {
                 let condition = self.condition(arg)?;
-                let (then, otherwise) = (self.branch_edge(then)?, self.branch_edge(otherwise)?);
-                let branch = self.builder.build_conditional_branch(condition, then, otherwise)?;
-                if let Some(taken) = self.weights.and_then(|it| it.taken.get(&inst)) {
-                    self.weigh(branch, *taken)?;
+                if let Some(taken) = condition.get_zero_extended_constant() {
+                    // FastISel drops an untaken constant edge from the machine CFG, but
+                    // its IR predecessor keeps the dead return alive. AArch64 CFIFixup
+                    // then leaks that return's epilogue rules into live cleanup calls.
+                    // Fold here even without optimization, as rustc does for SwitchInt.
+                    let target = self.edge(if taken != 0 { then } else { otherwise })?;
+                    self.builder.build_unconditional_branch(target)?;
+                } else {
+                    let (then, otherwise) = (self.branch_edge(then)?, self.branch_edge(otherwise)?);
+                    let branch =
+                        self.builder.build_conditional_branch(condition, then, otherwise)?;
+                    if let Some(taken) = self.weights.and_then(|it| it.taken.get(&inst)) {
+                        self.weigh(branch, *taken)?;
+                    }
                 }
             }
             InstructionData::BranchTable { arg, table, .. } => {

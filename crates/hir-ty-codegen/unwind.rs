@@ -564,3 +564,98 @@ impl Writer for WriterRelocate {
         }
     }
 }
+
+#[cfg(all(test, feature = "llvm", target_arch = "aarch64", not(windows)))]
+mod llvm_tests {
+    use super::*;
+    use crate::{
+        backend::{Optimization, Passes, Selection},
+        fragment::{FuncTarget, Wants},
+        llvm::emit,
+    };
+    use cranelift_codegen::ir::{self, InstBuilder, UserFuncName};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    #[test]
+    fn constant_branch_before_cleanup_keeps_the_return_address_saved() {
+        let isa = crate::target().unwrap();
+        let mut signature = Signature::new(isa.default_call_conv());
+        signature.params.push(AbiParam::new(types::I64));
+        let mut function =
+            ir::Function::with_name_signature(UserFuncName::default(), signature.clone());
+        let mut wants = Wants::new(&**isa);
+        let callee = wants.func(FuncTarget::Symbol("may_panic".into()), &signature);
+        let resume = wants.func(FuncTarget::Symbol("_Unwind_Resume".into()), &signature);
+        let callee = wants.declare_func_in_func(callee, &mut function);
+        let resume = wants.declare_func_in_func(resume, &mut function);
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut function, &mut context);
+        let entry = builder.create_block();
+        let live = builder.create_block();
+        let returned = builder.create_block();
+        let dead = builder.create_block();
+        let cleanup = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.append_block_param(cleanup, types::I64);
+        builder.switch_to_block(entry);
+        let argument = builder.block_params(entry)[0];
+        let yes = builder.ins().iconst(types::I8, 1);
+        builder.ins().brif(yes, live, &[], dead, &[]);
+        builder.switch_to_block(live);
+        let normal = builder.func.dfg.block_call(returned, &[]);
+        let unwound = builder.func.dfg.block_call(cleanup, &[ir::BlockArg::TryCallExn(0)]);
+        let signature = builder.func.dfg.ext_funcs[callee].signature;
+        let table = builder.func.dfg.exception_tables.push(ir::ExceptionTableData::new(
+            signature,
+            normal,
+            [ir::ExceptionTableItem::Tag(ir::ExceptionTag::with_number(CLEANUP).unwrap(), unwound)],
+        ));
+        builder.ins().try_call(callee, &[argument], table);
+        builder.switch_to_block(returned);
+        builder.ins().return_(&[]);
+        // FastISel used to drop the edge to this block, but keep its return and CFI.
+        builder.switch_to_block(dead);
+        builder.ins().call(callee, &[argument]);
+        builder.ins().return_(&[]);
+        builder.switch_to_block(cleanup);
+        let exception = builder.block_params(cleanup)[0];
+        builder.ins().call(resume, &[exception]);
+        builder.ins().trap(ir::TrapCode::unwrap_user(1));
+        builder.seal_all_blocks();
+        builder.finalize(isa.frontend_config());
+
+        let optimization = Optimization { passes: Passes::None, selection: Selection::Fast };
+        let code = emit(&mut wants, &[], &function, optimization, None, &[]).unwrap();
+        let Frame::Rows(frame) = code.unwind.unwrap().frame else { panic!("LLVM DWARF rows") };
+        let mut rules = frame.rows.iter().peekable();
+        let mut saved = false;
+        let mut states = Vec::new();
+        let mut calls = 0;
+        for (index, bytes) in code.bytes.chunks_exact(4).enumerate() {
+            let offset = index as u32 * 4;
+            while let Some(&&(at, rule)) = rules.peek() {
+                if at > offset {
+                    break;
+                }
+                match rule {
+                    FrameRule::Offset(30, _) => saved = true,
+                    FrameRule::Restore(30)
+                    | FrameRule::SameValue(30)
+                    | FrameRule::Undefined(30) => {
+                        saved = false;
+                    }
+                    FrameRule::RememberState => states.push(saved),
+                    FrameRule::RestoreState => saved = states.pop().expect("remembered CFI state"),
+                    _ => {}
+                }
+                rules.next();
+            }
+            let word = u32::from_le_bytes(bytes.try_into().unwrap());
+            if word & 0xfc00_0000 == 0x9400_0000 || word & 0xffff_fc1f == 0xd63f_0000 {
+                calls += 1;
+                assert!(saved, "x30 is unsaved at call {offset:#x}: {:?}", frame.rows);
+            }
+        }
+        assert!(calls >= 2, "the live call and cleanup resume must both be checked");
+    }
+}
