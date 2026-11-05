@@ -57,5 +57,67 @@ class RepositoryTests(TestCase):
                 self.assertIn("ScriptedAlchemy/blaze", run.call_args.args)
 
 
+class MergeQueueTests(TestCase):
+    def test_disabled_auto_merge_enqueues_scoped_exact_head(self):
+        current = dict(id="PR_node", state="OPEN", baseRefName="main",
+                       headRefOid="deadbeef", isInMergeQueue=False)
+        receipt = {"data": {"enqueuePullRequest": {"mergeQueueEntry": {"id": "MQ_node"}}}}
+        denied = mock.Mock(returncode=1,
+                           stderr="GraphQL: Auto merge is not allowed for this repository")
+        with mock.patch.object(land, "repository", return_value="ScriptedAlchemy/blaze"), \
+             mock.patch.object(land.subprocess, "run", return_value=denied) as run, \
+             mock.patch.object(land, "state", return_value=current), \
+             mock.patch.object(land, "gh", return_value=json.dumps(receipt)) as gh:
+            land.queue_merge(79, "deadbeef")
+        args = run.call_args.args[0]
+        self.assertIn("--match-head-commit", args)
+        self.assertEqual(args[args.index("--match-head-commit") + 1], "deadbeef")
+        graph = gh.call_args.args
+        self.assertIn("enqueuePullRequest", graph[3])
+        self.assertIn("expectedHeadOid", graph[3])
+        self.assertIn("pr=PR_node", graph)
+        self.assertIn("head=deadbeef", graph)
+
+    def test_changed_head_wrong_base_and_closed_pr_are_refused(self):
+        current = dict(id="PR_node", state="OPEN", baseRefName="main",
+                       headRefOid="deadbeef", isInMergeQueue=False)
+        for changed in ({"headRefOid": "another"}, {"baseRefName": "dist/main"},
+                        {"state": "CLOSED"}):
+            with self.subTest(changed=changed), \
+                 mock.patch.object(land, "state", return_value={**current, **changed}), \
+                 mock.patch.object(land, "gh") as gh:
+                with self.assertRaises(land.GhFailed):
+                    land.enqueue_with_head_guard(79, "deadbeef")
+                gh.assert_not_called()
+
+    def test_invalid_enqueue_receipt_is_not_a_success(self):
+        current = dict(id="PR_node", state="OPEN", baseRefName="main",
+                       headRefOid="deadbeef", isInMergeQueue=False)
+        with mock.patch.object(land, "state", return_value=current), \
+             mock.patch.object(land, "gh", return_value=json.dumps({
+                 "data": {"enqueuePullRequest": {"mergeQueueEntry": None}}})), \
+             self.assertRaises(land.GhFailed):
+            land.enqueue_with_head_guard(79, "deadbeef")
+
+    def test_other_cli_errors_never_bypass_to_graphql(self):
+        denied = mock.Mock(returncode=1, stderr="review required")
+        with mock.patch.object(land, "repository", return_value="ScriptedAlchemy/blaze"), \
+             mock.patch.object(land.subprocess, "run", return_value=denied), \
+             mock.patch.object(land, "state", return_value={"isInMergeQueue": False}), \
+             mock.patch.object(land, "gh") as gh:
+            with self.assertRaises(land.GhFailed):
+                land.queue_merge(79, "deadbeef")
+            gh.assert_not_called()
+
+    def test_already_queued_pr_does_not_reenqueue(self):
+        denied = mock.Mock(returncode=1, stderr="already in merge queue")
+        with mock.patch.object(land, "repository", return_value="ScriptedAlchemy/blaze"), \
+             mock.patch.object(land.subprocess, "run", return_value=denied), \
+             mock.patch.object(land, "state", return_value={"isInMergeQueue": True}), \
+             mock.patch.object(land, "gh") as gh:
+            land.queue_merge(79, "deadbeef")
+            gh.assert_not_called()
+
+
 if __name__ == "__main__":
     main()
