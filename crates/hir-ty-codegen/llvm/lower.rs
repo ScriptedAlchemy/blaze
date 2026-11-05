@@ -1399,6 +1399,19 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             InstructionData::Trap { .. } => self.trap()?,
             InstructionData::CondTrap { arg, .. } => {
                 let condition = self.condition(arg)?;
+                if let Some(value) = condition.get_zero_extended_constant() {
+                    let traps = match opcode {
+                        Opcode::Trapnz => value != 0,
+                        Opcode::Trapz => value == 0,
+                        _ => return Err(Unhandled::Opcode(opcode)),
+                    };
+                    if traps {
+                        self.trap()?;
+                        let rest = self.context.append_basic_block(self.function, "");
+                        self.builder.position_at_end(rest);
+                    }
+                    return Ok(());
+                }
                 let trap = self.context.append_basic_block(self.function, "");
                 let resume = self.context.append_basic_block(self.function, "");
                 match opcode {

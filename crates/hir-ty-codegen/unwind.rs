@@ -579,11 +579,41 @@ mod llvm_tests {
     #[test]
     fn constant_branch_before_cleanup_keeps_the_return_address_saved() {
         let isa = crate::target().unwrap();
+        let mut wants = Wants::new(&**isa);
+        let first = fixture(&**isa, &mut wants, 0);
+        let second = fixture(&**isa, &mut wants, 2);
+        let optimization = Optimization { passes: Passes::None, selection: Selection::Fast };
+        for (function, calls) in [(&first, 2), (&second, 4)] {
+            check_calls(&emit(&mut wants, &[], function, optimization, None, &[]).unwrap(), calls);
+        }
+        let members: Vec<_> = (0..400)
+            .map(|at| {
+                let func = if at % 2 == 0 { &first } else { &second };
+                let request = wants
+                    .func(FuncTarget::Symbol(format!("cleanup_{at}")), &func.signature)
+                    .as_u32();
+                Member { func, named: &[], pointees: &[], request }
+            })
+            .collect();
+        let read = &crate::backend::Tally::global().phases[crate::backend::Phase::Read as usize];
+        let before = read.load(std::sync::atomic::Ordering::Relaxed);
+        let unit = emit_unit(&mut wants, &members, optimization, &[]).unwrap();
+        let elapsed = read.load(std::sync::atomic::Ordering::Relaxed) - before;
+        eprintln!(
+            "400-member LLVM unit: Phase::Read {:?}",
+            std::time::Duration::from_nanos(elapsed)
+        );
+        for (at, code) in unit.members.into_iter().enumerate() {
+            let calls = if at % 2 == 0 { 2 } else { 4 };
+            check_calls(&code.unwrap(), calls);
+        }
+    }
+
+    fn fixture(isa: &dyn TargetIsa, wants: &mut Wants, extra_calls: usize) -> ir::Function {
         let mut signature = Signature::new(isa.default_call_conv());
         signature.params.push(AbiParam::new(types::I64));
         let mut function =
             ir::Function::with_name_signature(UserFuncName::default(), signature.clone());
-        let mut wants = Wants::new(&**isa);
         let callee = wants.func(FuncTarget::Symbol("may_panic".into()), &signature);
         let resume = wants.func(FuncTarget::Symbol("_Unwind_Resume".into()), &signature);
         let callee = wants.declare_func_in_func(callee, &mut function);
@@ -595,13 +625,16 @@ mod llvm_tests {
         let returned = builder.create_block();
         let dead = builder.create_block();
         let cleanup = builder.create_block();
+        let resuming = builder.create_block();
         builder.append_block_params_for_function_params(entry);
         builder.append_block_param(cleanup, types::I64);
         builder.switch_to_block(entry);
         let argument = builder.block_params(entry)[0];
-        let yes = builder.ins().iconst(types::I8, 1);
-        builder.ins().brif(yes, live, &[], dead, &[]);
+        builder.ins().jump(live, &[]);
         builder.switch_to_block(live);
+        for _ in 0..extra_calls {
+            builder.ins().call(callee, &[argument]);
+        }
         let normal = builder.func.dfg.block_call(returned, &[]);
         let unwound = builder.func.dfg.block_call(cleanup, &[ir::BlockArg::TryCallExn(0)]);
         let signature = builder.func.dfg.ext_funcs[callee].signature;
@@ -613,31 +646,22 @@ mod llvm_tests {
         builder.ins().try_call(callee, &[argument], table);
         builder.switch_to_block(returned);
         builder.ins().return_(&[]);
-        // FastISel used to drop the edge to this block, but keep its return and CFI.
+        // No call is made in dead code: the regression must catch the live resume.
         builder.switch_to_block(dead);
-        builder.ins().call(callee, &[argument]);
         builder.ins().return_(&[]);
         builder.switch_to_block(cleanup);
         let exception = builder.block_params(cleanup)[0];
+        let yes = builder.ins().iconst(types::I8, 1);
+        builder.ins().brif(yes, resuming, &[], dead, &[]);
+        builder.switch_to_block(resuming);
         builder.ins().call(resume, &[exception]);
         builder.ins().trap(ir::TrapCode::unwrap_user(1));
         builder.seal_all_blocks();
         builder.finalize(isa.frontend_config());
-
-        let optimization = Optimization { passes: Passes::None, selection: Selection::Fast };
-        let mut codes = vec![emit(&mut wants, &[], &function, optimization, None, &[]).unwrap()];
-        let requests = ["first_cleanup", "second_cleanup"]
-            .map(|name| wants.func(FuncTarget::Symbol(name.into()), &function.signature).as_u32());
-        let members =
-            requests.map(|request| Member { func: &function, named: &[], pointees: &[], request });
-        let unit = emit_unit(&mut wants, &members, optimization, &[]).unwrap();
-        codes.extend(unit.members.into_iter().map(Result::unwrap));
-        for code in codes {
-            check_calls(&code);
-        }
+        function
     }
 
-    fn check_calls(code: &crate::fragment::Code) {
+    fn check_calls(code: &crate::fragment::Code, expected_calls: usize) {
         let unwind = code.unwind.as_ref().expect("unwind information");
         assert!(unwind.landing_pads.as_ref().is_some_and(|table| !table.is_empty()));
         let Frame::Rows(frame) = &unwind.frame else { panic!("LLVM DWARF rows") };
@@ -645,7 +669,7 @@ mod llvm_tests {
         let mut rules = frame.rows.iter().peekable();
         let mut saved = false;
         let mut states = Vec::new();
-        let mut calls = 0;
+        let mut calls = Vec::new();
         for (index, bytes) in code.bytes.chunks_exact(4).enumerate() {
             let offset = index as u32 * 4;
             while let Some(&&(at, rule)) = rules.peek() {
@@ -667,10 +691,39 @@ mod llvm_tests {
             }
             let word = u32::from_le_bytes(bytes.try_into().unwrap());
             if word & 0xfc00_0000 == 0x9400_0000 || word & 0xffff_fc1f == 0xd63f_0000 {
-                calls += 1;
+                calls.push(offset);
                 assert!(saved, "x30 is unsaved at call {offset:#x}: {:?}", frame.rows);
             }
         }
-        assert!(calls >= 2, "the live call and cleanup resume must both be checked");
+        assert_eq!(calls.len(), expected_calls);
+        check_landing_pads(
+            unwind.landing_pads.as_ref().unwrap(),
+            frame.len,
+            calls[expected_calls - 2],
+        );
+    }
+
+    fn check_landing_pads(bytes: &[u8], code_len: u32, invoked_at: u32) {
+        use gimli::{EndianSlice, LittleEndian, Reader};
+        let mut table = EndianSlice::new(bytes, LittleEndian);
+        assert_eq!(table.read_u8().unwrap(), gimli::DW_EH_PE_omit.0);
+        assert_eq!(table.read_u8().unwrap(), gimli::DW_EH_PE_omit.0);
+        assert_eq!(table.read_u8().unwrap(), gimli::DW_EH_PE_uleb128.0);
+        let length = table.read_uleb128().unwrap() as usize;
+        let mut sites = table.split(length).unwrap();
+        let mut protected = false;
+        while !sites.is_empty() {
+            let start = sites.read_uleb128().unwrap();
+            let length = sites.read_uleb128().unwrap();
+            let pad = sites.read_uleb128().unwrap();
+            let action = sites.read_uleb128().unwrap();
+            assert!(start + length <= u64::from(code_len));
+            assert!(pad < u64::from(code_len));
+            assert_eq!(action, 0, "this fixture has cleanup handlers only");
+            protected |= pad != 0 && (start..start + length).contains(&u64::from(invoked_at));
+        }
+        assert!(protected, "the invoke must lead to this member's cleanup");
+        // Only alignment padding may follow this cleanup-only table, never a sibling's LSDA.
+        assert!(table.to_slice().unwrap().iter().all(|byte| *byte == 0));
     }
 }

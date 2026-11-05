@@ -37,6 +37,7 @@ pub(super) struct Emitted<'data, 'file> {
     text: SectionIndex,
     /// The function's atom within its section. Mach-O puts several functions in `__text`.
     atom: std::ops::Range<u64>,
+    unwind_index: &'file MachoUnwindIndex,
     /// The sections of every function of the object that is read.
     texts: &'file FxHashSet<SectionIndex>,
     /// Sections the code of more than one of them refers to.
@@ -64,6 +65,95 @@ enum Placement {
     Blob(DataId),
 }
 
+/// Resolve an object's Mach-O unwind pointers once. A unit may contain hundreds of
+/// functions; looking through every relocation for every pointer of every LSDA is cubic.
+#[derive(Default)]
+struct MachoUnwindIndex {
+    pointers: FxHashMap<(SectionIndex, u64), (SectionIndex, u64)>,
+    compact: FxHashMap<(SectionIndex, u64), u64>,
+    fdes: FxHashMap<(SectionIndex, u64), u64>,
+    pad_ends: FxHashMap<(SectionIndex, u64), u64>,
+}
+
+impl MachoUnwindIndex {
+    fn read(file: &object::File<'_>) -> Result<Self, Unhandled> {
+        let mut index = Self::default();
+        if file.format() != BinaryFormat::MachO {
+            return Ok(index);
+        }
+        let subtractor = match file.architecture() {
+            Architecture::Aarch64 => macho::ARM64_RELOC_SUBTRACTOR,
+            _ => macho::X86_64_RELOC_SUBTRACTOR,
+        };
+        let mut pads: FxHashMap<SectionIndex, Vec<u64>> = FxHashMap::default();
+        for section in
+            file.sections().filter(|it| matches!(it.name(), Ok("__compact_unwind" | "__eh_frame")))
+        {
+            let compact = section.name()? == "__compact_unwind";
+            if compact && section.size() % 32 != 0 {
+                return Err(Unhandled::Shape("a truncated Mach-O compact unwind table"));
+            }
+            let subtracts: FxHashMap<_, _> = section.relocations().filter(|(_, relocation)|
+                matches!(relocation.flags(), RelocationFlags::MachO {r_type, ..} if r_type == subtractor)
+            ).collect();
+            for (at, relocation) in section
+                .relocations()
+                .filter(|(_, relocation)| relocation.kind() == object::RelocationKind::Absolute)
+            {
+                if relocation.size() != 64 {
+                    return Err(Unhandled::Shape("a non-64-bit Mach-O unwind pointer"));
+                }
+                let (target, base) = match relocation.target() {
+                    RelocationTarget::Symbol(id) => {
+                        let symbol = file.symbol_by_index(id)?;
+                        let SymbolSection::Section(target) = symbol.section() else { continue };
+                        (target, symbol.address())
+                    }
+                    RelocationTarget::Section(target) => (target, 0),
+                    _ => return Err(Unhandled::Shape("a Mach-O unwind pointer without a section")),
+                };
+                let bytes = section
+                    .data()?
+                    .get(at as usize..at as usize + 8)
+                    .ok_or(Unhandled::Shape("a truncated Mach-O unwind pointer"))?;
+                let addend = u64::from_le_bytes(bytes.try_into().unwrap());
+                let mut address =
+                    base.wrapping_add(addend).wrapping_add_signed(relocation.addend());
+                if let Some(subtract) = subtracts.get(&at) {
+                    // DWARF PC-relative pointers have an UNSIGNED/SUBTRACTOR pair;
+                    // the stored addend includes the distance from the section base.
+                    address = address
+                        .wrapping_sub(Emitted::symbol(file, subtract)?.address())
+                        .wrapping_add(section.address() + at);
+                }
+                let target_section = file.section_by_index(target)?;
+                let offset = address
+                    .checked_sub(target_section.address())
+                    .ok_or(Unhandled::Shape("a Mach-O unwind pointer before its section"))?;
+                index.pointers.insert((section.index(), at), (target, offset));
+                if compact && at % 32 == 0 {
+                    index.compact.insert((target, offset), at);
+                } else if !compact && target_section.kind() == SectionKind::Text && at >= 8 {
+                    index.fdes.insert((target, offset), at - 8);
+                }
+                if target_section.name()? == "__gcc_except_tab" {
+                    pads.entry(target).or_default().push(offset);
+                }
+            }
+        }
+        for (section, mut starts) in pads {
+            starts.sort_unstable();
+            starts.dedup();
+            for (at, &start) in starts.iter().enumerate() {
+                let end =
+                    starts.get(at + 1).copied().unwrap_or(file.section_by_index(section)?.size());
+                index.pad_ends.insert((section, start), end);
+            }
+        }
+        Ok(index)
+    }
+}
+
 /// The code of each of `functions`, by its name in the object and its signature. What is wrong
 /// with the code of one is that function's; what is wrong with the object is every one's.
 pub(super) fn read(
@@ -72,6 +162,7 @@ pub(super) fn read(
     recorder: &mut Wants,
 ) -> Result<Vec<Result<Code, Unhandled>>, Unhandled> {
     let file = object::File::parse(object)?;
+    let unwind_index = MachoUnwindIndex::read(&file)?;
     let mut found: Vec<Option<(SectionIndex, u64)>> = vec![None; functions.len()];
     for symbol in file.symbols() {
         let (Ok(name), SymbolSection::Section(section)) = (symbol.name(), symbol.section()) else {
@@ -127,6 +218,7 @@ pub(super) fn read(
                     &file,
                     text,
                     start..end,
+                    &unwind_index,
                     &texts,
                     &shared,
                     name,
@@ -153,6 +245,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
         file: &'file object::File<'data>,
         text: SectionIndex,
         atom: std::ops::Range<u64>,
+        unwind_index: &'file MachoUnwindIndex,
         texts: &'file FxHashSet<SectionIndex>,
         shared: &'file FxHashSet<SectionIndex>,
         name: &'file str,
@@ -163,6 +256,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             file,
             text,
             atom,
+            unwind_index,
             texts,
             shared,
             name,
@@ -863,17 +957,33 @@ impl<'data, 'file> Emitted<'data, 'file> {
         let mut entries = eh_frame.entries(&bases);
         let mut rows = None;
         let mut table = None;
-        while let Some(entry) = entries.next().map_err(malformed)? {
-            let CieOrFde::Fde(partial) = entry else { continue };
-            let fde = partial
-                .parse(|_, bases, offset| eh_frame.cie_from_offset(bases, offset))
-                .map_err(malformed)?;
-            if macho
-                && self.macho_address(&section, fde.offset() as u64 + 8)?
-                    != Some((self.text, self.atom.start))
-            {
-                continue;
-            }
+        let mut selected =
+            if macho {
+                Some(
+                    *self.unwind_index.fdes.get(&(self.text, self.atom.start)).ok_or(
+                        Unhandled::Shape("a function without a matching Mach-O DWARF entry"),
+                    )?,
+                )
+            } else {
+                None
+            };
+        loop {
+            let fde = if macho {
+                let Some(offset) = selected.take() else { break };
+                eh_frame
+                    .fde_from_offset(
+                        &bases,
+                        gimli::EhFrameOffset(offset as usize),
+                        |_, bases, offset| eh_frame.cie_from_offset(bases, offset),
+                    )
+                    .map_err(malformed)?
+            } else {
+                let Some(entry) = entries.next().map_err(malformed)? else { break };
+                let CieOrFde::Fde(partial) = entry else { continue };
+                partial
+                    .parse(|_, bases, offset| eh_frame.cie_from_offset(bases, offset))
+                    .map_err(malformed)?
+            };
             if macho {
                 table = Some(self.table_of(
                     &section,
@@ -1039,22 +1149,11 @@ impl<'data, 'file> Emitted<'data, 'file> {
 
     fn macho_pads(&self, index: SectionIndex, start: u64) -> Result<Vec<u8>, Unhandled> {
         let table = self.file.section_by_index(index)?;
-        let mut end = table.size();
-        for section in self
-            .file
-            .sections()
-            .filter(|section| matches!(section.name(), Ok("__compact_unwind" | "__eh_frame")))
-        {
-            for (at, relocation) in section.relocations() {
-                if relocation.kind() == object::RelocationKind::Absolute
-                    && let Some((other, next)) = self.macho_address(&section, at)?
-                    && other == index
-                    && next > start
-                {
-                    end = end.min(next);
-                }
-            }
-        }
+        let end = *self
+            .unwind_index
+            .pad_ends
+            .get(&(index, start))
+            .ok_or(Unhandled::Shape("a Mach-O landing pad table without a boundary"))?;
         if table.relocations().any(|(at, _)| (start..end).contains(&at)) {
             return Err(Unhandled::Shape("landing pads that name a type"));
         }
@@ -1071,55 +1170,18 @@ impl<'data, 'file> Emitted<'data, 'file> {
         section: &object::Section<'data, '_>,
         at: u64,
     ) -> Result<Option<(SectionIndex, u64)>, Unhandled> {
-        let Some((_, relocation)) = section.relocations().find(|(offset, relocation)| {
-            *offset == at && relocation.kind() == object::RelocationKind::Absolute
-        }) else {
-            return Ok(None);
-        };
-        if relocation.kind() != object::RelocationKind::Absolute || relocation.size() != 64 {
-            return Err(Unhandled::Shape("a non-absolute Mach-O unwind pointer"));
-        }
-        let (index, base) = match relocation.target() {
-            RelocationTarget::Symbol(index) => {
-                let symbol = self.file.symbol_by_index(index)?;
-                let SymbolSection::Section(index) = symbol.section() else { return Ok(None) };
-                (index, symbol.address())
-            }
-            RelocationTarget::Section(index) => (index, 0),
-            _ => return Err(Unhandled::Shape("a Mach-O unwind pointer without a section")),
-        };
-        let bytes = section
-            .data()?
-            .get(at as usize..at as usize + 8)
-            .ok_or(Unhandled::Shape("a truncated Mach-O unwind pointer"))?;
-        let addend = u64::from_le_bytes(bytes.try_into().unwrap());
-        let mut address = base.wrapping_add(addend).wrapping_add_signed(relocation.addend());
-        // A DWARF PC-relative pointer is an UNSIGNED/SUBTRACTOR pair. Its field
-        // contains the remaining addend, including the distance from the section base.
-        let subtractor = match self.file.architecture() {
-            Architecture::Aarch64 => macho::ARM64_RELOC_SUBTRACTOR,
-            _ => macho::X86_64_RELOC_SUBTRACTOR,
-        };
-        if let Some((_, subtract)) = section.relocations().find(|(offset, relocation)| {
-            *offset == at && matches!(relocation.flags(), RelocationFlags::MachO {r_type, ..} if r_type == subtractor)
-        }) {
-            address = address.wrapping_sub(Self::symbol(self.file, &subtract)?.address())
-                .wrapping_add(section.address() + at);
-        }
-        Ok(Some((index, address - self.file.section_by_index(index)?.address())))
+        Ok(self.unwind_index.pointers.get(&(section.index(), at)).copied())
     }
 
     fn compact_entry(&self) -> Result<Option<(object::Section<'data, 'file>, u64)>, Unhandled> {
         let Some(section) = self.file.section_by_name("__compact_unwind") else { return Ok(None) };
-        if section.size() % 32 != 0 {
-            return Err(Unhandled::Shape("a truncated Mach-O compact unwind table"));
-        }
-        for at in (0..section.size()).step_by(32) {
-            if self.macho_address(&section, at)? == Some((self.text, self.atom.start)) {
-                return Ok(Some((section, at)));
-            }
-        }
-        Ok(None)
+        let at = self
+            .unwind_index
+            .compact
+            .get(&(self.text, self.atom.start))
+            .copied()
+            .ok_or(Unhandled::Shape("a function without a matching Mach-O unwind entry"))?;
+        Ok(Some((section, at)))
     }
 
     fn pads_of(table: &object::Section<'data, '_>) -> Result<Vec<u8>, Unhandled> {
