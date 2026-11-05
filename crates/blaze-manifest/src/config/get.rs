@@ -211,11 +211,7 @@ pub fn get(config: &Config, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
                         "# The following environment variables may affect the loaded values.\n",
                     );
                     for (k, v) in env {
-                        let _ = writeln!(
-                            out.stdout,
-                            "# {k}={}",
-                            shell_escape::escape(Cow::Borrowed(v))
-                        );
+                        let _ = writeln!(out.stdout, "# {k}={}", escape_cargo_env(v));
                     }
                 }
                 ConfigFormat::Json | ConfigFormat::JsonValue => {
@@ -223,8 +219,7 @@ pub fn get(config: &Config, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
                         "note: The following environment variables may affect the loaded values.\n",
                     );
                     for (k, v) in env {
-                        let _ =
-                            writeln!(out.stderr, "{k}={}", shell_escape::escape(Cow::Borrowed(v)));
+                        let _ = writeln!(out.stderr, "{k}={}", escape_cargo_env(v));
                     }
                 }
             }
@@ -238,6 +233,12 @@ pub fn get(config: &Config, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
         }
     }
     Ok(out)
+}
+
+/// Cargo's config-get annotations use Unix shell quoting on every platform.
+/// These are explanatory text, not arguments executed by the host shell.
+fn escape_cargo_env(value: &str) -> Cow<'_, str> {
+    shell_escape::unix::escape(Cow::Borrowed(value))
 }
 
 fn maybe_env<'a>(config: &'a Config, key: &ConfigKey, cv: &CV) -> Option<Vec<(&'a str, &'a str)>> {
@@ -387,7 +388,7 @@ fn print_toml_unmerged(
     if !env.is_empty() {
         out.push_str("# Environment variables\n");
         for (k, v) in env {
-            let _ = writeln!(out, "# {k}={}", shell_escape::escape(Cow::Borrowed(v)));
+            let _ = writeln!(out, "# {k}={}", escape_cargo_env(v));
         }
         out.push('\n');
     }
@@ -398,4 +399,15 @@ fn print_toml_unmerged(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod env_quoting_tests {
+    use super::escape_cargo_env;
+
+    #[test]
+    fn cargo_config_annotations_are_host_independent() {
+        assert_eq!(escape_cargo_env("simple").as_ref(), "simple");
+        assert_eq!(escape_cargo_env("x y").as_ref(), "'x y'");
+    }
 }
