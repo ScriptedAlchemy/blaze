@@ -457,17 +457,7 @@ impl LinkLine {
     /// splice declines a patch that calls what is not there, so the edit is linked in full.
     fn keep_unreached(&mut self) {
         match self.flavor {
-            Flavor::Cc | Flavor::Apple => self.args.retain_mut(|arg| {
-                if STRIPS_UNREACHED.contains(&arg.as_str()) {
-                    return false;
-                }
-                let Some(passed) = arg.strip_prefix(TO_THE_LINKER) else { return true };
-                let kept: Vec<&str> =
-                    passed.split(',').filter(|it| !STRIPS_UNREACHED.contains(it)).collect();
-                let any = !kept.is_empty();
-                *arg = format!("{TO_THE_LINKER}{}", kept.join(","));
-                any
-            }),
+            Flavor::Cc | Flavor::Apple => self.args.retain_mut(keep_unreached_arg),
             Flavor::Msvc => {
                 for arg in &mut self.args {
                     let named = arg.get(..OPT.len()).filter(|it| it.eq_ignore_ascii_case(OPT));
@@ -554,6 +544,17 @@ impl LinkLine {
         std::fs::write(response, quoted.join("\n"))?;
         Ok(format!("\"{}\" \"@{}\"", self.linker, response.display()))
     }
+}
+
+pub(crate) fn keep_unreached_arg(arg: &mut String) -> bool {
+    if STRIPS_UNREACHED.contains(&arg.as_str()) {
+        return false;
+    }
+    let Some(passed) = arg.strip_prefix(TO_THE_LINKER) else { return true };
+    let kept: Vec<&str> = passed.split(',').filter(|it| !STRIPS_UNREACHED.contains(it)).collect();
+    let any = !kept.is_empty();
+    *arg = format!("{TO_THE_LINKER}{}", kept.join(","));
+    any
 }
 
 /// The directories `link.exe` finds the libraries of the compiler and of the system in.

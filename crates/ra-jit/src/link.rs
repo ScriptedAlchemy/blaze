@@ -480,12 +480,15 @@ fn command_of(
         args.extend(splices.into_iter().map(OsString::from));
     }
     args.extend([OsString::from("-o"), exe.as_os_str().to_owned()]);
-    let args = args
+    let mut args = args
         .iter()
-        .map(|arg| arg.to_str())
+        .map(|arg| arg.to_str().map(str::to_owned))
         .collect::<Option<Vec<_>>>()
         .context("the legacy shell link command cannot represent a native argument")?;
-    shlex::try_join(args).context("a link argument has a NUL in it")
+    if let CommandPurpose::WholeLink = purpose {
+        args.retain_mut(crate::cargo::plan::keep_unreached_arg);
+    }
+    shlex::try_join(args.iter().map(String::as_str)).context("a link argument has a NUL in it")
 }
 
 /// The arguments `cc` links the program of some crates with, around its objects.
@@ -979,6 +982,30 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_links_keep_code_first_reached_by_edits() {
+        let work = tempfile::tempdir().unwrap();
+        for apple in [false, true] {
+            let target = Target { apple, arch: "arm64".into(), shared: false };
+            let line = Line {
+                before: Vec::new(),
+                after: target.trailing().into_iter().map(OsString::from).collect(),
+                apple,
+                shared: false,
+                env: Environment(BTreeMap::new()),
+                generated: Vec::new(),
+                strip: Strip::None,
+                objcopy: None,
+            };
+            let binary = work.path().join(format!("program-{apple}"));
+            let native = command_of(&line, &[], &binary, CommandPurpose::NativeInputs).unwrap();
+            let daemon = command_of(&line, &[], &binary, CommandPurpose::WholeLink).unwrap();
+            let flag = if apple { "-dead_strip" } else { "--gc-sections" };
+            assert!(native.contains(flag), "{native}");
+            assert!(!daemon.contains(flag), "{daemon}");
+        }
+    }
 
     #[test]
     #[cfg(unix)]

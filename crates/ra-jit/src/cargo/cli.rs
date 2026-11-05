@@ -464,6 +464,7 @@ pub(crate) fn build_env() -> BTreeMap<String, String> {
 pub(crate) fn worker_env() -> BTreeMap<String, String> {
     let mut env = env_named(WORKER_ENV);
     env.extend(env_named(MEMORY_ENV));
+    env.extend(env_named(&["RA_JIT_STATS", "RA_JIT_TRACE"]));
     env
 }
 
@@ -482,6 +483,17 @@ fn env_named(names: &[&str]) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_controls_reach_workers_without_changing_producer_identity() {
+        let controls = [("RA_JIT_STATS", "1"), ("RA_JIT_TRACE", "1")];
+        let _scope = crate::process::enter_native(crate::process::Native::of(
+            controls.map(|(name, value)| (name.into(), value.into())),
+        ));
+        let expected = controls.map(|(name, value)| (name.to_owned(), value.to_owned()));
+        assert_eq!(worker_env(), expected.clone().into_iter().collect());
+        assert!(producer_env_in(&expected).is_empty());
+    }
 
     #[test]
     fn producer_identity_reads_the_supplied_environment_without_memory_policy() {
