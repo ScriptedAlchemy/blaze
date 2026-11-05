@@ -96,6 +96,13 @@ impl Dependency {
     }
 
     pub fn serialized(&self) -> SerializedDependency<'_> {
+        let path = self.source_id.local_path();
+        #[cfg(windows)]
+        let path = path.map(|path| {
+            // A file URL round-trip loses Windows' verbatim prefix. Cargo metadata
+            // reports the canonical dependency path, including that prefix.
+            path.canonicalize().unwrap_or(path)
+        });
         SerializedDependency {
             name: &self.name,
             source: (!self.source_id.is_path()).then(|| self.source_id.as_url().to_string()),
@@ -110,7 +117,7 @@ impl Dependency {
             features: &self.features,
             target: self.platform.as_ref(),
             registry: self.registry_id.as_ref().map(|id| id.url.to_string()),
-            path: self.source_id.local_path(),
+            path,
         }
     }
 }
@@ -334,4 +341,23 @@ pub fn build_summary_features(
     }
 
     Ok(map)
+}
+
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    use super::*;
+
+    #[test]
+    fn serialized_dependency_path_matches_cargos_canonical_windows_path() {
+        let suffix = format!("blaze-dependency-metadata-{}", std::process::id());
+        let scratch = std::env::temp_dir().join(suffix);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let ordinary = std::path::absolute(&scratch).unwrap();
+        let canonical = ordinary.canonicalize().unwrap();
+        let source = SourceId::for_path(&ordinary).unwrap();
+        let dependency = Dependency::parse("helper", None, source).unwrap();
+        let serialized = serde_json::to_value(dependency.serialized()).unwrap();
+        assert_eq!(serialized["path"], serde_json::json!(canonical));
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
 }
