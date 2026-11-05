@@ -26,7 +26,7 @@ OPEN = {"assert_message", "future_unwind_flags", "fragment_edition_through_macro
 if os.environ.get("RA_JIT_BACKEND", "cranelift") == "cranelift":
     OPEN |= {"frame_of_array"}
 # What is reduced and not fixed either, where ra-jit says so: a function of these is left to rustc.
-LEFT = {"caller_in_constant", "empty_array_by_impl", "macro_reads_its_spelling", "fragment_ends_statement"}
+LEFT = {"empty_array_by_impl", "macro_reads_its_spelling", "fragment_ends_statement"}
 # Crates reduced and not fixed, where ra-jit says so: a function of these is left to rustc.
 LEFT_CRATES = []
 # Cases about the code around a function ra-jit has to leave to rustc: that one is meant to be.
