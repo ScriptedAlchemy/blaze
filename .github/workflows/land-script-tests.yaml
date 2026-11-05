@@ -1,0 +1,28 @@
+name: Landing script repository regressions
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/land.py'
+      - '.github/scripts/test_land.py'
+      - '.github/workflows/land-script-tests.yaml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/scripts/land.py'
+      - '.github/scripts/test_land.py'
+      - '.github/workflows/land-script-tests.yaml'
+permissions:
+  contents: read
+concurrency:
+  group: land-script-tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  repository:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify repository selection and scoped GitHub requests
+        run: python3 -m unittest discover -s .github/scripts -p test_land.py -v
