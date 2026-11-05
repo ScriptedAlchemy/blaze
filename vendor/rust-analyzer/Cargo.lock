@@ -988,6 +988,7 @@ dependencies = [
  "tracing-subscriber",
  "tracing-tree",
  "triomphe",
+ "unicode-width",
 ]
 
 [[package]]
