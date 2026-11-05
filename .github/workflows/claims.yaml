@@ -53,7 +53,9 @@ jobs:
         run: |
           export RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit"
           LIMIT="$INPUT_LIMIT"
+          status=0
           python3 uitest.py "$RUNNER_TEMP/rust" ${LIMIT:+--limit "$LIMIT"} --jobs 4 --work "$RUNNER_TEMP/ui" --json "$RUNNER_TEMP/ui.json" || status=$?
+          if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then exit "$status"; fi
           python3 uigate.py "$RUNNER_TEMP/ui.json" | tee -a "$GITHUB_STEP_SUMMARY"
           exit "${PIPESTATUS[0]}"
 
