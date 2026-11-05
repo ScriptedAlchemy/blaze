@@ -281,6 +281,47 @@ fn main() {
         );
     }
 
+    #[test]
+    fn borrowed_object_default_keeps_its_reference_lifetime() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, unsize, coerce_unsized
+trait Trait {}
+impl Trait for i32 {}
+struct Holder<'a> { value: &'a (dyn Trait + 'a) }
+fn identity(x: &dyn Trait) -> &dyn Trait { x }
+fn wrap(x: &dyn Trait) -> Holder<'_> { Holder { value: x } }
+fn distinct<'a, 'b>(x: &'a dyn Trait, _: &'b dyn Trait) -> &'a dyn Trait { x }
+"#,
+        );
+    }
+
+    #[test]
+    fn borrowed_objects_keep_independent_and_static_requirements() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, unsize, coerce_unsized
+trait Trait {}
+impl Trait for i32 {}
+struct Holder<'a> { value: &'a (dyn Trait + 'a) }
+fn wrap(x: &dyn Trait) -> Holder<'_> { Holder { value: x } }
+fn wrong<'a, 'b>(_: &'a dyn Trait, y: &'b dyn Trait) -> &'a dyn Trait {
+    y
+  //^ error: lifetime may not live long enough
+}
+fn static_object(x: &dyn Trait) -> &(dyn Trait + 'static) {
+    x
+  //^ error: lifetime may not live long enough
+}
+fn local<'a>() -> Holder<'a> {
+    let value = 1;
+    Holder { value: &value }
+  //^^^^^^^^^^^^^^^^^^^^^^^^ error: cannot return reference to local variable
+}
+"#,
+        );
+    }
+
     // rustc's tests/ui/dyn-compatibility/multiple-supers-should-work.rs.
     #[test]
     fn a_trait_object_keeps_projections_that_become_the_same() {

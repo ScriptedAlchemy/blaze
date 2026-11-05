@@ -968,24 +968,16 @@ impl<'db> Builder<'_, '_, 'db> {
                                 elided_lifetimes(self.ctx.db, &resolver, &written.store, param)
                                     == Some(1)
                             });
-                        let mut only = None;
-                        let errors = &mut errors[index];
-                        *input =
-                            rustc_type_ir::fold_regions(self.interner(), *input, |region, _| {
-                                let region = match region.kind() {
-                                    RegionKind::ReError(_) if single => {
-                                        *only.get_or_insert_with(|| {
-                                            self.new_universal(UniversalKind::AnonParam)
-                                        })
-                                    }
-                                    RegionKind::ReError(_) => {
-                                        self.new_universal(UniversalKind::AnonParam)
-                                    }
-                                    _ => return region,
-                                };
-                                errors.push(region);
-                                region
-                            });
+                        *input = rustc_type_ir::TypeFoldable::fold_with(
+                            *input,
+                            &mut InputRegions {
+                                interner: self.interner(),
+                                fresh: || self.new_universal(UniversalKind::AnonParam),
+                                single,
+                                only: None,
+                                errors: &mut errors[index],
+                            },
+                        );
                     }
                     // What an `impl Trait` it returns has for the lifetimes its parameters
                     // leave out.
@@ -5264,6 +5256,54 @@ impl<'db> Builder<'_, '_, 'db> {
             RegionKind::ReStatic => Some(self.regions.static_rv),
             _ => rv_of(region),
         }
+    }
+}
+
+struct InputRegions<'a, 'db, F> {
+    interner: hir_ty::next_solver::DbInterner<'db>,
+    fresh: F,
+    single: bool,
+    only: Option<Region<'db>>,
+    errors: &'a mut Vec<Region<'db>>,
+}
+
+impl<'db, F: FnMut() -> Region<'db>> rustc_type_ir::TypeFolder<hir_ty::next_solver::DbInterner<'db>>
+    for InputRegions<'_, 'db, F>
+{
+    fn cx(&self) -> hir_ty::next_solver::DbInterner<'db> {
+        self.interner
+    }
+
+    fn fold_region(&mut self, region: Region<'db>) -> Region<'db> {
+        if !matches!(region.kind(), RegionKind::ReError(_)) {
+            return region;
+        }
+        let region = if self.single {
+            *self.only.get_or_insert_with(&mut self.fresh)
+        } else {
+            (self.fresh)()
+        };
+        self.errors.push(region);
+        region
+    }
+
+    fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        use rustc_type_ir::{TypeFoldable, TypeSuperFoldable};
+
+        if let TyKind::Ref(region, inner, mutability) = ty.kind()
+            && matches!(region.kind(), RegionKind::ReError(_))
+            && let TyKind::Dynamic(predicates, object) = inner.kind()
+            && matches!(object.kind(), RegionKind::ReError(_))
+        {
+            // Lowering uses the reference's elided placeholder for the object default.
+            // Freshen it once, while retaining both positions for opaque captures.
+            let region = self.fold_region(region);
+            let predicates = predicates.fold_with(self);
+            self.errors.push(region);
+            let inner = Ty::new_dynamic(self.interner, predicates, region);
+            return Ty::new_ref(self.interner, region, inner, mutability);
+        }
+        ty.super_fold_with(self)
     }
 }
 
