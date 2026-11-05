@@ -2,7 +2,7 @@
   "schema_version": 1,
   "pull_request": "https://github.com/ScriptedAlchemy/blaze/pull/68",
   "status": "in_progress",
-  "tested_head": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+  "tested_head": "04c9c6ea1ffdd44fda164e57bbf417340b431bb2",
   "host": {
     "os": "macOS-26.6.2-arm64-arm-64bit",
     "architecture": "arm64",
@@ -86,7 +86,7 @@
     }
   ],
   "nix_evaluation": {
-    "tested_commit": "12738507c4b842bd26c2fe54e246df9aea0c452c",
+    "tested_commit": "04c9c6ea1ffdd44fda164e57bbf417340b431bb2",
     "result": "passed",
     "attributes": [
       "daemon",
@@ -95,13 +95,33 @@
       "daemon-units",
       "life-bin"
     ],
-    "command": "nix eval --raw .#packages.aarch64-darwin.<attribute>.drvPath"
+    "command": "nix eval --raw .#packages.aarch64-darwin.<attribute>.drvPath",
+    "log_sha256": {
+      "daemon": "987a51c81de36270664a9a1b9ae3ff0e7a86cdf6ecd7c1589ebc472a5d149d47",
+      "run": "60b5d8ac2bfdc684b69b4b865436bb5f517a4d122de1aca62ad5932f86756f5d",
+      "life": "10807356228eda0a3682af9ba6cd0c30e0e9eba93997256b2ad05566efc8f921",
+      "daemon-units": "e11706a73cfc2a9cd67c65c107d1ed83e3992934f9d114a0cf63c55995f82656",
+      "life-bin": "ab5c076f14e32238a91a9dc708452c6234ddb822895f56d06385ea3c63c57900"
+    }
   },
   "nix_package_build": {
-    "tested_commit": "12738507c4b842bd26c2fe54e246df9aea0c452c",
-    "result": "running",
-    "command": "nix build --print-build-logs --no-link .#daemon-units .#run",
-    "supervisor_note": "The T3 restart cancelled the Python supervisor. The original Nix build survived as an orphan and was confirmed still running; no duplicate build was launched."
+    "tested_commit": "04c9c6ea1ffdd44fda164e57bbf417340b431bb2",
+    "result": "passed",
+    "exit": 0,
+    "command": "nix build --print-build-logs --no-link --option max-jobs 4 --option cores 2 .#daemon-units .#run",
+    "log_sha256": "4cc36c5c483596e97acac08bbd1bc5dcf8cc2f566e74dc17cacf4e0b0009b3a0",
+    "runtime_smoke": {
+      "command": "nix run .#blaze -- --help",
+      "result": "passed",
+      "log_sha256": "c359839a62146d2651a04c896dc673775c2cc666c077376a04d6de8dec684996"
+    },
+    "profile_note": "The pinned PGO profile has a different crate identity from this Nix build and matches few workspace functions. The build uses the existing non-strict profile policy; this is an optimization warning, not a test failure.",
+    "recovery": "After the T3 restart, the surviving older-head build was interrupted after toolchain realization and before its release compilation. This current-head build reused completed store outputs.",
+    "previous_attempt": {
+      "tested_commit": "12738507c4b842bd26c2fe54e246df9aea0c452c",
+      "result": "interrupted",
+      "log_sha256": "7dab4f846ca3b9ecf17e58d3bc2880e7c8e4aa73373801652a5a6627d9003039"
+    }
   },
   "local_cache_configuration": {
     "setting": "NIX_CACHE_HOME=$HOME/code/.cache/nix",
@@ -119,12 +139,11 @@
   "merge_readiness": {
     "ready": false,
     "pending": [
-      "Darwin Nix package build",
-      "All remaining CI environments and functional tests",
-      "Native installer candidate checks",
-      "Complete Linux owned-server bootstrap after the source-toolchain binding fix"
+      "CI on the updated semantic changes",
+      "Resolution and validation of the reported LLVM corpus runtime mismatch",
+      "Remaining Linux and LLVM semantic validation"
     ],
-    "unit_gate_note": "The parallel validation lane reported 17 failures accepted by harness/unittests.py on an earlier head. That result must not be described as every test passing. Removal of those exceptions remains unverified here.",
+    "unit_gate_note": "The 17-entry exception set remains in tested Nix commit 04c9c6e. It is removed in the newly published semantic changes. These Nix receipts do not certify the newer compiler sources.",
     "landing_note": "dist/main requires ci and C2 runtime checks. Its merge queue is not configured. No merge or bypass has been performed."
   },
   "ci_blockers": [
@@ -201,7 +220,7 @@
       "producer-combined-norustc.log": "100991710ea204bb38c0ac941f6397b0083ea3fb67924a2c7d770afac3c51b12"
     }
   },
-  "latest_local_source_check": "6c5f7b30ffca49601e911ee9341b4f21c7d2ea82",
+  "latest_local_source_check": "04c9c6ea1ffdd44fda164e57bbf417340b431bb2",
   "installer_toolchain_report_change": {
     "historical_job": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41932716034/job/126933396117",
     "failure": "Installation succeeded, but the workflow only recognized an older blaze toolchain report label.",
@@ -216,5 +235,28 @@
     "native_ci": "Pending; local step verification does not certify the entire installer workflow.",
     "shared_implementation_commit": "2ed824e6a9cc401a513f4723977e3c6ff15ec0ae",
     "checker_sha256": "8ae19f8dfbe05c40fce9b2e6a191f12455c85bf083733af6be1fa16e331d42b3"
+  },
+  "latest_branch_observation": {
+    "head": "e7bdb38cfd98e8df310c56ca679d11e1d5660fdb",
+    "unit_gate": "The published gate removes OPEN and rejects assertion failures, build failures, crashes, and incomplete transcripts.",
+    "remaining_validation": "The semantic validation lane reports an LLVM corpus runtime mismatch under investigation; updated-head CI is running."
+  },
+  "ci_observation_before_semantic_update": {
+    "head": "04c9c6ea1ffdd44fda164e57bbf417340b431bb2",
+    "observed_at": "2026-11-05T03:09:44.942Z",
+    "passed": 47,
+    "failed": 0,
+    "pending": [
+      "dist linux-x64 / C2 runtime (ubuntu-24.04, saved-llvm)",
+      "serve / server"
+    ],
+    "skipped": 10
+  },
+  "host_memory_maintenance": {
+    "idle_bazel_servers_stopped": 1,
+    "stopped_server_footprint_mib": 1678,
+    "busy_servers_preserved": 6,
+    "fseventsd_restart": "Refused by macOS System Integrity Protection; no service change applied.",
+    "memory_pressure_after": "normal"
   }
 }
