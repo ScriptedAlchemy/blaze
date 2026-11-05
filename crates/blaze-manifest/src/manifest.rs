@@ -266,10 +266,18 @@ pub(crate) fn resolve_relative_path(
             old_root.display(),
             new_root.display()
         )),
-        Some(path) => Ok(path
-            .to_str()
-            .ok_or_else(|| anyhow!("`{label}` resolved to non-UTF value (`{}`)", path.display()))?
-            .to_owned()),
+        Some(path) => {
+            let relative = path
+                .to_str()
+                .ok_or_else(|| anyhow!("`{label}` resolved to non-UTF value (`{}`)", path.display()))?;
+            // Cargo serializes inherited manifest path fields with portable `/`
+            // separators, including when pathdiff uses `\` on Windows.
+            if matches!(label, "readme" | "license-file") {
+                Ok(relative.replace('\\', "/"))
+            } else {
+                Ok(relative.to_owned())
+            }
+        }
     }
 }
 
@@ -1678,4 +1686,23 @@ supported tools: {}",
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod inherited_path_tests {
+    use super::*;
+
+    #[test]
+    fn inherited_manifest_paths_keep_portable_separators() {
+        let root = std::env::temp_dir().join("blaze-inherited-path-test");
+        let member = root.join("a");
+        assert_eq!(
+            resolve_relative_path("readme", &root, &member, "README.md").unwrap(),
+            "../README.md"
+        );
+        assert_eq!(
+            resolve_relative_path("license-file", &root, &member, "LICENSE.txt").unwrap(),
+            "../LICENSE.txt"
+        );
+    }
 }
