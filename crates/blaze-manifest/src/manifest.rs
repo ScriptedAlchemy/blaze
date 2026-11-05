@@ -287,9 +287,9 @@ pub(crate) fn resolve_relative_path(
             new_root.display()
         )),
         Some(path) => {
-            let relative = path
-                .to_str()
-                .ok_or_else(|| anyhow!("`{label}` resolved to non-UTF value (`{}`)", path.display()))?;
+            let relative = path.to_str().ok_or_else(|| {
+                anyhow!("`{label}` resolved to non-UTF value (`{}`)", path.display())
+            })?;
             // Cargo serializes inherited manifest path fields with portable `/`
             // separators, including when pathdiff uses `\` on Windows.
             if matches!(label, "readme" | "license-file") {
