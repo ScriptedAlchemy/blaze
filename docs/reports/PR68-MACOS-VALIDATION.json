@@ -2,7 +2,7 @@
   "schema_version": 1,
   "pull_request": "https://github.com/ScriptedAlchemy/blaze/pull/68",
   "status": "in_progress",
-  "tested_head": "04c9c6ea1ffdd44fda164e57bbf417340b431bb2",
+  "tested_head": "f8bed03399660f6929517ecdccdcbdc2cedbc4cc",
   "host": {
     "os": "macOS-26.6.2-arm64-arm-64bit",
     "architecture": "arm64",
@@ -139,11 +139,11 @@
   "merge_readiness": {
     "ready": false,
     "pending": [
-      "CI on the updated semantic changes",
-      "Resolution and validation of the reported LLVM corpus runtime mismatch",
-      "Remaining Linux and LLVM semantic validation"
+      "Hosted CI on the repaired compiler",
+      "Complete C2 runtime acceptance",
+      "A permitted landing path: dist/main has no configured merge queue"
     ],
-    "unit_gate_note": "The 17-entry exception set remains in tested Nix commit 04c9c6e. It is removed in the newly published semantic changes. These Nix receipts do not certify the newer compiler sources.",
+    "unit_gate_note": "All 17 formerly excepted failures pass in the clean LLVM-selected gate. No new ignores were added.",
     "landing_note": "dist/main requires ci and C2 runtime checks. Its merge queue is not configured. No merge or bypass has been performed."
   },
   "ci_blockers": [
@@ -220,7 +220,7 @@
       "producer-combined-norustc.log": "100991710ea204bb38c0ac941f6397b0083ea3fb67924a2c7d770afac3c51b12"
     }
   },
-  "latest_local_source_check": "04c9c6ea1ffdd44fda164e57bbf417340b431bb2",
+  "latest_local_source_check": "f8bed03399660f6929517ecdccdcbdc2cedbc4cc",
   "installer_toolchain_report_change": {
     "historical_job": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41932716034/job/126933396117",
     "failure": "Installation succeeded, but the workflow only recognized an older blaze toolchain report label.",
@@ -237,9 +237,9 @@
     "checker_sha256": "8ae19f8dfbe05c40fce9b2e6a191f12455c85bf083733af6be1fa16e331d42b3"
   },
   "latest_branch_observation": {
-    "head": "e7bdb38cfd98e8df310c56ca679d11e1d5660fdb",
-    "unit_gate": "The published gate removes OPEN and rejects assertion failures, build failures, crashes, and incomplete transcripts.",
-    "remaining_validation": "The semantic validation lane reports an LLVM corpus runtime mismatch under investigation; updated-head CI is running."
+    "head": "f8bed03399660f6929517ecdccdcbdc2cedbc4cc",
+    "unit_gate": "OPEN is absent; clean LLVM-selected strict gate passed with zero failures.",
+    "remaining_validation": "Hosted CI, complete C2 acceptance and remaining platform coverage."
   },
   "ci_observation_before_semantic_update": {
     "head": "04c9c6ea1ffdd44fda164e57bbf417340b431bb2",
@@ -258,5 +258,90 @@
     "busy_servers_preserved": 6,
     "fseventsd_restart": "Refused by macOS System Integrity Protection; no service change applied.",
     "memory_pressure_after": "normal"
+  },
+  "llvm_unwind_repair": {
+    "tested_commit": "f8bed03399660f6929517ecdccdcbdc2cedbc4cc",
+    "tested_tree": "5193cc1ba6f5a6495e6acad49f9dc4702888d350",
+    "clean_before_and_after": true,
+    "compiler": {
+      "build_verified": true,
+      "head": "f8bed03399660f6929517ecdccdcbdc2cedbc4cc",
+      "sha256": "0ec7bfa477bd72ba1db49b442a7bbcb2b8c9c9e725d1f229321329277af6e647",
+      "size": 92085856
+    },
+    "strict_gate": {
+      "backend": "llvm",
+      "features": [
+        "llvm"
+      ],
+      "passed": 3105,
+      "failed": 0,
+      "ignored": 10,
+      "total": 3115,
+      "seconds": 376.72
+    },
+    "reduced_array_clone": {
+      "opt_levels": [
+        0,
+        2
+      ],
+      "rustc_and_llvm_match": true,
+      "compiled_roots": 2,
+      "total_roots": 2
+    },
+    "corpus": {
+      "backends": [
+        "llvm",
+        "cranelift"
+      ],
+      "output_matches_rustc": true,
+      "compiled_roots": 953,
+      "total_roots": 955,
+      "compared_layouts": 1261,
+      "wrong_layouts": 0,
+      "refusals": [
+        "undecided_alias_drop::ReadOnlyQuery::release_state: HasErrorType layout",
+        "stabilized::arm::naked_const: nonliteral asm constant"
+      ]
+    },
+    "llvm_runtime_smokes": {
+      "nocompact": "6/6",
+      "headerpad": "6/6"
+    },
+    "aarch64_cfi_scan": {
+      "llvm_corpus_calls_with_fde": 47039,
+      "llvm_unsaved_lr_calls": 0,
+      "rustc_reference_calls_with_fde": 30597,
+      "rustc_unsaved_lr_calls": 0,
+      "scope": "Checks saved x30 at FDE-covered call sites; not a complete unwind verifier."
+    },
+    "regression": {
+      "base_commit": "227b78f87d5e321a3cc8f41bac0574c4638853a8",
+      "base_result": "With only the standalone test added, the live resume call fails at offset 0x48. The fixture makes no calls in dead code.",
+      "fixed_result": "Distinct bodies, 400 members, CFI and bounded cleanup LSDA checks pass.",
+      "phase_read_ms": 18.883792,
+      "timing_scope": "Isolated native 400-member unit fixture on this Mac; not end-to-end performance."
+    },
+    "logs_sha256": {
+      "build-llvm.log": "68a8a905e024c7ad7631c3683d062bce1d8a46575ec32f8967820d6c3db0ac47",
+      "strict-unit-gate-llvm.log": "caa2c2d7f8d96a0c6c5cd74e7ebbba12c4116345b1bc910fe7ca93d06aeba780",
+      "unwind-llvm-o0.log": "d65a2b82f3a034c3e6e6b7903ab8c4c1189a2aaefedafc59751986b4504ebfb1",
+      "unwind-llvm-o2.log": "e7db61ed0a78a77387055030e8575acd58e508031ddf83113c9909cc0487d720",
+      "corpus-llvm-o2.log": "6d50c858e224707b7cdd74881803b955df77549241cf262df1c90f1b407b16ae",
+      "corpus-cranelift-o2.log": "49b377d5c815ca038a04a477fa124b5501f7b592f506db931dfdcdd9147497d7",
+      "nocompact-llvm-o2.log": "69742fc1db6d2510b12649238cf4c15c41fceda5425aefd72357e81a3affe098",
+      "headerpad-llvm-o2.log": "07da0fca0eb550c4c729e8a15f835b770b2f740d9bb4874228165081fdb0ea2f",
+      "corpus-cfi-scan.log": "0f3f7f0c7be0b086d49d19bfc1e7a17b65d30841158d5a19cbbbdedf80cf8d68",
+      "unit-400-clean.log": "cbbd6fea957dd3dc436eb4fa29e2d773450d0c073e94f47df9c750e343a4ba08"
+    },
+    "linux_precursor": {
+      "tested_commit": "ff37d9d45c3bdab2382059d1cc35cca63ce4e86d",
+      "cli_passed": 687,
+      "cli_failed": 0,
+      "cli_ignored": 5,
+      "linker": "LLD, two linker threads, 3 GiB container; GNU ld was killed before tests under the same memory limit.",
+      "other_suites": "dist, wire, spec, serve, metadata, registry, resolve, bundle transport and all 27 source-identity checks passed in preceding clean Linux runs.",
+      "scope": "Precursor receipts do not certify the later LLVM-only production changes."
+    }
   }
 }
