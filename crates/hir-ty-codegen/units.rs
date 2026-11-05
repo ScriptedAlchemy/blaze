@@ -138,7 +138,7 @@ impl Finder<'_> {
         let in_store = |callee: &Instance| {
             let Some(entries) = self.entries else { return false };
             names.instance(callee).is_some_and(|name| {
-                entries.usable(&name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol))
+                entries.usable(&name, &|symbol, checked| symbols.importable(symbol, checked))
             })
         };
         for request in requests {
@@ -647,8 +647,8 @@ impl Context<'_> {
                             && names.instance(&root_instance(db, *root)).is_some_and(|name| {
                                 stable::StableNames::of_checkout(&name)
                                     && self.entries.is_some_and(|entries| {
-                                        entries.usable(&name, &|symbol| {
-                                            symbols.provides(symbol) && symbols.linked(symbol)
+                                        entries.usable(&name, &|symbol, checked| {
+                                            symbols.importable(symbol, checked)
                                         })
                                     })
                             })

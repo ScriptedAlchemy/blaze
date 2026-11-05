@@ -88,6 +88,14 @@ const DIRECTORY: usize = size_of::<pe::ImageDataDirectory>();
 const FUNCTION: usize = 12;
 
 impl Image {
+    pub(super) fn provides(&self, name: &[u8]) -> bool {
+        match self.symbols.get(name) {
+            Some(Named::One(defined)) => defined.kind != Kind::ThreadLocal,
+            Some(Named::Many) => false,
+            None => matches!(self.symbols.get(&*[b"__imp_", name].concat()), Some(Named::One(_))),
+        }
+    }
+
     /// Reads the executable at `path` that was linked from `objects`, which define what
     /// they share a name for in that order.
     pub(super) fn read(bytes: &[u8], path: &Path, objects: &[&[u8]]) -> anyhow::Result<Image> {

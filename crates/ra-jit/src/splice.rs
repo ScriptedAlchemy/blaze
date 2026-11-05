@@ -538,6 +538,18 @@ impl Baseline {
         }
     }
 
+    /// Whether the immutable link base gives a native patch this symbol, using the same
+    /// uniqueness and thread-local rules as relocation resolution.
+    pub(crate) fn provides(&self, name: &str) -> bool {
+        match &*self.image {
+            Executable::MachO(image) => image.can_call(name),
+            Executable::Elf(image) => matches!(image.symbols.get(name.as_bytes()),
+                Some(Named::One(defined)) if defined.kind != SymbolKind::Tls),
+            Executable::Pe(image) => image.provides(name.as_bytes()),
+            Executable::Wasm(_) => true,
+        }
+    }
+
     /// Whether a patch can call the C symbol `name`, as far as the executable says: an
     /// executable other than Mach-O is not asked.
     pub(crate) fn can_call(&self, name: &str) -> bool {

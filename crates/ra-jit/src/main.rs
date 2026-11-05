@@ -430,7 +430,9 @@ struct Resolver<'a> {
     named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,
     /// The symbols of what rustc linked, when the patch goes into it.
     linked: Option<Arc<symbols::Linked>>,
-    /// Set once the build turns out to be one in full, which `linked` is not for.
+    /// The actual owned executable, before any edits were appended to it.
+    owned_base: Option<Arc<Baseline>>,
+    /// Set once the build turns out to be in full, so the previous link no longer limits imports.
     in_full: Arc<std::sync::atomic::AtomicBool>,
     /// A build in full is spliced into what rustc linked too ([`onto_rustcs`]), and is for
     /// `linked` as a patch is.
@@ -463,6 +465,8 @@ struct ResolverParts<'a> {
     shared_paths: SharedPaths,
     named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,
     linked: Option<Arc<symbols::Linked>>,
+    /// The actual owned executable, before any edits were appended to it.
+    owned_base: Option<Arc<Baseline>>,
     in_full: Arc<std::sync::atomic::AtomicBool>,
     onto: bool,
     prebuilt: Option<Arc<Prebuilt>>,
@@ -485,6 +489,7 @@ impl<'a> Resolver<'a> {
             shared_paths: self.shared_paths.clone(),
             named: self.named.clone(),
             linked: self.linked.clone(),
+            owned_base: self.owned_base.clone(),
             in_full: self.in_full.clone(),
             onto: self.onto,
             prebuilt: self.prebuilt.clone(),
@@ -512,6 +517,7 @@ impl<'a> ResolverParts<'a> {
             shared_paths,
             named,
             linked,
+            owned_base,
             in_full,
             onto,
             prebuilt,
@@ -532,6 +538,7 @@ impl<'a> ResolverParts<'a> {
             shared_paths,
             named,
             linked,
+            owned_base,
             in_full,
             onto,
             prebuilt,
@@ -752,6 +759,12 @@ impl<'a> Resolver<'a> {
                     && !rustc_symbols(binary).is_some_and(|it| it.has_own_thread_locals())
             });
         let linked = args.splice.as_deref().filter(|_| over_rustc || onto).and_then(rustc_symbols);
+        let owned_base = args
+            .splice
+            .as_deref()
+            .filter(|_| table.is_empty() && known.patches() && !known.builds_base() && *SPLICING)
+            .and_then(owned_baseline)
+            .map(Arc::new);
         let (root, base) = (args.checkout.clone(), args.base.clone());
         let debug = args.debug;
         let crate_debug = Arc::new(CrateDebug::of(db, args));
@@ -778,6 +791,7 @@ impl<'a> Resolver<'a> {
             shared_paths: Default::default(),
             named: Default::default(),
             linked,
+            owned_base,
             in_full: Arc::default(),
             onto,
             prebuilt,
@@ -1517,7 +1531,30 @@ impl SymbolResolver for Resolver<'_> {
             || self.prebuilt.as_ref().is_some_and(|it| it.defined.contains(symbol))
     }
 
+    fn native_function(&self, symbol: &str) -> Option<FunctionId> {
+        let prebuilt = self.prebuilt.as_ref().filter(|it| it.defined.contains(symbol))?;
+        let mut found = None;
+        for &krate in &prebuilt.crates {
+            let listed = self.listed.of(self.db, krate.into());
+            for &func in &listed.functions {
+                let named = exported_symbol(self.db, func).or_else(|| linked_symbol(self.db, func));
+                if named.as_deref() == Some(symbol) {
+                    if found.is_some_and(|previous| previous != func) {
+                        return None;
+                    }
+                    found = Some(func);
+                }
+            }
+        }
+        found
+    }
+
     fn linked(&self, symbol: &str) -> bool {
+        if !self.in_full.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(base) = &self.owned_base
+        {
+            return base.provides(symbol);
+        }
         self.rustcs().is_none_or(|it| it.has(symbol))
     }
 
@@ -6399,6 +6436,25 @@ fn shell(cmd: &str) -> Command {
     let mut command = Command::new(program);
     command.raw_arg(rest);
     command
+}
+
+/// Takes a view of the same immutable base the splicer resolves imports against. Reading
+/// the current file would also see definitions appended by a previous edit, which the next
+/// splice removes again.
+fn owned_baseline(binary: &Path) -> Option<Baseline> {
+    let mut linked = lock(&LINKED);
+    let executable = linked.remove(binary)?;
+    match executable.baseline() {
+        Ok(base) => {
+            let view = base.view();
+            linked.insert(binary.to_owned(), Executable::Read(Box::new(base)));
+            Some(view)
+        }
+        Err(why) => {
+            eprintln!("reading the owned executable's base: {why:#}");
+            None
+        }
+    }
 }
 
 /// Whether a patch of `binary` can call the C symbol `name`; yes while its executable is being

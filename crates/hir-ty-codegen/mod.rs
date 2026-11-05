@@ -321,10 +321,21 @@ pub trait SymbolResolver {
     fn provides(&self, symbol: &str) -> bool {
         self.defines(symbol)
     }
-    /// Whether the executable the patch goes into has the symbol: rustc's own link of it
-    /// leaves out every function nothing calls.
+    /// Whether the executable the patch goes into has the symbol. Native links leave out
+    /// functions nothing calls, including functions in an owned prebuilt object.
     fn linked(&self, _symbol: &str) -> bool {
         true
+    }
+    /// The unique source definition of a native symbol in an object built by ra-jit.
+    /// Used when an edit first calls a runtime entry point the base link stripped.
+    fn native_function(&self, _symbol: &str) -> Option<FunctionId> {
+        None
+    }
+    /// An unchecked foreign import may be supplied by the native linker. Every import
+    /// known to belong to a compiled object must also exist in the actual patch base.
+    fn importable(&self, symbol: &str, checked: bool) -> bool {
+        let provided = self.provides(symbol);
+        (!checked && !provided) || (provided && self.linked(symbol))
     }
     /// The copies the executable a patch goes into has of the instances of `func`, a generic
     /// function of a module, each by its path as [`Spelling::instance_path`] writes it with
@@ -341,8 +352,8 @@ pub trait SymbolResolver {
     fn closure(&self, _owner: FunctionId, _expr: hir_def::hir::ExprId) -> Option<String> {
         None
     }
-    /// The build is no patch of what rustc linked but one in full, which is linked: what
-    /// only that executable has is not to be named.
+    /// The build is in full and will be linked: imports may name everything its input
+    /// objects provide, rather than only what the previous executable retained.
     fn in_full(&self) {}
     /// Whether the build, in full, names what only the executable rustc linked has, for it is
     /// spliced into that: the store keeps nothing of it, which another program can't use.
@@ -804,9 +815,7 @@ impl CodegenUnit {
             kept.put_base(base);
             known.undo = Some(Box::new(kept));
         }
-        if over_rustc {
-            symbols.in_full();
-        }
+        symbols.in_full();
         let patching = known.patching;
         let used_by_rustc = known.used_by_rustc;
         // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
@@ -5402,7 +5411,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let name = self.stable_name(&root_instance(self.db, func))?;
         let symbols = self.symbols;
         let usable = |entries: &cached::Entries| {
-            entries.usable(&name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol))
+            entries.usable(&name, &|symbol, checked| symbols.importable(symbol, checked))
         };
         let stored =
             stable::StableNames::of_checkout(&name) && self.entries.as_deref().is_some_and(usable);
@@ -5437,7 +5446,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             {
                 let Some(name) = names.instance(&root_instance(db, func)) else { continue };
                 let name = StableName::from(name);
-                let usable = |symbol: &str| symbols.provides(symbol) && symbols.linked(symbol);
+                let usable = |symbol: &str, checked| symbols.importable(symbol, checked);
                 let stored =
                     stable::StableNames::of_checkout(&name) && entries.usable(&name, &usable);
                 named.push((func, name, stored));
@@ -5736,7 +5745,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate);
             let usable = |name: &str| {
                 let Some(entries) = entries else { return false };
-                entries.usable(name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol))
+                entries.usable(name, &|symbol, checked| symbols.importable(symbol, checked))
             };
             // What the store has is not compiled, nor looked into for what it calls.
             let in_store = |callee: &Instance| names.instance(callee).is_some_and(|it| usable(&it));
@@ -6224,12 +6233,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let Some(entries) = self.entries.clone() else { return Ok(None) };
         let symbols = self.symbols;
-        if !entries.usable(name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol)) {
+        if !entries.usable(name, &|symbol, checked| symbols.importable(symbol, checked)) {
             let why = match entries.get(name) {
                 None => "no entry",
-                Some(it)
-                    if !it.links(&|symbol| symbols.provides(symbol) && symbols.linked(symbol)) =>
-                {
+                Some(it) if !it.links(&|symbol, checked| symbols.importable(symbol, checked)) => {
                     "an entry linked against what the program lacks"
                 }
                 Some(_) => "an entry that calls what cannot be used",
@@ -6860,7 +6867,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 unsupported!("callee `{name}`: an instance of the base gained or lost code");
             }
             // The base's copy is of the source before the edit.
-            if self.replaced.changed.contains(&node) {
+            if self.replaced.changed.contains(&node) || !self.symbols.linked(&known.symbol) {
                 let compiled = compiled_instance(self.db, instance.clone(), known.env.clone());
                 let compiled = compiled.as_ref().map_err(Clone::clone)?;
                 let id = self.module.declare_function(
@@ -6964,7 +6971,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let from_store = self.entries.is_some() || self.base.is_some_and(|it| !it.found.is_empty());
         let stable = if from_store { self.stable_name(instance) } else { None };
         if let Some(name) = &stable {
-            if let Some(symbol) = self.base.and_then(|base| base.found.get(name)) {
+            if let Some(symbol) = self.base.and_then(|base| base.found.get(name))
+                && self.symbols.linked(symbol)
+            {
                 return self.import(symbol, sig);
             }
             let body = signature.is_some().then_some(sig);
@@ -7315,6 +7324,22 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn import(&mut self, symbol: &str, sig: &Signature) -> Result<FuncId> {
+        if !self.symbols.linked(symbol)
+            && let Some(func) = self.symbols.native_function(symbol)
+        {
+            let env = ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate: func.krate(self.db),
+            };
+            let instance = root_instance(self.db, func);
+            let env = env.store();
+            let compiled = compiled_instance(self.db, instance.clone(), env.clone());
+            let compiled = compiled.as_ref().map_err(Clone::clone)?;
+            if &compiled.code.signature != sig {
+                unsupported!("native symbol `{symbol}` has a different source signature");
+            }
+            return self.callee(&instance, &env, sig);
+        }
         if let Some(&id) = self.imports.get(symbol) {
             return Ok(id);
         }

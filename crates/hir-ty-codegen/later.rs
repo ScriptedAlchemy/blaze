@@ -461,9 +461,9 @@ impl<'db> Keeper<'_, 'db> {
             let target = if let export::FunctionBinding::TypeId(hash) = binding {
                 CachedTarget::TypeId(hash)
             } else if let export::FunctionBinding::Imported(symbol) = binding {
-                // rustc's copy of a function of the checkout is of the checkout as rustc
-                // built it, and uses rustc's copies of the statics.
-                let checked = self.symbols.defines(&symbol);
+                // Native definitions, including owned std, must be available in the next
+                // program that reuses the entry. Foreign imports are left to its linker.
+                let checked = self.symbols.provides(&symbol);
                 // An item of an `extern` block is the symbol it links to, whoever declares it.
                 let foreign = |callee: &Instance| match callee.def {
                     InstanceDef::Fn(func) => link_name(db, func).is_some(),

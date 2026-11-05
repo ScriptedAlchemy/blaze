@@ -82,7 +82,7 @@ pub(super) struct CachedFunc {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(super) enum CachedTarget {
-    /// `checked` when the symbol was one of the program's rustc build, which another
+    /// `checked` when the symbol belonged to an input object, which another
     /// program's may lack.
     Import { symbol: String, checked: bool },
     /// The entry of this name, or whatever else the build has for the instance.
@@ -485,18 +485,18 @@ impl Entry {
         datas && self.code.sound(|namespace| if namespace == 0 { funcs } else { self.datas.len() })
     }
 
-    /// Whether the program has everything of rustc's that the entry was linked against.
-    pub(super) fn links(&self, defines: &dyn Fn(&str) -> bool) -> bool {
+    /// Whether the program can provide every native import the entry was linked against.
+    pub(super) fn links(&self, defines: &dyn Fn(&str, bool) -> bool) -> bool {
         let funcs = self.funcs.iter().all(|it| match &it.target {
-            CachedTarget::Import { symbol, checked } => !checked || defines(symbol),
-            CachedTarget::Copy { symbol, .. } => defines(symbol),
+            CachedTarget::Import { symbol, checked } => defines(symbol, *checked),
+            CachedTarget::Copy { symbol, .. } => defines(symbol, true),
             CachedTarget::Named(_)
             | CachedTarget::Root(_)
             | CachedTarget::TypeId(_)
             | CachedTarget::Asm(_) => true,
         });
         let datas = self.datas.iter().all(|it| match it {
-            CachedData::Static { symbol, .. } => defines(symbol),
+            CachedData::Static { symbol, .. } => defines(symbol, true),
             _ => true,
         });
         funcs && datas
@@ -1012,7 +1012,7 @@ impl Entries {
 
     /// Whether there is an entry for `name` and for everything it calls, and what they import
     /// is in the program, as `defines` tells.
-    pub(super) fn usable(&self, name: &str, defines: &dyn Fn(&str) -> bool) -> bool {
+    pub(super) fn usable(&self, name: &str, defines: &dyn Fn(&str, bool) -> bool) -> bool {
         let settled = |name: &str| self.known().usable.get(name).copied();
         if let Some(usable) = settled(name) {
             return usable;
