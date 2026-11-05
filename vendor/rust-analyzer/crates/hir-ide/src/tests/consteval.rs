@@ -3340,3 +3340,69 @@ const GOAL: &str = core::panic::Location::caller().file();
         "/main.rs",
     );
 }
+
+#[test]
+fn caller_source_names_are_per_database_and_invalidate_constants() {
+    fn install(db: &mut TestDB, name: Option<&str>) {
+        let name = name.map(str::to_owned);
+        crate::mir::location::name_sources(db, move |_, _| name.clone());
+    }
+    fn value(db: &TestDB, file: EditionedFileId) -> String {
+        crate::attach_db(db, || {
+            let result = eval_goal(db, file).unwrap();
+            let bytes = &result.memory;
+            let width = bytes.len() / 2;
+            let address = usize::from_le_bytes(bytes[..width].try_into().unwrap());
+            let len = usize::from_le_bytes(bytes[width..].try_into().unwrap());
+            String::from_utf8(result.memory_map.get(address, len).unwrap().to_vec()).unwrap()
+        })
+    }
+    let fixture = r#"
+//- minicore: panic_location
+const CL: &core::panic::Location<'static> = core::panic::Location::caller();
+const GOAL: &str = CL.file();
+"#;
+    let (mut first, first_file) = TestDB::with_single_file(fixture);
+    let (mut second, second_file) = TestDB::with_single_file(fixture);
+    install(&mut first, Some("remapped/one.rs"));
+    install(&mut second, Some("remapped/two.rs"));
+    assert_eq!(value(&first, first_file), "remapped/one.rs");
+    assert_eq!(value(&second, second_file), "remapped/two.rs");
+    install(&mut first, None);
+    crate::attach_db(&first, || assert!(eval_goal(&first, first_file).is_err()));
+    install(&mut first, Some("remapped/three.rs"));
+    assert_eq!(value(&first, first_file), "remapped/three.rs");
+    assert_eq!(value(&second, second_file), "remapped/two.rs");
+}
+
+#[test]
+fn caller_location_in_a_macro_generated_constant() {
+    let fixture = r#"
+//- minicore: panic_location
+macro_rules! define_location { () => { const CL: &core::panic::Location<'static> = core::panic::Location::caller(); }; }
+define_location!();
+const GOAL: &str = CL.file();
+"#;
+    check_str(fixture, "/main.rs");
+    check_number(
+        &fixture.replace("const GOAL: &str = CL.file();", "const GOAL: u32 = CL.line();"),
+        2,
+    );
+}
+
+#[test]
+fn caller_location_in_an_included_constant() {
+    let fixture = r#"
+//- minicore: panic_location, include
+//- /inc.rs
+const CL: &core::panic::Location<'static> = core::panic::Location::caller();
+//- /main.rs crate:main
+include!("inc.rs");
+const GOAL: &str = CL.file();
+"#;
+    check_str(fixture, "/inc.rs");
+    check_number(
+        &fixture.replace("const GOAL: &str = CL.file();", "const GOAL: u32 = CL.line();"),
+        1,
+    );
+}

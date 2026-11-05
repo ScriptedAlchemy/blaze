@@ -105,38 +105,58 @@ pub fn tracks_caller<'db>(db: &'db dyn HirDatabase, function: hir_def::FunctionI
     trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
 }
 
-/// The build's remapped spelling takes precedence over the VFS's source name. Without a
-/// compiler embedding the interpreter, IDE fixtures and files keep their VFS names.
+/// The build's source spelling. Missing mappings fail closed, including before a build
+/// has installed its names. Fixtures install their own VFS provider explicitly.
 pub(super) fn source_name(db: &dyn HirDatabase, file: base_db::FileId) -> Option<String> {
-    if let Some(paths) = SOURCE_PATHS.read().unwrap_or_else(|e| e.into_inner()).clone() {
-        return paths(db, file);
-    }
-    let root = db.file_source_root(file).source_root_id(db);
-    Some(db.source_root(root).source_root(db).path_for_file(&file)?.to_string())
+    (SourceNames::try_get(db)?.provider(db).0)(db, file)
 }
 
 type SourcePaths = dyn Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync;
 
-/// What the build calls each file, for a constant with `file!()` in its value. The evaluator
-/// has no build to ask.
-static SOURCE_PATHS: std::sync::RwLock<Option<std::sync::Arc<SourcePaths>>> =
-    std::sync::RwLock::new(None);
+#[derive(Clone)]
+struct SourceNameProvider(std::sync::Arc<SourcePaths>);
 
-/// Tells the evaluator of constants what the build calls each file: `Symbols::source_path` in ra-jit.
+impl PartialEq for SourceNameProvider {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for SourceNameProvider {}
+impl std::fmt::Debug for SourceNameProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceNameProvider")
+    }
+}
+
+#[salsa::input(singleton)]
+struct SourceNames {
+    #[returns(ref)]
+    provider: SourceNameProvider,
+}
+
+/// Installs this database's source names. Updating the provider invalidates constants that
+/// read filenames, as rustc's source map belongs to its compilation context.
 pub fn name_sources(
+    db: &mut dyn HirDatabase,
     paths: impl Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync + 'static,
 ) {
-    *SOURCE_PATHS.write().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(paths));
+    use salsa::{Durability, Setter};
+    let paths = SourceNameProvider(std::sync::Arc::new(paths));
+    match SourceNames::try_get(db) {
+        Some(names) => {
+            names.set_provider(db).with_durability(Durability::HIGH).to(paths);
+        }
+        None => {
+            _ = SourceNames::builder(paths).durability(Durability::HIGH).new(db);
+        }
+    }
 }
 
 /// The value of the literal `expr` of `owner` when it is what `line!()`, `column!()`,
 /// `file!()` or a `concat!` of them expanded to: rust-analyzer expands them to placeholders,
 /// and a constant is evaluated from what it expanded them to.
 pub fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
-    let path = |file| {
-        let paths = SOURCE_PATHS.read().unwrap_or_else(|e| e.into_inner()).clone()?;
-        paths(db, file)
-    };
+    let path = |file| source_name(db, file);
     if let Some(file_id) = located_concats(db, owner).get(&expr) {
         let call = file_id.macro_file()?.loc(db).to_node(db);
         let mut text = String::new();

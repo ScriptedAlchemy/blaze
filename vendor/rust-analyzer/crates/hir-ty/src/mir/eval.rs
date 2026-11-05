@@ -3166,8 +3166,18 @@ impl<'db> Evaluator<'db> {
         use rustc_type_ir::TyKind;
         match next_ty.kind() {
             TyKind::FnDef(def, generic_args) => {
+                let (def, generic_args) = if let CallableDefId::FunctionId(function) = def.0 {
+                    let (implementation, args) =
+                        self.db.lookup_impl_method(self.param_env, function, generic_args);
+                    match implementation {
+                        Either::Left(function) => (CallableDefId::FunctionId(function), args),
+                        Either::Right(_) => (def.0, generic_args),
+                    }
+                } else {
+                    (def.0, generic_args)
+                };
                 let shim;
-                let locals = if let CallableDefId::FunctionId(function) = def.0
+                let locals = if let CallableDefId::FunctionId(function) = def
                     && super::location::tracks_caller(self.db, function)
                 {
                     // Reifying a tracked function creates rustc's untracked shim: calls through
@@ -3181,7 +3191,7 @@ impl<'db> Evaluator<'db> {
                 } else {
                     locals
                 };
-                self.exec_fn_def(def.0, generic_args, destination, args, locals, target_bb, span)
+                self.exec_fn_def(def, generic_args, destination, args, locals, target_bb, span)
             }
             TyKind::Closure(id, generic_args) => self.exec_closure(
                 id.0,
@@ -3478,7 +3488,14 @@ impl<'db> Evaluator<'db> {
             .ok_or_else(|| MirEvalError::InternalError("fn trait with no arg".into()))?;
         let mut func_ty = func.ty;
         let mut func_data = func.interval;
-        while let TyKind::Ref(_, z, _) = func_ty.kind() {
+        let mut fn_item_shim = Some(def);
+        while let TyKind::Ref(_, z, mutability) = func_ty.kind() {
+            // The reference blanket impl forwards to Fn or FnMut before the item shim.
+            // https://doc.rust-lang.org/stable/src/core/ops/function.rs.html
+            fn_item_shim = match mutability {
+                Mutability::Not => self.cached_fn_trait_func,
+                Mutability::Mut => self.cached_fn_mut_trait_func,
+            };
             func_ty = z;
             if matches!(func_ty.kind(), TyKind::Dynamic(..)) {
                 let id =
@@ -3490,8 +3507,34 @@ impl<'db> Evaluator<'db> {
             func_data = Interval { addr: Address::from_bytes(func_data.get(self)?)?, size };
         }
         match func_ty.kind() {
-            TyKind::FnDef(def, subst) => {
-                self.exec_fn_def(def.0, subst, destination, &args[1..], locals, target_bb, span)
+            TyKind::FnDef(callable, subst) => {
+                let shim;
+                let locals = if let CallableDefId::FunctionId(function) = callable.0
+                    && super::location::tracks_caller(self.db, function)
+                {
+                    // rustc's Fn-item shim is untracked and uses the Fn trait method's span.
+                    shim = Locals {
+                        ptr: locals.ptr.clone(),
+                        body: locals.body,
+                        caller_location: Some(CallerLocation::Declaration(
+                            fn_item_shim.ok_or_else(|| {
+                                MirEvalError::InternalError("missing Fn-item shim method".into())
+                            })?,
+                        )),
+                    };
+                    &shim
+                } else {
+                    locals
+                };
+                self.exec_fn_def(
+                    callable.0,
+                    subst,
+                    destination,
+                    &args[1..],
+                    locals,
+                    target_bb,
+                    span,
+                )
             }
             TyKind::FnPtr(..) => {
                 self.exec_fn_pointer(func_data, destination, &args[1..], locals, target_bb, span)

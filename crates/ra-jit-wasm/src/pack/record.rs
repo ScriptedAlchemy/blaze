@@ -119,6 +119,7 @@ pub fn record(
     let scripts = workspace.run_build_scripts(&cargo_config, &|_| {})?;
     workspace.set_build_scripts(scripts);
     let (mut db, vfs, _server) = load_workspace(workspace, &cargo_config.extra_env, &load_config)?;
+    hir_ty_codegen::name_sources(&mut db, |db, file| crate::source_path(db, file));
 
     // The crates of the program, dependencies first.
     let all = ide_db::base_db::all_crates(&db);

@@ -371,6 +371,7 @@ impl RootDatabase {
             .durability(Durability::MEDIUM)
             .new(&db);
         hir::db::set_expand_proc_attr_macros(&mut db, false);
+        hir::db::name_sources(&mut db, |_, _| None);
         db.update_base_query_lru_capacities(lru_capacity);
         db
     }

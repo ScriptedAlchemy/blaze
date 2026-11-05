@@ -700,8 +700,13 @@ fn source_path(
     Some(relative.unwrap_or(&path).to_string_lossy().into_owned())
 }
 
+fn configure_source_names(db: &mut RootDatabase, root: &Path, base: Option<&Path>) {
+    let (root, base) = (root.to_owned(), base.map(Path::to_owned));
+    hir_ty_codegen::name_sources(db, move |db, file| source_path(db, &root, base.as_deref(), file));
+}
+
 impl<'a> Resolver<'a> {
-    /// The symbols of the program of `args`, which panic locations are named for from now on.
+    /// The symbols of the program of `args`.
     /// `known` says whether what is compiled is a patch of what rustc linked.
     fn of(
         db: &'a RootDatabase,
@@ -727,10 +732,6 @@ impl<'a> Resolver<'a> {
         let debug = args.debug;
         let crate_debug = Arc::new(CrateDebug::of(db, args));
         let apart = (debug.kept != plan::Kept::Linked).then(|| args.out.clone());
-        let named = (root.clone(), base.clone());
-        hir_ty_codegen::name_sources(move |db, file| {
-            source_path(db, &named.0, named.1.as_deref(), file)
-        });
         let prebuilt = args.prebuilt.as_deref().filter(|_| table.is_empty()).map(|path| {
             let defined = defined_symbols(path);
             let defined =
@@ -9361,6 +9362,7 @@ fn run_holding(
         checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members, args.debug) = (root, base, members, debug);
     (args.lints_capped, args.strip) = (lints_capped, strip);
+    configure_source_names(&mut db, &args.checkout, args.base.as_deref());
     // The names are resolved before cargo says which program it built: those of the crates
     // it built are, and not of every crate of the workspace.
     if let Some(built) = built {

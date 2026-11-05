@@ -431,4 +431,40 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn production_database_source_names_fail_closed_and_invalidate_constants() {
+        let (mut db, _) = ide_db::RootDatabase::with_single_file(
+            r#"
+//- minicore: panic_location
+const CL: &core::panic::Location<'static> = core::panic::Location::caller();
+const GOAL: &str = CL.file();
+"#,
+        );
+        let goal = hir::attach_db(&db, || {
+            let name = hir_expand::name::Name::new_root("GOAL");
+            base_db::all_crates(&db)
+                .iter()
+                .find_map(|&krate| {
+                    hir_def::nameres::crate_def_map(&db, krate).modules(&db).find_map(
+                        |(_, module)| match module.scope(&db).get(&name).take_values()? {
+                            hir_def::ModuleDefId::ConstId(id) => Some(id),
+                            _ => None,
+                        },
+                    )
+                })
+                .unwrap()
+        });
+        hir::attach_db(&db, || assert!(db.const_eval(goal, GenericArgs::empty(), None).is_err()));
+        for expected in ["remapped/one.rs", "remapped/two.rs"] {
+            hir_ty::mir::location::name_sources(&mut db, move |_, _| Some(expected.to_owned()));
+            hir::attach_db(&db, || {
+                let value = db.const_eval(goal, GenericArgs::empty(), None).unwrap();
+                let width = value.memory.len() / 2;
+                let address = usize::from_le_bytes(value.memory[..width].try_into().unwrap());
+                let len = usize::from_le_bytes(value.memory[width..].try_into().unwrap());
+                assert_eq!(value.memory_map.get(address, len).unwrap(), expected.as_bytes());
+            });
+        }
+    }
 }
