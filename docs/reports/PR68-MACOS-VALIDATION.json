@@ -10,7 +10,7 @@
     "nix": "2.35.4",
     "llvm": "20.1.8 (flake pinned)"
   },
-  "scope_note": "The difference between the two tested commits is limited to harness/dist/buildspec.py and harness/dist/test_buildspec_cleanup.py. Compiler and runtime sources are identical. Earlier-head results are labelled explicitly.",
+  "scope_note": "Each check names its tested commit. Earlier macOS results do not certify later compiler changes. The producer fix has separate native verification and exact source hashes below; complete Linux bootstrap CI is still required.",
   "checks": [
     {
       "name": "remote keeper recovery",
@@ -120,10 +120,10 @@
     "pending": [
       "Darwin Nix package build",
       "All remaining CI environments and functional tests",
-      "Resolve the missing fork nightly assets",
-      "Obtain and resolve the owned server bootstrap diagnostic from CI"
+      "Native installer candidate checks",
+      "Complete Linux owned-server bootstrap after the source-toolchain binding fix"
     ],
-    "unit_gate_note": "The parallel validation lane reported 17 failures accepted by harness/unittests.py on the earlier head. Compiler sources are unchanged on this tested head, so that gate result must not be described as every test passing. A separate lane is working on removing the exceptions.",
+    "unit_gate_note": "The parallel validation lane reported 17 failures accepted by harness/unittests.py on an earlier head. That result must not be described as every test passing. Removal of those exceptions remains unverified here.",
     "landing_note": "dist/main requires ci and C2 runtime checks. Its merge queue is not configured. No merge or bypass has been performed."
   },
   "ci_blockers": [
@@ -136,7 +136,9 @@
     {
       "job": "this commit's build",
       "url": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41921616928/job/126896068187",
-      "failure": "The owned proc-macro server build exits nonzero. Its captured diagnostic was previously discarded; the release script now prints it and re-raises the original failure."
+      "failure": "The owned proc-macro server build exits nonzero. Its captured diagnostic was previously discarded; the release script now prints it and re-raises the original failure.",
+      "diagnosis": "The historical completed workflow archive exposes a libc build-script probe with a named rather than absolute source toolchain.",
+      "remediation": "Producer launchers now bind their resolved absolute source installation; native regression checks pass. Complete Linux bootstrap CI is pending."
     }
   ],
   "release_diagnostics_change": {
@@ -165,5 +167,38 @@
       "git diff --check: passed."
     ],
     "native_execution": "Pending CI; lint success is not an installation verdict."
-  }
+  },
+  "producer_probe_fix": {
+    "historical_failure_commit": "14910d3b3",
+    "historical_job": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41928450245/job/126918949193",
+    "root_error": "libc build.rs: the producer probe needs its absolute source toolchain",
+    "cause": "The owned launcher inherited a named RUSTUP_TOOLCHAIN instead of binding the resolved source installation.",
+    "change": "All three producer-launcher creation paths now supply their resolved sysroot. The launcher binds that absolute installation, and owned Cargo queries recognize the same binding. Shell quoting remains native-byte preserving and altered launchers are rejected.",
+    "source_sha256": {
+      "crates/ra-jit/src/answers.rs": "aaee732fb4993322d1f840abc7046e0c8208a672b6bb08dc96471573fcf16529",
+      "crates/ra-jit/src/cargo/producer_plan.rs": "d9651feeda1c38b90580de611ef3b2ea53794ac1cc4fef29fbbe6bf6586f1743",
+      "crates/ra-jit/src/main.rs": "0ae698da5ca62f50642d6f32d359d2a546e4b7509d2bc335ad3eb2b01de15051",
+      "crates/ra-jit/src/scripts/captured.rs": "d9b18488985ffe442d00abf2496dfa9f34cfd83549145abafb877feb86d68578"
+    },
+    "verification": [
+      "Pinned-LLVM release build of the combined implementation: passed.",
+      "answers:: native tests: 30 passed, 0 failed.",
+      "Fresh build.rs queried RUSTC --version with RUSTUP_TOOLCHAIN=1.99.0; its cfg-gated executable printed producer-probe-ok.",
+      "cargo +1.99.0 fmt --all -- --check: passed.",
+      "harness/rustcsites.py: 14 existing launch sites, none new.",
+      "harness/norustc_test.py: 9 total, 4 passed and 5 Linux-specific cases skipped on macOS.",
+      "git diff --check: passed."
+    ],
+    "linux_bootstrap": "Awaiting CI; local verification does not certify the complete Linux server bootstrap.",
+    "tested_commit": "6c5f7b30ffca49601e911ee9341b4f21c7d2ea82",
+    "shared_implementation_commit": "fa9e35370977982cdb0986b3599a670659d15c5b",
+    "completion": "Preserve the parallel launcher-binding implementation, update the remaining workspace and captured-script call sites, fix the recognizer slice type, and exercise named toolchains and exact argument preservation.",
+    "verification_log_sha256": {
+      "producer-combined-answers-tests.log": "5d52d6c3c3abec46226545a68d2c134adcc7cd027fd9ee45a9003903ddf6e000",
+      "producer-combined-release-build.log": "22e1bffe2d7b46f0c9a5a22c5623137365a68d25500e45fde2fdc8369de889b1",
+      "producer-combined-probe-integration.log": "a964a499e94320183c82807bc0d2ca59513210811b584dff204217b58a50d07c",
+      "producer-combined-norustc.log": "100991710ea204bb38c0ac941f6397b0083ea3fb67924a2c7d770afac3c51b12"
+    }
+  },
+  "latest_local_source_check": "6c5f7b30ffca49601e911ee9341b4f21c7d2ea82"
 }
