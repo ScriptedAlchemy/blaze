@@ -453,7 +453,10 @@ impl<'ctx> Debug<'ctx> {
     pub(super) fn of(module: &Module<'ctx>) -> Lowered<Option<Debug<'ctx>>> {
         // Without a flag that asks for CodeView, the table is DWARF in a COFF object too.
         let target = crate::Target::selected().map_err(Unhandled::Llvm)?;
-        if !matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::Coff) {
+        if !matches!(
+            target.object_format,
+            ObjectFormat::Elf | ObjectFormat::Coff | ObjectFormat::MachO
+        ) {
             return Ok(None);
         }
         let context = module.get_context();

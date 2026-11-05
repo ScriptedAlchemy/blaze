@@ -1252,7 +1252,6 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         Import { export: std::sync::Arc::new(export), id, funcs, datas: Vec::new() }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn named_stack_slots_survive_llvm_debug_record_emission() {
         use super::super::fragment::FuncTarget;

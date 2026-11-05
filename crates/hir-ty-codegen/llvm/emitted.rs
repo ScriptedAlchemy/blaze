@@ -319,8 +319,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
     }
 
     /// The bytes of the section `name` with what its relocations say filled in, as far as
-    /// that is known before linking: each function starts its section, which is at
-    /// [`Self::base`], and every other section is on its own.
+    /// that is known before linking: code sections are moved to [`Self::base`], keeping
+    /// each function's offset within its section. Other sections remain on their own.
     fn relocated(&self, name: &str) -> Option<Vec<u8>> {
         let Some(section) = self.file.section_by_name(name) else { return Some(Vec::new()) };
         let mut bytes = section.data().ok()?.to_vec();
@@ -328,14 +328,24 @@ impl<'data, 'file> Emitted<'data, 'file> {
             if relocation.kind() != object::RelocationKind::Absolute {
                 return None;
             }
-            let symbol = Self::symbol(self.file, &relocation).ok()?;
-            let base = match symbol.section() {
-                SymbolSection::Section(at) if self.texts.contains(&at) => Self::base(at),
-                _ => 0,
+            let (target, address) = match relocation.target() {
+                RelocationTarget::Symbol(index) => {
+                    let symbol = self.file.symbol_by_index(index).ok()?;
+                    (symbol.section_index(), symbol.address())
+                }
+                RelocationTarget::Section(index) => (Some(index), 0),
+                _ => return None,
             };
-            let value = (base + symbol.address()).wrapping_add_signed(relocation.addend());
+            let base = target.filter(|at| self.texts.contains(at)).map_or(0, Self::base);
             let size = usize::from(relocation.size() / 8);
             let at = bytes.get_mut(offset as usize..)?.get_mut(..size)?;
+            let mut implicit = [0; 8];
+            if relocation.has_implicit_addend() {
+                implicit.get_mut(..size)?.copy_from_slice(at);
+            }
+            let value = (base + address)
+                .wrapping_add_signed(relocation.addend())
+                .wrapping_add(u64::from_le_bytes(implicit));
             at.copy_from_slice(value.to_le_bytes().get(..size)?);
         }
         Some(bytes)

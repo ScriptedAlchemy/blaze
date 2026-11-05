@@ -1220,6 +1220,8 @@ fn different_lowering_policies_have_different_export_contexts() {
             .args(["--exact", "export::tests::process_child", "--ignored", "--nocapture"])
             .env("BLAZE_D0_PROCESS_DIR", &directory)
             .env("RA_JIT_PROMOTE", promote)
+            // Later LLVM optimization may eliminate the same slots independently.
+            .env("RA_JIT_OPT", "0")
             .output()
             .unwrap();
         assert!(
