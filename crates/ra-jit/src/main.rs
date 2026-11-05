@@ -679,6 +679,14 @@ type SharedKey = (u64, PathBuf, Option<PathBuf>);
 type SharedPaths =
     Arc<std::sync::Mutex<FxHashMap<Crate, Arc<std::sync::OnceLock<FxHashSet<String>>>>>>;
 
+/// The native file name and whether it belongs to a library source root.
+fn source_file_path(db: &dyn HirDatabase, file: vfs::FileId) -> Option<(PathBuf, bool)> {
+    let root = db.file_source_root(file).source_root_id(db);
+    let root = db.source_root(root).source_root(db);
+    let logical = root.path_for_file(&file)?.as_path()?.to_string();
+    Some((paths::native::resolve(Path::new(&logical)).ok()?.into_owned(), root.is_library))
+}
+
 /// What rustc is told a file is called: its place in the checkout when it is a file of it.
 fn source_path(
     db: &dyn HirDatabase,
@@ -686,23 +694,39 @@ fn source_path(
     base: Option<&Path>,
     file: vfs::FileId,
 ) -> Option<String> {
-    let source_root = db.file_source_root(file).source_root_id(db);
-    let source_root = db.source_root(source_root).source_root(db);
-    let logical = source_root.path_for_file(&file)?.as_path()?.to_string();
-    let path = paths::native::resolve(Path::new(&logical)).ok()?;
+    let (path, library) = source_file_path(db, file)?;
     let root = paths::native::resolve(root).ok()?;
     let base = base.and_then(|base| paths::native::resolve(base).ok());
     let base = base.as_deref().and_then(|base| path.strip_prefix(base).ok());
     // Cargo names source-replaced registry files absolutely even when vendor/
     // happens to live below the workspace. Only workspace files are relative.
-    let relative =
-        (!source_root.is_library).then(|| path.strip_prefix(&root).ok().or(base)).flatten();
+    let relative = (!library).then(|| path.strip_prefix(&root).ok().or(base)).flatten();
     Some(relative.unwrap_or(&path).to_string_lossy().into_owned())
 }
 
+fn install_source_names(db: &mut RootDatabase, mut roots: Vec<PathBuf>) {
+    // Constants are shared by all programs in a database. Their names depend on each
+    // file's own checkout, including nested or joined checkouts.
+    roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
+    hir_ty_codegen::name_sources(db, move |db, file| {
+        let (path, library) = source_file_path(db, file)?;
+        let relative = (!library)
+            .then(|| {
+                roots.iter().find_map(|root| {
+                    let root = paths::native::resolve(root).ok()?;
+                    path.strip_prefix(root.as_ref()).ok()
+                })
+            })
+            .flatten();
+        Some(relative.unwrap_or(&path).to_string_lossy().into_owned())
+    });
+}
+
 fn configure_source_names(db: &mut RootDatabase, root: &Path, base: Option<&Path>) {
-    let (root, base) = (root.to_owned(), base.map(Path::to_owned));
-    hir_ty_codegen::name_sources(db, move |db, file| source_path(db, &root, base.as_deref(), file));
+    install_source_names(
+        db,
+        std::iter::once(root.to_owned()).chain(base.map(Path::to_owned)).collect(),
+    );
 }
 
 impl<'a> Resolver<'a> {
@@ -2474,6 +2498,7 @@ fn load(
     let mut checkouts = Checkouts {
         compared: Default::default(),
         roots: Vec::new(),
+        named_roots: Vec::new(),
         origin,
         splits: Vec::new(),
         loaded: load_cargo::Loaded::default(),
@@ -2505,6 +2530,8 @@ struct Checkouts {
     compared: Compared,
     /// The project a build names, and the root of the workspace it is in.
     roots: Vec<CheckoutRoot>,
+    /// The workspace roots whose source names are installed in the database.
+    named_roots: Vec<PathBuf>,
     origin: LoadOrigin,
     /// For each of `roots`, what it shares with another when it is not loaded in full.
     splits: Vec<Option<Split>>,
@@ -2530,6 +2557,16 @@ struct Checkouts {
 }
 
 impl Checkouts {
+    fn name_sources(&mut self, db: &mut RootDatabase) {
+        let mut roots: Vec<_> = self.roots.iter().map(|root| root.workspace.clone()).collect();
+        roots.sort();
+        roots.dedup();
+        if roots != self.named_roots {
+            install_source_names(db, roots.clone());
+            self.named_roots = roots;
+        }
+    }
+
     fn root_of(&self, project: &Path) -> anyhow::Result<PathBuf> {
         let project = dunce::canonicalize(project)?;
         let root =
@@ -2954,6 +2991,7 @@ impl Checkouts {
         self.roots.extend(roots);
         self.splits.extend(splits);
         self.debug.extend(debug);
+        self.name_sources(db);
         Ok(())
     }
 
@@ -3188,6 +3226,7 @@ impl Checkouts {
         self.refresh_macro_image_identities();
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         self.collect_macro_generations();
+        self.name_sources(db);
         failed
     }
 
@@ -9362,7 +9401,6 @@ fn run_holding(
         checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members, args.debug) = (root, base, members, debug);
     (args.lints_capped, args.strip) = (lints_capped, strip);
-    configure_source_names(&mut db, &args.checkout, args.base.as_deref());
     // The names are resolved before cargo says which program it built: those of the crates
     // it built are, and not of every crate of the workspace.
     if let Some(built) = built {
@@ -12058,10 +12096,110 @@ fn main() { let _ = option_env!("CFLAGS"); let _ = env!("CFLAGS"); }
         assert!(!args(&["--cargo-project"]).own_target);
     }
 
+    #[test]
+    fn loaded_and_joined_checkouts_name_constant_files_before_semantic_work() {
+        use ide_db::base_db;
+        fn values(db: &RootDatabase) -> Vec<String> {
+            hir::attach_db(db, || {
+                base_db::all_crates(db)
+                    .iter()
+                    .flat_map(|&krate| {
+                        hir_def::nameres::crate_def_map(db, krate).modules(db).flat_map(
+                            |(_, module)| {
+                                module.scope(db).declarations().filter_map(|item| {
+                                    let hir_def::ModuleDefId::ConstId(goal) = item else {
+                                        return None;
+                                    };
+                                    let value = db
+                                        .const_eval(
+                                            goal,
+                                            hir_ty::next_solver::GenericArgs::empty(),
+                                            None,
+                                        )
+                                        .unwrap();
+                                    let width = value.memory.len() / 2;
+                                    let address = usize::from_le_bytes(
+                                        value.memory[..width].try_into().unwrap(),
+                                    );
+                                    let len = usize::from_le_bytes(
+                                        value.memory[width..].try_into().unwrap(),
+                                    );
+                                    Some(
+                                        String::from_utf8(
+                                            value.memory_map.get(address, len).unwrap().to_vec(),
+                                        )
+                                        .unwrap(),
+                                    )
+                                })
+                            },
+                        )
+                    })
+                    .collect()
+            })
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(directory.path()).unwrap();
+        let library = root.join("library");
+        let core = library.join("core/src/lib.rs");
+        std::fs::create_dir_all(core.parent().unwrap()).unwrap();
+        std::fs::write(&core, "#![no_core]\n").unwrap();
+        let roots = [root.join("a"), root.join("b"), root.join("a/member")];
+        for root in &roots {
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(
+                root.join("src/main.rs"),
+                r#"
+#[rustc_builtin_macro]
+macro_rules! file { () => {} }
+const GOAL: &str = file!();
+"#,
+            )
+            .unwrap();
+            std::fs::write(root.join("rust-project.json"), serde_json::to_vec(&serde_json::json!({
+                "sysroot_src": library,
+                "sysroot_project": {"crates": [{"root_module": core, "display_name": "core", "edition": "2021", "deps": [], "cfg": [], "env": {}}]},
+                "crates": [{"root_module": root.join("src/main.rs"), "edition": "2021", "deps": [], "cfg": [], "env": {}, "is_workspace_member": true}]
+            })).unwrap()).unwrap();
+        }
+        let config = LoadCargoConfig {
+            with_proc_macro_server: ProcMacroServerChoice::None,
+            ..load_config()
+        };
+        let (mut db, mut vfs, mut checkouts) = load(
+            &[&roots[0]],
+            &CargoConfig::default(),
+            config,
+            plan::Selection::default(),
+            None,
+            None,
+            LoadOrigin::Discover,
+        )
+        .unwrap();
+        let expected = Path::new("src").join("main.rs").to_string_lossy().into_owned();
+        assert_eq!(values(&db), [expected.clone()]);
+        for (index, root) in roots[1..].iter().enumerate() {
+            checkouts.add(&[root], &mut db, &mut vfs, load_owner(), None, &Sharing::Alone).unwrap();
+            assert_eq!(values(&db), vec![expected.clone(); index + 2]);
+        }
+        // A reload can discover a wider workspace root without changing the file itself.
+        checkouts.roots[0].workspace = root;
+        checkouts.name_sources(&mut db);
+        let mut found = values(&db);
+        found.sort();
+        let mut expected = vec![
+            Path::new("a").join("src/main.rs").to_string_lossy().into_owned(),
+            expected.clone(),
+            expected,
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
     fn source_checkouts(root: CheckoutRoot) -> Checkouts {
         Checkouts {
             compared: Default::default(),
             roots: vec![root],
+            named_roots: Vec::new(),
             origin: LoadOrigin::Discover,
             splits: vec![None],
             loaded: Default::default(),
