@@ -10311,7 +10311,7 @@ fn run_holding(
                                 edited: programs[0].unbuilt.edited.clone(),
                                 stale: true,
                                 unlinked: false,
-                                named_anew: true,
+                                named_anew: false,
                             };
                             let mut program = Program {
                                 tests: None,

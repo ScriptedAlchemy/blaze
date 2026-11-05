@@ -213,8 +213,12 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                same = run(checkout["bin"]) == run(built(checkout["reference"], "sapp"))
+                actual = run(checkout["bin"])
+                expected = run(built(checkout["reference"], "sapp"))
+                same = actual == expected
                 verdict = "same" if same else "DIFFERENT OUTPUT"
+                if not same:
+                    print(f"    expected {expected!r}; actual {actual!r}", flush=True)
             asked += 1
             wrong += verdict.isupper()
             print(f"    checkout {at} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
