@@ -172,7 +172,7 @@ struct StackFrame<'db> {
 
 #[derive(Clone)]
 enum MirOrDynIndex<'db> {
-    Mir(&'db MirBody<'db>),
+    Mir { function: FunctionId, body: &'db MirBody<'db> },
     Dyn(usize),
 }
 
@@ -1976,6 +1976,9 @@ impl<'db> Evaluator<'db> {
             return Ok(None);
         };
         Ok(match (crate::mir::location::placed(self.db, owner, expr), ty.kind()) {
+            (Some(Placed::Unavailable), _) => {
+                not_supported!("source location literal without a source name or location")
+            }
             (Some(Placed::Number(number)), TyKind::Uint(rustc_type_ir::UintTy::U32)) => {
                 let addr = self.heap_allocate(4, 4)?;
                 self.write_memory(addr, &number.to_le_bytes())?;
@@ -3362,7 +3365,7 @@ impl<'db> Evaluator<'db> {
                     vec![(Either::Left(imp), span, locals.body.owner)],
                 )
             })?;
-            MirOrDynIndex::Mir(mir_body)
+            MirOrDynIndex::Mir { function: imp, body: mir_body }
         };
         self.mir_or_dyn_index_cache.borrow_mut().insert(pair, r.clone());
         Ok(r)
@@ -3414,6 +3417,25 @@ impl<'db> Evaluator<'db> {
                         .enumerate()
                         .map(|(i, it)| if i == self_ty_idx { ty.into() } else { it }),
                 );
+                // An untracked vtable entry reifies an impl-only tracked method through an
+                // untracked shim, just as a function pointer does. Tracking on the trait
+                // declaration instead preserves the dynamic call site.
+                // https://github.com/rust-lang/rust/blob/main/compiler/rustc_ty_utils/src/instance.rs
+                let shim;
+                let locals = if !super::location::tracks_caller(self.db, def)
+                    && let (Either::Left(function), _) =
+                        self.db.lookup_impl_method(self.param_env, def, generics_for_target)
+                    && super::location::tracks_caller(self.db, function)
+                {
+                    shim = Locals {
+                        ptr: locals.ptr.clone(),
+                        body: locals.body,
+                        caller_location: Some(CallerLocation::Declaration(function)),
+                    };
+                    &shim
+                } else {
+                    locals
+                };
                 self.exec_fn_with_args(
                     def,
                     &args_for_target,
@@ -3424,10 +3446,10 @@ impl<'db> Evaluator<'db> {
                     span,
                 )
             }
-            MirOrDynIndex::Mir(body) => self.exec_looked_up_function(
+            MirOrDynIndex::Mir { function, body } => self.exec_looked_up_function(
                 body,
                 locals,
-                def,
+                function,
                 arg_bytes,
                 span,
                 destination,
@@ -3508,11 +3530,16 @@ impl<'db> Evaluator<'db> {
         }
         match func_ty.kind() {
             TyKind::FnDef(callable, subst) => {
+                let tracked = if let CallableDefId::FunctionId(function) = callable.0 {
+                    let (function, _) = self.db.lookup_impl_method(self.param_env, function, subst);
+                    matches!(function, Either::Left(function) if super::location::tracks_caller(self.db, function))
+                } else {
+                    false
+                };
                 let shim;
-                let locals = if let CallableDefId::FunctionId(function) = callable.0
-                    && super::location::tracks_caller(self.db, function)
-                {
+                let locals = if tracked {
                     // rustc's Fn-item shim is untracked and uses the Fn trait method's span.
+                    // https://github.com/rust-lang/rust/blob/main/compiler/rustc_mir_transform/src/shim.rs
                     shim = Locals {
                         ptr: locals.ptr.clone(),
                         body: locals.body,

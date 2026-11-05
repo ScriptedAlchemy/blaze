@@ -1387,9 +1387,14 @@ fn caller_location_of_a_function_item_through_fn_once_uses_the_shim() {
 type Loc = &'static core::panic::Location<'static>;
 #[track_caller] fn tracked() -> Loc { core::panic::Location::caller() }
 fn invoke<F: FnOnce() -> Loc>(f: F) -> Loc { f() }
+trait Site { fn site() -> Loc; }
+struct R;
+impl Site for R { #[track_caller] fn site() -> Loc { core::panic::Location::caller() } }
 fn main() {
     let location = invoke(tracked);
     if location.line() != ONCE_LINE || location.column() != ONCE_COLUMN { should_not_reach(); }
+    let from_impl = invoke(<R as Site>::site);
+    if from_impl.line() != ONCE_LINE || from_impl.column() != ONCE_COLUMN { should_not_reach(); }
     let shared = invoke(&tracked);
     if shared.line() != SHARED_LINE || shared.column() != SHARED_COLUMN { should_not_reach(); }
     let mut item = tracked;
@@ -1426,4 +1431,31 @@ fn should_not_reach() { panic!() }
             .replace(&format!("{name}_COLUMN"), &column.to_string());
     }
     check_pass(&fixture);
+}
+
+#[test]
+fn caller_location_with_tracking_only_on_the_impl() {
+    check_pass(
+        r#"
+//- minicore: panic_location, coerce_unsized, dispatch_from_dyn
+type Loc = &'static core::panic::Location<'static>;
+trait Site { fn site(&self) -> Loc; }
+struct R;
+impl Site for R {
+    #[track_caller]
+    fn site(&self) -> Loc { core::panic::Location::caller() }
+}
+fn generic<T: Site>(x: &T) -> Loc { x.site() }
+fn main() {
+    let direct = R.site();
+    if direct.line() != 10 || direct.column() != 20 { should_not_reach(); }
+    let indirect = generic(&R);
+    if indirect.line() != 8 || indirect.column() != 39 { should_not_reach(); }
+    let object: &dyn Site = &R;
+    let dynamic = object.site();
+    if dynamic.line() != 6 || dynamic.column() != 5 { should_not_reach(); }
+}
+fn should_not_reach() { panic!() }
+"#,
+    );
 }

@@ -82,6 +82,8 @@ pub fn located_concats<'db>(
 pub enum Placed {
     Number(u32),
     Text(String),
+    /// A location literal was recognized, but its source could not be resolved.
+    Unavailable,
 }
 
 /// A trait implementation inherits `#[track_caller]` from its declaration, as rustc's
@@ -144,10 +146,10 @@ pub fn name_sources(
     let paths = SourceNameProvider(std::sync::Arc::new(paths));
     match SourceNames::try_get(db) {
         Some(names) => {
-            names.set_provider(db).with_durability(Durability::HIGH).to(paths);
+            names.set_provider(db).with_durability(Durability::MEDIUM).to(paths);
         }
         None => {
-            _ = SourceNames::builder(paths).durability(Durability::HIGH).new(db);
+            _ = SourceNames::builder(paths).durability(Durability::MEDIUM).new(db);
         }
     }
 }
@@ -158,33 +160,39 @@ pub fn name_sources(
 pub fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
     let path = |file| source_name(db, file);
     if let Some(file_id) = located_concats(db, owner).get(&expr) {
-        let call = file_id.macro_file()?.loc(db).to_node(db);
-        let mut text = String::new();
-        for part in concat_parts(&call.value)? {
-            match part {
-                ConcatPart::Text(part) => text.push_str(&part),
-                ConcatPart::Location(expander, range) => {
-                    let (file, line, col) = location_of(db, call.file_id, range)?;
-                    match expander {
-                        BuiltinFnLikeExpander::Line => text.push_str(&line.to_string()),
-                        BuiltinFnLikeExpander::Column => text.push_str(&col.to_string()),
-                        _ => text.push_str(&path(file)?),
+        let value = || {
+            let call = file_id.macro_file()?.loc(db).to_node(db);
+            let mut text = String::new();
+            for part in concat_parts(&call.value)? {
+                match part {
+                    ConcatPart::Text(part) => text.push_str(&part),
+                    ConcatPart::Location(expander, range) => {
+                        let (file, line, col) = location_of(db, call.file_id, range)?;
+                        match expander {
+                            BuiltinFnLikeExpander::Line => text.push_str(&line.to_string()),
+                            BuiltinFnLikeExpander::Column => text.push_str(&col.to_string()),
+                            _ => text.push_str(&path(file)?),
+                        }
                     }
                 }
             }
-        }
-        return Some(Placed::Text(text));
+            Some(Placed::Text(text))
+        };
+        return Some(value().unwrap_or(Placed::Unavailable));
     }
     let &(expander, file_id) = location_macros(db, owner).get(&expr)?;
-    let site = written_call(db, file_id)?;
-    let range = InFile::new(site.file_id, written_range(&site.value));
-    let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
-    let (file, line, col) = location_of(db, file_id.into(), range)?;
-    Some(match expander {
-        BuiltinFnLikeExpander::Line => Placed::Number(line),
-        BuiltinFnLikeExpander::Column => Placed::Number(col),
-        _ => Placed::Text(path(file)?),
-    })
+    let value = || {
+        let site = written_call(db, file_id)?;
+        let range = InFile::new(site.file_id, written_range(&site.value));
+        let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
+        let (file, line, col) = location_of(db, file_id.into(), range)?;
+        Some(match expander {
+            BuiltinFnLikeExpander::Line => Placed::Number(line),
+            BuiltinFnLikeExpander::Column => Placed::Number(col),
+            _ => Placed::Text(path(file)?),
+        })
+    };
+    Some(value().unwrap_or(Placed::Unavailable))
 }
 
 /// The macro of `name` that expands to a place in the source.

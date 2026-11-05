@@ -3406,3 +3406,27 @@ const GOAL: &str = CL.file();
         1,
     );
 }
+
+#[test]
+fn file_macros_without_source_names_fail_closed() {
+    for expression in ["file!()", "concat!(\"prefix/\", file!())"] {
+        let fixture = format!(
+            r#"
+#[rustc_builtin_macro]
+macro_rules! file {{ () => {{}} }}
+#[rustc_builtin_macro]
+macro_rules! concat {{ () => {{}} }}
+const GOAL: &str = {expression};
+"#
+        );
+        let (mut db, file) = TestDB::with_single_file(&fixture);
+        crate::mir::location::name_sources(&mut db, |_, _| None);
+        crate::attach_db(&db, || {
+            let error = eval_goal(&db, file).expect_err("a placeholder must not become a value");
+            assert!(matches!(
+                simplify(error),
+                ConstEvalError::MirEvalError(MirEvalError::NotSupported(_))
+            ));
+        });
+    }
+}
