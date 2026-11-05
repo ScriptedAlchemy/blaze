@@ -5,7 +5,7 @@
             Struct(
                 Struct {
                     id: StructId(
-                        0680,
+                        0700,
                     ),
                 },
             ),
@@ -13,7 +13,7 @@
         loc: DeclarationLocation {
             hir_file_id: FileId(
                 EditionedFileId(
-                    Id(481),
+                    Id(501),
                 ),
             ),
             ptr: SyntaxNodePtr {

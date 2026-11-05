@@ -95,13 +95,19 @@ fn process_collection_does_not_panic_on_raw_value() {
         assert!(build_spec(&Request::parse(Subcommand::Build, &[]).unwrap(), &ctx).is_ok());
         return;
     }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "process_collection_does_not_panic_on_raw_value"])
         .env_clear()
         .env(MARKER, "1")
         .env("ARBITRARY", OsString::from_vec(vec![0xff]))
         .env("PATH", "/usr/bin:/bin")
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success());
+    assert!(
+        output.status.success(),
+        "child failed: {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
