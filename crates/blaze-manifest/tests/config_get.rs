@@ -31,7 +31,21 @@ fn copy_dir(from: &Path, to: &Path) {
 fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
     let root = scratch.join(fixture.file_name().unwrap());
     copy_dir(fixture, &root);
+    // Windows canonicalize returns a verbatim (\\\\?\\) path. Joining a
+    // relative --config argument to that path *removes* lexical '..' components,
+    // unlike the ordinary paths Cargo's recorded CLI fixtures use. Keep the
+    // fixture root absolute without introducing the verbatim prefix.
+    #[cfg(windows)]
+    let root = std::path::absolute(&root).unwrap();
+    #[cfg(not(windows))]
     let root = root.canonicalize().unwrap();
+    #[cfg(windows)]
+    assert!(
+        root.join("ws/sub").join("../.cargo/more.toml")
+            .to_string_lossy()
+            .contains(".."),
+        "Windows fixture root must preserve lexical parent components in CLI origins"
+    );
     let case: serde_json::Value = match std::fs::read_to_string(fixture.join("case.json")) {
         Ok(text) => serde_json::from_str(&text).unwrap(),
         Err(_) => serde_json::json!({}),

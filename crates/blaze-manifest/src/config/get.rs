@@ -211,11 +211,7 @@ pub fn get(config: &Config, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
                         "# The following environment variables may affect the loaded values.\n",
                     );
                     for (k, v) in env {
-                        let _ = writeln!(
-                            out.stdout,
-                            "# {k}={}",
-                            escape_cargo_env(v)
-                        );
+                        let _ = writeln!(out.stdout, "# {k}={}", escape_cargo_env(v));
                     }
                 }
                 ConfigFormat::Json | ConfigFormat::JsonValue => {
@@ -223,8 +219,7 @@ pub fn get(config: &Config, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
                         "note: The following environment variables may affect the loaded values.\n",
                     );
                     for (k, v) in env {
-                        let _ =
-                            writeln!(out.stderr, "{k}={}", escape_cargo_env(v));
+                        let _ = writeln!(out.stderr, "{k}={}", escape_cargo_env(v));
                     }
                 }
             }
