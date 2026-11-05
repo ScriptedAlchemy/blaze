@@ -99,9 +99,9 @@ def queue_runs(number):
 
 
 def enqueue_with_head_guard(number, expected_head):
-    """Use the merge queue directly when gh's auto-merge path is disabled.
+    """Only enqueue through GitHub's merge queue, guarded by the exact PR head.
 
-    This is only an enqueue, not a direct merge or protection bypass. GitHub
+    Never use a regular merge or repository auto-merge as a substitute. GitHub
     rejects a moved head atomically via expectedHeadOid.
     """
     pr = state(number)
@@ -126,23 +126,12 @@ def enqueue_with_head_guard(number, expected_head):
 
 
 def queue_merge(number, expected_head):
-    """Request protected-main queueing without silently merging a moved head."""
-    queued = subprocess.run(
-        ["gh", "pr", "merge", str(number), "--repo", repository(), "--merge",
-         "--auto", "--match-head-commit", expected_head],
-        capture_output=True, text=True,
-    )
-    try:
-        in_queue = state(number)["isInMergeQueue"]
-    except GhFailed:
-        in_queue = False
-    if queued.returncode and not in_queue:
-        # gh 2.92 sends enablePullRequestAutoMerge rather than enqueuePullRequest
-        # for a merge-queue branch when repository auto-merge is disabled.
-        # Fall back only for that exact condition, with an atomic head guard.
-        if "auto merge is not allowed for this repository" not in queued.stderr.lower():
-            raise GhFailed(f"gh pr merge failed: {queued.stderr.strip()}")
-        enqueue_with_head_guard(number, expected_head)
+    """Enqueue only: gh pr merge may merge directly if protections change.
+
+    The explicit GraphQL enqueuePullRequest mutation cannot bypass the queue,
+    and verifies a matching head, open PR, main target, and queue receipt.
+    """
+    enqueue_with_head_guard(number, expected_head)
 
 
 def files(number):

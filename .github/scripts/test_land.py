@@ -58,20 +58,15 @@ class RepositoryTests(TestCase):
 
 
 class MergeQueueTests(TestCase):
-    def test_disabled_auto_merge_enqueues_scoped_exact_head(self):
+    def test_queue_request_is_scoped_and_never_uses_direct_merge_cli(self):
         current = dict(id="PR_node", state="OPEN", baseRefName="main",
                        headRefOid="deadbeef", isInMergeQueue=False)
         receipt = {"data": {"enqueuePullRequest": {"mergeQueueEntry": {"id": "MQ_node"}}}}
-        denied = mock.Mock(returncode=1,
-                           stderr="GraphQL: Auto merge is not allowed for this repository")
-        with mock.patch.object(land, "repository", return_value="ScriptedAlchemy/blaze"), \
-             mock.patch.object(land.subprocess, "run", return_value=denied) as run, \
-             mock.patch.object(land, "state", return_value=current), \
-             mock.patch.object(land, "gh", return_value=json.dumps(receipt)) as gh:
+        with mock.patch.object(land, "state", return_value=current), \
+             mock.patch.object(land, "gh", return_value=json.dumps(receipt)) as gh, \
+             mock.patch.object(land.subprocess, "run") as subprocess_run:
             land.queue_merge(79, "deadbeef")
-        args = run.call_args.args[0]
-        self.assertIn("--match-head-commit", args)
-        self.assertEqual(args[args.index("--match-head-commit") + 1], "deadbeef")
+            subprocess_run.assert_not_called()
         graph = gh.call_args.args
         self.assertIn("enqueuePullRequest", graph[3])
         self.assertIn("expectedHeadOid", graph[3])
@@ -99,25 +94,31 @@ class MergeQueueTests(TestCase):
              self.assertRaises(land.GhFailed):
             land.enqueue_with_head_guard(79, "deadbeef")
 
-    def test_other_cli_errors_never_bypass_to_graphql(self):
-        denied = mock.Mock(returncode=1, stderr="review required")
-        with mock.patch.object(land, "repository", return_value="ScriptedAlchemy/blaze"), \
-             mock.patch.object(land.subprocess, "run", return_value=denied), \
-             mock.patch.object(land, "state", return_value={"isInMergeQueue": False}), \
-             mock.patch.object(land, "gh") as gh:
-            with self.assertRaises(land.GhFailed):
-                land.queue_merge(79, "deadbeef")
+    def test_already_queued_head_does_not_reenqueue(self):
+        current = dict(id="PR_node", state="OPEN", baseRefName="main",
+                       headRefOid="deadbeef", isInMergeQueue=True)
+        with mock.patch.object(land, "state", return_value=current), \
+             mock.patch.object(land, "gh") as gh, \
+             mock.patch.object(land.subprocess, "run") as subprocess_run:
+            land.queue_merge(79, "deadbeef")
             gh.assert_not_called()
+            subprocess_run.assert_not_called()
 
-    def test_already_queued_pr_does_not_reenqueue(self):
-        denied = mock.Mock(returncode=1, stderr="already in merge queue")
-        with mock.patch.object(land, "repository", return_value="ScriptedAlchemy/blaze"), \
-             mock.patch.object(land.subprocess, "run", return_value=denied), \
-             mock.patch.object(land, "state", return_value={"isInMergeQueue": True}), \
-             mock.patch.object(land, "gh") as gh:
+    def test_already_queued_moved_head_is_refused(self):
+        current = dict(id="PR_node", state="OPEN", baseRefName="main",
+                       headRefOid="another", isInMergeQueue=True)
+        with mock.patch.object(land, "state", return_value=current), \
+             mock.patch.object(land, "gh") as gh, \
+             self.assertRaises(land.GhFailed):
             land.queue_merge(79, "deadbeef")
             gh.assert_not_called()
 
+    def test_unavailable_queue_state_fails_closed(self):
+        with mock.patch.object(land, "state", side_effect=land.GhFailed("API unavailable")), \
+             mock.patch.object(land, "gh") as gh, \
+             self.assertRaises(land.GhFailed):
+            land.queue_merge(79, "deadbeef")
+            gh.assert_not_called()
 
 if __name__ == "__main__":
     main()
