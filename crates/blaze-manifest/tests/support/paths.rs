@@ -5,45 +5,73 @@ use serde_json::Value;
 pub fn normalize(text: &str, root: &Path, home: &Path) -> String {
     let mut text = text.to_owned();
     for (path, marker) in [(home, "$CARGO_HOME"), (root, "$ROOT")] {
-        let native = path.to_str().unwrap();
+        text = normalize_native(&text, path.to_str().unwrap(), marker);
         let url = url::Url::from_file_path(path).unwrap().to_string();
-        let escaped = serde_json::to_string(native).unwrap();
-        let escaped = &escaped[1..escaped.len() - 1];
-        text = text.replace(&format!("'{native}'"), marker);
-        let windows = native.contains('\\');
-        for (prefix, separator) in [
-            (escaped, windows.then_some("\\\\")),
-            (native, windows.then_some("\\")),
-            (url.strip_prefix("file://").unwrap(), None),
-        ] {
-            let mut normalized = String::new();
-            let mut rest = text.as_str();
-            while let Some((before, after)) = rest.split_once(prefix) {
-                normalized.push_str(before);
-                normalized.push_str(marker);
-                let mut suffix = after;
-                loop {
-                    if let Some(tail) = separator.and_then(|sep| suffix.strip_prefix(sep)) {
-                        normalized.push('/');
-                        suffix = tail;
-                    } else if let Some(c) = suffix
-                        .chars()
-                        .next()
-                        .filter(|c| c.is_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
-                    {
-                        normalized.push(c);
-                        suffix = &suffix[c.len_utf8()..];
-                    } else {
-                        break;
-                    }
-                }
-                rest = suffix;
-            }
-            normalized.push_str(rest);
-            text = normalized;
-        }
+        text = normalize_prefix(&text, url.strip_prefix("file://").unwrap(), marker, None);
     }
     text
+}
+
+fn normalize_native(text: &str, native: &str, marker: &str) -> String {
+    let drive = |path: &str| {
+        let bytes = path.as_bytes();
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1..3] == *b":\\"
+    };
+    // Windows canonicalize adds a verbatim prefix, while dependency paths may be
+    // simplified again. Both spellings identify the fixture's same absolute root.
+    let mut spellings = vec![native.to_owned()];
+    if let Some(unc) = native.strip_prefix(r"\\?\UNC\") {
+        spellings.push(format!(r"\\{unc}"));
+    } else if let Some(path) = native.strip_prefix(r"\\?\").filter(|path| drive(path)) {
+        spellings.push(path.to_owned());
+    } else if drive(native) {
+        spellings.push(format!(r"\\?\{native}"));
+    } else if let Some(unc) =
+        native.strip_prefix(r"\\").filter(|path| !path.starts_with(['?', '.']))
+    {
+        spellings.push(format!(r"\\?\UNC\{unc}"));
+    }
+    // Strip the whole verbatim root before its shorter drive/UNC spelling can
+    // match inside it and leave a dangling prefix in the normalized JSON.
+    spellings.sort_by_key(|path| std::cmp::Reverse(path.len()));
+    let mut text = text.to_owned();
+    for path in spellings {
+        text = text.replace(&format!("'{path}'"), marker);
+        let escaped = serde_json::to_string(&path).unwrap();
+        let escaped = &escaped[1..escaped.len() - 1];
+        let windows = path.contains('\\');
+        text = normalize_prefix(&text, escaped, marker, windows.then_some("\\\\"));
+        text = normalize_prefix(&text, &path, marker, windows.then_some("\\"));
+    }
+    text
+}
+
+fn normalize_prefix(text: &str, prefix: &str, marker: &str, separator: Option<&str>) -> String {
+    let mut normalized = String::new();
+    let mut rest = text;
+    while let Some((before, after)) = rest.split_once(prefix) {
+        normalized.push_str(before);
+        normalized.push_str(marker);
+        let mut suffix = after;
+        loop {
+            if let Some(tail) = separator.and_then(|sep| suffix.strip_prefix(sep)) {
+                normalized.push('/');
+                suffix = tail;
+            } else if let Some(c) = suffix
+                .chars()
+                .next()
+                .filter(|c| c.is_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+            {
+                normalized.push(c);
+                suffix = &suffix[c.len_utf8()..];
+            } else {
+                break;
+            }
+        }
+        rest = suffix;
+    }
+    normalized.push_str(rest);
+    normalized
 }
 
 /// Fixture paths use portable slash-delimited components. Emit native paths,
@@ -133,4 +161,32 @@ fn fixture_expansion_uses_native_components_and_preserves_urls_and_diagnostics()
         value["error"].as_str().unwrap(),
         format!("{}/src/lib.rs\nnext line", root.display())
     );
+}
+
+#[test]
+fn windows_verbatim_roots_normalize_both_dependency_path_spellings() {
+    for (root, native) in [
+        (
+            r"\\?\C:\Users\runneradmin\AppData\Local\Temp\fixture",
+            r"C:\Users\runneradmin\AppData\Local\Temp\fixture",
+        ),
+        (r"\\?\UNC\server\share\fixture", r"\\server\share\fixture"),
+    ] {
+        for declared in [root, native] {
+            let text = serde_json::json!({
+                "plain": format!("{native}\\tools\\helper"),
+                "verbatim": format!("{root}\\b"),
+                "unrelated": r"literal \n \other\value",
+            })
+            .to_string();
+            let normalized = normalize_native(&text, declared, "$ROOT");
+            assert_eq!(
+                serde_json::from_str::<Value>(&normalized).unwrap(),
+                serde_json::json!({
+                    "plain": "$ROOT/tools/helper", "verbatim": "$ROOT/b",
+                    "unrelated": r"literal \n \other\value",
+                })
+            );
+        }
+    }
 }
