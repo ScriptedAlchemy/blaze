@@ -61,6 +61,7 @@ HARNESSES = [
     ("core", ["bigbinary.py"], {}, on("linux", "macos"), None),
     # `cargo ra-jit` hands Windows builds to cargo, so there the daemon links nothing to test.
     ("core", ["unreached.py"], {}, on("linux", "macos"), 1),
+    ("core", ["nativecallees.py"], {}, on("linux", "macos"), 1),
     ("core", ["loadedits.py"], {}, on("linux", "macos"), 2),
     ("core", ["testselect.py"], {}, on("linux", "macos"), 2),
     ("core", ["doctestonce.py"], {}, on("linux", "macos"), 1),
