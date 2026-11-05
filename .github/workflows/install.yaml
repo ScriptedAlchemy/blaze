@@ -38,9 +38,48 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - run: shellcheck -s sh install.sh
+      - run: shellcheck -s sh install.sh .github/scripts/check_installed_toolchain.sh
+      - run: python3 -B .github/scripts/test_installed_toolchain.py
+
+  candidate:
+    # Portable archives must be built on the release's glibc baseline, not the
+    # newer hosts where installation and runtime behavior are exercised.
+    name: build candidate / ${{ matrix.target }}
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.build_os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { build_os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { build_os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { build_os: macos-26, target: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build this pull request's native installer archive
+        shell: bash
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rust-src
+          export RUSTUP_TOOLCHAIN=1.99.0
+          install_target="${{ matrix.target }}"
+          install_name="blaze-commit-$install_target"
+          release_args=(--target "$install_target" --out "$install_name")
+          if [ "$RUNNER_OS" = Linux ]; then release_args+=(--server); fi
+          python3 .github/scripts/build_release.py "${release_args[@]}"
+          install_archive="$RUNNER_TEMP/$install_name.tar.gz"
+          tar czf "$install_archive" "$install_name"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate-${{ matrix.target }}
+          path: ${{ runner.temp }}/blaze-commit-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
 
   install:
+    needs: [candidate]
+    # The PR candidate must succeed; a skipped PR-only builder must not block
+    # scheduled/published-release verification.
+    if: ${{ always() && (github.event_name != 'pull_request' || needs.candidate.result == 'success') }}
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ github.event_name == 'pull_request' && 90 || 20 }}
@@ -59,21 +98,20 @@ jobs:
       BLAZE_VERSION: ${{ inputs.version || (github.event_name == 'release' && github.event.release.tag_name) || '' }}
     steps:
       - uses: actions/checkout@v7
-      - name: Build this pull request's native installer archive
+      - uses: actions/download-artifact@v8
+        if: github.event_name == 'pull_request'
+        with:
+          name: candidate-${{ matrix.target }}
+          path: ${{ runner.temp }}/candidate
+      - name: verify the portable archive is for this target
         id: candidate
         if: github.event_name == 'pull_request'
         shell: bash
         run: |
-          rustup toolchain install 1.99.0 --profile minimal --component rust-src
-          export RUSTUP_TOOLCHAIN=1.99.0
-          install_target="${{ matrix.target }}"
-          install_name="blaze-commit-$install_target"
-          release_args=(--target "$install_target" --out "$install_name")
-          if [ "$RUNNER_OS" = Linux ]; then release_args+=(--server); fi
-          python3 .github/scripts/build_release.py "${release_args[@]}"
-          install_archive="$RUNNER_TEMP/$install_name.tar.gz"
-          tar czf "$install_archive" "$install_name"
-          echo "path=$install_archive" >> "$GITHUB_OUTPUT"
+          archive="$RUNNER_TEMP/candidate/blaze-commit-${{ matrix.target }}.tar.gz"
+          test -s "$archive"
+          tar -tzf "$archive" | grep -Fx "blaze-commit-${{ matrix.target }}/blaze"
+          echo "path=$archive" >> "$GITHUB_OUTPUT"
       # Here and not in the job's env, which has no runner context.
       - name: a CARGO_HOME of its own
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
@@ -89,12 +127,7 @@ jobs:
           cargo blaze --help | head -n 3
           # A release from before blaze had its own Rust has rustup install 1.99.0 instead.
           if [ -x "$CARGO_HOME/bin/blaze" ]; then
-            # Published releases choose their own pinned toolchain, which may
-            # differ from this source tree. Verify its identity and installed path.
-            toolchain_info=$(blaze toolchain)
-            printf '%s\n' "$toolchain_info" | tee /dev/stderr | grep -F "blaze's toolchain ("
-            toolchain_dir=${toolchain_info##* at }
-            test "$toolchain_dir" != "$toolchain_info" && test -d "$toolchain_dir"
+            sh .github/scripts/check_installed_toolchain.sh
           else
             rustup run 1.99.0 rustc --version
             rustup component list --toolchain 1.99.0 --installed | grep -q '^rust-src'
