@@ -619,8 +619,7 @@ mod member_path_tests {
             std::env::temp_dir().join(format!("blaze-workspace-path-{}", std::process::id()));
         std::fs::create_dir_all(scratch.join("tools/helper")).unwrap();
         let manifest = scratch.join("tools/helper/Cargo.toml");
-        std::fs::write(&manifest, "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n")
-            .unwrap();
+        std::fs::write(&manifest, "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n").unwrap();
         let absolute = std::path::absolute(&scratch).unwrap();
         let canonical = scratch.canonicalize().unwrap();
         let selected = normalize_member_path(&absolute.join("tools/helper/Cargo.toml"), &canonical);
@@ -628,11 +627,7 @@ mod member_path_tests {
         let members: FxHashSet<PathBuf> =
             [canonical.join("tools/helper/Cargo.toml")].into_iter().collect();
         assert!(
-            member_set_contains(
-                &members,
-                &absolute.join("tools/helper/Cargo.toml"),
-                &canonical,
-            ),
+            member_set_contains(&members, &absolute.join("tools/helper/Cargo.toml"), &canonical,),
             "a Windows file-URL alias must retain workspace-member profile semantics"
         );
         let _ = std::fs::remove_dir_all(scratch);
