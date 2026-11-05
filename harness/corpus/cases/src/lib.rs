@@ -1253,6 +1253,12 @@ pub mod locations {
         let lines = (a.line(), a.column(), b.line(), b.column());
         (lines.0, lines.1, lines.2, lines.3, c.file() == a.file() && c.line() == b.line())
     }
+    /// The evaluator's nested allocation survives emission into the compiled program.
+    pub fn constant_file() -> (&'static str, bool) {
+        const SITE: &Location<'static> = Location::caller();
+        const NAME: &str = SITE.file();
+        (NAME, NAME == file!() && NAME.len() > 4)
+    }
 }
 
 pub mod misc {

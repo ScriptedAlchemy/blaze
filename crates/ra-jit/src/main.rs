@@ -12187,7 +12187,7 @@ const GOAL: &str = file!();
         let mut found = values(&db);
         found.sort();
         let mut expected = vec![
-            Path::new("a").join("src/main.rs").to_string_lossy().into_owned(),
+            Path::new("a").join("src").join("main.rs").to_string_lossy().into_owned(),
             expected.clone(),
             expected,
         ];
