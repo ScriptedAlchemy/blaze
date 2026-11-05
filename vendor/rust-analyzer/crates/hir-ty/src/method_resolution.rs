@@ -734,6 +734,10 @@ fn impls_in_bodies(
                 let name = Symbol::intern(lexed.text(previous_at));
                 found.push((TextSize::from(lexed.text_start(previous_at) as u32), Some(name)));
             }
+            // Attribute and derive macros can emit impls for a foreign Self type too.
+            T![#] if bodies > 0 => {
+                found.push((TextSize::from(lexed.text_start(i) as u32), None));
+            }
             _ => {}
         }
         previous = kind;

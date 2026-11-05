@@ -2377,3 +2377,21 @@ macro_rules! make_impl {
 "#,
     );
 }
+
+#[test]
+fn attributes_inside_functions_can_write_foreign_self_impls() {
+    check_types(
+        r#"
+//- proc_macros: input_replace
+trait Trait { fn value(&self) -> u16; }
+fn holder() {
+    #[proc_macros::input_replace(impl Trait for u32 { fn value(&self) -> u16 { 2 } })]
+    struct Input;
+}
+fn outside() {
+    0u32.value();
+  //^^^^^^^^^^^^ u16
+}
+"#,
+    );
+}
