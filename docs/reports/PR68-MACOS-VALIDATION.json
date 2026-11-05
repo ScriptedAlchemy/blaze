@@ -100,7 +100,8 @@
   "nix_package_build": {
     "tested_commit": "12738507c4b842bd26c2fe54e246df9aea0c452c",
     "result": "running",
-    "command": "nix build --print-build-logs --no-link .#daemon-units .#run"
+    "command": "nix build --print-build-logs --no-link .#daemon-units .#run",
+    "supervisor_note": "The T3 restart cancelled the Python supervisor. The original Nix build survived as an orphan and was confirmed still running; no duplicate build was launched."
   },
   "local_cache_configuration": {
     "setting": "NIX_CACHE_HOME=$HOME/code/.cache/nix",
@@ -200,5 +201,20 @@
       "producer-combined-norustc.log": "100991710ea204bb38c0ac941f6397b0083ea3fb67924a2c7d770afac3c51b12"
     }
   },
-  "latest_local_source_check": "6c5f7b30ffca49601e911ee9341b4f21c7d2ea82"
+  "latest_local_source_check": "6c5f7b30ffca49601e911ee9341b4f21c7d2ea82",
+  "installer_toolchain_report_change": {
+    "historical_job": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41932716034/job/126933396117",
+    "failure": "Installation succeeded, but the workflow only recognized an older blaze toolchain report label.",
+    "change": "Preserve the shared checker and portable candidate-build jobs. Extend the checker to the explicit and owned source-installation reports in addition to rustup and older published formats; require the absolute installation and Rust library source directory to exist.",
+    "validation": [
+      "Executed the exact workflow step with native binaries in an isolated CARGO_HOME: previous check failed (exit 1), updated check passed (exit 0).",
+      "Five shell-backed identity, path-refusal, source-presence, and portable-host regressions passed.",
+      "actionlint install.yaml, shellcheck install.sh and the shared checker, runner-label checks, and git diff --check passed."
+    ],
+    "tested_step_sha256": "6baee5661df5e35a57908b4c58cbbcd0a22851d212fd94aba67538e8857b6855",
+    "log_sha256": "a4ab517a2c23ad607820499ecc38ec912adfba61f5ff4ae6325a2f220f08a835",
+    "native_ci": "Pending; local step verification does not certify the entire installer workflow.",
+    "shared_implementation_commit": "2ed824e6a9cc401a513f4723977e3c6ff15ec0ae",
+    "checker_sha256": "8ae19f8dfbe05c40fce9b2e6a191f12455c85bf083733af6be1fa16e331d42b3"
+  }
 }

@@ -24,14 +24,23 @@ class ToolchainIdentityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             path = root / "toolchain with spaces"
-            path.mkdir()
+            (path / "lib/rustlib/src/rust/library").mkdir(parents=True)
             self.check(root, f"blaze builds with Rust 1.99.0 from rustup, at {path}", True)
+
+    def test_explicit_and_owned_source_installations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "source toolchain"
+            (path / "lib/rustlib/src/rust/library").mkdir(parents=True)
+            for description in ("the toolchain", "blaze's own copy"):
+                with self.subTest(description=description):
+                    self.check(root, f"blaze builds with Rust 1.99.0, {description} at {path}", True)
 
     def test_published_nightly(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             path = root / "nightly"
-            path.mkdir()
+            (path / "lib/rustlib/src/rust/library").mkdir(parents=True)
             self.check(root, f"blaze builds with blaze-2026-10-27, blaze's toolchain (Rust nightly-2026-10-27) at {path}", True)
 
     def test_refuses_unknown_missing_and_relative(self):
@@ -40,6 +49,7 @@ class ToolchainIdentityTest(unittest.TestCase):
             self.check(root, f"arbitrary version at {root}", False)
             self.check(root, f"blaze builds with Rust 1.99.0 from rustup, at {root / 'missing'}", False)
             self.check(root, "blaze builds with Rust 1.99.0 from rustup, at relative/toolchain", False)
+            self.check(root, f"blaze builds with Rust 1.99.0 from rustup, at {root}", False)
 
     def test_portable_build_hosts_do_not_replace_newer_install_platforms(self):
         text = WORKFLOW.read_text()
