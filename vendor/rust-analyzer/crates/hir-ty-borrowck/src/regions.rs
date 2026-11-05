@@ -4605,15 +4605,16 @@ impl<'db> Builder<'_, '_, 'db> {
             .into_iter()
             .enumerate()
             .map(|(index, ty)| {
-                let ty =
-                    rustc_type_ir::fold_regions(interner, ty, |region, _| match region.kind() {
-                        RegionKind::ReError(_) => {
-                            let region = self.fresh_elided();
-                            errors[index].push(region);
-                            region
-                        }
-                        _ => region,
-                    });
+                let ty = rustc_type_ir::TypeFoldable::fold_with(
+                    ty,
+                    &mut InputRegions {
+                        interner,
+                        fresh: || self.fresh_elided(),
+                        single: false,
+                        only: None,
+                        errors: &mut errors[index],
+                    },
+                );
                 if static_self && index == 0 {
                     return ty;
                 }

@@ -318,6 +318,11 @@ fn local<'a>() -> Holder<'a> {
     Holder { value: &value }
   //^^^^^^^^^^^^^^^^^^^^^^^^ error: cannot return reference to local variable
 }
+fn local_call<'a>() -> Holder<'a> {
+    let value = 1;
+    wrap(&value)
+  //^^^^^^^^^^^^ error: cannot return reference to local variable
+}
 "#,
         );
     }
