@@ -6,6 +6,11 @@ on:
       - .github/scripts/test_land.py
       - .github/scripts/cancel_pr_runs.py
       - .github/scripts/test_cancel_pr_runs.py
+      - .github/scripts/pin_pgo_release.py
+      - .github/scripts/test_pin_pgo_release.py
+      - .github/scripts/publish_pgo_pin.py
+      - .github/scripts/test_publish_pgo_pin.py
+      - .github/workflows/pgo.yaml
       - .github/workflows/cancel-pr-runs.yaml
       - .github/workflows/land-script-tests.yaml
   push:
@@ -13,6 +18,11 @@ on:
     paths:
       - .github/scripts/land.py
       - .github/scripts/test_land.py
+      - .github/scripts/pin_pgo_release.py
+      - .github/scripts/test_pin_pgo_release.py
+      - .github/scripts/publish_pgo_pin.py
+      - .github/scripts/test_publish_pgo_pin.py
+      - .github/workflows/pgo.yaml
       - .github/workflows/land-script-tests.yaml
   workflow_dispatch:
 permissions:
@@ -32,3 +42,7 @@ jobs:
         run: python3 -m unittest discover -s .github/scripts -p test_land.py -v
       - name: Verify safe superseded PR cancellation
         run: python3 -I .github/scripts/test_cancel_pr_runs.py
+      - name: Verify queue-safe PGO pin publication and recovery
+        run: python3 -m unittest discover -s .github/scripts -p test_publish_pgo_pin.py -v
+      - name: Verify fork-owned PGO release pin destinations
+        run: python3 -m unittest discover -s .github/scripts -p test_pin_pgo_release.py -v
