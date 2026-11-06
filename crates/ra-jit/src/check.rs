@@ -110,11 +110,91 @@ include!(concat!(env!("OUT_DIR"), "/level.in"));
                 generated.to_str().unwrap().to_owned(),
             )]),
         );
-        let files = source_files(&mut db, vfs, krate);
+        let files = source_files(&mut db, &mut vfs, &[krate]);
         assert!(files.iter().any(|file| file.path == included), "generated source was not loaded");
         let diagnostics =
             hard_diagnostics(&db, &ide_diagnostics::DiagnosticsConfig::test_sample(), file, krate);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn owned_check_hydrates_generated_source_and_records_it() {
+        use std::collections::BTreeMap;
+        let directory = tempfile::tempdir().unwrap();
+        let sysroot = directory.path().join("toolchain");
+        crate::answers::tests::synthetic_toolchain(&sysroot);
+        for name in ["core", "std"] {
+            let root = sysroot.join("lib/rustlib/src/rust/library").join(name).join("src");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("lib.rs"), "").unwrap();
+        }
+        let out = directory.path().join("generated");
+        std::fs::create_dir(&out).unwrap();
+        let included = out.join("level.in");
+        std::fs::write(&included, "pub fn number() -> u32 { 7 }\n").unwrap();
+        let source = directory.path().join("lib.rs");
+        std::fs::write(
+            &source,
+            r#"#![no_std]
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+#[rustc_builtin_macro]
+macro_rules! concat { () => {} }
+#[rustc_builtin_macro]
+macro_rules! env { () => {} }
+include!(concat!(env!("OUT_DIR"), "/level.in"));
+pub fn value() -> u32 { number() }
+"#,
+        )
+        .unwrap();
+        let plan = crate::cargo::own_script::planned_description(
+            &sysroot,
+            vec![crate::cargo::own_script::Planned {
+                out_dir: None,
+                workspace_member: false,
+                name: "included".into(),
+                root: source,
+                edition: "2021".into(),
+                cfg: vec![],
+                codegen_flags: vec![],
+                env: BTreeMap::from([("OUT_DIR".into(), out.display().to_string())]),
+                deps: vec![],
+                proc_macro: None,
+            }],
+        );
+        let mut plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        plan["compiler_mode"] = serde_json::json!(true);
+        plan["crates"][0]["build"] = serde_json::json!({"target_kind":"lib", "label":"included", "build_file": directory.path().join("Cargo.toml")});
+        let project = directory.path().join("rust-project.json");
+        std::fs::write(&project, serde_json::to_vec(&plan).unwrap()).unwrap();
+        let output = directory.path().join("checked.json");
+        let trace = directory.path().join("inputs.d");
+        let args = || {
+            Args::parse(
+                [
+                    project.display().to_string(),
+                    "--crate".into(),
+                    "included".into(),
+                    "--out".into(),
+                    output.display().to_string(),
+                ]
+                .into_iter(),
+            )
+            .unwrap()
+        };
+        once(args(), &trace).unwrap();
+        assert!(output.is_file());
+        assert!(
+            std::fs::read(&trace)
+                .unwrap()
+                .windows(included.as_os_str().as_encoded_bytes().len())
+                .any(|part| part == included.as_os_str().as_encoded_bytes()),
+            "input trace omitted generated source"
+        );
+        std::fs::remove_file(&output).unwrap();
+        std::fs::write(&included, "pub fn number() -> u32 { \"wrong\" }\n").unwrap();
+        assert!(once(args(), &trace).unwrap_err().to_string().contains("E0308"));
+        assert!(!output.exists(), "failed check published an acceptance artifact");
     }
 
     #[test]
@@ -226,10 +306,10 @@ fn hard_diagnostics(
 
 fn source_files(
     db: &mut RootDatabase,
-    vfs: Vfs,
-    krate: ide_db::base_db::Crate,
+    vfs: &mut Vfs,
+    crates: &[ide_db::base_db::Crate],
 ) -> Vec<WatchedFile> {
-    let mut files = WatchedFile::sources(&vfs, db, SystemTime::now());
+    let mut files = WatchedFile::sources(vfs, db, SystemTime::now());
     let sources: Vec<_> = files
         .iter()
         .filter_map(|it| match it.file {
@@ -237,10 +317,11 @@ fn source_files(
             Watched::Included(_) => None,
         })
         .collect();
-    let mut tree = crate::tree::Tree::new(db, vfs, &sources);
+    let mut tree = crate::tree::Tree::new(db, std::mem::take(vfs), &sources);
     crate::hydrate_includes(db, &mut tree, &mut files, |db| {
-        crate::resolve_all(db, &[krate], crate::cores())
+        crate::resolve_all(db, crates, crate::cores())
     });
+    *vfs = std::mem::take(tree.vfs());
     files
 }
 
@@ -250,7 +331,7 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
     crate::process_wide();
     let config = crate::cargo_config(&args);
     let load = crate::LoadCargoConfig { load_out_dirs_from_check: false, ..crate::load_config() };
-    let (mut db, vfs, _) = crate::load(
+    let (mut db, mut vfs, _) = crate::load(
         &[&args.project],
         &config,
         load,
@@ -272,7 +353,7 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
         eprintln!("error[E0554]: `#![feature]` may not be used on the stable release channel");
         return Ok(false);
     }
-    let files = source_files(&mut db, vfs, id);
+    let files = source_files(&mut db, &mut vfs, &[id]);
     let paths: FxHashMap<_, _> = files
         .iter()
         .filter_map(|it| match it.file {
@@ -356,7 +437,7 @@ pub(crate) const RELOAD: &str = "reload";
 pub(crate) fn once(args: crate::Args, trace: &Path) -> anyhow::Result<()> {
     crate::process_wide();
     let read_from = SystemTime::now();
-    let (mut db, vfs, checkouts) = crate::load(
+    let (mut db, mut vfs, checkouts) = crate::load(
         &[&args.project],
         &crate::cargo_config(&args),
         crate::load_config(),
@@ -367,11 +448,12 @@ pub(crate) fn once(args: crate::Args, trace: &Path) -> anyhow::Result<()> {
     )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, lints_capped, .. } = checkouts.parts(&args.project)?;
-    let members = ide_db::base_db::all_crates(&db)
+    let members: FxHashSet<_> = ide_db::base_db::all_crates(&db)
         .iter()
         .copied()
         .filter(|&krate| !hir::Crate::from(krate).origin(&db).is_lang())
         .collect();
+    let _ = source_files(&mut db, &mut vfs, &members.iter().copied().collect::<Vec<_>>());
     let mut checker =
         Checker::new(&db, &vfs, &checkouts, &members, &[], read_from, root, lints_capped);
     checker.checked = members
@@ -396,7 +478,7 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     let cargo_config = crate::cargo_config(&args);
     let projects = [args.project.as_path()];
     let selection = args.selection.clone();
-    let (mut db, vfs, checkouts) = crate::load(
+    let (mut db, mut vfs, checkouts) = crate::load(
         &projects,
         &cargo_config,
         crate::load_config(),
@@ -407,6 +489,7 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
+    let _ = source_files(&mut db, &mut vfs, &members.iter().copied().collect::<Vec<_>>());
     let excludes = &args.selection.excludes;
     let mut checker =
         Checker::new(&db, &vfs, &checkouts, &members, excludes, read_from, root, lints_capped);
