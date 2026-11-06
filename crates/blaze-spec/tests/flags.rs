@@ -455,3 +455,14 @@ fn libtest_options_are_read_out_of_what_follows_the_dashes() {
     let run = parse(Subcommand::Run, &["--", "--exact"]).unwrap();
     assert!(!run.libtest.exact);
 }
+
+#[test]
+fn ordinary_test_execution_keeps_invalid_libtest_arguments() {
+    let words = ["--", "--test-threads=2", "--test-threads=0"].map(str::to_owned);
+    let request = Request::parse_for_execution(Subcommand::Test, &words).unwrap();
+    assert_eq!(request.trailing, ["--test-threads=2", "--test-threads=0"]);
+    assert_eq!(request.libtest.test_threads, None);
+    assert!(Request::parse(Subcommand::Test, &words).is_err());
+    let words = ["--unknown-cargo-flag"].map(str::to_owned);
+    assert!(Request::parse_for_execution(Subcommand::Test, &words).is_err());
+}

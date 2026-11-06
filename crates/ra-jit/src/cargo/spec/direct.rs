@@ -88,7 +88,7 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
             "owned direct cross-target execution is not implemented for {target}"
         );
     }
-    let request = Request::parse(command, &options.words)?;
+    let request = Request::parse_for_execution(command, &options.words)?;
     let root = cwd.ancestors().last().context("working directory has no filesystem root")?;
     let resolved = blaze_spec::assemble::resolve_live(
         &request,
@@ -238,6 +238,17 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         let reach = tests.as_ref().is_some_and(|tests| tests.reach(program));
         super::compile_at(program, &environment, Some(&prepared.resolved.graph.root), reach)?;
         super::admit_inputs(program)?;
+    }
+    if command == Subcommand::Test && original.get("RA_JIT_STATS").is_some_and(|v| v == "1") {
+        let harnesses = programs
+            .iter()
+            .filter(|p| p.run && p.harness && p.output == Output::Executable)
+            .count();
+        eprintln!(
+            "owned test plan: {} units compiled and admitted, {} runnable harnesses",
+            programs.len(),
+            harnesses
+        );
     }
     let mut published_support = false;
     let mut debug_objects = Vec::new();
