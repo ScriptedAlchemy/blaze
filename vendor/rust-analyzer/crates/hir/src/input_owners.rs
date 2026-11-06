@@ -69,27 +69,34 @@ pub fn discover_identity_inputs(db: &dyn HirDatabase, krate: Crate) -> IdentityI
             }
             _ => FxHashSet::default(),
         };
-        let unknown: Vec<_> = anonymous
-            .0
-            .into_iter()
-            .filter(|expr| !covered_inline.contains(expr))
-            .filter(|&expr| !context_free(expr))
-            .collect();
-        if !unknown.is_empty() {
-            let observed = hir_ide::consteval::owner_anonymous_consts_with_source_names(db, owner);
-            for (_, result) in &observed {
-                source_names.extend_from_slice(&result.source_names);
-            }
-            if unknown.into_iter().any(|expr| {
-                !observed.iter().any(|(root, result)| {
-                    let same = *root == expr
-                        || matches!(store[*root], Expr::Const(inner) if inner == expr);
-                    same && result.value.is_ok()
-                })
-            }) {
-                unresolved = true;
-                break;
-            }
+        let roots: Vec<_> =
+            anonymous.0.into_iter().filter(|expr| !covered_inline.contains(expr)).collect();
+        let unknown: Vec<_> = roots.iter().copied().filter(|&expr| !context_free(expr)).collect();
+        // A scalar proof shows an expression's shape, not what a selected implementation read:
+        // a required associated constant behind a const fn is a proof leaf whose instance may
+        // fold a filename. So a constant that cannot use the owner's generics always evaluates
+        // and keeps every read, even from a failed evaluation, while the proof still decides
+        // whether that failure leaves the identity unresolved. A constant that can use them
+        // has no instance here and evaluates only when the owner has an unproved root.
+        let observed = if !unknown.is_empty() {
+            hir_ide::consteval::owner_anonymous_consts_with_source_names(db, owner)
+        } else if !roots.is_empty() {
+            hir_ide::consteval::owner_non_generic_anonymous_consts_with_source_names(db, owner)
+        } else {
+            Vec::new()
+        };
+        for (_, result) in &observed {
+            source_names.extend_from_slice(&result.source_names);
+        }
+        if unknown.into_iter().any(|expr| {
+            !observed.iter().any(|(root, result)| {
+                let same =
+                    *root == expr || matches!(store[*root], Expr::Const(inner) if inner == expr);
+                same && result.value.is_ok()
+            })
+        }) {
+            unresolved = true;
+            break;
         }
         match owner {
             ExpressionStoreOwnerId::Body(DefWithBodyId::ConstId(id)) => {

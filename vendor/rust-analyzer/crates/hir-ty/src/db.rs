@@ -772,9 +772,15 @@ pub fn signature_anon_consts_and_diagnostics<'db>(
 impl<'db> AnonConstId<'db> {
     /// A `const { .. }` block of a body, which MIR lowering makes a constant of its own. The
     /// body inferred it.
+    ///
+    /// Only MIR lowering makes one, and it may use the body's generics. A `const { .. }` block
+    /// that inference itself turned into an anonymous constant, such as the count of
+    /// `[x; const { .. }]`, cannot, and is a constant with an inference of its own: treating it
+    /// as inline would have the body's inference ask for itself while merging that constant's.
     pub fn is_inline_const(self, db: &'db dyn HirDatabase) -> bool {
         let loc = self.loc(db);
-        matches!(loc.owner, ExpressionStoreOwnerId::Body(_))
+        loc.allow_using_generic_params
+            && matches!(loc.owner, ExpressionStoreOwnerId::Body(_))
             && matches!(
                 hir_def::expr_store::ExpressionStore::of(db, loc.owner)[loc.expr],
                 hir_def::hir::Expr::Const(_)

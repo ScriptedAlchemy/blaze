@@ -569,8 +569,28 @@ pub fn owner_anonymous_consts_with_source_names<'db>(
     db: &'db dyn HirDatabase,
     owner: ExpressionStoreOwnerId,
 ) -> Vec<(ExprId, WithSourceNames<Result<Allocation<'db>, ConstEvalError<'db>>>)> {
+    evaluate_owner_anonymous_consts(db, owner, owner_anonymous_const_ids(db, owner))
+}
+
+/// The owner's anonymous constants whose [`AnonConstLoc::allow_using_generic_params`] is false.
+/// They evaluate with empty arguments, so no instance of the owner can change what they select
+/// and their reads belong to the owner now.
+pub fn owner_non_generic_anonymous_consts_with_source_names<'db>(
+    db: &'db dyn HirDatabase,
+    owner: ExpressionStoreOwnerId,
+) -> Vec<(ExprId, WithSourceNames<Result<Allocation<'db>, ConstEvalError<'db>>>)> {
+    let mut constants = owner_anonymous_const_ids(db, owner);
+    constants.retain(|constant| !constant.loc(db).allow_using_generic_params);
+    evaluate_owner_anonymous_consts(db, owner, constants)
+}
+
+fn evaluate_owner_anonymous_consts<'db>(
+    db: &'db dyn HirDatabase,
+    owner: ExpressionStoreOwnerId,
+    constants: Vec<AnonConstId<'db>>,
+) -> Vec<(ExprId, WithSourceNames<Result<Allocation<'db>, ConstEvalError<'db>>>)> {
     let interner = DbInterner::new_no_crate(db);
-    owner_anonymous_const_ids(db, owner)
+    constants
         .into_iter()
         .map(|constant| {
             let loc = constant.loc(db);

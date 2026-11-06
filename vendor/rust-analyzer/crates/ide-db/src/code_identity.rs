@@ -690,6 +690,558 @@ impl dep::Vector for Value {{ const BYTES: usize = {value}; }}
         }
     }
 
+    /// Whether an anonymous constant is evaluated up front follows the flag its typed lowering
+    /// recorded, not its syntax. Every shape here selects a read only through a const fn, which
+    /// the scalar proof accepts, so a read reaches the owner only by evaluating the constant.
+    mod anonymous_const_policy {
+        use hir::input_owners::{IdentityInputs, discover_identity_inputs};
+        use test_fixture::WithFixture;
+
+        use super::super::{Hash, semantic_source_hash, source_hash};
+        use crate::base_db::Crate;
+
+        const FILENAME_LENGTH: &str = r#"
+#[rustc_builtin_macro] macro_rules! file { () => {} }
+const fn length(value: &str) -> usize {
+    unsafe { core::mem::transmute::<&str, (*const u8, usize)>(value).1 }
+}
+"#;
+        const PURE: &str = "impl dep::Size for Value { const WIDTH: usize = 16; }";
+        const READING: &str = "impl dep::Size for Value { const WIDTH: usize = length(file!()); }";
+        const GENERIC_READING: &str = "impl<T> dep::Size for Holder<T> { const WIDTH: usize = length(file!()) + core::mem::size_of::<T>(); }";
+        const FAILING: &str = "static NAME: &str = file!(); impl dep::Size for Value { const WIDTH: usize = { let _name = NAME; 1 / 0 }; }";
+        const VALUE: &str = "dep::wrapper::<values::Value>()";
+        const HOLDER: &str = "dep::wrapper::<values::Holder<u8>>()";
+        /// The first pair changes only the read: every evaluated value stays equal.
+        const SAME_LENGTH: [&str; 2] = ["values/aaaa.rs", "values/bbbb.rs"];
+        const OTHER_LENGTH: [&str; 2] = ["values/short.rs", "values/a-much-longer-name.rs"];
+
+        struct Fixture {
+            db: crate::RootDatabase,
+            app: Crate,
+            dep: Crate,
+            values: Crate,
+            app_file: base_db::FileId,
+            values_file: base_db::FileId,
+            other_file: Option<base_db::FileId>,
+        }
+
+        struct Observed {
+            app_inputs: IdentityInputs,
+            values_inputs: IdentityInputs,
+            app_semantic: Hash,
+            dep_semantic: Hash,
+            values_semantic: Hash,
+            app_source: Hash,
+        }
+
+        /// `implementation` is last, so it can add `//- /values/other.rs`.
+        fn fixture(consumer: &str, implementation: &str) -> Fixture {
+            let source = format!(
+                r#"
+//- minicore: sized, transmute, size_of
+//- /app/main.rs crate:app deps:dep,values
+{consumer}
+//- /dep/lib.rs crate:dep
+pub trait Size {{ const WIDTH: usize; }}
+pub const fn wrapper<T: Size>() -> usize {{ T::WIDTH }}
+//- /values/lib.rs crate:values deps:dep
+{FILENAME_LENGTH}
+pub struct Value;
+pub struct Holder<T>(T);
+{implementation}
+"#
+            );
+            let (db, files) = crate::RootDatabase::with_many_files(&source);
+            let named = |name: &str| {
+                *base_db::all_crates(&db)
+                    .iter()
+                    .find(|krate| {
+                        krate
+                            .extra_data(&db)
+                            .display_name
+                            .as_ref()
+                            .is_some_and(|display| display.to_string() == name)
+                    })
+                    .unwrap()
+            };
+            let [app, dep, values] = ["app", "dep", "values"].map(named);
+            let (app_file, values_file) = (files[0].file_id(&db), files[2].file_id(&db));
+            let other_file = files.get(3).map(|file| file.file_id(&db));
+            Fixture { db, app, dep, values, app_file, values_file, other_file }
+        }
+
+        fn name_only(fixture: &mut Fixture, file: base_db::FileId, name: &'static str) {
+            hir::mir::location::name_sources(&mut fixture.db, move |_, source| {
+                Some(if source == file { name.to_owned() } else { "unchanged.rs".to_owned() })
+            });
+        }
+
+        fn observe(fixture: &Fixture) -> Observed {
+            let db = &fixture.db;
+            Observed {
+                app_inputs: discover_identity_inputs(db, fixture.app).clone(),
+                values_inputs: discover_identity_inputs(db, fixture.values).clone(),
+                app_semantic: semantic_source_hash(db, fixture.app),
+                dep_semantic: semantic_source_hash(db, fixture.dep),
+                values_semantic: semantic_source_hash(db, fixture.values),
+                app_source: source_hash(db, fixture.app),
+            }
+        }
+
+        /// Observes `consumer` with the only changing name on the implementing file.
+        fn renamed(
+            consumer: &str,
+            implementation: &str,
+            names: [&'static str; 2],
+        ) -> (base_db::FileId, [Observed; 2]) {
+            let mut fixture = fixture(consumer, implementation);
+            let file = fixture.values_file;
+            let observed = names.map(|name| {
+                name_only(&mut fixture, file, name);
+                observe(&fixture)
+            });
+            (file, observed)
+        }
+
+        fn observes(inputs: &IdentityInputs, file: base_db::FileId, name: Option<&str>) -> bool {
+            inputs.source_names.iter().any(|read| read.file == file && read.name.as_deref() == name)
+        }
+
+        fn reads_file(inputs: &IdentityInputs, file: base_db::FileId) -> bool {
+            inputs.source_names.iter().any(|read| read.file == file)
+        }
+
+        fn selected_read(
+            consumer: &str,
+            selection: &str,
+            implementation: &str,
+            names: [&'static str; 2],
+            implementation_refused: bool,
+        ) {
+            let consumer = consumer.replace("WRAPPED", selection);
+            let (file, observed) = renamed(&consumer, implementation, names);
+            for (observed, name) in observed.iter().zip(names) {
+                assert!(!observed.app_inputs.unresolved, "the instance is concrete");
+                assert!(observes(&observed.app_inputs, file, Some(name)));
+                assert_eq!(
+                    observed.values_inputs.unresolved, implementation_refused,
+                    "the implementation's own guard is unchanged"
+                );
+            }
+            assert_ne!(
+                observed[0].app_semantic, observed[1].app_semantic,
+                "the owner of the anonymous constant holds the read"
+            );
+            assert_eq!(
+                observed[0].dep_semantic, observed[1].dep_semantic,
+                "the generic wrapper has no read of its own"
+            );
+            assert_ne!(observed[0].app_source, observed[1].app_source);
+        }
+
+        fn failed_evaluation_keeps_read(consumer: &str) {
+            let consumer = consumer.replace("WRAPPED", VALUE);
+            let (file, observed) = renamed(&consumer, FAILING, SAME_LENGTH);
+            for (observed, name) in observed.iter().zip(SAME_LENGTH) {
+                assert!(observes(&observed.app_inputs, file, Some(name)));
+                assert!(!observed.app_inputs.unresolved, "the proof covers the failure");
+                assert!(observed.values_inputs.unresolved, "no proof for the failing body");
+            }
+            assert_ne!(observed[0].app_semantic, observed[1].app_semantic);
+        }
+
+        fn named_control(consumer: &str) -> Observed {
+            let mut named = fixture(consumer, READING);
+            let file = named.values_file;
+            name_only(&mut named, file, "values/lib.rs");
+            observe(&named)
+        }
+
+        fn assert_missing_read(observed: &Observed, consumer: &str, file: base_db::FileId) {
+            assert!(observes(&observed.app_inputs, file, None));
+            assert!(!observes(&observed.app_inputs, file, Some("values/lib.rs")));
+            assert!(!observed.app_inputs.unresolved, "the proof covers the failure");
+            assert!(observed.values_inputs.unresolved);
+            assert_ne!(observed.app_semantic, named_control(consumer).app_semantic);
+        }
+
+        fn uninstalled_provider_keeps_missing_read(consumer: &str) {
+            let consumer = consumer.replace("WRAPPED", VALUE);
+            let fixture = fixture(&consumer, READING);
+            assert_missing_read(&observe(&fixture), &consumer, fixture.values_file);
+        }
+
+        fn nameless_provider_keeps_missing_read(consumer: &str) {
+            let consumer = consumer.replace("WRAPPED", VALUE);
+            let uninstalled = observe(&fixture(&consumer, READING));
+            let mut nameless = fixture(&consumer, READING);
+            hir::mir::location::name_sources(&mut nameless.db, |_, _| None);
+            let observed = observe(&nameless);
+            assert_missing_read(&observed, &consumer, nameless.values_file);
+            assert_eq!(observed.app_semantic, uninstalled.app_semantic);
+        }
+
+        fn stays_portable(consumer: &str, implementation: &str) {
+            let (_, observed) = renamed(consumer, implementation, OTHER_LENGTH);
+            for observed in &observed {
+                assert!(!observed.app_inputs.unresolved);
+                assert!(observed.app_inputs.source_names.is_empty());
+                assert!(!observed.values_inputs.unresolved);
+                assert!(observed.values_inputs.source_names.is_empty());
+            }
+            assert_eq!(observed[0].app_semantic, observed[1].app_semantic);
+            assert_eq!(observed[0].dep_semantic, observed[1].dep_semantic);
+            assert_eq!(observed[0].values_semantic, observed[1].values_semantic);
+            assert_eq!(observed[0].app_source, observed[1].app_source);
+        }
+
+        /// A proved constant that can use its owner's generics waits for its instance: the owner
+        /// records no read, while the dependency closure still carries the implementation's.
+        fn deferred_to_instance(consumer: &str) {
+            let (_, observed) = renamed(consumer, READING, SAME_LENGTH);
+            for observed in &observed {
+                assert!(!observed.app_inputs.unresolved);
+                assert!(observed.app_inputs.source_names.is_empty(), "the constant did not run");
+            }
+            assert_eq!(observed[0].app_semantic, observed[1].app_semantic);
+            assert_ne!(observed[0].app_source, observed[1].app_source);
+        }
+
+        /// A constant without a proof evaluates whatever its flag says.
+        fn unproved_constant_reads_its_own_file(consumer: &str) {
+            let consumer = format!("{FILENAME_LENGTH} {consumer}");
+            let mut fixture = fixture(&consumer, "");
+            let file = fixture.app_file;
+            let observed = ["app/aaaa.rs", "app/bbbb.rs"].map(|name| {
+                name_only(&mut fixture, file, name);
+                let observed = observe(&fixture);
+                assert!(!observed.app_inputs.unresolved);
+                assert!(observes(&observed.app_inputs, file, Some(name)));
+                observed
+            });
+            assert_ne!(observed[0].app_semantic, observed[1].app_semantic);
+        }
+
+        fn refused_without_an_instance(consumer: &str) {
+            let consumer = format!("{FILENAME_LENGTH} {consumer}");
+            let fixture = fixture(&consumer, READING);
+            assert!(observe(&fixture).app_inputs.unresolved);
+        }
+
+        /// Each `allow_using_generic_params: false` site gets its own module, so a red names the
+        /// shape and the scenario.
+        macro_rules! fenced_shapes {
+            ($($shape:ident: $consumer:literal,)*) => {$(
+                mod $shape {
+                    use super::*;
+                    const CONSUMER: &str = $consumer;
+
+                    #[test]
+                    fn same_length_rename_reaches_the_owner() {
+                        selected_read(CONSUMER, VALUE, READING, SAME_LENGTH, false);
+                    }
+
+                    #[test]
+                    fn other_length_rename_reaches_the_owner() {
+                        selected_read(CONSUMER, VALUE, READING, OTHER_LENGTH, false);
+                    }
+
+                    #[test]
+                    fn generic_implementation_selected_concretely_reaches_the_owner() {
+                        selected_read(CONSUMER, HOLDER, GENERIC_READING, OTHER_LENGTH, true);
+                    }
+
+                    #[test]
+                    fn failed_evaluation_keeps_its_read() {
+                        failed_evaluation_keeps_read(CONSUMER);
+                    }
+
+                    #[test]
+                    fn uninstalled_provider_keeps_a_missing_read() {
+                        uninstalled_provider_keeps_missing_read(CONSUMER);
+                    }
+
+                    #[test]
+                    fn nameless_provider_keeps_a_missing_read() {
+                        nameless_provider_keeps_missing_read(CONSUMER);
+                    }
+
+                    #[test]
+                    fn pure_implementation_stays_portable() {
+                        stays_portable(&CONSUMER.replace("WRAPPED", VALUE), PURE);
+                    }
+                }
+            )*};
+        }
+
+        fenced_shapes! {
+            type_alias_length: "pub type Alias = [u8; WRAPPED];",
+            pointee_field_length: "pub struct Pointee(pub *const [u8; WRAPPED]);",
+            fn_signature_length: "pub fn pointee(_: &[u8; WRAPPED]) {}",
+            generic_owner_signature_length: "pub fn pointee<T>(_: &[u8; WRAPPED], _: T) {}",
+            local_annotation_length: "pub fn local() { let _value: [u8; WRAPPED]; }",
+            repeat_count: "pub fn repeated() -> usize { let _ = [0u8; WRAPPED]; 1 }",
+            generic_owner_repeat_count: "pub fn repeated<T>() -> usize { let _ = [0u8; WRAPPED]; 1 }",
+            const_block_repeat_count: "pub fn repeated() -> usize { let _ = [0u8; const { WRAPPED }]; 1 }",
+            const_argument_in_type: "pub struct Count<const N: usize>; pub type Alias = Count<{ WRAPPED }>;",
+            const_argument_in_path: "pub const fn count<const N: usize>() -> usize { N } pub fn run() -> usize { count::<{ WRAPPED }>() }",
+            const_argument_in_method: "pub struct Counter; impl Counter { pub const fn count<const N: usize>(&self) -> usize { N } } pub fn run() -> usize { Counter.count::<{ WRAPPED }>() }",
+            const_parameter_default: "pub struct Defaulted<const N: usize = { WRAPPED }>;",
+        }
+
+        mod generic_capable {
+            use super::*;
+
+            #[test]
+            fn const_block_over_owner_generics_is_deferred() {
+                deferred_to_instance(
+                    "pub fn run<T: dep::Size>() -> usize { const { dep::wrapper::<T>() } }",
+                );
+            }
+
+            /// Not a statement that this is the final answer: the owner records no read for a
+            /// concrete block today. Repairing that means changing this expectation deliberately.
+            #[test]
+            fn concrete_const_block_follows_the_flag() {
+                deferred_to_instance(
+                    "pub fn run() -> usize { const { dep::wrapper::<values::Value>() } }",
+                );
+            }
+
+            #[test]
+            fn field_default_over_owner_generics_is_deferred() {
+                deferred_to_instance(
+                    "pub struct Field<T: dep::Size> { pub value: usize = dep::wrapper::<T>(), pub other: T }",
+                );
+            }
+
+            /// The shape syntax gets wrong: neither a literal nor a `const` block, flag true.
+            #[test]
+            fn concrete_field_default_follows_the_flag() {
+                deferred_to_instance(
+                    "pub struct Field { pub value: usize = dep::wrapper::<values::Value>() }",
+                );
+            }
+
+            #[test]
+            fn unproved_const_block_still_evaluates() {
+                unproved_constant_reads_its_own_file(
+                    "pub fn run() -> usize { const { length(file!()) } }",
+                );
+            }
+
+            #[test]
+            fn unproved_field_default_still_evaluates() {
+                unproved_constant_reads_its_own_file(
+                    "pub struct Field { pub value: usize = length(file!()) }",
+                );
+            }
+
+            /// A range side is only a literal or a path, so no proved pattern-type constant
+            /// exists. This path needs an anonymous constant, and it has no proof.
+            #[test]
+            fn unproved_pattern_type_bound_still_evaluates() {
+                let consumer = "pub type Bound = builtin#pattern_type(usize is 0..=<values::Value as dep::Size>::WIDTH);";
+                let (file, observed) = renamed(consumer, READING, SAME_LENGTH);
+                for (observed, name) in observed.iter().zip(SAME_LENGTH) {
+                    assert!(!observed.app_inputs.unresolved);
+                    assert!(observes(&observed.app_inputs, file, Some(name)));
+                }
+                assert_ne!(observed[0].app_semantic, observed[1].app_semantic);
+            }
+
+            #[test]
+            fn const_block_over_generics_without_a_proof_keeps_its_refusal() {
+                refused_without_an_instance(
+                    "pub fn refused<T>() -> usize { const { length(file!()) + core::mem::size_of::<T>() } }",
+                );
+            }
+
+            #[test]
+            fn field_default_over_generics_without_a_proof_keeps_its_refusal() {
+                refused_without_an_instance(
+                    "pub struct Refused<T> { pub value: usize = length(file!()) + core::mem::size_of::<T>(), pub other: T }",
+                );
+            }
+        }
+
+        mod mixed_owner {
+            use super::*;
+
+            const WITH_SIBLING: &str = r#"
+pub mod other;
+impl dep::Size for Value { const WIDTH: usize = length(file!()); }
+//- /values/other.rs
+pub struct Sibling;
+impl dep::Size for Sibling { const WIDTH: usize = super::length(file!()); }
+"#;
+
+            /// Evaluation is per constant: the fence must not run a generic-capable sibling.
+            #[test]
+            fn fenced_constant_does_not_evaluate_its_const_block_sibling() {
+                let consumer = "pub fn mixed() -> usize { let _ = [0u8; dep::wrapper::<values::Value>()]; const { dep::wrapper::<values::other::Sibling>() } }";
+                let mut fixture = fixture(consumer, WITH_SIBLING);
+                let file = fixture.values_file;
+                name_only(&mut fixture, file, "values/lib.rs");
+                let observed = observe(&fixture);
+                assert!(!observed.app_inputs.unresolved);
+                assert!(observes(&observed.app_inputs, file, Some("values/lib.rs")));
+                assert!(!reads_file(&observed.app_inputs, fixture.other_file.unwrap()));
+            }
+
+            /// An unproved root keeps the pre-existing path, which evaluates the whole owner.
+            #[test]
+            fn unproved_root_still_evaluates_the_whole_owner() {
+                let consumer = format!(
+                    "{FILENAME_LENGTH} pub fn mixed() -> usize {{ let _ = [0u8; length(file!())]; const {{ dep::wrapper::<values::other::Sibling>() }} }}"
+                );
+                let mut fixture = fixture(&consumer, WITH_SIBLING);
+                let file = fixture.other_file.unwrap();
+                name_only(&mut fixture, file, "values/other.rs");
+                let observed = observe(&fixture);
+                assert!(!observed.app_inputs.unresolved);
+                assert!(observes(&observed.app_inputs, fixture.app_file, Some("unchanged.rs")));
+                assert!(observes(&observed.app_inputs, file, Some("values/other.rs")));
+            }
+        }
+
+        mod partial_failure {
+            use super::*;
+
+            const FAILING_AND_READING: &str = r#"
+pub struct Fails;
+impl dep::Size for Fails { const WIDTH: usize = 1 / 0; }
+impl dep::Size for Value { const WIDTH: usize = length(file!()); }
+"#;
+
+            fn other_constant_keeps_its_read(consumer: &str) {
+                let (file, observed) = renamed(consumer, FAILING_AND_READING, SAME_LENGTH);
+                for (observed, name) in observed.iter().zip(SAME_LENGTH) {
+                    assert!(!observed.app_inputs.unresolved, "the proof covers the failure");
+                    assert!(observes(&observed.app_inputs, file, Some(name)));
+                }
+                assert_ne!(observed[0].app_semantic, observed[1].app_semantic);
+            }
+
+            #[test]
+            fn failure_before_a_reading_constant_in_one_owner() {
+                other_constant_keeps_its_read(
+                    "pub fn both(_: [u8; dep::wrapper::<values::Fails>()], _: [u8; dep::wrapper::<values::Value>()]) {}",
+                );
+            }
+
+            #[test]
+            fn failure_after_a_reading_constant_in_one_owner() {
+                other_constant_keeps_its_read(
+                    "pub fn both(_: [u8; dep::wrapper::<values::Value>()], _: [u8; dep::wrapper::<values::Fails>()]) {}",
+                );
+            }
+
+            /// A read past the failure is never reached, so the owner cannot record it. The
+            /// failing implementation's refusal and the dependency closure are what carry it.
+            #[test]
+            fn read_past_the_failure_is_carried_by_the_dependency_closure() {
+                let implementation = r#"
+pub mod other;
+static NAME: &str = file!();
+impl dep::Size for Value { const WIDTH: usize = { let _name = NAME; let _stop = 1 / 0; let _later = other::LATER; 1 }; }
+//- /values/other.rs
+pub static LATER: &str = file!();
+"#;
+                let mut fixture = fixture(
+                    "pub type Alias = [u8; dep::wrapper::<values::Value>()];",
+                    implementation,
+                );
+                let (file, other) = (fixture.values_file, fixture.other_file.unwrap());
+                name_only(&mut fixture, file, "values/lib.rs");
+                let observed = observe(&fixture);
+                assert!(!observed.app_inputs.unresolved);
+                assert!(observes(&observed.app_inputs, file, Some("values/lib.rs")));
+                assert!(!reads_file(&observed.app_inputs, other));
+                let observed = ["values/aaaa.rs", "values/bbbb.rs"].map(|name| {
+                    name_only(&mut fixture, other, name);
+                    let observed = observe(&fixture);
+                    assert!(observed.values_inputs.unresolved);
+                    assert!(observes(&observed.values_inputs, other, Some(name)));
+                    observed
+                });
+                assert_ne!(observed[0].app_source, observed[1].app_source);
+            }
+
+            #[test]
+            fn unproved_failure_stays_unresolved() {
+                let consumer = format!(
+                    "{FILENAME_LENGTH} pub type Alias = [u8; {{ let _stop = 1 / 0; length(file!()) }}];"
+                );
+                let fixture = fixture(&consumer, PURE);
+                assert!(observe(&fixture).app_inputs.unresolved);
+            }
+
+            /// `u8` implements nothing, so evaluation selects no value. The proof still answers,
+            /// as the named arm does for a failed evaluation.
+            #[test]
+            fn failed_selection_without_reads_falls_back_to_the_proof() {
+                let fixture = fixture("pub type Alias = [u8; dep::wrapper::<u8>()];", PURE);
+                let observed = observe(&fixture);
+                assert!(!observed.app_inputs.unresolved);
+                assert!(observed.app_inputs.source_names.is_empty());
+            }
+
+            /// A fenced constant cannot name the owner's parameter. Now that a proved one runs,
+            /// it has to fail cleanly on the empty arguments it evaluates with.
+            #[test]
+            fn fenced_constant_naming_a_forbidden_generic_fails_cleanly() {
+                let fixture =
+                    fixture("pub fn run<T: dep::Size>(_: [u8; dep::wrapper::<T>()]) {}", READING);
+                let observed = observe(&fixture);
+                assert!(!observed.app_inputs.unresolved);
+                assert!(observed.app_inputs.source_names.is_empty());
+            }
+        }
+
+        mod same_crate {
+            use super::*;
+
+            #[test]
+            fn implementation_in_the_owner_crate_stays_observed() {
+                unproved_constant_reads_its_own_file(
+                    "pub struct Local; impl dep::Size for Local { const WIDTH: usize = length(file!()); } pub type Alias = [u8; dep::wrapper::<Local>()];",
+                );
+            }
+        }
+
+        macro_rules! pure_controls {
+            ($($control:ident: $consumer:literal,)*) => {$(
+                #[test]
+                fn $control() {
+                    stays_portable($consumer, PURE);
+                }
+            )*};
+        }
+
+        mod pure_controls {
+            use super::*;
+
+            pure_controls! {
+                literal_length: "pub type Alias = [u8; 4];",
+                block_wrapped_literal_length: "pub type Alias = [u8; { 4 }];",
+                literal_repeat: "pub fn repeated() -> usize { let _ = [0u8; 4]; 1 }",
+                computed_length: "pub type Alias = [u8; (2u64 * 2) as usize];",
+                named_constant_length: "const WIDTH: usize = 4; pub type Alias = [u8; WIDTH];",
+                pure_const_fn_length: "pub const fn width() -> usize { 4 } pub type Alias = [u8; width()];",
+                pure_generic_const_fn_length: "pub const fn width<T>() -> usize { 4 } pub struct Pointee(pub *const [u8; width::<u8>()]);",
+                const_parameter_repeat: "pub fn repeated<const N: usize>() -> usize { let _ = [0u8; N]; N }",
+                ill_typed_literal_length: "pub type Alias = [u8; \"four\"];",
+                pure_const_block: "pub fn run() -> usize { const { 4 } }",
+                pure_field_default: "pub struct Field { pub value: usize = 4 }",
+                literal_pattern_type_range: "pub type Bound = builtin#pattern_type(usize is 0..=9);",
+                named_pattern_type_range: "const END: usize = 9; pub type Bound = builtin#pattern_type(usize is 0..=END);",
+                literal_match_range: "pub fn run(value: usize) -> usize { match value { 0..=4 => 1, _ => 0 } }",
+            }
+        }
+    }
+
     #[test]
     fn declarative_macros_cannot_hide_filename_dependent_type_roots() {
         let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";

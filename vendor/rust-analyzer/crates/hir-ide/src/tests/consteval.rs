@@ -2738,6 +2738,22 @@ const GOAL: usize = sized::<u8>(2) + sized::<u32>(10);
     );
 }
 
+/// The count of `[x; const { .. }]` is a constant with an inference of its own, not an inline
+/// const of the body: the body must infer, and evaluate, without waiting for itself.
+#[test]
+fn const_block_as_an_array_repeat_count() {
+    check_number(
+        r#"
+const fn counted() -> u8 {
+    let [first, _, last] = [7u8; const { 2 + 1 }];
+    first + last
+}
+const GOAL: u8 = counted();
+"#,
+        14,
+    );
+}
+
 #[test]
 fn impl_of_a_macro_in_the_body_of_a_dependency() {
     check_number(
