@@ -417,7 +417,7 @@ def owned_audit(args):
                 expected = 101 if (scenario, step) in (("edits", "an error"),
                                                       ("check unloaded", "an error")) else 0
                 ran = invoke(scenario, step, words, expected)
-                if expected == 101 and not re.search(r"^error\[E0308\]:", ran.stderr, re.M):
+                if expected == 101 and not re.search(r"(?:^|: )error\[E0308\]:", ran.stderr, re.M):
                     result["failures"].append(f"{scenario}: {step}: missing intentional type-error diagnostic")
                 if wait and ran.returncode == 0:
                     status = invoke(scenario, step + " status", ["status"])

@@ -39,7 +39,8 @@ class OwnedAuditTests(unittest.TestCase):
                                        timeout=1)
 
     def audit(self, *, fail_build=False, tool_attempt=False, drift=False,
-              accept_error=False, unready=False, timed_out=False, wrong_diagnostic=False):
+              accept_error=False, unready=False, timed_out=False, wrong_diagnostic=False,
+              wrapped_diagnostic=False):
         commands = []
 
         def product(argv, trace, *, cwd, env, timeout):
@@ -63,6 +64,8 @@ class OwnedAuditTests(unittest.TestCase):
                 self.server.write_text("changed")
             diagnostic = ("error[E0412]: unrelated failure\n" if wrong_diagnostic
                           else "error[E0308]: expected u32, found str\n") if code == 101 else ""
+            if diagnostic and wrapped_diagnostic:
+                diagnostic = "error: could not build `tally`: " + diagnostic
             return subprocess.CompletedProcess(argv, code, "owned: loading\n" if unready
                                                else "owned: ready\n", diagnostic)
 
@@ -100,6 +103,11 @@ class OwnedAuditTests(unittest.TestCase):
         code, result, _ = self.audit(wrong_diagnostic=True)
         self.assertEqual(code, 1)
         self.assertEqual(sum("missing intentional type-error" in error for error in result["failures"]), 2)
+
+    def test_wrapped_owned_compiler_diagnostics_satisfy_the_negative_control(self):
+        code, result, _ = self.audit(wrapped_diagnostic=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(result["failures"], [])
 
     def test_readiness_is_required_after_successful_cold_build(self):
         code, result, _ = self.audit(unready=True)
