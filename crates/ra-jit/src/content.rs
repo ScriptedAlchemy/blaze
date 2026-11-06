@@ -37,7 +37,7 @@ pub(crate) struct Contents {
     crates: Mutex<FxHashMap<Crate, Option<ContentId>>>,
     source_hashes: Mutex<FxHashMap<Crate, Hash>>,
     environments: Mutex<FxHashMap<Crate, Hash>>,
-    macro_consumers: Mutex<FxHashMap<Crate, bool>>,
+    macros_reached: Mutex<FxHashMap<Crate, bool>>,
     /// Where the build scripts of the crates hashed so far wrote to.
     places: Mutex<FxHashSet<String>>,
     /// Where cargo keeps the sources it fetched, once the crates were asked.
@@ -57,25 +57,37 @@ impl Contents {
         hash
     }
 
-    /// A reexport may put a macro in scope without a direct proc-macro dependency.
-    /// Their environment accesses are not observed, so their consumers retain the
-    /// complete crate environment in their identity.
-    fn uses_macros(&self, db: &RootDatabase, krate: Crate) -> bool {
+    /// Whether `krate` is a proc-macro crate or has one among its transitive dependencies.
+    fn reaches_macros(&self, db: &RootDatabase, krate: Crate) -> bool {
         if let Some(&known) =
-            self.macro_consumers.lock().unwrap_or_else(|e| e.into_inner()).get(&krate)
+            self.macros_reached.lock().unwrap_or_else(|e| e.into_inner()).get(&krate)
         {
             return known;
         }
         let data = krate.data(db);
-        let uses = data.target_kind.is_proc_macro()
-            || data.dependencies.iter().any(|dep| self.uses_macros(db, dep.crate_id));
-        self.macro_consumers.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, uses);
-        uses
+        let reaches = data.target_kind.is_proc_macro()
+            || data.dependencies.iter().any(|dep| self.reaches_macros(db, dep.crate_id));
+        self.macros_reached.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, reaches);
+        reaches
+    }
+
+    /// Whether macros of a proc-macro crate can be expanded in `krate`: one of its
+    /// dependencies is such a crate or reaches one, since a reexport may put a macro in
+    /// scope without a direct proc-macro dependency. A macro runs with the environment of
+    /// the crate it expands in and its reads are not observed, so the consumer retains
+    /// the complete crate environment in its identity.
+    ///
+    /// A proc-macro crate is not by that a consumer. Its own source is ordinary Rust: the
+    /// variables its `env!` calls read are observed, and the code its consumers load is
+    /// told apart by `macro_producer_identity`. Only one that also depends on a
+    /// proc-macro crate expands macros.
+    fn consumes_macros(&self, db: &RootDatabase, krate: Crate) -> bool {
+        krate.data(db).dependencies.iter().any(|dep| self.reaches_macros(db, dep.crate_id))
     }
 
     fn keyed_environment(&self, db: &RootDatabase, krate: Crate) -> ide_db::base_db::Env {
         let mut env = krate.env(db).clone();
-        if !self.uses_macros(db, krate) {
+        if !self.consumes_macros(db, krate) {
             // These exact cache-service controls do not affect Rust semantics unless
             // source reads them. Such reads are hashed separately, before an entry is
             // admitted. This copy only forms an identity: expansion and producers keep
@@ -170,7 +182,7 @@ impl Contents {
             }
         }
         field(&ide_db::code_identity::semantic_source_hash(db, krate));
-        let macros = self.uses_macros(db, krate);
+        let macros = self.consumes_macros(db, krate);
         field(&[u8::from(macros)]);
         if macros {
             field(format!("{:?}", krate.env(db)).as_bytes());
@@ -1231,6 +1243,278 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// What the proc-macro crate of `producer_fixture` depends on.
+    #[derive(Clone, Copy, Debug)]
+    enum Below {
+        Nothing,
+        /// An ordinary library.
+        Library,
+        /// A proc-macro crate, whose macros the producer can expand.
+        ProcMacro,
+        /// An ordinary library that depends on a proc-macro crate, as a reexport does.
+        Reexport,
+    }
+
+    /// A proc-macro crate `producer` at `root`, a directory that exists, and what it depends
+    /// on below it. The kinds and edges are the crate graph's own (`crate:proc-macro:` and
+    /// `deps:`), and are checked here so that no test depends on an assumed shape.
+    fn producer_fixture(
+        root: &str,
+        below: Below,
+        body: &str,
+        values: &[(&str, &str)],
+    ) -> (RootDatabase, Crate) {
+        use test_fixture::WithFixture;
+        let (deps, others, names) = match below {
+            Below::Nothing => ("", String::new(), vec!["producer"]),
+            Below::Library => (
+                " deps:below",
+                format!(
+                    "//- {root}/below/lib.rs crate:below new_source_root:local\npub fn below() {{}}\n"
+                ),
+                vec!["producer", "below"],
+            ),
+            Below::ProcMacro => (
+                " deps:below",
+                format!(
+                    "//- {root}/below/lib.rs crate:proc-macro:below new_source_root:local\npub fn below() {{}}\n"
+                ),
+                vec!["producer", "below"],
+            ),
+            Below::Reexport => (
+                " deps:below",
+                format!(
+                    "//- {root}/below/lib.rs crate:below deps:leaf new_source_root:local\npub fn below() {{}}\n\
+                     //- {root}/leaf/lib.rs crate:proc-macro:leaf new_source_root:local\npub fn leaf() {{}}\n"
+                ),
+                vec!["producer", "below", "leaf"],
+            ),
+        };
+        let fixture = format!(
+            "//- {root}/producer/lib.rs crate:proc-macro:producer{deps}\n\
+             #[rustc_builtin_macro]\nmacro_rules! env {{ () => {{}} }}\n\
+             #[rustc_builtin_macro]\nmacro_rules! file {{ () => {{}} }}\n\
+             {body}\n{others}"
+        );
+        let (mut db, files) = RootDatabase::with_many_files(&fixture);
+        let mut change = ide_db::ChangeWithProcMacros::default();
+        change.set_roots(
+            names
+                .iter()
+                .zip(&files)
+                .map(|(name, file)| {
+                    // Whether a manifest directory owns a file is read from the file system,
+                    // so the sources are written where the crate graph says they are.
+                    let path = format!("{root}/{name}/lib.rs");
+                    std::fs::create_dir_all(Path::new(&path).parent().unwrap()).unwrap();
+                    std::fs::write(&path, db.file_text(file.file_id(&db)).text(&db).as_bytes())
+                        .unwrap();
+                    let mut files = vfs::file_set::FileSet::default();
+                    files.insert(
+                        file.file_id(&db),
+                        vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(path.into())),
+                    );
+                    ide_db::base_db::SourceRoot::new_local(files)
+                })
+                .collect(),
+        );
+        db.apply_change(change);
+        let crates = ide_db::base_db::all_crates(&db);
+        let named = |name: &str| {
+            *crates
+                .iter()
+                .find(|krate| {
+                    krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == name
+                })
+                .unwrap()
+        };
+        // Resolved before any `set_env`, which needs the database mutably.
+        let built: Vec<(&str, Crate)> = names.iter().map(|&name| (name, named(name))).collect();
+        for &(name, krate) in &built {
+            let mut env = krate.env(&db).clone();
+            env.set("CARGO_MANIFEST_DIR", format!("{root}/{name}"));
+            if name == "producer" {
+                for &(key, value) in values {
+                    env.set(key, value);
+                }
+            }
+            db.set_env(krate, env);
+        }
+        let of = |wanted: &str| built.iter().find(|(name, _)| *name == wanted).unwrap().1;
+        let producer = of("producer");
+        let edges = |krate: Crate| -> Vec<(String, bool)> {
+            krate
+                .data(&db)
+                .dependencies
+                .iter()
+                .map(|dep| {
+                    (
+                        dep.name.as_str().to_owned(),
+                        dep.crate_id.data(&db).target_kind.is_proc_macro(),
+                    )
+                })
+                .collect()
+        };
+        assert!(producer.data(&db).target_kind.is_proc_macro(), "{below:?}");
+        let (below_edges, leaf_edges) = match below {
+            Below::Nothing => (vec![], vec![]),
+            Below::Library => (vec![("below".to_owned(), false)], vec![]),
+            Below::ProcMacro => (vec![("below".to_owned(), true)], vec![]),
+            Below::Reexport => (vec![("below".to_owned(), false)], vec![("leaf".to_owned(), true)]),
+        };
+        assert_eq!(edges(producer), below_edges, "{below:?}");
+        if names.len() > 1 {
+            assert_eq!(edges(of("below")), leaf_edges, "{below:?}");
+        }
+        (db, producer)
+    }
+
+    fn producer_id(db: &RootDatabase, producer: Crate, root: &str) -> Hash {
+        hir::attach_db(db, || {
+            Contents::default()
+                .hash(db, (Path::new(root), None), producer, &|_| None, &|krate| {
+                    crate::environment_reads(db, krate)
+                })
+                .unwrap()
+                .0
+        })
+    }
+
+    fn producer_environment(db: &RootDatabase, producer: Crate) -> Hash {
+        hir::attach_db(db, || {
+            Contents::default()
+                .environment_hash(db, producer, &|krate| crate::environment_reads(db, krate))
+        })
+    }
+
+    #[test]
+    fn macro_consumption_follows_the_dependency_graph_not_the_crate_kind() {
+        for (below, consumes) in [
+            (Below::Nothing, false),
+            (Below::Library, false),
+            (Below::ProcMacro, true),
+            (Below::Reexport, true),
+        ] {
+            let work = tempfile::tempdir().unwrap();
+            let root = work.path().join("checkout").to_string_lossy().into_owned();
+            let (db, producer) = producer_fixture(&root, below, "pub fn value() {}", &[]);
+            hir::attach_db(&db, || {
+                let contents = Contents::default();
+                assert!(
+                    contents.reaches_macros(&db, producer),
+                    "a proc-macro crate reaches itself"
+                );
+                assert_eq!(contents.consumes_macros(&db, producer), consumes, "{below:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn a_producer_without_macro_dependencies_has_one_identity_under_relocated_roots() {
+        let source = "pub fn value() -> &'static str { \"same source\" }";
+        let work = tempfile::tempdir().unwrap();
+        let at = |name: &str| work.path().join(name).to_string_lossy().into_owned();
+        for below in [Below::Nothing, Below::Library] {
+            let identity = |root: &str, control: &str| {
+                let (db, producer) =
+                    producer_fixture(root, below, source, &[("RA_JIT_REMOTE", control)]);
+                producer_id(&db, producer, root)
+            };
+            assert_eq!(
+                identity(&at("checkout-a"), "one"),
+                identity(&at("checkout-b"), "one"),
+                "{below:?}: the same producer source at another root"
+            );
+            assert_eq!(
+                identity(&at("checkout-a"), "one"),
+                identity(&at("checkout-a"), "other"),
+                "{below:?}: cache controls the source does not read"
+            );
+        }
+    }
+
+    #[test]
+    fn crates_that_consume_macros_keep_the_complete_environment_in_identity() {
+        let source = "pub fn value() -> &'static str { \"same source\" }";
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join("checkout").to_string_lossy().into_owned();
+        let identity = |below, control: &str| {
+            let (db, producer) =
+                producer_fixture(&root, below, source, &[("RA_JIT_REMOTE", control)]);
+            (producer_environment(&db, producer), producer_id(&db, producer, &root))
+        };
+        // A proc-macro crate that itself expands another's macros, directly or through a
+        // reexport, is a consumer like any other crate.
+        for below in [Below::ProcMacro, Below::Reexport] {
+            let (one, other) = (identity(below, "one"), identity(below, "other"));
+            assert_ne!(one.0, other.0, "{below:?}: the raw environment is hashed");
+            assert_ne!(one.1, other.1, "{below:?}");
+        }
+        // The same change reaches the identity of none that expands no macros.
+        for below in [Below::Nothing, Below::Library] {
+            let (one, other) = (identity(below, "one"), identity(below, "other"));
+            assert_eq!(one.0, other.0, "{below:?}");
+            assert_eq!(one.1, other.1, "{below:?}");
+        }
+    }
+
+    #[test]
+    fn a_producers_own_environment_observation_splits_its_identity() {
+        let body = "pub fn value() -> &'static str { env!(\"RA_JIT_REMOTE\") }";
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join("checkout").to_string_lossy().into_owned();
+        let identity = |value: &str| {
+            let (db, producer) =
+                producer_fixture(&root, Below::Nothing, body, &[("RA_JIT_REMOTE", value)]);
+            let id = producer_id(&db, producer, &root);
+            assert!(
+                db.env_read().iter().any(|&(of, ref key)| of == producer && key == "RA_JIT_REMOTE"),
+                "the producer's own env! is an observed read"
+            );
+            id
+        };
+        assert_ne!(identity("one"), identity("other"));
+        assert_eq!(identity("one"), identity("one"));
+    }
+
+    #[test]
+    fn a_producer_that_embeds_its_manifest_path_stays_split_by_root() {
+        let body = "pub fn value() -> &'static str { env!(\"CARGO_MANIFEST_DIR\") }";
+        let work = tempfile::tempdir().unwrap();
+        let at = |name: &str| work.path().join(name).to_string_lossy().into_owned();
+        let identity = |root: &str| {
+            let (db, producer) = producer_fixture(root, Below::Nothing, body, &[]);
+            producer_id(&db, producer, root)
+        };
+        assert_ne!(identity(&at("checkout-a")), identity(&at("checkout-b")));
+        assert_eq!(identity(&at("checkout-a")), identity(&at("checkout-a")));
+    }
+
+    #[test]
+    fn a_producer_with_deferred_filename_data_stays_split_by_source_path() {
+        // The same constants as `deferred_inline_constants_keep_unresolved_filename_context`,
+        // in a proc-macro crate: what file!() yields is the path of its file.
+        let body = "const CALLBACK: fn() -> &'static str = || const { file!() }; pub fn value() -> &'static str { CALLBACK() }";
+        let work = tempfile::tempdir().unwrap();
+        let at = |name: &str| work.path().join(name).to_string_lossy().into_owned();
+        let identity = |root: &str| {
+            let (mut db, producer) = producer_fixture(root, Below::Nothing, body, &[]);
+            hir_ty::mir::location::name_sources(&mut db, |_, _| Some("source/name.rs".to_owned()));
+            hir::attach_db(&db, || {
+                let inputs = hir::input_owners::discover_identity_inputs(&db, producer);
+                assert!(
+                    inputs
+                        .source_names
+                        .iter()
+                        .any(|read| read.name.as_deref() == Some("source/name.rs")),
+                    "the filename is read by the producer's own constant"
+                );
+            });
+            producer_id(&db, producer, root)
+        };
+        assert_ne!(identity(&at("checkout-a")), identity(&at("checkout-b")));
     }
 
     #[test]
