@@ -73,6 +73,12 @@ mod syntax_tests {
             ("never_existed_blaze_probe", true, false),
             ("box_syntax", true, false),
             ("associated_type_bounds", true, true),
+            ("test_accepted_feature", true, true),
+            ("test_accepted_feature", false, false),
+            ("never_type_fallback", true, false),
+            ("never_type_fallback", false, false),
+            ("proc_macro_span", true, false),
+            ("proc_macro_span", false, false),
         ] {
             plan["crates"][0]["env"] =
                 serde_json::json!({"RUSTC_BOOTSTRAP": if bootstrap { "1" } else { "-1" }});
@@ -402,6 +408,53 @@ mod syntax_tests {
             let warm = crate::broken_in(&db, &[file], &sources, &args.checkout, None, false);
             assert_eq!(cold.is_some(), rejected, "{source}");
             assert_eq!(warm, cold, "{source}");
+        }
+    }
+
+    /// Reconciled from the cases of upstream b217704c: the same outcomes, decided by
+    /// the pinned language catalog plus the effective loaded library attributes
+    /// rather than a name-only table. `proc_macro_span` is a library gate: unknown
+    /// unless `proc_macro` is loaded, as with rustc 1.99.0.
+    #[test]
+    fn bootstrap_probe_uses_pinned_feature_status_and_effective_names() {
+        use test_fixture::WithFixture;
+        for (source, on_stable, error) in [
+            ("fn main() {}", false, None),
+            ("#![cfg_attr(all(), feature(proc_macro_span))]\nfn main() {}", true, Some("E0635")),
+            ("#![cfg_attr(any(), feature(proc_macro_span))]\nfn main() {}", false, None),
+            ("#![feature(proc_macro_span)]\nfn main() {}", true, Some("E0635")),
+            ("#![feature(never_type)]\nfn main() {}", true, None),
+            ("#![feature(test_accepted_feature)]\nfn main() {}", true, None),
+            ("#![feature(never_type_fallback)]\nfn main() {}", true, Some("E0557")),
+            ("#![feature(not_a_rust_feature_199)]\nfn main() {}", true, Some("E0635")),
+        ] {
+            let (db, _) =
+                RootDatabase::with_single_file(&format!("//- /main.rs crate:app\n{source}\n"));
+            let krate = hir::Crate::from(ide_db::base_db::all_crates(&db)[0]);
+            let errors = krate.invalid_features(&db);
+            assert_eq!(krate.feature_attributes_on_stable(&db), on_stable, "{source}");
+            assert_eq!(errors.first().map(|it| it.0), error, "{source}: {errors:?}");
+        }
+        for (usage, expected) in [
+            ("extern crate proc_macro;", None),
+            ("", Some("E0635")),
+            ("use proc_macro::span;", None),
+        ] {
+            let fixture = format!(
+                "//- /main.rs crate:root deps:proc_macro\n#![feature(proc_macro_span)]\n{usage}\nfn main() {{}}\n//- /proc_macro.rs crate:proc_macro\n#[unstable(feature=\"proc_macro_span\", issue=\"54725\")] pub fn span() {{}}\n"
+            );
+            let (db, _) = RootDatabase::with_many_files(&fixture);
+            let root = ide_db::base_db::all_crates(&db)
+                .iter()
+                .copied()
+                .find(|krate| {
+                    hir::Crate::from(*krate)
+                        .display_name(&db)
+                        .is_some_and(|name| name.as_str() == "root")
+                })
+                .unwrap();
+            let errors = hir::Crate::from(root).invalid_features(&db);
+            assert_eq!(errors.first().map(|it| it.0), expected, "{usage}: {errors:?}");
         }
     }
 
