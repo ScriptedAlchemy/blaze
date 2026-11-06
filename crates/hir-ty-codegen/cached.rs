@@ -1010,6 +1010,22 @@ impl Entries {
         self.known().usable.insert(name, usable);
     }
 
+    fn linkable(&self, name: &str, defines: &dyn Fn(&str, bool) -> bool) -> Option<Arc<Entry>> {
+        let Some(entry) = self.get(name) else {
+            if keys_logged() {
+                eprintln!("cache closure miss: {name}: no entry");
+            }
+            return None;
+        };
+        entry.links(&|symbol, checked| {
+            let found = defines(symbol, checked);
+            if !found && keys_logged() {
+                eprintln!("cache closure miss: {name}: unavailable import {symbol} (checked={checked})");
+            }
+            found
+        }).then_some(entry)
+    }
+
     /// Whether there is an entry for `name` and for everything it calls, and what they import
     /// is in the program, as `defines` tells.
     pub(super) fn usable(&self, name: &str, defines: &dyn Fn(&str, bool) -> bool) -> bool {
@@ -1018,7 +1034,7 @@ impl Entries {
             return usable;
         }
         let name: Arc<str> = Arc::from(name);
-        let Some(entry) = self.get(&name).filter(|it| it.links(defines)) else {
+        let Some(entry) = self.linkable(&name, defines) else {
             self.settle(name, false);
             return false;
         };
@@ -1054,7 +1070,7 @@ impl Entries {
             let found = match settled(callee) {
                 Some(true) => continue,
                 Some(false) => None,
-                None => self.get(callee).filter(|it| it.links(defines)),
+                None => self.linkable(callee, defines),
             };
             let callee: Arc<str> = Arc::from(callee);
             let Some(entry) = found else {
