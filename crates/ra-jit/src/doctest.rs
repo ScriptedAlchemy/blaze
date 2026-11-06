@@ -326,8 +326,8 @@ impl Asked {
         if !test {
             return Err("rustdoc is not asked to run tests".to_owned());
         }
-        let wanted =
-            Wanted::parse(&test_args, false).map_err(|arg| format!("the tests are run with `{arg}`"))?;
+        let wanted = Wanted::parse(&test_args, false)
+            .map_err(|arg| format!("the tests are run with `{arg}`"))?;
         let build = match recorded.var(BUILD) {
             Some(build) => {
                 Some(serde_json::from_str(build).map_err(|it| format!("{BUILD}: {it}"))?)
