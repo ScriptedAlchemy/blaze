@@ -594,6 +594,94 @@ pub fn codegen_attribute_macro_calls(
         .collect()
 }
 
+/// Library gates declared by effective stability attributes, including renamed
+/// and removed gates. Source is used rather than flags, which omit stable gates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LibraryFeature {
+    Defined(Symbol),
+    Renamed { old: Symbol, new: Symbol },
+    Removed(Symbol),
+}
+
+#[salsa::tracked(returns(ref))]
+pub fn library_features(db: &dyn SourceDatabase, owner: AttrDefId) -> Vec<LibraryFeature> {
+    fn collect(meta: ast::Meta, features: &mut Vec<LibraryFeature>) {
+        let ast::Meta::TokenTreeMeta(meta) = meta else { return };
+        let Some(path) = meta.path() else { return };
+        let removed = path.is1("unstable_removed");
+        if !removed
+            && ![
+                "stable",
+                "unstable",
+                "rustc_const_stable",
+                "rustc_const_unstable",
+                "rustc_default_body_unstable",
+            ]
+            .iter()
+            .any(|name| path.is1(name))
+        {
+            return;
+        }
+        let Some(tt) = meta.token_tree() else { return };
+        let mut tokens = TokenTreeChildren::new(&tt);
+        let mut name = None;
+        let mut old = None;
+        while let Some(token) = tokens.next() {
+            let NodeOrToken::Token(token) = token else { continue };
+            if !matches!(token.text(), "feature" | "old_name") {
+                continue;
+            }
+            let Some(NodeOrToken::Token(eq)) = tokens.next() else { continue };
+            if eq.kind() != T![=] {
+                continue;
+            }
+            let Some(NodeOrToken::Token(value)) = tokens.next() else { continue };
+            let Some(value) = ast::String::cast(value)
+                .and_then(|it| it.value().ok().map(|value| Symbol::intern(&value)))
+            else {
+                continue;
+            };
+            if token.text() == "feature" { name = Some(value) } else { old = Some(value) }
+        }
+        if let Some(name) = name {
+            if removed {
+                features.push(LibraryFeature::Removed(name));
+            } else {
+                features.push(LibraryFeature::Defined(name.clone()));
+                if let Some(old) = old {
+                    features.push(LibraryFeature::Renamed { old, new: name });
+                }
+            }
+        }
+    }
+
+    let mut features = Vec::new();
+    collect_attrs(db, owner, |meta| {
+        collect(meta, &mut features);
+        ControlFlow::<()>::Continue(())
+    });
+    let (source, _, _, krate) = attrs_source(db, owner);
+    let cfg = krate.cfg_options(db);
+    let mut walk = source.value.syntax().preorder();
+    while let Some(event) = walk.next() {
+        let syntax::WalkEvent::Enter(node) = event else { continue };
+        let Some(node) = ast::AnyHasAttrs::cast(node) else { continue };
+        if AttrFlags::is_cfg_enabled_for(&node, cfg).is_err() {
+            walk.skip_subtree();
+            continue;
+        }
+        expand_cfg_attr(
+            ast::attrs_including_inner(&node),
+            || cfg,
+            |meta, _| {
+                collect(meta, &mut features);
+                ControlFlow::<()>::Continue(())
+            },
+        );
+    }
+    features
+}
+
 fn collect_field_attrs<T>(
     db: &dyn SourceDatabase,
     variant: VariantId,
@@ -892,7 +980,7 @@ impl AttrFlags {
             .unwrap_or_else(AttrFlags::empty)
     }
 
-    pub(crate) fn is_cfg_enabled_for(
+    pub fn is_cfg_enabled_for(
         owner: &dyn HasAttrs,
         cfg_options: &CfgOptions,
     ) -> Result<(), CfgExpr> {

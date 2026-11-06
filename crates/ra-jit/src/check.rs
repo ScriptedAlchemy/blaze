@@ -36,6 +36,223 @@ mod syntax_tests {
     use super::*;
 
     #[test]
+    fn bootstrap_source_probe_validates_release_features() {
+        let directory = tempfile::tempdir().unwrap();
+        let sysroot = directory.path().join("toolchain");
+        crate::answers::tests::synthetic_toolchain(&sysroot);
+        for name in ["core", "std"] {
+            let root = sysroot.join("lib/rustlib/src/rust/library").join(name).join("src");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("lib.rs"), "").unwrap();
+        }
+        let source = directory.path().join("lib.rs");
+        let plan = crate::cargo::own_script::planned_description(
+            &sysroot,
+            vec![crate::cargo::own_script::Planned {
+                out_dir: None,
+                workspace_member: false,
+                name: "probe".into(),
+                root: source.clone(),
+                edition: "2021".into(),
+                cfg: vec![],
+                codegen_flags: vec![],
+                env: Default::default(),
+                deps: vec![],
+                proc_macro: None,
+            }],
+        );
+        let mut plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        plan["compiler_mode"] = serde_json::json!(true);
+        plan["crates"][0]["build"] =
+            serde_json::json!({"target_kind":"lib", "label":"probe", "build_file": source});
+        let project = directory.path().join("rust-project.json");
+        std::fs::write(&project, serde_json::to_vec(&plan).unwrap()).unwrap();
+        for (feature, bootstrap, expected) in [
+            ("never_type", true, true),
+            ("never_type", false, false),
+            ("never_existed_blaze_probe", true, false),
+            ("box_syntax", true, false),
+            ("associated_type_bounds", true, true),
+        ] {
+            plan["crates"][0]["env"] =
+                serde_json::json!({"RUSTC_BOOTSTRAP": if bootstrap { "1" } else { "-1" }});
+            std::fs::write(&project, serde_json::to_vec(&plan).unwrap()).unwrap();
+            std::fs::write(&source, format!("#![no_std]\n#![feature({feature})]\n")).unwrap();
+            let args = Args::parse(
+                [
+                    project.display().to_string(),
+                    "--crate".into(),
+                    "probe".into(),
+                    "--out".into(),
+                    directory.path().join("unused.o").display().to_string(),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+            assert_eq!(
+                super::source(args, bootstrap).unwrap(),
+                expected,
+                "{feature}, bootstrap={bootstrap}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_library_features_follow_effective_loaded_declarations() {
+        use test_fixture::WithFixture;
+
+        for (staging, expected) in [("", Some("E0635")), ("#![feature(staged_api)]", None)] {
+            let (db, _) = RootDatabase::with_single_file(&format!(
+                "//- /main.rs crate:probe\n#![feature(probe_unknown)]\n{staging}\n#[unstable(feature=\"probe_unknown\", issue=\"none\")] pub fn api() {{}}\n"
+            ));
+            let krate = ide_db::base_db::all_crates(&db)[0];
+            let errors = hir::Crate::from(krate).invalid_features(&db);
+            assert_eq!(errors.first().map(|it| it.0), expected, "{staging}: {errors:?}");
+        }
+
+        let cases = [
+            (
+                "extern crate dep;",
+                "#[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;",
+                "probe_gate",
+                None,
+            ),
+            (
+                "use dep::Api;",
+                "#[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;",
+                "probe_gate",
+                None,
+            ),
+            (
+                "",
+                "#[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;",
+                "probe_gate",
+                Some("E0635"),
+            ),
+            (
+                "#[cfg(any())] extern crate dep;",
+                "#[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;",
+                "probe_gate",
+                Some("E0635"),
+            ),
+            (
+                "extern crate dep;",
+                "#[cfg(any())] #[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;",
+                "probe_gate",
+                Some("E0635"),
+            ),
+            (
+                "extern crate dep;",
+                "#[cfg_attr(all(), stable(feature=\"probe_gate\", since=\"1.0.0\"))] pub struct Api;",
+                "probe_gate",
+                None,
+            ),
+            (
+                "extern crate dep;",
+                "macro_rules! make { () => { #[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api; } } make!();",
+                "probe_gate",
+                None,
+            ),
+            (
+                "extern crate dep;",
+                "macro_rules! unused { () => { #[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api; } }",
+                "probe_gate",
+                Some("E0635"),
+            ),
+            (
+                "extern crate dep;",
+                "#[unstable(feature=\"probe_gate\", issue=\"none\", old_name=\"old_probe_gate\")] pub struct Api;",
+                "old_probe_gate",
+                Some("E0635"),
+            ),
+            (
+                "extern crate dep;",
+                "#![unstable_removed(feature=\"probe_gate\", reason=\"removed\", since=\"1.0.0\")]",
+                "probe_gate",
+                Some("E0557"),
+            ),
+            (
+                "extern crate dep;",
+                "pub struct Api { #[unstable(feature=\"probe_gate\", issue=\"none\")] pub value: u8 }",
+                "probe_gate",
+                None,
+            ),
+        ];
+        for (usage, dependency, feature, expected) in cases {
+            let fixture = format!(
+                "//- /main.rs crate:root deps:dep\n#![feature({feature})]\n{usage}\nfn main() {{}}\n//- /dep.rs crate:dep\n{dependency}\n"
+            );
+            let (db, _) = RootDatabase::with_many_files(&fixture);
+            let root = ide_db::base_db::all_crates(&db)
+                .iter()
+                .copied()
+                .find(|krate| {
+                    hir::Crate::from(*krate)
+                        .display_name(&db)
+                        .is_some_and(|name| name.as_str() == "root")
+                })
+                .unwrap();
+            let errors = hir::Crate::from(root).invalid_features(&db);
+            assert_eq!(
+                errors.first().map(|it| it.0),
+                expected,
+                "{usage}\n{dependency}\n{errors:?}"
+            );
+        }
+        for (outer, expected) in
+            [("pub fn value() {}", Some("E0635")), ("pub use dep::Api; pub fn value() {}", None)]
+        {
+            let fixture = format!(
+                "//- /main.rs crate:root deps:outer\n#![feature(probe_gate)]\nextern crate outer;\nfn main() {{ outer::value(); }}\n//- /outer.rs crate:outer deps:dep\n{outer}\n//- /dep.rs crate:dep\n#[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;\n"
+            );
+            let (db, _) = RootDatabase::with_many_files(&fixture);
+            let root = ide_db::base_db::all_crates(&db)
+                .iter()
+                .copied()
+                .find(|krate| {
+                    hir::Crate::from(*krate)
+                        .display_name(&db)
+                        .is_some_and(|name| name.as_str() == "root")
+                })
+                .unwrap();
+            let errors = hir::Crate::from(root).invalid_features(&db);
+            assert_eq!(errors.first().map(|it| it.0), expected, "{outer}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn bootstrap_language_features_preserve_release_dependencies_and_solver_policy() {
+        use ide_db::base_db::salsa::Setter as _;
+        use test_fixture::WithFixture;
+
+        for (features, flags, valid) in [
+            ("unsized_const_params", "", false),
+            ("unsized_const_params,adt_const_params", "", true),
+            ("macroless_generic_const_args", "", false),
+            ("macroless_generic_const_args,min_generic_const_args", "", true),
+            ("generic_const_args,min_generic_const_args", "", false),
+            ("generic_const_args,min_generic_const_args", "-Znext-solver=globally", true),
+            ("generic_const_args,min_generic_const_args", "-Z next-solver", true),
+            ("generic_const_args,min_generic_const_args", "-Znext-solver=coherence", false),
+            ("generic_const_exprs", "", true),
+            ("generic_const_exprs", "-Znext-solver=globally", false),
+            ("generic_const_exprs", "-Znext-solver=coherence", true),
+            ("generic_const_exprs", "-Znext-solver -Znext-solver=no", true),
+            ("ref_pat_eat_one_layer_2024,ref_pat_eat_one_layer_2024_structural", "", false),
+        ] {
+            let (mut db, _) = RootDatabase::with_single_file(&format!(
+                "//- /main.rs crate:probe\n#![feature({features})]\n"
+            ));
+            let krate = ide_db::base_db::all_crates(&db)[0];
+            let mut data = krate.data(&db).clone();
+            data.codegen_flags = flags.split_ascii_whitespace().map(str::to_owned).collect();
+            krate.set_data(&mut db).to(data);
+            let errors = hir::Crate::from(krate).invalid_features(&db);
+            assert_eq!(errors.is_empty(), valid, "{features} {flags}: {errors:?}");
+        }
+    }
+
+    #[test]
     fn cold_admission_checks_unreachable_bodies_and_cached_source_changes() {
         use test_fixture::WithFixture;
 
@@ -451,9 +668,11 @@ pub(crate) fn channel_error(
         value == "1"
             || name.as_deref().is_some_and(|name| value.split(',').any(|entry| entry == name))
     });
-    if allowed {
-        return None;
-    }
+    let (code, message) = if allowed {
+        source.invalid_features(db).into_iter().next()?
+    } else {
+        ("E0554", "`#![feature]` may not be used on the stable release channel".to_owned())
+    };
     let range = match source.root_module(db).definition_source(db).value {
         hir::ModuleSource::SourceFile(file) => file
             .attrs()
@@ -462,11 +681,7 @@ pub(crate) fn channel_error(
         _ => None,
     }
     .unwrap_or_else(|| syntax::TextRange::empty(0.into()));
-    Some((
-        ide_db::FileRange { file_id: source.root_file(db), range },
-        "E0554",
-        "`#![feature]` may not be used on the stable release channel".to_owned(),
-    ))
+    Some((ide_db::FileRange { file_id: source.root_file(db), range }, code, message))
 }
 
 fn hard_diagnostics(
@@ -537,15 +752,20 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
     anyhow::ensure!(crates.len() == 1, "the source probe must identify one crate");
     let krate = crates[0];
     let id = ide_db::base_db::Crate::from(krate);
-    if krate.feature_attributes_on_stable(&db) {
-        anyhow::ensure!(
-            !bootstrap,
-            "bootstrap feature probes require the owned release feature catalog"
-        );
+    if krate.feature_attributes_on_stable(&db) && !bootstrap {
         eprintln!("error[E0554]: `#![feature]` may not be used on the stable release channel");
         return Ok(false);
     }
     let files = source_files(&mut db, &mut vfs, &[id]);
+    if krate.feature_attributes_on_stable(&db) {
+        let errors = krate.invalid_features(&db);
+        if !errors.is_empty() {
+            for (code, message) in errors {
+                eprintln!("error[{code}]: {message}");
+            }
+            return Ok(false);
+        }
+    }
     let paths: FxHashMap<_, _> = files
         .iter()
         .filter_map(|it| match it.file {
