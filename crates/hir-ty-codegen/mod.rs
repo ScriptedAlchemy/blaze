@@ -121,6 +121,8 @@ mod relocate;
 #[cfg(feature = "llvm")]
 mod units;
 use self::places::{row_location, source_location};
+#[cfg(test)]
+mod deterministic_tests;
 mod promote;
 mod settled;
 mod stable;
@@ -307,6 +309,11 @@ pub trait SymbolResolver {
     /// Whether the object is split into parts that a linker reads apart, so that each unit
     /// of its description is best in sections of its own, beside the functions it describes.
     fn debug_grouped(&self) -> bool {
+        false
+    }
+    /// Whether this object's declarations and definitions must keep discovery order while
+    /// compilation runs ahead, so identical inputs produce identical object bytes.
+    fn deterministic_object(&self) -> bool {
         false
     }
     /// Whether every function keeps its frame pointer, as `-C force-frame-pointers` has it:
@@ -3942,6 +3949,8 @@ struct Ready<'a> {
     governor: &'a budget::Governor,
     /// The instances to put in the object that a thread is still to compile.
     waiting: FxHashMap<(Instance, StoredParamEnvAndCrate), Vec<FuncId>>,
+    /// Fixed pending waves for reproducible objects; live builds use `waiting`.
+    ordered: Option<std::collections::VecDeque<(Instance, StoredParamEnvAndCrate, FuncId)>>,
 }
 
 impl Ready<'_> {
@@ -3953,6 +3962,9 @@ impl Ready<'_> {
     ) -> Vec<(Instance, StoredParamEnvAndCrate, FuncId)> {
         if self.governor.look() {
             return Vec::new();
+        }
+        if self.ordered.is_some() {
+            return self.take_ordered(pending);
         }
         let mut ready = Vec::new();
         let mut state = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
@@ -3994,15 +4006,60 @@ impl Ready<'_> {
         }
     }
 
+    fn take_ordered(
+        &mut self,
+        pending: &mut Vec<(Instance, StoredParamEnvAndCrate, FuncId)>,
+    ) -> Vec<(Instance, StoredParamEnvAndCrate, FuncId)> {
+        let waiting = self.ordered.as_mut().expect("ordered emission");
+        let mut state = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queued = false;
+        let mut needed = FxHashSet::default();
+        for (instance, env, id) in pending.drain(..) {
+            let key = (instance.clone(), env.clone());
+            if !state.done.contains(&key) {
+                needed.insert(key.clone());
+                if !(state.alive == 0 && !state.seen.contains(&key))
+                    && state.seen.insert(key.clone())
+                {
+                    state.queue.push(key);
+                    queued = true;
+                }
+            }
+            waiting.push_back((instance, env, id));
+        }
+        if queued {
+            self.idle.notify_all();
+        }
+        loop {
+            for completed in state.fresh.drain(..) {
+                needed.remove(&completed);
+            }
+            // Cached entries are stitched after a wave. Its boundary must not depend on
+            // which worker finishes first, either.
+            if Self::ended(&state) || needed.is_empty() {
+                return waiting.drain(..).collect();
+            }
+            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn ended(state: &Ahead) -> bool {
+        state.stopped
+            || state.alive == 0
+            || (state.roots.is_empty() && state.queue.is_empty() && state.working == 0)
+    }
+
     /// Which of `held` no thread is still to compile, waiting until one is. The first when
     /// the threads are through with everything.
     fn ready_root(&self, held: &std::collections::VecDeque<FunctionId>) -> usize {
         let mut state = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            let found = held.iter().position(|it| Self::through(&state, *it));
-            let ended = state.stopped
-                || state.alive == 0
-                || (state.roots.is_empty() && state.queue.is_empty() && state.working == 0);
+            let found = if self.ordered.is_some() {
+                held.front().filter(|&&root| Self::through(&state, root)).map(|_| 0)
+            } else {
+                held.iter().position(|it| Self::through(&state, *it))
+            };
+            let ended = Self::ended(&state);
             match found {
                 Some(at) => return at,
                 None if ended => return 0,
@@ -4013,7 +4070,14 @@ impl Ready<'_> {
 
     /// Whether no thread is still to compile `root`.
     fn root_ready(&self, root: FunctionId) -> bool {
-        Self::through(&self.ahead.lock().unwrap_or_else(|e| e.into_inner()), root)
+        let mut state = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
+        if self.ordered.is_none() {
+            return Self::through(&state, root);
+        }
+        while !Self::through(&state, root) && !Self::ended(&state) && !self.governor.shed() {
+            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        !self.governor.shed()
     }
 
     fn through(state: &Ahead, root: FunctionId) -> bool {
@@ -5917,6 +5981,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             idle: &idle,
             governor: &governor,
             waiting: FxHashMap::default(),
+            ordered: self.symbols.deterministic_object().then(std::collections::VecDeque::new),
         };
         self.symbols.in_parallel_beside(threads, &work, &mut || {
             beside(self, Some(&mut ready));
