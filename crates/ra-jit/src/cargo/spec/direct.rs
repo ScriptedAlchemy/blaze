@@ -157,6 +157,27 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         &prepared.resolved.spec.build,
         &prepared.resolved.graph,
     )?;
+    if original.get("RA_JIT_STATS").is_some_and(|v| v == "1") {
+        let contexts: Vec<_> = programs.iter().filter(|p| p.output == Output::Doctest).collect();
+        if !contexts.is_empty() {
+            let libraries: BTreeSet<_> = contexts
+                .iter()
+                .flat_map(|p| {
+                    native[p.unit as usize].dependencies.iter().filter_map(|dep| {
+                        let library = &prepared.resolved.graph.units[dep.index];
+                        (library.mode == blaze_metadata::units::Mode::Build
+                            && library.package.id == native[p.unit as usize].package.id)
+                            .then_some(dep.index)
+                    })
+                })
+                .collect();
+            eprintln!(
+                "doctest plan: {} contexts, {} linked libraries in one owned plan",
+                contexts.len(),
+                libraries.len()
+            );
+        }
+    }
     let tests = super::test_policy::Policy::new(
         &prepared,
         &target.join("ra-jit/test-results"),

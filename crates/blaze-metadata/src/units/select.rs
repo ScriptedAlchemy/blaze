@@ -356,33 +356,29 @@ pub(super) struct Generator<'e, 'a> {
 }
 
 impl Generator<'_, '_> {
-    /// Libraries cargo compiles for documentation tests, even when the documentation-test
-    /// units themselves are not represented in this graph.
-    pub(super) fn doctest_libraries(&self, arena: &mut Arena) -> Result<Vec<usize>> {
+    /// Documentation-test contexts: normal and dev dependencies plus the ordinary library.
+    pub(super) fn doctest_contexts(&self, arena: &mut Arena) -> Result<Vec<usize>> {
         if self.env.intent != Intent::Test || matches!(self.filter, Filter::Only { .. }) {
             return Ok(Vec::new());
         }
-        let mut libraries = Vec::new();
+        let mut contexts = Vec::new();
         for &pkg in self.packages {
             for (at, target) in self.targets(pkg).iter().enumerate() {
                 if target.is_lib() && target.doctest && target.doctestable() {
-                    // A doctest's linked library is generated as a build dependency, not
-                    // a test root. In particular a proc macro uses its host profile.
+                    // Keep the dependency profile of the documented library. The
+                    // context itself is distinct from both that library and its tests.
                     let unit_for = if target.proc_macro {
                         UnitFor::new_host_test()
                     } else {
                         UnitFor::new_test()
                     };
-                    // Apply the host profile before interning. Profile equality ignores
-                    // deferred debuginfo, so a provisional Build unit could otherwise
-                    // absorb this one and lose the marker Sharing needs to weaken it.
-                    let mut library = self.make_unit(pkg, at, CMode::Build)?;
-                    library.profile = self.env.profile(pkg, unit_for);
-                    libraries.push(arena.intern(library));
+                    let mut context = self.make_unit(pkg, at, CMode::DocTest)?;
+                    context.profile = self.env.profile(pkg, unit_for);
+                    contexts.push(arena.intern(context));
                 }
             }
         }
-        Ok(libraries)
+        Ok(contexts)
     }
 
     fn targets(&self, pkg: PackageId) -> &[Target] {

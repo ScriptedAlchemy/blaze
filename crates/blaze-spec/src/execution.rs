@@ -130,7 +130,10 @@ fn reachable(build: &BuildSpec, native: &[&Unit], root: u32) -> BTreeSet<u32> {
         {
             continue;
         }
-        if seen.insert(at) && native[at as usize].target.kind != TargetKind::ProcMacro {
+        if seen.insert(at)
+            && (native[at as usize].target.kind != TargetKind::ProcMacro
+                || native[at as usize].mode == Mode::DocTest)
+        {
             next.extend(build.units[at as usize].deps.iter().map(|(at, _)| *at));
         }
     }
@@ -139,7 +142,24 @@ fn reachable(build: &BuildSpec, native: &[&Unit], root: u32) -> BTreeSet<u32> {
 
 fn roots(build: &BuildSpec, native: &[&Unit]) -> Vec<u32> {
     let mut roots: BTreeSet<_> = build.asked.iter().copied().collect();
-    if matches!(build.command, Command::Test(_)) {
+    if let Command::Test(run) = &build.command {
+        // Documentation contexts are command roots in their own right, including
+        // libraries with test=false. Their extern libraries must also be built
+        // when --no-run suppresses example execution.
+        for &at in build.asked.iter() {
+            if native[at as usize].mode != Mode::DocTest {
+                continue;
+            }
+            roots.extend(build.units[at as usize].deps.iter().filter_map(|(dep, _)| {
+                let unit = native[*dep as usize];
+                (unit.mode == Mode::Build
+                    && matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro))
+                .then_some(*dep)
+            }));
+        }
+        if run.doc == 0 || run.no_run {
+            roots.retain(|&at| native[at as usize].mode != Mode::DocTest);
+        }
         let mut seen = BTreeSet::new();
         let mut pending: Vec<_> = roots.iter().copied().collect();
         while let Some(at) = pending.pop() {
@@ -152,25 +172,6 @@ fn roots(build: &BuildSpec, native: &[&Unit]) -> Vec<u32> {
             }
             pending.extend(build.units[at as usize].deps.iter().map(|(at, _)| *at));
         }
-    }
-    if let Command::Test(run) = &build.command
-        && run.doc != 0
-        && !run.no_run
-    {
-        let selected: BTreeSet<_> =
-            build.asked.iter().map(|&at| &native[at as usize].package.id).collect();
-        roots.extend(
-            native
-                .iter()
-                .enumerate()
-                .filter(|(_, unit)| {
-                    matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro)
-                        && unit.mode == Mode::Build
-                        && unit.target.doctest
-                        && selected.contains(&unit.package.id)
-                })
-                .map(|(at, _)| at as u32),
-        );
     }
     let mut roots: Vec<_> = roots.into_iter().collect();
     roots.sort_by_key(|&at| (native[at as usize].test, at));
@@ -329,7 +330,9 @@ pub fn programs_with(
                 .get(&(at as u32))
                 .with_context(|| format!("missing configured canonical unit {at}"))?;
             ensure!(
-                unit.target.kind != TargetKind::ProcMacro || configured.proc_macro.is_some(),
+                unit.mode == Mode::DocTest
+                    || unit.target.kind != TargetKind::ProcMacro
+                    || configured.proc_macro.is_some(),
                 "missing owned macro image for {}:{}",
                 unit.package.name,
                 unit.target.name
@@ -430,16 +433,17 @@ pub fn programs_with(
                     },
                 ),
             );
-            let dependencies: Vec<_> = if unit.target.kind == TargetKind::ProcMacro {
-                Vec::new()
-            } else {
-                spec.deps
-                    .iter()
-                    .filter_map(|(dep, name)| {
-                        indexes.get(dep).map(|index| json!({"crate": index, "name": name}))
-                    })
-                    .collect()
-            };
+            let dependencies: Vec<_> =
+                if unit.target.kind == TargetKind::ProcMacro && unit.mode != Mode::DocTest {
+                    Vec::new()
+                } else {
+                    spec.deps
+                        .iter()
+                        .filter_map(|(dep, name)| {
+                            indexes.get(dep).map(|index| json!({"crate": index, "name": name}))
+                        })
+                        .collect()
+                };
             crates.push(json!({
                 "display_name": unit.target.name.replace('-', "_"),
                 "root_module": compiler_path(&unit.target.src_path),
@@ -458,14 +462,16 @@ pub fn programs_with(
             }));
         }
         let unit = native[root as usize];
-        let output = if unit.mode == Mode::Check {
+        let output = if unit.mode == Mode::DocTest {
+            Output::Doctest
+        } else if unit.mode == Mode::Check {
             Output::Check
         } else if is_program(unit) || unit.target.kind == TargetKind::Bench {
             Output::Executable
         } else {
             Output::Object
         };
-        let project = json!({
+        let mut project = json!({
             "compiler_mode": true,
             "blaze_native_units": blaze_wire::native::encode_units(&native_units),
             "blaze_spec_target": prepared.host.triple,
@@ -474,9 +480,14 @@ pub fn programs_with(
             "crates": crates,
             "blaze_spec_profile": {"version": 1, "profile": blaze_wire::encode(&root_unit.profile), "rustflags": build.rustflags.iter().map(|flag| flag.0.clone()).collect::<Vec<_>>()},
         });
+        if let Command::Test(run) = &build.command
+            && unit.mode == Mode::DocTest
+        {
+            project["blaze_spec_doctest"] = json!(blaze_wire::encode(run));
+        }
         let run = match &build.command {
             Command::Run(_) => true,
-            Command::Test(run) => unit.test && !run.no_run,
+            Command::Test(run) => (unit.test || unit.mode == Mode::DocTest) && !run.no_run,
             _ => false,
         };
         result.push(Program {
@@ -489,59 +500,10 @@ pub fn programs_with(
                 Output::Executable => executable(root),
                 Output::Object => artifacts.join(format!("unit-{root}/library.o")),
                 Output::Check => artifacts.join(format!("unit-{root}/checked.json")),
-                Output::Doctest => unreachable!(),
+                Output::Doctest => artifacts.join(format!("doctest-{root}/checked.json")),
             },
             project,
         });
-    }
-    if let Command::Test(run) = &build.command
-        && run.doc != 0
-        && !run.no_run
-    {
-        let selected: BTreeSet<_> =
-            roots.iter().map(|&at| &native[at as usize].package.id).collect();
-        let libraries: Vec<_> = native
-            .iter()
-            .enumerate()
-            .filter(|(_, unit)| {
-                matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro)
-                    && unit.mode == Mode::Build
-                    && unit.target.doctest
-                    && selected.contains(&unit.package.id)
-            })
-            .collect();
-        for (at, unit) in libraries {
-            // The library's source-only description is already needed by a root
-            // executable or by --doc itself. Reuse its exact crate graph/profile.
-            let project = result
-                .iter()
-                .find_map(|program| {
-                    let mut project = program.project.clone();
-                    let crates = project["crates"].as_array_mut()?;
-                    let root = crates.iter().position(|krate| {
-                        krate["blaze_native_unit"] == json!(at)
-                            && krate["build"]["target_kind"] == "lib"
-                    })?;
-                    for krate in crates.iter_mut() {
-                        krate["is_workspace_member"] = false.into();
-                    }
-                    crates[root]["is_workspace_member"] = true.into();
-                    project["blaze_spec_doctest"] = json!(blaze_wire::encode(run));
-                    project["blaze_spec_profile"]["profile"] =
-                        json!(blaze_wire::encode(&build.units[at].profile));
-                    Some(project)
-                })
-                .context("doctest library has no source description")?;
-            result.push(Program {
-                unit: at as u32,
-                crate_name: unit.target.name.replace('-', "_"),
-                harness: false,
-                run: true,
-                output: Output::Doctest,
-                executable: artifacts.join(format!("doctest-{at}/checked.json")),
-                project,
-            });
-        }
     }
     Ok(result)
 }

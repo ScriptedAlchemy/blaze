@@ -119,6 +119,8 @@ pub enum Mode {
     Test,
     /// A build script, run.
     RunCustomBuild,
+    /// A documentation-test dependency context, without cfg(test) or a libtest harness.
+    DocTest,
 }
 
 /// The package of a unit.
@@ -498,13 +500,15 @@ pub fn unit_graph_captured(
         warnings: &mut warnings,
     };
     let roots = generator.generate_root_units(&mut arena)?;
-    let doctest_libraries = generator.doctest_libraries(&mut arena)?;
+    let doctest_contexts = generator.doctest_contexts(&mut arena)?;
     let mut reachable = roots.clone();
-    reachable.extend(&doctest_libraries);
+    reachable.extend(&doctest_contexts);
     let graph = deps::build(&env, arena, &reachable)?;
-    let mut shared = share::share(&env, &graph, &roots, &doctest_libraries);
+    let mut shared = share::share(&env, &graph, &roots, &doctest_contexts);
     if asked.targets.doc_only {
-        shared.roots.clone_from(&shared.doctest_libraries);
+        shared.roots.clone_from(&shared.doctest_contexts);
+    } else {
+        shared.roots.extend(&shared.doctest_contexts);
     }
     warnings.extend(ctx.config.take_warnings());
     let graph = assemble(&env, &shared, ws.root(), &locked, warnings)?;
@@ -547,6 +551,7 @@ fn mode_of(mode: CMode) -> (Mode, bool) {
     match mode {
         CMode::Test => (Mode::Test, true),
         CMode::Build => (Mode::Build, false),
+        CMode::DocTest => (Mode::DocTest, false),
         CMode::Check { test } => (Mode::Check, test),
         CMode::RunCustomBuild => (Mode::RunCustomBuild, false),
     }
@@ -564,9 +569,6 @@ fn assemble(
     // or a proc macro. The others are only for the host.
     let mut linked = vec![false; shared.units.len()];
     let mut queue: Vec<usize> = shared.roots.clone();
-    // Libraries linked by omitted doctest executables are target-reachable too.
-    // The walk still stops at proc macros and build scripts.
-    queue.extend(&shared.doctest_libraries);
     while let Some(at) = queue.pop() {
         if env.target(&shared.units[at]).for_host || linked[at] {
             continue;

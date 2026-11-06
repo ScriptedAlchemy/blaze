@@ -589,7 +589,17 @@ fn cases() -> Vec<Case> {
                 Test,
                 &["--doc"],
             ),
-            units(lib, &[0], Test, &["--doc"]),
+            units(
+                || {
+                    vec![
+                        Make::new("a", TargetKind::Lib),
+                        Make::new("a", TargetKind::Lib).mode(Mode::DocTest).dep(0, "a"),
+                    ]
+                },
+                &[1],
+                Test,
+                &["--doc"],
+            ),
         ),
         case(
             Reason::Cwd,

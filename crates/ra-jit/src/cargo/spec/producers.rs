@@ -204,7 +204,7 @@ fn prepare_with(
     // Cargo may share a native library unit between the target and host. Reachability
     // from a host producer is the proof; for_host alone cannot identify that sharing.
     for (at, unit) in graph_units.iter().enumerate() {
-        if unit.mode != Mode::RunCustomBuild
+        if !matches!(unit.mode, Mode::RunCustomBuild | Mode::DocTest)
             && matches!(unit.target.kind, TargetKind::ProcMacro | TargetKind::CustomBuild)
         {
             mark(at, graph_units, &mut host_closure);
@@ -262,7 +262,7 @@ fn prepare_with(
             .collect();
         graph.units.push(captured::Unit {
             source: Planned { out_dir: None, workspace_member: false, name: unit.target.name.replace('-', "_"), root: unit.target.src_path.clone(), edition: unit.target.edition.to_string(), cfg: unit_cfg(replay, at), codegen_flags, env: text_env, deps, proc_macro: None },
-            kind: match unit.target.kind { TargetKind::CustomBuild => captured::Kind::BuildScript, TargetKind::ProcMacro => captured::Kind::ProcMacro, _ => captured::Kind::Rust },
+            kind: if unit.mode == Mode::DocTest { captured::Kind::Rust } else { match unit.target.kind { TargetKind::CustomBuild => captured::Kind::BuildScript, TargetKind::ProcMacro => captured::Kind::ProcMacro, _ => captured::Kind::Rust } },
             host: graph_units.iter().enumerate().any(|(original, other)| std::ptr::eq(other, unit) && host_closure.contains(&original)), target: target(unit), run: runs.first().copied(),
             profile: Some(serde_json::json!({"version": 1, "profile": blaze_wire::encode(&spec.profile), "rustflags": build.rustflags.iter().map(|flag| flag.0.clone()).collect::<Vec<_>>()})),
         });

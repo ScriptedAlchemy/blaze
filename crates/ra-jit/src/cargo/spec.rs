@@ -609,6 +609,19 @@ fn execute_inner(
     let given = &prepared.resolved.spec.build;
     let native = blaze_spec::assemble::canonical_units(given, &prepared.resolved.graph)?;
     let mut failed = 0;
+    let mut failed_targets = Vec::new();
+    let package_hint = if matches!(given.command, blaze_wire::Command::Test(_)) {
+        let manifests = prepared.manifests()?;
+        let workspace = blaze_manifest::Workspace::new(
+            &prepared.resolved.graph.root.join("Cargo.toml"),
+            &manifests,
+        )?;
+        workspace.members().count() > 1
+            || workspace.is_virtual()
+            || !prepared.request.packages.is_empty()
+    } else {
+        false
+    };
     let (mut left, mut always_run) = (0, 0);
     let mut running: Vec<_> = programs.iter().filter(|program| program.run).collect();
     if matches!(given.command, blaze_wire::Command::Test(_)) {
@@ -629,7 +642,11 @@ fn execute_inner(
         };
         if matches!(given.command, blaze_wire::Command::Test(_)) {
             if program.output == blaze_spec::execution::Output::Doctest {
-                super::say::status(false, "Doc-tests", &program.crate_name);
+                super::say::status(
+                    false,
+                    "Doc-tests",
+                    &native[program.unit as usize].target.name.replace('-', "_"),
+                );
             }
         }
         let root = native[program.unit as usize];
@@ -729,6 +746,7 @@ fn execute_inner(
             left += result.left;
             always_run += result.always_run;
             if !result.success {
+                failed_targets.push(test_failure(program, root, package_hint));
                 failed = 101;
                 if !run.no_fail_fast {
                     break;
@@ -776,6 +794,9 @@ fn execute_inner(
             super::run::exit_code(command.status()?)
         };
         if code != 0 {
+            if matches!(given.command, blaze_wire::Command::Test(_)) {
+                failed_targets.push(test_failure(program, root, package_hint));
+            }
             failed = if matches!(given.command, blaze_wire::Command::Test(_)) { 101 } else { code };
             if !run.no_fail_fast {
                 break;
@@ -785,7 +806,47 @@ fn execute_inner(
     if let Some(tests) = tests {
         super::run::test_summary(&tests.asked, left, always_run);
     }
+    if let blaze_wire::Command::Test(run) = &given.command
+        && run.no_fail_fast
+        && !failed_targets.is_empty()
+    {
+        let count = failed_targets.len();
+        super::say::error(&format!(
+            "{count} {} failed:",
+            if count == 1 { "target" } else { "targets" }
+        ));
+        for hint in failed_targets {
+            eprintln!("    `{hint}`");
+        }
+    }
     Ok(failed)
+}
+
+fn test_failure(
+    program: &blaze_spec::execution::Program,
+    unit: &blaze_metadata::units::Unit,
+    package_hint: bool,
+) -> String {
+    use blaze_metadata::units::TargetKind;
+    let doc = program.output == blaze_spec::execution::Output::Doctest;
+    let target = if doc {
+        "--doc".to_owned()
+    } else {
+        match unit.target.kind {
+            TargetKind::Lib | TargetKind::ProcMacro => "--lib".to_owned(),
+            TargetKind::Bin => format!("--bin {}", unit.target.name),
+            TargetKind::Example => format!("--example {}", unit.target.name),
+            TargetKind::Test => format!("--test {}", unit.target.name),
+            TargetKind::Bench => format!("--bench {}", unit.target.name),
+            TargetKind::CustomBuild => unreachable!("a build script is not a test target"),
+        }
+    };
+    let hint = if package_hint { format!("-p {} {target}", unit.package.name) } else { target };
+    super::say::error(&format!(
+        "{} failed, to rerun pass `{hint}`",
+        if doc { "doctest" } else { "test" }
+    ));
+    hint
 }
 
 fn toolchain_native_inputs(sysroot: &Path) -> anyhow::Result<blaze_spec::native::Closure> {

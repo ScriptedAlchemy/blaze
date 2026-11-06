@@ -970,9 +970,108 @@ fn implicit_doctests_of_a_standalone_library_have_their_own_normal_library_graph
         .iter()
         .find(|program| program.output == blaze_spec::execution::Output::Object)
         .unwrap();
-    assert_eq!(docs[0].unit, normal.unit);
-    assert_eq!(docs[0].project["crates"][0]["blaze_native_unit"], serde_json::json!(normal.unit));
+    assert_ne!(docs[0].unit, normal.unit);
+    assert_eq!(docs[0].project["crates"][0]["blaze_native_unit"], serde_json::json!(docs[0].unit));
     assert!(!normal.harness && !normal.run && docs[0].run);
+}
+
+#[test]
+fn doctest_dev_dependency_context_survives_standalone_capture_and_relocation() {
+    for args in
+        [&["--doc", "-p", "saved"][..], &["-p", "saved"][..], &["-p", "saved", "--no-run"][..]]
+    {
+        for unit_tests in [true, false] {
+            let f = fixture();
+            std::fs::remove_file(f.root().join("src/main.rs")).unwrap();
+            f.write("Cargo.toml", &format!("[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n[lib]\ntest={unit_tests}\n[dev-dependencies]\nrenamed={{package='helper',path='helper'}}\n"));
+            f.write("src/lib.rs", "/// ```\n/// assert_eq!(renamed::answer(), saved::answer());\n/// ```\npub fn answer() -> u32 { 42 }\n");
+            f.write("helper/Cargo.toml", "[package]\nname='helper'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nsaved={path='..'}\n");
+            f.write("helper/src/lib.rs", "pub fn answer() -> u32 { saved::answer() }\n");
+            std::fs::remove_file(f.root().join("Cargo.lock")).unwrap();
+            let store = tempfile::tempdir().unwrap();
+            let made = saved(&f, Subcommand::Test, args, store.path());
+            drop(f);
+            let worker = tempfile::tempdir().unwrap();
+            let replay = prepared(&made, store.path(), &worker.path().join("relocated"));
+            let plans = blaze_spec::execution::programs(
+                &replay,
+                Path::new("/owned/toolchain"),
+                &worker.path().join("artifacts"),
+            )
+            .unwrap();
+            let docs: Vec<_> = plans
+                .iter()
+                .filter(|p| p.output == blaze_spec::execution::Output::Doctest)
+                .collect();
+            if args.contains(&"--no-run") {
+                assert!(docs.is_empty());
+                assert!(plans.iter().all(|program| !program.run));
+                for name in ["saved", "helper"] {
+                    let object = plans
+                        .iter()
+                        .find(|program| {
+                            program.crate_name == name
+                                && program.output == blaze_spec::execution::Output::Object
+                        })
+                        .unwrap();
+                    assert!(
+                        !object.project["crates"][0]["cfg"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|cfg| cfg == "test")
+                    );
+                }
+                replay.validate_sources(store.path()).unwrap();
+                continue;
+            }
+            assert_eq!(docs.len(), 1);
+            let crates = docs[0].project["crates"].as_array().unwrap();
+            let context = &crates[0];
+            let dep = |krate: &serde_json::Value, name: &str| -> usize {
+                krate["deps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|d| d["name"] == name)
+                    .unwrap_or_else(|| panic!("missing {name} in {krate}"))
+                    .get("crate")
+                    .unwrap()
+                    .as_u64()
+                    .unwrap() as usize
+            };
+            let ordinary = dep(context, "saved");
+            let helper = dep(context, "renamed");
+            assert_ne!(ordinary, 0);
+            assert_eq!(dep(&crates[helper], "saved"), ordinary);
+            assert!(crates[ordinary]["deps"].as_array().unwrap().is_empty());
+            assert!(!crates[ordinary]["cfg"].as_array().unwrap().iter().any(|c| c == "test"));
+            fn visit(at: usize, crates: &[serde_json::Value], active: &mut Vec<usize>) {
+                assert!(at < crates.len());
+                assert!(!active.contains(&at), "cyclic doctest context");
+                active.push(at);
+                for dep in crates[at]["deps"].as_array().unwrap() {
+                    visit(dep["crate"].as_u64().unwrap() as usize, crates, active);
+                }
+                active.pop();
+            }
+            visit(0, crates, &mut Vec::new());
+            let build = &replay.resolved.spec.build;
+            assert_eq!(build.units[docs[0].unit as usize].target.0, 7);
+            let mut forged = build.clone();
+            forged.units[docs[0].unit as usize].deps = blaze_wire::Set::new(Vec::new());
+            assert!(
+                blaze_spec::assemble::canonical_units(&forged, &replay.resolved.graph).is_err()
+            );
+            let mut old_identity = build.clone();
+            old_identity.units[docs[0].unit as usize].target.0 = 0;
+            assert!(
+                blaze_spec::assemble::canonical_units(&old_identity, &replay.resolved.graph)
+                    .is_err()
+            );
+            replay.validate_sources(store.path()).unwrap();
+        }
+    }
 }
 
 #[test]

@@ -218,7 +218,7 @@ fn named_targets(asked: &[&UnitSpec]) -> Vec<String> {
     for unit in asked {
         let (kind, name) = (unit.target.0, unit.target.1.as_str());
         let flag = match kind {
-            0 | 6 => Some(("--lib", None)),
+            0 | 6 | 7 => Some(("--lib", None)),
             1 => Some(("--bin", Some(name))),
             2 => Some(("--test", Some(name))),
             3 => Some(("--example", Some(name))),

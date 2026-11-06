@@ -729,7 +729,11 @@ fn unit_specs(
                     unit.package.version.clone(),
                     Sha256::digest(unit.package.source.as_bytes()).into(),
                 ),
-                target: (kind_code(kind), unit.target.name.clone()),
+                // Kind 7 identifies a doctest context without changing ordinary unit keys.
+                target: (
+                    if unit.mode == Mode::DocTest { 7 } else { kind_code(kind) },
+                    unit.target.name.clone(),
+                ),
                 features: Set::new(unit.features.clone()),
                 cfg: Set::new(cfg.into_iter().map(Into::into).collect()),
                 edition: unit.target.edition,
@@ -819,7 +823,7 @@ fn asked_units(
         for &index in &graph.roots {
             let unit = &graph.units[index];
             let library = matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro)
-                && unit.mode == Mode::Build
+                && unit.mode == Mode::DocTest
                 && unit.target.doctest;
             if library {
                 asked.push(index);

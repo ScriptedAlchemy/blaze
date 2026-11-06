@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The doctests of a workspace of three libraries, run by `cargo test --doc` and by
-`cargo ra-jit test --doc`: ra-jit loads the workspace once for all of them, and they end as
+`cargo ra-jit test --doc`: ra-jit plans the workspace once for all of them, and they end as
 cargo's do, one library after another, each example reading where it runs and the variables
 as it does under rustdoc.
 
@@ -11,10 +11,12 @@ The steps: every example passes; an example of the first two libraries fails, an
 after the first; the same with `--no-fail-fast`; one of the first fails, with `--no-fail-fast`. In each, the exit status, the results of
 each library in turn, the `Doc-tests` lines and cargo's lines of what failed have to be
 cargo's, every example has to be ra-jit's, on macOS too (#255), and ra-jit has to have
-loaded the workspace once.
+made one owned plan containing all three dependency contexts and linked libraries.
 A difference is WRONG and fails the run."""
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -64,7 +66,7 @@ def tested(ws, command, args, extra, target_dir):
     """How the doctests ended: the exit status, each library's results in turn, the
     `Doc-tests` lines and cargo's lines of what failed, and all that was said beside."""
     path = os.path.dirname(RA_JIT) + os.pathsep + os.environ["PATH"]
-    env = {**os.environ, **extra, "PATH": path, "CARGO_TARGET_DIR": target_dir}
+    env = {**os.environ, **extra, "PATH": path, "CARGO_TARGET_DIR": target_dir, "RA_JIT_STATS": "1"}
     run = subprocess.run(["cargo", *command, "test", "--doc", *args], cwd=ws, capture_output=True,
                          text=True, timeout=3600, env=env)
     libraries = [doctest_report("running " + it) for it in re.split(r"(?m)^running ", run.stdout)[1:]]
@@ -89,13 +91,14 @@ def first_difference(want, got):
 
 def differences(want, got, said):
     """Compare the result and require evidence that blaze compiled every example run."""
-    loads = len(re.findall(r"(?m)^load workspace: ", said))
+    plans = re.findall(r"(?m)^doctest plan: (\d+) contexts, (\d+) linked libraries in one owned plan$", said)
+    loads = len(plans)
     left = re.findall(r"ra-jit: (?:the doctests are left to rustdoc|.* is rustc's): .*", said)
     built = sum(int(n) for n in re.findall(r"doctests: (\d+) built by ra-jit", said))
     parts = ["exit status", "results", "`Doc-tests` lines", "lines of what failed"]
     differs = [f"{part}: {first_difference(w, g)}"[:400] for part, w, g in zip(parts, want, got) if w != g]
-    if loads != 1:
-        differs.append(f"the workspace was loaded {loads} times")
+    if plans != [("3", "3")]:
+        differs.append(f"expected one owned plan with three contexts and libraries, got {plans!r}")
     if left:
         differs.append(f"not ra-jit's: {left[0][:80]} ... {left[0][-160:]}")
     # The fixture has no ignored or compile-fail examples: every test cargo reports
@@ -119,23 +122,30 @@ def selftest():
         def test_every_example_has_compiler_evidence(self):
             for count, status in [(6, 0), (3, 101), (6, 101)]:
                 result = self.result(count, status)
-                said = f"load workspace: once\ndoctests: {count} built by ra-jit\n"
+                said = f"doctest plan: 3 contexts, 3 linked libraries in one owned plan\ndoctests: {count} built by ra-jit\n"
                 self.assertEqual(differences(result, result, said)[0], [])
 
         def test_matching_results_without_compiler_evidence_fail(self):
             result = self.result(6)
             for count in [0, 3, 7]:
-                said = f"load workspace: once\ndoctests: {count} built by ra-jit\n"
+                said = f"doctest plan: 3 contexts, 3 linked libraries in one owned plan\ndoctests: {count} built by ra-jit\n"
                 self.assertTrue(differences(result, result, said)[0])
-            self.assertTrue(differences(result, result, "load workspace: once\n")[0])
+            self.assertTrue(differences(result, result, "doctest plan: 3 contexts, 3 linked libraries in one owned plan\n")[0])
+
+        def test_missing_partial_or_repeated_planning_evidence_fails(self):
+            result = self.result(6)
+            for plan in ["", "doctest plan: 2 contexts, 3 linked libraries in one owned plan\n",
+                         "doctest plan: 3 contexts, 2 linked libraries in one owned plan\n",
+                         "doctest plan: 3 contexts, 3 linked libraries in one owned plan\n" * 2]:
+                self.assertTrue(differences(result, result, plan + "doctests: 6 built by ra-jit\n")[0])
 
         def test_empty_reference_is_not_a_pass(self):
             result = self.result(0)
-            self.assertTrue(differences(result, result, "load workspace: once\n")[0])
+            self.assertTrue(differences(result, result, "doctest plan: 3 contexts, 3 linked libraries in one owned plan\n")[0])
 
         def test_counts_from_all_libraries_are_combined(self):
             result = self.result(6)
-            said = "load workspace: once\ndoctests: 3 built by ra-jit\ndoctests: 3 built by ra-jit\n"
+            said = "doctest plan: 3 contexts, 3 linked libraries in one owned plan\ndoctests: 3 built by ra-jit\ndoctests: 3 built by ra-jit\n"
             self.assertEqual(differences(result, result, said)[0], [])
 
     result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(Provenance))
@@ -144,23 +154,34 @@ def selftest():
 
 def main():
     wrong = 0
-    with tempfile.TemporaryDirectory(prefix="ra-jit-doctestonce-") as scratch:
+    scratch = tempfile.mkdtemp(prefix="ra-jit-doctestonce-")
+    records = []
+    try:
         ws = os.path.join(scratch, "ws")
         for file, text in WORKSPACE.items():
             os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
             open(os.path.join(ws, file), "w").write(text)
         for name, args, extra in STEPS:
-            want, _ = tested(ws, [], args, extra, os.path.join(scratch, "cargo"))
+            want, cargo_said = tested(ws, [], args, extra, os.path.join(scratch, "cargo"))
             got, said = tested(ws, ["ra-jit"], args, extra, os.path.join(scratch, "ra-jit"))
             differs, loads, built = differences(want, got, said)
+            records.append({"scenario": name, "args": args, "env": extra, "cargo": want, "owned": got, "cargo_stderr": cargo_said, "owned_stderr": said, "differences": differs})
             verdict = "WRONG" if differs else "same"
             wrong += bool(differs)
             print(f"  {name:32} exit {got[0]:3}  {len(got[1])} libraries, {built} examples built by ra-jit, "
-                  f"{loads} load{'s' if loads != 1 else ''}  {verdict}", flush=True)
+                  f"{loads} owned plan{'s' if loads != 1 else ''}  {verdict}", flush=True)
             for it in differs:
                 print(f"    {it}", flush=True)
             if differs and got[0] not in (0, want[0]):
                 print(f"    ra-jit said: {said.strip()[-800:]!r}", flush=True)
+    finally:
+        if report := os.environ.get("DOCTESTONCE_REPORT"):
+            with open(report, "w") as file:
+                json.dump({"scratch": scratch, "compiler": RA_JIT, "scenarios": records}, file, indent=2)
+        if len(records) == len(STEPS) and not wrong:
+            shutil.rmtree(scratch)
+        else:
+            print(f"doctest evidence retained at {scratch}", flush=True)
     print(f"{len(STEPS) - wrong}/{len(STEPS)} same")
     sys.exit(1 if wrong else 0)
 

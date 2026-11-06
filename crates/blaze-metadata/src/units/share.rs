@@ -21,7 +21,7 @@ pub(super) struct Shared {
     pub units: Vec<Inner>,
     pub deps: Vec<Vec<Dep>>,
     pub roots: Vec<usize>,
-    pub doctest_libraries: Vec<usize>,
+    pub doctest_contexts: Vec<usize>,
 }
 
 type Key =
@@ -40,7 +40,7 @@ pub(super) fn share(
     env: &Env<'_>,
     graph: &Graph,
     roots: &[usize],
-    doctest_libraries: &[usize],
+    doctest_contexts: &[usize],
 ) -> Shared {
     let mut sharing = Sharing {
         graph,
@@ -50,11 +50,10 @@ pub(super) fn share(
         index: FxHashMap::default(),
     };
     let roots: Vec<usize> = roots.iter().map(|&root| sharing.traverse(root, false)).collect();
-    // These libraries are dependencies of omitted doctest units, not command roots.
-    // In particular a proc macro's library keeps the host's debuginfo policy even
-    // when its test executable is a root with the full test profile.
+    // Traverse doctest contexts through the same interner so their ordinary
+    // dependencies share exactly the units reached by the command's other roots.
     let mut mapped_doctests = Vec::new();
-    for &library in doctest_libraries {
+    for &library in doctest_contexts {
         let is_for_host = env.target(&graph.arena.units[library]).for_host;
         mapped_doctests.push(sharing.traverse(library, is_for_host));
     }
@@ -80,7 +79,7 @@ pub(super) fn share(
             })
             .collect(),
         roots: roots.into_iter().map(|root| rank[root]).collect(),
-        doctest_libraries: mapped_doctests.into_iter().map(|unit| rank[unit]).collect(),
+        doctest_contexts: mapped_doctests.into_iter().map(|unit| rank[unit]).collect(),
     }
 }
 

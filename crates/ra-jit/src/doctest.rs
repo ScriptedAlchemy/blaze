@@ -1486,7 +1486,7 @@ fn plan(
             return (plans, None);
         }
     };
-    let mixing = with_another_copy(db, krate);
+    let mixing = with_another_copy(db, krate, asked);
     for (at, example) in add_crates(db, asked, krate, tests, &wanted) {
         let test = &tests[at];
         let source = &test.program.source;
@@ -1589,16 +1589,27 @@ fn uses_deprecated(db: &RootDatabase, file: vfs::FileId) -> bool {
 /// dev-dependency on a crate that depends on it from crates.io does. Its types and the
 /// library's are not each other's, which rustc says where an example mixes them, and
 /// rust-analyzer's checks do not.
-fn with_another_copy(db: &RootDatabase, library: hir::Crate) -> Vec<String> {
+fn with_another_copy(db: &RootDatabase, library: hir::Crate, asked: &Asked) -> Vec<String> {
     let library: ide_db::base_db::Crate = library.into();
     let name = |krate: ide_db::base_db::Crate| {
         hir::Crate::from(krate).display_name(db).map(|it| it.crate_name().as_str().to_owned())
     };
-    let Some(own) = name(library) else { return Vec::new() };
     let dependencies = library.data(db).dependencies.iter();
+    let identity = if asked.admission.is_some() {
+        dependencies
+            .clone()
+            .find(|dep| {
+                dep.name.as_str() == asked.crate_name
+                    && dep.crate_id.data(db).root_file_id == library.data(db).root_file_id
+            })
+            .map_or(library, |dep| dep.crate_id)
+    } else {
+        library
+    };
+    let Some(own) = name(identity) else { return Vec::new() };
     let mixing = dependencies.filter(|dependency| {
         let linked = dependency.crate_id.transitive_deps(db);
-        linked.into_iter().any(|it| it != library && name(it).as_deref() == Some(own.as_str()))
+        linked.into_iter().any(|it| it != identity && name(it).as_deref() == Some(own.as_str()))
     });
     mixing.map(|it| it.name.as_str().to_owned()).collect()
 }
@@ -1633,9 +1644,15 @@ fn add_crates(
     let library: base_db::Crate = library.into();
     let data = library.data(db).clone();
     let named = CrateName::normalize_dashes(&asked.crate_name);
-    let dependencies: Vec<BuiltDependency> = std::iter::once(BuiltDependency::new(named, library))
-        .chain(data.dependencies.iter().cloned())
-        .collect();
+    // An admitted doctest root is a canonical context whose edges already include
+    // the ordinary library. Linking the context itself would create a second copy.
+    let dependencies: Vec<BuiltDependency> = if asked.admission.is_some() {
+        data.dependencies.clone()
+    } else {
+        std::iter::once(BuiltDependency::new(named, library))
+            .chain(data.dependencies.iter().cloned())
+            .collect()
+    };
     let (workspace, cfg, env) = (
         library.workspace_data(db).clone(),
         library.cfg_options(db).clone(),

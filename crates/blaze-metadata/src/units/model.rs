@@ -32,13 +32,14 @@ impl Kind {
     }
 }
 
-/// cargo's `CompileMode`, less what only documentation and doc tests use. The order is cargo's.
+/// cargo's compilation modes, including the separate dependency context of doctests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) enum CMode {
     Test,
     Build,
     Check { test: bool },
     RunCustomBuild,
+    DocTest,
 }
 
 impl CMode {

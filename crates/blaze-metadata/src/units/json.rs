@@ -7,13 +7,30 @@ use serde_json::{Value, json};
 use super::{Mode, TargetKind, Unit, UnitGraph, UnitTarget};
 
 pub(super) fn of(graph: &UnitGraph) -> Value {
-    let units: Vec<Value> = graph.units.iter().map(unit).collect();
-    json!({ "version": 1, "units": units, "roots": graph.roots })
+    // Cargo's comparison format omits documentation tests; preserve all actual
+    // compile units, including those reached only from a doctest context.
+    let mut ranks = vec![None; graph.units.len()];
+    let mut units = Vec::new();
+    for (at, source) in graph.units.iter().enumerate() {
+        if source.mode != Mode::DocTest {
+            ranks[at] = Some(units.len());
+            units.push(unit(source));
+        }
+    }
+    for unit in &mut units {
+        for dep in unit["dependencies"].as_array_mut().unwrap() {
+            let old = dep["index"].as_u64().unwrap() as usize;
+            dep["index"] = json!(ranks[old].expect("compile units never depend on doctests"));
+        }
+    }
+    let roots: Vec<_> = graph.roots.iter().filter_map(|&at| ranks[at]).collect();
+    json!({ "version": 1, "units": units, "roots": roots })
 }
 
 fn unit(unit: &Unit) -> Value {
     let mode = match unit.mode {
         Mode::Build => "build",
+        Mode::DocTest => unreachable!("doctest contexts are omitted from Cargo JSON"),
         Mode::Check => "check",
         Mode::Test => "test",
         Mode::RunCustomBuild => "run-custom-build",
