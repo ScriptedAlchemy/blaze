@@ -284,7 +284,11 @@ fn run_build(mut ra_jit: Command, private: &[u8], dir: &Path) -> Result<String, 
     let said = String::from_utf8_lossy(&built.stderr).into_owned();
     std::fs::write(dir.join("ra-jit.log"), &said).map_err(|it| it.to_string())?;
     if !built.status.success() {
-        if let Some(at) = said.find("error:").into_iter().chain(said.find("Error:")).min() {
+        if let Some(at) = ["error:", "Error:", "panicked at "]
+            .into_iter()
+            .filter_map(|marker| said.find(marker))
+            .min()
+        {
             return Err(format!("ra-jit did not build it ({}):\n{}", built.status, &said[at..]));
         }
         let last = said.lines().rev().find(|it| !it.trim().is_empty()).unwrap_or("");
@@ -1248,6 +1252,24 @@ mod tests {
         assert!(failed.contains("Error: loading /source/toolchain"), "{failed}");
         assert!(
             failed.contains("Caused by:\n    No such file or directory (os error 2)"),
+            "{failed}"
+        );
+        assert!(!failed.contains("progress"), "{failed}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_producer_panic_keeps_its_cause_instead_of_the_backtrace_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fails = Command::new("sh");
+        fails.args([
+            "-c",
+            "printf '%s\\n' 'progress' \"thread 'main' (123) panicked at vendor/salsa/src/accumulator.rs:81:13:\" 'cannot accumulate values outside of an active tracked function' 'note: run with RUST_BACKTRACE=1 to display a backtrace' >&2; exit 101",
+        ]);
+        let failed = run_build(fails, b"", dir.path()).unwrap_err();
+        assert!(failed.contains("panicked at vendor/salsa/src/accumulator.rs:81:13"), "{failed}");
+        assert!(
+            failed.contains("cannot accumulate values outside of an active tracked function"),
             "{failed}"
         );
         assert!(!failed.contains("progress"), "{failed}");
