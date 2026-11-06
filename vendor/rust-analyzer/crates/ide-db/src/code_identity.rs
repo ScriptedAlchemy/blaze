@@ -522,51 +522,52 @@ mod tests {
     #[test]
     fn dependency_anonymous_type_context_reaches_the_callers_source_identity() {
         use test_fixture::WithFixture;
-        let (mut db, files) = crate::RootDatabase::with_many_files(
-            r#"
+        for body in ["let _: [u8; file!().len()]; 1", "size_of::<[u8; file!().len()]>()"] {
+            let source = format!(
+                r#"
 //- /app/main.rs crate:app deps:dep
-pub fn run() -> usize { dep::width() }
+pub fn run() -> usize {{ dep::width() }}
 //- /dep/lib.rs crate:dep
-#[rustc_builtin_macro] macro_rules! file { () => {} }
-pub const fn width() -> usize {
-    let _: [u8; file!().len()];
-    1
-}
-"#,
-        );
-        let named = |name: &str| {
-            *base_db::all_crates(&db)
-                .iter()
-                .find(|krate| {
-                    krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == name
-                })
-                .unwrap()
-        };
-        let app = named("app");
-        let dep = named("dep");
-        let file = files[1].file_id(&db);
-        let mut hashes = Vec::new();
-        for name in ["dependency/short.rs", "dependency/a-much-longer-name.rs"] {
-            hir::mir::location::name_sources(&mut db, move |_, source| {
-                Some(if source == file { name.to_owned() } else { "app/main.rs".to_owned() })
-            });
-            let current = hir::input_owners::discover_identity_inputs(&db, dep);
-            assert!(current.unresolved, "the nonliteral type constant keeps exact context");
-            assert!(
-                current
-                    .source_names
-                    .iter()
-                    .any(|read| read.file == file && read.name.as_deref() == Some(name))
+#[rustc_builtin_macro] macro_rules! file {{ () => {{}} }}
+#[rustc_intrinsic] fn size_of<T>() -> usize;
+pub const fn width() -> usize {{ {body} }}
+"#
             );
-            hashes.push((
-                semantic_source_hash(&db, app),
-                semantic_source_hash(&db, dep),
-                source_hash(&db, app),
-            ));
+            let (mut db, files) = crate::RootDatabase::with_many_files(&source);
+            let named = |name: &str| {
+                *base_db::all_crates(&db)
+                    .iter()
+                    .find(|krate| {
+                        krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == name
+                    })
+                    .unwrap()
+            };
+            let app = named("app");
+            let dep = named("dep");
+            let file = files[1].file_id(&db);
+            let mut hashes = Vec::new();
+            for name in ["dependency/short.rs", "dependency/a-much-longer-name.rs"] {
+                hir::mir::location::name_sources(&mut db, move |_, source| {
+                    Some(if source == file { name.to_owned() } else { "app/main.rs".to_owned() })
+                });
+                let current = hir::input_owners::discover_identity_inputs(&db, dep);
+                assert!(current.unresolved, "the nonliteral type constant keeps exact context");
+                assert!(
+                    current
+                        .source_names
+                        .iter()
+                        .any(|read| read.file == file && read.name.as_deref() == Some(name))
+                );
+                hashes.push((
+                    semantic_source_hash(&db, app),
+                    semantic_source_hash(&db, dep),
+                    source_hash(&db, app),
+                ));
+            }
+            assert_eq!(hashes[0].0, hashes[1].0, "the caller has no filename observation");
+            assert_ne!(hashes[0].1, hashes[1].1, "the dependency owns the anonymous constant");
+            assert_ne!(hashes[0].2, hashes[1].2, "dependency content enters its caller's key");
         }
-        assert_eq!(hashes[0].0, hashes[1].0, "the caller has no filename observation");
-        assert_ne!(hashes[0].1, hashes[1].1, "the dependency owns the anonymous constant");
-        assert_ne!(hashes[0].2, hashes[1].2, "dependency content enters its caller's key");
     }
 
     #[test]
@@ -600,6 +601,16 @@ pub const fn width() -> usize {
     }
 
     #[test]
+    fn generic_type_layout_queries_do_not_observe_source_names() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        let source = "#[rustc_intrinsic] fn align_of<T>() -> usize; trait Properties { const ALIGN: usize = align_of::<Self>(); } impl<T> Properties for T {} const fn alignment<T>() -> usize { <T as Properties>::ALIGN } struct Array<T>(T); trait Pointable { const ALIGN: usize; } impl<T> Pointable for Array<T> { const ALIGN: usize = alignment::<Array<T>>(); } pub fn value() -> u8 { 1 }";
+        assert_eq!(
+            generated_identity("/one/package", "/one/out", body, source),
+            generated_identity("/other/package", "/another/output", body, source),
+        );
+    }
+
+    #[test]
     fn required_associated_constants_do_not_observe_declaration_filenames() {
         let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
         for source in [
@@ -617,13 +628,18 @@ pub const fn width() -> usize {
     #[test]
     fn associated_constant_implementation_context_reaches_generic_callers() {
         use test_fixture::WithFixture;
-        for (value, contextual) in [("16", false), ("file!().len()", true)] {
+        for (declaration, value, contextual) in
+            ["const BYTES: usize;", "const BYTES: usize = 8;"].into_iter().flat_map(|declaration| {
+                [("16", false), ("file!().len()", true)]
+                    .map(|(value, contextual)| (declaration, value, contextual))
+            })
+        {
             let source = format!(
                 r#"
 //- /app/main.rs crate:app deps:dep,values
 pub fn run() -> usize {{ dep::width::<values::Value>() }}
 //- /dep/lib.rs crate:dep
-pub trait Vector {{ const BYTES: usize; }}
+pub trait Vector {{ {declaration} }}
 pub struct Double<T>(T);
 impl<T: Vector> Double<T> {{ pub const BYTES: usize = 2 * T::BYTES; }}
 pub fn width<T: Vector>() -> usize {{ Double::<T>::BYTES }}
@@ -685,6 +701,8 @@ impl dep::Vector for Value {{ const BYTES: usize = {value}; }}
             "struct Type<T>(T); impl<T> Type<T> { const WIDTH: usize = file!().len(); } pub struct Value([u8; Type::<u8>::WIDTH]);",
             "pub trait Size { const VALUE: [u8; file!().len()]; }",
             "pub trait Size { const WIDTH: usize = file!().len(); }",
+            "const fn align_of<T>() -> usize { file!().len() } struct Value<T>(T); impl<T> Value<T> { const ALIGN: usize = align_of::<T>(); }",
+            "#[rustc_intrinsic] fn size_of<T>() -> usize; const WIDTH: usize = size_of::<[u8; file!().len()]>();",
         ] {
             assert_ne!(
                 generated_identity("/one/package", "/one/out", body, source),

@@ -1112,7 +1112,7 @@ mod tests {
             .into_iter()
             .flat_map(|expression| [false, true].map(|included| (expression, included)))
             .flat_map(|(expression, included)| {
-                ["direct", "layout", "inline", "projection"]
+                ["direct", "layout", "inline", "projection", "type-size"]
                     .map(|mode| (expression, included, mode))
             })
         {
@@ -1125,6 +1125,9 @@ mod tests {
                 ),
                 "projection" => format!(
                     "trait Width {{ const BYTES: usize; }} struct Value; impl Width for Value {{ const BYTES: usize = {expression}.len(); }} struct Double<V>(V); impl<V: Width> Double<V> {{ const BYTES: usize = 2 * V::BYTES; }} const GOAL: usize = Double::<Value>::BYTES / 2;"
+                ),
+                "type-size" => format!(
+                    "trait Shape {{ const BYTES: usize; }} impl<T> Shape for T {{ const BYTES: usize = core::mem::size_of::<T>(); }} const GOAL: usize = <[u8; {expression}.len()] as Shape>::BYTES;"
                 ),
                 _ => format!("const GOAL: usize = {expression}.len();"),
             };

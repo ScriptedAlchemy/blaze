@@ -270,17 +270,50 @@ impl<'db> ContextFreeInputs<'db> {
                     else {
                         return None;
                     };
+                    let ty = inferred.expr_ty(expr);
+                    if inferred.expr_has_type_mismatch(expr)
+                        || ty.is_infer()
+                        || !(ty.is_numeric() || ty.is_bool() || ty.is_char())
+                    {
+                        return None;
+                    }
+                    if ConstSignature::of(db, id).flags.contains(ConstFlags::HAS_BODY) {
+                        let owner = ExpressionStoreOwnerId::Body(id.into());
+                        return scalar(self.expression(owner, Body::of(db, id.into()).root_expr()))
+                            .then_some(Scalar);
+                    }
                     // Like a const parameter, a required associated value is
                     // supplied by the instance. Its implementation owns any
                     // filename reads; declarations still own their type roots.
-                    let ty = inferred.expr_ty(expr);
-                    (matches!(id.lookup(db).container, ItemContainerId::TraitId(_))
-                        && !ConstSignature::of(db, id).flags.contains(ConstFlags::HAS_BODY)
-                        && !inferred.expr_has_type_mismatch(expr)
-                        && !ty.is_infer()
-                        && (ty.is_numeric() || ty.is_bool() || ty.is_char()))
-                    .then_some(Scalar)
+                    matches!(id.lookup(db).container, ItemContainerId::TraitId(_)).then_some(Scalar)
                 })
+            }
+            Expr::Call { callee, args } if args.is_empty() => {
+                let Expr::Path(path) = &store[*callee] else { return None };
+                let ValueNs::FunctionId(function) = resolve().resolve_path_in_value_ns_fully(
+                    db,
+                    path,
+                    store.expr_path_hygiene(*callee),
+                )?
+                else {
+                    return None;
+                };
+                let signature = FunctionSignature::of(db, function);
+                if !signature.params.is_empty() {
+                    return None;
+                }
+                if signature.flags.contains(FnFlags::RUSTC_INTRINSIC) {
+                    // Layout depends on the instance's types. Anonymous type
+                    // constants are independently observed in their source owner.
+                    return matches!(signature.name.as_str(), "size_of" | "align_of")
+                        .then_some(Scalar);
+                }
+                if !signature.flags.contains(FnFlags::CONST) {
+                    return None;
+                }
+                let owner = ExpressionStoreOwnerId::Body(function.into());
+                scalar(self.expression(owner, Body::of(db, function.into()).root_expr()))
+                    .then_some(Scalar)
             }
             Expr::BinaryOp { lhs, rhs, .. } => (scalar(self.expression(owner, *lhs))
                 && scalar(self.expression(owner, *rhs)))
