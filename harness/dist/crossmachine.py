@@ -1649,7 +1649,7 @@ def main():
     bad = failing(results)
     pending = [d for r in results for d in r["differences"] if d["pending"]]
     print(f"\n{len(results)} fixtures: {len(bad)} differences fail, {len(pending)} are pending")
-    if not a.keep:
+    if not a.keep and not bad and not watchdog.tripped:
         # The machines are most of the disk; the reports, the logs and the JSON stay.
         shutil.rmtree(os.path.join(work, "m"), ignore_errors=True)
     return 1 if bad or watchdog.tripped else 0
