@@ -2,7 +2,7 @@
 //! that code compiled by one run can be found by the next. A crate of the checkout is named
 //! by what is written in it, so an edit makes other names of everything in it.
 
-use std::{cell::RefCell, fmt::Write};
+use std::{cell::RefCell, fmt::Write, sync::Arc};
 
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, ModuleDefId,
@@ -20,7 +20,7 @@ use span::ErasedFileAstId;
 
 use base_db::Crate;
 
-use super::{Instance, InstanceDef, SymbolResolver};
+use super::{Instance, InstanceDef, InstanceIn, SymbolResolver};
 use hir_ty::{
     ImplTraitId, InferBodyId,
     consteval::try_const_usize,
@@ -180,6 +180,21 @@ struct Listed {
     functions: FxHashMap<String, Vec<FunctionId>>,
 }
 
+struct SemanticComponent {
+    contextual: bool,
+    constants: Vec<String>,
+    sources: Vec<super::cached::SemanticSource>,
+    dependencies: Vec<usize>,
+    inputs: std::sync::OnceLock<Option<Arc<super::cached::SemanticInputs>>>,
+}
+
+struct SemanticNode {
+    contextual: bool,
+    constants: Vec<String>,
+    sources: Vec<super::cached::SemanticSource>,
+    children: Vec<InstanceIn>,
+}
+
 pub(super) struct StableNames<'a, 'db> {
     db: &'db dyn HirDatabase,
     symbols: &'a dyn SymbolResolver,
@@ -207,6 +222,13 @@ pub(super) struct StableNames<'a, 'db> {
     missed: std::cell::Cell<&'static str>,
     /// How often each thing kept an instance from having a name.
     pub(super) misses: RefCell<FxHashMap<&'static str, usize>>,
+    // Completed SCCs belong to this naming view. Arena edges avoid recursive graph drops.
+    components: RefCell<Vec<SemanticComponent>>,
+    certificates: RefCell<FxHashMap<InstanceIn, Result<usize, &'static str>>>,
+    #[cfg(test)]
+    semantic_visits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    semantic_flatten_visits: std::cell::Cell<usize>,
 }
 
 impl<'a, 'db> StableNames<'a, 'db> {
@@ -232,6 +254,12 @@ impl<'a, 'db> StableNames<'a, 'db> {
             frozen: FxHashMap::default(),
             missed: std::cell::Cell::new(""),
             misses: RefCell::default(),
+            components: RefCell::default(),
+            certificates: RefCell::default(),
+            #[cfg(test)]
+            semantic_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            semantic_flatten_visits: std::cell::Cell::new(0),
         }
     }
 
@@ -308,7 +336,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
         let mut name = self.raw_instance(instance)?;
         if let Some(inputs) = self.semantic_inputs(instance, environment)? {
             name.push_str(SEMANTIC_INPUTS);
-            name.push_str(&inputs.digest());
+            name.push_str(inputs.digest());
         }
         Some(name)
     }
@@ -317,121 +345,290 @@ impl<'a, 'db> StableNames<'a, 'db> {
         &self,
         instance: &Instance,
         environment: &hir_ty::traits::StoredParamEnvAndCrate,
-    ) -> Option<Option<super::cached::SemanticInputs>> {
-        use hir_ty::consteval::inputs::{BodyInput, BodyKind, prepare_constants};
-        use hir_ty::db::GeneralConstId;
-        let mut pending = vec![(instance.clone(), environment.clone(), false)];
+    ) -> Option<Option<Arc<super::cached::SemanticInputs>>> {
+        self.db.unwind_if_revision_cancelled();
+        let key = InstanceIn::new(instance.clone(), environment.clone());
+        let cached = self.certificates.borrow().get(&key).copied();
+        let result = cached.unwrap_or_else(|| {
+            let result = self.semantic_closure(&key).ok_or_else(|| self.missed.get());
+            self.certificates.borrow_mut().insert(key, result);
+            result
+        });
+        match result {
+            Ok(component) => {
+                if !self.components.borrow()[component].contextual {
+                    return Some(None);
+                }
+                Some(Some(self.semantic_component_inputs(component)?))
+            }
+            Err(why) if cached.is_some() => self.miss(why),
+            Err(_) => None,
+        }
+    }
+
+    fn semantic_closure(&self, root: &InstanceIn) -> Option<usize> {
+        let mut pending = vec![(root.clone(), false)];
         let mut active = FxHashMap::<InstanceDef, usize>::default();
-        let mut seen = FxHashSet::default();
-        let mut fields = Vec::new();
-        let mut sources = Vec::new();
-        let mut homes = super::home::Homes::default();
-        let mut context_sensitive = false;
-        while let Some((instance, environment, exiting)) = pending.pop() {
+        let mut index = FxHashMap::default();
+        let mut keys = Vec::new();
+        let mut nodes = Vec::new();
+        while let Some((key, exiting)) = pending.pop() {
+            self.db.unwind_if_revision_cancelled();
             if exiting {
-                *active.get_mut(&instance.def).unwrap() -= 1;
+                *active.get_mut(&key.instance.def).unwrap() -= 1;
                 continue;
             }
-            if !seen.insert((instance.clone(), environment.clone())) {
+            let cached = self.certificates.borrow().get(&key).copied();
+            if let Some(cached) = cached {
+                if let Err(why) = cached {
+                    self.cache_semantic_failure(&key, &pending, why);
+                    return self.miss(why);
+                }
                 continue;
             }
-            if !environment.param_env(self.db).clauses().is_empty() {
-                return self.miss("semantic preparation with caller bounds");
+            if index.contains_key(&key) {
+                continue;
             }
-            context_sensitive |= self
-                .default_environment(&instance)
-                .as_ref()
-                .is_some_and(|default| default != &environment);
-            let mut body = self.raw_instance(&instance)?;
-            body.push_str(" environment ");
-            self.crate_(&mut body, environment.krate)?;
-            fields.push(format!("body {body}"));
-            let kind = match instance.def {
-                InstanceDef::Fn(function) => {
-                    if !hir_def::signatures::FunctionSignature::of(self.db, function).has_body()
-                        || hir_def::signatures::FunctionSignature::is_intrinsic(self.db, function)
-                    {
-                        continue;
-                    }
-                    BodyKind::Body(function.into())
-                }
-                InstanceDef::Closure(id) => BodyKind::Closure(InternedClosureId::from_id(id)),
-                InstanceDef::Coroutine(id) => BodyKind::Coroutine(InternedCoroutineId::from_id(id)),
-                InstanceDef::CoroutineByMove(id) => {
-                    BodyKind::CoroutineByMove(InternedCoroutineId::from_id(id))
-                }
-                _ => continue,
-            };
-            let depth = active.entry(instance.def).or_default();
+            let depth = active.entry(key.instance.def).or_default();
             *depth += 1;
-            if *depth > crate_def_map(self.db, environment.krate).recursion_limit() as usize {
+            if *depth > crate_def_map(self.db, key.env.krate).recursion_limit() as usize {
                 return self.miss("semantic instantiation recursion limit");
             }
-            pending.push((instance.clone(), environment.clone(), true));
-            let input = BodyInput::new(self.db, kind, instance.args.clone(), environment.clone());
-            let prepared = prepare_constants(self.db, input);
-            if prepared.result.is_err() {
-                return self.miss("concrete constant preparation failed");
+            let node = match self.semantic_node(&key) {
+                Some(node) => node,
+                None => {
+                    self.cache_semantic_failure(&key, &pending, self.missed.get());
+                    return None;
+                }
+            };
+            index.insert(key.clone(), nodes.len());
+            pending.push((key.clone(), true));
+            pending.extend(node.children.iter().cloned().map(|child| (child, false)));
+            keys.push(key);
+            nodes.push(node);
+        }
+        let edges: Vec<Vec<usize>> = nodes
+            .iter()
+            .map(|node| node.children.iter().filter_map(|key| index.get(key).copied()).collect())
+            .collect();
+        let components = semantic_components(&edges);
+        let mut component_of = vec![0; nodes.len()];
+        for (component, members) in components.iter().enumerate() {
+            for &member in members {
+                component_of[member] = component;
             }
-            for selection in &prepared.selections {
-                let mut name = format!("{body} constant ");
-                match selection.definition {
-                    GeneralConstId::ConstId(id) => {
-                        let at = id.lookup(self.db).id;
-                        self.item(&mut name, id.krate(self.db), at.file_id, at.value.erase())?;
-                    }
-                    GeneralConstId::StaticId(id) => {
-                        let at = id.lookup(self.db).id;
-                        self.item(&mut name, id.krate(self.db), at.file_id, at.value.erase())?;
-                    }
-                    GeneralConstId::AnonConstId(id) => {
-                        let loc = id.loc(self.db);
-                        let (_, map) = hir_def::expr_store::ExpressionStore::with_source_map(
-                            self.db, loc.owner,
-                        );
-                        let source = map.expr_syntax(loc.expr).ok()?;
-                        self.file(&mut name, source.file_id)?;
-                        write!(name, "@{:?}", source.value.syntax_node_ptr().text_range()).ok()?;
+        }
+        let mut complete: Vec<Option<usize>> = vec![None; components.len()];
+        for (component, members) in components.iter().enumerate().rev() {
+            self.db.unwind_if_revision_cancelled();
+            let mut constants = Vec::new();
+            let mut sources = Vec::new();
+            let mut contextual = false;
+            let mut dependencies = FxHashSet::default();
+            let mut boundaries = FxHashSet::default();
+            for &member in members {
+                let node = &nodes[member];
+                contextual |= node.contextual;
+                constants.extend(node.constants.iter().cloned());
+                sources.extend(node.sources.iter().cloned());
+                for child in &node.children {
+                    if let Some(&child) = index.get(child) {
+                        let child = component_of[child];
+                        if child != component {
+                            dependencies.insert(child);
+                        }
+                    } else {
+                        boundaries.insert(child.clone());
                     }
                 }
-                self.args(&mut name, selection.arguments.as_ref())?;
-                fields.push(name);
             }
-            for read in &prepared.source_names {
-                sources.push(super::cached::SemanticSource {
-                    body: body.clone(),
-                    file: self.file_path(read.file)?,
-                    name: read.name.clone()?,
-                });
+            let mut children = Vec::new();
+            for dependency in dependencies {
+                let child = complete[dependency].expect("semantic dependencies precede callers");
+                contextual |= self.components.borrow()[child].contextual;
+                children.push(child);
             }
-            for (kind, arguments) in &prepared.callees {
-                let def = match kind {
-                    BodyKind::Body(hir_ty::InferBodyId::DefWithBodyId(
-                        hir_def::DefWithBodyId::FunctionId(id),
-                    )) => InstanceDef::Fn(*id),
-                    BodyKind::Closure(id) => InstanceDef::Closure(id.as_id()),
-                    BodyKind::Coroutine(id) => InstanceDef::Coroutine(id.as_id()),
-                    BodyKind::CoroutineByMove(id) => InstanceDef::CoroutineByMove(id.as_id()),
-                    _ => return self.miss("semantic callee is not a function body"),
+            for child in boundaries {
+                let cached = self
+                    .certificates
+                    .borrow()
+                    .get(&child)
+                    .copied()
+                    .expect("discovered semantic boundary");
+                let child = match cached {
+                    Ok(child) => child,
+                    Err(why) => return self.miss(why),
                 };
-                let callee = Instance { def, args: arguments.clone(), checked: instance.checked };
-                let environment = homes.home(self.db, &callee, &environment);
-                let mut edge =
-                    format!("{body} callee {} environment ", self.raw_instance(&callee)?);
-                self.crate_(&mut edge, environment.krate)?;
-                fields.push(edge);
-                pending.push((callee, environment, false));
+                contextual |= self.components.borrow()[child].contextual;
+                children.push(child);
+            }
+            constants.sort();
+            constants.dedup();
+            sources.sort();
+            sources.dedup();
+            children.sort_unstable();
+            children.dedup();
+            let certificate = {
+                let mut arena = self.components.borrow_mut();
+                let at = arena.len();
+                arena.push(SemanticComponent {
+                    contextual,
+                    constants,
+                    sources,
+                    dependencies: children,
+                    inputs: std::sync::OnceLock::new(),
+                });
+                at
+            };
+            for &member in members {
+                self.certificates.borrow_mut().insert(keys[member].clone(), Ok(certificate));
+            }
+            complete[component] = Some(certificate);
+        }
+        self.certificates.borrow().get(root).copied()?.ok()
+    }
+
+    fn cache_semantic_failure(
+        &self,
+        failed: &InstanceIn,
+        pending: &[(InstanceIn, bool)],
+        why: &'static str,
+    ) {
+        let mut cache = self.certificates.borrow_mut();
+        cache.insert(failed.clone(), Err(why));
+        for (ancestor, exiting) in pending {
+            if *exiting {
+                cache.insert(ancestor.clone(), Err(why));
             }
         }
-        if sources.is_empty() && !context_sensitive {
-            return Some(None);
+    }
+
+    fn semantic_component_inputs(&self, root: usize) -> Option<Arc<super::cached::SemanticInputs>> {
+        let arena = self.components.borrow();
+        arena[root]
+            .inputs
+            .get_or_init(|| {
+                let mut pending = vec![root];
+                let mut seen = FxHashSet::default();
+                let mut constants = Vec::new();
+                let mut sources = Vec::new();
+                while let Some(component) = pending.pop() {
+                    self.db.unwind_if_revision_cancelled();
+                    if !seen.insert(component) {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    self.semantic_flatten_visits.set(self.semantic_flatten_visits.get() + 1);
+                    let component = &arena[component];
+                    constants.extend(component.constants.iter().cloned());
+                    sources.extend(component.sources.iter().cloned());
+                    pending.extend(&component.dependencies);
+                }
+                constants.sort();
+                constants.dedup();
+                sources.sort();
+                sources.dedup();
+                let inputs = super::cached::SemanticInputs::new(constants, sources);
+                inputs.canonical().then(|| Arc::new(inputs))
+            })
+            .clone()
+            .or_else(|| self.miss("ambiguous semantic source provenance"))
+    }
+
+    fn semantic_node(&self, key: &InstanceIn) -> Option<SemanticNode> {
+        use hir_ty::consteval::inputs::{BodyInput, BodyKind, prepare_constants};
+        use hir_ty::db::GeneralConstId;
+        #[cfg(test)]
+        self.semantic_visits.set(self.semantic_visits.get() + 1);
+        let instance = &key.instance;
+        let environment = &key.env;
+        if !environment.param_env(self.db).clauses().is_empty() {
+            return self.miss("semantic preparation with caller bounds");
         }
-        fields.sort();
-        fields.dedup();
-        sources.sort();
-        sources.dedup();
-        let inputs = super::cached::SemanticInputs { constants: fields, sources };
-        inputs.canonical().then_some(Some(inputs))
+        let contextual = self
+            .default_environment(instance)
+            .as_ref()
+            .is_some_and(|default| default != environment);
+        let mut body = self.raw_instance(instance)?;
+        body.push_str(" environment ");
+        self.crate_(&mut body, environment.krate)?;
+        let mut node = SemanticNode {
+            contextual,
+            constants: vec![format!("body {body}")],
+            sources: Vec::new(),
+            children: Vec::new(),
+        };
+        let kind = match instance.def {
+            InstanceDef::Fn(function) => {
+                if !hir_def::signatures::FunctionSignature::of(self.db, function).has_body()
+                    || hir_def::signatures::FunctionSignature::is_intrinsic(self.db, function)
+                {
+                    return Some(node);
+                }
+                BodyKind::Body(function.into())
+            }
+            InstanceDef::Closure(id) => BodyKind::Closure(InternedClosureId::from_id(id)),
+            InstanceDef::Coroutine(id) => BodyKind::Coroutine(InternedCoroutineId::from_id(id)),
+            InstanceDef::CoroutineByMove(id) => {
+                BodyKind::CoroutineByMove(InternedCoroutineId::from_id(id))
+            }
+            _ => return Some(node),
+        };
+        let input = BodyInput::new(self.db, kind, instance.args.clone(), environment.clone());
+        let prepared = prepare_constants(self.db, input);
+        if prepared.result.is_err() {
+            return self.miss("concrete constant preparation failed");
+        }
+        for selection in &prepared.selections {
+            let mut name = format!("{body} constant ");
+            match selection.definition {
+                GeneralConstId::ConstId(id) => {
+                    let at = id.lookup(self.db).id;
+                    self.item(&mut name, id.krate(self.db), at.file_id, at.value.erase())?;
+                }
+                GeneralConstId::StaticId(id) => {
+                    let at = id.lookup(self.db).id;
+                    self.item(&mut name, id.krate(self.db), at.file_id, at.value.erase())?;
+                }
+                GeneralConstId::AnonConstId(id) => {
+                    let loc = id.loc(self.db);
+                    let (_, map) =
+                        hir_def::expr_store::ExpressionStore::with_source_map(self.db, loc.owner);
+                    let source = map.expr_syntax(loc.expr).ok()?;
+                    self.file(&mut name, source.file_id)?;
+                    write!(name, "@{:?}", source.value.syntax_node_ptr().text_range()).ok()?;
+                }
+            }
+            self.args(&mut name, selection.arguments.as_ref())?;
+            node.constants.push(name);
+        }
+        for read in &prepared.source_names {
+            node.sources.push(super::cached::SemanticSource {
+                body: body.clone(),
+                file: self.file_path(read.file)?,
+                name: read.name.clone()?,
+            });
+        }
+        node.contextual |= !node.sources.is_empty();
+        let mut homes = super::home::Homes::default();
+        for (kind, arguments) in &prepared.callees {
+            let def = match kind {
+                BodyKind::Body(hir_ty::InferBodyId::DefWithBodyId(
+                    hir_def::DefWithBodyId::FunctionId(id),
+                )) => InstanceDef::Fn(*id),
+                BodyKind::Closure(id) => InstanceDef::Closure(id.as_id()),
+                BodyKind::Coroutine(id) => InstanceDef::Coroutine(id.as_id()),
+                BodyKind::CoroutineByMove(id) => InstanceDef::CoroutineByMove(id.as_id()),
+                _ => return self.miss("semantic callee is not a function body"),
+            };
+            let callee = Instance { def, args: arguments.clone(), checked: instance.checked };
+            let environment = homes.home(self.db, &callee, environment);
+            let mut edge = format!("{body} callee {} environment ", self.raw_instance(&callee)?);
+            self.crate_(&mut edge, environment.krate)?;
+            node.constants.push(edge);
+            node.children.push(InstanceIn::new(callee, environment));
+        }
+        Some(node)
     }
 
     pub(super) fn semantic_sources(&self) -> super::cached::SemanticSources {
@@ -1198,4 +1395,334 @@ fn native_place(
     .ok()?;
     let hash = Sha256::digest(encoded);
     Some(u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes")))
+}
+
+/// Strongly connected components in caller-before-dependency order, without recursive DFS.
+fn semantic_components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut reverse = vec![Vec::new(); edges.len()];
+    for (from, children) in edges.iter().enumerate() {
+        for &child in children {
+            reverse[child].push(from);
+        }
+    }
+    let mut seen = vec![false; edges.len()];
+    let mut finish = Vec::new();
+    for root in 0..edges.len() {
+        if seen[root] {
+            continue;
+        }
+        seen[root] = true;
+        let mut stack = vec![(root, 0)];
+        while let Some((node, next)) = stack.last_mut() {
+            if let Some(&child) = edges[*node].get(*next) {
+                *next += 1;
+                if !seen[child] {
+                    seen[child] = true;
+                    stack.push((child, 0));
+                }
+            } else {
+                let (node, _) = stack.pop().unwrap();
+                finish.push(node);
+            }
+        }
+    }
+    seen.fill(false);
+    let mut components = Vec::new();
+    for root in finish.into_iter().rev() {
+        if seen[root] {
+            continue;
+        }
+        let mut members = Vec::new();
+        let mut stack = vec![root];
+        seen[root] = true;
+        while let Some(node) = stack.pop() {
+            members.push(node);
+            for &parent in &reverse[node] {
+                if !seen[parent] {
+                    seen[parent] = true;
+                    stack.push(parent);
+                }
+            }
+        }
+        components.push(members);
+    }
+    components
+}
+
+#[cfg(test)]
+mod semantic_tests {
+    use super::*;
+    use ide_db::RootDatabase;
+    use rustc_type_ir::inherent::Ty as _;
+    use sha2::{Digest, Sha256};
+    use test_fixture::WithFixture;
+
+    fn functions(db: &RootDatabase, krate: Crate) -> FxHashMap<String, FunctionId> {
+        crate_def_map(db, krate)
+            .modules(db)
+            .flat_map(|(_, module)| module.scope(db).declarations())
+            .filter_map(|item| match item {
+                ModuleDefId::FunctionId(id) => Some((
+                    hir_def::signatures::FunctionSignature::of(db, id).name.as_str().to_owned(),
+                    id,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pure_graph_keeps_only_local_records() {
+        const N: usize = 1024;
+        let mut source = "//- minicore: sized\n//- /src/main.rs crate:pure_graph\n".to_owned();
+        for i in 0..N {
+            let value = if i + 1 == N { "17".to_owned() } else { format!("f{}::<T>()", i + 1) };
+            writeln!(source, "pub fn f{i}<T>() -> usize {{ {value} }}").unwrap();
+        }
+        let db = RootDatabase::with_files(&source);
+        hir::attach_db(&db, || {
+            let krate = *base_db::all_crates(&db)
+                .iter()
+                .find(|krate| krate.data(&db).origin.is_local())
+                .unwrap();
+            let functions = functions(&db, krate);
+            let symbols = crate::startup_tests::Symbols {
+                db: &db,
+                identity: Sha256::digest(source.as_bytes()).into(),
+            };
+            let names = StableNames::new(
+                &db,
+                &symbols,
+                base_db::all_crates(&db).iter().copied().collect(),
+                true,
+            );
+            let environment = hir_ty::ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate,
+            }
+            .store();
+            let args = GenericArgs::new_from_slice(&[Ty::new_unit(
+                hir_ty::next_solver::DbInterner::new_with(&db, krate),
+            )
+            .into()])
+            .store();
+            for i in 0..N {
+                let instance = Instance {
+                    def: InstanceDef::Fn(functions[&format!("f{i}")]),
+                    args: args.clone(),
+                    checked: false,
+                };
+                assert!(!has_semantic_inputs(&names.instance_in(&instance, &environment).unwrap()));
+            }
+            assert_eq!(names.semantic_visits.get(), N);
+            assert_eq!(names.semantic_flatten_visits.get(), 0);
+            let arena = names.components.borrow();
+            assert_eq!(arena.len(), N);
+            assert!(arena.iter().all(|component| component.inputs.get().is_none()));
+            assert_eq!(
+                arena.iter().map(|component| component.dependencies.len()).sum::<usize>(),
+                N - 1
+            );
+            assert!(
+                arena.iter().map(|component| component.constants.len()).sum::<usize>() <= 3 * N
+            );
+        });
+    }
+
+    #[test]
+    fn recursive_bodies_share_one_complete_certificate_and_honor_cancellation() {
+        use salsa::Database;
+        let source = "//- minicore: sized\n//- /src/main.rs crate:semantic_cycle\n#[rustc_builtin_macro] macro_rules! file {}\n#[rustc_intrinsic] const unsafe fn size_of_val<T: ?Sized>(value: *const T) -> usize;\nconst WIDTH: usize = unsafe { size_of_val(file!() as *const str) };\npub fn f<T>() -> usize { g::<T>() + WIDTH }\npub fn g<T>() -> usize { f::<T>() + WIDTH }\n";
+        let mut db = RootDatabase::with_files(source);
+        hir_ty::mir::location::name_sources(&mut db, |_, _| Some("cycle.rs".into()));
+        hir::attach_db(&db, || {
+            let krate = *base_db::all_crates(&db)
+                .iter()
+                .find(|krate| krate.data(&db).origin.is_local())
+                .unwrap();
+            let functions = functions(&db, krate);
+            let symbols = crate::startup_tests::Symbols {
+                db: &db,
+                identity: Sha256::digest(source.as_bytes()).into(),
+            };
+            let names = StableNames::new(
+                &db,
+                &symbols,
+                base_db::all_crates(&db).iter().copied().collect(),
+                true,
+            );
+            let environment = hir_ty::ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate,
+            }
+            .store();
+            let args = GenericArgs::new_from_slice(&[Ty::new_unit(
+                hir_ty::next_solver::DbInterner::new_with(&db, krate),
+            )
+            .into()])
+            .store();
+            let f = Instance {
+                def: InstanceDef::Fn(functions["f"]),
+                args: args.clone(),
+                checked: false,
+            };
+            let g = Instance { def: InstanceDef::Fn(functions["g"]), args, checked: false };
+            let a = names.semantic_inputs(&f, &environment).unwrap().unwrap();
+            let b = names.semantic_inputs(&g, &environment).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&a, &b));
+            assert_eq!(names.semantic_visits.get(), 2);
+            assert_eq!(names.semantic_flatten_visits.get(), 1);
+            assert_ne!(names.instance_in(&f, &environment), names.instance_in(&g, &environment));
+            let cancelled = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+                db.cancellation_token().cancel();
+                names.semantic_inputs(&f, &environment)
+            }));
+            assert!(matches!(cancelled, Err(salsa::Cancelled::Local)), "{cancelled:?}");
+        });
+    }
+
+    #[test]
+    fn naming_views_retract_failed_and_changed_source_observations() {
+        let source = "//- minicore: sized\n//- /src/main.rs crate:semantic_views\n#[rustc_builtin_macro] macro_rules! file {}\n#[rustc_intrinsic] const unsafe fn size_of_val<T: ?Sized>(value: *const T) -> usize;\nconst WIDTH: usize = unsafe { size_of_val(file!() as *const str) };\npub fn touched<T>() -> usize { WIDTH }\npub fn pure<T>() -> usize { 17 }\n";
+        let mut db = RootDatabase::with_files(source);
+        let mut results = Vec::new();
+        for provider in [Some("first.rs"), Some("other.rs"), None, Some("first.rs")] {
+            hir_ty::mir::location::name_sources(&mut db, move |_, _| provider.map(Into::into));
+            results.push(hir::attach_db(&db, || {
+                let krate = *base_db::all_crates(&db)
+                    .iter()
+                    .find(|krate| krate.data(&db).origin.is_local())
+                    .unwrap();
+                let functions = functions(&db, krate);
+                let symbols = crate::startup_tests::Symbols {
+                    db: &db,
+                    identity: Sha256::digest(source.as_bytes()).into(),
+                };
+                let names = StableNames::new(
+                    &db,
+                    &symbols,
+                    base_db::all_crates(&db).iter().copied().collect(),
+                    true,
+                );
+                let environment = hir_ty::ParamEnvAndCrate {
+                    param_env: hir_ty::next_solver::ParamEnv::empty(),
+                    krate,
+                }
+                .store();
+                let args = GenericArgs::new_from_slice(&[Ty::new_unit(
+                    hir_ty::next_solver::DbInterner::new_with(&db, krate),
+                )
+                .into()])
+                .store();
+                let touched = Instance {
+                    def: InstanceDef::Fn(functions["touched"]),
+                    args: args.clone(),
+                    checked: false,
+                };
+                let pure =
+                    Instance { def: InstanceDef::Fn(functions["pure"]), args, checked: false };
+                let first = names.instance_in(&touched, &environment);
+                let visits = names.semantic_visits.get();
+                assert_eq!(first, names.instance_in(&touched, &environment));
+                assert_eq!(names.semantic_visits.get(), visits);
+                let pure = names.instance_in(&pure, &environment).unwrap();
+                assert!(!has_semantic_inputs(&pure));
+                (first, pure)
+            }));
+        }
+        assert!(results[0].0.is_some());
+        assert_ne!(results[0].0, results[1].0);
+        assert!(results[2].0.is_none());
+        assert_eq!(results[0], results[3]);
+        assert!(results.iter().all(|result| result.1 == results[0].1));
+    }
+
+    #[test]
+    fn shared_semantic_graph_is_rendered_once_per_naming_view() {
+        const N: usize = 128;
+        let mut source = "//- minicore: sized\n//- /src/main.rs crate:semantic_graph\n#[rustc_builtin_macro] macro_rules! file {}\n#[rustc_intrinsic] const unsafe fn size_of_val<T: ?Sized>(value: *const T) -> usize;\nconst WIDTH: usize = unsafe { size_of_val(file!() as *const str) };\n".to_owned();
+        for i in 0..N {
+            let value = if i + 1 == N { "WIDTH".to_owned() } else { format!("f{}::<T>()", i + 1) };
+            writeln!(source, "pub fn f{i}<T>() -> usize {{ {value} }}").unwrap();
+        }
+        let mut db = RootDatabase::with_files(&source);
+        hir_ty::mir::location::name_sources(&mut db, |_, _| Some("graph.rs".into()));
+        hir::attach_db(&db, || {
+            let krate = *base_db::all_crates(&db)
+                .iter()
+                .find(|krate| krate.data(&db).origin.is_local())
+                .unwrap();
+            let mut functions: Vec<_> = crate_def_map(&db, krate)
+                .modules(&db)
+                .flat_map(|(_, module)| module.scope(&db).declarations())
+                .filter_map(|item| match item {
+                    ModuleDefId::FunctionId(id) => {
+                        hir_def::signatures::FunctionSignature::of(&db, id)
+                            .name
+                            .as_str()
+                            .strip_prefix('f')
+                            .and_then(|name| name.parse::<usize>().ok())
+                            .map(|index| (index, id))
+                    }
+                    _ => None,
+                })
+                .collect();
+            functions.sort_by_key(|item| item.0);
+            assert_eq!(functions.len(), N);
+            let symbols = crate::startup_tests::Symbols {
+                db: &db,
+                identity: Sha256::digest(source.as_bytes()).into(),
+            };
+            let names = StableNames::new(
+                &db,
+                &symbols,
+                base_db::all_crates(&db).iter().copied().collect(),
+                true,
+            );
+            let environment = hir_ty::ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate,
+            }
+            .store();
+            let interner = hir_ty::next_solver::DbInterner::new_with(&db, krate);
+            let args = GenericArgs::new_from_slice(&[Ty::new_unit(interner).into()]).store();
+            let began = std::time::Instant::now();
+            let instances: Vec<_> = functions
+                .into_iter()
+                .map(|(_, function)| Instance {
+                    def: InstanceDef::Fn(function),
+                    args: args.clone(),
+                    checked: false,
+                })
+                .collect();
+            let first: Vec<_> = instances
+                .iter()
+                .map(|instance| names.instance_in(instance, &environment).unwrap())
+                .collect();
+            let flattened = names.semantic_flatten_visits.get();
+            let second: Vec<_> = instances
+                .iter()
+                .map(|instance| names.instance_in(instance, &environment).unwrap())
+                .collect();
+            assert_eq!(first, second);
+            assert_eq!(
+                names.semantic_flatten_visits.get(),
+                flattened,
+                "repeated names must reuse canonical certificates"
+            );
+            eprintln!(
+                "semantic graph roots={N} visits={} flatten={} elapsed={:?} first={} last={}",
+                names.semantic_visits.get(),
+                names.semantic_flatten_visits.get(),
+                began.elapsed(),
+                first[0],
+                first[N - 1]
+            );
+            assert!(
+                names.semantic_visits.get() <= N,
+                "shared closure rendering must not revisit every descendant for every name: {}",
+                names.semantic_visits.get()
+            );
+        });
+    }
 }

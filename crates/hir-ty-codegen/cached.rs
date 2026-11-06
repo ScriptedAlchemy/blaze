@@ -53,13 +53,26 @@ pub(super) struct SemanticSource {
 }
 
 /// Current CTFE observations, sealed into both the name/key and the entry.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct SemanticInputs {
-    pub(super) constants: Vec<String>,
-    pub(super) sources: Vec<SemanticSource>,
+    constants: Vec<String>,
+    sources: Vec<SemanticSource>,
+    #[serde(skip)]
+    digest: OnceLock<String>,
 }
 
+impl PartialEq for SemanticInputs {
+    fn eq(&self, other: &Self) -> bool {
+        self.constants == other.constants && self.sources == other.sources
+    }
+}
+impl Eq for SemanticInputs {}
+
 impl SemanticInputs {
+    pub(super) fn new(constants: Vec<String>, sources: Vec<SemanticSource>) -> Self {
+        Self { constants, sources, digest: OnceLock::new() }
+    }
+
     pub(super) fn canonical(&self) -> bool {
         !self.constants.is_empty()
             && self.constants.windows(2).all(|pair| pair[0] < pair[1])
@@ -70,33 +83,36 @@ impl SemanticInputs {
     }
 
     pub(super) fn covers(&self, child: &Self) -> bool {
-        child.constants.iter().all(|item| self.constants.binary_search(item).is_ok())
-            && child.sources.iter().all(|item| self.sources.binary_search(item).is_ok())
+        std::ptr::eq(self, child)
+            || child.constants.iter().all(|item| self.constants.binary_search(item).is_ok())
+                && child.sources.iter().all(|item| self.sources.binary_search(item).is_ok())
     }
 
-    pub(super) fn digest(&self) -> String {
-        use std::fmt::Write;
-        let mut hash = Sha256::new();
-        let mut field = |bytes: &[u8]| {
-            hash.update((bytes.len() as u64).to_le_bytes());
-            hash.update(bytes);
-        };
-        field(b"blaze concrete semantic inputs 4");
-        for constant in &self.constants {
-            field(&[0]);
-            field(constant.as_bytes());
-        }
-        for source in &self.sources {
-            field(&[1]);
-            field(source.body.as_bytes());
-            field(source.file.as_bytes());
-            field(source.name.as_bytes());
-        }
-        let mut digest = String::new();
-        for byte in hash.finalize() {
-            write!(digest, "{byte:02x}").unwrap();
-        }
-        digest
+    pub(super) fn digest(&self) -> &str {
+        self.digest.get_or_init(|| {
+            use std::fmt::Write;
+            let mut hash = Sha256::new();
+            let mut field = |bytes: &[u8]| {
+                hash.update((bytes.len() as u64).to_le_bytes());
+                hash.update(bytes);
+            };
+            field(b"blaze concrete semantic inputs 4");
+            for constant in &self.constants {
+                field(&[0]);
+                field(constant.as_bytes());
+            }
+            for source in &self.sources {
+                field(&[1]);
+                field(source.body.as_bytes());
+                field(source.file.as_bytes());
+                field(source.name.as_bytes());
+            }
+            let mut digest = String::new();
+            for byte in hash.finalize() {
+                write!(digest, "{byte:02x}").unwrap();
+            }
+            digest
+        })
     }
 }
 
@@ -1394,6 +1410,29 @@ mod tests {
                 }]),
             }),
         }
+    }
+
+    #[test]
+    fn semantic_digest_memo_preserves_entry_wire_bytes() {
+        let mut entry = entry();
+        entry.debug.as_mut().unwrap().types.clear();
+        entry.semantic = Some(SemanticInputs::new(
+            vec!["body run environment case".into()],
+            vec![SemanticSource {
+                body: "run environment case".into(),
+                file: "src/lib.rs".into(),
+                name: "/actual/src/lib.rs".into(),
+            }],
+        ));
+        let before = postcard::to_allocvec(&entry).unwrap();
+        let digest = entry.semantic.as_ref().unwrap().digest().to_owned();
+        assert_eq!(before, postcard::to_allocvec(&entry).unwrap());
+        let decoded: Entry = postcard::from_bytes(&before).unwrap();
+        let semantic = decoded.semantic.as_ref().unwrap();
+        assert!(semantic.digest.get().is_none());
+        assert_eq!(decoded, entry);
+        assert_eq!(semantic.digest(), digest);
+        assert_eq!(before, postcard::to_allocvec(&decoded).unwrap());
     }
 
     /// An entry of a crate cargo fetched to `home`, with each kind of file name it can have.

@@ -531,7 +531,7 @@ impl<'db> Keeper<'_, 'db> {
                             }
                             _ => None,
                         };
-                        Some(self.callee_name_in(&callee, asked, semantic.as_ref()))
+                        Some(self.callee_name_in(&callee, asked, semantic.as_deref()))
                     }
                     _ => None,
                 };
@@ -565,7 +565,7 @@ impl<'db> Keeper<'_, 'db> {
                 let Some(callee) = &self.settled(at, callee) else {
                     return self.kept.unkept("unsettled callee");
                 };
-                let Some(name) = self.callee_name_in(callee, asked, semantic.as_ref()) else {
+                let Some(name) = self.callee_name_in(callee, asked, semantic.as_deref()) else {
                     return self.kept.unkept("unnamed callee");
                 };
                 // A function the program is built from has no entry: it is compiled anew.
@@ -684,7 +684,7 @@ impl<'db> Keeper<'_, 'db> {
             code: cached::CachedCode::from(&compiled.code),
             debug,
             tracked: None,
-            semantic,
+            semantic: semantic.map(|inputs| inputs.as_ref().clone()),
         })
     }
 }
