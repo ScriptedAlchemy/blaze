@@ -75,13 +75,21 @@ def run(argv, **kwargs):
 def external_execs(text):
     """Every external compiler/Cargo exec attempt, including split trace records."""
     started, paths = False, []
-    calls = re.finditer(r'^\s*(?:(?:\d+|\[pid\s+\d+\])\s+)?(execve|seccomp|prctl)\((.*)$',
+    calls = re.finditer(r'^\s*(?:(?:\d+|\[pid\s+\d+\])\s+)?(execve(?:at)?|seccomp|prctl)\((.*)$',
                         text, re.MULTILINE)
     for call in calls:
         name, args = call.groups()
-        if name == "execve":
+        if name in ("execve", "execveat"):
             started = True
-            path = re.match(r'"([^"\n]+)"', args)
+            if name == "execve":
+                path = re.match(r'"([^"\n]+)"', args)
+            else:
+                # fd-only and relative-to-unknown-dirfd execution are unverifiable.
+                fd = args.partition(",")[0].strip()
+                path = re.match(r'[^,]*,\s*"([^"\n]*)"', args)
+                if (not path or not path[1]
+                        or (fd != "AT_FDCWD" and not path[1].startswith("/"))):
+                    raise RuntimeError("execveat without an identifiable executable path")
             if path and os.path.basename(path[1]).removesuffix(".real") in (
                     *COUNTED, "rust-analyzer-proc-macro-srv"):
                 paths.append(path[1])
@@ -108,7 +116,7 @@ def exec_trace(argv, trace, *, detached=False):
     Raw arguments keep private thread names and filter data out of the trace.
     """
     return ["strace", "--seccomp-bpf", "-f", *(["-D"] if detached else []),
-            "-e", "trace=execve,seccomp,prctl", "-e", "raw=prctl,seccomp",
+            "-e", "trace=execve,execveat,seccomp,prctl", "-e", "raw=prctl,seccomp",
             "-o", os.fspath(trace), *argv]
 
 

@@ -162,5 +162,30 @@ class OwnedAuditTests(unittest.TestCase):
         self.assertNotIn("RA_JIT_TEST_PREFETCH_PAUSE", env)
 
 
+    def test_execveat_attempts_are_traced_and_counted(self):
+        command = norustc.exec_trace(["ra-jit", "cargo", "build"], "audit.log")
+        self.assertIn("trace=execve,execveat,seccomp,prctl", command)
+        trace = ('execve("/repo/ra-jit", ["ra-jit"], NULL) = 0\n'
+                 '[pid 20] execveat(AT_FDCWD, "/usr/bin/rustc", [], NULL, 0) = -1 ENOENT\n'
+                 '[pid 21] execveat(AT_FDCWD, "/sysroot/libexec/rust-analyzer-proc-macro-srv", [], NULL, 0) = 0\n')
+        self.assertEqual(norustc.external_execs(trace),
+                         ["/usr/bin/rustc", "/sysroot/libexec/rust-analyzer-proc-macro-srv"])
+
+    def test_execveat_fd_execution_fails_closed(self):
+        trace = ('execve("/repo/ra-jit", [], NULL) = 0\n'
+                 '[pid 20] execveat(5, "", [], NULL, AT_EMPTY_PATH) = 0\n')
+        with self.assertRaisesRegex(RuntimeError, "execveat"):
+            norustc.external_execs(trace)
+
+    def test_execveat_relative_to_unknown_fd_fails_closed(self):
+        trace = ('execve("/repo/ra-jit", [], NULL) = 0\n'
+                 '[pid 20] execveat(5, "custom-compiler", [], NULL, 0) = 0\n')
+        with self.assertRaisesRegex(RuntimeError, "execveat"):
+            norustc.external_execs(trace)
+
+    def test_unrelated_execveat_stays_allowed(self):
+        self.assertEqual(norustc.external_execs('execveat(AT_FDCWD, "/usr/bin/ls", [], NULL, 0) = 0\n'), [])
+
+
 if __name__ == "__main__":
     unittest.main()
