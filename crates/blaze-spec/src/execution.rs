@@ -117,6 +117,10 @@ pub fn unit_cfg(prepared: &Prepared, at: usize) -> Vec<String> {
         .collect()
 }
 
+fn is_macro_leaf(unit: &Unit) -> bool {
+    unit.target.kind == TargetKind::ProcMacro && !unit.test && unit.mode != Mode::DocTest
+}
+
 fn reachable(build: &BuildSpec, native: &[&Unit], root: u32) -> BTreeSet<u32> {
     let mut seen = BTreeSet::new();
     let mut next = vec![root];
@@ -130,10 +134,7 @@ fn reachable(build: &BuildSpec, native: &[&Unit], root: u32) -> BTreeSet<u32> {
         {
             continue;
         }
-        if seen.insert(at)
-            && (native[at as usize].target.kind != TargetKind::ProcMacro
-                || native[at as usize].mode == Mode::DocTest)
-        {
+        if seen.insert(at) && !is_macro_leaf(native[at as usize]) {
             next.extend(build.units[at as usize].deps.iter().map(|(at, _)| *at));
         }
     }
@@ -330,9 +331,7 @@ pub fn programs_with(
                 .get(&(at as u32))
                 .with_context(|| format!("missing configured canonical unit {at}"))?;
             ensure!(
-                unit.mode == Mode::DocTest
-                    || unit.target.kind != TargetKind::ProcMacro
-                    || configured.proc_macro.is_some(),
+                !is_macro_leaf(unit) || configured.proc_macro.is_some(),
                 "missing owned macro image for {}:{}",
                 unit.package.name,
                 unit.target.name
@@ -394,7 +393,8 @@ pub fn programs_with(
                     configured.rustc_env.iter().map(|(name, value)| (name.clone(), value.into())),
                 );
             }
-            let kind = if spec.test {
+            let proc_macro_test = unit.target.kind == TargetKind::ProcMacro && unit.test;
+            let kind = if spec.test || proc_macro_test {
                 "test"
             } else if matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro) {
                 "lib"
@@ -433,17 +433,17 @@ pub fn programs_with(
                     },
                 ),
             );
-            let dependencies: Vec<_> =
-                if unit.target.kind == TargetKind::ProcMacro && unit.mode != Mode::DocTest {
-                    Vec::new()
-                } else {
-                    spec.deps
-                        .iter()
-                        .filter_map(|(dep, name)| {
-                            indexes.get(dep).map(|index| json!({"crate": index, "name": name}))
-                        })
-                        .collect()
-                };
+            let is_proc_macro = unit.target.kind == TargetKind::ProcMacro && !unit.test;
+            let dependencies: Vec<_> = if is_macro_leaf(unit) {
+                Vec::new()
+            } else {
+                spec.deps
+                    .iter()
+                    .filter_map(|(dep, name)| {
+                        indexes.get(dep).map(|index| json!({"crate": index, "name": name}))
+                    })
+                    .collect()
+            };
             crates.push(json!({
                 "display_name": unit.target.name.replace('-', "_"),
                 "root_module": compiler_path(&unit.target.src_path),
@@ -456,8 +456,9 @@ pub fn programs_with(
                 "blaze_invalid_env": invalid_env,
                 "blaze_native_unit": at,
                 "is_workspace_member": at == root,
-                "is_proc_macro": unit.target.kind == TargetKind::ProcMacro,
-                "proc_macro_dylib_path": configured.and_then(|unit| unit.proc_macro.as_deref()).map(compiler_path),
+                "is_proc_macro": is_proc_macro,
+                "blaze_proc_macro_test": proc_macro_test,
+                "proc_macro_dylib_path": configured.filter(|_| is_proc_macro).and_then(|unit| unit.proc_macro.as_deref()).map(compiler_path),
                 "build": {"label": unit.target.name, "build_file": compiler_path(&unit.package.manifest_dir.join("Cargo.toml")), "target_kind": kind},
             }));
         }

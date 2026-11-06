@@ -1544,3 +1544,111 @@ fn live_and_recorded_resolution_do_not_bind_native_trees() {
     assert_eq!(probe.batches.get(), 1);
     assert_eq!(probe.calls.get(), calls);
 }
+
+#[test]
+fn proc_macro_unit_tests_compile_the_source_graph_instead_of_an_expansion_leaf() {
+    use blaze_metadata::units::TargetKind;
+    use blaze_spec::execution::{Output, ProducedUnit, programs_with, unit_cfg};
+    use std::collections::BTreeMap;
+
+    let f = Fixture::with_root(
+        "[package]\nname='tested'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n[dependencies]\nhelper={path='helper'}\ndecorator={path='decorator'}\n[dev-dependencies]\ndevonly={path='devonly'}\n",
+    );
+    f.write("src/lib.rs", "#[proc_macro] pub fn make(input: proc_macro::TokenStream)->proc_macro::TokenStream { input }\n#[test] fn uses_dependencies() { let _: fn(proc_macro::TokenStream)->proc_macro::TokenStream = make; assert!(!cfg!(proc_macro)); assert_eq!(helper::value(), devonly::value()); }\n");
+    for (name, dependencies, source) in [
+        (
+            "helper",
+            "[dependencies]\ndeep={path='../deep'}\n",
+            "pub fn value()->u32 { deep::value() }\n",
+        ),
+        ("deep", "", "pub fn value()->u32 { 42 }\n"),
+        ("devonly", "", "pub fn value()->u32 { 42 }\n"),
+        ("macro_impl", "", "pub fn value()->u32 { 42 }\n"),
+    ] {
+        f.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n{dependencies}"),
+        );
+        f.write(&format!("{name}/src/lib.rs"), source);
+    }
+    f.write("decorator/Cargo.toml", "[package]\nname='decorator'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n[dependencies]\nmacro_impl={path='../macro_impl'}\n");
+    f.write("decorator/src/lib.rs", "extern crate proc_macro; #[proc_macro] pub fn pass(input: proc_macro::TokenStream)->proc_macro::TokenStream { let _ = macro_impl::value(); input }\n");
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--lib", "--no-run"], store.path());
+    drop(f);
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    let canonical =
+        blaze_spec::assemble::canonical_units(&made.build, &replay.resolved.graph).unwrap();
+    let mut produced: BTreeMap<_, _> = canonical
+        .iter()
+        .enumerate()
+        .map(|(at, unit)| {
+            (
+                at as u32,
+                ProducedUnit {
+                    cfg: unit_cfg(&replay, at),
+                    codegen_flags: Vec::new(),
+                    native: blaze_wire::native::Unit::default(),
+                    proc_macro: (unit.target.kind == TargetKind::ProcMacro)
+                        .then(|| worker.path().join(format!("macro-{at}.so"))),
+                    rustc_env: BTreeMap::new(),
+                },
+            )
+        })
+        .collect();
+    let plans = programs_with(
+        &replay,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("artifacts"),
+        Some(&produced),
+    )
+    .unwrap();
+    assert_eq!(plans.len(), 1);
+    let program = &plans[0];
+    assert_eq!(program.output, Output::Executable);
+    assert!(program.harness && !program.run);
+    let crates = program.project["crates"].as_array().unwrap();
+    let root = &crates[0];
+    assert_eq!(root["build"]["target_kind"], "test");
+    assert_eq!(root["is_proc_macro"], false, "the compiler consumes a test root as source");
+    assert_eq!(root["blaze_proc_macro_test"], true);
+    assert!(root["proc_macro_dylib_path"].is_null());
+    assert!(root["cfg"].as_array().unwrap().contains(&serde_json::json!("test")));
+    assert!(!root["cfg"].as_array().unwrap().contains(&serde_json::json!("proc_macro")));
+    let dependency = |name: &str, from: &serde_json::Value| {
+        let edge =
+            from["deps"].as_array().unwrap().iter().find(|edge| edge["name"] == name).unwrap();
+        &crates[edge["crate"].as_u64().unwrap() as usize]
+    };
+    assert_eq!(dependency("deep", dependency("helper", root))["display_name"], "deep");
+    assert_eq!(dependency("devonly", root)["display_name"], "devonly");
+    let image = dependency("decorator", root);
+    assert_eq!(image["is_proc_macro"], true);
+    assert!(image["deps"].as_array().unwrap().is_empty());
+    assert!(image["proc_macro_dylib_path"].is_string());
+    assert!(!crates.iter().any(|unit| unit["display_name"] == "macro_impl"));
+
+    produced.get_mut(&program.unit).unwrap().proc_macro = None;
+    programs_with(
+        &replay,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("without-root-image"),
+        Some(&produced),
+    )
+    .expect("compiling a proc-macro's unit tests requires its source, not its macro image");
+    let image_unit = image["blaze_native_unit"].as_u64().unwrap() as u32;
+    produced.get_mut(&image_unit).unwrap().proc_macro = None;
+    assert!(
+        programs_with(
+            &replay,
+            Path::new("/owned/toolchain"),
+            &worker.path().join("missing-dependency-image"),
+            Some(&produced),
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("missing owned macro image")
+    );
+}

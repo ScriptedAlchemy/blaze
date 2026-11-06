@@ -710,7 +710,7 @@ fn unit_specs(
         if unit.test {
             cfg.push("test".to_owned());
         }
-        if kind == TargetKind::ProcMacro {
+        if kind == TargetKind::ProcMacro && !unit.test {
             cfg.push("proc_macro".to_owned());
         }
         if profile.debug_assertions {

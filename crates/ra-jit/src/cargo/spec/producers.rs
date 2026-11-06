@@ -45,6 +45,18 @@ impl Producers {
     }
 }
 
+fn producer_kind(kind: TargetKind, mode: Mode, test: bool) -> captured::Kind {
+    if mode == Mode::DocTest || test {
+        captured::Kind::Rust
+    } else {
+        match kind {
+            TargetKind::CustomBuild => captured::Kind::BuildScript,
+            TargetKind::ProcMacro => captured::Kind::ProcMacro,
+            _ => captured::Kind::Rust,
+        }
+    }
+}
+
 fn target(unit: &Unit) -> script::Target {
     let kind = match unit.target.kind {
         TargetKind::Lib => "lib",
@@ -205,7 +217,7 @@ fn prepare_with(
     // from a host producer is the proof; for_host alone cannot identify that sharing.
     for (at, unit) in graph_units.iter().enumerate() {
         if !matches!(unit.mode, Mode::RunCustomBuild | Mode::DocTest)
-            && matches!(unit.target.kind, TargetKind::ProcMacro | TargetKind::CustomBuild)
+            && producer_kind(unit.target.kind, unit.mode, unit.test) != captured::Kind::Rust
         {
             mark(at, graph_units, &mut host_closure);
         }
@@ -262,7 +274,7 @@ fn prepare_with(
             .collect();
         graph.units.push(captured::Unit {
             source: Planned { out_dir: None, workspace_member: false, name: unit.target.name.replace('-', "_"), root: unit.target.src_path.clone(), edition: unit.target.edition.to_string(), cfg: unit_cfg(replay, at), codegen_flags, env: text_env, deps, proc_macro: None },
-            kind: if unit.mode == Mode::DocTest { captured::Kind::Rust } else { match unit.target.kind { TargetKind::CustomBuild => captured::Kind::BuildScript, TargetKind::ProcMacro => captured::Kind::ProcMacro, _ => captured::Kind::Rust } },
+            kind: producer_kind(unit.target.kind, unit.mode, unit.test),
             host: graph_units.iter().enumerate().any(|(original, other)| std::ptr::eq(other, unit) && host_closure.contains(&original)), target: target(unit), run: runs.first().copied(),
             profile: Some(serde_json::json!({"version": 1, "profile": blaze_wire::encode(&spec.profile), "rustflags": build.rustflags.iter().map(|flag| flag.0.clone()).collect::<Vec<_>>()})),
         });
@@ -485,6 +497,25 @@ fn generated(prepared: &captured::Prepared) -> anyhow::Result<blaze_spec::native
 mod runtime_tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn proc_macro_test_roots_are_source_instead_of_host_image_producers() {
+        for mode in [Mode::Test, Mode::Check] {
+            assert_eq!(producer_kind(TargetKind::ProcMacro, mode, true), captured::Kind::Rust);
+        }
+        assert_eq!(
+            producer_kind(TargetKind::ProcMacro, Mode::Build, false),
+            captured::Kind::ProcMacro
+        );
+        assert_eq!(
+            producer_kind(TargetKind::ProcMacro, Mode::DocTest, false),
+            captured::Kind::Rust
+        );
+        assert_eq!(
+            producer_kind(TargetKind::CustomBuild, Mode::Build, false),
+            captured::Kind::BuildScript
+        );
+    }
 
     #[test]
     fn runtime_overlays_match_cargo_ambient_and_script_precedence() {
