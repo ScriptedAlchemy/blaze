@@ -8,7 +8,7 @@
 //! is only replaced by a writer that read what was there, and `hello`.
 
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener as StdListener, TcpStream},
     path::Path,
     sync::Arc,
@@ -84,9 +84,7 @@ impl Served {
         head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
         stream.write_all(head.as_bytes()).expect("a request");
         stream.write_all(body).expect("a body");
-        let mut answer = Vec::new();
-        stream.read_to_end(&mut answer).expect("an answer");
-        Answer::parse(&answer)
+        Answer::read(stream, method).expect("an answer")
     }
 
     fn post(&self, path: &str, body: &[u8]) -> Answer {
@@ -113,6 +111,29 @@ struct Answer {
 }
 
 impl Answer {
+    fn read(reader: impl Read, method: &str) -> std::io::Result<Answer> {
+        let mut reader = BufReader::new(reader);
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            if reader.read_until(b'\n', &mut head)? == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+        }
+        let mut answer = Self::parse(&head);
+        let length = if method == "HEAD" || matches!(answer.status, 204 | 304) {
+            0
+        } else {
+            answer
+                .header("content-length")
+                .ok_or(std::io::ErrorKind::InvalidData)?
+                .parse::<usize>()
+                .map_err(|_| std::io::ErrorKind::InvalidData)?
+        };
+        answer.body.resize(length, 0);
+        reader.read_exact(&mut answer.body)?;
+        Ok(answer)
+    }
+
     fn parse(answer: &[u8]) -> Answer {
         let split = answer.windows(4).position(|it| it == b"\r\n\r\n").expect("a head");
         let head = String::from_utf8_lossy(&answer[..split]).into_owned();
@@ -135,6 +156,44 @@ impl Answer {
 
     fn error(&self) -> WireError {
         decode::<WireError>(&self.body, &Limits::DOCUMENTED).expect("an error of section 8")
+    }
+}
+
+#[test]
+fn answer_reader_finishes_at_the_http_message_boundary() {
+    struct ResetAfter(std::io::Cursor<Vec<u8>>);
+    impl Read for ResetAfter {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.position() == self.0.get_ref().len() as u64 {
+                return Err(std::io::ErrorKind::ConnectionReset.into());
+            }
+            self.0.read(bytes)
+        }
+    }
+    let body = b"an error";
+    let mut response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\n".to_vec();
+    response.extend_from_slice(body);
+    let answer = Answer::read(ResetAfter(std::io::Cursor::new(response)), "PUT").unwrap();
+    assert_eq!(answer.status, 404);
+    assert_eq!(answer.body, body);
+}
+
+#[test]
+fn answer_reader_rejects_truncated_messages() {
+    for response in [
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n".as_slice(),
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nabc".as_slice(),
+    ] {
+        assert!(Answer::read(response, "PUT").is_err());
+    }
+}
+
+#[test]
+fn answer_reader_respects_bodyless_responses() {
+    for (method, status) in [("HEAD", 200), ("PUT", 204), ("GET", 304)] {
+        let response = format!("HTTP/1.1 {status} Response\r\nContent-Length: 100\r\n\r\n");
+        let answer = Answer::read(response.as_bytes(), method).unwrap();
+        assert!(answer.body.is_empty());
     }
 }
 
@@ -366,9 +425,7 @@ fn a_concurrent_write_of_one_blob_leaves_one_whole_blob() {
                 );
                 stream.write_all(head.as_bytes()).expect("a request");
                 stream.write_all(&bytes).expect("a body");
-                let mut answer = Vec::new();
-                stream.read_to_end(&mut answer).expect("an answer");
-                Answer::parse(&answer).status
+                Answer::read(stream, "PUT").expect("an answer").status
             })
         })
         .collect();
@@ -573,9 +630,7 @@ fn http_reads_reject_symlink_objects_and_oversize_upload_length() {
         Limits::DOCUMENTED.blob + 1
     );
     stream.write_all(request.as_bytes()).unwrap();
-    let mut answer = Vec::new();
-    stream.read_to_end(&mut answer).unwrap();
-    assert_eq!(Answer::parse(&answer).status, 413);
+    assert_eq!(Answer::read(stream, "PUT").unwrap().status, 413);
     assert!(
         std::fs::read_dir(served.dir().join("units")).unwrap().all(|entry| !entry
             .unwrap()
