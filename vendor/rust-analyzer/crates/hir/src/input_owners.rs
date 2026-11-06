@@ -63,7 +63,18 @@ pub fn discover_identity_inputs(db: &dyn HirDatabase, krate: Crate) -> IdentityI
         }
         anonymous.0.sort_unstable();
         anonymous.0.dedup();
-        let unknown: Vec<_> = anonymous.0.into_iter().filter(|&expr| !context_free(expr)).collect();
+        let covered_inline = match owner {
+            ExpressionStoreOwnerId::Body(body) if !matches!(body, DefWithBodyId::FunctionId(_)) => {
+                directly_evaluated_inline_consts(store, Body::of(db, body).root_expr())
+            }
+            _ => FxHashSet::default(),
+        };
+        let unknown: Vec<_> = anonymous
+            .0
+            .into_iter()
+            .filter(|expr| !covered_inline.contains(expr))
+            .filter(|&expr| !context_free(expr))
+            .collect();
         if !unknown.is_empty() {
             let observed = hir_ide::consteval::owner_anonymous_consts_with_source_names(db, owner);
             for (_, result) in &observed {
@@ -126,6 +137,28 @@ pub fn discover_identity_inputs(db: &dyn HirDatabase, krate: Crate) -> IdentityI
         }
     }
     IdentityInputs { unresolved, source_names }
+}
+
+/// Inline blocks in a constant body are evaluated by that body's ordinary CTFE
+/// query. A closure's body is deferred, so its roots need independent coverage.
+fn directly_evaluated_inline_consts(
+    store: &ExpressionStore,
+    root: hir_def::hir::ExprId,
+) -> FxHashSet<hir_def::hir::ExprId> {
+    use hir_def::hir::Expr;
+    let mut roots = FxHashSet::default();
+    let mut seen = FxHashSet::default();
+    let mut pending = vec![root];
+    while let Some(expr) = pending.pop() {
+        if !seen.insert(expr) || matches!(store[expr], Expr::Closure { .. }) {
+            continue;
+        }
+        if let Expr::Const(inner) = store[expr] {
+            roots.insert(inner);
+        }
+        store.walk_child_exprs(expr, |child| pending.push(child));
+    }
+    roots
 }
 
 /// A proof about source-name dependencies, not an evaluation of a constant's value.

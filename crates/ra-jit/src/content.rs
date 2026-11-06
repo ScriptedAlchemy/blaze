@@ -642,6 +642,7 @@ mod tests {
         for body in [
             "const WIDTH: usize = 4; pub fn value() -> &'static str { let _ = [0u8; WIDTH]; \"ok\" }",
             "macro_rules! width { () => { (2u64 * 2) as usize } } const WIDTH: usize = width!(); pub fn value() -> &'static str { let _ = [0u8; WIDTH]; \"ok\" }",
+            "const CALLBACK: fn() -> &'static str = const { || \"ok\" }; pub fn value() -> &'static str { CALLBACK() }",
         ] {
             for library in [false, true] {
                 let identity = |name: &'static str| {
@@ -658,6 +659,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn deferred_inline_constants_keep_unresolved_filename_context() {
+        let identity = |name: &'static str| {
+            let (mut db, crates) = environment_fixture(
+                "#[rustc_builtin_macro] macro_rules! file { () => {} } const CALLBACK: fn() -> &'static str = || const { file!() }; pub fn value() -> &'static str { CALLBACK() }",
+                true,
+                false,
+                &[],
+            );
+            hir_ty::mir::location::name_sources(&mut db, move |_, _| Some(name.to_owned()));
+            let inputs = hir::input_owners::discover_identity_inputs(&db, crates[1]);
+            assert!(inputs.unresolved, "the closure is deferred by the enclosing CTFE");
+            assert!(inputs.source_names.iter().any(|read| read.name.as_deref() == Some(name)));
+            environment_ids(&db, crates, false, false)
+        };
+        assert_ne!(identity("source/short.rs"), identity("source/much-longer.rs"));
     }
 
     #[test]
@@ -1089,19 +1108,21 @@ mod tests {
         use hir_def::{ModuleDefId, nameres::crate_def_map};
         use hir_ty::next_solver::GenericArgs;
         use test_fixture::WithFixture;
-        for (expression, included, layout) in ["file!()", "core::panic::Location::caller().file()"]
+        for (expression, included, mode) in ["file!()", "core::panic::Location::caller().file()"]
             .into_iter()
             .flat_map(|expression| [false, true].map(|included| (expression, included)))
             .flat_map(|(expression, included)| {
-                [false, true].map(|layout| (expression, included, layout))
+                ["direct", "layout", "inline"].map(|mode| (expression, included, mode))
             })
         {
-            let declaration = if layout {
-                format!(
+            let declaration = match mode {
+                "layout" => format!(
                     "struct Width([u8; {expression}.len()]); const GOAL: usize = core::mem::size_of::<Width>();"
-                )
-            } else {
-                format!("const GOAL: usize = {expression}.len();")
+                ),
+                "inline" => format!(
+                    "const fn width() -> usize {{ const {{ {expression}.len() }} }} const GOAL: usize = width();"
+                ),
+                _ => format!("const GOAL: usize = {expression}.len();"),
             };
             let body = if included {
                 format!("include!(\"generated.rs\");\n//- /generated.rs\n{declaration}")
@@ -1157,11 +1178,11 @@ mod tests {
                 });
                 hir::attach_db(&db, || {
                     identities.push(ide_db::code_identity::semantic_source_hash(&db, krate));
-                    if layout {
+                    if mode != "direct" {
                         let inputs = hir::input_owners::discover_identity_inputs(&db, krate);
                         assert!(
                             !inputs.unresolved,
-                            "the typed array constant is concrete: {inputs:?}"
+                            "the typed {mode} constant is concrete: {inputs:?}"
                         );
                         assert!(inputs.source_names.iter().any(|read| read.file == named_file
                             && read.name.as_deref() == Some(expected)));
@@ -1170,7 +1191,7 @@ mod tests {
                     assert_eq!(
                         usize::from_le_bytes(result.memory[..].try_into().unwrap()),
                         expected.len(),
-                        "{expression}, included={included}, layout={layout}"
+                        "{expression}, included={included}, mode={mode}"
                     );
                 });
             }

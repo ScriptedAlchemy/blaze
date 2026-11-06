@@ -567,7 +567,7 @@ pub fn owner_anonymous_consts_with_source_names<'db>(
     db: &'db dyn HirDatabase,
     owner: ExpressionStoreOwnerId,
 ) -> Vec<(ExprId, WithSourceNames<Result<Allocation<'db>, ConstEvalError<'db>>>)> {
-    let constants: Vec<_> = match owner {
+    let mut constants: Vec<_> = match owner {
         ExpressionStoreOwnerId::Body(body) => {
             crate::InferenceResult::of(db, body).defined_anon_consts().to_vec()
         }
@@ -578,6 +578,35 @@ pub fn owner_anonymous_consts_with_source_names<'db>(
             db.field_types_with_diagnostics(variant).defined_anon_consts().to_vec()
         }
     };
+    if let ExpressionStoreOwnerId::Body(body @ hir_def::DefWithBodyId::FunctionId(_)) = owner {
+        // Inline consts are inferred in place and acquire their typed ID during
+        // MIR lowering. Read those actual operands, including deferred closures.
+        let mut pending: Vec<_> = db.mir_body(body.into()).into_iter().collect();
+        let mut closures = rustc_hash::FxHashSet::default();
+        while let Some(body) = pending.pop() {
+            let mut operand = |operand: &crate::mir::Operand| {
+                if let crate::mir::OperandKind::Constant { konst, .. } = &operand.kind
+                    && let ConstKind::Unevaluated(value) = konst.as_ref().kind()
+                    && let GeneralConstId::AnonConstId(id) = value.def.0
+                {
+                    constants.push(id);
+                }
+            };
+            for (_, block) in body.basic_blocks.iter() {
+                for statement in &block.statements {
+                    statement.kind.for_each_operand(&mut operand);
+                }
+                if let Some(terminator) = &block.terminator {
+                    terminator.kind.for_each_operand(&mut operand);
+                }
+            }
+            for &closure in &body.closures {
+                if closures.insert(closure) {
+                    pending.extend(db.mir_body_for_closure(closure));
+                }
+            }
+        }
+    }
     let interner = DbInterner::new_no_crate(db);
     let mut seen = rustc_hash::FxHashSet::default();
     constants
