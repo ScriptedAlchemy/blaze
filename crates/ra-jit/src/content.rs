@@ -1112,7 +1112,8 @@ mod tests {
             .into_iter()
             .flat_map(|expression| [false, true].map(|included| (expression, included)))
             .flat_map(|(expression, included)| {
-                ["direct", "layout", "inline"].map(|mode| (expression, included, mode))
+                ["direct", "layout", "inline", "projection"]
+                    .map(|mode| (expression, included, mode))
             })
         {
             let declaration = match mode {
@@ -1121,6 +1122,9 @@ mod tests {
                 ),
                 "inline" => format!(
                     "const fn width() -> usize {{ const {{ {expression}.len() }} }} const GOAL: usize = width();"
+                ),
+                "projection" => format!(
+                    "trait Width {{ const BYTES: usize; }} struct Value; impl Width for Value {{ const BYTES: usize = {expression}.len(); }} struct Double<V>(V); impl<V: Width> Double<V> {{ const BYTES: usize = 2 * V::BYTES; }} const GOAL: usize = Double::<Value>::BYTES / 2;"
                 ),
                 _ => format!("const GOAL: usize = {expression}.len();"),
             };

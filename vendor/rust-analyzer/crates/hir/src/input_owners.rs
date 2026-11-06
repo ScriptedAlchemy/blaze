@@ -7,7 +7,7 @@ use hir_def::{
     attrs::codegen_attribute_macro_calls,
     expr_store::{ExpressionStore, StoreVisitor},
     item_scope::ItemScope,
-    signatures::{FnFlags, FunctionSignature},
+    signatures::{ConstFlags, ConstSignature, FnFlags, FunctionSignature},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -247,18 +247,41 @@ impl<'db> ContextFreeInputs<'db> {
                     _ => Scalar,
                 })
             }
-            Expr::Path(path) => match resolve().resolve_path_in_value_ns_fully(
-                db,
-                path,
-                store.expr_path_hygiene(expr),
-            )? {
-                ValueNs::ConstId(id) => {
-                    let owner = ExpressionStoreOwnerId::Body(id.into());
-                    self.expression(owner, Body::of(db, id.into()).root_expr())
-                }
-                ValueNs::GenericParam(id) if db.const_param_ty(id).is_scalar() => Some(Scalar),
-                _ => None,
-            },
+            Expr::Path(path) => {
+                let proved = match resolve().resolve_path_in_value_ns_fully(
+                    db,
+                    path,
+                    store.expr_path_hygiene(expr),
+                ) {
+                    Some(ValueNs::ConstId(id)) => {
+                        let owner = ExpressionStoreOwnerId::Body(id.into());
+                        self.expression(owner, Body::of(db, id.into()).root_expr())
+                    }
+                    Some(ValueNs::GenericParam(id)) if db.const_param_ty(id).is_scalar() => {
+                        Some(Scalar)
+                    }
+                    _ => None,
+                };
+                proved.or_else(|| {
+                    let ExpressionStoreOwnerId::Body(body) = owner else { return None };
+                    let inferred = hir_ide::InferenceResult::of(db, body);
+                    let (hir_ide::method_resolution::CandidateId::ConstId(id), _) =
+                        inferred.assoc_resolutions_for_expr(expr)?
+                    else {
+                        return None;
+                    };
+                    // Like a const parameter, a required associated value is
+                    // supplied by the instance. Its implementation owns any
+                    // filename reads; declarations still own their type roots.
+                    let ty = inferred.expr_ty(expr);
+                    (matches!(id.lookup(db).container, ItemContainerId::TraitId(_))
+                        && !ConstSignature::of(db, id).flags.contains(ConstFlags::HAS_BODY)
+                        && !inferred.expr_has_type_mismatch(expr)
+                        && !ty.is_infer()
+                        && (ty.is_numeric() || ty.is_bool() || ty.is_char()))
+                    .then_some(Scalar)
+                })
+            }
             Expr::BinaryOp { lhs, rhs, .. } => (scalar(self.expression(owner, *lhs))
                 && scalar(self.expression(owner, *rhs)))
             .then_some(Scalar),
@@ -388,7 +411,15 @@ impl Owners {
                 self.codegen_attributes(db, id.into());
                 self.body(id.into());
             }
-            AssocItemId::ConstId(id) => self.body(id.into()),
+            AssocItemId::ConstId(id) => {
+                // Required trait constants have a signature but no expression
+                // to evaluate. Defaults and implementations own their bodies.
+                if !matches!(id.lookup(db).container, ItemContainerId::TraitId(_))
+                    || ConstSignature::of(db, id).flags.contains(ConstFlags::HAS_BODY)
+                {
+                    self.body(id.into());
+                }
+            }
             AssocItemId::TypeAliasId(_) => {}
         }
     }

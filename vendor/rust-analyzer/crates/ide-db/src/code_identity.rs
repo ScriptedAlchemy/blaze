@@ -600,6 +600,81 @@ pub const fn width() -> usize {
     }
 
     #[test]
+    fn required_associated_constants_do_not_observe_declaration_filenames() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        for source in [
+            "pub trait Vector { const BYTES: usize; const ALIGN: usize; } impl Vector for u8 { const BYTES: usize = 16; const ALIGN: usize = Self::BYTES - 1; } pub fn value() -> u8 { 1 }",
+            "pub trait Vector { const BYTES: usize; } pub struct Width<V>(V); impl<V: Vector> Width<V> { const LOOP_SIZE: usize = 2 * V::BYTES; } pub fn value() -> u8 { 1 }",
+        ] {
+            assert_eq!(
+                generated_identity("/one/package", "/one/out", body, source),
+                generated_identity("/other/package", "/another/output", body, source),
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn associated_constant_implementation_context_reaches_generic_callers() {
+        use test_fixture::WithFixture;
+        for (value, contextual) in [("16", false), ("file!().len()", true)] {
+            let source = format!(
+                r#"
+//- /app/main.rs crate:app deps:dep,values
+pub fn run() -> usize {{ dep::width::<values::Value>() }}
+//- /dep/lib.rs crate:dep
+pub trait Vector {{ const BYTES: usize; }}
+pub struct Double<T>(T);
+impl<T: Vector> Double<T> {{ pub const BYTES: usize = 2 * T::BYTES; }}
+pub fn width<T: Vector>() -> usize {{ Double::<T>::BYTES }}
+//- /values/lib.rs crate:values deps:dep
+#[rustc_builtin_macro] macro_rules! file {{ () => {{}} }}
+pub struct Value;
+impl dep::Vector for Value {{ const BYTES: usize = {value}; }}
+"#
+            );
+            let (mut db, files) = crate::RootDatabase::with_many_files(&source);
+            let named = |name: &str| {
+                *base_db::all_crates(&db)
+                    .iter()
+                    .find(|krate| {
+                        krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == name
+                    })
+                    .unwrap()
+            };
+            let [app, dep, values] = ["app", "dep", "values"].map(named);
+            let file = files[2].file_id(&db);
+            let mut hashes = Vec::new();
+            for name in ["values/short.rs", "values/a-much-longer-name.rs"] {
+                hir::mir::location::name_sources(&mut db, move |_, source| {
+                    Some(if source == file { name.to_owned() } else { "unchanged.rs".to_owned() })
+                });
+                let generic = hir::input_owners::discover_identity_inputs(&db, dep);
+                assert!(!generic.unresolved);
+                assert!(generic.source_names.is_empty());
+                let implementation = hir::input_owners::discover_identity_inputs(&db, values);
+                assert_eq!(!implementation.source_names.is_empty(), contextual);
+                hashes.push((
+                    semantic_source_hash(&db, dep),
+                    semantic_source_hash(&db, values),
+                    source_hash(&db, app),
+                ));
+            }
+            assert_eq!(hashes[0].0, hashes[1].0, "the generic definition has no filename read");
+            assert_eq!(
+                hashes[0].1 != hashes[1].1,
+                contextual,
+                "the implementation owns its context"
+            );
+            assert_eq!(
+                hashes[0].2 != hashes[1].2,
+                contextual,
+                "the caller retains the implementation's context"
+            );
+        }
+    }
+
+    #[test]
     fn declarative_macros_cannot_hide_filename_dependent_type_roots() {
         let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
         for source in [
@@ -608,6 +683,8 @@ pub const fn width() -> usize {
             "macro_rules! name { () => { concat!(file!(), \".generated\") } } const NAME: &str = name!(); pub struct Value([u8; NAME.len()]);",
             "trait Size { const WIDTH: usize; } struct Type; impl Size for Type { const WIDTH: usize = file!().len(); } pub struct Value([u8; <Type as Size>::WIDTH]);",
             "struct Type<T>(T); impl<T> Type<T> { const WIDTH: usize = file!().len(); } pub struct Value([u8; Type::<u8>::WIDTH]);",
+            "pub trait Size { const VALUE: [u8; file!().len()]; }",
+            "pub trait Size { const WIDTH: usize = file!().len(); }",
         ] {
             assert_ne!(
                 generated_identity("/one/package", "/one/out", body, source),
