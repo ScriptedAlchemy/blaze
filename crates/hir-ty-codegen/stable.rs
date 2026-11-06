@@ -941,20 +941,17 @@ fn hashed(spelled: &str) -> String {
     out
 }
 
-/// Where a function inside a block is written, which its path does not say: two blocks of
-/// one function, or two `const _` of one module, can each hold an item of the same name.
+/// The identity of where a function inside a block is written, which its path does not say:
+/// two blocks of one function, or two `const _` of one module, can each hold an item of the same name.
 /// `None` for a function outside of any block.
 pub fn block_place(
     db: &dyn HirDatabase,
     symbols: &dyn SymbolResolver,
     func: FunctionId,
-) -> Option<String> {
+) -> Option<u64> {
     func.module(db).block(db)?;
     let id = func.lookup(db).id;
-    let mut out = String::new();
-    file_name(db, symbols, &mut out, id.file_id, &|path| path)?;
-    write!(out, "#{}", id.value.erase().into_raw()).ok()?;
-    Some(out)
+    native_place(db, symbols, id.file_id, id.value.erase())
 }
 
 /// Where a static inside a block is written, as [`block_place`] has it of a function.
@@ -962,11 +959,38 @@ pub fn static_place(
     db: &dyn HirDatabase,
     symbols: &dyn SymbolResolver,
     id: hir_def::StaticId,
-) -> Option<String> {
+) -> Option<u64> {
     id.module(db).block(db)?;
     let id = id.lookup(db).id;
-    let mut out = String::new();
-    file_name(db, symbols, &mut out, id.file_id, &|path| path)?;
-    write!(out, "#{}", id.value.erase().into_raw()).ok()?;
-    Some(out)
+    native_place(db, symbols, id.file_id, id.value.erase())
+}
+
+fn native_place(
+    db: &dyn HirDatabase,
+    symbols: &dyn SymbolResolver,
+    file: HirFileId,
+    item: ErasedFileAstId,
+) -> Option<u64> {
+    use sha2::{Digest, Sha256};
+    let names = StableNames::new(db, symbols, FxHashSet::default(), false);
+    let literal = std::cell::Cell::new(false);
+    let mut file_name_text = String::new();
+    file_name(db, symbols, &mut file_name_text, file, &|path| {
+        let path = path?;
+        Some(names.stored(path.clone()).unwrap_or_else(|| {
+            // Reserved stored-path spellings can also be real source paths. They
+            // remain native inputs even when no portable cache name can represent them.
+            literal.set(true);
+            path
+        }))
+    })?;
+    let encoded = postcard::to_allocvec(&(
+        b"ra-jit native place 1".as_slice(),
+        literal.get(),
+        file_name_text,
+        item.into_raw(),
+    ))
+    .ok()?;
+    let hash = Sha256::digest(encoded);
+    Some(u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes")))
 }

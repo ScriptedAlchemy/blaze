@@ -39,6 +39,8 @@ mod solving;
 mod splice;
 mod splicer;
 mod stub;
+#[cfg(test)]
+mod symbol_identity_tests;
 mod symbols;
 mod test_harness;
 mod tier;
@@ -965,7 +967,7 @@ impl Resolver<'_> {
             return Some(format!("ra-jit.{id:x}.{path}"));
         }
         let place = hir_ty_codegen::block_place(self.db, self, func)?;
-        Some(format!("ra-jit.{id:x}.{path}.{:x}", short_hash(&place)))
+        Some(format!("ra-jit.{id:x}.{path}.{place:x}"))
     }
 
     /// The name a static of a crate rustc built nothing of is defined under, in a build with
@@ -985,7 +987,7 @@ impl Resolver<'_> {
             return Some(format!("ra-jit.{crate_id:x}.{}", self.item_path(module, name.as_str())?));
         }
         let place = hir_ty_codegen::static_place(db, self, id)?;
-        Some(format!("ra-jit.{crate_id:x}.{}.{:x}", name.as_str(), short_hash(&place)))
+        Some(format!("ra-jit.{crate_id:x}.{}.{place:x}", name.as_str()))
     }
 
     /// Whether the function, or the `impl` it is in, takes types or constants. A method a
