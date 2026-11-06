@@ -9,7 +9,9 @@
 //! `$RA_JIT_SCRIPT_BARRIER_DIR/<point>.hold` exists, a build that reaches it writes
 //! `<point>.<build>.reached` and waits for `<point>.<build>.go`. The points are `consume`
 //! (a build's compile and link are to begin, its scripts judged) and `retire` (the daemon has
-//! answered the client and says the build is over). A wait ends at
+//! answered the client and says the build is over). Compiler readiness uses `symbols` and
+//! cached-list invalidation uses `listed-before-includes`, armed only by their harnesses.
+//! A wait ends at
 //! `RA_JIT_SCRIPT_BARRIER_SECS` (300) with `<point>.<build>.timeout` written, so that a harness
 //! that does not release a worker fails by name and a worker does not hang.
 
@@ -24,14 +26,18 @@ pub(crate) fn event(what: &str, build: u64, detail: &str) {
     );
 }
 
+/// The directory of an explicitly armed harness barrier.
+pub(crate) fn armed(point: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os("RA_JIT_SCRIPT_BARRIER_DIR").map(PathBuf::from)?;
+    dir.join(format!("{point}.hold")).exists().then_some(dir)
+}
+
 /// Holds the caller at `point` for `build` while the harness says so.
 pub(crate) fn hold(point: &str, build: u64) {
-    let Some(dir) = std::env::var_os("RA_JIT_SCRIPT_BARRIER_DIR").map(PathBuf::from) else {
-        return;
-    };
-    if build == 0 || !dir.join(format!("{point}.hold")).exists() {
+    if build == 0 {
         return;
     }
+    let Some(dir) = armed(point) else { return };
     let mark = |suffix: &str| dir.join(format!("{point}.{build}.{suffix}"));
     let _ = std::fs::write(mark("reached"), std::process::id().to_string());
     event("barrier-reached", build, point);

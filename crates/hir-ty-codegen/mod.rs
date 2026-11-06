@@ -2741,6 +2741,7 @@ fn pause_ahead(db: &dyn HirDatabase) {
         std::env::var("RA_JIT_AHEAD_PAUSE_MS").ok().and_then(|it| it.parse().ok())
     });
     let Some(pause) = *PAUSE else { return };
+    eprintln!("compiling ahead: paused");
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_millis(pause) {
         salsa::Database::unwind_if_revision_cancelled(db);

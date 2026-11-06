@@ -9,21 +9,20 @@ done, and the worker compiles the workspace's functions until the symbols are re
 second warm-store run the names resolved first, and one of the functions it began was a
 derived `release_state` of a read-only query struct, which takes the trait solver about two
 minutes: the worker finished it before it said it was ready, 148 s after the build in place of
-26. Here `RA_JIT_SYMBOLS_PAUSE_MS` has the symbols read late, so that functions are compiled
-ahead, and `RA_JIT_AHEAD_PAUSE_MS` has each of those take ten minutes. The daemon has to be
-ready within READY_SECS, and the builds after it, an edit's too, have to be the daemon's and
+26. Here the symbol reader waits at a file barrier until a real prefetch job has been dequeued.
+`RA_JIT_AHEAD_PAUSE_MS` has each job take ten minutes. After the barrier is released, the
+daemon has to be ready within READY_SECS, and the builds after it, an edit's too, have to be the daemon's and
 run as cargo's.
 
 Python 3, stdlib only.
 """
-import glob, os, re, shutil, subprocess, sys, tempfile
+import glob, os, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import cargo_ra_jit
-from cargo_ra_jit import Side, wait_warm
+from cargo_ra_jit import Side
 
-SYMBOLS_PAUSE_MS = 3000
 AHEAD_PAUSE_MS = 600_000
 # Loading the workspace, the pause and what is left: far short of one function compiled ahead.
 READY_SECS = 120
@@ -37,9 +36,20 @@ FILES = {
 def worker_log(home):
     """The log of the worker that compiled ahead, if one did."""
     for log in glob.glob(os.path.join(home, "*", "*", "log")):
-        if re.search(r"^compiled ahead: ", open(log, errors="replace").read(), re.M):
+        if re.search(r"^compiling ahead: paused$", open(log, errors="replace").read(), re.M):
             return log
     return None
+
+
+def wait_for(process, condition, seconds, what):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if value := condition():
+            return value
+        if process.poll() is not None:
+            raise RuntimeError(f"client ended {process.returncode} before {what}")
+        time.sleep(0.1)
+    raise TimeoutError(f"no {what} within {seconds}s")
 
 
 def tails(home, lines=40):
@@ -70,20 +80,43 @@ def main():
     env["PATH"] = bin_dir + os.pathsep + env["PATH"]
     for name in ("RUSTC_WRAPPER", "CARGO_INCREMENTAL", "RA_JIT_SPARE"):
         env.pop(name, None)
-    env.update(RA_JIT_SYMBOLS_PAUSE_MS=str(SYMBOLS_PAUSE_MS), RA_JIT_AHEAD_PAUSE_MS=str(AHEAD_PAUSE_MS))
+    barrier = os.path.join(root, "barrier")
+    os.makedirs(barrier)
+    open(os.path.join(barrier, "symbols.hold"), "w").close()
+    env.update(RA_JIT_SCRIPT_BARRIER_DIR=barrier, RA_JIT_AHEAD_PAUSE_MS=str(AHEAD_PAUSE_MS))
     side, reference = Side(ws, env, True), Side(ws, env, False)
     program = os.path.join(ws, "target", "debug", "app")
     wrong = []
+    cold = None
     try:
-        build(side, "cold", home)
-        took, states = wait_warm(side, ws)
-        if states != ["ready"]:
+        with open(os.path.join(root, "cold.stdout"), "w") as out, open(os.path.join(root, "cold.stderr"), "w") as err:
+            cold = subprocess.Popen(side.argv("build", "--bin", "app"), cwd=ws, env=env,
+                                    stdout=out, stderr=err, **cargo_ra_jit.OWN_GROUP)
+            marks = wait_for(cold, lambda: glob.glob(os.path.join(barrier, "symbols.*.reached")), 300, "symbol barrier")
+            worker_pid = open(marks[0]).read().strip()
+            wait_for(cold, lambda: worker_log(home), 300, "a dequeued prefetch job")
+            if glob.glob(os.path.join(barrier, "*.timeout")):
+                raise SystemExit(f"the symbol barrier expired{tails(home)}")
+            released = time.monotonic()
+            open(marks[0].removesuffix(".reached") + ".go", "w").close()
+            cold.wait(timeout=READY_SECS)
+        if cold.returncode != 0:
+            raise SystemExit(f"cold build ended {cold.returncode}{tails(home)}")
+        remaining = READY_SECS - (time.monotonic() - released)
+        if remaining <= 0:
+            raise SystemExit(f"readiness exceeded {READY_SECS}s{tails(home)}")
+        _, status = side.cargo("status", timeout=remaining)
+        states = re.findall(rf"^    {re.escape(os.path.realpath(ws))}: (.*)$", status.stdout, re.M)
+        took = time.monotonic() - released
+        if states != ["ready"] or f"worker: pid {worker_pid}," not in status.stdout:
             raise SystemExit(f"the daemon did not get ready: {states}{tails(home)}")
         log = worker_log(home)
         if log is None:
             raise SystemExit(f"the worker compiled nothing ahead, which is what this tests{tails(home)}")
         said = open(log, errors="replace").read()
         ahead = re.search(r"^compiled ahead: (\d+) from (\d+) functions", said, re.M)
+        if ahead is None or int(ahead[2]) == 0:
+            raise SystemExit(f"no completed prefetch census{tails(home)}")
         if took > READY_SECS:
             wrong.append(f"ready {took:.1f} s after the build: a function compiled ahead held it up")
         elif ahead[1] != "0":
@@ -95,13 +128,22 @@ def main():
             out = build(side, step, home)
             ran = subprocess.run([program], capture_output=True, text=True, timeout=60)
             _, theirs = reference.cargo("run", "-q", "--bin", "app")
-            right = "[ra-jit]" in out and ran.stdout == theirs.stdout
-            if "[ra-jit]" not in out:
+            _, status = side.cargo("status")
+            same_worker = f"worker: pid {worker_pid}," in status.stdout
+            right = same_worker and "[ra-jit]" in out and ran.returncode == theirs.returncode == 0 and ran.stdout == theirs.stdout
+            if not same_worker:
+                wrong.append(f"{step}: the worker was replaced")
+            elif "[ra-jit]" not in out:
                 wrong.append(f"{step}: the build was not the daemon's")
-            elif ran.stdout != theirs.stdout:
+            elif ran.returncode != 0 or theirs.returncode != 0 or ran.stdout != theirs.stdout:
                 wrong.append(f"{step}: the program printed {ran.stdout.strip()!r}, cargo's {theirs.stdout.strip()!r}")
             print(f"{step:30} {'ok' if right else 'WRONG':8} {ran.stdout.strip()}")
     finally:
+        for mark in glob.glob(os.path.join(barrier, "*.reached")):
+            open(mark.removesuffix(".reached") + ".go", "w").close()
+        if cold is not None and cold.poll() is None:
+            cargo_ra_jit.kill_all(cold)
+            cold.wait(timeout=10)
         side.cargo("stop")
     for why in wrong:
         print(f"  {why}")

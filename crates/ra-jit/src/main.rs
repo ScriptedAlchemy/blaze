@@ -3483,6 +3483,7 @@ fn pause_after_load() {
 /// Waits for `RA_JIT_SYMBOLS_PAUSE_MS` before the symbols rustc built are read, and says so:
 /// what `harness/aheadready.py` has functions compiled ahead in.
 fn pause_before_symbols() {
+    scripts::barrier::hold("symbols", load_owner());
     let pause = std::env::var("RA_JIT_SYMBOLS_PAUSE_MS").ok().and_then(|it| it.parse().ok());
     if let Some(pause) = pause {
         eprintln!("symbols: paused");
@@ -4518,6 +4519,51 @@ fn exported(db: &RootDatabase, functions: &[FunctionId]) -> Vec<bool> {
         };
         parts.into_iter().flat_map(joined).collect()
     })
+}
+
+fn report_listing(
+    db: &RootDatabase,
+    listed: &Listed,
+    crates: &[ide_db::base_db::Crate],
+    files: &[WatchedFile],
+    phase: &str,
+) {
+    hir::attach_db(db, || {
+        for &krate in crates {
+            let krate = hir::Crate::from(krate);
+            if !krate.origin(db).is_local() {
+                continue;
+            }
+            let Some(name) = &ide_db::base_db::Crate::from(krate).extra_data(db).display_name
+            else {
+                continue;
+            };
+            let entry = listed.of(db, krate);
+            let root = db.file_source_root(krate.root_file(db)).source_root_id(db);
+            let included = db.included_sources();
+            let requested: Vec<_> = included.iter().filter(|(_, owner)| *owner == root).collect();
+            let loaded = requested
+                .iter()
+                .filter(|(path, _)| {
+                    let path: &Path = path.as_ref();
+                    files
+                        .iter()
+                        .any(|file| matches!(file.file, Watched::Source(_)) && file.path == path)
+                })
+                .count();
+            scripts::barrier::event(
+                phase,
+                load_owner(),
+                &format!(
+                    "crate={} functions={} exports={} included_sources={loaded}/{}",
+                    name.canonical_name(),
+                    entry.functions.len(),
+                    entry.exported.iter().filter(|&&it| it).count(),
+                    requested.len()
+                ),
+            );
+        }
+    });
 }
 
 /// Whether a function is a method of an `impl GlobalAlloc`. The program calls the allocator
@@ -9482,6 +9528,13 @@ fn run_holding(
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
     shipped::fetched(shipped);
     let built = built_crates(&db, &args)?;
+    let late_listing =
+        args.socket.is_some() && scripts::barrier::armed("listed-before-includes").is_some();
+    if late_listing {
+        // Seed the cache before generated source joins the VFS, to exercise invalidation.
+        report_listing(&db, &listed, &built, &files, "listed-before-includes");
+        scripts::barrier::hold("listed-before-includes", load_owner());
+    }
     let mut served = frozen::serve(&mut db, &built);
     // What is frozen names the files its `include!`s read: those not loaded yet are, and
     // what named them is read again.
@@ -9495,6 +9548,9 @@ fn run_holding(
     {
         // A crate listed beside cargo's build was listed without what they declare.
         listed.touch(&db, None);
+    }
+    if late_listing {
+        report_listing(&db, &listed, &built, &files, "listed-after-includes");
     }
     if nothing_of_rustc && let Some(said) = check::admission(&db, &args, &files)? {
         errors_for_the_daemon(&args, &said)?;
