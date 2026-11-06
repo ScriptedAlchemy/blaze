@@ -124,6 +124,8 @@ use self::places::{row_location, source_location};
 mod promote;
 mod settled;
 mod stable;
+#[cfg(test)]
+mod startup_tests;
 use ra_jit_store as store;
 pub use stable::{block_place, lower_declared, static_place};
 mod target;
@@ -5474,9 +5476,39 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let _permit = budget::enter().inspect_err(|why| {
             self.shed = Some(why.to_string());
         })?;
+        let instance = root_instance(self.db, main);
+        // The shim has its own ABI and lowering, and is never the Rust main's body.
+        let name = self
+            .roots_from_store()
+            .then(|| self.stable_name(&instance))
+            .flatten()
+            .map(|name| StableName::from(format!("start 1 {name}")));
+        if let Some(name) = &name
+            && let Some(entries) = &self.entries
+            && entries.usable(name, &|symbol, checked| self.symbols.importable(symbol, checked))
+            && let Some(entry) = entries.get(name)
+        {
+            let id =
+                self.module.declare_function("main", Linkage::Export, entry.code.signature())?;
+            if let Err(e) = self.stitch_entry(name, id) {
+                eprintln!("entry of `{name}` does not fit: {e}");
+                cached::Entries::ban(name);
+                self.misfit = true;
+            }
+            return Ok(());
+        }
         let compiled = compiled_start(self.db, main).as_ref().map_err(Clone::clone)?;
         let id = self.module.declare_function("main", Linkage::Export, &compiled.code.signature)?;
-        self.stitch(id, compiled)?;
+        let ids = self.stitch(id, compiled)?;
+        if let Some(name) = name {
+            let of = later::Of::Root { func: main, symbol: "main".into() };
+            let later = later::Later::new(&self.module, id, of, compiled, ids);
+            let bindings =
+                export::ObjectBindings::new(self.module.declarations(), &self.type_ids, &later);
+            let kept =
+                self.keeper(None).keep_named(&instance, None, compiled, &bindings, None, name);
+            self.apply(&later, later::Made { debug: None, kept });
+        }
         Ok(())
     }
 

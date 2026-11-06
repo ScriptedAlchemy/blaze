@@ -341,11 +341,25 @@ impl<'db> Keeper<'_, 'db> {
         bindings: &dyn export::Bindings,
         debug: Option<FunctionDebug>,
     ) -> Option<cached::Kept> {
-        let store = store::Store::global().filter(|_| self.own)?;
+        store::Store::global().filter(|_| self.own)?;
         let Some(name) = self.stable_name(instance) else {
             self.kept.unnamed += 1;
             return None;
         };
+        self.keep_named(instance, Some(home), compiled, bindings, debug, name)
+    }
+
+    /// Compiler-generated code has its own name and no source body to mark for a patch.
+    pub(super) fn keep_named(
+        &mut self,
+        instance: &Instance,
+        home: Option<Crate>,
+        compiled: &CompiledFunction,
+        bindings: &dyn export::Bindings,
+        debug: Option<FunctionDebug>,
+        name: StableName,
+    ) -> Option<cached::Kept> {
+        let store = store::Store::global().filter(|_| self.own)?;
         let key = cached::Entry::key(&name, self.kept_told(), self.program.flatten().as_ref())?;
         let check = std::env::var_os("RA_JIT_CACHE_CHECK");
         let sets = || debug.iter().flat_map(|it| &it.types).cloned().collect::<Vec<_>>();
@@ -357,7 +371,10 @@ impl<'db> Keeper<'_, 'db> {
             self.kept.unnamed_requests += 1;
             return None;
         };
-        if self.markable && stable::StableNames::of_checkout(&name) {
+        if let Some(home) = home
+            && self.markable
+            && stable::StableNames::of_checkout(&name)
+        {
             match self.tracked(instance, home, compiled, described) {
                 Ok(tracked) => entry.tracked = Some(tracked),
                 Err(why) => self.kept.untracked(&name, why),
