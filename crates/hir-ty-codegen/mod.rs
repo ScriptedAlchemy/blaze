@@ -124,6 +124,8 @@ use self::places::{row_location, source_location};
 #[cfg(test)]
 mod deterministic_tests;
 mod promote;
+#[cfg(test)]
+mod refusal_tests;
 mod settled;
 mod stable;
 #[cfg(test)]
@@ -3438,7 +3440,14 @@ fn instance_body<'db>(
         | InstanceDef::FnPointerShim
         | InstanceDef::ReifyShim { .. } => unsupported!("the body of a shim"),
     };
-    body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))
+    body.map_err(|e| mir_error(db, &e))
+}
+
+fn mir_error<'db>(
+    db: &'db dyn HirDatabase,
+    error: &hir_ty::mir::MirLowerError<'db>,
+) -> CodegenError {
+    CodegenError::Frontend(format!("mir: {}", error.diagnostic(db)))
 }
 
 /// The types a body takes and returns, which is all its callers have to know about it. Asked
@@ -5080,7 +5089,7 @@ fn root_body<'db>(
     let tally = backend::Tally::global();
     tally.step(Step::Infer, || _ = InferenceResult::of(db, DefWithBodyId::from(func)));
     let body = tally.step(Step::Mir, || compiled_mir_body(db, owner));
-    let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+    let body = body.map_err(|e| mir_error(db, &e))?;
     let krate = owner.module(db).krate(db);
     // Not the function's own bounds: with nothing generic they are bounds on concrete
     // types, which hold through impls, and the calls have to resolve to those.
@@ -5099,7 +5108,7 @@ fn root_body<'db>(
                 MirOptLevel::Off => db.monomorphized_runtime_mir_body(owner, args, env.store()),
                 level => db.monomorphized_optimized_mir_body(owner, level, args, env.store()),
             })
-            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?
+            .map_err(|e| mir_error(db, &e))?
     } else {
         body
     };
@@ -5400,7 +5409,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             return Ok(symbol);
         }
-        db.mir_body(func.into()).map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        db.mir_body(func.into()).map_err(|e| mir_error(db, &e))?;
         let Some(symbol) = self.symbols.function(func) else {
             // FIXME: with a `main` of ours only what it reaches is compiled, and a function
             // left to rustc can still call one private to its object.
@@ -7960,11 +7969,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let Some(layout) = self.layouts.borrow().get(&ty) {
             return Ok(layout.clone());
         }
-        let layout = self
-            .cg
-            .db
-            .layout_of_ty(ty.store(), self.env.store())
-            .map_err(|e| CodegenError::Frontend(format!("layout of {ty:?}: {e:?}")))?;
+        let layout = self.cg.db.layout_of_ty(ty.store(), self.env.store()).map_err(|e| {
+            CodegenError::Frontend(
+                hir_ty::mir::MirEvalError::LayoutError(e, ty.store()).diagnostic(self.cg.db),
+            )
+        })?;
         if let Some(log) = &self.cg.layouts {
             log.borrow_mut().entry(ty).or_insert((layout.size.bytes(), layout.align.abi.bytes()));
             if let Some(line) = coroutine_layout_line(self.cg.db, ty, &layout) {
@@ -9978,7 +9987,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let allocation = db
             .const_eval_static(id)
-            .map_err(|e| CodegenError::Frontend(format!("const eval: {e:?}")))?;
+            .map_err(|e| CodegenError::Frontend(format!("const eval: {}", e.diagnostic(db))))?;
         // Nothing can be written to a static of no size.
         let writable = !allocation.memory.is_empty()
             && (flags.contains(StaticFlags::MUTABLE)
@@ -10119,7 +10128,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn eval_const(&mut self, unevaluated: UnevaluatedConst<'db>) -> Result<Allocation<'db>> {
         let db = self.cg.db;
         let UnevaluatedConst { def, args } = unevaluated;
-        let frontend = |e| CodegenError::Frontend(format!("const eval: {e:?}"));
+        let frontend = |e: hir_ty::consteval::ConstEvalError<'db>| {
+            CodegenError::Frontend(format!("const eval: {}", e.diagnostic(db)))
+        };
         match def.0 {
             GeneralConstId::ConstId(id) => {
                 let (id, args) = lookup_impl_const(&self.infcx, self.env.param_env, id, args);
@@ -11196,7 +11207,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let enum_variants = id.enum_variants(db);
         let discr_of = |index: usize| {
             db.const_eval_discriminant(enum_variants.variants[index].0)
-                .map_err(|e| CodegenError::Frontend(format!("discriminant: {e:?}")))
+                .map_err(|e| CodegenError::Frontend(format!("discriminant: {}", e.diagnostic(db))))
         };
         match &layout.variants {
             // There is no value to read it from, so this cannot be reached; rustc leaves the
@@ -11296,9 +11307,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let offset = layout.fields.offset(tag_field.index()).bytes_usize();
         let tag_value = match tag_encoding {
             TagEncoding::Direct => {
-                let discr = db
-                    .const_eval_discriminant(variant)
-                    .map_err(|e| CodegenError::Frontend(format!("discriminant: {e:?}")))?;
+                let discr = db.const_eval_discriminant(variant).map_err(|e| {
+                    CodegenError::Frontend(format!("discriminant: {}", e.diagnostic(db)))
+                })?;
                 Some(discr as u128)
             }
             TagEncoding::Niche { untagged_variant, .. } if untagged_variant.0 == index => None,
@@ -16041,7 +16052,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                                 continue;
                             }
                             let value = db.const_eval_discriminant(variant).map_err(|e| {
-                                CodegenError::Frontend(format!("discriminant: {e:?}"))
+                                CodegenError::Frontend(format!(
+                                    "discriminant: {}",
+                                    e.diagnostic(db)
+                                ))
                             })?;
                             let block = self.builder.create_block();
                             switch.set_entry(wide.entry(value), block);
@@ -16204,7 +16218,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             let mut arms = Vec::new();
                             for &(variant, _) in id.enum_variants(db).variants.values() {
                                 let value = db.const_eval_discriminant(variant).map_err(|e| {
-                                    CodegenError::Frontend(format!("discriminant: {e:?}"))
+                                    CodegenError::Frontend(format!(
+                                        "discriminant: {}",
+                                        e.diagnostic(db)
+                                    ))
                                 })?;
                                 let block = self.builder.create_block();
                                 switch.set_entry(wide.entry(value), block);

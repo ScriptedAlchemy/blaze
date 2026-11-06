@@ -965,7 +965,12 @@ impl<'db> Evaluator<'db> {
                                     *target,
                                     terminator.span,
                                 )?,
-                                it => not_supported!("unknown function type {it:?}"),
+                                _ => {
+                                    return Err(MirEvalError::NotSupported(format!(
+                                        "unknown function type {}",
+                                        super::lower::diagnostic::stable_type(self.db, fn_ty)
+                                    )));
+                                }
                             };
                             if let Some(stack_frame) = stack_frame {
                                 self.code_stack.push(my_stack_frame);
@@ -1823,8 +1828,11 @@ impl<'db> Evaluator<'db> {
                     r.extend(word_bytes(len));
                     Owned(r)
                 }
-                t => {
-                    not_supported!("slice unsizing from non array type {t:?}")
+                _ => {
+                    return Err(MirEvalError::NotSupported(format!(
+                        "slice unsizing from non array type {}",
+                        super::lower::diagnostic::stable_type(self.db, current_ty)
+                    )));
                 }
             },
             TyKind::Dynamic(..) => {
