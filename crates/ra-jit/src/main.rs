@@ -7089,6 +7089,17 @@ fn broken_in_except(
             .collect();
         checks.into_iter().flat_map(|it| it.join().unwrap_or_default()).collect()
     });
+    let mut channel_checked = FxHashSet::default();
+    for &file in edited {
+        for &krate in ide_db::base_db::relevant_crates(db, file).iter() {
+            if within.as_ref().is_none_or(|crates| crates.contains(&krate))
+                && channel_checked.insert(krate)
+                && let Some(error) = check::channel_error(db, krate)
+            {
+                found.push(error);
+            }
+        }
+    }
     if found.is_empty() {
         return None;
     }

@@ -69,6 +69,7 @@ const BUILD_ENV: &[&str] = &[
     "RUSTFLAGS",
     "RUSTC",
     "RUSTC_WRAPPER",
+    "RUSTC_BOOTSTRAP",
     "RUSTUP_TOOLCHAIN",
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_TARGET_DIR",
@@ -87,6 +88,7 @@ const BUILD_ENV: &[&str] = &[
 /// and the ones cargo reads flags and profiles from.
 const WORKER_ENV: &[&str] = &[
     "RUSTFLAGS",
+    "RUSTC_BOOTSTRAP",
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_BUILD_",
     "CARGO_PROFILE_",
@@ -483,6 +485,26 @@ fn env_named(names: &[&str]) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_policy_fences_build_and_producer_identity() {
+        let key = |value: Option<&str>| {
+            let environment =
+                value.map(|value| ("RUSTC_BOOTSTRAP".into(), value.into())).into_iter();
+            let _scope = crate::process::enter_native(crate::process::Native::of(environment));
+            build("build", "").key(Path::new("/ws"))
+        };
+        let stable = key(None);
+        let enabled = key(Some("1"));
+        assert_ne!(stable, enabled);
+        assert_ne!(enabled, key(Some("-1")));
+        assert_ne!(enabled, key(Some("app")));
+        assert_eq!(enabled, key(Some("1")));
+        assert_eq!(
+            producer_env_in(&[("RUSTC_BOOTSTRAP".into(), "app".into())]),
+            BTreeMap::from([("RUSTC_BOOTSTRAP".into(), "app".into())])
+        );
+    }
 
     #[test]
     fn diagnostic_controls_reach_workers_without_changing_producer_identity() {
