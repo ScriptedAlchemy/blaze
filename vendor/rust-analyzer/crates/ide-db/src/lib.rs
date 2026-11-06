@@ -122,7 +122,11 @@ impl fmt::Debug for RootDatabase {
 }
 
 impl RootDatabase {
-    /// The files outside the VFS that an `include_bytes!` or `include_str!` has read.
+    pub fn has_path_ownership(&self, path: &vfs::AbsPath) -> bool {
+        self.files.has_path_ownership(path)
+    }
+
+    /// Paths watched for included bytes or native source-role ownership.
     pub fn included_files(&self) -> Vec<vfs::AbsPathBuf> {
         self.files.included_files()
     }
@@ -240,6 +244,10 @@ impl SourceDatabase for RootDatabase {
 
     fn env_is_read(&self, krate: base_db::Crate, key: &str) {
         self.files.env_is_read(krate, key);
+    }
+
+    fn path_ownership(&self, path: &paths::AbsPath) -> Option<base_db::PathOwnership> {
+        Some(self.files.path_ownership(self, path))
     }
 
     fn depend_on_included_inputs(&self, krate: base_db::Crate) {

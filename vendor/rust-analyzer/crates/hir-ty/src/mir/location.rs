@@ -109,8 +109,11 @@ pub fn tracks_caller<'db>(db: &'db dyn HirDatabase, function: hir_def::FunctionI
 
 /// The build's source spelling. Missing mappings fail closed, including before a build
 /// has installed its names. Fixtures install their own VFS provider explicitly.
-pub(super) fn source_name(db: &dyn HirDatabase, file: base_db::FileId) -> Option<String> {
-    (SourceNames::try_get(db)?.provider(db).0)(db, file)
+pub fn source_name(db: &dyn HirDatabase, file: base_db::FileId) -> Option<String> {
+    use salsa::Accumulator as _;
+    let name = SourceNames::try_get(db).and_then(|names| (names.provider(db).0)(db, file));
+    base_db::CurrentSourceName { file, name: name.clone() }.accumulate(db);
+    name
 }
 
 type SourcePaths = dyn Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync;

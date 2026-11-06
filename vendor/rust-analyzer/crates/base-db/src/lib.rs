@@ -76,6 +76,7 @@ pub struct Files {
     source_roots: Arc<DashMap<SourceRootId, SourceRootInput, BuildHasherDefault<FxHasher>>>,
     file_source_roots: Arc<DashMap<vfs::FileId, FileSourceRootInput, BuildHasherDefault<FxHasher>>>,
     included: Arc<DashMap<AbsPathBuf, IncludedFile, BuildHasherDefault<FxHasher>>>,
+    ownership: Arc<DashMap<AbsPathBuf, PathOwnership, BuildHasherDefault<FxHasher>>>,
     /// Which crate's `include_bytes!` or `include_str!` read which of those.
     included_by: Arc<DashMap<(Crate, AbsPathBuf), (), BuildHasherDefault<FxHasher>>>,
     /// Files an `include!` or a module declaration named that are not in the VFS, with the
@@ -245,22 +246,62 @@ impl Files {
     }
 
     pub fn included_files(&self) -> Vec<AbsPathBuf> {
-        self.included.iter().map(|it| it.key().clone()).collect()
+        let mut paths: Vec<_> = self.included.iter().map(|it| it.key().clone()).collect();
+        paths.extend(self.ownership.iter().map(|it| it.key().clone()));
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    pub fn path_ownership(&self, db: &dyn SourceDatabase, path: &AbsPath) -> PathOwnership {
+        *self
+            .ownership
+            .entry(path.to_path_buf())
+            .or_insert_with(|| PathOwnership::new(db, self.read_ownership(path)))
+    }
+
+    pub fn has_path_ownership(&self, path: &AbsPath) -> bool {
+        self.ownership.contains_key(path)
+    }
+
+    fn read_ownership(&self, path: &AbsPath) -> Vec<AbsPathBuf> {
+        let physical = self.on_disk(path.as_ref());
+        let Ok(target) = std::fs::canonicalize(&physical) else { return Vec::new() };
+        std::path::Path::new(path.as_str())
+            .ancestors()
+            .skip(1)
+            .filter_map(|logical| {
+                let root = std::fs::canonicalize(self.on_disk(logical)).ok()?;
+                target.starts_with(root).then(|| AbsPathBuf::assert_utf8(logical.to_owned()))
+            })
+            .collect()
     }
 
     /// Whether the file on disk is what was read of it.
     pub fn included_is_read(&self, db: &dyn SourceDatabase, path: &AbsPath) -> bool {
-        let Some(file) = self.included.get(path).map(|it| *it) else { return false };
-        *file.bytes(db) == self.read_included(path)
+        let file = self.included.get(path).map(|it| *it);
+        let ownership = self.ownership.get(path).map(|it| *it);
+        (file.is_some() || ownership.is_some())
+            && file.is_none_or(|file| *file.bytes(db) == self.read_included(path))
+            && ownership.is_none_or(|input| *input.roots(db) == self.read_ownership(path))
     }
 
     /// Reads the file again, and says whether it changed.
     pub fn reload_included_file(&self, db: &mut dyn SourceDatabase, path: &AbsPath) -> bool {
-        let Some(file) = self.included.get(path).map(|it| *it) else { return false };
-        let bytes = self.read_included(path);
-        let changed = *file.bytes(db) != bytes;
-        if changed {
-            file.set_bytes(db).to(bytes);
+        let mut changed = false;
+        if let Some(file) = self.included.get(path).map(|it| *it) {
+            let bytes = self.read_included(path);
+            if *file.bytes(db) != bytes {
+                file.set_bytes(db).to(bytes);
+                changed = true;
+            }
+        }
+        if let Some(input) = self.ownership.get(path).map(|it| *it) {
+            let roots = self.read_ownership(path);
+            if *input.roots(db) != roots {
+                input.set_roots(db).to(roots);
+                changed = true;
+            }
         }
         changed
     }
@@ -407,6 +448,14 @@ pub struct IncludedFile {
     pub bytes: Option<std::sync::Arc<[u8]>>,
 }
 
+/// Declared logical ancestors that still contain the native selected target.
+/// The watcher refreshes this even when a symlink retarget preserves the bytes.
+#[salsa::input(debug)]
+pub struct PathOwnership {
+    #[returns(ref)]
+    pub roots: Vec<AbsPathBuf>,
+}
+
 /// An include performed by the current tracked query execution. Unlike the
 /// historical watcher map, salsa accumulators retract observations when the
 /// query stops reading a file, and replay them on memo hits.
@@ -415,6 +464,32 @@ pub struct IncludedFile {
 pub struct CurrentIncludedInput {
     pub krate: Crate,
     pub path: AbsPathBuf,
+}
+
+#[salsa::accumulator]
+#[derive(Clone, Debug)]
+pub struct CurrentEnvRead {
+    pub krate: Crate,
+    pub key: String,
+    /// The synthetic eager argument containing this occurrence, if it is an
+    /// include locator. Actual include output is deliberately not a locator.
+    pub include_input: Option<salsa::Id>,
+}
+
+#[salsa::accumulator]
+#[derive(Clone, Debug)]
+pub struct CurrentIncludeResolution {
+    pub krate: Crate,
+    pub input: salsa::Id,
+    pub path: AbsPathBuf,
+    pub present: bool,
+}
+
+#[salsa::accumulator]
+#[derive(Clone, Debug)]
+pub struct CurrentSourceName {
+    pub file: FileId,
+    pub name: Option<String>,
 }
 
 #[salsa::input(debug)]
@@ -478,6 +553,10 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     /// The file `path` names relative to `anchor`, when it is not one of the files of the VFS,
     /// as `krate` reads it.
     fn included_file(&self, _krate: Crate, _path: AnchoredPath<'_>) -> Option<IncludedFile> {
+        None
+    }
+
+    fn path_ownership(&self, _path: &AbsPath) -> Option<PathOwnership> {
         None
     }
 

@@ -10,6 +10,138 @@ use crate::base_db::Crate;
 
 pub type Hash = [u8; 32];
 
+fn input_hash(present: bool, contents: Hash) -> Hash {
+    let mut hash = Sha256::new();
+    hash.update([u8::from(present)]);
+    hash.update(contents);
+    hash.finalize().into()
+}
+
+/// Whether tracked native resolution keeps this selected file inside a declared root.
+pub fn path_owned_by(db: &dyn HirDatabase, path: &str, root: &str) -> bool {
+    let Ok(path) = base_db::AbsPathBuf::try_from(path) else { return false };
+    db.path_ownership(&path)
+        .is_some_and(|input| input.roots(db).iter().any(|owned| owned.as_str() == root))
+}
+
+/// Only declared package/output roots can supply portable include locators.
+/// Every expanded occurrence must lead to a successful include of that root.
+#[salsa::tracked(returns(ref))]
+pub fn include_only_environment(db: &dyn HirDatabase, krate: Crate) -> FxHashSet<String> {
+    use base_db::{CurrentEnvRead, CurrentIncludeResolution};
+    use hir::input_owners::discover_current_inputs;
+    discover_current_inputs(db, krate);
+    let resolutions = discover_current_inputs::accumulated::<CurrentIncludeResolution>(db, krate);
+    let reads = discover_current_inputs::accumulated::<CurrentEnvRead>(db, krate);
+    ["OUT_DIR", "CARGO_MANIFEST_DIR"]
+        .into_iter()
+        .filter_map(|key| {
+            let root = krate.env(db).get(key)?;
+            if !Path::new(&root).is_absolute() {
+                return None;
+            }
+            let occurrences: Vec<_> =
+                reads.iter().filter(|read| read.krate == krate && read.key == key).collect();
+            (!occurrences.is_empty()
+                && occurrences.iter().all(|read| {
+                    read.include_input.is_some_and(|input| {
+                        resolutions.iter().any(|resolution| {
+                            resolution.krate == krate
+                                && resolution.input == input
+                                && resolution.present
+                                && Path::new(resolution.path.as_str()).starts_with(&root)
+                                && path_owned_by(db, resolution.path.as_str(), &root)
+                        })
+                    })
+                }))
+            .then(|| key.to_owned())
+        })
+        .collect()
+}
+
+fn source_role(db: &dyn HirDatabase, krate: Crate, path: &str) -> String {
+    let env = krate.env(db);
+    for (key, role) in [("OUT_DIR", "output"), ("CARGO_MANIFEST_DIR", "package")] {
+        if let Some(root) = env.get(key)
+            && Path::new(&root).is_absolute()
+            && let Ok(relative) = Path::new(path).strip_prefix(&root)
+            && path_owned_by(db, path, &root)
+            && (key != "OUT_DIR" || include_only_environment(db, krate).contains(key))
+        {
+            return format!("{role}/{}", relative.to_string_lossy());
+        }
+    }
+    if !env.contains_key("CARGO_MANIFEST_DIR") {
+        let file = krate.data(db).root_file_id;
+        let root = db.file_source_root(file).source_root_id(db);
+        let sources = db.source_root(root).source_root(db);
+        if let Some(parent) = sources
+            .path_for_file(&file)
+            .and_then(|path| path.as_path())
+            .and_then(|path| path.parent())
+            && let Ok(relative) = Path::new(path).strip_prefix(parent.as_str())
+            && path_owned_by(db, path, parent.as_str())
+        {
+            return format!("package/{}", relative.to_string_lossy());
+        }
+    }
+    format!("external/{path}")
+}
+
+/// CTFE can erase filename strings into lengths, comparisons, or layouts. These
+/// reads must enter the key before a persistent entry is looked up; data relocation
+/// after a hit cannot repair such scalars.
+#[salsa::tracked(returns(copy))]
+pub fn semantic_source_hash(db: &dyn HirDatabase, krate: Crate) -> Hash {
+    use hir::input_owners::discover_identity_inputs;
+    let unresolved = discover_identity_inputs(db, krate);
+    let mut names: Vec<_> =
+        discover_identity_inputs::accumulated::<base_db::CurrentSourceName>(db, krate)
+            .into_iter()
+            .map(|read| {
+                let root = db.file_source_root(read.file).source_root_id(db);
+                let root = db.source_root(root).source_root(db);
+                (root.path_for_file(&read.file).map(ToString::to_string), read.name.clone())
+            })
+            .collect();
+    names.sort();
+    names.dedup();
+    let mut hash = Sha256::new();
+    hash.update(b"ra-jit semantic filenames 1");
+    hash.update([u8::from(unresolved)]);
+    for (path, name) in &names {
+        hash.update([u8::from(path.is_some())]);
+        let bytes = path.as_deref().unwrap_or_default().as_bytes();
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+        hash.update([u8::from(name.is_some())]);
+        let bytes = name.as_deref().unwrap_or_default().as_bytes();
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    if names.iter().any(|(path, name)| path.is_none() || name.is_none()) {
+        let mut paths = Vec::new();
+        for dependency in krate.transitive_deps(db).into_iter().chain([krate]) {
+            let root = db.file_source_root(dependency.data(db).root_file_id).source_root_id(db);
+            let root = db.source_root(root).source_root(db);
+            paths.extend(
+                root.iter().filter_map(|file| root.path_for_file(&file).map(ToString::to_string)),
+            );
+            paths.extend(
+                db.included_inputs(dependency).into_iter().map(|(path, _)| path.to_string()),
+            );
+        }
+        paths.sort();
+        paths.dedup();
+        hash.update(b"unresolved constant context");
+        for path in paths {
+            hash.update((path.len() as u64).to_le_bytes());
+            hash.update(path.as_bytes());
+        }
+    }
+    hash.finalize().into()
+}
+
 pub fn file_hash(db: &dyn HirDatabase, file: vfs::FileId) -> Hash {
     #[salsa::interned]
     struct IdentityFile {
@@ -59,7 +191,7 @@ pub fn direct_source_hash(db: &dyn HirDatabase, krate: Crate) -> Hash {
         .filter_map(|file| {
             let path = sources.path_for_file(&file)?.as_path()?.to_string();
             let hash = if db.has_file_text(file) {
-                file_hash(db, file)
+                input_hash(true, file_hash(db, file))
             } else {
                 // Register binary source-root files with the same tracked reader
                 // and watcher used by include_bytes!, rather than read raw disk in
@@ -68,22 +200,41 @@ pub fn direct_source_hash(db: &dyn HirDatabase, krate: Crate) -> Hash {
                     krate,
                     crate::base_db::AnchoredPath { anchor: file, path: &path },
                 );
-                Sha256::digest(
-                    input.and_then(|input| input.bytes(db).clone()).as_deref().unwrap_or_default(),
+                let bytes = input.and_then(|input| input.bytes(db).clone());
+                input_hash(
+                    bytes.is_some(),
+                    Sha256::digest(bytes.as_deref().unwrap_or_default()).into(),
                 )
-                .into()
             };
-            Some((path, hash))
+            Some((source_role(db, krate, &path), hash))
         })
         .collect();
-    hashed.extend(db.included_inputs(krate).into_iter().map(|(path, bytes)| {
-        let mut hash = Sha256::new();
-        hash.update([u8::from(bytes.is_some())]);
-        hash.update(bytes.as_deref().unwrap_or_default());
-        (path.as_str().to_owned(), hash.finalize().into())
-    }));
+    let current = hir::input_owners::current_input_paths(db, krate);
+    hashed.extend(
+        db.included_inputs(krate)
+            .into_iter()
+            .filter(|(path, _)| current.binary_search(path).is_ok())
+            .map(|(path, bytes)| {
+                let hash = input_hash(
+                    bytes.is_some(),
+                    Sha256::digest(bytes.as_deref().unwrap_or_default()).into(),
+                );
+                (source_role(db, krate, path.as_str()), hash)
+            }),
+    );
     hashed.sort_unstable();
-    hash_source_files(&hashed)
+    hashed.dedup();
+    // Roles are already relative to separate declared roots. A common-ancestor
+    // pass would erase the package/output distinction for a single-root crate.
+    let mut hash = Sha256::new();
+    hash.update(b"ra-jit source roles 1");
+    for (path, bytes) in hashed {
+        hash.update((path.len() as u64).to_le_bytes());
+        hash.update(path.as_bytes());
+        hash.update(bytes);
+    }
+    hash.update(semantic_source_hash(db, krate));
+    hash.finalize().into()
 }
 
 #[salsa::tracked(returns(copy))]
@@ -128,6 +279,344 @@ pub fn hash_source_files(files: &[(String, Hash)]) -> Hash {
 mod tests {
     use super::*;
     use crate::base_db::SourceDatabase as _;
+
+    struct GeneratedFixture {
+        db: crate::RootDatabase,
+        krate: Crate,
+        directory: std::path::PathBuf,
+    }
+
+    impl Drop for GeneratedFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.directory).unwrap();
+        }
+    }
+
+    fn generated_fixture(
+        package: &str,
+        output: &str,
+        body: &str,
+        generated: &str,
+    ) -> GeneratedFixture {
+        use test_fixture::WithFixture;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "include-identity-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let package =
+            directory.join(package.trim_start_matches('/')).to_string_lossy().into_owned();
+        let output = directory.join(output.trim_start_matches('/')).to_string_lossy().into_owned();
+        let source = format!(
+            "//- {package}/src/lib.rs crate:fixture\n\
+             #[rustc_builtin_macro] macro_rules! include {{ () => {{}} }}\n\
+             #[rustc_builtin_macro] macro_rules! env {{ () => {{}} }}\n\
+             #[rustc_builtin_macro] macro_rules! concat {{ () => {{}} }}\n\
+             #[rustc_builtin_macro] macro_rules! file {{ () => {{}} }}\n\
+             #[rustc_builtin_macro] macro_rules! include_str {{ () => {{}} }}\n\
+             {body}\n//- {output}/generated.rs\n{generated}\n"
+        );
+        let (mut db, files) = crate::RootDatabase::with_many_files(&source);
+        let mut set = vfs::file_set::FileSet::default();
+        for (file, path) in
+            files.iter().zip([format!("{package}/src/lib.rs"), format!("{output}/generated.rs")])
+        {
+            std::fs::create_dir_all(Path::new(&path).parent().unwrap()).unwrap();
+            std::fs::write(&path, db.file_text(file.file_id(&db)).text(&db).as_bytes()).unwrap();
+            set.insert(
+                file.file_id(&db),
+                vfs::VfsPath::from(base_db::AbsPathBuf::assert_utf8(path.into())),
+            );
+        }
+        let mut change = crate::ChangeWithProcMacros::default();
+        change.set_roots(vec![base_db::SourceRoot::new_local(set)]);
+        db.apply_change(change);
+        let krate = base_db::all_crates(&db)[0];
+        let mut env = krate.env(&db).clone();
+        env.set("CARGO_MANIFEST_DIR", &package);
+        env.set("OUT_DIR", &output);
+        db.set_env(krate, env);
+        GeneratedFixture { db, krate, directory }
+    }
+
+    fn generated_identity(package: &str, output: &str, body: &str, generated: &str) -> Hash {
+        let fixture = generated_fixture(package, output, body, generated);
+        direct_source_hash(&fixture.db, fixture.krate)
+    }
+
+    #[test]
+    fn generated_includes_have_separate_package_and_output_roots() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        let first = generated_identity(
+            "/one/package",
+            "/one/build/out",
+            body,
+            "pub fn value() -> u8 { 1 }",
+        );
+        assert_eq!(
+            first,
+            generated_identity(
+                "/other/deep/package",
+                "/elsewhere/out",
+                body,
+                "pub fn value() -> u8 { 1 }"
+            )
+        );
+        assert_ne!(
+            first,
+            generated_identity(
+                "/other/deep/package",
+                "/elsewhere/out",
+                body,
+                "pub fn value() -> u8 { 2 }"
+            )
+        );
+        assert_eq!(
+            generated_identity(
+                "/one/package",
+                "/one/package/target/first/out",
+                body,
+                "pub fn value() -> u8 { 1 }"
+            ),
+            generated_identity(
+                "/other/package",
+                "/other/package/target/another/out",
+                body,
+                "pub fn value() -> u8 { 1 }"
+            ),
+        );
+    }
+
+    #[test]
+    fn generated_file_macro_keeps_contextual_filename_identity() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        assert_ne!(
+            generated_identity(
+                "/one/package",
+                "/one/out",
+                body,
+                "pub const LENGTH: usize = file!().len();"
+            ),
+            generated_identity(
+                "/other/package",
+                "/another/output",
+                body,
+                "pub const LENGTH: usize = file!().len();"
+            ),
+        );
+    }
+
+    #[test]
+    fn include_locator_provenance_preserves_value_uses_and_errors() {
+        let include = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        for body in
+            [include.to_owned(), format!("macro_rules! load {{ () => {{ {include} }} }} load!();")]
+        {
+            let fixture =
+                generated_fixture("/package", "/output", &body, "pub fn value() -> u8 { 1 }");
+            let (db, krate) = (&fixture.db, fixture.krate);
+            assert!(include_only_environment(db, krate).contains("OUT_DIR"), "{body}");
+            assert!(
+                db.env_read().iter().any(|(of, key)| *of == krate && key == "OUT_DIR"),
+                "legacy dependency read remains exact"
+            );
+        }
+        for (body, generated) in [
+            (format!("{include} pub fn length() -> usize {{ env!(\"OUT_DIR\").len() }}"), "pub fn value() -> u8 { 1 }"),
+            (include.to_owned(), "pub fn length() -> usize { env!(\"OUT_DIR\").len() }"),
+            ("include!(concat!(env!(\"OUT_DIR\"), \"/missing.rs\"));".to_owned(), "pub fn value() -> u8 { 1 }"),
+            ("macro_rules! duplicate { ($path:expr) => { include!($path); pub const PATH: &str = $path; } } duplicate!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));".to_owned(), "pub fn value() -> u8 { 1 }"),
+        ] {
+            let fixture = generated_fixture("/package", "/output", &body, generated);
+            let (db, krate) = (&fixture.db, fixture.krate);
+            assert!(!include_only_environment(db, krate).contains("OUT_DIR"), "{body}: {generated}");
+        }
+    }
+
+    #[test]
+    fn removed_value_use_retracts_without_erasing_dependency_reads() {
+        let semantic = "pub fn length() -> usize { env!(\"OUT_DIR\").len() }";
+        let body = format!("include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\")); {semantic}");
+        let mut fixture =
+            generated_fixture("/package", "/output", &body, "pub fn value() -> u8 { 1 }");
+        let (db, krate) = (&mut fixture.db, fixture.krate);
+        assert!(!include_only_environment(db, krate).contains("OUT_DIR"));
+        let file = krate.data(db).root_file_id;
+        let source = db.file_text(file).text(db).replace(semantic, "");
+        db.set_file_text(file, &source);
+        assert!(include_only_environment(db, krate).contains("OUT_DIR"));
+        assert!(db.env_read().iter().any(|(of, key)| *of == krate && key == "OUT_DIR"));
+    }
+
+    #[test]
+    fn runtime_file_macro_keeps_typed_relocation_available() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        assert_eq!(
+            generated_identity(
+                "/one/package",
+                "/one/out",
+                body,
+                "pub fn value() -> &'static str { file!() }"
+            ),
+            generated_identity(
+                "/other/package",
+                "/another/output",
+                body,
+                "pub fn value() -> &'static str { file!() }"
+            ),
+        );
+    }
+
+    #[test]
+    fn literal_array_lengths_do_not_make_generated_sources_contextual() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        let source = "pub fn value() -> [u8; 1] { [7] }";
+        assert_eq!(
+            generated_identity("/one/package", "/one/out", body, source),
+            generated_identity("/other/package", "/another/output", body, source),
+        );
+    }
+
+    #[test]
+    fn parent_components_cannot_certify_output_ownership() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/../generated.rs\"));";
+        let mut fixture =
+            generated_fixture("/package", "/output", body, "pub fn value() -> u8 { 1 }");
+        let krate = fixture.krate;
+        let mut env = krate.env(&fixture.db).clone();
+        let output = Path::new(&env.get("OUT_DIR").unwrap()).join("nested");
+        std::fs::create_dir(&output).unwrap();
+        env.set("OUT_DIR", output.to_string_lossy());
+        fixture.db.set_env(krate, env);
+        assert!(!include_only_environment(&fixture.db, krate).contains("OUT_DIR"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_with_equal_bytes_invalidates_ownership() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        let mut fixture =
+            generated_fixture("/package", "/output", body, "pub fn value() -> u8 { 1 }");
+        let krate = fixture.krate;
+        assert!(include_only_environment(&fixture.db, krate).contains("OUT_DIR"));
+        let path = Path::new(&krate.env(&fixture.db).get("OUT_DIR").unwrap()).join("generated.rs");
+        let outside = fixture.directory.join("outside.rs");
+        std::fs::rename(&path, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        let path = base_db::AbsPathBuf::assert_utf8(path);
+        assert!(
+            fixture.db.reload_included_file(&path),
+            "ownership must change even when bytes do not"
+        );
+        assert!(!include_only_environment(&fixture.db, krate).contains("OUT_DIR"));
+        assert!(source_role(&fixture.db, krate, path.as_str()).starts_with("external/"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shallower_view_does_not_borrow_ownership_from_native_ancestors() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/subdir/generated.rs\"));";
+        let mut fixture = generated_fixture("/a", "/a/subdir", body, "pub fn value() -> u8 { 1 }");
+        let krate = fixture.krate;
+        let mut env = krate.env(&fixture.db).clone();
+        let package = env.get("CARGO_MANIFEST_DIR").unwrap();
+        let logical = Path::new(&package).join("subdir");
+        env.set("OUT_DIR", &package);
+        fixture.db.set_env(krate, env);
+        let physical = fixture.directory.join("b");
+        std::fs::create_dir(&physical).unwrap();
+        let outside = fixture.directory.join("outside.rs");
+        std::fs::rename(logical.join("generated.rs"), &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, physical.join("generated.rs")).unwrap();
+        fixture.db.set_view(&logical, &physical, Vec::new());
+        assert!(!include_only_environment(&fixture.db, krate).contains("OUT_DIR"));
+        assert!(
+            source_role(&fixture.db, krate, logical.join("generated.rs").to_str().unwrap())
+                .starts_with("external/")
+        );
+    }
+
+    #[test]
+    fn nested_path_payload_bytes_remain_exact() {
+        let identity = |package, output| {
+            let body = "include!(include_str!(concat!(env!(\"OUT_DIR\"), \"/locator.txt\")));";
+            let fixture = generated_fixture(package, output, body, "pub fn value() -> u8 { 1 }");
+            let output = fixture.krate.env(&fixture.db).get("OUT_DIR").unwrap();
+            std::fs::write(
+                Path::new(&output).join("locator.txt"),
+                format!("{output}/generated.rs"),
+            )
+            .unwrap();
+            let hash = direct_source_hash(&fixture.db, fixture.krate);
+            assert!(include_only_environment(&fixture.db, fixture.krate).contains("OUT_DIR"));
+            hash
+        };
+        assert_ne!(
+            identity("/one/package", "/one/output"),
+            identity("/another/package", "/another/output")
+        );
+    }
+
+    #[test]
+    fn included_text_identity_is_independent_of_vfs_materialization() {
+        let body = "pub fn value() -> &'static str { include_str!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\")) }";
+        let identity = |in_vfs: bool| {
+            let mut fixture = generated_fixture("/package", "/output", body, "payload");
+            if !in_vfs {
+                let file = fixture.krate.data(&fixture.db).root_file_id;
+                let root = fixture.db.file_source_root(file).source_root_id(&fixture.db);
+                let root = fixture.db.source_root(root).source_root(&fixture.db);
+                let mut files = vfs::file_set::FileSet::default();
+                files.insert(file, root.path_for_file(&file).unwrap().clone());
+                let mut change = crate::ChangeWithProcMacros::default();
+                change.set_roots(vec![base_db::SourceRoot::new_local(files)]);
+                fixture.db.apply_change(change);
+            }
+            direct_source_hash(&fixture.db, fixture.krate)
+        };
+        assert_eq!(identity(true), identity(false));
+    }
+
+    #[test]
+    fn included_text_identity_uses_vfs_edits_over_historical_disk_bytes() {
+        let body = "pub fn value() -> &'static str { include_str!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\")) }";
+        let mut fixture = generated_fixture("/package", "/output", body, "disk");
+        let krate = fixture.krate;
+        let file = krate.data(&fixture.db).root_file_id;
+        let root = fixture.db.file_source_root(file).source_root_id(&fixture.db);
+        let root = fixture.db.source_root(root).source_root(&fixture.db);
+        let entries: Vec<_> =
+            root.iter().map(|file| (file, root.path_for_file(&file).unwrap().clone())).collect();
+        let payload = entries.iter().find(|(id, _)| *id != file).unwrap().0;
+        let roots = |db: &mut crate::RootDatabase, hydrated| {
+            let mut files = vfs::file_set::FileSet::default();
+            for (id, path) in &entries {
+                if hydrated || *id == file {
+                    files.insert(*id, path.clone());
+                }
+            }
+            let mut change = crate::ChangeWithProcMacros::default();
+            change.set_roots(vec![base_db::SourceRoot::new_local(files)]);
+            db.apply_change(change);
+        };
+        roots(&mut fixture.db, false);
+        let external = direct_source_hash(&fixture.db, krate);
+        let old = fixture.db.included_by(krate)[0].1.clone();
+        roots(&mut fixture.db, true);
+        assert_eq!(external, direct_source_hash(&fixture.db, krate));
+        fixture.db.set_file_text(payload, "vfs-only");
+        let changed = direct_source_hash(&fixture.db, krate);
+        assert_ne!(external, changed);
+        assert_eq!(fixture.db.included_by(krate)[0].1, old);
+        let mut fresh = generated_fixture("/package", "/output", body, "vfs-only");
+        let file = fresh.krate.data(&fresh.db).root_file_id;
+        let root = fresh.db.file_source_root(file).source_root_id(&fresh.db);
+        let root = fresh.db.source_root(root).source_root(&fresh.db);
+        let payload = root.iter().find(|id| *id != file).unwrap();
+        fresh.db.set_file_text(payload, "vfs-only");
+        assert_eq!(changed, direct_source_hash(&fresh.db, fresh.krate));
+    }
 
     #[test]
     fn source_identity_tracks_relocation_and_bytes() {

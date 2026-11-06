@@ -8,6 +8,7 @@ use either::Either;
 use intern::{Symbol, sym};
 use itertools::Itertools;
 use mbe::{DelimiterKind, expect_fragment};
+use salsa::{Accumulator as _, plumbing::AsId as _};
 use span::{Edition, FileId, Span};
 use stdx::format_to;
 use syntax::{
@@ -916,7 +917,38 @@ pub fn include_input_to_file_id(
     arg: &tt::TopSubtree,
 ) -> Result<EditionedFileId, ExpandError> {
     let (s, span) = parse_string(arg, false)?;
-    relative_file(db, arg_id, s.as_str(), false, span)
+    let file = relative_file(db, arg_id, s.as_str(), false, span);
+    record_include_resolution(db, arg_id, s.as_str(), file.is_ok());
+    file
+}
+
+fn record_include_resolution(
+    db: &dyn SourceDatabase,
+    call: MacroCallId,
+    path: &str,
+    present: bool,
+) {
+    let loc = call.loc(db);
+    let crate::MacroCallKind::FnLike { eager: Some(eager), .. } = &loc.kind else { return };
+    if eager.error.is_some() {
+        return;
+    }
+    let anchor = loc.kind.file_id().original_file_respecting_includes(db).file_id(db);
+    let root = db.file_source_root(anchor).source_root_id(db);
+    let root = db.source_root(root).source_root(db);
+    let Some(parent) =
+        root.path_for_file(&anchor).and_then(|path| path.as_path()).and_then(|path| path.parent())
+    else {
+        return;
+    };
+    let Some(path) = paths::native::absolutize(parent, path) else { return };
+    base_db::CurrentIncludeResolution {
+        krate: loc.krate,
+        input: eager.arg_id.as_id(),
+        path,
+        present,
+    }
+    .accumulate(db);
 }
 
 fn include_bytes_expand(
@@ -956,6 +988,7 @@ fn included_bytes<'db>(
     if let Some(file) = db.resolve_path(path)
         && db.has_file_text(file)
     {
+        record_include_resolution(db, call_id, path.path, true);
         return Some(db.file_text(file).text(db).as_bytes());
     }
     let krate = call_id.loc(db).krate;
@@ -967,6 +1000,7 @@ fn included_bytes<'db>(
     let absolute =
         paths::native::absolutize(sources.path_for_file(&anchor)?.as_path()?.parent()?, path.path)?;
     base_db::CurrentIncludedInput { krate, path: absolute }.accumulate(db);
+    record_include_resolution(db, call_id, path.path, file.bytes(db).is_some());
     file.bytes(db).as_deref()
 }
 
@@ -1000,8 +1034,34 @@ fn include_str_expand(
 fn get_env_inner(db: &dyn SourceDatabase, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
     let krate = arg_id.loc(db).krate;
     db.env_is_read(krate, key.as_str());
+    record_env_read(db, arg_id, key);
     // As rustc reads them: what cargo set for the crate, then the process the build is for.
     krate.env(db).get(key.as_str()).or_else(|| base_db::process_env_var(db, key.as_str()))
+}
+
+fn record_env_read(db: &dyn SourceDatabase, call: MacroCallId, key: &Symbol) {
+    let mut parent = call.parent(db).macro_file();
+    let mut include_input = None;
+    while let Some(file) = parent {
+        let id = file;
+        let loc = id.loc(db);
+        if matches!(loc.def.kind, crate::MacroDefKind::ProcMacro(..)) {
+            break;
+        }
+        if loc.def.is_include_like() {
+            if matches!(loc.kind, crate::MacroCallKind::FnLike { eager: None, .. }) {
+                include_input = Some(id.as_id());
+            }
+            break;
+        }
+        parent = id.parent(db).macro_file();
+    }
+    base_db::CurrentEnvRead {
+        krate: call.loc(db).krate,
+        key: key.as_str().to_owned(),
+        include_input,
+    }
+    .accumulate(db);
 }
 
 fn non_unicode_env(
@@ -1021,6 +1081,7 @@ fn non_unicode_env(
         return None;
     }
     db.env_is_read(krate, key.as_str());
+    record_env_read(db, arg_id, key);
     Some(ExpandError::new(span, crate::ExpandErrorKind::NonUnicodeEnv(key.clone())))
 }
 

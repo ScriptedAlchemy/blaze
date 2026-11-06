@@ -18,6 +18,85 @@ pub fn discover_current_inputs(db: &dyn HirDatabase, krate: Crate) {
     expression_owners(db, krate);
 }
 
+/// Observe filenames consumed by CTFE before assigning persistent code identities.
+/// Anonymous and generic constants that cannot be evaluated without an instance
+/// retain their exact source context instead of guessing that relocation is safe.
+#[salsa::tracked(returns(copy))]
+pub fn discover_identity_inputs(db: &dyn HirDatabase, krate: Crate) -> bool {
+    use hir_def::{expr_store::Body, hir::Expr};
+    use hir_expand::{
+        MacroDefKind,
+        builtin::{BuiltinFnLikeExpander, EagerExpander},
+    };
+    use hir_ide::next_solver::GenericArgs;
+    let mut unresolved = false;
+    for owner in expression_owners(db, krate) {
+        if unresolved {
+            break;
+        }
+        let (store, source_map) = ExpressionStore::with_source_map(db, owner);
+        let context_free_literal = |expr| {
+            if !matches!(&store[expr], Expr::Literal(_)) {
+                return false;
+            }
+            let Ok(source) = source_map.expr_syntax(expr) else { return false };
+            let Some(call) = source.file_id.macro_file() else { return true };
+            matches!(
+                call.loc(db).def.kind,
+                MacroDefKind::BuiltIn(
+                    _,
+                    BuiltinFnLikeExpander::Line | BuiltinFnLikeExpander::Column
+                ) | MacroDefKind::BuiltInEager(
+                    _,
+                    EagerExpander::Env
+                        | EagerExpander::OptionEnv
+                        | EagerExpander::Include
+                        | EagerExpander::IncludeBytes
+                        | EagerExpander::IncludeStr
+                )
+            )
+        };
+        match owner {
+            ExpressionStoreOwnerId::Body(DefWithBodyId::ConstId(id)) => {
+                unresolved |= db.const_eval(id, GenericArgs::empty(), None).is_err();
+            }
+            ExpressionStoreOwnerId::Body(DefWithBodyId::StaticId(id)) => {
+                unresolved |= db.const_eval_static(id).is_err();
+            }
+            ExpressionStoreOwnerId::Body(DefWithBodyId::VariantId(id)) => {
+                unresolved |= db.const_eval_discriminant(id).is_err();
+            }
+            ExpressionStoreOwnerId::Body(body) => {
+                let root = Body::of(db, body).root_expr();
+                unresolved |=
+                    store.expr_roots().any(|expr| expr != root && !context_free_literal(expr))
+                        || store.exprs().any(|(_, expr)| {
+                            matches!(
+                                expr,
+                                Expr::Const(inner) if !context_free_literal(*inner)
+                            )
+                        });
+            }
+            _ => unresolved |= store.expr_roots().any(|expr| !context_free_literal(expr)),
+        }
+    }
+    if unresolved {
+        // A later instance can evaluate an anonymous/generic constant and call a
+        // dependency's const fn. Without that instance, retain every reachable
+        // source spelling rather than only the caller's filename.
+        let mut seen = FxHashSet::default();
+        for dependency in krate.transitive_deps(db).into_iter().chain([krate]) {
+            discover_current_inputs(db, dependency);
+            let root = db.file_source_root(dependency.data(db).root_file_id).source_root_id(db);
+            let root = db.source_root(root).source_root(db);
+            for file in root.iter().filter(|file| seen.insert(*file)) {
+                hir_ide::mir::location::source_name(db, file);
+            }
+        }
+    }
+    unresolved
+}
+
 pub(crate) fn expression_owners(db: &dyn HirDatabase, krate: Crate) -> Vec<ExpressionStoreOwnerId> {
     let mut walk = Owners { seen: FxHashSet::default(), pending: Vec::new() };
     for module in crate::Crate::from(krate).modules(db) {

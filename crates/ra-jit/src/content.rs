@@ -2,6 +2,7 @@
 //! sources have the same crate, and what was compiled for one is the code of the other.
 
 use std::{
+    collections::BTreeMap,
     path::Path,
     sync::{Mutex, OnceLock},
 };
@@ -151,9 +152,11 @@ impl Contents {
             hasher.update(bytes);
         };
         field(b"ra-jit observed environment 1");
-        let reads = environment_reads(krate);
-        // Observed values remain exact. Even a checkout path can be used for a
-        // compile-time length or comparison, leaving no relocatable string behind.
+        let include_only = ide_db::code_identity::include_only_environment(db, krate);
+        let reads: Vec<_> = environment_reads(krate)
+            .into_iter()
+            .filter(|(key, _)| !include_only.contains(key))
+            .collect();
         field(&(reads.len() as u64).to_le_bytes());
         for (key, value) in reads {
             field(key.as_bytes());
@@ -166,6 +169,7 @@ impl Contents {
                 }
             }
         }
+        field(&ide_db::code_identity::semantic_source_hash(db, krate));
         let macros = self.uses_macros(db, krate);
         field(&[u8::from(macros)]);
         if macros {
@@ -260,12 +264,13 @@ impl Contents {
         environment_reads: &dyn Fn(Crate) -> EnvironmentReads,
     ) -> Option<ContentId> {
         let data = krate.data(db);
+        hir::input_owners::discover_current_inputs(db, krate);
         let mut hasher = Sha256::new();
         let mut field = |bytes: &[u8]| {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit crate 4");
+        field(b"ra-jit crate 5");
         let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
         field(name.unwrap_or_default().as_bytes());
         field(format!("{:?} {}", data.edition, data.target_kind.is_proc_macro()).as_bytes());
@@ -285,58 +290,71 @@ impl Contents {
         let out = env.get("OUT_DIR");
         let root = db.file_source_root(data.root_file_id).source_root_id(db);
         let root = db.source_root(root).source_root(db);
-        let mut files: Vec<(Written, String, Hash)> = Vec::new();
+        let mut inputs = BTreeMap::new();
         for file in root.iter() {
             let Some(path) = root.path_for_file(&file).and_then(|it| it.as_path()) else {
                 continue;
             };
-            let path = path.to_string();
-            let path = Path::new(&path);
-            let (by, relative) = if let Ok(relative) = path.strip_prefix(&manifest) {
-                (Written::InPackage, relative)
-            } else if let Some(Ok(relative)) = out.as_ref().map(|out| path.strip_prefix(out)) {
+            let text = path.to_string();
+            let path = Path::new(&text);
+            let (by, relative) = if let Some(Ok(relative)) = out
+                .as_ref()
+                .filter(|out| ide_db::code_identity::path_owned_by(db, &text, out))
+                .map(|out| path.strip_prefix(out))
+            {
                 (Written::ByBuildScript, relative)
+            } else if let Ok(relative) = path.strip_prefix(&manifest)
+                && ide_db::code_identity::path_owned_by(db, &text, &manifest)
+            {
+                (Written::InPackage, relative)
+            } else if path.starts_with(&manifest)
+                || out.as_ref().is_some_and(|out| path.starts_with(out))
+            {
+                (Written::Elsewhere, path)
             } else {
                 continue;
             };
             let hash = file_hash(db, file, path)?;
-            files.push((by, relative.to_string_lossy().into_owned(), hash));
+            inputs.insert((by, relative.to_string_lossy().into_owned()), (true, hash));
         }
-        files.sort_unstable();
-        for (by, path, hash) in &files {
-            field(&[*by as u8]);
-            field(path.as_bytes());
-            field(hash);
-        }
-        // Discover reads before keying the environment, including values supplied by
-        // Cargo or a build script instead of by the caller's process.
-        field(&self.environment_hash(db, krate, environment_reads));
-        let env = format!("{:?}", self.keyed_environment(db, krate));
-        field(self.normalized_environment(db, krate, checkouts, env).as_bytes());
-        // What `include_bytes!` and `include_str!` in it read that no source root has, as it
-        // was read: known once the crate is listed, which asking its reads had it be.
-        let mut read: Vec<(Written, String, Hash)> = db
+        let environment = self.environment_hash(db, krate, environment_reads);
+        let current = hir::input_owners::current_input_paths(db, krate);
+        // The watcher retains historical reads. Only current semantic reads join
+        // source files, by the same logical key and presence encoding. A current
+        // external read supplies the tracked byte snapshot actually expanded.
+        for (path, bytes) in db
             .included_by(krate)
             .into_iter()
-            .map(|(path, bytes)| {
-                let path = Path::new(path.as_str());
-                let (by, path) = if let Ok(relative) = path.strip_prefix(&manifest) {
-                    (Written::InPackage, relative)
-                } else if let Some(Ok(relative)) = out.as_ref().map(|out| path.strip_prefix(out)) {
-                    (Written::ByBuildScript, relative)
-                } else {
-                    (Written::Elsewhere, path)
-                };
-                let hash = Sha256::digest(bytes.as_deref().unwrap_or_default()).into();
-                (by, path.to_string_lossy().into_owned(), hash)
-            })
-            .collect();
-        read.sort_unstable();
-        for (by, path, hash) in &read {
+            .filter(|(path, _)| current.binary_search(path).is_ok())
+        {
+            let text = path.as_str();
+            let path = Path::new(text);
+            let (by, path) = if let Some(Ok(relative)) = out
+                .as_ref()
+                .filter(|out| ide_db::code_identity::path_owned_by(db, text, out))
+                .map(|out| path.strip_prefix(out))
+            {
+                (Written::ByBuildScript, relative)
+            } else if let Ok(relative) = path.strip_prefix(&manifest)
+                && ide_db::code_identity::path_owned_by(db, text, &manifest)
+            {
+                (Written::InPackage, relative)
+            } else {
+                (Written::Elsewhere, path)
+            };
+            let hash: Hash = Sha256::digest(bytes.as_deref().unwrap_or_default()).into();
+            inputs.insert((by, path.to_string_lossy().into_owned()), (bytes.is_some(), hash));
+        }
+        field(&(inputs.len() as u64).to_le_bytes());
+        for ((by, path), (present, hash)) in &inputs {
             field(&[*by as u8]);
             field(path.as_bytes());
+            field(&[u8::from(*present)]);
             field(hash);
         }
+        field(&environment);
+        let env = format!("{:?}", self.keyed_environment(db, krate));
+        field(self.normalized_environment(db, krate, checkouts, env).as_bytes());
 
         // In the order of their names: the order they are listed in is the build's.
         let mut dependencies: Vec<_> = data.dependencies.iter().collect();
@@ -799,6 +817,324 @@ mod tests {
             environment_ids(&db, crates, false, false)
         };
         assert_ne!(identity("/first/dep"), identity("/another/depth/dep"));
+    }
+
+    #[test]
+    fn observed_path_lengths_remain_contextual() {
+        for key in ["OUT_DIR", "CARGO_MANIFEST_DIR"] {
+            let body = format!(
+                "macro_rules! length {{ () => {{ env!(\"{key}\").len() }} }} pub fn value() -> usize {{ length!() }}"
+            );
+            let identity = |value| {
+                let (db, crates) = environment_fixture(&body, true, false, &[(key, value)]);
+                environment_ids(&db, crates, false, false)
+            };
+            assert_ne!(identity("/one"), identity("/another/deeper/root"));
+        }
+    }
+
+    #[test]
+    fn generated_content_reuses_across_nested_and_external_output_roots() {
+        use test_fixture::WithFixture;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let identity = |package: &str, output: &str, generated: &str| {
+            let directory = std::env::temp_dir().join(format!(
+                "generated-content-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let package =
+                directory.join(package.trim_start_matches('/')).to_string_lossy().into_owned();
+            let output =
+                directory.join(output.trim_start_matches('/')).to_string_lossy().into_owned();
+            let fixture = format!(
+                "//- {package}/src/lib.rs crate:fixture\n\
+                 #[rustc_builtin_macro] macro_rules! include {{ () => {{}} }}\n\
+                 #[rustc_builtin_macro] macro_rules! env {{ () => {{}} }}\n\
+                 #[rustc_builtin_macro] macro_rules! concat {{ () => {{}} }}\n\
+                 include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n\
+                 //- {output}/generated.rs\n{generated}\n"
+            );
+            let (mut db, files) = RootDatabase::with_many_files(&fixture);
+            let mut set = vfs::file_set::FileSet::default();
+            for (file, path) in files
+                .iter()
+                .zip([format!("{package}/src/lib.rs"), format!("{output}/generated.rs")])
+            {
+                std::fs::create_dir_all(Path::new(&path).parent().unwrap()).unwrap();
+                std::fs::write(&path, db.file_text(file.file_id(&db)).text(&db).as_bytes())
+                    .unwrap();
+                set.insert(
+                    file.file_id(&db),
+                    vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(path.into())),
+                );
+            }
+            let mut change = ide_db::ChangeWithProcMacros::default();
+            change.set_roots(vec![ide_db::base_db::SourceRoot::new_local(set)]);
+            db.apply_change(change);
+            let krate = ide_db::base_db::all_crates(&db)[0];
+            let mut env = krate.env(&db).clone();
+            env.set("CARGO_MANIFEST_DIR", &package);
+            env.set("OUT_DIR", &output);
+            db.set_env(krate, env);
+            let identity = hir::attach_db(&db, || {
+                Contents::default()
+                    .hash(&db, (Path::new(&package), None), krate, &|_| None, &|krate| {
+                        crate::environment_reads(&db, krate)
+                    })
+                    .unwrap()
+                    .0
+            });
+            std::fs::remove_dir_all(directory).unwrap();
+            identity
+        };
+        let source = "pub fn value() -> u8 { 7 }";
+        let first = identity("/first/package", "/first/package/target/one/out", source);
+        assert_eq!(first, identity("/other/deeper/package", "/elsewhere/build/out", source));
+        assert_eq!(first, identity("/other/package", "/other/package/target/two/out", source));
+        assert_ne!(
+            first,
+            identity(
+                "/other/package",
+                "/other/package/target/two/out",
+                "pub fn value() -> u8 { 8 }"
+            )
+        );
+    }
+
+    #[test]
+    fn local_content_identity_survives_include_hydration() {
+        use test_fixture::WithFixture;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        for include in ["include_str", "include_bytes"] {
+            let directory = std::env::temp_dir().join(format!(
+                "local-include-hydration-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let package = directory.join("package");
+            let output = directory.join("out");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::create_dir_all(&output).unwrap();
+            let payload = output.join("payload.bin");
+            let ty = if include == "include_str" { "str" } else { "[u8]" };
+            let fixture = format!(
+                "//- {}/lib.rs crate:fixture\n\
+                #[rustc_builtin_macro] macro_rules! {include} {{ () => {{}} }}\n\
+                #[rustc_builtin_macro] macro_rules! env {{ () => {{}} }}\n\
+                #[rustc_builtin_macro] macro_rules! concat {{ () => {{}} }}\n\
+                pub fn value() -> &'static {ty} {{ {include}!(concat!(env!(\"OUT_DIR\"), \"/payload.bin\")) }}\n\
+                //- {}\nsame\n",
+                package.display(),
+                payload.display()
+            );
+            let (mut db, files) = RootDatabase::with_many_files(&fixture);
+            let [root_file, payload_file] = [files[0].file_id(&db), files[1].file_id(&db)];
+            std::fs::write(package.join("lib.rs"), db.file_text(root_file).text(&db).as_bytes())
+                .unwrap();
+            std::fs::write(&payload, db.file_text(payload_file).text(&db).as_bytes()).unwrap();
+            let roots = |db: &mut RootDatabase, hydrated| {
+                let mut set = vfs::file_set::FileSet::default();
+                set.insert(
+                    root_file,
+                    vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(package.join("lib.rs"))),
+                );
+                if hydrated {
+                    set.insert(
+                        payload_file,
+                        vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(payload.clone())),
+                    );
+                }
+                let mut change = ide_db::ChangeWithProcMacros::default();
+                change.set_roots(vec![ide_db::base_db::SourceRoot::new_local(set)]);
+                db.apply_change(change);
+            };
+            roots(&mut db, false);
+            let krate = ide_db::base_db::all_crates(&db)[0];
+            let mut env = krate.env(&db).clone();
+            env.set("CARGO_MANIFEST_DIR", package.to_string_lossy());
+            env.set("OUT_DIR", output.to_string_lossy());
+            db.set_env(krate, env);
+            let compiler_env = krate.env(&db).clone();
+            let fresh_identity = |source: &str, payload_text: Option<&str>| {
+                let mut fixture =
+                    format!("//- {}/lib.rs crate:fixture\n{source}", package.display());
+                if payload_text.is_some() {
+                    fixture.push_str(&format!("\n//- {}\nplaceholder\n", payload.display()));
+                }
+                let (mut fresh, files) = RootDatabase::with_many_files(&fixture);
+                let file = files[0].file_id(&fresh);
+                fresh.set_file_text(file, source);
+                let mut set = vfs::file_set::FileSet::default();
+                set.insert(
+                    file,
+                    vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(package.join("lib.rs"))),
+                );
+                if let Some(text) = payload_text {
+                    let file = files[1].file_id(&fresh);
+                    fresh.set_file_text(file, text);
+                    set.insert(
+                        file,
+                        vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(payload.clone())),
+                    );
+                }
+                let mut change = ide_db::ChangeWithProcMacros::default();
+                change.set_roots(vec![ide_db::base_db::SourceRoot::new_local(set)]);
+                fresh.apply_change(change);
+                let krate = ide_db::base_db::all_crates(&fresh)[0];
+                fresh.set_env(krate, compiler_env.clone());
+                hir::attach_db(&fresh, || {
+                    Contents::default()
+                        .hash(&fresh, (&package, None), krate, &|_| None, &|krate| {
+                            crate::environment_reads(&fresh, krate)
+                        })
+                        .unwrap()
+                        .0
+                })
+            };
+            let identity = |db: &RootDatabase| {
+                hir::attach_db(db, || {
+                    Contents::default()
+                        .hash(db, (&package, None), krate, &|_| None, &|krate| {
+                            crate::environment_reads(db, krate)
+                        })
+                        .unwrap()
+                        .0
+                })
+            };
+            let external = identity(&db);
+            assert!(!db.included_by(krate).is_empty());
+            roots(&mut db, true);
+            assert_eq!(
+                external,
+                identity(&db),
+                "{include}: hydration changes representation, not input content"
+            );
+            let disk_bytes = std::fs::read(&payload).unwrap();
+            db.set_file_text(payload_file, "vfs-only");
+            let vfs_only = identity(&db);
+            assert_ne!(external, vfs_only);
+            assert_eq!(std::fs::read(&payload).unwrap(), disk_bytes);
+            assert_eq!(db.included_by(krate)[0].1.as_deref(), Some(disk_bytes.as_slice()));
+            assert_eq!(
+                vfs_only,
+                fresh_identity(db.file_text(root_file).text(&db), Some("vfs-only")),
+                "{include}: stale external cache must not replace the selected VFS text"
+            );
+            std::fs::write(&payload, b"changed").unwrap();
+            db.set_file_text(payload_file, "changed");
+            let path = paths::AbsPathBuf::assert_utf8(payload.clone());
+            db.reload_included_file(&path);
+            let changed = identity(&db);
+            assert_ne!(external, changed);
+            roots(&mut db, false);
+            assert_eq!(
+                changed,
+                identity(&db),
+                "{include}: historical reads must not duplicate hydrated inputs"
+            );
+            std::fs::write(&payload, []).unwrap();
+            db.reload_included_file(&path);
+            let empty = identity(&db);
+            std::fs::remove_file(&payload).unwrap();
+            db.reload_included_file(&path);
+            assert_ne!(empty, identity(&db), "{include}: missing is not an empty input");
+            std::fs::write(&payload, []).unwrap();
+            db.reload_included_file(&path);
+            assert_eq!(empty, identity(&db));
+            let source = db.file_text(root_file).text(&db).to_string();
+            let call = format!("{include}!(concat!(env!(\"OUT_DIR\"), \"/payload.bin\"))");
+            let literal = if include == "include_str" { "\"fixed\"" } else { "b\"fixed\"" };
+            let dropped =
+                source.replace(&call, &format!("{{ let _ = env!(\"OUT_DIR\"); {literal} }}"));
+            assert_ne!(source, dropped);
+            db.set_file_text(root_file, &dropped);
+            let historical = identity(&db);
+            assert!(!db.included_by(krate).is_empty(), "legacy watcher history remains available");
+            let fresh_id = fresh_identity(&dropped, None);
+            assert_eq!(
+                historical, fresh_id,
+                "{include}: removed external reads must not survive in the key"
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn ctfe_filename_lengths_enter_identity_before_persistent_lookup() {
+        use hir::db::HirDatabase as _;
+        use hir_def::{ModuleDefId, nameres::crate_def_map};
+        use hir_ty::next_solver::GenericArgs;
+        use test_fixture::WithFixture;
+        for (expression, included) in ["file!()", "core::panic::Location::caller().file()"]
+            .into_iter()
+            .flat_map(|expression| [false, true].map(|included| (expression, included)))
+        {
+            let declaration = format!("const GOAL: usize = {expression}.len();");
+            let body = if included {
+                format!("include!(\"generated.rs\");\n//- /generated.rs\n{declaration}")
+            } else {
+                declaration
+            };
+            let fixture = format!(
+                r#"
+//- minicore: sized, panic_location
+//- /main.rs
+#[rustc_builtin_macro] macro_rules! file {{ () => {{}} }}
+#[rustc_builtin_macro] macro_rules! include {{ () => {{}} }}
+{body}
+"#
+            );
+            let (mut db, files) = RootDatabase::with_many_files(&fixture);
+            let named_file = files[usize::from(included)].file_id(&db);
+            let (krate, goal) = hir::attach_db(&db, || {
+                ide_db::base_db::all_crates(&db)
+                    .iter()
+                    .find_map(|&krate| {
+                        crate_def_map(&db, krate)
+                            .modules(&db)
+                            .flat_map(|(_, module)| module.scope(&db).declarations())
+                            .find_map(|definition| match definition {
+                                ModuleDefId::ConstId(id) => Some((krate, id)),
+                                _ => None,
+                            })
+                    })
+                    .unwrap()
+            });
+            let core =
+                *ide_db::base_db::all_crates(&db).iter().find(|&&other| other != krate).unwrap();
+            let core_file = core.data(&db).root_file_id;
+            let source = db.file_text(core_file).text(&db).to_string();
+            db.set_file_text(
+                core_file,
+                &format!(
+                    r#"{source}
+#[rustc_intrinsic] pub const unsafe fn size_of_val<T: ?Sized>(value: *const T) -> usize;
+#[lang = "str"] impl str {{ pub const fn len(&self) -> usize {{ unsafe {{ size_of_val(self) }} }} }}
+"#
+                ),
+            );
+            let mut identities = Vec::new();
+            for expected in ["source/short.rs", "source/much-longer-name.rs"] {
+                hir_ty::mir::location::name_sources(&mut db, move |_, file| {
+                    Some(if file == named_file {
+                        expected.to_owned()
+                    } else {
+                        "unrelated-file.rs".to_owned()
+                    })
+                });
+                hir::attach_db(&db, || {
+                    identities.push(ide_db::code_identity::semantic_source_hash(&db, krate));
+                    let result = db.const_eval(goal, GenericArgs::empty(), None).unwrap();
+                    assert_eq!(
+                        usize::from_le_bytes(result.memory[..].try_into().unwrap()),
+                        expected.len(),
+                        "{expression}, included={included}"
+                    );
+                });
+            }
+            assert_ne!(identities[0], identities[1], "{expression}");
+        }
     }
 
     #[test]
