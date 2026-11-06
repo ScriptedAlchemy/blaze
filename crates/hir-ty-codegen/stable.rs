@@ -2,7 +2,7 @@
 //! that code compiled by one run can be found by the next. A crate of the checkout is named
 //! by what is written in it, so an edit makes other names of everything in it.
 
-use std::{cell::RefCell, fmt::Write, sync::Arc};
+use std::{cell::RefCell, fmt::Write};
 
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, ModuleDefId,
@@ -180,12 +180,37 @@ struct Listed {
     functions: FxHashMap<String, Vec<FunctionId>>,
 }
 
+/// One SCC of the semantic call graph: what its own bodies observed, and which SCCs they reach.
+/// A certificate's transitive provenance is this graph and is never kept flattened: roots of
+/// a shared call graph overlap, so a flattened copy per root is quadratic in the graph.
 struct SemanticComponent {
     contextual: bool,
-    constants: Vec<String>,
-    sources: Vec<super::cached::SemanticSource>,
-    dependencies: Vec<usize>,
-    inputs: std::sync::OnceLock<Option<Arc<super::cached::SemanticInputs>>>,
+    constants: Box<[Box<str>]>,
+    sources: Box<[super::cached::SemanticSource]>,
+    dependencies: Box<[usize]>,
+    /// The digest of the complete closure, once it is asked for; `None` for a closure that is
+    /// not canonical, which has two names for one file.
+    digest: std::sync::OnceLock<Option<Box<str>>>,
+}
+
+/// The complete transitive provenance of an instance, by reference into the [`StableNames`]
+/// that made it, for as long as that view lives. Its closure is canonical. Ask that view for
+/// what is needed of it: [`StableNames::covers`], or [`StableNames::complete_inputs`] for the
+/// owned value an entry carries to the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SemanticCertificate(usize);
+
+/// Asks whether one certificate covers others. What it has found of the parent's closure is
+/// for one entry's callees, which are many, and goes with it: see [`StableNames::covers`].
+pub(super) struct SemanticCoverage {
+    parent: Option<SemanticCertificate>,
+    reached: Option<FxHashSet<usize>>,
+}
+
+impl SemanticCoverage {
+    pub(super) fn of(parent: Option<SemanticCertificate>) -> Self {
+        SemanticCoverage { parent, reached: None }
+    }
 }
 
 struct SemanticNode {
@@ -334,18 +359,22 @@ impl<'a, 'db> StableNames<'a, 'db> {
         environment: &hir_ty::traits::StoredParamEnvAndCrate,
     ) -> Option<String> {
         let mut name = self.raw_instance(instance)?;
-        if let Some(inputs) = self.semantic_inputs(instance, environment)? {
+        if let Some(certificate) = self.semantic_certificate(instance, environment)? {
             name.push_str(SEMANTIC_INPUTS);
-            name.push_str(inputs.digest());
+            let arena = self.components.borrow();
+            let digest = arena[certificate.0].digest.get().and_then(Option::as_deref);
+            name.push_str(digest.expect("a certificate's closure is canonical"));
         }
         Some(name)
     }
 
-    pub(super) fn semantic_inputs(
+    /// `None` for an instance with no certificate, `Some(None)` for one whose closure depends
+    /// on nothing of where it is compiled.
+    pub(super) fn semantic_certificate(
         &self,
         instance: &Instance,
         environment: &hir_ty::traits::StoredParamEnvAndCrate,
-    ) -> Option<Option<Arc<super::cached::SemanticInputs>>> {
+    ) -> Option<Option<SemanticCertificate>> {
         self.db.unwind_if_revision_cancelled();
         let key = InstanceIn::new(instance.clone(), environment.clone());
         let cached = self.certificates.borrow().get(&key).copied();
@@ -359,7 +388,8 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 if !self.components.borrow()[component].contextual {
                     return Some(None);
                 }
-                Some(Some(self.semantic_component_inputs(component)?))
+                self.seal_component(component)?;
+                Some(Some(SemanticCertificate(component)))
             }
             Err(why) if cached.is_some() => self.miss(why),
             Err(_) => None,
@@ -427,10 +457,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
             let mut dependencies = FxHashSet::default();
             let mut boundaries = FxHashSet::default();
             for &member in members {
-                let node = &nodes[member];
+                let node = &mut nodes[member];
                 contextual |= node.contextual;
-                constants.extend(node.constants.iter().cloned());
-                sources.extend(node.sources.iter().cloned());
+                constants.append(&mut node.constants);
+                sources.append(&mut node.sources);
                 for child in &node.children {
                     if let Some(&child) = index.get(child) {
                         let child = component_of[child];
@@ -473,10 +503,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 let at = arena.len();
                 arena.push(SemanticComponent {
                     contextual,
-                    constants,
-                    sources,
-                    dependencies: children,
-                    inputs: std::sync::OnceLock::new(),
+                    constants: constants.into_iter().map(String::into_boxed_str).collect(),
+                    sources: sources.into_boxed_slice(),
+                    dependencies: children.into_boxed_slice(),
+                    digest: std::sync::OnceLock::new(),
                 });
                 at
             };
@@ -503,36 +533,102 @@ impl<'a, 'db> StableNames<'a, 'db> {
         }
     }
 
-    fn semantic_component_inputs(&self, root: usize) -> Option<Arc<super::cached::SemanticInputs>> {
+    /// Works out the digest of the complete closure of `root`, once for each SCC of this view.
+    /// What it reads is borrowed from the arena and gone when this returns: only the digest is
+    /// kept. `None` for a closure that is not canonical.
+    fn seal_component(&self, root: usize) -> Option<()> {
         let arena = self.components.borrow();
-        arena[root]
-            .inputs
-            .get_or_init(|| {
-                let mut pending = vec![root];
-                let mut seen = FxHashSet::default();
-                let mut constants = Vec::new();
-                let mut sources = Vec::new();
-                while let Some(component) = pending.pop() {
-                    self.db.unwind_if_revision_cancelled();
-                    if !seen.insert(component) {
-                        continue;
-                    }
-                    #[cfg(test)]
-                    self.semantic_flatten_visits.set(self.semantic_flatten_visits.get() + 1);
-                    let component = &arena[component];
-                    constants.extend(component.constants.iter().cloned());
-                    sources.extend(component.sources.iter().cloned());
-                    pending.extend(&component.dependencies);
-                }
-                constants.sort();
-                constants.dedup();
-                sources.sort();
-                sources.dedup();
-                let inputs = super::cached::SemanticInputs::new(constants, sources);
-                inputs.canonical().then(|| Arc::new(inputs))
+        let digest = arena[root].digest.get_or_init(|| {
+            let (constants, sources) = self.closure_values(&arena, root);
+            super::cached::SemanticInputs::canonical_parts(
+                constants.iter().copied(),
+                sources.iter().copied(),
+            )
+            .then(|| {
+                super::cached::SemanticInputs::digest_parts(
+                    constants.iter().copied(),
+                    sources.iter().copied(),
+                )
+                .into_boxed_str()
             })
-            .clone()
-            .or_else(|| self.miss("ambiguous semantic source provenance"))
+        });
+        match digest {
+            Some(_) => Some(()),
+            None => self.miss("ambiguous semantic source provenance"),
+        }
+    }
+
+    /// The SCCs of `root`'s complete closure.
+    fn closure_components(&self, arena: &[SemanticComponent], root: usize) -> FxHashSet<usize> {
+        let mut pending = vec![root];
+        let mut seen = FxHashSet::default();
+        while let Some(component) = pending.pop() {
+            self.db.unwind_if_revision_cancelled();
+            if !seen.insert(component) {
+                continue;
+            }
+            #[cfg(test)]
+            self.semantic_flatten_visits.set(self.semantic_flatten_visits.get() + 1);
+            pending.extend(&arena[component].dependencies);
+        }
+        seen
+    }
+
+    /// What `root`'s complete closure observed, sorted and without repeats, by reference.
+    fn closure_values<'c>(
+        &self,
+        arena: &'c [SemanticComponent],
+        root: usize,
+    ) -> (Vec<&'c str>, Vec<&'c super::cached::SemanticSource>) {
+        let mut constants = Vec::new();
+        let mut sources = Vec::new();
+        for component in self.closure_components(arena, root) {
+            let component = &arena[component];
+            constants.extend(component.constants.iter().map(|it| &**it));
+            sources.extend(component.sources.iter());
+        }
+        constants.sort_unstable();
+        constants.dedup();
+        sources.sort_unstable();
+        sources.dedup();
+        (constants, sources)
+    }
+
+    /// Whether everything `child`'s complete closure observed is in the closure of the parent
+    /// of `coverage`. A closure that reaches `child` has it all, so that is asked first, of
+    /// the components alone. One that does not can still have it all, by the same names.
+    pub(super) fn covers(
+        &self,
+        coverage: &mut SemanticCoverage,
+        child: SemanticCertificate,
+    ) -> bool {
+        let Some(parent) = coverage.parent else { return false };
+        let arena = self.components.borrow();
+        let reached =
+            coverage.reached.get_or_insert_with(|| self.closure_components(&arena, parent.0));
+        if reached.contains(&child.0) {
+            return true;
+        }
+        let (constants, sources) = self.closure_values(&arena, parent.0);
+        self.closure_components(&arena, child.0).difference(reached).all(|&component| {
+            let component = &arena[component];
+            component.constants.iter().all(|it| constants.binary_search(&&**it).is_ok())
+                && component.sources.iter().all(|it| sources.binary_search(&it).is_ok())
+        })
+    }
+
+    /// The certificate as the owned value the store is given, for the one that gives it: it
+    /// is as big as the closure, and it is what must not be kept for each root.
+    pub(super) fn complete_inputs(
+        &self,
+        certificate: SemanticCertificate,
+    ) -> super::cached::SemanticInputs {
+        let arena = self.components.borrow();
+        let (constants, sources) = self.closure_values(&arena, certificate.0);
+        super::cached::SemanticInputs::new(
+            constants.into_iter().map(str::to_owned).collect(),
+            sources.into_iter().cloned().collect(),
+        )
     }
 
     fn semantic_node(&self, key: &InstanceIn) -> Option<SemanticNode> {
@@ -1518,7 +1614,7 @@ mod semantic_tests {
             assert_eq!(names.semantic_flatten_visits.get(), 0);
             let arena = names.components.borrow();
             assert_eq!(arena.len(), N);
-            assert!(arena.iter().all(|component| component.inputs.get().is_none()));
+            assert!(arena.iter().all(|component| component.digest.get().is_none()));
             assert_eq!(
                 arena.iter().map(|component| component.dependencies.len()).sum::<usize>(),
                 N - 1
@@ -1531,6 +1627,10 @@ mod semantic_tests {
 
     #[test]
     fn recursive_bodies_share_one_complete_certificate_and_honor_cancellation() {
+        semantically_shared_view();
+    }
+
+    fn semantically_shared_view() {
         use salsa::Database;
         let source = "//- minicore: sized\n//- /src/main.rs crate:semantic_cycle\n#[rustc_builtin_macro] macro_rules! file {}\n#[rustc_intrinsic] const unsafe fn size_of_val<T: ?Sized>(value: *const T) -> usize;\nconst WIDTH: usize = unsafe { size_of_val(file!() as *const str) };\npub fn f<T>() -> usize { g::<T>() + WIDTH }\npub fn g<T>() -> usize { f::<T>() + WIDTH }\n";
         let mut db = RootDatabase::with_files(source);
@@ -1567,15 +1667,24 @@ mod semantic_tests {
                 checked: false,
             };
             let g = Instance { def: InstanceDef::Fn(functions["g"]), args, checked: false };
-            let a = names.semantic_inputs(&f, &environment).unwrap().unwrap();
-            let b = names.semantic_inputs(&g, &environment).unwrap().unwrap();
-            assert!(Arc::ptr_eq(&a, &b));
+            let a = names.semantic_certificate(&f, &environment).unwrap().unwrap();
+            let b = names.semantic_certificate(&g, &environment).unwrap().unwrap();
+            assert_eq!(a, b);
             assert_eq!(names.semantic_visits.get(), 2);
             assert_eq!(names.semantic_flatten_visits.get(), 1);
             assert_ne!(names.instance_in(&f, &environment), names.instance_in(&g, &environment));
             let cancelled = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
                 db.cancellation_token().cancel();
-                names.semantic_inputs(&f, &environment)
+                names.semantic_certificate(&f, &environment)
+            }));
+            assert!(matches!(cancelled, Err(salsa::Cancelled::Local)), "{cancelled:?}");
+            // What walks the graph is cancelled as what builds it is.
+            let cancelled = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+                names.complete_inputs(a);
+            }));
+            assert!(matches!(cancelled, Err(salsa::Cancelled::Local)), "{cancelled:?}");
+            let cancelled = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+                names.covers(&mut SemanticCoverage::of(Some(a)), b)
             }));
             assert!(matches!(cancelled, Err(salsa::Cancelled::Local)), "{cancelled:?}");
         });
@@ -1724,5 +1833,289 @@ mod semantic_tests {
                 names.semantic_visits.get()
             );
         });
+    }
+
+    /// `N` roots of a call graph where each calls the next two, so that every root's complete
+    /// closure is every root after it, and only the last reads a file name. The same source
+    /// as a real generic call chain: nothing here is a mock of a certificate.
+    fn shared_call_graph(n: usize) -> String {
+        let mut source = "//- minicore: sized\n//- /src/main.rs crate:shared_graph\n#[rustc_builtin_macro] macro_rules! file {}\n#[rustc_intrinsic] const unsafe fn size_of_val<T: ?Sized>(value: *const T) -> usize;\nconst WIDTH: usize = unsafe { size_of_val(file!() as *const str) };\n".to_owned();
+        for i in 0..n {
+            let value = match n - i {
+                1 => "WIDTH".to_owned(),
+                2 => format!("f{}::<T>()", i + 1),
+                _ => format!("f{}::<T>() + f{}::<T>()", i + 1, i + 2),
+            };
+            writeln!(source, "pub fn f{i}<T>() -> usize {{ {value} }}").unwrap();
+        }
+        source
+    }
+
+    /// `body` with a fresh naming view of `source` where every file is named `provider`, and
+    /// the instance of a function by its name with `()` for its one type parameter.
+    fn in_view<R>(
+        source: &str,
+        provider: Option<&'static str>,
+        body: impl FnOnce(
+            &dyn Fn(&mut dyn FnMut(&StableNames<'_, '_>)),
+            &dyn Fn(&str) -> Instance,
+            &hir_ty::traits::StoredParamEnvAndCrate,
+        ) -> R,
+    ) -> R {
+        let mut db = RootDatabase::with_files(source);
+        hir_ty::mir::location::name_sources(&mut db, move |_, _| provider.map(Into::into));
+        hir::attach_db(&db, || {
+            let krate = *base_db::all_crates(&db)
+                .iter()
+                .find(|krate| krate.data(&db).origin.is_local())
+                .unwrap();
+            let functions = functions(&db, krate);
+            let symbols = crate::startup_tests::Symbols {
+                db: &db,
+                identity: Sha256::digest(source.as_bytes()).into(),
+            };
+            let view = |body: &mut dyn FnMut(&StableNames<'_, '_>)| {
+                let owned = base_db::all_crates(&db).iter().copied().collect();
+                body(&StableNames::new(&db, &symbols, owned, true));
+            };
+            let environment = hir_ty::ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate,
+            }
+            .store();
+            let args = GenericArgs::new_from_slice(&[Ty::new_unit(
+                hir_ty::next_solver::DbInterner::new_with(&db, krate),
+            )
+            .into()])
+            .store();
+            let instance = |name: &str| Instance {
+                def: InstanceDef::Fn(functions[name]),
+                args: args.clone(),
+                checked: false,
+            };
+            body(&view, &instance, &environment)
+        })
+    }
+
+    /// What a view of `n` roots holds once each of them is named, past what the database keeps.
+    fn view_bytes(n: usize) -> isize {
+        in_view(&shared_call_graph(n), Some("graph.rs"), |view, instance, environment| {
+            let roots: Vec<_> = (0..n).map(|i| instance(&format!("f{i}"))).collect();
+            let name_all = |names: &StableNames<'_, '_>| {
+                for root in &roots {
+                    names.instance_in(root, environment).unwrap();
+                }
+            };
+            // The queries and the interners of the first view stay in the database.
+            view(&mut |names| name_all(names));
+            let mut held = 0;
+            let before = ra_jit_fuzz::live_bytes();
+            view(&mut |names| {
+                name_all(names);
+                held = ra_jit_fuzz::live_bytes() - before;
+            });
+            held
+        })
+    }
+
+    #[test]
+    fn many_roots_of_a_shared_call_graph_do_not_each_retain_its_closure() {
+        // Four times the roots hold four times the components. A view that kept each root's
+        // flattened closure holds sixteen times what it did, as the failed bootstrap's 3.9 GiB
+        // of certificates beside 458 MiB of components did.
+        let (small, large) = (view_bytes(128), view_bytes(512));
+        eprintln!("view of 128 roots holds {small} bytes, of 512 roots {large} bytes");
+        assert!(large < 6 * small, "{large} bytes of 512 roots, {small} of 128");
+    }
+
+    /// A root's digest and the sealed bytes of its complete certificate, from the view's value.
+    fn sealed(
+        names: &StableNames<'_, '_>,
+        instance: &Instance,
+        environment: &hir_ty::traits::StoredParamEnvAndCrate,
+    ) -> (String, String, usize) {
+        let certificate = names.semantic_certificate(instance, environment).unwrap().unwrap();
+        let inputs = names.complete_inputs(certificate);
+        let wire = postcard::to_allocvec(&Some(&inputs)).unwrap();
+        let name = names.instance_in(instance, environment).unwrap();
+        let digest = semantic_digest(&name).unwrap().to_owned();
+        // What a reader works out of the bytes is what the name was sealed with.
+        let read: Option<crate::cached::SemanticInputs> = postcard::from_bytes(&wire).unwrap();
+        let read = read.unwrap();
+        assert_eq!(read.digest(), digest);
+        assert!(read.canonical());
+        (digest, hex(&Sha256::digest(&wire)), wire.len())
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Goldens taken from the flattening implementation these replaced, at `inputs4`.
+    #[test]
+    fn digests_and_wire_bytes_are_those_of_the_flattened_certificate() {
+        const CYCLE: &str = "//- minicore: sized\n//- /src/main.rs crate:semantic_cycle\n#[rustc_builtin_macro] macro_rules! file {}\n#[rustc_intrinsic] const unsafe fn size_of_val<T: ?Sized>(value: *const T) -> usize;\nconst WIDTH: usize = unsafe { size_of_val(file!() as *const str) };\npub fn f<T>() -> usize { g::<T>() + WIDTH }\npub fn g<T>() -> usize { f::<T>() + WIDTH }\n";
+        let graph = shared_call_graph(32);
+        let mut got = Vec::new();
+        for (source, provider, roots) in [
+            (graph.as_str(), "graph.rs", &["f0", "f7", "f30", "f31"][..]),
+            (graph.as_str(), "other.rs", &["f0", "f31"][..]),
+            (CYCLE, "cycle.rs", &["f", "g"][..]),
+        ] {
+            in_view(source, Some(provider), |view, instance, environment| {
+                view(&mut |names| {
+                    for root in roots {
+                        let (digest, wire, len) = sealed(names, &instance(root), environment);
+                        got.push(format!("{provider} {root} {digest} {wire} {len}"));
+                    }
+                });
+            });
+        }
+        let got = got.join("\n");
+        eprintln!("{got}");
+        assert_eq!(got, GOLDEN.trim());
+    }
+
+    const GOLDEN: &str = "\
+graph.rs f0 3596b3b126f309c7501c0cbe1310ad1df2cb7d6bfee008635b1118b0a5d4ba6d ef56cc8fbd83d03824166abc99983fcf53e87845e2c2b54f9416d6c73cf24bc0 28262\n\
+graph.rs f7 d383350c824f5c6f8ee4800601735d1f8b3fd29d7ad63e18bc611468f77949e6 e384387e820177af158eb89419a1208416e74ba1f4c5a96bfb3fc0d2dce4847a 21948\n\
+graph.rs f30 54ea71c3c8e92b2354c4dff09e47a82fc15e57f2c5428872a465300627b27cf9 3236028237396798672714cefd68732499d0ba173db3f2da6d53557729b68ead 1202\n\
+graph.rs f31 f2f5505cdce27d39f56e4cebb65439ef02b718e2e8e9a1b544d853d99f961118 48e4461ded267ebb7bcb70e5124e1a5d0c66873645884c22885ef28dfbcb4268 660\n\
+other.rs f0 b243ea88cc56aedc9186b4fb920ae4f67e5272b4adfa08754da870acd863212b 59117c203445c127e8ac3ed40d5f08ee75ef56a62dd5a093ad86a2e20788c39a 28262\n\
+other.rs f31 d580bb8eef8bc1f3ff2e725aaef336d3b62b034763a0f75a9fde2742c5642c20 036cc60a1475a9aaa0719aaab2321b09d994d6fed104c15264e6bba73c37064a 660\n\
+cycle.rs f 621069e58ee8a80a483aa7ea81b552696e20aa21240c699398e6db242df013e9 036b8a7dce7bc80ed75fb49e4a91348d3670e07b14161307927280283574069f 2037\n\
+cycle.rs g 621069e58ee8a80a483aa7ea81b552696e20aa21240c699398e6db242df013e9 036b8a7dce7bc80ed75fb49e4a91348d3670e07b14161307927280283574069f 2037\n\
+";
+
+    /// Every answer of the graph is the answer of the flattened sets.
+    #[test]
+    fn coverage_by_graph_is_coverage_of_the_complete_values() {
+        const N: usize = 16;
+        in_view(&shared_call_graph(N), Some("graph.rs"), |view, instance, environment| {
+            view(&mut |names| {
+                let certificates: Vec<_> = (0..N)
+                    .map(|i| {
+                        names
+                            .semantic_certificate(&instance(&format!("f{i}")), environment)
+                            .unwrap()
+                            .unwrap()
+                    })
+                    .collect();
+                let values: Vec<_> =
+                    certificates.iter().map(|it| names.complete_inputs(*it)).collect();
+                for (i, &parent) in certificates.iter().enumerate() {
+                    let mut coverage = SemanticCoverage::of(Some(parent));
+                    for (j, &child) in certificates.iter().enumerate() {
+                        let flat = values[i].covers(&values[j]);
+                        assert_eq!(names.covers(&mut coverage, child), flat, "{i} {j}");
+                        assert_eq!(flat, i <= j, "{i} {j}");
+                    }
+                }
+                assert!(!names.covers(&mut SemanticCoverage::of(None), certificates[0]));
+            });
+        });
+    }
+
+    /// A closure that does not reach a component can still hold what it observed, and a child
+    /// with one more constant or one other source name is not covered.
+    #[test]
+    fn coverage_of_a_component_not_reached_is_by_its_values() {
+        fn source(file: &str, name: &str) -> crate::cached::SemanticSource {
+            crate::cached::SemanticSource {
+                body: "body".into(),
+                file: file.into(),
+                name: name.into(),
+            }
+        }
+        in_view(&shared_call_graph(1), Some("graph.rs"), |view, _, _| {
+            view(&mut |names| {
+                let mut add = |constants: &[&str], sources: Vec<_>, dependencies: &[usize]| {
+                    let mut arena = names.components.borrow_mut();
+                    arena.push(SemanticComponent {
+                        contextual: true,
+                        constants: constants.iter().map(|it| Box::from(*it)).collect(),
+                        sources: sources.into(),
+                        dependencies: dependencies.into(),
+                        digest: Default::default(),
+                    });
+                    SemanticCertificate(arena.len() - 1)
+                };
+                let leaf = add(&["a", "b"], vec![source("f.rs", "/f.rs")], &[]);
+                let parent = add(&["c"], Vec::new(), &[leaf.0]);
+                let same = add(&["a", "c"], vec![source("f.rs", "/f.rs")], &[]);
+                let more = add(&["a", "z"], Vec::new(), &[]);
+                let other = add(&["a"], vec![source("f.rs", "/other.rs")], &[]);
+                let deep = add(&["b"], Vec::new(), &[more.0]);
+                let mut coverage = SemanticCoverage::of(Some(parent));
+                assert!(names.covers(&mut coverage, leaf));
+                assert!(names.covers(&mut coverage, same));
+                assert!(!names.covers(&mut coverage, more));
+                assert!(!names.covers(&mut coverage, other));
+                assert!(!names.covers(&mut coverage, deep), "what it depends on is asked too");
+            });
+        });
+    }
+
+    /// Two names for one file are refused however deep they are, and by the digest's guard
+    /// and no other: a root over the ambiguity has no certificate.
+    #[test]
+    fn an_ambiguous_closure_has_no_digest() {
+        in_view(&shared_call_graph(1), Some("graph.rs"), |view, _, _| {
+            view(&mut |names| {
+                let source = |name: &str| crate::cached::SemanticSource {
+                    body: "body".into(),
+                    file: "f.rs".into(),
+                    name: name.into(),
+                };
+                let mut arena = names.components.borrow_mut();
+                for (constant, name, dependencies) in
+                    [("a", "/one.rs", &[][..]), ("b", "/two.rs", &[0][..]), ("c", "/one.rs", &[])]
+                {
+                    arena.push(SemanticComponent {
+                        contextual: true,
+                        constants: Box::new([Box::from(constant)]),
+                        sources: Box::new([source(name)]),
+                        dependencies: dependencies.into(),
+                        digest: Default::default(),
+                    });
+                }
+                drop(arena);
+                assert!(names.seal_component(2).is_some());
+                assert!(names.seal_component(0).is_some());
+                assert!(names.seal_component(1).is_none());
+            });
+        });
+    }
+
+    /// A fresh view after the provider changed or lost a file sees that in the complete value,
+    /// through the closure's deepest body: nothing of the graph outlives its view.
+    #[test]
+    fn a_fresh_view_seals_what_the_provider_says_now() {
+        const N: usize = 8;
+        let graph = shared_call_graph(N);
+        let seal = |provider| {
+            in_view(&graph, provider, |view, instance, environment| {
+                let mut sealed = None;
+                view(&mut |names| {
+                    sealed = names.instance_in(&instance("f0"), environment).map(|name| {
+                        let certificate = names
+                            .semantic_certificate(&instance("f0"), environment)
+                            .unwrap()
+                            .unwrap();
+                        (name, names.complete_inputs(certificate))
+                    });
+                });
+                sealed
+            })
+        };
+        let (first, first_inputs) = seal(Some("first.rs")).unwrap();
+        let (other, other_inputs) = seal(Some("other.rs")).unwrap();
+        assert_ne!(first, other);
+        assert_ne!(first_inputs.digest(), other_inputs.digest());
+        assert_eq!(semantic_digest(&first), Some(first_inputs.digest()));
+        assert_eq!(semantic_digest(&other), Some(other_inputs.digest()));
+        assert!(seal(None).is_none(), "a file with no name now has no certificate");
+        let (again, _) = seal(Some("first.rs")).unwrap();
+        assert_eq!(first, again);
     }
 }

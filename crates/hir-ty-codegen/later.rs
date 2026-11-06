@@ -207,11 +207,11 @@ impl<'db> Keeper<'_, 'db> {
         &mut self,
         instance: &Instance,
         asked: &StoredParamEnvAndCrate,
-        parent: Option<&cached::SemanticInputs>,
+        parent: &mut stable::SemanticCoverage,
     ) -> Option<StableName> {
         let environment = home::Homes::default().home(self.db, instance, asked);
-        if let Some(child) = self.names.semantic_inputs(instance, &environment)?
-            && parent.is_none_or(|parent| !parent.covers(&child))
+        if let Some(child) = self.names.semantic_certificate(instance, &environment)?
+            && !self.names.covers(parent, child)
         {
             return self.kept.unkept("incomplete transitive semantic preparation");
         }
@@ -492,7 +492,8 @@ impl<'db> Keeper<'_, 'db> {
     ) -> Option<cached::Entry> {
         use cached::{CachedData, CachedFunc, CachedTarget};
         let db = self.db;
-        let semantic = self.names.semantic_inputs(instance, environment)?;
+        let semantic = self.names.semantic_certificate(instance, environment)?;
+        let mut coverage = stable::SemanticCoverage::of(semantic);
         let mut funcs = Vec::with_capacity(compiled.requests.funcs.len());
         for (at, request) in compiled.requests.funcs.iter().enumerate() {
             let foreign = |callee: &Instance| match callee.def {
@@ -531,7 +532,7 @@ impl<'db> Keeper<'_, 'db> {
                             }
                             _ => None,
                         };
-                        Some(self.callee_name_in(&callee, asked, semantic.as_deref()))
+                        Some(self.callee_name_in(&callee, asked, &mut coverage))
                     }
                     _ => None,
                 };
@@ -565,7 +566,7 @@ impl<'db> Keeper<'_, 'db> {
                 let Some(callee) = &self.settled(at, callee) else {
                     return self.kept.unkept("unsettled callee");
                 };
-                let Some(name) = self.callee_name_in(callee, asked, semantic.as_deref()) else {
+                let Some(name) = self.callee_name_in(callee, asked, &mut coverage) else {
                     return self.kept.unkept("unnamed callee");
                 };
                 // A function the program is built from has no entry: it is compiled anew.
@@ -677,6 +678,8 @@ impl<'db> Keeper<'_, 'db> {
                 }
             });
         }
+        // Last, as the entry is otherwise whole: this is as big as the closure.
+        let semantic = semantic.map(|it| self.names.complete_inputs(it));
         Some(cached::Entry {
             label: callee_name(db, instance.def).to_owned(),
             funcs,
@@ -684,7 +687,7 @@ impl<'db> Keeper<'_, 'db> {
             code: cached::CachedCode::from(&compiled.code),
             debug,
             tracked: None,
-            semantic: semantic.map(|inputs| inputs.as_ref().clone()),
+            semantic,
         })
     }
 }

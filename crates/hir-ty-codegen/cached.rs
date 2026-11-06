@@ -74,14 +74,23 @@ impl SemanticInputs {
     }
 
     pub(super) fn canonical(&self) -> bool {
-        !self.constants.is_empty()
-            && self.constants.windows(2).all(|pair| pair[0] < pair[1])
-            && self
-                .sources
-                .windows(2)
-                .all(|pair| (&pair[0].body, &pair[0].file) < (&pair[1].body, &pair[1].file))
+        Self::canonical_parts(self.constants.iter().map(String::as_str), self.sources.iter())
     }
 
+    /// Whether these, in this order, are a value that can be sealed: there is a constant, and
+    /// nothing is said twice, nor of one file of one body two different ways.
+    pub(super) fn canonical_parts<'v>(
+        constants: impl Iterator<Item = &'v str>,
+        mut sources: impl Iterator<Item = &'v SemanticSource>,
+    ) -> bool {
+        let mut constants = constants.peekable();
+        constants.peek().is_some()
+            && constants.is_sorted_by(|a, b| a < b)
+            && sources.is_sorted_by(|a, b| (&a.body, &a.file) < (&b.body, &b.file))
+    }
+
+    /// The set-based question [`super::stable::StableNames::covers`] answers from the graph.
+    #[cfg(test)]
     pub(super) fn covers(&self, child: &Self) -> bool {
         std::ptr::eq(self, child)
             || child.constants.iter().all(|item| self.constants.binary_search(item).is_ok())
@@ -90,29 +99,38 @@ impl SemanticInputs {
 
     pub(super) fn digest(&self) -> &str {
         self.digest.get_or_init(|| {
-            use std::fmt::Write;
-            let mut hash = Sha256::new();
-            let mut field = |bytes: &[u8]| {
-                hash.update((bytes.len() as u64).to_le_bytes());
-                hash.update(bytes);
-            };
-            field(b"blaze concrete semantic inputs 4");
-            for constant in &self.constants {
-                field(&[0]);
-                field(constant.as_bytes());
-            }
-            for source in &self.sources {
-                field(&[1]);
-                field(source.body.as_bytes());
-                field(source.file.as_bytes());
-                field(source.name.as_bytes());
-            }
-            let mut digest = String::new();
-            for byte in hash.finalize() {
-                write!(digest, "{byte:02x}").unwrap();
-            }
-            digest
+            Self::digest_parts(self.constants.iter().map(String::as_str), self.sources.iter())
         })
+    }
+
+    /// What the name of an instance is sealed with: one way of working it out, for a value
+    /// read from the store and for one the graph of a view has not flattened.
+    pub(super) fn digest_parts<'v>(
+        constants: impl Iterator<Item = &'v str>,
+        sources: impl Iterator<Item = &'v SemanticSource>,
+    ) -> String {
+        use std::fmt::Write;
+        let mut hash = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        };
+        field(b"blaze concrete semantic inputs 4");
+        for constant in constants {
+            field(&[0]);
+            field(constant.as_bytes());
+        }
+        for source in sources {
+            field(&[1]);
+            field(source.body.as_bytes());
+            field(source.file.as_bytes());
+            field(source.name.as_bytes());
+        }
+        let mut digest = String::new();
+        for byte in hash.finalize() {
+            write!(digest, "{byte:02x}").unwrap();
+        }
+        digest
     }
 }
 
@@ -840,7 +858,16 @@ impl Writer<'static> {
         writer
     }
 
-    pub(super) fn keep(&mut self, kept: Kept) {
+    /// Where the threads that compile can give the writer what they make as they make it, so
+    /// that an entry waits on the writer and not on the whole batch: an entry is as big as its
+    /// complete closure. The queue is bounded, and the writers wait for nobody. `None` when
+    /// there is no thread to be had.
+    pub(super) fn hand_off(&mut self) -> Option<std::sync::mpsc::SyncSender<Kept>> {
+        self.start();
+        self.threads.as_ref().map(|(jobs, _)| jobs.clone())
+    }
+
+    fn start(&mut self) {
         if self.threads.is_none() && !self.alone {
             // Backpressure bounds queued entries, not incremental cache retention.
             let (jobs, queued) = std::sync::mpsc::sync_channel::<Kept>(16);
@@ -871,6 +898,10 @@ impl Writer<'static> {
                 false => self.threads = Some((jobs, threads)),
             }
         }
+    }
+
+    pub(super) fn keep(&mut self, kept: Kept) {
+        self.start();
         match &self.threads {
             Some((jobs, _)) => {
                 if jobs.send(kept).is_err() {
@@ -1236,6 +1267,49 @@ mod tests {
         },
         *,
     };
+
+    #[test]
+    fn what_is_handed_off_from_many_threads_is_in_the_store_at_the_finish() {
+        super::super::store::compiles_against("1.99.0");
+        let directory = std::env::temp_dir().join(format!("blaze-hand-off-{}", std::process::id()));
+        let store: &'static _ =
+            Box::leak(Box::new(super::super::store::Store::owned(&directory).unwrap()));
+        let mut writer = Writer::new(store, None, None);
+        let sender = writer.hand_off().expect("this test has threads to spare");
+        let key = |thread: u8, at: u8| {
+            let mut key = [0; KEY];
+            (key[0], key[1]) = (thread, at);
+            key
+        };
+        std::thread::scope(|scope| {
+            for thread in 0..4 {
+                let sender = sender.clone();
+                scope.spawn(move || {
+                    for at in 0..64 {
+                        let entry = Box::new(entry());
+                        let kept = Kept::Entry { key: key(thread, at), entry, name: None };
+                        sender.send(kept).unwrap();
+                    }
+                });
+            }
+        });
+        // `finish` waits on the writers, and they on this: a batch drops its own when it ends.
+        drop(sender);
+        let written = writer.finish();
+        assert_eq!((written.added, written.errors.len()), (4 * 64, 0));
+        store.seal_checked().unwrap();
+        for thread in 0..4 {
+            for at in 0..64 {
+                let read = Entry::decode(&store.get(&key(thread, at)).unwrap()).unwrap();
+                assert_eq!(read.label, entry().label);
+            }
+        }
+        // The next batch of the object has writers again.
+        writer.hand_off().unwrap().send(Kept::Types(Vec::new())).unwrap();
+        assert!(writer.finish().errors.is_empty());
+        drop(writer);
+        std::fs::remove_dir_all(directory).ok();
+    }
 
     #[test]
     fn checked_finish_reports_every_panicked_writer() {

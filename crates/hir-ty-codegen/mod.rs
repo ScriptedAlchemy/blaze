@@ -6213,13 +6213,18 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     /// Makes what is made of the functions in the object that waited for it ([`later`]),
-    /// on every core, and tells the debugger and the store of them in the order they were
-    /// put in the object.
+    /// on every core, gives the store what is kept of them as it is made, and tells the
+    /// debugger of them in the order they were put in the object.
     fn make_later(&mut self) {
         let later = std::mem::take(&mut self.later);
         if later.is_empty() {
             return;
         }
+        // The store has what is kept as it is made, in no order of its own: what it is given
+        // is not kept for it until the whole batch is made.
+        let hand_off = store::Store::global()
+            .filter(|_| later.iter().any(|it| it.keeps))
+            .and_then(|store| self.writer(store).hand_off());
         const AT_ONCE: usize = 64;
         let parts: Vec<_> = later.chunks(AT_ONCE).collect();
         type Part = (Vec<later::Made>, Kept, FxHashMap<&'static str, usize>);
@@ -6264,7 +6269,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         .iter()
                         .map(|it| {
                             let bindings = export::ObjectBindings::new(declarations, type_ids, it);
-                            keeper.make(it, &bindings)
+                            let mut made = keeper.make(it, &bindings);
+                            if let Some(writer) = &hand_off
+                                && let Some(kept) = made.kept.take()
+                                && let Err(refused) = writer.send(kept)
+                            {
+                                // Kept where the writer that is gone is reported.
+                                made.kept = Some(refused.0);
+                            }
+                            made
                         })
                         .collect();
                     let kept = std::mem::take(&mut *keeper.kept);

@@ -107,23 +107,27 @@ struct Counting;
 
 thread_local! {
     static LARGEST: Cell<usize> = const { Cell::new(0) };
+    static LIVE: Cell<isize> = const { Cell::new(0) };
 }
 
 // SAFETY: every request is the system allocator's to answer, as it was given.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         Counting::saw(layout.size());
+        Counting::live(layout.size() as isize);
         // SAFETY: the caller's layout.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
+        Counting::live(-(layout.size() as isize));
         // SAFETY: the caller's pointer and layout.
         unsafe { System.dealloc(at, layout) }
     }
 
     unsafe fn realloc(&self, at: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         Counting::saw(size);
+        Counting::live(size as isize - layout.size() as isize);
         // SAFETY: the caller's pointer, layout and size.
         unsafe { System.realloc(at, layout, size) }
     }
@@ -133,6 +137,10 @@ impl Counting {
     fn saw(size: usize) {
         // A thread that is ending has nothing to count in.
         _ = LARGEST.try_with(|largest| largest.set(largest.get().max(size)));
+    }
+
+    fn live(change: isize) {
+        _ = LIVE.try_with(|live| live.set(live.get() + change));
     }
 }
 
@@ -144,6 +152,12 @@ pub fn largest_allocation<T>(read: impl FnOnce() -> T) -> (usize, T) {
     LARGEST.set(0);
     let read = read();
     (LARGEST.get(), read)
+}
+
+/// The bytes this thread has asked for and not given back: what a test tells retention by,
+/// past whatever other tests do at the same time.
+pub fn live_bytes() -> isize {
+    LIVE.get()
 }
 
 /// The most a read of `len` bytes may ask for at once: serde makes room for at most a
