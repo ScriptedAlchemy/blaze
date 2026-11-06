@@ -51,6 +51,9 @@ pub struct Program {
     pub output: Output,
     /// Where the linked executable is written.
     pub executable: PathBuf,
+    /// Cargo's build-directory scratch space for integration tests and benchmarks.
+    /// The executor creates this before compilation, even if rustc-env overrides its environment value.
+    pub test_scratch: Option<PathBuf>,
     /// A complete source description. No Cargo project is passed to the compiler.
     pub project: Value,
 }
@@ -350,6 +353,17 @@ pub fn programs_with(
     let mut result = Vec::new();
     for &root in &roots {
         let root_unit = &build.units[root as usize];
+        let test_scratch =
+            matches!(native[root as usize].target.kind, TargetKind::Test | TargetKind::Bench)
+                .then(|| {
+                    prepared
+                        .resolved
+                        .outputs
+                        .get(1)
+                        .map(|directory| directory.join("tmp"))
+                        .context("test or benchmark has no Cargo build directory")
+                })
+                .transpose()?;
         let mut order = vec![root];
         order.extend(reachable(build, &native, root).into_iter().filter(|&at| at != root));
         let indexes: BTreeMap<_, _> =
@@ -373,6 +387,11 @@ pub fn programs_with(
                     .iter()
                     .filter_map(|(name, value)| Some((name.to_str()?.to_owned(), value.clone())))
                     .collect();
+            }
+            if at == root
+                && let Some(scratch) = &test_scratch
+            {
+                crate_env.insert("CARGO_TARGET_TMPDIR".into(), scratch.as_os_str().to_owned());
             }
             if matches!(unit.target.kind, TargetKind::Test | TargetKind::Bench) {
                 for &binary in &roots {
@@ -503,6 +522,7 @@ pub fn programs_with(
                 Output::Check => artifacts.join(format!("unit-{root}/checked.json")),
                 Output::Doctest => artifacts.join(format!("doctest-{root}/checked.json")),
             },
+            test_scratch,
             project,
         });
     }

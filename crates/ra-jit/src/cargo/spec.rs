@@ -992,6 +992,11 @@ fn compile_at(
     cwd: Option<&Path>,
     reach: bool,
 ) -> anyhow::Result<()> {
+    if let Some(scratch) = &program.test_scratch {
+        std::fs::create_dir_all(scratch).with_context(|| {
+            format!("creating Cargo test scratch directory {}", scratch.display())
+        })?;
+    }
     let dir = program.executable.parent().context("artifact has no directory")?;
     std::fs::create_dir_all(dir)?;
     // Reach metadata must describe this compilation, never a previously built artifact.
@@ -1187,6 +1192,29 @@ pub(crate) fn admit_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compile_at_creates_cargo_test_scratch_before_rendering_project() {
+        let work = tempfile::tempdir().unwrap();
+        let scratch = work.path().join("cargo-build/tmp");
+        let mut program = blaze_spec::execution::Program {
+            unit: 0,
+            crate_name: "integration".into(),
+            harness: false,
+            run: false,
+            output: blaze_spec::execution::Output::Check,
+            executable: work.path().join("artifacts/checked.json"),
+            test_scratch: Some(scratch.clone()),
+            project: serde_json::json!({"blaze_native_path": [0]}),
+        };
+        let error = compile_at(&mut program, &BTreeMap::new(), None, false).unwrap_err();
+        assert!(format!("{error:#}").contains("NUL in compiler source path"), "{error:#}");
+        assert!(
+            scratch.is_dir(),
+            "Cargo's scratch directory must exist before compiler input is rendered"
+        );
+        assert!(!program.executable.exists());
+    }
 
     #[test]
     fn std_units_are_shared_only_inside_one_replay_and_for_the_same_key() {
