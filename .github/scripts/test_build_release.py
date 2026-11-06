@@ -25,12 +25,14 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_release as b  # noqa: E402
+from test_proc_macro_server_bootstrap import MacroBootstrapTests  # noqa: E402
 
 FAILED = []
 
@@ -73,6 +75,9 @@ def run_check(out: Path, mode: str):
 
 
 def main() -> int:
+    bootstrap_tests = unittest.defaultTestLoader.loadTestsFromTestCase(MacroBootstrapTests)
+    if not unittest.TextTestRunner(verbosity=2).run(bootstrap_tests).wasSuccessful():
+        FAILED.append("owned proc-macro bootstrap policy regressions")
     with tempfile.TemporaryDirectory(prefix="build-release-test-") as work:
         tmp = Path(work)
 
@@ -270,8 +275,9 @@ def main() -> int:
                  and check_version.called == expected)
             note(f"server bootstrap disables all prior expansion servers {counts}",
                  compile_image.call_args.kwargs["env"]["RA_JIT_PROC_MACRO_SERVER"] == "0")
-            note(f"server bootstrap authorizes Rust 1.99 in-tree features {counts}",
-                 compile_image.call_args.kwargs["env"]["RUSTC_BOOTSTRAP"] == "1")
+            note(f"server bootstrap preserves or scopes feature authorization {counts}",
+                 compile_image.call_args.kwargs["env"]["RUSTC_BOOTSTRAP"]
+                 == os.environ.get("RUSTC_BOOTSTRAP", "proc_macro_api,proc_macro_srv"))
 
         out = tmp / "bootstrap-failed"
         out.mkdir()
