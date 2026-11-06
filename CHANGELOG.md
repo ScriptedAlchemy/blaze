@@ -866,6 +866,14 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Fixed
 
+- The borrow checker no longer refuses code rustc accepts in smallvec, hashlink, hashbrown,
+  allocator-api2, boxcar, indexmap, rayon, tracing-core, dashmap or rust-analyzer's `syntax`, which
+  stopped an owned build of the proc-macro server: implied bounds follow `inferred_outlives_of`
+  at any depth and normalize associated types, an associated type normalizing to another is
+  tested as that one, `[].iter_mut()` promotes as `(&mut []).iter_mut()` does, `Self` of an impl
+  for `dyn Trait` keeps the header's `'static`, and an edition 2021 `impl Trait` may be returned
+  past a lifetime it does not capture. Such an error in a registry's file now names the file.
+
 - Remote-cache shutdown bounds the final publication grace period from signal receipt, even if an earlier push blocks the serial keeper or the keeper receiver has closed.
 
 - Remote lazy-cache packs can be fetched again after local eviction or truncation even if the remote manifest is unchanged; failed demand fetches retry at the keeper's existing refresh interval.

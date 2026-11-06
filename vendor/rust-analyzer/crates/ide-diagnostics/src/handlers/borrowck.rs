@@ -390,6 +390,173 @@ fn f() -> () {
         );
     }
 
+    // hashlink's `Keys`, hashbrown's `set::Iter`: `K: 'a` is rustc's `inferred_outlives_of` the
+    // type however many fields down its `&'a K` is.
+    #[test]
+    fn implied_outlives_of_nested_fields() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, copy, phantom_data, option
+use core::marker::PhantomData;
+pub struct Iter<'a, K, V> { marker: PhantomData<(&'a K, &'a V)> }
+impl<'a, K, V> Iter<'a, K, V> {
+    fn again(&self) -> Self { Iter { marker: PhantomData } }
+    fn key(&self) -> Option<&'a K> { None }
+}
+pub struct Keys<'a, K, V> { inner: Iter<'a, K, V> }
+impl<'a, K, V> Keys<'a, K, V> {
+    fn again(&self) -> Keys<'a, K, V> { Keys { inner: self.inner.again() } }
+    fn key(&self) -> Option<&'a K> { self.inner.key() }
+}
+pub struct Set<'a, K> { iter: Keys<'a, K, ()> }
+impl<K> Set<'_, K> {
+    fn again(&self) -> Self { Set { iter: self.iter.again() } }
+}
+// A field that does not need `K: 'a` implies nothing of it.
+pub struct NoRef<'a, K> { marker: PhantomData<&'a ()>, k: K }
+fn nothing_implied<'a, K>(_: NoRef<'a, K>) {
+    let _ = Iter::<'a, K, ()> { marker: PhantomData };
+          //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ error: the parameter type may not live long enough
+}
+"#,
+        );
+    }
+
+    // plotters' `MeshStyle` and zerocopy's `ProjectField`: an implied bound on an associated type
+    // is one on what it normalizes to, where the body asks it of that.
+    #[test]
+    fn implied_outlives_of_an_associated_type_normalize() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, fn, option
+trait Ranged { type Value; }
+struct Style<'b, X: Ranged> { format: Option<&'b dyn Fn(&X::Value)> }
+impl<'b, XT, X: Ranged<Value = XT>> Style<'b, X> {
+    fn again(&self) -> Self { Style { format: None } }
+}
+trait Tagged { type Tag; }
+struct Ptr<'a, T>(&'a T);
+struct Wrap<X>(X);
+impl<X: Tagged> Tagged for Wrap<X> { type Tag = X::Tag; }
+trait Project: Tagged { fn go<'a>(ptr: Ptr<'a, Self::Tag>); }
+impl<X: Project> Project for Wrap<X> {
+    fn go<'a>(ptr: Ptr<'a, <Self as Tagged>::Tag>) { X::go(ptr) }
+}
+struct Unrelated<'b, X>(&'b (), X);
+fn nothing_implied<'b, XT, X: Ranged<Value = XT>>(_: Unrelated<'b, X>) {
+    let _ = Style::<'b, X> { format: None };
+          //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ error: the parameter type may not live long enough
+}
+"#,
+        );
+    }
+
+    // smallvec's and allocator-api2's `Index`: `<[T] as Index<I>>::Output` is the
+    // `<I as SliceIndex<[T]>>::Output` the signature implies outlives its reference.
+    #[test]
+    fn associated_type_normalizes_to_the_one_the_signature_knows() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, index
+use core::ops::Index;
+trait SliceIndex<T> { type Output: ?Sized; }
+struct Slice<T>(T);
+impl<T, I: SliceIndex<T>> Index<I> for Slice<T> {
+    type Output = I::Output;
+    fn index(&self, _: I) -> &I::Output { loop {} }
+}
+struct Vec2<T>(Slice<T>);
+impl<T, I: SliceIndex<T>> Index<I> for Vec2<T> {
+    type Output = I::Output;
+    fn index(&self, index: I) -> &Self::Output { Index::index(&self.0, index) }
+}
+fn unrelated<'a, 'b, T, I: SliceIndex<T>>(s: &'a Slice<T>, i: I, _: &'b ()) -> &'b I::Output {
+    Index::index(s, i)
+  //^^^^^^^^^^^^^^^^^^ error: lifetime may not live long enough
+}
+"#,
+        );
+    }
+
+    // indexmap's, boxcar's and rayon's `[].iter_mut()`: an autoref is `&mut []` as written.
+    #[test]
+    fn an_autoref_of_an_empty_array_is_promoted() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, unsize, coerce_unsized, slice
+struct IterMut<'a, T>(&'a mut [T]);
+trait AsIter<T> { fn walk(&mut self) -> IterMut<'_, T>; }
+impl<T> AsIter<T> for [T] {
+    fn walk(&mut self) -> IterMut<'_, T> { IterMut(self) }
+}
+fn empty<'a, T>() -> IterMut<'a, T> { [].walk() }
+fn one<'a, T>(x: T) -> IterMut<'a, T> { [x].walk() }
+                                      //^^^^^^^^^^ error: returns a value referencing data owned by the current function
+"#,
+        );
+    }
+
+    // tracing-core's `impl Value for dyn Error`: `Self` is the object the impl's header writes,
+    // `'static` by default, where a `&dyn Trait` the signature writes has the reference's.
+    #[test]
+    fn self_of_an_impl_for_an_object_keeps_its_static_default() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, unsize, coerce_unsized
+trait Err {}
+trait Visit { fn error(&mut self, it: &(dyn Err + 'static)); }
+trait Value {
+    fn record(&self, visitor: &mut dyn Visit);
+    fn get(&mut self) -> &mut Self;
+    fn other<'s>(&'s self, o: &dyn Err) -> &'s (dyn Err + 's);
+    fn stat(&self) -> &'static (dyn Err + 'static);
+}
+impl Value for dyn Err {
+    fn record(&self, visitor: &mut dyn Visit) { visitor.error(self) }
+    fn get(&mut self) -> &mut Self { self }
+    fn other<'s>(&'s self, o: &dyn Err) -> &'s (dyn Err + 's) {
+        o
+      //^ error: lifetime may not live long enough
+    }
+    fn stat(&self) -> &'static (dyn Err + 'static) {
+        self
+      //^^^^ error: lifetime may not live long enough
+    }
+}
+impl dyn Err {
+    fn inherent(&mut self) -> &mut Self { self }
+    fn outer(&mut self) -> &mut Self { self.inherent() }
+}
+fn keep<'a>(x: &'a mut (dyn Err + 'static)) -> &'a mut (dyn Err + 'static) { x.get().get() }
+"#,
+        );
+    }
+
+    // rowan's `parent_ancestors` in syntax's `ancestors_at_offset`: an edition 2021 `impl Trait`
+    // does not capture the lifetime the signature elides, so what it returns may outlive it.
+    #[test]
+    fn impl_trait_of_2021_returned_past_the_borrow_it_does_not_capture() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, copy, fn
+//- /main.rs edition:2021
+struct Tok;
+impl Tok {
+    fn up(&self) -> impl Sized { 1u32 }
+    fn kept(&self) -> impl Sized + '_ { self }
+}
+fn free(t: &Tok) -> impl Sized { let _ = t; 1u32 }
+fn direct() -> impl Sized { let t = Tok; t.up() }
+fn through() -> impl Sized { let t = Tok; let u = t.up(); u }
+fn tuple() -> (impl Sized, u32) { let t = Tok; (t.up(), 1) }
+fn closure() { let f = |t: Tok| t.up(); let _ = f(Tok); }
+fn of_free() { let f = |t: Tok| free(&t); let _ = f(Tok); }
+fn captured() -> impl Sized { let t = Tok; t.kept() }
+                                         //^^^^^^^^ error: cannot return reference to local variable
+"#,
+        );
+    }
+
     #[test]
     fn unused_mut_self() {
         check_diagnostics(

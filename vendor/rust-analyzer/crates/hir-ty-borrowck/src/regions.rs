@@ -993,10 +993,18 @@ impl<'db> Builder<'_, '_, 'db> {
                         keep_static: writes_static_object(&written.store),
                         erase: false,
                     };
-                    for input in &mut inputs {
-                        *input = rustc_type_ir::TypeFoldable::fold_with(*input, &mut defaults);
+                    // `Self` is the object as the impl's header writes it, `'static` by default
+                    // (`impl Display for dyn Value`), whatever reference it is behind: only a
+                    // `&dyn Trait` the signature writes takes the reference's lifetime.
+                    let written_self = self.static_object_self(function);
+                    for (index, input) in inputs.iter_mut().enumerate() {
+                        if !written_self.as_ref().is_some_and(|it| it.input(index)) {
+                            *input = rustc_type_ir::TypeFoldable::fold_with(*input, &mut defaults);
+                        }
                     }
-                    output = rustc_type_ir::TypeFoldable::fold_with(output, &mut defaults);
+                    if !written_self.as_ref().is_some_and(|it| it.output) {
+                        output = rustc_type_ir::TypeFoldable::fold_with(output, &mut defaults);
+                    }
                     (inputs.len() == body.param_locals.len()).then_some((inputs, output))
                 }
                 _ => None,
@@ -2306,7 +2314,7 @@ impl<'db> Builder<'_, '_, 'db> {
         signature.extend(self.impl_header_types());
         let mut seen = FxHashSet::default();
         for ty in signature {
-            self.implied_bounds(ty, &mut pairs, &mut seen, 0, false);
+            self.implied_bounds(ty, &mut pairs, &mut seen, 0);
         }
         let count = self.regions.universals.len();
         let mut known = vec![BitSet::new(count); count];
@@ -2471,66 +2479,47 @@ impl<'db> Builder<'_, '_, 'db> {
             .collect()
     }
 
+    /// What `ty` being well-formed implies, as rustc's implied bounds: of an ADT, the bounds it
+    /// declares and those `inferred_outlives_of` infers of its fields, however deep they are
+    /// (`&Keys<'a, K, V>` of `Keys` of `Iter` of `PhantomData<(&'a K, &'a V)>` that `K: 'a`).
+    /// A type is finite, so only the times it is normalized, `normalized`, are limited.
     fn implied_bounds(
         &mut self,
         ty: Ty<'db>,
         pairs: &mut Vec<(Rv, Rv)>,
-        seen: &mut FxHashSet<(Ty<'db>, bool)>,
-        depth: usize,
-        in_field: bool,
+        seen: &mut FxHashSet<Ty<'db>>,
+        normalized: usize,
     ) {
-        if depth > 4 || !seen.insert((ty, in_field)) {
+        if normalized > 8 || !seen.insert(ty) {
             return;
         }
         match ty.kind() {
             TyKind::Ref(region, inner, _) => {
                 if let Some(shorter) = self.region_rv(region) {
-                    let referent = match inner.kind() {
-                        TyKind::Alias(_) => self.normalize(inner).unwrap_or(inner),
-                        _ => inner,
-                    };
-                    let mut components = Vec::new();
-                    let mut params = Vec::new();
-                    outlives_components(referent, &mut components, &mut params);
-                    alias_components(referent, &mut params);
-                    pairs.extend(components.into_iter().map(|longer| (longer, shorter)));
-                    self.regions.type_bounds.extend(params.into_iter().map(|it| (it, shorter)));
+                    self.implied_outlives(inner, shorter, pairs);
                 }
-                self.implied_bounds(inner, pairs, seen, depth + 1, in_field);
+                self.implied_bounds(inner, pairs, seen, normalized);
             }
             TyKind::Adt(def, args) => {
                 for arg in args.iter() {
                     if let GenericArgKind::Type(arg) = arg.kind() {
-                        self.implied_bounds(arg, pairs, seen, depth + 1, in_field);
+                        self.implied_bounds(arg, pairs, seen, normalized);
                     }
                 }
-                // What the fields imply is what rustc infers of the type's parameters.
-                let adt = def.def_id();
-                for variant in adt_variants(self.ctx.db, adt) {
-                    for (_, field) in self.ctx.db.field_types(variant).iter() {
-                        let field = field.ty().instantiate(self.interner(), args).skip_norm_wip();
-                        self.implied_bounds(field, pairs, seen, depth + 1, true);
-                    }
-                }
-                // And the bounds the type declares, which its well-formedness needs.
-                let clauses: Vec<_> = GenericPredicates::query_all(self.ctx.db, adt.into())
-                    .iter_instantiated(self.interner(), args.as_slice())
-                    .map(|it| it.skip_norm_wip())
-                    .collect();
+                let clauses = self.adt_clauses(def.def_id(), args);
                 self.implied_by_clauses(clauses, pairs);
             }
             TyKind::Tuple(tys) => {
                 for it in tys.iter() {
-                    self.implied_bounds(it, pairs, seen, depth + 1, in_field);
+                    self.implied_bounds(it, pairs, seen, normalized);
                 }
             }
             TyKind::Array(inner, _) | TyKind::Slice(inner) | TyKind::RawPtr(inner, _) => {
-                self.implied_bounds(inner, pairs, seen, depth + 1, in_field)
+                self.implied_bounds(inner, pairs, seen, normalized)
             }
             // `dyn Any + 'r` is well-formed only where `'r` outlives what the trait requires of
-            // `Self`: `trait Any: 'static`. Not in a field, of which rustc's inferred outlives
-            // leave out what mentions `Self`.
-            TyKind::Dynamic(predicates, region) if !in_field => {
+            // `Self`: `trait Any: 'static`.
+            TyKind::Dynamic(predicates, region) => {
                 let Some(shorter) = rv_of(region) else { return };
                 for predicate in predicates.iter() {
                     let trait_ = match predicate.skip_binder() {
@@ -2560,7 +2549,7 @@ impl<'db> Builder<'_, '_, 'db> {
             TyKind::Alias(alias) => {
                 if let rustc_type_ir::AliasTyKind::Projection { def_id } = alias.kind {
                     for it in alias.args.types() {
-                        self.implied_bounds(it, pairs, seen, depth + 1, in_field);
+                        self.implied_bounds(it, pairs, seen, normalized);
                     }
                     let clauses: Vec<_> =
                         GenericPredicates::query_all(self.ctx.db, def_id.0.into())
@@ -2572,10 +2561,10 @@ impl<'db> Builder<'_, '_, 'db> {
                             .collect();
                     self.implied_by_clauses(clauses, pairs);
                 }
-                if let Some(normalized) = self.normalize(ty)
-                    && normalized != ty
+                if let Some(it) = self.normalize(ty)
+                    && it != ty
                 {
-                    self.implied_bounds(normalized, pairs, seen, depth + 1, in_field);
+                    self.implied_bounds(it, pairs, seen, normalized + 1);
                 }
             }
             _ => (),
@@ -2647,17 +2636,33 @@ impl<'db> Builder<'_, '_, 'db> {
                 }
                 ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) => {
                     if let Some(shorter) = self.region_rv(region) {
-                        let mut components = Vec::new();
-                        let mut params = Vec::new();
-                        outlives_components(ty, &mut components, &mut params);
-                        pairs.extend(components.into_iter().map(|it| (it, shorter)));
-                        self.regions
-                            .type_bounds
-                            .extend(params.into_iter().chain([ty]).map(|it| (it, shorter)));
+                        self.implied_outlives(ty, shorter, pairs);
+                        self.regions.type_bounds.push((ty, shorter));
                     }
                 }
                 _ => (),
             }
+        }
+    }
+
+    /// What `ty: shorter` implies, with `ty` as it is written and as it normalizes, which is what
+    /// the body asks of it: `<X as Ranged>::Value: 'b` that `XT: 'b` given
+    /// `X: Ranged<Value = XT>`.
+    fn implied_outlives(&mut self, ty: Ty<'db>, shorter: Rv, pairs: &mut Vec<(Rv, Rv)>) {
+        let normalized = if rustc_type_ir::TypeVisitableExt::has_aliases(&ty)
+            && !rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty)
+        {
+            self.normalize(ty).unwrap_or(ty)
+        } else {
+            ty
+        };
+        for ty in [ty, normalized] {
+            let mut components = Vec::new();
+            let mut params = Vec::new();
+            outlives_components(ty, &mut components, &mut params);
+            alias_components(ty, &mut params);
+            pairs.extend(components.into_iter().map(|longer| (longer, shorter)));
+            self.regions.type_bounds.extend(params.into_iter().map(|it| (it, shorter)));
         }
     }
 
@@ -3107,7 +3112,10 @@ impl<'db> Builder<'_, '_, 'db> {
                     }
                     _ => None,
                 };
-                self.relate_args(x.args, y.args, variances.as_deref(), Variance::Invariant, at)
+                // Invariant in what it captures and bivariant in what it does not, as rustc's
+                // `variances_of` an opaque type: an ambient `Invariant` would make both invariant,
+                // and a lifetime it does not capture would have to be what it is returned as.
+                self.relate_args(x.args, y.args, variances.as_deref(), Variance::Covariant, at)
             }
             // A signature's associated type against what it is,
             // `<&'a mut Vec<T> as IntoIterator>::IntoIter` and `IterMut<'_, T>`.
@@ -3201,19 +3209,22 @@ impl<'db> Builder<'_, '_, 'db> {
             return;
         }
         let opaque = matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. });
-        if !opaque
-            && let Some(normalized) = self.normalize(ty)
-            && !matches!(normalized.kind(), TyKind::Alias(_) | TyKind::Infer(_))
-        {
-            self.type_outlives_at(normalized, region, at, depth + 1);
-            return;
-        }
-        let Some(rv) = self.region_rv(region) else { return };
         let interner = self.interner();
         let erase = |ty: Ty<'db>| {
             rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner))
         };
         let erased = erase(ty);
+        // What it normalizes to may be another associated type: `<[T] as Index<I>>::Output` is
+        // `<I as SliceIndex<[T]>>::Output`, which is what the signature knows of.
+        if !opaque
+            && let Some(normalized) = self.normalize(ty)
+            && !matches!(normalized.kind(), TyKind::Infer(_))
+            && erase(normalized) != erased
+        {
+            self.type_outlives_at(normalized, region, at, depth + 1);
+            return;
+        }
+        let Some(rv) = self.region_rv(region) else { return };
         let in_env = self.env_aliases.contains(&erased);
         let from_trait: Vec<Region<'db>> =
             rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
@@ -4407,7 +4418,7 @@ impl<'db> Builder<'_, '_, 'db> {
                             let container = function.lookup(self.ctx.db).container;
                             self.path_well_formed(expr, container, fn_args, span);
                         }
-                        let (self_param, keep_static, returns_self, static_self) = match def {
+                        let (self_param, keep_static, returns_self, written_self) = match def {
                             CallableDefId::FunctionId(it) => {
                                 let written = FunctionSignature::of(self.ctx.db, it);
                                 let returns_self = written.ret_type.is_some_and(|it| {
@@ -4419,10 +4430,10 @@ impl<'db> Builder<'_, '_, 'db> {
                                     written.has_self_param(),
                                     writes_static_object(&written.store),
                                     returns_self,
-                                    written.has_self_param() && self.impl_of_static_object(it),
+                                    self.static_object_self(it),
                                 )
                             }
-                            _ => (false, true, false, false),
+                            _ => (false, true, false, None),
                         };
                         let function = match def {
                             CallableDefId::FunctionId(it) => Some(it),
@@ -4435,7 +4446,7 @@ impl<'db> Builder<'_, '_, 'db> {
                             self_param,
                             keep_static,
                             returns_self,
-                            static_self,
+                            written_self.as_ref(),
                         );
                         // The signature as written is well-formed, `&'a &'b ()` that `'b: 'a`
                         // even where it normalizes to `()`; and the where clauses of its
@@ -4557,13 +4568,21 @@ impl<'db> Builder<'_, '_, 'db> {
         }
     }
 
-    /// Whether `function` is of an impl for a `dyn Trait + 'static`.
-    fn impl_of_static_object(&self, function: hir_def::FunctionId) -> bool {
+    /// Where the signature of `function`, of an impl for a `dyn Trait + 'static`, writes `Self`.
+    fn static_object_self(&self, function: hir_def::FunctionId) -> Option<StaticObjectSelf> {
         let ItemContainerId::ImplId(impl_) = function.lookup(self.ctx.db).container else {
-            return false;
+            return None;
         };
         let ty = self.ctx.db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
-        matches!(ty.kind(), TyKind::Dynamic(_, region) if matches!(region.kind(), RegionKind::ReStatic))
+        if !matches!(ty.kind(), TyKind::Dynamic(_, region) if matches!(region.kind(), RegionKind::ReStatic))
+        {
+            return None;
+        }
+        let written = FunctionSignature::of(self.ctx.db, function);
+        Some(StaticObjectSelf {
+            inputs: written.params.iter().map(|&it| writes_self(&written.store, it)).collect(),
+            output: written.ret_type.is_some_and(|it| writes_self(&written.store, it)),
+        })
     }
 
     /// Whether the closure `id` is of this body and writes no type of a parameter or of its
@@ -4583,8 +4602,9 @@ impl<'db> Builder<'_, '_, 'db> {
     /// region variables by the elision rules: each elided input lifetime its own, an elided
     /// output lifetime that of `self` when `self` is a reference, else that of the only
     /// lifetime of the inputs. The default lifetime of a trait object is not one of them.
-    /// `static_self`: `self` is of an impl for `dyn Trait`, whose lifetime the impl's header
-    /// defaults to `'static` (`impl dyn Trait { fn f(&self) }`), not the reference's.
+    /// `written_self`: where the signature of a function of an impl for `dyn Trait` writes
+    /// `Self`, whose lifetime the impl's header defaults to `'static`
+    /// (`impl dyn Trait { fn f(&self) }`), not the reference's.
     /// An `impl Trait` `function` returns has, for each lifetime its parameters leave out, that
     /// lifetime's region.
     #[allow(clippy::too_many_arguments)]
@@ -4596,7 +4616,7 @@ impl<'db> Builder<'_, '_, 'db> {
         self_param: bool,
         keep_static: bool,
         returns_self: bool,
-        static_self: bool,
+        written_self: Option<&StaticObjectSelf>,
     ) -> (Vec<Ty<'db>>, Ty<'db>) {
         let interner = self.interner();
         let mut defaults = ObjectDefaults { db: self.ctx.db, interner, keep_static, erase: false };
@@ -4615,7 +4635,7 @@ impl<'db> Builder<'_, '_, 'db> {
                         errors: &mut errors[index],
                     },
                 );
-                if static_self && index == 0 {
+                if written_self.is_some_and(|it| it.input(index)) {
                     return ty;
                 }
                 rustc_type_ir::TypeFoldable::fold_with(ty, &mut defaults)
@@ -4657,7 +4677,11 @@ impl<'db> Builder<'_, '_, 'db> {
                 RegionKind::ReError(_) => elided.unwrap_or_else(|| self.fresh_elided()),
                 _ => region,
             });
-        (inputs, rustc_type_ir::TypeFoldable::fold_with(output, &mut defaults))
+        let output = match written_self {
+            Some(it) if it.output => output,
+            _ => rustc_type_ir::TypeFoldable::fold_with(output, &mut defaults),
+        };
+        (inputs, output)
     }
 
     /// The where clauses of what a call calls, which the caller must prove.
@@ -4680,16 +4704,25 @@ impl<'db> Builder<'_, '_, 'db> {
         at: At,
         type_outlives: bool,
     ) {
+        let clauses = match def {
+            GenericDefId::AdtId(adt) => self.adt_clauses(adt, args),
+            _ => GenericPredicates::query_all(self.ctx.db, def)
+                .iter_instantiated(self.interner(), args.as_slice())
+                .map(|it| it.skip_norm_wip())
+                .collect(),
+        };
+        self.clauses(clauses, at, type_outlives);
+    }
+
+    /// The where clauses of `adt` with `args` and what its fields need of its lifetimes, rustc's
+    /// `inferred_outlives_of`, which hold wherever it is used as its where clauses do.
+    fn adt_clauses(&mut self, adt: AdtId, args: GenericArgs<'db>) -> Vec<Clause<'db>> {
         let interner = self.interner();
-        let mut clauses: Vec<_> = GenericPredicates::query_all(self.ctx.db, def)
+        let mut clauses: Vec<_> = GenericPredicates::query_all(self.ctx.db, adt.into())
             .iter_instantiated(interner, args.as_slice())
             .map(|it| it.skip_norm_wip())
             .collect();
-        // What an ADT's fields need of its lifetimes, rustc's `inferred_outlives_of`, holds
-        // where it is used as its where clauses do.
-        if let GenericDefId::AdtId(adt) = def
-            && args.regions().next().is_some()
-        {
+        if args.regions().next().is_some() {
             for predicate in self.inferred.of(self.ctx.db, adt) {
                 let OutlivesPredicate(arg, region) = rustc_type_ir::EarlyBinder::bind(predicate)
                     .instantiate(interner, args)
@@ -4704,7 +4737,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 });
             }
         }
-        self.clauses(clauses, at, type_outlives);
+        clauses
     }
 
     /// `clauses`, which hold where `at` is.
@@ -5257,6 +5290,19 @@ impl<'db> Builder<'_, '_, 'db> {
             RegionKind::ReStatic => Some(self.regions.static_rv),
             _ => rv_of(region),
         }
+    }
+}
+
+/// Which parameters of a function of an impl for a `dyn Trait + 'static` write `Self`, and
+/// whether its return type does.
+struct StaticObjectSelf {
+    inputs: Vec<bool>,
+    output: bool,
+}
+
+impl StaticObjectSelf {
+    fn input(&self, index: usize) -> bool {
+        self.inputs.get(index).copied().unwrap_or(false)
     }
 }
 

@@ -6920,16 +6920,19 @@ fn written_at(
         Some(at) if watched.paths.contains_key(&at.file_id.file_id(db)) => {
             let file = at.file_id.file_id(db);
             let text = db.file_text(file).text(db);
-            errors::at(None, message, &shown(watched, file, root), text, at.range)
+            errors::at(None, message, &shown(db, watched, file, root), text, at.range)
         }
         _ => errors::of_none(message),
     }
 }
 
-/// `file` as rustc names it in an error: from `root` when it is below it.
-fn shown(watched: &Sources, file: vfs::FileId, root: &Path) -> String {
-    let Some(path) = watched.paths.get(&file) else { return String::new() };
-    path.strip_prefix(root).unwrap_or(path).display().to_string()
+/// `file` as rustc names it in an error: from `root` when it is below it. A registry's file is
+/// not watched, as it is never written again, and is named as rustc is told its name.
+fn shown(db: &RootDatabase, watched: &Sources, file: vfs::FileId, root: &Path) -> String {
+    match watched.paths.get(&file) {
+        Some(path) => path.strip_prefix(root).unwrap_or(path).display().to_string(),
+        None => source_path(db, root, None, file).unwrap_or_default(),
+    }
 }
 
 /// The first error of the first of `sources` that does not parse, where it is.
@@ -6960,7 +6963,7 @@ fn unparsed(
             return Some(errors::at(
                 None,
                 &error.to_string(),
-                &shown(watched, file, root),
+                &shown(db, watched, file, root),
                 text,
                 range,
             ));
@@ -7122,7 +7125,7 @@ fn broken_in_except(
                 .strip_prefix('E')
                 .is_some_and(|it| !it.is_empty() && it.bytes().all(|b| b.is_ascii_digit()));
             let code = rustcs.then_some(*code);
-            let path = shown(watched, at.file_id, root);
+            let path = shown(db, watched, at.file_id, root);
             errors::at(code, message, &path, text, at.range)
         })
         .collect();
@@ -12610,6 +12613,26 @@ fn main() { let _ = LOGGER + RUNS; }
             assert!(reloaded.contains(name), "reloaded declaration {name}");
         }
         assert!(!reloaded.contains("FromA"));
+    }
+
+    // A dependency's refused body said ` --> :2061:10`: the registry is not watched.
+    #[test]
+    fn an_error_in_a_file_that_is_not_watched_names_the_file() {
+        use test_fixture::WithFixture as _;
+        let (mut db, file) = RootDatabase::with_single_file("pub fn value() {}\n");
+        let file = file.file_id(&db);
+        let source = "/registry/smallvec-1.15.1/src/lib.rs";
+        let mut files = vfs::file_set::FileSet::default();
+        files.insert(file, VfsPath::from(AbsPathBuf::assert_utf8(PathBuf::from(source))));
+        let mut change = ChangeWithProcMacros::default();
+        change.set_roots(vec![ide_db::base_db::SourceRoot::new_library(files)]);
+        db.apply_change(change);
+        let unwatched = Sources { paths: FxHashMap::default() };
+        assert_eq!(shown(&db, &unwatched, file, Path::new("/checkout")), source);
+        let watched = Sources {
+            paths: FxHashMap::from_iter([(file, PathBuf::from("/checkout/src/main.rs"))]),
+        };
+        assert_eq!(shown(&db, &watched, file, Path::new("/checkout")), "src/main.rs");
     }
 
     #[test]

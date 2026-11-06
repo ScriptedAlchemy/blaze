@@ -19,7 +19,9 @@ with a type error does; under `cargo ra-jit`, cargo then runs and rustc reports 
 `RA_JIT_BORROWCK_REFUSE=0` in the daemon's environment turns this off.
 
 This is safe because the checker reports nothing on any test rustc accepts, nor on ripgrep,
-fd, bat, hyperfine, just, axum or nushell: a refused build is one rustc refuses too. A
+fd, bat, hyperfine, just, axum or nushell: a refused build is one rustc refuses too. An owned
+build checks its dependencies as well, as nothing else does, and an error in a registry's file
+names that file. A
 borrow-check error ra-jit reports where rustc reports none is a bug; `RA_JIT_BORROWCK_REFUSE=0`
 works around it until it is fixed. What it does not do: it misses about a sixth of the
 errors rustc gives (it accepts code rustc rejects, listed below), so code with such an error
@@ -138,7 +140,9 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   its type (`fn(T::Gat<'a, '_>)`), `for<'a> T: 'a` as `'static`, and
   nothing of a `ManuallyDrop`), outlives constraints from every statement, call, cast and aggregate, the
   signature's universal regions and implied bounds (normalized parameters and the impl
-  header included, for associated consts too; a projection implies what its arguments do as
+  header included, for associated consts too; an ADT implies what it declares and rustc's
+  `inferred_outlives_of` it, however many fields down, a bound on an associated type implies
+  one on what it normalizes to too; a projection implies what its arguments do as
   well as what it normalizes to, `<&'a &'b () as Trait>::Type` that `'b: 'a`, and its trait's
   outlives where clauses, `<T as Trait<A>>::Assoc` that `A: 'static` where
   `trait Trait<A: 'static>`), where clauses (elaborated through
