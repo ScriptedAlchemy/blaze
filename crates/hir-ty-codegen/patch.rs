@@ -2787,7 +2787,8 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--nocapture"])
                 .env(CHILD, &directory)
-                .env("RA_JIT_STORE", directory.join("store"))
+                .env("RA_JIT_CACHE", directory.join("store"))
+                .env("RA_JIT_CACHE_SEAL_AT", "1")
                 .env("RA_JIT_NO_HOME", "1")
                 .env("RUST_BACKTRACE", "0")
                 .env_remove("RA_JIT_CACHE_CHECK")
@@ -2803,6 +2804,7 @@ mod tests {
             return;
         }
         store::compiles_against("1.99.0");
+        assert!(store::Store::global().is_some(), "context regression requires its owned cache");
         let source = "//- minicore: sized\n//- /src/main.rs crate:contexts\nfn helper<T>() -> usize { 17 }\npub fn root<T>() -> usize { helper::<T>() }";
         let db = RootDatabase::with_files(source);
         hir::attach_db(&db, || {
