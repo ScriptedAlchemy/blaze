@@ -20,9 +20,7 @@ pub(super) enum Status {
 }
 
 pub(super) fn classify(name: &str) -> Status {
-    if ACTIVE_LANG.binary_search(&name).is_ok()
-        || PROC_MACRO_LIB.binary_search(&name).is_ok()
-    {
+    if ACTIVE_LANG.binary_search(&name).is_ok() || PROC_MACRO_LIB.binary_search(&name).is_ok() {
         Status::Active
     } else if ACCEPTED_LANG.binary_search(&name).is_ok() {
         Status::Accepted

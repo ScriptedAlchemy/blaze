@@ -203,8 +203,7 @@ mod syntax_tests {
             (vec!["never_type_fallback"], false, false),
         ] {
             assert_eq!(
-                probe_feature_policy(bootstrap, features.into_iter().map(str::to_owned))
-                    .unwrap(),
+                probe_feature_policy(bootstrap, features.into_iter().map(str::to_owned)).unwrap(),
                 accepts
             );
         }
@@ -623,10 +622,8 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
     // Query effective (including cfg_attr-expanded) feature names, not the
     // source's raw feature tokens. Inactive cfg_attr must not gate a probe.
     let features = hir_def::unstable_features::UnstableFeatures::query(&db, id);
-    if !probe_feature_policy(
-        bootstrap,
-        features.iter().map(|feature| feature.as_str().to_owned()),
-    )? {
+    if !probe_feature_policy(bootstrap, features.iter().map(|feature| feature.as_str().to_owned()))?
+    {
         return Ok(false);
     }
     let files = source_files(&mut db, &mut vfs, &[id]);
