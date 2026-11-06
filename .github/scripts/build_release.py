@@ -297,7 +297,11 @@ def proc_macro_server(ra_jit, out):
     exe = out / SERVER_BIN
     with tempfile.TemporaryDirectory(prefix="blaze-server-") as work:
         env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RA_JIT_CACHE=str(Path(work) / "store"),
-                   RA_JIT_STD_FROM="off", RA_JIT_PROC_MACRO_SERVER="0", RUST_BACKTRACE="0")
+                   RA_JIT_STD_FROM="off", RA_JIT_PROC_MACRO_SERVER="0", RUST_BACKTRACE="0",
+                   RUSTC_BOOTSTRAP="1")
+        # The vendored Rust 1.99 in-tree server uses gated proc_macro internals.
+        # Authorize only this owned server build; ra-jit still checks each feature
+        # against its pinned release catalog and never delegates to rustc.
         start = time.monotonic()
         # `proc_macro` is not in the standard library's unit: the program that links it has it.
         try:
