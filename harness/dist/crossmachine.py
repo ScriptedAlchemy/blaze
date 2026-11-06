@@ -317,13 +317,14 @@ class Machine:
     its own. Everything under it has a path that differs from the other machine's, in depth as well
     as in name, so a path that leaks into a key cannot be the same by chance."""
 
-    def __init__(self, top, name, depth_words, seed_cargo_home, rust_home):
+    def __init__(self, top, name, depth_words, seed_cargo_home, rust_home, owned_server=None):
         self.name = name
         self.top = os.path.join(top, name)
         self.home = os.path.join(self.top, "u", *depth_words, "home")
         self.cargo_home = os.path.join(self.home, ".cargo")
         self.checkouts = os.path.join(self.top, "w", *depth_words)
         self.rust_home = rust_home
+        self.owned_server = owned_server
         os.makedirs(self.home)
         os.makedirs(self.checkouts)
         # What cargo downloaded, and not what it extracted: the sources are extracted again below this
@@ -354,6 +355,8 @@ class Machine:
         if "RA_JIT_RUN_ID" in os.environ:
             env["RA_JIT_RUN_ID"] = os.environ["RA_JIT_RUN_ID"]
         env.update(extra or {})
+        if self.owned_server is not None:
+            env["RA_JIT_PROC_MACRO_SERVER"] = self.owned_server
         return env
 
 
@@ -1085,9 +1088,10 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
     if pulled.returncode:
         raise RuntimeError(f"cache pull failed: {pulled.stdout[-1500:]}")
     result["pulled"] = pulled.stdout.strip()[-200:]
+    # The pull is complete: compare the same execution route with only store contents changed.
+    # Remote service selection would choose one-shot execution instead of the measured worker.
     runs["b-fed"] = build_and_run(b, bin_dir, wss["b"], spec, "B-fed", stores["b-fed"], homes["b-fed"],
-                                  os.path.join(top, "keys-b-fed.log"), dict(extra, RA_JIT_REMOTE=remote, RA_JIT_REMOTE_READONLY="1"),
-                                  progress)
+                                  os.path.join(top, "keys-b-fed.log"), extra, progress)
     runs["b-fed"].expected = expected["b"]
 
     for k, r in runs.items():
@@ -1097,6 +1101,8 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
                                 seconds=round(r.seconds, 1), **counts(r.said))
         if r.error is None and not r.right:
             result["differences"].append(Difference(name, "program", r.label, program_diff(r)).row())
+    with open(os.path.join(top, "native-outcomes.json"), "w") as output:
+        json.dump(result["runs"], output, indent=1, sort_keys=True)
     broken = [r for r in runs.values() if r.error]
     if broken:
         for r in broken:
@@ -1135,11 +1141,12 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
             continue  # Recompilation is required for this negative invalidation arm.
         result["differences"].append(d.row())
     a_by_name = {n: k for k, (_, n) in a_names.items()}
+    a_skeletons = {skeleton(n) for n in a_by_name}
     compiled = []
     for k, (digest, n) in fed_names.items():
         if n in a_by_name:
             compiled.append(("key equal, entry refused", n))
-        elif skeleton(n) in {skeleton(x) for x in a_by_name}:
+        elif skeleton(n) in a_skeletons:
             compiled.append(("crate id differs", n))
         else:
             compiled.append(("no such function on A", n))
@@ -1324,6 +1331,11 @@ def self_test():
 
     from cargo_ra_jit import Side
     from unittest import mock
+    machine = Machine.__new__(Machine)
+    machine.home, machine.cargo_home, machine.rust_home = "/machine/home", "/machine/cargo", "/rustup"
+    machine.owned_server = "/owned/server"
+    check("machine filtering preserves the pinned owned macro runtime",
+          machine.env("/bin", "/store", "/daemon")["RA_JIT_PROC_MACRO_SERVER"] == "/owned/server")
     env = {"RA_JIT_HOME": "/home/daemon", "CARGO": "/audit/cargo", "RUSTC": "/audit/rustc",
            "PATH": "/audit:/product"}
     direct = Side("/checkout", env, True, product_cli="/product/ra-jit")
@@ -1522,7 +1534,7 @@ def main():
                    help="same-daemon binary payload edit/delete/recreate on two checkout paths")
     p.add_argument("--warm-nonfunction", action="store_true")
     p.add_argument("--warm-macro-content", action="store_true")
-    p.add_argument("--owned-server", help="fresh matching blaze-built server for the strict macro witness")
+    p.add_argument("--owned-server", help="fresh matching blaze-built runtime for all product macro expansion")
     p.add_argument("--macro-reloads", type=int, default=0)
     p.add_argument("--remote", help="the server remote of unit C5; not implemented here")
     p.add_argument("--b-docker", action="store_true", help="machine B in a container of another libc: unit C5")
@@ -1551,6 +1563,14 @@ def main():
     for tool in ("ra-jit", "cargo-ra-jit"):
         if not os.path.exists(os.path.join(bin_dir, tool)):
             sys.exit(f"{bin_dir} has no {tool}: build it (under the heavy lock), or name the directory with --blaze-bin")
+    owned_runtime = None
+    if a.owned_server:
+        from owned_macro_server import runtime_record
+        owned_runtime = runtime_record(a.owned_server, os.path.join(bin_dir, "ra-jit"))
+        if not owned_runtime["bootstrap_compiler_matches"]:
+            p.error("--owned-server was bootstrapped by a different compiler image")
+    elif not a.reference_only and "macros" in names:
+        p.error("macro fixtures require --owned-server naming a fresh matching blaze-built runtime")
     os.environ["RA_JIT_BIN"] = os.path.join(bin_dir, "ra-jit")
     import cargo_ra_jit
     cargo_ra_jit.WARMUP_SECS = a.warmup_secs
@@ -1578,8 +1598,8 @@ def main():
         sources = {n: source_of(n, work, offline=not a.online) for n in names}
         seed = seed_cargo_home(work, names, sources, a.online)
         rust_home = os.environ.get("RUSTUP_HOME") or os.path.expanduser("~/.rustup")
-        a_m = Machine(os.path.join(work, "m"), "a", ["alice", "src", "co"], seed, rust_home)
-        b_m = Machine(os.path.join(work, "m"), "b", ["builder-2", "x"], seed, rust_home)
+        a_m = Machine(os.path.join(work, "m"), "a", ["alice", "src", "co"], seed, rust_home, owned_runtime["path"] if owned_runtime else None)
+        b_m = Machine(os.path.join(work, "m"), "b", ["builder-2", "x"], seed, rust_home, owned_runtime["path"] if owned_runtime else None)
         progress(f"machine A: home {a_m.home}\n           checkouts {a_m.checkouts}\n"
                  f"machine B: home {b_m.home}\n           checkouts {b_m.checkouts}")
         if a.reference_only:
@@ -1621,7 +1641,7 @@ def main():
     print(render(results))
     if watchdog.tripped:
         print("WATCHDOG killed the run:", watchdog.tripped["reason"])
-    summary = dict(results=results, watchdog=watchdog.tripped, bin=bin_dir,
+    summary = dict(results=results, watchdog=watchdog.tripped, bin=bin_dir, owned_runtime=owned_runtime,
                    built_from=(open(os.path.join(bin_dir, "BUILT_FROM")).read().strip()
                                if os.path.exists(os.path.join(bin_dir, "BUILT_FROM")) else None))
     with open(a.json or os.path.join(work, "crossmachine.json"), "w") as f:
