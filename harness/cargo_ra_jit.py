@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """cargo_ra_jit.py: `cargo ra-jit` against plain cargo on real projects, unmodified.
 
-    cargo_ra_jit.py [PROJECT...] [--small] [--only-projects] [--only-checks] [--ra-jit] [--plain] [--keep]
+    cargo_ra_jit.py [PROJECT...] [--small] [--only-projects] [--only-checks] [--ra-jit] [--plain] [--keep] [--report-dir DIR]
 
 Four parts, all of which have to pass.
 
@@ -27,20 +27,21 @@ Flags. A small workspace made here is built and run with each flag `cargo ra-jit
 through, cold and after an edit, and compared with cargo the same way.
 
 Daemon. Started on demand, reused, shared by a git worktree, alive after its client is
-killed, replaced when the client is another build of ra-jit, gone when idle, and its workers
+killed, replaced after a protocol-version mismatch, gone when idle, and its workers
 gone with it. A project whose rust-toolchain file names an older stable or a nightly is built
 and edited by the daemon, under the toolchain ra-jit compiles, and a `#![feature]` of the
 nightly fails with rustc's error and a note naming both releases. With no rustup and no Rust on
-the path, `blaze run` builds with blaze's own copy of its release and the edit is the daemon's.
+the path, `blaze run` selects its bundled release layout and the edit is the daemon's.
 
 Plain cargo. `ra-jit enable` and `ra-jit disable` over a cargo configuration that is there,
 that is not, and that is edited in between; a wrapper the user had; what a project's own
 configuration and the environment do; and plain `cargo build`, `run`, `test`, `check`,
-`install` and doc tests with the daemon there, killed, and of another version.
+`install` and doc tests with the daemon there, killed, and after a protocol-version mismatch.
 
-Writes CARGO-RA_JIT.md and cargo_ra_jit.json next to this file, or CARGO-RA_JIT-LLVM.md and
-cargo_ra_jit_llvm.json under `RA_JIT_BACKEND=llvm`. A run of some projects replaces their rows
-and keeps the others. `--small` is the three projects of the CI job.
+Writes CARGO-RA_JIT.md and cargo_ra_jit.json into the run's report directory (or
+`--report-dir DIR`), with LLVM names under `RA_JIT_BACKEND=llvm`. Reports contain only
+this invocation's results. Failed work is retained; a successful run removes its fixtures
+and leaves its reports. `--small` is the three projects of the CI job.
 """
 import collections, glob, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 
@@ -693,6 +694,88 @@ def flags(work):
     return rows, wrong, counted.stdout
 
 
+class VersionPeer:
+    """Present a different protocol version to a real daemon without copying its image.
+
+    The actual client still receives the daemon's Restart and waits for its EOF. The
+    listening path is released before that EOF so the client must start the replacement.
+    """
+    def __init__(self, old_home, new_home):
+        import socket
+        import threading
+        self.old_socket = os.path.join(old_home, "daemon.sock")
+        self.socket = os.path.join(new_home, "daemon.sock")
+        os.makedirs(new_home, mode=0o700, exist_ok=True)
+        self.listener = socket.socket(socket.AF_UNIX)
+        self.listener.bind(self.socket)
+        self.listener.listen()
+        self.listener.settimeout(0.1)
+        self.bound = True
+        self.stop = threading.Event()
+        self.events, self.errors = [], []
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+
+    def release(self):
+        if self.bound:
+            self.bound = False
+            self.listener.close()
+            os.unlink(self.socket)
+
+    def serve(self):
+        import socket
+        try:
+            while not self.stop.is_set():
+                try:
+                    client, _ = self.listener.accept()
+                except socket.timeout:
+                    continue
+                with client, socket.socket(socket.AF_UNIX) as daemon:
+                    client.settimeout(10)
+                    daemon.settimeout(10)
+                    with client.makefile("rb") as incoming:
+                        envelope = json.loads(incoming.readline())
+                    original = envelope["version"]
+                    envelope["version"] = original + "-harness-peer"
+                    daemon.connect(self.old_socket)
+                    daemon.sendall(json.dumps(envelope).encode() + b"\n")
+                    with daemon.makefile("rb") as answer:
+                        line = answer.readline()
+                        reply = json.loads(line)
+                        if reply != {"Restart": {"version": original}}:
+                            raise RuntimeError(f"version peer did not receive native Restart: {reply!r}")
+                        self.events.append((envelope["request"], envelope["replaces"]))
+                        client.sendall(line)
+                        if envelope["replaces"]:
+                            while chunk := answer.read(65536):
+                                client.sendall(chunk)
+                            self.release()
+                            return
+        except Exception as error:
+            if not self.stop.is_set():
+                self.errors.append(error)
+        finally:
+            self.release()
+
+    @property
+    def replaced(self):
+        return any(replaces for _, replaces in self.events) and not self.errors
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        self.stop.set()
+        self.thread.join(timeout=10)
+        if kind is None:
+            if self.thread.is_alive():
+                raise RuntimeError("version peer did not finish")
+            if self.errors:
+                raise self.errors[0]
+            if not self.replaced:
+                raise RuntimeError("no replacing client crossed the version peer")
+
+
 def daemon(work):
     """The life of the daemon. The result is each check with whether it held."""
     ws = os.path.realpath(os.path.join(work, "life"))
@@ -762,16 +845,14 @@ def daemon(work):
     _, after_kill = here.cargo("run")
     check("the daemon outlives a client that is killed", status()[0] == pid and after_kill.returncode == 0 and "hello world" in after_kill.stdout, how_built(after_kill.stderr))
 
-    other = os.path.join(work, "other-build")
-    os.makedirs(other, exist_ok=True)
-    for name in ("ra-jit" + EXE, "cargo-ra-jit" + EXE, "ra-jit-rustc" + EXE):
-        shutil.copy(os.path.join(os.path.dirname(RA_JIT), name), os.path.join(other, name))
-    newer = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
+    newer_env = dict(env, RA_JIT_HOME=os.path.join(work, "home-replacement"))
+    newer = Side(ws, newer_env, True)
     edit(ws, "five")
-    _, by_newer = newer.cargo("run")
+    with VersionPeer(home, newer_env["RA_JIT_HOME"]) as peer:
+        _, by_newer = newer.cargo("run")
     replaced = status(newer)[0]
     ran = by_newer.returncode == 0 and "hello world" in by_newer.stdout
-    check("a client of another build replaces the daemon", ran and replaced not in (None, pid) and not alive(pid), f"pid {pid} then {replaced}")
+    check("a client replaces a daemon that rejects its protocol version", peer.replaced and ran and replaced not in (None, pid) and not alive(pid), f"pid {pid} then {replaced}")
     check("the workers of the daemon it replaced are gone", not any(alive(p) for p in workers_now), f"{workers_now}")
     newer.cargo("stop")
 
@@ -840,41 +921,61 @@ def daemon(work):
     _, allowed = here.cargo("run", env=capped)
     check("with `--cap-lints` among the flags the build of that edit is the daemon's", allowed.returncode == 0 and how_built(allowed.stderr) == "daemon" and "hello world" in allowed.stdout, f"exit {allowed.returncode}, {how_built(allowed.stderr)}: {allowed.stderr.strip()[-300:]}")
     open(main, "w").write(kept)
+    from pathlib import Path
+    import norustc
+    here.cargo("stop")
+    audit_root = Path(work, "check-audit")
+    audit_log = Path(work, "check-tools.log")
+    toolchain = norustc.blocking_toolchain(audit_root, audit_log)
+    check_env = dict(env, RUSTUP_TOOLCHAIN=toolchain,
+                     PATH=os.path.join(toolchain, "bin") + os.pathsep + env["PATH"],
+                     **{name: os.path.join(toolchain, "bin", tool)
+                        for name, tool in (("RUSTC", "rustc"), ("RUSTDOC", "rustdoc"), ("CARGO", "cargo"))})
+    check_trace = os.path.join(work, "check-execs")
+    checking = Side(ws, check_env, True, product_cli=RA_JIT, exec_trace_dir=check_trace)
+    _, context = checking.cargo("build")
+    check("the loaded check context is built under the external-tool audit", context.returncode == 0,
+          f"exit {context.returncode}, {context.stderr.strip()[-300:]}")
     # `cargo ra-jit check` is what the daemon's build says, with no rustc.
-    _, checked = here.cargo("check")
-    check("`cargo ra-jit check` of a loaded build is the daemon's, and no rustc", checked.returncode == 0 and not by_rustc(checked.stderr) and "[ra-jit]" in checked.stderr, f"exit {checked.returncode}, {checked.stderr.strip()[-300:]}")
+    _, checked = checking.cargo("check")
+    check("owned check of a loaded build succeeds without external tools", checked.returncode == 0 and not by_rustc(checked.stderr), f"exit {checked.returncode}, {checked.stderr.strip()[-300:]}")
     open(main, "a").write("\nfn broken() -> u32 { \"text\" }\n")
-    _, failed = here.cargo("check")
+    _, failed = checking.cargo("check")
     said = re.search(r'^error\[E0308\]: .*\n +--> app/src/main\.rs:\d+:22\n', failed.stderr, re.M)
     check("`cargo ra-jit check` of an edit with an error fails with ra-jit's error, and no rustc", failed.returncode == 101 and not by_rustc(failed.stderr) and said, f"exit {failed.returncode}, {failed.stderr.strip()[-300:]}")
     open(main, "w").write(kept)
     # With no build of its flags loaded, the check is the daemon's checker's: no `cargo check`.
     cargo_checked = lambda stderr: by_rustc(stderr) or bool(re.search(r"^\s*Checking |this is `cargo check`", stderr, re.M))
-    here.cargo("stop")
-    _, unloaded = here.cargo("check")
-    check("`cargo ra-jit check` with no build loaded is the daemon's, and no rustc", unloaded.returncode == 0 and not cargo_checked(unloaded.stderr) and "[ra-jit]" in unloaded.stderr, f"exit {unloaded.returncode}, {unloaded.stderr.strip()[-300:]}")
+    checking.cargo("stop")
+    _, unloaded = checking.cargo("check")
+    check("owned check with no build loaded succeeds without external tools", unloaded.returncode == 0 and not cargo_checked(unloaded.stderr), f"exit {unloaded.returncode}, {unloaded.stderr.strip()[-300:]}")
     open(main, "a").write("\nfn broken() -> u32 { \"text\" }\n")
-    _, failed = here.cargo("check")
+    _, failed = checking.cargo("check")
     said = re.search(r'^error\[E0308\]: .*\n +--> app/src/main\.rs:\d+:22\n', failed.stderr, re.M)
     check("and of an edit with an error, ra-jit's error", failed.returncode == 101 and not cargo_checked(failed.stderr) and said, f"exit {failed.returncode}, {failed.stderr.strip()[-300:]}")
     open(main, "w").write(kept)
-    _, mended = here.cargo("check")
+    _, mended = checking.cargo("check")
     check("and once it is mended, no error", mended.returncode == 0 and not cargo_checked(mended.stderr), f"exit {mended.returncode}, {mended.stderr.strip()[-300:]}")
     # A module in a file the checker did not load is loaded with the workspace again.
     added = os.path.join(ws, "app/src/added.rs")
     open(added, "w").write("pub fn added() -> u32 { \"no\" }\n")
     open(main, "a").write("\nmod added;\nfn more() -> u32 { added::added() }\n")
-    _, moduled = here.cargo("check")
+    _, moduled = checking.cargo("check")
     said = re.search(r'^error\[E0308\]: .*\n +--> app/src/added\.rs:1:25\n', moduled.stderr, re.M)
     check("and of a new module with an error, its error", moduled.returncode == 101 and not cargo_checked(moduled.stderr) and said, f"exit {moduled.returncode}, {moduled.stderr.strip()[-300:]}")
     open(added, "w").write("pub fn added() -> u32 { 1 }\n")
-    _, moduled = here.cargo("check")
+    _, moduled = checking.cargo("check")
     check("and once that is mended, no error", moduled.returncode == 0 and not cargo_checked(moduled.stderr), f"exit {moduled.returncode}, {moduled.stderr.strip()[-300:]}")
     open(main, "w").write(kept)
     os.remove(added)
-    _, other = here.cargo("check", "--release")
-    check("`cargo ra-jit check` of flags no build had is the daemon's, and no rustc", other.returncode == 0 and not cargo_checked(other.stderr) and "`release` profile [ra-jit]" in other.stderr, f"exit {other.returncode}, {other.stderr.strip()[-300:]}")
-    here.cargo("stop")
+    _, other = checking.cargo("check", "--release")
+    check("owned check of flags no build had succeeds without external tools", other.returncode == 0 and not cargo_checked(other.stderr), f"exit {other.returncode}, {other.stderr.strip()[-300:]}")
+    checking.cargo("stop")
+    attempts = norustc.runs(str(audit_log))
+    if sys.platform == "linux":
+        attempts += [path for trace in sorted(glob.glob(os.path.join(check_trace, "*.log")))
+                     for path in norustc.external_execs(open(trace).read())]
+    check("owned checks attempted no external compiler, Cargo or official macro server", not attempts, repr(attempts))
     manners(work, ws, env, here, check, edit)
     abuse(work, ws, tree, env, check, status, alive)
     in_place(work, check)
@@ -887,10 +988,10 @@ def daemon(work):
 def fake_toolchain(dir, version):
     """A toolchain a project's rust-toolchain file names by its path, whose rustc says it is
     `version` and compiles nothing, so that a build with it fails. Its cargo is the real one,
-    copied: cargo names itself to what it runs by where it is."""
+    referenced through a symlink to its authoritative executable."""
     os.makedirs(os.path.join(dir, "bin"))
     cargo = subprocess.run(["rustup", "which", "--toolchain", TOOLCHAIN, "cargo"], capture_output=True, text=True, check=True).stdout.strip()
-    shutil.copy(cargo, os.path.join(dir, "bin", "cargo"))
+    os.symlink(cargo, os.path.join(dir, "bin", "cargo"))
     rustc = os.path.join(dir, "bin", "rustc")
     with open(rustc, "w") as script:
         script.write(f'#!/bin/sh\ncase "$1" in --version|-V) echo "rustc {version} (0000000 2026-01-01)"; exit 0;; esac\n'
@@ -944,8 +1045,8 @@ class Bare(Side):
 
 def own_toolchain(work, check):
     """A machine with no rustup and no Rust on the path (docs/self-contained.md): blaze builds
-    with its own copy of its release, laid out in `BLAZE_HOME` as rustup lays one out (here a
-    copy of rustup's, so nothing is downloaded), runs cargo and rustc from it, and the edit
+    with its bundled release layout in `BLAZE_HOME`. The fixture links the authoritative
+    release tree there without duplicating binaries; nothing is downloaded. The edit
     after the first build is the daemon's."""
     sysroot = subprocess.run(["rustup", "run", TOOLCHAIN, "rustc", "--print", "sysroot"], capture_output=True, text=True).stdout.strip() if shutil.which("rustup") else ""
     if WINDOWS or not os.path.exists(os.path.join(sysroot, "lib/rustlib/multirust-channel-manifest.toml")):
@@ -955,12 +1056,8 @@ def own_toolchain(work, check):
     host = subprocess.run([os.path.join(sysroot, "bin", "rustc"), "-vV"], capture_output=True, text=True).stdout.split("host: ")[1].split()[0]
     own = os.path.join(home, "toolchains", f"{TOOLCHAIN}-{host}")
 
-    def link(source, target):
-        try:
-            os.link(source, target)
-        except OSError:
-            shutil.copy2(source, target)
-    shutil.copytree(sysroot, own, symlinks=True, copy_function=link)
+    os.makedirs(os.path.dirname(own), exist_ok=True)
+    os.symlink(sysroot, own, target_is_directory=True)
     env = base_env(home)
     for name in ("RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC", "CARGO"):
         env.pop(name, None)
@@ -990,7 +1087,7 @@ def own_toolchain(work, check):
     open(os.path.join(ws, "src/main.rs"), "w").write('fn main() {\n    println!("own {}", 6 * 7);\n}\n')
     side = Bare(ws, env, True)
     _, said = side.cargo("toolchain")
-    check("with no rustup and no Rust on the path, blaze builds with its own copy of its release",
+    check("with no rustup and no Rust on the path, blaze selects its bundled release layout",
           said.returncode == 0 and f"blaze's own copy at {own}" in said.stdout and "Downloading" not in said.stderr,
           f"exit {said.returncode}, {said.stdout.strip()!r} {said.stderr.strip()[-300:]!r}")
     _, cold = side.cargo("run")
@@ -1268,19 +1365,22 @@ def abuse(work, ws, tree, env, check, status, alive):
     _, after = here.cargo("run", "after")
     check("the build after that is a new daemon's", after.returncode == 0 and greets(after.stdout, "tree0 after") and status()[0] not in (None, pid) and how_built(after.stderr) == "daemon", how_built(after.stderr))
 
-    other = os.path.join(work, "other-build")
-    older = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
+    older_env = dict(env, RA_JIT_HOME=os.path.join(work, "home-skew"))
+    older = Side(ws, older_env, True)
     pid = status()[0]
-    seen = next((line for line in older.cargo("status")[1].stdout.splitlines() if line.startswith("daemon:")), "")
-    check("status by another build says the daemon is another build, and leaves it", "another build of ra-jit" in seen and status()[0] == pid, seen)
-    edit("skew")
-    _, skewed = older.cargo("run", "skew")
+    with VersionPeer(env["RA_JIT_HOME"], older_env["RA_JIT_HOME"]) as peer:
+        seen = next((line for line in older.cargo("status")[1].stdout.splitlines() if line.startswith("daemon:")), "")
+        check("status with another version leaves the daemon serving", "another build of ra-jit" in seen and status()[0] == pid and ("Status", False) in peer.events, seen)
+        edit("skew")
+        _, skewed = older.cargo("run", "skew")
     said = how_built(skewed.stderr)
-    check("a build by another build of ra-jit is cargo's, says why, and replaces the daemon", skewed.returncode == 0 and greets(skewed.stdout, "tree0 skew") and "another build of ra-jit" in said and status(older)[0] not in (None, pid) and not alive(pid), said)
+    skew_pid = status(older)[0]
+    check("a version-mismatched build replaces the daemon and is owned", peer.replaced and skewed.returncode == 0 and greets(skewed.stdout, "tree0 skew") and said == "daemon" and skew_pid not in (None, pid) and not alive(pid), said)
     wait_warm(older, ws)
     edit("back")
-    _, back = here.cargo("run", "back")
-    check("and the first build of ra-jit replaces that one the same way", back.returncode == 0 and greets(back.stdout, "tree0 back") and "another build of ra-jit" in how_built(back.stderr) and status()[0] is not None, how_built(back.stderr))
+    with VersionPeer(older_env["RA_JIT_HOME"], env["RA_JIT_HOME"]) as peer:
+        _, back = here.cargo("run", "back")
+    check("and the original client replaces that daemon the same way", peer.replaced and back.returncode == 0 and greets(back.stdout, "tree0 back") and how_built(back.stderr) == "daemon" and status()[0] not in (None, skew_pid) and not alive(skew_pid), how_built(back.stderr))
     wait_warm(here, ws)
 
     stranger(env["RA_JIT_HOME"], check)
@@ -1590,26 +1690,26 @@ def plain(work):
     mine, how, wrong = same("run", "after")
     check("the build after that is a new daemon's", mine.returncode == 0 and not wrong and how == "daemon" and status()[0] not in (None, pid), how[:90])
 
-    # Another build of ra-jit: the same files in another place have another version.
-    other = os.path.join(work, "plain-other-build")
-    os.makedirs(other)
-    for name in ("ra-jit", "cargo-ra-jit", "ra-jit-rustc"):
-        shutil.copy(os.path.join(os.path.dirname(RA_JIT), name), os.path.join(other, name))
+    old_home = env["RA_JIT_HOME"]
     pid = status()[0]
-    subprocess.run([RA_JIT, "disable"], env=env, capture_output=True)
-    subprocess.run([os.path.join(other, "ra-jit"), "enable"], env=env, capture_output=True)
+    disabled = subprocess.run([RA_JIT, "disable"], env=env, capture_output=True)
+    env = dict(env, RA_JIT_HOME=os.path.join(work, "home-plain-replacement"))
+    enabled = subprocess.run([RA_JIT, "enable"], env=env, capture_output=True)
+    check("the user wrappers survive disable and re-enable before replacement", disabled.returncode == enabled.returncode == 0,
+          f"disable {disabled.returncode}, enable {enabled.returncode}")
+    here = Side(ws, env, "plain")
     touch("skew")
-    mine, how, wrong = same("run", "skew")
-    theirs = os.path.join(other, "ra-jit")
+    with VersionPeer(old_home, env["RA_JIT_HOME"]) as peer:
+        mine, how, wrong = same("run", "skew")
     began = time.time()
-    while "    " + ws + ": ready" not in status(theirs)[2] and time.time() - began < 120:
+    while "    " + ws + ": ready" not in status()[2] and time.time() - began < 120:
         time.sleep(0.25)
-    newer = status(theirs)[0]
-    check("plain cargo by another build of ra-jit is rustc's and replaces the daemon", mine.returncode == 0 and not wrong and how.startswith("cargo") and newer not in (None, pid) and not alive(pid), f"{how[:120]}; daemon {pid} then {newer}")
+    newer = status()[0]
+    check("plain cargo replaces a version-mismatched daemon and is right", peer.replaced and mine.returncode == 0 and not wrong and how.startswith("cargo") and newer not in (None, pid) and not alive(pid), f"{how[:120]}; daemon {pid} then {newer}")
     touch("skewed")
     mine, how, wrong = same("run", "skewed")
-    check("and the build after that is the new daemon's", mine.returncode == 0 and not wrong and how == "daemon" and status(theirs)[0] == newer, how[:90])
-    subprocess.run([os.path.join(other, "ra-jit"), "disable"], env=env, capture_output=True)
+    check("and the build after that is the replacement daemon's", mine.returncode == 0 and not wrong and how == "daemon" and status()[0] == newer, how[:90])
+    subprocess.run([RA_JIT, "disable"], env=env, capture_output=True)
 
     seen = subprocess.run([RA_JIT, "status"], env=env, cwd=ws, capture_output=True, text=True).stdout
     counted = re.search(r"(\d+) programs? linked by the daemon, (\d+) by rustc", seen)
@@ -1626,7 +1726,6 @@ def plain(work):
     by_ra_jit = [c[:200] for c in ours if "ra-jit-rustc" in c]
     check("and plain cargo is cargo alone again, through the user's wrappers", mine.returncode == 0 and not wrong and not re.search(r"^ra-jit:|\[ra-jit\]", mine.stderr, re.M) and not by_ra_jit and ours, f"exit {mine.returncode}, {wrong or 'same as cargo'}, {len(ours)} calls of the wrapper by this build ({len(later) - len(ours)} by others in the background), by ra-jit's {by_ra_jit[:2]}; {mine.stderr.strip()[-300:]}")
     subprocess.run([RA_JIT, "stop"], env=env, capture_output=True)
-    subprocess.run([os.path.join(other, "ra-jit"), "stop"], env=env, capture_output=True)
     return checks
 
 
@@ -1693,48 +1792,19 @@ def table(rows):
     return "\n".join(out)
 
 
-def main():
-    argv = sys.argv[1:]
-    names = [a for a in argv if not a.startswith("--")] or (SMALL if "--small" in argv else list(PROJECTS))
-    modes = [m for m in MODES if f"--{m}" in argv] or list(MODES)
-    # As the daemon names it: with no link and no short name in it.
-    # The path of a socket is at most 104 bytes on macOS, and its temporary directory is long.
-    work = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-cargo-", dir="/tmp" if sys.platform == "darwin" else None))
-    print(f"work {work}; ra-jit {RA_JIT}", flush=True)
-    result = dict(ra_jit=RA_JIT, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
-    if "--only-checks" not in argv:
-        for name in names:
-            for mode in modes:
-                print(f"{name}, {MODES[mode]}:", flush=True)
-                row = project(name, PROJECTS[name], work, mode)
-                result["projects"].append(row)
-                result["wrong"] += [f"{name}, {mode}: {w}" for w in row["wrong"]]
-                if "--keep" not in argv:
-                    shutil.rmtree(os.path.join(work, name), ignore_errors=True)
-    if "--only-projects" not in argv:
-        print("flags:", flush=True)
-        rows, wrong, counted = flags(work)
-        result["flags"], result["flags_status"] = rows, counted
-        result["wrong"] += wrong
-        print("daemon:", flush=True)
-        result["daemon"] = daemon(work)
-        result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
-        print("plain cargo:", flush=True)
-        result["plain"] = plain(work)
-        result["wrong"] += [f"plain cargo: {name} {detail}" for name, held, detail in result["plain"] if not held]
-    # A run of some of it leaves the rows of the rest as the run before wrote them.
-    llvm = os.environ.get("RA_JIT_BACKEND") == "llvm"
-    stored = os.path.join(HERE, "cargo_ra_jit_llvm.json" if llvm else "cargo_ra_jit.json")
-    before = json.load(open(stored)) if os.path.exists(stored) else {}
-    rows = {(row["project"], row.get("mode", "ra-jit")): row for row in before.get("projects", []) + result["projects"]}
-    result["projects"] = [rows[name, mode] for name in PROJECTS for mode in MODES if (name, mode) in rows]
-    if "--only-projects" in argv:
-        result.update({part: before.get(part, []) for part in ("flags", "flags_status", "daemon", "plain")})
-    json.dump(result, open(stored, "w"), indent=1)
-    with open(os.path.join(HERE, "CARGO-RA_JIT-LLVM.md" if llvm else "CARGO-RA_JIT.md"), "w") as md:
+def write_report(result, directory, llvm=False):
+    os.makedirs(directory, exist_ok=True)
+    stored = os.path.join(directory, "cargo_ra_jit_llvm.json" if llvm else "cargo_ra_jit.json")
+    with open(stored, "w") as file:
+        json.dump(result, file, indent=1)
+        file.write("\n")
+    with open(os.path.join(directory, "CARGO-RA_JIT-LLVM.md" if llvm else "CARGO-RA_JIT.md"), "w") as md:
         md.write(f"# cargo ra-jit against cargo, {'LLVM at -O2' if llvm else 'Cranelift'}\n\nGenerated by `harness/cargo_ra_jit.py`. Seconds, ra-jit / cargo alone for the same step; the steps in the second checkout (`tree`) are ra-jit's only. "
                  "Bold is a build the daemon did; `(c)` one cargo did in its place, with the reason below; `(f)` a warm-up that failed. "
                  "Differences counts the steps whose program output, exit status or test results were not cargo's.\n\n")
+        md.write(f"Result: {'FAIL' if result.get('error') or result['wrong'] else 'PASS'}\n\n")
+        if result.get("error"):
+            md.write("Stopped before completion: " + result["error"] + "\n\n")
         for mode, title in MODES.items():
             md.write(f"## {title}\n\n" + table([r for r in result["projects"] if r.get("mode", "ra-jit") == mode]) + "\n\n")
         for row in result["projects"]:
@@ -1748,8 +1818,64 @@ def main():
             md.write("\n## Daemon\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["daemon"]))
         if result.get("plain"):
             md.write("\n## Plain cargo after `ra-jit enable`\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["plain"]))
-    if "--keep" not in argv:
-        shutil.rmtree(work, ignore_errors=True)
+    return stored
+
+
+def main():
+    argv = sys.argv[1:]
+    report_dir = None
+    if "--report-dir" in argv:
+        at = argv.index("--report-dir")
+        if at + 1 == len(argv) or argv[at + 1].startswith("--"):
+            raise SystemExit("--report-dir requires a directory")
+        report_dir = os.path.abspath(argv[at + 1])
+        argv = argv[:at] + argv[at + 2:]
+    names = [a for a in argv if not a.startswith("--")] or (SMALL if "--small" in argv else list(PROJECTS))
+    modes = [m for m in MODES if f"--{m}" in argv] or list(MODES)
+    work = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-cargo-", dir="/tmp" if sys.platform == "darwin" else None))
+    report_dir = report_dir or os.path.join(work, "report")
+    print(f"work {work}; ra-jit {RA_JIT}", flush=True)
+    result = dict(ra_jit=RA_JIT, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
+    error = None
+    try:
+        if "--only-checks" not in argv:
+            for name in names:
+                for mode in modes:
+                    print(f"{name}, {MODES[mode]}:", flush=True)
+                    row = project(name, PROJECTS[name], work, mode)
+                    result["projects"].append(row)
+                    result["wrong"] += [f"{name}, {mode}: {w}" for w in row["wrong"]]
+                    if "--keep" not in argv and not row["wrong"]:
+                        shutil.rmtree(os.path.join(work, name), ignore_errors=True)
+        if "--only-projects" not in argv:
+            print("flags:", flush=True)
+            rows, wrong, counted = flags(work)
+            result["flags"], result["flags_status"] = rows, counted
+            result["wrong"] += wrong
+            print("daemon:", flush=True)
+            result["daemon"] = daemon(work)
+            result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
+            print("plain cargo:", flush=True)
+            result["plain"] = plain(work)
+            result["wrong"] += [f"plain cargo: {name} {detail}" for name, held, detail in result["plain"] if not held]
+    except BaseException as caught:
+        error = caught
+        result["error"] = f"{type(caught).__name__}: {caught}"
+        raise
+    finally:
+        stored = write_report(result, report_dir, os.environ.get("RA_JIT_BACKEND") == "llvm")
+        print(f"report {stored}", flush=True)
+        if "--keep" not in argv and not result["wrong"] and error is None:
+            for entry in os.listdir(work):
+                path = os.path.join(work, entry)
+                if report_dir == work or report_dir == path or report_dir.startswith(path + os.sep):
+                    continue
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+            if report_dir != work and not report_dir.startswith(work + os.sep):
+                os.rmdir(work)
     print("PASS" if not result["wrong"] else "FAIL:\n" + "\n".join(result["wrong"]))
     sys.exit(1 if result["wrong"] else 0)
 
