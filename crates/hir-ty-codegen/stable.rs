@@ -15,7 +15,7 @@ use rustc_type_ir::{
     AliasTy, AliasTyKind, BoundVarIndexKind, ExistentialPredicate, GenericArgKind, RegionKind,
     inherent::{IntoKind, Safety as _, Term as _},
 };
-use salsa::plumbing::FromId;
+use salsa::plumbing::{AsId, FromId};
 use span::ErasedFileAstId;
 
 use base_db::Crate;
@@ -34,7 +34,7 @@ const OF_CHECKOUT: char = '~';
 /// After the name of an instance compiled with `-C overflow-checks`.
 const CHECKED: &str = " checked";
 
-const SEMANTIC_INPUTS: &str = " inputs1:";
+const SEMANTIC_INPUTS: &str = " inputs2:";
 
 pub(super) fn without_semantic_inputs(name: &str) -> &str {
     match name.rsplit_once(SEMANTIC_INPUTS) {
@@ -299,70 +299,109 @@ impl<'a, 'db> StableNames<'a, 'db> {
     ) -> Option<Option<super::cached::SemanticInputs>> {
         use hir_ty::consteval::inputs::{BodyInput, BodyKind, prepare_constants};
         use hir_ty::db::GeneralConstId;
-        if !environment.param_env(self.db).clauses().is_empty() {
-            return self.miss("semantic preparation with caller bounds");
-        }
-        let kind = match instance.def {
-            InstanceDef::Fn(function) => {
-                let signature = hir_def::signatures::FunctionSignature::of(self.db, function);
-                if !signature.has_body()
-                    || signature.flags.contains(hir_def::signatures::FnFlags::RUSTC_INTRINSIC)
-                {
-                    return Some(None);
-                }
-                BodyKind::Body(function.into())
-            }
-            InstanceDef::Closure(id) => BodyKind::Closure(InternedClosureId::from_id(id)),
-            InstanceDef::Coroutine(id) => BodyKind::Coroutine(InternedCoroutineId::from_id(id)),
-            InstanceDef::CoroutineByMove(id) => {
-                BodyKind::CoroutineByMove(InternedCoroutineId::from_id(id))
-            }
-            _ => return Some(None),
-        };
-        let input = BodyInput::new(self.db, kind, instance.args.clone(), environment.clone());
-        let prepared = prepare_constants(self.db, input);
-        if prepared.result.is_err() {
-            return self.miss("concrete constant preparation failed");
-        }
-        if prepared.source_names.is_empty() {
-            return Some(None);
-        }
+        let mut pending = vec![(instance.clone(), environment.clone(), false)];
+        let mut active = FxHashMap::<InstanceDef, usize>::default();
+        let mut seen = FxHashSet::default();
         let mut fields = Vec::new();
-        for selection in &prepared.selections {
-            let mut name = String::new();
-            match selection.definition {
-                GeneralConstId::ConstId(id) => {
-                    let at = id.lookup(self.db).id;
-                    self.item(&mut name, id.krate(self.db), at.file_id, at.value.erase())?;
-                }
-                GeneralConstId::StaticId(id) => {
-                    let at = id.lookup(self.db).id;
-                    self.item(&mut name, id.krate(self.db), at.file_id, at.value.erase())?;
-                }
-                GeneralConstId::AnonConstId(id) => {
-                    let loc = id.loc(self.db);
-                    let (_, map) =
-                        hir_def::expr_store::ExpressionStore::with_source_map(self.db, loc.owner);
-                    let source = map.expr_syntax(loc.expr).ok()?;
-                    self.file(&mut name, source.file_id)?;
-                    write!(name, "@{:?}", source.value.syntax_node_ptr().text_range()).ok()?;
-                }
+        let mut sources = Vec::new();
+        let mut homes = super::home::Homes::default();
+        while let Some((instance, environment, exiting)) = pending.pop() {
+            if exiting {
+                *active.get_mut(&instance.def).unwrap() -= 1;
+                continue;
             }
-            self.args(&mut name, selection.arguments.as_ref())?;
-            fields.push(name);
+            if !seen.insert((instance.clone(), environment.clone())) {
+                continue;
+            }
+            if !environment.param_env(self.db).clauses().is_empty() {
+                return self.miss("semantic preparation with caller bounds");
+            }
+            let kind = match instance.def {
+                InstanceDef::Fn(function) => {
+                    if !hir_def::signatures::FunctionSignature::of(self.db, function).has_body()
+                        || hir_def::signatures::FunctionSignature::is_intrinsic(self.db, function)
+                    {
+                        continue;
+                    }
+                    BodyKind::Body(function.into())
+                }
+                InstanceDef::Closure(id) => BodyKind::Closure(InternedClosureId::from_id(id)),
+                InstanceDef::Coroutine(id) => BodyKind::Coroutine(InternedCoroutineId::from_id(id)),
+                InstanceDef::CoroutineByMove(id) => {
+                    BodyKind::CoroutineByMove(InternedCoroutineId::from_id(id))
+                }
+                _ => continue,
+            };
+            let depth = active.entry(instance.def).or_default();
+            *depth += 1;
+            if *depth > crate_def_map(self.db, environment.krate).recursion_limit() as usize {
+                return self.miss("semantic instantiation recursion limit");
+            }
+            pending.push((instance.clone(), environment.clone(), true));
+            let input = BodyInput::new(self.db, kind, instance.args.clone(), environment.clone());
+            let prepared = prepare_constants(self.db, input);
+            if prepared.result.is_err() {
+                return self.miss("concrete constant preparation failed");
+            }
+            let mut body = self.raw_instance(&instance)?;
+            body.push_str(" environment ");
+            self.crate_(&mut body, environment.krate)?;
+            fields.push(format!("body {body}"));
+            for selection in &prepared.selections {
+                let mut name = format!("{body} constant ");
+                match selection.definition {
+                    GeneralConstId::ConstId(id) => {
+                        let at = id.lookup(self.db).id;
+                        self.item(&mut name, id.krate(self.db), at.file_id, at.value.erase())?;
+                    }
+                    GeneralConstId::StaticId(id) => {
+                        let at = id.lookup(self.db).id;
+                        self.item(&mut name, id.krate(self.db), at.file_id, at.value.erase())?;
+                    }
+                    GeneralConstId::AnonConstId(id) => {
+                        let loc = id.loc(self.db);
+                        let (_, map) = hir_def::expr_store::ExpressionStore::with_source_map(
+                            self.db, loc.owner,
+                        );
+                        let source = map.expr_syntax(loc.expr).ok()?;
+                        self.file(&mut name, source.file_id)?;
+                        write!(name, "@{:?}", source.value.syntax_node_ptr().text_range()).ok()?;
+                    }
+                }
+                self.args(&mut name, selection.arguments.as_ref())?;
+                fields.push(name);
+            }
+            for read in &prepared.source_names {
+                sources.push(super::cached::SemanticSource {
+                    body: body.clone(),
+                    file: self.file_path(read.file)?,
+                    name: read.name.clone()?,
+                });
+            }
+            for (kind, arguments) in &prepared.callees {
+                let def = match kind {
+                    BodyKind::Body(hir_ty::InferBodyId::DefWithBodyId(
+                        hir_def::DefWithBodyId::FunctionId(id),
+                    )) => InstanceDef::Fn(*id),
+                    BodyKind::Closure(id) => InstanceDef::Closure(id.as_id()),
+                    BodyKind::Coroutine(id) => InstanceDef::Coroutine(id.as_id()),
+                    BodyKind::CoroutineByMove(id) => InstanceDef::CoroutineByMove(id.as_id()),
+                    _ => return self.miss("semantic callee is not a function body"),
+                };
+                let callee = Instance { def, args: arguments.clone(), checked: instance.checked };
+                let environment = homes.home(self.db, &callee, &environment);
+                let mut edge =
+                    format!("{body} callee {} environment ", self.raw_instance(&callee)?);
+                self.crate_(&mut edge, environment.krate)?;
+                fields.push(edge);
+                pending.push((callee, environment, false));
+            }
+        }
+        if sources.is_empty() {
+            return Some(None);
         }
         fields.sort();
         fields.dedup();
-        let mut sources = prepared
-            .source_names
-            .iter()
-            .map(|read| {
-                Some(super::cached::SemanticSource {
-                    file: self.file_path(read.file)?,
-                    name: read.name.clone()?,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
         sources.sort();
         sources.dedup();
         let inputs = super::cached::SemanticInputs { constants: fields, sources };

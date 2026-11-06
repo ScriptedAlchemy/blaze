@@ -3,6 +3,7 @@
 //! replacing any conservative source-owner guard with these observations.
 
 use base_db::CurrentSourceName;
+use hir_def::{CallableDefId, signatures::FunctionSignature};
 use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{Const as _, IntoKind};
 use salsa::SalsaValue;
@@ -13,7 +14,8 @@ use crate::{
     method_resolution::lookup_impl_const,
     mir::{MirLowerError, Operand, OperandKind},
     next_solver::{
-        ConstKind, DbInterner, GenericArgs, StoredGenericArgs, TypingMode, UnevaluatedConst,
+        ConstKind, DbInterner, GenericArgs, StoredGenericArgs, TyKind, TypingMode,
+        UnevaluatedConst,
         infer::{DbInternerInferExt, InferCtxt},
     },
     traits::StoredParamEnvAndCrate,
@@ -51,6 +53,7 @@ pub struct PreparedConstants<'db> {
     pub result: Result<(), ConstEvalError<'db>>,
     pub selections: Vec<ConstantSelection<'db>>,
     pub source_names: Vec<CurrentSourceName>,
+    pub callees: Vec<(BodyKind<'db>, StoredGenericArgs)>,
 }
 
 #[salsa::tracked(returns(ref), cycle_result = preparation_cycle)]
@@ -73,8 +76,12 @@ pub fn prepare_constants<'db>(
         BodyKind::CoroutineByMove(owner) => db
             .monomorphized_runtime_mir_body_for_coroutine_by_move(owner, args, environment.clone()),
     };
-    let mut prepared =
-        PreparedConstants { result: Ok(()), selections: Vec::new(), source_names: Vec::new() };
+    let mut prepared = PreparedConstants {
+        result: Ok(()),
+        selections: Vec::new(),
+        source_names: Vec::new(),
+        callees: Vec::new(),
+    };
     let body = match body {
         Ok(body) => body,
         Err(error) => {
@@ -83,7 +90,30 @@ pub fn prepare_constants<'db>(
         }
     };
     let mut constants = Vec::new();
+    let mut callees = Vec::new();
+    let mut seen_callees = FxHashSet::default();
     let mut collect = |operand: &Operand| {
+        let ty = match &operand.kind {
+            OperandKind::Constant { ty, .. } => Some(ty.as_ref()),
+            OperandKind::Allocation { allocation } => Some(allocation.as_ref().ty),
+            _ => None,
+        };
+        if let Some(ty) = ty
+            && let TyKind::FnDef(definition, arguments) = ty.kind()
+            && let CallableDefId::FunctionId(function) = definition.0
+        {
+            let (selected, arguments) =
+                db.lookup_impl_method(environment.as_ref(db), function, arguments);
+            if let either::Either::Left(function) = selected
+                && FunctionSignature::of(db, function).has_body()
+                && !FunctionSignature::is_intrinsic(db, function)
+            {
+                let callee = (BodyKind::Body(function.into()), arguments.store());
+                if seen_callees.insert(callee.clone()) {
+                    callees.push(callee);
+                }
+            }
+        }
         if let OperandKind::Constant { konst, .. } = &operand.kind
             && let ConstKind::Unevaluated(value) = konst.as_ref().kind()
         {
@@ -98,6 +128,7 @@ pub fn prepare_constants<'db>(
             terminator.kind.for_each_operand(&mut collect);
         }
     }
+    prepared.callees = callees;
     let mut seen = FxHashSet::default();
     for constant in constants {
         let selection = select_constant(db, constant, &environment);
@@ -169,5 +200,6 @@ fn preparation_cycle<'db>(
         result: Err(MirLowerError::Loop.into()),
         selections: Vec::new(),
         source_names: Vec::new(),
+        callees: Vec::new(),
     }
 }

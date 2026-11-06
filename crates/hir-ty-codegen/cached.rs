@@ -47,6 +47,7 @@ pub(super) struct Entry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct SemanticSource {
+    pub(super) body: String,
     pub(super) file: String,
     pub(super) name: String,
 }
@@ -62,7 +63,15 @@ impl SemanticInputs {
     pub(super) fn canonical(&self) -> bool {
         !self.sources.is_empty()
             && self.constants.windows(2).all(|pair| pair[0] < pair[1])
-            && self.sources.windows(2).all(|pair| pair[0].file < pair[1].file)
+            && self
+                .sources
+                .windows(2)
+                .all(|pair| (&pair[0].body, &pair[0].file) < (&pair[1].body, &pair[1].file))
+    }
+
+    pub(super) fn covers(&self, child: &Self) -> bool {
+        child.constants.iter().all(|item| self.constants.binary_search(item).is_ok())
+            && child.sources.iter().all(|item| self.sources.binary_search(item).is_ok())
     }
 
     pub(super) fn digest(&self) -> String {
@@ -72,13 +81,14 @@ impl SemanticInputs {
             hash.update((bytes.len() as u64).to_le_bytes());
             hash.update(bytes);
         };
-        field(b"blaze concrete semantic inputs 1");
+        field(b"blaze concrete semantic inputs 2");
         for constant in &self.constants {
             field(&[0]);
             field(constant.as_bytes());
         }
         for source in &self.sources {
             field(&[1]);
+            field(source.body.as_bytes());
             field(source.file.as_bytes());
             field(source.name.as_bytes());
         }
@@ -520,7 +530,7 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit entry 14");
+        field(b"ra-jit entry 15");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());

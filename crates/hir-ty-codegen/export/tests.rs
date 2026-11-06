@@ -935,10 +935,7 @@ fn mismatches_corruption_and_missing_types_never_admit_a_receipt() {
     });
 }
 
-#[test]
-fn imported_closure_rechecks_concrete_callee_source_names() {
-    store::compiles_against("1.99.0");
-    const SOURCE: &str = r#"
+const CONCRETE_CALLEE_SOURCE: &str = r#"
 //- minicore: sized
 //- /src/lib.rs crate:case
 #[rustc_builtin_macro] macro_rules! file {}
@@ -951,30 +948,37 @@ impl<T> Block<T> {
 fn helper<T>() -> usize { Block::<T>::VALUE.width }
 pub fn root() -> usize { helper::<u8>() }
 "#;
-    fn database(name: Option<&'static str>) -> (RootDatabase, FunctionId) {
-        let (mut db, _) = RootDatabase::with_single_file(SOURCE);
-        hir_ty::mir::location::name_sources(&mut db, move |_, _| name.map(str::to_owned));
-        let root = hir::attach_db(&db, || {
-            let krate =
-                *base_db::all_crates(&db).iter().find(|it| it.data(&db).origin.is_local()).unwrap();
-            hir_def::nameres::crate_def_map(&db, krate)
-                .modules(&db)
-                .flat_map(|(_, module)| module.scope(&db).declarations())
-                .find_map(|def| match def {
-                    hir_def::ModuleDefId::FunctionId(id)
-                        if FunctionSignature::of(&db, id).name.as_str() == "root" =>
-                    {
-                        Some(id)
-                    }
-                    _ => None,
-                })
-                .unwrap()
-        });
-        (db, root)
-    }
+fn concrete_callee_database(
+    source: &str,
+    name: Option<&'static str>,
+) -> (RootDatabase, FunctionId) {
+    let (mut db, _) = RootDatabase::with_single_file(source);
+    hir_ty::mir::location::name_sources(&mut db, move |_, _| name.map(str::to_owned));
+    let root = hir::attach_db(&db, || {
+        let krate =
+            *base_db::all_crates(&db).iter().find(|it| it.data(&db).origin.is_local()).unwrap();
+        hir_def::nameres::crate_def_map(&db, krate)
+            .modules(&db)
+            .flat_map(|(_, module)| module.scope(&db).declarations())
+            .find_map(|def| match def {
+                hir_def::ModuleDefId::FunctionId(id)
+                    if FunctionSignature::of(&db, id).name.as_str() == "root" =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .unwrap()
+    });
+    (db, root)
+}
+
+#[test]
+fn imported_closure_rechecks_concrete_callee_source_names() {
+    store::compiles_against("1.99.0");
     let directory = scratch("concrete-source-inputs");
     let store = store::Store::owned(&directory).unwrap();
-    let (db, root) = database(Some("short.rs"));
+    let (db, root) = concrete_callee_database(CONCRETE_CALLEE_SOURCE, Some("short.rs"));
     let (context_digest, receipt) = hir::attach_db(&db, || {
         let symbols = Symbols { db: &db, debug: false };
         let context = ExportContext::resolved(
@@ -994,7 +998,7 @@ pub fn root() -> usize { helper::<u8>() }
         (context.digest(), batch.receipt)
     });
     for name in [Some("other.rs"), None] {
-        let (db, root) = database(name);
+        let (db, root) = concrete_callee_database(CONCRETE_CALLEE_SOURCE, name);
         hir::attach_db(&db, || {
             let symbols = Symbols { db: &db, debug: false };
             let context = ExportContext::resolved(
@@ -1003,22 +1007,39 @@ pub fn root() -> usize { helper::<u8>() }
                 base_db::all_crates(&db).iter().copied(),
                 &[root],
                 policy(false),
-            )
-            .unwrap();
-            assert_eq!(
+            );
+            if name.is_none() {
+                assert!(context.err().unwrap().contains("root has no portable name"));
+                let names = stable::StableNames::new(
+                    &db,
+                    &symbols,
+                    base_db::all_crates(&db).iter().copied().collect(),
+                    true,
+                );
+                let sources = names.semantic_sources();
+                for exported in &receipt.entries {
+                    let entry = cached::Entry::decode(&store.get(&exported.key).unwrap()).unwrap();
+                    assert!(!entry.semantic_matches(&exported.work.name, &sources));
+                }
+                return;
+            }
+            let mut context = context.unwrap();
+            assert_ne!(
                 context.digest(),
                 context_digest,
-                "caller identity intentionally has no direct filename read"
+                "caller key must seal its contextual callee"
             );
+            // Independently exercise entry/closure validation behind the context fence.
+            context.digest = context_digest;
             assert!(
                 validate_receipt(&context, &store, &receipt)
                     .unwrap_err()
                     .contains("concrete semantic inputs")
             );
             let mut transitive = receipt.clone();
-            transitive.entries.retain(|it| !stable::has_semantic_inputs(&it.work.name));
+            transitive.entries.truncate(1);
             assert!(!transitive.entries.is_empty());
-            validate_receipt(&context, &store, &transitive).unwrap();
+            assert!(validate_receipt(&context, &store, &transitive).is_err());
             assert!(
                 admitted_closure(&context, &store, &transitive)
                     .unwrap_err()
@@ -1036,6 +1057,76 @@ pub fn root() -> usize { helper::<u8>() }
     }
     drop(store);
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn transitive_parent_key_seals_concrete_callee_inputs() {
+    store::compiles_against("1.99.0");
+    let mut parents = Vec::new();
+    for name in ["short.rs", "short.rs", "other.rs"] {
+        let (db, root) = concrete_callee_database(CONCRETE_CALLEE_SOURCE, Some(name));
+        hir::attach_db(&db, || {
+            let symbols = Symbols { db: &db, debug: false };
+            let context = ExportContext::resolved(
+                &db,
+                &symbols,
+                base_db::all_crates(&db).iter().copied(),
+                &[root],
+                policy(false),
+            )
+            .unwrap();
+            let directory = scratch("parent-concrete-inputs");
+            let store = store::Store::owned(&directory).unwrap();
+            let requests = all_requests(&context, &[root], &store);
+            let batch = compile_batch(&context, context.digest(), &requests, &store).unwrap();
+            require_exported(&batch, requests.len());
+            let name = context.work_name(&LocalRequest::root(root)).unwrap().name;
+            let parent =
+                batch.receipt.entries.iter().find(|entry| entry.work.name == name).unwrap();
+            parents.push((parent.key, parent.entry_digest));
+            drop(store);
+            std::fs::remove_dir_all(directory).unwrap();
+        });
+    }
+    assert_eq!(
+        parents[0], parents[1],
+        "unchanged contextual closure must reproduce the key and bytes"
+    );
+    assert_ne!(parents[0].1, parents[2].1, "fixture must change actual parent entry bytes");
+    assert_ne!(
+        parents[0].0, parents[2].0,
+        "different contextual callee bytes must not share the parent key"
+    );
+}
+
+#[test]
+fn recursive_semantic_closure_uses_existing_concrete_mir_once() {
+    store::compiles_against("1.99.0");
+    let source = CONCRETE_CALLEE_SOURCE
+        .replace("fn helper<T>() -> usize { Block::<T>::VALUE.width }", "fn helper<T>(n: usize) -> usize { if n == 0 { Block::<T>::VALUE.width } else { helper::<T>(n - 1) } }")
+        .replace("helper::<u8>()", "helper::<u8>(0)");
+    let (db, root) = concrete_callee_database(&source, Some("short.rs"));
+    hir::attach_db(&db, || {
+        let symbols = Symbols { db: &db, debug: false };
+        let context = ExportContext::resolved(
+            &db,
+            &symbols,
+            base_db::all_crates(&db).iter().copied(),
+            &[root],
+            policy(false),
+        )
+        .unwrap();
+        let directory = scratch("recursive-concrete-inputs");
+        let store = store::Store::owned(&directory).unwrap();
+        let requests = all_requests(&context, &[root], &store);
+        assert_eq!(requests.len(), 2, "one root and its recursive concrete instance");
+        let batch = compile_batch(&context, context.digest(), &requests, &store).unwrap();
+        require_exported(&batch, requests.len());
+        validate_receipt(&context, &store, &batch.receipt).unwrap();
+        admitted_closure(&context, &store, &batch.receipt).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    });
 }
 
 #[test]

@@ -207,8 +207,14 @@ impl<'db> Keeper<'_, 'db> {
         &mut self,
         instance: &Instance,
         asked: &StoredParamEnvAndCrate,
+        parent: Option<&cached::SemanticInputs>,
     ) -> Option<StableName> {
         let environment = home::Homes::default().home(self.db, instance, asked);
+        if let Some(child) = self.names.semantic_inputs(instance, &environment)?
+            && parent.is_none_or(|parent| !parent.covers(&child))
+        {
+            return self.kept.unkept("incomplete transitive semantic preparation");
+        }
         self.stable_name_in(instance, &environment)
     }
 
@@ -486,6 +492,7 @@ impl<'db> Keeper<'_, 'db> {
     ) -> Option<cached::Entry> {
         use cached::{CachedData, CachedFunc, CachedTarget};
         let db = self.db;
+        let semantic = self.names.semantic_inputs(instance, environment)?;
         let mut funcs = Vec::with_capacity(compiled.requests.funcs.len());
         for (at, request) in compiled.requests.funcs.iter().enumerate() {
             let foreign = |callee: &Instance| match callee.def {
@@ -524,7 +531,7 @@ impl<'db> Keeper<'_, 'db> {
                             }
                             _ => None,
                         };
-                        Some(self.callee_name_in(&callee, asked))
+                        Some(self.callee_name_in(&callee, asked, semantic.as_ref()))
                     }
                     _ => None,
                 };
@@ -558,7 +565,7 @@ impl<'db> Keeper<'_, 'db> {
                 let Some(callee) = &self.settled(at, callee) else {
                     return self.kept.unkept("unsettled callee");
                 };
-                let Some(name) = self.callee_name_in(callee, asked) else {
+                let Some(name) = self.callee_name_in(callee, asked, semantic.as_ref()) else {
                     return self.kept.unkept("unnamed callee");
                 };
                 // A function the program is built from has no entry: it is compiled anew.
@@ -677,7 +684,7 @@ impl<'db> Keeper<'_, 'db> {
             code: cached::CachedCode::from(&compiled.code),
             debug,
             tracked: None,
-            semantic: self.names.semantic_inputs(instance, environment)?,
+            semantic,
         })
     }
 }
