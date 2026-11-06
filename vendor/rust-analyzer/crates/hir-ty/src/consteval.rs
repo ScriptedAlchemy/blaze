@@ -560,6 +560,44 @@ pub(crate) fn anon_const_eval<'db>(
     anon_const_eval_with_source_names(db, def, subst, trait_env).value
 }
 
+/// Evaluate only anonymous constants already created by the compiler's typed
+/// lowering. Identity discovery must compose these with every source owner's
+/// results because layout can evaluate an inner constant before an interpreter.
+pub fn owner_anonymous_consts_with_source_names<'db>(
+    db: &'db dyn HirDatabase,
+    owner: ExpressionStoreOwnerId,
+) -> Vec<(ExprId, WithSourceNames<Result<Allocation<'db>, ConstEvalError<'db>>>)> {
+    let constants: Vec<_> = match owner {
+        ExpressionStoreOwnerId::Body(body) => {
+            crate::InferenceResult::of(db, body).defined_anon_consts().to_vec()
+        }
+        ExpressionStoreOwnerId::Signature(def) => {
+            AnonConstId::all_from_signature(db, def).collect()
+        }
+        ExpressionStoreOwnerId::VariantFields(variant) => {
+            db.field_types_with_diagnostics(variant).defined_anon_consts().to_vec()
+        }
+    };
+    let interner = DbInterner::new_no_crate(db);
+    let mut seen = rustc_hash::FxHashSet::default();
+    constants
+        .into_iter()
+        .filter(|&constant| seen.insert(constant))
+        .filter_map(|constant| {
+            let loc = constant.loc(db);
+            if loc.owner != owner {
+                return None;
+            }
+            let args = if loc.allow_using_generic_params {
+                GenericArgs::identity_for_item(interner, owner.generic_def(db).into())
+            } else {
+                GenericArgs::empty()
+            };
+            Some((loc.expr, anon_const_eval_with_source_names(db, constant, args, None)))
+        })
+        .collect()
+}
+
 pub fn anon_const_eval_with_source_names<'db>(
     db: &'db dyn HirDatabase,
     def: AnonConstId<'db>,

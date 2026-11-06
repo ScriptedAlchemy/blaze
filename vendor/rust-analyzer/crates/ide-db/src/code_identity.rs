@@ -570,6 +570,77 @@ pub const fn width() -> usize {
     }
 
     #[test]
+    fn macro_numeric_array_bounds_do_not_bind_source_filenames() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        let source = "macro_rules! width { () => { 2 + 2 } } const WIDTH: usize = width!(); pub fn value() -> [u8; WIDTH] { [0; WIDTH] }";
+        assert_eq!(
+            generated_identity("/one/package", "/one/out", body, source),
+            generated_identity("/other/package", "/another/output", body, source),
+        );
+    }
+
+    #[test]
+    fn numeric_constant_dependency_proofs_respect_scopes_and_generics() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        for source in [
+            "mod values { pub const WIDTH: usize = 4; } use values::WIDTH as BOUND; pub fn value() -> [u8; BOUND] { [0; BOUND] }",
+            "const WIDTH: usize = 4; pub fn value() -> [u8; 8] { const WIDTH: usize = 8; [0; WIDTH] }",
+            "pub fn value<const N: usize>() -> [u8; N] { [0; N] }",
+            "const WIDTH: usize = (2u64 * 2) as usize; pub fn value() -> [u8; WIDTH] { [0; WIDTH] }",
+            "const MUL: f64 = 1.0 / (1u64 << 63) as f64; pub fn value() -> f64 { MUL }",
+            "pub const fn width() -> usize { 4 } pub fn value() -> [u8; width()] { [0; width()] }",
+            "pub const fn width<T>() -> usize { 4 } pub fn value() -> [u8; width::<u8>()] { [0; width::<u8>()] }",
+        ] {
+            assert_eq!(
+                generated_identity("/one/package", "/one/out", body, source),
+                generated_identity("/other/package", "/another/output", body, source),
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn declarative_macros_cannot_hide_filename_dependent_type_roots() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        for source in [
+            "macro_rules! length { () => { file!().len() } } const WIDTH: usize = length!(); pub struct Value([u8; WIDTH]);",
+            "macro_rules! forward { ($value:expr) => { $value } } const WIDTH: usize = forward!(file!().len()); pub struct Value([u8; WIDTH]);",
+            "macro_rules! name { () => { concat!(file!(), \".generated\") } } const NAME: &str = name!(); pub struct Value([u8; NAME.len()]);",
+            "trait Size { const WIDTH: usize; } struct Type; impl Size for Type { const WIDTH: usize = file!().len(); } pub struct Value([u8; <Type as Size>::WIDTH]);",
+            "struct Type<T>(T); impl<T> Type<T> { const WIDTH: usize = file!().len(); } pub struct Value([u8; Type::<u8>::WIDTH]);",
+        ] {
+            assert_ne!(
+                generated_identity("/one/package", "/one/out", body, source),
+                generated_identity("/other/package", "/another/output", body, source),
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn named_numeric_array_bounds_do_not_bind_source_filenames() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        let source = "const WIDTH: usize = 4; pub fn value() -> [u8; WIDTH] { [0; WIDTH] }";
+        let identity = |package, output| {
+            let mut fixture = generated_fixture(package, output, body, source);
+            hir::mir::location::name_sources(&mut fixture.db, |db, file| {
+                let root = db.file_source_root(file).source_root_id(db);
+                db.source_root(root).source_root(db).path_for_file(&file).map(ToString::to_string)
+            });
+            let reads =
+                hir::input_owners::discover_identity_inputs(&fixture.db, fixture.krate).clone();
+            let semantic = semantic_source_hash(&fixture.db, fixture.krate);
+            (direct_source_hash(&fixture.db, fixture.krate), semantic, reads)
+        };
+        let first = identity("/one/package", "/one/out");
+        let second = identity("/other/package", "/another/output");
+        assert_eq!(first.1, second.1, "first differing leaf: {:#?} / {:#?}", first.2, second.2);
+        assert_eq!(first.0, second.0);
+        assert!(first.2.source_names.is_empty());
+        assert!(!first.2.unresolved);
+    }
+
+    #[test]
     fn parent_components_cannot_certify_output_ownership() {
         let body = "include!(concat!(env!(\"OUT_DIR\"), \"/../generated.rs\"));";
         let mut fixture =

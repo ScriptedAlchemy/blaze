@@ -638,6 +638,29 @@ mod tests {
     }
 
     #[test]
+    fn numeric_constant_roots_reuse_across_library_source_names() {
+        for body in [
+            "const WIDTH: usize = 4; pub fn value() -> &'static str { let _ = [0u8; WIDTH]; \"ok\" }",
+            "macro_rules! width { () => { (2u64 * 2) as usize } } const WIDTH: usize = width!(); pub fn value() -> &'static str { let _ = [0u8; WIDTH]; \"ok\" }",
+        ] {
+            for library in [false, true] {
+                let identity = |name: &'static str| {
+                    let (mut db, crates) = environment_fixture(body, library, false, &[]);
+                    hir_ty::mir::location::name_sources(&mut db, move |_, _| Some(name.to_owned()));
+                    let inputs = hir::input_owners::discover_identity_inputs(&db, crates[1]);
+                    assert!(!inputs.unresolved, "{body}");
+                    assert!(inputs.source_names.is_empty(), "{body}");
+                    environment_ids(&db, crates, false, false)
+                };
+                assert_eq!(
+                    identity("/cargo-a/registry/library.rs"),
+                    identity("/cargo-b/registry/library.rs")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unused_cache_service_environment_does_not_split_plain_source_identity() {
         let identity = |value| {
             let (db, crates) = environment_fixture(
@@ -1066,11 +1089,20 @@ mod tests {
         use hir_def::{ModuleDefId, nameres::crate_def_map};
         use hir_ty::next_solver::GenericArgs;
         use test_fixture::WithFixture;
-        for (expression, included) in ["file!()", "core::panic::Location::caller().file()"]
+        for (expression, included, layout) in ["file!()", "core::panic::Location::caller().file()"]
             .into_iter()
             .flat_map(|expression| [false, true].map(|included| (expression, included)))
+            .flat_map(|(expression, included)| {
+                [false, true].map(|layout| (expression, included, layout))
+            })
         {
-            let declaration = format!("const GOAL: usize = {expression}.len();");
+            let declaration = if layout {
+                format!(
+                    "struct Width([u8; {expression}.len()]); const GOAL: usize = core::mem::size_of::<Width>();"
+                )
+            } else {
+                format!("const GOAL: usize = {expression}.len();")
+            };
             let body = if included {
                 format!("include!(\"generated.rs\");\n//- /generated.rs\n{declaration}")
             } else {
@@ -1078,7 +1110,7 @@ mod tests {
             };
             let fixture = format!(
                 r#"
-//- minicore: sized, panic_location
+//- minicore: sized, panic_location, size_of
 //- /main.rs
 #[rustc_builtin_macro] macro_rules! file {{ () => {{}} }}
 #[rustc_builtin_macro] macro_rules! include {{ () => {{}} }}
@@ -1125,11 +1157,20 @@ mod tests {
                 });
                 hir::attach_db(&db, || {
                     identities.push(ide_db::code_identity::semantic_source_hash(&db, krate));
+                    if layout {
+                        let inputs = hir::input_owners::discover_identity_inputs(&db, krate);
+                        assert!(
+                            !inputs.unresolved,
+                            "the typed array constant is concrete: {inputs:?}"
+                        );
+                        assert!(inputs.source_names.iter().any(|read| read.file == named_file
+                            && read.name.as_deref() == Some(expected)));
+                    }
                     let result = db.const_eval(goal, GenericArgs::empty(), None).unwrap();
                     assert_eq!(
                         usize::from_le_bytes(result.memory[..].try_into().unwrap()),
                         expected.len(),
-                        "{expression}, included={included}"
+                        "{expression}, included={included}, layout={layout}"
                     );
                 });
             }

@@ -5,8 +5,8 @@
 
 use super::MirSpan;
 use crate::InferBodyId;
-use hir_def::expr_store::ExpressionStore;
-use hir_def::{DefWithBodyId, expr_store::Body, hir::ExprId};
+use hir_def::expr_store::{ExpressionStore, ExpressionStoreSourceMap};
+use hir_def::{DefWithBodyId, ExpressionStoreOwnerId, expr_store::Body, hir::ExprId};
 use hir_expand::{
     FileRange, HirFileId, InFile, MacroDefKind,
     builtin::{BuiltinFnLikeExpander, EagerExpander},
@@ -34,13 +34,22 @@ pub fn written_range(node: &SyntaxNode) -> TextRange {
 /// The literals of a body that `line!()`, `column!()` or `file!()` expanded to. The source map
 /// changes with every edit above the body, and this keeps code without such literals from
 /// changing with it.
-#[salsa::tracked(returns(ref))]
 pub fn location_macros<'db>(
     db: &'db dyn HirDatabase,
     owner: DefWithBodyId,
+) -> &'db FxHashMap<ExprId, (BuiltinFnLikeExpander, HirFileId)> {
+    owner_location_macros(db, owner.into(), ())
+}
+
+#[salsa::tracked(returns(ref))]
+fn owner_location_macros(
+    db: &dyn HirDatabase,
+    owner: ExpressionStoreOwnerId,
+    _: (),
 ) -> FxHashMap<ExprId, (BuiltinFnLikeExpander, HirFileId)> {
-    let (body, source_map) = (Body::of(db, owner), Body::unmoved_source_map(db, owner));
-    body.exprs()
+    let (store, source_map) = location_store(db, owner);
+    store
+        .exprs()
         .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
         .filter_map(|(id, _)| {
             let file_id = source_map.expr_syntax(id).ok()?.file_id;
@@ -60,13 +69,22 @@ pub fn location_macros<'db>(
 
 /// The literals of a body that `concat!` made of arguments with `line!()`, `column!()` or
 /// `file!()` among them, each with the expansion it is in.
-#[salsa::tracked(returns(ref))]
 pub fn located_concats<'db>(
     db: &'db dyn HirDatabase,
     owner: DefWithBodyId,
+) -> &'db FxHashMap<ExprId, HirFileId> {
+    owner_located_concats(db, owner.into(), ())
+}
+
+#[salsa::tracked(returns(ref))]
+fn owner_located_concats(
+    db: &dyn HirDatabase,
+    owner: ExpressionStoreOwnerId,
+    _: (),
 ) -> FxHashMap<ExprId, HirFileId> {
-    let (body, source_map) = (Body::of(db, owner), Body::unmoved_source_map(db, owner));
-    body.exprs()
+    let (store, source_map) = location_store(db, owner);
+    store
+        .exprs()
         .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
         .filter_map(|(id, _)| {
             let file_id = source_map.expr_syntax(id).ok()?.file_id;
@@ -76,6 +94,18 @@ pub fn located_concats<'db>(
             (concat && names_location(&loc.to_node(db).value)).then_some((id, file_id))
         })
         .collect()
+}
+
+fn location_store(
+    db: &dyn HirDatabase,
+    owner: ExpressionStoreOwnerId,
+) -> (&ExpressionStore, &ExpressionStoreSourceMap) {
+    match owner {
+        ExpressionStoreOwnerId::Body(body) => {
+            (ExpressionStore::of(db, owner), Body::unmoved_source_map(db, body))
+        }
+        _ => ExpressionStore::with_source_map(db, owner),
+    }
 }
 
 /// What `line!()`, `column!()`, `file!()` or a `concat!` of them is where it is written.
@@ -168,16 +198,16 @@ pub fn name_sources(
 /// `file!()` or a `concat!` of them expanded to: rust-analyzer expands them to placeholders,
 /// and a constant is evaluated from what it expanded them to.
 pub fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
-    placed_with_source_names(db, owner, expr, |file| source_name(db, file))
+    placed_with_source_names(db, owner.into(), expr, |file| source_name(db, file))
 }
 
 pub(crate) fn placed_with_source_names(
     db: &dyn HirDatabase,
-    owner: DefWithBodyId,
+    owner: ExpressionStoreOwnerId,
     expr: ExprId,
     path: impl Fn(base_db::FileId) -> Option<String>,
 ) -> Option<Placed> {
-    if let Some(file_id) = located_concats(db, owner).get(&expr) {
+    if let Some(file_id) = owner_located_concats(db, owner, ()).get(&expr) {
         let value = || {
             let call = file_id.macro_file()?.loc(db).to_node(db);
             let mut text = String::new();
@@ -198,7 +228,7 @@ pub(crate) fn placed_with_source_names(
         };
         return Some(value().unwrap_or(Placed::Unavailable));
     }
-    let &(expander, file_id) = location_macros(db, owner).get(&expr)?;
+    let &(expander, file_id) = owner_location_macros(db, owner, ()).get(&expr)?;
     let value = || {
         let site = written_call(db, file_id)?;
         let range = InFile::new(site.file_id, written_range(&site.value));

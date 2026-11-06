@@ -9,7 +9,7 @@ use hir_def::{
     item_scope::ItemScope,
     signatures::{FnFlags, FunctionSignature},
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::db::HirDatabase;
 
@@ -36,39 +36,16 @@ pub struct IdentityInputs {
 #[salsa::tracked(returns(ref))]
 pub fn discover_identity_inputs(db: &dyn HirDatabase, krate: Crate) -> IdentityInputs {
     use hir_def::{expr_store::Body, hir::Expr};
-    use hir_expand::{
-        MacroDefKind,
-        builtin::{BuiltinFnLikeExpander, EagerExpander},
-    };
     use hir_ide::next_solver::GenericArgs;
     let mut unresolved = false;
     let mut source_names = Vec::new();
+    let mut proof = ContextFreeInputs::new(db);
     for owner in expression_owners(db, krate) {
         if unresolved {
             break;
         }
-        let (store, source_map) = ExpressionStore::with_source_map(db, owner);
-        let context_free_literal = |expr| {
-            if !matches!(&store[expr], Expr::Literal(_)) {
-                return false;
-            }
-            let Ok(source) = source_map.expr_syntax(expr) else { return false };
-            let Some(call) = source.file_id.macro_file() else { return true };
-            matches!(
-                call.loc(db).def.kind,
-                MacroDefKind::BuiltIn(
-                    _,
-                    BuiltinFnLikeExpander::Line | BuiltinFnLikeExpander::Column
-                ) | MacroDefKind::BuiltInEager(
-                    _,
-                    EagerExpander::Env
-                        | EagerExpander::OptionEnv
-                        | EagerExpander::Include
-                        | EagerExpander::IncludeBytes
-                        | EagerExpander::IncludeStr
-                )
-            )
-        };
+        let store = ExpressionStore::of(db, owner);
+        let mut context_free = |expr| proof.expression(owner, expr).is_some();
         // Nested type constants are deliberately absent from inference roots
         // while a body is lowered. Visit their actual HIR references as well.
         let mut anonymous = AnonymousConsts::default();
@@ -81,9 +58,27 @@ pub fn discover_identity_inputs(db: &dyn HirDatabase, krate: Crate) -> IdentityI
         for (pat, _) in store.pats() {
             store.visit_pat_children(pat, &mut anonymous);
         }
-        if anonymous.0.into_iter().any(|expr| !context_free_literal(expr)) {
-            unresolved = true;
-            break;
+        if !matches!(owner, ExpressionStoreOwnerId::Body(_)) {
+            anonymous.0.extend(store.expr_roots());
+        }
+        anonymous.0.sort_unstable();
+        anonymous.0.dedup();
+        let unknown: Vec<_> = anonymous.0.into_iter().filter(|&expr| !context_free(expr)).collect();
+        if !unknown.is_empty() {
+            let observed = hir_ide::consteval::owner_anonymous_consts_with_source_names(db, owner);
+            for (_, result) in &observed {
+                source_names.extend_from_slice(&result.source_names);
+            }
+            if unknown.into_iter().any(|expr| {
+                !observed.iter().any(|(root, result)| {
+                    let same = *root == expr
+                        || matches!(store[*root], Expr::Const(inner) if inner == expr);
+                    same && result.value.is_ok()
+                })
+            }) {
+                unresolved = true;
+                break;
+            }
         }
         match owner {
             ExpressionStoreOwnerId::Body(DefWithBodyId::ConstId(id)) => {
@@ -94,31 +89,23 @@ pub fn discover_identity_inputs(db: &dyn HirDatabase, krate: Crate) -> IdentityI
                     None,
                 );
                 source_names.extend(observed.source_names);
-                unresolved |= observed.value.is_err();
+                unresolved |=
+                    observed.value.is_err() && !context_free(Body::of(db, id.into()).root_expr());
             }
             ExpressionStoreOwnerId::Body(DefWithBodyId::StaticId(id)) => {
                 let observed = hir_ide::consteval::const_eval_static_with_source_names(db, id);
                 source_names.extend(observed.source_names);
-                unresolved |= observed.value.is_err();
+                unresolved |=
+                    observed.value.is_err() && !context_free(Body::of(db, id.into()).root_expr());
             }
             ExpressionStoreOwnerId::Body(DefWithBodyId::VariantId(id)) => {
                 let observed =
                     hir_ide::consteval::const_eval_discriminant_with_source_names(db, id);
                 source_names.extend(observed.source_names);
-                unresolved |= observed.value.is_err();
-            }
-            ExpressionStoreOwnerId::Body(body) => {
-                let root = Body::of(db, body).root_expr();
                 unresolved |=
-                    store.expr_roots().any(|expr| expr != root && !context_free_literal(expr))
-                        || store.exprs().any(|(_, expr)| {
-                            matches!(
-                                expr,
-                                Expr::Const(inner) if !context_free_literal(*inner)
-                            )
-                        });
+                    observed.value.is_err() && !context_free(Body::of(db, id.into()).root_expr());
             }
-            _ => unresolved |= store.expr_roots().any(|expr| !context_free_literal(expr)),
+            _ => {}
         }
     }
     if unresolved {
@@ -139,6 +126,155 @@ pub fn discover_identity_inputs(db: &dyn HirDatabase, krate: Crate) -> IdentityI
         }
     }
     IdentityInputs { unresolved, source_names }
+}
+
+/// A proof about source-name dependencies, not an evaluation of a constant's value.
+/// Operators are accepted only over primitive scalar leaves; user constructors and
+/// unresolved calls stay contextual because their code may observe a filename.
+#[derive(Clone, Copy)]
+enum ContextFreeValue {
+    Scalar,
+    Aggregate,
+}
+
+struct ContextFreeInputs<'db> {
+    db: &'db dyn HirDatabase,
+    active: FxHashSet<(ExpressionStoreOwnerId, hir_def::hir::ExprId)>,
+    known: FxHashMap<(ExpressionStoreOwnerId, hir_def::hir::ExprId), Option<ContextFreeValue>>,
+}
+
+impl<'db> ContextFreeInputs<'db> {
+    fn new(db: &'db dyn HirDatabase) -> Self {
+        Self { db, active: FxHashSet::default(), known: FxHashMap::default() }
+    }
+
+    fn expression(
+        &mut self,
+        owner: ExpressionStoreOwnerId,
+        expr: hir_def::hir::ExprId,
+    ) -> Option<ContextFreeValue> {
+        if let Some(result) = self.known.get(&(owner, expr)) {
+            return *result;
+        }
+        if !self.active.insert((owner, expr)) {
+            return None;
+        }
+        let result = self.expression_inner(owner, expr);
+        self.active.remove(&(owner, expr));
+        self.known.insert((owner, expr), result);
+        result
+    }
+
+    fn expression_inner(
+        &mut self,
+        owner: ExpressionStoreOwnerId,
+        expr: hir_def::hir::ExprId,
+    ) -> Option<ContextFreeValue> {
+        use ContextFreeValue::{Aggregate, Scalar};
+        use hir_def::{
+            builtin_type::BuiltinType,
+            expr_store::{Body, scope::ExprScopes},
+            hir::{Array, Expr, Literal, Statement},
+            resolver::{TypeNs, ValueNs, resolver_for_scope},
+            type_ref::TypeRef,
+        };
+        use hir_expand::{
+            MacroDefKind,
+            builtin::{BuiltinFnLikeExpander, EagerExpander},
+        };
+        let db = self.db;
+        let (store, source_map) = ExpressionStore::with_source_map(db, owner);
+        let resolve = || resolver_for_scope(db, owner, ExprScopes::of(db, owner).scope_for(expr));
+        let scalar = |value| matches!(value, Some(Scalar));
+        match &store[expr] {
+            Expr::Literal(value) => {
+                let source = source_map.expr_syntax(expr).ok()?;
+                if let Some(call) = source.file_id.macro_file() {
+                    if !matches!(
+                        call.loc(db).def.kind,
+                        MacroDefKind::Declarative(..)
+                            | MacroDefKind::BuiltIn(
+                                _,
+                                BuiltinFnLikeExpander::Line | BuiltinFnLikeExpander::Column
+                            )
+                            | MacroDefKind::BuiltInEager(
+                                _,
+                                EagerExpander::Env
+                                    | EagerExpander::OptionEnv
+                                    | EagerExpander::Include
+                                    | EagerExpander::IncludeBytes
+                                    | EagerExpander::IncludeStr
+                            )
+                    ) {
+                        return None;
+                    }
+                }
+                Some(match value {
+                    Literal::String(_) | Literal::ByteString(_) | Literal::CString(_) => Aggregate,
+                    _ => Scalar,
+                })
+            }
+            Expr::Path(path) => match resolve().resolve_path_in_value_ns_fully(
+                db,
+                path,
+                store.expr_path_hygiene(expr),
+            )? {
+                ValueNs::ConstId(id) => {
+                    let owner = ExpressionStoreOwnerId::Body(id.into());
+                    self.expression(owner, Body::of(db, id.into()).root_expr())
+                }
+                ValueNs::GenericParam(id) if db.const_param_ty(id).is_scalar() => Some(Scalar),
+                _ => None,
+            },
+            Expr::BinaryOp { lhs, rhs, .. } => (scalar(self.expression(owner, *lhs))
+                && scalar(self.expression(owner, *rhs)))
+            .then_some(Scalar),
+            Expr::UnaryOp {
+                expr: inner,
+                op: syntax::ast::UnaryOp::Not | syntax::ast::UnaryOp::Neg,
+            } => scalar(self.expression(owner, *inner)).then_some(Scalar),
+            Expr::Cast { expr: inner, type_ref } => {
+                if !scalar(self.expression(owner, *inner)) {
+                    return None;
+                }
+                let TypeRef::Path(path) = &store[*type_ref] else { return None };
+                match resolve().resolve_path_in_type_ns(db, path)? {
+                    (
+                        TypeNs::BuiltinType(
+                            BuiltinType::Bool
+                            | BuiltinType::Char
+                            | BuiltinType::Int(_)
+                            | BuiltinType::Uint(_)
+                            | BuiltinType::Float(_),
+                        ),
+                        None,
+                        _,
+                    ) => Some(Scalar),
+                    _ => None,
+                }
+            }
+            Expr::Const(inner) => self.expression(owner, *inner),
+            Expr::Tuple { exprs } => exprs
+                .iter()
+                .all(|&expr| self.expression(owner, expr).is_some())
+                .then_some(Aggregate),
+            Expr::Array(Array::ElementList { elements }) => elements
+                .iter()
+                .all(|&expr| self.expression(owner, expr).is_some())
+                .then_some(Aggregate),
+            Expr::Array(Array::Repeat { initializer, repeat }) => {
+                (self.expression(owner, *initializer).is_some()
+                    && scalar(self.expression(owner, *repeat)))
+                .then_some(Aggregate)
+            }
+            Expr::Block { statements, tail, .. }
+                if statements.iter().all(|stmt| matches!(stmt, Statement::Item(_))) =>
+            {
+                tail.map_or(Some(Aggregate), |tail| self.expression(owner, tail))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Default)]

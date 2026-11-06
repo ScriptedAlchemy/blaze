@@ -2004,11 +2004,10 @@ impl<'db> Evaluator<'db> {
         locals: &Locals<'db>,
     ) -> Result<'db, Option<Interval>> {
         use crate::mir::location::Placed;
-        let (Some(MirSpan::ExprId(expr)), InferBodyId::DefWithBodyId(owner)) =
-            (it.span, locals.body.owner)
-        else {
+        let Some(MirSpan::ExprId(expr)) = it.span else {
             return Ok(None);
         };
+        let owner = locals.body.owner.expression_store_owner(self.db);
         let placed = crate::mir::location::placed_with_source_names(self.db, owner, expr, |file| {
             self.source_name(file)
         });
