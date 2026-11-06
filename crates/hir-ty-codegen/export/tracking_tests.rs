@@ -123,6 +123,9 @@ fn own(db: &RootDatabase, symbols: &dyn SymbolResolver) -> OwnStatics {
 
 fn execute(bytes: &[u8], directory: &Path, symbol: &str) -> String {
     let symbol = if cfg!(target_os = "macos") { format!("_{symbol}") } else { symbol.to_owned() };
+    // Rust instance names may include punctuation that GAS parses as operators.
+    // Quote the whole assembler label while keeping the exact symbol bytes.
+    let symbol = format!(r#"\"{symbol}\""#);
     std::fs::create_dir_all(directory).unwrap();
     std::fs::write(directory.join("code.o"), bytes).unwrap();
     std::fs::write(directory.join("main.c"), format!("#include <stdio.h>\n#include <stddef.h>\nextern size_t result(void) __asm__(\"{symbol}\");\nint rust_eh_personality(void) {{ return 0; }}\nint main(void) {{ printf(\"%zu\\n\", result()); }}\n")).unwrap();

@@ -183,7 +183,9 @@ fn nested_native_names_and_debug_entries_survive_cargo_home_relocation() {
                     .enumerate()
                     .map(|(nth, symbol)| {
                         let prefix = if cfg!(target_os = "macos") { "_" } else { "" };
-                        format!("extern unsigned value{nth}(void) __asm__(\"{prefix}{symbol}\");\n")
+                        // Preserve Rust's punctuated native names as one assembler symbol.
+                        let alias = format!(r#"\"{prefix}{symbol}\""#);
+                        format!("extern unsigned value{nth}(void) __asm__(\"{alias}\");\n")
                     })
                     .collect();
                 let sum = (0..names.len())
