@@ -171,6 +171,7 @@ MODES = {"ra-jit": "`cargo ra-jit`", "plain": "plain cargo after `ra-jit enable`
 
 # What cargo and `cargo ra-jit` print about the build, which is not the program's output.
 STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Waiting|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|ra-jit:|warning:)")
+BUILD_STATUS = re.compile(r"^    Building \S+ v\S+ \(.+\)$")
 
 
 def base_env(home):
@@ -334,17 +335,21 @@ def how_built(stderr):
 def program_output(ran):
     """What the program said, without what cargo said, and with the two target directories
     named alike."""
-    def clean(text):
+    def clean(text, stderr=False):
         # What rustc warned of, which cargo shows again with every build, comes before
         # cargo says what it runs.
         lines = text.splitlines()
         running = [at for at, l in enumerate(lines) if re.match(r"^\s*Running `", l)]
-        lines = [l for l in lines[running[-1] + 1 if running else 0:] if not STATUS.match(l)]
+        finished = max((at for at, l in enumerate(lines)
+                        if re.match(r"^\s*Finished\b.*\[ra-jit\]", l)), default=-1)
+        start = running[-1] + 1 if running else 0
+        lines = [l for at, l in enumerate(lines) if at >= start and not STATUS.match(l)
+                 and not (stderr and at < finished and BUILD_STATUS.fullmatch(l))]
         text = "\n".join(lines).replace("target-ref", "target")
         # A panic message has the id of the thread, and a logger the time.
         text = re.sub(r"' \(\d+\) panicked", "' panicked", text)
         return re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z?", "<time>", text)
-    return ran.returncode, clean(ran.stdout), clean(ran.stderr)
+    return ran.returncode, clean(ran.stdout), clean(ran.stderr, stderr=True)
 
 
 def test_results(ran):

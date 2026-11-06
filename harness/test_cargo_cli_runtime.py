@@ -164,5 +164,24 @@ class ReportsAndFixtures(unittest.TestCase):
             self.assertEqual(sorted(path.name for path in directory.rglob("*") if path.is_file() and not path.is_symlink()), ["rustc"])
 
 
+class ProgramOutput(unittest.TestCase):
+    def test_whole_build_status_is_removed_only_from_stderr(self):
+        status = "    Building app v0.1.0 (/tmp/project/app)\n"
+        finished = "    Finished `dev` profile [ra-jit] target(s) in 0.21s\n"
+        ran = harness.subprocess.CompletedProcess([], 0, status + "program output\n", status + finished)
+        self.assertEqual(harness.program_output(ran), (0, status.rstrip() + "\nprogram output", ""))
+
+    def test_building_text_and_failure_status_remain_visible(self):
+        text = "Building a house\n    Building failed: missing input\n"
+        ran = harness.subprocess.CompletedProcess([], 3, "", text)
+        self.assertEqual(harness.program_output(ran), (3, "", text.rstrip()))
+
+    def test_program_can_print_building_status_after_build_completion(self):
+        status = "    Building app v0.1.0 (/tmp/project/app)\n"
+        finished = "    Finished `dev` profile [ra-jit] target(s) in 0.21s\n"
+        ran = harness.subprocess.CompletedProcess([], 0, "", finished + status)
+        self.assertEqual(harness.program_output(ran), (0, "", status.rstrip()))
+
+
 if __name__ == "__main__":
     unittest.main()
