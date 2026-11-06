@@ -197,6 +197,7 @@ pub struct Evaluator<'db> {
     code_stack: Vec<StackFrame<'db>>,
     caller_locations: FxHashMap<(String, u32, u32), Address>,
     caller_location_files: FxHashMap<String, Address>,
+    source_names: RefCell<FxHashMap<base_db::FileId, Option<String>>>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
     static_locations: FxHashMap<StaticId, Address>,
@@ -488,6 +489,7 @@ struct Locals<'db> {
 }
 
 pub struct MirOutput {
+    pub(crate) source_names: Vec<base_db::CurrentSourceName>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -514,17 +516,27 @@ pub fn interpret_mir<'db>(
 ) -> Result<'db, (Result<'db, Allocation<'db>>, MirOutput)> {
     let ty = body.locals[return_slot()].ty.as_ref();
     let mut read_statics = FxHashSet::default();
+    let mut source_names = FxHashMap::default();
     loop {
         let mut evaluator =
             Evaluator::new(db, body.owner, assert_placeholder_ty_is_unused, trait_env)?;
         evaluator.read_statics = Some(read_statics.clone());
         let it = evaluator.evaluate(body, ty);
+        source_names.extend(evaluator.source_names.into_inner());
         if let Some(read) = evaluator.missing_static.take()
             && read_statics.insert(read)
         {
             continue;
         }
-        return Ok((it, MirOutput { stdout: evaluator.stdout, stderr: evaluator.stderr }));
+        let mut source_names: Vec<_> = source_names
+            .into_iter()
+            .map(|(file, name)| base_db::CurrentSourceName { file, name })
+            .collect();
+        source_names.sort_by_key(|read| read.file.index());
+        return Ok((
+            it,
+            MirOutput { source_names, stdout: evaluator.stdout, stderr: evaluator.stderr },
+        ));
     }
 }
 
@@ -534,6 +546,19 @@ const EXECUTION_LIMIT: usize = 100_000;
 const EXECUTION_LIMIT: usize = 10_000_000;
 
 impl<'db> Evaluator<'db> {
+    fn source_name(&self, file: base_db::FileId) -> Option<String> {
+        let name = crate::mir::location::source_name(self.db, file);
+        self.source_names.borrow_mut().insert(file, name.clone());
+        name
+    }
+
+    fn observe<T>(&self, result: crate::consteval::WithSourceNames<T>) -> T {
+        self.source_names
+            .borrow_mut()
+            .extend(result.source_names.into_iter().map(|read| (read.file, read.name)));
+        result.value
+    }
+
     /// Runs a body without arguments and takes its result out of the evaluator's memory.
     fn evaluate(&mut self, body: &'db MirBody<'db>, ty: Ty<'db>) -> Result<'db, Allocation<'db>> {
         let interval = self.interpret_mir(body, None.into_iter(), None)?;
@@ -601,6 +626,7 @@ impl<'db> Evaluator<'db> {
             allocations: Default::default(),
             code_stack: vec![],
             caller_locations: FxHashMap::default(),
+            source_names: RefCell::new(FxHashMap::default()),
             caller_location_files: FxHashMap::default(),
             vtable_map: VTableMap::default(),
             thread_local_storage: TlsData::default(),
@@ -1975,7 +2001,10 @@ impl<'db> Evaluator<'db> {
         else {
             return Ok(None);
         };
-        Ok(match (crate::mir::location::placed(self.db, owner, expr), ty.kind()) {
+        let placed = crate::mir::location::placed_with_source_names(self.db, owner, expr, |file| {
+            self.source_name(file)
+        });
+        Ok(match (placed, ty.kind()) {
             (Some(Placed::Unavailable), _) => {
                 not_supported!("source location literal without a source name or location")
             }
@@ -2206,21 +2235,32 @@ impl<'db> Evaluator<'db> {
                     return self.inline_const_in_heap(konst, subst, locals);
                 }
                 let allocation = match id {
-                    GeneralConstId::ConstId(const_id) => {
-                        self.db.const_eval(const_id, subst, Some(self.param_env)).map_err(|e| {
+                    GeneralConstId::ConstId(const_id) => self
+                        .observe(crate::consteval::const_eval_with_source_names(
+                            self.db,
+                            const_id,
+                            subst,
+                            Some(self.param_env),
+                        ))
+                        .map_err(|e| {
                             let name = id.name(self.db);
                             MirEvalError::ConstEvalError(name, Box::new(e))
-                        })?
-                    }
-                    GeneralConstId::StaticId(static_id) => {
-                        self.db.const_eval_static(static_id).map_err(|e| {
+                        })?,
+                    GeneralConstId::StaticId(static_id) => self
+                        .observe(crate::consteval::const_eval_static_with_source_names(
+                            self.db, static_id,
+                        ))
+                        .map_err(|e| {
                             let name = id.name(self.db);
                             MirEvalError::ConstEvalError(name, Box::new(e))
-                        })?
-                    }
+                        })?,
                     GeneralConstId::AnonConstId(anon_const_id) => self
-                        .db
-                        .anon_const_eval(anon_const_id, subst, Some(self.param_env))
+                        .observe(crate::consteval::anon_const_eval_with_source_names(
+                            self.db,
+                            anon_const_id,
+                            subst,
+                            Some(self.param_env),
+                        ))
                         .map_err(|e| {
                             let name = id.name(self.db);
                             MirEvalError::ConstEvalError(name, Box::new(e))
@@ -3626,9 +3666,11 @@ impl<'db> Evaluator<'db> {
             }
             Interval::new(addr, size)
         } else if !static_data.flags.contains(StaticFlags::EXTERN) {
-            let allocation = self.db.const_eval_static(st).map_err(|e| {
-                MirEvalError::ConstEvalError(static_data.name.as_str().to_owned(), Box::new(e))
-            })?;
+            let allocation = self
+                .observe(crate::consteval::const_eval_static_with_source_names(self.db, st))
+                .map_err(|e| {
+                    MirEvalError::ConstEvalError(static_data.name.as_str().to_owned(), Box::new(e))
+                })?;
             let (size, align) =
                 self.size_align_of(allocation.ty, locals)?.unwrap_or((allocation.memory.len(), 1));
             let result = Interval::new(self.heap_allocate(size, align)?, size);
@@ -3658,7 +3700,8 @@ impl<'db> Evaluator<'db> {
     }
 
     fn const_eval_discriminant(&self, variant: EnumVariantId) -> Result<'db, i128> {
-        let r = self.db.const_eval_discriminant(variant);
+        let r = self
+            .observe(crate::consteval::const_eval_discriminant_with_source_names(self.db, variant));
         match r {
             Ok(r) => Ok(r),
             Err(e) => {

@@ -117,11 +117,8 @@ pub fn source_name(db: &dyn HirDatabase, file: base_db::FileId) -> Option<String
     }
     #[salsa::tracked]
     fn read<'db>(db: &'db dyn HirDatabase, file: SourceFile<'db>) -> Option<String> {
-        use salsa::Accumulator as _;
         let file = file.file(db);
-        let name = SourceNames::try_get(db).and_then(|names| (names.provider(db).0)(db, file));
-        base_db::CurrentSourceName { file, name: name.clone() }.accumulate(db);
-        name
+        SourceNames::try_get(db).and_then(|names| (names.provider(db).0)(db, file))
     }
     read(db, SourceFile::new(db, file)).clone()
 }
@@ -171,7 +168,15 @@ pub fn name_sources(
 /// `file!()` or a `concat!` of them expanded to: rust-analyzer expands them to placeholders,
 /// and a constant is evaluated from what it expanded them to.
 pub fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
-    let path = |file| source_name(db, file);
+    placed_with_source_names(db, owner, expr, |file| source_name(db, file))
+}
+
+pub(crate) fn placed_with_source_names(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    expr: ExprId,
+    path: impl Fn(base_db::FileId) -> Option<String>,
+) -> Option<Placed> {
     if let Some(file_id) = located_concats(db, owner).get(&expr) {
         let value = || {
             let call = file_id.macro_file()?.loc(db).to_node(db);

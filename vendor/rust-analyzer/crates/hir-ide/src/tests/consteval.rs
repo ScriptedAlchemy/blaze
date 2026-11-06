@@ -119,8 +119,7 @@ fn pretty_print_err(e: ConstEvalError<'_>, db: &TestDB) -> String {
     err
 }
 
-fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Allocation<'_>, ConstEvalError<'_>> {
-    let _tracing = setup_tracing();
+fn goal_id(db: &TestDB, file_id: EditionedFileId) -> hir_def::ConstId {
     let module_id = db.module_for_file(file_id.file_id(db));
     let def_map = module_id.def_map(db);
     let scope = &def_map.module(db, module_id).scope(db);
@@ -143,7 +142,12 @@ fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Allocation<'_>, Co
             _ => None,
         })
         .expect("No const named GOAL found in the test");
-    db.const_eval(const_id, GenericArgs::empty(), None)
+    const_id
+}
+
+fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Allocation<'_>, ConstEvalError<'_>> {
+    let _tracing = setup_tracing();
+    db.const_eval(goal_id(db, file_id), GenericArgs::empty(), None)
 }
 
 #[test]
@@ -3383,20 +3387,20 @@ fn source_name_reads_are_tracked_and_replay_current_observations() {
         file: base_db::FileId,
     }
     #[salsa::tracked]
-    fn observe<'db>(db: &'db dyn HirDatabase, file: ObservedFile<'db>) -> Option<String> {
-        crate::mir::location::source_name(db, file.file(db))
+    fn observe<'db>(
+        db: &'db dyn HirDatabase,
+        file: ObservedFile<'db>,
+    ) -> base_db::CurrentSourceName {
+        let file = file.file(db);
+        base_db::CurrentSourceName { file, name: crate::mir::location::source_name(db, file) }
     }
     let (mut db, file) = TestDB::with_single_file("fn main() {}");
     let file = file.file_id(&db);
-    // MIR evaluation also reads filenames without an enclosing tracked evaluator.
     assert_eq!(crate::mir::location::source_name(&db, file).as_deref(), Some("/main.rs"));
     let check = |db: &TestDB, expected: Option<&str>| {
-        let observed = ObservedFile::new(db, file);
-        assert_eq!(observe(db, observed).as_deref(), expected);
-        let reads = observe::accumulated::<base_db::CurrentSourceName>(db, observed);
-        assert_eq!(reads.len(), 1);
-        assert_eq!(reads[0].file, file);
-        assert_eq!(reads[0].name.as_deref(), expected);
+        let read = observe(db, ObservedFile::new(db, file));
+        assert_eq!(read.file, file);
+        assert_eq!(read.name.as_deref(), expected);
     };
     check(&db, Some("/main.rs"));
     check(&db, Some("/main.rs"));
@@ -3413,6 +3417,198 @@ fn source_name_reads_are_tracked_and_replay_current_observations() {
     check(&db, Some("provider.rs"));
     crate::mir::location::name_sources(&mut db, |_, _| None);
     check(&db, None);
+}
+
+#[test]
+fn ctfe_source_names_are_co_cached_even_when_value_is_unchanged() {
+    let (mut db, file) = TestDB::with_single_file(
+        r#"
+//- minicore: transmute
+#[rustc_builtin_macro]
+macro_rules! file { () => {} }
+const fn length(value: &str) -> usize {
+    unsafe { core::mem::transmute::<&str, (*const u8, usize)>(value).1 }
+}
+const INNER: usize = length(file!());
+const MIDDLE: usize = INNER;
+const GOAL: usize = MIDDLE;
+"#,
+    );
+    let check = |db: &TestDB, expected: Option<&str>| {
+        let observed = crate::consteval::const_eval_with_source_names(
+            db,
+            goal_id(db, file),
+            GenericArgs::empty(),
+            None,
+        );
+        assert_eq!(
+            observed.source_names,
+            vec![base_db::CurrentSourceName {
+                file: file.file_id(db),
+                name: expected.map(str::to_owned),
+            }]
+        );
+        match expected {
+            Some(name) => {
+                assert_eq!(allocation_as_usize(observed.value.unwrap()), name.len() as u128)
+            }
+            None => assert!(observed.value.is_err()),
+        }
+    };
+    check(&db, Some("/main.rs"));
+    check(&db, Some("/main.rs"));
+    let root = db.file_source_root(file.file_id(&db)).source_root_id(&db);
+    let mut files = base_db::FileSet::default();
+    files.insert(file.file_id(&db), base_db::VfsPath::new_virtual_path("/move.rs".into()));
+    db.set_source_root_with_durability(
+        root,
+        base_db::SourceRoot::new_local(files).into(),
+        salsa::Durability::LOW,
+    );
+    check(&db, Some("/move.rs"));
+    check(&db, Some("/move.rs"));
+    crate::mir::location::name_sources(&mut db, |_, _| Some("/same.rs".into()));
+    check(&db, Some("/same.rs"));
+    check(&db, Some("/same.rs"));
+    crate::mir::location::name_sources(&mut db, |_, _| None);
+    check(&db, None);
+    check(&db, None);
+}
+
+#[test]
+fn ctfe_layout_values_invalidate_after_nested_filename_reads() {
+    let (mut db, file) = TestDB::with_single_file(
+        r#"
+//- minicore: transmute, size_of
+#[rustc_builtin_macro]
+macro_rules! file { () => {} }
+const fn length(value: &str) -> usize {
+    unsafe { core::mem::transmute::<&str, (*const u8, usize)>(value).1 }
+}
+const LENGTH: usize = length(file!());
+struct Buffer([u8; LENGTH]);
+const GOAL: usize = core::mem::size_of::<Buffer>();
+"#,
+    );
+    let check = |db: &TestDB, expected| {
+        let observed = crate::consteval::const_eval_with_source_names(
+            db,
+            goal_id(db, file),
+            GenericArgs::empty(),
+            None,
+        );
+        assert_eq!(allocation_as_usize(observed.value.unwrap()), expected);
+    };
+    check(&db, 8);
+    check(&db, 8);
+    crate::mir::location::name_sources(&mut db, |_, _| Some("changed.rs".into()));
+    check(&db, 10);
+    check(&db, 10);
+}
+
+#[test]
+fn ctfe_source_names_survive_static_retry_and_errors() {
+    for expression in ["length(NAME)", "{ let _name = NAME; 1 / 0 }"] {
+        let fixture = format!(
+            r#"
+//- minicore: transmute
+#[rustc_builtin_macro]
+macro_rules! file {{ () => {{}} }}
+const fn length(value: &str) -> usize {{
+    unsafe {{ core::mem::transmute::<&str, (*const u8, usize)>(value).1 }}
+}}
+static NAME: &str = file!();
+const GOAL: usize = {expression};
+"#
+        );
+        let (db, file) = TestDB::with_single_file(&fixture);
+        for _ in 0..2 {
+            let observed = crate::consteval::const_eval_with_source_names(
+                &db,
+                goal_id(&db, file),
+                GenericArgs::empty(),
+                None,
+            );
+            assert_eq!(
+                observed.source_names,
+                vec![base_db::CurrentSourceName {
+                    file: file.file_id(&db),
+                    name: Some("/main.rs".into()),
+                }]
+            );
+            if expression == "length(NAME)" {
+                assert_eq!(allocation_as_usize(observed.value.unwrap()), 8);
+            } else {
+                assert!(observed.value.is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn ctfe_source_names_follow_implicit_discriminants() {
+    let (db, file) = TestDB::with_single_file(
+        r#"
+//- minicore: transmute
+#[rustc_builtin_macro]
+macro_rules! file { () => {} }
+const fn length(value: &str) -> usize {
+    unsafe { core::mem::transmute::<&str, (*const u8, usize)>(value).1 }
+}
+enum Value { First = length(file!()) as isize, Second }
+"#,
+    );
+    let module = db.module_for_file(file.file_id(&db));
+    let map = module.def_map(&db);
+    let id = map
+        .module(&db, module)
+        .scope(&db)
+        .declarations()
+        .find_map(|id| match id {
+            hir_def::ModuleDefId::AdtId(hir_def::AdtId::EnumId(id)) => Some(id),
+            _ => None,
+        })
+        .unwrap();
+    let variant = id.enum_variants(&db).variants[1].0;
+    for _ in 0..2 {
+        let observed = crate::consteval::const_eval_discriminant_with_source_names(&db, variant);
+        assert_eq!(observed.value.unwrap(), 9);
+        assert_eq!(
+            observed.source_names,
+            vec![base_db::CurrentSourceName {
+                file: file.file_id(&db),
+                name: Some("/main.rs".into()),
+            }]
+        );
+    }
+}
+
+#[test]
+fn ctfe_source_names_follow_nested_caller_locations() {
+    let (db, file) = TestDB::with_single_file(
+        r#"
+//- minicore: panic_location
+const INNER: &core::panic::Location<'static> = core::panic::Location::caller();
+const MIDDLE: &core::panic::Location<'static> = INNER;
+const GOAL: &str = MIDDLE.file();
+"#,
+    );
+    for _ in 0..2 {
+        let observed = crate::consteval::const_eval_with_source_names(
+            &db,
+            goal_id(&db, file),
+            GenericArgs::empty(),
+            None,
+        );
+        assert!(observed.value.is_ok());
+        assert_eq!(
+            observed.source_names,
+            vec![base_db::CurrentSourceName {
+                file: file.file_id(&db),
+                name: Some("/main.rs".into()),
+            }]
+        );
+    }
 }
 
 #[test]

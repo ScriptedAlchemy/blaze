@@ -38,7 +38,7 @@ impl<'db> Evaluator<'db> {
             }
         }
         .ok_or_else(|| MirEvalError::NotSupported("caller location without source".into()))?;
-        let file = super::super::location::source_name(self.db, file).ok_or_else(|| {
+        let file = self.source_name(file).ok_or_else(|| {
             MirEvalError::NotSupported("caller location without a source name".into())
         })?;
         let key = (file.clone(), line, column);
