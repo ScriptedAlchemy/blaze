@@ -1,41 +1,24 @@
 #!/usr/bin/env python3
-"""norustc.py: how many times rustc and rustdoc run in each scenario of a small workspace built
-with `cargo ra-jit`, against the counts recorded in norustc/baseline.json. A count above its
-baseline fails: ra-jit is to run no rustc, and a change may only lower the counts
-(docs/no-rustc.md).
+"""Audit owned builds, edits, tests, doctests and checks without external Rust tools.
 
-    norustc.py [--record] [--keep]
+    norustc.py --owned-server PATH [--bin PATH] [--work DIR] [--json FILE]
 
-It is also the module of the stand-ins: [`stand_ins`] writes a `rustc`, `rustdoc` and `cargo`
-that log each run (the tool, its pid, its parent's command line, its argv) and then run the real
-tool, and [`runs`] reads that log back. `harness/tracedecay.py` puts them on `PATH` and in
-`RUSTC`, `RUSTDOC` and `CARGO` for a blaze run, so that a run of rustc or rustdoc by blaze, by
-cargo or by anything they start is counted and can be named (P0-A, docs/distributed.md).
+Every scenario checks its expected exit status. Blocking stand-ins must log no rustc,
+rustdoc, Cargo, rustup or official macro-server attempts. Linux also audits exec attempts;
+on macOS the audit covers PATH and the configured tool paths. Completed scratch is removed;
+failures retain their diagnostics. The historical count baseline is never read or changed.
 
-The workspace, norustc/fixture, has a program with an `asm!` block, a library with unit tests,
-doctests and features, which the root package uses through another library, a proc macro, and a path dependency outside the workspace with a build script that
-`include!`s a file, `include_str!`s another, reads a variable with `option_env!` and expands the proc macro. It
-is built with a copy of the pinned toolchain whose rustc, rustdoc and cargo write a line for
-each run and then become the real tool, linked with rustup under a name of its own for the run.
-A scenario ends once no counted tool runs and the log has been still for a while, so what the
-daemon does after a command is counted with it.
-
---record writes this platform's and backend's counts into the baseline, after a change that
-lowered them. Where a count differs from run to run (cargo's own cache of what rustc answered
-is raced by the cargos ra-jit runs beside it), the baseline is the highest seen. --keep leaves the work directory. Linux and macOS: the stand-ins are shell
-scripts.
+The public stand_ins/runs/exec helpers remain available to other harnesses. Their default
+counting mode is unchanged; this CLI uses their copy-free blocking mode exclusively.
 """
-import json, os, platform, re, shlex, shutil, subprocess, sys, tempfile, time
+import argparse, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit")
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 FIXTURE = os.path.join(HERE, "norustc", "fixture")
-BASELINE = os.path.join(HERE, "norustc", "baseline.json")
-SYSTEM = {"linux": "linux", "darwin": "macos"}[sys.platform]
-ARCH = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
-PLACE = f"{SYSTEM}-{ARCH} {os.environ.get('RA_JIT_BACKEND') or 'cranelift'}"
 COUNTED = ("rustc", "rustdoc", "cargo", "rustup")
 # How long the log has to be still, with no counted tool running, for a step to be over.
 STILL = 4
@@ -328,96 +311,171 @@ def apply(ws, edits):
         open(path, "w").write(text + new if old is None else text.replace(old, new, 1))
 
 
-def main():
-    record, keep = "--record" in sys.argv, "--keep" in sys.argv
-    # Under /tmp on macOS: the daemon's socket is in RA_JIT_HOME below, and under $TMPDIR
-    # (/var/folders/...) its path passes the 104 bytes macOS has for one.
-    work = tempfile.mkdtemp(prefix="ra-jit-norustc-", dir="/tmp" if sys.platform == "darwin" else None)
-    log = os.path.join(work, "runs.log")
-    open(log, "w").close()
-    name = f"ra-jit-norustc-{os.getpid()}"
-    toolchain = counted_toolchain(work, log)
-    run(["rustup", "toolchain", "link", name, toolchain], check=True)
-    ws = os.path.join(work, "ws")
-    shutil.copytree(FIXTURE, ws)
-    home = os.path.join(work, "home")
-    os.makedirs(home, mode=0o700)
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("RA_JIT", "RUSTC", "RUSTDOC"))}
-    for unset in ("RUSTFLAGS", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "CARGO"):
-        env.pop(unset, None)
-    # Flags the shell gives a target (nix's x86-64 Linux shell sets
-    # CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS) have cargo ask rustc about the target again
-    # under them: six more runs that only ask in the cold build.
-    for key in [k for k in env if k.endswith("RUSTFLAGS")]:
-        del env[key]
-    env.update(RUSTUP_TOOLCHAIN=name, RA_JIT_HOME=home, RA_JIT_CACHE=os.path.join(work, "store"),
-               PATH=os.path.dirname(os.path.abspath(RA_JIT)) + os.pathsep + env["PATH"],
-               CARGO_TERM_COLOR="never", RUST_BACKTRACE="0", CARGO_NET_OFFLINE="true")
+def blocking_toolchain(work, log):
+    toolchain = stand_ins(str(work), str(log), block=True, block_macro_server=True)
+    controls = []
+    for tool in (*COUNTED, "rust-analyzer-proc-macro-srv"):
+        folder = "libexec" if tool == "rust-analyzer-proc-macro-srv" else "bin"
+        path = os.path.join(toolchain, folder, tool)
+        control = run([path, "--version"])
+        controls.append({"tool": tool, "path": path, "code": control.returncode})
+        if control.returncode != 97:
+            raise RuntimeError(f"blocking control failed: {controls}")
+    if [row["tool"] for row in runs(str(log))] != [row["tool"] for row in controls]:
+        raise RuntimeError("blocking controls were not all logged")
+    (work / "tool-controls.json").write_text(json.dumps(controls, indent=2) + "\n")
+    log.write_text("")
+    return toolchain
+
+
+def owned_environment(work, compiler, server, toolchain):
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("RA_JIT", "BLAZE", "RUSTC", "RUSTDOC"))
+           and not k.endswith("RUSTFLAGS")}
+    for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "CARGO_ENCODED_RUSTFLAGS", "CARGO"):
+        env.pop(key, None)
+    env.update(RUSTUP_TOOLCHAIN=toolchain, RA_JIT_HOME=str(work / "home"),
+               RA_JIT_CACHE=str(work / "store"), CARGO_TARGET_DIR=str(work / "target"),
+               RA_JIT_PROC_MACRO_SERVER=str(server), RA_JIT_ANSWERS="own", BLAZE_ANSWERS="own",
+               RA_JIT_OWN_RESOLVE="1", BLAZE_OWN_RESOLVE="1", RA_JIT_STD_FROM="off",
+               PATH=os.path.join(toolchain, "bin") + os.pathsep + str(compiler.parent)
+                    + os.pathsep + env.get("PATH", ""),
+               CARGO_TERM_COLOR="never", RUST_BACKTRACE="0", CARGO_NET_OFFLINE="true",
+               RA_JIT_MEMORY_MAX="16384M", RA_JIT_OWN_BASE_MEMORY="12288M", RA_JIT_SPARE="0")
+    env[RUN_ID_ENV] = os.environ.get(RUN_ID_ENV) or f"norustc-{os.getpid()}-{time.time_ns()}"
+    for name, tool in (("RUSTC", "rustc"), ("RUSTDOC", "rustdoc"), ("CARGO", "cargo")):
+        env[name] = os.path.join(toolchain, "bin", tool)
     if os.environ.get("RA_JIT_BACKEND"):
         env["RA_JIT_BACKEND"] = os.environ["RA_JIT_BACKEND"]
-    found, failed = {}, []
-    try:
-        for scenario, steps in SCENARIOS:
-            began = len(open(log).read().splitlines())
-            for step, args, edits, wait in steps:
-                apply(ws, edits)
-                ran = run(["cargo", "ra-jit", *args], cwd=ws, env=env, timeout=1200)
-                if wait and ran.returncode == 0:
-                    for _ in range(600):
-                        status = run(["cargo", "ra-jit", "status"], cwd=ws, env=env).stdout
-                        if ": ready" in status:
-                            break
-                        time.sleep(1)
-                settle(log)
-                said = (ran.stderr.strip().splitlines() or [""])[-1][:100]
-                print(f"  {scenario}: {step}: exit {ran.returncode}  {said}", flush=True)
-                if scenario == "doctests" and ran.returncode != 0:
-                    failed.append(f"{scenario}: {step}: {said}")
-            lines = open(log).read().splitlines()[began:]
-            runs, questions = counts(lines)
-            found[scenario] = {"rustc": runs["rustc"], "rustdoc": runs["rustdoc"]}
-            with open(os.path.join(work, f"{scenario.replace(' ', '-')}.log"), "w") as out:
-                out.write("\n".join(lines) + "\n")
-            print(f"{scenario}: rustc {runs['rustc']} ({questions} only asking), rustdoc {runs['rustdoc']}, "
-                  f"cargo {runs['cargo']}", flush=True)
-    finally:
-        run(["cargo", "ra-jit", "stop"], cwd=ws, env=env)
-        run(["rustup", "toolchain", "uninstall", name])
-    baseline = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
-    recorded = baseline.get(PLACE)
-    if record:
-        baseline[PLACE] = found
-        with open(BASELINE, "w") as out:
-            json.dump(baseline, out, indent=1, sort_keys=True)
-            out.write("\n")
-        print(f"recorded the counts of {PLACE} in {BASELINE}")
-    risen, fallen = [], []
-    for scenario, now in found.items():
-        for tool, count in now.items():
-            was = (recorded or {}).get(scenario, {}).get(tool)
-            if was is not None and count > was:
-                risen.append(f"{scenario}: {tool} ran {count} times, {was} recorded")
-            elif was is not None and count < was:
-                fallen.append(f"{scenario}: {tool} ran {count} times, {was} recorded")
-    if not keep:
-        shutil.rmtree(work, ignore_errors=True)
+    return env
+
+
+def owned_audit(args):
+    # Imported only by the CLI: stand-in users keep their import-time behavior.
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from dist.owned_macro_server import runtime_record
+    compiler = args.bin.resolve(strict=True)
+    server = args.owned_server.resolve(strict=True)
+    pins = runtime_record(server, compiler)
+    if not pins["bootstrap_compiler_matches"]:
+        raise RuntimeError("owned macro runtime was bootstrapped by a different compiler")
+    if not os.access(compiler, os.X_OK) or not os.access(server, os.X_OK):
+        raise RuntimeError("compiler and owned macro runtime must be executable")
+    if args.work:
+        work = args.work.resolve()
+        work.mkdir(parents=True, exist_ok=False)
     else:
-        print(f"kept {work}")
-    if recorded is None and not record:
-        print(f"no counts recorded for {PLACE}; norustc.py --record records these:\n{json.dumps(found)}")
-    for line in fallen:
-        print(f"lower: {line}; norustc.py --record lowers the baseline")
-    for line in risen:
-        print(f"RISEN: {line}")
-    for line in failed:
-        print(f"FAILED: {line}")
-    if risen and not record:
-        print("ra-jit runs rustc more than it did: docs/no-rustc.md says why that is refused")
-        sys.exit(1)
-    if failed:
-        print("the fixture's doctests failed: they pass under rustdoc")
-        sys.exit(1)
+        work = Path(tempfile.mkdtemp(prefix="ra-jit-norustc-",
+                                    dir="/tmp" if sys.platform == "darwin" else None)).resolve()
+    result = {"runtime": pins, "work": str(work), "steps": [], "failures": [],
+              "audit_scope": "all exec attempts" if sys.platform == "linux"
+                             else "PATH and configured Rust tool paths"}
+    log, traces = work / "runs.log", []
+    env = None
+    ws = work / "ws"
+
+    def invoke(scenario, step, words, expected=0):
+        number = len(result["steps"])
+        trace = work / f"{number:02d}.exec"
+        if sys.platform == "linux":
+            traces.append(trace)
+        row = {"scenario": scenario, "step": step, "args": words, "expected": expected,
+               "stdout": str(trace) + ".stdout", "stderr": str(trace) + ".stderr"}
+        result["steps"].append(row)
+        began = time.monotonic()
+        try:
+            ran = traced_run([str(compiler), "cargo", *words], trace, cwd=str(ws),
+                             env=env, timeout=args.timeout)
+        except subprocess.TimeoutExpired as error:
+            row["timed_out"] = True
+            for field in ("stdout", "stderr"):
+                output = getattr(error, field) or ""
+                if not Path(row[field]).exists():
+                    Path(row[field]).write_text(output.decode(errors="replace")
+                                               if isinstance(output, bytes) else output)
+            raise RuntimeError(f"{scenario}: {step} exceeded {args.timeout}s") from error
+        finally:
+            row["seconds"] = round(time.monotonic() - began, 3)
+        row["code"] = ran.returncode
+        Path(row["stdout"]).write_text(ran.stdout)
+        Path(row["stderr"]).write_text(ran.stderr)
+        print(f"  {scenario}: {step}: exit {ran.returncode} (expected {expected})", flush=True)
+        if ran.returncode != expected:
+            result["failures"].append(f"{scenario}: {step}: exit {ran.returncode}, expected {expected}")
+        return ran
+
+    try:
+        log.write_text("")
+        toolchain = blocking_toolchain(work, log)
+        shutil.copytree(FIXTURE, ws)
+        (work / "home").mkdir(mode=0o700)
+        env = owned_environment(work, compiler, server, toolchain)
+        for scenario, steps in SCENARIOS:
+            for step, words, edits, wait in steps:
+                apply(str(ws), edits)
+                expected = 101 if (scenario, step) in (("edits", "an error"),
+                                                      ("check unloaded", "an error")) else 0
+                ran = invoke(scenario, step, words, expected)
+                if expected == 101 and not re.search(r"^error\[E0308\]:", ran.stderr, re.M):
+                    result["failures"].append(f"{scenario}: {step}: missing intentional type-error diagnostic")
+                if wait and ran.returncode == 0:
+                    status = invoke(scenario, step + " status", ["status"])
+                    if ": ready" not in status.stdout:
+                        result["failures"].append(f"{scenario}: {step}: daemon is not ready")
+    except Exception as error:
+        result["failures"].append(f"{type(error).__name__}: {error}")
+    finally:
+        if env is not None:
+            try:
+                invoke("cleanup", "stop", ["stop"])
+            except Exception as error:
+                result["failures"].append(f"daemon stop failed: {error}")
+        result["tool_calls"] = runs(str(log))
+        if log.exists() and log.read_text().strip():
+            result["failures"].append("prohibited tool attempts logged in runs.log")
+        for trace in traces:
+            try:
+                calls = external_execs(trace.read_text(errors="replace"))
+                if calls:
+                    result["failures"].append(f"prohibited exec attempts in {trace.name}: {calls}")
+            except Exception as error:
+                result["failures"].append(f"exec audit failed for {trace.name}: {error}")
+        try:
+            if runtime_record(server, compiler) != pins:
+                result["failures"].append("compiler or owned macro runtime changed during audit")
+        except Exception as error:
+            result["failures"].append(f"runtime pin recheck failed: {error}")
+        summary = json.dumps(result, indent=2) + "\n"
+        (work / "summary.json").write_text(summary)
+        if args.json:
+            args.json.resolve().write_text(summary)
+    if result["failures"]:
+        for failure in result["failures"]:
+            print(f"FAILED: {failure}", file=sys.stderr)
+        print(f"diagnostics retained at {work}", file=sys.stderr)
+        return 1
+    shutil.rmtree(work)
+    print(f"passed {len(result['steps'])} steps; zero prohibited tool calls; scratch removed")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bin", type=Path, default=Path(RA_JIT))
+    parser.add_argument("--owned-server", type=Path, required=True)
+    parser.add_argument("--work", type=Path)
+    parser.add_argument("--json", type=Path)
+    parser.add_argument("--timeout", type=int, default=1200, help="seconds per command")
+    args = parser.parse_args()
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    try:
+        return owned_audit(args)
+    except Exception as error:
+        print(f"FAILED: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

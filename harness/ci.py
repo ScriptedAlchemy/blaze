@@ -75,7 +75,7 @@ HARNESSES = [
     # cargo run it again is still the daemon's.
     ("core", ["scriptrerun.py"], {}, on("linux", "macos"), 1),
     ("core", ["rustsrc.py"], {}, EVERYWHERE, 1),
-    # Each scenario runs rustc and rustdoc no more often than norustc/baseline.json says.
+    # Every scenario uses the owned macro runtime and blocks external Rust tools.
     ("core", ["norustc.py"], {}, on("linux", "macos"), 2),
     # `cargo ra-jit check`'s diagnostics, in each `--message-format`, against rustc's.
     ("core", ["check_json.py"], {}, on("linux", "macos", backend="cranelift"), 2),
@@ -140,6 +140,13 @@ def run(part):
         sys.exit(f"ci.py: no harness of part {part!r} runs on {SYSTEM} {ARCH} with {BACKEND}; the parts here are {parts(tier)}")
     failed, times = [], []
     for args, env in chosen:
+        args = list(args)
+        if args[0] == "norustc.py":
+            server = os.environ.get("RA_JIT_PROC_MACRO_SERVER")
+            if not server and os.environ.get("RUNNER_TEMP"):
+                server = os.path.join(os.environ["RUNNER_TEMP"], "owned-runtime", "blaze-proc-macro-srv")
+            if server:
+                args += ["--owned-server", server]
         what = " ".join(args)
         print(f"::group::{what}", flush=True)
         start = time.monotonic()
