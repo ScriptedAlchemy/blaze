@@ -18,7 +18,8 @@ import build_release as release
 
 
 class MacroBootstrapTests(unittest.TestCase):
-    def run_bootstrap(self, inherited=None, *, refused=0, crash=False, receipt=True):
+    def run_bootstrap(self, inherited=None, *, refused=0, crash=False, receipt=True,
+                      target="x86_64-unknown-linux-gnu", version_error=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             compiler = root / "ra-jit"
@@ -40,16 +41,17 @@ class MacroBootstrapTests(unittest.TestCase):
                 environment["RUSTC_BOOTSTRAP"] = inherited
             with mock.patch.dict(os.environ, environment, clear=True), \
                  mock.patch.object(release, "run", side_effect=compile_server), \
-                 mock.patch.object(release.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 mock.patch.object(release.subprocess, "run", side_effect=version_error,
+                                   return_value=subprocess.CompletedProcess(
                      [], 0, "owned server 1.99.0\n", "")) as version, \
                  contextlib.redirect_stdout(io.StringIO()), \
                  contextlib.redirect_stderr(io.StringIO()):
                 before = dict(os.environ)
                 error = None
                 try:
-                    returned = release.proc_macro_server(compiler, root)
+                    returned = release.proc_macro_server(compiler, root, target)
                     self.assertEqual(returned, executable)
-                except (SystemExit, subprocess.CalledProcessError) as caught:
+                except (SystemExit, subprocess.CalledProcessError, OSError) as caught:
                     error = caught
                 self.assertEqual(dict(os.environ), before)
                 if version.called:
@@ -87,10 +89,54 @@ class MacroBootstrapTests(unittest.TestCase):
         argv, kwargs = calls[0]
         self.assertEqual(Path(argv[0]).name, "ra-jit")
         self.assertEqual(argv[1], str(release.SERVER))
-        self.assertEqual(argv[2:6], ["--crate", release.SERVER_CRATE, "--crate", "proc_macro"])
+        self.assertEqual(argv[4:8], ["--crate", release.SERVER_CRATE, "--crate", "proc_macro"])
         self.assertEqual(kwargs["env"]["RA_JIT_PROC_MACRO_SERVER"], "0")
         self.assertEqual(kwargs["env"]["RA_JIT_STD_FROM"], "off")
         self.assertEqual(kwargs["env"]["UNCHANGED"], "yes")
+
+    def test_selected_target_is_passed_into_the_owned_compiler(self):
+        # On a clean runner there is no cached target to infer. The exact release
+        # target must reach owned Cargo metadata without asking an external rustc.
+        for target in ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"):
+            calls, error, exists, count = self.run_bootstrap(target=target)
+            self.assertIsNone(error)
+            self.assertTrue(exists)
+            self.assertEqual(count, 1)
+            self.assertEqual(calls[0][0][2:4], ["--target", target])
+
+    def test_release_main_hands_exact_target_to_server(self):
+        for target in ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                compiler = root / "ra-jit"
+                compiler.write_bytes(b"owned compiler fixture")
+                out = root / "release"
+                with mock.patch.object(release, "profile", return_value=(
+                         root / "profile", {"crate": "fixture", "commit": "a" * 40})), \
+                     mock.patch.object(release, "build", return_value=([compiler], 0)), \
+                     mock.patch.object(release, "crate_hash", return_value="fixture"), \
+                     mock.patch.object(release, "proc_macro_server") as server, \
+                     mock.patch.object(release, "check_artifact") as artifact, \
+                     mock.patch.object(sys, "argv", [
+                         "build_release.py", "--target", target, "--out", str(out), "--server"
+                     ]), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    release.main()
+                server.assert_called_once_with(out / "ra-jit", out, target)
+                artifact.assert_called_once_with(out, "portable")
+
+    def test_failed_version_check_removes_unverified_server(self):
+        _, error, exists, count = self.run_bootstrap(
+            version_error=subprocess.CalledProcessError(42, ["server", "--version"]))
+        self.assertIsInstance(error, subprocess.CalledProcessError)
+        self.assertFalse(exists)
+        self.assertEqual(count, 1)
+
+    def test_unlaunchable_server_removes_unverified_image(self):
+        _, error, exists, count = self.run_bootstrap(version_error=OSError("exec failed"))
+        self.assertIsInstance(error, OSError)
+        self.assertFalse(exists)
+        self.assertEqual(count, 1)
 
     def test_failed_owned_compilation_still_refuses_the_artifact(self):
         _, error, exists, count = self.run_bootstrap(crash=True)

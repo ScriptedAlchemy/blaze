@@ -265,7 +265,7 @@ def main() -> int:
                     patch.object(b.subprocess, "run", return_value=version) as check_version, \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 try:
-                    b.proc_macro_server(tmp / "ra-jit", out)
+                    b.proc_macro_server(tmp / "ra-jit", out, "x86_64-unknown-linux-gnu")
                     accepted = True
                 except SystemExit:
                     accepted = False
@@ -275,6 +275,9 @@ def main() -> int:
                  and check_version.called == expected)
             note(f"server bootstrap disables all prior expansion servers {counts}",
                  compile_image.call_args.kwargs["env"]["RA_JIT_PROC_MACRO_SERVER"] == "0")
+            note(f"server bootstrap preserves the exact requested target {counts}",
+                 compile_image.call_args.args[0][2:4]
+                 == ["--target", "x86_64-unknown-linux-gnu"])
             note(f"server bootstrap preserves or scopes feature authorization {counts}",
                  compile_image.call_args.kwargs["env"]["RUSTC_BOOTSTRAP"]
                  == os.environ.get("RUSTC_BOOTSTRAP", "proc_macro_api,proc_macro_srv"))
@@ -291,7 +294,7 @@ def main() -> int:
                 patch.object(b.subprocess, "run") as check_version, \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             try:
-                b.proc_macro_server(tmp / "ra-jit", out)
+                b.proc_macro_server(tmp / "ra-jit", out, "x86_64-unknown-linux-gnu")
                 raised = None
             except subprocess.CalledProcessError as error:
                 raised = error
