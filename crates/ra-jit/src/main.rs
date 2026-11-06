@@ -1481,8 +1481,13 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn debug_directory(&self) -> Option<String> {
-        (self.crate_debug.most != plan::Level::Nothing)
-            .then(|| self.root.to_string_lossy().into_owned())
+        (self.crate_debug.most != plan::Level::Nothing).then(|| {
+            if self.library { String::new() } else { self.root.to_string_lossy().into_owned() }
+        })
+    }
+
+    fn deterministic_object(&self) -> bool {
+        self.library
     }
 
     fn describes_variables(&self) -> bool {
@@ -5262,7 +5267,7 @@ fn std_unit(
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
-    field(b"ra-jit standard library 4");
+    field(b"ra-jit standard library 5");
     field(format!("{:?} {debug:?}", args.selection.target).as_bytes());
     // An object of one section is linked whole, with what the program never reaches.
     if !hir_ty_codegen::sections_of_their_own() {
@@ -7159,6 +7164,15 @@ fn hydrate_includes(
 }
 
 impl WatchedFile {
+    fn ownership(&self, db: &RootDatabase) -> Option<AbsPathBuf> {
+        let path = AbsPathBuf::try_from(self.path.to_str()?).ok()?;
+        db.has_path_ownership(&path).then_some(path)
+    }
+
+    fn ownership_changed(&self, db: &RootDatabase) -> bool {
+        self.ownership(db).is_some_and(|path| !db.included_is_read(&path))
+    }
+
     /// Whether the file is never written again: everything is watched but the sysroot, the
     /// registry, the Nix store (crates vendored by Nix, which `nix run` of the demo reads its
     /// thousands of files from) and what a build made, as path dependencies live outside the
@@ -10735,6 +10749,7 @@ fn run_holding(
             let before = touched.len() + gone.len();
             for (index, file) in files.iter_mut().enumerate() {
                 let on_disk = db.on_disk(&file.path);
+                let ownership_changed = file.ownership_changed(&db);
                 let Ok(now) = std::fs::metadata(&on_disk).and_then(|m| m.modified()) else {
                     if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
                         touched.remove(&index);
@@ -10751,21 +10766,23 @@ fn run_holding(
                 gone.remove(&index);
                 if switched.iter().any(|base| file.path.starts_with(base)) {
                     file.mtime = now;
-                    let same = match file.file {
-                        Watched::Source(id) => source_on_disk(&on_disk)
-                            .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
-                        Watched::Included(ref path) => db.included_is_read(path),
-                    };
+                    let same = !ownership_changed
+                        && match file.file {
+                            Watched::Source(id) => source_on_disk(&on_disk)
+                                .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
+                            Watched::Included(ref path) => db.included_is_read(path),
+                        };
                     if !same {
                         touched.insert(index);
                         noticed.get_or_insert((Instant::now(), Duration::ZERO));
                     }
-                } else if now != file.mtime {
+                } else if now != file.mtime || ownership_changed {
                     let was = std::mem::replace(&mut file.mtime, now);
                     // An editor that sent its text writes it after: the same text again.
                     let built = match file.file {
                         Watched::Source(id) if was != SystemTime::UNIX_EPOCH => {
-                            !sent.contains_key(&id)
+                            !ownership_changed
+                                && !sent.contains_key(&id)
                                 && source_on_disk(&on_disk)
                                     .is_ok_and(|text| *text == **db.file_text(id).text(&db))
                         }
@@ -10846,6 +10863,7 @@ fn run_holding(
             let WatchedFile { file, path, .. } = &files[index];
             match file {
                 Watched::Source(id) => {
+                    included.extend(files[index].ownership(&db));
                     let text = match sent.remove(id) {
                         Some((text, _)) => text,
                         None => source_on_disk(&db.on_disk(path))?,
@@ -12832,6 +12850,85 @@ fn main() {}
     }
 
     #[test]
+    fn standard_library_debug_objects_do_not_depend_on_the_callers_checkout() {
+        use object::{Object as _, ObjectSection as _};
+        use test_fixture::WithFixture;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("sysroot/library/std/src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "#[unsafe(no_mangle)]\npub fn value() -> u32 { 7 }\n").unwrap();
+        let checkout_a = directory.path().join("alice/checkout");
+        let checkout_b = directory.path().join("builder/deeper/checkout");
+        let (mut db, file) = RootDatabase::with_single_file(
+            "//- /sysroot/library/std/src/lib.rs crate:std\n#[unsafe(no_mangle)]\npub fn value() -> u32 { 7 }\n",
+        );
+        let file = file.file_id(&db);
+        let mut files = vfs::file_set::FileSet::default();
+        files.insert(file, vfs::VfsPath::from(vfs::AbsPathBuf::assert_utf8(source.clone())));
+        let mut change = ide_db::ChangeWithProcMacros::default();
+        change.set_roots(vec![ide_db::base_db::SourceRoot::new_library(files)]);
+        db.apply_change(change);
+        hir::attach_db(&db, || {
+            let krate = ide_db::base_db::all_crates(&db)[0];
+            let functions = declared_in(&db, krate.into()).functions;
+            assert_eq!(functions.len(), 1);
+            let build = |checkout: &Path, library| {
+                let mut args = Args::parse(
+                    ["project", "--crate", "std", "--out", "std.o"].into_iter().map(str::to_owned),
+                )
+                .unwrap();
+                args.checkout = checkout.to_owned();
+                args.library = library;
+                args.debug.level = plan::Level::Lines;
+                let table = SymbolTable::default();
+                let contents = content::Contents::default();
+                let listed = Listed::default();
+                let mut known = Rejections::default();
+                let resolver = Resolver::of(&db, &table, &args, &known, &contents, &listed);
+                let roots = Roots {
+                    entries: &functions,
+                    on_demand: &[],
+                    start: None,
+                    allocator: None,
+                    shared: false,
+                    whole: true,
+                    kept: &[],
+                    offered: &[],
+                };
+                let compiled =
+                    CodegenUnit::compile(&db, &resolver, roots, &Default::default(), &mut known)
+                        .unwrap();
+                assert!(compiled.skipped.is_empty());
+                compiled.object.unwrap()
+            };
+            let a = build(&checkout_a, true);
+            let b = build(&checkout_b, true);
+            assert!(a == b, "standard-library object bytes depend on the caller's checkout");
+            let object = object::File::parse(a.as_slice()).unwrap();
+            let debug: Vec<_> = object
+                .sections()
+                .filter(|section| section.name().unwrap().contains("debug"))
+                .collect();
+            assert!(!debug.is_empty(), "the test must preserve debug information");
+            let source_directory = source.parent().unwrap().to_str().unwrap().as_bytes();
+            assert!(
+                debug.iter().any(|section| section
+                    .data()
+                    .unwrap()
+                    .windows(source_directory.len())
+                    .any(|bytes| bytes == source_directory)),
+                "debug info lost its real source directory"
+            );
+            assert_ne!(
+                build(&checkout_a, false),
+                build(&checkout_b, false),
+                "ordinary program debug roots must retain their checkout"
+            );
+        });
+    }
+
+    #[test]
     fn the_commit_of_a_toolchain_is_the_one_its_library_has_its_sources_under() {
         let commit = "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4";
         let built = format!("\0/rustc/short/a.rs\0/rustc/{commit}x\0/rustc/{commit}/library/b.rs");
@@ -12909,6 +13006,44 @@ fn main() {}
             let want = [symbols[3].0, symbols[0].0, symbols[1].0];
             assert_eq!(defined, want, "{format:?}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn source_watcher_refreshes_same_content_symlink_ownership() {
+        use ide_db::base_db::SourceDatabase as _;
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("out");
+        std::fs::create_dir(&output).unwrap();
+        let inside = output.join("inside.rs");
+        let outside = directory.path().join("outside.rs");
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for path in [&inside, &outside] {
+            std::fs::write(path, "pub fn value() -> u8 { 7 }\n").unwrap();
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(time))
+                .unwrap();
+        }
+        let link = output.join("selected.rs");
+        std::os::unix::fs::symlink(&inside, &link).unwrap();
+        let mut db = RootDatabase::new(None);
+        let path = AbsPathBuf::assert_utf8(link.clone());
+        let root = AbsPathBuf::assert_utf8(output);
+        let ownership = db.path_ownership(&path).unwrap();
+        assert!(ownership.roots(&db).contains(&root));
+        let watched =
+            WatchedFile::new(Watched::Source(vfs::FileId::from_raw(0)), &link, &link).unwrap();
+        assert!(!watched.ownership_changed(&db));
+        let text = source_on_disk(&link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert_eq!(std::fs::metadata(&link).unwrap().modified().unwrap(), watched.mtime);
+        assert_eq!(source_on_disk(&link).unwrap(), text);
+        assert!(watched.ownership_changed(&db));
+        assert!(db.reload_included_file(&watched.ownership(&db).unwrap()));
+        assert!(!watched.ownership_changed(&db));
+        assert!(!ownership.roots(&db).contains(&root));
     }
 
     #[test]
