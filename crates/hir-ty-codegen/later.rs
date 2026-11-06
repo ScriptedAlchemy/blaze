@@ -101,13 +101,13 @@ impl<'db> Keeper<'_, 'db> {
             later.tiered,
         );
         let kept = later.keeps.then(|| match &later.of {
-            Of::Root { func, .. } => (root_instance(self.db, *func), func.krate(self.db)),
-            Of::Instance { instance, env } => (instance.clone(), env.krate),
+            Of::Root { func, .. } => root_instance(self.db, *func),
+            Of::Instance { instance, .. } => instance.clone(),
         });
-        let kept = kept.and_then(|(instance, home)| {
+        let kept = kept.and_then(|instance| {
             let tally = backend::Tally::global();
             tally.step(Step::StoreWrite, || {
-                self.keep(&instance, home, later.compiled, bindings, debug.clone())
+                self.keep(&instance, later.compiled, bindings, debug.clone())
             })
         });
         Made { debug, kept }
@@ -336,7 +336,6 @@ impl<'db> Keeper<'_, 'db> {
     fn keep(
         &mut self,
         instance: &Instance,
-        home: Crate,
         compiled: &CompiledFunction,
         bindings: &dyn export::Bindings,
         debug: Option<FunctionDebug>,
@@ -346,14 +345,14 @@ impl<'db> Keeper<'_, 'db> {
             self.kept.unnamed += 1;
             return None;
         };
-        self.keep_named(instance, Some(home), compiled, bindings, debug, name)
+        self.keep_named(instance, true, compiled, bindings, debug, name)
     }
 
     /// Compiler-generated code has its own name and no source body to mark for a patch.
     pub(super) fn keep_named(
         &mut self,
         instance: &Instance,
-        home: Option<Crate>,
+        track_source: bool,
         compiled: &CompiledFunction,
         bindings: &dyn export::Bindings,
         debug: Option<FunctionDebug>,
@@ -371,11 +370,8 @@ impl<'db> Keeper<'_, 'db> {
             self.kept.unnamed_requests += 1;
             return None;
         };
-        if let Some(home) = home
-            && self.markable
-            && stable::StableNames::of_checkout(&name)
-        {
-            match self.tracked(instance, home, compiled, described) {
+        if track_source && self.markable && stable::StableNames::of_checkout(&name) {
+            match self.tracked(instance, compiled, described) {
                 Ok(tracked) => entry.tracked = Some(tracked),
                 Err(why) => self.kept.untracked(&name, why),
             }
@@ -419,7 +415,6 @@ impl<'db> Keeper<'_, 'db> {
     pub(super) fn tracked(
         &self,
         instance: &Instance,
-        home: Crate,
         compiled: &CompiledFunction,
         described: bool,
     ) -> std::result::Result<cached::Tracked, &'static str> {
@@ -434,11 +429,9 @@ impl<'db> Keeper<'_, 'db> {
             files.iter().map(|&file| self.names.file_path(file)).collect::<Option<Vec<_>>>()
         });
         let items = patch::written_items(self.db, self.names, instance, compiled, described);
-        let home = match self.names.of_the_checkout(home) {
-            true => Some(self.names.content_id(home).ok_or("its crate has no content id")?.0),
-            false => None,
-        };
-        Ok(cached::Tracked { mark, home, files, items })
+        // The requesting crate is absent from the entry key. Hydration recovers its
+        // current environment from callers and conservatively considers every edit.
+        Ok(cached::Tracked { mark, home: None, files, items })
     }
 
     /// The function of the program that an instance without arguments is of, and its symbol.

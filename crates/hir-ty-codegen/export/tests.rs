@@ -4,6 +4,9 @@ use super::*;
 use ide_db::RootDatabase;
 use test_fixture::WithFixture;
 
+#[path = "tracking_tests.rs"]
+mod tracking;
+
 const SOURCE: &str = r#"
 //- minicore: sized, fn, copy, concat, unsize, coerce_unsized, dispatch_from_dyn
 //- /src/lib.rs crate:case

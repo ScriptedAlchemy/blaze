@@ -453,11 +453,10 @@ pub fn compile_batch(
         let told = ToldTypes::default();
         let mut keeper = context.keeper(&mut stable_names, &mut source_paths, &mut kept, &told);
         let work = context.work_name(request);
-        let (compiled, instance, home, of) = match &request.kind {
+        let (compiled, instance, of) = match &request.kind {
             LocalKind::Root(root) => (
                 compiled_root(context.db, *root),
                 root_instance(context.db, *root),
-                root.krate(context.db),
                 later::Of::Root {
                     func: *root,
                     symbol: context.symbols.function(*root).ok_or("root has no link name")?,
@@ -466,7 +465,6 @@ pub fn compile_batch(
             LocalKind::Instance(instance, env) => (
                 compiled_instance(context.db, instance.clone(), env.clone()),
                 instance.clone(),
-                env.krate,
                 later::Of::Instance { instance: instance.clone(), env: env.clone() },
             ),
         };
@@ -525,7 +523,7 @@ pub fn compile_batch(
             continue;
         };
         if stable::StableNames::of_checkout(&work.name) {
-            match keeper.tracked(&instance, home, compiled, described) {
+            match keeper.tracked(&instance, compiled, described) {
                 Ok(tracked) => entry.tracked = Some(tracked),
                 Err(why) => {
                     outcomes.push(Outcome::Local { work: Ok(work), why: why.into() });

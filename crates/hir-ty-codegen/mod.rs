@@ -5579,7 +5579,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let bindings =
                 export::ObjectBindings::new(self.module.declarations(), &self.type_ids, &later);
             let kept =
-                self.keeper(None).keep_named(&instance, None, compiled, &bindings, None, name);
+                self.keeper(None).keep_named(&instance, false, compiled, &bindings, None, name);
             self.apply(&later, later::Made { debug: None, kept });
         }
         Ok(())

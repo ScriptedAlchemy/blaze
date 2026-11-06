@@ -49,7 +49,8 @@ pub(super) struct Entry {
 pub(super) struct Tracked {
     /// The stable mark of the code.
     pub(super) mark: u128,
-    /// The crate it is compiled as, by the id it is named by, when that is of the checkout.
+    /// An optional crate hint accepted by the reader. Portable writers leave this unset:
+    /// the requesting crate is absent from the key, and hydration finds its current callers.
     pub(super) home: Option<[u8; 32]>,
     /// The files its code comes from, as [`super::stable::StableNames::file_path`] names
     /// them; `None` when any file can be one.
