@@ -191,7 +191,10 @@ class UIVerdictTests(unittest.TestCase):
 
 class DistributedVerdictTests(unittest.TestCase):
     def setUp(self):
+        # These synthetic transcripts predate owned admission; exercise the legacy
+        # verdict contract without starting workers or a workspace.
         self.harness = dist.Harness.__new__(dist.Harness)
+        self.harness.legacy = True
 
     def test_expected_assertion_failure_requires_exit_101(self):
         for code in (101, -11, -9, -6, 137, 124, 1, 0):
@@ -208,6 +211,40 @@ class DistributedVerdictTests(unittest.TestCase):
         run = dist.Run(101, "[ra-jit]\nerror: Option 'quiet' given more than once\n")
         self.assertEqual(self.harness.verdict(run, set(), dist.REJECTED), "ok")
         self.assertNotEqual(self.harness.verdict(run, set(), False), "ok")
+
+
+class OwnedPlanVerdictTests(unittest.TestCase):
+    def setUp(self):
+        # An isolated real-mode verdict: no daemon or watchdog required.
+        self.harness = dist.Harness.__new__(dist.Harness)
+        self.harness.legacy = False
+
+    def test_success_requires_completed_owned_admission(self):
+        plan = "owned test plan: 2 units compiled and admitted, 1 runnable harnesses\n"
+        self.assertEqual(self.harness.verdict(dist.Run(0, plan), set(), True), "ok")
+        self.assertEqual(self.harness.verdict(dist.Run(0, "[ra-jit]\n"), set(), True),
+                         "NO COMPLETED OWNED TEST PLAN")
+
+    def test_missing_malformed_or_ambiguous_plan_is_rejected(self):
+        valid = "owned test plan: 1 units compiled and admitted, 1 runnable harnesses\n"
+        invalid = ("",
+                   "owned test plan: 0 units compiled and admitted, 1 runnable harnesses\n",
+                   "owned test plan: 1 units compiled and admitted, 0 runnable harnesses\n",
+                   "owned test plan: 1 units compiled and admitted, 2 runnable harnesses\n",
+                   valid + valid,
+                   valid.rstrip() + " (partial)\n")
+        for output in invalid:
+            with self.subTest(output=output):
+                self.assertEqual(self.harness.verdict(dist.Run(0, output), set(), True),
+                                 "NO COMPLETED OWNED TEST PLAN")
+
+    def test_refused_invocation_requires_owned_admission_and_libtest_error(self):
+        plan = "owned test plan: 1 units compiled and admitted, 1 runnable harnesses\n"
+        failure = "error: Option 'quiet' given more than once\n"
+        self.assertEqual(self.harness.verdict(dist.Run(101, plan + failure), set(), dist.REJECTED), "ok")
+        self.assertEqual(self.harness.verdict(dist.Run(101, failure), set(), dist.REJECTED),
+                         "NO COMPLETED OWNED TEST PLAN")
+        self.assertNotEqual(self.harness.verdict(dist.Run(0, plan + failure), set(), dist.REJECTED), "ok")
 
 
 if __name__ == "__main__":
