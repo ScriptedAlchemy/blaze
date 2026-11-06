@@ -548,7 +548,7 @@ impl Built {
         // happens to load. Failure loses warmth, never adds a compiling cargo invocation.
         let producer = match ahead {
             Some(ahead) => {
-                Ok((ahead.root.join(&ahead.config.project), ahead.config.selection.clone()))
+                Ok((ahead.root.join(&ahead.config.project), ahead.config.selection_at(&ahead.root)))
             }
             None => std::env::current_dir().and_then(|cwd| {
                 project(asked, &cwd, &metadata(asked))

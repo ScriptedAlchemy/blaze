@@ -327,9 +327,15 @@ impl WorkerConfig {
 }
 
 impl WorkerConfig {
+    pub(super) fn selection_at(&self, root: &Path) -> crate::plan::Selection {
+        let mut selection = self.selection.clone();
+        selection.asked_in = selection.asked_in.map(|path| root.join(path));
+        selection
+    }
+
     /// What a worker's command line says of the workspace under `root` and of `crates` of
     /// it: all that loading it and compiling its functions reads.
-    fn args(&self, root: &Path, crates: &[PathBuf]) -> Vec<OsString> {
+    pub(super) fn args(&self, root: &Path, crates: &[PathBuf]) -> Vec<OsString> {
         let mut args: Vec<OsString> =
             vec![root.join(&self.project).into(), "--own-target".into(), "--cargo-project".into()];
         args.extend(self.selection.flags().into_iter().map(Into::into));
@@ -339,7 +345,7 @@ impl WorkerConfig {
         if self.selection.dev_deps {
             args.push("--dev-deps".into());
         }
-        if let Some(asked_in) = &self.selection.asked_in {
+        if let Some(asked_in) = self.selection_at(root).asked_in {
             args.extend(["--asked-in".into(), asked_in.into()]);
         }
         for krate in crates {
@@ -1891,7 +1897,12 @@ mod tests {
     #[test]
     fn cargo_workers_keep_their_package_origin_without_an_asked_in_manifest() {
         let root = Path::new("/checkout");
-        for asked_in in [None, Some(PathBuf::from("/workspace/Cargo.toml"))] {
+        for asked_in in [
+            None,
+            Some(PathBuf::from("/workspace/Cargo.toml")),
+            Some(PathBuf::from("member/Cargo.toml")),
+            Some(PathBuf::new()),
+        ] {
             let config = WorkerConfig {
                 repository: root.join(".git"),
                 project: PathBuf::from("member"),
@@ -1908,7 +1919,10 @@ mod tests {
                 crate::Args::parse(args.into_iter().map(|arg| arg.into_string().unwrap())).unwrap();
             assert_eq!(args.project_origin, crate::project_input::LoadOrigin::CargoPackage);
             assert_eq!(args.project, root.join("member"));
-            assert_eq!(args.selection.asked_in, config.selection.asked_in);
+            assert_eq!(
+                args.selection.asked_in,
+                config.selection.asked_in.as_ref().map(|path| root.join(path))
+            );
         }
     }
 

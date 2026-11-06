@@ -238,6 +238,14 @@ fn config_of(
     });
     let asked_in =
         asked.flags.manifest_path.as_ref().map_or_else(|| cwd.to_owned(), |it| cwd.join(it));
+    // Rebase checkout-local selection when a shared worker changes worktrees.
+    // Parent traversal stays absolute: resolving it can cross a directory alias.
+    let asked_in = asked_in
+        .strip_prefix(root)
+        .ok()
+        .filter(|path| !path.components().any(|part| part == std::path::Component::ParentDir))
+        .unwrap_or(&asked_in)
+        .to_owned();
     Ok(WorkerConfig {
         repository: repository(root),
         project: project.strip_prefix(root).unwrap_or(Path::new("")).to_owned(),
@@ -717,6 +725,56 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_worktree_invocations_share_worker_identity() {
+        let _scope = crate::process::enter_native(crate::process::Native::default());
+        let scratch = tempfile::tempdir().unwrap();
+        let first = scratch.path().join("first");
+        let second = scratch.path().join("second");
+        std::fs::create_dir_all(first.join(".git/worktrees/second")).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(
+            second.join(".git"),
+            format!("gitdir: {}\n", first.join(".git/worktrees/second").display()),
+        )
+        .unwrap();
+        let configured = |root: &Path, cwd: &str, manifest: Option<&Path>| {
+            let args = manifest.map_or_else(Vec::new, |path| {
+                vec!["--manifest-path".to_owned(), path.to_str().unwrap().to_owned()]
+            });
+            config_with_args(args, &root.join(cwd), root, &root.join("member"))
+        };
+        for cwd in ["", "member", "member/src"] {
+            assert_eq!(
+                configured(&first, cwd, None).id(),
+                configured(&second, cwd, None).id(),
+                "equivalent invocation {cwd:?} must share its worker across worktrees"
+            );
+        }
+        assert_eq!(
+            configured(&first, "", Some(&first.join("member/Cargo.toml"))).id(),
+            configured(&second, "", Some(&second.join("member/Cargo.toml"))).id(),
+        );
+        assert_ne!(configured(&first, "", None).id(), configured(&first, "member", None).id());
+        assert_ne!(
+            configured(&first, "member", None).id(),
+            configured(&first, "member/src", None).id(),
+            "nested invocation directories may select different Cargo configuration"
+        );
+        assert_ne!(
+            configured(&first, "", Some(Path::new("/external/a/Cargo.toml"))).id(),
+            configured(&second, "", Some(Path::new("/external/b/Cargo.toml"))).id(),
+        );
+        for root in [&first, &second] {
+            let manifest = Path::new("../external/Cargo.toml");
+            assert_eq!(
+                configured(root, "", Some(manifest)).selection.asked_in,
+                Some(root.join(manifest)),
+                "parent traversal must not gain checkout-relative identity"
+            );
+        }
+    }
+
+    #[test]
     fn worker_resolution_keeps_the_invocation_directory() {
         let ws = tempfile::tempdir().unwrap();
         let root = ws.path();
@@ -777,12 +835,20 @@ mod tests {
             });
             let config = config_with_args(args, &cwd, root, &member);
             let asked_in = manifest.as_ref().map_or_else(|| cwd.clone(), |it| cwd.join(it));
-            assert_eq!(config.selection.asked_in.as_deref(), Some(asked_in.as_path()));
+            assert_eq!(
+                config.selection.asked_in.as_ref().map(|path| root.join(path)),
+                Some(asked_in)
+            );
             assert_eq!(config.repository, repository(root));
             assert_eq!(config.project, Path::new("member"));
             // Exercise the worker's actual resolver callback, not just the identity hash.
             // Loading the member must still resolve root defaults when asked from the root.
-            let own = super::super::metadata::own(&config.selection).unwrap();
+            let mut worker_args = config.args(root, &[member.join("src/main.rs")]);
+            worker_args.extend(["--out".into(), "main.o".into()]);
+            let worker_args =
+                crate::Args::parse(worker_args.into_iter().map(|arg| arg.into_string().unwrap()))
+                    .unwrap();
+            let own = super::super::metadata::own(&worker_args.selection).unwrap();
             let (metadata, _) =
                 (own.metadata)(&loaded, Some("x86_64-unknown-linux-gnu"), &[], &Default::default())
                     .unwrap();
