@@ -123,12 +123,17 @@ fn own(db: &RootDatabase, symbols: &dyn SymbolResolver) -> OwnStatics {
 
 fn execute(bytes: &[u8], directory: &Path, symbol: &str) -> String {
     let symbol = if cfg!(target_os = "macos") { format!("_{symbol}") } else { symbol.to_owned() };
-    // Rust instance names may include punctuation that GAS parses as operators.
-    // Quote the whole assembler label while keeping the exact symbol bytes.
-    let symbol = format!(r#"\"{symbol}\""#);
+    // Clang quotes punctuated labels itself; GCC passes the spelling to GAS.
+    let native_label = r#"
+#ifdef __clang__
+#define NATIVE_LABEL(name) name
+#else
+#define NATIVE_LABEL(name) "\"" name "\""
+#endif
+"#;
     std::fs::create_dir_all(directory).unwrap();
     std::fs::write(directory.join("code.o"), bytes).unwrap();
-    std::fs::write(directory.join("main.c"), format!("#include <stdio.h>\n#include <stddef.h>\nextern size_t result(void) __asm__(\"{symbol}\");\nint rust_eh_personality(void) {{ return 0; }}\nint main(void) {{ printf(\"%zu\\n\", result()); }}\n")).unwrap();
+    std::fs::write(directory.join("main.c"), format!("#include <stdio.h>\n#include <stddef.h>\n{native_label}extern size_t result(void) __asm__(NATIVE_LABEL(\"{symbol}\"));\nint rust_eh_personality(void) {{ return 0; }}\nint main(void) {{ printf(\"%zu\\n\", result()); }}\n")).unwrap();
     let linked = std::process::Command::new("cc")
         .args([directory.join("main.c"), directory.join("code.o")])
         .arg("-o")

@@ -183,9 +183,7 @@ fn nested_native_names_and_debug_entries_survive_cargo_home_relocation() {
                     .enumerate()
                     .map(|(nth, symbol)| {
                         let prefix = if cfg!(target_os = "macos") { "_" } else { "" };
-                        // Preserve Rust's punctuated native names as one assembler symbol.
-                        let alias = format!(r#"\"{prefix}{symbol}\""#);
-                        format!("extern unsigned value{nth}(void) __asm__(\"{alias}\");\n")
+                        format!("extern unsigned value{nth}(void) __asm__(NATIVE_LABEL(\"{prefix}{symbol}\"));\n")
                     })
                     .collect();
                 let sum = (0..names.len())
@@ -193,7 +191,15 @@ fn nested_native_names_and_debug_entries_survive_cargo_home_relocation() {
                     .collect::<Vec<_>>()
                     .join("+");
                 std::fs::write(directory.path().join("old.o"), &old.object).unwrap();
-                std::fs::write(directory.path().join("main.c"), format!("#include <stdio.h>\n{declarations}int rust_eh_personality(void) {{ return 0; }}\nint main(void) {{ printf(\"%u\\n\", {sum}); }}\n")).unwrap();
+                // Clang quotes punctuated labels itself; GCC passes the spelling to GAS.
+                let native_label = r#"
+#ifdef __clang__
+#define NATIVE_LABEL(name) name
+#else
+#define NATIVE_LABEL(name) "\"" name "\""
+#endif
+"#;
+                std::fs::write(directory.path().join("main.c"), format!("#include <stdio.h>\n{native_label}{declarations}int rust_eh_personality(void) {{ return 0; }}\nint main(void) {{ printf(\"%u\\n\", {sum}); }}\n")).unwrap();
                 let linked = std::process::Command::new("cc")
                     .args([directory.path().join("main.c"), directory.path().join("old.o")])
                     .arg("-o")
