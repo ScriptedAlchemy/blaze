@@ -372,3 +372,101 @@ fn unused_git_patch_replays_from_precise_facts_without_its_checkout_or_manifest(
     assert_eq!(facts, replayed_facts);
     assert!(!home.exists());
 }
+
+#[test]
+fn compile_only_cargo_roots_preserve_doc_only_library_builds() {
+    use blaze_metadata::units::{Mode, unit_graph};
+    let scratch = Scratch::new("doc-roots");
+    scratch.write(
+        "Cargo.toml",
+        "[workspace]\nmembers=['a','b','util','dev','pm']\ndefault-members=['a','b']\nresolver='2'\n",
+    );
+    for name in ["a", "b", "util", "dev", "pm"] {
+        let extra = match name {
+            "a" => {
+                "[lib]\ntest=false\n[dependencies]\nutil={path='../util'}\n[dev-dependencies]\ndev={path='../dev'}\n"
+            }
+            "b" => "[dependencies]\na={path='../a'}\n",
+            "pm" => "[lib]\nproc-macro=true\n",
+            _ => "",
+        };
+        scratch.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n{extra}"),
+        );
+        scratch.write(
+            &format!("{name}/src/lib.rs"),
+            if name == "pm" {
+                "extern crate proc_macro;\n"
+            } else {
+                "pub fn value() -> u32 { 1 }\n"
+            },
+        );
+    }
+    let home = scratch.0.join("home");
+    for (doc_only, package, workspace, expected) in [
+        (true, Some("a"), false, vec![("a", "build")]),
+        (true, Some("b"), false, vec![("b", "build")]),
+        (true, Some("pm"), false, vec![("pm", "build")]),
+        (true, None, false, vec![("a", "build"), ("b", "build")]),
+        (
+            true,
+            None,
+            true,
+            vec![
+                ("a", "build"),
+                ("b", "build"),
+                ("dev", "build"),
+                ("pm", "build"),
+                ("util", "build"),
+            ],
+        ),
+        (false, None, false, vec![("b", "test")]),
+        (false, Some("a"), false, vec![("a", "build")]),
+    ] {
+        let packages: Vec<_> = package.into_iter().map(str::to_owned).collect();
+        let asked = Asked {
+            locked: false,
+            cargo_home: Some(home.clone()),
+            cwd: &scratch.0,
+            env: vec![("__CARGO_TEST_ROOT".into(), scratch.0.to_str().unwrap().into())],
+            manifest_path: None,
+            config: &[],
+            features: &[],
+            all_features: false,
+            no_default_features: false,
+            build: Some(Build { packages: &packages, workspace, excludes: &[], dev_units: true }),
+            platform: Some(TargetPlatform { triple: "x86_64-unknown-linux-gnu", cfg: &[] }),
+            offline: true,
+            store: None,
+            rust_release: None,
+        };
+        let graph = unit_graph(&UnitsAsked {
+            asked: &asked,
+            command: Command::Test,
+            targets: &TargetFilter { doc_only, ..Default::default() },
+            profile: None,
+        })
+        .unwrap();
+        assert!(graph.roots.iter().any(|&root| graph.units[root].mode == Mode::DocTest));
+        let original = graph.clone();
+        let rendered = graph.to_cargo_json();
+        let units = rendered["units"].as_array().unwrap();
+        assert!(units.iter().all(|unit| unit["mode"] != "doctest"));
+        let mut roots: Vec<_> = rendered["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|root| {
+                let unit = &units[root.as_u64().unwrap() as usize];
+                (unit["target"]["name"].as_str().unwrap(), unit["mode"].as_str().unwrap())
+            })
+            .collect();
+        roots.sort();
+        assert_eq!(
+            roots, expected,
+            "doc_only={doc_only}, package={package:?}, workspace={workspace}"
+        );
+        assert_eq!(graph, original, "the owned doctest contexts must remain intact");
+    }
+}

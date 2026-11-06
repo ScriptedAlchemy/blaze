@@ -2,6 +2,8 @@
 //! allows unstable features (`RUSTC_BOOTSTRAP=1`): the edges say `public`, `noprelude` and
 //! `nounused`.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
 
 use super::{Mode, TargetKind, Unit, UnitGraph, UnitTarget};
@@ -23,7 +25,31 @@ pub(super) fn of(graph: &UnitGraph) -> Value {
             dep["index"] = json!(ranks[old].expect("compile units never depend on doctests"));
         }
     }
-    let roots: Vec<_> = graph.roots.iter().filter_map(|&at| ranks[at]).collect();
+    let doc_only = !graph.roots.is_empty()
+        && graph.roots.iter().all(|&at| graph.units[at].mode == Mode::DocTest);
+    let roots: Vec<_> = if doc_only {
+        // In the compile-only view, doc-only roots are their documented library
+        // builds, not every normal or dev dependency of those contexts.
+        graph
+            .roots
+            .iter()
+            .flat_map(|&at| {
+                let documented = &graph.units[at];
+                documented.dependencies.iter().filter_map(move |dep| {
+                    let compiled = &graph.units[dep.index];
+                    (compiled.mode == Mode::Build
+                        && compiled.package.id == documented.package.id
+                        && compiled.target == documented.target)
+                        .then_some(dep.index)
+                })
+            })
+            .filter_map(|at| ranks[at])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    } else {
+        graph.roots.iter().filter_map(|&at| ranks[at]).collect()
+    };
     json!({ "version": 1, "units": units, "roots": roots })
 }
 
