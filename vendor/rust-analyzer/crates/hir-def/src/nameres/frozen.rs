@@ -3162,6 +3162,37 @@ pub fn made() {}
     }
 
     #[test]
+    fn native_include_can_be_encoded_outside_a_tracked_query() {
+        use base_db::SourceDatabase;
+        let mut db = TestDB::with_files(
+            r#"
+//- /native/lib.rs crate:main
+#[rustc_builtin_macro] macro_rules! include { () => {} }
+include!("made.rs");
+//- /native/made.rs
+pub fn made() {}
+"#,
+        );
+        let krate = crate_named(&db, "main");
+        let root = db.file_source_root(krate.data(&db).root_file_id).source_root_id(&db);
+        let old = db.source_root(root).source_root(&db);
+        let mut files = base_db::FileSet::default();
+        for file in old.iter() {
+            files.insert(
+                file,
+                VfsPath::new_real_path(old.path_for_file(&file).unwrap().to_string()),
+            );
+        }
+        db.set_source_root_with_durability(
+            root,
+            TArc::new(base_db::SourceRoot::new_local(files)),
+            salsa::Durability::LOW,
+        );
+        let bytes = encode(&db, krate).unwrap();
+        assert_eq!(unreadable(&db, krate, &bytes), None);
+    }
+
+    #[test]
     fn an_included_file_is_read_only_as_written() {
         const INCLUDED: &str = r#"
 //- /main.rs crate:main deps:lib

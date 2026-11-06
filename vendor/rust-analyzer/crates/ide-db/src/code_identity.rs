@@ -28,11 +28,10 @@ pub fn path_owned_by(db: &dyn HirDatabase, path: &str, root: &str) -> bool {
 /// Every expanded occurrence must lead to a successful include of that root.
 #[salsa::tracked(returns(ref))]
 pub fn include_only_environment(db: &dyn HirDatabase, krate: Crate) -> FxHashSet<String> {
-    use base_db::{CurrentEnvRead, CurrentIncludeResolution};
     use hir::input_owners::discover_current_inputs;
-    discover_current_inputs(db, krate);
-    let resolutions = discover_current_inputs::accumulated::<CurrentIncludeResolution>(db, krate);
-    let reads = discover_current_inputs::accumulated::<CurrentEnvRead>(db, krate);
+    let inputs = discover_current_inputs(db, krate);
+    let resolutions = &inputs.resolutions;
+    let reads = &inputs.environment;
     ["OUT_DIR", "CARGO_MANIFEST_DIR"]
         .into_iter()
         .filter_map(|key| {
@@ -94,16 +93,17 @@ fn source_role(db: &dyn HirDatabase, krate: Crate, path: &str) -> String {
 #[salsa::tracked(returns(copy))]
 pub fn semantic_source_hash(db: &dyn HirDatabase, krate: Crate) -> Hash {
     use hir::input_owners::discover_identity_inputs;
-    let unresolved = discover_identity_inputs(db, krate);
-    let mut names: Vec<_> =
-        discover_identity_inputs::accumulated::<base_db::CurrentSourceName>(db, krate)
-            .into_iter()
-            .map(|read| {
-                let root = db.file_source_root(read.file).source_root_id(db);
-                let root = db.source_root(root).source_root(db);
-                (root.path_for_file(&read.file).map(ToString::to_string), read.name.clone())
-            })
-            .collect();
+    let inputs = discover_identity_inputs(db, krate);
+    let unresolved = inputs.unresolved;
+    let mut names: Vec<_> = inputs
+        .source_names
+        .iter()
+        .map(|read| {
+            let root = db.file_source_root(read.file).source_root_id(db);
+            let root = db.source_root(root).source_root(db);
+            (root.path_for_file(&read.file).map(ToString::to_string), read.name.clone())
+        })
+        .collect();
     names.sort();
     names.dedup();
     let mut hash = Sha256::new();
@@ -450,6 +450,31 @@ mod tests {
     }
 
     #[test]
+    fn returned_macro_reads_replay_and_retract_attribute_value_uses() {
+        let attribute = r#"#[unsafe(export_name = concat!(env!("OUT_DIR"), "symbol"))]"#;
+        let body = format!(
+            r#"include!(concat!(env!("OUT_DIR"), "/generated.rs")); {attribute} pub fn exported() {{}}"#
+        );
+        let mut fixture =
+            generated_fixture("/package", "/output", &body, "pub fn value() -> u8 { 1 }");
+        let (db, krate) = (&mut fixture.db, fixture.krate);
+        let first = hir::input_owners::discover_current_inputs(db, krate).clone();
+        assert_eq!(&first, hir::input_owners::discover_current_inputs(db, krate));
+        let reads: Vec<_> = first.environment.iter().filter(|read| read.key == "OUT_DIR").collect();
+        assert_eq!(reads.len(), 2);
+        assert!(reads.iter().any(|read| read.include_input.is_some()));
+        assert!(reads.iter().any(|read| read.include_input.is_none()));
+        assert!(!include_only_environment(db, krate).contains("OUT_DIR"));
+        let file = krate.data(db).root_file_id;
+        let source = db.file_text(file).text(db).replace(attribute, "");
+        db.set_file_text(file, &source);
+        let current = hir::input_owners::discover_current_inputs(db, krate);
+        assert_eq!(current.environment.iter().filter(|read| read.key == "OUT_DIR").count(), 1);
+        assert!(include_only_environment(db, krate).contains("OUT_DIR"));
+        assert!(db.env_read().iter().any(|(of, key)| *of == krate && key == "OUT_DIR"));
+    }
+
+    #[test]
     fn runtime_file_macro_keeps_typed_relocation_available() {
         let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
         assert_eq!(
@@ -476,6 +501,72 @@ mod tests {
             generated_identity("/one/package", "/one/out", body, source),
             generated_identity("/other/package", "/another/output", body, source),
         );
+    }
+
+    #[test]
+    fn type_level_filename_observations_keep_layout_contextual() {
+        let body = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));";
+        for generated in [
+            "pub struct Width([u8; file!().len()]); pub const LENGTH: usize = core::mem::size_of::<Width>();",
+            "pub fn value() -> [u8; file!().len()] { loop {} }",
+            "pub struct Width<const N: usize = { file!().len() }>([u8; N]);",
+        ] {
+            assert_ne!(
+                generated_identity("/one/package", "/one/out", body, generated),
+                generated_identity("/other/package", "/another/output", body, generated),
+                "{generated}",
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_anonymous_type_context_reaches_the_callers_source_identity() {
+        use test_fixture::WithFixture;
+        let (mut db, files) = crate::RootDatabase::with_many_files(
+            r#"
+//- /app/main.rs crate:app deps:dep
+pub fn run() -> usize { dep::width() }
+//- /dep/lib.rs crate:dep
+#[rustc_builtin_macro] macro_rules! file { () => {} }
+pub const fn width() -> usize {
+    let _: [u8; file!().len()];
+    1
+}
+"#,
+        );
+        let named = |name: &str| {
+            *base_db::all_crates(&db)
+                .iter()
+                .find(|krate| {
+                    krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == name
+                })
+                .unwrap()
+        };
+        let app = named("app");
+        let dep = named("dep");
+        let file = files[1].file_id(&db);
+        let mut hashes = Vec::new();
+        for name in ["dependency/short.rs", "dependency/a-much-longer-name.rs"] {
+            hir::mir::location::name_sources(&mut db, move |_, source| {
+                Some(if source == file { name.to_owned() } else { "app/main.rs".to_owned() })
+            });
+            let current = hir::input_owners::discover_identity_inputs(&db, dep);
+            assert!(current.unresolved, "the nonliteral type constant keeps exact context");
+            assert!(
+                current
+                    .source_names
+                    .iter()
+                    .any(|read| read.file == file && read.name.as_deref() == Some(name))
+            );
+            hashes.push((
+                semantic_source_hash(&db, app),
+                semantic_source_hash(&db, dep),
+                source_hash(&db, app),
+            ));
+        }
+        assert_eq!(hashes[0].0, hashes[1].0, "the caller has no filename observation");
+        assert_ne!(hashes[0].1, hashes[1].1, "the dependency owns the anonymous constant");
+        assert_ne!(hashes[0].2, hashes[1].2, "dependency content enters its caller's key");
     }
 
     #[test]

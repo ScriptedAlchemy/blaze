@@ -551,18 +551,47 @@ fn collect_attrs<BreakValue>(
 /// The value of the `#[name = value]` attribute of `owner`, with the macros in it expanded:
 /// rustc expands the expression of a key-value attribute before it reads it
 /// (`rustc_expand::expand::InvocationCollector::visit_attribute` walks into `AttrArgs::Eq`).
-fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<Symbol> {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ExpandedSymbolAttr {
+    value: Option<Symbol>,
+    calls: Vec<hir_expand::MacroCallId>,
+}
+
+#[salsa::tracked(returns(ref))]
+fn expanded_symbol_attr(
+    db: &dyn SourceDatabase,
+    owner: AttrDefId,
+    name: Symbol,
+) -> ExpandedSymbolAttr {
     let (source, _, _, krate) = attrs_source(db, owner);
     let value = collect_attrs(db, owner, |attr| match attr {
-        ast::Meta::KeyValueMeta(attr) if attr.path().is1(name) => match attr.expr() {
+        ast::Meta::KeyValueMeta(attr) if attr.path().is1(name.as_str()) => match attr.expr() {
             Some(value) => ControlFlow::Break(value),
             None => ControlFlow::Continue(()),
         },
         _ => ControlFlow::Continue(()),
-    })?;
+    });
+    let Some(value) = value else { return ExpandedSymbolAttr::default() };
     let resolver = resolver_for_attr_def_id(db, owner);
-    let value = docs::expand_attr_value(db, krate, resolver, source.with_value(value))?;
-    Some(Symbol::intern(&value))
+    let (value, calls) = docs::expand_attr_value(db, krate, resolver, source.with_value(value));
+    ExpandedSymbolAttr { value: value.map(|value| Symbol::intern(&value)), calls: calls.into() }
+}
+
+fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<Symbol> {
+    expanded_symbol_attr(db, owner, Symbol::intern(name)).value.clone()
+}
+
+/// Macro occurrences actually expanded while computing symbol/section attributes.
+pub fn codegen_attribute_macro_calls(
+    db: &dyn SourceDatabase,
+    owner: AttrDefId,
+) -> Vec<hir_expand::MacroCallId> {
+    ["export_name", "link_name", "link_section", "linkage"]
+        .into_iter()
+        .flat_map(|name| {
+            expanded_symbol_attr(db, owner, Symbol::intern(name)).calls.iter().copied()
+        })
+        .collect()
 }
 
 fn collect_field_attrs<T>(

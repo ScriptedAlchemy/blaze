@@ -618,7 +618,11 @@ fn expand_doc_macro_call<'db>(
         |path| {
             expander.resolver.resolve_path_as_macro_def(expander.db, path, Some(MacroSubNs::Bang))
         },
-        &mut |_, _| (),
+        &mut |_, call| {
+            if let hir_expand::MacroCallKind::FnLike { ast_id, .. } = call.loc(expander.db).kind {
+                macro_calls.push((ast_id, call));
+            }
+        },
     )
     .ok()?
     .value?;
@@ -655,7 +659,7 @@ pub(crate) fn expand_attr_value<'db>(
     krate: Crate,
     resolver: Resolver<'db>,
     value: InFile<ast::Expr>,
-) -> Option<String> {
+) -> (Option<String>, ThinVec<MacroCallId>) {
     let file_id = value.file_id;
     let recursion_limit = resolver.top_level_def_map().recursion_limit();
     let mut expander = DocMacroExpander {
@@ -668,7 +672,9 @@ pub(crate) fn expand_attr_value<'db>(
         ast_id_map: file_id.ast_id_map(db),
         span_map: file_id.span_map(db),
     };
-    expand_doc_expr_via_macro_pipeline(&mut expander, &mut ThinVec::new(), value.value)
+    let mut calls = ThinVec::new();
+    let value = expand_doc_expr_via_macro_pipeline(&mut expander, &mut calls, value.value);
+    (value, calls.into_iter().map(|(_, call)| call).collect())
 }
 
 fn extend_with_attrs<'a, 'db>(

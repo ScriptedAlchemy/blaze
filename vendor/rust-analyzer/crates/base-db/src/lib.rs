@@ -456,18 +456,15 @@ pub struct PathOwnership {
     pub roots: Vec<AbsPathBuf>,
 }
 
-/// An include performed by the current tracked query execution. Unlike the
-/// historical watcher map, salsa accumulators retract observations when the
-/// query stops reading a file, and replay them on memo hits.
-#[salsa::accumulator]
-#[derive(Clone, Debug)]
+/// An external input selected by the current macro graph. Returned observation
+/// sets retract obsolete reads and remain valid in Salsa fixpoint queries.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CurrentIncludedInput {
     pub krate: Crate,
     pub path: AbsPathBuf,
 }
 
-#[salsa::accumulator]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CurrentEnvRead {
     pub krate: Crate,
     pub key: String,
@@ -476,8 +473,7 @@ pub struct CurrentEnvRead {
     pub include_input: Option<salsa::Id>,
 }
 
-#[salsa::accumulator]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CurrentIncludeResolution {
     pub krate: Crate,
     pub input: salsa::Id,
@@ -485,11 +481,26 @@ pub struct CurrentIncludeResolution {
     pub present: bool,
 }
 
-#[salsa::accumulator]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CurrentSourceName {
     pub file: FileId,
     pub name: Option<String>,
+}
+
+/// Provenance returned by macro input reads, never a query execution side effect.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InputReadSet {
+    pub included: Vec<CurrentIncludedInput>,
+    pub environment: Vec<CurrentEnvRead>,
+    pub resolutions: Vec<CurrentIncludeResolution>,
+}
+
+impl InputReadSet {
+    pub fn extend(&mut self, other: &Self) {
+        self.included.extend_from_slice(&other.included);
+        self.environment.extend_from_slice(&other.environment);
+        self.resolutions.extend_from_slice(&other.resolutions);
+    }
 }
 
 #[salsa::input(debug)]
