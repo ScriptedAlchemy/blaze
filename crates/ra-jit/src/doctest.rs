@@ -89,9 +89,9 @@ struct Wanted {
 
 impl Wanted {
     /// `Err` is the argument that asks for something not done here.
-    fn parse(args: &[String]) -> Result<Wanted, String> {
+    fn parse(args: &[String], presentation_quiet: bool) -> Result<Wanted, String> {
         let mut wanted = Wanted::default();
-        let (mut quiet, mut format) = (false, None);
+        let (mut quiet, mut format) = (presentation_quiet, None);
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             let (flag, joined) = match arg.split_once('=') {
@@ -166,7 +166,7 @@ fn named_from(project: &serde_json::Value, run_in: &Path) -> anyhow::Result<Path
     })
 }
 
-pub(crate) fn saved(project: &Path, crate_name: &str) -> anyhow::Result<i32> {
+pub(crate) fn saved(project: &Path, crate_name: &str, quiet: bool) -> anyhow::Result<i32> {
     let json = crate::compiler_json::read(project)?;
     let bytes: Vec<u8> = serde_json::from_value(json["blaze_spec_doctest"].clone())?;
     let requested: blaze_wire::RunSpec =
@@ -187,7 +187,7 @@ pub(crate) fn saved(project: &Path, crate_name: &str) -> anyhow::Result<i32> {
             env
         }
     };
-    let mut wanted = Wanted::parse(&requested.harness_args).map_err(anyhow::Error::msg)?;
+    let mut wanted = Wanted::parse(&requested.harness_args, quiet).map_err(anyhow::Error::msg)?;
     wanted.filters.extend(requested.filters);
     wanted.exact = requested.exact;
     wanted.skipped = requested.skip;
@@ -327,7 +327,7 @@ impl Asked {
             return Err("rustdoc is not asked to run tests".to_owned());
         }
         let wanted =
-            Wanted::parse(&test_args).map_err(|arg| format!("the tests are run with `{arg}`"))?;
+            Wanted::parse(&test_args, false).map_err(|arg| format!("the tests are run with `{arg}`"))?;
         let build = match recorded.var(BUILD) {
             Some(build) => {
                 Some(serde_json::from_str(build).map_err(|it| format!("{BUILD}: {it}"))?)
@@ -732,6 +732,15 @@ mod recording_tests {
         },
         process::Native,
     };
+
+    #[test]
+    fn quiet_presentation_uses_terse_doctests_with_explicit_format_precedence() {
+        assert!(!Wanted::parse(&[], false).unwrap().terse);
+        assert!(Wanted::parse(&[], true).unwrap().terse);
+        assert!(!Wanted::parse(&["--format=pretty".into()], true).unwrap().terse);
+        assert!(Wanted::parse(&["--format".into(), "terse".into()], false).unwrap().terse);
+        assert!(Wanted::parse(&["--quiet".into()], false).unwrap().terse);
+    }
 
     /// `workspace-doctests` in saved_spec.py: a member's doctest is `a/src/lib.rs - saved_a
     /// (line 1)` under cargo, named from the workspace root rustdoc runs in, not the package.

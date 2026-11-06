@@ -150,10 +150,15 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
         }
         return Ok(0);
     }
-    if let [mode, project, root] = words
+    if let [mode, project, root, presentation @ ..] = words
         && mode == "--compiler-doctest"
     {
-        return crate::doctest::saved(Path::new(project), root);
+        let quiet = match presentation {
+            [] => false,
+            [flag] if flag == "--quiet" => true,
+            _ => bail!("unknown compiler doctest presentation options"),
+        };
+        return crate::doctest::saved(Path::new(project), root, quiet);
     }
     if let [run, file] = words
         && run == "--run"
@@ -763,6 +768,9 @@ fn execute_inner(
             command.args(["cargo", "spec", "--compiler-doctest"]);
             command.arg(program.executable.parent().unwrap().join("rust-project.json"));
             command.arg(&program.crate_name);
+            if tests.is_some_and(|tests| tests.asked.flags.quiet) {
+                command.arg("--quiet");
+            }
             command
         } else {
             let mut command = Command::new(&program.executable);
