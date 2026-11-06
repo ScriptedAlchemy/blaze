@@ -270,6 +270,8 @@ def main() -> int:
                  and check_version.called == expected)
             note(f"server bootstrap disables all prior expansion servers {counts}",
                  compile_image.call_args.kwargs["env"]["RA_JIT_PROC_MACRO_SERVER"] == "0")
+            note(f"server bootstrap authorizes Rust 1.99 in-tree features {counts}",
+                 compile_image.call_args.kwargs["env"]["RUSTC_BOOTSTRAP"] == "1")
 
         out = tmp / "bootstrap-failed"
         out.mkdir()
