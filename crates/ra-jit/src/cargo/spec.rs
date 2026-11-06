@@ -428,7 +428,7 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         } else {
             None
         };
-    prepared.validate_sources(&store)?;
+    prepared.prepare_test_scratch(&store)?;
     let mut bindings = prepared.native_closure(&blaze_spec::platform::System)?;
     bindings.roots.push(blaze_spec::native::Root {
         name: "source".into(),

@@ -121,9 +121,27 @@ impl Prepared {
         Ok(described.native)
     }
 
-    /// Revalidate all materialized source bytes, kinds, native names and membership.
+    /// Revalidate source bytes, kinds and membership, composed only with the exact
+    /// directory scaffolding required by the authenticated Cargo test roots.
     pub fn validate_sources(&self, store: &Path) -> anyhow::Result<()> {
-        Snapshot::verify_materialized(source_root(&self.resolved.spec.build)?, store, &self.root)
+        Snapshot::verify_materialized_with_directories(
+            source_root(&self.resolved.spec.build)?,
+            store,
+            &self.root,
+            &crate::execution::test_scratch_directories(self)?,
+        )
+    }
+
+    /// Stage Cargo's scratch directories before capturing complete native source
+    /// bindings. Only their directory nodes, never generated inputs, augment the snapshot.
+    pub fn prepare_test_scratch(&self, store: &Path) -> anyhow::Result<()> {
+        self.validate_sources(store)?;
+        for path in crate::execution::test_scratch_directories(self)? {
+            std::fs::create_dir_all(&path).with_context(|| {
+                format!("creating Cargo test scratch directory {}", path.display())
+            })?;
+        }
+        self.validate_sources(store)
     }
 
     /// Whether the requester's process had a variable called `name`, whether or not the spec

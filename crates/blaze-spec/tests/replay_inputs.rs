@@ -1817,3 +1817,170 @@ fn explicit_rustc_env_overrides_scratch_value_without_changing_cargo_directory()
     assert_eq!(overrides, 2);
     assert!(!explicit.exists() && !expected.exists());
 }
+
+#[test]
+fn planned_cargo_test_scratch_preserves_replay_source_admission() {
+    let f = fixture();
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    replay.validate_sources(store.path()).unwrap();
+    let plans = blaze_spec::execution::programs(
+        &replay,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("artifacts"),
+    )
+    .unwrap();
+    let scratch: std::collections::BTreeSet<_> =
+        plans.iter().filter_map(|plan| plan.test_scratch.as_deref()).collect();
+    assert_eq!(scratch.len(), 1);
+    for scratch in scratch {
+        std::fs::create_dir_all(scratch).unwrap();
+    }
+    replay.validate_sources(store.path()).unwrap();
+}
+
+#[test]
+fn staged_cargo_scratch_is_bound_before_compilation_and_keeps_native_checks_strict() {
+    use blaze_spec::native::{Closure, Root};
+    use blaze_spec::native_tree::Tree;
+    let f = fixture();
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    f.write(".cargo/config.toml", "[build]\ntarget-dir='final'\nbuild-dir='intermediate'\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    let scratch = replay.root.join("intermediate/tmp");
+    assert!(!scratch.exists());
+    replay.prepare_test_scratch(store.path()).unwrap();
+    assert!(scratch.is_dir());
+    let bindings = Closure {
+        roots: vec![Root { name: "source".into(), tree: Tree::capture(&replay.root).unwrap() }],
+    };
+    let encoded = bindings.encode_bindings();
+    // compile_at still ensures the directory exists. That operation must not
+    // change any bound input after the executor has staged its layout.
+    std::fs::create_dir_all(&scratch).unwrap();
+    replay.validate_sources(store.path()).unwrap();
+    let SourceRef::Root(source) = &made.build.source else { unreachable!() };
+    assert!(
+        blaze_spec::snapshot::Snapshot::verify_materialized(
+            source.root,
+            store.path(),
+            &replay.root,
+        )
+        .is_err(),
+        "the generic source snapshot still requires exact membership"
+    );
+    assert_eq!(Closure::from_bindings(&encoded).unwrap(), bindings);
+    bindings.validate().unwrap();
+    std::fs::write(scratch.join("unrecorded.h"), "not an authenticated input").unwrap();
+    assert!(replay.validate_sources(store.path()).is_err());
+    assert!(Closure::from_bindings(&encoded).is_err());
+    assert!(bindings.validate().is_err());
+}
+
+#[test]
+fn scratch_scaffolding_does_not_admit_changes_to_the_source_manifest() {
+    let f = fixture();
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    for mutation in ["source-bytes", "source-member", "scratch-file", "scratch-directory"] {
+        let worker = tempfile::tempdir().unwrap();
+        let replay = prepared(&made, store.path(), &worker.path().join("source"));
+        replay.prepare_test_scratch(store.path()).unwrap();
+        let scratch = replay.resolved.outputs[1].join("tmp");
+        match mutation {
+            "source-bytes" => {
+                let file = replay.root.join("src/main.rs");
+                std::fs::remove_file(&file).unwrap();
+                std::fs::write(file, "fn main() {}")
+            }
+            "source-member" => std::fs::write(replay.root.join("unrecorded.h"), "header"),
+            "scratch-file" => std::fs::write(scratch.join("generated.h"), "header"),
+            "scratch-directory" => std::fs::create_dir(scratch.join("unplanned")),
+            _ => unreachable!(),
+        }
+        .unwrap();
+        assert!(replay.validate_sources(store.path()).is_err(), "admitted {mutation}");
+        assert!(replay.prepare_test_scratch(store.path()).is_err(), "laundered {mutation}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn scratch_scaffolding_preserves_source_aliases_without_authorizing_new_ones() {
+    let f = fixture();
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    f.write(".cargo/config.toml", "[build]\nbuild-dir='output-alias'\n");
+    f.write("actual-output/input", "authenticated");
+    std::os::unix::fs::symlink("actual-output", f.root().join("output-alias")).unwrap();
+    std::os::unix::fs::symlink("../output-alias/input", f.root().join("src/data")).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    for mutation in ["none", "retained-output-input", "scratch-alias"] {
+        let worker = tempfile::tempdir().unwrap();
+        let replay = prepared(&made, store.path(), &worker.path().join("source"));
+        assert!(
+            std::fs::symlink_metadata(replay.root.join("output-alias"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        replay.prepare_test_scratch(store.path()).unwrap();
+        let scratch = replay.resolved.outputs[1].join("tmp");
+        assert!(scratch.is_dir());
+        match mutation {
+            "none" => continue,
+            "retained-output-input" => {
+                let file = replay.root.join("actual-output/input");
+                std::fs::remove_file(&file).unwrap();
+                std::fs::write(file, "different").unwrap();
+            }
+            "scratch-alias" => {
+                std::fs::remove_dir(&scratch).unwrap();
+                std::os::unix::fs::symlink(worker.path(), &scratch).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(replay.validate_sources(store.path()).is_err(), "admitted {mutation}");
+    }
+}
+
+#[test]
+fn unasked_test_scratch_is_not_an_authenticated_execution_directory() {
+    let f = fixture();
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Build, &[], store.path());
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    replay.prepare_test_scratch(store.path()).unwrap();
+    let scratch = replay.resolved.outputs[1].join("tmp");
+    assert!(!scratch.exists());
+    std::fs::create_dir_all(&scratch).unwrap();
+    assert!(replay.validate_sources(store.path()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_external_output_alias_cannot_grant_source_directory_authority() {
+    let f = fixture();
+    let outside = tempfile::tempdir().unwrap();
+    let alias = outside.path().join("output-alias");
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    f.write(".cargo/config.toml", &format!("[build]\nbuild-dir={:?}\n", alias.to_str().unwrap()));
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.outputs[1], alias);
+    std::os::unix::fs::symlink(&replay.root, &alias).unwrap();
+    replay.validate_sources(store.path()).unwrap();
+    assert!(replay.prepare_test_scratch(store.path()).is_err());
+    assert!(replay.validate_sources(store.path()).is_err());
+}

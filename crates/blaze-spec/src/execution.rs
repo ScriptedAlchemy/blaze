@@ -182,6 +182,31 @@ fn roots(build: &BuildSpec, native: &[&Unit]) -> Vec<u32> {
     roots
 }
 
+fn test_scratch(prepared: &Prepared, unit: &Unit) -> anyhow::Result<Option<PathBuf>> {
+    matches!(unit.target.kind, TargetKind::Test | TargetKind::Bench)
+        .then(|| {
+            prepared
+                .resolved
+                .outputs
+                .get(1)
+                .map(|directory| directory.join("tmp"))
+                .context("test or benchmark has no Cargo build directory")
+        })
+        .transpose()
+}
+
+/// Directory scaffolding required by the authenticated execution roots, before
+/// native inputs are bound. Planning this list performs no filesystem writes.
+pub(crate) fn test_scratch_directories(prepared: &Prepared) -> anyhow::Result<Vec<PathBuf>> {
+    let build = &prepared.resolved.spec.build;
+    let native = canonical_units(build, &prepared.resolved.graph)?;
+    let directories = roots(build, &native)
+        .into_iter()
+        .map(|root| test_scratch(prepared, native[root as usize]))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(directories.into_iter().flatten().collect::<BTreeSet<_>>().into_iter().collect())
+}
+
 fn is_program(unit: &Unit) -> bool {
     unit.test
         || matches!(unit.target.kind, TargetKind::Bin | TargetKind::Example | TargetKind::Test)
@@ -353,17 +378,7 @@ pub fn programs_with(
     let mut result = Vec::new();
     for &root in &roots {
         let root_unit = &build.units[root as usize];
-        let test_scratch =
-            matches!(native[root as usize].target.kind, TargetKind::Test | TargetKind::Bench)
-                .then(|| {
-                    prepared
-                        .resolved
-                        .outputs
-                        .get(1)
-                        .map(|directory| directory.join("tmp"))
-                        .context("test or benchmark has no Cargo build directory")
-                })
-                .transpose()?;
+        let test_scratch = test_scratch(prepared, native[root as usize])?;
         let mut order = vec![root];
         order.extend(reachable(build, &native, root).into_iter().filter(|&at| at != root));
         let indexes: BTreeMap<_, _> =
