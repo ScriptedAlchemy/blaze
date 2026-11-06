@@ -6919,23 +6919,8 @@ fn unparsed(
 /// The errors rust-analyzer is as sure of as rustc is: a wrong one fails a build that is
 /// right.
 const SURE: &[&str] = &[
-    "E0004",
-    "E0005",
-    "E0023",
-    "E0046",
-    "E0057",
-    "E0061",
-    "E0063",
-    "E0308",
-    "E0407",
-    "E0425",
-    "E0432",
-    "E0559",
-    "E0560",
-    "E0583",
-    "E0599",
-    "non-unicode-env",
-    "unresolved-macro-call",
+    "E0004", "E0005", "E0023", "E0046", "E0057", "E0061", "E0063", "E0308", "E0407", "E0425",
+    "E0432", "E0559", "E0560", "E0583", "E0599",
 ];
 
 /// The borrow checker's errors, which fail a build unless `RA_JIT_BORROWCK_REFUSE=0`:
@@ -7034,6 +7019,7 @@ fn broken_in_except(
                                     it.severity == ide_db::Severity::Error
                                         && !except.contains(&code)
                                         && (SURE.contains(&code)
+                                            || check::EXPANSION_ERRORS.contains(&code)
                                             || refuse_borrowck && BORROWCK.contains(&code)
                                             || lints
                                                 && !expanded
@@ -9510,8 +9496,7 @@ fn run_holding(
         // A crate listed beside cargo's build was listed without what they declare.
         listed.touch(&db, None);
     }
-    if nothing_of_rustc && let Some(error) = check::syntax(&db, &args, &files)? {
-        let said = errors::Said::one(error);
+    if nothing_of_rustc && let Some(said) = check::admission(&db, &args, &files)? {
         errors_for_the_daemon(&args, &said)?;
         anyhow::bail!("{said}");
     }
@@ -12075,6 +12060,11 @@ fn main() { let _ = option_env!("CFLAGS"); let _ = env!("CFLAGS"); }
         );
         let sources = Sources { paths: [(file, PathBuf::from("/main.rs"))].into_iter().collect() };
         let refused = broken_in(&db, &[file], &sources, Path::new("/"), None, true);
+        let args = Args::parse(
+            ["project", "--crate", "app", "--out", "app.o"].into_iter().map(str::to_owned),
+        )
+        .unwrap();
+        assert!(check::admission(&db, &args, &[]).unwrap().is_some());
         db.set_env(krate, Env::from_iter([("CFLAGS".to_owned(), "unicode".to_owned())]));
         let valid = hir::attach_db(&db, || {
             ide_diagnostics::semantic_diagnostics_within(

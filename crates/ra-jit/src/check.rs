@@ -19,6 +19,9 @@ use vfs::Vfs;
 
 use crate::{Args, Parts, Sources, Watched, WatchedFile};
 
+pub(crate) const EXPANSION_ERRORS: &[&str] =
+    &["syntax-error", "macro-error", "macro-def-error", "non-unicode-env", "unresolved-macro-call"];
+
 /// An included expression is allowed to be non-item source, but the expression
 /// parser's ERROR recovery root is not evidence of a valid expression. That
 /// parser can consume trailing items without reporting an error for them.
@@ -31,6 +34,41 @@ pub(crate) fn expression_input(text: &str, edition: syntax::Edition) -> bool {
 #[cfg(test)]
 mod syntax_tests {
     use super::*;
+
+    #[test]
+    fn fresh_compilation_checks_macro_errors_before_codegen() {
+        use test_fixture::WithFixture;
+
+        let args = Args::parse(
+            ["project", "--crate", "app", "--out", "app.o"].into_iter().map(str::to_owned),
+        )
+        .unwrap();
+        for source in [
+            "compile_error!(\"admission failure\");",
+            "macro_rules! fail { () => { compile_error!(\"admission failure\"); } } fail!();",
+            "fn unused<T>() { compile_error!(\"admission failure\"); }",
+        ] {
+            let fixture = format!(
+                "//- /main.rs crate:app\n#[rustc_builtin_macro]\nmacro_rules! compile_error {{ ($($t:tt)*) => {{}} }}\n{source}\n"
+            );
+            let (db, _) = RootDatabase::with_single_file(&fixture);
+            let error = admission(&db, &args, &[]).unwrap();
+            assert!(
+                error.is_some_and(|it| serde_json::to_string(&it)
+                    .unwrap()
+                    .contains("admission failure")),
+                "accepted {source}"
+            );
+        }
+        let (db, _) = RootDatabase::with_single_file(
+            "//- /main.rs crate:app\nmacro_rules! broken { () => { pub fn bad() { let = 1; } } } broken!();\n",
+        );
+        assert!(admission(&db, &args, &[]).unwrap().is_some());
+        let (db, _) = RootDatabase::with_single_file(
+            "//- /main.rs crate:app\n#[rustc_builtin_macro]\nmacro_rules! compile_error { ($($t:tt)*) => {} }\n#[cfg(any())] compile_error!(\"inactive\");\npub fn valid() {}\n",
+        );
+        assert!(admission(&db, &args, &[]).unwrap().is_none());
+    }
 
     #[test]
     fn trailing_item_recovery_does_not_hide_a_dependency_syntax_error() {
@@ -46,24 +84,35 @@ pub fn broken() -> u8 { 1 + }
     }
 }
 
-/// Syntax failures in source-only builds must be reported before codegen/linking.
+/// Syntax and expansion failures must be reported before codegen/linking, even
+/// when the crate has no functions or the failing body is never instantiated.
 /// Walk semantic modules rather than all loaded source-root files.
-pub(crate) fn syntax(
+pub(crate) fn admission(
     db: &RootDatabase,
     args: &Args,
     files: &[WatchedFile],
-) -> anyhow::Result<Option<crate::errors::Diagnostic>> {
+) -> anyhow::Result<Option<crate::errors::Said>> {
     let mut checked = Vec::new();
+    let mut modules = Vec::new();
+    let mut seen = FxHashSet::default();
     for name in args.crates() {
         for krate in crate::crates_named(db, name, args)? {
             for id in ide_db::base_db::Crate::from(krate).transitive_deps(db) {
-                if id.data(db).origin.is_lang() {
+                if id.data(db).origin.is_lang() || !seen.insert(id) {
                     continue;
                 }
                 let krate = hir::Crate::from(id);
-                checked.extend(krate.modules(db).into_iter().map(|module| {
-                    module.definition_source_file_id(db).original_file(db).file_id(db)
-                }));
+                let mut files: Vec<_> = krate
+                    .modules(db)
+                    .into_iter()
+                    .map(|module| {
+                        module.definition_source_file_id(db).original_file(db).file_id(db)
+                    })
+                    .collect();
+                files.sort_unstable();
+                files.dedup();
+                checked.extend(&files);
+                modules.push((id, files));
             }
         }
     }
@@ -76,7 +125,56 @@ pub(crate) fn syntax(
             Watched::Included(_) => None,
         })
         .collect();
-    Ok(crate::unparsed(db, &checked, &Sources { paths }, &args.checkout))
+    let sources = Sources { paths };
+    if let Some(error) = crate::unparsed(db, &checked, &sources, &args.checkout) {
+        return Ok(Some(crate::errors::Said::one(error)));
+    }
+    let config = ide_diagnostics::DiagnosticsConfig::test_sample();
+    let mut errors = Vec::new();
+    for (krate, files) in modules {
+        for file in files {
+            for diagnostic in hard_diagnostics(db, &config, file, krate)
+                .into_iter()
+                .filter(|it| EXPANSION_ERRORS.contains(&it.code.as_str()))
+            {
+                let at = diagnostic.range;
+                let text = db.file_text(at.file_id).text(db);
+                let path = crate::shown(&sources, at.file_id, &args.checkout);
+                let error = crate::errors::at(None, &diagnostic.message, &path, text, at.range);
+                if !errors.contains(&error) {
+                    errors.push(error);
+                }
+            }
+        }
+    }
+    Ok((!errors.is_empty()).then_some(crate::errors::Said(errors)))
+}
+
+fn hard_diagnostics(
+    db: &RootDatabase,
+    config: &ide_diagnostics::DiagnosticsConfig,
+    file: vfs::FileId,
+    krate: ide_db::base_db::Crate,
+) -> Vec<ide_diagnostics::Diagnostic> {
+    hir::attach_db(db, || {
+        ide_diagnostics::semantic_diagnostics_within(
+            db,
+            config,
+            &ide_db::assists::AssistResolveStrategy::None,
+            file,
+            Some(std::sync::Arc::new(FxHashSet::from_iter([krate]))),
+        )
+        .into_iter()
+        .filter(|it| it.severity == ide_db::Severity::Error)
+        .filter(|it| {
+            matches!(
+                it.code,
+                ide_diagnostics::DiagnosticCode::RustcHardError(_)
+                    | ide_diagnostics::DiagnosticCode::SyntaxError
+            ) || EXPANSION_ERRORS.contains(&it.code.as_str())
+        })
+        .collect()
+    })
 }
 
 /// A metadata-only compiler probe checks all source bodies, including unreachable
@@ -126,30 +224,11 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
     let diagnostics = ide_diagnostics::DiagnosticsConfig::test_sample();
     let mut undecided = Vec::new();
     for &file in &checked {
-        let (inferred, hard): (Vec<_>, Vec<_>) = hir::attach_db(&db, || {
-            ide_diagnostics::semantic_diagnostics_within(
-                &db,
-                &diagnostics,
-                &ide_db::assists::AssistResolveStrategy::None,
-                file,
-                Some(std::sync::Arc::new(FxHashSet::from_iter([id]))),
-            )
-            .into_iter()
-            .filter(|it| it.severity == ide_db::Severity::Error)
-            .filter(|it| {
-                // A syntax error found in lowering, as `..base` in a destructuring assignment
-                // or a free function without a body, is one rustc reports too.
-                matches!(
-                    it.code,
-                    ide_diagnostics::DiagnosticCode::RustcHardError(_)
-                        | ide_diagnostics::DiagnosticCode::SyntaxError
-                ) || matches!(it.code.as_str(), "macro-error" | "macro-def-error")
-            })
-            .partition(|it| {
+        let (inferred, hard): (Vec<_>, Vec<_>) =
+            hard_diagnostics(&db, &diagnostics, file, id).into_iter().partition(|it| {
                 let code = it.code.as_str();
                 INFERRED.contains(&code) || crate::BORROWCK.contains(&code)
-            })
-        });
+            });
         undecided
             .extend(inferred.into_iter().map(|it| format!("{}: {}", it.code.as_str(), it.message)));
         let hard: Vec<_> = hard.into_iter().map(|it| it.message).collect();
