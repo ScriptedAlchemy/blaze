@@ -71,6 +71,53 @@ mod syntax_tests {
     }
 
     #[test]
+    fn metadata_probe_hydrates_generated_includes() {
+        use test_fixture::WithFixture;
+        let directory = tempfile::tempdir().unwrap();
+        let generated = directory.path().join("output");
+        std::fs::create_dir(&generated).unwrap();
+        let included = generated.join("level.in");
+        std::fs::write(&included, "pub fn number() -> u32 { 7 }\n").unwrap();
+        let (mut db, file) = RootDatabase::with_single_file(
+            r#"//- /main.rs crate:app
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+#[rustc_builtin_macro]
+macro_rules! concat { () => {} }
+#[rustc_builtin_macro]
+macro_rules! env { () => {} }
+include!(concat!(env!("OUT_DIR"), "/level.in"));
+"#,
+        );
+        let file = file.file_id(&db);
+        let path = directory.path().join("lib.rs");
+        let text = db.file_text(file).text(&db).to_string();
+        std::fs::write(&path, &text).unwrap();
+        let at = vfs::VfsPath::from(vfs::AbsPathBuf::assert_utf8(path.clone()));
+        let mut vfs = Vfs::default();
+        vfs.set_file_contents(at.clone(), Some(text.into_bytes()));
+        assert_eq!(vfs.file_id(&at).unwrap().0, file);
+        let mut root = vfs::file_set::FileSet::default();
+        root.insert(file, at);
+        let mut change = ChangeWithProcMacros::default();
+        change.set_roots(vec![ide_db::base_db::SourceRoot::new_local(root)]);
+        db.apply_change(change);
+        let krate = ide_db::base_db::all_crates(&db)[0];
+        db.set_env(
+            krate,
+            ide_db::base_db::Env::from_iter([(
+                "OUT_DIR".to_owned(),
+                generated.to_str().unwrap().to_owned(),
+            )]),
+        );
+        let files = source_files(&mut db, vfs, krate);
+        assert!(files.iter().any(|file| file.path == included), "generated source was not loaded");
+        let diagnostics =
+            hard_diagnostics(&db, &ide_diagnostics::DiagnosticsConfig::test_sample(), file, krate);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
     fn trailing_item_recovery_does_not_hide_a_dependency_syntax_error() {
         let text = r#"include!(concat!(env!("OUT_DIR"), "/shared.rs"));
 pub fn value() -> u8 { 1 }
@@ -177,6 +224,26 @@ fn hard_diagnostics(
     })
 }
 
+fn source_files(
+    db: &mut RootDatabase,
+    vfs: Vfs,
+    krate: ide_db::base_db::Crate,
+) -> Vec<WatchedFile> {
+    let mut files = WatchedFile::sources(&vfs, db, SystemTime::now());
+    let sources: Vec<_> = files
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(file) => Some((file, &*it.path)),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    let mut tree = crate::tree::Tree::new(db, vfs, &sources);
+    crate::hydrate_includes(db, &mut tree, &mut files, |db| {
+        crate::resolve_all(db, &[krate], crate::cores())
+    });
+    files
+}
+
 /// A metadata-only compiler probe checks all source bodies, including unreachable
 /// ones. It loads an owned source description, not a Cargo workspace or rmeta.
 pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
@@ -205,7 +272,7 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
         eprintln!("error[E0554]: `#![feature]` may not be used on the stable release channel");
         return Ok(false);
     }
-    let files = WatchedFile::sources(&vfs, &db, SystemTime::now());
+    let files = source_files(&mut db, vfs, id);
     let paths: FxHashMap<_, _> = files
         .iter()
         .filter_map(|it| match it.file {
