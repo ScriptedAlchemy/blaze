@@ -3376,6 +3376,46 @@ const GOAL: &str = CL.file();
 }
 
 #[test]
+fn source_name_reads_are_tracked_and_replay_current_observations() {
+    #[salsa::interned]
+    struct ObservedFile {
+        #[returns(copy)]
+        file: base_db::FileId,
+    }
+    #[salsa::tracked]
+    fn observe<'db>(db: &'db dyn HirDatabase, file: ObservedFile<'db>) -> Option<String> {
+        crate::mir::location::source_name(db, file.file(db))
+    }
+    let (mut db, file) = TestDB::with_single_file("fn main() {}");
+    let file = file.file_id(&db);
+    // MIR evaluation also reads filenames without an enclosing tracked evaluator.
+    assert_eq!(crate::mir::location::source_name(&db, file).as_deref(), Some("/main.rs"));
+    let check = |db: &TestDB, expected: Option<&str>| {
+        let observed = ObservedFile::new(db, file);
+        assert_eq!(observe(db, observed).as_deref(), expected);
+        let reads = observe::accumulated::<base_db::CurrentSourceName>(db, observed);
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].file, file);
+        assert_eq!(reads[0].name.as_deref(), expected);
+    };
+    check(&db, Some("/main.rs"));
+    check(&db, Some("/main.rs"));
+    let root = db.file_source_root(file).source_root_id(&db);
+    let mut files = base_db::FileSet::default();
+    files.insert(file, base_db::VfsPath::new_virtual_path("/moved.rs".into()));
+    db.set_source_root_with_durability(
+        root,
+        base_db::SourceRoot::new_local(files).into(),
+        salsa::Durability::LOW,
+    );
+    check(&db, Some("/moved.rs"));
+    crate::mir::location::name_sources(&mut db, |_, _| Some("provider.rs".into()));
+    check(&db, Some("provider.rs"));
+    crate::mir::location::name_sources(&mut db, |_, _| None);
+    check(&db, None);
+}
+
+#[test]
 fn caller_location_in_a_macro_generated_constant() {
     let fixture = r#"
 //- minicore: panic_location
