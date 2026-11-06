@@ -419,8 +419,7 @@ pub fn capture(
 ) -> anyhow::Result<Spec> {
     let subcommand = request.command.unwrap_or(Subcommand::Build);
     ensure!(Request::parse(subcommand, words)? == *request, "request does not match its words");
-    let mut first = assemble::resolve(request, ctx)?;
-    drop(first.observation.take());
+    let first = assemble::resolve_sources(request, ctx)?;
     let native = native(ctx);
     let home = environment::cargo_home(&native, ctx.cwd)
         .unwrap_or_else(|| first.graph.root.join(".blaze-cargo-home"));

@@ -1462,10 +1462,10 @@ fn capture_compares_native_observations_without_an_extra_probe() {
     let mut ctx = context(&f, &env, &host, &root);
     ctx.probe = &stable;
     capture(&request, &[], &ctx, store.path(), &[]).unwrap();
-    assert_eq!(stable.batches.get(), 3);
+    assert_eq!(stable.batches.get(), 2);
 
     let changed_store = tempfile::tempdir().unwrap();
-    let changed = ChangingProbe::new(2);
+    let changed = ChangingProbe::new(1);
     ctx.probe = &changed;
     let error = capture(&request, &[], &ctx, changed_store.path(), &[]).err().unwrap();
     let message = format!("{error:#}");
@@ -1486,7 +1486,7 @@ fn persisted_prepare_has_no_historical_observation_and_authenticates_first() {
     let env = f.env();
     let request = Request::parse(Subcommand::Build, &[]).unwrap();
     let store = tempfile::tempdir().unwrap();
-    let probe = ChangingProbe::new(3);
+    let probe = ChangingProbe::new(2);
     let mut ctx = context(&f, &env, &host, &root);
     ctx.probe = &probe;
     let made = capture(&request, &[], &ctx, store.path(), &[]).unwrap();
@@ -1522,7 +1522,7 @@ fn persisted_prepare_has_no_historical_observation_and_authenticates_first() {
         format!("{error:#}"),
         "execution machine does not match the BuildSpec: platform fields differ: native_root"
     );
-    assert_eq!(probe.batches.get(), 4);
+    assert_eq!(probe.batches.get(), 3);
 }
 
 #[test]
