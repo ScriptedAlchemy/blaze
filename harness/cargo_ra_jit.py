@@ -781,6 +781,53 @@ class VersionPeer:
                 raise RuntimeError("no replacing client crossed the version peer")
 
 
+def first_build(side, barrier, timeout=7200):
+    """Holds the first worker before readiness; the client must still be waiting."""
+    from aheadready import wait_for
+    os.makedirs(barrier)
+    hold = os.path.join(barrier, "symbols.hold")
+    open(hold, "w").close()
+    env = dict(side.env, RA_JIT_SCRIPT_BARRIER_DIR=barrier,
+               RA_JIT_SCRIPT_BARRIER_SECS=str(timeout))
+    argv = side.argv("build")
+    began = time.monotonic()
+    finished = False
+    client = None
+    with open(os.path.join(barrier, "stdout"), "w") as out, open(os.path.join(barrier, "stderr"), "w") as err:
+        try:
+            client = subprocess.Popen(argv, cwd=side.ws, env=env, stdout=out, stderr=err,
+                                      stdin=subprocess.DEVNULL, **OWN_GROUP)
+            marks = wait_for(client, lambda: glob.glob(os.path.join(barrier, "symbols.*.reached")),
+                             timeout, "the first worker's symbol barrier")
+            if len(marks) != 1:
+                raise RuntimeError(f"expected one first worker at the symbol barrier: {marks}")
+            if glob.glob(os.path.join(barrier, "*.timeout")):
+                raise RuntimeError("the first worker's symbol barrier expired")
+            with open(marks[0]) as mark:
+                worker = int(mark.read().strip())
+            if not alive(worker) or client.poll() is not None:
+                raise RuntimeError("the first client finished before its worker was released")
+            os.unlink(hold)
+            open(marks[0].removesuffix(".reached") + ".go", "w").close()
+            client.wait(timeout=max(0, timeout - (time.monotonic() - began)))
+            if glob.glob(os.path.join(barrier, "*.timeout")):
+                raise RuntimeError("the first worker's symbol barrier expired")
+            finished = True
+        finally:
+            if os.path.exists(hold):
+                os.unlink(hold)
+            for mark in glob.glob(os.path.join(barrier, "symbols.*.reached")):
+                open(mark.removesuffix(".reached") + ".go", "w").close()
+            if client is not None and client.poll() is None:
+                kill_all(client)
+                client.wait(timeout=10)
+            if client is not None and not finished:
+                side.cargo("stop", timeout=10)
+    with open(os.path.join(barrier, "stdout"), errors="replace") as out, open(os.path.join(barrier, "stderr"), errors="replace") as err:
+        ran = subprocess.CompletedProcess(argv, client.returncode, out.read(), err.read())
+    return time.monotonic() - began, ran, worker
+
+
 def daemon(work):
     """The life of the daemon. The result is each check with whether it held."""
     ws = os.path.realpath(os.path.join(work, "life"))
@@ -813,11 +860,10 @@ def daemon(work):
     edit = lambda root, text: open(os.path.join(root, "app/src/main.rs"), "a").write(f"\n// {text}\n")
 
     check("no daemon before the first build", status()[0] is None)
-    _, first = here.cargo("build")
+    _, first, first_worker = first_build(here, os.path.join(work, "life-barrier"))
     pid, workers, _ = status()
     check("the first build starts one", first.returncode == 0 and pid is not None, f"pid {pid}")
-    waited = first.stderr.count("Waiting for blaze to load the workspace")
-    check("and waits for it: the first build's program is the daemon's", how_built(first.stderr) == "daemon" and waited == 1, f"{how_built(first.stderr)}, {waited} waiting lines")
+    check("and waits for it: the first build's program is the daemon's", first.returncode == 0 and how_built(first.stderr) == "daemon" and first_worker in workers, f"{how_built(first.stderr)}, worker {first_worker} held until release")
     wait_warm(here, ws)
     # A program that runs plain `cargo build` on its own checkout, as a test suite may, after
     # the daemon built it: cargo's own artifacts are behind the sources, so cargo builds

@@ -9,6 +9,7 @@ import socket
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from unittest import mock
 
@@ -162,6 +163,88 @@ class ReportsAndFixtures(unittest.TestCase):
             self.assertTrue(reference.is_symlink())
             self.assertEqual(reference.resolve(), cargo.resolve())
             self.assertEqual(sorted(path.name for path in directory.rglob("*") if path.is_file() and not path.is_symlink()), ["rustc"])
+
+
+class FirstBuildBarrier(unittest.TestCase):
+    def side(self, root, mode="held"):
+        script = root / "worker.py"
+        script.write_text('''import json, os, sys, time
+from pathlib import Path
+if sys.argv[1] == "early":
+    raise SystemExit(7)
+barrier = Path(os.environ["RA_JIT_SCRIPT_BARRIER_DIR"])
+assert (barrier / "symbols.hold").is_file()
+if sys.argv[1] == "expired":
+    (barrier / "symbols.1.timeout").touch()
+(barrier / "symbols.1.reached").write_text(str(os.getpid()))
+if sys.argv[1] == "premature":
+    raise SystemExit(0)
+while not (barrier / "symbols.1.go").exists():
+    time.sleep(0.001)
+assert not (barrier / "symbols.hold").exists()
+print(json.dumps({"seconds": os.environ["RA_JIT_SCRIPT_BARRIER_SECS"], "released": True}))
+''')
+        side = types.SimpleNamespace(ws=str(root), env=dict(os.environ), stops=[])
+        side.argv = lambda command: [sys.executable, str(script), mode]
+        side.cargo = lambda command, **kwargs: side.stops.append((command, kwargs))
+        return side
+
+    def test_real_client_waits_for_release_and_barrier_env_is_invocation_owned(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            side = self.side(root)
+            before = side.env.copy()
+            barrier = root / "barrier"
+            _, ran, worker = harness.first_build(side, str(barrier), timeout=2)
+            self.assertEqual(ran.returncode, 0)
+            self.assertEqual(json.loads(ran.stdout), {"seconds": "2", "released": True})
+            self.assertEqual(ran.stderr, "")
+            self.assertEqual(worker, int((barrier / "symbols.1.reached").read_text()))
+            self.assertFalse(harness.alive(worker))
+            self.assertFalse((barrier / "symbols.hold").exists())
+            self.assertTrue((barrier / "symbols.1.go").is_file())
+            self.assertEqual(side.env, before)
+            self.assertEqual(side.stops, [])
+
+    def test_client_exit_before_the_worker_barrier_cannot_pass(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            side = self.side(root, "early")
+            with self.assertRaisesRegex(RuntimeError, "client ended 7 before"):
+                harness.first_build(side, str(root / "barrier"), timeout=2)
+            self.assertFalse((root / "barrier/symbols.hold").exists())
+            self.assertEqual(side.stops, [("stop", {"timeout": 10})])
+            self.assertTrue((root / "barrier/stderr").exists())
+
+    def test_expired_barrier_fails_and_releases_or_ends_its_worker(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            side = self.side(root, "expired")
+            barrier = root / "barrier"
+            with self.assertRaisesRegex(RuntimeError, "symbol barrier expired"):
+                harness.first_build(side, str(barrier), timeout=2)
+            self.assertFalse((barrier / "symbols.hold").exists())
+            self.assertTrue((barrier / "symbols.1.go").is_file())
+            worker = int((barrier / "symbols.1.reached").read_text())
+            self.assertFalse(harness.alive(worker))
+            self.assertEqual(side.stops, [("stop", {"timeout": 10})])
+
+    def test_a_completed_client_cannot_pass_even_if_its_worker_is_alive(self):
+        import aheadready
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            side = self.side(root, "premature")
+
+            def finished(client, condition, seconds, what):
+                client.wait(timeout=seconds)
+                return condition()
+
+            with mock.patch.object(aheadready, "wait_for", side_effect=finished), mock.patch.object(harness, "alive", return_value=True):
+                with self.assertRaisesRegex(RuntimeError, "client finished before its worker was released"):
+                    harness.first_build(side, str(root / "barrier"), timeout=2)
+            self.assertFalse((root / "barrier/symbols.hold").exists())
+            self.assertTrue((root / "barrier/symbols.1.go").is_file())
+            self.assertEqual(side.stops, [("stop", {"timeout": 10})])
 
 
 class ProgramOutput(unittest.TestCase):
