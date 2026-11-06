@@ -671,7 +671,14 @@ fn local_extern_bindings_preserve_the_object_symbol_and_batch_policy() {
         let bindings = ObjectBindings::new(object.module.declarations(), &object.type_ids, &later);
         let entry = object
             .keeper(None)
-            .entry(&root_instance(&db, root), compiled, &bindings, None)
+            .entry(
+                &root_instance(&db, root),
+                &ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate }
+                    .store(),
+                compiled,
+                &bindings,
+                None,
+            )
             .unwrap();
         assert_eq!(
             entry.funcs[0].target,
@@ -721,19 +728,27 @@ fn real_object_bindings_and_batch_bindings_construct_identical_entries() {
         let laters = std::mem::take(&mut object.later);
         assert!(laters.len() > roots.len());
         for later in &laters {
-            let instance = match &later.of {
-                later::Of::Root { func, .. } => root_instance(&db, *func),
-                later::Of::Instance { instance, .. } => instance.clone(),
+            let (instance, environment) = match &later.of {
+                later::Of::Root { func, .. } => (
+                    root_instance(&db, *func),
+                    ParamEnvAndCrate {
+                        param_env: hir_ty::next_solver::ParamEnv::empty(),
+                        krate: func.krate(&db),
+                    }
+                    .store(),
+                ),
+                later::Of::Instance { instance, env } => (instance.clone(), env.clone()),
             };
             let bindings =
                 ObjectBindings::new(object.module.declarations(), &object.type_ids, later);
             let mut keeper = object.keeper(None);
             let debug = keeper.describe_function(&later.of, later.compiled, None, false);
             let local = keeper
-                .entry(&instance, later.compiled, &bindings, debug.clone())
+                .entry(&instance, &environment, later.compiled, &bindings, debug.clone())
                 .unwrap_or_else(|| panic!("object entry: {:?}", keeper.kept.unkept));
-            let exported =
-                keeper.entry(&instance, later.compiled, &context, debug).unwrap_or_else(|| {
+            let exported = keeper
+                .entry(&instance, &environment, later.compiled, &context, debug)
+                .unwrap_or_else(|| {
                     for request in &later.compiled.requests.funcs {
                         let kind = match &request.target {
                             FuncTarget::Symbol(symbol) | FuncTarget::Path(symbol) => symbol.clone(),
@@ -918,6 +933,109 @@ fn mismatches_corruption_and_missing_types_never_admit_a_receipt() {
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     });
+}
+
+#[test]
+fn imported_closure_rechecks_concrete_callee_source_names() {
+    store::compiles_against("1.99.0");
+    const SOURCE: &str = r#"
+//- minicore: sized
+//- /src/lib.rs crate:case
+#[rustc_builtin_macro] macro_rules! file {}
+#[rustc_intrinsic] const unsafe fn size_of_val<T: ?Sized>(value: *const T) -> usize;
+struct Aggregate { width: usize }
+struct Block<T>([T; 0]);
+impl<T> Block<T> {
+    const VALUE: Aggregate = Aggregate { width: unsafe { size_of_val(file!() as *const str) } };
+}
+fn helper<T>() -> usize { Block::<T>::VALUE.width }
+pub fn root() -> usize { helper::<u8>() }
+"#;
+    fn database(name: Option<&'static str>) -> (RootDatabase, FunctionId) {
+        let (mut db, _) = RootDatabase::with_single_file(SOURCE);
+        hir_ty::mir::location::name_sources(&mut db, move |_, _| name.map(str::to_owned));
+        let root = hir::attach_db(&db, || {
+            let krate =
+                *base_db::all_crates(&db).iter().find(|it| it.data(&db).origin.is_local()).unwrap();
+            hir_def::nameres::crate_def_map(&db, krate)
+                .modules(&db)
+                .flat_map(|(_, module)| module.scope(&db).declarations())
+                .find_map(|def| match def {
+                    hir_def::ModuleDefId::FunctionId(id)
+                        if FunctionSignature::of(&db, id).name.as_str() == "root" =>
+                    {
+                        Some(id)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        });
+        (db, root)
+    }
+    let directory = scratch("concrete-source-inputs");
+    let store = store::Store::owned(&directory).unwrap();
+    let (db, root) = database(Some("short.rs"));
+    let (context_digest, receipt) = hir::attach_db(&db, || {
+        let symbols = Symbols { db: &db, debug: false };
+        let context = ExportContext::resolved(
+            &db,
+            &symbols,
+            base_db::all_crates(&db).iter().copied(),
+            &[root],
+            policy(false),
+        )
+        .unwrap();
+        let requests = all_requests(&context, &[root], &store);
+        let batch = compile_batch(&context, context.digest(), &requests, &store).unwrap();
+        require_exported(&batch, requests.len());
+        assert!(batch.receipt.entries.iter().any(|it| stable::has_semantic_inputs(&it.work.name)));
+        validate_receipt(&context, &store, &batch.receipt).unwrap();
+        admitted_closure(&context, &store, &batch.receipt).unwrap();
+        (context.digest(), batch.receipt)
+    });
+    for name in [Some("other.rs"), None] {
+        let (db, root) = database(name);
+        hir::attach_db(&db, || {
+            let symbols = Symbols { db: &db, debug: false };
+            let context = ExportContext::resolved(
+                &db,
+                &symbols,
+                base_db::all_crates(&db).iter().copied(),
+                &[root],
+                policy(false),
+            )
+            .unwrap();
+            assert_eq!(
+                context.digest(),
+                context_digest,
+                "caller identity intentionally has no direct filename read"
+            );
+            assert!(
+                validate_receipt(&context, &store, &receipt)
+                    .unwrap_err()
+                    .contains("concrete semantic inputs")
+            );
+            let mut transitive = receipt.clone();
+            transitive.entries.retain(|it| !stable::has_semantic_inputs(&it.work.name));
+            assert!(!transitive.entries.is_empty());
+            validate_receipt(&context, &store, &transitive).unwrap();
+            assert!(
+                admitted_closure(&context, &store, &transitive)
+                    .unwrap_err()
+                    .contains("concrete semantic inputs")
+            );
+            let staging = scratch("changed-concrete-source-inputs");
+            assert!(
+                import_batch(&context, &transitive, &staging, |name| store.pack(name))
+                    .err()
+                    .unwrap()
+                    .contains("concrete semantic inputs")
+            );
+            assert!(!staging.exists());
+        });
+    }
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1181,8 +1299,15 @@ fn real_type_id_request_and_constant_blob_derive_the_same_full_value_as_the_obje
                 ObjectBindings::new(object.module.declarations(), &object.type_ids, later);
             let mut keeper = object.keeper(None);
             let instance = root_instance(&db, func);
-            let local = keeper.entry(&instance, later.compiled, &bindings, None).unwrap();
-            let exported = keeper.entry(&instance, later.compiled, &context, None).unwrap();
+            let environment = ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate: func.krate(&db),
+            }
+            .store();
+            let local =
+                keeper.entry(&instance, &environment, later.compiled, &bindings, None).unwrap();
+            let exported =
+                keeper.entry(&instance, &environment, later.compiled, &context, None).unwrap();
             assert_eq!(local.encode(), exported.encode());
         }
         drop(store);

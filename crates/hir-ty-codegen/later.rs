@@ -69,7 +69,7 @@ pub(super) struct Keeper<'k, 'db> {
     pub(super) db: &'db dyn HirDatabase,
     pub(super) symbols: &'k dyn SymbolResolver,
     pub(super) names: &'k stable::StableNames<'k, 'db>,
-    pub(super) stable_names: &'k mut FxHashMap<Instance, Option<StableName>>,
+    pub(super) stable_names: &'k mut FxHashMap<NamedInstance, Option<StableName>>,
     pub(super) source_paths: &'k mut FxHashMap<base_db::FileId, Option<String>>,
     pub(super) kept: &'k mut Kept,
     pub(super) root_names: &'k FxHashMap<StableName, Option<FunctionId>>,
@@ -101,13 +101,20 @@ impl<'db> Keeper<'_, 'db> {
             later.tiered,
         );
         let kept = later.keeps.then(|| match &later.of {
-            Of::Root { func, .. } => root_instance(self.db, *func),
-            Of::Instance { instance, .. } => instance.clone(),
+            Of::Root { func, .. } => (
+                root_instance(self.db, *func),
+                ParamEnvAndCrate {
+                    param_env: hir_ty::next_solver::ParamEnv::empty(),
+                    krate: func.krate(self.db),
+                }
+                .store(),
+            ),
+            Of::Instance { instance, env } => (instance.clone(), env.clone()),
         });
-        let kept = kept.and_then(|instance| {
+        let kept = kept.and_then(|(instance, env)| {
             let tally = backend::Tally::global();
             tally.step(Step::StoreWrite, || {
-                self.keep(&instance, later.compiled, bindings, debug.clone())
+                self.keep(&instance, &env, later.compiled, bindings, debug.clone())
             })
         });
         Made { debug, kept }
@@ -182,13 +189,27 @@ impl<'db> Keeper<'_, 'db> {
         self.describe(compiled, rows, debug, declared, told)
     }
 
-    fn stable_name(&mut self, instance: &Instance) -> Option<StableName> {
-        if let Some(known) = self.stable_names.get(instance) {
+    fn stable_name_in(
+        &mut self,
+        instance: &Instance,
+        environment: &StoredParamEnvAndCrate,
+    ) -> Option<StableName> {
+        let key = (instance.clone(), Some(environment.clone()));
+        if let Some(known) = self.stable_names.get(&key) {
             return known.clone();
         }
-        let name = self.names.instance(instance).map(StableName::from);
-        self.stable_names.insert(instance.clone(), name.clone());
+        let name = self.names.instance_in(instance, environment).map(StableName::from);
+        self.stable_names.insert(key, name.clone());
         name
+    }
+
+    fn callee_name_in(
+        &mut self,
+        instance: &Instance,
+        asked: &StoredParamEnvAndCrate,
+    ) -> Option<StableName> {
+        let environment = home::Homes::default().home(self.db, instance, asked);
+        self.stable_name_in(instance, &environment)
     }
 
     fn source_path(&mut self, file: base_db::FileId) -> Option<String> {
@@ -336,22 +357,24 @@ impl<'db> Keeper<'_, 'db> {
     fn keep(
         &mut self,
         instance: &Instance,
+        environment: &StoredParamEnvAndCrate,
         compiled: &CompiledFunction,
         bindings: &dyn export::Bindings,
         debug: Option<FunctionDebug>,
     ) -> Option<cached::Kept> {
         store::Store::global().filter(|_| self.own)?;
-        let Some(name) = self.stable_name(instance) else {
+        let Some(name) = self.stable_name_in(instance, environment) else {
             self.kept.unnamed += 1;
             return None;
         };
-        self.keep_named(instance, true, compiled, bindings, debug, name)
+        self.keep_named(instance, environment, true, compiled, bindings, debug, name)
     }
 
     /// Compiler-generated code has its own name and no source body to mark for a patch.
     pub(super) fn keep_named(
         &mut self,
         instance: &Instance,
+        environment: &StoredParamEnvAndCrate,
         track_source: bool,
         compiled: &CompiledFunction,
         bindings: &dyn export::Bindings,
@@ -366,7 +389,7 @@ impl<'db> Keeper<'_, 'db> {
             return Some(cached::Kept::Types(sets()));
         }
         let described = debug.is_some();
-        let Some(mut entry) = self.entry(instance, compiled, bindings, debug) else {
+        let Some(mut entry) = self.entry(instance, environment, compiled, bindings, debug) else {
             self.kept.unnamed_requests += 1;
             return None;
         };
@@ -456,6 +479,7 @@ impl<'db> Keeper<'_, 'db> {
     pub(super) fn entry(
         &mut self,
         instance: &Instance,
+        environment: &StoredParamEnvAndCrate,
         compiled: &CompiledFunction,
         bindings: &dyn export::Bindings,
         debug: Option<FunctionDebug>,
@@ -488,7 +512,7 @@ impl<'db> Keeper<'_, 'db> {
                 let checked = self.symbols.provides(&symbol);
                 let mut copied = None;
                 let callee = match &request.target {
-                    FuncTarget::Instance(callee, _) if !foreign(callee) => {
+                    FuncTarget::Instance(callee, asked) if !foreign(callee) => {
                         let Some(callee) = self.settled(at, callee) else {
                             return self.kept.unkept("unsettled callee");
                         };
@@ -500,7 +524,7 @@ impl<'db> Keeper<'_, 'db> {
                             }
                             _ => None,
                         };
-                        Some(self.stable_name(&callee))
+                        Some(self.callee_name_in(&callee, asked))
                     }
                     _ => None,
                 };
@@ -530,11 +554,11 @@ impl<'db> Keeper<'_, 'db> {
                     }
                     _ => CachedTarget::Import { symbol, checked },
                 }
-            } else if let FuncTarget::Instance(callee, _) = &request.target {
+            } else if let FuncTarget::Instance(callee, asked) = &request.target {
                 let Some(callee) = &self.settled(at, callee) else {
                     return self.kept.unkept("unsettled callee");
                 };
-                let Some(name) = self.stable_name(callee) else {
+                let Some(name) = self.callee_name_in(callee, asked) else {
                     return self.kept.unkept("unnamed callee");
                 };
                 // A function the program is built from has no entry: it is compiled anew.
@@ -554,8 +578,9 @@ impl<'db> Keeper<'_, 'db> {
             funcs.push(CachedFunc { target, sig: request.sig.clone() });
         }
         // Only a crate of the checkout is compiled with where the checkout is.
-        let placed =
-            self.stable_name(instance).is_some_and(|it| stable::StableNames::of_checkout(&it));
+        let placed = self
+            .stable_name_in(instance, environment)
+            .is_some_and(|it| stable::StableNames::of_checkout(&it));
         let home = self.symbols.cargo_home();
         let library = self.symbols.library_sources();
         let mut datas = Vec::with_capacity(compiled.requests.datas.len());
@@ -652,6 +677,7 @@ impl<'db> Keeper<'_, 'db> {
             code: cached::CachedCode::from(&compiled.code),
             debug,
             tracked: None,
+            semantic: self.names.semantic_inputs(instance, environment)?,
         })
     }
 }

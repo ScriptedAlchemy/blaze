@@ -794,7 +794,7 @@ impl<'db> AnonConstId<'db> {
 
 /// A constant, which might appears as a const item, an anonymous const block in expressions
 /// or patterns, or as a constant in types with const generics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype, salsa::SalsaValue)]
 pub enum GeneralConstId<'db> {
     ConstId(ConstId),
     StaticId(StaticId),

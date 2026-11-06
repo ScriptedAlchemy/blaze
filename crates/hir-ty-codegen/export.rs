@@ -246,7 +246,18 @@ impl<'a, 'db> ExportContext<'a, 'db> {
                 (instance.clone(), env.krate)
             }
         };
-        let name = self.names.instance(&instance).ok_or("request has no portable stable name")?;
+        let environment = match &request.kind {
+            LocalKind::Root(root) => ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate: root.krate(self.db),
+            }
+            .store(),
+            LocalKind::Instance(_, env) => env.clone(),
+        };
+        let name = self
+            .names
+            .instance_in(&instance, &environment)
+            .ok_or("request has no portable stable name")?;
         if !self.owned.contains(&home) {
             return Err("request home is outside the resolved owned closure".into());
         }
@@ -279,7 +290,7 @@ impl<'a, 'db> ExportContext<'a, 'db> {
 
     fn keeper<'k>(
         &'k self,
-        stable_names: &'k mut FxHashMap<Instance, Option<StableName>>,
+        stable_names: &'k mut FxHashMap<NamedInstance, Option<StableName>>,
         source_paths: &'k mut FxHashMap<base_db::FileId, Option<String>>,
         kept: &'k mut Kept,
         told: &'k ToldTypes,
@@ -512,9 +523,18 @@ pub fn compile_batch(
             outcomes.push(Outcome::Local { work: Ok(work), why });
             continue;
         }
+        let environment = match &request.kind {
+            LocalKind::Root(root) => ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate: root.krate(context.db),
+            }
+            .store(),
+            LocalKind::Instance(_, env) => env.clone(),
+        };
         let debug = keeper.describe_function(&of, compiled, None, false);
         let described = debug.is_some();
-        let Some(mut entry) = keeper.entry(&instance, compiled, context, debug) else {
+        let Some(mut entry) = keeper.entry(&instance, &environment, compiled, context, debug)
+        else {
             let mut reasons = keeper.kept.unkept.keys().copied().collect::<Vec<_>>();
             reasons.sort();
             let why = reasons.join("; ");
@@ -584,6 +604,7 @@ fn validate_receipt(
         keys.extend(store::pack_keys(name, &bytes).map_err(str::to_owned)?);
     }
     let mut entries = FxHashMap::default();
+    let semantic_sources = context.names.semantic_sources();
     for exported in &receipt.entries {
         if !context.owned.iter().any(|&krate| {
             context.names.content_id(krate).is_some_and(|id| id.0 == exported.work.home)
@@ -616,6 +637,9 @@ fn validate_receipt(
             return Err("receipt entry digest mismatch".into());
         }
         let mut entry = cached::Entry::decode(&bytes).ok_or("invalid entry references")?;
+        if !entry.semantic_matches(&exported.work.name, &semantic_sources) {
+            return Err("receipt concrete semantic inputs differ from the current context".into());
+        }
         // An entry is described as the crate its code is written in is built, which its name
         // says where that is not as the build's own code is.
         let told = stable::told_in(&exported.work.name)
@@ -813,10 +837,14 @@ pub(super) fn admitted_closure(
     let mut admitted: Vec<(String, Digest256)> =
         receipt.entries.iter().map(|it| (it.work.name.clone(), it.key)).collect();
     let mut seen: FxHashSet<Digest256> = admitted.iter().map(|(_, key)| *key).collect();
-    let mut stack: Vec<Digest256> = seen.iter().copied().collect();
-    while let Some(key) = stack.pop() {
+    let mut stack = admitted.clone();
+    let semantic_sources = context.names.semantic_sources();
+    while let Some((name, key)) = stack.pop() {
         let bytes = store.get_installed(&key).ok_or("closure entry missing")?;
         let entry = cached::Entry::decode(&bytes).ok_or("closure entry invalid")?;
+        if !entry.semantic_matches(&name, &semantic_sources) {
+            return Err("closure concrete semantic inputs differ from the current context".into());
+        }
         if entry.datas.iter().any(|it| matches!(it, cached::CachedData::OwnStatic(_))) {
             return Err("receipt closure requires the owned-static batch exporter".into());
         }
@@ -849,7 +877,7 @@ pub(super) fn admitted_closure(
                 return Err(format!("receipt closure lacks `{name}`"));
             }
             admitted.push((name.clone(), target));
-            stack.push(target);
+            stack.push((name.clone(), target));
         }
     }
     Ok(admitted)
@@ -912,7 +940,8 @@ impl Imported {
             context.symbols.cargo_home(),
             context.symbols.library_sources(),
         )
-        .in_checkout(context.symbols.checkout()))
+        .in_checkout(context.symbols.checkout())
+        .in_semantic_sources(context.names.semantic_sources()))
     }
 }
 

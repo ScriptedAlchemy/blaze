@@ -34,6 +34,27 @@ const OF_CHECKOUT: char = '~';
 /// After the name of an instance compiled with `-C overflow-checks`.
 const CHECKED: &str = " checked";
 
+const SEMANTIC_INPUTS: &str = " inputs1:";
+
+pub(super) fn without_semantic_inputs(name: &str) -> &str {
+    match name.rsplit_once(SEMANTIC_INPUTS) {
+        Some((name, hash)) if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            name
+        }
+        _ => name,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn has_semantic_inputs(name: &str) -> bool {
+    without_semantic_inputs(name).len() != name.len()
+}
+
+pub(super) fn semantic_digest(name: &str) -> Option<&str> {
+    let (base, digest) = name.rsplit_once(SEMANTIC_INPUTS)?;
+    (without_semantic_inputs(name) == base).then_some(digest)
+}
+
 /// Before what stands for a crate from outside the checkout that rustc has no id for.
 const OF_LIBRARY: char = '^';
 
@@ -248,6 +269,124 @@ impl<'a, 'db> StableNames<'a, 'db> {
 
     /// `None` for an instance that names anything this has no stable name for.
     pub(super) fn instance(&self, instance: &Instance) -> Option<String> {
+        let Some(krate) = super::written_in(self.db, instance.def) else {
+            return self.raw_instance(instance);
+        };
+        let asked =
+            hir_ty::ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate }
+                .store();
+        let environment = super::home::Homes::default().home(self.db, instance, &asked);
+        self.instance_in(instance, &environment)
+    }
+
+    pub(super) fn instance_in(
+        &self,
+        instance: &Instance,
+        environment: &hir_ty::traits::StoredParamEnvAndCrate,
+    ) -> Option<String> {
+        let mut name = self.raw_instance(instance)?;
+        if let Some(inputs) = self.semantic_inputs(instance, environment)? {
+            name.push_str(SEMANTIC_INPUTS);
+            name.push_str(&inputs.digest());
+        }
+        Some(name)
+    }
+
+    pub(super) fn semantic_inputs(
+        &self,
+        instance: &Instance,
+        environment: &hir_ty::traits::StoredParamEnvAndCrate,
+    ) -> Option<Option<super::cached::SemanticInputs>> {
+        use hir_ty::consteval::inputs::{BodyInput, BodyKind, prepare_constants};
+        use hir_ty::db::GeneralConstId;
+        if !environment.param_env(self.db).clauses().is_empty() {
+            return self.miss("semantic preparation with caller bounds");
+        }
+        let kind = match instance.def {
+            InstanceDef::Fn(function) => {
+                let signature = hir_def::signatures::FunctionSignature::of(self.db, function);
+                if !signature.has_body()
+                    || signature.flags.contains(hir_def::signatures::FnFlags::RUSTC_INTRINSIC)
+                {
+                    return Some(None);
+                }
+                BodyKind::Body(function.into())
+            }
+            InstanceDef::Closure(id) => BodyKind::Closure(InternedClosureId::from_id(id)),
+            InstanceDef::Coroutine(id) => BodyKind::Coroutine(InternedCoroutineId::from_id(id)),
+            InstanceDef::CoroutineByMove(id) => {
+                BodyKind::CoroutineByMove(InternedCoroutineId::from_id(id))
+            }
+            _ => return Some(None),
+        };
+        let input = BodyInput::new(self.db, kind, instance.args.clone(), environment.clone());
+        let prepared = prepare_constants(self.db, input);
+        if prepared.result.is_err() {
+            return self.miss("concrete constant preparation failed");
+        }
+        if prepared.source_names.is_empty() {
+            return Some(None);
+        }
+        let mut fields = Vec::new();
+        for selection in &prepared.selections {
+            let mut name = String::new();
+            match selection.definition {
+                GeneralConstId::ConstId(id) => {
+                    let at = id.lookup(self.db).id;
+                    self.item(&mut name, id.krate(self.db), at.file_id, at.value.erase())?;
+                }
+                GeneralConstId::StaticId(id) => {
+                    let at = id.lookup(self.db).id;
+                    self.item(&mut name, id.krate(self.db), at.file_id, at.value.erase())?;
+                }
+                GeneralConstId::AnonConstId(id) => {
+                    let loc = id.loc(self.db);
+                    let (_, map) =
+                        hir_def::expr_store::ExpressionStore::with_source_map(self.db, loc.owner);
+                    let source = map.expr_syntax(loc.expr).ok()?;
+                    self.file(&mut name, source.file_id)?;
+                    write!(name, "@{:?}", source.value.syntax_node_ptr().text_range()).ok()?;
+                }
+            }
+            self.args(&mut name, selection.arguments.as_ref())?;
+            fields.push(name);
+        }
+        fields.sort();
+        fields.dedup();
+        let mut sources = prepared
+            .source_names
+            .iter()
+            .map(|read| {
+                Some(super::cached::SemanticSource {
+                    file: self.file_path(read.file)?,
+                    name: read.name.clone()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        sources.sort();
+        sources.dedup();
+        let inputs = super::cached::SemanticInputs { constants: fields, sources };
+        inputs.canonical().then_some(Some(inputs))
+    }
+
+    pub(super) fn semantic_sources(&self) -> super::cached::SemanticSources {
+        let mut values = super::cached::SemanticSources::default();
+        let mut seen = FxHashSet::default();
+        for &krate in base_db::all_crates(self.db).iter() {
+            let root =
+                self.db.file_source_root(krate.data(self.db).root_file_id).source_root_id(self.db);
+            for file in self.db.source_root(root).source_root(self.db).iter() {
+                if seen.insert(file)
+                    && let Some(path) = self.file_path(file)
+                {
+                    values.insert(path, hir_ty::mir::location::source_name(self.db, file));
+                }
+            }
+        }
+        values
+    }
+
+    fn raw_instance(&self, instance: &Instance) -> Option<String> {
         let mut out = String::new();
         match instance.def {
             InstanceDef::Fn(func) => {
@@ -319,6 +458,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
     /// The functions an instance without arguments can be of: one for each crate that the
     /// one build of its crate is here.
     pub(super) fn functions_named(&self, name: &str) -> Vec<FunctionId> {
+        let name = without_semantic_inputs(name);
         let name = name.strip_suffix(CHECKED).unwrap_or(name);
         // An instance of a library's function with a type of the checkout is asked about
         // too, and no function without type parameters is named so: its crate is not listed.

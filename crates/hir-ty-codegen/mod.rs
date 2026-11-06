@@ -64,7 +64,7 @@ use hir_ty::{
     db::{GeneralConstId, InternedClosureId, InternedCoroutineId},
     drop::{DropGlue, destructor, has_drop_glue},
     layout::{CoroutineFrame, Layout, RustcEnumVariantIdx, RustcFieldIdx},
-    method_resolution::{is_dyn_method, lookup_impl_const},
+    method_resolution::is_dyn_method,
     next_solver::{
         Allocation, AllocationData, ConstKind, DbInterner, GenericArgs, Region, StoredGenericArgs,
         StoredTy, TraitRef, Ty, TyKind, TypingMode, UnevaluatedConst, ValTree,
@@ -1780,6 +1780,8 @@ struct Instance {
     checked: bool,
 }
 
+type NamedInstance = (Instance, Option<StoredParamEnvAndCrate>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum InstanceDef {
     Fn(FunctionId),
@@ -2221,7 +2223,7 @@ struct ObjectCodegen<'a, 'db> {
     names: stable::StableNames<'a, 'db>,
     /// Whether the code of the checkout's crates can come from the store.
     hydrate: bool,
-    stable_names: FxHashMap<Instance, Option<StableName>>,
+    stable_names: FxHashMap<NamedInstance, Option<StableName>>,
     kept: Kept,
     /// The functions in the object whose description and entry of the store are still to
     /// be made ([`later`]).
@@ -5185,6 +5187,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 us(start.elapsed() - settled_at),
             );
         }
+        let semantic_sources = store.map(|_| names.semantic_sources()).unwrap_or_default();
         Ok(ObjectCodegen {
             db,
             symbols,
@@ -5245,7 +5248,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let (home, library) = (symbols.cargo_home(), symbols.library_sources());
                     std::sync::Arc::new(
                         cached::Entries::new(store, debugged, program.flatten(), home, library)
-                            .in_checkout(symbols.checkout()),
+                            .in_checkout(symbols.checkout())
+                            .in_semantic_sources(semantic_sources),
                     )
                 }),
             named: FxHashMap::default(),
@@ -5578,8 +5582,20 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let later = later::Later::new(&self.module, id, of, compiled, ids);
             let bindings =
                 export::ObjectBindings::new(self.module.declarations(), &self.type_ids, &later);
-            let kept =
-                self.keeper(None).keep_named(&instance, false, compiled, &bindings, None, name);
+            let environment = ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate: main.krate(self.db),
+            }
+            .store();
+            let kept = self.keeper(None).keep_named(
+                &instance,
+                &environment,
+                false,
+                compiled,
+                &bindings,
+                None,
+                name,
+            );
             self.apply(&later, later::Made { debug: None, kept });
         }
         Ok(())
@@ -6061,11 +6077,26 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn stable_name(&mut self, instance: &Instance) -> Option<StableName> {
-        if let Some(known) = self.stable_names.get(instance) {
+        let key = (instance.clone(), None);
+        if let Some(known) = self.stable_names.get(&key) {
             return known.clone();
         }
         let name = self.names.instance(instance).map(StableName::from);
-        self.stable_names.insert(instance.clone(), name.clone());
+        self.stable_names.insert(key, name.clone());
+        name
+    }
+
+    fn stable_name_in(
+        &mut self,
+        instance: &Instance,
+        environment: &StoredParamEnvAndCrate,
+    ) -> Option<StableName> {
+        let key = (instance.clone(), Some(environment.clone()));
+        if let Some(known) = self.stable_names.get(&key) {
+            return known.clone();
+        }
+        let name = self.names.instance_in(instance, environment).map(StableName::from);
+        self.stable_names.insert(key, name.clone());
         name
     }
 
@@ -7076,7 +7107,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             unsupported!("call to `{name}`, which has no body and no rustc symbol");
         }
         let from_store = self.entries.is_some() || self.base.is_some_and(|it| !it.found.is_empty());
-        let stable = if from_store { self.stable_name(instance) } else { None };
+        let semantic_environment = self.homes.home(self.db, instance, env);
+        let stable =
+            if from_store { self.stable_name_in(instance, &semantic_environment) } else { None };
         if let Some(name) = &stable {
             if let Some(symbol) = self.base.and_then(|base| base.found.get(name))
                 && self.symbols.linked(symbol)
@@ -10127,20 +10160,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     fn eval_const(&mut self, unevaluated: UnevaluatedConst<'db>) -> Result<Allocation<'db>> {
         let db = self.cg.db;
-        let UnevaluatedConst { def, args } = unevaluated;
         let frontend = |e: hir_ty::consteval::ConstEvalError<'db>| {
             CodegenError::Frontend(format!("const eval: {}", e.diagnostic(db)))
         };
-        match def.0 {
-            GeneralConstId::ConstId(id) => {
-                let (id, args) = lookup_impl_const(&self.infcx, self.env.param_env, id, args);
-                db.const_eval(id, args, Some(self.env)).map_err(frontend)
-            }
-            GeneralConstId::StaticId(id) => db.const_eval_static(id).map_err(frontend),
-            GeneralConstId::AnonConstId(id) => {
-                db.anon_const_eval(id, args, Some(self.env)).map_err(frontend)
-            }
-        }
+        let environment = self.env.store();
+        let selection = hir_ty::consteval::inputs::select_constant_in_context(
+            &self.infcx,
+            unevaluated,
+            &environment,
+        );
+        hir_ty::consteval::inputs::evaluate_selection(db, &selection, &environment)
+            .value
+            .map_err(frontend)
     }
 
     fn blob_addr(&mut self, blob: ConstBlob) -> Result<Value> {

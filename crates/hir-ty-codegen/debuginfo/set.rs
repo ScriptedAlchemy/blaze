@@ -1089,6 +1089,7 @@ mod tests {
             };
             let mut entry = cached::Entry {
                 label: "test".into(),
+                semantic: None,
                 funcs: vec![],
                 datas: vec![],
                 code: (&code).into(),

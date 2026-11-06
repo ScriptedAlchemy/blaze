@@ -42,6 +42,91 @@ pub(super) struct Entry {
     /// For code of the checkout: what a patch base that has it from the store tells an edit
     /// of it by, without compiling it.
     pub(super) tracked: Option<Tracked>,
+    pub(super) semantic: Option<SemanticInputs>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct SemanticSource {
+    pub(super) file: String,
+    pub(super) name: String,
+}
+
+/// Current CTFE observations, sealed into both the name/key and the entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct SemanticInputs {
+    pub(super) constants: Vec<String>,
+    pub(super) sources: Vec<SemanticSource>,
+}
+
+impl SemanticInputs {
+    pub(super) fn canonical(&self) -> bool {
+        !self.sources.is_empty()
+            && self.constants.windows(2).all(|pair| pair[0] < pair[1])
+            && self.sources.windows(2).all(|pair| pair[0].file < pair[1].file)
+    }
+
+    pub(super) fn digest(&self) -> String {
+        use std::fmt::Write;
+        let mut hash = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        };
+        field(b"blaze concrete semantic inputs 1");
+        for constant in &self.constants {
+            field(&[0]);
+            field(constant.as_bytes());
+        }
+        for source in &self.sources {
+            field(&[1]);
+            field(source.file.as_bytes());
+            field(source.name.as_bytes());
+        }
+        let mut digest = String::new();
+        for byte in hash.finalize() {
+            write!(digest, "{byte:02x}").unwrap();
+        }
+        digest
+    }
+}
+
+/// An immutable compile/admission view, never an accumulated dependency trace.
+#[derive(Debug, Clone, Default)]
+pub(super) struct SemanticSources {
+    values: FxHashMap<String, Option<String>>,
+    ambiguous: FxHashSet<String>,
+}
+
+impl SemanticSources {
+    pub(super) fn insert(&mut self, file: String, name: Option<String>) {
+        if let Some(previous) = self.values.get(&file) {
+            if previous != &name {
+                self.ambiguous.insert(file);
+            }
+        } else {
+            self.values.insert(file, name);
+        }
+    }
+
+    fn matches(&self, source: &SemanticSource) -> bool {
+        !self.ambiguous.contains(&source.file)
+            && self.values.get(&source.file).and_then(Option::as_deref)
+                == Some(source.name.as_str())
+    }
+}
+
+impl Entry {
+    pub(super) fn semantic_matches(&self, name: &str, sources: &SemanticSources) -> bool {
+        match (&self.semantic, super::stable::semantic_digest(name)) {
+            (None, None) => true,
+            (Some(inputs), Some(digest)) => {
+                inputs.canonical()
+                    && inputs.digest() == digest
+                    && inputs.sources.iter().all(|source| sources.matches(source))
+            }
+            _ => false,
+        }
+    }
 }
 
 /// What a patch base knows of an entry of the checkout. See [`super::patch::stable_mark`].
@@ -435,7 +520,7 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit entry 13");
+        field(b"ra-jit entry 14");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());
@@ -595,6 +680,7 @@ pub(super) struct Entries {
     /// The checkout's directory here.
     checkout: Option<String>,
     known: Mutex<Known>,
+    semantic_sources: SemanticSources,
 }
 
 enum EntryStore {
@@ -912,6 +998,7 @@ impl Entries {
             library,
             checkout: None,
             known: Mutex::default(),
+            semantic_sources: SemanticSources::default(),
         }
     }
 
@@ -919,6 +1006,11 @@ impl Entries {
     /// in it.
     pub(super) fn in_checkout(mut self, root: Option<String>) -> Entries {
         self.checkout = root;
+        self
+    }
+
+    pub(super) fn in_semantic_sources(mut self, sources: SemanticSources) -> Entries {
+        self.semantic_sources = sources;
         self
     }
 
@@ -941,6 +1033,7 @@ impl Entries {
             library,
             checkout: None,
             known: Mutex::default(),
+            semantic_sources: SemanticSources::default(),
         }
     }
 
@@ -977,6 +1070,9 @@ impl Entries {
             let key =
                 admitted_key.or_else(|| Entry::key(name, self.debug, self.program.as_ref()))?;
             let mut entry = Entry::decode(&self.store.get(&key)?)?;
+            if !entry.semantic_matches(name, &self.semantic_sources) {
+                return None;
+            }
             if let Some(debug) = &mut entry.debug {
                 let types = debug.stored_types.iter().map(|key| self.types(key));
                 debug.types = types.collect::<Option<_>>()?;
@@ -1268,6 +1364,7 @@ mod tests {
         ];
         Entry {
             label: "case::run".to_owned(),
+            semantic: None,
             funcs: targets
                 .into_iter()
                 .map(|target| CachedFunc { target, sig: signature() })

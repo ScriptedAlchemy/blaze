@@ -31,6 +31,8 @@ use crate::{
 
 use super::mir::interpret_mir;
 
+pub mod inputs;
+
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
 pub enum ConstEvalError<'db> {
     MirLowerError(MirLowerError<'db>),
