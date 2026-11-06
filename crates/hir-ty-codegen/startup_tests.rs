@@ -51,8 +51,8 @@ impl SymbolResolver for Symbols<'_> {
     }
 }
 
-fn build(source: &str) -> (Vec<u8>, usize) {
-    let (db, _) = RootDatabase::with_single_file(source);
+fn build(source: &str, entry: &str, start: bool, allocator: bool) -> (Vec<u8>, usize) {
+    let db = RootDatabase::with_files(source);
     hir::attach_db(&db, || {
         let krate = *base_db::all_crates(&db)
             .iter()
@@ -63,7 +63,7 @@ fn build(source: &str) -> (Vec<u8>, usize) {
             .flat_map(|(_, module)| module.scope(&db).declarations())
             .find_map(|item| match item {
                 hir_def::ModuleDefId::FunctionId(id)
-                    if FunctionSignature::of(&db, id).name.as_str() == "main" =>
+                    if FunctionSignature::of(&db, id).name.as_str() == entry =>
                 {
                     Some(id)
                 }
@@ -74,8 +74,8 @@ fn build(source: &str) -> (Vec<u8>, usize) {
         let roots = Roots {
             entries: &[main],
             on_demand: &[],
-            start: Some(main),
-            allocator: None,
+            start: start.then_some(main),
+            allocator: allocator.then_some(krate),
             shared: false,
             whole: true,
             kept: &[],
@@ -130,11 +130,12 @@ pub fn lang_start<T>(main: fn() -> T, _: isize, _: *const *const u8, _: u8) -> i
 unsafe extern "C" { fn startup_result() -> isize; }
 pub fn main() {}
 "#;
-    let (first, compiled) = build(source);
+    let (first, compiled) = build(source, "main", true, false);
     assert!(compiled >= 3, "the first build must compile main, startup and lang_start");
-    let (reused, compiled) = build(source);
+    let (reused, compiled) = build(source, "main", true, false);
     assert_eq!(compiled, 0, "an equivalent fresh database must reuse the startup shim");
-    let (changed, compiled) = build(&source.replace("main();", "main(); main();"));
+    let (changed, compiled) =
+        build(&source.replace("main();", "main(); main();"), "main", true, false);
     assert!(compiled >= 3, "a changed required source identity must invalidate startup code");
 
     let directory = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
@@ -160,4 +161,94 @@ pub fn main() {}
         assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
         assert_eq!(std::process::Command::new(program).status().unwrap().code(), Some(result));
     }
+}
+
+#[test]
+fn allocator_shim_calls_remain_native_bindings_in_cached_code() {
+    const TEST: &str = "startup_tests::allocator_shim_calls_remain_native_bindings_in_cached_code";
+    if std::env::var_os(CHILD).is_none() {
+        let directory =
+            std::env::temp_dir().join(format!("blaze-allocator-cache-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, &directory)
+            .env("RA_JIT_CACHE", directory.join("store"))
+            .env("RA_JIT_CACHE_SEAL_AT", "1")
+            .env("RA_JIT_KEYS_LOG", directory.join("keys.log"))
+            .env("RUST_BACKTRACE", "0")
+            .env_remove("RA_JIT_CACHE_CHECK")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    store::compiles_against("1.99.0");
+    let source = r#"
+//- minicore: sized
+//- /src/main.rs crate:allocator deps:runtime
+#![feature(lang_items)]
+#[lang = "owned_box"]
+pub struct Box<T>(T);
+pub extern "C" fn root() -> usize { unsafe { *runtime::__rust_alloc(16, 8) as usize } }
+//- /runtime.rs crate:runtime library
+unsafe extern "C" { pub fn __rust_alloc(size: usize, align: usize) -> *mut u8; }
+"#;
+    let (first, compiled) = build(source, "root", false, true);
+    assert_eq!(compiled, 1);
+    let (reused, compiled) = build(source, "root", false, true);
+    assert_eq!(compiled, 0, "a locally defined native shim has no Rust body entry to require");
+    let directory = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
+    for (name, bytes, result) in [("first", first, 17), ("reused", reused, 29)] {
+        let object = directory.join(format!("{name}.o"));
+        let native = directory.join(format!("{name}.c"));
+        let program = directory.join(name);
+        std::fs::write(&object, bytes).unwrap();
+        std::fs::write(
+            &native,
+            format!(
+                "#include <stdint.h>\n#include <stdlib.h>\n\
+                 _Alignas(16) static unsigned char allocation[16] = {{ {result} }};\n\
+                 void *__rdl_alloc(uintptr_t size, uintptr_t align) {{ return allocation; }}\n\
+                 void __rdl_dealloc(void *ptr, uintptr_t size, uintptr_t align) {{ }}\n\
+                 void *__rdl_realloc(void *ptr, uintptr_t size, uintptr_t align, uintptr_t new_size) {{ return ptr; }}\n\
+                 void *__rdl_alloc_zeroed(uintptr_t size, uintptr_t align) {{ return 0; }}\n\
+                 void __rdl_alloc_error_handler(uintptr_t size, uintptr_t align) {{ abort(); }}\n\
+                 int rust_eh_personality(void) {{ return 0; }}\n\
+                 extern uintptr_t fixture_root(void);\n\
+                 int main(void) {{ return (int)fixture_root(); }}\n"
+            ),
+        )
+        .unwrap();
+        let linked = std::process::Command::new("cc")
+            .arg(&object)
+            .arg(&native)
+            .arg("-o")
+            .arg(&program)
+            .output()
+            .unwrap();
+        assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
+        assert_eq!(std::process::Command::new(program).status().unwrap().code(), Some(result));
+    }
+    let missing = directory.join("missing.c");
+    std::fs::write(
+        &missing,
+        "#include <stdint.h>\nextern uintptr_t fixture_root(void);\nint main(void) { return (int)fixture_root(); }\n",
+    )
+    .unwrap();
+    let linked = std::process::Command::new("cc")
+        .arg(directory.join("reused.o"))
+        .arg(missing)
+        .arg("-o")
+        .arg(directory.join("missing"))
+        .output()
+        .unwrap();
+    assert!(!linked.status.success(), "cached code still requires its native definitions");
+    assert!(String::from_utf8_lossy(&linked.stderr).contains("__rdl_alloc"));
 }

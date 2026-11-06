@@ -471,9 +471,21 @@ impl<'db> Keeper<'_, 'db> {
         let db = self.db;
         let mut funcs = Vec::with_capacity(compiled.requests.funcs.len());
         for (at, request) in compiled.requests.funcs.iter().enumerate() {
+            let foreign = |callee: &Instance| match callee.def {
+                InstanceDef::Fn(func) => link_name(db, func).is_some(),
+                _ => false,
+            };
             let binding = match bindings.function(at, request) {
                 Ok(binding) => binding,
                 Err(why) => return self.kept.unkept(why),
+            };
+            let binding = match binding {
+                export::FunctionBinding::Defined(Some(symbol)) if matches!(&request.target, FuncTarget::Instance(callee, _) if foreign(callee)) =>
+                {
+                    // A generated native definition has a symbol, not a Rust body entry.
+                    export::FunctionBinding::Imported(symbol)
+                }
+                binding => binding,
             };
             let target = if let export::FunctionBinding::TypeId(hash) = binding {
                 CachedTarget::TypeId(hash)
@@ -481,11 +493,6 @@ impl<'db> Keeper<'_, 'db> {
                 // Native definitions, including owned std, must be available in the next
                 // program that reuses the entry. Foreign imports are left to its linker.
                 let checked = self.symbols.provides(&symbol);
-                // An item of an `extern` block is the symbol it links to, whoever declares it.
-                let foreign = |callee: &Instance| match callee.def {
-                    InstanceDef::Fn(func) => link_name(db, func).is_some(),
-                    _ => false,
-                };
                 let mut copied = None;
                 let callee = match &request.target {
                     FuncTarget::Instance(callee, _) if !foreign(callee) => {

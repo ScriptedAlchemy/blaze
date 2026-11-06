@@ -310,7 +310,7 @@ impl Bindings for ExportContext<'_, '_> {
         request: &FuncRequest,
     ) -> std::result::Result<FunctionBinding, &'static str> {
         let symbol = match &request.target {
-            FuncTarget::Asm(_) => return Ok(FunctionBinding::Defined),
+            FuncTarget::Asm(_) => return Ok(FunctionBinding::Defined(None)),
             FuncTarget::Symbol(symbol) => Some(symbol.clone()),
             FuncTarget::Path(path) => {
                 Some(self.symbols.path(path).ok_or("path has no resolved import")?)
@@ -348,7 +348,7 @@ impl Bindings for ExportContext<'_, '_> {
                             .map(FunctionBinding::Imported)
                             .ok_or("owned root has no link name");
                     } else if self.owned.contains(&func.krate(self.db)) {
-                        return Ok(FunctionBinding::Defined);
+                        return Ok(FunctionBinding::Defined(None));
                     } else if instance.args.as_ref().iter().all(|it| it.region().is_some())
                         && as_its_crate_compiles(self.db, self.symbols, instance)
                     {
@@ -357,7 +357,7 @@ impl Bindings for ExportContext<'_, '_> {
                         return Err("provided function does not match the requested instance");
                     }
                 } else {
-                    return Ok(FunctionBinding::Defined);
+                    return Ok(FunctionBinding::Defined(None));
                 }
             }
         }
@@ -933,9 +933,10 @@ impl Receipt {
     }
 }
 
-/// How the final link binds one function request, before any object is defined.
+/// How the final link binds one function request.
 pub(super) enum FunctionBinding {
-    Defined,
+    /// The resolved object symbol; batch definitions have no object symbol yet.
+    Defined(Option<String>),
     Imported(String),
     TypeId(u128),
 }
@@ -980,7 +981,9 @@ impl ObjectBindings {
                         declarations.get_function_decl(id).linkage_name(id).into_owned(),
                     )
                 } else {
-                    FunctionBinding::Defined
+                    FunctionBinding::Defined(Some(
+                        declarations.get_function_decl(id).linkage_name(id).into_owned(),
+                    ))
                 }
             })
             .collect();
@@ -1016,7 +1019,7 @@ impl Bindings for ObjectBindings {
             Some(FunctionBinding::Imported(symbol)) => {
                 Ok(FunctionBinding::Imported(symbol.clone()))
             }
-            Some(FunctionBinding::Defined) => Ok(FunctionBinding::Defined),
+            Some(FunctionBinding::Defined(symbol)) => Ok(FunctionBinding::Defined(symbol.clone())),
             None => Err("missing function binding"),
         }
     }

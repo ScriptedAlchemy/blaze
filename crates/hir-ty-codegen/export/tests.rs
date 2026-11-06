@@ -612,6 +612,78 @@ fn real_queries_export_roots_generics_consts_bounds_closure_paths_and_debug() {
 }
 
 #[test]
+fn local_extern_bindings_preserve_the_object_symbol_and_batch_policy() {
+    let (db, _) = RootDatabase::with_single_file(
+        "//- minicore: sized\n//- /src/lib.rs crate:case\n\
+         unsafe extern \"C\" { fn external() -> i32; }\n\
+         pub fn root() -> i32 { unsafe { external() } }\n",
+    );
+    hir::attach_db(&db, || {
+        let krate = *base_db::all_crates(&db)
+            .iter()
+            .find(|krate| krate.data(&db).origin.is_local())
+            .unwrap();
+        let root = hir_def::nameres::crate_def_map(&db, krate)
+            .modules(&db)
+            .flat_map(|(_, module)| module.scope(&db).declarations())
+            .find_map(|item| match item {
+                hir_def::ModuleDefId::FunctionId(id)
+                    if FunctionSignature::of(&db, id).name.as_str() == "root" =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let symbols = Symbols { db: &db, debug: false };
+        let compiled = compiled_root(&db, root).as_ref().unwrap();
+        assert_eq!(compiled.requests.funcs.len(), 1);
+        let rejected = FxHashMap::default();
+        let on_demand = FxHashSet::default();
+        let owned = OwnStatics::new(
+            &db,
+            &symbols,
+            [krate].into_iter().collect(),
+            Default::default(),
+            Default::default(),
+            true,
+        );
+        let mut object =
+            ObjectCodegen::new(&db, &symbols, &rejected, owned, &on_demand, None, true).unwrap();
+        let id = object
+            .module
+            .declare_function("case_root", Linkage::Export, &compiled.code.signature)
+            .unwrap();
+        let native = object
+            .module
+            .declare_function("remapped_native", Linkage::Export, &compiled.requests.funcs[0].sig)
+            .unwrap();
+        let later = later::Later::new(
+            &object.module,
+            id,
+            later::Of::Root { func: root, symbol: "case_root".into() },
+            compiled,
+            Resolved { funcs: vec![native], datas: Vec::new() },
+        );
+        let bindings = ObjectBindings::new(object.module.declarations(), &object.type_ids, &later);
+        let entry = object
+            .keeper(None)
+            .entry(&root_instance(&db, root), compiled, &bindings, None)
+            .unwrap();
+        assert_eq!(
+            entry.funcs[0].target,
+            cached::CachedTarget::Import { symbol: "remapped_native".into(), checked: false }
+        );
+        let context =
+            ExportContext::resolved(&db, &symbols, [krate], &[root], policy(false)).unwrap();
+        assert!(matches!(
+            context.function(0, &compiled.requests.funcs[0]),
+            Err("function is not provided by the immutable link policy")
+        ));
+    });
+}
+
+#[test]
 fn real_object_bindings_and_batch_bindings_construct_identical_entries() {
     store::compiles_against("1.99.0");
     let (db, roots, krate) = fixture();
