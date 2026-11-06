@@ -6,9 +6,9 @@ use test_fixture::WithFixture;
 const TEST: &str = "startup_tests::startup_shim_reuses_code_and_rebinds_native_calls";
 const CHILD: &str = "BLAZE_STARTUP_CACHE_CHILD";
 
-struct Symbols<'a> {
-    db: &'a RootDatabase,
-    identity: [u8; 32],
+pub(super) struct Symbols<'a> {
+    pub(super) db: &'a RootDatabase,
+    pub(super) identity: [u8; 32],
 }
 
 impl SymbolResolver for Symbols<'_> {

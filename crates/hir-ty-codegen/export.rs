@@ -233,26 +233,27 @@ impl<'a, 'db> ExportContext<'a, 'db> {
         Ok(())
     }
 
+    /// The requester fences the work tuple; the selected home controls compilation.
     /// Work identity for the local registry. Nonempty caller bounds require the semantic
     /// environment-key query not present on this base; do not silently alias them to an
     /// empty environment. The original request remains compilable and locally held.
     pub fn work_name(&self, request: &LocalRequest) -> std::result::Result<WorkName, String> {
-        let (instance, home) = match &request.kind {
-            LocalKind::Root(root) => (root_instance(self.db, *root), root.krate(self.db)),
+        let (instance, environment, home) = match &request.kind {
+            LocalKind::Root(root) => (
+                root_instance(self.db, *root),
+                ParamEnvAndCrate {
+                    param_env: hir_ty::next_solver::ParamEnv::empty(),
+                    krate: root.krate(self.db),
+                }
+                .store(),
+                root.krate(self.db),
+            ),
             LocalKind::Instance(instance, env) => {
                 if !env.param_env(self.db).clauses().is_empty() {
                     return Err("caller bounds need a canonical semantic environment key".into());
                 }
-                (instance.clone(), env.krate)
+                (instance.clone(), home::Homes::default().home(self.db, instance, env), env.krate)
             }
-        };
-        let environment = match &request.kind {
-            LocalKind::Root(root) => ParamEnvAndCrate {
-                param_env: hir_ty::next_solver::ParamEnv::empty(),
-                krate: root.krate(self.db),
-            }
-            .store(),
-            LocalKind::Instance(_, env) => env.clone(),
         };
         let name = self
             .names
@@ -280,7 +281,7 @@ impl<'a, 'db> ExportContext<'a, 'db> {
             && *instance == root_instance(self.db, func)
             && self
                 .names
-                .instance(instance)
+                .instance_in(instance, env)
                 .is_some_and(|name| self.roots.get(name.as_str()) == Some(&Some(func)))
         {
             return LocalRequest::root(func);
@@ -326,7 +327,7 @@ impl Bindings for ExportContext<'_, '_> {
             FuncTarget::Path(path) => {
                 Some(self.symbols.path(path).ok_or("path has no resolved import")?)
             }
-            FuncTarget::Instance(instance, _) => {
+            FuncTarget::Instance(instance, env) => {
                 if let InstanceDef::Fn(func) = instance.def {
                     if let Some(of) =
                         type_id_of(self.db, self.symbols, func, instance.args.as_ref())
@@ -348,7 +349,10 @@ impl Bindings for ExportContext<'_, '_> {
                         // requesting its definition. Shared classification yields Root.
                         let name = self
                             .names
-                            .instance(instance)
+                            .instance_in(
+                                instance,
+                                &home::Homes::default().home(self.db, instance, env),
+                            )
                             .ok_or("owned root has no portable name")?;
                         if self.roots.get(name.as_str()) != Some(&Some(func)) {
                             return Err("owned root is absent from the immutable pre-index");
@@ -473,11 +477,14 @@ pub fn compile_batch(
                     symbol: context.symbols.function(*root).ok_or("root has no link name")?,
                 },
             ),
-            LocalKind::Instance(instance, env) => (
-                compiled_instance(context.db, instance.clone(), env.clone()),
-                instance.clone(),
-                later::Of::Instance { instance: instance.clone(), env: env.clone() },
-            ),
+            LocalKind::Instance(instance, env) => {
+                let environment = home::Homes::default().home(context.db, instance, env);
+                (
+                    compiled_instance(context.db, instance.clone(), environment.clone()),
+                    instance.clone(),
+                    later::Of::Instance { instance: instance.clone(), env: environment },
+                )
+            }
         };
         let compiled = match compiled {
             Ok(compiled) => compiled,
@@ -523,13 +530,13 @@ pub fn compile_batch(
             outcomes.push(Outcome::Local { work: Ok(work), why });
             continue;
         }
-        let environment = match &request.kind {
-            LocalKind::Root(root) => ParamEnvAndCrate {
+        let environment = match &of {
+            later::Of::Root { func, .. } => ParamEnvAndCrate {
                 param_env: hir_ty::next_solver::ParamEnv::empty(),
-                krate: root.krate(context.db),
+                krate: func.krate(context.db),
             }
             .store(),
-            LocalKind::Instance(_, env) => env.clone(),
+            later::Of::Instance { env, .. } => env.clone(),
         };
         let debug = keeper.describe_function(&of, compiled, None, false);
         let described = debug.is_some();

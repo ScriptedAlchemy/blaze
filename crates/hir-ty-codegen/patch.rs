@@ -26,8 +26,8 @@ type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
 use hir_ty::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 
 use super::{
-    CodegenError, ContentId, Instance, InstanceDef, ObjectCodegen, OwnStatics, Phases, Rejections,
-    Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks,
+    CodegenError, ContentId, Instance, InstanceDef, InstanceIn, ObjectCodegen, OwnStatics, Phases,
+    Rejections, Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks,
     cached::WrittenItem,
     compiled_instance, compiled_root, compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
@@ -57,7 +57,10 @@ pub(super) fn stable_mark(
         match &request.target {
             FuncTarget::Symbol(symbol) => (0u8, symbol).hash(&mut hasher),
             FuncTarget::Path(path) => (1u8, path).hash(&mut hasher),
-            FuncTarget::Instance(instance, _) => (2u8, names.instance(instance)?).hash(&mut hasher),
+            FuncTarget::Instance(instance, env) => {
+                let context = InstanceIn::requested(db, instance, env);
+                (2u8, names.instance_in(&context.instance, &context.env)?).hash(&mut hasher);
+            }
             FuncTarget::Asm(text) => (3u8, text).hash(&mut hasher),
         }
     }
@@ -304,16 +307,16 @@ fn instance_mark(
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum Node {
     Root(FunctionId),
-    Instance(Instance),
+    Instance(InstanceIn),
     Static(StaticId),
 }
 
 impl Node {
-    fn is_asked_for_by(&self, requests: &Requests) -> bool {
+    fn is_asked_for_by(&self, db: &dyn HirDatabase, requests: &Requests) -> bool {
         match self {
             Node::Root(_) => false,
             Node::Instance(instance) => requests.funcs.iter().any(
-                |it| matches!(&it.target, FuncTarget::Instance(asked, _) if asked == instance),
+                |it| matches!(&it.target, FuncTarget::Instance(asked, env) if InstanceIn::requested(db, asked, env) == *instance),
             ),
             Node::Static(id) => requests
                 .datas
@@ -406,7 +409,7 @@ impl TheirWalk {
         db: &dyn HirDatabase,
         found: &TheirStatics,
         walked: Walked,
-        instances: &mut FxIndexMap<Instance, BaseInstance>,
+        instances: &mut FxIndexMap<InstanceIn, BaseInstance>,
         statics: &mut FxHashMap<StaticId, BaseStatic>,
     ) -> TheirWalk {
         instances.values_mut().for_each(|it| it.theirs = false);
@@ -414,9 +417,8 @@ impl TheirWalk {
         let mut walk = TheirWalk::default();
         let mut seen = FxHashSet::default();
         for (instance, env) in walked {
-            if let Some(known) = instances.get_mut(&instance)
-                && known.env == env
-            {
+            let env = super::home::Homes::default().home(db, &instance, &env);
+            if let Some(known) = instances.get_mut(&InstanceIn::requested(db, &instance, &env)) {
                 known.theirs = true;
                 continue;
             }
@@ -516,7 +518,7 @@ impl Reached {
                         let krate = written_in(db, instance).map_or(env.krate, |it| it.krate(db));
                         let requests = compiled.as_ref().ok().map(|it| &it.requests);
                         (
-                            Node::Instance(instance.clone()),
+                            Node::Instance(InstanceIn::requested(db, instance, env)),
                             krate,
                             body_files(db, instance),
                             requests,
@@ -525,7 +527,11 @@ impl Reached {
                 };
                 stack.extend(requests.map(|it| (it, by)));
                 let walked = requests.is_some();
-                reached.push(Reached { node, env: env.clone(), by, krate, files, walked });
+                let env = match &node {
+                    Node::Instance(context) => context.env.clone(),
+                    _ => env.clone(),
+                };
+                reached.push(Reached { node, env, by, krate, files, walked });
             }
         }
         reached
@@ -535,8 +541,8 @@ impl Reached {
         let (serial, compiled) = match &self.node {
             Node::Root(func) => (root_serial(db, *func), compiled_root(db, *func)),
             Node::Instance(instance) => (
-                instance_serial(db, instance.clone(), self.env.clone()),
-                compiled_instance(db, instance.clone(), self.env.clone()),
+                instance_serial(db, instance.instance.clone(), instance.env.clone()),
+                compiled_instance(db, instance.instance.clone(), instance.env.clone()),
             ),
             Node::Static(_) => return None,
         };
@@ -547,7 +553,7 @@ impl Reached {
     fn func(&self, db: &dyn HirDatabase) -> Option<FunctionId> {
         match &self.node {
             Node::Root(func) => Some(*func),
-            Node::Instance(instance) => written_in(db, instance),
+            Node::Instance(instance) => written_in(db, &instance.instance),
             Node::Static(_) => None,
         }
     }
@@ -750,7 +756,7 @@ impl Frozen {
         let edited = !self.edited.is_empty() || !self.edited_bodies.is_empty();
         let mut forwarded = base.instances.iter().filter(|it| edited && it.1.forwarded);
         forwarded.find_map(|(it, known)| {
-            let (crates, files) = (mentioned_crates(db, it), known.files.as_deref());
+            let (crates, files) = (mentioned_crates(db, &it.instance), known.files.as_deref());
             let untouched = match (crates, files) {
                 (Some(crates), Some(files)) => {
                     crates.is_disjoint(&self.edited)
@@ -758,13 +764,14 @@ impl Frozen {
                 }
                 // Of a function generic over nothing, rustc's copy has only what its crate
                 // and those below it wrote.
-                _ if it.args.as_ref().iter().all(|arg| arg.region().is_some()) => {
-                    written_in(db, it).is_some_and(|func| !self.touched_from(db, func.krate(db)))
+                _ if it.instance.args.as_ref().iter().all(|arg| arg.region().is_some()) => {
+                    written_in(db, &it.instance)
+                        .is_some_and(|func| !self.touched_from(db, func.krate(db)))
                 }
                 _ => false,
             };
             (!untouched).then(|| OutOfDate {
-                func: written_in(db, it),
+                func: written_in(db, &it.instance),
                 why: "an instance of it does not compile".to_owned(),
                 left_from_the_start: false,
                 calls: None,
@@ -794,7 +801,7 @@ pub(super) struct Base {
     their_walk: TheirWalk,
     /// What rustc's copies of `from_rustc` call of rustc's.
     reached: Vec<Reached>,
-    pub(super) instances: FxIndexMap<Instance, BaseInstance>,
+    pub(super) instances: FxIndexMap<InstanceIn, BaseInstance>,
     homes: Homes,
     pub(super) statics: FxHashMap<StaticId, BaseStatic>,
     /// The symbols of the functions built from entries of the store, by their stable names.
@@ -938,7 +945,7 @@ impl Homes {
         compiled: &[(FunctionId, String)],
         crates: &[Crate],
         files: &[FileId],
-        instances: &FxIndexMap<Instance, BaseInstance>,
+        instances: &FxIndexMap<InstanceIn, BaseInstance>,
     ) -> Homes {
         let mut homes = Homes::default();
         for (i, &(root, _)) in compiled.iter().enumerate() {
@@ -1010,12 +1017,14 @@ impl Touched {
         *self = Touched::default();
         for stale in found {
             self.roots.extend(&stale.roots);
-            self.instances.extend(stale.instances.iter().cloned());
+            self.instances.extend(stale.instances.iter().map(|it| it.instance.clone()));
             self.statics.extend(&stale.statics);
             self.hydrated.extend(stale.hydrated.iter().map(|(at, ..)| *at));
             for (node, _) in &stale.broken {
                 match node {
-                    Node::Instance(instance) => _ = self.instances.insert(instance.clone()),
+                    Node::Instance(instance) => {
+                        _ = self.instances.insert(instance.instance.clone())
+                    }
                     Node::Static(id) => _ = self.statics.insert(*id),
                     Node::Root(_) => {}
                 }
@@ -1035,7 +1044,7 @@ impl Touched {
 #[derive(Clone, Default)]
 pub struct Stale {
     roots: Vec<FunctionId>,
-    instances: Vec<Instance>,
+    instances: Vec<InstanceIn>,
     /// By their index in [`Base::hydrated`], with the instance each was found to be.
     hydrated: Vec<(u32, Instance, StoredParamEnvAndCrate)>,
     /// The statics with another value, which a patch defines again under their name.
@@ -1301,18 +1310,19 @@ impl Base {
             .zip(instance_marks)
             .map(|(of, mark)| {
                 let (instance, env) = of;
-                let id = *cg.instances.get(instance)?;
+                let context = InstanceIn::new(instance.clone(), env.clone());
+                let id = *cg.instances.get(&context)?;
                 let (mark, files) = mark.into_inner().unwrap_or_else(|| instance_mark(db, of));
                 let known = BaseInstance {
                     env: env.clone(),
                     symbol: decls.get_function_decl(id).linkage_name(id).into_owned(),
                     mark,
-                    forwarded: cg.forwarded.contains(instance),
+                    forwarded: cg.forwarded.contains(&context),
                     files,
                     parents: Vec::new(),
                     theirs: false,
                 };
-                (known.mark.is_some() || known.forwarded).then(|| (instance.clone(), known))
+                (known.mark.is_some() || known.forwarded).then(|| (context, known))
             })
             .collect::<Option<FxIndexMap<_, _>>>()?;
         let mut statics = cg
@@ -1336,8 +1346,11 @@ impl Base {
         let mut edges = Vec::new();
         let mut note = |parent: Node, requests: &Requests| {
             for request in &requests.funcs {
-                if let FuncTarget::Instance(instance, _) = &request.target {
-                    edges.push((Node::Instance(instance.clone()), parent.clone()));
+                if let FuncTarget::Instance(instance, env) = &request.target {
+                    edges.push((
+                        Node::Instance(InstanceIn::requested(db, instance, env)),
+                        parent.clone(),
+                    ));
                 }
             }
             for request in &requests.datas {
@@ -1363,7 +1376,9 @@ impl Base {
             }
         }
         for (instance, known) in &instances {
-            if let Ok(compiled) = compiled_instance(db, instance.clone(), known.env.clone()) {
+            if let Ok(compiled) =
+                compiled_instance(db, instance.instance.clone(), known.env.clone())
+            {
                 note(Node::Instance(instance.clone()), &compiled.requests);
             }
         }
@@ -1371,8 +1386,13 @@ impl Base {
             note(Node::Static(id), &compiled_static(db, id).as_ref().ok()?.requests);
         }
         edges.extend(from_store.root_edges.iter().cloned());
-        let known_at: FxHashMap<&Instance, u32> = (from_store.hydrated.iter().enumerate())
-            .filter_map(|(at, it)| Some((&it.known.as_ref()?.0, at as u32)))
+        let known_at: FxHashMap<InstanceIn, u32> = (from_store.hydrated.iter().enumerate())
+            .filter_map(|(at, it)| {
+                Some((
+                    InstanceIn::new(it.known.as_ref()?.0.clone(), it.known.as_ref()?.1.clone()),
+                    at as u32,
+                ))
+            })
             .collect();
         let mut called = Vec::new();
         for (child, parent) in &edges {
@@ -1405,9 +1425,9 @@ impl Base {
             .rejected
             .iter()
             .filter(|(instance, it)| {
-                compiled_instance(db, (*instance).clone(), it.env.clone()).is_err()
+                compiled_instance(db, instance.instance.clone(), it.env.clone()).is_err()
             })
-            .map(|(instance, it)| (instance.clone(), it.env.clone()))
+            .map(|(instance, it)| (instance.instance.clone(), it.env.clone()))
             .collect();
         let crates: Vec<Crate> = compiled.iter().map(|&(root, _)| root.krate(db)).collect();
         let files: Vec<FileId> =
@@ -1418,7 +1438,7 @@ impl Base {
         let cached_instances = (0..instances.len() as u32)
             .filter(|&i| {
                 let (instance, _) = instances.get_index(i as usize).unwrap();
-                matches!(instance.def, InstanceDef::Fn(func) if cached(func))
+                matches!(instance.instance.def, InstanceDef::Fn(func) if cached(func))
             })
             .collect();
         Some(Base {
@@ -1726,7 +1746,7 @@ impl Base {
                 parents: Vec::new(),
                 theirs: false,
             };
-            self.instances.entry(instance).or_insert(known);
+            self.instances.entry(InstanceIn::new(instance, known.env.clone())).or_insert(known);
         }
         unknown.extend(copies.into_values().map(|it| it.0));
         for func in generic {
@@ -1765,7 +1785,9 @@ impl Base {
                         parents: Vec::new(),
                         theirs: false,
                     };
-                    self.instances.entry(instance.clone()).or_insert(known);
+                    self.instances
+                        .entry(InstanceIn::new(instance.clone(), known.env.clone()))
+                        .or_insert(known);
                 }
                 None => unnamed.push((instance.clone(), mark)),
             }
@@ -1922,11 +1944,11 @@ impl Base {
             asked.extend(&self.cached_instances);
         }
         asked.extend(
-            touched
-                .instances
+            self.instances
                 .iter()
-                .filter_map(|it| self.instances.get_index_of(it))
-                .map(|it| it as u32),
+                .enumerate()
+                .filter(|(_, (context, _))| touched.instances.contains(&context.instance))
+                .map(|(index, _)| index as u32),
         );
         Box::new(part_of(asked, part, parts))
     }
@@ -2092,8 +2114,9 @@ impl Base {
             };
             instance = compiled.requests.funcs.iter().find_map(|request| {
                 let FuncTarget::Instance(callee, env) = &request.target else { return None };
-                let named = names.instance(callee)?;
-                (*named == *was.name).then(|| (callee.clone(), homes.home(db, callee, env)))
+                let environment = homes.home(db, callee, env);
+                let named = names.instance_in(callee, &environment)?;
+                (*named == *was.name).then(|| (callee.clone(), environment))
             });
             if instance.is_some() {
                 break;
@@ -2125,7 +2148,7 @@ impl Base {
             Caller::Base(Node::Root(root)) => probe(|| compiled_root(db, *root).as_ref().ok()),
             Caller::Base(Node::Instance(instance)) => {
                 let env = self.instances.get(instance)?.env.clone();
-                probe(|| compiled_instance(db, instance.clone(), env).as_ref().ok())
+                probe(|| compiled_instance(db, instance.instance.clone(), env).as_ref().ok())
             }
             Caller::Base(Node::Static(_)) => None,
             Caller::Hydrated(at) => {
@@ -2303,14 +2326,14 @@ impl Base {
             let Some((instance, was)) = self.instances.get_index(i) else { continue };
             let touched = self.touched.reaches(was.env.krate)
                 || self.touched.reaches_bodies(was.files.as_deref())
-                || self.touched.instances.contains(instance)
+                || self.touched.instances.contains(&instance.instance)
                 || self.touched.edited()
                     && self.cached_instances.binary_search(&(i as u32)).is_ok();
             if !touched && !check_all {
                 continue;
             }
             let asked = stdx::time::Instant::now();
-            let mark = probe(|| Mark::of_instance(db, instance, &was.env, self.debug));
+            let mark = probe(|| Mark::of_instance(db, &instance.instance, &was.env, self.debug));
             stale.steps.instances_asked += 1;
             stale.steps.slowest = stale.steps.slowest.max(asked.elapsed());
             stale.their_walk_changed |= touched
@@ -2464,12 +2487,12 @@ impl Base {
         let requests = match parent {
             Node::Root(root) => compiled_root(db, *root).as_ref().ok().map(|it| &it.requests),
             Node::Instance(instance) => self.instances.get(instance).and_then(|known| {
-                let compiled = compiled_instance(db, instance.clone(), known.env.clone());
+                let compiled = compiled_instance(db, instance.instance.clone(), known.env.clone());
                 compiled.as_ref().ok().map(|it| &it.requests)
             }),
             Node::Static(id) => compiled_static(db, *id).as_ref().ok().map(|it| &it.requests),
         };
-        requests.is_some_and(|requests| node.is_asked_for_by(requests))
+        requests.is_some_and(|requests| node.is_asked_for_by(db, requests))
     }
 
     /// The futures that functions left to rustc handle, or `None` when that can be any.
@@ -2559,11 +2582,12 @@ impl Base {
                     }
                 }
                 super::tier::Kind::Instance(instance, env) => {
-                    let known = self.instances.get(instance);
-                    if known.is_some_and(|it| it.env == *env && it.mark.is_some() && !it.forwarded)
-                        && !changed_instances.contains(instance)
+                    let context = InstanceIn::new(instance.clone(), env.clone());
+                    let known = self.instances.get(&context);
+                    if known.is_some_and(|it| it.mark.is_some() && !it.forwarded)
+                        && !changed_instances.contains(&context)
                     {
-                        changed_instances.push(instance.clone());
+                        changed_instances.push(context);
                     }
                 }
             }
@@ -2612,7 +2636,8 @@ impl Base {
         for instance in &changed_instances {
             let _permit = super::budget::enter()?;
             let was = &self.instances[instance];
-            let Ok(compiled) = compiled_instance(db, instance.clone(), was.env.clone()).as_ref()
+            let Ok(compiled) =
+                compiled_instance(db, instance.instance.clone(), was.env.clone()).as_ref()
             else {
                 return Ok(Err("an instance of the base no longer compiles"));
             };
@@ -2622,7 +2647,7 @@ impl Base {
                 &compiled.code.signature,
             )?;
             cg.instances.insert(instance.clone(), id);
-            cg.pending.push((instance.clone(), was.env.clone(), id));
+            cg.pending.push((instance.instance.clone(), was.env.clone(), id));
         }
         // What calls code from the store calls it by the base's symbol, which the patch takes.
         for (i, instance, env) in changed_hydrated {
@@ -2631,7 +2656,8 @@ impl Base {
             let Ok(compiled) = compiled_instance(db, instance.clone(), env.clone()).as_ref() else {
                 return Ok(Err("code of the checkout from the store no longer compiles"));
             };
-            if cg.instances.contains_key(&instance) {
+            let context = InstanceIn::new(instance.clone(), env.clone());
+            if cg.instances.contains_key(&context) {
                 continue;
             }
             let id = cg.module.declare_function(
@@ -2639,7 +2665,7 @@ impl Base {
                 Linkage::Hidden,
                 &compiled.code.signature,
             )?;
-            cg.instances.insert(instance.clone(), id);
+            cg.instances.insert(context, id);
             cg.pending.push((instance, env, id));
         }
         for &id in &changed_statics {
@@ -2717,7 +2743,12 @@ impl Base {
 
 #[cfg(test)]
 mod tests {
-    use super::probe;
+    use super::*;
+    use crate::{ParamEnvAndCrate, startup_tests::Symbols, store};
+    use ide_db::RootDatabase;
+    use rustc_type_ir::inherent::Ty as _;
+    use sha2::{Digest, Sha256};
+    use test_fixture::WithFixture;
 
     #[test]
     fn a_program_started_again_keeps_what_rustcs_copies_are_of() {
@@ -2742,5 +2773,140 @@ mod tests {
         });
         let stopped: Box<dyn std::any::Any + Send> = interrupted.unwrap_err();
         assert!(stopped.is::<salsa::Cancelled>());
+    }
+    #[test]
+    fn one_instance_keeps_distinct_request_environments_and_patch_edges() {
+        const TEST: &str =
+            "patch::tests::one_instance_keeps_distinct_request_environments_and_patch_edges";
+        const CHILD: &str = "BLAZE_INSTANCE_CONTEXT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = std::env::temp_dir()
+                .join(format!("blaze-instance-contexts-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, &directory)
+                .env("RA_JIT_STORE", directory.join("store"))
+                .env("RA_JIT_NO_HOME", "1")
+                .env("RUST_BACKTRACE", "0")
+                .env_remove("RA_JIT_CACHE_CHECK")
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        store::compiles_against("1.99.0");
+        let source = "//- minicore: sized\n//- /src/main.rs crate:contexts\nfn helper<T>() -> usize { 17 }\npub fn root<T>() -> usize { helper::<T>() }";
+        let db = RootDatabase::with_files(source);
+        hir::attach_db(&db, || {
+            let crates = base_db::all_crates(&db);
+            let app = *crates.iter().find(|krate| krate.data(&db).origin.is_local()).unwrap();
+            let library = *crates.iter().find(|&&krate| krate != app).unwrap();
+            let root = hir_def::nameres::crate_def_map(&db, app)
+                .modules(&db)
+                .flat_map(|(_, module)| module.scope(&db).declarations())
+                .find_map(|item| match item {
+                    hir_def::ModuleDefId::FunctionId(id)
+                        if FunctionSignature::of(&db, id).name.as_str() == "root" =>
+                    {
+                        Some(id)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let app_environment =
+                ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate: app }
+                    .store();
+            let library_environment = ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate: library,
+            }
+            .store();
+            let interner = hir_ty::next_solver::DbInterner::new_with(&db, app);
+            let args = hir_ty::next_solver::GenericArgs::new_from_slice(&[
+                hir_ty::next_solver::Ty::new_unit(interner).into(),
+            ]);
+            let instance =
+                Instance { def: InstanceDef::Fn(root), args: args.store(), checked: false };
+            let compiled =
+                compiled_instance(&db, instance.clone(), app_environment.clone()).as_ref().unwrap();
+            let symbols = Symbols { db: &db, identity: Sha256::digest(source.as_bytes()).into() };
+            let owned = OwnStatics::new(
+                &db,
+                &symbols,
+                crates.iter().copied().collect(),
+                Default::default(),
+                Default::default(),
+                true,
+            );
+            let rejected = Default::default();
+            let on_demand = Default::default();
+            let mut object =
+                ObjectCodegen::new(&db, &symbols, &rejected, owned, &on_demand, None, true)
+                    .unwrap();
+            let first =
+                object.callee(&instance, &app_environment, &compiled.code.signature).unwrap();
+            let second =
+                object.callee(&instance, &library_environment, &compiled.code.signature).unwrap();
+            assert_ne!(
+                first, second,
+                "different retained request environments must not alias a native declaration"
+            );
+            assert_eq!(object.pending.len(), 2);
+            for env in [&app_environment, &library_environment] {
+                let code = crate::tier::for_build(|| {
+                    crate::instance_code(&db, instance.clone(), env.clone(), crate::Detach::No)
+                })
+                .unwrap()
+                .code();
+                object.unit_instances.insert(InstanceIn::new(instance.clone(), env.clone()), code);
+            }
+            assert_eq!(
+                object.unit_instances.len(),
+                2,
+                "saved units must retain both compilation contexts"
+            );
+            assert!(object.define_instances().unwrap().is_empty());
+            assert!(
+                object.unit_instances.is_empty(),
+                "each native definition consumes only its own saved unit"
+            );
+            assert_eq!(
+                object.instances.len(),
+                4,
+                "both roots and both concrete helper contexts must compile"
+            );
+            let base = Base::record(&db, &object, &[], &[], &[]).unwrap();
+            assert_eq!(
+                base.instances.len(),
+                4,
+                "patch capture must preserve every compiled context"
+            );
+            let mut helpers = 0;
+            for (instance, known) in &base.instances {
+                let InstanceDef::Fn(function) = instance.instance.def else { continue };
+                if FunctionSignature::of(&db, function).name.as_str() != "helper" {
+                    continue;
+                }
+                helpers += 1;
+                assert_eq!(known.parents.len(), 1);
+                let Node::Instance(parent) = &known.parents[0] else {
+                    panic!("helper must have an instance caller")
+                };
+                let parent = base.instances.get(parent).unwrap();
+                assert_eq!(
+                    parent.env, known.env,
+                    "patch edges must retain their request environment"
+                );
+            }
+            assert_eq!(helpers, 2);
+        });
     }
 }

@@ -34,7 +34,7 @@ const OF_CHECKOUT: char = '~';
 /// After the name of an instance compiled with `-C overflow-checks`.
 const CHECKED: &str = " checked";
 
-const SEMANTIC_INPUTS: &str = " inputs2:";
+const SEMANTIC_INPUTS: &str = " inputs3:";
 
 pub(super) fn without_semantic_inputs(name: &str) -> &str {
     match name.rsplit_once(SEMANTIC_INPUTS) {
@@ -267,16 +267,37 @@ impl<'a, 'db> StableNames<'a, 'db> {
         name.contains(OF_CHECKOUT)
     }
 
-    /// `None` for an instance that names anything this has no stable name for.
-    pub(super) fn instance(&self, instance: &Instance) -> Option<String> {
-        let Some(krate) = super::written_in(self.db, instance.def) else {
-            return self.raw_instance(instance);
+    fn default_environment(
+        &self,
+        instance: &Instance,
+    ) -> Option<hir_ty::traits::StoredParamEnvAndCrate> {
+        let krate = match super::written_in(self.db, instance.def) {
+            Some(krate) => krate,
+            None => {
+                let mut crates = super::home::mentioned_crates(self.db, instance)?
+                    .into_iter()
+                    .map(|krate| {
+                        let mut name = String::new();
+                        self.crate_(&mut name, krate)?;
+                        Some((name, krate))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                crates.sort_by(|a, b| a.0.cmp(&b.0));
+                crates.first()?.1
+            }
         };
         let asked =
             hir_ty::ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate }
                 .store();
-        let environment = super::home::Homes::default().home(self.db, instance, &asked);
-        self.instance_in(instance, &environment)
+        Some(super::home::Homes::default().home(self.db, instance, &asked))
+    }
+
+    /// `None` for an instance that names anything this has no stable name for.
+    pub(super) fn instance(&self, instance: &Instance) -> Option<String> {
+        match self.default_environment(instance) {
+            Some(environment) => self.instance_in(instance, &environment),
+            None => self.raw_instance(instance),
+        }
     }
 
     pub(super) fn instance_in(
@@ -305,6 +326,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
         let mut fields = Vec::new();
         let mut sources = Vec::new();
         let mut homes = super::home::Homes::default();
+        let mut context_sensitive = false;
         while let Some((instance, environment, exiting)) = pending.pop() {
             if exiting {
                 *active.get_mut(&instance.def).unwrap() -= 1;
@@ -316,6 +338,14 @@ impl<'a, 'db> StableNames<'a, 'db> {
             if !environment.param_env(self.db).clauses().is_empty() {
                 return self.miss("semantic preparation with caller bounds");
             }
+            context_sensitive |= self
+                .default_environment(&instance)
+                .as_ref()
+                .is_some_and(|default| default != &environment);
+            let mut body = self.raw_instance(&instance)?;
+            body.push_str(" environment ");
+            self.crate_(&mut body, environment.krate)?;
+            fields.push(format!("body {body}"));
             let kind = match instance.def {
                 InstanceDef::Fn(function) => {
                     if !hir_def::signatures::FunctionSignature::of(self.db, function).has_body()
@@ -343,10 +373,6 @@ impl<'a, 'db> StableNames<'a, 'db> {
             if prepared.result.is_err() {
                 return self.miss("concrete constant preparation failed");
             }
-            let mut body = self.raw_instance(&instance)?;
-            body.push_str(" environment ");
-            self.crate_(&mut body, environment.krate)?;
-            fields.push(format!("body {body}"));
             for selection in &prepared.selections {
                 let mut name = format!("{body} constant ");
                 match selection.definition {
@@ -397,7 +423,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 pending.push((callee, environment, false));
             }
         }
-        if sources.is_empty() {
+        if sources.is_empty() && !context_sensitive {
             return Some(None);
         }
         fields.sort();

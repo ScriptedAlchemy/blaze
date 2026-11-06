@@ -61,7 +61,7 @@ pub(super) struct SemanticInputs {
 
 impl SemanticInputs {
     pub(super) fn canonical(&self) -> bool {
-        !self.sources.is_empty()
+        !self.constants.is_empty()
             && self.constants.windows(2).all(|pair| pair[0] < pair[1])
             && self
                 .sources
@@ -81,7 +81,7 @@ impl SemanticInputs {
             hash.update((bytes.len() as u64).to_le_bytes());
             hash.update(bytes);
         };
-        field(b"blaze concrete semantic inputs 2");
+        field(b"blaze concrete semantic inputs 3");
         for constant in &self.constants {
             field(&[0]);
             field(constant.as_bytes());
@@ -530,7 +530,7 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit entry 15");
+        field(b"ra-jit entry 16");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());

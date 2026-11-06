@@ -54,7 +54,7 @@ use hir_ty::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
-    Backend, COMPILED, CompiledFunction, Detach, Instance, InstanceDef, ObjectCodegen,
+    Backend, COMPILED, CompiledFunction, Detach, Instance, InstanceDef, InstanceIn, ObjectCodegen,
     ObjectFormat, ParallelWork, Pending, Produced, Rejected, Result, SymbolResolver,
     backend::{self, Tally},
     cached, compiled_instance, compiled_root,
@@ -120,7 +120,7 @@ struct Found {
 /// it is compiled only once called; not an instance an earlier round rejected; and not one
 /// the store has.
 struct Finder<'x> {
-    rejected: &'x FxHashMap<Instance, Rejected>,
+    rejected: &'x FxHashMap<InstanceIn, Rejected>,
     on_demand: &'x FxHashSet<FunctionId>,
     entries: Option<&'x cached::Entries>,
 }
@@ -135,9 +135,10 @@ impl Finder<'_> {
         requests: impl IntoIterator<Item = &'r FuncRequest>,
         found: &mut Found,
     ) {
-        let in_store = |callee: &Instance| {
+        let in_store = |callee: &Instance, env: &StoredParamEnvAndCrate| {
             let Some(entries) = self.entries else { return false };
-            names.instance(callee).is_some_and(|name| {
+            let context = InstanceIn::requested(db, callee, env);
+            names.instance_in(&context.instance, &context.env).is_some_and(|name| {
                 entries.usable(&name, &|symbol, checked| symbols.importable(symbol, checked))
             })
         };
@@ -154,7 +155,10 @@ impl Finder<'_> {
                 }
                 _ => false,
             };
-            if !root && !self.rejected.contains_key(callee) && !in_store(callee) {
+            if !root
+                && !self.rejected.contains_key(&InstanceIn::requested(db, callee, asked))
+                && !in_store(callee, asked)
+            {
                 found.instances.push((callee.clone(), homes.home(db, callee, asked)));
             }
         }
@@ -350,10 +354,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         for (kind, outcome) in codes {
             match (kind, outcome) {
                 (Kind::Root(root), Outcome::Code(code)) => _ = self.unit_roots.insert(root, code),
-                (Kind::Instance(instance, _), Outcome::Code(code)) => {
-                    _ = self.unit_instances.insert(instance, code)
+                (Kind::Instance(instance, env), Outcome::Code(code)) => {
+                    _ = self.unit_instances.insert(InstanceIn::new(instance, env), code)
                 }
-                (Kind::Instance(instance, _), Outcome::Kept(code)) => kept.push((instance, code)),
+                (Kind::Instance(instance, env), Outcome::Kept(code)) => {
+                    kept.push((InstanceIn::new(instance, env), code))
+                }
                 _ => {}
             }
         }

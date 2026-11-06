@@ -1029,13 +1029,21 @@ impl CodegenUnit {
             cg.make_later();
             if cg.misfit {
                 start_over("an entry of the store did not fit");
-                rejected.extend(failed);
+                rejected.extend(
+                    failed
+                        .into_iter()
+                        .map(|(instance, why)| (InstanceIn::new(instance, why.env.clone()), why)),
+                );
                 continue;
             }
             // The `main` the C runtime calls would call a `main` that is not in the object.
             if start.is_some_and(|main| skipped.iter().any(|(root, _)| *root == main)) {
                 start = None;
-                rejected.extend(failed);
+                rejected.extend(
+                    failed
+                        .into_iter()
+                        .map(|(instance, why)| (InstanceIn::new(instance, why.env.clone()), why)),
+                );
                 continue;
             }
             let fallback_start = stdx::time::Instant::now();
@@ -1065,7 +1073,11 @@ impl CodegenUnit {
                     split.len()
                 ));
                 cg.reject(&mut failed, &compiled, &from_rustc, &mut own_statics);
-                rejected.extend(failed);
+                rejected.extend(
+                    failed
+                        .into_iter()
+                        .map(|(instance, why)| (InstanceIn::new(instance, why.env.clone()), why)),
+                );
                 continue;
             }
             // The copy rustc makes of a function without a symbol, where it is used, handles
@@ -1083,7 +1095,7 @@ impl CodegenUnit {
                     futures.extend(async_blocks(db, *root).iter().flatten().copied());
                 }
                 for (instance, env) in &cg.envs {
-                    if cg.forwarded.contains(instance) {
+                    if cg.forwarded.contains(&InstanceIn::new(instance.clone(), env.clone())) {
                         futures.extend(made_futures(db, instance, env));
                     }
                 }
@@ -1200,7 +1212,11 @@ impl CodegenUnit {
                 why_most(&failed)
             ));
             cg.reject(&mut failed, &compiled, &from_rustc, &mut own_statics);
-            rejected.extend(failed);
+            rejected.extend(
+                failed
+                    .into_iter()
+                    .map(|(instance, why)| (InstanceIn::new(instance, why.env.clone()), why)),
+            );
         }
     }
 }
@@ -1362,7 +1378,7 @@ pub fn empty_object() -> Result<Vec<u8>> {
 
 #[derive(Default, Clone)]
 pub struct Rejections {
-    rejected: FxHashMap<Instance, Rejected>,
+    rejected: FxHashMap<InstanceIn, Rejected>,
     /// The statics that functions left to rustc refer to, and the crates where that is unknown.
     theirs: FxHashSet<StaticId>,
     unknown: FxHashSet<Crate>,
@@ -1572,8 +1588,15 @@ impl Rejections {
         if let Some((root, _)) = base.compiled.iter().find(|(_, it)| it == symbol) {
             return Some(tier::Node(tier::Kind::Root(*root)));
         }
-        if let Some((instance, known)) = base.instances.iter().find(|(_, it)| it.symbol == symbol) {
-            return Some(tier::Node(tier::Kind::Instance(instance.clone(), known.env.clone())));
+        let mut contexts = base.instances.iter().filter(|(_, it)| it.symbol == symbol);
+        if let Some((instance, known)) = contexts.next() {
+            if contexts.next().is_some() {
+                return None;
+            }
+            return Some(tier::Node(tier::Kind::Instance(
+                instance.instance.clone(),
+                known.env.clone(),
+            )));
         }
         let (instance, env) = base.found_instances.get(symbol)?;
         Some(tier::Node(tier::Kind::Instance(instance.clone(), env.clone())))
@@ -1586,12 +1609,14 @@ impl Rejections {
             tier::Kind::Root(root) => {
                 base.compiled.iter().find(|(it, _)| it == root).map(|it| it.1.clone())
             }
-            tier::Kind::Instance(instance, env) => {
-                base.instances.get(instance).map(|it| it.symbol.clone()).or_else(|| {
+            tier::Kind::Instance(instance, env) => base
+                .instances
+                .get(&InstanceIn::new(instance.clone(), env.clone()))
+                .map(|it| it.symbol.clone())
+                .or_else(|| {
                     let mut found = base.found_instances.iter();
                     found.find(|(_, it)| it.0 == *instance && it.1 == *env).map(|it| it.0.clone())
-                })
-            }
+                }),
         }
     }
 
@@ -1778,6 +1803,22 @@ struct Instance {
     /// Whether the crate that compiles it has `-C overflow-checks`: the one that asks for it,
     /// until [`ObjectCodegen::settled`] says which crate rustc had compile it.
     checked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InstanceIn {
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+}
+
+impl InstanceIn {
+    fn new(instance: Instance, env: StoredParamEnvAndCrate) -> Self {
+        Self { instance, env }
+    }
+
+    fn requested(db: &dyn HirDatabase, instance: &Instance, env: &StoredParamEnvAndCrate) -> Self {
+        Self::new(instance.clone(), home::Homes::default().home(db, instance, env))
+    }
 }
 
 type NamedInstance = (Instance, Option<StoredParamEnvAndCrate>);
@@ -2162,7 +2203,7 @@ struct ObjectCodegen<'a, 'db> {
     imports: FxHashMap<String, FuncId>,
     /// The functions of `asm!` blocks, by their assembly.
     assemblies: FxHashMap<String, FuncId>,
-    instances: FxHashMap<Instance, FuncId>,
+    instances: FxHashMap<InstanceIn, FuncId>,
     pending: Vec<(Instance, StoredParamEnvAndCrate, FuncId)>,
     /// Every instance that went through `pending`.
     envs: Vec<(Instance, StoredParamEnvAndCrate)>,
@@ -2172,10 +2213,10 @@ struct ObjectCodegen<'a, 'db> {
     /// The code of the roots and instances compiled in units ([`units`]), yet to be put in
     /// the object, and the roots units compiled or tried to.
     unit_roots: FxHashMap<FunctionId, CompiledFunction>,
-    unit_instances: FxHashMap<Instance, CompiledFunction>,
+    unit_instances: FxHashMap<InstanceIn, CompiledFunction>,
     unit_tried: FxHashSet<FunctionId>,
     /// The instances that call rustc's copy instead of having code of their own.
-    forwarded: FxHashSet<Instance>,
+    forwarded: FxHashSet<InstanceIn>,
     /// [`Rejections::futures`] as the round started.
     rustc_futures: FxHashSet<salsa::Id>,
     /// Whether instances and statics get names another object can refer to.
@@ -2191,7 +2232,7 @@ struct ObjectCodegen<'a, 'db> {
     wanted: Vec<FunctionId>,
     on_demand_crates: FxHashSet<Crate>,
     /// Instances that failed in an earlier round, with the reason.
-    rejected: &'a FxHashMap<Instance, Rejected>,
+    rejected: &'a FxHashMap<InstanceIn, Rejected>,
     /// Size and alignment of every type laid out, collected when `RA_JIT_LAYOUTS` names a file
     /// to write them to. The harness compares them with rustc's.
     layouts: FxHashMap<String, (u64, u64)>,
@@ -5121,7 +5162,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn new(
         db: &'db dyn HirDatabase,
         symbols: &'a dyn SymbolResolver,
-        rejected: &'a FxHashMap<Instance, Rejected>,
+        rejected: &'a FxHashMap<InstanceIn, Rejected>,
         own_statics: OwnStatics,
         on_demand: &'a FxHashSet<FunctionId>,
         base: Option<&'a patch::Base>,
@@ -5751,7 +5792,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 #[cfg(feature = "llvm")]
                 None if self.units() => {
                     let wave = std::mem::take(&mut self.pending);
-                    let fresh = wave.iter().filter(|it| !self.unit_instances.contains_key(&it.0));
+                    let fresh = wave.iter().filter(|it| {
+                        !self
+                            .unit_instances
+                            .contains_key(&InstanceIn::new(it.0.clone(), it.1.clone()))
+                    });
                     let fresh = fresh.map(|(instance, env, _)| (instance.clone(), env.clone()));
                     let fresh = fresh.collect();
                     self.compile_units(&[], fresh);
@@ -5786,7 +5831,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         break;
                     }
                     if self.forward_to_rustc(&instance, id).is_some() {
-                        self.forwarded.insert(instance);
+                        self.forwarded.insert(InstanceIn::new(instance, env));
                     } else {
                         failed.push((instance, Rejected { env, why: e.to_string() }));
                     }
@@ -5870,7 +5915,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 entries.usable(name, &|symbol, checked| symbols.importable(symbol, checked))
             };
             // What the store has is not compiled, nor looked into for what it calls.
-            let in_store = |callee: &Instance| names.instance(callee).is_some_and(|it| usable(&it));
+            let in_store = |callee: &Instance, env: &StoredParamEnvAndCrate| {
+                let context = InstanceIn::requested(db, callee, env);
+                names.instance_in(&context.instance, &context.env).is_some_and(|it| usable(&it))
+            };
             // A root only called is asked about here, as it is reached.
             let stored_root = |root: FunctionId| match stored.get(&root) {
                 Some(name) => name.is_some(),
@@ -5957,7 +6005,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         }
                         _ => false,
                     };
-                    if !root && !rejected.contains_key(callee) && !in_store(callee) {
+                    if !root
+                        && !rejected.contains_key(&InstanceIn::requested(db, callee, asked))
+                        && !in_store(callee, asked)
+                    {
                         found.push((callee.clone(), homes.home(db, callee, asked)));
                     }
                 }
@@ -6032,7 +6083,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let tiers = self.tiers;
         let node = tier::Node(tier::Kind::Instance(instance.clone(), env.clone()));
         let tiered = tiers.and_then(|it| it.code(self.db, &node));
-        let unit = self.unit_instances.remove(instance).filter(|_| tiered.is_none());
+        let unit = self
+            .unit_instances
+            .remove(&InstanceIn::new(instance.clone(), env.clone()))
+            .filter(|_| tiered.is_none());
         let compiled = match (tiered, &unit) {
             (Some(code), _) => code,
             (None, Some(unit)) => unit,
@@ -6990,17 +7044,19 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             | InstanceDef::ReifyShim { .. } => None,
         };
         let name = self.callee_name(def);
-        if let Some(Rejected { why, .. }) = self.rejected.get(instance) {
+        let environment = self.homes.home(self.db, instance, env);
+        let context = InstanceIn::new(instance.clone(), environment.clone());
+        if let Some(Rejected { why, .. }) = self.rejected.get(&context) {
             unsupported!("callee `{name}`: {why}");
         }
         if self.handles_rustc_future(instance) {
             unsupported!("callee `{name}`: handles a future rustc lays out");
         }
-        if let Some(&id) = self.instances.get(instance) {
+        if let Some(&id) = self.instances.get(&context) {
             return Ok(id);
         }
-        if let Some(known) = self.base.and_then(|base| base.instances.get(instance)) {
-            let node = patch::Node::Instance(instance.clone());
+        if let Some(known) = self.base.and_then(|base| base.instances.get(&context)) {
+            let node = patch::Node::Instance(context.clone());
             if self.replaced.broken.contains(&node) {
                 unsupported!("callee `{name}`: an instance of the base gained or lost code");
             }
@@ -7013,7 +7069,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     Linkage::Hidden,
                     &compiled.code.signature,
                 )?;
-                self.instances.insert(instance.clone(), id);
+                self.instances.insert(context.clone(), id);
                 self.pending.push((instance.clone(), known.env.clone(), id));
                 return Ok(id);
             }
@@ -7032,7 +7088,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let mut hasher =
                 type_id::TypeIdHasher::new(self.db, self.symbols, &self.own_statics.crates);
             if let Some(hash) = hasher.type_id(of) {
-                return self.constant_type_id(instance.clone(), sig, hash);
+                return self.constant_type_id(instance.clone(), &environment, sig, hash);
             }
             let stuck = hasher.stuck.unwrap_or_default();
             let Some(ty) = self.symbol_type(of) else {
@@ -7080,7 +7136,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             builder.finalize(self.module.isa().frontend_config());
             self.builder_ctx = builder_ctx;
             self.define_shim(id, &mut ctx)?;
-            self.instances.insert(instance.clone(), id);
+            self.instances.insert(context.clone(), id);
             return Ok(id);
         }
         if signature.is_some_and(|it| !it.has_body()) {
@@ -7107,7 +7163,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             unsupported!("call to `{name}`, which has no body and no rustc symbol");
         }
         let from_store = self.entries.is_some() || self.base.is_some_and(|it| !it.found.is_empty());
-        let semantic_environment = self.homes.home(self.db, instance, env);
+        let semantic_environment = environment.clone();
         let stable =
             if from_store { self.stable_name_in(instance, &semantic_environment) } else { None };
         if let Some(name) = &stable {
@@ -7118,7 +7174,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             let body = signature.is_some().then_some(sig);
             if let Some(id) = self.found_callee(name, body)? {
-                self.instances.insert(instance.clone(), id);
+                self.instances.insert(context.clone(), id);
                 let home = self.homes.home(self.db, instance, env);
                 self.found_instances.insert(id, (instance.clone(), home));
                 return Ok(id);
@@ -7133,7 +7189,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .module
             .declare_function(&symbol, linkage, sig)
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
-        self.instances.insert(instance.clone(), id);
+        self.instances.insert(context.clone(), id);
         self.pending.push((instance.clone(), env.clone(), id));
         self.envs.push((instance.clone(), env.clone()));
         if let Some(name) = stable {
@@ -7153,26 +7209,34 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if failed.is_empty() {
             return;
         }
-        let mut callers: FxHashMap<&Instance, Vec<usize>> = FxHashMap::default();
+        let mut callers: FxHashMap<InstanceIn, Vec<usize>> = FxHashMap::default();
         for (at, (instance, env)) in self.envs.iter().enumerate() {
             let Ok(compiled) = compiled_instance(self.db, instance.clone(), env.clone()).as_ref()
             else {
                 continue;
             };
             for request in &compiled.requests.funcs {
-                if let FuncTarget::Instance(callee, _) = &request.target {
-                    callers.entry(callee).or_default().push(at);
+                if let FuncTarget::Instance(callee, asked) = &request.target {
+                    callers
+                        .entry(InstanceIn::requested(self.db, callee, asked))
+                        .or_default()
+                        .push(at);
                 }
             }
         }
-        let mut seen: FxHashSet<Instance> = failed.iter().map(|it| it.0.clone()).collect();
+        let mut seen: FxHashSet<InstanceIn> =
+            failed.iter().map(|it| InstanceIn::new(it.0.clone(), it.1.env.clone())).collect();
         let mut next = 0;
-        while let Some((callee, Rejected { why, .. })) = failed.get(next) {
+        while let Some((callee, Rejected { why, env })) = failed.get(next) {
             next += 1;
             let why = format!("callee `{}`: {why}", self.callee_name(callee.def));
-            for &at in callers.get(callee).into_iter().flatten() {
+            for &at in
+                callers.get(&InstanceIn::requested(self.db, callee, env)).into_iter().flatten()
+            {
                 let (caller, env) = &self.envs[at];
-                if !self.stands_in(caller) && seen.insert(caller.clone()) {
+                if !self.stands_in(caller, env)
+                    && seen.insert(InstanceIn::new(caller.clone(), env.clone()))
+                {
                     failed.push((caller.clone(), Rejected { env: env.clone(), why: why.clone() }));
                 }
             }
@@ -7201,8 +7265,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Whether rustc's copy of `instance` stands in for it when it is not compiled, which its
     /// callers then call.
-    fn stands_in(&self, instance: &Instance) -> bool {
-        self.forwarded.contains(instance)
+    fn stands_in(&self, instance: &Instance, env: &StoredParamEnvAndCrate) -> bool {
+        self.forwarded.contains(&InstanceIn::requested(self.db, instance, env))
             || matches!(instance.def, InstanceDef::Fn(func) if self
                 .instance_path(func, instance.args.as_ref())
                 .and_then(|path| self.symbols.path(&path))
@@ -7216,12 +7280,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         compiled: &[(FunctionId, String)],
         failed: &[(Instance, Rejected)],
     ) -> Vec<FunctionId> {
-        let lost: FxHashSet<&Instance> =
-            failed.iter().map(|it| &it.0).filter(|it| !self.stands_in(it)).collect();
+        let lost: FxHashSet<InstanceIn> = failed
+            .iter()
+            .filter(|(instance, why)| !self.stands_in(instance, &why.env))
+            .map(|(instance, why)| InstanceIn::new(instance.clone(), why.env.clone()))
+            .collect();
         let calls_lost = |root: FunctionId| {
             compiled_root(self.db, root).as_ref().is_ok_and(|it| {
                 it.requests.funcs.iter().any(|request| {
-                    matches!(&request.target, FuncTarget::Instance(callee, _) if lost.contains(callee))
+                    matches!(&request.target, FuncTarget::Instance(callee, env) if lost.contains(&InstanceIn::requested(self.db, callee, env)))
                 })
             })
         };
@@ -7287,14 +7354,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn constant_type_id(
         &mut self,
         instance: Instance,
+        environment: &StoredParamEnvAndCrate,
         sig: &Signature,
         hash: u128,
     ) -> Result<FuncId> {
-        if let Some(&id) = self.instances.get(&instance) {
+        let context = InstanceIn::new(instance, environment.clone());
+        if let Some(&id) = self.instances.get(&context) {
             return Ok(id);
         }
         let id = self.type_id_shim(sig, hash)?;
-        self.instances.insert(instance, id);
+        self.instances.insert(context, id);
         Ok(id)
     }
 
