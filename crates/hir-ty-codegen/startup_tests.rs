@@ -186,21 +186,101 @@ pub fn root() -> usize { Block::<u8>::VALUE.width }
             ("changed", changed, "a-longer-source.rs".len()),
             ("same-length", same_length, "other.rs".len()),
         ] {
-            let object = directory.join(format!("{name}.o"));
-            let native = directory.join(format!("{name}.c"));
-            let program = directory.join(name);
-            std::fs::write(&object, bytes).unwrap();
-            std::fs::write(&native, format!("#include <stdint.h>\nextern uintptr_t fixture_root(void);\nint main(void) {{ return fixture_root() == {expected} ? 0 : 1; }}\nint rust_eh_personality(void) {{ return 0; }}\n")).unwrap();
-            let linked = std::process::Command::new("cc")
-                .arg(&object)
-                .arg(&native)
-                .arg("-o")
-                .arg(&program)
-                .output()
-                .unwrap();
-            assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
-            assert!(std::process::Command::new(program).status().unwrap().success());
+            assert_eq!(native_usize(&directory, name, &bytes), expected);
         }
+    }
+}
+
+fn native_usize(directory: &std::path::Path, name: &str, bytes: &[u8]) -> usize {
+    let object = directory.join(format!("{name}.o"));
+    let driver = directory.join(format!("{name}.c"));
+    let program = directory.join(name);
+    std::fs::write(&object, bytes).unwrap();
+    std::fs::write(&driver, "#include <stdint.h>\n#include <stdio.h>\nextern uintptr_t fixture_root(void);\nint main(void) { printf(\"%zu\\n\", (size_t)fixture_root()); return 0; }\nint rust_eh_personality(void) { return 0; }\n").unwrap();
+    let linked = std::process::Command::new("cc")
+        .arg(&object)
+        .arg(&driver)
+        .arg("-o")
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
+    let output = std::process::Command::new(program).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value = stdout.trim().parse().unwrap();
+    assert_eq!(stdout, format!("{value}\n"));
+    value
+}
+
+#[test]
+fn cached_layout_observes_anonymous_type_filename_inputs() {
+    const TEST: &str = "startup_tests::cached_layout_observes_anonymous_type_filename_inputs";
+    if std::env::var_os(CHILD).is_none() {
+        let directory =
+            std::env::temp_dir().join(format!("blaze-type-filename-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, &directory)
+            .env("RA_JIT_CACHE", directory.join("store"))
+            .env("RA_JIT_CACHE_SEAL_AT", "1")
+            .env("RUST_BACKTRACE", "0")
+            .env_remove("RA_JIT_CACHE_CHECK")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    store::compiles_against("1.99.0");
+    let source = r#"
+//- minicore: sized
+//- /src/main.rs crate:type_inputs
+#[rustc_builtin_macro] macro_rules! file {}
+#[rustc_intrinsic] const unsafe fn size_of_val<T: ?Sized>(value: *const T) -> usize;
+#[rustc_intrinsic] const fn size_of<T>() -> usize;
+struct Block<T> { field: [u8; unsafe { size_of_val(file!() as *const str) }], value: [T; 0] }
+pub fn root() -> usize { size_of::<Block<u8>>() }
+"#;
+    for repeat in [false, true] {
+        let source = if repeat {
+            source.replace("pub fn root() -> usize { size_of::<Block<u8>>() }", "pub fn root() -> usize { let value = [0u8; unsafe { size_of_val(file!() as *const str) }]; unsafe { size_of_val(&value as *const _) } }")
+        } else {
+            source.to_owned()
+        };
+        let directory = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let (first, cold) =
+            build_with_source_name(&source, "root", false, false, Some("short.rs")).unwrap();
+        assert!(cold > 0);
+        assert_eq!(native_usize(&directory, "cold", &first), "short.rs".len());
+        let (_, compiled) =
+            build_with_source_name(&source, "root", false, false, Some("short.rs")).unwrap();
+        assert_eq!(compiled, 0);
+        let (changed, compiled) =
+            build_with_source_name(&source, "root", false, false, Some("a-longer-source.rs"))
+                .unwrap();
+        assert_eq!(
+            native_usize(&directory, "changed", &changed),
+            "a-longer-source.rs".len(),
+            "a warm native layout must reflect its actual current anonymous type constant"
+        );
+        assert!(compiled > 0);
+        let (same_length, compiled) =
+            build_with_source_name(&source, "root", false, false, Some("other.rs")).unwrap();
+        assert_eq!(native_usize(&directory, "same-length", &same_length), "other.rs".len());
+        assert!(compiled > 0, "equal layout bytes must still preserve the current observation set");
+        assert!(
+            build_with_source_name(&source, "root", false, false, None).is_err(),
+            "missing type filename inputs must not hit a previous cache entry"
+        );
     }
 }
 

@@ -81,7 +81,7 @@ impl SemanticInputs {
             hash.update((bytes.len() as u64).to_le_bytes());
             hash.update(bytes);
         };
-        field(b"blaze concrete semantic inputs 3");
+        field(b"blaze concrete semantic inputs 4");
         for constant in &self.constants {
             field(&[0]);
             field(constant.as_bytes());
@@ -530,7 +530,7 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit entry 16");
+        field(b"ra-jit entry 17");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());

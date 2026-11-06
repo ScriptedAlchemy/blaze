@@ -1,11 +1,14 @@
-//! Concrete observations for explicit constant operands of one MIR body.
+//! Concrete observations for MIR constants and their typed anonymous owners.
 //! Callers must compose type/normalization and reached-body obligations before
 //! replacing any conservative source-owner guard with these observations.
 
 use base_db::CurrentSourceName;
-use hir_def::{CallableDefId, signatures::FunctionSignature};
+use hir_def::{AdtId, CallableDefId, ExpressionStoreOwnerId, signatures::FunctionSignature};
 use rustc_hash::FxHashSet;
-use rustc_type_ir::inherent::{Const as _, IntoKind};
+use rustc_type_ir::{
+    TypeSuperVisitable, TypeVisitable, TypeVisitor,
+    inherent::{Const as _, IntoKind},
+};
 use salsa::SalsaValue;
 
 use crate::{
@@ -14,7 +17,7 @@ use crate::{
     method_resolution::lookup_impl_const,
     mir::{MirLowerError, Operand, OperandKind},
     next_solver::{
-        ConstKind, DbInterner, GenericArgs, StoredGenericArgs, TyKind, TypingMode,
+        ConstKind, DbInterner, GenericArgs, StoredGenericArgs, Ty, TyKind, TypingMode,
         UnevaluatedConst,
         infer::{DbInternerInferExt, InferCtxt},
     },
@@ -90,6 +93,7 @@ pub fn prepare_constants<'db>(
         }
     };
     let mut constants = Vec::new();
+    let mut types = Vec::new();
     let mut callees = Vec::new();
     let mut seen_callees = FxHashSet::default();
     let mut collect = |operand: &Operand| {
@@ -98,6 +102,7 @@ pub fn prepare_constants<'db>(
             OperandKind::Allocation { allocation } => Some(allocation.as_ref().ty),
             _ => None,
         };
+        types.extend(ty);
         if let Some(ty) = ty
             && let TyKind::FnDef(definition, arguments) = ty.kind()
             && let CallableDefId::FunctionId(function) = definition.0
@@ -129,9 +134,50 @@ pub fn prepare_constants<'db>(
         }
     }
     prepared.callees = callees;
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let crate::mir::StatementKind::Assign(_, crate::mir::Rvalue::Repeat(_, count)) =
+                &statement.kind
+                && let ConstKind::Unevaluated(value) = count.as_ref().kind()
+            {
+                constants.push(value);
+            }
+        }
+    }
+    types.extend(body.locals.iter().map(|(_, local)| local.ty.as_ref()));
+    let mut owner_inputs =
+        TypeOwners { db, seen: FxHashSet::default(), owners: Vec::new(), fields: Vec::new() };
+    for ty in types {
+        ty.visit_with(&mut owner_inputs);
+    }
+    while let Some(ty) = owner_inputs.fields.pop() {
+        ty.visit_with(&mut owner_inputs);
+    }
+    let arguments = input.arguments(db).clone();
+    if let InferBodyId::DefWithBodyId(owner) = body.owner {
+        owner_inputs.owners.push((ExpressionStoreOwnerId::Body(owner), arguments.clone()));
+        owner_inputs
+            .owners
+            .push((ExpressionStoreOwnerId::Signature(body.owner.generic_def(db)), arguments));
+    }
+    let mut selections: Vec<_> =
+        constants.into_iter().map(|constant| select_constant(db, constant, &environment)).collect();
+    let mut owners = FxHashSet::default();
+    for (owner, arguments) in owner_inputs.owners {
+        if !owners.insert((owner, arguments.clone())) {
+            continue;
+        }
+        for constant in super::owner_anonymous_const_ids(db, owner) {
+            let arguments = if constant.loc(db).allow_using_generic_params {
+                arguments.clone()
+            } else {
+                GenericArgs::empty().store()
+            };
+            selections.push(ConstantSelection { definition: constant.into(), arguments });
+        }
+    }
     let mut seen = FxHashSet::default();
-    for constant in constants {
-        let selection = select_constant(db, constant, &environment);
+    for selection in selections {
         if !seen.insert((selection.definition, selection.arguments.clone())) {
             continue;
         }
@@ -146,6 +192,58 @@ pub fn prepare_constants<'db>(
     prepared.source_names.sort_by(|a, b| (a.file.index(), &a.name).cmp(&(b.file.index(), &b.name)));
     prepared.source_names.dedup();
     prepared
+}
+
+struct TypeOwners<'db> {
+    db: &'db dyn HirDatabase,
+    seen: FxHashSet<Ty<'db>>,
+    owners: Vec<(ExpressionStoreOwnerId, StoredGenericArgs)>,
+    fields: Vec<Ty<'db>>,
+}
+
+impl<'db> TypeVisitor<DbInterner<'db>> for TypeOwners<'db> {
+    type Result = ();
+    fn visit_ty(&mut self, ty: Ty<'db>) {
+        if !self.seen.insert(ty) {
+            return;
+        }
+        match ty.kind() {
+            TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(..) => return,
+            TyKind::Adt(def, arguments) => {
+                let def = def.def_id();
+                self.owners
+                    .push((ExpressionStoreOwnerId::Signature(def.into()), arguments.store()));
+                let variants: Vec<_> = match def {
+                    AdtId::StructId(id) => vec![id.into()],
+                    AdtId::UnionId(id) => vec![id.into()],
+                    AdtId::EnumId(id) => id
+                        .enum_variants(self.db)
+                        .variants
+                        .values()
+                        .map(|&(id, _)| id.into())
+                        .collect(),
+                };
+                for variant in variants {
+                    self.owners
+                        .push((ExpressionStoreOwnerId::VariantFields(variant), arguments.store()));
+                    if crate::representability::representability(self.db, def)
+                        != crate::representability::Representability::Infinite
+                    {
+                        let interner = DbInterner::new_no_crate(self.db);
+                        self.fields.extend(self.db.field_types(variant).iter().map(
+                            |(_, field)| {
+                                field.ty().instantiate(interner, arguments).skip_norm_wip()
+                            },
+                        ));
+                    }
+                }
+                // Fields determine layout; unused arguments can hide phantom/pointer cycles.
+                return;
+            }
+            _ => {}
+        }
+        ty.super_visit_with(self)
+    }
 }
 
 pub fn select_constant<'db>(

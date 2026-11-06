@@ -34,7 +34,7 @@ const OF_CHECKOUT: char = '~';
 /// After the name of an instance compiled with `-C overflow-checks`.
 const CHECKED: &str = " checked";
 
-const SEMANTIC_INPUTS: &str = " inputs3:";
+const SEMANTIC_INPUTS: &str = " inputs4:";
 
 pub(super) fn without_semantic_inputs(name: &str) -> &str {
     match name.rsplit_once(SEMANTIC_INPUTS) {
