@@ -19,6 +19,9 @@ use vfs::Vfs;
 
 use crate::{Args, Parts, Sources, Watched, WatchedFile};
 
+#[path = "release_features.rs"]
+mod release_features;
+
 pub(crate) const EXPANSION_ERRORS: &[&str] =
     &["syntax-error", "macro-error", "macro-def-error", "non-unicode-env", "unresolved-macro-call"];
 
@@ -185,6 +188,52 @@ mod syntax_tests {
             let warm = crate::broken_in(&db, &[file], &sources, &args.checkout, None, false);
             assert_eq!(cold.is_some(), rejected, "{source}");
             assert_eq!(warm, cold, "{source}");
+        }
+    }
+
+    #[test]
+    fn bootstrap_probe_uses_pinned_feature_status_and_does_not_loosen_gates() {
+        for (features, bootstrap, accepts) in [
+            (vec![], false, true),
+            (vec!["proc_macro_span"], true, true),
+            (vec!["never_type"], true, true),
+            (vec!["test_accepted_feature"], true, true),
+            (vec!["proc_macro_span"], false, false),
+            (vec!["never_type_fallback"], true, false),
+            (vec!["never_type_fallback"], false, false),
+        ] {
+            assert_eq!(
+                probe_feature_policy(bootstrap, features.into_iter().map(str::to_owned))
+                    .unwrap(),
+                accepts
+            );
+        }
+        assert!(
+            probe_feature_policy(true, ["not_a_rust_feature_199".to_owned()])
+                .unwrap_err()
+                .to_string()
+                .contains("cannot prove feature")
+        );
+    }
+
+    #[test]
+    fn bootstrap_probe_uses_effective_cfg_attr_feature_names() {
+        use test_fixture::WithFixture;
+        for (source, wanted) in [
+            ("#![cfg_attr(all(), feature(proc_macro_span))]\nfn main() {}", true),
+            ("#![cfg_attr(any(), feature(proc_macro_span))]\nfn main() {}", false),
+            ("#![feature(proc_macro_span)]\nfn main() {}", true),
+        ] {
+            let (db, _) =
+                RootDatabase::with_single_file(&format!("//- /main.rs crate:app\n{source}\n"));
+            let krate = ide_db::base_db::all_crates(&db)[0];
+            let names: Vec<String> =
+                hir_def::unstable_features::UnstableFeatures::query(&db, krate)
+                    .iter()
+                    .map(|name| name.as_str().to_owned())
+                    .collect();
+            assert_eq!(names.iter().any(|name| name == "proc_macro_span"), wanted);
+            assert!(probe_feature_policy(true, names).unwrap());
         }
     }
 
@@ -517,6 +566,40 @@ fn source_files(
     files
 }
 
+/// Source probes must not mistake an unrecognized or removed feature for a
+/// successful bootstrap compilation. cfg_attr has already been expanded by
+/// the crate def map; the catalog describes the pinned Rust 1.99 release.
+fn probe_feature_policy(
+    bootstrap: bool,
+    feature_names: impl IntoIterator<Item = String>,
+) -> anyhow::Result<bool> {
+    let mut names: Vec<String> = feature_names.into_iter().collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return Ok(true);
+    }
+    if !bootstrap {
+        eprintln!("error[E0554]: `#![feature]` may not be used on the stable release channel");
+        return Ok(false);
+    }
+    for name in names {
+        match release_features::classify(&name) {
+            release_features::Status::Active | release_features::Status::Accepted => {}
+            release_features::Status::Removed => {
+                eprintln!("error[E0557]: feature `{name}` has been removed in Rust 1.99.0");
+                return Ok(false);
+            }
+            release_features::Status::Unknown => {
+                anyhow::bail!(
+                    "owned Rust 1.99.0 feature catalog cannot prove feature `{name}`;                      refusing the bootstrap probe rather than accepting an unknown feature"
+                );
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// A metadata-only compiler probe checks all source bodies, including unreachable
 /// ones. It loads an owned source description, not a Cargo workspace or rmeta.
 pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
@@ -537,12 +620,13 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
     anyhow::ensure!(crates.len() == 1, "the source probe must identify one crate");
     let krate = crates[0];
     let id = ide_db::base_db::Crate::from(krate);
-    if krate.feature_attributes_on_stable(&db) {
-        anyhow::ensure!(
-            !bootstrap,
-            "bootstrap feature probes require the owned release feature catalog"
-        );
-        eprintln!("error[E0554]: `#![feature]` may not be used on the stable release channel");
+    // Query effective (including cfg_attr-expanded) feature names, not the
+    // source's raw feature tokens. Inactive cfg_attr must not gate a probe.
+    let features = hir_def::unstable_features::UnstableFeatures::query(&db, id);
+    if !probe_feature_policy(
+        bootstrap,
+        features.iter().map(|feature| feature.as_str().to_owned()),
+    )? {
         return Ok(false);
     }
     let files = source_files(&mut db, &mut vfs, &[id]);
