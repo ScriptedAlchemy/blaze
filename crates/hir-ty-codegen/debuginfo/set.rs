@@ -341,11 +341,7 @@ impl TypeSet {
     pub(crate) fn to_vec(&self) -> Vec<DebugType> {
         let mut flat = Flat::default();
         flat.add(self);
-        let Flat { mut types, names, named, .. } = flat;
-        for (at, nth, name) in named {
-            types[at as usize].1[nth] = names.get(&name).copied();
-        }
-        types.iter().map(|(told, of)| expand(told, of)).collect()
+        flat.canonical()
     }
 
     /// The set of the first of `types`, which name each other by their places among them.
@@ -420,28 +416,138 @@ struct Flat {
 
 impl Flat {
     fn add(&mut self, set: &TypeSet) -> TypeIndex {
-        if let Some(&at) = self.places.get(&set.at()) {
-            return at;
-        }
-        let at = self.types.len() as TypeIndex;
-        let told = set.node().told.clone();
-        if let Some(name) = told.name() {
-            self.names.entry(name.clone()).or_insert(at);
-        }
-        self.types.push((told, Vec::new()));
-        self.places.insert(set.at(), at);
-        let mut of = Vec::with_capacity(set.node().of.len());
-        for (nth, part) in set.of().enumerate() {
-            of.push(match part {
-                Of::Type(set) => Some(self.add(&set)),
-                Of::Named(name) => {
-                    self.named.push((at, nth, name.clone()));
-                    None
+        let root = set.at();
+        let mut pending: Vec<(TypeSet, Option<(usize, usize)>)> = vec![(set.clone(), None)];
+        while let Some((set, parent)) = pending.pop() {
+            let known = self.places.get(&set.at()).copied();
+            let at = known.unwrap_or(self.types.len() as TypeIndex);
+            if let Some((parent, nth)) = parent {
+                self.types[parent].1[nth] = Some(at);
+            }
+            if known.is_some() {
+                continue;
+            }
+            let told = set.node().told.clone();
+            if let Some(name) = told.name() {
+                self.names.entry(name.clone()).or_insert(at);
+            }
+            let parts: Vec<_> = set.of().collect();
+            self.types.push((told, vec![None; parts.len()]));
+            self.places.insert(set.at(), at);
+            for (nth, part) in parts.into_iter().enumerate().rev() {
+                match part {
+                    Of::Type(set) => pending.push((set, Some((at as usize, nth)))),
+                    Of::Named(name) => self.named.push((at, nth, name.clone())),
                 }
-            });
+            }
         }
-        self.types[at as usize].1 = of;
-        at
+        self.places[&root]
+    }
+
+    fn canonical(mut self) -> Vec<DebugType> {
+        let mut unresolved = vec![Vec::new(); self.types.len()];
+        for (at, nth, name) in self.named {
+            let target = self.names.get(&name).copied();
+            self.types[at as usize].1[nth] = target;
+            if target.is_none() {
+                unresolved[at as usize].push((nth, name));
+            }
+        }
+        for names in &mut unresolved {
+            names.sort_unstable_by_key(|(nth, _)| *nth);
+        }
+
+        // Resolving the same recursive types concurrently can leave independent but
+        // equivalent groups in a set. Partition by all metadata and ordered edges,
+        // rather than by allocation sharing, before assigning the stored type indices.
+        let mut groups = FxHashMap::default();
+        let mut blocks: Vec<Vec<usize>> = Vec::new();
+        let mut classes = Vec::with_capacity(self.types.len());
+        let mut positions = Vec::with_capacity(self.types.len());
+        let mut incoming = vec![Vec::new(); self.types.len()];
+        for (at, (told, of)) in self.types.iter().enumerate() {
+            let class = *groups.entry((told, of.len(), &unresolved[at])).or_insert_with(|| {
+                blocks.push(Vec::new());
+                blocks.len() - 1
+            });
+            classes.push(class);
+            positions.push(blocks[class].len());
+            blocks[class].push(at);
+            for (nth, target) in of.iter().enumerate() {
+                if let Some(target) = target {
+                    incoming[*target as usize].push((at, nth));
+                }
+            }
+        }
+
+        let mut pending: std::collections::VecDeque<_> = (0..blocks.len()).collect();
+        let mut queued = vec![true; blocks.len()];
+        while let Some(target) = pending.pop_front() {
+            queued[target] = false;
+            let mut edges = FxHashMap::<_, Vec<_>>::default();
+            for &at in &blocks[target] {
+                for &(parent, nth) in &incoming[at] {
+                    edges.entry(nth).or_default().push(parent);
+                }
+            }
+            for parents in edges.into_values() {
+                let mut touched = FxHashMap::<_, Vec<_>>::default();
+                for parent in parents {
+                    touched.entry(classes[parent]).or_default().push(parent);
+                }
+                for (class, split) in touched {
+                    if split.len() == blocks[class].len() {
+                        continue;
+                    }
+                    let new = blocks.len();
+                    blocks.push(Vec::with_capacity(split.len()));
+                    queued.push(false);
+                    for at in split {
+                        let position = positions[at];
+                        blocks[class].swap_remove(position);
+                        if let Some(&swapped) = blocks[class].get(position) {
+                            positions[swapped] = position;
+                        }
+                        classes[at] = new;
+                        positions[at] = blocks[new].len();
+                        blocks[new].push(at);
+                    }
+                    // Each edge is revisited only for smaller splitters, unless both
+                    // halves replace a block that was already waiting in the queue.
+                    let next = if queued[class] || blocks[new].len() < blocks[class].len() {
+                        new
+                    } else {
+                        class
+                    };
+                    if !queued[next] {
+                        queued[next] = true;
+                        pending.push_back(next);
+                    }
+                }
+            }
+        }
+
+        let mut order = Vec::new();
+        let mut indices = vec![None; blocks.len()];
+        let mut pending = vec![0];
+        while let Some(at) = pending.pop() {
+            let class = classes[at];
+            if indices[class].is_some() {
+                continue;
+            }
+            indices[class] = Some(order.len() as TypeIndex);
+            order.push(at);
+            pending.extend(self.types[at].1.iter().rev().flatten().map(|&at| at as usize));
+        }
+        order
+            .into_iter()
+            .map(|at| {
+                let (told, of) = &self.types[at];
+                let of: Vec<_> =
+                    of.iter().map(|at| at.and_then(|at| indices[classes[at as usize]])).collect();
+                expand(told, &of)
+            })
+            .collect()
     }
 }
 
@@ -711,5 +817,300 @@ mod tests {
         let set = resolve(&mut found, &names[0]).unwrap();
         assert_eq!(set.to_vec().len(), 40);
         assert_eq!(found.1.len(), 40);
+    }
+
+    fn pair(left: TypeSet, right: TypeSet) -> TypeSet {
+        TypeSet {
+            group: Arc::new([Node {
+                told: Interned::new(Told::Struct(Shape {
+                    name: Symbol::intern("Pair"),
+                    size: 16,
+                    fields: Box::new([(Symbol::intern("left"), 0), (Symbol::intern("right"), 8)]),
+                    parameters: Box::new([]),
+                })),
+                of: Box::new([Part::Type(left), Part::Type(right)]),
+            }]),
+            nth: 0,
+        }
+    }
+
+    fn recursive() -> TypeSet {
+        TypeSet::from(vec![
+            DebugType::Struct(aggregate("A", 8, vec![field("b", 0, 1)], vec![])),
+            DebugType::Struct(aggregate("B", 8, vec![field("a", 0, 0)], vec![])),
+        ])
+    }
+
+    #[test]
+    fn equal_graphs_have_identical_bytes_regardless_of_sharing() {
+        let one = TypeSet::from(list());
+        let shared = pair(one.clone(), one);
+        let duplicated = pair(TypeSet::from(list()), TypeSet::from(list()));
+        assert!(shared == duplicated);
+        assert_eq!(shared.to_vec(), duplicated.to_vec());
+        assert_eq!(
+            postcard::to_allocvec(&shared.to_vec()),
+            postcard::to_allocvec(&duplicated.to_vec())
+        );
+    }
+
+    #[test]
+    fn mutually_recursive_graphs_have_identical_bytes_regardless_of_sharing() {
+        let one = recursive();
+        let shared = pair(one.clone(), one);
+        let duplicated = pair(recursive(), recursive());
+        assert!(shared == duplicated);
+        assert_eq!(shared.to_vec(), duplicated.to_vec());
+        assert_eq!(shared.to_vec().len(), 3);
+        assert!(TypeSet::from(duplicated.to_vec()) == shared);
+    }
+
+    #[test]
+    fn local_named_edges_and_direct_edges_have_identical_bytes() {
+        let direct = TypeSet::from(vec![DebugType::Struct(aggregate(
+            "Recursive",
+            8,
+            vec![field("next", 0, 0)],
+            vec![],
+        ))]);
+        let named = TypeSet {
+            group: Arc::new([Node {
+                told: direct.node().told.clone(),
+                of: Box::new([Part::Named(Symbol::intern("Recursive"))]),
+            }]),
+            nth: 0,
+        };
+        assert_eq!(pair(direct.clone(), direct.clone()).to_vec(), pair(direct, named).to_vec());
+    }
+
+    #[test]
+    fn equal_names_do_not_merge_distinct_type_metadata() {
+        let original = aggregate("Same", 16, vec![field("value", 0, 1)], vec![("T".into(), 1)]);
+        let base = DebugType::Base { name: "u8".into(), size: 1, encoding: 7 };
+        let graph = |of| TypeSet::from(vec![DebugType::Struct(of), base.clone()]);
+        let mut variants = Vec::new();
+        let mut changed = original.clone();
+        changed.size = 32;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.fields[0].name = "other".into();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.fields[0].offset = 8;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.parameters[0].0 = "U".into();
+        variants.push(changed);
+        for variant in variants {
+            let left = graph(original.clone());
+            let right = graph(variant);
+            assert!(left != right);
+            let combined = pair(left, right);
+            let encoded = combined.to_vec();
+            let same = encoded
+                .iter()
+                .filter(|ty| matches!(ty, DebugType::Struct(it) if it.name == "Same"))
+                .count();
+            assert_eq!(same, 2);
+            assert!(TypeSet::from(encoded) == combined);
+        }
+    }
+
+    #[test]
+    fn equal_layouts_retain_distinct_targets_and_field_order() {
+        let graph = |encoding| {
+            TypeSet::from(vec![
+                DebugType::Struct(aggregate("Same", 1, vec![field("value", 0, 1)], vec![])),
+                DebugType::Base { name: "byte".into(), size: 1, encoding },
+            ])
+        };
+        let unsigned = graph(7);
+        let signed = graph(5);
+        let forward = pair(unsigned.clone(), signed.clone()).to_vec();
+        let reverse = pair(signed, unsigned).to_vec();
+        assert_ne!(forward, reverse);
+        assert_eq!(forward.len(), 5);
+        assert_eq!(
+            forward
+                .iter()
+                .filter(|ty| matches!(ty, DebugType::Struct(it) if it.name == "Same"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn unresolved_named_edges_remain_distinct() {
+        let pointer = |name| TypeSet {
+            group: Arc::new([Node {
+                told: Interned::new(Told::Pointer { name: Symbol::intern("opaque") }),
+                of: Box::new([Part::Named(Symbol::intern(name))]),
+            }]),
+            nth: 0,
+        };
+        let encoded = pair(pointer("ExternalA"), pointer("ExternalB")).to_vec();
+        assert_eq!(encoded.len(), 3);
+        assert_eq!(encoded[1], DebugType::Pointer { name: "opaque".into(), to: None });
+        assert_eq!(encoded[2], encoded[1]);
+    }
+
+    #[test]
+    fn long_chains_are_partitioned_and_written_without_recursive_traversal() {
+        let mut sets =
+            vec![TypeSet::from(vec![DebugType::Struct(aggregate("Link", 8, vec![], vec![]))])];
+        let told = Interned::new(Told::Struct(Shape {
+            name: Symbol::intern("Link"),
+            size: 8,
+            fields: Box::new([(Symbol::intern("next"), 0)]),
+            parameters: Box::new([]),
+        }));
+        for _ in 0..8192 {
+            let child = sets.last().unwrap().clone();
+            sets.push(TypeSet {
+                group: Arc::new([Node { told: told.clone(), of: Box::new([Part::Type(child)]) }]),
+                nth: 0,
+            });
+        }
+        let encoded = sets.last().unwrap().to_vec();
+        assert_eq!(encoded.len(), sets.len());
+        for (nth, ty) in encoded.iter().enumerate() {
+            let DebugType::Struct(it) = ty else { panic!("not a link") };
+            if nth + 1 == encoded.len() {
+                assert!(it.fields.is_empty());
+            } else {
+                assert_eq!(it.fields, [field("next", 0, (nth + 1) as TypeIndex)]);
+            }
+        }
+        // Drop each owner before its child rather than testing Arc's recursive destructor.
+        while sets.pop().is_some() {}
+    }
+
+    #[test]
+    fn overlapping_resolutions_in_one_cache_have_identical_bytes() {
+        struct Shared {
+            definitions: Named,
+            cache: Arc<std::sync::Mutex<FxHashMap<&'static str, Option<TypeSet>>>>,
+            start: Arc<std::sync::Barrier>,
+        }
+        impl Found for Shared {
+            type Key = &'static str;
+
+            fn own(&mut self, key: &&'static str) -> Option<Arc<Own<Self::Key>>> {
+                if *key == "A" {
+                    self.start.wait();
+                }
+                self.definitions.own(key)
+            }
+
+            fn set(&mut self, key: &&'static str) -> Option<Option<TypeSet>> {
+                self.cache.lock().unwrap().get(key).cloned()
+            }
+
+            fn keep(&mut self, key: &&'static str, set: Option<TypeSet>) {
+                self.cache.lock().unwrap().insert(key, set);
+            }
+        }
+        let cache = Arc::new(std::sync::Mutex::new(FxHashMap::default()));
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|nth| {
+                    let mut found = Shared {
+                        definitions: Named(
+                            vec![("A", vec!["B"]), ("B", vec!["A"])],
+                            FxHashMap::default(),
+                        ),
+                        cache: cache.clone(),
+                        start: start.clone(),
+                    };
+                    scope.spawn(move || {
+                        let first = if nth % 2 == 0 { "A" } else { "B" };
+                        resolve(&mut found, &first).unwrap();
+                        resolve(&mut found, &"A").unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|it| it.join().unwrap()).collect::<Vec<_>>()
+        });
+        let expected = results[0].to_vec();
+        for set in &results {
+            assert!(set == &results[0]);
+            assert_eq!(set.to_vec(), expected);
+        }
+        assert_eq!(
+            pair(results[0].clone(), results[0].clone()).to_vec(),
+            pair(results[1].clone(), results[2].clone()).to_vec()
+        );
+    }
+
+    #[test]
+    fn concurrently_resolved_graphs_have_stable_store_keys_and_entry_references() {
+        use crate::{cached, debuginfo::FunctionDebug, fragment::Code, store};
+        use cranelift_codegen::{ir::Signature, isa::CallConv};
+
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let resolved = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|nth| {
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        let mut found =
+                            Named(vec![("A", vec!["B"]), ("B", vec!["A"])], FxHashMap::default());
+                        barrier.wait();
+                        let first = if nth % 2 == 0 { "A" } else { "B" };
+                        resolve(&mut found, &first).unwrap();
+                        resolve(&mut found, &"A").unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|it| it.join().unwrap()).collect::<Vec<_>>()
+        });
+        let shared = pair(resolved[0].clone(), resolved[0].clone());
+        let interleaved = pair(resolved[1].clone(), resolved[2].clone());
+        assert!(shared == interleaved);
+
+        store::compiles_against("1.99.0");
+        let directory =
+            std::env::temp_dir().join(format!("blaze-debug-graph-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let store = store::Store::owned(&directory).unwrap();
+        let encode = |types| {
+            let mut debug = FunctionDebug::new("test".into(), "test".into());
+            debug.types = vec![types];
+            let code = Code {
+                signature: Signature::new(CallConv::SystemV),
+                bytes: vec![],
+                align: 1,
+                relocs: vec![],
+                elf_types: vec![],
+                unwind: None,
+                lines: vec![],
+                slots: Default::default(),
+            };
+            let mut entry = cached::Entry {
+                label: "test".into(),
+                funcs: vec![],
+                datas: vec![],
+                code: (&code).into(),
+                debug: Some(debug),
+                tracked: None,
+            };
+            let bytes = cached::Writer::alone(&store, None, None).encoded(&mut entry).unwrap();
+            let references = &entry.debug.as_ref().unwrap().stored_types;
+            assert_eq!(references.len(), 1);
+            store.seal_checked().unwrap();
+            assert!(store.get(&references[0]).is_some());
+            assert_eq!(
+                cached::Entry::decode(&bytes).unwrap().debug.unwrap().stored_types,
+                *references
+            );
+            (bytes, references.clone())
+        };
+        let first = encode(shared);
+        let second = encode(interleaved);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(first.1, second.1);
+        assert_eq!(first.0, second.0);
     }
 }
