@@ -123,6 +123,10 @@ impl Program {
             }
         };
         push_lines(&mut source, &parts.crate_attrs);
+        if !parts.crate_attrs.is_empty() {
+            // rustdoc separates the example's inner attributes from its program.
+            source.push('\n');
+        }
         let injects = !parts.names_the_crate
             && !frame.no_crate_inject
             && frame.crate_name != "std"
@@ -132,7 +136,7 @@ impl Program {
             source.push_str(&format!("extern crate r#{};\n", frame.crate_name));
             lines_before += 1;
         }
-        push_lines(&mut source, &parts.extern_crates);
+        push_lines(&mut source, parts.extern_crates.trim_start());
         if parts.has_main || source.contains("![no_std]") {
             source.push_str(rest);
             return Program { source, lines_before };
@@ -162,7 +166,7 @@ mod tests {
     fn attributes_alone_have_a_main() {
         assert_eq!(
             program("#![allow(dead_code)]"),
-            "#![allow(unused)]\n#![allow(dead_code)]\n\
+            "#![allow(unused)]\n#![allow(dead_code)]\n\n\
              fn main() { #[allow(non_snake_case)] fn _doctest_main_src_lib_rs_3_0() {\n\n} _doctest_main_src_lib_rs_3_0() }"
         );
     }
@@ -183,6 +187,26 @@ mod tests {
             program("use app::double;\nfn main() {\n    println!(\"printed {}\", double(5));\n}"),
             "#![allow(unused)]\n#[allow(unused_extern_crates)]\nextern crate r#app;\n\
              use app::double;\nfn main() {\n    println!(\"printed {}\", double(5));\n}"
+        );
+    }
+
+    #[test]
+    fn inner_attributes_separate_from_an_injected_library() {
+        assert_eq!(
+            program("#![allow(unused_variables)]\nlet _ = app::WORDS;"),
+            "#![allow(unused)]\n#![allow(unused_variables)]\n\n\
+             #[allow(unused_extern_crates)]\nextern crate r#app;\n\
+             fn main() { #[allow(non_snake_case)] fn _doctest_main_src_lib_rs_3_0() {\n\
+             let _ = app::WORDS;\n} _doctest_main_src_lib_rs_3_0() }"
+        );
+    }
+
+    #[test]
+    fn inner_attributes_separate_from_an_explicit_main() {
+        assert_eq!(
+            program("#![allow(unused_variables)]\nfn main() { panic!(\"here\"); }"),
+            "#![allow(unused)]\n#![allow(unused_variables)]\n\n\
+             fn main() { panic!(\"here\"); }"
         );
     }
 

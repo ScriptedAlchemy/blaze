@@ -1133,8 +1133,9 @@ struct Test {
     name: String,
     marks: Marks,
     program: Program,
-    /// The path and line rustc is to show for the first line of the example.
+    /// The file rustdoc reports for the generated standalone program.
     shown_path: String,
+    /// The documentation fence line, used in the test's name.
     line: usize,
     edition: Edition,
     /// Whether rustdoc builds the example in one program with the others, as it does from
@@ -1217,12 +1218,6 @@ impl Test {
             edition,
             in_one,
         }
-    }
-
-    /// The lines before the program's first in a file of it whose lines are numbered as
-    /// rustdoc has rustc show them: from the line of the example in its documentation.
-    fn padding(&self) -> usize {
-        self.line.saturating_sub(self.program.lines_before)
     }
 
     /// The name with what the harness adds for how the example is tested.
@@ -1676,8 +1671,9 @@ fn add_crates(
         };
         let file = vfs::FileId::from_raw(FIRST_FILE - n as u32);
         let root = SourceRootId(FIRST_SOURCE_ROOT - n as u32);
-        let text = format!("{}{}", "\n".repeat(test.padding()), test.program.source);
-        db.set_file_text_with_durability(file, &text, Durability::LOW);
+        // Runtime locations count the generated wrapper's lines. The fence's
+        // original line belongs only to the harness label.
+        db.set_file_text_with_durability(file, &test.program.source, Durability::LOW);
         db.set_file_source_root_with_durability(file, root, Durability::LOW);
         let mut files = FileSet::default();
         files.insert(file, VfsPath::from(vfs_path));
@@ -1711,6 +1707,103 @@ fn add_crates(
     let all: Vec<base_db::Crate> = base_db::all_crates(db).iter().copied().chain(crates).collect();
     base_db::set_all_crates_with_durability(db, all, Durability::MEDIUM);
     added
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+    use test_fixture::WithFixture;
+
+    fn check(code: &str, locations: &[(&str, u32, u32)]) {
+        // Moving the same block changes the harness label, not the standalone
+        // program's runtime source coordinates (rustdoc 1.99, edition 2021).
+        for fence in [1, 13, 41] {
+            let (mut db, _) = RootDatabase::with_single_file(
+                "//- /workspace/util/src/lib.rs crate:util edition:2021\npub const WORDS: usize = 2;",
+            );
+            let library = ide_db::base_db::all_crates(&db)[0];
+            let asked = Asked {
+                admission: None,
+                crate_name: "util".into(),
+                source: "util/src/lib.rs".into(),
+                edition: "2021".into(),
+                cwd: "/workspace".into(),
+                run_in: "/workspace/util".into(),
+                env: Vec::new(),
+                rustc_args: Vec::new(),
+                target: None,
+                features: Vec::new(),
+                build: None,
+                wanted: Wanted::default(),
+                dir: "/scratch".into(),
+            };
+            let example = Example {
+                item: "WORDS".into(),
+                file: "/workspace/util/src/lib.rs".into(),
+                line: fence,
+                marks: Marks::default(),
+                code: code.to_owned(),
+            };
+            let frame = Frame { crate_name: "util", attrs: &[], no_crate_inject: false };
+            let examples = vec![Test::of(&asked, example, &frame)];
+            assert_eq!(examples[0].line, fence);
+            assert_eq!(examples[0].shown_path, "util/src/lib.rs");
+            assert_eq!(examples[0].name, format!("util/src/lib.rs - WORDS (line {fence})"));
+            let added = add_crates(&mut db, &asked, library.into(), &examples, &[0]);
+            assert_eq!(added.len(), 1);
+            let file = added[0].1.root_file;
+            hir::attach_db(&db, || {
+                let text = db.file_text(file).text(&db);
+                let file = ide_db::base_db::EditionedFileId::new(&db, file, Edition::Edition2021);
+                for &(needle, expected_line, expected_column) in locations {
+                    let offset = text.find(needle).unwrap();
+                    let range = syntax::TextRange::at(
+                        syntax::TextSize::new(offset as u32),
+                        syntax::TextSize::new(needle.len() as u32),
+                    );
+                    let (_, line, column) =
+                        hir_ty::mir::location::caller_location_of(&db, file.into(), range).unwrap();
+                    assert_eq!(
+                        (line, column),
+                        (expected_line, expected_column),
+                        "{needle}, fence {fence}, generated source:\n{text}"
+                    );
+                    let (_, line, column) =
+                        hir_ty::mir::location::location_of(&db, file.into(), range).unwrap();
+                    assert_eq!((line, column), (expected_line, expected_column));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn injected_library_assertions_use_standalone_wrapper_lines() {
+        check("assert_eq!(util::WORDS.len(), 1);", &[("assert_eq!", 5, 1)]);
+    }
+
+    #[test]
+    fn hidden_lines_keep_their_runtime_coordinates() {
+        check(
+            "let hidden = line!();\nprintln!(\"HIDDEN {hidden} {}:{}:{}\", file!(), line!(), column!());\npanic!(\"HIDDEN\");",
+            &[("line!", 3, 14), ("file!", 4, 38), ("column!", 4, 56), ("panic!", 5, 1)],
+        );
+    }
+
+    #[test]
+    fn explicit_main_keeps_its_lines_and_columns() {
+        check(
+            "fn main() {\n    println!(\"MAIN {}:{}:{}\", file!(), line!(), column!());\n    panic!(\"MAIN\");\n}",
+            &[("file!", 3, 31), ("column!", 3, 49), ("panic!", 4, 5)],
+        );
+    }
+
+    #[test]
+    fn inner_attributes_keep_their_runtime_coordinates() {
+        check(
+            "#![allow(unused_variables)]\nprintln!(\"ATTR {}:{}:{}\", file!(), line!(), column!());\npanic!(\"ATTR\");",
+            &[("file!", 5, 27), ("column!", 5, 45), ("panic!", 6, 1)],
+        );
+    }
 }
 
 /// Compiles the example whose crate is `name` with everything it links over the standard
