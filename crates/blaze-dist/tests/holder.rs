@@ -209,6 +209,46 @@ fn review_a_batch_finishing_after_cancellation_releases_its_findings() {
     assert!(effects.iter().all(|effect| matches!(effect, Effect::Release(_))));
 }
 
+/// A duplicated completion can arrive after the holder moved to Reporting.
+/// Compiler discoveries from both copies are retained until acknowledged and
+/// must be released exactly once, including an extra unexpected name.
+#[test]
+fn unexpected_compiler_completion_fences_and_releases_every_finding_once() {
+    let (mut holder, batch) = compiling(false);
+    let mut effects = Vec::new();
+    holder.step(3, Event::Compiled(batch.clone()), &mut effects);
+    assert!(effects.iter().any(
+        |effect| matches!(effect, Effect::Send { call: Call::Result(_), .. })
+    ));
+
+    let extra = WorkName([11; 32]);
+    let mut duplicate = batch;
+    duplicate.roots[0].found = Set::new(vec![
+        Found { name: FOUND, tuple: [10; 32] },
+        Found { name: extra, tuple: [12; 32] },
+    ]);
+    effects.clear();
+    holder.step(4, Event::Compiled(duplicate), &mut effects);
+    assert!(holder.is_stopped(), "unexpected batch cannot silently remain in Reporting");
+    let released_names: Vec<WorkName> = effects
+        .iter()
+        .flat_map(|effect| match effect {
+            Effect::Release(names) => names.as_slice(),
+            _ => &[],
+        })
+        .copied()
+        .collect();
+    assert_eq!(released_names.len(), 2, "every retained name is released exactly once");
+    assert_eq!(
+        released_names.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([FOUND, extra])
+    );
+    assert!(effects.iter().any(
+        |effect| matches!(effect, Effect::Stop(StopWhy::Protocol(why)) if why.contains("active grant"))
+    ));
+    assert!(!effects.iter().any(|effect| matches!(effect, Effect::Send { .. })));
+}
+
 /// An incorrect-generation batch has retained its discoveries but can never be
 /// committed under this grant. It must not strand the holder in Compiling.
 #[test]

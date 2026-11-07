@@ -509,7 +509,29 @@ impl Holder {
     }
 
     fn compiled(&mut self, now: Millis, batch: Compiled, out: &mut Vec<Effect>) {
-        let Phase::Compiling { grant, lost } = &self.phase else { return };
+        let Phase::Compiling { grant, lost } = &self.phase else {
+            // An out-of-order or duplicate compiler completion must not silently
+            // discard discoveries while a previous result is awaiting acknowledgment.
+            // stop() releases accepted and pending findings; release only the extra
+            // names from this unexpected batch, without releasing any name twice.
+            let mut extra: BTreeSet<WorkName> = batch
+                .roots
+                .iter()
+                .chain(&batch.names)
+                .flat_map(|item| item.found.iter().map(|found| found.name))
+                .collect();
+            extra.retain(|name| !self.findings.contains_key(name));
+            if let Phase::Reporting { result, .. } = &self.phase {
+                for found in result.items.iter().flat_map(|item| item.found.iter()) {
+                    extra.remove(&found.name);
+                }
+            }
+            self.release(extra, out);
+            return self.stop(
+                StopWhy::Protocol("compiler batch without an active grant".into()),
+                out,
+            );
+        };
         if batch.generation != grant.lease.generation {
             // A compiler result for another lease is not an empty batch. Its
             // discoveries are already retained by the compiler and must be

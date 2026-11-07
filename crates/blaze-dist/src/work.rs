@@ -1022,7 +1022,12 @@ impl WorkSet {
             return;
         };
         if slot.tuple == found.tuple {
-            if !matches!(slot.state, Slot::Done(_)) {
+            if matches!(slot.state, Slot::Done(_)) {
+                // The name is already terminal. Do not add a finder, but tell
+                // this holder to release the discovery its compiler retained.
+                // A release acknowledgment is not a new determinism conflict.
+                conflicts.insert(name);
+            } else {
                 slot.finders.insert(from.to_owned());
                 if let Some(holder) = self.holders.get_mut(from) {
                     holder.findings.insert(name);

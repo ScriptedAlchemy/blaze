@@ -381,6 +381,34 @@ fn two_tuples_for_one_name_are_a_conflict_and_invalidate_its_export() {
 }
 
 #[test]
+fn rediscovering_a_terminal_name_releases_the_new_finding_without_a_false_conflict() {
+    let mut w = set(WorkConfig { grant_roots: 1, ..small() });
+    let rs = rootset(3, 1);
+    join(&mut w, 0, "lead", &rs).unwrap();
+
+    let g = lease(&mut w, 0, "lead").unwrap();
+    let items = vec![with_found(exported(name(100)), &[(name(7), 7)])];
+    w.result(1, "lead", &result(&g, 1, items, Vec::new()), &mut Vec::new()).unwrap();
+
+    let g = lease(&mut w, 2, "lead").unwrap();
+    assert_eq!(g.names.as_slice(), &[name(7)]);
+    w.result(3, "lead", &result(&g, 2, root_items(&g), vec![exported(name(7))]), &mut Vec::new())
+        .unwrap();
+
+    let old_terminal = w.report().names[&name(7)].1.clone();
+    let old_conflicts = w.counters().conflicts;
+    let g = lease(&mut w, 4, "lead").unwrap();
+    let items = vec![with_found(exported(name(102)), &[(name(7), 7)])];
+    let answer = w.result(5, "lead", &result(&g, 3, items, Vec::new()), &mut Vec::new()).unwrap();
+
+    // Without an explicit release signal the other batch's compiler retains
+    // name(7) forever although the coordinator has already made it terminal.
+    assert_eq!(answer.conflicts.as_slice(), &[name(7)]);
+    assert_eq!(w.counters().conflicts, old_conflicts);
+    assert_eq!(w.report().names[&name(7)].1, old_terminal);
+}
+
+#[test]
 fn an_unnamed_request_is_an_edge_and_its_parent_is_local() {
     let mut w = set(WorkConfig { grant_roots: 1, ..small() });
     join(&mut w, 0, "lead", &rootset(1, 1)).unwrap();
