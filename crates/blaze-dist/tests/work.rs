@@ -227,7 +227,8 @@ fn a_lead_rejected_new_helper_discovery_is_acknowledged_for_release() {
     join(&mut w, 0, "helper", &roots).unwrap();
     let grant = lease(&mut w, 0, "helper").unwrap();
     let items = vec![with_found(exported(name(100)), &[(name(7), 7)])];
-    let answer = w.result(1, "helper", &result(&grant, 1, items, Vec::new()), &mut Vec::new()).unwrap();
+    let answer =
+        w.result(1, "helper", &result(&grant, 1, items, Vec::new()), &mut Vec::new()).unwrap();
 
     // A helper need not have the lead's policy. The coordinator must tell it
     // to release even a first-time discovery that the lead already rejected.
