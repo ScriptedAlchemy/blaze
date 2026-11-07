@@ -671,9 +671,9 @@ mod tests {
             config
         })
         .await;
-        let abandoned = run.server.store().dir().join("units/.abandoned.123-456-1.tmp");
+        let abandoned = run.server.store().dir().join("packs/.abandoned.123-456-1.tmp");
         std::fs::write(&abandoned, b"cut").unwrap();
-        let path = run.server.store().dir().join("units/.active.123-456-2.tmp");
+        let path = run.server.store().dir().join("packs/.active.123-456-2.tmp");
         let (file, owner) = Temporary::create(path.clone()).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while abandoned.exists() {
@@ -778,9 +778,9 @@ mod tests {
             errors.push_back(std::io::Error::from_raw_os_error(libc::EPROTO));
             errors.push_back(std::io::Error::from_raw_os_error(libc::ENETUNREACH));
         }
-        let stale_dir = run.server.store().dir().join("units/.bad.123-456-1.tmp");
+        let stale_dir = run.server.store().dir().join("packs/.bad.123-456-1.tmp");
         std::fs::create_dir(&stale_dir).unwrap();
-        let abandoned = run.server.store().dir().join("units/.abandoned.123-456-2.tmp");
+        let abandoned = run.server.store().dir().join("packs/.abandoned.123-456-2.tmp");
         std::fs::write(&abandoned, b"leftover").unwrap();
         assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -828,9 +828,10 @@ mod tests {
         for gone in ["/v1/hello", "/v1/cache/missing", "/v1/objects?prefix=packs/"] {
             assert_eq!(run.request("POST", gone, "", &[]).await.0, 404, "{gone}");
         }
+        // A method no call is made with is the request's fault.
         assert_eq!(
             run.request("DELETE", &format!("/v1/blob/packs/{name}.pack"), "", &[]).await.0,
-            405
+            400
         );
     }
 

@@ -151,7 +151,7 @@ impl Store {
     /// hour a remote's collection gives an object: a write that is in flight when this runs is
     /// younger than that, and no request is in flight when the store is opened.
     pub(crate) fn sweep_temporaries(&self, older_than: std::time::Duration) -> Result<(), Error> {
-        for sub in ["", "packs", "keys", "units", "manifests", "deps"] {
+        for sub in ["", "packs", "manifests"] {
             let at = if sub.is_empty() { self.dir.clone() } else { self.dir.join(sub) };
             let entries = match std::fs::read_dir(&at) {
                 Ok(entries) => entries,
@@ -509,8 +509,8 @@ mod tests {
         std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join(&name)).unwrap();
         assert!(store.open_blob(&name).is_err());
         assert!(store.put_blob(&name, b"outside").is_err());
-        std::fs::remove_dir(dir.path().join("keys")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), dir.path().join("keys")).unwrap();
+        std::fs::remove_dir(dir.path().join("manifests")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("manifests")).unwrap();
         assert!(Store::open(dir.path()).is_err());
     }
 }
