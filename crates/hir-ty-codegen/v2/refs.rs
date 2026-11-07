@@ -1286,7 +1286,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         for field in args.as_coroutine().tupled_upvars_ty().tuple_fields().iter() {
             self.drop_value(field)?;
         }
-        Ok(())
+        // Polling it after it returned or panicked panics at its body (`resumed_after_end`).
+        self.panic(&["panicking", "panic_const", "panic_const_async_fn_resumed"])?;
+        self.panic(&["panicking", "panic_const", "panic_const_async_fn_resumed_panic"])
     }
 
     /// The read-only data of each promoted local, as `promoted_constant` makes it. Its
