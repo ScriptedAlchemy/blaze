@@ -209,6 +209,34 @@ fn review_the_leads_rejections_apply_to_provisional_discoveries() {
 }
 
 #[test]
+fn a_lead_rejected_new_helper_discovery_is_acknowledged_for_release() {
+    let mut w = set(WorkConfig { grant_roots: 1, ..small() });
+    let roots = rootset(1, 1);
+    w.join(
+        0,
+        "lead",
+        &WorkJoinRequest {
+            execution: EXEC,
+            attempt: A1,
+            roots: roots.clone(),
+            rejected: Set::new(vec![name(7)]),
+        },
+        &mut Vec::new(),
+    )
+    .unwrap();
+    join(&mut w, 0, "helper", &roots).unwrap();
+    let grant = lease(&mut w, 0, "helper").unwrap();
+    let items = vec![with_found(exported(name(100)), &[(name(7), 7)])];
+    let answer = w.result(1, "helper", &result(&grant, 1, items, Vec::new()), &mut Vec::new()).unwrap();
+
+    // A helper need not have the lead's policy. The coordinator must tell it
+    // to release even a first-time discovery that the lead already rejected.
+    assert_eq!(answer.conflicts.as_slice(), &[name(7)]);
+    assert_eq!(w.report().names[&name(7)].1, Some(Terminal::Tail(TailWhy::Rejected)));
+    assert_eq!(w.counters().conflicts, 0);
+}
+
+#[test]
 fn review_an_invalidated_held_name_is_acknowledged_even_when_unknown() {
     for rejected in [false, true] {
         let mut w = set(WorkConfig { grant_roots: 1, ..small() });

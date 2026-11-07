@@ -998,6 +998,9 @@ impl WorkSet {
         let Some(slot) = self.names.get_mut(&name) else {
             let rejected = self.rejected.contains(&name);
             let state = if rejected {
+                // Even the first discovery needs an acknowledgment to release the
+                // compiler's retained finding when only the lead rejects this name.
+                conflicts.insert(name);
                 Slot::Done(Terminal::Tail(TailWhy::Rejected))
             } else {
                 self.waiting.insert(name);
