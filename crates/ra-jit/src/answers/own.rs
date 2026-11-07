@@ -685,11 +685,7 @@ mod tests {
         let query = |args: &[&str], bootstrap: Option<&str>| {
             let args = args.iter().map(OsString::from).collect::<Vec<_>>();
             answer(&rustc, &args, &[], &|name| {
-                if name == "RUSTC_BOOTSTRAP" {
-                    bootstrap.map(OsString::from)
-                } else {
-                    None
-                }
+                if name == "RUSTC_BOOTSTRAP" { bootstrap.map(OsString::from) } else { None }
             })
         };
 
