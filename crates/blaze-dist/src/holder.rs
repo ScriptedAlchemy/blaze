@@ -487,7 +487,22 @@ impl Holder {
     fn compiled(&mut self, now: Millis, batch: Compiled, out: &mut Vec<Effect>) {
         let Phase::Compiling { grant, lost } = &self.phase else { return };
         if batch.generation != grant.lease.generation {
-            return;
+            // A compiler result for another lease is not an empty batch. Its
+            // discoveries are already retained by the compiler and must be
+            // released, then the holder must fail instead of waiting forever
+            // for the only in-flight batch to complete a second time.
+            self.release(
+                batch
+                    .roots
+                    .iter()
+                    .chain(&batch.names)
+                    .flat_map(|item| item.found.iter().map(|found| found.name)),
+                out,
+            );
+            return self.stop(
+                StopWhy::Protocol("compiler batch generation does not match grant".into()),
+                out,
+            );
         }
         let (grant, lost) = (grant.clone(), lost.clone());
         let returned: BTreeSet<WorkName> = batch.returned_names.iter().copied().collect();

@@ -177,6 +177,24 @@ fn review_a_batch_finishing_after_cancellation_releases_its_findings() {
     assert!(effects.iter().all(|effect| matches!(effect, Effect::Release(_))));
 }
 
+/// An incorrect-generation batch has retained its discoveries but can never be
+/// committed under this grant. It must not strand the holder in Compiling.
+#[test]
+fn a_wrong_generation_batch_releases_findings_and_fences_the_holder() {
+    let (mut holder, mut batch) = compiling(false);
+    batch.generation += 1;
+    let mut effects = Vec::new();
+    holder.step(3, Event::Compiled(batch), &mut effects);
+    assert!(holder.is_stopped(), "a mismatched batch left the holder compiling");
+    assert_eq!(released(&effects), BTreeSet::from([FOUND]));
+    assert!(effects.iter().any(
+        |effect| matches!(effect, Effect::Stop(StopWhy::Protocol(why)) if why.contains("generation"))
+    ));
+    assert!(!effects.iter().any(
+        |effect| matches!(effect, Effect::Send { call: Call::Result(_), .. })
+    ));
+}
+
 /// A delayed heartbeat reply must not be invalidated by the next interval. A
 /// coordinator's CANCEL is authoritative even if its response took longer than
 /// the configured heartbeat period.
