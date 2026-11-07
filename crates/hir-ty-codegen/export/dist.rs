@@ -41,6 +41,18 @@ fn names_digest(domain: &str, names: &[(blaze_wire::WorkName, Digest)]) -> Diges
     digest_of_encoded_name(domain, &encode(&names.to_vec()))
 }
 
+/// Canonical root indices may not alias two different code identities. Two identical
+/// requests are harmless duplicates; the same wire name with a different tuple
+/// would let one granted index stand for incompatible work on different executors.
+fn canonicalize_roots<T>(named: &mut Vec<(blaze_wire::WorkName, Digest, T)>) -> Result<(), String> {
+    named.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    if named.windows(2).any(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1) {
+        return Err("root work name maps to conflicting code identities".to_owned());
+    }
+    named.dedup_by(|next, kept| next.0 == kept.0 && next.1 == kept.1);
+    Ok(())
+}
+
 /// One executor's batch compiler over a loaded front end: its canonical roots,
 /// the findings its committed batches discovered, and the receipts it sealed.
 pub struct Worker<'a, 'db> {
@@ -74,8 +86,7 @@ impl<'a, 'db> Worker<'a, 'db> {
             let work = context.work_name(&request)?;
             named.push((wire_name(&work), work.tuple, request));
         }
-        named.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-        named.dedup_by(|next, kept| next.0 == kept.0 && next.1 == kept.1);
+        canonicalize_roots(&mut named)?;
         let pairs: Vec<(blaze_wire::WorkName, Digest)> =
             named.iter().map(|(name, tuple, _)| (*name, *tuple)).collect();
         let roots = RootSet {
@@ -403,4 +414,29 @@ pub fn merged_receipt(receipts: &[Receipt]) -> Result<Receipt, String> {
         }
     }
     Ok(merged)
+}
+
+#[cfg(test)]
+mod canonical_root_tests {
+    use super::*;
+
+    #[test]
+    fn a_wire_root_name_must_not_alias_different_code_tuples() {
+        let a = blaze_wire::WorkName([1; 32]);
+        let b = blaze_wire::WorkName([2; 32]);
+        // Input order is deliberately noncanonical. Aliasing a name to two tuples
+        // must fail before either root can be leased to a compiler.
+        let mut conflicting = vec![(a, [9; 32], ()), (b, [3; 32], ()), (a, [4; 32], ())];
+        assert_eq!(
+            canonicalize_roots(&mut conflicting),
+            Err("root work name maps to conflicting code identities".to_owned())
+        );
+
+        // Exact duplicates are harmless: keep one canonical root index per pair.
+        let mut same = vec![(b, [3; 32], ()), (a, [9; 32], ()), (a, [9; 32], ())];
+        canonicalize_roots(&mut same).unwrap();
+        assert_eq!(same.len(), 2);
+        assert_eq!((same[0].0, same[0].1), (a, [9; 32]));
+        assert_eq!((same[1].0, same[1].1), (b, [3; 32]));
+    }
 }
