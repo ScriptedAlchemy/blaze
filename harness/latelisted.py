@@ -4,33 +4,24 @@ daemon listed the crate beside cargo's build before the file was loaded.
 
 usage: latelisted.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
 
-bun's crates `include!` the code its generators write, from a directory a build script names in
-a variable (`BUN_CODEGEN_DIR`). The VFS has none of those files when the daemon, told of the
-build ahead of cargo, lists a crate cargo has built while cargo still compiles the rest: the
-files are read once the names are resolved. The listing was kept, so the functions they declare
-were missing from the program's entries until an edit had the crate listed again, and that
-edit's patch then compiled every one of them as a function added. Here a library includes
-`exports.in` (not a `.rs` file, so nothing loads it but the macro) with EXPORTS functions of the
-C ABI, and the binary's build script keeps cargo busy after it. Once the daemon serves the build,
-a function is added to the library: its patch has to be of a few functions, not of the
-EXPORTS, and the program has to print what cargo's does. The daemon's first build is its own
-(`RA_JIT_RUSTC_BASE=0`), which the edit patches: a base it builds in the background, once
-idle, may be given up on a small machine, and an added function does not patch what rustc
-linked.
+A library includes `exports.in` (not a `.rs` file) from GEN_DIR set by its owned build
+script. An armed file barrier seeds the real cached listing before include hydration and
+holds that worker. The harness requires zero exports and the include absent from loaded sources then, releases
+normal hydration, and requires all EXPORTS declarations in the refreshed listing. A function
+added afterward must be a small native splice by the same worker, with exactly Cargo's output.
+The hook and barrier are inactive during ordinary compilation.
 
 Python 3, stdlib only.
 """
-import glob, os, re, shutil, subprocess, sys, tempfile, time
+import glob, os, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import cargo_ra_jit
 from cargo_ra_jit import Side, wait_warm
-from spare import FIRST_MAIN, FIRST_TOML, settled
+from aheadready import wait_for
 
 EXPORTS = 64
-# How long the binary's build script keeps cargo busy once the library is built.
-WAIT_SECS = 10
 FILES = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "gen"]\nresolver = "2"\n',
     "gen/Cargo.toml": '[package]\nname = "gen"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n',
@@ -43,10 +34,8 @@ FILES = {
                                         for i in range(EXPORTS)),
     "gen/src/lib.rs": 'include!(concat!(env!("GEN_DIR"), "/exports.in"));\n\n'
                       'pub fn value() -> u32 {\n    1\n}\n',
-    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n\n'
+    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
                       '[dependencies]\ngen = { path = "../gen" }\n',
-    "app/build.rs": f'fn main() {{\n    println!("cargo:rerun-if-changed=build.rs");\n'
-                    f'    std::thread::sleep(std::time::Duration::from_secs({WAIT_SECS}));\n}}\n',
     "app/src/main.rs": 'fn main() {\n    println!("{} {}", gen::value(), gen::late_export_3());\n}\n',
 }
 
@@ -59,12 +48,13 @@ def patches(home):
     return found
 
 
-def worker_log(home):
-    """The log of the worker that loaded the workspace beside cargo's build, if one did."""
+def listings(home, phase):
+    found = []
     for log in glob.glob(os.path.join(home, "*", "*", "log")):
-        if re.search(r"^compiled ahead: ", open(log, errors="replace").read(), re.M):
-            return log
-    return None
+        found += re.findall(
+            rf"^script-lease: {phase} build=(\d+) pid=(\d+) at_us=\d+ crate=gen functions=(\d+) exports=(\d+) included_sources=(\d+)/(\d+)$",
+            open(log, errors="replace").read(), re.M)
+    return found
 
 
 def tails(home, lines=40):
@@ -87,39 +77,50 @@ def main():
         raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
     # Short, for the daemon's sockets under its home.
     root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-ll-", dir="/tmp"))
-    ws, first_ws, home = (os.path.join(root, n) for n in ("ws", "first", "home"))
+    ws, home = (os.path.join(root, n) for n in ("ws", "home"))
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    os.makedirs(os.path.join(first_ws, "src"))
-    open(os.path.join(first_ws, "Cargo.toml"), "w").write(FIRST_TOML)
-    open(os.path.join(first_ws, "src/main.rs"), "w").write(FIRST_MAIN)
     env = cargo_ra_jit.base_env(home)
     env["PATH"] = bin_dir + os.pathsep + env["PATH"]
     for name in ("RUSTC_WRAPPER", "CARGO_INCREMENTAL", "RA_JIT_SPARE"):
         env.pop(name, None)
     env["RA_JIT_RUSTC_BASE"] = "0"
-    first, side = Side(first_ws, env, True), Side(ws, env, True)
+    barrier = os.path.join(root, "barrier")
+    os.makedirs(barrier)
+    point = "listed-before-includes"
+    open(os.path.join(barrier, point + ".hold"), "w").close()
+    env["RA_JIT_SCRIPT_BARRIER_DIR"] = barrier
+    side = Side(ws, env, True)
     reference = Side(ws, env, False)
     program = os.path.join(ws, "target", "debug", "app")
     wrong = []
+    cold = None
     try:
-        # A daemon with a spare already up is told of the next build ahead of cargo.
-        build(first, "first", home)
-        wait_warm(first, first_ws)
-        settled(home)
-        build(side, "cold", home)
+        with open(os.path.join(root, "cold.stdout"), "w") as out, open(os.path.join(root, "cold.stderr"), "w") as err:
+            cold = subprocess.Popen(side.argv("build"), cwd=ws, env=env, stdout=out, stderr=err,
+                                    **cargo_ra_jit.OWN_GROUP)
+            marks = wait_for(cold, lambda: glob.glob(os.path.join(barrier, point + ".*.reached")), 300, point)
+            before = listings(home, point)
+            if len(before) != 1 or before[0][2:] != ("1", "0", "0", "1"):
+                raise SystemExit(f"the initial cached listing was not missing its include: {before}{tails(home)}")
+            owner, pid, *_ = before[0]
+            if open(marks[0]).read().strip() != pid:
+                raise SystemExit("the barrier and cached listing belong to different workers")
+            open(marks[0].removesuffix(".reached") + ".go", "w").close()
+            cold.wait(timeout=300)
+        if cold.returncode != 0 or glob.glob(os.path.join(barrier, "*.timeout")):
+            raise SystemExit(f"the owned cold build failed or its barrier expired{tails(home)}")
+        after = listings(home, "listed-after-includes")
+        if after != [(owner, pid, str(EXPORTS + 1), str(EXPORTS), "1", "1")]:
+            raise SystemExit(f"hydration did not refresh the cached listing: {after}{tails(home)}")
         _, states = wait_warm(side, ws)
         if states != ["ready"]:
             raise SystemExit(f"the daemon did not get ready: {states}{tails(home)}")
-        for _ in range(240):
-            if "[ra-jit]" in build(side, "wait for the daemon", home):
-                break
-            time.sleep(0.5)
-        else:
-            raise SystemExit(f"no build said `[ra-jit]`{tails(home)}")
-        if worker_log(home) is None:
-            raise SystemExit(f"the daemon listed nothing beside cargo's build, which is what this tests{tails(home)}")
+        print(f"late includes: 0 -> {EXPORTS} exports in worker {pid}", flush=True)
+        log = next(path for path in glob.glob(os.path.join(home, "*", "*", "log"))
+                   if f"pid={pid} " in open(path, errors="replace").read())
+        log_offset = os.path.getsize(log)
         seen = len(patches(home))
         lib = os.path.join(ws, "gen/src/lib.rs")
         text = open(lib).read()
@@ -135,11 +136,24 @@ def main():
             wrong.append("the edit was not patched")
         elif made[-1] >= EXPORTS:
             wrong.append(f"the patch is of {made[-1]} functions: the {EXPORTS} the included file declares were not listed")
-        if ran.stdout != theirs.stdout:
+        with open(log, "rb") as worker:
+            worker.seek(log_offset)
+            edited_log = worker.read().decode(errors="replace")
+        _, status = side.cargo("status")
+        if f"worker: pid {pid}," not in status.stdout:
+            wrong.append("the edit replaced the worker")
+        if not re.search(r"^link: .*\(spliced: ", edited_log, re.M):
+            wrong.append("the edit did not splice its native executable")
+        if ran.returncode != 0 or theirs.returncode != 0 or ran.stdout != theirs.stdout:
             wrong.append(f"the program printed {ran.stdout.strip()!r}, cargo's {theirs.stdout.strip()!r}")
         print(f"{'a function added':30} {'ok' if not wrong else 'WRONG':8} patch of {made[-1] if made else '-'} functions")
     finally:
-        first.cargo("stop")
+        for mark in glob.glob(os.path.join(barrier, "*.reached")):
+            open(mark.removesuffix(".reached") + ".go", "w").close()
+        if cold is not None and cold.poll() is None:
+            cargo_ra_jit.kill_all(cold)
+            cold.wait(timeout=10)
+        side.cargo("stop")
     for why in wrong:
         print(f"  {why}")
     if wrong:

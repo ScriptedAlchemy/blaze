@@ -90,6 +90,17 @@ pub(crate) fn disk_json(
     path: &std::path::Path,
     value: &serde_json::Value,
 ) -> anyhow::Result<Vec<u8>> {
+    disk_json_with(path, value, crate::cargo::client::ask)
+}
+
+fn disk_json_with(
+    path: &std::path::Path,
+    value: &serde_json::Value,
+    ask: impl FnOnce(
+        crate::cargo::daemon::Request,
+        crate::cargo::client::Start,
+    ) -> anyhow::Result<Option<crate::cargo::daemon::Reply>>,
+) -> anyhow::Result<Vec<u8>> {
     let mut kept = value.clone();
     let mut removed = std::collections::BTreeMap::new();
     fn strip(
@@ -127,21 +138,25 @@ pub(crate) fn disk_json(
             "fields".into(),
             serde_json::to_string(&removed)?.into(),
         )]);
-        crate::cargo::client::ask(
-            crate::cargo::daemon::Request::RememberScript { dir: path.to_owned(), env: snapshot },
-            crate::cargo::client::Start::Never,
-        )?;
+        crate::cargo::script::retain_environment(path.to_owned(), snapshot, ask)?;
         kept["_memory_environment_fields"] = serde_json::json!(removed.keys().collect::<Vec<_>>());
     }
     serde_json::to_vec(&kept).map_err(Into::into)
 }
 
 pub(crate) fn read_json(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    read_json_with(path, crate::cargo::script::environment)
+}
+
+fn read_json_with(
+    path: &std::path::Path,
+    environment: impl FnOnce(&std::path::Path) -> Option<crate::process::Native>,
+) -> anyhow::Result<serde_json::Value> {
     use anyhow::Context as _;
     let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     if value.get("_memory_environment_fields").is_some() {
-        let snapshot = crate::cargo::script::environment(path)
-            .context("record environment is no longer in daemon memory")?;
+        let snapshot =
+            environment(path).context("record environment is no longer in daemon memory")?;
         let text = snapshot
             .vars()
             .find(|(name, _)| name == "fields")
@@ -159,6 +174,75 @@ pub(crate) fn read_json(path: &std::path::Path) -> anyhow::Result<serde_json::Va
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn first_client_retains_fields_before_publishing_a_record() {
+        use crate::cargo::{
+            client::Start,
+            daemon::{Reply, Request},
+        };
+        use std::{cell::RefCell, collections::BTreeMap, path::PathBuf};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("record.json");
+        let secret = "synthetic-first-client-secret";
+        let value = serde_json::json!({"env": {"TOKEN": secret}, "key": "unit"});
+        let owner = RefCell::new(None::<BTreeMap<PathBuf, crate::process::Native>>);
+        let bytes = super::disk_json_with(&path, &value, |request, start| {
+            if start == Start::IfMissing && owner.borrow().is_none() {
+                *owner.borrow_mut() = Some(BTreeMap::new());
+            }
+            let Request::RememberScript { dir, env } = request else {
+                panic!("record publication must retain its environment");
+            };
+            let mut owner = owner.borrow_mut();
+            let Some(owner) = owner.as_mut() else { return Ok(None) };
+            owner.insert(dir, env);
+            Ok(Some(Reply::Warming))
+        })
+        .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+        std::fs::write(&path, bytes).unwrap();
+        let restored = super::read_json_with(&path, |path| {
+            owner.borrow().as_ref().and_then(|owner| owner.get(path)).cloned()
+        })
+        .expect("the first producer must retain what the later reader needs");
+        assert_eq!(restored, value);
+    }
+
+    #[test]
+    fn unacknowledged_fields_cannot_be_published() {
+        use crate::cargo::daemon::Reply;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("record.json");
+        let value = serde_json::json!({"env": {"TOKEN": "synthetic-secret"}});
+        for reply in [None, Some(Reply::Stopping)] {
+            let result = super::disk_json_with(&path, &value, |_, _| Ok(reply));
+            assert!(result.is_err(), "a missing or incorrect ACK cannot publish stripped fields");
+            assert!(!path.exists());
+        }
+        assert!(
+            super::disk_json_with(&path, &value, |_, _| {
+                anyhow::bail!("memory owner unavailable")
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn lost_owner_leaves_published_fields_unreadable() {
+        use crate::cargo::daemon::Reply;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("record.json");
+        let value = serde_json::json!({"env": {"TOKEN": "synthetic-secret"}});
+        let bytes = super::disk_json_with(&path, &value, |_, _| Ok(Some(Reply::Warming))).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-secret"));
+        std::fs::write(&path, bytes).unwrap();
+        let error = super::read_json_with(&path, |_| None).unwrap_err();
+        assert!(error.to_string().contains("record environment is no longer in daemon memory"));
+    }
+
     #[test]
     fn private_identities_keep_the_existing_hmac_format() {
         assert_eq!(
@@ -194,25 +278,19 @@ mod tests {
             "cache_env": crate::process::Native::of([("AWS_SECRET_ACCESS_KEY".into(), secret.into())]),
             "key": "ordinary"
         });
-        // A missing daemon is harmless for serialization and loses read eligibility.
-        let bytes = super::disk_json(&path, &value).unwrap();
+        let bytes = super::disk_json_with(&path, &value, |request, _| {
+            let crate::cargo::daemon::Request::RememberScript { dir, env } = request else {
+                panic!("record publication must retain its environment");
+            };
+            crate::cargo::script::remember(dir, env);
+            Ok(Some(crate::cargo::daemon::Reply::Warming))
+        })
+        .unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains(secret));
         assert!(
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["cache_env"].is_null()
         );
         assert!(!String::from_utf8_lossy(&bytes).contains(value["cache_env"].as_str().unwrap()));
-        let fields = std::collections::BTreeMap::from([
-            ("/checkouts/0/env", value["checkouts"][0]["env"].clone()),
-            ("/configured", value["configured"].clone()),
-            ("/cache_env", value["cache_env"].clone()),
-        ]);
-        crate::cargo::script::remember(
-            path.clone(),
-            crate::process::Native::of([(
-                "fields".into(),
-                serde_json::to_string(&fields).unwrap().into(),
-            )]),
-        );
         std::fs::write(&path, bytes).unwrap();
         assert_eq!(super::read_json(&path).unwrap(), value);
     }

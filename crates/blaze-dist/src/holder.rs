@@ -97,6 +97,19 @@ pub struct Compiled {
     pub returned_names: Vec<WorkName>,
 }
 
+/// What a holder's driver compiles its plans with: the executor's batch
+/// compiler (the existing batch exporter), and where findings the
+/// coordinator no longer counts on are dropped. It lives with the holder,
+/// not with any carrier, so a compiler crate can implement it without
+/// depending on a transport (the local carrier is Unix-only; the compiler
+/// is not). A compile failure is the driver's to surface, named.
+pub trait BatchCompiler {
+    /// Compile one granted batch whole, its entries sealed and uploaded.
+    fn compile(&mut self, plan: &Plan) -> Result<Compiled, String>;
+    /// Drop retained findings of these names.
+    fn release(&mut self, names: &[WorkName]);
+}
+
 /// Why a holder left the execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopWhy {
@@ -382,6 +395,30 @@ impl Holder {
                 other => self.refused(other, &error, out),
             },
             (Phase::Reporting { result, root_items }, Reply::Result(Ok(answer))) => {
+                // A successful result may only acknowledge names carried by this batch.
+                // An unrelated conflict could otherwise release a retained finding from
+                // an earlier batch, while a foreign grant would be silently accepted.
+                let found: BTreeSet<WorkName> = result
+                    .items
+                    .iter()
+                    .flat_map(|item| item.found.iter().map(|f| f.name))
+                    .collect();
+                let processed: BTreeSet<WorkName> =
+                    result.items[root_items..].iter().map(|item| item.name).collect();
+                if !answer.granted.iter().all(|name| found.contains(name))
+                    || !answer
+                        .conflicts
+                        .iter()
+                        .all(|name| found.contains(name) || processed.contains(name))
+                {
+                    // Restore the in-flight batch so stop() releases all its retained
+                    // discoveries, in addition to previously accepted findings.
+                    self.phase = Phase::Reporting { result, root_items };
+                    return self.stop(
+                        StopWhy::Protocol("result acknowledgment names foreign work".into()),
+                        out,
+                    );
+                }
                 self.committed(&result, root_items, &answer, out);
                 self.lease(now, out);
             }
@@ -472,9 +509,44 @@ impl Holder {
     }
 
     fn compiled(&mut self, now: Millis, batch: Compiled, out: &mut Vec<Effect>) {
-        let Phase::Compiling { grant, lost } = &self.phase else { return };
+        let Phase::Compiling { grant, lost } = &self.phase else {
+            // An out-of-order or duplicate compiler completion must not silently
+            // discard discoveries while a previous result is awaiting acknowledgment.
+            // stop() releases accepted and pending findings; release only the extra
+            // names from this unexpected batch, without releasing any name twice.
+            let mut extra: BTreeSet<WorkName> = batch
+                .roots
+                .iter()
+                .chain(&batch.names)
+                .flat_map(|item| item.found.iter().map(|found| found.name))
+                .collect();
+            extra.retain(|name| !self.findings.contains_key(name));
+            if let Phase::Reporting { result, .. } = &self.phase {
+                for found in result.items.iter().flat_map(|item| item.found.iter()) {
+                    extra.remove(&found.name);
+                }
+            }
+            self.release(extra, out);
+            return self
+                .stop(StopWhy::Protocol("compiler batch without an active grant".into()), out);
+        };
         if batch.generation != grant.lease.generation {
-            return;
+            // A compiler result for another lease is not an empty batch. Its
+            // discoveries are already retained by the compiler and must be
+            // released, then the holder must fail instead of waiting forever
+            // for the only in-flight batch to complete a second time.
+            self.release(
+                batch
+                    .roots
+                    .iter()
+                    .chain(&batch.names)
+                    .flat_map(|item| item.found.iter().map(|found| found.name)),
+                out,
+            );
+            return self.stop(
+                StopWhy::Protocol("compiler batch generation does not match grant".into()),
+                out,
+            );
         }
         let (grant, lost) = (grant.clone(), lost.clone());
         let returned: BTreeSet<WorkName> = batch.returned_names.iter().copied().collect();

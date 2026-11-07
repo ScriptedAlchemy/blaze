@@ -88,7 +88,7 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
             "owned direct cross-target execution is not implemented for {target}"
         );
     }
-    let request = Request::parse(command, &options.words)?;
+    let request = Request::parse_for_execution(command, &options.words)?;
     let root = cwd.ancestors().last().context("working directory has no filesystem root")?;
     let resolved = blaze_spec::assemble::resolve_live(
         &request,
@@ -157,6 +157,30 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         &prepared.resolved.spec.build,
         &prepared.resolved.graph,
     )?;
+    if original.get("RA_JIT_STATS").is_some_and(|v| v == "1") {
+        let contexts: Vec<_> = programs.iter().filter(|p| p.output == Output::Doctest).collect();
+        if !contexts.is_empty() {
+            let libraries: BTreeSet<_> = contexts
+                .iter()
+                .flat_map(|p| {
+                    native[p.unit as usize].dependencies.iter().filter_map(|dep| {
+                        let library = &prepared.resolved.graph.units[dep.index];
+                        (library.mode == blaze_metadata::units::Mode::Build
+                            && library.package.id == native[p.unit as usize].package.id)
+                            .then_some(dep.index)
+                    })
+                })
+                .collect();
+            eprintln!(
+                "doctest plan: {} contexts, {} linked libraries in one owned plan",
+                contexts.len(),
+                libraries.len()
+            );
+        }
+    }
+    for program in &mut programs {
+        bind_test_scratch(program, options.target.as_deref(), &producers.units)?;
+    }
     let tests = super::test_policy::Policy::new(
         &prepared,
         &target.join("ra-jit/test-results"),
@@ -206,7 +230,7 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         .collect();
     for program in &mut programs {
         super::source_naming(program, &prepared)?;
-        bind_binaries(&mut program.project, &binaries, &producers.units)?;
+        bind_target_environment(&mut program.project, &binaries, None, &producers.units)?;
         crate::dep_info::ensure_replay_key(&mut program.project)?;
         program.project["blaze_direct_execution"] = serde_json::json!(1);
         if let Some(runtime) = &runtime {
@@ -217,6 +241,17 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         let reach = tests.as_ref().is_some_and(|tests| tests.reach(program));
         super::compile_at(program, &environment, Some(&prepared.resolved.graph.root), reach)?;
         super::admit_inputs(program)?;
+    }
+    if command == Subcommand::Test && original.get("RA_JIT_STATS").is_some_and(|v| v == "1") {
+        let harnesses = programs
+            .iter()
+            .filter(|p| p.run && p.harness && p.output == Output::Executable)
+            .count();
+        eprintln!(
+            "owned test plan: {} units compiled and admitted, {} runnable harnesses",
+            programs.len(),
+            harnesses
+        );
     }
     let mut published_support = false;
     let mut debug_objects = Vec::new();
@@ -454,18 +489,47 @@ fn artifact(unit: &blaze_metadata::units::Unit, path: &Path, output: Output) -> 
     })
 }
 
-fn bind_binaries(
-    project: &mut serde_json::Value,
-    binaries: &BTreeMap<String, OsString>,
+fn bind_test_scratch(
+    program: &mut blaze_spec::execution::Program,
+    target: Option<&str>,
     produced: &BTreeMap<u32, blaze_spec::execution::ProducedUnit>,
 ) -> anyhow::Result<()> {
+    let (Some(target), Some(scratch)) = (target, &mut program.test_scratch) else {
+        return Ok(());
+    };
+    *scratch = scratch
+        .parent()
+        .context("Cargo test scratch has no build directory")?
+        .join(target)
+        .join("tmp");
+    bind_target_environment(
+        &mut program.project,
+        &BTreeMap::new(),
+        Some((program.unit, scratch)),
+        produced,
+    )
+}
+
+fn bind_target_environment(
+    project: &mut serde_json::Value,
+    binaries: &BTreeMap<String, OsString>,
+    scratch: Option<(u32, &Path)>,
+    produced: &BTreeMap<u32, blaze_spec::execution::ProducedUnit>,
+) -> anyhow::Result<()> {
+    let bindings = |id| {
+        binaries.iter().map(|(name, value)| (name.clone(), value.clone())).chain(
+            scratch
+                .filter(|(unit, _)| *unit == id)
+                .map(|(_, path)| ("CARGO_TARGET_TMPDIR".to_owned(), path.as_os_str().to_owned())),
+        )
+    };
     let bytes: Vec<u8> = serde_json::from_value(project[blaze_wire::native::UNIT_FIELD].clone())?;
     let mut units = blaze_wire::native::decode_units(&bytes)?;
     for (id, unit) in &mut units {
         let explicit =
             &produced.get(id).context("native source unit has no producer provenance")?.rustc_env;
-        for (name, value) in binaries {
-            if unit.env.contains_key(std::ffi::OsStr::new(name)) && !explicit.contains_key(name) {
+        for (name, value) in bindings(*id) {
+            if unit.env.contains_key(std::ffi::OsStr::new(&name)) && !explicit.contains_key(&name) {
                 unit.env.insert(name.into(), value.clone());
             }
         }
@@ -478,10 +542,10 @@ fn bind_binaries(
         )?;
         let explicit =
             &produced.get(&id).context("source crate has no producer provenance")?.rustc_env;
-        for (name, value) in binaries {
-            if krate["env"].get(name).is_some() && !explicit.contains_key(name) {
+        for (name, value) in bindings(id) {
+            if krate["env"].get(&name).is_some() && !explicit.contains_key(&name) {
                 if let Some(value) = value.to_str() {
-                    krate["env"][name] = value.into();
+                    krate["env"][&name] = value.into();
                 }
             }
         }
@@ -565,6 +629,99 @@ pub(super) fn admit_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_host_target_scratch_preserves_cargo_layout_scope_and_overrides() {
+        let target = "aarch64-apple-darwin";
+        let options =
+            Options::read(&["--target".into(), target.into(), "--no-run".into()]).unwrap();
+        assert_eq!(options.target.as_deref(), Some(target));
+        Request::parse_for_execution(Subcommand::Test, &options.words).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let original = work.path().join("intermediate/tmp");
+        let expected = work.path().join("intermediate").join(target).join("tmp");
+        for explicit in [false, true] {
+            let units = BTreeMap::from([
+                (
+                    7,
+                    blaze_wire::native::Unit {
+                        env: [("CARGO_TARGET_TMPDIR".into(), original.as_os_str().to_owned())]
+                            .into(),
+                        flags: Vec::new(),
+                    },
+                ),
+                (
+                    8,
+                    blaze_wire::native::Unit {
+                        env: [("CARGO_TARGET_TMPDIR".into(), "inherited".into())].into(),
+                        flags: Vec::new(),
+                    },
+                ),
+            ]);
+            let produced = units
+                .iter()
+                .map(|(&id, unit)| {
+                    (
+                        id,
+                        blaze_spec::execution::ProducedUnit {
+                            cfg: Vec::new(),
+                            codegen_flags: Vec::new(),
+                            native: unit.clone(),
+                            proc_macro: None,
+                            rustc_env: if id == 7 && explicit {
+                                [(
+                                    "CARGO_TARGET_TMPDIR".into(),
+                                    original.to_str().unwrap().to_owned(),
+                                )]
+                                .into()
+                            } else {
+                                BTreeMap::new()
+                            },
+                        },
+                    )
+                })
+                .collect();
+            let mut program = blaze_spec::execution::Program {
+                unit: 7,
+                crate_name: "integration".into(),
+                harness: false,
+                run: false,
+                output: Output::Executable,
+                executable: work.path().join("private-artifacts/program"),
+                test_scratch: Some(original.clone()),
+                project: serde_json::json!({
+                    "blaze_native_units": blaze_wire::native::encode_units(&units),
+                    "crates": [{"blaze_native_unit":7,"env":{"CARGO_TARGET_TMPDIR":original}},
+                        {"blaze_native_unit":8,"env":{"CARGO_TARGET_TMPDIR":"inherited"}}],
+                }),
+            };
+            bind_test_scratch(&mut program, options.target.as_deref(), &produced).unwrap();
+            assert_eq!(program.test_scratch.as_ref(), Some(&expected));
+            let value = if explicit { &original } else { &expected };
+            assert_eq!(
+                program.project["crates"][0]["env"]["CARGO_TARGET_TMPDIR"],
+                serde_json::json!(value)
+            );
+            assert_eq!(program.project["crates"][1]["env"]["CARGO_TARGET_TMPDIR"], "inherited");
+            let bytes: Vec<u8> =
+                serde_json::from_value(program.project[blaze_wire::native::UNIT_FIELD].clone())
+                    .unwrap();
+            let native = blaze_wire::native::decode_units(&bytes).unwrap();
+            assert_eq!(
+                native[&7].env[std::ffi::OsStr::new("CARGO_TARGET_TMPDIR")],
+                value.as_os_str()
+            );
+            assert_eq!(native[&8].env[std::ffi::OsStr::new("CARGO_TARGET_TMPDIR")], "inherited");
+            program.test_scratch = None;
+            let before = program.project.clone();
+            bind_test_scratch(&mut program, options.target.as_deref(), &produced).unwrap();
+            assert_eq!(
+                program.project, before,
+                "ordinary unit roots have no generated scratch binding"
+            );
+        }
+        assert!(!expected.exists(), "only the shared compile boundary creates scratch space");
+    }
 
     #[test]
     fn test_publication_preserves_the_private_compiled_generation() {
@@ -771,9 +928,10 @@ mod tests {
             "crates": [{"root_module": original, "blaze_native_unit": 7,
                 "env": {"USER_INPUT": "private-live-input", "CARGO_BIN_EXE_app": "old-job/app"}}],
         });
-        bind_binaries(
+        bind_target_environment(
             &mut project,
             &BTreeMap::from([("CARGO_BIN_EXE_app".into(), "target/debug/app".into())]),
+            None,
             &BTreeMap::from([(
                 7,
                 blaze_spec::execution::ProducedUnit {
@@ -829,9 +987,10 @@ mod tests {
         )]);
         let mut project = serde_json::json!({"blaze_native_units": blaze_wire::native::encode_units(&BTreeMap::from([(3,native)])),
             "crates":[{"blaze_native_unit":3,"env":{"CARGO_BIN_EXE_app":"/derived/app"}}]});
-        bind_binaries(
+        bind_target_environment(
             &mut project,
             &BTreeMap::from([("CARGO_BIN_EXE_app".into(), "/published/app".into())]),
+            None,
             &produced,
         )
         .unwrap();

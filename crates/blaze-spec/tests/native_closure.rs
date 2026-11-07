@@ -670,3 +670,59 @@ fn parent_spelled_roots_allow_parent_traversal_inside_observed_directories() {
     let actual = Tree::capture(&escape).unwrap();
     closure.admission().admit(&escape, actual.entry(Path::new("")).unwrap()).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn validation_and_binding_recapture_reject_each_native_identity_change() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for change in ["bytes", "membership", "mode", "alias", "absence", "kind"] {
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join("inputs");
+        fs::create_dir(&root).unwrap();
+        let file = root.join("first.a");
+        fs::write(&file, b"first").unwrap();
+        fs::write(root.join("second.a"), b"first").unwrap();
+        symlink("first.a", root.join("alias")).unwrap();
+        let absent = root.join("absent");
+        let paths = [root.clone(), file.clone(), root.clone(), absent.clone()];
+        let closure = Closure {
+            roots: Tree::capture_many(&paths)
+                .unwrap()
+                .into_iter()
+                .enumerate()
+                .map(|(at, tree)| Root { name: format!("role/{at}"), tree })
+                .collect(),
+        };
+        let encoded = closure.encode_bindings();
+        closure.validate().unwrap();
+        assert_eq!(Closure::from_bindings(&encoded).unwrap().encode_bindings(), encoded);
+        assert_eq!(closure.encode_bindings(), encoded);
+        match change {
+            "bytes" => {
+                let stamp = fs::metadata(&file).unwrap().modified().unwrap();
+                fs::write(&file, b"other").unwrap();
+                fs::File::options().write(true).open(&file).unwrap().set_modified(stamp).unwrap();
+            }
+            "membership" => fs::write(root.join("new"), b"member").unwrap(),
+            "mode" => {
+                let mut mode = fs::metadata(&file).unwrap().permissions();
+                mode.set_mode(mode.mode() ^ 0o111);
+                fs::set_permissions(&file, mode).unwrap();
+            }
+            "alias" => {
+                fs::remove_file(root.join("alias")).unwrap();
+                symlink("second.a", root.join("alias")).unwrap();
+            }
+            "absence" => fs::write(absent, b"new candidate").unwrap(),
+            "kind" => {
+                fs::remove_file(&file).unwrap();
+                fs::create_dir(file).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(closure.validate().is_err(), "validation admitted changed {change}");
+        assert!(Closure::from_bindings(&encoded).is_err(), "load admitted changed {change}");
+        assert_eq!(closure.encode_bindings(), encoded, "validation changed the expected capture");
+    }
+}

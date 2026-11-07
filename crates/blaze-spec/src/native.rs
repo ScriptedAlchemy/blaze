@@ -5,6 +5,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+#[cfg(test)]
+use std::sync::Arc;
+
 use anyhow::{Context as _, ensure};
 use blaze_wire::{ConfigEnvValue as EnvValue, Digest, InputText};
 use sha2::{Digest as _, Sha256};
@@ -159,9 +162,9 @@ impl Closure {
     /// Verify complete root identities again after a compiler or producer has finished.
     pub fn validate(&self) -> anyhow::Result<()> {
         let paths: Vec<_> = self.roots.iter().map(|root| root.tree.root.clone()).collect();
-        for (root, current) in self.roots.iter().zip(Tree::capture_many(&paths)?) {
+        for (root, current) in self.roots.iter().zip(Tree::recapture_digests(&paths)?) {
             ensure!(
-                current.digest() == root.tree.digest(),
+                current == root.tree.digest(),
                 "native root {} changed during compilation",
                 root.tree.root.display()
             );
@@ -488,8 +491,10 @@ mod observation_tests {
         )]);
         assert!(report(&initial, &member).contains("  changed membership content mode\n"));
         let mut executable = tree(b"one");
-        if let Kind::File { executable, .. } =
-            &mut executable.entries.get_mut(Path::new("secret-sentinel")).unwrap().kind
+        if let Kind::File { executable, .. } = &mut Arc::make_mut(&mut executable.entries)
+            .get_mut(Path::new("secret-sentinel"))
+            .unwrap()
+            .kind
         {
             *executable = true;
         }
@@ -502,7 +507,7 @@ mod observation_tests {
     #[test]
     fn links_use_relocated_identity() {
         let mut a = tree(b"one");
-        a.entries
+        Arc::make_mut(&mut a.entries)
             .get_mut(Path::new("secret-sentinel"))
             .unwrap()
             .links
@@ -510,7 +515,7 @@ mod observation_tests {
         let mut b =
             Tree::from_files("/relocated", [(PathBuf::from("secret-sentinel"), b"one".to_vec())])
                 .unwrap();
-        b.entries
+        Arc::make_mut(&mut b.entries)
             .get_mut(Path::new("secret-sentinel"))
             .unwrap()
             .links
@@ -519,10 +524,10 @@ mod observation_tests {
             !report(&closure(vec![("r", a)]), &closure(vec![("r", b.clone())]))
                 .contains("root 0 expected")
         );
-        b.entries.get_mut(Path::new("secret-sentinel")).unwrap().links[0] =
+        Arc::make_mut(&mut b.entries).get_mut(Path::new("secret-sentinel")).unwrap().links[0] =
             PathBuf::from("/external-secret");
         let mut c = tree(b"one");
-        c.entries
+        Arc::make_mut(&mut c.entries)
             .get_mut(Path::new("secret-sentinel"))
             .unwrap()
             .links

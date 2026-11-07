@@ -9,7 +9,7 @@ no `cargo build` (docs/no-rustc.md, step K, #91), through the default owned rout
 The fixtures are a workspace of a program, an example and a library with a build script,
 built from nothing by `cargo blaze build` (dev, then release) and `cargo blaze run --example`:
 each executable has to be where cargo puts it and print what cargo's build of the same source
-does, and no `cargo build` may run (cargo would leave `.fingerprint` in the target directory).
+does. Product invocations run under blocking, counted external-tool stand-ins; Linux also audits exec attempts. The independent Cargo oracle keeps its own toolchain.
 An edit to a body after the first build is built by the daemon on what it loaded. A program that reaches a function blaze cannot compile fails its build with what it is, exit
 101, and leaves no executable and no cargo build behind.
 
@@ -26,9 +26,11 @@ import glob, os, re, shutil, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import cargo_ra_jit
+import norustc
 from cargo_ra_jit import RA_JIT, base_env
 
 TIMEOUT = 3600
+AUDITS = {}
 FILES = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "parts"]\nresolver = "2"\n',
     "parts/Cargo.toml": '[package]\nname = "kparts"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n',
@@ -133,13 +135,31 @@ def env_for(root, remote=None):
     env = base_env(os.path.join(root, "home"))
     if remote:
         env["RA_JIT_STD_FROM"] = remote
+    env["RA_JIT_STATS"] = "1"
+    log = os.path.join(root, "owned-tools.log")
+    toolchain = norustc.stand_ins(os.path.join(root, "audit"), log, block=True, block_macro_server=True)
+    controls = (*norustc.COUNTED, "rust-analyzer-proc-macro-srv")
+    for tool in controls:
+        folder = "libexec" if tool == "rust-analyzer-proc-macro-srv" else "bin"
+        control = subprocess.run([os.path.join(toolchain, folder, tool), "--version"], capture_output=True)
+        assert control.returncode == 97, (tool, control.returncode)
+    assert [row["tool"] for row in norustc.runs(log)] == list(controls)
+    open(log, "w").close()
+    AUDITS[env["RA_JIT_HOME"]] = (toolchain, log, [])
     return env
 
 
 def blaze(ws, env, *args):
     start = time.monotonic()
-    ran = subprocess.run(["cargo", "ra-jit", *args], cwd=ws, env=env, capture_output=True, text=True,
-                         timeout=TIMEOUT)
+    toolchain, log, traces = AUDITS[env["RA_JIT_HOME"]]
+    own = dict(env, PATH=os.path.join(toolchain, "bin") + os.pathsep + env["PATH"],
+               RUSTUP_TOOLCHAIN=toolchain,
+               **{name: os.path.join(toolchain, "bin", tool)
+                  for name, tool in (("RUSTC", "rustc"), ("RUSTDOC", "rustdoc"), ("CARGO", "cargo"))})
+    trace = log + f".{len(traces)}.exec"
+    ran = norustc.traced_run([RA_JIT, "cargo", *args], trace, cwd=ws, env=own, timeout=TIMEOUT)
+    if sys.platform == "linux":
+        traces.append(trace)
     return ran, time.monotonic() - start
 
 
@@ -157,13 +177,35 @@ def printed(program, args=(), cwd=None, env=None):
     return ran.returncode, ran.stdout, re.sub(r"thread '([^']*)' \(\d+\)", r"thread '\1'", ran.stderr)
 
 
-def cargo_built(target):
-    """Whether cargo built anything into `target`: it leaves `.fingerprint` in each profile.
-    The build scripts and proc macros blaze loads the workspace with are in its own
-    `target/rust-analyzer`."""
-    own = os.path.join(target, "rust-analyzer")
-    return any(".fingerprint" in dirs for at, dirs, _ in os.walk(target)
-               if at != own and not at.startswith(own + os.sep))
+def external_tools(env):
+    """Product-only tool attempts; the Cargo oracle uses the original environment."""
+    _, log, traces = AUDITS[env["RA_JIT_HOME"]]
+    return [*norustc.runs(log), *(path for trace in traces
+            for path in norustc.external_execs(open(trace).read()))]
+
+
+def workers(ws, env):
+    ran = subprocess.run([RA_JIT, "cargo", "status"], cwd=ws, env=env,
+                         capture_output=True, text=True, timeout=120)
+    assert ran.returncode == 0, ran.stderr
+    return {int(pid): (log, os.path.getsize(log))
+            for pid, log in re.findall(r"^  worker: pid (\d+), .*log (.+)$", ran.stdout, re.M)}
+
+
+def reused_worker(ws, env, before):
+    after = workers(ws, env)
+    if not before or before.keys() != after.keys():
+        return False
+    for pid, (path, size) in before.items():
+        if after[pid][0] != path:
+            return False
+        with open(path, "rb") as log:
+            log.seek(size)
+            added = log.read().decode(errors="replace")
+        if re.search(r"^edit \(apply .*\): compiled ", added, re.M) and any(
+                int(reused) > 0 for reused in re.findall(r"^stats: \d+ of \d+ functions compiled, (\d+) reused$", added, re.M)):
+            return True
+    return False
 
 
 def c_main_allocation():
@@ -206,7 +248,7 @@ pub extern "C" fn main() -> i32 {
                             executable.write(b"not an executable\n")
                     ran, _ = blaze(ws, env, "build")
                     ok = (ran.returncode == 0 and os.path.exists(program)
-                          and not cargo_built(os.path.join(ws, "target"))
+                          and not external_tools(env)
                           and printed(program) == printed(os.path.join(refdir, "debug", "cold_c_main")))
                     print(f"no_main allocation splice={splice} {label:8} {'ok' if ok else 'WRONG'}", flush=True)
                     if not ok:
@@ -246,7 +288,7 @@ def fixtures():
         ran, took = blaze(ws, env, "build", *flags)
         said = ran.stdout + ran.stderr
         check(f"`cargo blaze build {' '.join(flags)}` from nothing builds", ran.returncode == 0, said)
-        check(f"  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(ws, "target")), said)
+        check(f"  ... no build is cargo's", "building with cargo" not in said and not external_tools(env), said)
         program = os.path.join(ws, "target", profile, "kapp")
         reference, _ = cargo(ws, env, os.path.join(root, "ref"), "build", *flags)
         assert reference.returncode == 0, reference.stderr[-3000:]
@@ -260,11 +302,12 @@ def fixtures():
                 source = f.read()
             with open(main, "w") as f:
                 f.write(source.replace('println!("debug")', 'println!("debug, edited")'))
+            before = workers(ws, env)
             ran, again = blaze(ws, env, "build")
             said = ran.stdout + ran.stderr
             check("  ... an edit to a body then builds", ran.returncode == 0, said)
-            check("  ... on what the daemon has loaded", "building with cargo" not in said and not cargo_built(os.path.join(ws, "target"))
-                  and again < took, f"{said}\nfrom nothing {took:.1f}s, the edit {again:.1f}s")
+            check("  ... on what the daemon has loaded", "building with cargo" not in said and not external_tools(env)
+                  and reused_worker(ws, env, before), f"{said}\nfrom nothing {took:.1f}s, the edit {again:.1f}s")
             edited = printed(program) if os.path.exists(program) else None
             check("  ... and target/debug/kapp prints the edit", edited is not None and "debug, edited" in edited[1],
                   f"blaze's printed {edited!r}")
@@ -291,7 +334,7 @@ def fixtures():
         said = ran.stdout + ran.stderr
         what = " ".join(["`cargo blaze build", *args, "`"])
         check(f"{what}: builds", ran.returncode == 0, said)
-        check("  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(feat, "target")), said)
+        check("  ... no build is cargo's", "building with cargo" not in said and not external_tools(env), said)
         program = os.path.join(feat, "target", "debug", "kfeat")
         ours = printed(program) if os.path.exists(program) else None
         theirs = printed(os.path.join(root, "feat-ref", "debug", "kfeat"))
@@ -315,7 +358,7 @@ def fixtures():
         ran, _ = blaze(cwd, env, "build", *args)
         said = ran.stdout + ran.stderr
         check(f"member selection from {where or 'root'} {' '.join(args)}: builds", ran.returncode == 0, said)
-        check("  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(members, "target")), said)
+        check("  ... no build is cargo's", "building with cargo" not in said and not external_tools(env), said)
         program = os.path.join(members, "target", "debug", name)
         ours = printed(program) if os.path.exists(program) else None
         theirs = printed(os.path.join(root, "member-ref", "debug", name))
@@ -329,7 +372,7 @@ def fixtures():
         check(f"a program with {whose} function blaze cannot compile fails", ran.returncode == 101, said)
         check("  ... and says which and why", "could not compile" in said and "halved" in said and "f128" in said, said)
         check("  ... with no executable and no build of cargo's",
-              not os.path.exists(os.path.join(bad, "target", "debug", package)) and not cargo_built(os.path.join(bad, "target")))
+              not os.path.exists(os.path.join(bad, "target", "debug", package)) and not external_tools(env))
     subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     if wrong:
         sys.exit(f"coldbuild.py: {len(wrong)} wrong; under {root}")
@@ -353,7 +396,7 @@ def edited(ws, root, name, env, build, changes, spec):
     why = None
     if ours.returncode != 0:
         why = "FAILS: " + (said.strip().splitlines() or [""])[-1][:160]
-    elif "building with cargo" in said or cargo_built(os.path.join(ws, "target")):
+    elif "building with cargo" in said or external_tools(env):
         why = "CARGO BUILT IT"
     elif spec.get("run") is not None:
         debug = os.path.join(ws, "target", "debug")
@@ -391,7 +434,7 @@ def bench(names, keep=False):
             verdict = "cargo's build fails"
         elif ours.returncode != 0:
             verdict = "FAILS: " + (said.strip().splitlines() or [""])[-1][:160]
-        elif "building with cargo" in said or cargo_built(os.path.join(ws, "target")):
+        elif "building with cargo" in said or external_tools(env):
             verdict = "CARGO BUILT IT"
         elif spec.get("run") is not None:
             debug = os.path.join(ws, "target", "debug")

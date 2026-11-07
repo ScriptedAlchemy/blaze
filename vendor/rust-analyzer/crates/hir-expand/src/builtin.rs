@@ -11,6 +11,6 @@ pub use self::{
     derive_macro::{BuiltinDeriveExpander, find_builtin_derive},
     fn_macro::{
         BuiltinFnLikeExpander, EagerExpander, MODULE_PATH_PLACEHOLDER, find_builtin_macro,
-        include_input_to_file_id,
+        include_input_to_file_id, macro_input_reads,
     },
 };

@@ -5,6 +5,7 @@ use std::{
     fs::{self, Metadata},
     io::{self, Read},
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -54,12 +55,13 @@ pub struct Entry {
 pub struct Tree {
     /// The absolute location used to capture this tree, excluded from its digest.
     pub root: PathBuf,
-    /// All logical nodes in native pathname order.
-    pub entries: BTreeMap<PathBuf, Entry>,
+    /// All logical nodes in native pathname order. Clones share this capture; writers use
+    /// `Arc::make_mut`, so changing one observation never changes another's identity.
+    pub entries: Arc<BTreeMap<PathBuf, Entry>>,
     resolved_root: Option<PathBuf>,
-    ancestor_links: BTreeMap<PathBuf, PathBuf>,
-    raw_links: BTreeMap<PathBuf, Vec<Link>>,
-    locations: BTreeMap<PathBuf, (PathBuf, PathBuf)>,
+    ancestor_links: Arc<BTreeMap<PathBuf, PathBuf>>,
+    raw_links: Arc<BTreeMap<PathBuf, Vec<Link>>>,
+    locations: Arc<BTreeMap<PathBuf, (PathBuf, PathBuf)>>,
 }
 
 impl Tree {
@@ -70,6 +72,10 @@ impl Tree {
     /// of the observed platform even though its members cannot be. Other permission, I/O and
     /// unsupported-node errors propagate; only `NotFound` becomes a missing node.
     pub fn capture(root: &Path) -> io::Result<Self> {
+        Self::capture_with(root, &mut FileReads::default())
+    }
+
+    fn capture_with(root: &Path, reads: &mut FileReads) -> io::Result<Self> {
         let root =
             if root.is_absolute() { root.to_owned() } else { std::env::current_dir()?.join(root) };
         let first = resolve(&root)?;
@@ -77,13 +83,17 @@ impl Tree {
             matches!(first.kind, ResolvedKind::Directory(_)).then(|| first.path.clone());
         let mut tree = Self {
             root: root.clone(),
-            entries: BTreeMap::new(),
+            entries: Arc::default(),
             resolved_root,
-            ancestor_links: first.ancestors.clone(),
-            raw_links: BTreeMap::new(),
-            locations: BTreeMap::new(),
+            ancestor_links: if reads.details {
+                Arc::new(first.ancestors.clone())
+            } else {
+                Arc::default()
+            },
+            raw_links: Arc::default(),
+            locations: Arc::default(),
         };
-        tree.walk(&root, Path::new(""), first, &mut BTreeSet::new())?;
+        tree.walk(&root, Path::new(""), first, &mut BTreeSet::new(), reads)?;
         Ok(tree)
     }
 
@@ -94,6 +104,17 @@ impl Tree {
     /// have on the same filesystem. Re-rooting that changes a directory-cycle boundary
     /// falls back to a separate complete capture. Nothing is cached between calls.
     pub fn capture_many(paths: &[PathBuf]) -> io::Result<Vec<Self>> {
+        Self::capture_many_with(paths, &mut FileReads::default())
+    }
+
+    /// A fresh, complete observation for validation needs the same identity and race
+    /// checks, but no per-node pathname index for subsequently admitting linker reads.
+    pub(crate) fn recapture_digests(paths: &[PathBuf]) -> io::Result<Vec<Digest>> {
+        let mut reads = FileReads { details: false, ..FileReads::default() };
+        Ok(Self::capture_many_with(paths, &mut reads)?.iter().map(Self::digest).collect())
+    }
+
+    fn capture_many_with(paths: &[PathBuf], reads: &mut FileReads) -> io::Result<Vec<Self>> {
         let requests = paths
             .iter()
             .map(|path| {
@@ -117,30 +138,59 @@ impl Tree {
         for index in order {
             let (root, resolved) = &requests[index];
             if matches!(resolved.kind, ResolvedKind::Missing | ResolvedKind::Cycle) {
-                result[index] = Some(Self::capture(root)?);
+                result[index] = Some(Self::capture_with(root, reads)?);
                 continue;
             }
             let mut derived = None;
-            for tree in &captured {
-                if let Some(tree) = tree.reroot(root, resolved)? {
+            for tree in captured
+                .iter()
+                .filter(|tree| tree.root == *root)
+                .chain(captured.iter().filter(|tree| tree.root != *root))
+            {
+                if let Some(tree) = tree.reroot(root, resolved, reads)? {
                     derived = Some(tree);
                     break;
                 }
             }
             if derived.is_none() {
-                let tree = Self::capture(&resolved.path)?;
-                derived = tree.reroot(root, resolved)?;
+                let tree = Self::capture_with(&resolved.path, reads)?;
+                derived = tree.reroot(root, resolved, reads)?;
                 captured.push(tree);
             }
-            result[index] = Some(match derived {
+            let tree = match derived {
                 Some(tree) => tree,
-                None => Self::capture(root)?,
-            });
+                None => Self::capture_with(root, reads)?,
+            };
+            // A derived cycle can need a fresh boundary probe when selected again.
+            // Keep those probes on the original captured ancestor; reuse only
+            // non-cyclic derived views, once per shared entry allocation.
+            if !captured.iter().any(|old| Arc::ptr_eq(&old.entries, &tree.entries))
+                && !tree.entries.values().any(|entry| entry.kind == Kind::Cycle)
+            {
+                captured.push(tree.clone());
+            }
+            result[index] = Some(tree);
         }
         Ok(result.into_iter().map(Option::unwrap).collect())
     }
 
-    fn reroot(&self, root: &Path, resolved: &Resolved) -> io::Result<Option<Self>> {
+    fn reroot(
+        &self,
+        root: &Path,
+        resolved: &Resolved,
+        reads: &mut FileReads,
+    ) -> io::Result<Option<Self>> {
+        let details = reads.details;
+        if root == self.root
+            && self.locations.get(Path::new("")).is_some_and(|(_, path)| *path == resolved.path)
+            && self.raw_links.get(Path::new("")) == Some(&resolved.links)
+            && self
+                .entries
+                .get(Path::new(""))
+                .is_some_and(|entry| same_kind(&resolved.kind, &entry.kind))
+        {
+            return Ok(Some(self.clone()));
+        }
         let Ok(prefix) = resolved.path.strip_prefix(&self.root) else { return Ok(None) };
         let Some(entry) = self.entries.get(prefix) else { return Ok(None) };
         if !same_kind(&resolved.kind, &entry.kind) {
@@ -148,14 +198,24 @@ impl Tree {
         }
         let mut tree = Self {
             root: root.to_owned(),
-            entries: BTreeMap::new(),
+            entries: Arc::default(),
             resolved_root: matches!(resolved.kind, ResolvedKind::Directory(_))
                 .then(|| resolved.path.clone()),
-            ancestor_links: resolved.ancestors.clone(),
-            raw_links: BTreeMap::new(),
-            locations: BTreeMap::new(),
+            ancestor_links: if details {
+                Arc::new(resolved.ancestors.clone())
+            } else {
+                Arc::default()
+            },
+            raw_links: Arc::default(),
+            locations: Arc::default(),
         };
-        for (path, entry) in &self.entries {
+        for (path, entry) in
+            self.entries.range(prefix.to_owned()..).take_while(|(path, _)| path.starts_with(prefix))
+        {
+            #[cfg(test)]
+            {
+                reads.reroot_nodes += 1;
+            }
             let Ok(relative) = path.strip_prefix(prefix) else { continue };
             if !prefix.as_os_str().is_empty() && entry.kind == Kind::Cycle {
                 let cycle = resolve(&resolved.path.join(relative))?;
@@ -165,22 +225,29 @@ impl Tree {
                     return Ok(None);
                 }
             }
-            let raw = if relative.as_os_str().is_empty() {
-                resolved.links.clone()
+            let links = if relative.as_os_str().is_empty() {
+                Self::visible_links(resolved.links.clone())
             } else {
-                let Some(raw) = self.raw_links.get(path) else { return Ok(None) };
-                raw.clone()
+                entry.links.clone()
             };
-            let links = Self::visible_links(raw.clone());
-            tree.raw_links.insert(relative.to_owned(), raw);
-            let location = if relative.as_os_str().is_empty() {
-                (root.to_owned(), resolved.path.clone())
-            } else {
-                let Some(location) = self.locations.get(path) else { return Ok(None) };
-                location.clone()
-            };
-            tree.locations.insert(relative.to_owned(), location);
-            tree.entries.insert(relative.to_owned(), Entry { links, kind: entry.kind.clone() });
+            if details || relative.as_os_str().is_empty() {
+                let raw = if relative.as_os_str().is_empty() {
+                    resolved.links.clone()
+                } else {
+                    let Some(raw) = self.raw_links.get(path) else { return Ok(None) };
+                    raw.clone()
+                };
+                Arc::make_mut(&mut tree.raw_links).insert(relative.to_owned(), raw);
+                let location = if relative.as_os_str().is_empty() {
+                    (root.to_owned(), resolved.path.clone())
+                } else {
+                    let Some(location) = self.locations.get(path) else { return Ok(None) };
+                    location.clone()
+                };
+                Arc::make_mut(&mut tree.locations).insert(relative.to_owned(), location);
+            }
+            Arc::make_mut(&mut tree.entries)
+                .insert(relative.to_owned(), Entry { links, kind: entry.kind.clone() });
         }
         Ok(Some(tree))
     }
@@ -265,11 +332,11 @@ impl Tree {
             .collect();
         Ok(Self {
             root,
-            entries,
+            entries: Arc::new(entries),
             resolved_root: None,
-            ancestor_links: BTreeMap::new(),
-            raw_links: BTreeMap::new(),
-            locations,
+            ancestor_links: Arc::default(),
+            raw_links: Arc::default(),
+            locations: Arc::new(locations),
         })
     }
 
@@ -284,7 +351,7 @@ impl Tree {
         // stay valid.
         frame(&mut hash, b"blaze.native-tree.v1");
         hash.update((self.entries.len() as u64).to_le_bytes());
-        for (path, entry) in &self.entries {
+        for (path, entry) in self.entries.iter() {
             frame(&mut hash, path.as_os_str().as_encoded_bytes());
             hash.update((entry.links.len() as u64).to_le_bytes());
             for target in &entry.links {
@@ -333,7 +400,7 @@ impl Tree {
         let mut mode = component(b"mode");
         let mut links = component(b"links");
         let mut counts = [0_u64; 6];
-        for (path, entry) in &self.entries {
+        for (path, entry) in self.entries.iter() {
             let path = path.as_os_str().as_encoded_bytes();
             frame(&mut membership, path);
             let kind = match &entry.kind {
@@ -412,10 +479,14 @@ impl Tree {
         logical: &Path,
         resolved: Resolved,
         active: &mut BTreeSet<PathBuf>,
+        reads: &mut FileReads,
     ) -> io::Result<()> {
         let Resolved { path, links, kind, .. } = resolved;
-        self.locations.insert(logical.to_owned(), (requested.to_owned(), path.clone()));
-        self.raw_links.insert(logical.to_owned(), links.clone());
+        if reads.details || logical.as_os_str().is_empty() {
+            Arc::make_mut(&mut self.locations)
+                .insert(logical.to_owned(), (requested.to_owned(), path.clone()));
+            Arc::make_mut(&mut self.raw_links).insert(logical.to_owned(), links.clone());
+        }
         let links = Self::visible_links(links);
         let stamp = match &kind {
             ResolvedKind::File(metadata) | ResolvedKind::Directory(metadata) => {
@@ -427,12 +498,13 @@ impl Tree {
             ResolvedKind::Missing => Kind::Missing,
             ResolvedKind::Cycle => Kind::Cycle,
             ResolvedKind::File(metadata) => {
-                let (digest, len) = read_file(&path, &metadata, &mut || {})?;
+                let (digest, len) = reads.read(&path, &metadata, &mut || {})?;
                 Kind::File { digest, len, executable: executable(&metadata) }
             }
             ResolvedKind::Directory(_) => {
                 if !active.insert(path.clone()) {
-                    self.entries.insert(logical.to_owned(), Entry { links, kind: Kind::Cycle });
+                    Arc::make_mut(&mut self.entries)
+                        .insert(logical.to_owned(), Entry { links, kind: Kind::Cycle });
                     return Ok(());
                 }
                 let children = match names(&path) {
@@ -442,7 +514,7 @@ impl Tree {
                 };
                 match children {
                     Some(children) => {
-                        self.entries.insert(
+                        Arc::make_mut(&mut self.entries).insert(
                             logical.to_owned(),
                             Entry { links: links.clone(), kind: Kind::Directory },
                         );
@@ -453,6 +525,7 @@ impl Tree {
                                 &logical.join(name),
                                 resolve(&requested)?,
                                 active,
+                                reads,
                             )?;
                         }
                         // Membership is what a directory binds: an entry added, removed or
@@ -489,7 +562,7 @@ impl Tree {
         {
             return Err(changed(requested));
         }
-        self.entries.insert(logical.to_owned(), Entry { links, kind });
+        Arc::make_mut(&mut self.entries).insert(logical.to_owned(), Entry { links, kind });
         Ok(())
     }
 }
@@ -676,7 +749,7 @@ fn resolve_path(
     Ok((current, kind))
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Stamp {
     len: u64,
     modified: SystemTime,
@@ -718,6 +791,110 @@ fn executable(metadata: &Metadata) -> bool {
     }
 }
 
+/// Successful byte observations belong to one capture operation. Every alias still
+/// resolves and opens its file, and validates the full identity before reusing bytes.
+struct FileReads {
+    details: bool,
+    files: BTreeMap<FileIdentity, (Stamp, Digest, u64)>,
+    #[cfg(test)]
+    reuse: bool,
+    #[cfg(test)]
+    reroot_nodes: u64,
+    #[cfg(test)]
+    hashed: u64,
+    #[cfg(test)]
+    bytes: u64,
+    #[cfg(test)]
+    hits: u64,
+}
+
+impl Default for FileReads {
+    fn default() -> Self {
+        Self {
+            details: true,
+            files: BTreeMap::new(),
+            #[cfg(test)]
+            reuse: true,
+            #[cfg(test)]
+            reroot_nodes: 0,
+            #[cfg(test)]
+            hashed: 0,
+            #[cfg(test)]
+            bytes: 0,
+            #[cfg(test)]
+            hits: 0,
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct FileIdentity {
+    #[cfg(unix)]
+    native: (u64, u64),
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+impl FileIdentity {
+    fn of(path: &Path, stamp: &Stamp) -> Self {
+        #[cfg(unix)]
+        {
+            let _ = path;
+            Self { native: (stamp.unix.0, stamp.unix.1) }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = stamp;
+            Self { path: path.to_owned() }
+        }
+    }
+}
+
+impl FileReads {
+    fn read(
+        &mut self,
+        path: &Path,
+        metadata: &Metadata,
+        between: &mut dyn FnMut(),
+    ) -> io::Result<(Digest, u64)> {
+        let before = Stamp::of(metadata)?;
+        #[cfg(test)]
+        let reuse = self.reuse;
+        #[cfg(not(test))]
+        let reuse = true;
+        if reuse {
+            if let Some((known, digest, len)) =
+                self.files.get(&FileIdentity::of(path, &before)).cloned()
+            {
+                if known == before {
+                    let file = fs::File::open(path)?;
+                    let opened = Stamp::of(&file.metadata()?)?;
+                    between();
+                    let after = Stamp::of(&file.metadata()?)?;
+                    let now = Stamp::of(&fs::metadata(path)?)?;
+                    if opened == before && after == before && now == before {
+                        #[cfg(test)]
+                        {
+                            self.hits += 1;
+                        }
+                        return Ok((digest, len));
+                    }
+                }
+            }
+        }
+        let (digest, len, stamp) = read_file(path, metadata, &mut |_len| {
+            #[cfg(test)]
+            {
+                self.hashed += 1;
+                self.bytes += _len;
+            }
+            between();
+        })?;
+        self.files.insert(FileIdentity::of(path, &stamp), (stamp, digest, len));
+        Ok((digest, len))
+    }
+}
+
 /// The digest and length of the file at `path`, read whole. A file whose stamp moves while it
 /// is read is read again, and is the input it was when its bytes are the same both times: Nix's
 /// store optimiser relinks a file in place, which changes its inode and ctime and not a byte,
@@ -726,8 +903,8 @@ fn executable(metadata: &Metadata) -> bool {
 fn read_file(
     path: &Path,
     metadata: &Metadata,
-    between: &mut dyn FnMut(),
-) -> io::Result<(Digest, u64)> {
+    between: &mut dyn FnMut(u64),
+) -> io::Result<(Digest, u64, Stamp)> {
     let mut before = Stamp::of(metadata)?;
     let mut first: Option<(Digest, u64)> = None;
     for _ in 0..3 {
@@ -744,7 +921,7 @@ fn read_file(
             len += count as u64;
             hash.update(&buffer[..count]);
         }
-        between();
+        between(len);
         let read: (Digest, u64) = (hash.finalize().into(), len);
         match first {
             Some(it) if it != read => return Err(changed(path)),
@@ -753,7 +930,7 @@ fn read_file(
         let after = Stamp::of(&file.metadata()?)?;
         let now = fs::metadata(path)?;
         if opened == before && after == before && Stamp::of(&now)? == before {
-            return Ok(read);
+            return Ok((read.0, read.1, before));
         }
         // Moved while read: the next read has to find the same bytes.
         first = Some(read);
@@ -812,7 +989,7 @@ mod digest_compatibility_tests {
                 0x2a, 0x94, 0x96, 0x9b,
             ]
         );
-        let entry = tree.entries.get_mut(Path::new("include/a.h")).unwrap();
+        let entry = Arc::make_mut(&mut tree.entries).get_mut(Path::new("include/a.h")).unwrap();
         entry.links =
             vec![root.join("include/a.h"), PathBuf::from("/outside/x"), PathBuf::from("../other")];
         if let Kind::File { executable, .. } = &mut entry.kind {
@@ -848,7 +1025,7 @@ mod read_tests {
         let (path, metadata) = written(dir.path(), b"the same bytes");
         let mut moved = 0;
         let later = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
-        let (digest, len) = read_file(&path, &metadata, &mut || {
+        let (digest, len, _) = read_file(&path, &metadata, &mut |_| {
             // Relinked in place, as Nix's store optimiser does: a new stamp, the same bytes.
             if moved == 0 {
                 let again = dir.path().join("again");
@@ -870,7 +1047,7 @@ mod read_tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, metadata) = written(dir.path(), b"first bytes");
         let mut moved = 0;
-        let error = read_file(&path, &metadata, &mut || {
+        let error = read_file(&path, &metadata, &mut |_| {
             if moved == 0 {
                 fs::write(&path, b"other bytes").unwrap();
             }
@@ -885,12 +1062,289 @@ mod read_tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, metadata) = written(dir.path(), b"restless");
         let mut tick = 0_u64;
-        let error = read_file(&path, &metadata, &mut || {
+        let error = read_file(&path, &metadata, &mut |_| {
             tick += 1;
             let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(tick);
             fs::File::options().write(true).open(&path).unwrap().set_modified(at).unwrap();
         })
         .unwrap_err();
         assert!(error.to_string().contains("changed while reading"), "{error}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod memo_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn fresh_and_memo(paths: &[PathBuf]) -> (FileReads, FileReads) {
+        let mut fresh = FileReads { reuse: false, ..FileReads::default() };
+        let mut memo = FileReads::default();
+        let a = Tree::capture_many_with(paths, &mut fresh).unwrap();
+        let b = Tree::capture_many_with(paths, &mut memo).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            a.iter().map(Tree::digest).collect::<Vec<_>>(),
+            b.iter().map(Tree::digest).collect::<Vec<_>>()
+        );
+        (fresh, memo)
+    }
+
+    #[test]
+    fn physical_aliases_hash_once_in_one_observation() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("physical")).unwrap();
+        let file = root.path().join("physical/header.h");
+        fs::write(&file, b"native bytes").unwrap();
+        fs::hard_link(&file, root.path().join("physical/hard.h")).unwrap();
+        fs::hard_link(&file, outside.path().join("another.h")).unwrap();
+        symlink("physical", root.path().join("alias-a")).unwrap();
+        symlink("physical", root.path().join("alias-b")).unwrap();
+        let paths =
+            [root.path().to_owned(), root.path().join("alias-a"), outside.path().join("another.h")];
+        let (fresh, memo) = fresh_and_memo(&paths);
+        assert_eq!(fresh.hashed, 7);
+        assert_eq!(memo.hashed, 1, "aliases rehashed physical bytes");
+        assert_eq!(memo.hits, 6);
+        assert_eq!(memo.bytes, b"native bytes".len() as u64);
+    }
+
+    #[test]
+    fn memo_preserves_missing_external_alias_cycles_and_unreadable_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("nested")).unwrap();
+        fs::write(root.path().join("nested/header.h"), b"header").unwrap();
+        fs::write(outside.path().join("external.h"), b"external").unwrap();
+        symlink("..", root.path().join("nested/up")).unwrap();
+        symlink("self", root.path().join("self")).unwrap();
+        symlink("missing", root.path().join("absent")).unwrap();
+        symlink(outside.path(), root.path().join("external")).unwrap();
+        let denied = root.path().join("denied");
+        fs::create_dir(&denied).unwrap();
+        fs::write(denied.join("member"), b"not necessarily accessible").unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+        let paths = [
+            root.path().to_owned(),
+            root.path().join("nested"),
+            root.path().join("self"),
+            root.path().join("absent"),
+        ];
+        let mut fresh = FileReads { reuse: false, ..FileReads::default() };
+        let mut memo = FileReads::default();
+        let a = Tree::capture_many_with(&paths, &mut fresh);
+        let b = Tree::capture_many_with(&paths, &mut memo);
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a, b);
+        assert_eq!(
+            a.iter().map(Tree::digest).collect::<Vec<_>>(),
+            b.iter().map(Tree::digest).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn memo_is_fresh_after_restored_mtime_updates_and_retargeting() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        fs::write(&path, b"first").unwrap();
+        let stamp = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut memo = FileReads::default();
+        let first = Tree::capture_with(root.path(), &mut memo).unwrap();
+        fs::write(&path, b"other").unwrap();
+        fs::File::options().write(true).open(&path).unwrap().set_modified(stamp).unwrap();
+        let second = Tree::capture_with(root.path(), &mut memo).unwrap();
+        assert_ne!(first.digest(), second.digest());
+        assert_eq!(second, Tree::capture(root.path()).unwrap());
+        fs::write(root.path().join("next"), b"third").unwrap();
+        symlink("file", root.path().join("alias")).unwrap();
+        let before = Tree::capture_with(root.path(), &mut memo).unwrap();
+        fs::remove_file(root.path().join("alias")).unwrap();
+        symlink("next", root.path().join("alias")).unwrap();
+        let after = Tree::capture_with(root.path(), &mut memo).unwrap();
+        assert_ne!(before.digest(), after.digest());
+        assert_eq!(after, Tree::capture(root.path()).unwrap());
+        fresh_and_memo(&[root.path().to_owned()]);
+    }
+
+    #[test]
+    fn cached_alias_reopens_and_checks_changes_during_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        fs::write(&path, b"first").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let mut memo = FileReads::default();
+        let first = memo.read(&path, &metadata, &mut || {}).unwrap();
+        let mut changed = false;
+        let second = memo
+            .read(&path, &metadata, &mut || {
+                if !changed {
+                    fs::write(&path, b"other").unwrap();
+                    fs::File::options()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_modified(SystemTime::UNIX_EPOCH)
+                        .unwrap();
+                    changed = true;
+                }
+            })
+            .unwrap();
+        assert_ne!(first, second);
+        let metadata = fs::metadata(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            memo.read(&path, &metadata, &mut || {}).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit installed SDK measurement; reads the complete supplied root"]
+    fn installed_sdk_capture_and_validation_once() {
+        let root = PathBuf::from(
+            std::env::var_os("BLAZE_NATIVE_SDK_CAPTURE_ROOT").expect("explicit SDK root"),
+        );
+        let mut expected = None;
+        for details in [true, false] {
+            let start = std::time::Instant::now();
+            let mut reads = FileReads { details, ..FileReads::default() };
+            let tree =
+                Tree::capture_many_with(std::slice::from_ref(&root), &mut reads).unwrap().remove(0);
+            let identity = (tree.digest(), reads.hashed, reads.bytes, reads.hits);
+            eprintln!(
+                "native SDK: admission_paths={} entries={} stored_paths={} stored_links={} hash_reads={} hash_bytes={} memo_hits={} seconds={:.3} digest={:02x?}",
+                details,
+                tree.entries.len(),
+                tree.locations.len(),
+                tree.raw_links.len(),
+                reads.hashed,
+                reads.bytes,
+                reads.hits,
+                start.elapsed().as_secs_f64(),
+                identity.0
+            );
+            if let Some(expected) = expected {
+                assert_eq!(identity, expected);
+            }
+            expected = Some(identity);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_roles_and_clones_share_captured_nodes_without_sharing_mutations() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("include")).unwrap();
+        fs::write(root.path().join("include/native.h"), b"native input").unwrap();
+        let paths = [
+            root.path().to_owned(),
+            root.path().to_owned(),
+            root.path().join("include"),
+            root.path().join("include"),
+        ];
+        let captured = Tree::capture_many(&paths).unwrap();
+        for (a, b, name) in [
+            (&captured[0], &captured[1], "include/native.h"),
+            (&captured[2], &captured[3], "native.h"),
+        ] {
+            assert!(
+                std::ptr::eq(
+                    a.entries.get(Path::new(name)).unwrap(),
+                    b.entries.get(Path::new(name)).unwrap()
+                ),
+                "identical native roles allocated duplicate captured nodes"
+            );
+        }
+        let mut cloned = captured[0].clone();
+        assert!(
+            std::ptr::eq(
+                captured[0].entries.get(Path::new("include/native.h")).unwrap(),
+                cloned.entries.get(Path::new("include/native.h")).unwrap(),
+            ),
+            "cloning a native binding duplicated its complete capture"
+        );
+        let original = captured[0].digest();
+        Arc::make_mut(&mut cloned.entries).remove(Path::new("include/native.h"));
+        assert_eq!(captured[0].digest(), original);
+        assert_ne!(cloned.digest(), original);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod validation_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn validation_keeps_identity_and_fresh_reads_without_materializing_admission_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("include")).unwrap();
+        fs::write(root.path().join("include/native.h"), b"native input").unwrap();
+        fs::write(outside.path().join("external"), b"outside").unwrap();
+        symlink(outside.path().join("external"), root.path().join("external")).unwrap();
+        symlink(".", root.path().join("cycle")).unwrap();
+        symlink("include", root.path().join("alias")).unwrap();
+        let paths = [
+            root.path().to_owned(),
+            root.path().join("alias"),
+            root.path().join("include"),
+            root.path().join("include"),
+            root.path().join("absent"),
+        ];
+        let mut full_reads = FileReads::default();
+        let full = Tree::capture_many_with(&paths, &mut full_reads).unwrap();
+        let mut validation_reads = FileReads { details: false, ..FileReads::default() };
+        let validation = Tree::capture_many_with(&paths, &mut validation_reads).unwrap();
+        assert_eq!(
+            full.iter().map(Tree::digest).collect::<Vec<_>>(),
+            validation.iter().map(Tree::digest).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            (full_reads.hashed, full_reads.bytes, full_reads.hits),
+            (validation_reads.hashed, validation_reads.bytes, validation_reads.hits)
+        );
+        assert!(full[0].locations.len() > 1);
+        assert!(
+            validation.iter().all(|tree| tree.locations.len() <= 1
+                && tree.raw_links.len() <= 1
+                && tree.ancestor_links.is_empty()),
+            "validation allocated per-node admission paths that its consumer discards"
+        );
+    }
+}
+
+#[cfg(test)]
+mod subtree_work_tests {
+    use super::*;
+
+    #[test]
+    fn reroot_work_is_bounded_by_selected_subtree_not_unrelated_siblings() {
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().canonicalize().unwrap();
+        fs::create_dir(root.join("selected")).unwrap();
+        fs::write(root.as_path().join("selected/header.h"), b"selected").unwrap();
+        fs::create_dir(root.as_path().join("unrelated")).unwrap();
+        for n in 0..128 {
+            fs::write(root.as_path().join(format!("unrelated/{n}")), b"other").unwrap();
+        }
+        let mut reads = FileReads::default();
+        let captured = Tree::capture_many_with(
+            &[root.as_path().to_owned(), root.as_path().join("selected")],
+            &mut reads,
+        )
+        .unwrap();
+        assert_eq!(
+            captured[1].digest(),
+            Tree::capture(&root.as_path().join("selected")).unwrap().digest()
+        );
+        assert_eq!(reads.hashed, 129, "every physical file must still be freshly hashed");
+        assert_eq!(reads.reroot_nodes, 2, "reroot visited nodes outside the selected subtree");
     }
 }

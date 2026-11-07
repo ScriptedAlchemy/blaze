@@ -1319,7 +1319,12 @@ fn project_json_to_crate_graph(
         if let Some(&from) = idx_to_crate_id.get(&from_idx) {
             public_deps.add_to_crate_graph(crate_graph, from);
             if let Some(proc_macro) = libproc_macro {
-                add_proc_macro_dep(crate_graph, from, proc_macro, krate.is_proc_macro);
+                add_proc_macro_dep(
+                    crate_graph,
+                    from,
+                    proc_macro,
+                    krate.is_proc_macro || krate.blaze_proc_macro_test,
+                );
             }
 
             for dep in &krate.deps {

@@ -64,7 +64,7 @@ use hir_ty::{
     db::{GeneralConstId, InternedClosureId, InternedCoroutineId},
     drop::{DropGlue, destructor, has_drop_glue},
     layout::{CoroutineFrame, Layout, RustcEnumVariantIdx, RustcFieldIdx},
-    method_resolution::{is_dyn_method, lookup_impl_const},
+    method_resolution::is_dyn_method,
     next_solver::{
         Allocation, AllocationData, ConstKind, DbInterner, GenericArgs, Region, StoredGenericArgs,
         StoredTy, TraitRef, Ty, TyKind, TypingMode, UnevaluatedConst, ValTree,
@@ -85,7 +85,7 @@ pub use hir_ty::mir::location::name_sources;
 use hir_ty::mir::{
     AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirOptLevel,
     MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind,
-    StoredPlace, TerminatorKind, UnOp, interpret_mir, is_builtin_index,
+    StoredPlace, TerminatorKind, UnOp, interpret_mir,
     location::{
         ConcatPart, concat_parts, line_and_column, located_concats, location_macros, location_of,
         written_call, written_range,
@@ -121,9 +121,15 @@ mod relocate;
 #[cfg(feature = "llvm")]
 mod units;
 use self::places::{row_location, source_location};
+#[cfg(test)]
+mod deterministic_tests;
 mod promote;
+#[cfg(test)]
+mod refusal_tests;
 mod settled;
 mod stable;
+#[cfg(test)]
+mod startup_tests;
 use ra_jit_store as store;
 pub use stable::{block_place, lower_declared, static_place};
 mod target;
@@ -307,6 +313,11 @@ pub trait SymbolResolver {
     fn debug_grouped(&self) -> bool {
         false
     }
+    /// Whether this object's declarations and definitions must keep discovery order while
+    /// compilation runs ahead, so identical inputs produce identical object bytes.
+    fn deterministic_object(&self) -> bool {
+        false
+    }
     /// Whether every function keeps its frame pointer, as `-C force-frame-pointers` has it:
     /// code that walks its own frames (bun's backtraces) reads them.
     fn keeps_frame_pointers(&self) -> bool {
@@ -321,10 +332,21 @@ pub trait SymbolResolver {
     fn provides(&self, symbol: &str) -> bool {
         self.defines(symbol)
     }
-    /// Whether the executable the patch goes into has the symbol: rustc's own link of it
-    /// leaves out every function nothing calls.
+    /// Whether the executable the patch goes into has the symbol. Native links leave out
+    /// functions nothing calls, including functions in an owned prebuilt object.
     fn linked(&self, _symbol: &str) -> bool {
         true
+    }
+    /// The unique source definition of a native symbol in an object built by ra-jit.
+    /// Used when an edit first calls a runtime entry point the base link stripped.
+    fn native_function(&self, _symbol: &str) -> Option<FunctionId> {
+        None
+    }
+    /// An unchecked foreign import may be supplied by the native linker. Every import
+    /// known to belong to a compiled object must also exist in the actual patch base.
+    fn importable(&self, symbol: &str, checked: bool) -> bool {
+        let provided = self.provides(symbol);
+        (!checked && !provided) || (provided && self.linked(symbol))
     }
     /// The copies the executable a patch goes into has of the instances of `func`, a generic
     /// function of a module, each by its path as [`Spelling::instance_path`] writes it with
@@ -341,8 +363,8 @@ pub trait SymbolResolver {
     fn closure(&self, _owner: FunctionId, _expr: hir_def::hir::ExprId) -> Option<String> {
         None
     }
-    /// The build is no patch of what rustc linked but one in full, which is linked: what
-    /// only that executable has is not to be named.
+    /// The build is in full and will be linked: imports may name everything its input
+    /// objects provide, rather than only what the previous executable retained.
     fn in_full(&self) {}
     /// Whether the build, in full, names what only the executable rustc linked has, for it is
     /// spliced into that: the store keeps nothing of it, which another program can't use.
@@ -804,9 +826,7 @@ impl CodegenUnit {
             kept.put_base(base);
             known.undo = Some(Box::new(kept));
         }
-        if over_rustc {
-            symbols.in_full();
-        }
+        symbols.in_full();
         let patching = known.patching;
         let used_by_rustc = known.used_by_rustc;
         // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
@@ -1009,13 +1029,21 @@ impl CodegenUnit {
             cg.make_later();
             if cg.misfit {
                 start_over("an entry of the store did not fit");
-                rejected.extend(failed);
+                rejected.extend(
+                    failed
+                        .into_iter()
+                        .map(|(instance, why)| (InstanceIn::new(instance, why.env.clone()), why)),
+                );
                 continue;
             }
             // The `main` the C runtime calls would call a `main` that is not in the object.
             if start.is_some_and(|main| skipped.iter().any(|(root, _)| *root == main)) {
                 start = None;
-                rejected.extend(failed);
+                rejected.extend(
+                    failed
+                        .into_iter()
+                        .map(|(instance, why)| (InstanceIn::new(instance, why.env.clone()), why)),
+                );
                 continue;
             }
             let fallback_start = stdx::time::Instant::now();
@@ -1045,7 +1073,11 @@ impl CodegenUnit {
                     split.len()
                 ));
                 cg.reject(&mut failed, &compiled, &from_rustc, &mut own_statics);
-                rejected.extend(failed);
+                rejected.extend(
+                    failed
+                        .into_iter()
+                        .map(|(instance, why)| (InstanceIn::new(instance, why.env.clone()), why)),
+                );
                 continue;
             }
             // The copy rustc makes of a function without a symbol, where it is used, handles
@@ -1063,7 +1095,7 @@ impl CodegenUnit {
                     futures.extend(async_blocks(db, *root).iter().flatten().copied());
                 }
                 for (instance, env) in &cg.envs {
-                    if cg.forwarded.contains(instance) {
+                    if cg.forwarded.contains(&InstanceIn::new(instance.clone(), env.clone())) {
                         futures.extend(made_futures(db, instance, env));
                     }
                 }
@@ -1180,7 +1212,11 @@ impl CodegenUnit {
                 why_most(&failed)
             ));
             cg.reject(&mut failed, &compiled, &from_rustc, &mut own_statics);
-            rejected.extend(failed);
+            rejected.extend(
+                failed
+                    .into_iter()
+                    .map(|(instance, why)| (InstanceIn::new(instance, why.env.clone()), why)),
+            );
         }
     }
 }
@@ -1342,7 +1378,7 @@ pub fn empty_object() -> Result<Vec<u8>> {
 
 #[derive(Default, Clone)]
 pub struct Rejections {
-    rejected: FxHashMap<Instance, Rejected>,
+    rejected: FxHashMap<InstanceIn, Rejected>,
     /// The statics that functions left to rustc refer to, and the crates where that is unknown.
     theirs: FxHashSet<StaticId>,
     unknown: FxHashSet<Crate>,
@@ -1552,8 +1588,15 @@ impl Rejections {
         if let Some((root, _)) = base.compiled.iter().find(|(_, it)| it == symbol) {
             return Some(tier::Node(tier::Kind::Root(*root)));
         }
-        if let Some((instance, known)) = base.instances.iter().find(|(_, it)| it.symbol == symbol) {
-            return Some(tier::Node(tier::Kind::Instance(instance.clone(), known.env.clone())));
+        let mut contexts = base.instances.iter().filter(|(_, it)| it.symbol == symbol);
+        if let Some((instance, known)) = contexts.next() {
+            if contexts.next().is_some() {
+                return None;
+            }
+            return Some(tier::Node(tier::Kind::Instance(
+                instance.instance.clone(),
+                known.env.clone(),
+            )));
         }
         let (instance, env) = base.found_instances.get(symbol)?;
         Some(tier::Node(tier::Kind::Instance(instance.clone(), env.clone())))
@@ -1566,12 +1609,14 @@ impl Rejections {
             tier::Kind::Root(root) => {
                 base.compiled.iter().find(|(it, _)| it == root).map(|it| it.1.clone())
             }
-            tier::Kind::Instance(instance, env) => {
-                base.instances.get(instance).map(|it| it.symbol.clone()).or_else(|| {
+            tier::Kind::Instance(instance, env) => base
+                .instances
+                .get(&InstanceIn::new(instance.clone(), env.clone()))
+                .map(|it| it.symbol.clone())
+                .or_else(|| {
                     let mut found = base.found_instances.iter();
                     found.find(|(_, it)| it.0 == *instance && it.1 == *env).map(|it| it.0.clone())
-                })
-            }
+                }),
         }
     }
 
@@ -1759,6 +1804,24 @@ struct Instance {
     /// until [`ObjectCodegen::settled`] says which crate rustc had compile it.
     checked: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InstanceIn {
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+}
+
+impl InstanceIn {
+    fn new(instance: Instance, env: StoredParamEnvAndCrate) -> Self {
+        Self { instance, env }
+    }
+
+    fn requested(db: &dyn HirDatabase, instance: &Instance, env: &StoredParamEnvAndCrate) -> Self {
+        Self::new(instance.clone(), home::Homes::default().home(db, instance, env))
+    }
+}
+
+type NamedInstance = (Instance, Option<StoredParamEnvAndCrate>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum InstanceDef {
@@ -2140,7 +2203,7 @@ struct ObjectCodegen<'a, 'db> {
     imports: FxHashMap<String, FuncId>,
     /// The functions of `asm!` blocks, by their assembly.
     assemblies: FxHashMap<String, FuncId>,
-    instances: FxHashMap<Instance, FuncId>,
+    instances: FxHashMap<InstanceIn, FuncId>,
     pending: Vec<(Instance, StoredParamEnvAndCrate, FuncId)>,
     /// Every instance that went through `pending`.
     envs: Vec<(Instance, StoredParamEnvAndCrate)>,
@@ -2150,10 +2213,10 @@ struct ObjectCodegen<'a, 'db> {
     /// The code of the roots and instances compiled in units ([`units`]), yet to be put in
     /// the object, and the roots units compiled or tried to.
     unit_roots: FxHashMap<FunctionId, CompiledFunction>,
-    unit_instances: FxHashMap<Instance, CompiledFunction>,
+    unit_instances: FxHashMap<InstanceIn, CompiledFunction>,
     unit_tried: FxHashSet<FunctionId>,
     /// The instances that call rustc's copy instead of having code of their own.
-    forwarded: FxHashSet<Instance>,
+    forwarded: FxHashSet<InstanceIn>,
     /// [`Rejections::futures`] as the round started.
     rustc_futures: FxHashSet<salsa::Id>,
     /// Whether instances and statics get names another object can refer to.
@@ -2169,7 +2232,7 @@ struct ObjectCodegen<'a, 'db> {
     wanted: Vec<FunctionId>,
     on_demand_crates: FxHashSet<Crate>,
     /// Instances that failed in an earlier round, with the reason.
-    rejected: &'a FxHashMap<Instance, Rejected>,
+    rejected: &'a FxHashMap<InstanceIn, Rejected>,
     /// Size and alignment of every type laid out, collected when `RA_JIT_LAYOUTS` names a file
     /// to write them to. The harness compares them with rustc's.
     layouts: FxHashMap<String, (u64, u64)>,
@@ -2201,7 +2264,7 @@ struct ObjectCodegen<'a, 'db> {
     names: stable::StableNames<'a, 'db>,
     /// Whether the code of the checkout's crates can come from the store.
     hydrate: bool,
-    stable_names: FxHashMap<Instance, Option<StableName>>,
+    stable_names: FxHashMap<NamedInstance, Option<StableName>>,
     kept: Kept,
     /// The functions in the object whose description and entry of the store are still to
     /// be made ([`later`]).
@@ -2732,6 +2795,7 @@ fn pause_ahead(db: &dyn HirDatabase) {
         std::env::var("RA_JIT_AHEAD_PAUSE_MS").ok().and_then(|it| it.parse().ok())
     });
     let Some(pause) = *PAUSE else { return };
+    eprintln!("compiling ahead: paused");
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_millis(pause) {
         salsa::Database::unwind_if_revision_cancelled(db);
@@ -3419,7 +3483,14 @@ fn instance_body<'db>(
         | InstanceDef::FnPointerShim
         | InstanceDef::ReifyShim { .. } => unsupported!("the body of a shim"),
     };
-    body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))
+    body.map_err(|e| mir_error(db, &e))
+}
+
+fn mir_error<'db>(
+    db: &'db dyn HirDatabase,
+    error: &hir_ty::mir::MirLowerError<'db>,
+) -> CodegenError {
+    CodegenError::Frontend(format!("mir: {}", error.diagnostic(db)))
 }
 
 /// The types a body takes and returns, which is all its callers have to know about it. Asked
@@ -3930,6 +4001,8 @@ struct Ready<'a> {
     governor: &'a budget::Governor,
     /// The instances to put in the object that a thread is still to compile.
     waiting: FxHashMap<(Instance, StoredParamEnvAndCrate), Vec<FuncId>>,
+    /// Fixed pending waves for reproducible objects; live builds use `waiting`.
+    ordered: Option<std::collections::VecDeque<(Instance, StoredParamEnvAndCrate, FuncId)>>,
 }
 
 impl Ready<'_> {
@@ -3941,6 +4014,9 @@ impl Ready<'_> {
     ) -> Vec<(Instance, StoredParamEnvAndCrate, FuncId)> {
         if self.governor.look() {
             return Vec::new();
+        }
+        if self.ordered.is_some() {
+            return self.take_ordered(pending);
         }
         let mut ready = Vec::new();
         let mut state = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
@@ -3982,15 +4058,60 @@ impl Ready<'_> {
         }
     }
 
+    fn take_ordered(
+        &mut self,
+        pending: &mut Vec<(Instance, StoredParamEnvAndCrate, FuncId)>,
+    ) -> Vec<(Instance, StoredParamEnvAndCrate, FuncId)> {
+        let waiting = self.ordered.as_mut().expect("ordered emission");
+        let mut state = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queued = false;
+        let mut needed = FxHashSet::default();
+        for (instance, env, id) in pending.drain(..) {
+            let key = (instance.clone(), env.clone());
+            if !state.done.contains(&key) {
+                needed.insert(key.clone());
+                if !(state.alive == 0 && !state.seen.contains(&key))
+                    && state.seen.insert(key.clone())
+                {
+                    state.queue.push(key);
+                    queued = true;
+                }
+            }
+            waiting.push_back((instance, env, id));
+        }
+        if queued {
+            self.idle.notify_all();
+        }
+        loop {
+            for completed in state.fresh.drain(..) {
+                needed.remove(&completed);
+            }
+            // Cached entries are stitched after a wave. Its boundary must not depend on
+            // which worker finishes first, either.
+            if Self::ended(&state) || needed.is_empty() {
+                return waiting.drain(..).collect();
+            }
+            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn ended(state: &Ahead) -> bool {
+        state.stopped
+            || state.alive == 0
+            || (state.roots.is_empty() && state.queue.is_empty() && state.working == 0)
+    }
+
     /// Which of `held` no thread is still to compile, waiting until one is. The first when
     /// the threads are through with everything.
     fn ready_root(&self, held: &std::collections::VecDeque<FunctionId>) -> usize {
         let mut state = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            let found = held.iter().position(|it| Self::through(&state, *it));
-            let ended = state.stopped
-                || state.alive == 0
-                || (state.roots.is_empty() && state.queue.is_empty() && state.working == 0);
+            let found = if self.ordered.is_some() {
+                held.front().filter(|&&root| Self::through(&state, root)).map(|_| 0)
+            } else {
+                held.iter().position(|it| Self::through(&state, *it))
+            };
+            let ended = Self::ended(&state);
             match found {
                 Some(at) => return at,
                 None if ended => return 0,
@@ -4001,7 +4122,14 @@ impl Ready<'_> {
 
     /// Whether no thread is still to compile `root`.
     fn root_ready(&self, root: FunctionId) -> bool {
-        Self::through(&self.ahead.lock().unwrap_or_else(|e| e.into_inner()), root)
+        let mut state = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
+        if self.ordered.is_none() {
+            return Self::through(&state, root);
+        }
+        while !Self::through(&state, root) && !Self::ended(&state) && !self.governor.shed() {
+            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        !self.governor.shed()
     }
 
     fn through(state: &Ahead, root: FunctionId) -> bool {
@@ -4208,6 +4336,16 @@ fn source_location_in_file<'db>(
     span: MirSpan,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let (file_id, range) = source_range(db, owner, span)?;
+    hir_ty::mir::location::caller_location_of(db, file_id, range)
+}
+
+#[salsa::tracked]
+fn scalar_source_location_in_file<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+    span: MirSpan,
+) -> Option<(base_db::FileId, u32, u32)> {
+    let (file_id, range) = source_range(db, owner, span)?;
     location_of(db, file_id, range)
 }
 
@@ -4225,7 +4363,7 @@ fn row_location_in_file<'db>(
 ) -> Option<(base_db::FileId, u32, u32)> {
     let (file_id, range) = source_range(db, owner, span)?;
     if file_id.macro_file().is_none() {
-        return *source_location_in_file(db, owner, span);
+        return *scalar_source_location_in_file(db, owner, span);
     }
     let source_map = &Body::with_source_map(db, owner).1;
     let code = closure.unwrap_or_else(|| Body::of(db, owner).root_expr());
@@ -4234,7 +4372,7 @@ fn row_location_in_file<'db>(
             let start = TextRange::empty(body.value.syntax_node_ptr().text_range().start());
             body.file_id.span_map(db).span_for_range(start).ctx
         }
-        Err(_) => return *source_location_in_file(db, owner, span),
+        Err(_) => return *scalar_source_location_in_file(db, owner, span),
     };
     written_place(db, file_id, range, Some(within))
 }
@@ -4271,77 +4409,7 @@ fn source_range<'db>(
     owner: DefWithBodyId,
     span: MirSpan,
 ) -> Option<(HirFileId, TextRange)> {
-    let source_map = &Body::with_source_map(db, owner).1;
-    let source = match span {
-        MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
-        // The block an `async fn` is taken to wrap its body in is not written anywhere, and
-        // ends where the body does.
-        MirSpan::ExprEnd(expr) => {
-            match (source_map.expr_syntax(expr), &Body::of(db, owner)[expr]) {
-                (Ok(written), _) => written,
-                (Err(_), hir_def::hir::Expr::Block { tail: Some(tail), .. }) => {
-                    source_map.expr_syntax(*tail).ok()?
-                }
-                (Err(_), _) => return None,
-            }
-        }
-        MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
-        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
-    };
-    if let MirSpan::ExprEnd(_) = span {
-        // The brace that closes a block, which is where rustc has a scope left.
-        let range = source.value.syntax_node_ptr().text_range();
-        let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
-        return Some((source.file_id, TextRange::new(last?, range.end())));
-    }
-    let range = match span {
-        MirSpan::ExprId(expr) => {
-            let root = source.file_id.parse_or_expand(db);
-            let node = source.value.syntax_node_ptr().to_node(&root);
-            reported_range(db, owner, expr, source.file_id, &node)?
-        }
-        _ => source.value.syntax_node_ptr().text_range(),
-    };
-    Some((source.file_id, range))
-}
-
-/// The part of an expression that rustc's span of it covers where it panics: a method call
-/// from the method's name on, an index through `Index` from its bracket on, and any other
-/// expression together with the parentheses it is written in.
-fn reported_range(
-    db: &dyn HirDatabase,
-    owner: DefWithBodyId,
-    expr: ExprId,
-    file_id: HirFileId,
-    node: &SyntaxNode,
-) -> Option<TextRange> {
-    let end = node.text_range().end();
-    if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
-        return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
-    }
-    if let Some(written) = ast::IndexExpr::cast(node.clone())
-        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner)[expr]
-        && !is_builtin_index(InferenceResult::of(db, owner), base, index)
-    {
-        return Some(TextRange::new(written.l_brack_token()?.text_range().start(), end));
-    }
-    Some(parenthesized(db, file_id, node))
-}
-
-/// The range of an expression with the parentheses around it. rustc's span of an expression
-/// includes them when both are written in one place, and not when a macro put the
-/// parentheses around what it was passed.
-fn parenthesized(db: &dyn HirDatabase, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
-    let passed_in = |range: TextRange| {
-        file_id.macro_file().is_none()
-            || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
-    };
-    let inner = passed_in(node.text_range());
-    node.ancestors()
-        .skip(1)
-        .take_while(|it| it.kind() == SyntaxKind::PAREN_EXPR && passed_in(it.text_range()) == inner)
-        .last()
-        .map_or(node.text_range(), |it| it.text_range())
+    hir_ty::mir::location::source_range(db, owner.into(), span)
 }
 
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
@@ -4352,7 +4420,11 @@ fn declaration_location<'db>(
     func: FunctionId,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let source = func.lookup(db).source(db);
-    location_of(db, source.file_id, written_range(source.value.syntax()))
+    hir_ty::mir::location::caller_location_of(
+        db,
+        source.file_id,
+        written_range(source.value.syntax()),
+    )
 }
 
 /// File, line and column a debugger is told a function is declared on, and its code ahead of
@@ -4369,7 +4441,7 @@ fn debug_declaration_location<'db>(
 ) -> Option<(base_db::FileId, u32, u32)> {
     let source = func.lookup(db).source(db);
     if source.file_id.macro_file().is_none() {
-        return *declaration_location(db, func);
+        return location_of(db, source.file_id, written_range(source.value.syntax()));
     }
     written_place(db, source.file_id, written_range(source.value.syntax()), None)
 }
@@ -5060,7 +5132,7 @@ fn root_body<'db>(
     let tally = backend::Tally::global();
     tally.step(Step::Infer, || _ = InferenceResult::of(db, DefWithBodyId::from(func)));
     let body = tally.step(Step::Mir, || compiled_mir_body(db, owner));
-    let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+    let body = body.map_err(|e| mir_error(db, &e))?;
     let krate = owner.module(db).krate(db);
     // Not the function's own bounds: with nothing generic they are bounds on concrete
     // types, which hold through impls, and the calls have to resolve to those.
@@ -5079,7 +5151,7 @@ fn root_body<'db>(
                 MirOptLevel::Off => db.monomorphized_runtime_mir_body(owner, args, env.store()),
                 level => db.monomorphized_optimized_mir_body(owner, level, args, env.store()),
             })
-            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?
+            .map_err(|e| mir_error(db, &e))?
     } else {
         body
     };
@@ -5090,7 +5162,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn new(
         db: &'db dyn HirDatabase,
         symbols: &'a dyn SymbolResolver,
-        rejected: &'a FxHashMap<Instance, Rejected>,
+        rejected: &'a FxHashMap<InstanceIn, Rejected>,
         own_statics: OwnStatics,
         on_demand: &'a FxHashSet<FunctionId>,
         base: Option<&'a patch::Base>,
@@ -5156,6 +5228,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 us(start.elapsed() - settled_at),
             );
         }
+        let semantic_sources = store.map(|_| names.semantic_sources()).unwrap_or_default();
         Ok(ObjectCodegen {
             db,
             symbols,
@@ -5216,7 +5289,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let (home, library) = (symbols.cargo_home(), symbols.library_sources());
                     std::sync::Arc::new(
                         cached::Entries::new(store, debugged, program.flatten(), home, library)
-                            .in_checkout(symbols.checkout()),
+                            .in_checkout(symbols.checkout())
+                            .in_semantic_sources(semantic_sources),
                     )
                 }),
             named: FxHashMap::default(),
@@ -5380,7 +5454,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             return Ok(symbol);
         }
-        db.mir_body(func.into()).map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        db.mir_body(func.into()).map_err(|e| mir_error(db, &e))?;
         let Some(symbol) = self.symbols.function(func) else {
             // FIXME: with a `main` of ours only what it reaches is compiled, and a function
             // left to rustc can still call one private to its object.
@@ -5458,7 +5532,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let name = self.stable_name(&root_instance(self.db, func))?;
         let symbols = self.symbols;
         let usable = |entries: &cached::Entries| {
-            entries.usable(&name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol))
+            entries.usable(&name, &|symbol, checked| symbols.importable(symbol, checked))
         };
         let stored =
             stable::StableNames::of_checkout(&name) && self.entries.as_deref().is_some_and(usable);
@@ -5482,18 +5556,20 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let roots = &roots[..];
         let start = stdx::time::Instant::now();
         let owned = &self.own_statics.crates;
+        let graph = self.names.semantic_graph();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let found = std::sync::Mutex::new(Vec::new());
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
         self.symbols.in_parallel(threads, &|db, symbols, _| {
-            let names = stable::StableNames::new(db, symbols, owned.clone(), true);
+            let names =
+                stable::StableNames::new(db, symbols, owned.clone(), true).sharing(graph.clone());
             let mut named = Vec::new();
             while let Some(&func) =
                 roots.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
             {
                 let Some(name) = names.instance(&root_instance(db, func)) else { continue };
                 let name = StableName::from(name);
-                let usable = |symbol: &str| symbols.provides(symbol) && symbols.linked(symbol);
+                let usable = |symbol: &str, checked| symbols.importable(symbol, checked);
                 let stored =
                     stable::StableNames::of_checkout(&name) && entries.usable(&name, &usable);
                 named.push((func, name, stored));
@@ -5520,9 +5596,51 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let _permit = budget::enter().inspect_err(|why| {
             self.shed = Some(why.to_string());
         })?;
+        let instance = root_instance(self.db, main);
+        // The shim has its own ABI and lowering, and is never the Rust main's body.
+        let name = self
+            .roots_from_store()
+            .then(|| self.stable_name(&instance))
+            .flatten()
+            .map(|name| StableName::from(format!("start 1 {name}")));
+        if let Some(name) = &name
+            && let Some(entries) = &self.entries
+            && entries.usable(name, &|symbol, checked| self.symbols.importable(symbol, checked))
+            && let Some(entry) = entries.get(name)
+        {
+            let id =
+                self.module.declare_function("main", Linkage::Export, entry.code.signature())?;
+            if let Err(e) = self.stitch_entry(name, id) {
+                eprintln!("entry of `{name}` does not fit: {e}");
+                cached::Entries::ban(name);
+                self.misfit = true;
+            }
+            return Ok(());
+        }
         let compiled = compiled_start(self.db, main).as_ref().map_err(Clone::clone)?;
         let id = self.module.declare_function("main", Linkage::Export, &compiled.code.signature)?;
-        self.stitch(id, compiled)?;
+        let ids = self.stitch(id, compiled)?;
+        if let Some(name) = name {
+            let of = later::Of::Root { func: main, symbol: "main".into() };
+            let later = later::Later::new(&self.module, id, of, compiled, ids);
+            let bindings =
+                export::ObjectBindings::new(self.module.declarations(), &self.type_ids, &later);
+            let environment = ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate: main.krate(self.db),
+            }
+            .store();
+            let kept = self.keeper(None).keep_named(
+                &instance,
+                &environment,
+                false,
+                compiled,
+                &bindings,
+                None,
+                name,
+            );
+            self.apply(&later, later::Made { debug: None, kept });
+        }
         Ok(())
     }
 
@@ -5676,7 +5794,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 #[cfg(feature = "llvm")]
                 None if self.units() => {
                     let wave = std::mem::take(&mut self.pending);
-                    let fresh = wave.iter().filter(|it| !self.unit_instances.contains_key(&it.0));
+                    let fresh = wave.iter().filter(|it| {
+                        !self
+                            .unit_instances
+                            .contains_key(&InstanceIn::new(it.0.clone(), it.1.clone()))
+                    });
                     let fresh = fresh.map(|(instance, env, _)| (instance.clone(), env.clone()));
                     let fresh = fresh.collect();
                     self.compile_units(&[], fresh);
@@ -5711,7 +5833,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         break;
                     }
                     if self.forward_to_rustc(&instance, id).is_some() {
-                        self.forwarded.insert(instance);
+                        self.forwarded.insert(InstanceIn::new(instance, env));
                     } else {
                         failed.push((instance, Rejected { env, why: e.to_string() }));
                     }
@@ -5788,14 +5910,19 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let told = told.as_ref();
         let on_demand = self.on_demand;
         let (stored, roots_from_store) = (&self.stored_roots.clone(), self.roots_from_store());
+        let graph = self.names.semantic_graph();
         let run = |db: &dyn HirDatabase, symbols: &dyn SymbolResolver| {
-            let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate);
+            let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate)
+                .sharing(graph.clone());
             let usable = |name: &str| {
                 let Some(entries) = entries else { return false };
-                entries.usable(name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol))
+                entries.usable(name, &|symbol, checked| symbols.importable(symbol, checked))
             };
             // What the store has is not compiled, nor looked into for what it calls.
-            let in_store = |callee: &Instance| names.instance(callee).is_some_and(|it| usable(&it));
+            let in_store = |callee: &Instance, env: &StoredParamEnvAndCrate| {
+                let context = InstanceIn::requested(db, callee, env);
+                names.instance_in(&context.instance, &context.env).is_some_and(|it| usable(&it))
+            };
             // A root only called is asked about here, as it is reached.
             let stored_root = |root: FunctionId| match stored.get(&root) {
                 Some(name) => name.is_some(),
@@ -5882,7 +6009,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         }
                         _ => false,
                     };
-                    if !root && !rejected.contains_key(callee) && !in_store(callee) {
+                    if !root
+                        && !rejected.contains_key(&InstanceIn::requested(db, callee, asked))
+                        && !in_store(callee, asked)
+                    {
                         found.push((callee.clone(), homes.home(db, callee, asked)));
                     }
                 }
@@ -5931,6 +6061,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             idle: &idle,
             governor: &governor,
             waiting: FxHashMap::default(),
+            ordered: self.symbols.deterministic_object().then(std::collections::VecDeque::new),
         };
         self.symbols.in_parallel_beside(threads, &work, &mut || {
             beside(self, Some(&mut ready));
@@ -5956,7 +6087,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let tiers = self.tiers;
         let node = tier::Node(tier::Kind::Instance(instance.clone(), env.clone()));
         let tiered = tiers.and_then(|it| it.code(self.db, &node));
-        let unit = self.unit_instances.remove(instance).filter(|_| tiered.is_none());
+        let unit = self
+            .unit_instances
+            .remove(&InstanceIn::new(instance.clone(), env.clone()))
+            .filter(|_| tiered.is_none());
         let compiled = match (tiered, &unit) {
             (Some(code), _) => code,
             (None, Some(unit)) => unit,
@@ -6001,11 +6135,26 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn stable_name(&mut self, instance: &Instance) -> Option<StableName> {
-        if let Some(known) = self.stable_names.get(instance) {
+        let key = (instance.clone(), None);
+        if let Some(known) = self.stable_names.get(&key) {
             return known.clone();
         }
         let name = self.names.instance(instance).map(StableName::from);
-        self.stable_names.insert(instance.clone(), name.clone());
+        self.stable_names.insert(key, name.clone());
+        name
+    }
+
+    fn stable_name_in(
+        &mut self,
+        instance: &Instance,
+        environment: &StoredParamEnvAndCrate,
+    ) -> Option<StableName> {
+        let key = (instance.clone(), Some(environment.clone()));
+        if let Some(known) = self.stable_names.get(&key) {
+            return known.clone();
+        }
+        let name = self.names.instance_in(instance, environment).map(StableName::from);
+        self.stable_names.insert(key, name.clone());
         name
     }
 
@@ -6068,13 +6217,18 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     /// Makes what is made of the functions in the object that waited for it ([`later`]),
-    /// on every core, and tells the debugger and the store of them in the order they were
-    /// put in the object.
+    /// on every core, gives the store what is kept of them as it is made, and tells the
+    /// debugger of them in the order they were put in the object.
     fn make_later(&mut self) {
         let later = std::mem::take(&mut self.later);
         if later.is_empty() {
             return;
         }
+        // The store has what is kept as it is made, in no order of its own: what it is given
+        // is not kept for it until the whole batch is made.
+        let hand_off = store::Store::global()
+            .filter(|_| later.iter().any(|it| it.keeps))
+            .and_then(|store| self.writer(store).hand_off());
         const AT_ONCE: usize = 64;
         let parts: Vec<_> = later.chunks(AT_ONCE).collect();
         type Part = (Vec<later::Made>, Kept, FxHashMap<&'static str, usize>);
@@ -6090,10 +6244,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // Each thread names what it makes with names of its own, which it asks the same
             // of over and over: they are not made again for each part.
             let next = std::sync::atomic::AtomicUsize::new(0);
-            let listings = self.names.listings();
+            let (listings, graph) = (self.names.listings(), self.names.semantic_graph());
             let work = |db: &dyn HirDatabase, symbols: &dyn SymbolResolver, _: usize| {
                 let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate)
-                    .listing(listings.clone());
+                    .listing(listings.clone())
+                    .sharing(graph.clone());
                 let (mut stable_names, mut source_paths) = Default::default();
                 let mut kept = Kept::default();
                 let mut keeper = later::Keeper {
@@ -6119,7 +6274,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         .iter()
                         .map(|it| {
                             let bindings = export::ObjectBindings::new(declarations, type_ids, it);
-                            keeper.make(it, &bindings)
+                            let mut made = keeper.make(it, &bindings);
+                            if let Some(writer) = &hand_off
+                                && let Some(kept) = made.kept.take()
+                                && let Err(refused) = writer.send(kept)
+                            {
+                                // Kept where the writer that is gone is reported.
+                                made.kept = Some(refused.0);
+                            }
+                            made
                         })
                         .collect();
                     let kept = std::mem::take(&mut *keeper.kept);
@@ -6280,12 +6443,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let Some(entries) = self.entries.clone() else { return Ok(None) };
         let symbols = self.symbols;
-        if !entries.usable(name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol)) {
+        if !entries.usable(name, &|symbol, checked| symbols.importable(symbol, checked)) {
             let why = match entries.get(name) {
                 None => "no entry",
-                Some(it)
-                    if !it.links(&|symbol| symbols.provides(symbol) && symbols.linked(symbol)) =>
-                {
+                Some(it) if !it.links(&|symbol, checked| symbols.importable(symbol, checked)) => {
                     "an entry linked against what the program lacks"
                 }
                 Some(_) => "an entry that calls what cannot be used",
@@ -6901,22 +7062,24 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             | InstanceDef::ReifyShim { .. } => None,
         };
         let name = self.callee_name(def);
-        if let Some(Rejected { why, .. }) = self.rejected.get(instance) {
+        let environment = self.homes.home(self.db, instance, env);
+        let context = InstanceIn::new(instance.clone(), environment.clone());
+        if let Some(Rejected { why, .. }) = self.rejected.get(&context) {
             unsupported!("callee `{name}`: {why}");
         }
         if self.handles_rustc_future(instance) {
             unsupported!("callee `{name}`: handles a future rustc lays out");
         }
-        if let Some(&id) = self.instances.get(instance) {
+        if let Some(&id) = self.instances.get(&context) {
             return Ok(id);
         }
-        if let Some(known) = self.base.and_then(|base| base.instances.get(instance)) {
-            let node = patch::Node::Instance(instance.clone());
+        if let Some(known) = self.base.and_then(|base| base.instances.get(&context)) {
+            let node = patch::Node::Instance(context.clone());
             if self.replaced.broken.contains(&node) {
                 unsupported!("callee `{name}`: an instance of the base gained or lost code");
             }
             // The base's copy is of the source before the edit.
-            if self.replaced.changed.contains(&node) {
+            if self.replaced.changed.contains(&node) || !self.symbols.linked(&known.symbol) {
                 let compiled = compiled_instance(self.db, instance.clone(), known.env.clone());
                 let compiled = compiled.as_ref().map_err(Clone::clone)?;
                 let id = self.module.declare_function(
@@ -6924,7 +7087,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     Linkage::Hidden,
                     &compiled.code.signature,
                 )?;
-                self.instances.insert(instance.clone(), id);
+                self.instances.insert(context.clone(), id);
                 self.pending.push((instance.clone(), known.env.clone(), id));
                 return Ok(id);
             }
@@ -6943,7 +7106,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let mut hasher =
                 type_id::TypeIdHasher::new(self.db, self.symbols, &self.own_statics.crates);
             if let Some(hash) = hasher.type_id(of) {
-                return self.constant_type_id(instance.clone(), sig, hash);
+                return self.constant_type_id(instance.clone(), &environment, sig, hash);
             }
             let stuck = hasher.stuck.unwrap_or_default();
             let Some(ty) = self.symbol_type(of) else {
@@ -6991,7 +7154,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             builder.finalize(self.module.isa().frontend_config());
             self.builder_ctx = builder_ctx;
             self.define_shim(id, &mut ctx)?;
-            self.instances.insert(instance.clone(), id);
+            self.instances.insert(context.clone(), id);
             return Ok(id);
         }
         if signature.is_some_and(|it| !it.has_body()) {
@@ -7018,14 +7181,18 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             unsupported!("call to `{name}`, which has no body and no rustc symbol");
         }
         let from_store = self.entries.is_some() || self.base.is_some_and(|it| !it.found.is_empty());
-        let stable = if from_store { self.stable_name(instance) } else { None };
+        let semantic_environment = environment.clone();
+        let stable =
+            if from_store { self.stable_name_in(instance, &semantic_environment) } else { None };
         if let Some(name) = &stable {
-            if let Some(symbol) = self.base.and_then(|base| base.found.get(name)) {
+            if let Some(symbol) = self.base.and_then(|base| base.found.get(name))
+                && self.symbols.linked(symbol)
+            {
                 return self.import(symbol, sig);
             }
             let body = signature.is_some().then_some(sig);
             if let Some(id) = self.found_callee(name, body)? {
-                self.instances.insert(instance.clone(), id);
+                self.instances.insert(context.clone(), id);
                 let home = self.homes.home(self.db, instance, env);
                 self.found_instances.insert(id, (instance.clone(), home));
                 return Ok(id);
@@ -7040,7 +7207,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .module
             .declare_function(&symbol, linkage, sig)
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
-        self.instances.insert(instance.clone(), id);
+        self.instances.insert(context.clone(), id);
         self.pending.push((instance.clone(), env.clone(), id));
         self.envs.push((instance.clone(), env.clone()));
         if let Some(name) = stable {
@@ -7060,26 +7227,34 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if failed.is_empty() {
             return;
         }
-        let mut callers: FxHashMap<&Instance, Vec<usize>> = FxHashMap::default();
+        let mut callers: FxHashMap<InstanceIn, Vec<usize>> = FxHashMap::default();
         for (at, (instance, env)) in self.envs.iter().enumerate() {
             let Ok(compiled) = compiled_instance(self.db, instance.clone(), env.clone()).as_ref()
             else {
                 continue;
             };
             for request in &compiled.requests.funcs {
-                if let FuncTarget::Instance(callee, _) = &request.target {
-                    callers.entry(callee).or_default().push(at);
+                if let FuncTarget::Instance(callee, asked) = &request.target {
+                    callers
+                        .entry(InstanceIn::requested(self.db, callee, asked))
+                        .or_default()
+                        .push(at);
                 }
             }
         }
-        let mut seen: FxHashSet<Instance> = failed.iter().map(|it| it.0.clone()).collect();
+        let mut seen: FxHashSet<InstanceIn> =
+            failed.iter().map(|it| InstanceIn::new(it.0.clone(), it.1.env.clone())).collect();
         let mut next = 0;
-        while let Some((callee, Rejected { why, .. })) = failed.get(next) {
+        while let Some((callee, Rejected { why, env })) = failed.get(next) {
             next += 1;
             let why = format!("callee `{}`: {why}", self.callee_name(callee.def));
-            for &at in callers.get(callee).into_iter().flatten() {
+            for &at in
+                callers.get(&InstanceIn::requested(self.db, callee, env)).into_iter().flatten()
+            {
                 let (caller, env) = &self.envs[at];
-                if !self.stands_in(caller) && seen.insert(caller.clone()) {
+                if !self.stands_in(caller, env)
+                    && seen.insert(InstanceIn::new(caller.clone(), env.clone()))
+                {
                     failed.push((caller.clone(), Rejected { env: env.clone(), why: why.clone() }));
                 }
             }
@@ -7108,8 +7283,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Whether rustc's copy of `instance` stands in for it when it is not compiled, which its
     /// callers then call.
-    fn stands_in(&self, instance: &Instance) -> bool {
-        self.forwarded.contains(instance)
+    fn stands_in(&self, instance: &Instance, env: &StoredParamEnvAndCrate) -> bool {
+        self.forwarded.contains(&InstanceIn::requested(self.db, instance, env))
             || matches!(instance.def, InstanceDef::Fn(func) if self
                 .instance_path(func, instance.args.as_ref())
                 .and_then(|path| self.symbols.path(&path))
@@ -7123,12 +7298,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         compiled: &[(FunctionId, String)],
         failed: &[(Instance, Rejected)],
     ) -> Vec<FunctionId> {
-        let lost: FxHashSet<&Instance> =
-            failed.iter().map(|it| &it.0).filter(|it| !self.stands_in(it)).collect();
+        let lost: FxHashSet<InstanceIn> = failed
+            .iter()
+            .filter(|(instance, why)| !self.stands_in(instance, &why.env))
+            .map(|(instance, why)| InstanceIn::new(instance.clone(), why.env.clone()))
+            .collect();
         let calls_lost = |root: FunctionId| {
             compiled_root(self.db, root).as_ref().is_ok_and(|it| {
                 it.requests.funcs.iter().any(|request| {
-                    matches!(&request.target, FuncTarget::Instance(callee, _) if lost.contains(callee))
+                    matches!(&request.target, FuncTarget::Instance(callee, env) if lost.contains(&InstanceIn::requested(self.db, callee, env)))
                 })
             })
         };
@@ -7194,14 +7372,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn constant_type_id(
         &mut self,
         instance: Instance,
+        environment: &StoredParamEnvAndCrate,
         sig: &Signature,
         hash: u128,
     ) -> Result<FuncId> {
-        if let Some(&id) = self.instances.get(&instance) {
+        let context = InstanceIn::new(instance, environment.clone());
+        if let Some(&id) = self.instances.get(&context) {
             return Ok(id);
         }
         let id = self.type_id_shim(sig, hash)?;
-        self.instances.insert(instance, id);
+        self.instances.insert(context, id);
         Ok(id)
     }
 
@@ -7371,6 +7551,22 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn import(&mut self, symbol: &str, sig: &Signature) -> Result<FuncId> {
+        if !self.symbols.linked(symbol)
+            && let Some(func) = self.symbols.native_function(symbol)
+        {
+            let env = ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate: func.krate(self.db),
+            };
+            let instance = root_instance(self.db, func);
+            let env = env.store();
+            let compiled = compiled_instance(self.db, instance.clone(), env.clone());
+            let compiled = compiled.as_ref().map_err(Clone::clone)?;
+            if &compiled.code.signature != sig {
+                unsupported!("native symbol `{symbol}` has a different source signature");
+            }
+            return self.callee(&instance, &env, sig);
+        }
         if let Some(&id) = self.imports.get(symbol) {
             return Ok(id);
         }
@@ -7659,19 +7855,7 @@ pub(crate) fn erase_regions<'db>(
 /// Whether calls to `func` pass a `&Location` after the declared arguments. A method of a trait
 /// impl inherits the attribute from the trait's declaration.
 fn track_caller(db: &dyn HirDatabase, func: FunctionId) -> bool {
-    let has =
-        |func: FunctionId| AttrFlags::query(db, func.into()).contains(AttrFlags::TRACK_CALLER);
-    if has(func) {
-        return true;
-    }
-    let ItemContainerId::ImplId(impl_id) = func.lookup(db).container else {
-        return false;
-    };
-    let Some(trait_ref) = db.impl_trait(impl_id) else {
-        return false;
-    };
-    let name = &FunctionSignature::of(db, func).name;
-    trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
+    hir_ty::mir::location::tracks_caller(db, func)
 }
 
 /// The integer an address is on the target.
@@ -7905,11 +8089,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let Some(layout) = self.layouts.borrow().get(&ty) {
             return Ok(layout.clone());
         }
-        let layout = self
-            .cg
-            .db
-            .layout_of_ty(ty.store(), self.env.store())
-            .map_err(|e| CodegenError::Frontend(format!("layout of {ty:?}: {e:?}")))?;
+        let layout = self.cg.db.layout_of_ty(ty.store(), self.env.store()).map_err(|e| {
+            CodegenError::Frontend(
+                hir_ty::mir::MirEvalError::LayoutError(e, ty.store()).diagnostic(self.cg.db),
+            )
+        })?;
         if let Some(log) = &self.cg.layouts {
             log.borrow_mut().entry(ty).or_insert((layout.size.bytes(), layout.align.abi.bytes()));
             if let Some(line) = coroutine_layout_line(self.cg.db, ty, &layout) {
@@ -9923,7 +10107,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let allocation = db
             .const_eval_static(id)
-            .map_err(|e| CodegenError::Frontend(format!("const eval: {e:?}")))?;
+            .map_err(|e| CodegenError::Frontend(format!("const eval: {}", e.diagnostic(db))))?;
         // Nothing can be written to a static of no size.
         let writable = !allocation.memory.is_empty()
             && (flags.contains(StaticFlags::MUTABLE)
@@ -10063,18 +10247,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     fn eval_const(&mut self, unevaluated: UnevaluatedConst<'db>) -> Result<Allocation<'db>> {
         let db = self.cg.db;
-        let UnevaluatedConst { def, args } = unevaluated;
-        let frontend = |e| CodegenError::Frontend(format!("const eval: {e:?}"));
-        match def.0 {
-            GeneralConstId::ConstId(id) => {
-                let (id, args) = lookup_impl_const(&self.infcx, self.env.param_env, id, args);
-                db.const_eval(id, args, Some(self.env)).map_err(frontend)
-            }
-            GeneralConstId::StaticId(id) => db.const_eval_static(id).map_err(frontend),
-            GeneralConstId::AnonConstId(id) => {
-                db.anon_const_eval(id, args, Some(self.env)).map_err(frontend)
-            }
-        }
+        let frontend = |e: hir_ty::consteval::ConstEvalError<'db>| {
+            CodegenError::Frontend(format!("const eval: {}", e.diagnostic(db)))
+        };
+        let environment = self.env.store();
+        let selection = hir_ty::consteval::inputs::select_constant_in_context(
+            &self.infcx,
+            unevaluated,
+            &environment,
+        );
+        hir_ty::consteval::inputs::evaluate_selection(db, &selection, &environment)
+            .value
+            .map_err(frontend)
     }
 
     fn blob_addr(&mut self, blob: ConstBlob) -> Result<Value> {
@@ -11141,7 +11325,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let enum_variants = id.enum_variants(db);
         let discr_of = |index: usize| {
             db.const_eval_discriminant(enum_variants.variants[index].0)
-                .map_err(|e| CodegenError::Frontend(format!("discriminant: {e:?}")))
+                .map_err(|e| CodegenError::Frontend(format!("discriminant: {}", e.diagnostic(db))))
         };
         match &layout.variants {
             // There is no value to read it from, so this cannot be reached; rustc leaves the
@@ -11241,9 +11425,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let offset = layout.fields.offset(tag_field.index()).bytes_usize();
         let tag_value = match tag_encoding {
             TagEncoding::Direct => {
-                let discr = db
-                    .const_eval_discriminant(variant)
-                    .map_err(|e| CodegenError::Frontend(format!("discriminant: {e:?}")))?;
+                let discr = db.const_eval_discriminant(variant).map_err(|e| {
+                    CodegenError::Frontend(format!("discriminant: {}", e.diagnostic(db)))
+                })?;
                 Some(discr as u128)
             }
             TagEncoding::Niche { untagged_variant, .. } if untagged_variant.0 == index => None,
@@ -15986,7 +16170,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                                 continue;
                             }
                             let value = db.const_eval_discriminant(variant).map_err(|e| {
-                                CodegenError::Frontend(format!("discriminant: {e:?}"))
+                                CodegenError::Frontend(format!(
+                                    "discriminant: {}",
+                                    e.diagnostic(db)
+                                ))
                             })?;
                             let block = self.builder.create_block();
                             switch.set_entry(wide.entry(value), block);
@@ -16149,7 +16336,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             let mut arms = Vec::new();
                             for &(variant, _) in id.enum_variants(db).variants.values() {
                                 let value = db.const_eval_discriminant(variant).map_err(|e| {
-                                    CodegenError::Frontend(format!("discriminant: {e:?}"))
+                                    CodegenError::Frontend(format!(
+                                        "discriminant: {}",
+                                        e.diagnostic(db)
+                                    ))
                                 })?;
                                 let block = self.builder.create_block();
                                 switch.set_entry(wide.entry(value), block);

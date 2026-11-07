@@ -998,6 +998,9 @@ impl WorkSet {
         let Some(slot) = self.names.get_mut(&name) else {
             let rejected = self.rejected.contains(&name);
             let state = if rejected {
+                // Even the first discovery needs an acknowledgment to release the
+                // compiler's retained finding when only the lead rejects this name.
+                conflicts.insert(name);
                 Slot::Done(Terminal::Tail(TailWhy::Rejected))
             } else {
                 self.waiting.insert(name);
@@ -1022,7 +1025,12 @@ impl WorkSet {
             return;
         };
         if slot.tuple == found.tuple {
-            if !matches!(slot.state, Slot::Done(_)) {
+            if matches!(slot.state, Slot::Done(_)) {
+                // The name is already terminal. Do not add a finder, but tell
+                // this holder to release the discovery its compiler retained.
+                // A release acknowledgment is not a new determinism conflict.
+                conflicts.insert(name);
+            } else {
                 slot.finders.insert(from.to_owned());
                 if let Some(holder) = self.holders.get_mut(from) {
                     holder.findings.insert(name);

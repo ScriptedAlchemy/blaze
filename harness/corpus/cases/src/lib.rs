@@ -552,6 +552,25 @@ pub mod dynamic {
         let s: &dyn Speak = if dog { &d } else { &Cat };
         s.speak()
     }
+
+    struct Borrowed<'a>(&'a u32);
+    impl Speak for Borrowed<'_> {
+        fn speak(&self) -> u32 {
+            *self.0
+        }
+    }
+    /// `&dyn Speak` inherits its reference's lifetime and accepts borrowed local data.
+    pub fn borrowed(value: u32) -> u32 {
+        call(&Borrowed(&value))
+    }
+
+    pub fn borrowed_type_arguments(value: u32) -> u32 {
+        struct Ref<'a, T: ?Sized + 'a>(&'a T);
+        let inner = Borrowed(&value);
+        let borrowed: Ref<'_, dyn Speak> = Ref(&inner);
+        let boxed: Box<dyn Speak> = Box::new(Borrowed(&value));
+        borrowed.0.speak() + boxed.speak()
+    }
 }
 
 pub mod objects {
@@ -1233,6 +1252,12 @@ pub mod locations {
         let c = table[x.unwrap_or(0) as usize & 1].0(x.unwrap_or(0));
         let lines = (a.line(), a.column(), b.line(), b.column());
         (lines.0, lines.1, lines.2, lines.3, c.file() == a.file() && c.line() == b.line())
+    }
+    /// The evaluator's nested allocation survives emission into the compiled program.
+    pub fn constant_file() -> (&'static str, bool) {
+        const SITE: &Location<'static> = Location::caller();
+        const NAME: &str = SITE.file();
+        (NAME, NAME == file!() && NAME.len() > 4)
     }
 }
 

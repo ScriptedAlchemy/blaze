@@ -551,18 +551,135 @@ fn collect_attrs<BreakValue>(
 /// The value of the `#[name = value]` attribute of `owner`, with the macros in it expanded:
 /// rustc expands the expression of a key-value attribute before it reads it
 /// (`rustc_expand::expand::InvocationCollector::visit_attribute` walks into `AttrArgs::Eq`).
-fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<Symbol> {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ExpandedSymbolAttr {
+    value: Option<Symbol>,
+    calls: Vec<hir_expand::MacroCallId>,
+}
+
+#[salsa::tracked(returns(ref))]
+fn expanded_symbol_attr(
+    db: &dyn SourceDatabase,
+    owner: AttrDefId,
+    name: Symbol,
+) -> ExpandedSymbolAttr {
     let (source, _, _, krate) = attrs_source(db, owner);
     let value = collect_attrs(db, owner, |attr| match attr {
-        ast::Meta::KeyValueMeta(attr) if attr.path().is1(name) => match attr.expr() {
+        ast::Meta::KeyValueMeta(attr) if attr.path().is1(name.as_str()) => match attr.expr() {
             Some(value) => ControlFlow::Break(value),
             None => ControlFlow::Continue(()),
         },
         _ => ControlFlow::Continue(()),
-    })?;
+    });
+    let Some(value) = value else { return ExpandedSymbolAttr::default() };
     let resolver = resolver_for_attr_def_id(db, owner);
-    let value = docs::expand_attr_value(db, krate, resolver, source.with_value(value))?;
-    Some(Symbol::intern(&value))
+    let (value, calls) = docs::expand_attr_value(db, krate, resolver, source.with_value(value));
+    ExpandedSymbolAttr { value: value.map(|value| Symbol::intern(&value)), calls: calls.into() }
+}
+
+fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<Symbol> {
+    expanded_symbol_attr(db, owner, Symbol::intern(name)).value.clone()
+}
+
+/// Macro occurrences actually expanded while computing symbol/section attributes.
+pub fn codegen_attribute_macro_calls(
+    db: &dyn SourceDatabase,
+    owner: AttrDefId,
+) -> Vec<hir_expand::MacroCallId> {
+    ["export_name", "link_name", "link_section", "linkage"]
+        .into_iter()
+        .flat_map(|name| {
+            expanded_symbol_attr(db, owner, Symbol::intern(name)).calls.iter().copied()
+        })
+        .collect()
+}
+
+/// Library gates declared by effective stability attributes, including renamed
+/// and removed gates. Source is used rather than flags, which omit stable gates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LibraryFeature {
+    Defined(Symbol),
+    Renamed { old: Symbol, new: Symbol },
+    Removed(Symbol),
+}
+
+#[salsa::tracked(returns(ref))]
+pub fn library_features(db: &dyn SourceDatabase, owner: AttrDefId) -> Vec<LibraryFeature> {
+    fn collect(meta: ast::Meta, features: &mut Vec<LibraryFeature>) {
+        let ast::Meta::TokenTreeMeta(meta) = meta else { return };
+        let Some(path) = meta.path() else { return };
+        let removed = path.is1("unstable_removed");
+        if !removed
+            && ![
+                "stable",
+                "unstable",
+                "rustc_const_stable",
+                "rustc_const_unstable",
+                "rustc_default_body_unstable",
+            ]
+            .iter()
+            .any(|name| path.is1(name))
+        {
+            return;
+        }
+        let Some(tt) = meta.token_tree() else { return };
+        let mut tokens = TokenTreeChildren::new(&tt);
+        let mut name = None;
+        let mut old = None;
+        while let Some(token) = tokens.next() {
+            let NodeOrToken::Token(token) = token else { continue };
+            if !matches!(token.text(), "feature" | "old_name") {
+                continue;
+            }
+            let Some(NodeOrToken::Token(eq)) = tokens.next() else { continue };
+            if eq.kind() != T![=] {
+                continue;
+            }
+            let Some(NodeOrToken::Token(value)) = tokens.next() else { continue };
+            let Some(value) = ast::String::cast(value)
+                .and_then(|it| it.value().ok().map(|value| Symbol::intern(&value)))
+            else {
+                continue;
+            };
+            if token.text() == "feature" { name = Some(value) } else { old = Some(value) }
+        }
+        if let Some(name) = name {
+            if removed {
+                features.push(LibraryFeature::Removed(name));
+            } else {
+                features.push(LibraryFeature::Defined(name.clone()));
+                if let Some(old) = old {
+                    features.push(LibraryFeature::Renamed { old, new: name });
+                }
+            }
+        }
+    }
+
+    let mut features = Vec::new();
+    collect_attrs(db, owner, |meta| {
+        collect(meta, &mut features);
+        ControlFlow::<()>::Continue(())
+    });
+    let (source, _, _, krate) = attrs_source(db, owner);
+    let cfg = krate.cfg_options(db);
+    let mut walk = source.value.syntax().preorder();
+    while let Some(event) = walk.next() {
+        let syntax::WalkEvent::Enter(node) = event else { continue };
+        let Some(node) = ast::AnyHasAttrs::cast(node) else { continue };
+        if AttrFlags::is_cfg_enabled_for(&node, cfg).is_err() {
+            walk.skip_subtree();
+            continue;
+        }
+        expand_cfg_attr(
+            ast::attrs_including_inner(&node),
+            || cfg,
+            |meta, _| {
+                collect(meta, &mut features);
+                ControlFlow::<()>::Continue(())
+            },
+        );
+    }
+    features
 }
 
 fn collect_field_attrs<T>(
@@ -863,7 +980,7 @@ impl AttrFlags {
             .unwrap_or_else(AttrFlags::empty)
     }
 
-    pub(crate) fn is_cfg_enabled_for(
+    pub fn is_cfg_enabled_for(
         owner: &dyn HasAttrs,
         cfg_options: &CfgOptions,
     ) -> Result<(), CfgExpr> {

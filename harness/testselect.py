@@ -33,9 +33,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from dist.tests import owned_plan
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 TIMEOUT = 900
 LIB = """pub fn helper(x: u32) -> u32 {
@@ -279,22 +280,20 @@ BENCHED_ADDED = ("src/lib.rs", "    #[test]\n    fn adds()",
 
 def benched(root, env):
     """A test added to a program with a bench: what the step's line says."""
-    ws, env = os.path.join(root, "benched"), dict(env, RUSTC_BOOTSTRAP="1", CARGO_UNSTABLE_CHECKSUM_FRESHNESS="false")
+    ws, env = os.path.join(root, "benched"), dict(env, RUSTC_BOOTSTRAP="1")
     for path, text in BENCHED.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    deadline = time.monotonic() + 300
-    while "[ra-jit]" not in test(ws, env, "all")[1]:
-        if time.monotonic() > deadline:
-            return "NEVER SERVED BY THE DAEMON"
-        time.sleep(0.5)
+    code, said = test(ws, env, "all")
+    if code != 0 or not owned_plan(said):
+        return f"INITIAL OWNED PLAN FAILED: {said[-3000:]}"
     path, old, new = BENCHED_ADDED
     text = open(os.path.join(ws, path)).read()
     open(os.path.join(ws, path), "w").write(text.replace(old, new, 1))
     code, said = test(ws, env, "all")
     ran = {name for name, _ in RAN.findall(said)}
-    if "[ra-jit]" not in said:
-        return "NOT SERVED BY THE DAEMON"
+    if not owned_plan(said):
+        return "NO COMPLETED OWNED TEST PLAN"
     if ran != {"tests::added", "tests::adds", "tests::bench_add"} or code != 0:
         return f"ENDED {code} HAVING RUN {', '.join(sorted(ran)) or 'nothing'}"
     return "ok"
@@ -323,23 +322,18 @@ def main():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home,
-               RUST_BACKTRACE="0")
+               RUST_BACKTRACE="0", RA_JIT_STATS="1", RA_JIT_CACHE=os.path.join(home, "store"))
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RA_JIT_TESTS"):
         env.pop(name, None)
     wrong = 0
     try:
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            code, said = test(ws, env, "affected")
-            if code != 0:
-                raise SystemExit(f"the tests failed before any edit:\n{said[-3000:]}")
-            if "[ra-jit]" in said:
-                break
-            time.sleep(0.5)
-        else:
-            raise SystemExit(f"no build said `[ra-jit]`; the daemon's log is in {home}")
-        # The daemon's first build of the tests: each is new to it, and runs.
-        test(ws, env, "affected")
+        code, said = test(ws, env, "affected")
+        if code != 0 or not owned_plan(said, 2):
+            raise SystemExit(f"the initial owned test plan failed:\n{said[-4000:]}")
+        code, said = test(ws, env, "affected")
+        ran = {name for name, _ in RAN.findall(said)}
+        if code != 0 or not owned_plan(said, 2) or ran != F:
+            raise SystemExit(f"the unchanged owned test plan did not reuse its passes:\n{said[-4000:]}")
         for what, edits, mode, expected, passes in STEPS:
             for path, old, new in edits:
                 text = open(os.path.join(ws, path)).read()
@@ -349,12 +343,12 @@ def main():
             ran = {name for name, _ in RAN.findall(said)}
             failed = {name for name, end in RAN.findall(said) if end == "FAILED"}
             verdict = "ok"
-            if "[ra-jit]" not in said:
-                verdict = "NOT SERVED BY THE DAEMON"
+            if not owned_plan(said, 2):
+                verdict = "NO COMPLETED OWNED TEST PLAN"
             elif ran != expected:
                 extra, missing = sorted(ran - expected), sorted(expected - ran)
                 verdict = f"RAN {', '.join(extra) or 'nothing more'}; DID NOT RUN {', '.join(missing) or '-'}"
-            elif (code == 0) != passes or (failed == set()) != passes:
+            elif code != (0 if passes else 101) or (failed == set()) != passes:
                 verdict = f"ENDED {code} WITH {', '.join(sorted(failed)) or 'no test'} FAILED"
             elif unsaid := [it for it in SAYS.get(what, []) if not re.search(it, said, re.M)]:
                 verdict = f"DID NOT SAY {' NOR '.join(unsaid)}"

@@ -103,6 +103,29 @@ pub struct Workspace<'c> {
     warnings: Vec<String>,
 }
 
+// Windows file:// source IDs can lose the \\?\ prefix of a canonical
+// workspace root on round-trip. Reconcile existing members with the root's
+// identity before prefix checks and member-set lookups. External paths retain
+// their original identity and membership behavior.
+fn normalize_member_path(path: &Path, _root: &Path) -> PathBuf {
+    let path = normalize_path(path);
+    #[cfg(windows)]
+    if !path.starts_with(_root) {
+        if let Ok(canonical) = path.canonicalize() {
+            if canonical.starts_with(_root) {
+                return canonical;
+            }
+        }
+    }
+    path
+}
+
+/// All membership lookups use the same identity as the keys inserted by
+/// find_path_deps, including file-URL path aliases on Windows.
+fn member_set_contains(members: &FxHashSet<PathBuf>, path: &Path, root: &Path) -> bool {
+    members.contains(&normalize_member_path(path, root))
+}
+
 impl<'c> Workspace<'c> {
     pub fn new(manifest_path: &Path, ctx: &'c Context) -> anyhow::Result<Workspace<'c>> {
         let mut ws = Workspace {
@@ -199,7 +222,7 @@ impl<'c> Workspace<'c> {
     }
 
     pub fn is_member(&self, manifest_path: &Path) -> bool {
-        self.member_set.contains(manifest_path)
+        member_set_contains(&self.member_set, manifest_path, self.root())
     }
 
     /// The member packages with their manifest paths, in cargo's order.
@@ -345,7 +368,7 @@ impl<'c> Workspace<'c> {
         root_manifest: &Path,
         is_path_dep: bool,
     ) -> anyhow::Result<()> {
-        let manifest_path = normalize_path(manifest_path);
+        let manifest_path = normalize_member_path(manifest_path, self.root());
         if self.member_set.contains(&manifest_path) {
             return Ok(());
         }
@@ -584,5 +607,30 @@ impl<'c> Workspace<'c> {
             let rendered = Renderer::plain().render(&[report]);
             self.warnings.push(rendered.strip_prefix("warning: ").unwrap_or(&rendered).to_owned());
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod member_path_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_drive_alias_is_a_member_of_verbatim_workspace_root() {
+        let scratch =
+            std::env::temp_dir().join(format!("blaze-workspace-path-{}", std::process::id()));
+        std::fs::create_dir_all(scratch.join("tools/helper")).unwrap();
+        let manifest = scratch.join("tools/helper/Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n").unwrap();
+        let absolute = std::path::absolute(&scratch).unwrap();
+        let canonical = scratch.canonicalize().unwrap();
+        let selected = normalize_member_path(&absolute.join("tools/helper/Cargo.toml"), &canonical);
+        assert_eq!(selected, canonical.join("tools/helper/Cargo.toml"));
+        let members: FxHashSet<PathBuf> =
+            [canonical.join("tools/helper/Cargo.toml")].into_iter().collect();
+        assert!(
+            member_set_contains(&members, &absolute.join("tools/helper/Cargo.toml"), &canonical,),
+            "a Windows file-URL alias must retain workspace-member profile semantics"
+        );
+        let _ = std::fs::remove_dir_all(scratch);
     }
 }

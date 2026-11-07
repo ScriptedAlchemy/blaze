@@ -549,10 +549,24 @@ impl Request {
             || self.targets.all_targets
     }
 
+    /// Ordinary test execution leaves malformed libtest arguments to its test executable.
+    /// Saved specifications still require the strict [`Request::parse`] projection.
+    pub fn parse_for_execution(command: Subcommand, args: &[String]) -> Result<Request, Refusal> {
+        Self::parse_with(command, args, false)
+    }
+
     /// Reads the arguments after the subcommand. A flag blaze does not honour is a
     /// [`Refusal`] naming it; one that changes nothing about the build or the run is
     /// accepted and left out.
     pub fn parse(command: Subcommand, args: &[String]) -> Result<Request, Refusal> {
+        Self::parse_with(command, args, true)
+    }
+
+    fn parse_with(
+        command: Subcommand,
+        args: &[String],
+        strict_libtest: bool,
+    ) -> Result<Request, Refusal> {
         let mut request = Request { command: Some(command), ..Request::default() };
         let mut seen = Seen::default();
         let mut words = args.iter();
@@ -618,6 +632,11 @@ impl Request {
             }
         }
         request.finish(command, seen)?;
+        if command == Subcommand::Test {
+            let selection = Libtest::read(&request.trailing);
+            request.libtest =
+                if strict_libtest { selection? } else { selection.unwrap_or_default() };
+        }
         Ok(request)
     }
 
@@ -783,7 +802,6 @@ impl Request {
         if command == Subcommand::Test {
             self.targets.all_test_targets =
                 !self.doc && !self.targets.explicit && !self.positional.is_empty();
-            self.libtest = Libtest::read(&self.trailing)?;
         }
         Ok(())
     }

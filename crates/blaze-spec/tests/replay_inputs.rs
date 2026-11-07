@@ -970,9 +970,108 @@ fn implicit_doctests_of_a_standalone_library_have_their_own_normal_library_graph
         .iter()
         .find(|program| program.output == blaze_spec::execution::Output::Object)
         .unwrap();
-    assert_eq!(docs[0].unit, normal.unit);
-    assert_eq!(docs[0].project["crates"][0]["blaze_native_unit"], serde_json::json!(normal.unit));
+    assert_ne!(docs[0].unit, normal.unit);
+    assert_eq!(docs[0].project["crates"][0]["blaze_native_unit"], serde_json::json!(docs[0].unit));
     assert!(!normal.harness && !normal.run && docs[0].run);
+}
+
+#[test]
+fn doctest_dev_dependency_context_survives_standalone_capture_and_relocation() {
+    for args in
+        [&["--doc", "-p", "saved"][..], &["-p", "saved"][..], &["-p", "saved", "--no-run"][..]]
+    {
+        for unit_tests in [true, false] {
+            let f = fixture();
+            std::fs::remove_file(f.root().join("src/main.rs")).unwrap();
+            f.write("Cargo.toml", &format!("[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n[lib]\ntest={unit_tests}\n[dev-dependencies]\nrenamed={{package='helper',path='helper'}}\n"));
+            f.write("src/lib.rs", "/// ```\n/// assert_eq!(renamed::answer(), saved::answer());\n/// ```\npub fn answer() -> u32 { 42 }\n");
+            f.write("helper/Cargo.toml", "[package]\nname='helper'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nsaved={path='..'}\n");
+            f.write("helper/src/lib.rs", "pub fn answer() -> u32 { saved::answer() }\n");
+            std::fs::remove_file(f.root().join("Cargo.lock")).unwrap();
+            let store = tempfile::tempdir().unwrap();
+            let made = saved(&f, Subcommand::Test, args, store.path());
+            drop(f);
+            let worker = tempfile::tempdir().unwrap();
+            let replay = prepared(&made, store.path(), &worker.path().join("relocated"));
+            let plans = blaze_spec::execution::programs(
+                &replay,
+                Path::new("/owned/toolchain"),
+                &worker.path().join("artifacts"),
+            )
+            .unwrap();
+            let docs: Vec<_> = plans
+                .iter()
+                .filter(|p| p.output == blaze_spec::execution::Output::Doctest)
+                .collect();
+            if args.contains(&"--no-run") {
+                assert!(docs.is_empty());
+                assert!(plans.iter().all(|program| !program.run));
+                for name in ["saved", "helper"] {
+                    let object = plans
+                        .iter()
+                        .find(|program| {
+                            program.crate_name == name
+                                && program.output == blaze_spec::execution::Output::Object
+                        })
+                        .unwrap();
+                    assert!(
+                        !object.project["crates"][0]["cfg"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|cfg| cfg == "test")
+                    );
+                }
+                replay.validate_sources(store.path()).unwrap();
+                continue;
+            }
+            assert_eq!(docs.len(), 1);
+            let crates = docs[0].project["crates"].as_array().unwrap();
+            let context = &crates[0];
+            let dep = |krate: &serde_json::Value, name: &str| -> usize {
+                krate["deps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|d| d["name"] == name)
+                    .unwrap_or_else(|| panic!("missing {name} in {krate}"))
+                    .get("crate")
+                    .unwrap()
+                    .as_u64()
+                    .unwrap() as usize
+            };
+            let ordinary = dep(context, "saved");
+            let helper = dep(context, "renamed");
+            assert_ne!(ordinary, 0);
+            assert_eq!(dep(&crates[helper], "saved"), ordinary);
+            assert!(crates[ordinary]["deps"].as_array().unwrap().is_empty());
+            assert!(!crates[ordinary]["cfg"].as_array().unwrap().iter().any(|c| c == "test"));
+            fn visit(at: usize, crates: &[serde_json::Value], active: &mut Vec<usize>) {
+                assert!(at < crates.len());
+                assert!(!active.contains(&at), "cyclic doctest context");
+                active.push(at);
+                for dep in crates[at]["deps"].as_array().unwrap() {
+                    visit(dep["crate"].as_u64().unwrap() as usize, crates, active);
+                }
+                active.pop();
+            }
+            visit(0, crates, &mut Vec::new());
+            let build = &replay.resolved.spec.build;
+            assert_eq!(build.units[docs[0].unit as usize].target.0, 7);
+            let mut forged = build.clone();
+            forged.units[docs[0].unit as usize].deps = blaze_wire::Set::new(Vec::new());
+            assert!(
+                blaze_spec::assemble::canonical_units(&forged, &replay.resolved.graph).is_err()
+            );
+            let mut old_identity = build.clone();
+            old_identity.units[docs[0].unit as usize].target.0 = 0;
+            assert!(
+                blaze_spec::assemble::canonical_units(&old_identity, &replay.resolved.graph)
+                    .is_err()
+            );
+            replay.validate_sources(store.path()).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -1363,10 +1462,10 @@ fn capture_compares_native_observations_without_an_extra_probe() {
     let mut ctx = context(&f, &env, &host, &root);
     ctx.probe = &stable;
     capture(&request, &[], &ctx, store.path(), &[]).unwrap();
-    assert_eq!(stable.batches.get(), 3);
+    assert_eq!(stable.batches.get(), 2);
 
     let changed_store = tempfile::tempdir().unwrap();
-    let changed = ChangingProbe::new(2);
+    let changed = ChangingProbe::new(1);
     ctx.probe = &changed;
     let error = capture(&request, &[], &ctx, changed_store.path(), &[]).err().unwrap();
     let message = format!("{error:#}");
@@ -1387,7 +1486,7 @@ fn persisted_prepare_has_no_historical_observation_and_authenticates_first() {
     let env = f.env();
     let request = Request::parse(Subcommand::Build, &[]).unwrap();
     let store = tempfile::tempdir().unwrap();
-    let probe = ChangingProbe::new(3);
+    let probe = ChangingProbe::new(2);
     let mut ctx = context(&f, &env, &host, &root);
     ctx.probe = &probe;
     let made = capture(&request, &[], &ctx, store.path(), &[]).unwrap();
@@ -1423,7 +1522,7 @@ fn persisted_prepare_has_no_historical_observation_and_authenticates_first() {
         format!("{error:#}"),
         "execution machine does not match the BuildSpec: platform fields differ: native_root"
     );
-    assert_eq!(probe.batches.get(), 4);
+    assert_eq!(probe.batches.get(), 3);
 }
 
 #[test]
@@ -1444,4 +1543,444 @@ fn live_and_recorded_resolution_do_not_bind_native_trees() {
     blaze_spec::assemble::resolve_recorded(&request, &ctx, &bound.spec.platform).unwrap();
     assert_eq!(probe.batches.get(), 1);
     assert_eq!(probe.calls.get(), calls);
+}
+
+#[test]
+fn proc_macro_unit_tests_compile_the_source_graph_instead_of_an_expansion_leaf() {
+    use blaze_metadata::units::TargetKind;
+    use blaze_spec::execution::{Output, ProducedUnit, programs_with, unit_cfg};
+    use std::collections::BTreeMap;
+
+    let f = Fixture::with_root(
+        "[package]\nname='tested'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n[dependencies]\nhelper={path='helper'}\ndecorator={path='decorator'}\n[dev-dependencies]\ndevonly={path='devonly'}\n",
+    );
+    f.write("src/lib.rs", "#[proc_macro] pub fn make(input: proc_macro::TokenStream)->proc_macro::TokenStream { input }\n#[test] fn uses_dependencies() { let _: fn(proc_macro::TokenStream)->proc_macro::TokenStream = make; assert!(!cfg!(proc_macro)); assert_eq!(helper::value(), devonly::value()); }\n");
+    for (name, dependencies, source) in [
+        (
+            "helper",
+            "[dependencies]\ndeep={path='../deep'}\n",
+            "pub fn value()->u32 { deep::value() }\n",
+        ),
+        ("deep", "", "pub fn value()->u32 { 42 }\n"),
+        ("devonly", "", "pub fn value()->u32 { 42 }\n"),
+        ("macro_impl", "", "pub fn value()->u32 { 42 }\n"),
+    ] {
+        f.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n{dependencies}"),
+        );
+        f.write(&format!("{name}/src/lib.rs"), source);
+    }
+    f.write("decorator/Cargo.toml", "[package]\nname='decorator'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n[dependencies]\nmacro_impl={path='../macro_impl'}\n");
+    f.write("decorator/src/lib.rs", "extern crate proc_macro; #[proc_macro] pub fn pass(input: proc_macro::TokenStream)->proc_macro::TokenStream { let _ = macro_impl::value(); input }\n");
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--lib", "--no-run"], store.path());
+    drop(f);
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    let canonical =
+        blaze_spec::assemble::canonical_units(&made.build, &replay.resolved.graph).unwrap();
+    let mut produced: BTreeMap<_, _> = canonical
+        .iter()
+        .enumerate()
+        .map(|(at, unit)| {
+            (
+                at as u32,
+                ProducedUnit {
+                    cfg: unit_cfg(&replay, at),
+                    codegen_flags: Vec::new(),
+                    native: blaze_wire::native::Unit::default(),
+                    proc_macro: (unit.target.kind == TargetKind::ProcMacro)
+                        .then(|| worker.path().join(format!("macro-{at}.so"))),
+                    rustc_env: BTreeMap::new(),
+                },
+            )
+        })
+        .collect();
+    let plans = programs_with(
+        &replay,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("artifacts"),
+        Some(&produced),
+    )
+    .unwrap();
+    assert_eq!(plans.len(), 1);
+    let program = &plans[0];
+    assert_eq!(program.output, Output::Executable);
+    assert!(program.harness && !program.run);
+    let crates = program.project["crates"].as_array().unwrap();
+    let root = &crates[0];
+    assert_eq!(root["build"]["target_kind"], "test");
+    assert_eq!(root["is_proc_macro"], false, "the compiler consumes a test root as source");
+    assert_eq!(root["blaze_proc_macro_test"], true);
+    assert!(root["proc_macro_dylib_path"].is_null());
+    assert!(root["cfg"].as_array().unwrap().contains(&serde_json::json!("test")));
+    assert!(!root["cfg"].as_array().unwrap().contains(&serde_json::json!("proc_macro")));
+    let dependency = |name: &str, from: &serde_json::Value| {
+        let edge =
+            from["deps"].as_array().unwrap().iter().find(|edge| edge["name"] == name).unwrap();
+        &crates[edge["crate"].as_u64().unwrap() as usize]
+    };
+    assert_eq!(dependency("deep", dependency("helper", root))["display_name"], "deep");
+    assert_eq!(dependency("devonly", root)["display_name"], "devonly");
+    let image = dependency("decorator", root);
+    assert_eq!(image["is_proc_macro"], true);
+    assert!(image["deps"].as_array().unwrap().is_empty());
+    assert!(image["proc_macro_dylib_path"].is_string());
+    assert!(!crates.iter().any(|unit| unit["display_name"] == "macro_impl"));
+
+    produced.get_mut(&program.unit).unwrap().proc_macro = None;
+    programs_with(
+        &replay,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("without-root-image"),
+        Some(&produced),
+    )
+    .expect("compiling a proc-macro's unit tests requires its source, not its macro image");
+    let image_unit = image["blaze_native_unit"].as_u64().unwrap() as u32;
+    produced.get_mut(&image_unit).unwrap().proc_macro = None;
+    assert!(
+        programs_with(
+            &replay,
+            Path::new("/owned/toolchain"),
+            &worker.path().join("missing-dependency-image"),
+            Some(&produced),
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("missing owned macro image")
+    );
+}
+
+#[test]
+fn cargo_target_tmpdir_uses_build_directory_for_only_integration_and_bench_targets() {
+    use blaze_metadata::units::TargetKind;
+    let f = fixture();
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n[[test]]\nname='custom'\nharness=false\n[[bench]]\nname='speed'\nharness=false\n");
+    f.write(".cargo/config.toml", "[build]\ntarget-dir='final-target'\nbuild-dir='intermediate'\n");
+    f.write("src/lib.rs", "pub fn value() {}\n");
+    f.write("tests/custom.rs", "fn main() {}\n");
+    f.write("tests/ordinary.rs", "#[test] fn ordinary() {}\n");
+    f.write("benches/speed.rs", "fn main() {}\n");
+    let words = ["--all-targets", "--no-run"];
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &words, store.path());
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    let expected = replay.root.join("intermediate/tmp");
+    assert_eq!(replay.resolved.outputs[1].join("tmp"), expected);
+    assert_eq!(replay.resolved.outputs[0].join("tmp"), replay.root.join("final-target/tmp"));
+    let plans = blaze_spec::execution::programs(
+        &replay,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("artifacts"),
+    )
+    .unwrap();
+    let native =
+        blaze_spec::assemble::canonical_units(&replay.resolved.spec.build, &replay.resolved.graph)
+            .unwrap();
+    let (mut custom, mut ordinary, mut bench, mut library_test, mut binary_test) =
+        (false, false, false, false, false);
+    for plan in plans {
+        let unit = native[plan.unit as usize];
+        let root_env = &plan.project["crates"][0]["env"];
+        let contexts: Vec<u8> =
+            serde_json::from_value(plan.project["blaze_native_units"].clone()).unwrap();
+        let contexts = blaze_wire::native::decode_units(&contexts).unwrap();
+        if matches!(unit.target.kind, TargetKind::Test | TargetKind::Bench) {
+            assert_eq!(plan.test_scratch.as_deref(), Some(expected.as_path()));
+            assert_eq!(root_env["CARGO_TARGET_TMPDIR"], serde_json::json!(expected));
+            assert_eq!(
+                contexts[&plan.unit].env[OsStr::new("CARGO_TARGET_TMPDIR")],
+                expected.as_os_str()
+            );
+            custom |= unit.target.kind == TargetKind::Test && !plan.harness;
+            ordinary |= unit.target.kind == TargetKind::Test && plan.harness;
+            bench |= unit.target.kind == TargetKind::Bench;
+        } else {
+            assert!(plan.test_scratch.is_none());
+            assert!(root_env.get("CARGO_TARGET_TMPDIR").is_none());
+            assert!(!contexts[&plan.unit].env.contains_key(OsStr::new("CARGO_TARGET_TMPDIR")));
+            library_test |= unit.target.kind == TargetKind::Lib && unit.test;
+            binary_test |= unit.target.kind == TargetKind::Bin && unit.test;
+        }
+    }
+    assert!(custom && ordinary && bench && library_test && binary_test);
+    assert!(!expected.exists(), "description planning must not create scratch directories");
+    let root = f.root();
+    let env = f.env();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Test, &words.map(str::to_owned)).unwrap();
+    let resolved =
+        blaze_spec::assemble::resolve_live(&request, &context(&f, &env, &host, &root)).unwrap();
+    let live = blaze_spec::replay::Prepared::from_live(
+        resolved,
+        root.clone(),
+        root.clone(),
+        request,
+        env.into_iter().map(|(name, value)| (name, value.into())).collect(),
+        host,
+    )
+    .unwrap();
+    let live_expected = root.join("intermediate/tmp");
+    assert_eq!(live.resolved.outputs[1].join("tmp"), live_expected);
+    assert!(expected.starts_with(&replay.root));
+    assert_ne!(live_expected, expected, "saved execution relocates the worker's output layout");
+    let live_plans = blaze_spec::execution::programs(
+        &live,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("live-artifacts"),
+    )
+    .unwrap();
+    let mut roots = 0;
+    for plan in live_plans {
+        if let Some(scratch) = &plan.test_scratch {
+            assert_eq!(scratch, &live_expected);
+            assert_eq!(
+                plan.project["crates"][0]["env"]["CARGO_TARGET_TMPDIR"],
+                serde_json::json!(live_expected)
+            );
+            roots += 1;
+        }
+    }
+    assert_eq!(roots, 3);
+}
+
+#[test]
+fn explicit_rustc_env_overrides_scratch_value_without_changing_cargo_directory() {
+    use blaze_metadata::units::TargetKind;
+    use blaze_spec::execution::{ProducedUnit, flags, programs_with, unit_cfg};
+    let f = fixture();
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n[[test]]\nname='custom'\nharness=false\n[[bench]]\nname='speed'\nharness=false\n");
+    f.write("tests/custom.rs", "fn main() {}\n");
+    f.write("benches/speed.rs", "fn main() {}\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    let canonical =
+        blaze_spec::assemble::canonical_units(&made.build, &replay.resolved.graph).unwrap();
+    let explicit = worker.path().join("producer-not-created");
+    let produced = canonical
+        .iter()
+        .enumerate()
+        .map(|(at, unit)| {
+            (
+                at as u32,
+                ProducedUnit {
+                    cfg: unit_cfg(&replay, at),
+                    codegen_flags: flags(&made.build.units[at].profile, &made.build),
+                    native: blaze_wire::native::Unit {
+                        env: [("CARGO_TARGET_TMPDIR".into(), OsString::from("ambient"))].into(),
+                        flags: Vec::new(),
+                    },
+                    proc_macro: None,
+                    rustc_env: if matches!(unit.target.kind, TargetKind::Test | TargetKind::Bench) {
+                        [("CARGO_TARGET_TMPDIR".into(), explicit.to_str().unwrap().into())].into()
+                    } else {
+                        Default::default()
+                    },
+                },
+            )
+        })
+        .collect();
+    let plans = programs_with(
+        &replay,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("artifacts"),
+        Some(&produced),
+    )
+    .unwrap();
+    let expected = replay.resolved.outputs[1].join("tmp");
+    let mut overrides = 0;
+    for plan in plans {
+        let expected_value = if plan.test_scratch.is_some() {
+            overrides += 1;
+            explicit.as_os_str()
+        } else {
+            OsStr::new("ambient")
+        };
+        assert_eq!(
+            plan.project["crates"][0]["env"]["CARGO_TARGET_TMPDIR"],
+            expected_value.to_str().unwrap()
+        );
+        let bytes: Vec<u8> =
+            serde_json::from_value(plan.project["blaze_native_units"].clone()).unwrap();
+        let native = blaze_wire::native::decode_units(&bytes).unwrap();
+        assert_eq!(native[&plan.unit].env[OsStr::new("CARGO_TARGET_TMPDIR")], expected_value);
+        if let Some(scratch) = &plan.test_scratch {
+            assert_eq!(scratch, &expected);
+            assert_ne!(scratch, &explicit);
+        }
+    }
+    assert_eq!(overrides, 2);
+    assert!(!explicit.exists() && !expected.exists());
+}
+
+#[test]
+fn planned_cargo_test_scratch_preserves_replay_source_admission() {
+    let f = fixture();
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    replay.validate_sources(store.path()).unwrap();
+    let plans = blaze_spec::execution::programs(
+        &replay,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("artifacts"),
+    )
+    .unwrap();
+    let scratch: std::collections::BTreeSet<_> =
+        plans.iter().filter_map(|plan| plan.test_scratch.as_deref()).collect();
+    assert_eq!(scratch.len(), 1);
+    for scratch in scratch {
+        std::fs::create_dir_all(scratch).unwrap();
+    }
+    replay.validate_sources(store.path()).unwrap();
+}
+
+#[test]
+fn staged_cargo_scratch_is_bound_before_compilation_and_keeps_native_checks_strict() {
+    use blaze_spec::native::{Closure, Root};
+    use blaze_spec::native_tree::Tree;
+    let f = fixture();
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    f.write(".cargo/config.toml", "[build]\ntarget-dir='final'\nbuild-dir='intermediate'\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    let scratch = replay.root.join("intermediate/tmp");
+    assert!(!scratch.exists());
+    replay.prepare_test_scratch(store.path()).unwrap();
+    assert!(scratch.is_dir());
+    let bindings = Closure {
+        roots: vec![Root { name: "source".into(), tree: Tree::capture(&replay.root).unwrap() }],
+    };
+    let encoded = bindings.encode_bindings();
+    // compile_at still ensures the directory exists. That operation must not
+    // change any bound input after the executor has staged its layout.
+    std::fs::create_dir_all(&scratch).unwrap();
+    replay.validate_sources(store.path()).unwrap();
+    let SourceRef::Root(source) = &made.build.source else { unreachable!() };
+    assert!(
+        blaze_spec::snapshot::Snapshot::verify_materialized(
+            source.root,
+            store.path(),
+            &replay.root,
+        )
+        .is_err(),
+        "the generic source snapshot still requires exact membership"
+    );
+    assert_eq!(Closure::from_bindings(&encoded).unwrap(), bindings);
+    bindings.validate().unwrap();
+    std::fs::write(scratch.join("unrecorded.h"), "not an authenticated input").unwrap();
+    assert!(replay.validate_sources(store.path()).is_err());
+    assert!(Closure::from_bindings(&encoded).is_err());
+    assert!(bindings.validate().is_err());
+}
+
+#[test]
+fn scratch_scaffolding_does_not_admit_changes_to_the_source_manifest() {
+    let f = fixture();
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    for mutation in ["source-bytes", "source-member", "scratch-file", "scratch-directory"] {
+        let worker = tempfile::tempdir().unwrap();
+        let replay = prepared(&made, store.path(), &worker.path().join("source"));
+        replay.prepare_test_scratch(store.path()).unwrap();
+        let scratch = replay.resolved.outputs[1].join("tmp");
+        match mutation {
+            "source-bytes" => {
+                let file = replay.root.join("src/main.rs");
+                std::fs::remove_file(&file).unwrap();
+                std::fs::write(file, "fn main() {}")
+            }
+            "source-member" => std::fs::write(replay.root.join("unrecorded.h"), "header"),
+            "scratch-file" => std::fs::write(scratch.join("generated.h"), "header"),
+            "scratch-directory" => std::fs::create_dir(scratch.join("unplanned")),
+            _ => unreachable!(),
+        }
+        .unwrap();
+        assert!(replay.validate_sources(store.path()).is_err(), "admitted {mutation}");
+        assert!(replay.prepare_test_scratch(store.path()).is_err(), "laundered {mutation}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn scratch_scaffolding_preserves_source_aliases_without_authorizing_new_ones() {
+    let f = fixture();
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    f.write(".cargo/config.toml", "[build]\nbuild-dir='output-alias'\n");
+    f.write("actual-output/input", "authenticated");
+    std::os::unix::fs::symlink("actual-output", f.root().join("output-alias")).unwrap();
+    std::os::unix::fs::symlink("../output-alias/input", f.root().join("src/data")).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    for mutation in ["none", "retained-output-input", "scratch-alias"] {
+        let worker = tempfile::tempdir().unwrap();
+        let replay = prepared(&made, store.path(), &worker.path().join("source"));
+        assert!(
+            std::fs::symlink_metadata(replay.root.join("output-alias"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        replay.prepare_test_scratch(store.path()).unwrap();
+        let scratch = replay.resolved.outputs[1].join("tmp");
+        assert!(scratch.is_dir());
+        match mutation {
+            "none" => continue,
+            "retained-output-input" => {
+                let file = replay.root.join("actual-output/input");
+                std::fs::remove_file(&file).unwrap();
+                std::fs::write(file, "different").unwrap();
+            }
+            "scratch-alias" => {
+                std::fs::remove_dir(&scratch).unwrap();
+                std::os::unix::fs::symlink(worker.path(), &scratch).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(replay.validate_sources(store.path()).is_err(), "admitted {mutation}");
+    }
+}
+
+#[test]
+fn unasked_test_scratch_is_not_an_authenticated_execution_directory() {
+    let f = fixture();
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Build, &[], store.path());
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    replay.prepare_test_scratch(store.path()).unwrap();
+    let scratch = replay.resolved.outputs[1].join("tmp");
+    assert!(!scratch.exists());
+    std::fs::create_dir_all(&scratch).unwrap();
+    assert!(replay.validate_sources(store.path()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_external_output_alias_cannot_grant_source_directory_authority() {
+    let f = fixture();
+    let outside = tempfile::tempdir().unwrap();
+    let alias = outside.path().join("output-alias");
+    f.write("tests/integration.rs", "#[test] fn example() {}\n");
+    f.write(".cargo/config.toml", &format!("[build]\nbuild-dir={:?}\n", alias.to_str().unwrap()));
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.outputs[1], alias);
+    std::os::unix::fs::symlink(&replay.root, &alias).unwrap();
+    replay.validate_sources(store.path()).unwrap();
+    assert!(replay.prepare_test_scratch(store.path()).is_err());
+    assert!(replay.validate_sources(store.path()).is_err());
 }

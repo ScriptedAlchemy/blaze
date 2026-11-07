@@ -453,7 +453,10 @@ impl<'ctx> Debug<'ctx> {
     pub(super) fn of(module: &Module<'ctx>) -> Lowered<Option<Debug<'ctx>>> {
         // Without a flag that asks for CodeView, the table is DWARF in a COFF object too.
         let target = crate::Target::selected().map_err(Unhandled::Llvm)?;
-        if !matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::Coff) {
+        if !matches!(
+            target.object_format,
+            ObjectFormat::Elf | ObjectFormat::Coff | ObjectFormat::MachO
+        ) {
             return Ok(None);
         }
         let context = module.get_context();
@@ -1355,10 +1358,20 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             }
             InstructionData::Brif { arg, blocks: [then, otherwise], .. } => {
                 let condition = self.condition(arg)?;
-                let (then, otherwise) = (self.branch_edge(then)?, self.branch_edge(otherwise)?);
-                let branch = self.builder.build_conditional_branch(condition, then, otherwise)?;
-                if let Some(taken) = self.weights.and_then(|it| it.taken.get(&inst)) {
-                    self.weigh(branch, *taken)?;
+                if let Some(taken) = condition.get_zero_extended_constant() {
+                    // FastISel drops an untaken constant edge from the machine CFG, but
+                    // its IR predecessor keeps the dead return alive. AArch64 CFIFixup
+                    // then leaks that return's epilogue rules into live cleanup calls.
+                    // Fold here even without optimization, as rustc does for SwitchInt.
+                    let target = self.edge(if taken != 0 { then } else { otherwise })?;
+                    self.builder.build_unconditional_branch(target)?;
+                } else {
+                    let (then, otherwise) = (self.branch_edge(then)?, self.branch_edge(otherwise)?);
+                    let branch =
+                        self.builder.build_conditional_branch(condition, then, otherwise)?;
+                    if let Some(taken) = self.weights.and_then(|it| it.taken.get(&inst)) {
+                        self.weigh(branch, *taken)?;
+                    }
                 }
             }
             InstructionData::BranchTable { arg, table, .. } => {
@@ -1386,6 +1399,19 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             InstructionData::Trap { .. } => self.trap()?,
             InstructionData::CondTrap { arg, .. } => {
                 let condition = self.condition(arg)?;
+                if let Some(value) = condition.get_zero_extended_constant() {
+                    let traps = match opcode {
+                        Opcode::Trapnz => value != 0,
+                        Opcode::Trapz => value == 0,
+                        _ => return Err(Unhandled::Opcode(opcode)),
+                    };
+                    if traps {
+                        self.trap()?;
+                        let rest = self.context.append_basic_block(self.function, "");
+                        self.builder.position_at_end(rest);
+                    }
+                    return Ok(());
+                }
                 let trap = self.context.append_basic_block(self.function, "");
                 let resume = self.context.append_basic_block(self.function, "");
                 match opcode {

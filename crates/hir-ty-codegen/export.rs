@@ -1,5 +1,7 @@
 //! Object-free export of the compiler's local requests. No Salsa identity is an artifact.
 
+pub mod dist;
+
 #[cfg(test)]
 mod tests;
 
@@ -231,20 +233,32 @@ impl<'a, 'db> ExportContext<'a, 'db> {
         Ok(())
     }
 
+    /// The requester fences the work tuple; the selected home controls compilation.
     /// Work identity for the local registry. Nonempty caller bounds require the semantic
     /// environment-key query not present on this base; do not silently alias them to an
     /// empty environment. The original request remains compilable and locally held.
     pub fn work_name(&self, request: &LocalRequest) -> std::result::Result<WorkName, String> {
-        let (instance, home) = match &request.kind {
-            LocalKind::Root(root) => (root_instance(self.db, *root), root.krate(self.db)),
+        let (instance, environment, home) = match &request.kind {
+            LocalKind::Root(root) => (
+                root_instance(self.db, *root),
+                ParamEnvAndCrate {
+                    param_env: hir_ty::next_solver::ParamEnv::empty(),
+                    krate: root.krate(self.db),
+                }
+                .store(),
+                root.krate(self.db),
+            ),
             LocalKind::Instance(instance, env) => {
                 if !env.param_env(self.db).clauses().is_empty() {
                     return Err("caller bounds need a canonical semantic environment key".into());
                 }
-                (instance.clone(), env.krate)
+                (instance.clone(), home::Homes::default().home(self.db, instance, env), env.krate)
             }
         };
-        let name = self.names.instance(&instance).ok_or("request has no portable stable name")?;
+        let name = self
+            .names
+            .instance_in(&instance, &environment)
+            .ok_or("request has no portable stable name")?;
         if !self.owned.contains(&home) {
             return Err("request home is outside the resolved owned closure".into());
         }
@@ -267,7 +281,7 @@ impl<'a, 'db> ExportContext<'a, 'db> {
             && *instance == root_instance(self.db, func)
             && self
                 .names
-                .instance(instance)
+                .instance_in(instance, env)
                 .is_some_and(|name| self.roots.get(name.as_str()) == Some(&Some(func)))
         {
             return LocalRequest::root(func);
@@ -277,7 +291,7 @@ impl<'a, 'db> ExportContext<'a, 'db> {
 
     fn keeper<'k>(
         &'k self,
-        stable_names: &'k mut FxHashMap<Instance, Option<StableName>>,
+        stable_names: &'k mut FxHashMap<NamedInstance, Option<StableName>>,
         source_paths: &'k mut FxHashMap<base_db::FileId, Option<String>>,
         kept: &'k mut Kept,
         told: &'k ToldTypes,
@@ -308,12 +322,12 @@ impl Bindings for ExportContext<'_, '_> {
         request: &FuncRequest,
     ) -> std::result::Result<FunctionBinding, &'static str> {
         let symbol = match &request.target {
-            FuncTarget::Asm(_) => return Ok(FunctionBinding::Defined),
+            FuncTarget::Asm(_) => return Ok(FunctionBinding::Defined(None)),
             FuncTarget::Symbol(symbol) => Some(symbol.clone()),
             FuncTarget::Path(path) => {
                 Some(self.symbols.path(path).ok_or("path has no resolved import")?)
             }
-            FuncTarget::Instance(instance, _) => {
+            FuncTarget::Instance(instance, env) => {
                 if let InstanceDef::Fn(func) = instance.def {
                     if let Some(of) =
                         type_id_of(self.db, self.symbols, func, instance.args.as_ref())
@@ -335,7 +349,10 @@ impl Bindings for ExportContext<'_, '_> {
                         // requesting its definition. Shared classification yields Root.
                         let name = self
                             .names
-                            .instance(instance)
+                            .instance_in(
+                                instance,
+                                &home::Homes::default().home(self.db, instance, env),
+                            )
                             .ok_or("owned root has no portable name")?;
                         if self.roots.get(name.as_str()) != Some(&Some(func)) {
                             return Err("owned root is absent from the immutable pre-index");
@@ -346,7 +363,7 @@ impl Bindings for ExportContext<'_, '_> {
                             .map(FunctionBinding::Imported)
                             .ok_or("owned root has no link name");
                     } else if self.owned.contains(&func.krate(self.db)) {
-                        return Ok(FunctionBinding::Defined);
+                        return Ok(FunctionBinding::Defined(None));
                     } else if instance.args.as_ref().iter().all(|it| it.region().is_some())
                         && as_its_crate_compiles(self.db, self.symbols, instance)
                     {
@@ -355,7 +372,7 @@ impl Bindings for ExportContext<'_, '_> {
                         return Err("provided function does not match the requested instance");
                     }
                 } else {
-                    return Ok(FunctionBinding::Defined);
+                    return Ok(FunctionBinding::Defined(None));
                 }
             }
         }
@@ -451,22 +468,23 @@ pub fn compile_batch(
         let told = ToldTypes::default();
         let mut keeper = context.keeper(&mut stable_names, &mut source_paths, &mut kept, &told);
         let work = context.work_name(request);
-        let (compiled, instance, home, of) = match &request.kind {
+        let (compiled, instance, of) = match &request.kind {
             LocalKind::Root(root) => (
                 compiled_root(context.db, *root),
                 root_instance(context.db, *root),
-                root.krate(context.db),
                 later::Of::Root {
                     func: *root,
                     symbol: context.symbols.function(*root).ok_or("root has no link name")?,
                 },
             ),
-            LocalKind::Instance(instance, env) => (
-                compiled_instance(context.db, instance.clone(), env.clone()),
-                instance.clone(),
-                env.krate,
-                later::Of::Instance { instance: instance.clone(), env: env.clone() },
-            ),
+            LocalKind::Instance(instance, env) => {
+                let environment = home::Homes::default().home(context.db, instance, env);
+                (
+                    compiled_instance(context.db, instance.clone(), environment.clone()),
+                    instance.clone(),
+                    later::Of::Instance { instance: instance.clone(), env: environment },
+                )
+            }
         };
         let compiled = match compiled {
             Ok(compiled) => compiled,
@@ -512,9 +530,18 @@ pub fn compile_batch(
             outcomes.push(Outcome::Local { work: Ok(work), why });
             continue;
         }
+        let environment = match &of {
+            later::Of::Root { func, .. } => ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate: func.krate(context.db),
+            }
+            .store(),
+            later::Of::Instance { env, .. } => env.clone(),
+        };
         let debug = keeper.describe_function(&of, compiled, None, false);
         let described = debug.is_some();
-        let Some(mut entry) = keeper.entry(&instance, compiled, context, debug) else {
+        let Some(mut entry) = keeper.entry(&instance, &environment, compiled, context, debug)
+        else {
             let mut reasons = keeper.kept.unkept.keys().copied().collect::<Vec<_>>();
             reasons.sort();
             let why = reasons.join("; ");
@@ -523,7 +550,7 @@ pub fn compile_batch(
             continue;
         };
         if stable::StableNames::of_checkout(&work.name) {
-            match keeper.tracked(&instance, home, compiled, described) {
+            match keeper.tracked(&instance, compiled, described) {
                 Ok(tracked) => entry.tracked = Some(tracked),
                 Err(why) => {
                     outcomes.push(Outcome::Local { work: Ok(work), why: why.into() });
@@ -584,6 +611,7 @@ fn validate_receipt(
         keys.extend(store::pack_keys(name, &bytes).map_err(str::to_owned)?);
     }
     let mut entries = FxHashMap::default();
+    let semantic_sources = context.names.semantic_sources();
     for exported in &receipt.entries {
         if !context.owned.iter().any(|&krate| {
             context.names.content_id(krate).is_some_and(|id| id.0 == exported.work.home)
@@ -616,6 +644,9 @@ fn validate_receipt(
             return Err("receipt entry digest mismatch".into());
         }
         let mut entry = cached::Entry::decode(&bytes).ok_or("invalid entry references")?;
+        if !entry.semantic_matches(&exported.work.name, &semantic_sources) {
+            return Err("receipt concrete semantic inputs differ from the current context".into());
+        }
         // An entry is described as the crate its code is written in is built, which its name
         // says where that is not as the build's own code is.
         let told = stable::told_in(&exported.work.name)
@@ -769,46 +800,102 @@ pub fn import_batch(
         }
         store.refresh();
         validate_receipt(context, &store, receipt)?;
-        validate_closure(&store, receipt)
+        admitted_closure(context, &store, receipt)
     })();
-    if let Err(why) = admitted {
-        drop(store);
-        let cleanup = std::fs::remove_dir_all(directory);
-        return Err(match cleanup {
-            Ok(()) => why,
-            Err(e) => format!("{why}; staging cleanup: {e}"),
-        });
-    }
-    Ok(Imported { store: std::sync::Arc::new(store), receipt: receipt.clone() })
+    let admitted = match admitted {
+        Ok(admitted) => admitted,
+        Err(why) => {
+            drop(store);
+            let cleanup = std::fs::remove_dir_all(directory);
+            return Err(match cleanup {
+                Ok(()) => why,
+                Err(e) => format!("{why}; staging cleanup: {e}"),
+            });
+        }
+    };
+    Ok(Imported { store: std::sync::Arc::new(store), receipt: receipt.clone(), admitted })
 }
 
-/// Raw batch receipts may name work held by another batch. Admission, unlike export,
-/// requires a closed set: both Named and Root edges are checked, including cycles.
-fn validate_closure(store: &store::Store, receipt: &Receipt) -> std::result::Result<(), String> {
-    let names: FxHashSet<_> = receipt.entries.iter().map(|it| it.work.name.as_str()).collect();
-    for exported in &receipt.entries {
-        let bytes = store.get_installed(&exported.key).ok_or("closure entry missing")?;
+/// The key a name's entry is kept under in this context, as `validate_receipt`
+/// recomputes it: what the name says it was told of, else the build's own.
+pub(super) fn entry_key_of(
+    context: &ExportContext<'_, '_>,
+    name: &str,
+) -> std::result::Result<Digest256, String> {
+    let told = stable::told_in(name)
+        .unwrap_or(cached::Told::of(context.policy.debug, context.policy.variables));
+    cached::Entry::key(name, told, context.policy.program.as_ref())
+        .ok_or_else(|| "entry key settings unavailable".to_owned())
+}
+
+/// The admitted closure of a receipt over a store: its entries, and every entry
+/// their `Named` and `Root` edges reach that the store holds installed, cycles
+/// included. A `FromStore` item's closure lives in the packs exactly like this
+/// (docs/distributed.md, section 4: "the execution's pinned packs hold its whole
+/// usable closure"), so admission is reachability from the receipt over verified
+/// packs, and the returned `(name, key)` list — never the packs at large — is
+/// what the lead's assembly may read. An edge to an entry no pack holds refuses
+/// the whole import, as a missing debug type blob of a reached entry does.
+pub(super) fn admitted_closure(
+    context: &ExportContext<'_, '_>,
+    store: &store::Store,
+    receipt: &Receipt,
+) -> std::result::Result<Vec<(String, Digest256)>, String> {
+    let mut admitted: Vec<(String, Digest256)> =
+        receipt.entries.iter().map(|it| (it.work.name.clone(), it.key)).collect();
+    let mut seen: FxHashSet<Digest256> = admitted.iter().map(|(_, key)| *key).collect();
+    let mut stack = admitted.clone();
+    let semantic_sources = context.names.semantic_sources();
+    while let Some((name, key)) = stack.pop() {
+        let bytes = store.get_installed(&key).ok_or("closure entry missing")?;
         let entry = cached::Entry::decode(&bytes).ok_or("closure entry invalid")?;
-        for function in &entry.funcs {
-            match &function.target {
-                cached::CachedTarget::Named(name) | cached::CachedTarget::Root(name)
-                    if !names.contains(name.as_str()) =>
-                {
-                    return Err(format!("receipt closure lacks `{name}`"));
-                }
-                _ => {}
-            }
+        if !entry.semantic_matches(&name, &semantic_sources) {
+            return Err("closure concrete semantic inputs differ from the current context".into());
         }
         if entry.datas.iter().any(|it| matches!(it, cached::CachedData::OwnStatic(_))) {
             return Err("receipt closure requires the owned-static batch exporter".into());
         }
+        if let Some(debug) = &entry.debug {
+            for types in &debug.stored_types {
+                // A reachable entry may be absent from receipt.entries (FromStore).
+                // validate_receipt checks only listed entries, so transitive blobs
+                // must be checked here too, not merely found by their store key.
+                let bytes =
+                    store.get_installed(types).ok_or("receipt closure lacks a debug type blob")?;
+                if digest_types(&bytes) != *types {
+                    return Err("receipt closure debug type digest mismatch".into());
+                }
+                let set: Vec<debuginfo::DebugType> =
+                    postcard::from_bytes(&bytes).map_err(|e| e.to_string())?;
+                validate_types(&set)?;
+            }
+        }
+        for function in &entry.funcs {
+            let (cached::CachedTarget::Named(name) | cached::CachedTarget::Root(name)) =
+                &function.target
+            else {
+                continue;
+            };
+            let target = entry_key_of(context, name)?;
+            if !seen.insert(target) {
+                continue;
+            }
+            if store.get_installed(&target).is_none() {
+                return Err(format!("receipt closure lacks `{name}`"));
+            }
+            admitted.push((name.clone(), target));
+            stack.push((name.clone(), target));
+        }
     }
-    Ok(())
+    Ok(admitted)
 }
 
 pub struct Imported {
     store: std::sync::Arc<store::Store>,
     receipt: Receipt,
+    /// The admitted closure: receipt entries first, then what their edges reach
+    /// in the imported packs. The only entries this import exposes.
+    admitted: Vec<(String, Digest256)>,
 }
 
 impl Imported {
@@ -818,10 +905,9 @@ impl Imported {
 
     /// Only admitted entries are exposed, never arbitrary keys in a received pack.
     pub fn entry_bytes(&self, key: &Digest256) -> Option<Vec<u8>> {
-        self.receipt
-            .entries
+        self.admitted
             .iter()
-            .any(|it| &it.key == key)
+            .any(|(_, admitted)| admitted == key)
             .then(|| self.store.get_installed(key))
             .flatten()
     }
@@ -836,16 +922,12 @@ impl Imported {
         if context.digest != self.receipt.context {
             return Err("imported entry requested under a different context".into());
         }
-        let exported = self
-            .receipt
-            .entries
+        let (name, _) = self
+            .admitted
             .iter()
-            .find(|it| &it.key == key)
+            .find(|(_, admitted)| admitted == key)
             .ok_or("entry is not in the admitted set")?;
-        let entry = self
-            .entries(context)?
-            .get(&exported.work.name)
-            .ok_or("admitted entry cannot be rebound")?;
+        let entry = self.entries(context)?.get(name).ok_or("admitted entry cannot be rebound")?;
         entry.encode().ok_or("rebound entry encoding failed".into())
     }
 
@@ -859,13 +941,14 @@ impl Imported {
         context.check_settings()?;
         Ok(cached::Entries::owned(
             self.store.clone(),
-            self.receipt.entries.iter().map(|it| (it.work.name.clone(), it.key)).collect(),
+            self.admitted.iter().cloned().collect(),
             cached::Told::of(context.policy.debug, context.policy.variables),
             context.policy.program,
             context.symbols.cargo_home(),
             context.symbols.library_sources(),
         )
-        .in_checkout(context.symbols.checkout()))
+        .in_checkout(context.symbols.checkout())
+        .in_semantic_sources(context.names.semantic_sources()))
     }
 }
 
@@ -884,9 +967,10 @@ impl Receipt {
     }
 }
 
-/// How the final link binds one function request, before any object is defined.
+/// How the final link binds one function request.
 pub(super) enum FunctionBinding {
-    Defined,
+    /// The resolved object symbol; batch definitions have no object symbol yet.
+    Defined(Option<String>),
     Imported(String),
     TypeId(u128),
 }
@@ -931,7 +1015,9 @@ impl ObjectBindings {
                         declarations.get_function_decl(id).linkage_name(id).into_owned(),
                     )
                 } else {
-                    FunctionBinding::Defined
+                    FunctionBinding::Defined(Some(
+                        declarations.get_function_decl(id).linkage_name(id).into_owned(),
+                    ))
                 }
             })
             .collect();
@@ -967,7 +1053,7 @@ impl Bindings for ObjectBindings {
             Some(FunctionBinding::Imported(symbol)) => {
                 Ok(FunctionBinding::Imported(symbol.clone()))
             }
-            Some(FunctionBinding::Defined) => Ok(FunctionBinding::Defined),
+            Some(FunctionBinding::Defined(symbol)) => Ok(FunctionBinding::Defined(symbol.clone())),
             None => Err("missing function binding"),
         }
     }

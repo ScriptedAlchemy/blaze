@@ -155,7 +155,7 @@ impl<'a> State<'_, 'a> {
 
         // A binary, test or example is compiled against the library of its package, which
         // `resolve.deps` does not list.
-        if target.is_lib() {
+        if target.is_lib() && unit.mode != CMode::DocTest {
             return Ok(ret);
         }
         ret.extend(self.maybe_lib(&unit, unit_for)?);
@@ -237,6 +237,7 @@ impl<'a> State<'_, 'a> {
                         && !super::select::is_test(target)
                         && !super::select::is_example(target)
                         && !unit.mode.is_any_test()
+                        && unit.mode != CMode::DocTest
                     {
                         return false;
                     }

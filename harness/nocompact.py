@@ -39,6 +39,12 @@ unsafe extern "C" {
     fn _dyld_get_image_vmaddr_slide(image: u32) -> isize;
 }
 
+// Give the patched root an unambiguous exported Mach-O name. Blaze uses the
+// linker's symbol for compiled roots, not the ra-jit:: names of callees.
+// The splicer retargets that symbol's address; its frame is what we probe.
+// Never inline this function into `main`.
+#[inline(never)]
+#[unsafe(export_name = "ncu_answer")]
 fn answer() -> u32 {
     1
 }
@@ -55,7 +61,9 @@ fn has_frame(at: &str) -> bool {
 
 fn main() {
     let framed = std::env::args().nth(1).map(|at| has_frame(&at));
-    println!("{} {}", answer(), framed.map_or("unasked", |it| if it { "framed" } else { "unframed" }));
+    // The opaque function pointer keeps the edited function address-taken.
+    let call = std::hint::black_box(answer as fn() -> u32);
+    println!("{} {}", call(), framed.map_or("unasked", |it| if it { "framed" } else { "unframed" }));
 }
 """,
 }
@@ -82,12 +90,36 @@ def links(home):
     return lines
 
 
+def symbol_address(listed, name):
+    """Find exactly one exported root's Mach-O address, not a private callee.
+
+    Blaze exports non-generic roots under their linked symbol, and the
+    splicer updates that symbol's address when replacing the function.
+    """
+    found = re.findall(
+        rf"^([0-9a-fA-F]+)[ \t]+[tTsS][ \t]+_{re.escape(name)}$",
+        listed, re.M
+    )
+    return "0x" + found[0] if len(found) == 1 else None
+
+
 def address_of(program, name):
-    """Where the code of the function `name` is, as the executable was linked: ra-jit's symbol
-    of it (rustc's is a jump there)."""
-    listed = subprocess.run(["nm", program], capture_output=True, text=True).stdout
-    found = re.findall(rf"^([0-9a-f]+) [ts] _ra-jit::{name}::\d+$", listed, re.M)
-    return "0x" + found[0] if found else None
+    """The exported root address, rewritten by the splicer after an edit."""
+    found = subprocess.run(["nm", program], capture_output=True, text=True)
+    if found.returncode:
+        raise SystemExit(f"nm failed for {program}: {found.stderr.strip()[-1000:]}")
+    at = symbol_address(found.stdout, name)
+    if at is None:
+        lines = found.stdout.splitlines()
+        named = [line for line in lines if name in line]
+        code = [line for line in lines
+                if re.search(r"[ \t]+[tTsS][ \t]+_ra[-_]jit::", line)]
+        sample = named if named else code
+        print(f"no unique {name} symbol in {program} ({len(lines)} nm rows, "
+              f"{len(named)} name rows, {len(code)} private code rows):\n"
+              + "\n".join(sample[:24]), file=sys.stderr)
+    return at
+
 
 
 def sections(program):
@@ -106,13 +138,13 @@ def edit(ws, env, home, program, step, want):
     """Builds, runs the program and says what is wrong with it, or "ok"."""
     seen = len(links(home))
     said = build(ws, env, step)
-    at = address_of(program, "answer")
+    at = address_of(program, "ncu_answer")
     ran = subprocess.run([program, at or "0"], capture_output=True, text=True, timeout=60)
     made = links(home)[seen:]
     how = made[-1] if made else "no link"
     verdict = "ok"
     if at is None:
-        verdict = "NO SYMBOL OF `answer`"
+        verdict = "NO SYMBOL OF `ncu_answer`"
     elif ran.returncode != 0 or ran.stdout.strip() != f"{want} framed":
         verdict = f"PRINTED {ran.stdout.strip()!r} (exit {ran.returncode}), NOT {want} framed"
     elif "[ra-jit]" not in said:
@@ -120,6 +152,26 @@ def edit(ws, env, home, program, step, want):
     elif not how.startswith("spliced"):
         verdict = "NOT SPLICED"
     return verdict, how
+
+
+
+def expanded_source(source, count=MANY):
+    """Grow the frame section without moving answer's no-inline attribute to a new function."""
+    target = "#[inline(never)]\n#[unsafe(export_name = \"ncu_answer\")]\nfn answer() -> u32 {\n"
+    if source.count(target) != 1:
+        raise ValueError("no unique no-inline answer in the fixture")
+    # Trivial constant-returning leaves can have no frame descriptors on arm64.
+    # Keep 1000 reachable functions with a genuine non-tail indirect call, so
+    # their unwind frames (not merely their symbols) force __eh_frame to grow.
+    many = "".join(
+        f"#[inline(never)]\nfn f{i}() -> u32 {{\n"
+        "    let call = std::hint::black_box(answer as fn() -> u32);\n"
+        f"    call().wrapping_add({i})\n"
+        "}\n\n"
+        for i in range(count)
+    )
+    named = "".join(f"    std::hint::black_box(f{i} as fn() -> u32);\n" for i in range(count))
+    return source.replace(target, many + target + named, 1)
 
 
 def main():
@@ -162,14 +214,12 @@ def main():
             wrong += verdict != "ok"
             print(f"{f'edit {n}':30} {verdict:12} {how[:110]}", flush=True)
         text = open(source).read()
-        many = "".join(f"fn f{i}() -> u32 {{\n    {i}\n}}\n\n" for i in range(MANY))
-        named = "".join(f"    std::hint::black_box(f{i} as fn() -> u32);\n" for i in range(MANY))
-        used = "fn answer() -> u32 {\n" + named
-        open(source, "w").write(text.replace("fn answer() -> u32 {\n", many + used, 1))
+        open(source, "w").write(expanded_source(text))
         verdict, how = edit(ws, env, home, program, f"{MANY} functions added", EDITS + 1)
         at = starts(program)
         if verdict == "ok" and not at.get("__eh_frame", 0) < at.get("__text", 0):
-            verdict = "FRAMES NOT MOVED"
+            verdict = (f"FRAMES NOT MOVED (__eh_frame={at.get('__eh_frame')!r}, "
+                       f"__text={at.get('__text')!r})")
         wrong += verdict != "ok"
         print(f"{f'{MANY} functions added':30} {verdict:12} {how[:110]}", flush=True)
     finally:

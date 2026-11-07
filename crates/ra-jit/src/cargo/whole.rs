@@ -21,7 +21,7 @@ use super::{
     FAILED,
     cli::{Invocation, Subcommand, worker_env},
     client::{self, Start},
-    daemon::{Checkout, Reply, Request, WorkerConfig},
+    daemon::{Checkout, NotBuilt, Reply, Request, WorkerConfig},
     plan::Plan as Linked,
     run, say,
     state::{as_built, configured_env, place, repository},
@@ -91,7 +91,15 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
     let runtime = match whole(asked, &cwd, &metadata, &config, &programs, &dir) {
         Ok(runtime) => runtime,
         Err(why) => {
-            say::error(&why);
+            match why {
+                NotBuilt::Error(said) => {
+                    let format = super::messages::Format::of(&asked.flags.message_format)
+                        .map_err(anyhow::Error::msg)?;
+                    super::messages::turned_down(format, &[said], &metadata);
+                }
+                why => say::error(&why.why()),
+            }
+            super::toolchain::note_failed();
             return Ok(Some(FAILED));
         }
     };
@@ -115,11 +123,12 @@ fn whole(
     config: &WorkerConfig,
     programs: &[Program],
     dir: &Path,
-) -> Result<Vec<super::runtime_context::Context>, String> {
+) -> Result<Vec<super::runtime_context::Context>, NotBuilt> {
     let checkout = checkout(asked, cwd, metadata, config, programs, dir);
-    let compiler = std::env::current_exe().map_err(|it| format!("finding owned compiler: {it}"))?;
+    let compiler = std::env::current_exe()
+        .map_err(|it| NotBuilt::Failed(format!("finding owned compiler: {it}")))?;
     let cargo = super::runtime_context::cargo_frontend(&compiler, &dir.join("cargo-frontend"))
-        .map_err(|it| format!("{it:#}"))?;
+        .map_err(|it| NotBuilt::Failed(format!("{it:#}")))?;
     let mut request = super::asking(&checkout);
     request.env.remove("CARGO");
     let env = request
@@ -130,28 +139,42 @@ fn whole(
     request.env =
         env.unicode().iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
     request.native_env = Some(env);
-    let reply =
-        client::ask(Request::Build(request), Start::IfMissing).map_err(|it| format!("{it:#}"))?;
+    let reply = client::ask(Request::Build(request), Start::IfMissing)
+        .map_err(|it| NotBuilt::Failed(format!("{it:#}")))?;
     let (built, runtime) = match reply {
         Some(Reply::Synced { programs, runtime, .. }) => (programs, runtime),
-        Some(Reply::Cold { reason }) => return Err(not_loaded(cwd, &checkout, &reason)),
-        None => return Err(client::why_none()),
-        Some(other) => return Err(format!("the daemon answered {other:?}")),
+        Some(Reply::Cold { reason }) => {
+            return Err(NotBuilt::Failed(not_loaded(cwd, &checkout, &reason)));
+        }
+        None => return Err(NotBuilt::Failed(client::why_none())),
+        Some(other) => return Err(NotBuilt::Failed(format!("the daemon answered {other:?}"))),
     };
     if built.len() != programs.len() {
-        return Err("the whole-build reply has no matching program results".into());
+        return Err(NotBuilt::Failed(
+            "the whole-build reply has no matching program results".into(),
+        ));
     }
     for (program, built) in programs.iter().zip(&built) {
         if let Err(why) = built {
-            return Err(format!("could not build `{}`: {}", program.name, why.clone().why()));
+            return Err(match why {
+                NotBuilt::Error(said) => NotBuilt::Error(said.clone()),
+                why => NotBuilt::Failed(format!(
+                    "could not build `{}`: {}",
+                    program.name,
+                    why.clone().why()
+                )),
+            });
         }
     }
     if runtime.len() != programs.len() || runtime.iter().any(Option::is_none) {
-        return Err("the whole-build reply has no matching runtime contexts".into());
+        return Err(NotBuilt::Failed(
+            "the whole-build reply has no matching runtime contexts".into(),
+        ));
     }
     for ((program, plan), context) in programs.iter().zip(&checkout.programs).zip(&runtime) {
         let _unwritten = crate::splice::unwritten(&plan.binary);
-        let stand_ins = crate::link::stand_ins(&plan.binary).map_err(|it| format!("{it:#}"))?;
+        let stand_ins = crate::link::stand_ins(&plan.binary)
+            .map_err(|it| NotBuilt::Failed(format!("{it:#}")))?;
         if !stand_ins.is_empty() {
             let mut reached: Vec<String> = stand_ins
                 .iter()
@@ -162,31 +185,36 @@ fn whole(
             if stand_ins.len() > SHOWN {
                 reached.push(format!("and {} more", stand_ins.len() - SHOWN));
             }
-            return Err(format!(
+            return Err(NotBuilt::Failed(format!(
                 "`{}` can reach functions blaze could not compile, so it is not built:\n  {}",
                 program.name,
                 reached.join("\n  ")
-            ));
+            )));
         }
         if let Some(parent) = program.executable.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|it| format!("creating {}: {it}", parent.display()))?;
+                .map_err(|it| NotBuilt::Failed(format!("creating {}: {it}", parent.display())))?;
         }
         // The daemon's executable keeps its symbols for the edits spliced into it: what the
         // profile strips is taken out of cargo's copy, as rustc's link takes it out.
-        let strip = crate::link::noted_strip(&plan.binary).map_err(|it| format!("{it:#}"))?;
+        let strip = crate::link::noted_strip(&plan.binary)
+            .map_err(|it| NotBuilt::Failed(format!("{it:#}")))?;
         if strip == crate::link::Strip::None {
-            place(&plan.binary, &program.executable)
-                .map_err(|it| format!("installing {}: {it}", program.executable.display()))?;
+            place(&plan.binary, &program.executable).map_err(|it| {
+                NotBuilt::Failed(format!("installing {}: {it}", program.executable.display()))
+            })?;
         } else {
             let sysroot = context.as_ref().and_then(|it| it.sysroot());
             crate::link::place_stripped(&plan.binary, &program.executable, strip, sysroot)
-                .map_err(|it| format!("{it:#}"))?;
+                .map_err(|it| NotBuilt::Failed(format!("{it:#}")))?;
         }
     }
     runtime
         .into_iter()
-        .map(|context| context.ok_or_else(|| "whole build omitted its runtime context".into()))
+        .map(|context| {
+            context
+                .ok_or_else(|| NotBuilt::Failed("whole build omitted its runtime context".into()))
+        })
         .collect()
 }
 
@@ -210,6 +238,14 @@ fn config_of(
     });
     let asked_in =
         asked.flags.manifest_path.as_ref().map_or_else(|| cwd.to_owned(), |it| cwd.join(it));
+    // Rebase checkout-local selection when a shared worker changes worktrees.
+    // Parent traversal stays absolute: resolving it can cross a directory alias.
+    let asked_in = asked_in
+        .strip_prefix(root)
+        .ok()
+        .filter(|path| !path.components().any(|part| part == std::path::Component::ParentDir))
+        .unwrap_or(&asked_in)
+        .to_owned();
     Ok(WorkerConfig {
         repository: repository(root),
         project: project.strip_prefix(root).unwrap_or(Path::new("")).to_owned(),
@@ -651,6 +687,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cold_feature_policy_is_part_of_worker_identity() {
+        let policy = |value: Option<&str>| {
+            let environment =
+                value.map(|value| ("RUSTC_BOOTSTRAP".into(), value.into())).into_iter();
+            let _scope = crate::process::enter_native(crate::process::Native::of(environment));
+            config("").id()
+        };
+        let stable = policy(None);
+        let enabled = policy(Some("1"));
+        assert_ne!(stable, enabled);
+        assert_ne!(enabled, policy(Some("-1")));
+        assert_ne!(enabled, policy(Some("app")));
+        assert_eq!(enabled, policy(Some("1")));
+    }
+
     /// Two builds with different compiler settings must not publish from the same file.
     #[test]
     fn a_build_links_into_a_directory_of_its_own() {
@@ -670,6 +722,56 @@ mod tests {
         assert_eq!(linked(""), linked(""));
         // Under the target directory, beside the daemon's other files.
         assert!(linked("--features x").starts_with(target.join("ra-jit/whole")));
+    }
+
+    #[test]
+    fn equivalent_worktree_invocations_share_worker_identity() {
+        let _scope = crate::process::enter_native(crate::process::Native::default());
+        let scratch = tempfile::tempdir().unwrap();
+        let first = scratch.path().join("first");
+        let second = scratch.path().join("second");
+        std::fs::create_dir_all(first.join(".git/worktrees/second")).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(
+            second.join(".git"),
+            format!("gitdir: {}\n", first.join(".git/worktrees/second").display()),
+        )
+        .unwrap();
+        let configured = |root: &Path, cwd: &str, manifest: Option<&Path>| {
+            let args = manifest.map_or_else(Vec::new, |path| {
+                vec!["--manifest-path".to_owned(), path.to_str().unwrap().to_owned()]
+            });
+            config_with_args(args, &root.join(cwd), root, &root.join("member"))
+        };
+        for cwd in ["", "member", "member/src"] {
+            assert_eq!(
+                configured(&first, cwd, None).id(),
+                configured(&second, cwd, None).id(),
+                "equivalent invocation {cwd:?} must share its worker across worktrees"
+            );
+        }
+        assert_eq!(
+            configured(&first, "", Some(&first.join("member/Cargo.toml"))).id(),
+            configured(&second, "", Some(&second.join("member/Cargo.toml"))).id(),
+        );
+        assert_ne!(configured(&first, "", None).id(), configured(&first, "member", None).id());
+        assert_ne!(
+            configured(&first, "member", None).id(),
+            configured(&first, "member/src", None).id(),
+            "nested invocation directories may select different Cargo configuration"
+        );
+        assert_ne!(
+            configured(&first, "", Some(Path::new("/external/a/Cargo.toml"))).id(),
+            configured(&second, "", Some(Path::new("/external/b/Cargo.toml"))).id(),
+        );
+        for root in [&first, &second] {
+            let manifest = Path::new("../external/Cargo.toml");
+            assert_eq!(
+                configured(root, "", Some(manifest)).selection.asked_in,
+                Some(root.join(manifest)),
+                "parent traversal must not gain checkout-relative identity"
+            );
+        }
     }
 
     #[test]
@@ -733,12 +835,20 @@ mod tests {
             });
             let config = config_with_args(args, &cwd, root, &member);
             let asked_in = manifest.as_ref().map_or_else(|| cwd.clone(), |it| cwd.join(it));
-            assert_eq!(config.selection.asked_in.as_deref(), Some(asked_in.as_path()));
+            assert_eq!(
+                config.selection.asked_in.as_ref().map(|path| root.join(path)),
+                Some(asked_in)
+            );
             assert_eq!(config.repository, repository(root));
             assert_eq!(config.project, Path::new("member"));
             // Exercise the worker's actual resolver callback, not just the identity hash.
             // Loading the member must still resolve root defaults when asked from the root.
-            let own = super::super::metadata::own(&config.selection).unwrap();
+            let mut worker_args = config.args(root, &[member.join("src/main.rs")]);
+            worker_args.extend(["--out".into(), "main.o".into()]);
+            let worker_args =
+                crate::Args::parse(worker_args.into_iter().map(|arg| arg.into_string().unwrap()))
+                    .unwrap();
+            let own = super::super::metadata::own(&worker_args.selection).unwrap();
             let (metadata, _) =
                 (own.metadata)(&loaded, Some("x86_64-unknown-linux-gnu"), &[], &Default::default())
                     .unwrap();

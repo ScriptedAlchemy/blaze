@@ -324,11 +324,10 @@ pub(crate) fn target_cfg(
     target: &str,
     env: &BTreeMap<String, String>,
 ) -> Option<Vec<String>> {
-    let nightly = match env.get("RUSTC_BOOTSTRAP").map(String::as_str) {
-        None => false,
-        Some("1") => true,
-        Some(_) => return None,
-    };
+    // This is an unnamed target query, not a crate compilation. Rust 1.99's
+    // crate-scoped RUSTC_BOOTSTRAP list must not disable its stable cfg answer:
+    // only the global value "1" enables nightly cfgs for an unnamed query.
+    let nightly = env.get("RUSTC_BOOTSTRAP").is_some_and(|value| value == "1");
     let toolchain = Toolchain::of(&sysroot.join("bin/rustc"))?;
     let target = toolchain.release.targets.get(target)?;
     let given = Given { opt_level: Some("2"), ..Given::default() };
@@ -593,11 +592,7 @@ pub(super) fn answer(
     if deployment_error(rustc, args, var).is_some() {
         return None;
     }
-    let nightly = match var("RUSTC_BOOTSTRAP") {
-        None => false,
-        Some(it) if it == "1" => true,
-        Some(_) => return None,
-    };
+    let bootstrap = var("RUSTC_BOOTSTRAP");
     let args = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>()?;
     // A driver of rustc's (clippy's) may answer otherwise.
     if rustc.file_stem()? != "rustc" {
@@ -617,6 +612,13 @@ pub(super) fn answer(
         return Some(text.into_bytes());
     }
     let given = Given::of(&args)?;
+    // Rust 1.99's UnstableFeatures::from_environment uses the crate name, if any.
+    // An unnamed toolchain query is stable under a named bootstrap allowlist;
+    // only RUSTC_BOOTSTRAP=1 grants nightly behavior to every crate.
+    let nightly = bootstrap.as_ref().and_then(|value| value.to_str()).is_some_and(|value| {
+        value == "1"
+            || given.crate_name.is_some_and(|name| value.split(',').any(|entry| entry == name))
+    });
     if given.prints.is_empty() || (given.from_stdin && !stdin.trim_ascii().is_empty()) {
         return None;
     }
@@ -674,6 +676,66 @@ pub(super) fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_bootstrap_keeps_unnamed_release_queries_stable() {
+        let directory = tempfile::tempdir().unwrap();
+        let rustc = crate::answers::tests::synthetic_toolchain(directory.path());
+        let query = |args: &[&str], bootstrap: Option<&str>| {
+            let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+            answer(&rustc, &args, &[], &|name| {
+                if name == "RUSTC_BOOTSTRAP" { bootstrap.map(OsString::from) } else { None }
+            })
+        };
+
+        let version = query(&["-vV"], Some("proc_macro_api,proc_macro_srv")).unwrap();
+        assert!(String::from_utf8(version).unwrap().contains("host: aarch64-apple-darwin"));
+
+        let cfg = ["--print", "cfg", "--target", "aarch64-apple-darwin"];
+        let stable = query(&cfg, None).unwrap();
+        assert!(!stable.is_empty());
+        for bootstrap in ["proc_macro_api,proc_macro_srv", "-1", "other_crate", ""] {
+            assert_eq!(query(&cfg, Some(bootstrap)).unwrap(), stable, "{bootstrap}");
+        }
+
+        let gated = [
+            "-Z",
+            "unstable-options",
+            "--print",
+            "target-spec-json",
+            "--target",
+            "aarch64-apple-darwin",
+            "--crate-name",
+            "proc_macro_srv",
+        ];
+        assert!(query(&gated, Some("proc_macro_api,proc_macro_srv")).is_some());
+        assert!(query(&gated, Some("1")).is_some());
+        for bootstrap in [None, Some("proc_macro_api"), Some("other_crate"), Some("-1")] {
+            assert!(query(&gated, bootstrap).is_none(), "{bootstrap:?}");
+        }
+    }
+
+    #[test]
+    fn target_cfg_is_stable_under_scoped_bootstrap_for_release_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::answers::tests::synthetic_toolchain(dir.path());
+        for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let stable = target_cfg(dir.path(), triple, &BTreeMap::new())
+                .expect("the pinned release has this target");
+            assert!(!stable.is_empty(), "{triple}");
+            for scope in ["proc_macro_api,proc_macro_srv", "-1", "", "another_crate"] {
+                let env = BTreeMap::from([("RUSTC_BOOTSTRAP".to_owned(), scope.to_owned())]);
+                assert_eq!(
+                    target_cfg(dir.path(), triple, &env),
+                    Some(stable.clone()),
+                    "{triple}: {scope}"
+                );
+            }
+            let global = BTreeMap::from([("RUSTC_BOOTSTRAP".to_owned(), "1".to_owned())]);
+            assert!(target_cfg(dir.path(), triple, &global).is_some(), "{triple}");
+        }
+        assert!(target_cfg(dir.path(), "not-a-rust-target", &BTreeMap::new()).is_none());
+    }
 
     #[test]
     fn llvm_targets_use_owned_layouts_and_macos_deployment_versions() {

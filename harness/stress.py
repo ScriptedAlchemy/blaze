@@ -8,7 +8,8 @@ applies STEPS in order. The edits stay: each step builds on the ones before. Aft
 sync` is asked for a build, the program is run, and `cargo build` of the same source is run and its
 program's output compared. A step marked broken is one cargo rejects: the daemon has to say
 so and survive it, and the first step after it that cargo builds has to be a patch: the text
-refused leaves the build the next edit is a patch of as it was (issue #31). Writes STRESS.md,
+refused leaves the build the next edit is a patch of as it was (issue #31). Writes STRESS.md
+beside the run's daemon log,
 and exits 1 when a step is wrong.
 """
 import json, os, re, shlex, shutil, subprocess, sys, tempfile, time
@@ -387,11 +388,12 @@ def main():
             restarts += 1
     daemon.kill()
     good = sum(1 for r in rows if r[4] == "same" or r[4].startswith("said so"))
-    with open(os.path.join(HERE, "STRESS.md"), "w") as md:
+    report = os.path.join(work, "STRESS.md")
+    with open(report, "w") as md:
         md.write(f"# Stress edits\n\n{good} of {len(rows)} steps right, {restarts} restarts. Log: {log_path}\n\n| # | Edit | Reply | ms | Result |\n|---|---|---|---:|---|\n")
         for index, name, kind, took, verdict in rows:
             md.write(f"| {index} | {name} | {kind} | {took:.0f} | {verdict} |\n")
-    print(f"{good} of {len(rows)} right, {restarts} restarts; log {log_path}; source {ws}")
+    print(f"{good} of {len(rows)} right, {restarts} restarts; log {log_path}; source {ws}; report {report}")
     sys.exit(0 if good == len(rows) else 1)
 
 

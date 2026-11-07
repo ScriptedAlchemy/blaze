@@ -73,6 +73,7 @@ jobs:
       - name: Check CI helper contracts before compiling
         run: |
           python3 -I .github/scripts/test_changes.py
+          python3 -I .github/scripts/test_cancel_pr_runs.py
           python3 -I .github/scripts/test_bundle_integrity.py
           python3 -I .github/scripts/test_bundle_transport.py
           python3 -I .github/scripts/test_bundle_build.py
@@ -120,7 +121,7 @@ jobs:
     uses: ./.github/workflows/bundle.yaml
     with:
       platform: macos-arm64
-      os: macos-15
+      os: macos-26
       base-sha: ${{ github.event.pull_request.base.sha }}
       cache-write: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/dist/') }}
 
@@ -139,7 +140,7 @@ jobs:
     uses: ./.github/workflows/bundle-check.yaml
     with:
       platform: macos-arm64
-      os: macos-15
+      os: macos-26
       bundle-sha256: ${{ needs.build-macos.outputs.sha256 }}
 
   serve:
@@ -202,7 +203,7 @@ jobs:
     uses: ./.github/workflows/blaze-dist-review.yaml
     with:
       platform: macos-arm64
-      os: macos-15
+      os: macos-26
       bundle-sha256: ${{ needs.build-macos.outputs.sha256 }}
       lanes: '["saved-llvm", "saved-cranelift", "basic", "profiles-native", "commands", "workspace nested"]'
 

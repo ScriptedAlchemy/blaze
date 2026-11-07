@@ -19,7 +19,7 @@ use hir_def::{
     resolver::{HasResolver, ValueNs},
     signatures::{EnumSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
 };
-use hir_expand::{InFile, mod_path::path};
+use hir_expand::mod_path::path;
 use la_arena::ArenaMap;
 use macros::GenericTypeVisitable;
 use rustc_abi::{Size, TargetDataLayout};
@@ -34,9 +34,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind, Region as _, SliceLike, Ty as _},
 };
 use salsa::SalsaValue;
-use span::FileId;
 use stdx::never;
-use syntax::{SyntaxNodePtr, TextRange};
 use triomphe::Arc;
 
 use crate::{
@@ -62,7 +60,10 @@ use super::{
     StatementKind, StoredPlace, TerminatorKind, UnOp, return_slot,
 };
 
+mod caller_location;
 mod shim;
+
+use caller_location::CallerLocation;
 
 macro_rules! from_bytes {
     // A `usize` of the target, which is as wide as what holds it.
@@ -171,7 +172,7 @@ struct StackFrame<'db> {
 
 #[derive(Clone)]
 enum MirOrDynIndex<'db> {
-    Mir(&'db MirBody<'db>),
+    Mir { function: FunctionId, body: &'db MirBody<'db> },
     Dyn(usize),
 }
 
@@ -194,6 +195,9 @@ pub struct Evaluator<'db> {
     /// doesn't say how much memory it can reach, its allocation does.
     allocations: [Vec<Allocated>; 2],
     code_stack: Vec<StackFrame<'db>>,
+    caller_locations: FxHashMap<(String, u32, u32), Address>,
+    caller_location_files: FxHashMap<String, Address>,
+    source_names: RefCell<FxHashMap<base_db::FileId, Option<String>>>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
     static_locations: FxHashMap<StaticId, Address>,
@@ -481,9 +485,11 @@ type Result<'db, T> = std::result::Result<T, MirEvalError<'db>>;
 struct Locals<'db> {
     ptr: ArenaMap<LocalId, Interval>,
     body: &'db MirBody<'db>,
+    caller_location: Option<CallerLocation<'db>>,
 }
 
 pub struct MirOutput {
+    pub(crate) source_names: Vec<base_db::CurrentSourceName>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -510,17 +516,27 @@ pub fn interpret_mir<'db>(
 ) -> Result<'db, (Result<'db, Allocation<'db>>, MirOutput)> {
     let ty = body.locals[return_slot()].ty.as_ref();
     let mut read_statics = FxHashSet::default();
+    let mut source_names = FxHashMap::default();
     loop {
         let mut evaluator =
             Evaluator::new(db, body.owner, assert_placeholder_ty_is_unused, trait_env)?;
         evaluator.read_statics = Some(read_statics.clone());
         let it = evaluator.evaluate(body, ty);
+        source_names.extend(evaluator.source_names.into_inner());
         if let Some(read) = evaluator.missing_static.take()
             && read_statics.insert(read)
         {
             continue;
         }
-        return Ok((it, MirOutput { stdout: evaluator.stdout, stderr: evaluator.stderr }));
+        let mut source_names: Vec<_> = source_names
+            .into_iter()
+            .map(|(file, name)| base_db::CurrentSourceName { file, name })
+            .collect();
+        source_names.sort_by_key(|read| read.file.index());
+        return Ok((
+            it,
+            MirOutput { source_names, stdout: evaluator.stdout, stderr: evaluator.stderr },
+        ));
     }
 }
 
@@ -530,12 +546,28 @@ const EXECUTION_LIMIT: usize = 100_000;
 const EXECUTION_LIMIT: usize = 10_000_000;
 
 impl<'db> Evaluator<'db> {
+    fn source_name(&self, file: base_db::FileId) -> Option<String> {
+        let name = crate::mir::location::source_name(self.db, file);
+        self.source_names.borrow_mut().insert(file, name.clone());
+        name
+    }
+
+    fn observe<T>(&self, result: crate::consteval::WithSourceNames<T>) -> T {
+        self.source_names
+            .borrow_mut()
+            .extend(result.source_names.into_iter().map(|read| (read.file, read.name)));
+        result.value
+    }
+
     /// Runs a body without arguments and takes its result out of the evaluator's memory.
     fn evaluate(&mut self, body: &'db MirBody<'db>, ty: Ty<'db>) -> Result<'db, Allocation<'db>> {
-        let interval = self.interpret_mir(body, None.into_iter())?;
+        let interval = self.interpret_mir(body, None.into_iter(), None)?;
         let bytes = interval.get(self)?;
-        let mut memory_map =
-            self.create_memory_map(bytes, ty, &Locals { ptr: ArenaMap::new(), body })?;
+        let mut memory_map = self.create_memory_map(
+            bytes,
+            ty,
+            &Locals { ptr: ArenaMap::new(), body, caller_location: None },
+        )?;
         // The ids made here are not rustc's hashes and mean nothing outside this evaluation,
         // so a constant that may hold one says what each is of. A `TypeId` is pointers to
         // const eval, which cannot read them as integers, so no other value is computed from
@@ -593,6 +625,9 @@ impl<'db> Evaluator<'db> {
             heap: vec![0],
             allocations: Default::default(),
             code_stack: vec![],
+            caller_locations: FxHashMap::default(),
+            source_names: RefCell::new(FxHashMap::default()),
+            caller_location_files: FxHashMap::default(),
             vtable_map: VTableMap::default(),
             thread_local_storage: TlsData::default(),
             static_locations: Default::default(),
@@ -655,37 +690,6 @@ impl<'db> Evaluator<'db> {
 
     fn ptr_size(&self) -> usize {
         self.cached_ptr_size
-    }
-
-    fn resolve_mir_span(
-        &self,
-        owner: InferBodyId<'db>,
-        span: MirSpan,
-    ) -> Option<(FileId, TextRange)> {
-        let (source_map, self_param_syntax) = match owner {
-            InferBodyId::DefWithBodyId(def) => {
-                let body = &Body::with_source_map(self.db, def).1;
-                (&**body, body.self_param_syntax())
-            }
-            InferBodyId::AnonConstId(def) => {
-                (ExpressionStore::with_source_map(self.db, def.loc(self.db).owner).1, None)
-            }
-        };
-        let span: InFile<SyntaxNodePtr> = match span {
-            MirSpan::ExprId(e) | MirSpan::ExprEnd(e) => {
-                source_map.expr_syntax(e).ok()?.map(|it| it.into())
-            }
-            MirSpan::PatId(p) => source_map.pat_syntax(p).ok()?.map(|it| it.syntax_node_ptr()),
-            MirSpan::BindingId(b) => source_map
-                .patterns_for_binding(b)
-                .iter()
-                .find_map(|p| source_map.pat_syntax(*p).ok())?
-                .map(|it| it.syntax_node_ptr()),
-            MirSpan::SelfParam => self_param_syntax?.map(|it| it.syntax_node_ptr()),
-            MirSpan::Unknown => return None,
-        };
-        let file_id = span.file_id.original_file(self.db);
-        Some((file_id.file_id(self.db), span.value.text_range()))
     }
 
     fn projected_ty(&self, ty: PlaceTy<'db>, proj: PlaceElem) -> PlaceTy<'db> {
@@ -867,6 +871,7 @@ impl<'db> Evaluator<'db> {
         &mut self,
         body: &'db MirBody<'db>,
         args: impl Iterator<Item = IntervalOrOwned>,
+        caller_location: Option<CallerLocation<'db>>,
     ) -> Result<'db, Interval> {
         if let Some(it) = self.stack_depth_limit.checked_sub(1) {
             self.stack_depth_limit = it;
@@ -876,6 +881,7 @@ impl<'db> Evaluator<'db> {
         let mut current_block_idx = body.start_block;
         let (mut locals, prev_stack_ptr) = self.create_locals_for_body(body, None)?;
         self.fill_locals_for_body(body, &mut locals, args)?;
+        locals.caller_location = caller_location;
         let prev_code_stack = mem::take(&mut self.code_stack);
         let span = (MirSpan::Unknown, body.owner);
         self.code_stack.push(StackFrame { locals, destination: None, prev_stack_ptr, span });
@@ -959,7 +965,12 @@ impl<'db> Evaluator<'db> {
                                     *target,
                                     terminator.span,
                                 )?,
-                                it => not_supported!("unknown function type {it:?}"),
+                                _ => {
+                                    return Err(MirEvalError::NotSupported(format!(
+                                        "unknown function type {}",
+                                        super::lower::diagnostic::stable_type(self.db, fn_ty)
+                                    )));
+                                }
                             };
                             if let Some(stack_frame) = stack_frame {
                                 self.code_stack.push(my_stack_frame);
@@ -1067,9 +1078,10 @@ impl<'db> Evaluator<'db> {
         }
         let mut locals =
             match self.unused_locals_store.borrow_mut().entry(body.owner).or_default().pop() {
-                None => Locals { ptr: ArenaMap::new(), body },
+                None => Locals { ptr: ArenaMap::new(), body, caller_location: None },
                 Some(mut l) => {
                     l.body = body;
+                    l.caller_location = None;
                     l
                 }
             };
@@ -1816,8 +1828,11 @@ impl<'db> Evaluator<'db> {
                     r.extend(word_bytes(len));
                     Owned(r)
                 }
-                t => {
-                    not_supported!("slice unsizing from non array type {t:?}")
+                _ => {
+                    return Err(MirEvalError::NotSupported(format!(
+                        "slice unsizing from non array type {}",
+                        super::lower::diagnostic::stable_type(self.db, current_ty)
+                    )));
                 }
             },
             TyKind::Dynamic(..) => {
@@ -1989,12 +2004,17 @@ impl<'db> Evaluator<'db> {
         locals: &Locals<'db>,
     ) -> Result<'db, Option<Interval>> {
         use crate::mir::location::Placed;
-        let (Some(MirSpan::ExprId(expr)), InferBodyId::DefWithBodyId(owner)) =
-            (it.span, locals.body.owner)
-        else {
+        let Some(MirSpan::ExprId(expr)) = it.span else {
             return Ok(None);
         };
-        Ok(match (crate::mir::location::placed(self.db, owner, expr), ty.kind()) {
+        let owner = locals.body.owner.expression_store_owner(self.db);
+        let placed = crate::mir::location::placed_with_source_names(self.db, owner, expr, |file| {
+            self.source_name(file)
+        });
+        Ok(match (placed, ty.kind()) {
+            (Some(Placed::Unavailable), _) => {
+                not_supported!("source location literal without a source name or location")
+            }
             (Some(Placed::Number(number)), TyKind::Uint(rustc_type_ir::UintTy::U32)) => {
                 let addr = self.heap_allocate(4, 4)?;
                 self.write_memory(addr, &number.to_le_bytes())?;
@@ -2222,21 +2242,32 @@ impl<'db> Evaluator<'db> {
                     return self.inline_const_in_heap(konst, subst, locals);
                 }
                 let allocation = match id {
-                    GeneralConstId::ConstId(const_id) => {
-                        self.db.const_eval(const_id, subst, Some(self.param_env)).map_err(|e| {
+                    GeneralConstId::ConstId(const_id) => self
+                        .observe(crate::consteval::const_eval_with_source_names(
+                            self.db,
+                            const_id,
+                            subst,
+                            Some(self.param_env),
+                        ))
+                        .map_err(|e| {
                             let name = id.name(self.db);
                             MirEvalError::ConstEvalError(name, Box::new(e))
-                        })?
-                    }
-                    GeneralConstId::StaticId(static_id) => {
-                        self.db.const_eval_static(static_id).map_err(|e| {
+                        })?,
+                    GeneralConstId::StaticId(static_id) => self
+                        .observe(crate::consteval::const_eval_static_with_source_names(
+                            self.db, static_id,
+                        ))
+                        .map_err(|e| {
                             let name = id.name(self.db);
                             MirEvalError::ConstEvalError(name, Box::new(e))
-                        })?
-                    }
+                        })?,
                     GeneralConstId::AnonConstId(anon_const_id) => self
-                        .db
-                        .anon_const_eval(anon_const_id, subst, Some(self.param_env))
+                        .observe(crate::consteval::anon_const_eval_with_source_names(
+                            self.db,
+                            anon_const_id,
+                            subst,
+                            Some(self.param_env),
+                        ))
                         .map_err(|e| {
                             let name = id.name(self.db);
                             MirEvalError::ConstEvalError(name, Box::new(e))
@@ -2267,7 +2298,7 @@ impl<'db> Evaluator<'db> {
             MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e.clone())))
         })?;
         let previous_context = std::mem::replace(&mut self.const_context, true);
-        let result = self.interpret_mir(body, iter::empty());
+        let result = self.interpret_mir(body, iter::empty(), None);
         self.const_context = previous_context;
         let result = result?;
         let ty = body.locals[return_slot()].ty.as_ref();
@@ -3185,7 +3216,32 @@ impl<'db> Evaluator<'db> {
         use rustc_type_ir::TyKind;
         match next_ty.kind() {
             TyKind::FnDef(def, generic_args) => {
-                self.exec_fn_def(def.0, generic_args, destination, args, locals, target_bb, span)
+                let (def, generic_args) = if let CallableDefId::FunctionId(function) = def.0 {
+                    let (implementation, args) =
+                        self.db.lookup_impl_method(self.param_env, function, generic_args);
+                    match implementation {
+                        Either::Left(function) => (CallableDefId::FunctionId(function), args),
+                        Either::Right(_) => (def.0, generic_args),
+                    }
+                } else {
+                    (def.0, generic_args)
+                };
+                let shim;
+                let locals = if let CallableDefId::FunctionId(function) = def
+                    && super::location::tracks_caller(self.db, function)
+                {
+                    // Reifying a tracked function creates rustc's untracked shim: calls through
+                    // the pointer report the function's declaration, not the indirect call site.
+                    shim = Locals {
+                        ptr: locals.ptr.clone(),
+                        body: locals.body,
+                        caller_location: Some(CallerLocation::Declaration(function)),
+                    };
+                    &shim
+                } else {
+                    locals
+                };
+                self.exec_fn_def(def, generic_args, destination, args, locals, target_bb, span)
             }
             TyKind::Closure(id, generic_args) => self.exec_closure(
                 id.0,
@@ -3237,7 +3293,7 @@ impl<'db> Evaluator<'db> {
             .chain(args.iter().map(|it| Ok(it.get(self)?.to_owned())))
             .collect::<Result<'db, Vec<_>>>()?;
         let interval = self
-            .interpret_mir(mir_body, arg_bytes.into_iter().map(IntervalOrOwned::Owned))
+            .interpret_mir(mir_body, arg_bytes.into_iter().map(IntervalOrOwned::Owned), None)
             .map_err(|e| {
                 MirEvalError::InFunction(
                     Box::new(e),
@@ -3356,7 +3412,7 @@ impl<'db> Evaluator<'db> {
                     vec![(Either::Left(imp), span, locals.body.owner)],
                 )
             })?;
-            MirOrDynIndex::Mir(mir_body)
+            MirOrDynIndex::Mir { function: imp, body: mir_body }
         };
         self.mir_or_dyn_index_cache.borrow_mut().insert(pair, r.clone());
         Ok(r)
@@ -3408,6 +3464,25 @@ impl<'db> Evaluator<'db> {
                         .enumerate()
                         .map(|(i, it)| if i == self_ty_idx { ty.into() } else { it }),
                 );
+                // An untracked vtable entry reifies an impl-only tracked method through an
+                // untracked shim, just as a function pointer does. Tracking on the trait
+                // declaration instead preserves the dynamic call site.
+                // https://github.com/rust-lang/rust/blob/main/compiler/rustc_ty_utils/src/instance.rs
+                let shim;
+                let locals = if !super::location::tracks_caller(self.db, def)
+                    && let (Either::Left(function), _) =
+                        self.db.lookup_impl_method(self.param_env, def, generics_for_target)
+                    && super::location::tracks_caller(self.db, function)
+                {
+                    shim = Locals {
+                        ptr: locals.ptr.clone(),
+                        body: locals.body,
+                        caller_location: Some(CallerLocation::Declaration(function)),
+                    };
+                    &shim
+                } else {
+                    locals
+                };
                 self.exec_fn_with_args(
                     def,
                     &args_for_target,
@@ -3418,10 +3493,10 @@ impl<'db> Evaluator<'db> {
                     span,
                 )
             }
-            MirOrDynIndex::Mir(body) => self.exec_looked_up_function(
+            MirOrDynIndex::Mir { function, body } => self.exec_looked_up_function(
                 body,
                 locals,
-                def,
+                function,
                 arg_bytes,
                 span,
                 destination,
@@ -3440,14 +3515,23 @@ impl<'db> Evaluator<'db> {
         destination: Interval,
         target_bb: Option<BasicBlockId>,
     ) -> Result<'db, Option<StackFrame<'db>>> {
+        let caller_location = super::location::tracks_caller(self.db, def).then(|| {
+            locals.caller_location.unwrap_or(CallerLocation::Call(locals.body.owner, span))
+        });
         if let Some(target_bb) = target_bb {
+            let site = (span, locals.body.owner);
             let (mut locals, prev_stack_ptr) =
                 self.create_locals_for_body(mir_body, Some(destination))?;
             self.fill_locals_for_body(mir_body, &mut locals, arg_bytes.into_iter())?;
-            let span = (span, locals.body.owner);
-            Ok(Some(StackFrame { locals, destination: Some(target_bb), prev_stack_ptr, span }))
+            locals.caller_location = caller_location;
+            Ok(Some(StackFrame {
+                locals,
+                destination: Some(target_bb),
+                prev_stack_ptr,
+                span: site,
+            }))
         } else {
-            let result = self.interpret_mir(mir_body, arg_bytes).map_err(|e| {
+            let result = self.interpret_mir(mir_body, arg_bytes, caller_location).map_err(|e| {
                 MirEvalError::InFunction(
                     Box::new(e),
                     vec![(Either::Left(def), span, locals.body.owner)],
@@ -3473,7 +3557,14 @@ impl<'db> Evaluator<'db> {
             .ok_or_else(|| MirEvalError::InternalError("fn trait with no arg".into()))?;
         let mut func_ty = func.ty;
         let mut func_data = func.interval;
-        while let TyKind::Ref(_, z, _) = func_ty.kind() {
+        let mut fn_item_shim = Some(def);
+        while let TyKind::Ref(_, z, mutability) = func_ty.kind() {
+            // The reference blanket impl forwards to Fn or FnMut before the item shim.
+            // https://doc.rust-lang.org/stable/src/core/ops/function.rs.html
+            fn_item_shim = match mutability {
+                Mutability::Not => self.cached_fn_trait_func,
+                Mutability::Mut => self.cached_fn_mut_trait_func,
+            };
             func_ty = z;
             if matches!(func_ty.kind(), TyKind::Dynamic(..)) {
                 let id =
@@ -3485,8 +3576,39 @@ impl<'db> Evaluator<'db> {
             func_data = Interval { addr: Address::from_bytes(func_data.get(self)?)?, size };
         }
         match func_ty.kind() {
-            TyKind::FnDef(def, subst) => {
-                self.exec_fn_def(def.0, subst, destination, &args[1..], locals, target_bb, span)
+            TyKind::FnDef(callable, subst) => {
+                let tracked = if let CallableDefId::FunctionId(function) = callable.0 {
+                    let (function, _) = self.db.lookup_impl_method(self.param_env, function, subst);
+                    matches!(function, Either::Left(function) if super::location::tracks_caller(self.db, function))
+                } else {
+                    false
+                };
+                let shim;
+                let locals = if tracked {
+                    // rustc's Fn-item shim is untracked and uses the Fn trait method's span.
+                    // https://github.com/rust-lang/rust/blob/main/compiler/rustc_mir_transform/src/shim.rs
+                    shim = Locals {
+                        ptr: locals.ptr.clone(),
+                        body: locals.body,
+                        caller_location: Some(CallerLocation::Declaration(
+                            fn_item_shim.ok_or_else(|| {
+                                MirEvalError::InternalError("missing Fn-item shim method".into())
+                            })?,
+                        )),
+                    };
+                    &shim
+                } else {
+                    locals
+                };
+                self.exec_fn_def(
+                    callable.0,
+                    subst,
+                    destination,
+                    &args[1..],
+                    locals,
+                    target_bb,
+                    span,
+                )
             }
             TyKind::FnPtr(..) => {
                 self.exec_fn_pointer(func_data, destination, &args[1..], locals, target_bb, span)
@@ -3551,9 +3673,11 @@ impl<'db> Evaluator<'db> {
             }
             Interval::new(addr, size)
         } else if !static_data.flags.contains(StaticFlags::EXTERN) {
-            let allocation = self.db.const_eval_static(st).map_err(|e| {
-                MirEvalError::ConstEvalError(static_data.name.as_str().to_owned(), Box::new(e))
-            })?;
+            let allocation = self
+                .observe(crate::consteval::const_eval_static_with_source_names(self.db, st))
+                .map_err(|e| {
+                    MirEvalError::ConstEvalError(static_data.name.as_str().to_owned(), Box::new(e))
+                })?;
             let (size, align) =
                 self.size_align_of(allocation.ty, locals)?.unwrap_or((allocation.memory.len(), 1));
             let result = Interval::new(self.heap_allocate(size, align)?, size);
@@ -3583,7 +3707,8 @@ impl<'db> Evaluator<'db> {
     }
 
     fn const_eval_discriminant(&self, variant: EnumVariantId) -> Result<'db, i128> {
-        let r = self.db.const_eval_discriminant(variant);
+        let r = self
+            .observe(crate::consteval::const_eval_discriminant_with_source_names(self.db, variant));
         match r {
             Ok(r) => Ok(r),
             Err(e) => {
@@ -3748,6 +3873,7 @@ pub fn render_const_using_debug_impl<'db>(
     let mut evaluator = Evaluator::new(db, owner, false, None)?;
     let locals = &Locals {
         ptr: ArenaMap::new(),
+        caller_location: None,
         body: db
             .runtime_mir_body(owner)
             .map_err(|_| MirEvalError::NotSupported("unreachable".to_owned()))?,
@@ -3796,6 +3922,7 @@ pub fn render_const_using_debug_impl<'db>(
         db.runtime_mir_body(format_fn.into())
             .map_err(|e| MirEvalError::MirLowerError(format_fn, e))?,
         [IntervalOrOwned::Borrowed(Interval { addr: arguments, size: ptr_size * 2 })].into_iter(),
+        None,
     )?;
     let message_string = interval.get(&evaluator)?;
     let words = [

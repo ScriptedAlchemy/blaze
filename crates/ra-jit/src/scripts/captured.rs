@@ -430,7 +430,7 @@ pub(crate) fn run_with_context(
     let lease = load_cargo::proc_macro_producer_lifetime::lease(&generation)?;
     load_cargo::proc_macro_producer_lifetime::collect(&generations, &generation)?;
     let probe = generation.join("producer-rustc");
-    crate::answers::producer_launcher(&probe)?;
+    crate::answers::producer_launcher(&probe, sysroot)?;
     let failure = generation.join("unsupported-probe");
     let env_map = probe_environment(&environment, &probe, &failure);
     let compiler_env_map =

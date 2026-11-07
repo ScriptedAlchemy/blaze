@@ -19,6 +19,9 @@ use vfs::Vfs;
 
 use crate::{Args, Parts, Sources, Watched, WatchedFile};
 
+pub(crate) const EXPANSION_ERRORS: &[&str] =
+    &["syntax-error", "macro-error", "macro-def-error", "non-unicode-env", "unresolved-macro-call"];
+
 /// An included expression is allowed to be non-item source, but the expression
 /// parser's ERROR recovery root is not evidence of a valid expression. That
 /// parser can consume trailing items without reporting an error for them.
@@ -31,6 +34,591 @@ pub(crate) fn expression_input(text: &str, edition: syntax::Edition) -> bool {
 #[cfg(test)]
 mod syntax_tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_source_probe_validates_release_features() {
+        let directory = tempfile::tempdir().unwrap();
+        let sysroot = directory.path().join("toolchain");
+        crate::answers::tests::synthetic_toolchain(&sysroot);
+        for name in ["core", "std"] {
+            let root = sysroot.join("lib/rustlib/src/rust/library").join(name).join("src");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("lib.rs"), "").unwrap();
+        }
+        let source = directory.path().join("lib.rs");
+        let plan = crate::cargo::own_script::planned_description(
+            &sysroot,
+            vec![crate::cargo::own_script::Planned {
+                out_dir: None,
+                workspace_member: false,
+                name: "probe".into(),
+                root: source.clone(),
+                edition: "2021".into(),
+                cfg: vec![],
+                codegen_flags: vec![],
+                env: Default::default(),
+                deps: vec![],
+                proc_macro: None,
+            }],
+        );
+        let mut plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        plan["compiler_mode"] = serde_json::json!(true);
+        plan["crates"][0]["build"] =
+            serde_json::json!({"target_kind":"lib", "label":"probe", "build_file": source});
+        let project = directory.path().join("rust-project.json");
+        std::fs::write(&project, serde_json::to_vec(&plan).unwrap()).unwrap();
+        for (feature, bootstrap, expected) in [
+            ("never_type", true, true),
+            ("never_type", false, false),
+            ("never_existed_blaze_probe", true, false),
+            ("box_syntax", true, false),
+            ("associated_type_bounds", true, true),
+            ("test_accepted_feature", true, true),
+            ("test_accepted_feature", false, false),
+            ("never_type_fallback", true, false),
+            ("never_type_fallback", false, false),
+            ("proc_macro_span", true, false),
+            ("proc_macro_span", false, false),
+        ] {
+            plan["crates"][0]["env"] =
+                serde_json::json!({"RUSTC_BOOTSTRAP": if bootstrap { "1" } else { "-1" }});
+            std::fs::write(&project, serde_json::to_vec(&plan).unwrap()).unwrap();
+            std::fs::write(&source, format!("#![no_std]\n#![feature({feature})]\n")).unwrap();
+            let args = Args::parse(
+                [
+                    project.display().to_string(),
+                    "--crate".into(),
+                    "probe".into(),
+                    "--out".into(),
+                    directory.path().join("unused.o").display().to_string(),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+            assert_eq!(
+                super::source(args, bootstrap).unwrap(),
+                expected,
+                "{feature}, bootstrap={bootstrap}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_library_features_follow_effective_loaded_declarations() {
+        use test_fixture::WithFixture;
+
+        for (staging, expected) in [("", Some("E0635")), ("#![feature(staged_api)]", None)] {
+            let (db, _) = RootDatabase::with_single_file(&format!(
+                "//- /main.rs crate:probe\n#![feature(probe_unknown)]\n{staging}\n#[unstable(feature=\"probe_unknown\", issue=\"none\")] pub fn api() {{}}\n"
+            ));
+            let krate = ide_db::base_db::all_crates(&db)[0];
+            let errors = hir::Crate::from(krate).invalid_features(&db);
+            assert_eq!(errors.first().map(|it| it.0), expected, "{staging}: {errors:?}");
+        }
+
+        let cases = [
+            (
+                "extern crate dep;",
+                "#[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;",
+                "probe_gate",
+                None,
+            ),
+            (
+                "use dep::Api;",
+                "#[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;",
+                "probe_gate",
+                None,
+            ),
+            (
+                "",
+                "#[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;",
+                "probe_gate",
+                Some("E0635"),
+            ),
+            (
+                "#[cfg(any())] extern crate dep;",
+                "#[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;",
+                "probe_gate",
+                Some("E0635"),
+            ),
+            (
+                "extern crate dep;",
+                "#[cfg(any())] #[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;",
+                "probe_gate",
+                Some("E0635"),
+            ),
+            (
+                "extern crate dep;",
+                "#[cfg_attr(all(), stable(feature=\"probe_gate\", since=\"1.0.0\"))] pub struct Api;",
+                "probe_gate",
+                None,
+            ),
+            (
+                "extern crate dep;",
+                "macro_rules! make { () => { #[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api; } } make!();",
+                "probe_gate",
+                None,
+            ),
+            (
+                "extern crate dep;",
+                "macro_rules! unused { () => { #[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api; } }",
+                "probe_gate",
+                Some("E0635"),
+            ),
+            (
+                "extern crate dep;",
+                "#[unstable(feature=\"probe_gate\", issue=\"none\", old_name=\"old_probe_gate\")] pub struct Api;",
+                "old_probe_gate",
+                Some("E0635"),
+            ),
+            (
+                "extern crate dep;",
+                "#![unstable_removed(feature=\"probe_gate\", reason=\"removed\", since=\"1.0.0\")]",
+                "probe_gate",
+                Some("E0557"),
+            ),
+            (
+                "extern crate dep;",
+                "pub struct Api { #[unstable(feature=\"probe_gate\", issue=\"none\")] pub value: u8 }",
+                "probe_gate",
+                None,
+            ),
+        ];
+        for (usage, dependency, feature, expected) in cases {
+            let fixture = format!(
+                "//- /main.rs crate:root deps:dep\n#![feature({feature})]\n{usage}\nfn main() {{}}\n//- /dep.rs crate:dep\n{dependency}\n"
+            );
+            let (db, _) = RootDatabase::with_many_files(&fixture);
+            let root = ide_db::base_db::all_crates(&db)
+                .iter()
+                .copied()
+                .find(|krate| {
+                    hir::Crate::from(*krate)
+                        .display_name(&db)
+                        .is_some_and(|name| name.as_str() == "root")
+                })
+                .unwrap();
+            let errors = hir::Crate::from(root).invalid_features(&db);
+            assert_eq!(
+                errors.first().map(|it| it.0),
+                expected,
+                "{usage}\n{dependency}\n{errors:?}"
+            );
+        }
+        for (outer, expected) in
+            [("pub fn value() {}", Some("E0635")), ("pub use dep::Api; pub fn value() {}", None)]
+        {
+            let fixture = format!(
+                "//- /main.rs crate:root deps:outer\n#![feature(probe_gate)]\nextern crate outer;\nfn main() {{ outer::value(); }}\n//- /outer.rs crate:outer deps:dep\n{outer}\n//- /dep.rs crate:dep\n#[unstable(feature=\"probe_gate\", issue=\"none\")] pub struct Api;\n"
+            );
+            let (db, _) = RootDatabase::with_many_files(&fixture);
+            let root = ide_db::base_db::all_crates(&db)
+                .iter()
+                .copied()
+                .find(|krate| {
+                    hir::Crate::from(*krate)
+                        .display_name(&db)
+                        .is_some_and(|name| name.as_str() == "root")
+                })
+                .unwrap();
+            let errors = hir::Crate::from(root).invalid_features(&db);
+            assert_eq!(errors.first().map(|it| it.0), expected, "{outer}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn bootstrap_language_features_preserve_release_dependencies_and_solver_policy() {
+        use ide_db::base_db::salsa::Setter as _;
+        use test_fixture::WithFixture;
+
+        for (features, flags, valid) in [
+            ("unsized_const_params", "", false),
+            ("unsized_const_params,adt_const_params", "", true),
+            ("macroless_generic_const_args", "", false),
+            ("macroless_generic_const_args,min_generic_const_args", "", true),
+            ("generic_const_args,min_generic_const_args", "", false),
+            ("generic_const_args,min_generic_const_args", "-Znext-solver=globally", true),
+            ("generic_const_args,min_generic_const_args", "-Z next-solver", true),
+            ("generic_const_args,min_generic_const_args", "-Znext-solver=coherence", false),
+            ("generic_const_exprs", "", true),
+            ("generic_const_exprs", "-Znext-solver=globally", false),
+            ("generic_const_exprs", "-Znext-solver=coherence", true),
+            ("generic_const_exprs", "-Znext-solver -Znext-solver=no", true),
+            ("ref_pat_eat_one_layer_2024,ref_pat_eat_one_layer_2024_structural", "", false),
+        ] {
+            let (mut db, _) = RootDatabase::with_single_file(&format!(
+                "//- /main.rs crate:probe\n#![feature({features})]\n"
+            ));
+            let krate = ide_db::base_db::all_crates(&db)[0];
+            let mut data = krate.data(&db).clone();
+            data.codegen_flags = flags.split_ascii_whitespace().map(str::to_owned).collect();
+            krate.set_data(&mut db).to(data);
+            let errors = hir::Crate::from(krate).invalid_features(&db);
+            assert_eq!(errors.is_empty(), valid, "{features} {flags}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn cold_admission_checks_unreachable_bodies_and_cached_source_changes() {
+        use test_fixture::WithFixture;
+
+        let source = "fn main() {}\nfn broken() -> u32 { \"text\" }\n";
+        let (mut db, file) =
+            RootDatabase::with_single_file(&format!("//- /main.rs crate:app\n{source}"));
+        let file = file.file_id(&db);
+        let args = Args::parse(
+            ["project", "--crate", "app", "--out", "app.o"].into_iter().map(str::to_owned),
+        )
+        .unwrap();
+        let files = [WatchedFile {
+            file: Watched::Source(file),
+            path: PathBuf::from("/main.rs"),
+            mtime: SystemTime::now(),
+        }];
+        let first = admission(&db, &args, &files)
+            .unwrap()
+            .expect("a cold build must reject a type error in an unreachable body");
+        assert!(first.0.iter().any(|it| it.code.as_deref() == Some("E0308")));
+        assert_eq!(admission(&db, &args, &files).unwrap(), Some(first));
+
+        let mut fixed = ChangeWithProcMacros::default();
+        fixed.change_file(file, Some("fn main() {}\nfn broken() -> u32 { 7 }\n".into()));
+        db.apply_change(fixed);
+        assert!(admission(&db, &args, &files).unwrap().is_none());
+        assert!(admission(&db, &args, &files).unwrap().is_none());
+
+        let mut broken = ChangeWithProcMacros::default();
+        broken.change_file(file, Some(source.into()));
+        db.apply_change(broken);
+        assert!(admission(&db, &args, &files).unwrap().is_some());
+    }
+
+    #[test]
+    fn cold_admission_checks_selected_dependencies_and_active_configuration() {
+        use test_fixture::WithFixture;
+
+        let args = Args::parse(
+            ["project", "--crate", "app", "--out", "app.o"].into_iter().map(str::to_owned),
+        )
+        .unwrap();
+        for (body, rejected) in [
+            ("pub fn broken() -> u32 { \"text\" }", true),
+            ("#[cfg(any())] pub fn broken() -> u32 { \"text\" }", false),
+            ("pub fn broken() -> u32 { 7 }", false),
+        ] {
+            let fixture = format!(
+                "//- /main.rs crate:app deps:dep\nfn main() {{ dep::value(); }}\n\
+                 //- /dep.rs crate:dep\npub fn value() -> u32 {{ 1 }}\n{body}\n\
+                 //- /unselected.rs crate:unselected\nfn broken() -> u32 {{ \"text\" }}\n"
+            );
+            let (db, _) = RootDatabase::with_many_files(&fixture);
+            assert_eq!(admission(&db, &args, &[]).unwrap().is_some(), rejected, "{body}");
+        }
+    }
+
+    #[test]
+    fn cold_admission_uses_the_builds_lint_cap() {
+        use test_fixture::WithFixture;
+
+        let (db, _) = RootDatabase::with_single_file(
+            "//- /main.rs crate:app\n#![deny(non_snake_case)]\nfn main() {}\npub fn Denied() {}\n",
+        );
+        let mut args = Args::parse(
+            ["project", "--crate", "app", "--out", "app.o"].into_iter().map(str::to_owned),
+        )
+        .unwrap();
+        assert!(admission(&db, &args, &[]).unwrap().is_some());
+        args.lints_capped = true;
+        assert!(admission(&db, &args, &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn cold_admission_checks_stable_feature_attributes_and_bootstrap_policy() {
+        use ide_db::base_db::{Env, set_process_env};
+        use test_fixture::WithFixture;
+
+        let (mut db, _) = RootDatabase::with_single_file(
+            "//- /main.rs crate:gated\n#![feature(never_type)]\nfn main() {}\n",
+        );
+        let args = Args::parse(
+            ["project", "--crate", "gated", "--out", "gated.o"].into_iter().map(str::to_owned),
+        )
+        .unwrap();
+        for (bootstrap, rejected) in [
+            (None, true),
+            (Some("1"), false),
+            (Some("-1"), true),
+            (Some("gated"), false),
+            (Some("other"), true),
+            (Some("gated,other"), false),
+            (Some("1,other"), true),
+            (Some("-gated"), true),
+            (Some(" gated"), true),
+        ] {
+            let environment =
+                bootstrap.map(|value| ("RUSTC_BOOTSTRAP".to_owned(), value.to_owned())).into_iter();
+            set_process_env(&mut db, Env::from_iter(environment));
+            let said = admission(&db, &args, &[]).unwrap();
+            assert_eq!(said.is_some(), rejected, "bootstrap {bootstrap:?}");
+            if let Some(said) = said {
+                assert!(said.0.iter().any(|it| it.code.as_deref() == Some("E0554")));
+            }
+        }
+
+        set_process_env(&mut db, Env::from_iter([("RUSTC_BOOTSTRAP".into(), "1".into())]));
+        let krate = ide_db::base_db::all_crates(&db)[0];
+        db.set_env(krate, Env::from_iter([("RUSTC_BOOTSTRAP".into(), "other".into())]));
+        assert!(admission(&db, &args, &[]).unwrap().is_some());
+        db.set_env(krate, Env::from_iter([("RUSTC_BOOTSTRAP".into(), "gated".into())]));
+        assert!(admission(&db, &args, &[]).unwrap().is_none());
+        let mut raw = Env::default();
+        raw.set_non_unicode("RUSTC_BOOTSTRAP");
+        db.set_env(krate, raw);
+        assert!(admission(&db, &args, &[]).unwrap().is_some());
+    }
+
+    #[test]
+    fn cold_and_warm_admission_check_effective_feature_attributes() {
+        use test_fixture::WithFixture;
+
+        let (mut db, file) =
+            RootDatabase::with_single_file("//- /main.rs crate:app\nfn main() {}\n");
+        let file = file.file_id(&db);
+        let args = Args::parse(
+            ["project", "--crate", "app", "--out", "app.o"].into_iter().map(str::to_owned),
+        )
+        .unwrap();
+        let files = [WatchedFile {
+            file: Watched::Source(file),
+            path: PathBuf::from("/main.rs"),
+            mtime: SystemTime::now(),
+        }];
+        let sources = Sources { paths: [(file, PathBuf::from("/main.rs"))].into_iter().collect() };
+        for (source, rejected) in [
+            ("fn main() {}", false),
+            ("#![cfg_attr(all(), feature(never_type))]\nfn main() {}", true),
+            ("#![cfg_attr(any(), feature(never_type))]\nfn main() {}", false),
+            ("#![feature(never_type)]\nfn main() {}", true),
+            ("fn main() {}", false),
+        ] {
+            let mut changed = ChangeWithProcMacros::default();
+            changed.change_file(file, Some(source.into()));
+            db.apply_change(changed);
+            let cold = admission(&db, &args, &files).unwrap();
+            let warm = crate::broken_in(&db, &[file], &sources, &args.checkout, None, false);
+            assert_eq!(cold.is_some(), rejected, "{source}");
+            assert_eq!(warm, cold, "{source}");
+        }
+    }
+
+    /// Reconciled from the cases of upstream b217704c: the same outcomes, decided by
+    /// the pinned language catalog plus the effective loaded library attributes
+    /// rather than a name-only table. `proc_macro_span` is a library gate: unknown
+    /// unless `proc_macro` is loaded, as with rustc 1.99.0.
+    #[test]
+    fn bootstrap_probe_uses_pinned_feature_status_and_effective_names() {
+        use test_fixture::WithFixture;
+        for (source, on_stable, error) in [
+            ("fn main() {}", false, None),
+            ("#![cfg_attr(all(), feature(proc_macro_span))]\nfn main() {}", true, Some("E0635")),
+            ("#![cfg_attr(any(), feature(proc_macro_span))]\nfn main() {}", false, None),
+            ("#![feature(proc_macro_span)]\nfn main() {}", true, Some("E0635")),
+            ("#![feature(never_type)]\nfn main() {}", true, None),
+            ("#![feature(test_accepted_feature)]\nfn main() {}", true, None),
+            ("#![feature(never_type_fallback)]\nfn main() {}", true, Some("E0557")),
+            ("#![feature(not_a_rust_feature_199)]\nfn main() {}", true, Some("E0635")),
+        ] {
+            let (db, _) =
+                RootDatabase::with_single_file(&format!("//- /main.rs crate:app\n{source}\n"));
+            let krate = hir::Crate::from(ide_db::base_db::all_crates(&db)[0]);
+            let errors = krate.invalid_features(&db);
+            assert_eq!(krate.feature_attributes_on_stable(&db), on_stable, "{source}");
+            assert_eq!(errors.first().map(|it| it.0), error, "{source}: {errors:?}");
+        }
+        for (usage, expected) in [
+            ("extern crate proc_macro;", None),
+            ("", Some("E0635")),
+            ("use proc_macro::span;", None),
+        ] {
+            let fixture = format!(
+                "//- /main.rs crate:root deps:proc_macro\n#![feature(proc_macro_span)]\n{usage}\nfn main() {{}}\n//- /proc_macro.rs crate:proc_macro\n#[unstable(feature=\"proc_macro_span\", issue=\"54725\")] pub fn span() {{}}\n"
+            );
+            let (db, _) = RootDatabase::with_many_files(&fixture);
+            let root = ide_db::base_db::all_crates(&db)
+                .iter()
+                .copied()
+                .find(|krate| {
+                    hir::Crate::from(*krate)
+                        .display_name(&db)
+                        .is_some_and(|name| name.as_str() == "root")
+                })
+                .unwrap();
+            let errors = hir::Crate::from(root).invalid_features(&db);
+            assert_eq!(errors.first().map(|it| it.0), expected, "{usage}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn fresh_compilation_checks_macro_errors_before_codegen() {
+        use test_fixture::WithFixture;
+
+        let args = Args::parse(
+            ["project", "--crate", "app", "--out", "app.o"].into_iter().map(str::to_owned),
+        )
+        .unwrap();
+        for source in [
+            "compile_error!(\"admission failure\");",
+            "macro_rules! fail { () => { compile_error!(\"admission failure\"); } } fail!();",
+            "fn unused<T>() { compile_error!(\"admission failure\"); }",
+        ] {
+            let fixture = format!(
+                "//- /main.rs crate:app\n#[rustc_builtin_macro]\nmacro_rules! compile_error {{ ($($t:tt)*) => {{}} }}\n{source}\n"
+            );
+            let (db, _) = RootDatabase::with_single_file(&fixture);
+            let error = admission(&db, &args, &[]).unwrap();
+            assert!(
+                error.is_some_and(|it| serde_json::to_string(&it)
+                    .unwrap()
+                    .contains("admission failure")),
+                "accepted {source}"
+            );
+        }
+        let (db, _) = RootDatabase::with_single_file(
+            "//- /main.rs crate:app\nmacro_rules! broken { () => { pub fn bad() { let = 1; } } } broken!();\n",
+        );
+        assert!(admission(&db, &args, &[]).unwrap().is_some());
+        let (db, _) = RootDatabase::with_single_file(
+            "//- /main.rs crate:app\n#[rustc_builtin_macro]\nmacro_rules! compile_error { ($($t:tt)*) => {} }\n#[cfg(any())] compile_error!(\"inactive\");\npub fn valid() {}\n",
+        );
+        assert!(admission(&db, &args, &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn metadata_probe_hydrates_generated_includes() {
+        use test_fixture::WithFixture;
+        let directory = tempfile::tempdir().unwrap();
+        let generated = directory.path().join("output");
+        std::fs::create_dir(&generated).unwrap();
+        let included = generated.join("level.in");
+        std::fs::write(&included, "pub fn number() -> u32 { 7 }\n").unwrap();
+        let (mut db, file) = RootDatabase::with_single_file(
+            r#"//- /main.rs crate:app
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+#[rustc_builtin_macro]
+macro_rules! concat { () => {} }
+#[rustc_builtin_macro]
+macro_rules! env { () => {} }
+include!(concat!(env!("OUT_DIR"), "/level.in"));
+"#,
+        );
+        let file = file.file_id(&db);
+        let path = directory.path().join("lib.rs");
+        let text = db.file_text(file).text(&db).to_string();
+        std::fs::write(&path, &text).unwrap();
+        let at = vfs::VfsPath::from(vfs::AbsPathBuf::assert_utf8(path.clone()));
+        let mut vfs = Vfs::default();
+        vfs.set_file_contents(at.clone(), Some(text.into_bytes()));
+        assert_eq!(vfs.file_id(&at).unwrap().0, file);
+        let mut root = vfs::file_set::FileSet::default();
+        root.insert(file, at);
+        let mut change = ChangeWithProcMacros::default();
+        change.set_roots(vec![ide_db::base_db::SourceRoot::new_local(root)]);
+        db.apply_change(change);
+        let krate = ide_db::base_db::all_crates(&db)[0];
+        db.set_env(
+            krate,
+            ide_db::base_db::Env::from_iter([(
+                "OUT_DIR".to_owned(),
+                generated.to_str().unwrap().to_owned(),
+            )]),
+        );
+        let files = source_files(&mut db, &mut vfs, &[krate]);
+        assert!(files.iter().any(|file| file.path == included), "generated source was not loaded");
+        let diagnostics =
+            hard_diagnostics(&db, &ide_diagnostics::DiagnosticsConfig::test_sample(), file, krate);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn owned_check_hydrates_generated_source_and_records_it() {
+        use std::collections::BTreeMap;
+        let directory = tempfile::tempdir().unwrap();
+        let sysroot = directory.path().join("toolchain");
+        crate::answers::tests::synthetic_toolchain(&sysroot);
+        for name in ["core", "std"] {
+            let root = sysroot.join("lib/rustlib/src/rust/library").join(name).join("src");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("lib.rs"), "").unwrap();
+        }
+        let out = directory.path().join("generated");
+        std::fs::create_dir(&out).unwrap();
+        let included = out.join("level.in");
+        std::fs::write(&included, "pub fn number() -> u32 { 7 }\n").unwrap();
+        let source = directory.path().join("lib.rs");
+        std::fs::write(
+            &source,
+            r#"#![no_std]
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+#[rustc_builtin_macro]
+macro_rules! concat { () => {} }
+#[rustc_builtin_macro]
+macro_rules! env { () => {} }
+include!(concat!(env!("OUT_DIR"), "/level.in"));
+pub fn value() -> u32 { number() }
+"#,
+        )
+        .unwrap();
+        let plan = crate::cargo::own_script::planned_description(
+            &sysroot,
+            vec![crate::cargo::own_script::Planned {
+                out_dir: None,
+                workspace_member: false,
+                name: "included".into(),
+                root: source,
+                edition: "2021".into(),
+                cfg: vec![],
+                codegen_flags: vec![],
+                env: BTreeMap::from([("OUT_DIR".into(), out.display().to_string())]),
+                deps: vec![],
+                proc_macro: None,
+            }],
+        );
+        let mut plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        plan["compiler_mode"] = serde_json::json!(true);
+        plan["crates"][0]["build"] = serde_json::json!({"target_kind":"lib", "label":"included", "build_file": directory.path().join("Cargo.toml")});
+        let project = directory.path().join("rust-project.json");
+        std::fs::write(&project, serde_json::to_vec(&plan).unwrap()).unwrap();
+        let output = directory.path().join("checked.json");
+        let trace = directory.path().join("inputs.d");
+        let args = || {
+            Args::parse(
+                [
+                    project.display().to_string(),
+                    "--crate".into(),
+                    "included".into(),
+                    "--out".into(),
+                    output.display().to_string(),
+                ]
+                .into_iter(),
+            )
+            .unwrap()
+        };
+        once(args(), &trace).unwrap();
+        assert!(output.is_file());
+        assert!(
+            std::fs::read(&trace)
+                .unwrap()
+                .windows(included.as_os_str().as_encoded_bytes().len())
+                .any(|part| part == included.as_os_str().as_encoded_bytes()),
+            "input trace omitted generated source"
+        );
+        std::fs::remove_file(&output).unwrap();
+        std::fs::write(&included, "pub fn number() -> u32 { \"wrong\" }\n").unwrap();
+        assert!(once(args(), &trace).unwrap_err().to_string().contains("E0308"));
+        assert!(!output.exists(), "failed check published an acceptance artifact");
+    }
 
     #[test]
     fn trailing_item_recovery_does_not_hide_a_dependency_syntax_error() {
@@ -46,24 +634,35 @@ pub fn broken() -> u8 { 1 + }
     }
 }
 
-/// Syntax failures in source-only builds must be reported before codegen/linking.
+/// Syntax and expansion failures must be reported before codegen/linking, even
+/// when the crate has no functions or the failing body is never instantiated.
 /// Walk semantic modules rather than all loaded source-root files.
-pub(crate) fn syntax(
+pub(crate) fn admission(
     db: &RootDatabase,
     args: &Args,
     files: &[WatchedFile],
-) -> anyhow::Result<Option<crate::errors::Diagnostic>> {
+) -> anyhow::Result<Option<crate::errors::Said>> {
     let mut checked = Vec::new();
+    let mut modules = Vec::new();
+    let mut seen = FxHashSet::default();
     for name in args.crates() {
         for krate in crate::crates_named(db, name, args)? {
             for id in ide_db::base_db::Crate::from(krate).transitive_deps(db) {
-                if id.data(db).origin.is_lang() {
+                if id.data(db).origin.is_lang() || !seen.insert(id) {
                     continue;
                 }
                 let krate = hir::Crate::from(id);
-                checked.extend(krate.modules(db).into_iter().map(|module| {
-                    module.definition_source_file_id(db).original_file(db).file_id(db)
-                }));
+                let mut files: Vec<_> = krate
+                    .modules(db)
+                    .into_iter()
+                    .map(|module| {
+                        module.definition_source_file_id(db).original_file(db).file_id(db)
+                    })
+                    .collect();
+                files.sort_unstable();
+                files.dedup();
+                checked.extend(&files);
+                modules.push((id, files));
             }
         }
     }
@@ -76,7 +675,114 @@ pub(crate) fn syntax(
             Watched::Included(_) => None,
         })
         .collect();
-    Ok(crate::unparsed(db, &checked, &Sources { paths }, &args.checkout))
+    let sources = Sources { paths };
+    if let Some(error) = crate::unparsed(db, &checked, &sources, &args.checkout) {
+        return Ok(Some(crate::errors::Said::one(error)));
+    }
+    let mut errors = Vec::new();
+    for (krate, files) in modules {
+        let within = Some(std::sync::Arc::new(FxHashSet::from_iter([krate])));
+        if let Some(said) =
+            crate::broken_in(db, &files, &sources, &args.checkout, within, !args.lints_capped)
+        {
+            for error in said.0 {
+                if !errors.contains(&error) {
+                    errors.push(error);
+                }
+            }
+        }
+    }
+    Ok((!errors.is_empty()).then_some(crate::errors::Said(errors)))
+}
+
+pub(crate) fn channel_error(
+    db: &RootDatabase,
+    krate: ide_db::base_db::Crate,
+) -> Option<(ide_db::FileRange, &'static str, String)> {
+    use syntax::ast::{AstNode as _, HasAttrs as _};
+
+    if krate.data(db).origin.is_lang() {
+        return None;
+    }
+    let source = hir::Crate::from(krate);
+    if !source.feature_attributes_on_stable(db) {
+        return None;
+    }
+    let environment = krate.env(db);
+    let bootstrap = if environment.is_non_unicode("RUSTC_BOOTSTRAP") {
+        None
+    } else {
+        environment
+            .get("RUSTC_BOOTSTRAP")
+            .or_else(|| ide_db::base_db::process_env_var(db, "RUSTC_BOOTSTRAP"))
+    };
+    let name = source.display_name(db).map(|name| name.to_string());
+    let allowed = bootstrap.as_deref().is_some_and(|value| {
+        value == "1"
+            || name.as_deref().is_some_and(|name| value.split(',').any(|entry| entry == name))
+    });
+    let (code, message) = if allowed {
+        source.invalid_features(db).into_iter().next()?
+    } else {
+        ("E0554", "`#![feature]` may not be used on the stable release channel".to_owned())
+    };
+    let range = match source.root_module(db).definition_source(db).value {
+        hir::ModuleSource::SourceFile(file) => file
+            .attrs()
+            .find(|attr| attr.simple_name().as_deref() == Some("feature"))
+            .map(|attr| attr.syntax().text_range()),
+        _ => None,
+    }
+    .unwrap_or_else(|| syntax::TextRange::empty(0.into()));
+    Some((ide_db::FileRange { file_id: source.root_file(db), range }, code, message))
+}
+
+fn hard_diagnostics(
+    db: &RootDatabase,
+    config: &ide_diagnostics::DiagnosticsConfig,
+    file: vfs::FileId,
+    krate: ide_db::base_db::Crate,
+) -> Vec<ide_diagnostics::Diagnostic> {
+    hir::attach_db(db, || {
+        ide_diagnostics::semantic_diagnostics_within(
+            db,
+            config,
+            &ide_db::assists::AssistResolveStrategy::None,
+            file,
+            Some(std::sync::Arc::new(FxHashSet::from_iter([krate]))),
+        )
+        .into_iter()
+        .filter(|it| it.severity == ide_db::Severity::Error)
+        .filter(|it| {
+            matches!(
+                it.code,
+                ide_diagnostics::DiagnosticCode::RustcHardError(_)
+                    | ide_diagnostics::DiagnosticCode::SyntaxError
+            ) || EXPANSION_ERRORS.contains(&it.code.as_str())
+        })
+        .collect()
+    })
+}
+
+fn source_files(
+    db: &mut RootDatabase,
+    vfs: &mut Vfs,
+    crates: &[ide_db::base_db::Crate],
+) -> Vec<WatchedFile> {
+    let mut files = WatchedFile::sources(vfs, db, SystemTime::now());
+    let sources: Vec<_> = files
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(file) => Some((file, &*it.path)),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    let mut tree = crate::tree::Tree::new(db, std::mem::take(vfs), &sources);
+    crate::hydrate_includes(db, &mut tree, &mut files, |db| {
+        crate::resolve_all(db, crates, crate::cores())
+    });
+    *vfs = std::mem::take(tree.vfs());
+    files
 }
 
 /// A metadata-only compiler probe checks all source bodies, including unreachable
@@ -85,7 +791,7 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
     crate::process_wide();
     let config = crate::cargo_config(&args);
     let load = crate::LoadCargoConfig { load_out_dirs_from_check: false, ..crate::load_config() };
-    let (mut db, vfs, _) = crate::load(
+    let (mut db, mut vfs, _) = crate::load(
         &[&args.project],
         &config,
         load,
@@ -99,15 +805,20 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
     anyhow::ensure!(crates.len() == 1, "the source probe must identify one crate");
     let krate = crates[0];
     let id = ide_db::base_db::Crate::from(krate);
-    if krate.feature_attributes_on_stable(&db) {
-        anyhow::ensure!(
-            !bootstrap,
-            "bootstrap feature probes require the owned release feature catalog"
-        );
+    if krate.feature_attributes_on_stable(&db) && !bootstrap {
         eprintln!("error[E0554]: `#![feature]` may not be used on the stable release channel");
         return Ok(false);
     }
-    let files = WatchedFile::sources(&vfs, &db, SystemTime::now());
+    let files = source_files(&mut db, &mut vfs, &[id]);
+    if krate.feature_attributes_on_stable(&db) {
+        let errors = krate.invalid_features(&db);
+        if !errors.is_empty() {
+            for (code, message) in errors {
+                eprintln!("error[{code}]: {message}");
+            }
+            return Ok(false);
+        }
+    }
     let paths: FxHashMap<_, _> = files
         .iter()
         .filter_map(|it| match it.file {
@@ -126,30 +837,11 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
     let diagnostics = ide_diagnostics::DiagnosticsConfig::test_sample();
     let mut undecided = Vec::new();
     for &file in &checked {
-        let (inferred, hard): (Vec<_>, Vec<_>) = hir::attach_db(&db, || {
-            ide_diagnostics::semantic_diagnostics_within(
-                &db,
-                &diagnostics,
-                &ide_db::assists::AssistResolveStrategy::None,
-                file,
-                Some(std::sync::Arc::new(FxHashSet::from_iter([id]))),
-            )
-            .into_iter()
-            .filter(|it| it.severity == ide_db::Severity::Error)
-            .filter(|it| {
-                // A syntax error found in lowering, as `..base` in a destructuring assignment
-                // or a free function without a body, is one rustc reports too.
-                matches!(
-                    it.code,
-                    ide_diagnostics::DiagnosticCode::RustcHardError(_)
-                        | ide_diagnostics::DiagnosticCode::SyntaxError
-                ) || matches!(it.code.as_str(), "macro-error" | "macro-def-error")
-            })
-            .partition(|it| {
+        let (inferred, hard): (Vec<_>, Vec<_>) =
+            hard_diagnostics(&db, &diagnostics, file, id).into_iter().partition(|it| {
                 let code = it.code.as_str();
                 INFERRED.contains(&code) || crate::BORROWCK.contains(&code)
-            })
-        });
+            });
         undecided
             .extend(inferred.into_iter().map(|it| format!("{}: {}", it.code.as_str(), it.message)));
         let hard: Vec<_> = hard.into_iter().map(|it| it.message).collect();
@@ -210,7 +902,7 @@ pub(crate) const RELOAD: &str = "reload";
 pub(crate) fn once(args: crate::Args, trace: &Path) -> anyhow::Result<()> {
     crate::process_wide();
     let read_from = SystemTime::now();
-    let (mut db, vfs, checkouts) = crate::load(
+    let (mut db, mut vfs, checkouts) = crate::load(
         &[&args.project],
         &crate::cargo_config(&args),
         crate::load_config(),
@@ -221,11 +913,12 @@ pub(crate) fn once(args: crate::Args, trace: &Path) -> anyhow::Result<()> {
     )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, lints_capped, .. } = checkouts.parts(&args.project)?;
-    let members = ide_db::base_db::all_crates(&db)
+    let members: FxHashSet<_> = ide_db::base_db::all_crates(&db)
         .iter()
         .copied()
         .filter(|&krate| !hir::Crate::from(krate).origin(&db).is_lang())
         .collect();
+    let _ = source_files(&mut db, &mut vfs, &members.iter().copied().collect::<Vec<_>>());
     let mut checker =
         Checker::new(&db, &vfs, &checkouts, &members, &[], read_from, root, lints_capped);
     checker.checked = members
@@ -250,7 +943,7 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     let cargo_config = crate::cargo_config(&args);
     let projects = [args.project.as_path()];
     let selection = args.selection.clone();
-    let (mut db, vfs, checkouts) = crate::load(
+    let (mut db, mut vfs, checkouts) = crate::load(
         &projects,
         &cargo_config,
         crate::load_config(),
@@ -261,6 +954,7 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
+    let _ = source_files(&mut db, &mut vfs, &members.iter().copied().collect::<Vec<_>>());
     let excludes = &args.selection.excludes;
     let mut checker =
         Checker::new(&db, &vfs, &checkouts, &members, excludes, read_from, root, lints_capped);

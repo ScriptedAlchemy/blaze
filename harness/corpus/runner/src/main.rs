@@ -118,7 +118,9 @@ fn main() {
         dynamic::call(&dynamic::Dog(4)),
         dynamic::call(&dynamic::Cat),
         dynamic::make(true),
-        dynamic::make(false)
+        dynamic::make(false),
+        dynamic::borrowed(41),
+        dynamic::borrowed_type_arguments(41)
     );
 
     {
@@ -232,6 +234,7 @@ fn main() {
         locations::borrows(&std::cell::RefCell::new(4))
     );
     case!(locations::through_pointers(Some(7)), locations::through_pointers(None));
+    case!(locations::constant_file());
 
     case!(
         heap::boxed(1),

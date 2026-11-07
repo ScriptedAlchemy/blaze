@@ -453,6 +453,8 @@ wire_struct! {
     /// One unit of the resolved graph.
     UnitSpec {
         0 => package: (String, String, Digest),
+        // Kinds 0..=6 are compile targets; 7 is a doctest dependency context.
+        // This uses the existing discriminant: ordinary unit encodings stay identical.
         1 => target: (u8, String),
         2 => features: Set<String>,
         3 => cfg: Set<InputText>,

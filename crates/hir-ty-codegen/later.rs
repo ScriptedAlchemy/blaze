@@ -69,7 +69,7 @@ pub(super) struct Keeper<'k, 'db> {
     pub(super) db: &'db dyn HirDatabase,
     pub(super) symbols: &'k dyn SymbolResolver,
     pub(super) names: &'k stable::StableNames<'k, 'db>,
-    pub(super) stable_names: &'k mut FxHashMap<Instance, Option<StableName>>,
+    pub(super) stable_names: &'k mut FxHashMap<NamedInstance, Option<StableName>>,
     pub(super) source_paths: &'k mut FxHashMap<base_db::FileId, Option<String>>,
     pub(super) kept: &'k mut Kept,
     pub(super) root_names: &'k FxHashMap<StableName, Option<FunctionId>>,
@@ -101,13 +101,20 @@ impl<'db> Keeper<'_, 'db> {
             later.tiered,
         );
         let kept = later.keeps.then(|| match &later.of {
-            Of::Root { func, .. } => (root_instance(self.db, *func), func.krate(self.db)),
-            Of::Instance { instance, env } => (instance.clone(), env.krate),
+            Of::Root { func, .. } => (
+                root_instance(self.db, *func),
+                ParamEnvAndCrate {
+                    param_env: hir_ty::next_solver::ParamEnv::empty(),
+                    krate: func.krate(self.db),
+                }
+                .store(),
+            ),
+            Of::Instance { instance, env } => (instance.clone(), env.clone()),
         });
-        let kept = kept.and_then(|(instance, home)| {
+        let kept = kept.and_then(|(instance, env)| {
             let tally = backend::Tally::global();
             tally.step(Step::StoreWrite, || {
-                self.keep(&instance, home, later.compiled, bindings, debug.clone())
+                self.keep(&instance, &env, later.compiled, bindings, debug.clone())
             })
         });
         Made { debug, kept }
@@ -182,13 +189,33 @@ impl<'db> Keeper<'_, 'db> {
         self.describe(compiled, rows, debug, declared, told)
     }
 
-    fn stable_name(&mut self, instance: &Instance) -> Option<StableName> {
-        if let Some(known) = self.stable_names.get(instance) {
+    fn stable_name_in(
+        &mut self,
+        instance: &Instance,
+        environment: &StoredParamEnvAndCrate,
+    ) -> Option<StableName> {
+        let key = (instance.clone(), Some(environment.clone()));
+        if let Some(known) = self.stable_names.get(&key) {
             return known.clone();
         }
-        let name = self.names.instance(instance).map(StableName::from);
-        self.stable_names.insert(instance.clone(), name.clone());
+        let name = self.names.instance_in(instance, environment).map(StableName::from);
+        self.stable_names.insert(key, name.clone());
         name
+    }
+
+    fn callee_name_in(
+        &mut self,
+        instance: &Instance,
+        asked: &StoredParamEnvAndCrate,
+        parent: &mut stable::SemanticCoverage,
+    ) -> Option<StableName> {
+        let environment = home::Homes::default().home(self.db, instance, asked);
+        if let Some(child) = self.names.semantic_certificate(instance, &environment)?
+            && !self.names.covers(parent, child)
+        {
+            return self.kept.unkept("incomplete transitive semantic preparation");
+        }
+        self.stable_name_in(instance, &environment)
     }
 
     fn source_path(&mut self, file: base_db::FileId) -> Option<String> {
@@ -336,16 +363,31 @@ impl<'db> Keeper<'_, 'db> {
     fn keep(
         &mut self,
         instance: &Instance,
-        home: Crate,
+        environment: &StoredParamEnvAndCrate,
         compiled: &CompiledFunction,
         bindings: &dyn export::Bindings,
         debug: Option<FunctionDebug>,
     ) -> Option<cached::Kept> {
-        let store = store::Store::global().filter(|_| self.own)?;
-        let Some(name) = self.stable_name(instance) else {
+        store::Store::global().filter(|_| self.own)?;
+        let Some(name) = self.stable_name_in(instance, environment) else {
             self.kept.unnamed += 1;
             return None;
         };
+        self.keep_named(instance, environment, true, compiled, bindings, debug, name)
+    }
+
+    /// Compiler-generated code has its own name and no source body to mark for a patch.
+    pub(super) fn keep_named(
+        &mut self,
+        instance: &Instance,
+        environment: &StoredParamEnvAndCrate,
+        track_source: bool,
+        compiled: &CompiledFunction,
+        bindings: &dyn export::Bindings,
+        debug: Option<FunctionDebug>,
+        name: StableName,
+    ) -> Option<cached::Kept> {
+        let store = store::Store::global().filter(|_| self.own)?;
         let key = cached::Entry::key(&name, self.kept_told(), self.program.flatten().as_ref())?;
         let check = std::env::var_os("RA_JIT_CACHE_CHECK");
         let sets = || debug.iter().flat_map(|it| &it.types).cloned().collect::<Vec<_>>();
@@ -353,12 +395,12 @@ impl<'db> Keeper<'_, 'db> {
             return Some(cached::Kept::Types(sets()));
         }
         let described = debug.is_some();
-        let Some(mut entry) = self.entry(instance, compiled, bindings, debug) else {
+        let Some(mut entry) = self.entry(instance, environment, compiled, bindings, debug) else {
             self.kept.unnamed_requests += 1;
             return None;
         };
-        if self.markable && stable::StableNames::of_checkout(&name) {
-            match self.tracked(instance, home, compiled, described) {
+        if track_source && self.markable && stable::StableNames::of_checkout(&name) {
+            match self.tracked(instance, compiled, described) {
                 Ok(tracked) => entry.tracked = Some(tracked),
                 Err(why) => self.kept.untracked(&name, why),
             }
@@ -402,7 +444,6 @@ impl<'db> Keeper<'_, 'db> {
     pub(super) fn tracked(
         &self,
         instance: &Instance,
-        home: Crate,
         compiled: &CompiledFunction,
         described: bool,
     ) -> std::result::Result<cached::Tracked, &'static str> {
@@ -417,11 +458,9 @@ impl<'db> Keeper<'_, 'db> {
             files.iter().map(|&file| self.names.file_path(file)).collect::<Option<Vec<_>>>()
         });
         let items = patch::written_items(self.db, self.names, instance, compiled, described);
-        let home = match self.names.of_the_checkout(home) {
-            true => Some(self.names.content_id(home).ok_or("its crate has no content id")?.0),
-            false => None,
-        };
-        Ok(cached::Tracked { mark, home, files, items })
+        // The requesting crate is absent from the entry key. Hydration recovers its
+        // current environment from callers and conservatively considers every edit.
+        Ok(cached::Tracked { mark, home: None, files, items })
     }
 
     /// The function of the program that an instance without arguments is of, and its symbol.
@@ -446,32 +485,42 @@ impl<'db> Keeper<'_, 'db> {
     pub(super) fn entry(
         &mut self,
         instance: &Instance,
+        environment: &StoredParamEnvAndCrate,
         compiled: &CompiledFunction,
         bindings: &dyn export::Bindings,
         debug: Option<FunctionDebug>,
     ) -> Option<cached::Entry> {
         use cached::{CachedData, CachedFunc, CachedTarget};
         let db = self.db;
+        let semantic = self.names.semantic_certificate(instance, environment)?;
+        let mut coverage = stable::SemanticCoverage::of(semantic);
         let mut funcs = Vec::with_capacity(compiled.requests.funcs.len());
         for (at, request) in compiled.requests.funcs.iter().enumerate() {
+            let foreign = |callee: &Instance| match callee.def {
+                InstanceDef::Fn(func) => link_name(db, func).is_some(),
+                _ => false,
+            };
             let binding = match bindings.function(at, request) {
                 Ok(binding) => binding,
                 Err(why) => return self.kept.unkept(why),
             };
+            let binding = match binding {
+                export::FunctionBinding::Defined(Some(symbol)) if matches!(&request.target, FuncTarget::Instance(callee, _) if foreign(callee)) =>
+                {
+                    // A generated native definition has a symbol, not a Rust body entry.
+                    export::FunctionBinding::Imported(symbol)
+                }
+                binding => binding,
+            };
             let target = if let export::FunctionBinding::TypeId(hash) = binding {
                 CachedTarget::TypeId(hash)
             } else if let export::FunctionBinding::Imported(symbol) = binding {
-                // rustc's copy of a function of the checkout is of the checkout as rustc
-                // built it, and uses rustc's copies of the statics.
-                let checked = self.symbols.defines(&symbol);
-                // An item of an `extern` block is the symbol it links to, whoever declares it.
-                let foreign = |callee: &Instance| match callee.def {
-                    InstanceDef::Fn(func) => link_name(db, func).is_some(),
-                    _ => false,
-                };
+                // Native definitions, including owned std, must be available in the next
+                // program that reuses the entry. Foreign imports are left to its linker.
+                let checked = self.symbols.provides(&symbol);
                 let mut copied = None;
                 let callee = match &request.target {
-                    FuncTarget::Instance(callee, _) if !foreign(callee) => {
+                    FuncTarget::Instance(callee, asked) if !foreign(callee) => {
                         let Some(callee) = self.settled(at, callee) else {
                             return self.kept.unkept("unsettled callee");
                         };
@@ -483,7 +532,7 @@ impl<'db> Keeper<'_, 'db> {
                             }
                             _ => None,
                         };
-                        Some(self.stable_name(&callee))
+                        Some(self.callee_name_in(&callee, asked, &mut coverage))
                     }
                     _ => None,
                 };
@@ -513,11 +562,11 @@ impl<'db> Keeper<'_, 'db> {
                     }
                     _ => CachedTarget::Import { symbol, checked },
                 }
-            } else if let FuncTarget::Instance(callee, _) = &request.target {
+            } else if let FuncTarget::Instance(callee, asked) = &request.target {
                 let Some(callee) = &self.settled(at, callee) else {
                     return self.kept.unkept("unsettled callee");
                 };
-                let Some(name) = self.stable_name(callee) else {
+                let Some(name) = self.callee_name_in(callee, asked, &mut coverage) else {
                     return self.kept.unkept("unnamed callee");
                 };
                 // A function the program is built from has no entry: it is compiled anew.
@@ -537,8 +586,9 @@ impl<'db> Keeper<'_, 'db> {
             funcs.push(CachedFunc { target, sig: request.sig.clone() });
         }
         // Only a crate of the checkout is compiled with where the checkout is.
-        let placed =
-            self.stable_name(instance).is_some_and(|it| stable::StableNames::of_checkout(&it));
+        let placed = self
+            .stable_name_in(instance, environment)
+            .is_some_and(|it| stable::StableNames::of_checkout(&it));
         let home = self.symbols.cargo_home();
         let library = self.symbols.library_sources();
         let mut datas = Vec::with_capacity(compiled.requests.datas.len());
@@ -628,6 +678,8 @@ impl<'db> Keeper<'_, 'db> {
                 }
             });
         }
+        // Last, as the entry is otherwise whole: this is as big as the closure.
+        let semantic = semantic.map(|it| self.names.complete_inputs(it));
         Some(cached::Entry {
             label: callee_name(db, instance.def).to_owned(),
             funcs,
@@ -635,6 +687,7 @@ impl<'db> Keeper<'_, 'db> {
             code: cached::CachedCode::from(&compiled.code),
             debug,
             tracked: None,
+            semantic,
         })
     }
 }

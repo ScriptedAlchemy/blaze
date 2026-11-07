@@ -125,6 +125,15 @@ SAYS = {
 }
 
 
+def owned_plan(out, harnesses=1):
+    """One completed direct compilation/admission, with the expected test executables."""
+    lines = [line for line in out.splitlines() if line.startswith("owned test plan:")]
+    if len(lines) != 1:
+        return False
+    match = re.fullmatch(r"owned test plan: ([1-9]\d*) units compiled and admitted, ([1-9]\d*) runnable harnesses", lines[0])
+    return bool(match and int(match[1]) >= harnesses and int(match[2]) == harnesses)
+
+
 class Run:
     def __init__(self, code, out):
         self.code, self.out = code, out
@@ -137,8 +146,8 @@ class Run:
 
 
 class Harness:
-    def __init__(self, bin_dir, keep):
-        self.bin_dir, self.keep = bin_dir, keep
+    def __init__(self, bin_dir, keep, legacy=False):
+        self.bin_dir, self.keep, self.legacy = bin_dir, keep, legacy
         self.root = tempfile.mkdtemp(prefix="ra-jit-tests-contract-")
         # The daemon's sockets are under its home, and a socket's path is short (104 bytes on macOS).
         self.home = tempfile.mkdtemp(prefix="rj-tc-", dir="/tmp")
@@ -150,7 +159,7 @@ class Harness:
 
     def make_env(self):
         env = dict(os.environ, PATH=f"{self.bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=self.home,
-                   RUST_BACKTRACE="0")
+                   RUST_BACKTRACE="0", RA_JIT_STATS="1", RA_JIT_CACHE=os.path.join(self.home, "store"))
         for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RA_JIT_TESTS",
                      "RA_JIT_FLAKY_TEST_ATTEMPTS", "RA_JIT_TEST_ENV", "T1_DECLARED"):
             env.pop(name, None)
@@ -193,21 +202,25 @@ class Harness:
             raise SystemExit(f"THE WATCHDOG KILLED THE RUN: {self.watchdog.tripped}")
         return Run(proc.returncode, out)
 
+    def admitted(self, out):
+        return "[ra-jit]" in out if self.legacy else owned_plan(out)
+
     def warm(self, package, positional=(), extra=None):
-        """Runs until the daemon serves the build, as testselect.py does, and once more: the
-        daemon's first build of the tests is one in which each is new to it."""
+        """Admit the initial plan, then check a second unchanged invocation."""
         deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
+        while True:
             run = self.cargo("all" if positional else "affected", package, positional=positional, extra=extra)
             if run.code != 0:
                 raise SystemExit(f"the tests failed before any edit:\n{run.out[-3000:]}")
-            if "[ra-jit]" in run.out:
+            if self.admitted(run.out):
                 break
+            if not self.legacy or time.monotonic() >= deadline:
+                raise SystemExit(f"no completed owned test plan:\n{run.out[-4000:]}")
             time.sleep(0.5)
-        else:
-            raise SystemExit(f"no build said `[ra-jit]`; the daemon's log is in {self.home}\n{run.out[-4000:]}")
         if not positional:
-            self.cargo("affected", package, extra=extra)
+            again = self.cargo("affected", package, extra=extra)
+            if again.code != 0 or not self.admitted(again.out):
+                raise SystemExit(f"the unchanged test plan failed admission:\n{again.out[-4000:]}")
 
     def check(self, what, verdict):
         self.total += 1
@@ -220,8 +233,8 @@ class Harness:
             return self.rejected(run, expected, says)
         if failed is None and (passes or len(expected) == 1):
             failed = NONE if passes else expected
-        if served and "[ra-jit]" not in run.out:
-            return "NOT SERVED BY THE DAEMON"
+        if served and not self.admitted(run.out):
+            return "NO COMPLETED OWNED TEST PLAN"
         if run.ran != expected:
             extra, missing = sorted(run.ran - expected), sorted(expected - run.ran)
             return f"RAN {', '.join(extra) or 'nothing more'}; DID NOT RUN {', '.join(missing) or '-'}"
@@ -241,8 +254,8 @@ class Harness:
         """A run libtest refuses: it says `error: ...`, ends 101 and runs no test at all, so
         there is no test outcome to judge and nothing of it to keep. This is a different
         result from a test that failed, which the steps that expect `False` still require."""
-        if served and "[ra-jit]" not in run.out:
-            return "NOT SERVED BY THE DAEMON"
+        if served and not self.admitted(run.out):
+            return "NO COMPLETED OWNED TEST PLAN"
         if run.ran != expected:
             return f"RAN {', '.join(sorted(run.ran)) or 'no test'}: A REFUSED INVOCATION RAN TESTS"
         if run.code != REJECTED_EXIT:
@@ -275,7 +288,7 @@ class Harness:
                     if repeated != "ok":
                         verdict = f"A KEPT PASS HID THE REFUSAL: {repeated}"
                 self.check(what, verdict)
-            elif what == "configured declared environment" and "[ra-jit]" not in run.out:
+            elif self.legacy and what == "configured declared environment" and not self.admitted(run.out):
                 # Cargo configuration invalidates the whole build state. The cold build
                 # must rerun every test; warm its replacement state before checking reuse.
                 verdict = self.verdict(run, expected, passes, says, served=False)
@@ -441,7 +454,7 @@ def contract(args):
     print(f"{h.total - wrong} of {h.total} right; under {h.root}, the daemon's home {h.home}")
     print("pending: the no-rustc audit (P0-A): the steps are not run under norustc.py's stand-ins")
     if args.before:
-        before = Harness(os.path.abspath(args.before), args.keep)
+        before = Harness(os.path.abspath(args.before), args.keep, legacy=True)
         try:
             before.before()
         finally:
@@ -465,6 +478,14 @@ def selected_retry(args):
 def self_test():
     """The tables are consistent with the fixture, and the parsing reads what libtest prints."""
     wrong = []
+    receipt = "owned test plan: 2 units compiled and admitted, 1 runnable harnesses\n"
+    for bad in ("", "[ra-jit]\n", receipt * 2, receipt.replace("2 units", "0 units"),
+                receipt.replace("1 runnable", "0 runnable"), receipt.replace("1 runnable", "2 runnable"),
+                receipt.replace("admitted,", "admitted malformed,")):
+        if owned_plan(bad):
+            wrong.append(f"accepted invalid admission evidence: {bad!r}")
+    if not owned_plan(receipt) or owned_plan(receipt, 2):
+        wrong.append("admission evidence did not bind the harness population")
     files = {}
     lib = open(os.path.join(FIXTURE, "cache", "src", "lib.rs")).read()
     tests = {"tests::" + name for name in re.findall(r"#\[test\]\s+fn (\w+)", lib)}
@@ -489,27 +510,28 @@ def self_test():
     if retried.failed != {"b"}:
         wrong.append("a passed retry was counted as a final failure")
     h = Harness.__new__(Harness)
+    h.legacy = False
     for out, passes in (("test a ... ignored\n", True), ("test a ... FAILED\n", True),
                         ("test a ... ok\n", False)):
         for served in (True, False):
-            run = Run(0, "[ra-jit]\n" + out)
+            run = Run(0, receipt + out)
             if h.verdict(run, {"a"}, passes, served=served) == "ok":
                 wrong.append("ignored/inconsistent terminal outcome accepted")
-    if h.verdict(Run(1, "[ra-jit]\ntest a ... FAILED\n"), {"a"}, False, failed={"b"}) == "ok":
+    if h.verdict(Run(1, receipt + "test a ... FAILED\n"), {"a"}, False, failed={"b"}) == "ok":
         wrong.append("wrong failing test accepted")
     # A refused invocation is a result of its own: libtest says `error: ...` and ends 101
     # before running a test. A step that expects REJECTED accepts that and only that, and a
     # step that expects a failing test (`False`) still demands the failed test's outcome.
-    refused = "[ra-jit]\nerror: Option 'quiet' given more than once\n"
+    refused = receipt + "error: Option 'quiet' given more than once\n"
     says = [r"^error: Option 'quiet' given more than once$"]
     if h.verdict(Run(REJECTED_EXIT, refused), NONE, REJECTED, says) != "ok":
         wrong.append("a refused invocation was not accepted where it is expected")
     if h.verdict(Run(REJECTED_EXIT, refused), NONE, False) == "ok":
         wrong.append("a refusal accepted where a failed test is expected")
-    if h.verdict(Run(REJECTED_EXIT, "[ra-jit]\n"), NONE, REJECTED) == "ok":
+    if h.verdict(Run(REJECTED_EXIT, receipt), NONE, REJECTED) == "ok":
         wrong.append("a run that said no `error:` line accepted as a refusal")
     for why, run in (
-        ("a failed test", Run(REJECTED_EXIT, "[ra-jit]\ntest a ... FAILED\n")),
+        ("a failed test", Run(REJECTED_EXIT, receipt + "test a ... FAILED\n")),
         ("a test result", Run(REJECTED_EXIT, refused + "test result: FAILED. 0 passed\n")),
         ("another exit status", Run(1, refused)),
         ("a refused run that ran a test", Run(REJECTED_EXIT, refused + "test a ... ok\n")),

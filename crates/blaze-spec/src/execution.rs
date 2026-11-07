@@ -51,6 +51,9 @@ pub struct Program {
     pub output: Output,
     /// Where the linked executable is written.
     pub executable: PathBuf,
+    /// Cargo's build-directory scratch space for integration tests and benchmarks.
+    /// The executor creates this before compilation, even if rustc-env overrides its environment value.
+    pub test_scratch: Option<PathBuf>,
     /// A complete source description. No Cargo project is passed to the compiler.
     pub project: Value,
 }
@@ -117,6 +120,10 @@ pub fn unit_cfg(prepared: &Prepared, at: usize) -> Vec<String> {
         .collect()
 }
 
+fn is_macro_leaf(unit: &Unit) -> bool {
+    unit.target.kind == TargetKind::ProcMacro && !unit.test && unit.mode != Mode::DocTest
+}
+
 fn reachable(build: &BuildSpec, native: &[&Unit], root: u32) -> BTreeSet<u32> {
     let mut seen = BTreeSet::new();
     let mut next = vec![root];
@@ -130,7 +137,7 @@ fn reachable(build: &BuildSpec, native: &[&Unit], root: u32) -> BTreeSet<u32> {
         {
             continue;
         }
-        if seen.insert(at) && native[at as usize].target.kind != TargetKind::ProcMacro {
+        if seen.insert(at) && !is_macro_leaf(native[at as usize]) {
             next.extend(build.units[at as usize].deps.iter().map(|(at, _)| *at));
         }
     }
@@ -139,7 +146,24 @@ fn reachable(build: &BuildSpec, native: &[&Unit], root: u32) -> BTreeSet<u32> {
 
 fn roots(build: &BuildSpec, native: &[&Unit]) -> Vec<u32> {
     let mut roots: BTreeSet<_> = build.asked.iter().copied().collect();
-    if matches!(build.command, Command::Test(_)) {
+    if let Command::Test(run) = &build.command {
+        // Documentation contexts are command roots in their own right, including
+        // libraries with test=false. Their extern libraries must also be built
+        // when --no-run suppresses example execution.
+        for &at in build.asked.iter() {
+            if native[at as usize].mode != Mode::DocTest {
+                continue;
+            }
+            roots.extend(build.units[at as usize].deps.iter().filter_map(|(dep, _)| {
+                let unit = native[*dep as usize];
+                (unit.mode == Mode::Build
+                    && matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro))
+                .then_some(*dep)
+            }));
+        }
+        if run.doc == 0 || run.no_run {
+            roots.retain(|&at| native[at as usize].mode != Mode::DocTest);
+        }
         let mut seen = BTreeSet::new();
         let mut pending: Vec<_> = roots.iter().copied().collect();
         while let Some(at) = pending.pop() {
@@ -153,28 +177,34 @@ fn roots(build: &BuildSpec, native: &[&Unit]) -> Vec<u32> {
             pending.extend(build.units[at as usize].deps.iter().map(|(at, _)| *at));
         }
     }
-    if let Command::Test(run) = &build.command
-        && run.doc != 0
-        && !run.no_run
-    {
-        let selected: BTreeSet<_> =
-            build.asked.iter().map(|&at| &native[at as usize].package.id).collect();
-        roots.extend(
-            native
-                .iter()
-                .enumerate()
-                .filter(|(_, unit)| {
-                    matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro)
-                        && unit.mode == Mode::Build
-                        && unit.target.doctest
-                        && selected.contains(&unit.package.id)
-                })
-                .map(|(at, _)| at as u32),
-        );
-    }
     let mut roots: Vec<_> = roots.into_iter().collect();
     roots.sort_by_key(|&at| (native[at as usize].test, at));
     roots
+}
+
+fn test_scratch(prepared: &Prepared, unit: &Unit) -> anyhow::Result<Option<PathBuf>> {
+    matches!(unit.target.kind, TargetKind::Test | TargetKind::Bench)
+        .then(|| {
+            prepared
+                .resolved
+                .outputs
+                .get(1)
+                .map(|directory| directory.join("tmp"))
+                .context("test or benchmark has no Cargo build directory")
+        })
+        .transpose()
+}
+
+/// Directory scaffolding required by the authenticated execution roots, before
+/// native inputs are bound. Planning this list performs no filesystem writes.
+pub(crate) fn test_scratch_directories(prepared: &Prepared) -> anyhow::Result<Vec<PathBuf>> {
+    let build = &prepared.resolved.spec.build;
+    let native = canonical_units(build, &prepared.resolved.graph)?;
+    let directories = roots(build, &native)
+        .into_iter()
+        .map(|root| test_scratch(prepared, native[root as usize]))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(directories.into_iter().flatten().collect::<BTreeSet<_>>().into_iter().collect())
 }
 
 fn is_program(unit: &Unit) -> bool {
@@ -329,7 +359,7 @@ pub fn programs_with(
                 .get(&(at as u32))
                 .with_context(|| format!("missing configured canonical unit {at}"))?;
             ensure!(
-                unit.target.kind != TargetKind::ProcMacro || configured.proc_macro.is_some(),
+                !is_macro_leaf(unit) || configured.proc_macro.is_some(),
                 "missing owned macro image for {}:{}",
                 unit.package.name,
                 unit.target.name
@@ -348,6 +378,7 @@ pub fn programs_with(
     let mut result = Vec::new();
     for &root in &roots {
         let root_unit = &build.units[root as usize];
+        let test_scratch = test_scratch(prepared, native[root as usize])?;
         let mut order = vec![root];
         order.extend(reachable(build, &native, root).into_iter().filter(|&at| at != root));
         let indexes: BTreeMap<_, _> =
@@ -372,6 +403,11 @@ pub fn programs_with(
                     .filter_map(|(name, value)| Some((name.to_str()?.to_owned(), value.clone())))
                     .collect();
             }
+            if at == root
+                && let Some(scratch) = &test_scratch
+            {
+                crate_env.insert("CARGO_TARGET_TMPDIR".into(), scratch.as_os_str().to_owned());
+            }
             if matches!(unit.target.kind, TargetKind::Test | TargetKind::Bench) {
                 for &binary in &roots {
                     let other = native[binary as usize];
@@ -391,7 +427,8 @@ pub fn programs_with(
                     configured.rustc_env.iter().map(|(name, value)| (name.clone(), value.into())),
                 );
             }
-            let kind = if spec.test {
+            let proc_macro_test = unit.target.kind == TargetKind::ProcMacro && unit.test;
+            let kind = if spec.test || proc_macro_test {
                 "test"
             } else if matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro) {
                 "lib"
@@ -430,7 +467,8 @@ pub fn programs_with(
                     },
                 ),
             );
-            let dependencies: Vec<_> = if unit.target.kind == TargetKind::ProcMacro {
+            let is_proc_macro = unit.target.kind == TargetKind::ProcMacro && !unit.test;
+            let dependencies: Vec<_> = if is_macro_leaf(unit) {
                 Vec::new()
             } else {
                 spec.deps
@@ -452,20 +490,23 @@ pub fn programs_with(
                 "blaze_invalid_env": invalid_env,
                 "blaze_native_unit": at,
                 "is_workspace_member": at == root,
-                "is_proc_macro": unit.target.kind == TargetKind::ProcMacro,
-                "proc_macro_dylib_path": configured.and_then(|unit| unit.proc_macro.as_deref()).map(compiler_path),
+                "is_proc_macro": is_proc_macro,
+                "blaze_proc_macro_test": proc_macro_test,
+                "proc_macro_dylib_path": configured.filter(|_| is_proc_macro).and_then(|unit| unit.proc_macro.as_deref()).map(compiler_path),
                 "build": {"label": unit.target.name, "build_file": compiler_path(&unit.package.manifest_dir.join("Cargo.toml")), "target_kind": kind},
             }));
         }
         let unit = native[root as usize];
-        let output = if unit.mode == Mode::Check {
+        let output = if unit.mode == Mode::DocTest {
+            Output::Doctest
+        } else if unit.mode == Mode::Check {
             Output::Check
         } else if is_program(unit) || unit.target.kind == TargetKind::Bench {
             Output::Executable
         } else {
             Output::Object
         };
-        let project = json!({
+        let mut project = json!({
             "compiler_mode": true,
             "blaze_native_units": blaze_wire::native::encode_units(&native_units),
             "blaze_spec_target": prepared.host.triple,
@@ -474,9 +515,14 @@ pub fn programs_with(
             "crates": crates,
             "blaze_spec_profile": {"version": 1, "profile": blaze_wire::encode(&root_unit.profile), "rustflags": build.rustflags.iter().map(|flag| flag.0.clone()).collect::<Vec<_>>()},
         });
+        if let Command::Test(run) = &build.command
+            && unit.mode == Mode::DocTest
+        {
+            project["blaze_spec_doctest"] = json!(blaze_wire::encode(run));
+        }
         let run = match &build.command {
             Command::Run(_) => true,
-            Command::Test(run) => unit.test && !run.no_run,
+            Command::Test(run) => (unit.test || unit.mode == Mode::DocTest) && !run.no_run,
             _ => false,
         };
         result.push(Program {
@@ -489,59 +535,11 @@ pub fn programs_with(
                 Output::Executable => executable(root),
                 Output::Object => artifacts.join(format!("unit-{root}/library.o")),
                 Output::Check => artifacts.join(format!("unit-{root}/checked.json")),
-                Output::Doctest => unreachable!(),
+                Output::Doctest => artifacts.join(format!("doctest-{root}/checked.json")),
             },
+            test_scratch,
             project,
         });
-    }
-    if let Command::Test(run) = &build.command
-        && run.doc != 0
-        && !run.no_run
-    {
-        let selected: BTreeSet<_> =
-            roots.iter().map(|&at| &native[at as usize].package.id).collect();
-        let libraries: Vec<_> = native
-            .iter()
-            .enumerate()
-            .filter(|(_, unit)| {
-                matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro)
-                    && unit.mode == Mode::Build
-                    && unit.target.doctest
-                    && selected.contains(&unit.package.id)
-            })
-            .collect();
-        for (at, unit) in libraries {
-            // The library's source-only description is already needed by a root
-            // executable or by --doc itself. Reuse its exact crate graph/profile.
-            let project = result
-                .iter()
-                .find_map(|program| {
-                    let mut project = program.project.clone();
-                    let crates = project["crates"].as_array_mut()?;
-                    let root = crates.iter().position(|krate| {
-                        krate["blaze_native_unit"] == json!(at)
-                            && krate["build"]["target_kind"] == "lib"
-                    })?;
-                    for krate in crates.iter_mut() {
-                        krate["is_workspace_member"] = false.into();
-                    }
-                    crates[root]["is_workspace_member"] = true.into();
-                    project["blaze_spec_doctest"] = json!(blaze_wire::encode(run));
-                    project["blaze_spec_profile"]["profile"] =
-                        json!(blaze_wire::encode(&build.units[at].profile));
-                    Some(project)
-                })
-                .context("doctest library has no source description")?;
-            result.push(Program {
-                unit: at as u32,
-                crate_name: unit.target.name.replace('-', "_"),
-                harness: false,
-                run: true,
-                output: Output::Doctest,
-                executable: artifacts.join(format!("doctest-{at}/checked.json")),
-                project,
-            });
-        }
     }
     Ok(result)
 }

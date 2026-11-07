@@ -62,6 +62,7 @@ printf '\nfailures:\n    flaky\n\ntest result: FAILED. 1 passed; 1 failed\n'
                 starts += 1;
                 cmd.spawn()
             },
+            &mut std::io::sink(),
         )
         .unwrap();
         assert!(!result.success, "a crashed process passed after retry: {ending}");
@@ -79,8 +80,13 @@ fn command_construction_error_revokes_earlier_passes() {
     std::fs::write(&saved, "old\tfirst\n").unwrap();
     let asked = crate::cargo::cli::of_cargo(&["test".into()]).unwrap();
     let context = context(root, &script);
-    let result =
-        test_with(&asked, &context, || anyhow::bail!("fixture command error"), Command::spawn);
+    let result = test_with(
+        &asked,
+        &context,
+        || anyhow::bail!("fixture command error"),
+        Command::spawn,
+        &mut std::io::sink(),
+    );
     assert!(result.is_err());
     assert!(!saved.exists(), "a failed invocation retained an older success");
 }
@@ -108,6 +114,7 @@ fn failed_retry_spawn_revokes_earlier_passes() {
             }
             cmd.spawn()
         },
+        &mut std::io::sink(),
     );
     assert!(result.is_err());
     assert_eq!(starts, 2);

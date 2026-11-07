@@ -229,12 +229,53 @@ pub fn resolve_captured(
     )
 }
 
+/// Source resolution before the final capture layout and native platform are known.
+/// This cannot be scheduled: only assembly produces a validated BuildSpec.
+pub(crate) struct SourceResolution {
+    pub(crate) graph: UnitGraph,
+    pub(crate) inputs: Vec<(PathBuf, Vec<u8>)>,
+    pub(crate) sources: Vec<blaze_metadata::CapturedSource>,
+    pub(crate) facts: blaze_metadata::ResolverFacts,
+    manifest: PathBuf,
+    outputs: Vec<PathBuf>,
+    config: ConfigRead,
+}
+
+pub(crate) fn resolve_sources(
+    request: &Request,
+    ctx: &Context<'_>,
+) -> Result<SourceResolution, Refusal> {
+    resolve_source_graph(request, ctx, None)
+}
+
 fn resolve_with_platform(
     request: &Request,
     ctx: &Context<'_>,
     platform: Platform<'_>,
     sources: Option<blaze_metadata::CapturedResolution<'_>>,
 ) -> Result<Resolved, Refusal> {
+    let SourceResolution { graph, mut inputs, manifest, outputs, sources, facts, config } =
+        resolve_source_graph(request, ctx, sources)?;
+    let assembly = assemble_with_inputs(request, ctx, &graph, platform)?;
+    inputs.extend(assembly.inputs);
+    Ok(Resolved {
+        spec: assembly.spec,
+        graph,
+        inputs,
+        manifest,
+        outputs,
+        sources,
+        facts,
+        config,
+        observation: assembly.observation,
+    })
+}
+
+fn resolve_source_graph(
+    request: &Request,
+    ctx: &Context<'_>,
+    sources: Option<blaze_metadata::CapturedResolution<'_>>,
+) -> Result<SourceResolution, Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
     let (offline, mut initial, manifest, outputs, config) = Opened::with(request, ctx, |opened| {
         let config = &opened.manifests.config;
@@ -288,20 +329,8 @@ fn resolve_with_platform(
         units::unit_graph_captured(&wanted, sources, ctx.config_root, ctx.config_image).map_err(
             |error| Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}")),
         )?;
-    let assembly = assemble_with_inputs(request, ctx, &graph, platform)?;
     inputs.append(&mut initial);
-    inputs.extend(assembly.inputs);
-    Ok(Resolved {
-        spec: assembly.spec,
-        graph,
-        inputs,
-        manifest,
-        outputs,
-        sources,
-        facts,
-        config,
-        observation: assembly.observation,
-    })
+    Ok(SourceResolution { graph, inputs, manifest, outputs, sources, facts, config })
 }
 
 /// The members a command builds and whether it builds what the dev-dependencies are for.
@@ -710,7 +739,7 @@ fn unit_specs(
         if unit.test {
             cfg.push("test".to_owned());
         }
-        if kind == TargetKind::ProcMacro {
+        if kind == TargetKind::ProcMacro && !unit.test {
             cfg.push("proc_macro".to_owned());
         }
         if profile.debug_assertions {
@@ -729,7 +758,11 @@ fn unit_specs(
                     unit.package.version.clone(),
                     Sha256::digest(unit.package.source.as_bytes()).into(),
                 ),
-                target: (kind_code(kind), unit.target.name.clone()),
+                // Kind 7 identifies a doctest context without changing ordinary unit keys.
+                target: (
+                    if unit.mode == Mode::DocTest { 7 } else { kind_code(kind) },
+                    unit.target.name.clone(),
+                ),
                 features: Set::new(unit.features.clone()),
                 cfg: Set::new(cfg.into_iter().map(Into::into).collect()),
                 edition: unit.target.edition,
@@ -819,7 +852,7 @@ fn asked_units(
         for &index in &graph.roots {
             let unit = &graph.units[index];
             let library = matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro)
-                && unit.mode == Mode::Build
+                && unit.mode == Mode::DocTest
                 && unit.target.doctest;
             if library {
                 asked.push(index);

@@ -8,6 +8,10 @@
 #[path = "../examples/profiles/walk.rs"]
 mod walk;
 
+#[path = "support/paths.rs"]
+#[allow(dead_code)]
+mod fixture_paths;
+
 use std::path::Path;
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -66,9 +70,7 @@ fn check(fixture: &Path, scratch: &Path) -> (usize, Vec<String>) {
     };
     let cwd = root.join(case["cwd"].as_str().unwrap_or(""));
     let root_text = root.display().to_string();
-    let normalize = |text: &str| {
-        text.replace(&home.display().to_string(), "$CARGO_HOME").replace(&root_text, "$ROOT")
-    };
+    let normalize = |text: &str| fixture_paths::normalize(text, &root, &home);
     let expected: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(fixture.join("expected.json")).unwrap())
             .unwrap();
@@ -83,7 +85,11 @@ fn check(fixture: &Path, scratch: &Path) -> (usize, Vec<String>) {
         }
         let graph = match &run["graph"] {
             serde_json::Value::Null => String::new(),
-            graph => graph.to_string().replace("$ROOT", &root_text),
+            graph => {
+                let mut graph = graph.clone();
+                fixture_paths::expand(&mut graph, &root, &home);
+                graph.to_string()
+            }
         };
         let output = walk::main(&cwd, env, host, &args, &graph);
         let what = format!("{name} `{}`", args.join(" "));

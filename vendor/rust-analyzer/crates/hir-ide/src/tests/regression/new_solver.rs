@@ -150,7 +150,7 @@ fn test() -> i32 {
             307..359 'core::...n Foo)': DynMetadata<dyn Foo + '?>
             327..328 '0': usize
             327..340 '0 as *const F': *const F
-            327..358 '0 as *...yn Foo': *const (dyn Foo + 'static)
+            327..358 '0 as *...yn Foo': *const (dyn Foo + '?)
             370..371 'f': F
             374..378 'F {}': F
             388..395 'fat_ptr': *const (dyn Foo + '?)
@@ -533,10 +533,10 @@ fn foo() {
             214..221 'loop {}': !
             219..221 '{}': ()
             234..271 '{     ...c(); }': ()
-            244..246 '_x': {unknown}
+            244..246 '_x': Vec<u8>
             249..257 'to_bytes': fn to_bytes() -> [u8; _]
             249..259 'to_bytes()': [u8; _]
-            249..268 'to_byt..._vec()': Vec<<[u8; _] as Foo>::Item>
+            249..268 'to_byt..._vec()': Vec<u8>
         "#]],
     );
 }
@@ -733,7 +733,7 @@ fn main() {
             210..272 '{     ...32>; }': ()
             220..221 '_': &'? (dyn Map<MapValue = u32, Key = u32> + '?)
             224..227 '&()': &'? ()
-            224..269 '&()   ...e=u32>': &'? (dyn Map<MapValue = u32, Key = u32> + 'static)
+            224..269 '&()   ...e=u32>': &'? (dyn Map<MapValue = u32, Key = u32> + '?)
             225..227 '()': ()
         "#]],
     );

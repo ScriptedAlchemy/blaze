@@ -2910,6 +2910,7 @@ impl B for Astruct {}
         expect![[r#"
             733..737 'self': Box<[T], A>
             766..798 '{     ...     }': Vec<T, A>
+            776..792 'unimpl...ted!()': Vec<T, A>
             812..940 '{     ...])); }': ()
             822..825 'vec': Vec<i32, Global>
             828..843 '<[_]>::into_vec': fn into_vec<i32, Global>(Box<[i32], Global>) -> Vec<i32, Global>
@@ -2918,7 +2919,7 @@ impl B for Astruct {}
             844..859 'box_new([1i32])': Box<[i32; 1], Global>
             852..858 '[1i32]': [i32; 1]
             853..857 '1i32': i32
-            870..871 'v': Vec<Box<dyn B + 'static, Global>, Global>
+            870..871 'v': Vec<Box<dyn B + '?, Global>, Global>
             891..908 '<[_]> ...to_vec': fn into_vec<Box<dyn B + '?, Global>, Global>(Box<[Box<dyn B + '?, Global>], Global>) -> Vec<Box<dyn B + '?, Global>, Global>
             891..937 '<[_]> ...ct)]))': Vec<Box<dyn B + '?, Global>, Global>
             909..916 'box_new': fn box_new<[Box<dyn B + '?, Global>; 1]>([Box<dyn B + '?, Global>; 1]) -> Box<[Box<dyn B + '?, Global>; 1], Global>

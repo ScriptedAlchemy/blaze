@@ -927,6 +927,8 @@ mod tests {
             headers: &str,
             bytes: &[u8],
         ) -> (u16, String, Vec<u8>) {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+
             let mut stream = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
             let head = format!(
                 "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n",
@@ -934,15 +936,33 @@ mod tests {
             );
             stream.write_all(head.as_bytes()).await.unwrap();
             stream.write_all(bytes).await.unwrap();
-            let mut out = Vec::new();
-            tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut out))
-                .await
-                .unwrap()
-                .unwrap();
-            let split = out.windows(4).position(|it| it == b"\r\n\r\n").unwrap();
-            let head = String::from_utf8(out[..split].to_vec()).unwrap().to_lowercase();
-            let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
-            (status, head, out[split + 4..].to_vec())
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                // A rejected upload can close with unread request bytes and reset TCP on
+                // macOS. HTTP completion is its message framing, not a subsequent TCP EOF.
+                let mut reader = BufReader::new(stream);
+                let mut head = String::new();
+                while !head.ends_with("\r\n\r\n") {
+                    assert_ne!(reader.read_line(&mut head).await.unwrap(), 0, "truncated headers");
+                }
+                let head = head.trim_end_matches("\r\n").to_lowercase();
+                let status = head.split_whitespace().nth(1).unwrap().parse::<u16>().unwrap();
+                let length = if method == "HEAD" || matches!(status, 204 | 304) {
+                    0
+                } else {
+                    head.lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .expect("the test server frames responses with Content-Length")
+                        .trim()
+                        .parse::<u64>()
+                        .unwrap()
+                };
+                let mut body = Vec::new();
+                let read = reader.take(length).read_to_end(&mut body).await.unwrap();
+                assert_eq!(read as u64, length, "truncated response body");
+                (status, head, body)
+            })
+            .await
+            .unwrap()
         }
     }
 

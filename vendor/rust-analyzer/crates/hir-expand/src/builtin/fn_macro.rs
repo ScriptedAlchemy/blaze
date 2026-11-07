@@ -8,6 +8,7 @@ use either::Either;
 use intern::{Symbol, sym};
 use itertools::Itertools;
 use mbe::{DelimiterKind, expect_fragment};
+use salsa::plumbing::AsId as _;
 use span::{Edition, FileId, Span};
 use stdx::format_to;
 use syntax::{
@@ -919,6 +920,37 @@ pub fn include_input_to_file_id(
     relative_file(db, arg_id, s.as_str(), false, span)
 }
 
+fn include_resolution(
+    db: &dyn SourceDatabase,
+    call: MacroCallId,
+    path: &str,
+    present: bool,
+) -> Option<base_db::CurrentIncludeResolution> {
+    let loc = call.loc(db);
+    let crate::MacroCallKind::FnLike { eager: Some(eager), .. } = &loc.kind else { return None };
+    if eager.error.is_some() {
+        return None;
+    }
+    Some(base_db::CurrentIncludeResolution {
+        krate: loc.krate,
+        input: eager.arg_id.as_id(),
+        path: include_path(db, call, path)?,
+        present,
+    })
+}
+
+fn include_path(
+    db: &dyn SourceDatabase,
+    call: MacroCallId,
+    path: &str,
+) -> Option<base_db::AbsPathBuf> {
+    let anchor = call.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
+    let root = db.file_source_root(anchor).source_root_id(db);
+    let root = db.source_root(root).source_root(db);
+    let parent = root.path_for_file(&anchor)?.as_path()?.parent()?;
+    paths::native::absolutize(parent, path)
+}
+
 fn include_bytes_expand(
     db: &dyn SourceDatabase,
     arg_id: MacroCallId,
@@ -943,31 +975,78 @@ fn include_bytes_expand(
     }
 }
 
-/// The contents of the file an `include_bytes!` or `include_str!` at `call_id` names.
+/// The selected reader of an `include_bytes!` or `include_str!` input.
+enum IncludedBytes {
+    Vfs(FileId),
+    External(base_db::IncludedFile),
+}
+
+impl IncludedBytes {
+    fn bytes<'db>(&self, db: &'db dyn SourceDatabase) -> Option<&'db [u8]> {
+        match *self {
+            Self::Vfs(file) => Some(db.file_text(file).text(db).as_bytes()),
+            Self::External(file) => file.bytes(db).as_deref(),
+        }
+    }
+}
+
+fn selected_include_bytes(
+    db: &dyn SourceDatabase,
+    call_id: MacroCallId,
+    path: &str,
+) -> Option<IncludedBytes> {
+    let anchor = call_id.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
+    let path = AnchoredPath { anchor, path };
+    if let Some(file) = db.resolve_path(path)
+        && db.has_file_text(file)
+    {
+        return Some(IncludedBytes::Vfs(file));
+    }
+    db.included_file(call_id.loc(db).krate, path).map(IncludedBytes::External)
+}
+
 fn included_bytes<'db>(
     db: &'db dyn SourceDatabase,
     call_id: MacroCallId,
     path: &str,
 ) -> Option<&'db [u8]> {
-    use salsa::Accumulator as _;
-    let anchor = call_id.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
-    let path = AnchoredPath { anchor, path };
-    // A file of the VFS that is not UTF-8 is read from disk like one outside it.
-    if let Some(file) = db.resolve_path(path)
-        && db.has_file_text(file)
-    {
-        return Some(db.file_text(file).text(db).as_bytes());
+    selected_include_bytes(db, call_id, path)?.bytes(db)
+}
+
+/// Observe the same selected readers used by expansion. Values are returned from
+/// ordinary tracked queries so recursive type queries never inherit accumulators.
+#[salsa::tracked(returns(ref))]
+pub fn macro_input_reads(db: &dyn SourceDatabase, call: MacroCallId) -> base_db::InputReadSet {
+    let mut reads = base_db::InputReadSet::default();
+    let loc = call.loc(db);
+    let crate::MacroDefKind::BuiltInEager(_, expander) = loc.def.kind else { return reads };
+    let crate::MacroCallKind::FnLike { eager: Some(eager), .. } = &loc.kind else { return reads };
+    if expander.is_env_or_option_env() {
+        if let Ok((key, _)) = parse_string(&eager.arg, expander == EagerExpander::Env) {
+            reads.environment.push(env_read(db, call, &key));
+        }
+    } else if expander.is_include_like() {
+        if let Ok((path, span)) = parse_string(&eager.arg, false) {
+            let present = if expander == EagerExpander::Include {
+                relative_file(db, call, path.as_str(), false, span).is_ok()
+            } else {
+                let selected = selected_include_bytes(db, call, path.as_str());
+                let present = selected.as_ref().is_some_and(|input| input.bytes(db).is_some());
+                if matches!(selected, Some(IncludedBytes::External(_))) {
+                    if let Some(path) = include_path(db, call, path.as_str()) {
+                        reads
+                            .included
+                            .push(base_db::CurrentIncludedInput { krate: loc.krate, path });
+                    }
+                }
+                present
+            };
+            if let Some(resolution) = include_resolution(db, call, path.as_str(), present) {
+                reads.resolutions.push(resolution);
+            }
+        }
     }
-    let krate = call_id.loc(db).krate;
-    let file = db.included_file(krate, path)?;
-    // The path is anchored as the input reader resolves it, including files
-    // outside VFS. Accumulate before reading so missing inputs are live too.
-    let root = db.file_source_root(anchor).source_root_id(db);
-    let sources = db.source_root(root).source_root(db);
-    let absolute =
-        paths::native::absolutize(sources.path_for_file(&anchor)?.as_path()?.parent()?, path.path)?;
-    base_db::CurrentIncludedInput { krate, path: absolute }.accumulate(db);
-    file.bytes(db).as_deref()
+    reads
 }
 
 fn include_str_expand(
@@ -1002,6 +1081,30 @@ fn get_env_inner(db: &dyn SourceDatabase, arg_id: MacroCallId, key: &Symbol) -> 
     db.env_is_read(krate, key.as_str());
     // As rustc reads them: what cargo set for the crate, then the process the build is for.
     krate.env(db).get(key.as_str()).or_else(|| base_db::process_env_var(db, key.as_str()))
+}
+
+fn env_read(db: &dyn SourceDatabase, call: MacroCallId, key: &Symbol) -> base_db::CurrentEnvRead {
+    let mut parent = call.parent(db).macro_file();
+    let mut include_input = None;
+    while let Some(file) = parent {
+        let id = file;
+        let loc = id.loc(db);
+        if matches!(loc.def.kind, crate::MacroDefKind::ProcMacro(..)) {
+            break;
+        }
+        if loc.def.is_include_like() {
+            if matches!(loc.kind, crate::MacroCallKind::FnLike { eager: None, .. }) {
+                include_input = Some(id.as_id());
+            }
+            break;
+        }
+        parent = id.parent(db).macro_file();
+    }
+    base_db::CurrentEnvRead {
+        krate: call.loc(db).krate,
+        key: key.as_str().to_owned(),
+        include_input,
+    }
 }
 
 fn non_unicode_env(

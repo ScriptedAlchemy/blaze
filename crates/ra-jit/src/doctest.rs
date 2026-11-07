@@ -89,9 +89,9 @@ struct Wanted {
 
 impl Wanted {
     /// `Err` is the argument that asks for something not done here.
-    fn parse(args: &[String]) -> Result<Wanted, String> {
+    fn parse(args: &[String], presentation_quiet: bool) -> Result<Wanted, String> {
         let mut wanted = Wanted::default();
-        let (mut quiet, mut format) = (false, None);
+        let (mut quiet, mut format) = (presentation_quiet, None);
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             let (flag, joined) = match arg.split_once('=') {
@@ -166,7 +166,7 @@ fn named_from(project: &serde_json::Value, run_in: &Path) -> anyhow::Result<Path
     })
 }
 
-pub(crate) fn saved(project: &Path, crate_name: &str) -> anyhow::Result<i32> {
+pub(crate) fn saved(project: &Path, crate_name: &str, quiet: bool) -> anyhow::Result<i32> {
     let json = crate::compiler_json::read(project)?;
     let bytes: Vec<u8> = serde_json::from_value(json["blaze_spec_doctest"].clone())?;
     let requested: blaze_wire::RunSpec =
@@ -187,7 +187,7 @@ pub(crate) fn saved(project: &Path, crate_name: &str) -> anyhow::Result<i32> {
             env
         }
     };
-    let mut wanted = Wanted::parse(&requested.harness_args).map_err(anyhow::Error::msg)?;
+    let mut wanted = Wanted::parse(&requested.harness_args, quiet).map_err(anyhow::Error::msg)?;
     wanted.filters.extend(requested.filters);
     wanted.exact = requested.exact;
     wanted.skipped = requested.skip;
@@ -326,8 +326,8 @@ impl Asked {
         if !test {
             return Err("rustdoc is not asked to run tests".to_owned());
         }
-        let wanted =
-            Wanted::parse(&test_args).map_err(|arg| format!("the tests are run with `{arg}`"))?;
+        let wanted = Wanted::parse(&test_args, false)
+            .map_err(|arg| format!("the tests are run with `{arg}`"))?;
         let build = match recorded.var(BUILD) {
             Some(build) => {
                 Some(serde_json::from_str(build).map_err(|it| format!("{BUILD}: {it}"))?)
@@ -733,6 +733,15 @@ mod recording_tests {
         process::Native,
     };
 
+    #[test]
+    fn quiet_presentation_uses_terse_doctests_with_explicit_format_precedence() {
+        assert!(!Wanted::parse(&[], false).unwrap().terse);
+        assert!(Wanted::parse(&[], true).unwrap().terse);
+        assert!(!Wanted::parse(&["--format=pretty".into()], true).unwrap().terse);
+        assert!(Wanted::parse(&["--format".into(), "terse".into()], false).unwrap().terse);
+        assert!(Wanted::parse(&["--quiet".into()], false).unwrap().terse);
+    }
+
     /// `workspace-doctests` in saved_spec.py: a member's doctest is `a/src/lib.rs - saved_a
     /// (line 1)` under cargo, named from the workspace root rustdoc runs in, not the package.
     #[test]
@@ -1124,8 +1133,9 @@ struct Test {
     name: String,
     marks: Marks,
     program: Program,
-    /// The path and line rustc is to show for the first line of the example.
+    /// The file rustdoc reports for the generated standalone program.
     shown_path: String,
+    /// The documentation fence line, used in the test's name.
     line: usize,
     edition: Edition,
     /// Whether rustdoc builds the example in one program with the others, as it does from
@@ -1208,12 +1218,6 @@ impl Test {
             edition,
             in_one,
         }
-    }
-
-    /// The lines before the program's first in a file of it whose lines are numbered as
-    /// rustdoc has rustc show them: from the line of the example in its documentation.
-    fn padding(&self) -> usize {
-        self.line.saturating_sub(self.program.lines_before)
     }
 
     /// The name with what the harness adds for how the example is tested.
@@ -1486,7 +1490,7 @@ fn plan(
             return (plans, None);
         }
     };
-    let mixing = with_another_copy(db, krate);
+    let mixing = with_another_copy(db, krate, asked);
     for (at, example) in add_crates(db, asked, krate, tests, &wanted) {
         let test = &tests[at];
         let source = &test.program.source;
@@ -1589,16 +1593,27 @@ fn uses_deprecated(db: &RootDatabase, file: vfs::FileId) -> bool {
 /// dev-dependency on a crate that depends on it from crates.io does. Its types and the
 /// library's are not each other's, which rustc says where an example mixes them, and
 /// rust-analyzer's checks do not.
-fn with_another_copy(db: &RootDatabase, library: hir::Crate) -> Vec<String> {
+fn with_another_copy(db: &RootDatabase, library: hir::Crate, asked: &Asked) -> Vec<String> {
     let library: ide_db::base_db::Crate = library.into();
     let name = |krate: ide_db::base_db::Crate| {
         hir::Crate::from(krate).display_name(db).map(|it| it.crate_name().as_str().to_owned())
     };
-    let Some(own) = name(library) else { return Vec::new() };
     let dependencies = library.data(db).dependencies.iter();
+    let identity = if asked.admission.is_some() {
+        dependencies
+            .clone()
+            .find(|dep| {
+                dep.name.as_str() == asked.crate_name
+                    && dep.crate_id.data(db).root_file_id == library.data(db).root_file_id
+            })
+            .map_or(library, |dep| dep.crate_id)
+    } else {
+        library
+    };
+    let Some(own) = name(identity) else { return Vec::new() };
     let mixing = dependencies.filter(|dependency| {
         let linked = dependency.crate_id.transitive_deps(db);
-        linked.into_iter().any(|it| it != library && name(it).as_deref() == Some(own.as_str()))
+        linked.into_iter().any(|it| it != identity && name(it).as_deref() == Some(own.as_str()))
     });
     mixing.map(|it| it.name.as_str().to_owned()).collect()
 }
@@ -1633,9 +1648,15 @@ fn add_crates(
     let library: base_db::Crate = library.into();
     let data = library.data(db).clone();
     let named = CrateName::normalize_dashes(&asked.crate_name);
-    let dependencies: Vec<BuiltDependency> = std::iter::once(BuiltDependency::new(named, library))
-        .chain(data.dependencies.iter().cloned())
-        .collect();
+    // An admitted doctest root is a canonical context whose edges already include
+    // the ordinary library. Linking the context itself would create a second copy.
+    let dependencies: Vec<BuiltDependency> = if asked.admission.is_some() {
+        data.dependencies.clone()
+    } else {
+        std::iter::once(BuiltDependency::new(named, library))
+            .chain(data.dependencies.iter().cloned())
+            .collect()
+    };
     let (workspace, cfg, env) = (
         library.workspace_data(db).clone(),
         library.cfg_options(db).clone(),
@@ -1650,8 +1671,9 @@ fn add_crates(
         };
         let file = vfs::FileId::from_raw(FIRST_FILE - n as u32);
         let root = SourceRootId(FIRST_SOURCE_ROOT - n as u32);
-        let text = format!("{}{}", "\n".repeat(test.padding()), test.program.source);
-        db.set_file_text_with_durability(file, &text, Durability::LOW);
+        // Runtime locations count the generated wrapper's lines. The fence's
+        // original line belongs only to the harness label.
+        db.set_file_text_with_durability(file, &test.program.source, Durability::LOW);
         db.set_file_source_root_with_durability(file, root, Durability::LOW);
         let mut files = FileSet::default();
         files.insert(file, VfsPath::from(vfs_path));
@@ -1685,6 +1707,103 @@ fn add_crates(
     let all: Vec<base_db::Crate> = base_db::all_crates(db).iter().copied().chain(crates).collect();
     base_db::set_all_crates_with_durability(db, all, Durability::MEDIUM);
     added
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+    use test_fixture::WithFixture;
+
+    fn check(code: &str, locations: &[(&str, u32, u32)]) {
+        // Moving the same block changes the harness label, not the standalone
+        // program's runtime source coordinates (rustdoc 1.99, edition 2021).
+        for fence in [1, 13, 41] {
+            let (mut db, _) = RootDatabase::with_single_file(
+                "//- /workspace/util/src/lib.rs crate:util edition:2021\npub const WORDS: usize = 2;",
+            );
+            let library = ide_db::base_db::all_crates(&db)[0];
+            let asked = Asked {
+                admission: None,
+                crate_name: "util".into(),
+                source: "util/src/lib.rs".into(),
+                edition: "2021".into(),
+                cwd: "/workspace".into(),
+                run_in: "/workspace/util".into(),
+                env: Vec::new(),
+                rustc_args: Vec::new(),
+                target: None,
+                features: Vec::new(),
+                build: None,
+                wanted: Wanted::default(),
+                dir: "/scratch".into(),
+            };
+            let example = Example {
+                item: "WORDS".into(),
+                file: "/workspace/util/src/lib.rs".into(),
+                line: fence,
+                marks: Marks::default(),
+                code: code.to_owned(),
+            };
+            let frame = Frame { crate_name: "util", attrs: &[], no_crate_inject: false };
+            let examples = vec![Test::of(&asked, example, &frame)];
+            assert_eq!(examples[0].line, fence);
+            assert_eq!(examples[0].shown_path, "util/src/lib.rs");
+            assert_eq!(examples[0].name, format!("util/src/lib.rs - WORDS (line {fence})"));
+            let added = add_crates(&mut db, &asked, library.into(), &examples, &[0]);
+            assert_eq!(added.len(), 1);
+            let file = added[0].1.root_file;
+            hir::attach_db(&db, || {
+                let text = db.file_text(file).text(&db);
+                let file = ide_db::base_db::EditionedFileId::new(&db, file, Edition::Edition2021);
+                for &(needle, expected_line, expected_column) in locations {
+                    let offset = text.find(needle).unwrap();
+                    let range = syntax::TextRange::at(
+                        syntax::TextSize::new(offset as u32),
+                        syntax::TextSize::new(needle.len() as u32),
+                    );
+                    let (_, line, column) =
+                        hir_ty::mir::location::caller_location_of(&db, file.into(), range).unwrap();
+                    assert_eq!(
+                        (line, column),
+                        (expected_line, expected_column),
+                        "{needle}, fence {fence}, generated source:\n{text}"
+                    );
+                    let (_, line, column) =
+                        hir_ty::mir::location::location_of(&db, file.into(), range).unwrap();
+                    assert_eq!((line, column), (expected_line, expected_column));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn injected_library_assertions_use_standalone_wrapper_lines() {
+        check("assert_eq!(util::WORDS.len(), 1);", &[("assert_eq!", 5, 1)]);
+    }
+
+    #[test]
+    fn hidden_lines_keep_their_runtime_coordinates() {
+        check(
+            "let hidden = line!();\nprintln!(\"HIDDEN {hidden} {}:{}:{}\", file!(), line!(), column!());\npanic!(\"HIDDEN\");",
+            &[("line!", 3, 14), ("file!", 4, 38), ("column!", 4, 56), ("panic!", 5, 1)],
+        );
+    }
+
+    #[test]
+    fn explicit_main_keeps_its_lines_and_columns() {
+        check(
+            "fn main() {\n    println!(\"MAIN {}:{}:{}\", file!(), line!(), column!());\n    panic!(\"MAIN\");\n}",
+            &[("file!", 3, 31), ("column!", 3, 49), ("panic!", 4, 5)],
+        );
+    }
+
+    #[test]
+    fn inner_attributes_keep_their_runtime_coordinates() {
+        check(
+            "#![allow(unused_variables)]\nprintln!(\"ATTR {}:{}:{}\", file!(), line!(), column!());\npanic!(\"ATTR\");",
+            &[("file!", 5, 27), ("column!", 5, 45), ("panic!", 6, 1)],
+        );
+    }
 }
 
 /// Compiles the example whose crate is `name` with everything it links over the standard

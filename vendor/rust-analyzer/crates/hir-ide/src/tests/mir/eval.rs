@@ -1292,10 +1292,170 @@ fn should_not_reach() {
 
 fn main() {
     let loc = core::panic::Location::caller();
-    if loc.line() != 1 || loc.column() != 1 {
+    if loc.line() != 6 || loc.column() != 15 {
         should_not_reach();
     }
 }
+"#,
+    );
+}
+
+#[test]
+fn caller_location_propagation_and_display_columns() {
+    // Expected positions are the output of this fixture's calls under rustc 1.99.0.
+    check_pass(
+        r#"
+//- minicore: panic_location
+type Loc = &'static core::panic::Location<'static>;
+#[track_caller] fn tracked() -> Loc { core::panic::Location::caller() }
+#[track_caller] fn forwarded() -> Loc { tracked() }
+fn untracked() -> Loc { forwarded() }
+trait Site { #[track_caller] fn site(&self) -> Loc; }
+struct Receiver;
+impl Site for Receiver { fn site(&self) -> Loc { forwarded() } }
+macro_rules! own { () => { core::panic::Location::caller() }; }
+macro_rules! passed { ($value:expr) => { $value }; }
+const CONSTANT: Loc = core::panic::Location::caller();
+fn main() {
+    let plain = core::panic::Location::caller();
+	let tab = core::panic::Location::caller();
+    let _ = "界"; let wide = core::panic::Location::caller();
+    let through = forwarded();
+    let stopped = untracked();
+    let from_own = own!();
+    let argument = passed!(core::panic::Location::caller());
+    let method = Receiver.site();
+    let pointer: fn() -> Loc = tracked;
+    let indirect = pointer();
+    let chain = { let r = &Receiver; r }.site();
+    if plain.line() != 12 || plain.column() != 17 { should_not_reach(); }
+    if tab.line() != 13 || tab.column() != 15 { should_not_reach(); }
+    if wide.line() != 14 || wide.column() != 30 { should_not_reach(); }
+    if through.line() != 15 || through.column() != 19 { should_not_reach(); }
+    if stopped.line() != 4 || stopped.column() != 25 { should_not_reach(); }
+    if from_own.line() != 17 || from_own.column() != 20 { should_not_reach(); }
+    if argument.line() != 18 || argument.column() != 28 { should_not_reach(); }
+    if method.line() != 19 || method.column() != 27 { should_not_reach(); }
+    if indirect.line() != 2 || indirect.column() != 17 { should_not_reach(); }
+    if chain.line() != 22 || chain.column() != 42 { should_not_reach(); }
+    if CONSTANT.line() != 10 || CONSTANT.column() != 23 { should_not_reach(); }
+    let mut left = CONSTANT;
+    let mut right = CONSTANT;
+    let mut index = 0;
+    while index < 2 {
+        let value = forwarded();
+        if index == 0 { left = value; } else { right = value; }
+        index += 1;
+    }
+    if left as *const _ != right as *const _ { should_not_reach(); }
+    if plain.file() as *const str as *const u8 != tab.file() as *const str as *const u8 {
+        should_not_reach();
+    }
+
+}
+fn should_not_reach() { panic!() }
+"#,
+    );
+}
+
+#[test]
+fn caller_location_of_a_trait_method_pointer_uses_the_impl_declaration() {
+    check_pass(
+        r#"
+//- minicore: panic_location
+type Loc = &'static core::panic::Location<'static>;
+trait Site { #[track_caller] fn site(&self) -> Loc; }
+struct R;
+impl Site for R {
+    fn site(&self) -> Loc { core::panic::Location::caller() }
+}
+fn main() {
+    let pointer: fn(&R) -> Loc = Site::site;
+    let location = pointer(&R);
+    if location.line() != 5 || location.column() != 5 { should_not_reach(); }
+}
+fn should_not_reach() { panic!() }
+"#,
+    );
+}
+
+#[test]
+fn caller_location_of_a_function_item_through_fn_once_uses_the_shim() {
+    use base_db::SourceDatabase;
+    let fixture = r#"
+//- minicore: panic_location, fn
+type Loc = &'static core::panic::Location<'static>;
+#[track_caller] fn tracked() -> Loc { core::panic::Location::caller() }
+fn invoke<F: FnOnce() -> Loc>(f: F) -> Loc { f() }
+trait Site { fn site() -> Loc; }
+struct R;
+impl Site for R { #[track_caller] fn site() -> Loc { core::panic::Location::caller() } }
+fn main() {
+    let location = invoke(tracked);
+    if location.line() != ONCE_LINE || location.column() != ONCE_COLUMN { should_not_reach(); }
+    let from_impl = invoke(<R as Site>::site);
+    if from_impl.line() != ONCE_LINE || from_impl.column() != ONCE_COLUMN { should_not_reach(); }
+    let shared = invoke(&tracked);
+    if shared.line() != SHARED_LINE || shared.column() != SHARED_COLUMN { should_not_reach(); }
+    let mut item = tracked;
+    let mutable = invoke(&mut item);
+    if mutable.line() != MUTABLE_LINE || mutable.column() != MUTABLE_COLUMN { should_not_reach(); }
+}
+fn should_not_reach() { panic!() }
+"#;
+    // rustc 1.99 reports the corresponding Fn trait declaration for each implicit shim.
+    // Locate them in the fixture's core source without using the location implementation.
+    let (db, _) = TestDB::with_single_file(fixture);
+    let sites = crate::attach_db(&db, || {
+        let site = |needle: &str| {
+            base_db::all_crates(&db)
+                .iter()
+                .find_map(|krate| {
+                    let text = db.file_text(krate.data(&db).root_file_id);
+                    text.text(&db).lines().enumerate().find_map(|(row, line)| {
+                        line.contains(needle).then(|| (row + 1, line.find("extern").unwrap() + 1))
+                    })
+                })
+                .unwrap()
+        };
+        [
+            ("ONCE", site("fn call_once(self, args: Args)")),
+            ("SHARED", site("fn call(&self, args: Args)")),
+            ("MUTABLE", site("fn call_mut(&mut self, args: Args)")),
+        ]
+    });
+    let mut fixture = fixture.to_owned();
+    for (name, (line, column)) in sites {
+        fixture = fixture
+            .replace(&format!("{name}_LINE"), &line.to_string())
+            .replace(&format!("{name}_COLUMN"), &column.to_string());
+    }
+    check_pass(&fixture);
+}
+
+#[test]
+fn caller_location_with_tracking_only_on_the_impl() {
+    check_pass(
+        r#"
+//- minicore: panic_location, coerce_unsized, dispatch_from_dyn
+type Loc = &'static core::panic::Location<'static>;
+trait Site { fn site(&self) -> Loc; }
+struct R;
+impl Site for R {
+    #[track_caller]
+    fn site(&self) -> Loc { core::panic::Location::caller() }
+}
+fn generic<T: Site>(x: &T) -> Loc { x.site() }
+fn main() {
+    let direct = R.site();
+    if direct.line() != 10 || direct.column() != 20 { should_not_reach(); }
+    let indirect = generic(&R);
+    if indirect.line() != 8 || indirect.column() != 39 { should_not_reach(); }
+    let object: &dyn Site = &R;
+    let dynamic = object.site();
+    if dynamic.line() != 6 || dynamic.column() != 5 { should_not_reach(); }
+}
+fn should_not_reach() { panic!() }
 "#,
     );
 }

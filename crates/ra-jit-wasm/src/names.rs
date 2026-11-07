@@ -257,9 +257,7 @@ impl Resolver<'_> {
 
 impl SymbolResolver for Resolver<'_> {
     fn source_path(&self, file: FileId) -> Option<String> {
-        let root = self.db.file_source_root(file).source_root_id(self.db);
-        let root = self.db.source_root(root).source_root(self.db);
-        Some(root.path_for_file(&file)?.to_string())
+        crate::source_path(self.db, file)
     }
 
     fn function(&self, func: FunctionId) -> Option<String> {

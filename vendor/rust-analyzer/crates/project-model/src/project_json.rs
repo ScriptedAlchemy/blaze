@@ -189,6 +189,7 @@ impl ProjectJson {
                         include,
                         exclude,
                         is_proc_macro: crate_data.is_proc_macro,
+                        blaze_proc_macro_test: crate_data.blaze_proc_macro_test,
                         repository: crate_data.repository,
                         build,
                         proc_macro_cwd: crate_data.proc_macro_cwd.map(absolutize_on_base),
@@ -288,6 +289,8 @@ pub struct Crate {
     pub(crate) include: Vec<AbsPathBuf>,
     pub(crate) exclude: Vec<AbsPathBuf>,
     pub(crate) is_proc_macro: bool,
+    /// A source test target with Cargo's explicit `--extern proc_macro`.
+    pub(crate) blaze_proc_macro_test: bool,
     /// The working directory to run proc-macros in. This is usually the workspace root of cargo workspaces.
     pub(crate) proc_macro_cwd: Option<AbsPathBuf>,
     pub(crate) repository: Option<String>,
@@ -434,6 +437,26 @@ impl<'de> Deserialize<'de> for ProjectJsonData {
         D: serde::Deserializer<'de>,
     {
         let mut data = ProjectJsonDataFields::deserialize(deserializer)?;
+        for krate in &data.crates {
+            if krate.blaze_proc_macro_test
+                && (!data.compiler_mode
+                    || krate.is_proc_macro
+                    || krate.proc_macro_dylib_path.is_some()
+                    || !matches!(
+                        krate.build.as_ref().map(|build| &build.target_kind),
+                        Some(TargetKindData::Test)
+                    )
+                    || !krate.cfg.as_ref().is_some_and(|cfg| {
+                        cfg.0.iter().any(
+                            |atom| matches!(atom, CfgAtom::Flag(flag) if flag.as_str() == "test"),
+                        )
+                    }))
+            {
+                return Err(de::Error::custom(
+                    "a compiler_mode proc-macro test requires a source test target, cfg(test), and no macro image",
+                ));
+            }
+        }
         if data.compiler_mode {
             for krate in &data.crates {
                 if krate.cfg.is_none() {
@@ -498,6 +521,8 @@ struct CrateData {
     source: Option<CrateSource>,
     #[serde(default)]
     is_proc_macro: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    blaze_proc_macro_test: bool,
     repository: Option<String>,
     build: Option<BuildData>,
     proc_macro_cwd: Option<Utf8PathBuf>,

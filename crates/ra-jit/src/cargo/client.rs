@@ -56,8 +56,12 @@ pub(crate) fn ask(mut request: Request, start: Start) -> anyhow::Result<Option<R
     // A daemon of another version exits for a client that starts its own, and for one that
     // tells it to stop.
     let replaces = start == Start::IfMissing || matches!(request, Request::Stop);
-    // A whole build is asked for at once: no cargo builds meanwhile for a spare to load beside.
-    let spares = !matches!(&request, Request::Build(checkout) if checkout.config.whole);
+    // Whole builds and environment retention have no cargo build to load beside.
+    let spares = match &request {
+        Request::Build(checkout) => !checkout.config.whole,
+        Request::RememberScript { .. } => false,
+        _ => true,
+    };
     let started = |home: &Path| started(home, spares);
     let envelope = serde_json::to_string(&Envelope { version: version(), replaces, request })?;
     let mut stream = match (connect(&socket), start) {

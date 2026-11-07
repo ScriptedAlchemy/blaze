@@ -52,5 +52,12 @@ wasmparser = "0.244"
 debug = 0
 
 [patch.crates-io]
+# Keep the standalone workspace on the same front end as the native compiler.
+rowan = { path = "../../vendor/rust-analyzer/lib/rowan" }
+ra-ap-rustc_type_ir = { path = "../../vendor/rustc_type_ir" }
+ra-ap-rustc_next_trait_solver = { path = "../../vendor/rustc_next_trait_solver" }
+salsa = { path = "../../vendor/salsa" }
+salsa-macros = { path = "../../vendor/salsa-macros" }
+salsa-macro-rules = { path = "../../vendor/salsa-macro-rules" }
 # As in the main workspace: rustc's layout code, from the tag of the stable it is pinned to.
 ra-ap-rustc_abi = { path = "../../vendor/rustc_abi" }

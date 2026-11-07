@@ -1,5 +1,7 @@
 //! This module generates a polymorphic MIR from a hir body
 
+pub(super) mod diagnostic;
+
 use std::{borrow::Cow, iter, mem};
 
 use arrayvec::ArrayVec;
@@ -543,8 +545,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         else {
             return Ok(None);
         };
-        // `CONST.len()` borrows a promoted constant just as `(&CONST).len()` does.
-        if bk == BorrowKind::Shared
+        // `CONST.len()` borrows a promoted constant just as `(&CONST).len()` does, and
+        // `[].iter_mut()` one just as `(&mut []).iter_mut()`.
+        if (bk == BorrowKind::Shared || self.is_empty_array(expr_id))
             && rest.is_empty()
             && p.local.into_raw().into_u32() as usize >= locals
             && p.projection.as_slice().is_empty()
@@ -4298,7 +4301,13 @@ fn cast_kind<'db>(
         (Some(CastTy::Int(_)), Some(CastTy::Float)) => CastKind::IntToFloat,
         (Some(CastTy::Float), Some(CastTy::Float)) => CastKind::FloatToFloat,
         (Some(CastTy::Ptr(..)), Some(CastTy::Ptr(..))) => CastKind::PtrToPtr,
-        _ => not_supported!("Unknown cast between {source_ty:?} and {target_ty:?}"),
+        _ => {
+            return Err(MirLowerError::NotSupported(format!(
+                "Unknown cast between {} and {}",
+                diagnostic::stable_type(db, source_ty),
+                diagnostic::stable_type(db, target_ty)
+            )));
+        }
     })
 }
 

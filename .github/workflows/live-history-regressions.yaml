@@ -1,0 +1,27 @@
+name: Live latency history publication regressions
+on:
+  pull_request:
+    paths:
+      - .github/workflows/live-latency.yaml
+      - .github/scripts/publish_live_history.sh
+      - .github/scripts/test_publish_live_history.py
+      - .github/scripts/test_live_regression_issue.py
+      - .github/workflows/live-history-regressions.yaml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: live-history-tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  publication:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify protected-main-safe publication and retries
+        run: python3 -m unittest discover -s .github/scripts -p test_publish_live_history.py -v
+      - name: Verify reporting when GitHub Issues are disabled
+        run: python3 -m unittest discover -s .github/scripts -p test_live_regression_issue.py -v

@@ -153,18 +153,64 @@ impl Snapshot {
     /// Check a materialized tree against its authenticated complete member/type/content
     /// manifest without writing blobs or changing the source directory.
     pub fn verify_materialized(root: Digest, store: &Path, directory: &Path) -> anyhow::Result<()> {
+        Self::verify_materialized_with_directories(root, store, directory, &[])
+    }
+
+    /// Compose an immutable source tree with execution's explicitly planned directory
+    /// scaffolding. New files, aliases and unplanned descendants remain unrecorded inputs.
+    pub(crate) fn verify_materialized_with_directories(
+        root: Digest,
+        store: &Path,
+        directory: &Path,
+        additional: &[PathBuf],
+    ) -> anyhow::Result<()> {
         let snapshot = parse(&get(store, &root)?)?;
         let expected: BTreeMap<_, _> = snapshot
             .entries
             .iter()
             .map(|entry| Ok((entry.0.to_native()?, entry)))
             .collect::<anyhow::Result<_>>()?;
+        let mut scaffolding = BTreeSet::new();
+        for path in additional.iter().filter(|path| path.starts_with(directory)) {
+            let mut paths = vec![path.clone()];
+            // Retain the same authority through a source-authenticated directory
+            // alias. The ordinary manifest checks below still verify every link.
+            for parent in path.ancestors() {
+                match parent.canonicalize() {
+                    Ok(canonical) => {
+                        paths.push(canonical.join(path.strip_prefix(parent)?));
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            for path in paths {
+                if let Ok(relative) = path.strip_prefix(directory) {
+                    scaffolding.extend(
+                        relative
+                            .ancestors()
+                            .filter(|path| !path.as_os_str().is_empty())
+                            .map(Path::to_owned),
+                    );
+                }
+            }
+        }
         let mut seen = BTreeSet::new();
         let mut pending = vec![PathBuf::new()];
         while let Some(parent) = pending.pop() {
             for item in fs::read_dir(directory.join(&parent))? {
                 let item = item?;
                 let relative = parent.join(item.file_name());
+                if !expected.contains_key(&relative) && scaffolding.contains(&relative) {
+                    ensure!(
+                        fs::symlink_metadata(item.path())?.is_dir(),
+                        "unrecorded snapshot member {} is not a planned directory",
+                        relative.display()
+                    );
+                    pending.push(relative);
+                    continue;
+                }
                 let Entry(_, kind, mode, digest) = expected.get(&relative).with_context(|| {
                     format!("unrecorded snapshot member {}", relative.display())
                 })?;

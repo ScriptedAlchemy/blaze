@@ -53,6 +53,10 @@ impl Default for TestDB {
             .durability(Durability::MEDIUM)
             .new(&this);
         CrateGraphBuilder::default().set_in_db(&mut this);
+        crate::mir::location::name_sources(&mut this, |db, file| {
+            let root = db.file_source_root(file).source_root_id(db);
+            Some(db.source_root(root).source_root(db).path_for_file(&file)?.to_string())
+        });
         this
     }
 }

@@ -45,10 +45,15 @@ runs:
         fi
         body=$(printf '%s at %s (%s):\n\n%s\n\n%s\n' "$RUN" "${GITHUB_SHA:0:10}" "$(date -u +%F)" \
           "${failed:-no job failed by name; see the run}" "$note")
-        if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" != true ]; then
-          printf '## %s\n\n%s\n' "$title" "$body" >> "$GITHUB_STEP_SUMMARY"
+        printf '## %s\n\n%s\n' "$title" "$body" >> "$GITHUB_STEP_SUMMARY"
+        has_issues=$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)
+        if [ "$has_issues" = false ]; then
           echo "::warning title=$title::issues are turned off in $GITHUB_REPOSITORY; the report is in the job summary"
           exit 0
+        fi
+        if [ "$has_issues" != true ]; then
+          echo "Cannot determine whether $GITHUB_REPOSITORY supports issues: $has_issues" >&2
+          exit 1
         fi
         number=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number,title \
           --jq "map(select(.title == \"$title\")) | first | .number // empty")

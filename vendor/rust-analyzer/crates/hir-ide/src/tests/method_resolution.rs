@@ -1154,9 +1154,9 @@ fn dyn_trait_super_trait_not_in_scope() {
             51..55 'self': &'? Self
             64..69 '{ 0 }': u32
             66..67 '0': u32
-            176..177 'd': &'? (dyn Trait + 'static)
+            176..177 'd': &'? (dyn Trait + '?)
             191..207 '{     ...o(); }': ()
-            197..198 'd': &'? (dyn Trait + 'static)
+            197..198 'd': &'? (dyn Trait + '?)
             197..204 'd.foo()': u32
         "#]],
     );
@@ -2049,7 +2049,7 @@ impl dyn Error + Send {
     /// Attempts to downcast the box to a concrete type.
     pub fn downcast<T: Error + 'static>(self: Box<Self>) -> Result<Box<T>, Box<dyn Error + Send>> {
         let err: Box<dyn Error> = self;
-                               // ^^^^ expected Box<dyn Error + 'static>, got Box<dyn Error + Send + 'static>
+                               // ^^^^ expected Box<dyn Error + '?>, got Box<dyn Error + Send + 'static>
                                // FIXME, type mismatch should not occur
         <dyn Error>::downcast(err).map_err(|_| loop {})
       //^^^^^^^^^^^^^^^^^^^^^ type: fn downcast<{unknown}>(Box<dyn Error + 'static>) -> Result<Box<{unknown}>, Box<dyn Error + 'static>>
@@ -2339,6 +2339,58 @@ pub struct S;
 impl S {
     #[unstable(feature = "gated", issue = "none")]
     pub fn gated(&self) -> u16 { 0 }
+}
+"#,
+    );
+}
+
+#[test]
+fn dependency_macros_can_write_impls_inside_functions() {
+    check_types(
+        r#"
+//- /main.rs crate:main deps:dep
+use dep::Trait;
+struct Direct;
+struct Generated;
+fn holder() { dep::make_impl!(Direct); }
+macro_rules! make_holder { () => { fn generated_holder() { dep::make_impl!(Generated); } }; }
+make_holder!();
+fn outside() {
+    Direct.inherent();
+  //^^^^^^^^^^^^^^^^^ u16
+    Direct.from_trait();
+  //^^^^^^^^^^^^^^^^^^^ u32
+    Generated.inherent();
+  //^^^^^^^^^^^^^^^^^^^^ u16
+    Generated.from_trait();
+  //^^^^^^^^^^^^^^^^^^^^^^ u32
+}
+//- /dep.rs crate:dep
+pub trait Trait { fn from_trait(&self) -> u32; }
+#[macro_export]
+macro_rules! make_impl {
+    ($ty:ty) => {
+        impl $crate::Trait for $ty { fn from_trait(&self) -> u32 { 1 } }
+        impl $ty { fn inherent(&self) -> u16 { 2 } }
+    };
+}
+"#,
+    );
+}
+
+#[test]
+fn attributes_inside_functions_can_write_foreign_self_impls() {
+    check_types(
+        r#"
+//- proc_macros: input_replace
+trait Trait { fn value(&self) -> u16; }
+fn holder() {
+    #[proc_macros::input_replace(impl Trait for u32 { fn value(&self) -> u16 { 2 } })]
+    struct Input;
+}
+fn outside() {
+    0u32.value();
+  //^^^^^^^^^^^^ u16
 }
 "#,
     );

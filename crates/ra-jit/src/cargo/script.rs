@@ -105,6 +105,21 @@ pub(crate) fn environment(dir: &Path) -> Option<crate::process::Native> {
     })
 }
 
+pub(crate) fn retain_environment(
+    dir: PathBuf,
+    env: crate::process::Native,
+    ask: impl FnOnce(
+        super::daemon::Request,
+        super::client::Start,
+    ) -> anyhow::Result<Option<super::daemon::Reply>>,
+) -> anyhow::Result<()> {
+    match ask(super::daemon::Request::RememberScript { dir, env }, super::client::Start::IfMissing)?
+    {
+        Some(super::daemon::Reply::Warming) => Ok(()),
+        _ => anyhow::bail!("the daemon did not retain the record environment"),
+    }
+}
+
 /// Has cargo run the script rustc linked at `linked` through `ra-jit build-script`.
 #[cfg(unix)]
 pub(crate) fn stand_in_front(linked: &Path) -> anyhow::Result<()> {
@@ -183,14 +198,7 @@ pub(crate) fn run_as_cargo_does(
         }
     }
     if let Some(run_dir) = out_dir.as_deref().and_then(Path::parent) {
-        // This request is memory-only. A daemon restart loses replay eligibility;
-        // it never reconstructs a caller snapshot from disk or its own environment.
-        let _ = super::client::ask(
-            super::daemon::Request::RememberScript { dir: run_dir.to_owned(), env: env.clone() },
-            super::client::Start::Never,
-        );
-        let ran = Ran::recorded(real.clone(), cwd.clone(), &env);
-        let _ = std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran)?);
+        record_run(run_dir, &real, &cwd, &env, super::client::ask)?;
     }
     // A run is not replayed from the store: what a script reads besides the files it names,
     // and what it does beside its `OUT_DIR` (a file elsewhere, an extended attribute), are
@@ -198,6 +206,30 @@ pub(crate) fn run_as_cargo_does(
     let mut script = Command::new(&real);
     script.args(&args).env_remove(REAL).env_remove(continuation::KEY);
     become_it(&mut script)
+}
+
+fn record_run(
+    run_dir: &Path,
+    real: &Path,
+    cwd: &Path,
+    env: &crate::process::Native,
+    ask: impl FnOnce(
+        super::daemon::Request,
+        super::client::Start,
+    ) -> anyhow::Result<Option<super::daemon::Reply>>,
+) -> anyhow::Result<()> {
+    let path = run_dir.join(RAN);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Running the script needs no replay record, but a prior run must not describe it.
+    if retain_environment(run_dir.to_owned(), env.clone(), ask).is_err() {
+        return Ok(());
+    }
+    let ran = Ran::recorded(real.to_owned(), cwd.to_owned(), env);
+    Ok(std::fs::write(path, serde_json::to_vec(&ran)?)?)
 }
 
 #[cfg(unix)]
@@ -985,6 +1017,64 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
+
+    #[test]
+    fn unacknowledged_run_cannot_leave_stale_replay_metadata() {
+        use crate::cargo::daemon::Reply;
+
+        for reply in [None, Some(Reply::Stopping)] {
+            let dir = tempfile::tempdir().unwrap();
+            let env = crate::process::Native::of([("TOKEN".into(), "synthetic-secret".into())]);
+            let old = Ran::recorded(dir.path().join("old-script"), dir.path().to_owned(), &env);
+            std::fs::write(dir.path().join(RAN), serde_json::to_vec(&old).unwrap()).unwrap();
+            record_run(dir.path(), &dir.path().join("script"), dir.path(), &env, |_, _| Ok(reply))
+                .unwrap();
+            assert!(!dir.path().join(RAN).exists(), "unretained runs cannot remain replayable");
+            assert!(remembered(dir.path()).is_none());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::process::Native::of([("TOKEN".into(), "synthetic-secret".into())]);
+        std::fs::write(dir.path().join(RAN), b"old run").unwrap();
+        record_run(dir.path(), &dir.path().join("script"), dir.path(), &env, |_, _| {
+            anyhow::bail!("memory owner unavailable")
+        })
+        .unwrap();
+        assert!(!dir.path().join(RAN).exists());
+    }
+
+    #[test]
+    fn an_unremovable_run_descriptor_prevents_a_new_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(RAN)).unwrap();
+        let env = crate::process::Native::of([]);
+        let result =
+            record_run(dir.path(), &dir.path().join("script"), dir.path(), &env, |_, _| {
+                panic!("invalidate the old descriptor before retaining a new run")
+            });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn acknowledged_run_keeps_environment_in_memory_and_names_on_disk() {
+        use crate::cargo::daemon::{Reply, Request};
+
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::process::Native::of([("TOKEN".into(), "synthetic-secret".into())]);
+        record_run(dir.path(), &dir.path().join("script"), dir.path(), &env, |request, start| {
+            assert!(start == super::super::client::Start::IfMissing);
+            let Request::RememberScript { dir, env } = request else {
+                panic!("run publication must retain its environment");
+            };
+            remember(dir, env);
+            Ok(Some(Reply::Warming))
+        })
+        .unwrap();
+        let bytes = std::fs::read(dir.path().join(RAN)).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-secret"));
+        assert_eq!(super::recorded(dir.path()).unwrap().env_names, ["TOKEN"]);
+        assert_eq!(remembered(dir.path()), Some(env));
+        crate::lock(&ENVIRONMENTS).remove(dir.path());
+    }
 
     /// The link search directories a script printed, as cargo passes them: by either prefix,
     /// with or without a kind, and the `-L` of `rustc-flags` joined or apart.

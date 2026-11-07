@@ -1601,9 +1601,8 @@ impl<'db> Evaluator<'db> {
             }
             "const_deallocate" => Ok(()),
             "caller_location" => {
-                // A constant holds what rustc would name the file, which is known to whoever
-                // builds the program and not here.
-                not_supported!("the caller's location in a constant")
+                let location = self.caller_location(locals, span)?;
+                destination.write_from_bytes(self, &location.to_bytes()[..self.ptr_size()])
             }
             "box_new" => {
                 let ty = generic_args.type_at(0);

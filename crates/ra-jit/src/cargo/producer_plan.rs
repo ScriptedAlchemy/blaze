@@ -171,7 +171,7 @@ impl Producers {
         let mut env: BTreeMap<String, String> =
             crate::process::unicode(self.compile_env.vars()).collect();
         let probe = dir.join("producer-rustc");
-        crate::answers::producer_launcher(&probe)?;
+        crate::answers::producer_launcher(&probe, sysroot)?;
         env.insert("RUSTC".into(), probe.display().to_string());
         env.insert("RUSTDOC".into(), probe.display().to_string());
         env.remove("RUSTC_WRAPPER");

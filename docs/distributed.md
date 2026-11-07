@@ -566,7 +566,7 @@ the explicit saved manifest. No repository-root fallback or project-name inferen
 struct UnitSpec {                   // 0..=8
     package: (String, String, Digest), // 0, name, version, source id digest
     target: (u8, String),           // 1, kind (0 lib, 1 bin, 2 test, 3 example, 4 bench,
-                                    //    5 build script, 6 proc macro) and name
+                                    //    5 build script, 6 proc macro, 7 doctest context) and name
     features: Vec<String>,          // 2, set: after unification
     cfg: Vec<InputText>,            // 3, set: message-bounded cfg derived from flags
     edition: u16,                   // 4

@@ -42,6 +42,7 @@ class ReplayCleanupTests(unittest.TestCase):
         self.status = 0
         self.publish = True
         self.missing_program = False
+        self.output, self.errors, self.timed_out = "@@result\n", "", False
 
     def run_product(self, args, cwd, env, merge):
         # An incomplete replay still leaves scratch output when a command fails.
@@ -57,7 +58,7 @@ class ReplayCleanupTests(unittest.TestCase):
                 "executable": str(artifact), "test": False,
                 "target_kind": 1, "target": "fixture",
             }]}))
-        return Run(args, self.status, "@@result\n", "", 0.01)
+        return Run(args, self.status, self.output, self.errors, 0.01, self.timed_out)
 
     def stop_product(self, home, cwd, env):
         # Inspection/cleanup must not race a live producer.
@@ -118,6 +119,22 @@ class ReplayCleanupTests(unittest.TestCase):
         self.assertEqual(run.code, 1)
         self.assertEqual(summary["programs"], [])
         self.assertFalse(self.created[-1].exists())
+        self.assert_preserved()
+
+    def test_timeout_diagnostics_survive_replay_cleanup(self):
+        self.ctx.args.json = str(self.root / "evidence" / "local.json")
+        self.status, self.publish, self.timed_out = -9, False, True
+        self.output, self.errors = "last completed replay phase\n", "replay diagnostic\n"
+        _, run, _ = self.execute()
+        self.assertTrue(run.timed_out)
+        self.assertFalse(self.created[-1].exists())
+        evidence = Path(self.ctx.args.json + ".runs") / "run-test.json"
+        record = json.loads(evidence.read_text())
+        self.assertEqual(record["code"], -9)
+        self.assertTrue(record["timed_out"])
+        self.assertEqual(record["argv"], ["cargo", "spec", "--run", str(self.spec)])
+        self.assertEqual(record["stdout"], self.output)
+        self.assertEqual(record["stderr"], self.errors)
         self.assert_preserved()
 
     def test_new_symlink_is_not_followed_or_removed(self):

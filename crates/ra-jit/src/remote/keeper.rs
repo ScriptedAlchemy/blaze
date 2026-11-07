@@ -22,7 +22,7 @@ use super::{Digest, Lazy, Shared, collect::parse_age, push};
 const PUSH_EVERY: Duration = Duration::from_secs(5 * 60);
 /// The manifest is read no more often than this, however many builds lack something.
 const LOOK_EVERY: Duration = Duration::from_secs(5);
-/// How long the push of a daemon that was told to end may take before it ends anyway.
+/// Shutdown grace period, measured from signal receipt.
 const LAST_PUSH: Duration = Duration::from_secs(60);
 
 /// `RA_JIT_REMOTE_PUSH_EVERY`: a count and `s`, `m`, `h` or `d`, or `off`.
@@ -144,9 +144,8 @@ impl Shared {
                 }
                 Step::Push => self.send().await,
                 Step::End(signal) => {
-                    if tokio::time::timeout(LAST_PUSH, self.send()).await.is_err() {
-                        eprintln!("remote: the last push took over {LAST_PUSH:?} and was left");
-                    }
+                    // request_end owns the deadline; publication may finish sooner.
+                    self.send().await;
                     end_by(signal);
                 }
             }
@@ -220,7 +219,7 @@ async fn told_to_end(steps: UnboundedSender<Step>) {
             Either::Right(_) => libc::SIGINT,
         }
     };
-    _ = steps.send(Step::End(by));
+    request_end(steps, by, LAST_PUSH).await;
 }
 
 /// On Windows a process is told to end by an event of its console: Ctrl-C, Ctrl-Break, which
@@ -241,7 +240,16 @@ async fn told_to_end(steps: UnboundedSender<Step>) {
     let (interrupted, broken, closed) =
         (pin!(interrupted.recv()), pin!(broken.recv()), pin!(closed.recv()));
     select(select(interrupted, broken), closed).await;
-    _ = steps.send(Step::End(CONTROL_C_EXIT));
+    request_end(steps, CONTROL_C_EXIT, LAST_PUSH).await;
+}
+
+// Keep the deadline outside the serial keeper: an earlier push may block its queue.
+async fn request_end(steps: UnboundedSender<Step>, signal: i32, grace: Duration) -> ! {
+    if steps.send(Step::End(signal)).is_ok() {
+        tokio::time::sleep(grace).await;
+    }
+    // Logging here could block termination on stderr backpressure.
+    end_by(signal)
 }
 
 /// How Windows ends a process that waits for none of those events.
@@ -268,3 +276,7 @@ fn end_by(status: i32) -> ! {
 #[cfg(test)]
 #[path = "keeper/recovery_tests.rs"]
 mod recovery_tests;
+
+#[cfg(test)]
+#[path = "keeper/shutdown_tests.rs"]
+mod shutdown_tests;

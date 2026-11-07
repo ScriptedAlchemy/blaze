@@ -35,6 +35,9 @@ pub(super) struct Emitted<'data, 'file> {
     file: &'file object::File<'data>,
     /// The section of the function.
     text: SectionIndex,
+    /// The function's atom within its section. Mach-O puts several functions in `__text`.
+    atom: std::ops::Range<u64>,
+    unwind_index: &'file MachoUnwindIndex,
     /// The sections of every function of the object that is read.
     texts: &'file FxHashSet<SectionIndex>,
     /// Sections the code of more than one of them refers to.
@@ -62,6 +65,95 @@ enum Placement {
     Blob(DataId),
 }
 
+/// Resolve an object's Mach-O unwind pointers once. A unit may contain hundreds of
+/// functions; looking through every relocation for every pointer of every LSDA is cubic.
+#[derive(Default)]
+struct MachoUnwindIndex {
+    pointers: FxHashMap<(SectionIndex, u64), (SectionIndex, u64)>,
+    compact: FxHashMap<(SectionIndex, u64), u64>,
+    fdes: FxHashMap<(SectionIndex, u64), u64>,
+    pad_ends: FxHashMap<(SectionIndex, u64), u64>,
+}
+
+impl MachoUnwindIndex {
+    fn read(file: &object::File<'_>) -> Result<Self, Unhandled> {
+        let mut index = Self::default();
+        if file.format() != BinaryFormat::MachO {
+            return Ok(index);
+        }
+        let subtractor = match file.architecture() {
+            Architecture::Aarch64 => macho::ARM64_RELOC_SUBTRACTOR,
+            _ => macho::X86_64_RELOC_SUBTRACTOR,
+        };
+        let mut pads: FxHashMap<SectionIndex, Vec<u64>> = FxHashMap::default();
+        for section in
+            file.sections().filter(|it| matches!(it.name(), Ok("__compact_unwind" | "__eh_frame")))
+        {
+            let compact = section.name()? == "__compact_unwind";
+            if compact && section.size() % 32 != 0 {
+                return Err(Unhandled::Shape("a truncated Mach-O compact unwind table"));
+            }
+            let subtracts: FxHashMap<_, _> = section.relocations().filter(|(_, relocation)|
+                matches!(relocation.flags(), RelocationFlags::MachO {r_type, ..} if r_type == subtractor)
+            ).collect();
+            for (at, relocation) in section
+                .relocations()
+                .filter(|(_, relocation)| relocation.kind() == object::RelocationKind::Absolute)
+            {
+                if relocation.size() != 64 {
+                    return Err(Unhandled::Shape("a non-64-bit Mach-O unwind pointer"));
+                }
+                let (target, base) = match relocation.target() {
+                    RelocationTarget::Symbol(id) => {
+                        let symbol = file.symbol_by_index(id)?;
+                        let SymbolSection::Section(target) = symbol.section() else { continue };
+                        (target, symbol.address())
+                    }
+                    RelocationTarget::Section(target) => (target, 0),
+                    _ => return Err(Unhandled::Shape("a Mach-O unwind pointer without a section")),
+                };
+                let bytes = section
+                    .data()?
+                    .get(at as usize..at as usize + 8)
+                    .ok_or(Unhandled::Shape("a truncated Mach-O unwind pointer"))?;
+                let addend = u64::from_le_bytes(bytes.try_into().unwrap());
+                let mut address =
+                    base.wrapping_add(addend).wrapping_add_signed(relocation.addend());
+                if let Some(subtract) = subtracts.get(&at) {
+                    // DWARF PC-relative pointers have an UNSIGNED/SUBTRACTOR pair;
+                    // the stored addend includes the distance from the section base.
+                    address = address
+                        .wrapping_sub(Emitted::symbol(file, subtract)?.address())
+                        .wrapping_add(section.address() + at);
+                }
+                let target_section = file.section_by_index(target)?;
+                let offset = address
+                    .checked_sub(target_section.address())
+                    .ok_or(Unhandled::Shape("a Mach-O unwind pointer before its section"))?;
+                index.pointers.insert((section.index(), at), (target, offset));
+                if compact && at % 32 == 0 {
+                    index.compact.insert((target, offset), at);
+                } else if !compact && target_section.kind() == SectionKind::Text && at >= 8 {
+                    index.fdes.insert((target, offset), at - 8);
+                }
+                if target_section.name()? == "__gcc_except_tab" {
+                    pads.entry(target).or_default().push(offset);
+                }
+            }
+        }
+        for (section, mut starts) in pads {
+            starts.sort_unstable();
+            starts.dedup();
+            for (at, &start) in starts.iter().enumerate() {
+                let end =
+                    starts.get(at + 1).copied().unwrap_or(file.section_by_index(section)?.size());
+                index.pad_ends.insert((section, start), end);
+            }
+        }
+        Ok(index)
+    }
+}
+
 /// The code of each of `functions`, by its name in the object and its signature. What is wrong
 /// with the code of one is that function's; what is wrong with the object is every one's.
 pub(super) fn read(
@@ -70,13 +162,15 @@ pub(super) fn read(
     recorder: &mut Wants,
 ) -> Result<Vec<Result<Code, Unhandled>>, Unhandled> {
     let file = object::File::parse(object)?;
+    let unwind_index = MachoUnwindIndex::read(&file)?;
     let mut found: Vec<Option<(SectionIndex, u64)>> = vec![None; functions.len()];
     for symbol in file.symbols() {
         let (Ok(name), SymbolSection::Section(section)) = (symbol.name(), symbol.section()) else {
             continue;
         };
         if let Some(at) = functions.iter().position(|it| it.0 == plain(&file, name)) {
-            found[at] = Some((section, symbol.address()));
+            found[at] =
+                Some((section, symbol.address() - file.section_by_index(section)?.address()));
         }
     }
     let texts: FxHashSet<SectionIndex> = found.iter().flatten().map(|it| it.0).collect();
@@ -101,15 +195,36 @@ pub(super) fn read(
     for (at, (_, signature)) in functions.iter().enumerate() {
         let code = match found[at] {
             None => Err(Unhandled::Shape("an object without the function")),
-            Some((_, address)) if address != 0 => {
+            Some((_, address)) if address != 0 && file.format() != BinaryFormat::MachO => {
                 Err(Unhandled::Shape("code ahead of the function"))
             }
-            Some((text, _)) if found.iter().flatten().filter(|it| it.0 == text).count() > 1 => {
+            Some((text, _))
+                if file.format() != BinaryFormat::MachO
+                    && found.iter().flatten().filter(|it| it.0 == text).count() > 1 =>
+            {
                 Err(Unhandled::Shape("functions that share a section"))
             }
-            Some((text, _)) => {
+            Some((text, start)) => {
                 let name = functions[at].0;
-                Emitted::code(&file, text, &texts, &shared, name, signature.clone(), recorder)
+                let section = file.section_by_index(text)?;
+                let end = found
+                    .iter()
+                    .flatten()
+                    .filter(|&&(other, address)| other == text && address > start)
+                    .map(|&(_, address)| address)
+                    .min()
+                    .unwrap_or(section.size());
+                Emitted::code(
+                    &file,
+                    text,
+                    start..end,
+                    &unwind_index,
+                    &texts,
+                    &shared,
+                    name,
+                    signature.clone(),
+                    recorder,
+                )
             }
         };
         codes.push(code);
@@ -129,6 +244,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
     fn code(
         file: &'file object::File<'data>,
         text: SectionIndex,
+        atom: std::ops::Range<u64>,
+        unwind_index: &'file MachoUnwindIndex,
         texts: &'file FxHashSet<SectionIndex>,
         shared: &'file FxHashSet<SectionIndex>,
         name: &'file str,
@@ -138,6 +255,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
         let mut emitted = Emitted {
             file,
             text,
+            atom,
+            unwind_index,
             texts,
             shared,
             name,
@@ -294,8 +413,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
     }
 
     /// The bytes of the section `name` with what its relocations say filled in, as far as
-    /// that is known before linking: each function starts its section, which is at
-    /// [`Self::base`], and every other section is on its own.
+    /// that is known before linking: code sections are moved to [`Self::base`], keeping
+    /// each function's offset within its section. Other sections remain on their own.
     fn relocated(&self, name: &str) -> Option<Vec<u8>> {
         let Some(section) = self.file.section_by_name(name) else { return Some(Vec::new()) };
         let mut bytes = section.data().ok()?.to_vec();
@@ -303,14 +422,24 @@ impl<'data, 'file> Emitted<'data, 'file> {
             if relocation.kind() != object::RelocationKind::Absolute {
                 return None;
             }
-            let symbol = Self::symbol(self.file, &relocation).ok()?;
-            let base = match symbol.section() {
-                SymbolSection::Section(at) if self.texts.contains(&at) => Self::base(at),
-                _ => 0,
+            let (target, address) = match relocation.target() {
+                RelocationTarget::Symbol(index) => {
+                    let symbol = self.file.symbol_by_index(index).ok()?;
+                    (symbol.section_index(), symbol.address())
+                }
+                RelocationTarget::Section(index) => (Some(index), 0),
+                _ => return None,
             };
-            let value = (base + symbol.address()).wrapping_add_signed(relocation.addend());
+            let base = target.filter(|at| self.texts.contains(at)).map_or(0, Self::base);
             let size = usize::from(relocation.size() / 8);
             let at = bytes.get_mut(offset as usize..)?.get_mut(..size)?;
+            let mut implicit = [0; 8];
+            if relocation.has_implicit_addend() {
+                implicit.get_mut(..size)?.copy_from_slice(at);
+            }
+            let value = (base + address)
+                .wrapping_add_signed(relocation.addend())
+                .wrapping_add(u64::from_le_bytes(implicit));
             at.copy_from_slice(value.to_le_bytes().get(..size)?);
         }
         Some(bytes)
@@ -325,7 +454,11 @@ impl<'data, 'file> Emitted<'data, 'file> {
     /// How far into the function an address [`Self::relocated`] filled in is, if it is in the
     /// function's section.
     fn local(&self, address: u64) -> Option<u32> {
-        u32::try_from(address.checked_sub(Self::base(self.text))?).ok()
+        let section = self.file.section_by_index(self.text).ok()?;
+        let offset = address.checked_sub(Self::base(self.text) + section.address())?;
+        (self.atom.start <= offset && offset <= self.atom.end)
+            .then(|| u32::try_from(offset - self.atom.start).ok())
+            .flatten()
     }
 
     /// Which source location the code is of from each offset on, from the line table: the
@@ -350,7 +483,12 @@ impl<'data, 'file> Emitted<'data, 'file> {
         let named = header.file_names().iter().any(ours);
         // Each run of code is of one section: the function's are those that start in it.
         let mut ranges = Vec::new();
-        for sequence in sequences.iter().filter(|it| self.local(it.start).is_some()) {
+        let section = self.file.section_by_index(self.text)?;
+        let base = Self::base(self.text) + section.address();
+        for sequence in sequences
+            .iter()
+            .filter(|it| it.start < base + self.atom.end && it.end > base + self.atom.start)
+        {
             let mut rows = program.resume_from(sequence);
             while let Some((header, row)) = rows.next_row().map_err(|_| MALFORMED)? {
                 let line = row.line().map_or(0, |line| line.get());
@@ -617,11 +755,12 @@ impl<'data, 'file> Emitted<'data, 'file> {
     fn place_paged(&mut self, text: SectionIndex, recorder: &mut Wants) -> Result<(), Unhandled> {
         let section = self.file.section_by_index(text)?;
         self.align = section.align().max(1);
-        self.bytes.extend_from_slice(section.data()?);
+        self.bytes
+            .extend_from_slice(&section.data()?[self.atom.start as usize..self.atom.end as usize]);
         self.code = Self::lengthen(&mut self.bytes)?;
         self.placed.insert(text, Placement::Inline(0));
         self.inline.push(text);
-        for (_, relocation) in section.relocations() {
+        for (_, relocation) in section.relocations().filter(|(at, _)| self.atom.contains(at)) {
             let Destination::Section(index) = Self::destination(self.file, &relocation)? else {
                 continue;
             };
@@ -711,7 +850,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
     /// the data objects its constants became.
     fn relocate_paged(&mut self, recorder: &mut Wants) -> Result<(), Unhandled> {
         let section = self.file.section_by_index(self.inline[0])?;
-        for (offset, relocation) in section.relocations() {
+        for (offset, relocation) in section.relocations().filter(|(at, _)| self.atom.contains(at)) {
+            let offset = offset - self.atom.start;
             let kind = match relocation.flags() {
                 RelocationFlags::MachO { r_type, .. } => match r_type {
                     macho::ARM64_RELOC_BRANCH26 => Reloc::Arm64Call,
@@ -800,11 +940,14 @@ impl<'data, 'file> Emitted<'data, 'file> {
         };
         let Some(section) = self.file.section_by_name(name) else { return Ok(None) };
         let eh_frame = EhFrame::new(section.data()?, LittleEndian);
-        let bases = BaseAddresses::default().set_eh_frame(0).set_text(0);
+        let macho = self.file.format() == BinaryFormat::MachO;
+        let bases = BaseAddresses::default()
+            .set_eh_frame(if macho { section.address() } else { 0 })
+            .set_text(0);
         let malformed = |_| Unhandled::Shape("an unwind table that does not parse");
         // Of an object of more than one function, the entries of this one: those whose
         // start, eight bytes in, is relocated against its section.
-        let ours: Option<FxHashSet<u64>> = (self.texts.len() > 1).then(|| {
+        let ours: Option<FxHashSet<u64>> = (!macho && self.texts.len() > 1).then(|| {
             let starts = section.relocations().filter(|(_, relocation)| {
                 Self::symbol(self.file, relocation)
                     .is_ok_and(|it| it.section() == SymbolSection::Section(self.text))
@@ -814,11 +957,39 @@ impl<'data, 'file> Emitted<'data, 'file> {
         let mut entries = eh_frame.entries(&bases);
         let mut rows = None;
         let mut table = None;
-        while let Some(entry) = entries.next().map_err(malformed)? {
-            let CieOrFde::Fde(partial) = entry else { continue };
-            let fde = partial
-                .parse(|_, bases, offset| eh_frame.cie_from_offset(bases, offset))
-                .map_err(malformed)?;
+        let mut selected =
+            if macho {
+                Some(
+                    *self.unwind_index.fdes.get(&(self.text, self.atom.start)).ok_or(
+                        Unhandled::Shape("a function without a matching Mach-O DWARF entry"),
+                    )?,
+                )
+            } else {
+                None
+            };
+        loop {
+            let fde = if macho {
+                let Some(offset) = selected.take() else { break };
+                eh_frame
+                    .fde_from_offset(
+                        &bases,
+                        gimli::EhFrameOffset(offset as usize),
+                        |_, bases, offset| eh_frame.cie_from_offset(bases, offset),
+                    )
+                    .map_err(malformed)?
+            } else {
+                let Some(entry) = entries.next().map_err(malformed)? else { break };
+                let CieOrFde::Fde(partial) = entry else { continue };
+                partial
+                    .parse(|_, bases, offset| eh_frame.cie_from_offset(bases, offset))
+                    .map_err(malformed)?
+            };
+            if macho {
+                table = Some(self.table_of(
+                    &section,
+                    fde.offset() as u64..fde.offset() as u64 + fde.entry_len() as u64 + 4,
+                )?);
+            }
             if let Some(ours) = &ours {
                 let at = fde.offset() as u64;
                 if !ours.contains(&at) {
@@ -870,6 +1041,12 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 continue;
             };
             let table = self.file.section_by_index(index)?;
+            if table.name()? == "__gcc_except_tab"
+                && relocation.kind() == object::RelocationKind::Absolute
+                && let Some((index, start)) = self.macho_address(eh_frame, offset)?
+            {
+                return self.macho_pads(index, start).map(Some);
+            }
             if table.name()?.starts_with(".gcc_except_table") {
                 return Self::pads_of(&table).map(Some);
             }
@@ -960,7 +1137,51 @@ impl<'data, 'file> Emitted<'data, 'file> {
             BinaryFormat::MachO => "__gcc_except_tab",
             _ => ".gcc_except_table",
         };
+        if self.file.format() == BinaryFormat::MachO {
+            let Some((compact, at)) = self.compact_entry()? else { return Ok(None) };
+            let Some((index, start)) = self.macho_address(&compact, at + 24)? else {
+                return Ok(None);
+            };
+            return self.macho_pads(index, start).map(Some);
+        }
         self.file.section_by_name(name).map(|table| Self::pads_of(&table)).transpose()
+    }
+
+    fn macho_pads(&self, index: SectionIndex, start: u64) -> Result<Vec<u8>, Unhandled> {
+        let table = self.file.section_by_index(index)?;
+        let end = *self
+            .unwind_index
+            .pad_ends
+            .get(&(index, start))
+            .ok_or(Unhandled::Shape("a Mach-O landing pad table without a boundary"))?;
+        if table.relocations().any(|(at, _)| (start..end).contains(&at)) {
+            return Err(Unhandled::Shape("landing pads that name a type"));
+        }
+        table
+            .data()?
+            .get(start as usize..end as usize)
+            .map(<[u8]>::to_vec)
+            .ok_or(Unhandled::Shape("a Mach-O landing pad table outside its section"))
+    }
+
+    /// A pointer in a Mach-O unwind record, resolved to an offset within its section.
+    fn macho_address(
+        &self,
+        section: &object::Section<'data, '_>,
+        at: u64,
+    ) -> Result<Option<(SectionIndex, u64)>, Unhandled> {
+        Ok(self.unwind_index.pointers.get(&(section.index(), at)).copied())
+    }
+
+    fn compact_entry(&self) -> Result<Option<(object::Section<'data, 'file>, u64)>, Unhandled> {
+        let Some(section) = self.file.section_by_name("__compact_unwind") else { return Ok(None) };
+        let at = self
+            .unwind_index
+            .compact
+            .get(&(self.text, self.atom.start))
+            .copied()
+            .ok_or(Unhandled::Shape("a function without a matching Mach-O unwind entry"))?;
+        Ok(Some((section, at)))
     }
 
     fn pads_of(table: &object::Section<'data, '_>) -> Result<Vec<u8>, Unhandled> {
@@ -992,16 +1213,13 @@ impl<'data, 'file> Emitted<'data, 'file> {
             (0x400, 76),
             (0x800, 78),
         ];
-        let Some(section) = self.file.section_by_name("__compact_unwind") else {
+        let Some((section, at)) = self.compact_entry()? else {
             return Ok(None);
         };
-        let data = section.data()?;
+        let data = &section.data()?[at as usize..at as usize + 32];
         let &[_, _, _, _, _, _, _, _, l0, l1, l2, l3, e0, e1, e2, e3, ..] = data else {
             return Ok(None);
         };
-        if data.len() != 32 {
-            return Err(Unhandled::Shape("more than one unwind table entry"));
-        }
         let (len, encoding) =
             (u32::from_le_bytes([l0, l1, l2, l3]), u32::from_le_bytes([e0, e1, e2, e3]));
         // x86-64's modes have different register and stack fields. Its DWARF frame

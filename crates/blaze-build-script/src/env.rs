@@ -320,7 +320,9 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
     }
     if host.macos && dylib_path_is_empty {
         if let Some(home) = inherited_var("HOME") {
-            search_path.push(Path::new(home).join("lib"));
+            let mut lib = home.to_os_string();
+            lib.push("/lib");
+            search_path.push(lib.into());
         }
         search_path.push(PathBuf::from("/usr/local/lib"));
         search_path.push(PathBuf::from("/usr/lib"));

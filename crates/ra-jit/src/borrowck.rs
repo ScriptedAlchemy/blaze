@@ -98,6 +98,14 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         let mut change = ChangeWithProcMacros::default();
         change.change_file(file, Some(load_cargo::source_text(text)));
         db.apply_change(change);
+        let (source_file, source_name, checkout) = (file, test.clone(), dir.clone());
+        hir_ty_codegen::name_sources(&mut db, move |db, file| {
+            if file == source_file {
+                Some(source_name.clone())
+            } else {
+                crate::source_path(db, &checkout, None, file)
+            }
+        });
         if let Ok(name) = std::env::var("RA_JIT_BORROWCK_MIR") {
             dump_mir(&db, file, &name);
         }
@@ -143,8 +151,9 @@ fn check_project(project: &str) -> anyhow::Result<()> {
         proc_macro_processes: 1,
     };
     let started = Instant::now();
-    let (db, vfs, _) =
+    let (mut db, vfs, _) =
         load_cargo::load_workspace_at(root.as_ref(), &cargo_config, &load_config, &|_| ())?;
+    crate::configure_source_names(&mut db, root.as_ref(), None);
     let config = ide_diagnostics::DiagnosticsConfig::test_sample();
     let files: Vec<vfs::FileId> = hir::attach_db(&db, || {
         let mut files = Vec::new();

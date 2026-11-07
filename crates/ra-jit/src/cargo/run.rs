@@ -80,14 +80,14 @@ const PRINTED_KEPT: usize = 4 << 20;
 fn listing_failures(
     command: &mut Command,
     start: impl FnOnce(&mut Command) -> std::io::Result<std::process::Child>,
+    out: &mut impl std::io::Write,
 ) -> std::io::Result<(ExitStatus, Option<Vec<String>>)> {
-    use std::io::{IsTerminal as _, Read as _, Write as _};
-    let out = std::io::stdout();
+    use std::io::{IsTerminal as _, Read as _};
     let colored = command.get_args().any(|it| {
         let it = it.to_string_lossy();
         it == "--color" || it.starts_with("--color=")
     });
-    if !colored && out.is_terminal() {
+    if !colored && std::io::stdout().is_terminal() {
         command.arg("--color=always");
     }
     command.stdout(std::process::Stdio::piped());
@@ -109,7 +109,6 @@ fn listing_failures(
                 }
             };
             // A reader that went away does not stop the tests, as it would not under cargo.
-            let mut out = out.lock();
             _ = out.write_all(&chunk[..read]).and_then(|()| out.flush());
             printed.extend_from_slice(&chunk[..read]);
             if printed.len() > PRINTED_KEPT {
@@ -238,6 +237,7 @@ pub(crate) fn tests(
                 drop(held);
                 child
             },
+            &mut std::io::stdout(),
         )?;
         left += result.left;
         always_run += result.always_run;
@@ -288,8 +288,9 @@ pub(crate) fn test_with(
     context: &TestRun<'_>,
     make_command: impl FnMut() -> anyhow::Result<Command>,
     start: impl FnMut(&mut Command) -> std::io::Result<std::process::Child>,
+    output: &mut impl std::io::Write,
 ) -> anyhow::Result<TestResult> {
-    let result = test_with_inner(asked, context, make_command, start);
+    let result = test_with_inner(asked, context, make_command, start, output);
     if result.is_err() {
         if let Some(directory) = context.cache.directory {
             affected::forget_passes_at(directory)
@@ -304,6 +305,7 @@ fn test_with_inner(
     context: &TestRun<'_>,
     mut make_command: impl FnMut() -> anyhow::Result<Command>,
     mut start: impl FnMut(&mut Command) -> std::io::Result<std::process::Child>,
+    output: &mut impl std::io::Write,
 ) -> anyhow::Result<TestResult> {
     let (mut left, mut always_run) = (0, 0);
     let mut running = context.label.to_owned();
@@ -403,7 +405,7 @@ fn test_with_inner(
         .and_then(|(_, list)| list.map(|it| it.to_owned()));
     let listing = matches!(pick, Pick::Some { .. }) || context.attempts.any();
     let ran = match listing {
-        true => listing_failures(&mut command, &mut start),
+        true => listing_failures(&mut command, &mut start, output),
         false => start(&mut command)?.wait().map(|it| (it, None)),
     };
     let (mut status, mut failures) = ran.with_context(|| format!("could not execute {running}"))?;
@@ -433,7 +435,7 @@ fn test_with_inner(
         // Each attempt is built from what the command asked, never from the argv of the
         // attempt before: libtest refuses an option it is given twice.
         again.args(retry_args(&asked.program_args().cloned().collect::<Vec<_>>(), &retry));
-        (status, failures) = listing_failures(&mut again, &mut start)
+        (status, failures) = listing_failures(&mut again, &mut start, output)
             .with_context(|| format!("could not execute {running}"))?;
     }
     if status.success() && !exhausted.is_empty() {
@@ -811,6 +813,7 @@ exit 101
                     Ok(command)
                 },
                 Command::spawn,
+                &mut std::io::sink(),
             )
             .unwrap();
             assert_eq!(result.success, exact);

@@ -45,6 +45,8 @@ stdx.workspace = true
 syntax.workspace = true
 
 ra-jit-store.workspace = true
+blaze-wire.workspace = true
+blaze-dist = { path = "../blaze-dist" }
 
 cranelift-codegen = { version = "0.136", features = ["incremental-cache", "x86", "arm64"] }
 cranelift-frontend = "0.136"
@@ -62,6 +64,9 @@ inkwell = { version = "0.9.0", default-features = false, features = ["llvm20-1-p
 # no Nix, so there llvm-sys finds and links LLVM.
 [target.'cfg(not(windows))'.dependencies]
 llvm-sys = { version = "201.1.1", features = ["no-llvm-linking"], optional = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+blaze-dist-local = { path = "../blaze-dist-local" }
 
 [dev-dependencies]
 ra-jit-fuzz.workspace = true

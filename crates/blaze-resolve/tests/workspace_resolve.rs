@@ -4,7 +4,6 @@
 //! writes them).
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::metadata::{MetadataPackages, resolve_graph};
@@ -18,7 +17,7 @@ use rustc_hash::FxHashMap;
 use url::Url;
 
 fn path_source(dir: &str) -> SourceId {
-    SourceId::for_path(Path::new(dir)).unwrap()
+    SourceId::from_url(&format!("path+file://{dir}")).unwrap()
 }
 
 fn summary(name: &str, version: &str, source: SourceId, deps: Vec<Dependency>) -> Summary {

@@ -480,6 +480,24 @@ struct FixedPoint<T, U, V>(&'static FixedPoint<(), T, U>, V);
     );
 }
 
+#[test]
+fn recursive_variance_with_macro_inputs() {
+    check(
+        r#"
+//- /main.rs env:WIDTH=one
+#[rustc_builtin_macro] macro_rules! env { () => {} }
+#[rustc_builtin_macro] macro_rules! include_str { () => {} }
+struct FixedPoint<T, U, V>(
+    &'static FixedPoint<(), T, U>, V,
+    [u8; { let _ = env!("WIDTH"); let _ = include_str!("main.rs"); 1 }],
+);
+"#,
+        expect![[r#"
+                FixedPoint[T: covariant, U: covariant, V: covariant]
+            "#]],
+    );
+}
+
 #[track_caller]
 fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected: Expect) {
     // use tracing_subscriber::{layer::SubscriberExt, Layer};

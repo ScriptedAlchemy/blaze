@@ -1161,6 +1161,11 @@ impl<'db> InferenceResult<'db> {
         }
     }
 
+    /// Anonymous constants interned with this body's inferred types.
+    pub fn defined_anon_consts(&self) -> &[AnonConstId<'db>] {
+        &self.defined_anon_consts
+    }
+
     pub fn method_resolution(&self, expr: ExprId) -> Option<(FunctionId, GenericArgs<'db>)> {
         self.method_resolutions.get(&expr).map(|(func, args)| (*func, args.as_ref()))
     }

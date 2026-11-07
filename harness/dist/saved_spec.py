@@ -76,9 +76,26 @@ renamed={package="saved-words",path="../words",default-features=false,features=[
 compile_error!("analyzer cfg entered the saved compiler request");
 #[cfg(ancestor_hostile)]
 compile_error!("a config file above the replay directory entered the saved compile");
+struct RootFileLayout([u8; file!().len()]);
+struct RootCallerLayout([u8; std::panic::Location::caller().file().len()]);
+include!("layout.rs");
 fn main() {
+    assert_eq!(std::mem::size_of::<RootFileLayout>(), file!().len(),
+               "root file! array layout");
+    assert_eq!(std::mem::size_of::<RootCallerLayout>(),
+               std::panic::Location::caller().file().len(), "root caller array layout");
+    assert_included_layouts();
     println!("{}|{}|{}", renamed::word(), env!("SAVED_SPEC_LABEL"),
              std::env::args().nth(1).unwrap_or_default());
+}
+''')
+    write(root, "app/src/layout.rs", '''struct IncludedFileLayout([u8; file!().len()]);
+struct IncludedCallerLayout([u8; std::panic::Location::caller().file().len()]);
+fn assert_included_layouts() {
+    assert_eq!(std::mem::size_of::<IncludedFileLayout>(), file!().len(),
+               "included file! array layout");
+    assert_eq!(std::mem::size_of::<IncludedCallerLayout>(),
+               std::panic::Location::caller().file().len(), "included caller array layout");
 }
 ''')
     write(root, "words/Cargo.toml", '''[package]

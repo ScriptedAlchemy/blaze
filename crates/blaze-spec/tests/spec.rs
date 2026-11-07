@@ -65,10 +65,15 @@ fn build(
 }
 
 fn app(command: Subcommand, args: &[&str]) -> Spec {
-    // This component helper supplies an already-selected graph. Doctest requests
-    // select its library rather than its binary; real selection is tested in build_spec.rs.
-    let roots = if args.contains(&"--doc") { vec![1] } else { vec![0] };
-    build(&Fixture::new(), command, args, units(), roots)
+    // Selection is supplied by this component fixture; build_spec.rs tests real selection.
+    let mut units = units();
+    let roots = if args.contains(&"--doc") {
+        units.push(units[1].clone().mode(Mode::DocTest).dep(1, "lib_a"));
+        vec![3]
+    } else {
+        vec![0]
+    };
+    build(&Fixture::new(), command, args, units, roots)
         .unwrap_or_else(|e| panic!("{command:?} {args:?}: {e}"))
 }
 
@@ -648,8 +653,10 @@ fn the_doc_tests_are_of_the_libraries_of_the_members() {
         Make::new("b", TargetKind::Lib),
         Make::new("dep", TargetKind::Lib).registry(),
         Make::new("macro", TargetKind::ProcMacro).host(),
+        Make::new("a", TargetKind::Lib).mode(Mode::DocTest).dep(1, "a"),
+        Make::new("b", TargetKind::Lib).mode(Mode::DocTest).dep(2, "b"),
     ];
-    let spec = build(&fixture, Subcommand::Test, &["--doc"], units.clone(), vec![1, 2]).unwrap();
+    let spec = build(&fixture, Subcommand::Test, &["--doc"], units.clone(), vec![5, 6]).unwrap();
     let asked: Vec<&str> = spec
         .build
         .asked
@@ -657,6 +664,7 @@ fn the_doc_tests_are_of_the_libraries_of_the_members() {
         .map(|&it| spec.build.units[it as usize].package.0.as_str())
         .collect();
     assert_eq!(asked, ["a", "b"]);
+    assert!(spec.build.asked.iter().all(|&it| spec.build.units[it as usize].target.0 == 7));
     assert!(spec.build.asked.iter().all(|&it| !spec.build.units[it as usize].test));
     let only_unit_tests = vec![Make::new("a", TargetKind::Lib).mode(Mode::Test)];
     let error =

@@ -238,6 +238,16 @@ metadata and main with all the others, so:
 
 ## Landing a change
 
+Pull-request workflows use a per-PR concurrency group and cancel the older run on a
+new push. `cancel-pr-runs.yaml` also cleans up superseded and closed PR runs, including
+ones stuck cancelling: it paginates the Actions API, checks PR identity and live head,
+and uses force-cancel. It never cancels push, nightly, manual or merge-queue acceptance
+runs just because they share a branch or commit. Its privileged `pull_request_target`
+job executes only the trusted base-branch script, never the PR head. Install the
+workflow on the default branch and the script on each supported PR base before relying
+on cleanup; adding it to an unmerged PR does not activate the privileged workflow.
+Cleanup still needs a runner, so workflow concurrency remains the immediate safeguard.
+
 Main moves only through the merge queue: nobody pushes to it or merges into it by hand. Once the
 branch's work is committed and the local gate passed ([What a change needs](#what-a-change-needs)),
 run in the lane's worktree

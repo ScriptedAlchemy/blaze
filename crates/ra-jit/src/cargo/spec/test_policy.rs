@@ -168,7 +168,13 @@ impl Policy {
             sandbox_env: Some(sandbox_env),
             attempts: affected::attempts_at(&self.root, self.attempts.as_deref()),
         };
-        let result = run::test_with(&self.asked, &context, || command(executable), run::started);
+        let result = run::test_with(
+            &self.asked,
+            &context,
+            || command(executable),
+            run::started,
+            &mut std::io::stdout(),
+        );
         // Published CARGO_BIN_EXE paths can be replaced by another build while a test is
         // running. Such a run does not certify either generation as a reusable pass.
         if result.is_err() || !matches!((before, identity()), (Ok(a), Ok(b)) if a == b) {

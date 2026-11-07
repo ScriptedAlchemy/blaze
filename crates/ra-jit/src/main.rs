@@ -39,6 +39,8 @@ mod solving;
 mod splice;
 mod splicer;
 mod stub;
+#[cfg(test)]
+mod symbol_identity_tests;
 mod symbols;
 mod test_harness;
 mod tier;
@@ -430,7 +432,9 @@ struct Resolver<'a> {
     named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,
     /// The symbols of what rustc linked, when the patch goes into it.
     linked: Option<Arc<symbols::Linked>>,
-    /// Set once the build turns out to be one in full, which `linked` is not for.
+    /// The actual owned executable, before any edits were appended to it.
+    owned_base: Option<Arc<Baseline>>,
+    /// Set once the build turns out to be in full, so the previous link no longer limits imports.
     in_full: Arc<std::sync::atomic::AtomicBool>,
     /// A build in full is spliced into what rustc linked too ([`onto_rustcs`]), and is for
     /// `linked` as a patch is.
@@ -463,6 +467,8 @@ struct ResolverParts<'a> {
     shared_paths: SharedPaths,
     named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,
     linked: Option<Arc<symbols::Linked>>,
+    /// The actual owned executable, before any edits were appended to it.
+    owned_base: Option<Arc<Baseline>>,
     in_full: Arc<std::sync::atomic::AtomicBool>,
     onto: bool,
     prebuilt: Option<Arc<Prebuilt>>,
@@ -485,6 +491,7 @@ impl<'a> Resolver<'a> {
             shared_paths: self.shared_paths.clone(),
             named: self.named.clone(),
             linked: self.linked.clone(),
+            owned_base: self.owned_base.clone(),
             in_full: self.in_full.clone(),
             onto: self.onto,
             prebuilt: self.prebuilt.clone(),
@@ -512,6 +519,7 @@ impl<'a> ResolverParts<'a> {
             shared_paths,
             named,
             linked,
+            owned_base,
             in_full,
             onto,
             prebuilt,
@@ -532,6 +540,7 @@ impl<'a> ResolverParts<'a> {
             shared_paths,
             named,
             linked,
+            owned_base,
             in_full,
             onto,
             prebuilt,
@@ -679,6 +688,14 @@ type SharedKey = (u64, PathBuf, Option<PathBuf>);
 type SharedPaths =
     Arc<std::sync::Mutex<FxHashMap<Crate, Arc<std::sync::OnceLock<FxHashSet<String>>>>>>;
 
+/// The native file name and whether it belongs to a library source root.
+fn source_file_path(db: &dyn HirDatabase, file: vfs::FileId) -> Option<(PathBuf, bool)> {
+    let root = db.file_source_root(file).source_root_id(db);
+    let root = db.source_root(root).source_root(db);
+    let logical = root.path_for_file(&file)?.as_path()?.to_string();
+    Some((paths::native::resolve(Path::new(&logical)).ok()?.into_owned(), root.is_library))
+}
+
 /// What rustc is told a file is called: its place in the checkout when it is a file of it.
 fn source_path(
     db: &dyn HirDatabase,
@@ -686,22 +703,43 @@ fn source_path(
     base: Option<&Path>,
     file: vfs::FileId,
 ) -> Option<String> {
-    let source_root = db.file_source_root(file).source_root_id(db);
-    let source_root = db.source_root(source_root).source_root(db);
-    let logical = source_root.path_for_file(&file)?.as_path()?.to_string();
-    let path = paths::native::resolve(Path::new(&logical)).ok()?;
+    let (path, library) = source_file_path(db, file)?;
     let root = paths::native::resolve(root).ok()?;
     let base = base.and_then(|base| paths::native::resolve(base).ok());
     let base = base.as_deref().and_then(|base| path.strip_prefix(base).ok());
     // Cargo names source-replaced registry files absolutely even when vendor/
     // happens to live below the workspace. Only workspace files are relative.
-    let relative =
-        (!source_root.is_library).then(|| path.strip_prefix(&root).ok().or(base)).flatten();
+    let relative = (!library).then(|| path.strip_prefix(&root).ok().or(base)).flatten();
     Some(relative.unwrap_or(&path).to_string_lossy().into_owned())
 }
 
+fn install_source_names(db: &mut RootDatabase, mut roots: Vec<PathBuf>) {
+    // Constants are shared by all programs in a database. Their names depend on each
+    // file's own checkout, including nested or joined checkouts.
+    roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
+    hir_ty_codegen::name_sources(db, move |db, file| {
+        let (path, library) = source_file_path(db, file)?;
+        let relative = (!library)
+            .then(|| {
+                roots.iter().find_map(|root| {
+                    let root = paths::native::resolve(root).ok()?;
+                    path.strip_prefix(root.as_ref()).ok()
+                })
+            })
+            .flatten();
+        Some(relative.unwrap_or(&path).to_string_lossy().into_owned())
+    });
+}
+
+fn configure_source_names(db: &mut RootDatabase, root: &Path, base: Option<&Path>) {
+    install_source_names(
+        db,
+        std::iter::once(root.to_owned()).chain(base.map(Path::to_owned)).collect(),
+    );
+}
+
 impl<'a> Resolver<'a> {
-    /// The symbols of the program of `args`, which panic locations are named for from now on.
+    /// The symbols of the program of `args`.
     /// `known` says whether what is compiled is a patch of what rustc linked.
     fn of(
         db: &'a RootDatabase,
@@ -723,14 +761,16 @@ impl<'a> Resolver<'a> {
                     && !rustc_symbols(binary).is_some_and(|it| it.has_own_thread_locals())
             });
         let linked = args.splice.as_deref().filter(|_| over_rustc || onto).and_then(rustc_symbols);
+        let owned_base = args
+            .splice
+            .as_deref()
+            .filter(|_| table.is_empty() && known.patches() && !known.builds_base() && *SPLICING)
+            .and_then(owned_baseline)
+            .map(Arc::new);
         let (root, base) = (args.checkout.clone(), args.base.clone());
         let debug = args.debug;
         let crate_debug = Arc::new(CrateDebug::of(db, args));
         let apart = (debug.kept != plan::Kept::Linked).then(|| args.out.clone());
-        let named = (root.clone(), base.clone());
-        hir_ty_codegen::name_sources(move |db, file| {
-            source_path(db, &named.0, named.1.as_deref(), file)
-        });
         let prebuilt = args.prebuilt.as_deref().filter(|_| table.is_empty()).map(|path| {
             let defined = defined_symbols(path);
             let defined =
@@ -753,6 +793,7 @@ impl<'a> Resolver<'a> {
             shared_paths: Default::default(),
             named: Default::default(),
             linked,
+            owned_base,
             in_full: Arc::default(),
             onto,
             prebuilt,
@@ -926,7 +967,7 @@ impl Resolver<'_> {
             return Some(format!("ra-jit.{id:x}.{path}"));
         }
         let place = hir_ty_codegen::block_place(self.db, self, func)?;
-        Some(format!("ra-jit.{id:x}.{path}.{:x}", short_hash(&place)))
+        Some(format!("ra-jit.{id:x}.{path}.{place:x}"))
     }
 
     /// The name a static of a crate rustc built nothing of is defined under, in a build with
@@ -946,7 +987,7 @@ impl Resolver<'_> {
             return Some(format!("ra-jit.{crate_id:x}.{}", self.item_path(module, name.as_str())?));
         }
         let place = hir_ty_codegen::static_place(db, self, id)?;
-        Some(format!("ra-jit.{crate_id:x}.{}.{:x}", name.as_str(), short_hash(&place)))
+        Some(format!("ra-jit.{crate_id:x}.{}.{place:x}", name.as_str()))
     }
 
     /// Whether the function, or the `impl` it is in, takes types or constants. A method a
@@ -1442,8 +1483,13 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn debug_directory(&self) -> Option<String> {
-        (self.crate_debug.most != plan::Level::Nothing)
-            .then(|| self.root.to_string_lossy().into_owned())
+        (self.crate_debug.most != plan::Level::Nothing).then(|| {
+            if self.library { String::new() } else { self.root.to_string_lossy().into_owned() }
+        })
+    }
+
+    fn deterministic_object(&self) -> bool {
+        self.library
     }
 
     fn describes_variables(&self) -> bool {
@@ -1492,7 +1538,30 @@ impl SymbolResolver for Resolver<'_> {
             || self.prebuilt.as_ref().is_some_and(|it| it.defined.contains(symbol))
     }
 
+    fn native_function(&self, symbol: &str) -> Option<FunctionId> {
+        let prebuilt = self.prebuilt.as_ref().filter(|it| it.defined.contains(symbol))?;
+        let mut found = None;
+        for &krate in &prebuilt.crates {
+            let listed = self.listed.of(self.db, krate.into());
+            for &func in &listed.functions {
+                let named = exported_symbol(self.db, func).or_else(|| linked_symbol(self.db, func));
+                if named.as_deref() == Some(symbol) {
+                    if found.is_some_and(|previous| previous != func) {
+                        return None;
+                    }
+                    found = Some(func);
+                }
+            }
+        }
+        found
+    }
+
     fn linked(&self, symbol: &str) -> bool {
+        if !self.in_full.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(base) = &self.owned_base
+        {
+            return base.provides(symbol);
+        }
         self.rustcs().is_none_or(|it| it.has(symbol))
     }
 
@@ -2473,6 +2542,7 @@ fn load(
     let mut checkouts = Checkouts {
         compared: Default::default(),
         roots: Vec::new(),
+        named_roots: Vec::new(),
         origin,
         splits: Vec::new(),
         loaded: load_cargo::Loaded::default(),
@@ -2504,6 +2574,8 @@ struct Checkouts {
     compared: Compared,
     /// The project a build names, and the root of the workspace it is in.
     roots: Vec<CheckoutRoot>,
+    /// The workspace roots whose source names are installed in the database.
+    named_roots: Vec<PathBuf>,
     origin: LoadOrigin,
     /// For each of `roots`, what it shares with another when it is not loaded in full.
     splits: Vec<Option<Split>>,
@@ -2529,6 +2601,16 @@ struct Checkouts {
 }
 
 impl Checkouts {
+    fn name_sources(&mut self, db: &mut RootDatabase) {
+        let mut roots: Vec<_> = self.roots.iter().map(|root| root.workspace.clone()).collect();
+        roots.sort();
+        roots.dedup();
+        if roots != self.named_roots {
+            install_source_names(db, roots.clone());
+            self.named_roots = roots;
+        }
+    }
+
     fn root_of(&self, project: &Path) -> anyhow::Result<PathBuf> {
         let project = dunce::canonicalize(project)?;
         let root =
@@ -2953,6 +3035,7 @@ impl Checkouts {
         self.roots.extend(roots);
         self.splits.extend(splits);
         self.debug.extend(debug);
+        self.name_sources(db);
         Ok(())
     }
 
@@ -3187,6 +3270,7 @@ impl Checkouts {
         self.refresh_macro_image_identities();
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         self.collect_macro_generations();
+        self.name_sources(db);
         failed
     }
 
@@ -3406,6 +3490,7 @@ fn pause_after_load() {
 /// Waits for `RA_JIT_SYMBOLS_PAUSE_MS` before the symbols rustc built are read, and says so:
 /// what `harness/aheadready.py` has functions compiled ahead in.
 fn pause_before_symbols() {
+    scripts::barrier::hold("symbols", load_owner());
     let pause = std::env::var("RA_JIT_SYMBOLS_PAUSE_MS").ok().and_then(|it| it.parse().ok());
     if let Some(pause) = pause {
         eprintln!("symbols: paused");
@@ -3758,7 +3843,7 @@ fn workspace_at(
             let producer_dir = cargo.target_directory().join("blaze-owned-producers");
             std::fs::create_dir_all(&producer_dir)?;
             let probe = producer_dir.join("producer-rustc");
-            crate::answers::producer_launcher(probe.as_ref())?;
+            crate::answers::producer_launcher(probe.as_ref(), plan_asked.sysroot)?;
             env.insert("RUSTC".into(), probe.to_string());
             env.insert("RUSTDOC".into(), probe.to_string());
             env.remove("RUSTC_WRAPPER");
@@ -4441,6 +4526,51 @@ fn exported(db: &RootDatabase, functions: &[FunctionId]) -> Vec<bool> {
         };
         parts.into_iter().flat_map(joined).collect()
     })
+}
+
+fn report_listing(
+    db: &RootDatabase,
+    listed: &Listed,
+    crates: &[ide_db::base_db::Crate],
+    files: &[WatchedFile],
+    phase: &str,
+) {
+    hir::attach_db(db, || {
+        for &krate in crates {
+            let krate = hir::Crate::from(krate);
+            if !krate.origin(db).is_local() {
+                continue;
+            }
+            let Some(name) = &ide_db::base_db::Crate::from(krate).extra_data(db).display_name
+            else {
+                continue;
+            };
+            let entry = listed.of(db, krate);
+            let root = db.file_source_root(krate.root_file(db)).source_root_id(db);
+            let included = db.included_sources();
+            let requested: Vec<_> = included.iter().filter(|(_, owner)| *owner == root).collect();
+            let loaded = requested
+                .iter()
+                .filter(|(path, _)| {
+                    let path: &Path = path.as_ref();
+                    files
+                        .iter()
+                        .any(|file| matches!(file.file, Watched::Source(_)) && file.path == path)
+                })
+                .count();
+            scripts::barrier::event(
+                phase,
+                load_owner(),
+                &format!(
+                    "crate={} functions={} exports={} included_sources={loaded}/{}",
+                    name.canonical_name(),
+                    entry.functions.len(),
+                    entry.exported.iter().filter(|&&it| it).count(),
+                    requested.len()
+                ),
+            );
+        }
+    });
 }
 
 /// Whether a function is a method of an `impl GlobalAlloc`. The program calls the allocator
@@ -5139,7 +5269,7 @@ fn std_unit(
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
-    field(b"ra-jit standard library 4");
+    field(b"ra-jit standard library 5");
     field(format!("{:?} {debug:?}", args.selection.target).as_bytes());
     // An object of one section is linked whole, with what the program never reaches.
     if !hir_ty_codegen::sections_of_their_own() {
@@ -6361,6 +6491,25 @@ fn shell(cmd: &str) -> Command {
     command
 }
 
+/// Takes a view of the same immutable base the splicer resolves imports against. Reading
+/// the current file would also see definitions appended by a previous edit, which the next
+/// splice removes again.
+fn owned_baseline(binary: &Path) -> Option<Baseline> {
+    let mut linked = lock(&LINKED);
+    let executable = linked.remove(binary)?;
+    match executable.baseline() {
+        Ok(base) => {
+            let view = base.view();
+            linked.insert(binary.to_owned(), Executable::Read(Box::new(base)));
+            Some(view)
+        }
+        Err(why) => {
+            eprintln!("reading the owned executable's base: {why:#}");
+            None
+        }
+    }
+}
+
 /// Whether a patch of `binary` can call the C symbol `name`; yes while its executable is being
 /// read, which a splice then says.
 fn can_call(binary: &Path, name: &str) -> bool {
@@ -6771,16 +6920,19 @@ fn written_at(
         Some(at) if watched.paths.contains_key(&at.file_id.file_id(db)) => {
             let file = at.file_id.file_id(db);
             let text = db.file_text(file).text(db);
-            errors::at(None, message, &shown(watched, file, root), text, at.range)
+            errors::at(None, message, &shown(db, watched, file, root), text, at.range)
         }
         _ => errors::of_none(message),
     }
 }
 
-/// `file` as rustc names it in an error: from `root` when it is below it.
-fn shown(watched: &Sources, file: vfs::FileId, root: &Path) -> String {
-    let Some(path) = watched.paths.get(&file) else { return String::new() };
-    path.strip_prefix(root).unwrap_or(path).display().to_string()
+/// `file` as rustc names it in an error: from `root` when it is below it. A registry's file is
+/// not watched, as it is never written again, and is named as rustc is told its name.
+fn shown(db: &RootDatabase, watched: &Sources, file: vfs::FileId, root: &Path) -> String {
+    match watched.paths.get(&file) {
+        Some(path) => path.strip_prefix(root).unwrap_or(path).display().to_string(),
+        None => source_path(db, root, None, file).unwrap_or_default(),
+    }
 }
 
 /// The first error of the first of `sources` that does not parse, where it is.
@@ -6811,7 +6963,7 @@ fn unparsed(
             return Some(errors::at(
                 None,
                 &error.to_string(),
-                &shown(watched, file, root),
+                &shown(db, watched, file, root),
                 text,
                 range,
             ));
@@ -6823,23 +6975,8 @@ fn unparsed(
 /// The errors rust-analyzer is as sure of as rustc is: a wrong one fails a build that is
 /// right.
 const SURE: &[&str] = &[
-    "E0004",
-    "E0005",
-    "E0023",
-    "E0046",
-    "E0057",
-    "E0061",
-    "E0063",
-    "E0308",
-    "E0407",
-    "E0425",
-    "E0432",
-    "E0559",
-    "E0560",
-    "E0583",
-    "E0599",
-    "non-unicode-env",
-    "unresolved-macro-call",
+    "E0004", "E0005", "E0023", "E0046", "E0057", "E0061", "E0063", "E0308", "E0407", "E0425",
+    "E0432", "E0559", "E0560", "E0583", "E0599",
 ];
 
 /// The borrow checker's errors, which fail a build unless `RA_JIT_BORROWCK_REFUSE=0`:
@@ -6938,6 +7075,7 @@ fn broken_in_except(
                                     it.severity == ide_db::Severity::Error
                                         && !except.contains(&code)
                                         && (SURE.contains(&code)
+                                            || check::EXPANSION_ERRORS.contains(&code)
                                             || refuse_borrowck && BORROWCK.contains(&code)
                                             || lints
                                                 && !expanded
@@ -6954,6 +7092,17 @@ fn broken_in_except(
             .collect();
         checks.into_iter().flat_map(|it| it.join().unwrap_or_default()).collect()
     });
+    let mut channel_checked = FxHashSet::default();
+    for &file in edited {
+        for &krate in ide_db::base_db::relevant_crates(db, file).iter() {
+            if within.as_ref().is_none_or(|crates| crates.contains(&krate))
+                && channel_checked.insert(krate)
+                && let Some(error) = check::channel_error(db, krate)
+            {
+                found.push(error);
+            }
+        }
+    }
     if found.is_empty() {
         return None;
     }
@@ -6976,7 +7125,7 @@ fn broken_in_except(
                 .strip_prefix('E')
                 .is_some_and(|it| !it.is_empty() && it.bytes().all(|b| b.is_ascii_digit()));
             let code = rustcs.then_some(*code);
-            let path = shown(watched, at.file_id, root);
+            let path = shown(db, watched, at.file_id, root);
             errors::at(code, message, &path, text, at.range)
         })
         .collect();
@@ -7031,6 +7180,15 @@ fn hydrate_includes(
 }
 
 impl WatchedFile {
+    fn ownership(&self, db: &RootDatabase) -> Option<AbsPathBuf> {
+        let path = AbsPathBuf::try_from(self.path.to_str()?).ok()?;
+        db.has_path_ownership(&path).then_some(path)
+    }
+
+    fn ownership_changed(&self, db: &RootDatabase) -> bool {
+        self.ownership(db).is_some_and(|path| !db.included_is_read(&path))
+    }
+
     /// Whether the file is never written again: everything is watched but the sysroot, the
     /// registry, the Nix store (crates vendored by Nix, which `nix run` of the demo reads its
     /// thousands of files from) and what a build made, as path dependencies live outside the
@@ -9400,6 +9558,13 @@ fn run_holding(
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
     shipped::fetched(shipped);
     let built = built_crates(&db, &args)?;
+    let late_listing =
+        args.socket.is_some() && scripts::barrier::armed("listed-before-includes").is_some();
+    if late_listing {
+        // Seed the cache before generated source joins the VFS, to exercise invalidation.
+        report_listing(&db, &listed, &built, &files, "listed-before-includes");
+        scripts::barrier::hold("listed-before-includes", load_owner());
+    }
     let mut served = frozen::serve(&mut db, &built);
     // What is frozen names the files its `include!`s read: those not loaded yet are, and
     // what named them is read again.
@@ -9414,8 +9579,10 @@ fn run_holding(
         // A crate listed beside cargo's build was listed without what they declare.
         listed.touch(&db, None);
     }
-    if nothing_of_rustc && let Some(error) = check::syntax(&db, &args, &files)? {
-        let said = errors::Said::one(error);
+    if late_listing {
+        report_listing(&db, &listed, &built, &files, "listed-after-includes");
+    }
+    if nothing_of_rustc && let Some(said) = check::admission(&db, &args, &files)? {
         errors_for_the_daemon(&args, &said)?;
         anyhow::bail!("{said}");
     }
@@ -10271,7 +10438,7 @@ fn run_holding(
                                 edited: programs[0].unbuilt.edited.clone(),
                                 stale: true,
                                 unlinked: false,
-                                named_anew: true,
+                                named_anew: false,
                             };
                             let mut program = Program {
                                 tests: None,
@@ -10598,6 +10765,7 @@ fn run_holding(
             let before = touched.len() + gone.len();
             for (index, file) in files.iter_mut().enumerate() {
                 let on_disk = db.on_disk(&file.path);
+                let ownership_changed = file.ownership_changed(&db);
                 let Ok(now) = std::fs::metadata(&on_disk).and_then(|m| m.modified()) else {
                     if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
                         touched.remove(&index);
@@ -10614,21 +10782,23 @@ fn run_holding(
                 gone.remove(&index);
                 if switched.iter().any(|base| file.path.starts_with(base)) {
                     file.mtime = now;
-                    let same = match file.file {
-                        Watched::Source(id) => source_on_disk(&on_disk)
-                            .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
-                        Watched::Included(ref path) => db.included_is_read(path),
-                    };
+                    let same = !ownership_changed
+                        && match file.file {
+                            Watched::Source(id) => source_on_disk(&on_disk)
+                                .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
+                            Watched::Included(ref path) => db.included_is_read(path),
+                        };
                     if !same {
                         touched.insert(index);
                         noticed.get_or_insert((Instant::now(), Duration::ZERO));
                     }
-                } else if now != file.mtime {
+                } else if now != file.mtime || ownership_changed {
                     let was = std::mem::replace(&mut file.mtime, now);
                     // An editor that sent its text writes it after: the same text again.
                     let built = match file.file {
                         Watched::Source(id) if was != SystemTime::UNIX_EPOCH => {
-                            !sent.contains_key(&id)
+                            !ownership_changed
+                                && !sent.contains_key(&id)
                                 && source_on_disk(&on_disk)
                                     .is_ok_and(|text| *text == **db.file_text(id).text(&db))
                         }
@@ -10709,6 +10879,7 @@ fn run_holding(
             let WatchedFile { file, path, .. } = &files[index];
             match file {
                 Watched::Source(id) => {
+                    included.extend(files[index].ownership(&db));
                     let text = match sent.remove(id) {
                         Some((text, _)) => text,
                         None => source_on_disk(&db.on_disk(path))?,
@@ -11979,6 +12150,11 @@ fn main() { let _ = option_env!("CFLAGS"); let _ = env!("CFLAGS"); }
         );
         let sources = Sources { paths: [(file, PathBuf::from("/main.rs"))].into_iter().collect() };
         let refused = broken_in(&db, &[file], &sources, Path::new("/"), None, true);
+        let args = Args::parse(
+            ["project", "--crate", "app", "--out", "app.o"].into_iter().map(str::to_owned),
+        )
+        .unwrap();
+        assert!(check::admission(&db, &args, &[]).unwrap().is_some());
         db.set_env(krate, Env::from_iter([("CFLAGS".to_owned(), "unicode".to_owned())]));
         let valid = hir::attach_db(&db, || {
             ide_diagnostics::semantic_diagnostics_within(
@@ -12056,10 +12232,110 @@ fn main() { let _ = option_env!("CFLAGS"); let _ = env!("CFLAGS"); }
         assert!(!args(&["--cargo-project"]).own_target);
     }
 
+    #[test]
+    fn loaded_and_joined_checkouts_name_constant_files_before_semantic_work() {
+        use ide_db::base_db;
+        fn values(db: &RootDatabase) -> Vec<String> {
+            hir::attach_db(db, || {
+                base_db::all_crates(db)
+                    .iter()
+                    .flat_map(|&krate| {
+                        hir_def::nameres::crate_def_map(db, krate).modules(db).flat_map(
+                            |(_, module)| {
+                                module.scope(db).declarations().filter_map(|item| {
+                                    let hir_def::ModuleDefId::ConstId(goal) = item else {
+                                        return None;
+                                    };
+                                    let value = db
+                                        .const_eval(
+                                            goal,
+                                            hir_ty::next_solver::GenericArgs::empty(),
+                                            None,
+                                        )
+                                        .unwrap();
+                                    let width = value.memory.len() / 2;
+                                    let address = usize::from_le_bytes(
+                                        value.memory[..width].try_into().unwrap(),
+                                    );
+                                    let len = usize::from_le_bytes(
+                                        value.memory[width..].try_into().unwrap(),
+                                    );
+                                    Some(
+                                        String::from_utf8(
+                                            value.memory_map.get(address, len).unwrap().to_vec(),
+                                        )
+                                        .unwrap(),
+                                    )
+                                })
+                            },
+                        )
+                    })
+                    .collect()
+            })
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(directory.path()).unwrap();
+        let library = root.join("library");
+        let core = library.join("core/src/lib.rs");
+        std::fs::create_dir_all(core.parent().unwrap()).unwrap();
+        std::fs::write(&core, "#![no_core]\n").unwrap();
+        let roots = [root.join("a"), root.join("b"), root.join("a/member")];
+        for root in &roots {
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(
+                root.join("src/main.rs"),
+                r#"
+#[rustc_builtin_macro]
+macro_rules! file { () => {} }
+const GOAL: &str = file!();
+"#,
+            )
+            .unwrap();
+            std::fs::write(root.join("rust-project.json"), serde_json::to_vec(&serde_json::json!({
+                "sysroot_src": library,
+                "sysroot_project": {"crates": [{"root_module": core, "display_name": "core", "edition": "2021", "deps": [], "cfg": [], "env": {}}]},
+                "crates": [{"root_module": root.join("src/main.rs"), "edition": "2021", "deps": [], "cfg": [], "env": {}, "is_workspace_member": true}]
+            })).unwrap()).unwrap();
+        }
+        let config = LoadCargoConfig {
+            with_proc_macro_server: ProcMacroServerChoice::None,
+            ..load_config()
+        };
+        let (mut db, mut vfs, mut checkouts) = load(
+            &[&roots[0]],
+            &CargoConfig::default(),
+            config,
+            plan::Selection::default(),
+            None,
+            None,
+            LoadOrigin::Discover,
+        )
+        .unwrap();
+        let expected = Path::new("src").join("main.rs").to_string_lossy().into_owned();
+        assert_eq!(values(&db), [expected.clone()]);
+        for (index, root) in roots[1..].iter().enumerate() {
+            checkouts.add(&[root], &mut db, &mut vfs, load_owner(), None, &Sharing::Alone).unwrap();
+            assert_eq!(values(&db), vec![expected.clone(); index + 2]);
+        }
+        // A reload can discover a wider workspace root without changing the file itself.
+        checkouts.roots[0].workspace = root;
+        checkouts.name_sources(&mut db);
+        let mut found = values(&db);
+        found.sort();
+        let mut expected = vec![
+            Path::new("a").join("src").join("main.rs").to_string_lossy().into_owned(),
+            expected.clone(),
+            expected,
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
     fn source_checkouts(root: CheckoutRoot) -> Checkouts {
         Checkouts {
             compared: Default::default(),
             roots: vec![root],
+            named_roots: Vec::new(),
             origin: LoadOrigin::Discover,
             splits: vec![None],
             loaded: Default::default(),
@@ -12339,6 +12615,26 @@ fn main() { let _ = LOGGER + RUNS; }
         assert!(!reloaded.contains("FromA"));
     }
 
+    // A dependency's refused body said ` --> :2061:10`: the registry is not watched.
+    #[test]
+    fn an_error_in_a_file_that_is_not_watched_names_the_file() {
+        use test_fixture::WithFixture as _;
+        let (mut db, file) = RootDatabase::with_single_file("pub fn value() {}\n");
+        let file = file.file_id(&db);
+        let source = "/registry/smallvec-1.15.1/src/lib.rs";
+        let mut files = vfs::file_set::FileSet::default();
+        files.insert(file, VfsPath::from(AbsPathBuf::assert_utf8(PathBuf::from(source))));
+        let mut change = ChangeWithProcMacros::default();
+        change.set_roots(vec![ide_db::base_db::SourceRoot::new_library(files)]);
+        db.apply_change(change);
+        let unwatched = Sources { paths: FxHashMap::default() };
+        assert_eq!(shown(&db, &unwatched, file, Path::new("/checkout")), source);
+        let watched = Sources {
+            paths: FxHashMap::from_iter([(file, PathBuf::from("/checkout/src/main.rs"))]),
+        };
+        assert_eq!(shown(&db, &watched, file, Path::new("/checkout")), "src/main.rs");
+    }
+
     #[test]
     fn settled_noop_requires_the_artifacts_this_publication_wrote() {
         let dir = tempfile::tempdir().unwrap();
@@ -12590,6 +12886,85 @@ fn main() {}
     }
 
     #[test]
+    fn standard_library_debug_objects_do_not_depend_on_the_callers_checkout() {
+        use object::{Object as _, ObjectSection as _};
+        use test_fixture::WithFixture;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("sysroot/library/std/src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "#[unsafe(no_mangle)]\npub fn value() -> u32 { 7 }\n").unwrap();
+        let checkout_a = directory.path().join("alice/checkout");
+        let checkout_b = directory.path().join("builder/deeper/checkout");
+        let (mut db, file) = RootDatabase::with_single_file(
+            "//- /sysroot/library/std/src/lib.rs crate:std\n#[unsafe(no_mangle)]\npub fn value() -> u32 { 7 }\n",
+        );
+        let file = file.file_id(&db);
+        let mut files = vfs::file_set::FileSet::default();
+        files.insert(file, vfs::VfsPath::from(vfs::AbsPathBuf::assert_utf8(source.clone())));
+        let mut change = ide_db::ChangeWithProcMacros::default();
+        change.set_roots(vec![ide_db::base_db::SourceRoot::new_library(files)]);
+        db.apply_change(change);
+        hir::attach_db(&db, || {
+            let krate = ide_db::base_db::all_crates(&db)[0];
+            let functions = declared_in(&db, krate.into()).functions;
+            assert_eq!(functions.len(), 1);
+            let build = |checkout: &Path, library| {
+                let mut args = Args::parse(
+                    ["project", "--crate", "std", "--out", "std.o"].into_iter().map(str::to_owned),
+                )
+                .unwrap();
+                args.checkout = checkout.to_owned();
+                args.library = library;
+                args.debug.level = plan::Level::Lines;
+                let table = SymbolTable::default();
+                let contents = content::Contents::default();
+                let listed = Listed::default();
+                let mut known = Rejections::default();
+                let resolver = Resolver::of(&db, &table, &args, &known, &contents, &listed);
+                let roots = Roots {
+                    entries: &functions,
+                    on_demand: &[],
+                    start: None,
+                    allocator: None,
+                    shared: false,
+                    whole: true,
+                    kept: &[],
+                    offered: &[],
+                };
+                let compiled =
+                    CodegenUnit::compile(&db, &resolver, roots, &Default::default(), &mut known)
+                        .unwrap();
+                assert!(compiled.skipped.is_empty());
+                compiled.object.unwrap()
+            };
+            let a = build(&checkout_a, true);
+            let b = build(&checkout_b, true);
+            assert!(a == b, "standard-library object bytes depend on the caller's checkout");
+            let object = object::File::parse(a.as_slice()).unwrap();
+            let debug: Vec<_> = object
+                .sections()
+                .filter(|section| section.name().unwrap().contains("debug"))
+                .collect();
+            assert!(!debug.is_empty(), "the test must preserve debug information");
+            let source_directory = source.parent().unwrap().to_str().unwrap().as_bytes();
+            assert!(
+                debug.iter().any(|section| section
+                    .data()
+                    .unwrap()
+                    .windows(source_directory.len())
+                    .any(|bytes| bytes == source_directory)),
+                "debug info lost its real source directory"
+            );
+            assert_ne!(
+                build(&checkout_a, false),
+                build(&checkout_b, false),
+                "ordinary program debug roots must retain their checkout"
+            );
+        });
+    }
+
+    #[test]
     fn the_commit_of_a_toolchain_is_the_one_its_library_has_its_sources_under() {
         let commit = "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4";
         let built = format!("\0/rustc/short/a.rs\0/rustc/{commit}x\0/rustc/{commit}/library/b.rs");
@@ -12667,6 +13042,44 @@ fn main() {}
             let want = [symbols[3].0, symbols[0].0, symbols[1].0];
             assert_eq!(defined, want, "{format:?}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn source_watcher_refreshes_same_content_symlink_ownership() {
+        use ide_db::base_db::SourceDatabase as _;
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("out");
+        std::fs::create_dir(&output).unwrap();
+        let inside = output.join("inside.rs");
+        let outside = directory.path().join("outside.rs");
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for path in [&inside, &outside] {
+            std::fs::write(path, "pub fn value() -> u8 { 7 }\n").unwrap();
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(time))
+                .unwrap();
+        }
+        let link = output.join("selected.rs");
+        std::os::unix::fs::symlink(&inside, &link).unwrap();
+        let mut db = RootDatabase::new(None);
+        let path = AbsPathBuf::assert_utf8(link.clone());
+        let root = AbsPathBuf::assert_utf8(output);
+        let ownership = db.path_ownership(&path).unwrap();
+        assert!(ownership.roots(&db).contains(&root));
+        let watched =
+            WatchedFile::new(Watched::Source(vfs::FileId::from_raw(0)), &link, &link).unwrap();
+        assert!(!watched.ownership_changed(&db));
+        let text = source_on_disk(&link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert_eq!(std::fs::metadata(&link).unwrap().modified().unwrap(), watched.mtime);
+        assert_eq!(source_on_disk(&link).unwrap(), text);
+        assert!(watched.ownership_changed(&db));
+        assert!(db.reload_included_file(&watched.ownership(&db).unwrap()));
+        assert!(!watched.ownership_changed(&db));
+        assert!(!ownership.roots(&db).contains(&root));
     }
 
     #[test]

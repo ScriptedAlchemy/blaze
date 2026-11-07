@@ -256,7 +256,7 @@ $0",
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 0)],
         expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -268,6 +268,9 @@ $0",
                 "TraitImpls < 'db >::for_crate_",
                 "lang_items",
                 "crate_lang_items",
+                "holds_impl",
+                "impls_in_bodies",
+                "holds_impl",
             ]
         "#]],
     );
@@ -295,7 +298,7 @@ pub struct NewStruct {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -304,6 +307,7 @@ pub struct NewStruct {
                 "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls < 'db >::for_crate_",
+                "impls_in_bodies",
             ]
         "#]],
     );
@@ -330,7 +334,7 @@ $0",
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 0)],
         expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -342,6 +346,9 @@ $0",
                 "TraitImpls < 'db >::for_crate_",
                 "lang_items",
                 "crate_lang_items",
+                "holds_impl",
+                "impls_in_bodies",
+                "holds_impl",
             ]
         "#]],
     );
@@ -370,7 +377,7 @@ pub enum SomeEnum {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -379,6 +386,7 @@ pub enum SomeEnum {
                 "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls < 'db >::for_crate_",
+                "impls_in_bodies",
             ]
         "#]],
     );
@@ -405,7 +413,7 @@ $0",
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 0)],
         expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -417,6 +425,9 @@ $0",
                 "TraitImpls < 'db >::for_crate_",
                 "lang_items",
                 "crate_lang_items",
+                "holds_impl",
+                "impls_in_bodies",
+                "holds_impl",
             ]
         "#]],
     );
@@ -442,7 +453,7 @@ fn bar() -> f32 {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -452,6 +463,7 @@ fn bar() -> f32 {
                 "crate_local_def_map",
                 "TraitImpls < 'db >::for_crate_",
                 "crate_lang_items",
+                "impls_in_bodies",
             ]
         "#]],
     );
@@ -482,7 +494,7 @@ $0",
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 0)],
         expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -494,6 +506,9 @@ $0",
                 "TraitImpls < 'db >::for_crate_",
                 "lang_items",
                 "crate_lang_items",
+                "holds_impl",
+                "impls_in_bodies",
+                "holds_impl",
             ]
         "#]],
     );
@@ -527,7 +542,7 @@ impl SomeStruct {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 1), ("Body::of_", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -536,6 +551,9 @@ impl SomeStruct {
                 "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls < 'db >::for_crate_",
+                "impls_in_bodies",
+                "ImplItems::of_",
+                "holds_impl",
             ]
         "#]],
     );
@@ -595,7 +613,8 @@ fn main() {
                 "Modules < 'db >::module_",
                 "TraitItems::query_with_diagnostics_",
                 "Body::of_",
-                "Body::with_source_map_",
+                "Body::relative_",
+                "body_syntax",
                 "AttrFlags::query_",
                 "ModuleScope < 'db >::legacy_macro_",
                 "ModuleScope < 'db >::name_",
@@ -608,7 +627,8 @@ fn main() {
                 "FunctionSignature::with_source_map_",
                 "AttrFlags::query_",
                 "Body::of_",
-                "Body::with_source_map_",
+                "Body::relative_",
+                "body_syntax",
                 "trait_environment_query",
                 "lang_items",
                 "crate_lang_items",
@@ -632,8 +652,12 @@ fn main() {
                 "GenericPredicates::query_with_diagnostics_",
                 "InherentImpls < 'db >::in_crate_for_self_ty_",
                 "InherentImpls < 'db >::for_crate_",
+                "holds_impl",
+                "impls_in_bodies",
                 "TraitImpls < 'db >::in_crate_and_deps_for_trait_and_self_ty_",
                 "TraitImpls < 'db >::for_crate_and_deps_",
+                "loaded_crates",
+                "include_macro_invoc",
                 "TraitImpls < 'db >::for_crate_",
                 "impl_trait_with_diagnostics",
                 "ImplSignature::of_",
@@ -702,7 +726,8 @@ fn main() {
                 "real_span_map",
                 "crate_local_def_map",
                 "TraitItems::query_with_diagnostics_",
-                "Body::with_source_map_",
+                "body_syntax",
+                "Body::relative_",
                 "AttrFlags::query_",
                 "ModuleScope < 'db >::legacy_macro_",
                 "ModuleScope < 'db >::name_",
@@ -713,8 +738,7 @@ fn main() {
                 "AttrFlags::query_",
                 "FunctionSignature::with_source_map_",
                 "FunctionSignature::of_",
-                "Body::with_source_map_",
-                "Body::of_",
+                "body_syntax",
                 "ModuleScope < 'db >::traits_",
                 "FunctionSignature::with_source_map_",
                 "InferenceResult < 'db >::for_body_",
@@ -724,6 +748,8 @@ fn main() {
                 "StructSignature::with_source_map_",
                 "AttrFlags::query_",
                 "InherentImpls < 'db >::for_crate_",
+                "impls_in_bodies",
+                "include_macro_invoc",
                 "TraitImpls < 'db >::for_crate_",
                 "ImplSignature::with_source_map_",
                 "ImplSignature::of_",
@@ -736,6 +762,67 @@ fn main() {
             ]
         "#]],
     );
+}
+
+#[test]
+fn plain_body_edits_do_not_rebuild_impl_indexes() {
+    let source = "trait T {} struct S; fn first() { let _ = 1; } fn second() { let _ = 2; }";
+    let (mut db, pos) = TestDB::with_position(&format!("{source}$0"));
+    crate::attach_db(&db, || {
+        let (executed, _) = db.log_executed(|| {
+            let krate = db.module_for_file(pos.file_id.file_id(&db)).krate(&db);
+            TraitImpls::for_crate(&db, krate);
+            crate::method_resolution::InherentImpls::for_crate(&db, krate);
+        });
+        assert_eq!(
+            executed.iter().filter(|it| it.contains("Body::of_")).count(),
+            0,
+            "{executed:#?}"
+        );
+    });
+    db.set_file_text(pos.file_id.file_id(&db), &source.replace("= 1", "= 9"));
+    crate::attach_db(&db, || {
+        let (executed, _) = db.log_executed(|| {
+            let krate = db.module_for_file(pos.file_id.file_id(&db)).krate(&db);
+            TraitImpls::for_crate(&db, krate);
+            crate::method_resolution::InherentImpls::for_crate(&db, krate);
+        });
+        assert!(
+            !executed.iter().any(|it| it.contains("::for_crate_") || it.contains("Body::of_")),
+            "{executed:#?}"
+        );
+    });
+    db.set_file_text(pos.file_id.file_id(&db), &source.replace("let _ = 1;", "impl T for S {}"));
+    crate::attach_db(&db, || {
+        let (executed, _) = db.log_executed(|| {
+            let krate = db.module_for_file(pos.file_id.file_id(&db)).krate(&db);
+            TraitImpls::for_crate(&db, krate);
+        });
+        assert!(
+            executed.iter().any(|it| it.contains("TraitImpls < 'db >::for_crate_")),
+            "{executed:#?}"
+        );
+    });
+}
+
+#[test]
+fn macro_holder_body_edits_do_not_rebuild_impl_indexes() {
+    let source = "trait T {} struct S; macro_rules! make_impl { () => { impl T for S {} }; } fn holder() { make_impl!(); let _ = 1; }";
+    let (mut db, pos) = TestDB::with_position(&format!("{source}$0"));
+    crate::attach_db(&db, || {
+        let krate = db.module_for_file(pos.file_id.file_id(&db)).krate(&db);
+        TraitImpls::for_crate(&db, krate);
+        crate::method_resolution::InherentImpls::for_crate(&db, krate);
+    });
+    db.set_file_text(pos.file_id.file_id(&db), &source.replace("= 1", "= 9"));
+    crate::attach_db(&db, || {
+        let (executed, _) = db.log_executed(|| {
+            let krate = db.module_for_file(pos.file_id.file_id(&db)).krate(&db);
+            TraitImpls::for_crate(&db, krate);
+            crate::method_resolution::InherentImpls::for_crate(&db, krate);
+        });
+        assert!(!executed.iter().any(|it| it.contains("::for_crate_")), "{executed:#?}");
+    });
 }
 
 fn execute_assert_events(

@@ -56,6 +56,12 @@ pub const MAIN: &str = "/app/main.rs";
 /// Where `core` starts, when its source is there.
 pub const CORE: &str = "/core/src/lib.rs";
 
+fn source_path(db: &dyn ide_db::base_db::SourceDatabase, file: FileId) -> Option<String> {
+    let root = db.file_source_root(file).source_root_id(db);
+    let root = db.source_root(root).source_root(db);
+    Some(root.path_for_file(&file)?.to_string())
+}
+
 /// The layout of `wasm32-unknown-unknown`.
 const DATA_LAYOUT: &str = "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20";
 
@@ -145,8 +151,10 @@ impl Default for Compiler {
         hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
         // MIR is lowered for the target's address size, which is said when it is selected.
         hir_ty_codegen::Target::current();
+        let mut db = RootDatabase::new(None);
+        hir_ty_codegen::name_sources(&mut db, |db, file| source_path(db, file));
         Compiler {
-            db: RootDatabase::new(None),
+            db,
             files: FxHashMap::default(),
             new_files: false,
             known: Rejections::default(),
@@ -549,9 +557,7 @@ impl SymbolResolver for Names<'_> {
     }
 
     fn source_path(&self, file: FileId) -> Option<String> {
-        let root = self.db.file_source_root(file).source_root_id(self.db);
-        let root = self.db.source_root(root).source_root(self.db);
-        Some(root.path_for_file(&file)?.to_string())
+        crate::source_path(self.db, file)
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {

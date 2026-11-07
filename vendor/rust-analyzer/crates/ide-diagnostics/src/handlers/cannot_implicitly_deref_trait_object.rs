@@ -34,7 +34,7 @@ trait Trait {}
 
 fn f(x: &dyn Trait) {
     let &ref _y = x;
-      //^^^^^^^ error: type `&(dyn Trait + 'static)` cannot be dereferenced
+      //^^^^^^^ error: type `&dyn Trait` cannot be dereferenced
 }
 "#,
         );

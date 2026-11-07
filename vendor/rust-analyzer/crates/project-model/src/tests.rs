@@ -610,3 +610,69 @@ fn script_output_identity_is_independent_of_an_out_dir_environment_override() {
         assert_eq!(graph[owner].env.get("OUT_DIR").as_deref(), Some(override_value));
     }
 }
+
+#[test]
+fn compiler_proc_macro_tests_keep_source_role_and_extern_prelude() {
+    let mut json = compiler_project();
+    let mut ordinary = json["crates"][1].clone();
+    ordinary["display_name"] = "ordinary_tests".into();
+    ordinary["root_module"] = "ordinary_tests.rs".into();
+    json["crates"].as_array_mut().unwrap().push(ordinary);
+    json["crates"][1]["blaze_proc_macro_test"] = true.into();
+    let data: ProjectJsonData = serde_json::from_value(json).unwrap();
+    let roundtrip = serde_json::to_value(&data).unwrap();
+    assert_eq!(roundtrip["crates"][1]["blaze_proc_macro_test"], true);
+    let mut workspace = rust_project_workspace(data);
+    let mut library = compiler_project()["crates"][2].clone();
+    library["display_name"] = "proc_macro".into();
+    library["root_module"] = "proc_macro.rs".into();
+    let sysroot = serde_json::json!({"compiler_mode": true, "crates": [library]});
+    workspace.sysroot.set_workspace(RustLibSrcWorkspace::Json(rooted_project_json(
+        serde_json::from_value(sysroot).unwrap(),
+    )));
+    let (graph, images) = to_crate_graph(workspace, &mut Default::default());
+    for id in graph.iter() {
+        let krate = &graph[id];
+        let name = krate.extra.display_name.as_ref().unwrap().canonical_name().as_str();
+        if name == "proc_macro" {
+            continue;
+        }
+        let dep =
+            krate.basic.dependencies.iter().find(|dep| dep.name.as_str() == "proc_macro").unwrap();
+        assert_eq!(
+            dep,
+            &base_db::DependencyBuilder::with_prelude(
+                dep.name.clone(),
+                dep.crate_id,
+                matches!(name, "tests" | "macros"),
+                true,
+            ),
+            "{name}",
+        );
+        if name == "tests" {
+            assert_eq!(krate.basic.target_kind, TargetKind::Test);
+            assert!(krate.cfg_options.check_atom(&CfgAtom::Flag(sym::test)));
+            assert!(!krate.cfg_options.check_atom(&CfgAtom::Flag(sym::proc_macro)));
+            assert!(!images.contains_key(&id));
+        }
+    }
+}
+
+#[test]
+fn compiler_proc_macro_test_intent_rejects_image_and_non_test_roles() {
+    let mut valid = compiler_project();
+    valid["crates"][1]["blaze_proc_macro_test"] = true.into();
+    for invalid in ["compiler_mode", "kind", "image", "proc_macro", "cfg"] {
+        let mut json = valid.clone();
+        match invalid {
+            "compiler_mode" => json["compiler_mode"] = false.into(),
+            "kind" => json["crates"][1]["build"]["target_kind"] = "bin".into(),
+            "image" => json["crates"][1]["proc_macro_dylib_path"] = "/macro.so".into(),
+            "proc_macro" => json["crates"][1]["is_proc_macro"] = true.into(),
+            "cfg" => json["crates"][1]["cfg"] = serde_json::json!([]),
+            _ => unreachable!(),
+        }
+        let error = serde_json::from_value::<ProjectJsonData>(json).unwrap_err();
+        assert!(error.to_string().contains("proc-macro test"), "{invalid}: {error}");
+    }
+}

@@ -1,0 +1,46 @@
+# Test the native-path metadata fixtures on the platform that exposed their bug.
+# The ordinary PR tier intentionally skips Windows; its merge queue checks Linux
+# and macOS, while the full Windows matrix otherwise runs only at night.
+name: Windows metadata parity
+
+on:
+  pull_request:
+    paths:
+      - 'crates/blaze-manifest/**'
+      - 'crates/ra-jit/src/cargo/metadata.rs'
+      - '.github/workflows/windows-metadata.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/blaze-manifest/**'
+      - 'crates/ra-jit/src/cargo/metadata.rs'
+      - '.github/workflows/windows-metadata.yaml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-metadata-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  parity:
+    name: Windows Cargo metadata fixture parity
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - name: Preserve native checkout paths
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          shared-key: windows-metadata-parity
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Strict manifest, configuration and profile fixture parity
+        run: cargo +1.99.0 test --locked --release -p blaze-manifest --tests
+      - name: Strict ra-jit metadata parity against Cargo
+        run: cargo +1.99.0 test --locked --release -p ra-jit --bin ra-jit cargo::metadata::tests::fixtures_are_what_cargo_metadata_gives -- --exact

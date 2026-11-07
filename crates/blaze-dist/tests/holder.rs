@@ -142,6 +142,38 @@ fn review_a_fresh_rejected_finding_is_released() {
     assert!(holder.findings().is_empty());
 }
 
+/// An acknowledgment cannot name findings unrelated to the committed batch:
+/// a foreign conflict would incorrectly release an older retained finding.
+#[test]
+fn result_acknowledgment_rejects_foreign_grants_and_conflicts() {
+    let foreign = WorkName([99; 32]);
+    for (granted, conflicts) in [(vec![foreign], Vec::new()), (Vec::new(), vec![foreign])] {
+        let (mut holder, id) = reporting(false);
+        let mut effects = Vec::new();
+        holder.step(
+            4,
+            Event::Reply {
+                id,
+                reply: Reply::Result(Ok(WorkResultAnswer {
+                    granted: Set::new(granted),
+                    conflicts: Set::new(conflicts),
+                })),
+            },
+            &mut effects,
+        );
+        assert!(holder.is_stopped(), "foreign acknowledgment must fence the holder");
+        assert_eq!(released(&effects), BTreeSet::from([FOUND]));
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::Stop(StopWhy::Protocol(why)) if why.contains("foreign"))
+        ));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send { call: Call::Lease(_), .. }))
+        );
+    }
+}
+
 #[test]
 fn review_cancellation_releases_findings_in_an_unacknowledged_result() {
     let (mut holder, _) = reporting(false);
@@ -175,6 +207,61 @@ fn review_a_batch_finishing_after_cancellation_releases_its_findings() {
     holder.step(5, Event::Compiled(batch), &mut effects);
     assert_eq!(released(&effects), BTreeSet::from([FOUND]));
     assert!(effects.iter().all(|effect| matches!(effect, Effect::Release(_))));
+}
+
+/// A duplicated completion can arrive after the holder moved to Reporting.
+/// Compiler discoveries from both copies are retained until acknowledged and
+/// must be released exactly once, including an extra unexpected name.
+#[test]
+fn unexpected_compiler_completion_fences_and_releases_every_finding_once() {
+    let (mut holder, batch) = compiling(false);
+    let mut effects = Vec::new();
+    holder.step(3, Event::Compiled(batch.clone()), &mut effects);
+    assert!(
+        effects.iter().any(|effect| matches!(effect, Effect::Send { call: Call::Result(_), .. }))
+    );
+
+    let extra = WorkName([11; 32]);
+    let mut duplicate = batch;
+    duplicate.roots[0].found = Set::new(vec![
+        Found { name: FOUND, tuple: [10; 32] },
+        Found { name: extra, tuple: [12; 32] },
+    ]);
+    effects.clear();
+    holder.step(4, Event::Compiled(duplicate), &mut effects);
+    assert!(holder.is_stopped(), "unexpected batch cannot silently remain in Reporting");
+    let released_names: Vec<WorkName> = effects
+        .iter()
+        .flat_map(|effect| match effect {
+            Effect::Release(names) => names.as_slice(),
+            _ => &[],
+        })
+        .copied()
+        .collect();
+    assert_eq!(released_names.len(), 2, "every retained name is released exactly once");
+    assert_eq!(released_names.into_iter().collect::<BTreeSet<_>>(), BTreeSet::from([FOUND, extra]));
+    assert!(effects.iter().any(
+        |effect| matches!(effect, Effect::Stop(StopWhy::Protocol(why)) if why.contains("active grant"))
+    ));
+    assert!(!effects.iter().any(|effect| matches!(effect, Effect::Send { .. })));
+}
+
+/// An incorrect-generation batch has retained its discoveries but can never be
+/// committed under this grant. It must not strand the holder in Compiling.
+#[test]
+fn a_wrong_generation_batch_releases_findings_and_fences_the_holder() {
+    let (mut holder, mut batch) = compiling(false);
+    batch.generation += 1;
+    let mut effects = Vec::new();
+    holder.step(3, Event::Compiled(batch), &mut effects);
+    assert!(holder.is_stopped(), "a mismatched batch left the holder compiling");
+    assert_eq!(released(&effects), BTreeSet::from([FOUND]));
+    assert!(effects.iter().any(
+        |effect| matches!(effect, Effect::Stop(StopWhy::Protocol(why)) if why.contains("generation"))
+    ));
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::Send { call: Call::Result(_), .. }))
+    );
 }
 
 /// A delayed heartbeat reply must not be invalidated by the next interval. A

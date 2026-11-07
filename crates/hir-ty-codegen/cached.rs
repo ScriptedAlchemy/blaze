@@ -42,6 +42,135 @@ pub(super) struct Entry {
     /// For code of the checkout: what a patch base that has it from the store tells an edit
     /// of it by, without compiling it.
     pub(super) tracked: Option<Tracked>,
+    pub(super) semantic: Option<SemanticInputs>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct SemanticSource {
+    pub(super) body: String,
+    pub(super) file: String,
+    pub(super) name: String,
+}
+
+/// Current CTFE observations, sealed into both the name/key and the entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct SemanticInputs {
+    constants: Vec<String>,
+    sources: Vec<SemanticSource>,
+    #[serde(skip)]
+    digest: OnceLock<String>,
+}
+
+impl PartialEq for SemanticInputs {
+    fn eq(&self, other: &Self) -> bool {
+        self.constants == other.constants && self.sources == other.sources
+    }
+}
+impl Eq for SemanticInputs {}
+
+impl SemanticInputs {
+    pub(super) fn new(constants: Vec<String>, sources: Vec<SemanticSource>) -> Self {
+        Self { constants, sources, digest: OnceLock::new() }
+    }
+
+    pub(super) fn canonical(&self) -> bool {
+        Self::canonical_parts(self.constants.iter().map(String::as_str), self.sources.iter())
+    }
+
+    /// Whether these, in this order, are a value that can be sealed: there is a constant, and
+    /// nothing is said twice, nor of one file of one body two different ways.
+    pub(super) fn canonical_parts<'v>(
+        constants: impl Iterator<Item = &'v str>,
+        mut sources: impl Iterator<Item = &'v SemanticSource>,
+    ) -> bool {
+        let mut constants = constants.peekable();
+        constants.peek().is_some()
+            && constants.is_sorted_by(|a, b| a < b)
+            && sources.is_sorted_by(|a, b| (&a.body, &a.file) < (&b.body, &b.file))
+    }
+
+    /// The set-based question [`super::stable::StableNames::covers`] answers from the graph.
+    #[cfg(test)]
+    pub(super) fn covers(&self, child: &Self) -> bool {
+        std::ptr::eq(self, child)
+            || child.constants.iter().all(|item| self.constants.binary_search(item).is_ok())
+                && child.sources.iter().all(|item| self.sources.binary_search(item).is_ok())
+    }
+
+    pub(super) fn digest(&self) -> &str {
+        self.digest.get_or_init(|| {
+            Self::digest_parts(self.constants.iter().map(String::as_str), self.sources.iter())
+        })
+    }
+
+    /// What the name of an instance is sealed with: one way of working it out, for a value
+    /// read from the store and for one the graph of a view has not flattened.
+    pub(super) fn digest_parts<'v>(
+        constants: impl Iterator<Item = &'v str>,
+        sources: impl Iterator<Item = &'v SemanticSource>,
+    ) -> String {
+        use std::fmt::Write;
+        let mut hash = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        };
+        field(b"blaze concrete semantic inputs 4");
+        for constant in constants {
+            field(&[0]);
+            field(constant.as_bytes());
+        }
+        for source in sources {
+            field(&[1]);
+            field(source.body.as_bytes());
+            field(source.file.as_bytes());
+            field(source.name.as_bytes());
+        }
+        let mut digest = String::new();
+        for byte in hash.finalize() {
+            write!(digest, "{byte:02x}").unwrap();
+        }
+        digest
+    }
+}
+
+/// An immutable compile/admission view, never an accumulated dependency trace.
+#[derive(Debug, Clone, Default)]
+pub(super) struct SemanticSources {
+    values: FxHashMap<String, Option<String>>,
+    ambiguous: FxHashSet<String>,
+}
+
+impl SemanticSources {
+    pub(super) fn insert(&mut self, file: String, name: Option<String>) {
+        if let Some(previous) = self.values.get(&file) {
+            if previous != &name {
+                self.ambiguous.insert(file);
+            }
+        } else {
+            self.values.insert(file, name);
+        }
+    }
+
+    fn matches(&self, source: &SemanticSource) -> bool {
+        !self.ambiguous.contains(&source.file)
+            && self.values.get(&source.file).and_then(Option::as_deref)
+                == Some(source.name.as_str())
+    }
+}
+
+impl Entry {
+    pub(super) fn semantic_matches(&self, name: &str, sources: &SemanticSources) -> bool {
+        match (&self.semantic, super::stable::semantic_digest(name)) {
+            (None, None) => true,
+            (Some(inputs), Some(digest)) => {
+                inputs.canonical()
+                    && inputs.digest() == digest
+                    && inputs.sources.iter().all(|source| sources.matches(source))
+            }
+            _ => false,
+        }
+    }
 }
 
 /// What a patch base knows of an entry of the checkout. See [`super::patch::stable_mark`].
@@ -49,7 +178,8 @@ pub(super) struct Entry {
 pub(super) struct Tracked {
     /// The stable mark of the code.
     pub(super) mark: u128,
-    /// The crate it is compiled as, by the id it is named by, when that is of the checkout.
+    /// An optional crate hint accepted by the reader. Portable writers leave this unset:
+    /// the requesting crate is absent from the key, and hydration finds its current callers.
     pub(super) home: Option<[u8; 32]>,
     /// The files its code comes from, as [`super::stable::StableNames::file_path`] names
     /// them; `None` when any file can be one.
@@ -82,7 +212,7 @@ pub(super) struct CachedFunc {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(super) enum CachedTarget {
-    /// `checked` when the symbol was one of the program's rustc build, which another
+    /// `checked` when the symbol belonged to an input object, which another
     /// program's may lack.
     Import { symbol: String, checked: bool },
     /// The entry of this name, or whatever else the build has for the instance.
@@ -434,7 +564,7 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit entry 13");
+        field(b"ra-jit entry 17");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());
@@ -485,18 +615,18 @@ impl Entry {
         datas && self.code.sound(|namespace| if namespace == 0 { funcs } else { self.datas.len() })
     }
 
-    /// Whether the program has everything of rustc's that the entry was linked against.
-    pub(super) fn links(&self, defines: &dyn Fn(&str) -> bool) -> bool {
+    /// Whether the program can provide every native import the entry was linked against.
+    pub(super) fn links(&self, defines: &dyn Fn(&str, bool) -> bool) -> bool {
         let funcs = self.funcs.iter().all(|it| match &it.target {
-            CachedTarget::Import { symbol, checked } => !checked || defines(symbol),
-            CachedTarget::Copy { symbol, .. } => defines(symbol),
+            CachedTarget::Import { symbol, checked } => defines(symbol, *checked),
+            CachedTarget::Copy { symbol, .. } => defines(symbol, true),
             CachedTarget::Named(_)
             | CachedTarget::Root(_)
             | CachedTarget::TypeId(_)
             | CachedTarget::Asm(_) => true,
         });
         let datas = self.datas.iter().all(|it| match it {
-            CachedData::Static { symbol, .. } => defines(symbol),
+            CachedData::Static { symbol, .. } => defines(symbol, true),
             _ => true,
         });
         funcs && datas
@@ -594,6 +724,7 @@ pub(super) struct Entries {
     /// The checkout's directory here.
     checkout: Option<String>,
     known: Mutex<Known>,
+    semantic_sources: SemanticSources,
 }
 
 enum EntryStore {
@@ -727,7 +858,16 @@ impl Writer<'static> {
         writer
     }
 
-    pub(super) fn keep(&mut self, kept: Kept) {
+    /// Where the threads that compile can give the writer what they make as they make it, so
+    /// that an entry waits on the writer and not on the whole batch: an entry is as big as its
+    /// complete closure. The queue is bounded, and the writers wait for nobody. `None` when
+    /// there is no thread to be had.
+    pub(super) fn hand_off(&mut self) -> Option<std::sync::mpsc::SyncSender<Kept>> {
+        self.start();
+        self.threads.as_ref().map(|(jobs, _)| jobs.clone())
+    }
+
+    fn start(&mut self) {
         if self.threads.is_none() && !self.alone {
             // Backpressure bounds queued entries, not incremental cache retention.
             let (jobs, queued) = std::sync::mpsc::sync_channel::<Kept>(16);
@@ -758,6 +898,10 @@ impl Writer<'static> {
                 false => self.threads = Some((jobs, threads)),
             }
         }
+    }
+
+    pub(super) fn keep(&mut self, kept: Kept) {
+        self.start();
         match &self.threads {
             Some((jobs, _)) => {
                 if jobs.send(kept).is_err() {
@@ -911,6 +1055,7 @@ impl Entries {
             library,
             checkout: None,
             known: Mutex::default(),
+            semantic_sources: SemanticSources::default(),
         }
     }
 
@@ -918,6 +1063,11 @@ impl Entries {
     /// in it.
     pub(super) fn in_checkout(mut self, root: Option<String>) -> Entries {
         self.checkout = root;
+        self
+    }
+
+    pub(super) fn in_semantic_sources(mut self, sources: SemanticSources) -> Entries {
+        self.semantic_sources = sources;
         self
     }
 
@@ -940,6 +1090,7 @@ impl Entries {
             library,
             checkout: None,
             known: Mutex::default(),
+            semantic_sources: SemanticSources::default(),
         }
     }
 
@@ -976,6 +1127,9 @@ impl Entries {
             let key =
                 admitted_key.or_else(|| Entry::key(name, self.debug, self.program.as_ref()))?;
             let mut entry = Entry::decode(&self.store.get(&key)?)?;
+            if !entry.semantic_matches(name, &self.semantic_sources) {
+                return None;
+            }
             if let Some(debug) = &mut entry.debug {
                 let types = debug.stored_types.iter().map(|key| self.types(key));
                 debug.types = types.collect::<Option<_>>()?;
@@ -1010,15 +1164,31 @@ impl Entries {
         self.known().usable.insert(name, usable);
     }
 
+    fn linkable(&self, name: &str, defines: &dyn Fn(&str, bool) -> bool) -> Option<Arc<Entry>> {
+        let Some(entry) = self.get(name) else {
+            if keys_logged() {
+                eprintln!("cache closure miss: {name}: no entry");
+            }
+            return None;
+        };
+        entry.links(&|symbol, checked| {
+            let found = defines(symbol, checked);
+            if !found && keys_logged() {
+                eprintln!("cache closure miss: {name}: unavailable import {symbol} (checked={checked})");
+            }
+            found
+        }).then_some(entry)
+    }
+
     /// Whether there is an entry for `name` and for everything it calls, and what they import
     /// is in the program, as `defines` tells.
-    pub(super) fn usable(&self, name: &str, defines: &dyn Fn(&str) -> bool) -> bool {
+    pub(super) fn usable(&self, name: &str, defines: &dyn Fn(&str, bool) -> bool) -> bool {
         let settled = |name: &str| self.known().usable.get(name).copied();
         if let Some(usable) = settled(name) {
             return usable;
         }
         let name: Arc<str> = Arc::from(name);
-        let Some(entry) = self.get(&name).filter(|it| it.links(defines)) else {
+        let Some(entry) = self.linkable(&name, defines) else {
             self.settle(name, false);
             return false;
         };
@@ -1054,7 +1224,7 @@ impl Entries {
             let found = match settled(callee) {
                 Some(true) => continue,
                 Some(false) => None,
-                None => self.get(callee).filter(|it| it.links(defines)),
+                None => self.linkable(callee, defines),
             };
             let callee: Arc<str> = Arc::from(callee);
             let Some(entry) = found else {
@@ -1097,6 +1267,49 @@ mod tests {
         },
         *,
     };
+
+    #[test]
+    fn what_is_handed_off_from_many_threads_is_in_the_store_at_the_finish() {
+        super::super::store::compiles_against("1.99.0");
+        let directory = std::env::temp_dir().join(format!("blaze-hand-off-{}", std::process::id()));
+        let store: &'static _ =
+            Box::leak(Box::new(super::super::store::Store::owned(&directory).unwrap()));
+        let mut writer = Writer::new(store, None, None);
+        let sender = writer.hand_off().expect("this test has threads to spare");
+        let key = |thread: u8, at: u8| {
+            let mut key = [0; KEY];
+            (key[0], key[1]) = (thread, at);
+            key
+        };
+        std::thread::scope(|scope| {
+            for thread in 0..4 {
+                let sender = sender.clone();
+                scope.spawn(move || {
+                    for at in 0..64 {
+                        let entry = Box::new(entry());
+                        let kept = Kept::Entry { key: key(thread, at), entry, name: None };
+                        sender.send(kept).unwrap();
+                    }
+                });
+            }
+        });
+        // `finish` waits on the writers, and they on this: a batch drops its own when it ends.
+        drop(sender);
+        let written = writer.finish();
+        assert_eq!((written.added, written.errors.len()), (4 * 64, 0));
+        store.seal_checked().unwrap();
+        for thread in 0..4 {
+            for at in 0..64 {
+                let read = Entry::decode(&store.get(&key(thread, at)).unwrap()).unwrap();
+                assert_eq!(read.label, entry().label);
+            }
+        }
+        // The next batch of the object has writers again.
+        writer.hand_off().unwrap().send(Kept::Types(Vec::new())).unwrap();
+        assert!(writer.finish().errors.is_empty());
+        drop(writer);
+        std::fs::remove_dir_all(directory).ok();
+    }
 
     #[test]
     fn checked_finish_reports_every_panicked_writer() {
@@ -1251,6 +1464,7 @@ mod tests {
         ];
         Entry {
             label: "case::run".to_owned(),
+            semantic: None,
             funcs: targets
                 .into_iter()
                 .map(|target| CachedFunc { target, sig: signature() })
@@ -1270,6 +1484,29 @@ mod tests {
                 }]),
             }),
         }
+    }
+
+    #[test]
+    fn semantic_digest_memo_preserves_entry_wire_bytes() {
+        let mut entry = entry();
+        entry.debug.as_mut().unwrap().types.clear();
+        entry.semantic = Some(SemanticInputs::new(
+            vec!["body run environment case".into()],
+            vec![SemanticSource {
+                body: "run environment case".into(),
+                file: "src/lib.rs".into(),
+                name: "/actual/src/lib.rs".into(),
+            }],
+        ));
+        let before = postcard::to_allocvec(&entry).unwrap();
+        let digest = entry.semantic.as_ref().unwrap().digest().to_owned();
+        assert_eq!(before, postcard::to_allocvec(&entry).unwrap());
+        let decoded: Entry = postcard::from_bytes(&before).unwrap();
+        let semantic = decoded.semantic.as_ref().unwrap();
+        assert!(semantic.digest.get().is_none());
+        assert_eq!(decoded, entry);
+        assert_eq!(semantic.digest(), digest);
+        assert_eq!(before, postcard::to_allocvec(&decoded).unwrap());
     }
 
     /// An entry of a crate cargo fetched to `home`, with each kind of file name it can have.

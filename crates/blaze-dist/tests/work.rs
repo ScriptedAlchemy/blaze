@@ -209,6 +209,35 @@ fn review_the_leads_rejections_apply_to_provisional_discoveries() {
 }
 
 #[test]
+fn a_lead_rejected_new_helper_discovery_is_acknowledged_for_release() {
+    let mut w = set(WorkConfig { grant_roots: 1, ..small() });
+    let roots = rootset(1, 1);
+    w.join(
+        0,
+        "lead",
+        &WorkJoinRequest {
+            execution: EXEC,
+            attempt: A1,
+            roots: roots.clone(),
+            rejected: Set::new(vec![name(7)]),
+        },
+        &mut Vec::new(),
+    )
+    .unwrap();
+    join(&mut w, 0, "helper", &roots).unwrap();
+    let grant = lease(&mut w, 0, "helper").unwrap();
+    let items = vec![with_found(exported(name(100)), &[(name(7), 7)])];
+    let answer =
+        w.result(1, "helper", &result(&grant, 1, items, Vec::new()), &mut Vec::new()).unwrap();
+
+    // A helper need not have the lead's policy. The coordinator must tell it
+    // to release even a first-time discovery that the lead already rejected.
+    assert_eq!(answer.conflicts.as_slice(), &[name(7)]);
+    assert_eq!(w.report().names[&name(7)].1, Some(Terminal::Tail(TailWhy::Rejected)));
+    assert_eq!(w.counters().conflicts, 0);
+}
+
+#[test]
 fn review_an_invalidated_held_name_is_acknowledged_even_when_unknown() {
     for rejected in [false, true] {
         let mut w = set(WorkConfig { grant_roots: 1, ..small() });
@@ -378,6 +407,34 @@ fn two_tuples_for_one_name_are_a_conflict_and_invalidate_its_export() {
     assert_eq!(answer.conflicts.as_slice(), &[name(7)]);
     assert!(log.iter().any(|e| matches!(e, Effect::ExportInvalidated { .. })));
     assert_eq!(w.report().names[&name(7)].1, Some(Terminal::Tail(TailWhy::Conflict)));
+}
+
+#[test]
+fn rediscovering_a_terminal_name_releases_the_new_finding_without_a_false_conflict() {
+    let mut w = set(WorkConfig { grant_roots: 1, ..small() });
+    let rs = rootset(3, 1);
+    join(&mut w, 0, "lead", &rs).unwrap();
+
+    let g = lease(&mut w, 0, "lead").unwrap();
+    let items = vec![with_found(exported(name(100)), &[(name(7), 7)])];
+    w.result(1, "lead", &result(&g, 1, items, Vec::new()), &mut Vec::new()).unwrap();
+
+    let g = lease(&mut w, 2, "lead").unwrap();
+    assert_eq!(g.names.as_slice(), &[name(7)]);
+    w.result(3, "lead", &result(&g, 2, root_items(&g), vec![exported(name(7))]), &mut Vec::new())
+        .unwrap();
+
+    let old_terminal = w.report().names[&name(7)].1.clone();
+    let old_conflicts = w.counters().conflicts;
+    let g = lease(&mut w, 4, "lead").unwrap();
+    let items = vec![with_found(exported(name(102)), &[(name(7), 7)])];
+    let answer = w.result(5, "lead", &result(&g, 3, items, Vec::new()), &mut Vec::new()).unwrap();
+
+    // Without an explicit release signal the other batch's compiler retains
+    // name(7) forever although the coordinator has already made it terminal.
+    assert_eq!(answer.conflicts.as_slice(), &[name(7)]);
+    assert_eq!(w.counters().conflicts, old_conflicts);
+    assert_eq!(w.report().names[&name(7)].1, old_terminal);
 }
 
 #[test]

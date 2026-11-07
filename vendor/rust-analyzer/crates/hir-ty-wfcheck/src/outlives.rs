@@ -501,6 +501,31 @@ impl<'db> Inferred<'db> {
                     .collect();
                 clause_needs(&clauses, &mut needs);
             }
+            // `dyn Trait<'a, T>` with `trait Trait<'a, T: 'a>`: what the trait declares of its
+            // parameters, not what it declares of the `Self` an object has none of.
+            TyKind::Dynamic(predicates, _) => {
+                for predicate in predicates.iter() {
+                    let ExistentialPredicate::Trait(it) = predicate.skip_binder() else {
+                        continue;
+                    };
+                    let dummy_self = Ty::new_unit(interner);
+                    let args = GenericArgs::new_from_iter(
+                        std::iter::once(GenericArg::from(dummy_self)).chain(it.args.iter()),
+                    );
+                    let clauses: Vec<Clause<'db>> =
+                        GenericPredicates::query_all(db, it.def_id.0.into())
+                            .iter_instantiated(interner, args.as_slice())
+                            .map(|it| it.skip_norm_wip())
+                            .filter(|clause| match clause.kind().skip_binder() {
+                                ClauseKind::TypeOutlives(OutlivesPredicate(ty, _)) => {
+                                    ty != dummy_self
+                                }
+                                _ => true,
+                            })
+                            .collect();
+                    clause_needs(&clauses, &mut needs);
+                }
+            }
             _ => (),
         }
         for need in needs {
