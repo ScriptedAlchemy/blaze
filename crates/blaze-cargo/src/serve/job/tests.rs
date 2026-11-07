@@ -46,6 +46,9 @@ fn opened(root: u8) -> Opened {
 /// A job of nothing but its views, as [`Jobs::begin`] puts one in.
 fn job(views: Vec<Opened>) -> Job<Real> {
     Job {
+        paused: blaze_graph::pressure::Paused::default(),
+        began: std::time::Duration::ZERO,
+        doing_said: None,
         work: Work::Snapshot,
         views,
         ready: Vec::new(),
