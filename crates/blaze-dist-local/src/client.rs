@@ -169,6 +169,8 @@ fn validate_answer(command: &Command, answer: &Answer) -> Result<(), Error> {
         (Command::Result(_), Answer::Result(_)) => true,
         (Command::WorkerEvents(_), Answer::WorkerEvents(_)) => true,
         (Command::KillAck(_), Answer::KillAck(_)) => true,
+        (Command::Claim(_), Answer::Claimed(_)) => true,
+        (Command::Packs(_), Answer::Packs(_)) => true,
         (Command::Terminal(s), Answer::Terminal(t)) => {
             t.subscription == *s
                 && t.value.as_ref().is_none_or(|value| {
