@@ -291,21 +291,21 @@ def pin(dirs):
     PINS.write_text(json.dumps(table, indent=2) + "\n")
 
 
-def proc_macro_server(ra_jit, out):
+def proc_macro_server(ra_jit, out, target):
     """blaze's proc-macro server, built and linked by `ra-jit` into `out`, from a store of its
     own; the path of the executable."""
     exe = out / SERVER_BIN
     with tempfile.TemporaryDirectory(prefix="blaze-server-") as work:
         env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RA_JIT_CACHE=str(Path(work) / "store"),
-                   RA_JIT_STD_FROM="off", RA_JIT_PROC_MACRO_SERVER="0", RUST_BACKTRACE="0",
-                   RUSTC_BOOTSTRAP="1")
-        # The vendored Rust 1.99 in-tree server uses gated proc_macro internals.
-        # Authorize only this owned server build; ra-jit still checks each feature
-        # against its pinned release catalog and never delegates to rustc.
+                   RA_JIT_STD_FROM="off", RA_JIT_PROC_MACRO_SERVER="0", RUST_BACKTRACE="0")
+        # The pinned server crates use unstable proc_macro APIs. Authorize only
+        # those crate names by default, retaining an explicit caller policy.
+        env.setdefault("RUSTC_BOOTSTRAP", "proc_macro_api,proc_macro_srv")
         start = time.monotonic()
         # `proc_macro` is not in the standard library's unit: the program that links it has it.
         try:
-            built = run([str(ra_jit), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",
+            built = run([str(ra_jit), str(SERVER), "--target", target,
+                         "--crate", SERVER_CRATE, "--crate", "proc_macro",
                          "--out", str(Path(work) / "server.o"), "--exe", str(exe)], cwd=SERVER, env=env,
                         capture_output=True, text=True)
         except subprocess.CalledProcessError as error:
@@ -320,8 +320,13 @@ def proc_macro_server(ra_jit, out):
         if not missing or any(int(count) != 0 for count in missing):
             exe.unlink(missing_ok=True)
             sys.exit("error: build_release: the owned proc-macro server is not completely compiled")
-    said = subprocess.run([str(exe), "--version"], capture_output=True, text=True, check=True,
-                          env=dict(os.environ, RUST_ANALYZER_INTERNALS_DO_NOT_USE="this is unstable"))
+    try:
+        said = subprocess.run([str(exe), "--version"], capture_output=True, text=True, check=True,
+                             env=dict(os.environ, RUST_ANALYZER_INTERNALS_DO_NOT_USE="this is unstable"))
+    except (OSError, subprocess.CalledProcessError):
+        # An image that did not pass the executable check is not an installable server.
+        exe.unlink(missing_ok=True)
+        raise
     print(f"build_release: {said.stdout.strip()} as {exe}, built by ra-jit in {time.monotonic() - start:.1f} s",
           flush=True)
     return exe
@@ -531,7 +536,7 @@ def main():
         for binary in binaries:
             shutil.copy2(binary, args.out / binary.name)
         if args.server:
-            proc_macro_server(args.out / "ra-jit", args.out)
+            proc_macro_server(args.out / "ra-jit", args.out, args.target)
         if "linux" in args.target:
             check_artifact(args.out, args.artifact_mode)
     shown = args.out or binaries[0].parent

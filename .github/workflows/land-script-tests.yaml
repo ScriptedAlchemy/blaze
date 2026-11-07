@@ -2,6 +2,9 @@ name: Landing script repository regressions
 on:
   pull_request:
     paths:
+      - .github/scripts/build_release.py
+      - .github/scripts/test_build_release.py
+      - .github/scripts/test_proc_macro_server_bootstrap.py
       - .github/scripts/land.py
       - .github/scripts/test_land.py
       - .github/scripts/cancel_pr_runs.py
@@ -16,6 +19,9 @@ on:
   push:
     branches: [main]
     paths:
+      - .github/scripts/build_release.py
+      - .github/scripts/test_build_release.py
+      - .github/scripts/test_proc_macro_server_bootstrap.py
       - .github/scripts/land.py
       - .github/scripts/test_land.py
       - .github/scripts/pin_pgo_release.py
@@ -46,3 +52,5 @@ jobs:
         run: python3 -m unittest discover -s .github/scripts -p test_publish_pgo_pin.py -v
       - name: Verify fork-owned PGO release pin destinations
         run: python3 -m unittest discover -s .github/scripts -p test_pin_pgo_release.py -v
+      - name: Verify release artifact and owned bootstrap contracts
+        run: python3 -B -I .github/scripts/test_build_release.py
