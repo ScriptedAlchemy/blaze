@@ -2,20 +2,20 @@
 //! [`Client`], hands its compile plans to the caller's batch compiler, and ticks it
 //! with the caller's clock until the holder leaves the execution.
 //!
-//! The compile runs on the driver's thread, so no heartbeat is sent while a batch
-//! compiles: a batch must fit inside the work set's lease window (`lease_ms` of
-//! silence, and the progress timeout), which the batch sizing of section 4 already
-//! assumes. A driver that compiles on other threads keeps this same shape and
-//! delivers [`Compiled`] through its own queue.
+//! A scoped compiler worker owns compile and release calls, while the driver keeps
+//! servicing holder events and heartbeats. A cancelled batch still finishes in the
+//! worker; its unpublished findings are released before the driver returns.
 //!
 //! Nothing here compiles by itself and nothing falls back: a transport failure is
 //! returned to the caller, whose `LocalPolicy` decides what happens next.
 
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
-use blaze_dist::holder::{BatchCompiler, Call, Effect, Event, Holder, Reply, StopWhy};
-use blaze_wire::JobContent;
+use blaze_dist::holder::{BatchCompiler, Call, Compiled, Effect, Event, Holder, Plan, Reply, StopWhy};
+use blaze_wire::{JobContent, WorkName};
 
 use crate::Error;
 use crate::client::Client;
@@ -36,11 +36,10 @@ impl Default for DriverConfig {
     }
 }
 
-/// Run `holder` to its stop over `client`, compiling its plans with `compile` and
-/// dropping retained findings through `release`. `now_ms` is the daemon-relative
-/// monotonic clock the holder's timings live on; the welcome's `now_ms` anchors the
-/// first steps, so the caller's clock and the daemon's must share an origin (the
-/// local carrier's `MonotonicClock` and a driver started beside it do).
+/// Run the holder to completion over a local carrier. The batch compiler must be
+/// Send: the worker borrows it for the lifetime of the driver, while the driver
+/// continues to tick and send heartbeats. No compiler or compiler fallback is
+/// started by the carrier. The caller's clock must share the coordinator's origin.
 pub fn run_holder(
     client: &mut Client,
     socket: &Path,
@@ -49,34 +48,156 @@ pub fn run_holder(
     executor: &str,
     config: &DriverConfig,
     now_ms: impl Fn() -> u64,
-    compiler: &mut dyn BatchCompiler,
+    compiler: &mut (dyn BatchCompiler + Send),
 ) -> Result<StopWhy, Error> {
     let mut pending: Option<u64> = None;
-    let mut effects = Vec::new();
-    holder.start(now_ms(), &mut effects);
-    holder.step(now_ms(), Event::Loaded, &mut effects);
-    loop {
-        if effects.is_empty() {
-            std::thread::sleep(config.poll);
-            holder.step(now_ms(), Event::Tick, &mut effects);
-            continue;
-        }
-        for effect in std::mem::take(&mut effects) {
-            match effect {
-                Effect::Stop(why) => return Ok(why),
-                Effect::Release(names) => compiler.release(&names),
-                Effect::Compile(plan) => {
-                    let batch = compiler.compile(&plan).map_err(Error::Protocol)?;
-                    holder.step(now_ms(), Event::Compiled(batch), &mut effects);
-                }
-                Effect::Send { id, call } => {
-                    let reply =
-                        send(client, socket, content, executor, &call, id, &mut pending, config)?;
-                    holder.step(now_ms(), Event::Reply { id, reply }, &mut effects);
+    drive(holder, config, now_ms, compiler, |call, id| {
+        send(client, socket, content, executor, call, id, &mut pending, config)
+    })
+}
+
+enum CompilerTask {
+    Compile(Plan),
+    Release(Vec<WorkName>),
+}
+
+/// The same event loop as the socket driver, with the transport boundary injected
+/// so cancellation, late results and transport loss can be tested deterministically.
+fn drive(
+    holder: &mut Holder,
+    config: &DriverConfig,
+    now_ms: impl Fn() -> u64,
+    compiler: &mut (dyn BatchCompiler + Send),
+    mut transmit: impl FnMut(&Call, u64) -> Result<Reply, Error>,
+) -> Result<StopWhy, Error> {
+    std::thread::scope(|scope| {
+        let (tasks, receiver) = mpsc::channel::<CompilerTask>();
+        let (finished, completions) = mpsc::channel::<Result<Compiled, String>>();
+        let worker = scope.spawn(move || {
+            while let Ok(task) = receiver.recv() {
+                match task {
+                    CompilerTask::Compile(plan) => {
+                        if finished.send(compiler.compile(&plan)).is_err() {
+                            break;
+                        }
+                    }
+                    CompilerTask::Release(names) => compiler.release(&names),
                 }
             }
+        });
+
+        let mut working = false;
+        // The compiler retains new findings until the result is acknowledged.
+        // Transport failure before acknowledgment must release them as well as
+        // findings already retained from earlier successful batches.
+        let mut unconfirmed = BTreeSet::new();
+        let result = (|| -> Result<StopWhy, Error> {
+            let mut effects = Vec::new();
+            let mut stopped: Option<StopWhy> = None;
+            holder.start(now_ms(), &mut effects);
+            holder.step(now_ms(), Event::Loaded, &mut effects);
+            loop {
+                if effects.is_empty() {
+                    if let Some(why) = stopped.take() {
+                        if !working {
+                            return Ok(why);
+                        }
+                        stopped = Some(why);
+                    }
+                    match completions.recv_timeout(config.poll) {
+                        Ok(Ok(batch)) => {
+                            working = false;
+                            if !holder.is_stopped() {
+                                unconfirmed.extend(
+                                    batch.roots.iter().chain(&batch.names).flat_map(|item| {
+                                        item.found.iter().map(|found| found.name)
+                                    }),
+                                );
+                            }
+                            // The stopped holder releases even findings from a
+                            // compile that finished after cancellation.
+                            holder.step(now_ms(), Event::Compiled(batch), &mut effects);
+                        }
+                        Ok(Err(error)) => {
+                            working = false;
+                            if stopped.is_none() {
+                                return Err(Error::Protocol(error));
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            if stopped.is_none() {
+                                holder.step(now_ms(), Event::Tick, &mut effects);
+                            }
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err(Error::Protocol(
+                                "compiler worker exited without a result".to_owned(),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                for effect in std::mem::take(&mut effects) {
+                    match effect {
+                        Effect::Stop(why) => stopped = Some(why),
+                        Effect::Release(names) => {
+                            for name in &names {
+                                unconfirmed.remove(name);
+                            }
+                            tasks.send(CompilerTask::Release(names)).map_err(|_| {
+                                Error::Protocol("compiler worker is unavailable".to_owned())
+                            })?;
+                        }
+                        Effect::Compile(plan) => {
+                            if working {
+                                return Err(Error::Protocol(
+                                    "holder granted overlapping compiler batches".to_owned(),
+                                ));
+                            }
+                            tasks.send(CompilerTask::Compile(plan)).map_err(|_| {
+                                Error::Protocol("compiler worker is unavailable".to_owned())
+                            })?;
+                            working = true;
+                        }
+                        Effect::Send { id, call } if stopped.is_none() => {
+                            let is_result = matches!(call, Call::Result(_));
+                            let reply = transmit(&call, id)?;
+                            holder.step(now_ms(), Event::Reply { id, reply }, &mut effects);
+                            if is_result {
+                                // The holder has either retained or released every
+                                // discovery from this acknowledged result.
+                                unconfirmed.clear();
+                            }
+                        }
+                        Effect::Send { .. } => {}
+                    }
+                }
+            }
+        })();
+
+        if result.is_err() {
+            if working {
+                // The socket failed while compilation was running. Do not leave
+                // unreported findings in the caller's compiler after joining it.
+                if let Ok(Ok(batch)) = completions.recv() {
+                    unconfirmed.extend(
+                        batch.roots.iter().chain(&batch.names).flat_map(|item| {
+                            item.found.iter().map(|found| found.name)
+                        }),
+                    );
+                }
+            }
+            unconfirmed.extend(holder.findings().keys().copied());
+            if !unconfirmed.is_empty() {
+                let _ = tasks.send(CompilerTask::Release(unconfirmed.into_iter().collect()));
+            }
         }
-    }
+        drop(tasks);
+        if worker.join().is_err() {
+            return Err(Error::Protocol("compiler worker panicked".to_owned()));
+        }
+        result
+    })
 }
 
 /// One holder call over the carrier. A repeated `Send` of the call still pending in
@@ -151,4 +272,184 @@ fn reply(call: &Call, answer: Answer) -> Result<Reply, Error> {
             return Err(Error::Protocol(format!("answer {answer:?} to holder call {call:?}")));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, Instant};
+
+    use blaze_dist::Ranges;
+    use blaze_dist::holder::{Compiled, HolderConfig};
+    use blaze_wire::{
+        Attempt, EntryKey, EntryRef, ExecutionId, Found, Grant, ItemOutcome, ItemResult, Lease,
+        RootSet, Set, WorkJoinAnswer, WorkLeaseAnswer, WorkersEventsAnswer,
+    };
+
+    use super::*;
+
+    const FOUND: WorkName = WorkName([7; 32]);
+
+    struct SlowCompiler {
+        active: Arc<AtomicBool>,
+        released: Vec<WorkName>,
+    }
+
+    impl BatchCompiler for SlowCompiler {
+        fn compile(&mut self, plan: &Plan) -> Result<Compiled, String> {
+            self.active.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(120));
+            self.active.store(false, Ordering::SeqCst);
+            Ok(Compiled {
+                generation: plan.grant.lease.generation,
+                roots: vec![ItemResult {
+                    name: WorkName([8; 32]),
+                    outcome: ItemOutcome::Exported(EntryRef { entry: EntryKey([9; 32]) }),
+                    found: Set::new(vec![Found { name: FOUND, tuple: [10; 32] }]),
+                    unnamed: Set::new(Vec::new()),
+                }],
+                names: Vec::new(),
+                packs: Vec::new(),
+                returned_roots: Ranges::new(),
+                returned_names: Vec::new(),
+            })
+        }
+
+        fn release(&mut self, names: &[WorkName]) {
+            self.released.extend_from_slice(names);
+        }
+    }
+
+    fn test_holder() -> (Holder, RootSet, Grant) {
+        let roots =
+            RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
+        let grant = Grant {
+            lease: Lease {
+                execution: ExecutionId(1),
+                attempt: Attempt(1),
+                holder: "helper".to_owned(),
+                generation: 1,
+            },
+            roots: Set::new(vec![(0, 1)]),
+            names: Set::new(Vec::new()),
+        };
+        let holder = Holder::new(
+            "helper",
+            ExecutionId(1),
+            Attempt(1),
+            roots.clone(),
+            Set::new(Vec::new()),
+            BTreeSet::new(),
+            HolderConfig { heartbeat_ms: 10, retry_ms: 100, idle_ms: 5 },
+        );
+        (holder, roots, grant)
+    }
+
+    #[test]
+    fn heartbeats_during_compile_fence_a_cancelled_batch_and_release_its_findings() {
+        let (mut holder, roots, grant) = test_holder();
+        let active = Arc::new(AtomicBool::new(false));
+        let during = Arc::new(AtomicUsize::new(0));
+        let mut compiler = SlowCompiler { active: active.clone(), released: Vec::new() };
+        let mut leased = false;
+        let start = Instant::now();
+        let why = drive(
+            &mut holder,
+            &DriverConfig { poll: Duration::from_millis(1), max_reconnects: 0 },
+            || start.elapsed().as_millis() as u64,
+            &mut compiler,
+            |call, _| {
+                Ok(match call {
+                    Call::Events(_) => {
+                        if active.load(Ordering::SeqCst)
+                            && during.fetch_add(1, Ordering::SeqCst) >= 1
+                        {
+                            Reply::Events(Ok(WorkersEventsAnswer::CANCEL))
+                        } else {
+                            Reply::Events(Ok(WorkersEventsAnswer::CONTINUE))
+                        }
+                    }
+                    Call::Join(_) => {
+                        Reply::Join(Ok(WorkJoinAnswer { roots: roots.clone(), fixed: true }))
+                    }
+                    Call::Lease(_) => {
+                        let next = (!leased).then_some(grant.clone());
+                        leased = true;
+                        Reply::Lease(Ok(WorkLeaseAnswer { grant: next }))
+                    }
+                    Call::Result(_) => panic!("cancelled work must not be published"),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(why, StopWhy::Cancelled);
+        assert!(during.load(Ordering::SeqCst) >= 2, "no heartbeat while compiling");
+        assert_eq!(compiler.released, vec![FOUND]);
+        assert!(holder.is_stopped());
+    }
+
+    #[test]
+    fn transport_failure_during_compile_releases_its_unreported_findings() {
+        let (mut holder, roots, grant) = test_holder();
+        let active = Arc::new(AtomicBool::new(false));
+        let mut compiler = SlowCompiler { active: active.clone(), released: Vec::new() };
+        let start = Instant::now();
+        let mut leased = false;
+        let result = drive(
+            &mut holder,
+            &DriverConfig { poll: Duration::from_millis(1), max_reconnects: 0 },
+            || start.elapsed().as_millis() as u64,
+            &mut compiler,
+            |call, _| match call {
+                Call::Events(_) if active.load(Ordering::SeqCst) => {
+                    Err(Error::Protocol("carrier disconnected while compiling".to_owned()))
+                }
+                Call::Events(_) => Ok(Reply::Events(Ok(WorkersEventsAnswer::CONTINUE))),
+                Call::Join(_) => {
+                    Ok(Reply::Join(Ok(WorkJoinAnswer { roots: roots.clone(), fixed: true })))
+                }
+                Call::Lease(_) => {
+                    let next = (!leased).then_some(grant.clone());
+                    leased = true;
+                    Ok(Reply::Lease(Ok(WorkLeaseAnswer { grant: next })))
+                }
+                Call::Result(_) => panic!("a disconnected carrier cannot commit the batch"),
+            },
+        );
+        assert!(matches!(result, Err(Error::Protocol(_))));
+        assert_eq!(compiler.released, vec![FOUND]);
+    }
+
+    #[test]
+    fn failed_result_acknowledgement_releases_new_findings() {
+        let (mut holder, roots, grant) = test_holder();
+        let active = Arc::new(AtomicBool::new(false));
+        let mut compiler = SlowCompiler { active, released: Vec::new() };
+        let start = Instant::now();
+        let mut leased = false;
+        let result = drive(
+            &mut holder,
+            &DriverConfig { poll: Duration::from_millis(1), max_reconnects: 0 },
+            || start.elapsed().as_millis() as u64,
+            &mut compiler,
+            |call, _| match call {
+                Call::Events(_) => Ok(Reply::Events(Ok(WorkersEventsAnswer::CONTINUE))),
+                Call::Join(_) => {
+                    Ok(Reply::Join(Ok(WorkJoinAnswer { roots: roots.clone(), fixed: true })))
+                }
+                Call::Lease(_) => {
+                    let next = (!leased).then_some(grant.clone());
+                    leased = true;
+                    Ok(Reply::Lease(Ok(WorkLeaseAnswer { grant: next })))
+                }
+                Call::Result(_) => Err(Error::Protocol("result acknowledgement lost".to_owned())),
+            },
+        );
+        assert!(matches!(result, Err(Error::Protocol(_))));
+        assert_eq!(compiler.released, vec![FOUND]);
+    }
 }

@@ -5,6 +5,9 @@ on:
       - crates/blaze-dist/src/**
       - crates/blaze-dist/tests/**
       - crates/blaze-dist/Cargo.toml
+      - crates/blaze-dist-local/src/**
+      - crates/blaze-dist-local/tests/**
+      - crates/blaze-dist-local/Cargo.toml
       - crates/blaze-wire/**
       - Cargo.toml
       - Cargo.lock
@@ -15,6 +18,9 @@ on:
       - crates/blaze-dist/src/**
       - crates/blaze-dist/tests/**
       - crates/blaze-dist/Cargo.toml
+      - crates/blaze-dist-local/src/**
+      - crates/blaze-dist-local/tests/**
+      - crates/blaze-dist-local/Cargo.toml
       - crates/blaze-wire/**
       - Cargo.toml
       - Cargo.lock
@@ -37,6 +43,8 @@ jobs:
           rustup toolchain install 1.99.0 --profile minimal -c rustfmt
           rustup default 1.99.0
       - name: Exercise the actual holder protocol
-        run: cargo test --locked -p blaze-dist --test holder --test holder_boundary
+        run: |
+          cargo test --locked -p blaze-dist --test holder --test holder_boundary
+          cargo test --locked -p blaze-dist-local --lib driver::tests
       - name: Format
         run: cargo fmt --all -- --check
