@@ -540,7 +540,10 @@ struct World {
     deaths: u32,
 }
 
-#[expect(clippy::needless_pass_by_value, reason = "a refusal is consumed by the wire form it stands for")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a refusal is consumed by the wire form it stands for"
+)]
 fn wire(refusal: Refusal) -> blaze_wire::WireError {
     let retry = (refusal == Refusal::NotYet).then_some(3_000);
     refusal.to_wire(retry)
@@ -612,7 +615,6 @@ impl World {
             id: 1,
             deadline_ms: DEADLINE_MS,
             policy: LocalPolicy::Never,
-            test_timeout_ms: None,
             state: SubscriberState::Attached,
         };
         let mut log = Vec::new();
@@ -952,7 +954,10 @@ impl World {
         (batch, took)
     }
 
-#[expect(clippy::needless_pass_by_value, reason = "a call is what the simulated network delivers, once")]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "a call is what the simulated network delivers, once"
+    )]
     fn call(&mut self, from: usize, id: u64, call: Call) -> Result<(), Violation> {
         let holder_id = self.nodes[from].id.clone();
         let now = self.now;

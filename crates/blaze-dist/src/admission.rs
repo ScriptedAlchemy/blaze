@@ -23,7 +23,7 @@ pub struct AdmissionConfig {
     pub queue_limit: usize,
     /// What a `busy` answer tells the requester to wait.
     pub busy_retry_ms: u64,
-    /// A pull request's executor idle this long is destroyed (section 2: 24 h).
+    /// A pull request's executor idle this long is destroyed (24 h).
     pub pr_idle_ms: u64,
 }
 
@@ -43,12 +43,11 @@ pub enum Class {
 }
 
 impl Class {
-    /// The class of a namespace's jobs. `Std` is read-only and runs no job; it is not one.
-    pub fn of(namespace: &Namespace) -> Option<Class> {
+    /// The class of a namespace's jobs.
+    pub fn of(namespace: &Namespace) -> Class {
         match namespace {
-            Namespace::Main => Some(Class::Main),
-            Namespace::Pr(_) => Some(Class::Pr),
-            Namespace::Std => None,
+            Namespace::Main => Class::Main,
+            Namespace::Pr(_) => Class::Pr,
         }
     }
 }
@@ -249,9 +248,7 @@ impl Admission {
 
     /// Queues a job, or answers `busy` past `Q`.
     pub fn enqueue(&mut self, waiting: Waiting) -> Result<(), (Refusal, u64)> {
-        let Some(class) = Class::of(&waiting.namespace) else {
-            return Err((Refusal::Malformed("no job runs in Std".to_owned()), 0));
-        };
+        let class = Class::of(&waiting.namespace);
         let queue = self.queues.entry(waiting.platform).or_default();
         if queue.main.len() + queue.pr.len() >= self.config.queue_limit {
             return Err((Refusal::Busy, self.config.busy_retry_ms));
@@ -295,8 +292,8 @@ impl Admission {
                 let Some((executor, created)) = self.place(now, &head) else { break };
                 let queue = self.queues.get_mut(&platform).expect("platform");
                 match Class::of(&head.namespace) {
-                    Some(Class::Main) => queue.main.pop_front(),
-                    _ => queue.pr.pop_front(),
+                    Class::Main => queue.main.pop_front(),
+                    Class::Pr => queue.pr.pop_front(),
                 };
                 self.executors.get_mut(&executor).expect("placed").busy =
                     Some((head.execution, Attempt(1)));

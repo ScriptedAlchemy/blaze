@@ -30,7 +30,7 @@ fn busy(error: &WireError) -> bool {
 /// The holder's timings, on its own clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HolderConfig {
-    /// A heartbeat this often (section 4: every 5 s).
+    /// A heartbeat this often (every 5 s).
     pub heartbeat_ms: u64,
     /// A call not answered in this long is sent again.
     pub retry_ms: u64,
@@ -421,7 +421,10 @@ impl Holder {
         }
     }
 
-#[expect(clippy::needless_pass_by_value, reason = "what the core refused with, whole; matched by its variants")]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "what the core refused with, whole; matched by its variants"
+    )]
     fn refused(&mut self, refusal: Option<Refusal>, error: &WireError, out: &mut Vec<Effect>) {
         let why = match refusal {
             Some(Refusal::AttemptMoved) => StopWhy::AttemptMoved,

@@ -1,3 +1,8 @@
+---
+status: record
+summary: How the fork carried native compiler environments through its V1 BuildSpec; V2 has no such path.
+date: 2026-10-30
+---
 # Native request environment
 
 The local daemon request carries a complete client environment snapshot.

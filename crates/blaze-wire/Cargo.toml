@@ -1,6 +1,6 @@
 [package]
 name = "blaze-wire"
-description = "blaze's wire schema: every type of docs/distributed.md in deterministic CBOR, its validator, digests, signatures and a JSON rendering"
+description = "blaze's wire schema: the types of docs/distributed.md in deterministic CBOR, its validator, digests and a JSON rendering"
 publish = false
 
 version.workspace = true
@@ -16,7 +16,6 @@ doctest = false
 [dependencies]
 serde_json.workspace = true
 sha2 = "0.10"
-ed25519-dalek = "2.2"
 
 [lints]
 workspace = true

@@ -1,3 +1,8 @@
+---
+status: record
+summary: The fork's CI as it was before the fork retired its private runners.
+date: 2026-10-30
+---
 # CI on the fork: one build per platform, every check consumes it (2026-10-30)
 
 What upstream's CI does is in [harness.md](../harness.md#ci) and [CI.md](CI.md). This is the

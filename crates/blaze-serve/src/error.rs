@@ -1,4 +1,4 @@
-//! Section 8's one error shape: a code, a message, and the milliseconds to wait.
+//! The one error shape: a code, a message, and the milliseconds to wait.
 //!
 //! Every answer that is not a success is a [`WireError`](blaze_wire::WireError) in CBOR, with
 //! the HTTP status of its code's class. A blob's answer is not CBOR and carries the same body.
@@ -10,7 +10,7 @@ pub use blaze_wire::ErrorCode;
 /// One failure, as the server answers it.
 #[derive(Clone, Debug)]
 pub struct Error {
-    /// The code of section 8, whose class is the HTTP status.
+    /// The code, whose class is the HTTP status.
     pub code: ErrorCode,
     /// What went wrong, in one line, for the person reading a log or a message.
     pub message: String,
@@ -54,7 +54,7 @@ impl Error {
         self.code.status()
     }
 
-    /// This error as section 8's shape, for the body of the answer.
+    /// This error as the wire's shape, for the body of the answer.
     pub fn wire(&self) -> WireError {
         let mut error = WireError::new(self.code, self.message.clone());
         error.retry_after_ms = self.retry_after_ms;

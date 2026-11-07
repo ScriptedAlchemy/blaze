@@ -1,4 +1,4 @@
-//! Every type round-trips byte-identically, its digest and its signature match the golden vectors
+//! Every type round-trips byte-identically, its digest matches the golden vectors
 //! checked in, and the validator accepts what the encoder writes.
 
 use blaze_wire::vectors::{Entry, Vector, every};
@@ -48,41 +48,6 @@ fn the_validator_accepts_every_value_the_encoder_writes() {
 }
 
 #[test]
-fn golden_vectors_match() {
-    for entry in entries() {
-        let name = entry.name;
-        let text = std::fs::read_to_string(golden_path(name))
-            .unwrap_or_else(|e| panic!("{name}: no golden file: {e}"));
-        let golden = Vector::from_golden(&text)
-            .unwrap_or_else(|| panic!("{name}: the golden file is not a vector"));
-        let made = (entry.vector)(1);
-        assert_eq!(golden.name, name, "{name}: the golden file names another type");
-        assert_eq!(
-            blaze_wire::json::hex(&made.cbor),
-            blaze_wire::json::hex(&golden.cbor),
-            "{name}: the encoding differs from the golden vector"
-        );
-        assert_eq!(
-            blaze_wire::json::hex(&made.digest),
-            blaze_wire::json::hex(&golden.digest),
-            "{name}: the digest differs from the golden vector"
-        );
-        assert_eq!(
-            blaze_wire::json::hex(&made.signature),
-            blaze_wire::json::hex(&golden.signature),
-            "{name}: the signature differs from the golden vector"
-        );
-        assert_eq!(
-            blaze_wire::json::hex(&made.key),
-            blaze_wire::json::hex(&golden.key),
-            "{name}: the key differs from the golden vector"
-        );
-        assert!(golden.digest_matches(), "{name}: the golden digest is not its CBOR's");
-        assert!(golden.signature_verifies(), "{name}: the golden signature does not verify");
-    }
-}
-
-#[test]
 fn every_type_has_a_golden_file() {
     for entry in entries() {
         assert!(
@@ -113,9 +78,34 @@ fn two_seeds_give_two_values() {
 #[test]
 fn the_schema_has_every_type() {
     let names: Vec<&str> = entries().iter().map(|entry| entry.name).collect();
-    assert!(names.len() >= 90, "the schema has {} types, fewer than the doc's", names.len());
+    assert_eq!(names.len(), 43, "a type added or removed: its golden file and the doc go with it");
     let mut sorted = names.clone();
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), names.len(), "two types have the same name");
+}
+
+#[test]
+fn golden_vectors_match() {
+    for entry in entries() {
+        let name = entry.name;
+        let path = golden_path(name);
+        let made = (entry.vector)(1);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{name}: no golden file: {e}"));
+        let golden = Vector::from_golden(&text)
+            .unwrap_or_else(|| panic!("{name}: the golden file is not a vector"));
+        assert_eq!(golden.name, name, "{name}: the golden file names another type");
+        assert_eq!(
+            blaze_wire::json::hex(&made.cbor),
+            blaze_wire::json::hex(&golden.cbor),
+            "{name}: the encoding differs from the golden vector"
+        );
+        assert_eq!(
+            blaze_wire::json::hex(&made.digest),
+            blaze_wire::json::hex(&golden.digest),
+            "{name}: the digest differs from the golden vector"
+        );
+        assert!(golden.digest_matches(), "{name}: the golden digest is not its CBOR's");
+    }
 }

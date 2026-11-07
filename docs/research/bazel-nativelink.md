@@ -1,3 +1,8 @@
+---
+status: record
+summary: Research on Bazel with NativeLink for Rust, against the fork's V1 distributed design.
+date: 2026-10-26
+---
 # Bazel with NativeLink, for Rust, against blaze's distributed design
 
 This survey, dated 2026-10-25, is unit u3 of the distributed program. It examines

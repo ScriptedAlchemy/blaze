@@ -24,9 +24,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use blaze_wire::{
-    Attempt, BuildSpec, Command, Digest, DoneEvent, ExecutionId, JobEvent, JobRequest, LocalPolicy,
-    Namespace, Outcome, PrNamespace, ProfileSpec, RefusedEvent, Reservation, SourcePath, SourceRef,
-    Stage, StoreIdentity, WorkersEventsRequest,
+    Attempt, Digest, DoneEvent, ExecutionId, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome,
+    PrNamespace, RefusedEvent, Reservation, Stage, WorkersEventsRequest,
 };
 
 use super::{Rng, Violation};
@@ -70,7 +69,7 @@ struct World {
     rng: Rng,
     now: Millis,
     jobs: Jobs,
-    specs: Vec<BuildSpec>,
+    specs: Vec<SimUnit>,
     queue_limit: usize,
     /// The checker's own queue: per platform and class, the executions waiting, in order.
     shadow: BTreeMap<(Digest, Class), VecDeque<ExecutionId>>,
@@ -317,15 +316,16 @@ impl World {
             Namespace::Pr(PrNamespace { n: self.rng.range(1, 4) })
         };
         let req = JobRequest {
-            spec: spec.clone(),
+            unit: spec.unit,
+            platform: spec.platform,
             namespace: namespace.clone(),
+            source: spec.unit,
             deadline_ms: self.now + self.rng.range(20_000, 600_000),
-            local: match self.rng.below(3) {
-                0 => LocalPolicy::Never,
-                1 => LocalPolicy::Fallback,
-                _ => LocalPolicy::Race,
+            local: if self.rng.chance(500_000) {
+                LocalPolicy::Never
+            } else {
+                LocalPolicy::Fallback
             },
-            test_timeout_ms: None,
         };
         let need = Reservation {
             memory: self.rng.range(4, 32),
@@ -333,7 +333,7 @@ impl World {
             disk: self.rng.range(10, 100),
         };
         let platform = spec.platform;
-        let class = Class::of(&namespace).expect("a job's namespace");
+        let class = Class::of(&namespace);
         let mut out = Vec::new();
         let answer = self.jobs.submit(self.now, &req, need.clone(), &mut out);
         // Submission advances timers before coalescing or queueing. Apply those existing
@@ -355,7 +355,8 @@ impl World {
                     && self.meta.get(&e.id).is_some_and(|(_, ns, _)| *ns == namespace)
                     && e.content
                         == blaze_wire::JobContent::of(&blaze_wire::JobContentInput {
-                            spec: blaze_wire::digest_of(&spec),
+                            unit: spec.unit,
+                            platform: spec.platform,
                             namespace: namespace.clone(),
                         })
             })
@@ -393,6 +394,8 @@ impl World {
                     }
                 }
             }
+            // A unit of a revision its pull request replaced: only a pull request has revisions.
+            Err((Refusal::Superseded, _)) if matches!(namespace, Namespace::Pr(_)) => {}
             Err((Refusal::Busy, _)) => {
                 self.summary.busy += 1;
                 if running.is_some() || waiting < self.queue_limit {
@@ -599,7 +602,7 @@ impl World {
         let (platform, namespace, need) = self.meta.get(&id).cloned().expect("submitted");
         match event {
             JobEvent::Stage(stage) if stage.stage == Stage::Admitted => {
-                let class = Class::of(&namespace).expect("a job's");
+                let class = Class::of(&namespace);
                 let queue = self.shadow.entry((platform, class)).or_default();
                 if queue.front() != Some(&id) {
                     let first = queue.front().copied();
@@ -756,36 +759,15 @@ fn stages(e: &jobs::Execution) -> Result<(), String> {
     Ok(())
 }
 
-fn spec(platform: Digest, i: u64) -> BuildSpec {
-    let profile = ProfileSpec {
-        name: "dev".to_owned(),
-        opt_level: 0,
-        debug: 1,
-        debug_assertions: true,
-        overflow_checks: true,
-        panic: 0,
-        strip: 0,
-        split_debuginfo: 0,
-        backend: 0,
-        mir_opt: 0,
-        backend_opt: 0,
-        backend_emit: 0,
-    };
-    BuildSpec {
-        source: SourceRef::Root(blaze_wire::RootRef { root: [i as u8; 32] }),
-        lock: [1; 32],
-        units: Vec::new(),
-        asked: blaze_wire::Set::new(Vec::new()),
-        profile,
-        platform,
-        rustflags: Vec::new(),
-        config_env: blaze_wire::Set::new(Vec::new()),
-        script_env: blaze_wire::Set::new(Vec::new()),
-        cwd: SourcePath::new(".".into()).unwrap(),
-        command: Command::Build,
-        toolchain: StoreIdentity([2; 32]),
-        workspace_manifest: SourcePath::new("Cargo.toml".into()).unwrap(),
-    }
+/// A job's identity: its unit on its platform.
+#[derive(Clone, Copy, Debug)]
+struct SimUnit {
+    unit: Digest,
+    platform: Digest,
+}
+
+fn spec(platform: Digest, i: u64) -> SimUnit {
+    SimUnit { unit: [i as u8; 32], platform }
 }
 
 /// Runs the jobs simulation of `seed`.

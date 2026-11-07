@@ -32,12 +32,8 @@ ServerFrame = [0, LocalWelcome] | [1, Response] | [2, WireError]
 
 The carrier and terminal contract are both version 2. The global codec version is
 `blaze_wire::VERSION`. All three must match. A mismatch is refused without trying
-another BuildSpec decoder or invoking Cargo or a compiler.
-
-This branch uses global schema 1. C2's separate schema 3 branch changes the global
-codec, types and digest domains. Integrating it requires selecting its reviewed
-codec and updating the fixtures. Terminal version 2 does not imply global schema 2
-or a `/v2` digest domain. Typed digests use the selected codec's domain.
+another decoder or invoking a compiler. Terminal version 2 is not global schema 2:
+typed digests use the codec's domain.
 
 ### Transport 2: the daemon issues session labels
 
@@ -68,15 +64,13 @@ reinterpreted as transport 2.
 
 `Submission.request` is an opaque CBOR byte string containing exactly a JobRequest.
 The server decodes it only in the negotiated global codec, recomputes
-`JobContent::of(JobContentInput {spec: digest_of(spec), namespace})`, and compares
-the supplied content before submission. No source/materialization or resolved
-unit graph is synthesized in this carrier. The compiler/C2 integration is still
-a dependency.
+`JobContent::of(JobContentInput {unit, platform, namespace})`, and compares
+the supplied content before submission.
 
 ## Commands and bindings
 
 The command discriminants are Submit 0, Subscribe 1, Resume 2, Events 3, Cancel 4,
-Join 5, Lease 6, Result 7, WorkerEvents 8, KillAck 9, Terminal 10 and Release 11.
+Join 5, Lease 6, Result 7, WorkerEvents 8, KillAck 9, Terminal 10, Release 11, Claim 12 and Packs 13.
 All payloads and their integer field numbers are in `src/protocol.rs`. All
 responses are in `Answer`.
 
@@ -132,9 +126,7 @@ claimed durable across process crashes.
 This covers a multi-stage report retried after later stages were already
 accepted: it is answered from the journal, not re-fed as backwards progress.
 Clients must retain the pending request on IO failure and reconnect/retry it
-unchanged. A new session means **new** requests, not the old idempotency lifetime: a
-client with an unresolved request must abandon it explicitly rather than replay it
-into a fresh lifetime.
+unchanged. A new session means **new** requests, not the old idempotency lifetime.
 
 The default limits are:
 
@@ -165,20 +157,15 @@ slow clients. Production `Effects` callbacks must enqueue backend work promptly.
 The carrier delivers actual effects once, but never auto-acknowledges a kill.
 
 ```
-blaze-dist-local serve /private/daemon.sock
-blaze-dist-local hello /private/daemon.sock
-blaze-dist-local client /private/daemon.sock
+blaze-dist-local coordinate SOCKET TRIPLE EXECUTORS
 ```
 
-`serve` has no configured worker and no compiler backend; stdin `stop` or EOF
-ends it. The embedding API configures admission, builders and a holder/agent
-callback. `client` accepts one hex-rendered CBOR Command per stdin line and prints
-its CBOR Answer. The CLI does not install a test worker. Shutdown cancels remaining
-interests, emits stop effects, closes connections and removes only the
-owned socket inode, never another daemon's replacement.
+`coordinate` is the coordinator of a machine's daemons: EXECUTORS builders of one host triple,
+until stdin says `stop` or closes. Shutdown cancels remaining interests, emits stop effects,
+closes connections and removes only the owned socket inode, never another daemon's replacement.
 
-Tests use Unix sockets, the compiled CLI, a callback that stops a process and
-the production Jobs/WorkSet code. Their accepted-work fixture reports a Local
-item without compiling Rust or importing a pack. Compiler integration requires
-a compiler-holder backend and a source/store adapter. Two-worker compilation,
-HTTP fleet operation, crash durability and production client races are untested.
+`agent.rs` is what a daemon runs, and `tests/agent.rs` runs it over the real carrier and the real
+cache server with a batch compiler standing in for the code generator. `tests/unix.rs` uses Unix
+sockets, the compiled program, a callback that stops a process and the production Jobs/WorkSet
+code. `harness/distv2.py` runs real daemons. HTTP fleet operation and crash durability are
+untested.

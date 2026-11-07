@@ -10,8 +10,8 @@ use std::sync::{
 use std::time::Duration;
 
 use blaze_dist::admission::{Admission, AdmissionConfig};
-use blaze_dist::jobs::{Effect, ExecutionConfig, Jobs, LocalAction};
-use blaze_dist_local::client::{Client, terminal_action};
+use blaze_dist::jobs::{Effect, ExecutionConfig, Jobs, LocalAction, local_action};
+use blaze_dist_local::client::Client;
 use blaze_dist_local::coordinator::Config;
 use blaze_dist_local::protocol::*;
 use blaze_dist_local::server::{Clock, Server, frame, random_id};
@@ -125,14 +125,6 @@ impl Fixture {
         self.clock.0.store(now, Ordering::Release);
         std::thread::sleep(Duration::from_millis(10));
     }
-    /// Stop the reactor deliberately, keeping the path so a later call fails on IO rather
-    /// than on a missing socket. Drop then finds the thread already joined.
-    fn stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
-        }
-    }
 }
 
 impl Drop for Fixture {
@@ -150,15 +142,13 @@ fn need() -> Reservation {
 }
 
 fn job(deadline_ms: u64) -> JobRequest {
-    let mut spec =
-        <blaze_wire::BuildSpec as blaze_wire::Sample>::sample(&mut blaze_wire::Gen::new(1));
-    spec.platform = [1; 32];
     JobRequest {
-        spec,
+        unit: [9; 32],
+        platform: [1; 32],
         namespace: blaze_wire::Namespace::Main,
+        source: [0; 32],
         deadline_ms,
         local: LocalPolicy::Fallback,
-        test_timeout_ms: None,
     }
 }
 
@@ -248,9 +238,7 @@ fn versions_content_session_and_terminal_bindings_fail_closed() {
     let b = submit(&mut c, 1000);
     let mut wrong = b.subscription.clone();
     wrong.subscriber += 1;
-    assert!(matches!(c.call(Command::Terminal(wrong.clone())).unwrap(), Answer::Error(_)));
-    let t = Terminal { subscription: wrong, value: None };
-    assert!(terminal_action(&b, &t, &LocalPolicy::Fallback).is_err());
+    assert!(matches!(c.call(Command::Terminal(wrong)).unwrap(), Answer::Error(_)));
 }
 
 #[test]
@@ -392,11 +380,9 @@ fn actual_work_completion_terminal_and_kill_callback_roundtrip() {
     let Answer::Terminal(t) = c.call(Command::Terminal(b.subscription.clone())).unwrap() else {
         panic!()
     };
-    assert_eq!(terminal_action(&b, &t, &LocalPolicy::Fallback).unwrap(), Some(LocalAction::Take));
+    let termination = &t.value.as_ref().unwrap().termination;
+    assert_eq!(local_action(&LocalPolicy::Fallback, termination).unwrap(), LocalAction::Take);
     assert_eq!(t.value.as_ref().unwrap().termination.outcome, Outcome::Passed);
-    let mut wrong = t.clone();
-    wrong.value.as_mut().unwrap().attempt = Attempt(99);
-    assert!(terminal_action(&b, &wrong, &LocalPolicy::Fallback).is_err());
     let assignment = f
         .effects
         .lock()
@@ -465,8 +451,8 @@ fn reconnect_subscribe_replay_cancel_and_deadline_preserve_interests() {
     };
     assert_eq!(t.value.as_ref().unwrap().termination.outcome, Outcome::TimedOut);
     assert_eq!(
-        terminal_action(&b, &t, &LocalPolicy::Fallback).unwrap(),
-        Some(LocalAction::BuildLocally)
+        local_action(&LocalPolicy::Fallback, &t.value.as_ref().unwrap().termination).unwrap(),
+        LocalAction::BuildLocally
     );
 }
 
@@ -482,8 +468,8 @@ fn no_worker_never_passes_and_old_attempt_is_fenced_after_reconnect() {
     };
     assert_eq!(t.value.as_ref().unwrap().termination.outcome, Outcome::Lost);
     assert_eq!(
-        terminal_action(&b, &t, &LocalPolicy::Fallback).unwrap(),
-        Some(LocalAction::BuildLocally)
+        local_action(&LocalPolicy::Fallback, &t.value.as_ref().unwrap().termination).unwrap(),
+        LocalAction::BuildLocally
     );
     let f = Fixture::new(false, Config::default());
     let mut c = f.client();
@@ -494,32 +480,18 @@ fn no_worker_never_passes_and_old_attempt_is_fenced_after_reconnect() {
 }
 
 #[test]
-fn ordinary_cli_hellos_exceed_the_live_cap_without_restart_or_capacity_loss() {
-    // The reported defect: a CLI that mints a lifetime per call consumed the default
-    // 32-session cap forever. Forty-five real `hello` processes against one daemon, each
-    // releasing its lifetime, must all succeed, and the daemon must stay bounded.
+fn released_lifetimes_exceed_the_live_cap_without_restart_or_capacity_loss() {
+    // The reported defect: a client that mints a lifetime per call consumed the default
+    // 32-session cap forever. Forty-five clients against one daemon, each releasing its
+    // lifetime, must all succeed, and the daemon must stay bounded.
     let f = Fixture::new(false, Config::default());
-    let executable = env!("CARGO_BIN_EXE_blaze-dist-local");
     let mut sessions = Vec::new();
     for _ in 0..45 {
-        let output =
-            std::process::Command::new(executable).arg("hello").arg(&f.path).output().unwrap();
-        assert!(
-            output.status.success(),
-            "hello failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let hex = String::from_utf8(output.stdout).unwrap();
-        let bytes: Vec<u8> = hex
-            .trim()
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
-            .collect();
-        let welcome: LocalWelcome = decode(&bytes, &Limits::DOCUMENTED).unwrap();
-        assert!(welcome.created);
-        assert_eq!(welcome.transport, TRANSPORT_VERSION);
-        sessions.push(welcome.session);
+        let mut client = Client::connect(&f.path, random_id().unwrap()).unwrap();
+        assert!(client.welcome.created);
+        assert_eq!(client.welcome.transport, TRANSPORT_VERSION);
+        sessions.push(client.welcome.session);
+        client.release().unwrap();
     }
     // Issued labels are distinct: no call was answered with another lifetime's identity.
     let mut unique = sessions.clone();
@@ -630,141 +602,8 @@ fn expired_lifetime_creation_retry_is_not_mistaken_for_the_old_one() {
 }
 
 #[test]
-fn pending_request_is_never_migrated_into_a_fresh_lifetime() {
-    // A client whose answer was lost holds an unresolved request. It may not renew into a
-    // new lifetime while that request is pending: renewing would re-issue the work as a new
-    // request and repeat the effect. Abandoning is explicit and returns the exact bytes.
-    let mut f = Fixture::new(true, Config::default());
-    let mut c = f.client();
-    let first = c.welcome.clone();
-    let b = submit(&mut c, 100_000);
-    let count_assigned = |f: &Fixture| {
-        f.effects
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(
-                |(_, e)| matches!(e, Effect::Event(i) if matches!(i.event, JobEvent::Assigned(_))),
-            )
-            .count()
-    };
-    assert_eq!(count_assigned(&f), 1);
-    // Stop the daemon so the next call cannot be answered: the client keeps the request.
-    f.stop();
-    assert!(c.call(Command::Resume(b.subscription.clone())).is_err());
-    // Renewal is refused before any connection, so the request cannot be re-issued.
-    let refused = c.renew(&f.path, [32; 32]).unwrap_err();
-    assert!(format!("{refused:?}").contains("pending-request"));
-    // Abandoning is explicit, returns the exact pending bytes, and only then is renewal
-    // ordinary: a genuinely fresh lifetime, not the old one under a new label.
-    let abandoned = c.abandon_pending().expect("the unresolved request is returned");
-    assert_eq!(abandoned.session, first.session);
-    assert_eq!(abandoned.sequence, 2);
-    // With nothing pending the guard is gone; a dead path now fails on IO, not on the guard.
-    let renewed = c.renew(&f.path, [32; 32]).unwrap_err();
-    assert!(!format!("{renewed:?}").contains("pending-request"));
-    // The work was submitted exactly once: abandoning and failing to renew repeats no effect.
-    assert_eq!(count_assigned(&f), 1);
-}
-
-#[test]
-fn committed_lost_answer_cannot_be_reissued_by_renewal_or_replayed_after_expiry() {
-    // Drop the answer after Submit commits. Neither renewing into a fresh session nor
-    // replaying the old bytes after expiry may submit the work again. The production client
-    // receives no answer because the test drops it on the socket.
-    let f = Fixture::new(true, Config { session_ms: 40, ..Config::default() });
-    let count_assigned = |f: &Fixture| {
-        f.effects
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(
-                |(_, e)| matches!(e, Effect::Event(i) if matches!(i.event, JobEvent::Assigned(_))),
-            )
-            .count()
-    };
-    let nonce = [61; 32];
-    let mut c = Client::connect(&f.path, nonce).unwrap();
-    let committed = c.welcome.clone();
-    // Submit on the client's own journaled path, then throw the answer away by dropping the
-    // connection after the daemon has committed: the request bytes stay reconstructible.
-    let mut stream = raw(&f);
-    let w = resume_raw(&mut stream, &committed);
-    assert_eq!(w.session, committed.session);
-    let submit_bytes = frame(&encode(&ClientFrame::Request(Request {
-        epoch: w.epoch,
-        session: w.session,
-        sequence: w.next_request,
-        command: Command::Submit(submission(&job(100_000), need())),
-    })));
-    stream.write_all(&submit_bytes).unwrap();
-    // The daemon answered, but this client never read it: drop the socket with the reply
-    // still queued. The commit is real, and exactly one Assigned effect exists.
-    drop(stream);
-    std::thread::sleep(Duration::from_millis(20));
-    assert_eq!(count_assigned(&f), 1);
-    // (a) Renewal with the same nonce while the lifetime is live adopts it, so nothing new is
-    // submitted; the pending answer is recoverable by replaying the exact bytes, not by re-issuing.
-    let mut same = Client::connect(&f.path, nonce).unwrap();
-    assert!(!same.welcome.created, "the live nonce names the committed lifetime");
-    assert_eq!(same.welcome.session, committed.session);
-    let mut stream = raw(&f);
-    resume_raw(&mut stream, &committed);
-    stream.write_all(&submit_bytes).unwrap();
-    let ServerFrame::Response(Response { answer: Answer::Binding(b), .. }) = read(&mut stream)
-    else {
-        panic!("the journaled answer must replay")
-    };
-    assert_eq!(b.subscription.content, submission(&job(100_000), need()).content);
-    assert_eq!(count_assigned(&f), 1, "replay must not submit twice");
-    // (b) After expiry the same nonce creates a NEW lifetime, and the old bytes are refused
-    // rather than replayed into it: the committed work is never re-issued.
-    f.at(41);
-    let mut fresh = raw(&f);
-    let created = create_raw(&f, &mut fresh, nonce);
-    assert!(created.created);
-    assert_ne!(created.session, committed.session);
-    fresh.write_all(&submit_bytes).unwrap();
-    assert!(matches!(read(&mut fresh), ServerFrame::Error(_)));
-    assert_eq!(count_assigned(&f), 1, "expired replay must not submit twice");
-    // (c) The old label is not resumable either.
-    let mut stream = raw(&f);
-    stream
-        .write_all(&frame(&encode(&ClientFrame::Hello(resume(committed.session, committed.epoch)))))
-        .unwrap();
-    assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
-    let _ = b;
-}
-
-#[test]
-fn renew_after_release_creates_a_distinct_lifetime_and_old_label_stays_dead() {
-    let f = Fixture::new(false, Config::default());
-    let mut c = f.client();
-    let first = c.welcome.clone();
-    c.release().unwrap();
-    // The released label is not resumable, so renew must create, never adopt it.
-    c.renew(&f.path, [42; 32]).unwrap();
-    assert!(c.welcome.created);
-    assert_ne!(c.welcome.session, first.session);
-    let mut stream = raw(&f);
-    stream
-        .write_all(&frame(&encode(&ClientFrame::Hello(resume(first.session, first.epoch)))))
-        .unwrap();
-    assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
-    // The renewed lifetime itself resumes normally.
-    c.reconnect(&f.path).unwrap();
-}
-
-#[test]
-fn real_cli_hello_and_lifetime_retention_are_bounded() {
+fn lifetime_retention_is_bounded() {
     let f = Fixture::new(false, Config { session_ms: 10, ..Config::default() });
-    // The executable is the transport CLI Cargo built for this integration test,
-    // not a Cargo subprocess or a compiler fallback.
-    let executable = env!("CARGO_BIN_EXE_blaze-dist-local");
-    let output = std::process::Command::new(executable).arg("hello").arg(&f.path).output().unwrap();
-    assert!(output.status.success());
-    let hex = String::from_utf8(output.stdout).unwrap();
-    assert!(!hex.trim().is_empty());
     let mut c = f.client();
     let expired = c.welcome.clone();
     f.at(11);
@@ -897,7 +736,7 @@ fn a_full_execution_pool_can_still_join_an_existing_job_within_its_subscriber_li
     };
     assert!(error.message.contains("subscriber-retention-capacity"));
     let mut other = job(1000);
-    other.spec.source = blaze_wire::SourceRef::Root(blaze_wire::RootRef { root: [9; 32] });
+    other.unit = [10; 32];
     let Answer::Error(error) = c.call(Command::Submit(submission(&other, need()))).unwrap() else {
         panic!("a different job exceeded the execution cap");
     };
@@ -976,32 +815,6 @@ fn late_attempt_work_after_reconnect_is_refused_and_typed_terminal_is_bound() {
     stop.store(true, Ordering::Release);
     thread.join().unwrap();
     assert!(!path.exists());
-}
-
-#[test]
-fn production_cli_client_transmits_cbor_submit_over_the_socket() {
-    let f = Fixture::new(false, Config::default());
-    let executable = env!("CARGO_BIN_EXE_blaze-dist-local");
-    let mut child = std::process::Command::new(executable)
-        .arg("client")
-        .arg(&f.path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let body = encode(&Command::Submit(submission(&job(1000), need())));
-    let line: String = body.iter().map(|b| format!("{b:02x}")).collect();
-    writeln!(child.stdin.take().unwrap(), "{line}").unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    let output = String::from_utf8(output.stdout).unwrap();
-    let response = output.lines().nth(1).unwrap();
-    let bytes: Vec<u8> = response
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
-        .collect();
-    assert!(matches!(decode::<Answer>(&bytes, &Limits::DOCUMENTED).unwrap(), Answer::Binding(_)));
 }
 
 #[test]
@@ -1085,15 +898,17 @@ fn hello_retry_is_idempotent_and_clock_rollback_does_not_extend_lifetime() {
 }
 
 #[test]
-fn production_cli_server_owns_and_removes_its_actual_socket() {
+fn the_coordinator_owns_and_removes_its_actual_socket() {
     let path = PathBuf::from(format!(
         "/tmp/blaze-cli-{}.sock",
         random_id().unwrap()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>()
     ));
     let executable = env!("CARGO_BIN_EXE_blaze-dist-local");
     let mut child = std::process::Command::new(executable)
-        .arg("serve")
+        .arg("coordinate")
         .arg(&path)
+        .arg("some-triple")
+        .arg("0")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -1109,148 +924,10 @@ fn production_cli_server_owns_and_removes_its_actual_socket() {
     let deadline = c.welcome.now_ms + 1000;
     let b = submit(&mut c, deadline);
     let Answer::Terminal(t) = c.call(Command::Terminal(b.subscription)).unwrap() else { panic!() };
-    assert!(t.value.is_none()); // CLI has no holder; it cannot claim Passed.
+    assert!(t.value.is_none()); // No executor: nothing can claim Passed.
     writeln!(child.stdin.take().unwrap(), "stop").unwrap();
     assert!(child.wait().unwrap().success());
     assert!(!path.exists());
-}
-
-/// No builder ever runs the job: the subscriber's own deadline ends it
-/// `TimedOut`, which is no verdict, so `Fallback` builds locally and `Never`
-/// fails. This is the requester half of local-owned fallback; the owned
-/// build it then runs is the caller's, of the same admitted spec.
-#[test]
-fn await_terminal_builds_locally_when_the_deadline_times_out() {
-    let f = Fixture::new(false, Config::default());
-    let mut c = f.client();
-    let b = submit(&mut c, 1000);
-    f.at(1001);
-    assert_eq!(
-        c.await_terminal(
-            &b,
-            &LocalPolicy::Fallback,
-            Duration::from_millis(1),
-            Duration::from_secs(10),
-        )
-        .unwrap(),
-        LocalAction::BuildLocally
-    );
-    assert_eq!(
-        c.await_terminal(
-            &b,
-            &LocalPolicy::Never,
-            Duration::from_millis(1),
-            Duration::from_secs(10),
-        )
-        .unwrap(),
-        LocalAction::Fail
-    );
-}
-
-/// The coordinator process is gone: under `Fallback` the requester builds
-/// locally instead of erroring; under `Never` the IO failure is its answer.
-#[test]
-fn await_terminal_builds_locally_when_the_coordinator_is_gone() {
-    for policy in [LocalPolicy::Fallback, LocalPolicy::Never] {
-        let mut f = Fixture::new(true, Config::default());
-        let mut c = f.client();
-        let b = submit(&mut c, 1_000_000);
-        f.stop();
-        let action =
-            c.await_terminal(&b, &policy, Duration::from_millis(1), Duration::from_secs(10));
-        match policy {
-            LocalPolicy::Fallback => {
-                assert_eq!(action.unwrap(), LocalAction::BuildLocally);
-            }
-            _ => assert!(action.is_err(), "{action:?}"),
-        }
-    }
-}
-
-/// A reported verdict is taken under `Fallback` too: fallback is for jobs
-/// the remote never decided, never a second opinion on one it did.
-#[test]
-fn await_terminal_takes_a_reported_verdict_under_fallback() {
-    let f = Fixture::new(true, Config::default());
-    let mut c = f.client();
-    let b = submit(&mut c, 1_000_000);
-    let content = b.subscription.content;
-    let execution = b.subscription.execution;
-    let join = Join {
-        content,
-        executor: f.executor.clone(),
-        request: WorkJoinRequest {
-            execution,
-            attempt: b.attempt,
-            roots: RootSet {
-                spec: [1; 32],
-                roots: [2; 32],
-                count: 1,
-                index: [3; 32],
-                inputs: [4; 32],
-            },
-            rejected: Set::new(Vec::new()),
-        },
-    };
-    assert!(matches!(c.call(Command::Join(join)).unwrap(), Answer::Join(_)));
-    let Answer::Lease(answer) = c
-        .call(Command::Lease(Lease {
-            content,
-            executor: f.executor.clone(),
-            request: WorkLeaseRequest { execution, attempt: b.attempt },
-        }))
-        .unwrap()
-    else {
-        panic!()
-    };
-    let grant = answer.grant.unwrap();
-    assert!(matches!(
-        c.call(Command::Result(BatchSubmission {
-            content,
-            executor: f.executor.clone(),
-            request: BatchResult {
-                lease: grant.lease.clone(),
-                seq: 1,
-                items: vec![ItemResult {
-                    name: WorkName([9; 32]),
-                    outcome: ItemOutcome::Local(Why { why: "fixture".to_owned() }),
-                    found: Set::new(Vec::new()),
-                    unnamed: Set::new(Vec::new()),
-                }],
-                packs: Vec::new(),
-                returned_roots: Set::new(Vec::new()),
-                returned_names: Set::new(Vec::new()),
-            },
-        }))
-        .unwrap(),
-        Answer::Result(_)
-    ));
-    assert!(matches!(
-        c.call(Command::WorkerEvents(WorkerEvents {
-            content,
-            executor: f.executor.clone(),
-            request: WorkersEventsRequest {
-                execution,
-                attempt: b.attempt,
-                events: vec![JobEvent::Done(DoneEvent {
-                    outcome: Outcome::Passed,
-                    counters: Vec::new(),
-                })],
-            },
-        }))
-        .unwrap(),
-        Answer::WorkerEvents(_)
-    ));
-    assert_eq!(
-        c.await_terminal(
-            &b,
-            &LocalPolicy::Fallback,
-            Duration::from_millis(1),
-            Duration::from_secs(10),
-        )
-        .unwrap(),
-        LocalAction::Take
-    );
 }
 
 fn two_roots() -> RootSet {

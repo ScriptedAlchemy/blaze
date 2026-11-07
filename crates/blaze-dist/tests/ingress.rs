@@ -8,9 +8,8 @@ use blaze_dist::jobs::{
 use blaze_wire::job_terminal_v2::{TerminationReasonV2 as Reason, TerminationV2, decode_terminal};
 use blaze_wire::{
     AssignedEvent, Attempt, BatchResult, DoneEvent, ExecutionId, JobContent, JobEvent, Limits,
-    LocalPolicy, Namespace, Outcome, OutputEvent, ProgramEvent, PublishedEvent, RefusedEvent,
-    RootSet, Set, Stage, StageEvent, WorkJoinRequest, WorkLeaseRequest, WorkersEventsRequest,
-    encode,
+    LocalPolicy, Namespace, Outcome, OutputEvent, RefusedEvent, RootSet, Set, Stage, StageEvent,
+    WorkJoinRequest, WorkLeaseRequest, WorkersEventsRequest, encode,
 };
 
 fn execution(mode: CompletionMode) -> Execution {
@@ -23,7 +22,6 @@ fn execution(mode: CompletionMode) -> Execution {
             id: 1,
             deadline_ms: 100_000,
             policy: LocalPolicy::Fallback,
-            test_timeout_ms: None,
             state: SubscriberState::Attached,
         },
         ExecutionConfig { completion: mode, ..ExecutionConfig::default() },
@@ -59,12 +57,12 @@ fn join_at(e: &mut Execution, holder: &str, count: u64, tag: u8, now: u64) {
     e.join(now, holder, &r, &mut Vec::new()).unwrap();
 }
 
-fn rejects_without_public_effects(e: &mut Execution, from: &str, r: WorkersEventsRequest) {
+fn rejects_without_public_effects(e: &mut Execution, from: &str, r: &WorkersEventsRequest) {
     let before = e.events(0).to_vec();
     let stages = e.stages().to_vec();
     let state = e.state();
     let mut effects = Vec::new();
-    assert!(e.worker_events(1, from, &r, &mut effects).is_err());
+    assert!(e.worker_events(1, from, r, &mut effects).is_err());
     assert!(effects.is_empty(), "rejected batch emitted {effects:?}");
     assert_eq!(e.events(0), before, "rejected batch changed public stream");
     assert_eq!(e.stages(), stages);
@@ -87,25 +85,17 @@ fn coordinator_stages_and_assignments_never_enter_from_workers() {
         ] {
             let mut e = execution(CompletionMode::WorkProtocol);
             let r = request(&e, vec![event.clone(), event]);
-            rejects_without_public_effects(&mut e, from, r);
+            rejects_without_public_effects(&mut e, from, &r);
         }
     }
     let mut e = execution(CompletionMode::WorkProtocol);
     let r = request(&e, vec![stage(Stage::Loaded)]);
-    rejects_without_public_effects(&mut e, "helper", r);
+    rejects_without_public_effects(&mut e, "helper", &r);
 }
 
 #[test]
 fn helper_roles_and_mixed_batches_are_prevalidated_atomically() {
-    for event in [
-        done(Outcome::Failed),
-        JobEvent::Verdict(<blaze_wire::TestVerdict as blaze_wire::Sample>::sample(
-            &mut blaze_wire::Gen::new(1),
-        )),
-        JobEvent::Program(ProgramEvent { name: "program".to_owned(), blob: [1; 32] }),
-        JobEvent::Published(PublishedEvent { records: Vec::new() }),
-        stage(Stage::Compiled),
-    ] {
+    for event in [done(Outcome::Failed), stage(Stage::Compiled)] {
         let mut e = execution(CompletionMode::NoCompileWork);
         let r = request(
             &e,
@@ -115,7 +105,7 @@ fn helper_roles_and_mixed_batches_are_prevalidated_atomically() {
                 event,
             ],
         );
-        rejects_without_public_effects(&mut e, "helper", r);
+        rejects_without_public_effects(&mut e, "helper", &r);
         // Even the valid Refused prefix was not applied.
         let passed = request(&e, vec![done(Outcome::Passed)]);
         e.worker_events(2, "lead", &passed, &mut Vec::new()).unwrap();
@@ -128,9 +118,9 @@ fn stale_and_duplicate_worker_batches_cannot_forge_stages_or_multiple_verdicts()
     let mut e = execution(CompletionMode::NoCompileWork);
     let old = request(&e, vec![stage(Stage::Compiled)]);
     e.assign(1, "helper", &[], &mut Vec::new()).unwrap();
-    rejects_without_public_effects(&mut e, "lead", old);
+    rejects_without_public_effects(&mut e, "lead", &old);
     let duplicate = request(&e, vec![done(Outcome::Passed), done(Outcome::Passed)]);
-    rejects_without_public_effects(&mut e, "helper", duplicate);
+    rejects_without_public_effects(&mut e, "helper", &duplicate);
     let passed = request(&e, vec![done(Outcome::Passed)]);
     e.worker_events(2, "helper", &passed, &mut Vec::new()).unwrap();
     let before = e.events(0).to_vec();
@@ -159,7 +149,7 @@ fn worker_cannot_classify_infrastructure_failure_as_a_verdict() {
     for outcome in [Outcome::Lost, Outcome::Cancelled, Outcome::TimedOut] {
         let mut e = execution(CompletionMode::NoCompileWork);
         let r = request(&e, vec![done(outcome)]);
-        rejects_without_public_effects(&mut e, "lead", r);
+        rejects_without_public_effects(&mut e, "lead", &r);
     }
 }
 
@@ -167,10 +157,10 @@ fn worker_cannot_classify_infrastructure_failure_as_a_verdict() {
 fn success_requires_authoritative_completion_not_provisional_or_returned_work() {
     let mut e = execution(CompletionMode::WorkProtocol);
     let passed = request(&e, vec![done(Outcome::Passed)]);
-    rejects_without_public_effects(&mut e, "lead", passed);
+    rejects_without_public_effects(&mut e, "lead", &passed);
     join(&mut e, "helper", 0, 2);
     let passed = request(&e, vec![done(Outcome::Passed)]);
-    rejects_without_public_effects(&mut e, "lead", passed);
+    rejects_without_public_effects(&mut e, "lead", &passed);
     // A differing authoritative list reopens work; returned roots are not coverage.
     join(&mut e, "lead", 1, 3);
     let grant = e
@@ -198,7 +188,7 @@ fn success_requires_authoritative_completion_not_provisional_or_returned_work() 
     )
     .unwrap();
     let passed = request(&e, vec![done(Outcome::Passed)]);
-    rejects_without_public_effects(&mut e, "lead", passed);
+    rejects_without_public_effects(&mut e, "lead", &passed);
 }
 
 #[test]
@@ -220,7 +210,7 @@ fn retained_completion_requires_the_replacement_leads_agreement() {
     join(&mut e, "lead", 0, 2);
     e.assign(1, "helper", &[], &mut Vec::new()).unwrap();
     let passed = request(&e, vec![done(Outcome::Passed)]);
-    rejects_without_public_effects(&mut e, "helper", passed);
+    rejects_without_public_effects(&mut e, "helper", &passed);
     join(&mut e, "helper", 0, 2);
     let passed = request(&e, vec![done(Outcome::Passed)]);
     e.worker_events(2, "helper", &passed, &mut Vec::new()).unwrap();
@@ -239,7 +229,7 @@ fn terminal_delivery_retains_reason_through_wire_and_client_policy() {
         (Reason::Deadline, Outcome::Cancelled),
         (Reason::SubscriberDeadline, Outcome::TimedOut),
     ] {
-        for policy in [LocalPolicy::Never, LocalPolicy::Fallback, LocalPolicy::Race] {
+        for policy in [LocalPolicy::Never, LocalPolicy::Fallback] {
             let value =
                 TerminationV2 { version: 2, reason: reason.clone(), outcome: outcome.clone() };
             let expected = if reason == Reason::Reported {
@@ -297,18 +287,16 @@ fn no_lead_lost_delivery_is_not_a_completed_failed_verdict() {
     admission.add_machine("machine", [1; 32], reservation.clone());
     admission.add_builder(0, "machine", reservation.clone()).unwrap();
     let mut jobs = blaze_dist::jobs::Jobs::new(admission, ExecutionConfig::default());
-    let mut spec =
-        <blaze_wire::BuildSpec as blaze_wire::Sample>::sample(&mut blaze_wire::Gen::new(1));
-    spec.platform = [1; 32];
     let answer = jobs
         .submit(
             0,
             &blaze_wire::JobRequest {
-                spec,
+                unit: [9; 32],
+                platform: [1; 32],
                 namespace: Namespace::Main,
+                source: [0; 32],
                 deadline_ms: 100_000,
                 local: LocalPolicy::Fallback,
-                test_timeout_ms: None,
             },
             reservation,
             &mut Vec::new(),
@@ -346,7 +334,7 @@ fn changed_root_epoch_blocks_success_until_its_work_is_done() {
     e.assign(1, "helper", &[], &mut Vec::new()).unwrap();
     join(&mut e, "helper", 1, 3);
     let passed = request(&e, vec![done(Outcome::Passed)]);
-    rejects_without_public_effects(&mut e, "helper", passed);
+    rejects_without_public_effects(&mut e, "helper", &passed);
     let grant = e
         .lease(
             0,
@@ -412,7 +400,7 @@ fn randomized_ingress_checks_public_stream_for_10000_seeds() {
         } else {
             r.attempt = e.attempt();
         }
-        rejects_without_public_effects(&mut e, from, r);
+        rejects_without_public_effects(&mut e, from, &r);
     }
 }
 
@@ -433,20 +421,15 @@ fn randomized_lead_progress_is_forward_deduplicated_and_coordinator_timed() {
         e.worker_events(2, "lead", &duplicate, &mut Vec::new()).unwrap();
         assert_eq!(e.events(0), before, "duplicate progress seed {seed}");
         let backwards = request(&e, vec![stage(Stage::Fetched)]);
-        rejects_without_public_effects(&mut e, "lead", backwards);
+        rejects_without_public_effects(&mut e, "lead", &backwards);
         if mode == CompletionMode::WorkProtocol {
             let early = request(&e, vec![stage(Stage::Linked)]);
-            rejects_without_public_effects(&mut e, "lead", early);
+            rejects_without_public_effects(&mut e, "lead", &early);
             join_at(&mut e, "lead", 0, 2, 2);
         }
         let progress = request(
             &e,
-            vec![
-                stage(Stage::Published),
-                stage(Stage::Linked),
-                stage(Stage::Tested),
-                stage(Stage::Reported),
-            ],
+            vec![stage(Stage::Published), stage(Stage::Linked), stage(Stage::Reported)],
         );
         e.worker_events(3, "lead", &progress, &mut Vec::new()).unwrap();
         let public: Vec<_> = e
@@ -461,6 +444,6 @@ fn randomized_lead_progress_is_forward_deduplicated_and_coordinator_timed() {
         assert_eq!(public.last(), Some(&(Stage::Reported, 3)));
         let old = request(&e, vec![stage(Stage::Reported)]);
         e.assign(4, "helper", &[], &mut Vec::new()).unwrap();
-        rejects_without_public_effects(&mut e, "lead", old);
+        rejects_without_public_effects(&mut e, "lead", &old);
     }
 }

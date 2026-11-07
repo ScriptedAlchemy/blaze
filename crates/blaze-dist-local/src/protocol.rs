@@ -11,8 +11,7 @@
 use blaze_wire::job_terminal_v2::SubscriberTerminalV2;
 use blaze_wire::{
     Ack, Attempt, BatchResult, Bytes, Digest, EventItem, ExecutionId, JobContent, LocalPolicy,
-    PackRef,
-    Reservation, Set, WireError, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
+    PackRef, Reservation, Set, WireError, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
     WorkLeaseRequest, WorkResultAnswer, WorkersEventsAnswer, WorkersEventsRequest, wire_enum,
     wire_struct,
 };
@@ -265,7 +264,8 @@ wire_enum! {
 pub fn submission(request: &blaze_wire::JobRequest, need: Reservation) -> Submission {
     Submission {
         content: JobContent::of(&blaze_wire::JobContentInput {
-            spec: blaze_wire::digest_of(&request.spec),
+            unit: request.unit,
+            platform: request.platform,
             namespace: request.namespace.clone(),
         }),
         request: Bytes::new(blaze_wire::encode(request)),

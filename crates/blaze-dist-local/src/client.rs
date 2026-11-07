@@ -6,8 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use blaze_dist::jobs::{LocalAction, local_action};
-use blaze_wire::{Digest, Limits, LocalPolicy, decode, encode};
+use blaze_wire::{Digest, Limits, decode, encode};
 
 use crate::Error;
 use crate::protocol::*;
@@ -20,11 +19,12 @@ pub struct Client {
     pub welcome: LocalWelcome,
     next: u64,
     pending: Option<Request>,
-    /// Creation nonce, kept so a retried creation returns this same lifetime.
-    nonce: Digest,
 }
 
-#[expect(clippy::needless_pass_by_value, reason = "a hello is sent once; its one caller gives it up")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a hello is sent once; its one caller gives it up"
+)]
 fn connect(path: &Path, hello: LocalHello) -> Result<(UnixStream, LocalWelcome), Error> {
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -68,7 +68,7 @@ impl Client {
     /// idempotent while that lifetime is live; it is not a capability or an authority.
     pub fn connect(path: &Path, nonce: Digest) -> Result<Self, Error> {
         let (stream, welcome) = connect(path, hello(nonce))?;
-        Ok(Self { next: welcome.next_request, welcome, stream, pending: None, nonce })
+        Ok(Self { next: welcome.next_request, welcome, stream, pending: None })
     }
 
     /// Resume this same lifetime and epoch. A pending request is never changed, skipped or
@@ -90,42 +90,12 @@ impl Client {
         Ok(())
     }
 
-    /// Explicitly create a fresh lifetime after expiry. Nothing of the old lifetime carries
-    /// over: it is refused while a request is pending, because an unresolved request is
-    /// never migrated into a new session, and its exact bytes stay available for inspection.
-    pub fn renew(&mut self, path: &Path, nonce: Digest) -> Result<(), Error> {
-        if self.pending.is_some() {
-            return Err(Error::Protocol(
-                "pending-request: abandon it explicitly, never migrate it".to_owned(),
-            ));
-        }
-        let (stream, welcome) = connect(path, hello(nonce))?;
-        self.next = welcome.next_request;
-        self.stream = stream;
-        self.welcome = welcome;
-        self.nonce = nonce;
-        Ok(())
-    }
-
-    /// Give up the pending request deliberately, returning it so the caller can decide
-    /// whether to re-issue the work as a new request in a new lifetime.
-    pub fn abandon_pending(&mut self) -> Option<Request> {
-        self.pending.take()
-    }
-
-    /// The creation nonce this client was opened with.
-    pub fn nonce(&self) -> Digest {
-        self.nonce
-    }
-
     /// End this lifetime deliberately. The daemon journals the answer first, then removes the
     /// session, so capacity returns at once instead of at the fixed lifetime. Nothing of it
     /// can be resumed afterwards; a pending request is refused rather than migrated.
     pub fn release(&mut self) -> Result<(), Error> {
         if self.pending.is_some() {
-            return Err(Error::Protocol(
-                "pending-request: abandon it explicitly, never migrate it".to_owned(),
-            ));
+            return Err(Error::Protocol("pending-request: it is never migrated".to_owned()));
         }
         self.call(Command::Release(Release {}))?;
         Ok(())
@@ -210,122 +180,4 @@ fn validate_answer(command: &Command, answer: &Answer) -> Result<(), Error> {
         _ => false,
     };
     if matched { Ok(()) } else { Err(Error::Protocol("answer-command-binding".to_owned())) }
-}
-
-// The requester applies the same transport-loss policy during Terminal and Resume.
-fn transport_lost(policy: &LocalPolicy, error: std::io::Error) -> Result<LocalAction, Error> {
-    match policy {
-        LocalPolicy::Never => Err(Error::Io(error)),
-        LocalPolicy::Fallback | LocalPolicy::Race => Ok(LocalAction::BuildLocally),
-    }
-}
-
-impl Client {
-    /// Wait for this subscription's terminal and say what the requester does
-    /// under `policy`: take the remote verdict, build locally, or fail.
-    ///
-    /// A reported verdict (passed, failed, refused) is always taken, under
-    /// every policy. Anything else — a timed-out or lost execution, a
-    /// coordinator that stops answering, or still no terminal when `give_up`
-    /// elapses — builds locally under `Fallback` and `Race` and fails under
-    /// `Never`. Building locally is the requester's own owned build of the
-    /// same admitted `BuildSpec`, inside the same no-rustc boundary; this
-    /// carrier never starts it. After a lead loss the subscription is resumed
-    /// for its current attempt, as `terminal_action` requires. A refused
-    /// terminal call (an expired session, a mismatched subscription) is an
-    /// error, never a fallback: it names no outcome to fall back from.
-    pub fn await_terminal(
-        &mut self,
-        binding: &Binding,
-        policy: &LocalPolicy,
-        poll: Duration,
-        give_up: Duration,
-    ) -> Result<LocalAction, Error> {
-        let started = std::time::Instant::now();
-        let mut binding = binding.clone();
-        loop {
-            let answer = match self.call(Command::Terminal(binding.subscription.clone())) {
-                Ok(answer) => answer,
-                Err(Error::Io(error)) => return transport_lost(policy, error),
-                Err(error) => return Err(error),
-            };
-            let Answer::Terminal(terminal) = answer else {
-                return Err(Error::Protocol(format!("terminal refused: {answer:?}")));
-            };
-            if let Some(value) = &terminal.value
-                && value.attempt != binding.attempt
-            {
-                // The lead moved after this binding was issued: resume the
-                // subscription for the attempt its terminal now names.
-                let resumed = match self.call(Command::Resume(binding.subscription.clone())) {
-                    Ok(answer) => answer,
-                    Err(Error::Io(error)) => return transport_lost(policy, error),
-                    Err(error) => return Err(error),
-                };
-                let Answer::Binding(current) = resumed else {
-                    return Err(Error::Protocol("resume refused".to_owned()));
-                };
-                if current.attempt == binding.attempt {
-                    return Err(Error::Protocol("resume did not advance attempt".to_owned()));
-                }
-                binding = current;
-                continue;
-            }
-            if let Some(action) = terminal_action(&binding, &terminal, policy)? {
-                return Ok(action);
-            }
-            if started.elapsed() >= give_up {
-                return match policy {
-                    LocalPolicy::Never => Err(Error::Protocol(
-                        "terminal-timeout: no terminal before the requester gave up".to_owned(),
-                    )),
-                    LocalPolicy::Fallback | LocalPolicy::Race => Ok(LocalAction::BuildLocally),
-                };
-            }
-            std::thread::sleep(poll);
-        }
-    }
-}
-
-/// The policy conversion boundary requires exact content/execution/subscriber/attempt binding.
-/// A pending or mismatched terminal never triggers fallback. Call Resume first after lead loss.
-pub fn terminal_action(
-    binding: &Binding,
-    terminal: &Terminal,
-    policy: &LocalPolicy,
-) -> Result<Option<LocalAction>, Error> {
-    if binding.subscription != terminal.subscription {
-        return Err(Error::Protocol("terminal-subscription-binding".to_owned()));
-    }
-    let Some(value) = &terminal.value else {
-        return Ok(None);
-    };
-    if value.execution != binding.subscription.execution
-        || value.subscriber != binding.subscription.subscriber
-        || value.attempt != binding.attempt
-    {
-        return Err(Error::Protocol("terminal-attempt-binding".to_owned()));
-    }
-    local_action(policy, &value.termination)
-        .map(Some)
-        .map_err(|e| Error::Protocol(format!("terminal-contract: {e:?}")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn requester_uses_the_same_io_policy_during_resume_and_terminal() {
-        for policy in [LocalPolicy::Fallback, LocalPolicy::Race] {
-            assert_eq!(
-                transport_lost(&policy, std::io::ErrorKind::ConnectionReset.into()).unwrap(),
-                LocalAction::BuildLocally
-            );
-        }
-        assert!(matches!(
-            transport_lost(&LocalPolicy::Never, std::io::ErrorKind::ConnectionReset.into()),
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::ConnectionReset
-        ));
-    }
 }

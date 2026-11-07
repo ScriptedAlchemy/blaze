@@ -1,6 +1,6 @@
 //! Why the coordinator refused a call: a typed reason in the code, one `WireError` on the wire.
 //!
-//! The wire's error has a code and a message (section 8). Several refusals share code 6
+//! The wire's error has a code and a message. Several refusals share code 6
 //! (conflict), and an executor must tell them apart: a dead lease asks for a new one, a moved
 //! attempt stops, a join that came before the lead tries again. So each refusal's message starts
 //! with a stable token and a colon, which [`Refusal::of`] reads back.
@@ -35,6 +35,8 @@ pub enum Refusal {
     Busy,
     /// No such subscriber.
     NoSubscriber,
+    /// A unit of a source its pull request has replaced: the build is obsolete.
+    Superseded,
 }
 
 impl Refusal {
@@ -53,10 +55,11 @@ impl Refusal {
             Refusal::Malformed(_) => "malformed",
             Refusal::Busy => "busy",
             Refusal::NoSubscriber => "no-subscriber",
+            Refusal::Superseded => "superseded",
         }
     }
 
-    /// The section 8 code it is answered with.
+    /// The code it is answered with.
     pub fn code(&self) -> ErrorCode {
         match self {
             Refusal::NotJoined | Refusal::NoExecution | Refusal::NoSubscriber => {
@@ -66,7 +69,8 @@ impl Refusal {
             | Refusal::FrontEndDiffers
             | Refusal::AttemptMoved
             | Refusal::DeadLease
-            | Refusal::Ended => ErrorCode::Conflict,
+            | Refusal::Ended
+            | Refusal::Superseded => ErrorCode::Conflict,
             Refusal::NotHolder => ErrorCode::NotAllowed,
             Refusal::SeqReused | Refusal::Malformed(_) => ErrorCode::Malformed,
             Refusal::Busy => ErrorCode::Busy,
@@ -89,6 +93,7 @@ impl Refusal {
             Refusal::Malformed(what) => what.as_str(),
             Refusal::Busy => "the queue is full",
             Refusal::NoSubscriber => "no such subscriber",
+            Refusal::Superseded => "a newer source of this pull request replaced this one",
         };
         let error = WireError::new(self.code(), format!("{}: {text}", self.token()));
         match retry_after_ms {
@@ -114,6 +119,7 @@ impl Refusal {
             "malformed" => Refusal::Malformed(rest.to_owned()),
             "busy" => Refusal::Busy,
             "no-subscriber" => Refusal::NoSubscriber,
+            "superseded" => Refusal::Superseded,
             _ => return None,
         })
     }

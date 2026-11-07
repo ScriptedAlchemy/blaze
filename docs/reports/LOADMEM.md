@@ -1,3 +1,8 @@
+---
+status: record
+summary: What held a loading worker's memory under V1.
+date: 2026-10-25
+---
 # What holds the memory when a blaze worker loads tracedecay
 
 2026-10-26, unit u5-memprof of the distributed program, on the fork's `dist/main` at

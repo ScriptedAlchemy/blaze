@@ -1,28 +1,17 @@
-//! The HTTP/1.1 side: section 8's calls over `hyper`, and the answers they get.
+//! The HTTP/1.1 side: the calls over `hyper`, and the answers they get.
 //!
 //! One connection is one task. A message is read whole, held to [`Limits::request`] and
 //! refused by the validator when it is not canonical CBOR; a `PUT` of a blob is streamed to a
 //! temporary file as it arrives, so a blob larger than the memory of the machine is still
 //! taken, and nothing of it is named until it is checked against its name.
 //!
-//! Every answer that is not a success is section 8's [`WireError`] in CBOR, with the status of
+//! Every answer that is not a success is a [`WireError`] in CBOR, with the status of
 //! its code's class. A blob's bytes are not CBOR; the bytes of a list are the list's own text.
 
-use std::{
-    convert::Infallible,
-    io::SeekFrom,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use blaze_wire::{
-    CacheMissingAnswer, CacheMissingRequest, Digest, ErrorCode, HelloAnswer, HelloRequest, Limits,
-    Namespace, Set, VERSION, Wire, decode, encode,
-};
+use blaze_wire::{ErrorCode, Limits, encode};
 use bytes::Bytes;
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{
     Method, Request as HttpRequest, Response as HttpResponse, StatusCode,
@@ -32,46 +21,38 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
-use sha2::{Digest as _, Sha256};
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Semaphore,
 };
 
-use crate::blob::{ObjectName, hex, parse_range};
+use crate::blob::{ObjectName, hex};
 use crate::error::{Error, failed};
-use crate::store::{Expect, Store, Verification, temporary};
+use crate::store::{Store, temporary};
 
-mod pages;
-mod preconditions;
 mod progress;
 mod publication;
 
-use preconditions::Condition;
-use publication::{Temporary, key_of};
+use publication::Temporary;
 
 /// The bytes of one read of a file that is sent.
 const CHUNK: usize = 1 << 16;
 
-/// The header an object's write time is answered in, in milliseconds since the epoch: a client
-/// reads a number rather than parsing a date, and a collection goes by it.
-const WRITTEN_MS: &str = "x-blaze-written-ms";
-
 /// What the server is told when it starts.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// The directory that holds today's layout: `packs/`, `keys/`, `units/`, `manifests/`.
+    /// The directory that holds `packs/` and `manifests/`.
     pub dir: PathBuf,
     /// Where it listens. `127.0.0.1:PORT` unless the operator says otherwise.
     pub listen: SocketAddr,
     /// Request and connection liveness policy, not a compile-worker memory limit.
     pub resources: Resources,
-    /// Wire ceilings advertised in hello.
+    /// The most bytes a blob or a request may be.
     pub limits: Limits,
 }
 
-/// Resource leases for network peers and listing snapshots.
+/// Resource leases for network peers.
 #[derive(Clone, Debug)]
 pub struct Resources {
     /// Longest pause between request-body frames or while reading request headers.
@@ -82,8 +63,6 @@ pub struct Resources {
     pub sweep_every: Duration,
     /// Age after which an unlocked staging file can be removed.
     pub temporary_age: Duration,
-    /// Lifetime of an immutable listing snapshot.
-    pub snapshot_age: Duration,
 }
 
 impl Default for Resources {
@@ -93,7 +72,6 @@ impl Default for Resources {
             connections: 256,
             sweep_every: Duration::from_secs(60),
             temporary_age: Duration::from_secs(3600),
-            snapshot_age: Duration::from_secs(600),
         }
     }
 }
@@ -113,55 +91,33 @@ impl Config {
 /// A running server's state, shared by its connections.
 pub struct Server {
     store: Arc<Store>,
-    key: SigningKey,
     limits: Limits,
-    /// One epoch, Main's. C6 makes epochs real; until then a record that names one names 1.
-    epochs: Vec<(Namespace, u64)>,
     resources: Resources,
-    pages: pages::Pages,
     #[cfg(test)]
     accept_errors: std::sync::Mutex<std::collections::VecDeque<std::io::Error>>,
 }
 
 impl Server {
-    /// The server on `config.dir`, with its key read from the directory or made now.
+    /// The server on `config.dir`.
     pub fn open(config: &Config) -> Result<Server, Error> {
         if config.resources.idle.is_zero()
             || config.resources.connections == 0
             || config.resources.sweep_every.is_zero()
-            || config.resources.snapshot_age.is_zero()
             || config.limits.request == 0
             || config.limits.batch_items == 0
         {
-            return Err(Error::malformed(
-                "server resource leases and wire limits must be positive",
-            ));
+            return Err(Error::malformed("server resource leases and wire limits must be positive"));
         }
         let limits = config.limits;
         let ceiling = Limits::DOCUMENTED;
-        if limits.request > ceiling.request
-            || limits.blob < 32
-            || limits.blob > ceiling.blob
-            || limits.event == 0
-            || limits.event > ceiling.event
-            || limits.lookup_items == 0
-            || limits.lookup_items > limits.batch_items
-            || limits.lookup_items > ceiling.lookup_items
-            || limits.batch_items > ceiling.batch_items
-            || limits.string == 0
-            || limits.string > ceiling.string
-        {
+        if limits.request > ceiling.request || limits.blob < 32 || limits.blob > ceiling.blob {
             return Err(Error::malformed("unsupported server wire limits"));
         }
         let store = Store::open(&config.dir)?;
-        let key = key_of(&config.dir)?;
         Ok(Server {
             store: Arc::new(store),
-            key,
             limits: config.limits,
-            epochs: vec![(Namespace::Main, 1)],
             resources: config.resources.clone(),
-            pages: pages::Pages::default(),
             #[cfg(test)]
             accept_errors: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
@@ -170,16 +126,6 @@ impl Server {
     /// The directory it serves.
     pub fn store(&self) -> &Store {
         &self.store
-    }
-
-    /// The key the `hello` answer carries, and the one C6 signs records with.
-    pub fn verifying_key(&self) -> VerifyingKey {
-        self.key.verifying_key()
-    }
-
-    /// The limits the `hello` answer carries.
-    pub fn limits(&self) -> &Limits {
-        &self.limits
     }
 
     async fn disk<T: Send + 'static>(
@@ -196,8 +142,7 @@ impl Server {
     pub async fn answer(&self, request: HttpRequest<Incoming>) -> HttpResponse<Body> {
         let (parts, body) = request.into_parts();
         let path = parts.uri.path().to_owned();
-        let query = parts.uri.query().unwrap_or_default().to_owned();
-        let answered = self.route(&parts.method, &path, &query, &parts.headers, body).await;
+        let answered = self.route(&parts.method, &path, &parts.headers, body).await;
         match answered {
             Ok(answer) => answer,
             Err(error) => error_answer(&error),
@@ -208,116 +153,23 @@ impl Server {
         &self,
         method: &Method,
         path: &str,
-        query: &str,
         headers: &hyper::HeaderMap,
         body: Incoming,
     ) -> Result<HttpResponse<Body>, Error> {
-        match path {
-            "/" => Ok(text(StatusCode::OK, "blaze-serve: a cache of today's layout\n")),
-            "/v1/hello" => self.hello(method, headers, body).await,
-            "/v1/cache/missing" => self.missing(method, headers, body).await,
-            "/v1/objects" => self.objects(method, query, headers).await,
-            _ => {
-                let Some((endpoint, name)) =
-                    path.strip_prefix("/v1/").and_then(|it| it.split_once('/'))
-                else {
-                    return Err(Error::not_found(format!("{path} is not a call of this server")));
-                };
-                match endpoint {
-                    "blob" => self.blob(method, name, headers, body).await,
-                    "list" => self.list(method, name, headers, body).await,
-                    _ => Err(Error::not_found(format!("{path} is not a call of this server"))),
-                }
-            }
+        if path == "/" {
+            return Ok(text(StatusCode::OK, "blaze-serve\n"));
         }
-    }
-
-    /// `POST /v1/hello`: the versions the client speaks, and the one this server does.
-    async fn hello(
-        &self,
-        method: &Method,
-        headers: &hyper::HeaderMap,
-        body: Incoming,
-    ) -> Result<HttpResponse<Body>, Error> {
-        if *method != Method::POST {
-            return Err(method_not_allowed(method, "POST"));
-        }
-        let request: HelloRequest = self.message(headers, body).await?;
-        let Some(version) = request.versions.iter().copied().filter(|it| *it == VERSION).max()
+        let Some((endpoint, name)) = path.strip_prefix("/v1/").and_then(|it| it.split_once('/'))
         else {
-            return Err(Error::version(format!(
-                "this server speaks {VERSION}, and the client speaks {:?}",
-                request.versions.as_slice()
-            )));
+            return Err(Error::not_found(format!("{path} is not a call of this server")));
         };
-        // C3 serves every identity: it holds no records and no identity table, so there is
-        // nothing to refuse. C5 answers the identities its records name.
-        let answer = HelloAnswer {
-            version,
-            key: self.verifying_key().to_bytes(),
-            epochs: Set::new(self.epochs.clone()),
-            identities: Set::new(Vec::new()),
-            limits: self.limits.clone(),
-        };
-        Ok(cbor(&answer))
+        match endpoint {
+            "blob" => self.blob(method, name, headers, body).await,
+            "list" => self.list(method, name, headers, body).await,
+            _ => Err(Error::not_found(format!("{path} is not a call of this server"))),
+        }
     }
 
-    /// `POST /v1/cache/missing`: the blobs asked for that this directory does not hold,
-    /// answered from the existence set in memory.
-    async fn missing(
-        &self,
-        method: &Method,
-        headers: &hyper::HeaderMap,
-        body: Incoming,
-    ) -> Result<HttpResponse<Body>, Error> {
-        if *method != Method::POST {
-            return Err(method_not_allowed(method, "POST"));
-        }
-        let request: CacheMissingRequest = self.message(headers, body).await?;
-        let asked: Vec<Digest> = request.blobs.iter().copied().collect();
-        let answer = CacheMissingAnswer { missing: Set::new(self.store.missing(&asked)) };
-        Ok(cbor(&answer))
-    }
-
-    /// `GET /v1/objects?prefix=<p>`: the objects under a prefix, for `cache gc --remote`.
-    async fn objects(
-        &self,
-        method: &Method,
-        query: &str,
-        headers: &hyper::HeaderMap,
-    ) -> Result<HttpResponse<Body>, Error> {
-        if *method != Method::GET {
-            return Err(method_not_allowed(method, "GET"));
-        }
-        if headers.contains_key("x-blaze-listing-version") {
-            return self.paged_objects(query, headers).await;
-        }
-        let prefix = query
-            .split('&')
-            .find_map(|it| it.strip_prefix("prefix="))
-            .map(unescape)
-            .unwrap_or_default();
-        let objects: Vec<_> = self
-            .disk(move |store| store.list(&prefix))
-            .await?
-            .into_iter()
-            .map(|it| (it.name, it.len, written_ms(it.written)))
-            .collect();
-        if objects.len() > self.limits.batch_items as usize {
-            return Err(Error::too_large("the listing exceeds the advertised batch limit"));
-        }
-        let bytes = encode(&crate::list::answer(objects));
-        if bytes.len() > self.limits.request as usize {
-            return Err(Error::too_large("the listing exceeds the advertised request limit"));
-        }
-        Ok(HttpResponse::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/cbor")
-            .body(full(bytes))?)
-    }
-
-    /// `GET`, `HEAD`, `PUT`, `DELETE /v1/blob/<name>`.
-    #[allow(clippy::too_many_lines)]
     async fn blob(
         &self,
         method: &Method,
@@ -325,114 +177,35 @@ impl Server {
         headers: &hyper::HeaderMap,
         body: Incoming,
     ) -> Result<HttpResponse<Body>, Error> {
-        // Section 8 writes a blob's path as `/v1/blob/<sha256>`: a bare digest finds the object
-        // named by it, whichever of today's four kinds that is.
-        let lookup = name.to_owned();
-        let name = match bare_digest(name) {
-            Some(digest) if *method == Method::PUT => {
-                crate::blob::ObjectName::of(crate::blob::Kind::Unit, &digest).expect("a unit name")
-            }
-            Some(digest) => {
-                self.disk(move |store| Ok(store.name_of_digest(&digest))).await?.ok_or_else(
-                    || Error::not_found(format!("no blob of this cache is named {}", hex(&digest))),
-                )?
-            }
-            None => lookup,
-        };
-        let object = ObjectName::parse(&name)
+        let object = ObjectName::parse(name)
             .ok_or_else(|| Error::not_found(format!("`{name}` is not an object of this cache")))?;
         if !object.is_blob() {
             return Err(Error::not_found(format!("`{name}` is a list, not a blob")));
         }
-        let name = object.name.clone();
-        let name = name.as_str();
         match *method {
-            Method::GET | Method::HEAD => {
-                let owned = name.to_owned();
-                let opened = self
-                    .disk(move |store| {
-                        let Some((file, len)) = store.open_blob(&owned)? else { return Ok(None) };
-                        let written = file.metadata()?.modified().ok();
-                        Ok(Some((file, len, written)))
-                    })
-                    .await?;
-                let Some((file, len, written)) = opened else {
+            Method::GET => {
+                let owned = object.name.clone();
+                let opened = self.disk(move |store| store.open_blob(&owned)).await?;
+                let Some((file, len)) = opened else {
                     return Err(Error::not_found(format!("{name} is not here")));
                 };
-                let mut file = tokio::fs::File::from_std(file);
-                let asked = match headers.get(header::RANGE).and_then(|it| it.to_str().ok()) {
-                    None => None,
-                    Some(text) => match parse_range(text) {
-                        Ok(range) => Some(range.of(len)),
-                        Err(_) => Some(None),
-                    },
-                };
-                let (start, end, status) = match asked {
-                    None => (0, len.saturating_sub(1), StatusCode::OK),
-                    Some(Some((first, last))) => (first, last, StatusCode::PARTIAL_CONTENT),
-                    // A range this object cannot answer is 416, as HTTP says: a client that
-                    // asked for the rest of a blob it has all of gets no bytes.
-                    Some(None) => {
-                        let mut answer = empty(StatusCode::RANGE_NOT_SATISFIABLE);
-                        if let Ok(value) = HeaderValue::from_str(&format!("bytes */{len}")) {
-                            answer.headers_mut().insert(header::CONTENT_RANGE, value);
-                        }
-                        return Ok(answer);
-                    }
-                };
-                let count = if len == 0 { 0 } else { end - start + 1 };
-                file.seek(SeekFrom::Start(start))
-                    .await
-                    .map_err(|e| failed(&format!("reading {name}"), e))?;
-                let mut answer = HttpResponse::builder()
-                    .status(status)
+                Ok(HttpResponse::builder()
+                    .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/octet-stream")
-                    .header(header::ACCEPT_RANGES, "bytes")
-                    .header(header::CONTENT_LENGTH, count.to_string());
-                if object.kind != crate::blob::Kind::Packed {
-                    answer = answer.header(
-                        header::ETAG,
-                        format!("\"{}\"", hex(&object.digest.expect("a blob digest"))),
-                    );
-                }
-                if let Some(written) = written
-                    && let Ok(value) = HeaderValue::from_str(&written_ms(written).to_string())
-                {
-                    answer = answer.header(HeaderName::from_static(WRITTEN_MS), value);
-                }
-                if status == StatusCode::PARTIAL_CONTENT {
-                    answer =
-                        answer.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"));
-                }
-                let answer = answer.body(if *method == Method::HEAD {
-                    empty_body()
-                } else {
-                    file_body(file, count)
-                })?;
-                Ok(answer)
+                    .header(header::CONTENT_LENGTH, len.to_string())
+                    .header(header::ETAG, format!("\"{}\"", hex(&object.digest)))
+                    .body(file_body(tokio::fs::File::from_std(file), len))?)
             }
             Method::PUT => {
-                let (verification, written) = self.put_blob(&object, headers, body).await?;
+                let written = self.put_blob(&object, headers, body).await?;
                 let mut answer = empty(StatusCode::NO_CONTENT);
-                answer.headers_mut().insert(
-                    HeaderName::from_static("x-blaze-verified"),
-                    HeaderValue::from_static(match verification {
-                        Verification::Hashed => "hashed",
-                        Verification::Unpacked => "unpacked",
-                    }),
-                );
                 let said = if written { "written" } else { "already there" };
                 if let Ok(value) = HeaderValue::from_str(&format!("{name}: {said}")) {
                     answer.headers_mut().insert(HeaderName::from_static("x-blaze-blob"), value);
                 }
                 Ok(answer)
             }
-            Method::DELETE => {
-                let name = name.to_owned();
-                self.disk(move |store| store.delete(&name)).await?;
-                Ok(empty(StatusCode::NO_CONTENT))
-            }
-            _ => Err(method_not_allowed(method, "GET, HEAD, PUT, DELETE")),
+            _ => Err(method_not_allowed(method, "GET, PUT")),
         }
     }
 
@@ -443,7 +216,7 @@ impl Server {
         object: &ObjectName,
         headers: &hyper::HeaderMap,
         mut body: Incoming,
-    ) -> Result<(Verification, bool), Error> {
+    ) -> Result<bool, Error> {
         if let Some(len) = content_length(headers)
             && len > self.limits.blob
         {
@@ -494,6 +267,8 @@ impl Server {
     }
 
     /// `GET`, `HEAD`, `PUT`, `DELETE /v1/list/<name>`: a manifest or a project's units.
+    /// A unit's list. A list is written once: what a second writer would put names the same
+    /// keys, so its `PUT` answers 412 and the first stays.
     async fn list(
         &self,
         method: &Method,
@@ -501,92 +276,36 @@ impl Server {
         headers: &hyper::HeaderMap,
         body: Incoming,
     ) -> Result<HttpResponse<Body>, Error> {
-        let name = unescape_path(name)?;
-        let name = name.as_str();
         let object = ObjectName::parse(name)
             .ok_or_else(|| Error::not_found(format!("`{name}` is not an object of this cache")))?;
         if object.is_blob() {
             return Err(Error::not_found(format!("`{name}` is a blob, not a list")));
         }
+        let owned = object.name.clone();
         match *method {
-            Method::GET | Method::HEAD => {
-                let owned = name.to_owned();
+            Method::GET => {
                 let most = u64::from(self.limits.request);
-                let read = self
-                    .disk(move |store| {
-                        let bytes = store.read_small(&owned, most)?;
-                        let found = store.found(&owned)?;
-                        Ok((bytes, found))
-                    })
-                    .await?;
-                let (Some(bytes), found) = read else {
+                let read = self.disk(move |store| store.read_small(&owned, most)).await?;
+                let Some(bytes) = read else {
                     return Err(Error::not_found(format!("{name} is not here")));
                 };
-                let etag = hex(&sha256(&bytes));
-                let mut answer = HttpResponse::builder()
+                Ok(HttpResponse::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
                     .header(header::CONTENT_LENGTH, bytes.len().to_string())
-                    .header(header::ETAG, format!("\"{etag}\""));
-                if let Some(found) = found {
-                    answer = answer
-                        .header(header::LAST_MODIFIED, httpdate::fmt_http_date(found.written));
-                    answer = answer.header(WRITTEN_MS, written_ms(found.written).to_string());
-                }
-                let answer = answer.body(if *method == Method::HEAD {
-                    empty_body()
-                } else {
-                    full(bytes)
-                })?;
-                Ok(answer)
+                    .body(full(bytes))?)
             }
             Method::PUT => {
-                let condition = preconditions::parse(headers);
                 let bytes = self.read_whole(headers, body).await?;
-                let condition = condition?;
-                let owned = name.to_owned();
-                let wrote = self
-                    .disk(move |store| {
-                        let expect = match &condition {
-                            Condition::Any => Expect::Any,
-                            Condition::None => Expect::Absent,
-                            Condition::Match(tag) => Expect::Read(tag),
-                        };
-                        store.put_list(&owned, &bytes, expect)
-                    })
-                    .await?;
-                if !wrote {
-                    return Err(Error::new(
-                        ErrorCode::Conflict,
-                        format!("{name} was written by another since it was read"),
-                    ));
-                }
-                Ok(empty(StatusCode::NO_CONTENT))
+                let wrote = self.disk(move |store| store.put_list(&owned, &bytes)).await?;
+                Ok(empty(if wrote {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::PRECONDITION_FAILED
+                }))
             }
-            Method::DELETE => {
-                let name = name.to_owned();
-                self.disk(move |store| store.delete(&name)).await?;
-                Ok(empty(StatusCode::NO_CONTENT))
-            }
-            _ => Err(method_not_allowed(method, "GET, HEAD, PUT, DELETE")),
+            _ => Err(method_not_allowed(method, "GET, PUT")),
         }
-    }
-
-    /// A message of section 8: read whole, held to the request limit, and refused by the
-    /// validator when it is not canonical CBOR of the type the call names.
-    async fn message<T: Wire>(
-        &self,
-        headers: &hyper::HeaderMap,
-        body: Incoming,
-    ) -> Result<T, Error> {
-        let bytes = self.read_whole(headers, body).await?;
-        decode::<T>(&bytes, &self.limits).map_err(|error| {
-            Error::malformed(format!(
-                "the message is not {}: {}",
-                std::any::type_name::<T>(),
-                error.offence()
-            ))
-        })
     }
 
     async fn read_whole(
@@ -627,8 +346,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("listening on {}: {e}", config.listen))?;
     let local = listener.local_addr()?;
     println!(
-        "blaze-serve: serving {} on http://{local}, routes /v1, codec {VERSION}, no authentication",
-        server.store().dir().display()
+        "blaze-serve: serving {} on http://{local}, routes /v1, codec {}, no authentication",
+        server.store().dir().display(),
+        blaze_wire::VERSION
     );
     tokio::select! {
         done = serve_on(listener, server) => done,
@@ -649,7 +369,6 @@ pub async fn serve_on(listener: TcpListener, server: Arc<Server>) -> anyhow::Res
                 if let Err(error) = server.disk(move |store| store.sweep_temporaries(age)).await {
                     eprintln!("blaze-serve: staging janitor failed: {error}; service continues");
                 }
-                server.pages.expire(server.resources.snapshot_age);
             }
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
             accepted = accept(&listener, &server), if permits.available_permits() != 0 => {
@@ -788,14 +507,6 @@ fn empty(status: StatusCode) -> HttpResponse<Body> {
     HttpResponse::builder().status(status).body(empty_body()).expect("an empty answer")
 }
 
-fn cbor<T: Wire>(value: &T) -> HttpResponse<Body> {
-    HttpResponse::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/cbor")
-        .body(full(encode(value)))
-        .expect("a CBOR answer")
-}
-
 fn error_answer(error: &Error) -> HttpResponse<Body> {
     let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut answer = HttpResponse::builder()
@@ -815,81 +526,11 @@ fn method_not_allowed(method: &Method, allowed: &str) -> Error {
     Error::malformed(format!("{method} is not how this call is made: {allowed}"))
 }
 
-/// The digest a bare `/v1/blob/<sha256>` names, when the name is one.
-fn bare_digest(name: &str) -> Option<Digest> {
-    let mut digest = [0u8; 32];
-    if name.len() != 64
-        || !name.bytes().all(|it| it.is_ascii_digit() || (b'a'..=b'f').contains(&it))
-    {
-        return None;
-    }
-    for (byte, pair) in digest.iter_mut().zip(name.as_bytes().chunks(2)) {
-        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
-    }
-    Some(digest)
-}
-
 fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
     headers
         .get(header::CONTENT_LENGTH)
         .and_then(|it| it.to_str().ok())
         .and_then(|it| it.parse().ok())
-}
-
-/// Decode an object path without repairing malformed escapes or invalid UTF-8. Layout
-/// validation runs afterward and rejects decoded separators, dot paths and NUL bytes.
-fn unescape_path(text: &str) -> Result<String, Error> {
-    let mut bytes = text.bytes();
-    let mut out = Vec::with_capacity(text.len());
-    while let Some(byte) = bytes.next() {
-        if byte == b'%' {
-            let digit = |byte: u8| (byte as char).to_digit(16).map(|it| it as u8);
-            let high = bytes.next().and_then(digit);
-            let low = bytes.next().and_then(digit);
-            let (Some(high), Some(low)) = (high, low) else {
-                return Err(Error::malformed("invalid percent escape in object path"));
-            };
-            out.push((high << 4) | low);
-        } else {
-            out.push(byte);
-        }
-    }
-    String::from_utf8(out).map_err(|_| Error::malformed("object path is not UTF-8"))
-}
-
-/// A `%XX` in a query, as its byte.
-fn unescape(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        if bytes[at] == b'%' && at + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[at + 1..at + 3]).ok();
-            if let Some(byte) = hex.and_then(|it| u8::from_str_radix(it, 16).ok()) {
-                out.push(byte);
-                at += 3;
-                continue;
-            }
-        }
-        out.push(bytes[at]);
-        at += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn sha256(bytes: &[u8]) -> Digest {
-    Sha256::digest(bytes).into()
-}
-
-fn written_ms(at: SystemTime) -> u64 {
-    at.duration_since(UNIX_EPOCH).map_or(0, |it| it.as_millis() as u64)
-}
-
-/// The objects a listing answer holds, for a test.
-pub fn listed(answer: &[u8]) -> Result<Vec<(String, u64, u64)>, Error> {
-    let answer: crate::list::ObjectsAnswer =
-        decode(answer, &Limits::DOCUMENTED).map_err(|error| Error::malformed(error.offence()))?;
-    Ok(answer.objects.into_iter().map(|it| (it.name, it.len, it.written_ms)).collect())
 }
 
 #[cfg(test)]
@@ -972,64 +613,16 @@ mod tests {
         }
     }
 
-    fn hello_request() -> HelloRequest {
-        HelloRequest {
-            versions: Set::new(vec![VERSION]),
-            identity: blaze_wire::StoreIdentity([0; 32]),
-            platform: blaze_wire::ExecPlatform {
-                triple: "aarch64-apple-darwin".into(),
-                os: "macos".into(),
-                sdk: None,
-                libc: None,
-                linker: ("".into(), "".into(), [0; 32]),
-                cpu: "aarch64".into(),
-                cc: None,
-                cxx: None,
-                ar: None,
-                native_root: None,
-            },
-            role: 0,
-        }
-    }
-
-    #[tokio::test]
-    async fn http_hello_with_small_limits_preserves_collection_bounds() {
-        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
-            config.limits.request = 512;
-            // The collection ceiling must also fit ExecPlatform's ten-field map in hello.
-            config.limits.batch_items = 16;
-            config.limits.lookup_items = 8;
-            config
-        })
-        .await;
-        let mut hello = hello_request();
-        let (status, _, body) = run.request("POST", "/v1/hello", "", &encode(&hello)).await;
-        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-        let answer: HelloAnswer = decode(&body, run.server.limits()).unwrap();
-        assert_eq!(answer.limits, *run.server.limits());
-
-        hello.versions = Set::new((0..=answer.limits.batch_items).collect());
-        let (status, _, body) = run.request("POST", "/v1/hello", "", &encode(&hello)).await;
-        assert_eq!(status, 400);
-        let error: blaze_wire::WireError = decode(&body, &Limits::DOCUMENTED).unwrap();
-        assert!(error.message.contains("oversize item"));
-
-        for count in [8u32, 9] {
-            let request = CacheMissingRequest {
-                blobs: Set::new((0..count).map(|at| sha256(&at.to_le_bytes())).collect()),
-            };
-            let (status, _, body) =
-                run.request("POST", "/v1/cache/missing", "", &encode(&request)).await;
-            if count == 8 {
-                assert_eq!(status, 200);
-                let answer: CacheMissingAnswer = decode(&body, run.server.limits()).unwrap();
-                assert_eq!(answer.missing, request.blobs);
-            } else {
-                assert_eq!(status, 400);
-                let error: blaze_wire::WireError = decode(&body, &Limits::DOCUMENTED).unwrap();
-                assert!(error.message.contains("oversize item"));
-            }
-        }
+    /// Bytes the server takes as a pack, with the digest that names them.
+    fn pack(rest: &[u8]) -> (Vec<u8>, String) {
+        let mut bytes = blaze_wire::DIST_PACK_MAGIC.to_vec();
+        bytes.extend_from_slice(rest);
+        let name = {
+            use sha2::Digest as _;
+            let digest: blaze_wire::Digest = sha2::Sha256::digest(&bytes).into();
+            hex(&digest)
+        };
+        (bytes, name)
     }
 
     #[tokio::test]
@@ -1039,7 +632,8 @@ mod tests {
             config
         })
         .await;
-        let name = format!("units/{}", hex(&sha256(b"complete")));
+        let (_, digest) = pack(b"complete");
+        let name = format!("packs/{digest}.pack");
         let mut idle = TcpStream::connect(("127.0.0.1", run.port)).await.unwrap();
         idle.write_all(
             format!(
@@ -1049,7 +643,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let directory = run.server.store().dir().join("units");
+        let directory = run.server.store().dir().join("packs");
         for _ in 0..100 {
             if std::fs::read_dir(&directory).unwrap().count() != 0 {
                 break;
@@ -1065,7 +659,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(run.server.store().found(&name).unwrap().is_none());
+        assert!(run.server.store().open_blob(&name).unwrap().is_none());
         assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
     }
 
@@ -1103,13 +697,12 @@ mod tests {
         let stale = server.store().dir().join("manifests/.default.123-456-3.tmp");
         std::fs::write(&stale, b"incomplete").unwrap();
         drop(server);
-        let run = Running::with_config(dir, |mut config| {
+        let _run = Running::with_config(dir, |mut config| {
             config.resources.sweep_every = Duration::from_millis(20);
             config.resources.temporary_age = Duration::ZERO;
             config
         })
         .await;
-        assert!(run.server.store().list("manifests/").unwrap().is_empty());
         tokio::time::timeout(Duration::from_secs(2), async {
             while stale.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await
@@ -1145,7 +738,8 @@ mod tests {
         })
         .await;
         let bytes = vec![b'x'; 16 << 20];
-        let name = format!("units/{}", hex(&sha256(&bytes)));
+        let (bytes, digest) = pack(&bytes);
+        let name = format!("packs/{digest}.pack");
         run.server.store().put_blob(&name, &bytes).unwrap();
         let mut stalled = TcpStream::connect(("127.0.0.1", run.port)).await.unwrap();
         socket2::SockRef::from(&stalled).set_recv_buffer_size(4096).unwrap();
@@ -1158,7 +752,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         // With one permit, this response cannot arrive until the blocked writer expires.
         assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
-        assert!(run.server.store().found(&name).unwrap().is_some());
+        assert!(run.server.store().open_blob(&name).unwrap().is_some());
         drop(stalled);
     }
 
@@ -1202,260 +796,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_listing_cursors_fail_without_silently_restarting_the_snapshot() {
-        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
-            config.resources.snapshot_age = Duration::from_millis(50);
-            config
-        })
-        .await;
-        for name in ["manifests/a", "manifests/b"] {
-            run.server.store().put_list(name, b"\n", Expect::Any).unwrap();
-        }
-        let (status, headers, _) = run
-            .request(
-                "GET",
-                "/v1/objects?prefix=manifests/&limit=1",
-                "X-Blaze-Listing-Version: 1\r\n",
-                &[],
-            )
-            .await;
-        assert_eq!(status, 200);
-        let cursor = headers
-            .lines()
-            .find_map(|it| it.strip_prefix("x-blaze-listing-next: "))
-            .unwrap()
-            .to_owned();
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        assert_eq!(
-            run.request(
-                "GET",
-                &format!("/v1/objects?prefix=manifests/&cursor={cursor}"),
-                "X-Blaze-Listing-Version: 1\r\n",
-                &[],
-            )
-            .await
-            .0,
-            409
-        );
-        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
-    }
-
-    #[tokio::test]
-    async fn failed_listing_pages_release_their_snapshot_slots() {
-        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
-            config.resources.connections = 1;
-            config.limits.request = 100;
-            config
-        })
-        .await;
-        let long_name = format!("manifests/z{}", "x".repeat(150));
-        for name in ["manifests/a", "deps/a", "deps/b", &long_name] {
-            run.server.store().put_list(name, b"\n", Expect::Any).unwrap();
-        }
-        let header = "X-Blaze-Listing-Version: 1\r\n";
-        // Failure on a new listing must not occupy the only snapshot slot.
-        for _ in 0..2 {
-            assert_eq!(
-                run.request("GET", "/v1/objects?prefix=manifests/z", header, &[]).await.0,
-                413
-            );
-        }
-        let (status, headers, _) =
-            run.request("GET", "/v1/objects?prefix=manifests/&limit=1", header, &[]).await;
-        assert_eq!(status, 200);
-        let cursor =
-            headers.lines().find_map(|it| it.strip_prefix("x-blaze-listing-next: ")).unwrap();
-        // Failure while following an issued cursor must release that lease as well.
-        assert_eq!(
-            run.request(
-                "GET",
-                &format!("/v1/objects?prefix=manifests/&cursor={cursor}"),
-                header,
-                &[],
-            )
-            .await
-            .0,
-            413
-        );
-        let (status, headers, _) =
-            run.request("GET", "/v1/objects?prefix=deps/&limit=1", header, &[]).await;
-        assert_eq!(status, 200);
-        assert!(headers.contains("x-blaze-listing-next:"));
-    }
-
-    #[tokio::test]
-    async fn escaped_project_names_round_trip_through_http_and_listings() {
-        let run = Running::start().await;
-        for (encoded, name) in [
-            ("hello%20world", "hello world"),
-            ("percent%252Fname", "percent%2Fname"),
-            ("caf%C3%A9%3F%23", "café?#"),
-        ] {
-            let path = format!("/v1/list/manifests/{encoded}");
-            assert_eq!(run.request("PUT", &path, "", b"contents\n").await.0, 204);
-            let object = format!("manifests/{name}");
-            assert_eq!(
-                run.server.store().read_small(&object, 100).unwrap(),
-                Some(b"contents\n".to_vec())
-            );
-            let (_, _, listing) = run
-                .request(
-                    "GET",
-                    "/v1/objects?prefix=manifests/",
-                    "X-Blaze-Listing-Version: 1\r\n",
-                    &[],
-                )
-                .await;
-            assert!(listed(&listing).unwrap().iter().any(|(listed, _, _)| listed == &object));
-            let (status, _, bytes) = run.request("GET", &path, "", &[]).await;
-            assert_eq!((status, bytes), (200, b"contents\n".to_vec()));
-            assert_eq!(run.request("DELETE", &path, "", &[]).await.0, 204);
-            assert!(run.server.store().read_small(&object, 100).unwrap().is_none());
-        }
-        assert!(run.server.store().list("manifests/").unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn malformed_and_traversing_object_paths_are_not_published() {
         let run = Running::start().await;
-        let valid = "manifests/replacement-�";
-        run.server.store().put_list(valid, b"original\n", Expect::Any).unwrap();
-        // Lossy UTF-8 decoding must not turn an invalid path into a valid object's name.
-        assert_eq!(
-            run.request("PUT", "/v1/list/manifests/replacement-%FF", "", b"replacement\n").await.0,
-            400
-        );
-        assert_eq!(
-            run.server.store().read_small(valid, 100).unwrap(),
-            Some(b"original\n".to_vec())
-        );
-        for name in ["%", "%2", "%GG", "%ff", "%00", "a%2Fb", "a%5Cb", "%2e%2e"] {
+        for name in ["%", "%2", "%GG", "%ff", "%00", "a%2Fb", "a%5Cb", "%2e%2e", "default"] {
             let (status, _, _) = run
                 .request("PUT", &format!("/v1/list/manifests/{name}"), "", b"must not appear\n")
                 .await;
-            assert!(matches!(status, 400 | 404), "{name}: {status}");
+            assert_eq!(status, 404, "{name}: {status}");
         }
-        assert_eq!(run.server.store().list("manifests/").unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_dir(run.server.store().dir().join("manifests")).unwrap().count(),
+            0
+        );
     }
 
     #[tokio::test]
-    async fn http_put_get_head_ranges_and_wrong_digest() {
+    async fn http_put_get_and_wrong_digest() {
         let run = Running::start().await;
-        let bytes = b"0123456789";
-        let name = hex(&sha256(bytes));
-        let path = format!("/v1/blob/{name}");
-        assert_eq!(run.request("PUT", &path, "", bytes).await.0, 204);
+        let (bytes, name) = pack(b"0123456789");
+        let path = format!("/v1/blob/packs/{name}.pack");
+        assert_eq!(run.request("PUT", &path, "", &bytes).await.0, 204);
         let (status, head, body) = run.request("GET", &path, "", &[]).await;
-        assert_eq!((status, body), (200, bytes.to_vec()));
+        assert_eq!((status, body), (200, bytes.clone()));
         assert!(head.contains(&format!("etag: \"{name}\"")));
-        let (status, head, body) = run.request("HEAD", &path, "", &[]).await;
-        assert_eq!((status, body), (200, Vec::new()));
-        assert!(head.contains("content-length: 10"));
-        for (range, expected, content) in [
-            ("bytes=2-4", &bytes[2..5], "bytes 2-4/10"),
-            ("bytes=-3", &bytes[7..], "bytes 7-9/10"),
-            ("bytes=8-", &bytes[8..], "bytes 8-9/10"),
-        ] {
-            let (status, head, body) =
-                run.request("GET", &path, &format!("Range: {range}\r\n"), &[]).await;
-            assert_eq!((status, body), (206, expected.to_vec()));
-            assert!(head.contains(content));
-        }
-        for range in ["bytes=10-", "bytes=9-2", "bytes=-0", "bytes=a-b"] {
-            let (status, head, _) =
-                run.request("GET", &path, &format!("Range: {range}\r\n"), &[]).await;
-            assert_eq!(status, 416);
-            assert!(head.contains("bytes */10"));
-        }
-        let wrong = format!("/v1/blob/units/{}", hex(&[1; 32]));
-        assert_eq!(run.request("PUT", &wrong, "", bytes).await.0, 422);
+        let wrong = format!("/v1/blob/packs/{}.pack", hex(&[1; 32]));
+        assert_eq!(run.request("PUT", &wrong, "", &bytes).await.0, 422);
         assert_eq!(run.request("GET", &wrong, "", &[]).await.0, 404);
-    }
-
-    #[tokio::test]
-    async fn http_missing_and_version_limits() {
-        let run = Running::start().await;
-        for count in [0, 1, 4096] {
-            let blobs = Set::new((0..count).map(|at: u32| sha256(&at.to_le_bytes())).collect());
-            let request = CacheMissingRequest { blobs: blobs.clone() };
-            let (status, _, body) = run
-                .request(
-                    "POST",
-                    "/v1/cache/missing",
-                    "Content-Type: application/cbor\r\n",
-                    &encode(&request),
-                )
-                .await;
-            assert_eq!(status, 200);
-            let answer: CacheMissingAnswer = decode(&body, &Limits::DOCUMENTED).unwrap();
-            assert_eq!(answer.missing, blobs);
+        let (unframed, name) = (b"not a pack".to_vec(), hex(&[2; 32]));
+        let path = format!("/v1/blob/packs/{name}.pack");
+        assert_eq!(run.request("PUT", &path, "", &unframed).await.0, 422);
+        for gone in ["/v1/hello", "/v1/cache/missing", "/v1/objects?prefix=packs/"] {
+            assert_eq!(run.request("POST", gone, "", &[]).await.0, 404, "{gone}");
         }
-        let request = CacheMissingRequest {
-            blobs: Set::new((0..4097u32).map(|at| sha256(&at.to_le_bytes())).collect()),
-        };
-        assert_ne!(run.request("POST", "/v1/cache/missing", "", &encode(&request)).await.0, 200);
-        let hello = hello_request();
-        let (status, _, body) = run.request("POST", "/v1/hello", "", &encode(&hello)).await;
-        assert_eq!(status, 200);
-        let answer: HelloAnswer = decode(&body, &Limits::DOCUMENTED).unwrap();
-        assert_eq!(answer.version, VERSION);
-        assert_eq!(answer.limits.batch_items, 65_536);
-        assert_eq!(answer.limits.lookup_items, 4096);
-        let mut hello = hello;
-        hello.versions = Set::new(vec![VERSION + 1]);
-        assert_eq!(run.request("POST", "/v1/hello", "", &encode(&hello)).await.0, 400);
+        assert_eq!(
+            run.request("DELETE", &format!("/v1/blob/packs/{name}.pack"), "", &[]).await.0,
+            405
+        );
     }
 
     #[tokio::test]
-    async fn http_list_etag_concurrent_publication_and_traversal() {
+    async fn http_list_is_written_once_and_a_second_writer_is_told() {
         let run = Running::start().await;
-        let path = "/v1/list/manifests/default";
-        assert_eq!(run.request("PUT", path, "If-None-Match: *\r\n", b"first\n").await.0, 204);
-        let (status, head, _) = run.request("GET", path, "", &[]).await;
-        assert_eq!(status, 200);
-        let etag = head.lines().find_map(|it| it.strip_prefix("etag: ")).unwrap();
-        let condition = format!("If-Match: {etag}\r\n");
+        let path = format!("/v1/list/manifests/{}", hex(&[7; 32]));
         let (a, b) = tokio::join!(
-            run.request("PUT", path, &condition, b"second\n"),
-            run.request("PUT", path, &condition, b"third\n"),
+            run.request("PUT", &path, "", b"first\n"),
+            run.request("PUT", &path, "", b"second\n"),
         );
         let mut statuses = [a.0, b.0];
         statuses.sort();
-        assert_eq!(statuses, [204, 409]);
+        assert_eq!(statuses, [204, 412]);
+        let (status, _, body) = run.request("GET", &path, "", &[]).await;
+        assert_eq!(status, 200);
+        assert!(body == b"first\n" || body == b"second\n");
         for path in [
             "/v1/blob/packs/../key",
             "/v1/list/manifests/../key",
             "/v1/list/manifests/%2e%2e%2fkey",
-            "/v1/objects?prefix=../",
-            "/v1/objects?prefix=%2Fetc",
         ] {
             assert_ne!(run.request("GET", path, "", &[]).await.0, 200, "{path}");
         }
     }
 
     #[tokio::test]
-    async fn unsupported_conditions_never_overwrite_a_list() {
-        let run = Running::start().await;
-        let path = "/v1/list/manifests/default";
-        let original = b"original\n";
-        assert_eq!(run.request("PUT", path, "", original).await.0, 204);
-        for headers in [
-            "If-None-Match: \"existing\"\r\n",
-            "If-Match: unquoted\r\n",
-            "If-Match: W/\"existing\"\r\n",
-            "If-Match: \"one\"\r\nIf-Match: \"two\"\r\n",
-            "If-Match: \"one\"\r\nIf-None-Match: *\r\n",
-        ] {
-            assert_eq!(run.request("PUT", path, headers, b"replacement\n").await.0, 400);
-            let (status, _, bytes) = run.request("GET", path, "", &[]).await;
-            assert_eq!((status, bytes), (200, original.to_vec()));
-        }
-    }
-
-    #[tokio::test]
     async fn a_short_http_upload_is_not_published_and_leaves_no_temporary() {
         let run = Running::start().await;
-        let name = format!("units/{}", hex(&sha256(b"complete")));
+        let (_, digest) = pack(b"complete");
+        let name = format!("packs/{digest}.pack");
         let mut stream = TcpStream::connect(("127.0.0.1", run.port)).await.unwrap();
         let request = format!(
             "PUT /v1/blob/{name} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\ncut"
@@ -1467,12 +873,12 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(2), stream.read_to_end(&mut out))
                 .await;
         for _ in 0..100 {
-            if std::fs::read_dir(run.server.store().dir().join("units")).unwrap().count() == 0 {
+            if std::fs::read_dir(run.server.store().dir().join("packs")).unwrap().count() == 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(run.server.store().found(&name).unwrap().is_none());
-        assert_eq!(std::fs::read_dir(run.server.store().dir().join("units")).unwrap().count(), 0);
+        assert!(run.server.store().open_blob(&name).unwrap().is_none());
+        assert_eq!(std::fs::read_dir(run.server.store().dir().join("packs")).unwrap().count(), 0);
     }
 }

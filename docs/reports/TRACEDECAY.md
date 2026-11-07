@@ -1,3 +1,8 @@
+---
+status: record
+summary: blaze on tracedecay under V1, measured against cargo.
+date: 2026-10-24
+---
 # blaze on tracedecay, measured against cargo
 
 Units u1 and u1b measured whether blaze could build, rebuild and test tracedecay's
@@ -60,7 +65,7 @@ of item 7.
 | Every run | `RUST_BACKTRACE=0`, `--locked`, its own target directory, its own blaze daemon directory and store |
 | Guard (u1b's runs only) | `RA_JIT_MEMORY_MAX=16G`, `RA_JIT_OWN_BASE_MEMORY=12G`, `RA_JIT_SPARE=0`, and the harness watchdog (below). u1's runs had none of these: the daemon's ceiling was the default 24,576 MB |
 
-Everything is driven by [`harness/tracedecay.py`](../../harness/tracedecay.py), which records
+Everything is driven by `harness/tracedecay.py`, which records
 one line of JSON per run. `harness/tracedecay.py --help` says how. Sizes are in MB and GB of 1,024
 MB, as `top`, `footprint` and `blaze status` count them; the Mac has 48 GB of memory in that sense.
 

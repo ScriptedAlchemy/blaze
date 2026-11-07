@@ -1,3 +1,8 @@
+---
+status: record
+summary: Holders of a loading worker's memory: one V1 run of unit u7.
+date: 2026-10-25
+---
 # u7-bound, run A3: what holds the memory as a governed cold tracedecay worker nears its bound
 
 Profiles of run A3 (`--prof`, `lg_prof_sample:18`, one every 2 GB of live heap), folded with `heapfold.py` and grouped by `loadmem_holders.py`. MB sampled. The last is 14,563 MB live, shortly before the worker stopped itself at 16,387 MB footprint (docs/reports/LOADMEM.md, section 8).

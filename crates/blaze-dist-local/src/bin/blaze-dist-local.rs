@@ -1,4 +1,4 @@
-//! Local transport operator/test client; no compiler or automatic fallback command.
+//! The coordinator of a machine's daemons, over the local transport. It compiles nothing.
 
 use std::io::{self, BufRead};
 use std::path::Path;
@@ -9,40 +9,31 @@ use std::sync::{
 
 use blaze_dist::admission::{Admission, AdmissionConfig};
 use blaze_dist::jobs::{ExecutionConfig, Jobs};
-use blaze_dist_local::client::Client;
 use blaze_dist_local::coordinator::Config;
-use blaze_dist_local::protocol::Command;
-use blaze_dist_local::server::{MonotonicClock, Server, random_id};
-use blaze_wire::{Limits, decode, encode};
+use blaze_dist_local::server::{MonotonicClock, Server};
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex(text: &str) -> Result<Vec<u8>, String> {
-    if !text.len().is_multiple_of(2) {
-        return Err("odd hex length".to_owned());
-    }
-    text.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let s = std::str::from_utf8(pair).map_err(|_| "hex UTF8")?;
-            u8::from_str_radix(s, 16).map_err(|_| "invalid hex".to_owned())
-        })
-        .collect()
-}
+const USAGE: &str = "usage: blaze-dist-local coordinate SOCKET TRIPLE EXECUTORS [LEASE_MS]";
 
 /// The coordinator a machine's daemons build through: `EXECUTORS` builders of one host triple,
 /// each of the daemons' units one execution, until stdin closes or says `stop`. Its bounds are
-/// a whole build's: the carrier's defaults are one client's.
+/// a whole build's: the carrier's defaults are one client's. `LEASE_MS` is how long a holder may
+/// be silent before its lease ends. What fences a holder or moves an attempt goes to stdout, one
+/// line each, for the person or the harness reading what happened.
 fn coordinate(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Error>> {
-    let [path, triple, executors] = args else {
-        return Err("usage: blaze-dist-local coordinate SOCKET TRIPLE EXECUTORS".into());
+    let (path, triple, executors, lease) = match args {
+        [path, triple, executors] => (path, triple, executors, None),
+        [path, triple, executors, lease] => (path, triple, executors, Some(lease)),
+        _ => return Err(USAGE.into()),
     };
     let (triple, executors): (&str, u32) = (
         triple.to_str().ok_or("TRIPLE is not text")?,
         executors.to_str().ok_or("EXECUTORS is not text")?.parse()?,
     );
+    let defaults = blaze_dist::work::WorkConfig::default();
+    let lease_ms = match lease {
+        Some(it) => it.to_str().ok_or("LEASE_MS is not text")?.parse()?,
+        None => defaults.lease_ms,
+    };
     let need = blaze_dist_local::agent::NEED;
     let mut admission = Admission::new(AdmissionConfig {
         queue_limit: 1 << 16,
@@ -64,7 +55,7 @@ fn coordinate(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Err
     let jobs = Jobs::new(
         admission,
         ExecutionConfig {
-            work: blaze_dist::work::WorkConfig { grant_roots: 64, ..Default::default() },
+            work: blaze_dist::work::WorkConfig { grant_roots: 64, lease_ms, ..defaults },
             ..Default::default()
         },
     );
@@ -94,87 +85,42 @@ fn coordinate(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Err
             ..Config::default()
         },
         Arc::new(MonotonicClock::default()),
-        |_: Vec<(blaze_wire::ExecutionId, blaze_dist::jobs::Effect)>| {},
+        |effects: Vec<(blaze_wire::ExecutionId, blaze_dist::jobs::Effect)>| {
+            for (execution, effect) in effects {
+                report(execution, &effect);
+            }
+        },
     )?;
     println!("ready {}", Path::new(path).display());
     server.run(stop)?;
     Ok(())
 }
 
+/// One line for what took work back from a holder. Everything else is the ordinary run.
+fn report(execution: blaze_wire::ExecutionId, effect: &blaze_dist::jobs::Effect) {
+    use blaze_dist::jobs::Effect;
+    use blaze_dist::work::Effect as Work;
+    let what = match effect {
+        Effect::NeedLead => "lead-lost".to_owned(),
+        Effect::Kill { executor, assignment } => {
+            format!("kill {executor} attempt {}", assignment.attempt.0)
+        }
+        Effect::Work(Work::Refused { holder, refusal }) => format!("refused {holder}: {refusal:?}"),
+        Effect::Work(Work::HolderLost { holder, .. }) => format!("holder-lost {holder}"),
+        Effect::Work(Work::Fenced { holder, generation, .. }) => {
+            format!("fenced {holder} generation {generation}")
+        }
+        _ => return,
+    };
+    println!("execution {}: {what}", execution.0);
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().collect();
-    if args.get(1).and_then(|it| it.to_str()) == Some("coordinate") {
-        return coordinate(&args[2..]);
+    if args.get(1).and_then(|it| it.to_str()) != Some("coordinate") {
+        return Err(USAGE.into());
     }
-    if args.len() != 3 {
-        return Err(
-            "usage: blaze-dist-local serve|hello|client SOCKET, or coordinate SOCKET TRIPLE EXECUTORS".into()
-        );
-    }
-    let path = Path::new(&args[2]);
-    match args[1].to_str() {
-        Some("serve") => {
-            // No configured worker => no fabricated availability/completion. An embedding
-            // agent configures admission and supplies an actual holder callback instead.
-            let jobs =
-                Jobs::new(Admission::new(AdmissionConfig::default()), ExecutionConfig::default());
-            let stop = Arc::new(AtomicBool::new(false));
-            let signal = stop.clone();
-            std::thread::spawn(move || {
-                for line in io::stdin().lock().lines() {
-                    if line.is_ok_and(|line| line == "stop") {
-                        signal.store(true, Ordering::Release);
-                        return;
-                    }
-                }
-                signal.store(true, Ordering::Release);
-            });
-            let server = Server::bind(
-                path,
-                jobs,
-                Config::default(),
-                Arc::new(MonotonicClock::default()),
-                |effects: Vec<(blaze_wire::ExecutionId, blaze_dist::jobs::Effect)>| {
-                    if !effects.is_empty() {
-                        eprintln!("holder callback: {effects:?}");
-                    }
-                },
-            )?;
-            println!("ready {}", path.display());
-            server.run(stop)?;
-        }
-        Some("hello") => {
-            let mut client = Client::connect(path, random_id()?)?;
-            println!("{}", hex(&encode(&client.welcome)));
-            // The daemon issued this lifetime; give it back so repeated `hello` runs do not
-            // consume the fixed lifetime of the daemon and exhaust live capacity.
-            client.release()?;
-        }
-        Some("client") => {
-            let mut client = Client::connect(path, random_id()?)?;
-            println!("welcome {}", hex(&encode(&client.welcome)));
-            let mut failed = None;
-            for line in io::stdin().lock().lines() {
-                let bytes = unhex(line?.trim())?;
-                let command: Command = decode(&bytes, &Limits::DOCUMENTED)?;
-                match client.call(command) {
-                    Ok(answer) => println!("{}", hex(&encode(&answer))),
-                    Err(error) => {
-                        failed = Some(error);
-                        break;
-                    }
-                }
-            }
-            // Release only a clean lifetime: a pending request stays pending so its exact
-            // bytes are never migrated into a new session, and the error is reported.
-            match failed {
-                Some(error) => return Err(error.into()),
-                None => client.release()?,
-            }
-        }
-        _ => return Err("unknown local transport mode".into()),
-    }
-    Ok(())
+    coordinate(&args[2..])
 }
 
 fn main() {

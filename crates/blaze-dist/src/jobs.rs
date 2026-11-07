@@ -1,11 +1,11 @@
-//! Executions of jobs, as section 4's "Warm remote jobs" and unit E3 describe them.
+//! Executions of jobs (docs/distributed.md).
 //!
-//! A job's content (`JobContent`, its `BuildSpec` and namespace) has at most one running
+//! A job's content (`JobContent`: its unit, platform and namespace) has at most one running
 //! execution: an equal request joins it as another subscriber. Each subscriber has its own
 //! deadline and `LocalPolicy`; the execution runs until its latest live subscriber's deadline,
 //! and ends when its last subscriber leaves. A lead that misses three heartbeats loses the job:
 //! it is reassigned once with a new `Attempt`, and the dead attempt's late events and work
-//! calls are refused; a second loss ends it `Lost`. The work set of section 4 lives inside the
+//! calls are refused; a second loss ends it `Lost`. The work set lives inside the
 //! execution, so a reassignment fences its leases in the same transition.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +16,7 @@ use blaze_wire::job_terminal_v2::{
 use blaze_wire::{
     AssignedEvent, Attempt, BatchResult, Digest, DoneEvent, EventItem, ExecutionId, JobAnswer,
     JobContent, JobContentInput, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome, PackRef,
-    Reservation, SourceRef, Stage, StageEvent, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
+    Reservation, Stage, StageEvent, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
     WorkLeaseRequest, WorkResultAnswer, WorkersEventsAnswer, WorkersEventsRequest,
 };
 
@@ -46,7 +46,7 @@ pub enum CompletionMode {
     WorkProtocol,
     /// Admission established that no compile work is required (for example verified cached
     /// artifacts or an already-built test shard). The lead still reports the final verdict.
-    /// This is a driver decision, not a worker claim or inference from an empty BuildSpec.
+    /// This is a driver decision, not a worker claim or inference from an empty unit.
     NoCompileWork,
 }
 
@@ -70,8 +70,6 @@ pub struct Subscriber {
     pub deadline_ms: u64,
     /// What it does when the remote build does not answer in time.
     pub policy: LocalPolicy,
-    /// Its test timeout.
-    pub test_timeout_ms: Option<u64>,
     /// Where it is.
     pub state: SubscriberState,
 }
@@ -715,8 +713,8 @@ impl Execution {
     }
 }
 
-/// What a requester does when its subscription ends, by its `LocalPolicy`: section 4's
-/// "Failure" paragraph, the client's side of it.
+/// What a requester does when its subscription ends, by its `LocalPolicy`: the client's
+/// side of a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalAction {
     /// Take the remote outcome.
@@ -729,8 +727,7 @@ pub enum LocalAction {
 
 /// The action for a versioned, classified terminal delivery under `policy`. `Passed`, `Failed`
 /// and `Refused` are taken as verdicts; other outcomes fail under `Never` and build locally
-/// under `Fallback`. `Race` was building locally from the start, and the first verdict wins,
-/// a build error or failed test included.
+/// under `Fallback`.
 ///
 /// Unknown versions or inconsistent outcome/reason pairs are refused, never guessed from
 /// the v1 stream. `NoLead` is delivered as `Lost` in both v1 and v2, with its explicit reason
@@ -755,18 +752,10 @@ pub fn local_action(policy: &LocalPolicy, remote: &TerminationV2) -> Result<Loca
                 LocalAction::BuildLocally
             }
         }
-        LocalPolicy::Race => {
-            if verdict {
-                LocalAction::Take
-            } else {
-                // The local build is already running; the race is its to win.
-                LocalAction::BuildLocally
-            }
-        }
     })
 }
 
-/// The server's executions: one per running `JobContent`, admitted in section 5's order.
+/// The server's executions: one per running `JobContent`, admitted in admission's order.
 #[derive(Clone, Debug)]
 pub struct Jobs {
     config: ExecutionConfig,
@@ -782,10 +771,13 @@ pub struct Jobs {
 
 #[derive(Clone, Debug)]
 struct PrJobs {
-    /// The source of the most recently submitted revision; platforms and profiles may differ.
-    source: SourceRef,
+    /// The source of the most recently pushed revision. Every unit of its build names it.
+    source: Digest,
+    /// The sources it replaced: a unit of one of them is refused. A build is many jobs, so
+    /// two revisions' builds overlap, and the older one's next unit is not a newer push.
+    superseded: BTreeSet<Digest>,
     /// Live executions of this pull request, including older revisions kept by subscribers.
-    executions: BTreeMap<ExecutionId, SourceRef>,
+    executions: BTreeMap<ExecutionId, Digest>,
 }
 
 impl Jobs {
@@ -870,13 +862,7 @@ impl Jobs {
             return Err(Refusal::NoExecution);
         }
         let id = self.next_subscriber;
-        e.subscribe(Subscriber {
-            id,
-            deadline_ms,
-            policy,
-            test_timeout_ms: None,
-            state: SubscriberState::Attached,
-        })?;
+        e.subscribe(Subscriber { id, deadline_ms, policy, state: SubscriberState::Attached })?;
         self.next_subscriber += 1;
         Ok(JobAnswer { content, execution, subscriber: id })
     }
@@ -986,10 +972,11 @@ impl Jobs {
         Ok(report.done.then(|| report.packs.into_iter().collect()))
     }
 
-    /// `POST /v1/jobs`, with the reservation the server measured for its lead. An equal
+    /// Submits a job, with the reservation the server measured for its lead. An equal
     /// `JobContent` running already is joined, not started again. A pull request's new push
-    /// cancels earlier-source executions when nothing else subscribes to them. Platform,
-    /// command and profile variants of the same source run together.
+    /// cancels earlier-source executions when nothing else subscribes to them; units and
+    /// platforms of the same source run together, and a unit of a source the pull request
+    /// already replaced is refused ([`Refusal::Superseded`]).
     pub fn submit(
         &mut self,
         now: Millis,
@@ -1000,15 +987,20 @@ impl Jobs {
         // Coalescing is only for live executions. Expire prior subscribers before a new
         // deadline can extend their execution, even when the driver's timer has not run.
         self.tick(now, out);
+        if let Namespace::Pr(pr) = &req.namespace
+            && self.pr_jobs.get(&pr.n).is_some_and(|jobs| jobs.superseded.contains(&req.source))
+        {
+            return Err((Refusal::Superseded, None));
+        }
         let content = JobContent::of(&JobContentInput {
-            spec: blaze_wire::digest_of(&req.spec),
+            unit: req.unit,
+            platform: req.platform,
             namespace: req.namespace.clone(),
         });
         let subscriber = Subscriber {
             id: self.next_subscriber,
             deadline_ms: req.deadline_ms,
             policy: req.local.clone(),
-            test_timeout_ms: req.test_timeout_ms,
             state: SubscriberState::Attached,
         };
         if let Some(&id) = self.running.get(&content) {
@@ -1018,13 +1010,14 @@ impl Jobs {
                 .subscribe(subscriber)
                 .map_err(|r| (r, None))?;
             self.next_subscriber += 1;
+            self.pr_submitted(now, req, id, out);
             return Ok(JobAnswer { content, execution: id, subscriber: self.next_subscriber - 1 });
         }
         let id = ExecutionId(self.next_execution);
         let waiting = Waiting {
             execution: id,
             namespace: req.namespace.clone(),
-            platform: req.spec.platform,
+            platform: req.platform,
             need: need.clone(),
             at: now,
         };
@@ -1044,7 +1037,7 @@ impl Jobs {
         out.extend(log.into_iter().map(|e| (id, e)));
         self.executions.insert(id, execution);
         self.running.insert(content, id);
-        self.platforms.insert(id, (req.spec.platform, need));
+        self.platforms.insert(id, (req.platform, need));
         self.pr_submitted(now, req, id, out);
         Ok(JobAnswer { content, execution: id, subscriber: subscriber.id })
     }
@@ -1058,18 +1051,22 @@ impl Jobs {
     ) {
         let Namespace::Pr(pr) = &req.namespace else { return };
         let jobs = self.pr_jobs.entry(pr.n).or_insert_with(|| PrJobs {
-            source: req.spec.source.clone(),
+            source: req.source,
+            superseded: BTreeSet::new(),
             executions: BTreeMap::new(),
         });
-        jobs.executions.insert(id, req.spec.source.clone());
-        if jobs.source == req.spec.source {
+        // A joined execution is the source's that last asked for it: its older subscriber may
+        // leave, and that must not make it look like an obsolete job of the older revision.
+        jobs.executions.insert(id, req.source);
+        if jobs.source == req.source {
             return;
         }
-        jobs.source = req.spec.source.clone();
+        jobs.superseded.insert(jobs.source);
+        jobs.source = req.source;
         let previous: Vec<_> = jobs
             .executions
             .iter()
-            .filter(|(_, source)| **source != req.spec.source)
+            .filter(|(_, source)| **source != req.source)
             .map(|(&id, _)| id)
             .collect();
         for previous in previous {
@@ -1170,7 +1167,7 @@ impl Jobs {
     }
 
     /// Offer idle executors to running executions as helpers of their current attempt:
-    /// section 4's claim that one build's batches are granted from one work set to every
+    /// the claim that one build's batches are granted from one work set to every
     /// executor that joined it. Non-blocking, as `add_helper` is: a lead never waits for
     /// a helper, and an execution whose compile phase is done takes none. While a job
     /// waits for a lead on the same platform, idle executors stay leads-in-waiting, so
@@ -1316,44 +1313,16 @@ impl Jobs {
 mod retention_tests {
     use super::*;
     use crate::admission::AdmissionConfig;
-    use blaze_wire::{
-        BuildSpec, Command, PrNamespace, ProfileSpec, RootRef, Set, SourcePath, StoreIdentity,
-    };
+    use blaze_wire::PrNamespace;
 
     fn request(pr: u64, source: u8) -> JobRequest {
         JobRequest {
-            spec: BuildSpec {
-                source: SourceRef::Root(RootRef { root: [source; 32] }),
-                lock: [1; 32],
-                units: Vec::new(),
-                asked: Set::new(Vec::new()),
-                profile: ProfileSpec {
-                    name: "dev".to_owned(),
-                    opt_level: 0,
-                    debug: 1,
-                    debug_assertions: true,
-                    overflow_checks: true,
-                    panic: 0,
-                    strip: 0,
-                    split_debuginfo: 0,
-                    backend: 0,
-                    mir_opt: 0,
-                    backend_opt: 0,
-                    backend_emit: 0,
-                },
-                platform: [1; 32],
-                rustflags: Vec::new(),
-                config_env: Set::new(Vec::new()),
-                script_env: Set::new(Vec::new()),
-                cwd: SourcePath::new(".".into()).unwrap(),
-                command: Command::Build,
-                toolchain: StoreIdentity([2; 32]),
-                workspace_manifest: SourcePath::new("Cargo.toml".into()).unwrap(),
-            },
+            unit: [source; 32],
+            platform: [1; 32],
             namespace: Namespace::Pr(PrNamespace { n: pr }),
+            source: [source; 32],
             deadline_ms: 100_000,
             local: LocalPolicy::Never,
-            test_timeout_ms: None,
         }
     }
 
@@ -1366,7 +1335,7 @@ mod retention_tests {
             let mut effects = Vec::new();
             let first = jobs.submit(0, &request(pr, 1), need.clone(), &mut effects).unwrap();
             let mut other_platform = request(pr, 1);
-            other_platform.spec.platform = [3; 32];
+            other_platform.platform = [3; 32];
             let sibling = jobs.submit(0, &other_platform, need.clone(), &mut effects).unwrap();
             jobs.unsubscribe(1, first.execution, first.subscriber, &mut effects).unwrap();
             assert_eq!(jobs.pr_jobs[&pr].executions.len(), 1);

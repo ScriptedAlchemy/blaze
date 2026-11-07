@@ -164,55 +164,6 @@ fn a_tag_is_refused() {
 }
 
 #[test]
-fn an_unknown_key_is_refused() {
-    // `ExecPlatform`'s ten keys and then `10: 0`: key 10 is not `ExecPlatform`'s.
-    let mut bytes = Vec::new();
-    let v = blaze_wire::ExecPlatform {
-        triple: ".".into(),
-        os: ".".into(),
-        sdk: None,
-        libc: None,
-        linker: (String::new(), String::new(), [0u8; 32]),
-        cpu: ".".into(),
-        cc: None,
-        cxx: None,
-        ar: None,
-        native_root: None,
-    };
-    bytes.extend_from_slice(&encode(&v));
-    // Replace the map's ten keys with eleven: a map of ten is `aa`.
-    bytes[0] = 0xab;
-    bytes.extend_from_slice(&[0x0a, 0x00]);
-    let (named, kind) = refused_as::<blaze_wire::ExecPlatform>(&bytes);
-    assert_eq!(named, "unknown key");
-    assert_eq!(kind, ErrorKind::UnknownKey(10));
-}
-
-#[test]
-fn a_missing_key_is_refused() {
-    // `ExecPlatform` without key 9: the map has nine keys.
-    let v = blaze_wire::ExecPlatform {
-        triple: ".".into(),
-        os: ".".into(),
-        sdk: None,
-        libc: None,
-        linker: (String::new(), String::new(), [0u8; 32]),
-        cpu: ".".into(),
-        cc: None,
-        cxx: None,
-        ar: None,
-        native_root: None,
-    };
-    let mut bytes = encode(&v);
-    // The last field is key 9, one byte, and its value `null`, one, so drop two and count nine.
-    bytes.truncate(bytes.len() - 2);
-    bytes[0] = 0xa9;
-    let (named, kind) = refused_as::<blaze_wire::ExecPlatform>(&bytes);
-    assert_eq!(named, "missing key");
-    assert_eq!(kind, ErrorKind::MissingKey(9));
-}
-
-#[test]
 fn an_oversize_item_is_refused() {
     // A text string one byte past the limit, with its head.
     let limits = Limits { string: 4, ..Limits::DOCUMENTED };
@@ -400,4 +351,28 @@ fn a_unit_variant_with_a_payload_is_refused() {
     let error = decode::<blaze_wire::Outcome>(&[0x82, 0x00, 0x00], &limits())
         .expect_err("a unit variant took a payload");
     assert_eq!(error.kind, ErrorKind::UnexpectedType { expected: "null" });
+}
+
+#[test]
+fn an_unknown_key_is_refused() {
+    // `Reservation`'s three keys and then `3: 0`: key 3 is not `Reservation`'s.
+    let v = blaze_wire::Reservation { memory: 1, cpus: 1, disk: 1 };
+    let mut bytes = encode(&v);
+    bytes[0] = 0xa4;
+    bytes.extend_from_slice(&[0x03, 0x00]);
+    let (named, kind) = refused_as::<blaze_wire::Reservation>(&bytes);
+    assert_eq!(named, "unknown key");
+    assert_eq!(kind, ErrorKind::UnknownKey(3));
+}
+
+#[test]
+fn a_missing_key_is_refused() {
+    // `Reservation` without key 2: its value is one byte, its key one, so drop two.
+    let v = blaze_wire::Reservation { memory: 1, cpus: 1, disk: 1 };
+    let mut bytes = encode(&v);
+    bytes.truncate(bytes.len() - 2);
+    bytes[0] = 0xa2;
+    let (named, kind) = refused_as::<blaze_wire::Reservation>(&bytes);
+    assert_eq!(named, "missing key");
+    assert_eq!(kind, ErrorKind::MissingKey(2));
 }

@@ -1,3 +1,8 @@
+---
+status: record
+summary: The review of the distributed protocol's deterministic simulation.
+date: 2026-10-28
+---
 # Protocol state-machine review
 
 Review of PR #19, starting at `79c80c7051f9f4fc4982b5ad83b70334c823fa78`, on

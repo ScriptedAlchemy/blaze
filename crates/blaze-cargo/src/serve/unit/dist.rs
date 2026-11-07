@@ -1,4 +1,4 @@
-//! A unit's codegen across executors (docs/distributed.md, section 4), when a build's request
+//! A unit's codegen across executors (docs/distributed.md), when a build's request
 //! names a coordinator (`BLAZE_DIST_SOCKET`) and a cache server (`BLAZE_DIST_BLOBS`).
 //!
 //! There is one compiler pipeline, [`Build`]. Each daemon that builds a unit walks it, and the
@@ -35,7 +35,7 @@ use blaze_dist_local::{
     server::random_id,
 };
 use blaze_ids::ContentId;
-use blaze_wire::LocalPolicy;
+use blaze_wire::{LocalPolicy, Namespace, PrNamespace, digest_of_encoded_name};
 
 /// The coordinator's socket.
 const SOCKET_VAR: &str = "BLAZE_DIST_SOCKET";
@@ -47,6 +47,11 @@ const LOCAL_VAR: &str = "BLAZE_DIST_LOCAL";
 const REPORT_VAR: &str = "BLAZE_DIST_REPORT";
 /// How long a unit may wait for its execution, in seconds.
 const DEADLINE_VAR: &str = "BLAZE_DIST_DEADLINE_SECS";
+/// The pull request this build is of: its executions are its own, and a newer
+/// [`SOURCE_VAR`] of it supersedes an older one's. What it publishes is shared by content.
+const PR_VAR: &str = "BLAZE_DIST_PR";
+/// Which revision of [`PR_VAR`] this build is of: any text, such as a commit.
+const SOURCE_VAR: &str = "BLAZE_DIST_SOURCE";
 
 /// How long a unit waits for its execution by default: a long unit on a loaded machine.
 const DEADLINE: Duration = Duration::from_secs(3_600);
@@ -86,6 +91,20 @@ impl Dist {
                 it.parse().map_err(|e| format!("{DEADLINE_VAR} is {it}: {e}"))?,
             ),
         };
+        let namespace = match var(env, PR_VAR) {
+            None => Namespace::Main,
+            Some(it) => Namespace::Pr(PrNamespace {
+                n: it.parse().map_err(|e| format!("{PR_VAR} is {it}: {e}"))?,
+            }),
+        };
+        let source = match (var(env, SOURCE_VAR), &namespace) {
+            (Some(it), Namespace::Pr(_)) => digest_of_encoded_name("blaze/dist-source", it.as_bytes()),
+            (None, Namespace::Pr(_)) => return Err(format!("{PR_VAR} needs {SOURCE_VAR}")),
+            (Some(it), Namespace::Main) => {
+                return Err(format!("{SOURCE_VAR} is {it}, with no {PR_VAR} it is a revision of"));
+            }
+            (None, Namespace::Main) => [0; 32],
+        };
         let claimant = random_id().map_err(|e| format!("naming this agent: {e}"))?;
         Ok(Some(Dist {
             config: agent::Config {
@@ -94,6 +113,8 @@ impl Dist {
                 claimant,
                 platform: agent::platform(triple),
                 local,
+                namespace,
+                source,
                 deadline,
                 holder: HolderConfig { heartbeat_ms: 1_000, retry_ms: 5_000, idle_ms: 10 },
                 poll: Duration::from_millis(10),
@@ -102,16 +123,20 @@ impl Dist {
         }))
     }
 
-    /// What a failure of the distributed path means for the unit.
-    pub(super) fn or_compile_here(&self, what: String) -> Result<(), String> {
-        match self.config.local {
-            LocalPolicy::Never => Err(format!(
-                "the distributed build failed: {what} ({LOCAL_VAR}=fallback compiles the unit here instead)"
-            )),
-            _ => {
+    /// What a failure of the distributed path means for the unit named `what`.
+    pub(super) fn or_compile_here(
+        &self,
+        what: String,
+        failure: blaze_dist_local::Error,
+    ) -> Result<(), String> {
+        match agent::decide(&self.config.local, failure) {
+            Ok(()) => {
                 tracing::warn!(target: "blaze", what, "dist: the unit compiles here");
                 Ok(())
             }
+            Err(failure) => Err(format!(
+                "the distributed build failed: {what}: {failure} ({LOCAL_VAR}=fallback compiles the unit here instead)"
+            )),
         }
     }
 

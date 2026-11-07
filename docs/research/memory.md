@@ -1,3 +1,8 @@
+---
+status: record
+summary: Research on whether the warm V1 daemon leaks, and what would shrink it.
+date: 2026-10-25
+---
 # Does the warm daemon leak, and what would shrink it
 
 This survey, dated 2026-10-26, is unit u4-memory of the distributed program.

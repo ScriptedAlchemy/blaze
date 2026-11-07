@@ -1,141 +1,13 @@
-//! The shapes of section 8's calls: every endpoint's request and answer, `Hello`'s limits, the
-//! errors, and the credentials' headers.
+//! The shapes of a distributed build's calls: a job's request and answer, the work calls of its
+//! executors, and the errors.
 //!
 //! Every request and answer is a map with every field present, its keys the numbers
-//! `docs/distributed.md` gives in ascending order. A lookup's answer is in the order of its
-//! request's keys, so a client reads it without a map.
+//! `docs/distributed.md` gives in ascending order.
 
-use crate::cbor::Limits;
 use crate::cbor::Wire;
 use crate::shapes::*;
 use crate::wire_struct;
 use crate::{Digest, Named};
-
-wire_struct! {
-    /// `POST /v1/hello`'s request: the versions the client speaks and what it is.
-    HelloRequest {
-        0 => versions: crate::Set<u32>,
-        1 => identity: StoreIdentity,
-        2 => platform: ExecPlatform,
-        3 => role: u8,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/hello`'s answer: the version the server picked and what it holds.
-    HelloAnswer {
-        0 => version: u32,
-        1 => key: [u8; 32],
-        2 => epochs: crate::Set<(Namespace, u64)>,
-        3 => identities: crate::Set<StoreIdentity>,
-        4 => limits: Limits,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/auth`'s request: the GitHub OIDC token, and nothing else.
-    AuthRequest {
-        0 => token: String,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/auth`'s answer, and the bytes of `Blaze-Capability`.
-    SignedCapability {
-        0 => capability: Capability,
-        1 => signature: [u8; 64],
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/cache/lookup`'s request: its keys are held to [`Limits::lookup_items`].
-    CacheLookupRequest {
-        lookup [1],
-        0 => namespaces: Vec<Namespace>,
-        1 => keys: crate::Set<CrateKey>,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/cache/lookup`'s answer: per key, in the request's order, the newest record.
-    CacheLookupAnswer {
-        lookup [0],
-        0 => records: Vec<Option<CrateRecord>>,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/cache/missing`'s request: its blobs are held to [`Limits::lookup_items`].
-    CacheMissingRequest {
-        lookup [0],
-        0 => blobs: crate::Set<Digest>,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/cache/missing`'s answer: its missing blobs are held to [`Limits::lookup_items`].
-    CacheMissingAnswer {
-        lookup [0],
-        0 => missing: crate::Set<Digest>,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/cache/publish`'s request.
-    CachePublishRequest {
-        0 => crate_key: CrateKey,
-        1 => packs: crate::Set<PackRef>,
-        2 => generation: u64,
-        3 => source: SourceRef,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/cache/publish`'s answer.
-    CachePublishAnswer {
-        0 => record: CrateRecord,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/results/lookup`'s request: its keys are held to [`Limits::lookup_items`].
-    ResultsLookupRequest {
-        lookup [1],
-        0 => namespaces: Vec<Namespace>,
-        1 => keys: crate::Set<TestBaseKey>,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/results/lookup`'s answer: per key, in the request's order, its passes.
-    ResultsLookupAnswer {
-        lookup [0],
-        0 => results: Vec<Vec<TestPass>>,
-    }
-}
-
-wire_struct! {
-    /// One kept pass: the table's "pass with manifest digest".
-    TestPass {
-        0 => key: TestKey,
-        1 => manifest: Digest,
-        2 => duration_ns: u64,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/results/publish`'s request.
-    ResultsPublishRequest {
-        0 => verdicts: Vec<TestVerdict>,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/results/publish`'s answer.
-    ResultsPublishAnswer {
-        0 => kept: u64,
-    }
-}
 
 /// The answer of every call that has nothing to say: `{}`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -164,13 +36,18 @@ impl crate::vectors::Sample for Ack {
 }
 
 wire_struct! {
-    /// `POST /v1/jobs`'s request. Fields 2 to 4 are the subscriber's, not the content's.
+    /// A job: one unit of a build on one platform. Fields 0 to 2 are its content, what equal
+    /// jobs share an execution by. `unit` is what the unit's walk computed from its sources,
+    /// settings and toolchain (`blaze_codegen::driver::WorkSet::digest`). `source` says which
+    /// build of a pull request this is: a newer one supersedes the older one's executions that
+    /// nothing else waits for. Fields 3 to 5 are the subscriber's.
     JobRequest {
-        0 => spec: BuildSpec,
-        1 => namespace: Namespace,
-        2 => deadline_ms: u64,
-        3 => local: LocalPolicy,
-        4 => test_timeout_ms: Option<u64>,
+        0 => unit: Digest,
+        1 => platform: Digest,
+        2 => namespace: Namespace,
+        3 => source: Digest,
+        4 => deadline_ms: u64,
+        5 => local: LocalPolicy,
     }
 }
 
@@ -189,48 +66,6 @@ wire_struct! {
         0 => sequence: u64,
         1 => attempt: Attempt,
         2 => event: JobEvent,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/workers/hello`'s request.
-    WorkersHelloRequest {
-        0 => agent: String,
-        1 => capacity: Reservation,
-        2 => executors: Vec<ExecutorState>,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/workers/hello`'s answer.
-    WorkersHelloAnswer {
-        0 => accepted: bool,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/workers/next`'s request.
-    WorkersNextRequest {
-        0 => free: Vec<Reservation>,
-        1 => front_ends: crate::Set<FrontEndKey>,
-    }
-}
-
-wire_struct! {
-    /// `POST /v1/workers/next`'s answer: an assignment, or `null` for nothing.
-    WorkersNextAnswer {
-        0 => assignment: Option<Assignment>,
-    }
-}
-
-wire_struct! {
-    /// One job assigned to an executor.
-    Assignment {
-        0 => execution: ExecutionId,
-        1 => attempt: Attempt,
-        2 => spec: BuildSpec,
-        3 => capability: Capability,
-        4 => role: u8,
     }
 }
 
@@ -318,13 +153,13 @@ impl WireError {
         WireError { retry_after_ms: Some(ms), ..self }
     }
 
-    /// The code, when it is one section 8 names.
+    /// The code, when it is one this schema names.
     pub fn code(&self) -> Option<ErrorCode> {
         ErrorCode::from_u8(self.code)
     }
 }
 
-/// The codes of section 8's errors, with the HTTP status each is answered with.
+/// The codes of the errors, with the HTTP status each is answered with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum ErrorCode {
@@ -351,7 +186,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// The code of a byte, when it is one section 8 names.
+    /// The code of a byte, when it is one this schema names.
     pub fn from_u8(code: u8) -> Option<ErrorCode> {
         Some(match code {
             1 => ErrorCode::Malformed,
@@ -381,46 +216,5 @@ impl ErrorCode {
             ErrorCode::Busy => 429,
             ErrorCode::Internal => 500,
         }
-    }
-}
-
-/// The bits of a `Capability`'s `ops`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u32)]
-pub enum Op {
-    /// 0: a lookup of a crate's record.
-    Lookup = 1 << 0,
-    /// 1: a fetch of a blob.
-    Fetch = 1 << 1,
-    /// 2: a publish of packs and a record.
-    Publish = 1 << 2,
-    /// 3: an execution's events.
-    Events = 1 << 3,
-    /// 4: a cancel of an execution.
-    Cancel = 1 << 4,
-    /// 5: a root manifest's write.
-    Roots = 1 << 5,
-    /// 6: a namespace's deletion.
-    DeleteNamespace = 1 << 6,
-    /// 7: work: join, lease and result.
-    Work = 1 << 7,
-}
-
-impl Op {
-    /// Every operation, in bit order.
-    pub const ALL: [Op; 8] = [
-        Op::Lookup,
-        Op::Fetch,
-        Op::Publish,
-        Op::Events,
-        Op::Cancel,
-        Op::Roots,
-        Op::DeleteNamespace,
-        Op::Work,
-    ];
-
-    /// Whether `ops` has this bit.
-    pub fn in_bits(self, ops: u32) -> bool {
-        ops & (self as u32) != 0
     }
 }

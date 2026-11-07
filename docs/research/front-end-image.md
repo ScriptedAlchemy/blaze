@@ -1,3 +1,8 @@
+---
+status: record
+summary: Research on a mapped front-end image for V1's workers.
+date: 2026-10-27
+---
 # Storing a worker's initial front-end state in a file
 
 2026-10-26, for [#274](https://github.com/indexable-inc/blaze/issues/274) (state as an image) and

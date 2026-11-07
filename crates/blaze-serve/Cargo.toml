@@ -1,6 +1,6 @@
 [package]
 name = "blaze-serve"
-description = "blaze's cache server: today's remote layout over HTTP/1.1, deterministic CBOR on the wire, blobs with Range, an existence set, and verification on write"
+description = "blaze's cache server: the packs and unit lists of a distributed build over HTTP/1.1, each pack checked against its name on write"
 publish = false
 
 version.workspace = true
@@ -17,17 +17,12 @@ doctest = false
 blaze-wire.workspace = true
 anyhow.workspace = true
 sha2 = "0.10"
-ed25519-dalek = "2.2"
-getrandom = "0.3"
-zstd.workspace = true
 # The HTTP/1.1 server: hyper is the stack the rest of blaze already uses, and its `server`
 # feature is the only thing this crate turns on that the tree did not have on.
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["server", "http1", "tokio"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 http-body-util = "0.1"
-# hyper's `server` feature needs it for the Date header; this crate uses it for Last-Modified.
-httpdate = "1"
 tokio = { version = "1.47", features = ["rt-multi-thread", "net", "fs", "io-util", "signal", "sync", "time", "macros"] }
 bytes = "1"
 # Already in the lockfile; configures transport liveness rather than job policy.

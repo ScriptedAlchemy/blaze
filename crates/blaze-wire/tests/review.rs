@@ -6,7 +6,6 @@
 #![allow(missing_docs)]
 
 use blaze_wire::*;
-use ed25519_dalek::{Signature, Signer, SigningKey};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 
@@ -290,45 +289,6 @@ fn ordinary_decoder_enforces_real_documented_16mib_request_limit() {
     );
 }
 
-/// The digest of the `n`th of a lookup's items: 32 bytes with `n` big-endian in the first eight.
-fn nth_digest(n: u64) -> Digest {
-    let mut d = [0; 32];
-    d[..8].copy_from_slice(&n.to_be_bytes());
-    d
-}
-
-/// P2: a lookup's collection is 4,096 items and one more is refused, at both edges.
-#[test]
-fn schema_lookup_limit_enforced() {
-    let at_limit = CacheMissingRequest { blobs: Set::new((0..4096u64).map(nth_digest).collect()) };
-    let b = encode(&at_limit);
-    assert_eq!(
-        validate_as::<CacheMissingRequest>(&b, &limits()).unwrap().blobs.len(),
-        4096,
-        "exactly the lookup limit of 4096 items was refused"
-    );
-    let over = CacheMissingRequest { blobs: Set::new((0..4097u64).map(nth_digest).collect()) };
-    let b = encode(&over);
-    let error = validate_as::<CacheMissingRequest>(&b, &limits()).unwrap_err();
-    assert_eq!(error.offence(), "oversize item", "accepted 4097 lookup items (limit 4096)");
-    assert!(
-        matches!(error.kind, ErrorKind::OversizeItem { what: "array", len: 4097, limit: 4096 }),
-        "{error:?}"
-    );
-    // The answer's per-key list and the crate lookup's keys are the same limit.
-    let answer = CacheMissingAnswer { missing: Set::new((0..4097u64).map(nth_digest).collect()) };
-    assert!(validate_as::<CacheMissingAnswer>(&encode(&answer), &limits()).is_err());
-    let keys: Vec<CrateKey> = (0..4097u64).map(|n| CrateKey(nth_digest(n))).collect();
-    let lookup = CacheLookupRequest { namespaces: vec![Namespace::Main], keys: Set::new(keys) };
-    assert!(validate_as::<CacheLookupRequest>(&encode(&lookup), &limits()).is_err());
-    let keys: Vec<CrateKey> = (0..4096u64).map(|n| CrateKey(nth_digest(n))).collect();
-    let lookup = CacheLookupRequest { namespaces: vec![Namespace::Main], keys: Set::new(keys) };
-    assert!(validate_as::<CacheLookupRequest>(&encode(&lookup), &limits()).is_ok());
-    let bases: Vec<TestBaseKey> = (0..4097u64).map(|n| TestBaseKey(nth_digest(n))).collect();
-    let lookup = ResultsLookupRequest { namespaces: vec![Namespace::Main], keys: Set::new(bases) };
-    assert!(validate_as::<ResultsLookupRequest>(&encode(&lookup), &limits()).is_err());
-}
-
 /// P2: the lookup limit is a lookup's, not every array's: a batch's collection keeps 65,536.
 #[test]
 fn a_batch_keeps_the_batch_limit_not_the_lookup_limit() {
@@ -357,7 +317,7 @@ fn a_batch_keeps_the_batch_limit_not_the_lookup_limit() {
 #[test]
 fn digest_input_matches_documented_formula() {
     let v = Attempt(24);
-    let mut expected = b"blaze/Attempt/v4\0".to_vec();
+    let mut expected = b"blaze/Attempt/v5\0".to_vec();
     expected.extend(encode(&v));
     assert_eq!(digest_of(&v), <[u8; 32]>::from(Sha256::digest(&expected)));
     assert_eq!(digest_input(&v), expected, "public digest_input must return actual hash preimage");
@@ -385,7 +345,7 @@ fn every_digest_input_is_the_encoding_the_golden_digest_uses() {
     assert!(!input.is_empty(), "digest_input returned no bytes");
     assert_eq!(<[u8; 32]>::from(Sha256::digest(&input)), digest_of(&v));
     // It is exactly the bytes the golden digest is taken over for the same value.
-    let mut expected = b"blaze/Attempt/v4\0".to_vec();
+    let mut expected = b"blaze/Attempt/v5\0".to_vec();
     expected.extend(encode(&v));
     assert_eq!(input, expected);
     assert_eq!(<[u8; 32]>::from(Sha256::digest(&expected)), digest_of(&v));
@@ -418,16 +378,14 @@ fn new_into_really_appends_to_caller_output() {
 #[test]
 fn all_domains_are_unique_and_prefix_free() {
     let entries = every();
-    assert_eq!(entries.len(), 103);
+    assert_eq!(entries.len(), 43);
     let mut names = BTreeSet::new();
     let mut domains = vec![];
     for e in entries {
         assert!(names.insert(e.name));
         assert!(!e.name.contains('\0'));
-        domains.push(format!("blaze/{}/v4\0", e.name).into_bytes());
-        domains.push(format!("blaze/sig/{}/v4\0", e.name).into_bytes());
+        domains.push(format!("blaze/{}/v5\0", e.name).into_bytes());
     }
-    domains.push(b"blaze/req/v1\0".to_vec());
     for (i, a) in domains.iter().enumerate() {
         for (j, b) in domains.iter().enumerate() {
             if i != j {
@@ -435,79 +393,6 @@ fn all_domains_are_unique_and_prefix_free() {
             }
         }
     }
-}
-
-#[test]
-fn generic_signature_covers_documented_domain_cbor_not_digest() {
-    let k = SigningKey::from_bytes(&[7; 32]);
-    let v = Attempt(24);
-    let sig = sign(&k, &v);
-    let mut input = b"blaze/sig/Attempt/v4\0".to_vec();
-    input.extend(encode(&v));
-    assert_eq!(signature_input(&v), input);
-    assert_eq!(sig, k.sign(&input).to_bytes());
-    assert!(k.verifying_key().verify_strict(&input, &Signature::from_bytes(&sig)).is_ok());
-    assert!(k.verifying_key().verify_strict(&digest_of(&v), &Signature::from_bytes(&sig)).is_err());
-}
-
-fn record() -> CrateRecord {
-    CrateRecord {
-        namespace: Namespace::Main,
-        epoch: 1,
-        crate_key: CrateKey([0; 32]),
-        generation: 1,
-        packs: Set::new(vec![]),
-        source: SourceRef::Root(RootRef { root: [0; 32] }),
-        signature: [0; 64],
-    }
-}
-
-fn record_fields_0_to_5(r: &CrateRecord) -> Vec<u8> {
-    let mut e = Encoder::new();
-    e.map(6);
-    e.uint(0);
-    r.namespace.encode(&mut e);
-    e.uint(1);
-    r.epoch.encode(&mut e);
-    e.uint(2);
-    r.crate_key.encode(&mut e);
-    e.uint(3);
-    r.generation.encode(&mut e);
-    e.uint(4);
-    r.packs.encode(&mut e);
-    e.uint(5);
-    r.source.encode(&mut e);
-    e.into_bytes()
-}
-
-/// P1: the signed bytes are the documented six-field map, not seven fields with field 6 zeroed.
-#[test]
-fn record_signs_only_fields_0_to_5() {
-    let r = record();
-    assert_eq!(r.signed_bytes(), record_fields_0_to_5(&r));
-}
-
-/// P1: the record's signature is over the six fields under `blaze/sig/CrateRecord/v2`.
-#[test]
-fn record_signature_uses_documented_domain_separation() {
-    let r = record();
-    let k = SigningKey::from_bytes(&[7; 32]);
-    let mut preimage = b"blaze/sig/CrateRecord/v4\0".to_vec();
-    preimage.extend(record_fields_0_to_5(&r));
-    let sig = k.sign(&preimage).to_bytes();
-    assert!(r.signature_is(&k.verifying_key(), &sig), "valid documented signature rejected");
-}
-
-/// P1: a signature over raw CBOR, without the domain, is not the record's signature.
-#[test]
-fn record_rejects_raw_undomained_signature() {
-    let r = record();
-    let k = SigningKey::from_bytes(&[7; 32]);
-    let sig = k.sign(&r.signed_bytes()).to_bytes();
-    assert!(
-        !r.signature_is(&k.verifying_key(), &sig),
-        "raw CBOR signature accepted without domain"
-    );
 }
 
 /// P2: the doc and the code agree that `Pr` is the payload map `[1, {0: n}]`.
@@ -523,14 +408,6 @@ fn namespace_pr_agrees_with_doc_payload_map() {
     );
 }
 
-/// Lower priority: base64url text has one form per byte string, so a signature header has no
-/// alias that verifies.
-#[test]
-fn base64url_rejects_nonzero_pad_bits() {
-    assert_eq!(base64url_decode("AA"), Some(vec![0]));
-    assert!(base64url_decode("AB").is_none(), "nonzero pad bits accepted");
-}
-
 /// Lower priority: -2^64 is a well-formed CBOR item and renders without overflow.
 #[test]
 fn accepted_negative_u64_max_json_does_not_overflow() {
@@ -539,18 +416,6 @@ fn accepted_negative_u64_max_json_does_not_overflow() {
     let mut out = String::new();
     json::render_cbor(&b, &mut out);
     assert_eq!(out, "-18446744073709551616");
-}
-
-#[test]
-fn unknown_schema_field_and_missing_field_named() {
-    assert!(matches!(
-        validate_as::<Ack>(&[0xa1, 0, 0], &limits()).unwrap_err().kind,
-        ErrorKind::UnknownKey(0)
-    ));
-    assert!(matches!(
-        validate_as::<AuthRequest>(&[0xa0], &limits()).unwrap_err().kind,
-        ErrorKind::MissingKey(0)
-    ));
 }
 
 #[test]
@@ -633,108 +498,6 @@ fn ordinary_audit<T: Wire + Named + Sample>(seed: u64) {
 }
 
 #[test]
-fn ordinary_decoder_schema_identity_and_mutations_all_98_types() {
-    ordinary_audit::<ExecPlatform>(1);
-    ordinary_audit::<SourceRef>(1);
-    ordinary_audit::<GitRef>(1);
-    ordinary_audit::<RootRef>(1);
-    ordinary_audit::<BuildSpec>(1);
-    ordinary_audit::<UnitSpec>(1);
-    ordinary_audit::<ProfileSpec>(1);
-    ordinary_audit::<LocalPolicy>(1);
-    ordinary_audit::<Command>(1);
-    ordinary_audit::<RunSpec>(1);
-    ordinary_audit::<Namespace>(1);
-    ordinary_audit::<PrNamespace>(1);
-    ordinary_audit::<CrateRecord>(1);
-    ordinary_audit::<PackRef>(1);
-    ordinary_audit::<RootManifest>(1);
-    ordinary_audit::<Capability>(1);
-    ordinary_audit::<WorkKey>(1);
-    ordinary_audit::<ItemKey>(1);
-    ordinary_audit::<EdgeKey>(1);
-    ordinary_audit::<Found>(1);
-    ordinary_audit::<RootSet>(1);
-    ordinary_audit::<Lease>(1);
-    ordinary_audit::<Grant>(1);
-    ordinary_audit::<ItemOutcome>(1);
-    ordinary_audit::<EntryRef>(1);
-    ordinary_audit::<Why>(1);
-    ordinary_audit::<ItemResult>(1);
-    ordinary_audit::<BatchResult>(1);
-    ordinary_audit::<InputManifest>(1);
-    ordinary_audit::<Observation>(1);
-    ordinary_audit::<FileObservation>(1);
-    ordinary_audit::<DirObservation>(1);
-    ordinary_audit::<AbsentObservation>(1);
-    ordinary_audit::<LinkObservation>(1);
-    ordinary_audit::<TestVerdict>(1);
-    ordinary_audit::<RuntimeBundle>(1);
-    ordinary_audit::<Reservation>(1);
-    ordinary_audit::<Stage>(1);
-    ordinary_audit::<JobEvent>(1);
-    ordinary_audit::<StageEvent>(1);
-    ordinary_audit::<AssignedEvent>(1);
-    ordinary_audit::<PublishedEvent>(1);
-    ordinary_audit::<ProgramEvent>(1);
-    ordinary_audit::<RefusedEvent>(1);
-    ordinary_audit::<OutputEvent>(1);
-    ordinary_audit::<DoneEvent>(1);
-    ordinary_audit::<Outcome>(1);
-    ordinary_audit::<ExecutorState>(1);
-    ordinary_audit::<StoreIdentity>(1);
-    ordinary_audit::<EntryKey>(1);
-    ordinary_audit::<CrateKey>(1);
-    ordinary_audit::<CrateKeyInput>(1);
-    ordinary_audit::<FrontEndKey>(1);
-    ordinary_audit::<FrontEndUnit>(1);
-    ordinary_audit::<FrontEndKeyInput>(1);
-    ordinary_audit::<ConfigKey>(1);
-    ordinary_audit::<ConfigKeyInput>(1);
-    ordinary_audit::<JobContent>(1);
-    ordinary_audit::<JobContentInput>(1);
-    ordinary_audit::<TestBaseKey>(1);
-    ordinary_audit::<TestBaseKeyInput>(1);
-    ordinary_audit::<TestKey>(1);
-    ordinary_audit::<WorkName>(1);
-    ordinary_audit::<ExecutionId>(1);
-    ordinary_audit::<Attempt>(1);
-    ordinary_audit::<HelloRequest>(1);
-    ordinary_audit::<HelloAnswer>(1);
-    ordinary_audit::<Limits>(1);
-    ordinary_audit::<AuthRequest>(1);
-    ordinary_audit::<SignedCapability>(1);
-    ordinary_audit::<CacheLookupRequest>(1);
-    ordinary_audit::<CacheLookupAnswer>(1);
-    ordinary_audit::<CacheMissingRequest>(1);
-    ordinary_audit::<CacheMissingAnswer>(1);
-    ordinary_audit::<CachePublishRequest>(1);
-    ordinary_audit::<CachePublishAnswer>(1);
-    ordinary_audit::<ResultsLookupRequest>(1);
-    ordinary_audit::<ResultsLookupAnswer>(1);
-    ordinary_audit::<TestPass>(1);
-    ordinary_audit::<ResultsPublishRequest>(1);
-    ordinary_audit::<ResultsPublishAnswer>(1);
-    ordinary_audit::<Ack>(1);
-    ordinary_audit::<JobRequest>(1);
-    ordinary_audit::<JobAnswer>(1);
-    ordinary_audit::<EventItem>(1);
-    ordinary_audit::<WorkersHelloRequest>(1);
-    ordinary_audit::<WorkersHelloAnswer>(1);
-    ordinary_audit::<WorkersNextRequest>(1);
-    ordinary_audit::<WorkersNextAnswer>(1);
-    ordinary_audit::<Assignment>(1);
-    ordinary_audit::<WorkJoinRequest>(1);
-    ordinary_audit::<WorkJoinAnswer>(1);
-    ordinary_audit::<WorkLeaseRequest>(1);
-    ordinary_audit::<WorkLeaseAnswer>(1);
-    ordinary_audit::<WorkResultAnswer>(1);
-    ordinary_audit::<WorkersEventsRequest>(1);
-    ordinary_audit::<WorkersEventsAnswer>(1);
-    ordinary_audit::<WireError>(1);
-}
-
-#[test]
 fn full_array_and_map_lengths_at_65535_65536() {
     for n in [23, 24, 255, 256, 65535, 65536] {
         let mut e = Encoder::new();
@@ -768,28 +531,6 @@ fn simple_value_sweep_reports_all_illegal_encodings() {
     }
 }
 
-/// Lower priority: a signature header's text is canonical, so a string-keyed replay check cannot
-/// be fooled by an alias of the same bytes.
-#[test]
-fn agent_signature_header_is_not_malleable() {
-    let k = SigningKey::from_bytes(&[7; 32]);
-    let r = credentials::agent_request();
-    let sig = r.sign(&k);
-    assert!(r.verify(&k.verifying_key(), &sig));
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut alias = sig.clone().into_bytes();
-    let last = alias.last_mut().unwrap();
-    let index = alphabet.iter().position(|c| c == last).unwrap();
-    assert_eq!(index & 15, 0);
-    *last = alphabet[index + 1];
-    let alias = String::from_utf8(alias).unwrap();
-    assert_ne!(sig, alias);
-    assert!(
-        !r.verify(&k.verifying_key(), &alias),
-        "noncanonical signature string verifies; string-keyed replay detection would be unsafe"
-    );
-}
-
 /// JSON renders enums as the protocol's two-element array, as documented in `json.rs`.
 #[test]
 fn json_enum_rendering_agrees_with_public_docs() {
@@ -805,3 +546,76 @@ fn illegal_simple_map_key_is_rejected_and_named() {
     let b = [0xa1, 0xf8, 0x14, 0];
     assert!(validate(&b, &limits()).is_err(), "nonminimal false map key accepted");
 }
+
+#[test]
+fn unknown_schema_field_and_missing_field_named() {
+    assert!(matches!(
+        validate_as::<Ack>(&[0xa1, 0, 0], &limits()).unwrap_err().kind,
+        ErrorKind::UnknownKey(0)
+    ));
+    assert!(matches!(
+        validate_as::<PrNamespace>(&[0xa0], &limits()).unwrap_err().kind,
+        ErrorKind::MissingKey(0)
+    ));
+}
+
+macro_rules! audit_each {
+    ($($ty:ty),* $(,)?) => {
+        /// Every type of the schema, as [`blaze_wire::vectors::every`] lists it: encoding is
+        /// identity, and a damaged message either fails or is the message it says it is.
+        #[test]
+        fn ordinary_decoder_schema_identity_and_mutations_of_every_type() {
+            let mut names = BTreeSet::new();
+            $(ordinary_audit::<$ty>(1); names.insert(<$ty as Named>::NAME.to_owned());)*
+            let listed: BTreeSet<String> =
+                blaze_wire::vectors::every().iter().map(|it| it.name.to_owned()).collect();
+            assert_eq!(names, listed, "the audit does not cover the schema's list");
+        }
+    };
+}
+
+audit_each!(
+    LocalPolicy,
+    Namespace,
+    PrNamespace,
+    PackRef,
+    WorkKey,
+    ItemKey,
+    EdgeKey,
+    Found,
+    RootSet,
+    Lease,
+    Grant,
+    ItemOutcome,
+    EntryRef,
+    Why,
+    ItemResult,
+    BatchResult,
+    Reservation,
+    Stage,
+    JobEvent,
+    StageEvent,
+    AssignedEvent,
+    RefusedEvent,
+    OutputEvent,
+    DoneEvent,
+    Outcome,
+    EntryKey,
+    JobContent,
+    JobContentInput,
+    WorkName,
+    ExecutionId,
+    Attempt,
+    Ack,
+    JobRequest,
+    JobAnswer,
+    EventItem,
+    WorkJoinRequest,
+    WorkJoinAnswer,
+    WorkLeaseRequest,
+    WorkLeaseAnswer,
+    WorkResultAnswer,
+    WorkersEventsRequest,
+    WorkersEventsAnswer,
+    WireError,
+);

@@ -7,10 +7,9 @@ use blaze_dist::jobs::{
 };
 use blaze_dist::work::EndWhy;
 use blaze_wire::{
-    Attempt, BatchResult, BuildSpec, Command, Digest, DoneEvent, ExecutionId, ItemOutcome,
-    ItemResult, JobContent, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome, PrNamespace,
-    ProfileSpec, RefusedEvent, Reservation, RootRef, RootSet, Set, SourcePath, SourceRef,
-    StoreIdentity, Why, WorkJoinRequest, WorkLeaseRequest, WorkName, WorkersEventsRequest,
+    Attempt, BatchResult, Digest, DoneEvent, ExecutionId, ItemOutcome, ItemResult, JobContent,
+    JobEvent, JobRequest, LocalPolicy, Namespace, Outcome, PrNamespace, RefusedEvent, Reservation,
+    RootSet, Set, Why, WorkJoinRequest, WorkLeaseRequest, WorkName, WorkersEventsRequest,
 };
 
 fn execution() -> Execution {
@@ -28,17 +27,11 @@ fn execution() -> Execution {
 }
 
 fn subscriber(id: u64, deadline_ms: u64) -> Subscriber {
-    Subscriber {
-        id,
-        deadline_ms,
-        policy: LocalPolicy::Never,
-        test_timeout_ms: None,
-        state: SubscriberState::Attached,
-    }
+    Subscriber { id, deadline_ms, policy: LocalPolicy::Never, state: SubscriberState::Attached }
 }
 
 // Deadline/verdict tests explicitly establish zero authoritative work. This is not
-// permission to infer cache-only success from a worker Done or an empty BuildSpec.
+// permission to infer cache-only success from a worker Done or an empty unit.
 fn complete_empty_work(e: &mut Execution, now: u64) {
     let request = blaze_wire::WorkJoinRequest {
         execution: e.id,
@@ -201,38 +194,12 @@ fn reservation() -> Reservation {
 
 fn request(source: u8) -> JobRequest {
     JobRequest {
-        spec: BuildSpec {
-            source: SourceRef::Root(RootRef { root: [source; 32] }),
-            lock: [1; 32],
-            units: Vec::new(),
-            asked: Set::new(Vec::new()),
-            profile: ProfileSpec {
-                name: "dev".to_owned(),
-                opt_level: 0,
-                debug: 1,
-                debug_assertions: true,
-                overflow_checks: true,
-                panic: 0,
-                strip: 0,
-                split_debuginfo: 0,
-                backend: 0,
-                mir_opt: 0,
-                backend_opt: 0,
-                backend_emit: 0,
-            },
-            platform: [1; 32],
-            rustflags: Vec::new(),
-            config_env: Set::new(Vec::new()),
-            script_env: Set::new(Vec::new()),
-            cwd: SourcePath::new(".".into()).unwrap(),
-            command: Command::Build,
-            toolchain: StoreIdentity([2; 32]),
-            workspace_manifest: SourcePath::new("Cargo.toml".into()).unwrap(),
-        },
+        unit: [source; 32],
+        platform: [1; 32],
         namespace: Namespace::Main,
+        source: [source; 32],
         deadline_ms: 100_000,
         local: LocalPolicy::Never,
-        test_timeout_ms: None,
     }
 }
 
@@ -332,9 +299,9 @@ fn review_pr_supersession_follows_source_and_preserves_shared_executions() {
     let mut linux = request(1);
     linux.namespace = Namespace::Pr(PrNamespace { n: 7 });
     let mut macos = linux.clone();
-    macos.spec.platform = [2; 32];
+    macos.platform = [2; 32];
     let mut release = linux.clone();
-    release.spec.profile.name = "release".to_owned();
+    release.unit = [0x70; 32];
     let first = jobs.submit(0, &linux, reservation(), &mut effects).unwrap();
     let second = jobs.submit(0, &macos, reservation(), &mut effects).unwrap();
     let shared = jobs.submit(0, &release, reservation(), &mut effects).unwrap();
@@ -345,7 +312,8 @@ fn review_pr_supersession_follows_source_and_preserves_shared_executions() {
     }
 
     let mut next_push = linux.clone();
-    next_push.spec.source = request(2).spec.source;
+    next_push.unit = request(2).unit;
+    next_push.source = request(2).source;
     let next = jobs.submit(1, &next_push, reservation(), &mut effects).unwrap();
     for id in [first.execution, second.execution] {
         assert_eq!(jobs.execution(id).unwrap().state(), ExecState::Ended(Outcome::Cancelled));
@@ -353,17 +321,18 @@ fn review_pr_supersession_follows_source_and_preserves_shared_executions() {
     assert_eq!(jobs.execution(shared.execution).unwrap().state(), ExecState::Queued);
     assert_eq!(jobs.execution(next.execution).unwrap().state(), ExecState::Queued);
 
-    // Joining a protected older execution is another subscriber, not a push that rolls the
-    // pull request back and cancels its newer source.
-    let rejoined = jobs.submit(1, &release, reservation(), &mut effects).unwrap();
-    assert_eq!(rejoined.execution, shared.execution);
+    // The older build's next unit is not a push that rolls the pull request back: it is refused,
+    // and the newer source's executions stay.
+    let refused = jobs.submit(1, &release, reservation(), &mut effects).unwrap_err();
+    assert_eq!(refused.0, blaze_dist::Refusal::Superseded);
+    assert_eq!(jobs.execution(shared.execution).unwrap().state(), ExecState::Queued);
     assert_eq!(jobs.execution(next.execution).unwrap().state(), ExecState::Queued);
-    jobs.unsubscribe(2, rejoined.execution, rejoined.subscriber, &mut effects).unwrap();
 
     // A shared execution remains tracked: if its other subscriber leaves, a later push
     // supersedes it too rather than leaking an obsolete sole-subscriber job.
     jobs.unsubscribe(2, other.execution, other.subscriber, &mut effects).unwrap();
-    next_push.spec.source = request(3).spec.source;
+    next_push.unit = request(3).unit;
+    next_push.source = request(3).source;
     let latest = jobs.submit(3, &next_push, reservation(), &mut effects).unwrap();
     for id in [shared.execution, next.execution] {
         assert_eq!(jobs.execution(id).unwrap().state(), ExecState::Ended(Outcome::Cancelled));
@@ -539,11 +508,12 @@ fn submit(jobs: &mut blaze_dist::jobs::Jobs, tag: u64) -> ExecutionId {
     jobs.submit(
         0,
         &blaze_wire::JobRequest {
-            spec: spec([1; 32], tag),
+            unit: [tag as u8; 32],
+            platform: [1; 32],
             namespace: Namespace::Main,
+            source: [0; 32],
             deadline_ms: 100_000,
             local: LocalPolicy::Never,
-            test_timeout_ms: None,
         },
         reservation(),
         &mut Vec::new(),
@@ -844,63 +814,26 @@ fn assigning_an_unstarted_helper_does_not_forge_liveness() {
     assert!(e.heard_recently(13).contains(&"silent".to_owned()));
 }
 
-fn spec(platform: Digest, i: u64) -> BuildSpec {
-    let profile = ProfileSpec {
-        name: "dev".to_owned(),
-        opt_level: 0,
-        debug: 1,
-        debug_assertions: true,
-        overflow_checks: true,
-        panic: 0,
-        strip: 0,
-        split_debuginfo: 0,
-        backend: 0,
-        mir_opt: 0,
-        backend_opt: 0,
-        backend_emit: 0,
-    };
-    BuildSpec {
-        source: SourceRef::Root(blaze_wire::RootRef { root: [i as u8; 32] }),
-        lock: [1; 32],
-        units: Vec::new(),
-        asked: blaze_wire::Set::new(Vec::new()),
-        profile,
-        platform,
-        rustflags: Vec::new(),
-        config_env: blaze_wire::Set::new(Vec::new()),
-        script_env: blaze_wire::Set::new(Vec::new()),
-        cwd: SourcePath::new(".".into()).unwrap(),
-        command: Command::Build,
-        toolchain: StoreIdentity([2; 32]),
-        workspace_manifest: SourcePath::new("Cargo.toml".into()).unwrap(),
-    }
-}
-
 mod claim {
     use blaze_dist::admission::{Admission, AdmissionConfig};
     use blaze_dist::jobs::{ExecutionConfig, Jobs};
-    use blaze_wire::{BuildSpec, Gen, JobRequest, LocalPolicy, Namespace, Reservation, Sample};
+    use blaze_wire::{JobRequest, LocalPolicy, Namespace, Reservation};
 
     fn started(executors: u32) -> (Jobs, blaze_wire::ExecutionId) {
         let need = Reservation { memory: 1, cpus: 1, disk: 1 };
         let mut admission = Admission::new(AdmissionConfig::default());
-        admission.add_machine(
-            "machine",
-            [1; 32],
-            Reservation { memory: 64, cpus: 64, disk: 64 },
-        );
+        admission.add_machine("machine", [1; 32], Reservation { memory: 64, cpus: 64, disk: 64 });
         for _ in 0..executors {
             admission.add_builder(0, "machine", need.clone()).unwrap();
         }
         let mut jobs = Jobs::new(admission, ExecutionConfig::default());
-        let mut spec = BuildSpec::sample(&mut Gen::new(1));
-        spec.platform = [1; 32];
         let request = JobRequest {
-            spec,
+            unit: [9; 32],
+            platform: [1; 32],
             namespace: Namespace::Main,
+            source: [0; 32],
             deadline_ms: 3_600_000,
             local: LocalPolicy::Never,
-            test_timeout_ms: None,
         };
         let mut out = Vec::new();
         let answer = jobs.submit(0, &request, need, &mut out).unwrap();

@@ -9,14 +9,12 @@
 //! [`every`] lists one entry per schema type, so a test can walk all of them and the golden
 //! vectors can be generated and checked in one place.
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest as _, Sha256};
 
 use crate::calls::*;
-use crate::cbor::Limits;
 use crate::cbor::{Named, Wire};
 use crate::shapes::*;
-use crate::{Digest, Set, digest_of, encode, sign};
+use crate::{Digest, Set, digest_of, encode};
 
 /// A deterministic stream of random values.
 #[derive(Clone, Debug)]
@@ -187,30 +185,19 @@ impl<A: Sample, B: Sample, C: Sample> Sample for (A, B, C) {
     }
 }
 
-/// One value of a type, its canonical CBOR, its digest and its signature under a key derived from
-/// the type's name.
-///
-/// The key is `sha256(name)`, so a golden vector carries no secret and every run of the test makes
-/// the same signature.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One value of a type, and what the wire says of it: what a golden file holds.
+#[derive(Clone, Debug)]
 pub struct Vector {
-    /// The type's name, as the domain separation spells it.
+    /// The type's name.
     pub name: &'static str,
-    /// The value's canonical CBOR.
+    /// The value's encoding.
     pub cbor: Vec<u8>,
-    /// `sha256("blaze/" ‖ name ‖ "/v1" ‖ 0x00 ‖ cbor)`.
+    /// Its digest under the type's domain.
     pub digest: Digest,
-    /// Ed25519 over `"blaze/sig/" ‖ name ‖ "/v1" ‖ 0x00 ‖ ` the signed bytes.
-    pub signature: [u8; 64],
-    /// The bytes the signature is over, when they are not the whole `cbor`: a `CrateRecord`'s
-    /// fields 0 to 5, which its field 6 is the signature of.
-    pub signed: Option<Vec<u8>>,
-    /// The public half of the key the signature is under.
-    pub key: [u8; 32],
 }
 
 impl Vector {
-    /// The vector of one value of `T`, and of that value's encoding, digest and signature.
+    /// The vector of one value of `T`, and of that value's encoding and digest.
     pub fn of<T: Wire + Named + Sample>(seed: u64) -> Vector {
         let mut g = Gen::new(seed);
         let value: T = T::sample(&mut g);
@@ -219,54 +206,7 @@ impl Vector {
 
     /// The vector of `value`.
     pub fn of_value<T: Wire + Named>(value: &T) -> Vector {
-        let key = key_for(T::NAME);
-        Vector {
-            name: T::NAME,
-            cbor: encode(value),
-            digest: digest_of(value),
-            signature: sign(&key, value),
-            signed: None,
-            key: key.verifying_key().to_bytes(),
-        }
-    }
-
-    /// The vector of one value of a type whose signature is a field of it: a `CrateRecord`.
-    ///
-    /// The value's own signature field is the key's signature over the six fields it signs, under
-    /// the type's domain, so the golden vector carries a record a client can check rather than a
-    /// record with a random field 6. The digest is still the whole record's, field 6 included,
-    /// and `signed` is the bytes the signature is over.
-    pub fn of_record<T: Wire + Named + Sample + SelfSigned>(seed: u64) -> Vector {
-        let mut g = Gen::new(seed);
-        let value: T = T::sample(&mut g);
-        let key = key_for(T::NAME);
-        let signed = value.signed_bytes();
-        let value = value.with_signature(&key);
-        Vector {
-            name: T::NAME,
-            cbor: encode(&value),
-            digest: digest_of(&value),
-            signature: value.own_signature().unwrap_or([0u8; 64]),
-            signed: Some(signed),
-            key: key.verifying_key().to_bytes(),
-        }
-    }
-
-    /// The signing key a type's vector is signed with: `sha256(name)`.
-    pub fn signing_key(&self) -> SigningKey {
-        key_for(self.name)
-    }
-
-    /// The bytes the vector's signature is over: [`Vector::signed`] when the value carries its
-    /// own signature, and the whole `cbor` otherwise.
-    pub fn signed_bytes(&self) -> &[u8] {
-        self.signed.as_deref().unwrap_or(&self.cbor)
-    }
-
-    /// Whether the signature is the one this vector's key makes over its signed bytes.
-    pub fn signature_verifies(&self) -> bool {
-        let key = self.signing_key().verifying_key();
-        crate::verify_encoded_name(self.name, self.signed_bytes(), &key, &self.signature)
+        Vector { name: T::NAME, cbor: encode(value), digest: digest_of(value) }
     }
 
     /// Whether the digest is the one this vector's name and CBOR make.
@@ -276,74 +216,28 @@ impl Vector {
 
     /// The vector as the text of a golden file.
     pub fn to_golden(&self) -> String {
-        let mut out = String::new();
-        out.push_str("type: ");
-        out.push_str(self.name);
-        out.push_str("\ncbor: ");
-        out.push_str(&crate::json::hex(&self.cbor));
-        if let Some(signed) = &self.signed {
-            out.push_str("\nsigned: ");
-            out.push_str(&crate::json::hex(signed));
-        }
-        out.push_str("\ndigest: ");
-        out.push_str(&crate::json::hex(&self.digest));
-        out.push_str("\nsignature: ");
-        out.push_str(&crate::json::hex(&self.signature));
-        out.push_str("\nkey: ");
-        out.push_str(&crate::json::hex(&self.key));
-        out.push('\n');
-        out
+        format!(
+            "type: {}\ncbor: {}\ndigest: {}\n",
+            self.name,
+            crate::json::hex(&self.cbor),
+            crate::json::hex(&self.digest)
+        )
     }
 
     /// The vector a golden file's text says.
     pub fn from_golden(text: &str) -> Option<Vector> {
-        let mut name = None;
-        let mut cbor = None;
-        let mut signed = None;
-        let mut digest = None;
-        let mut signature = None;
-        let mut key = None;
+        let (mut name, mut cbor, mut digest) = (None, None, None);
         for line in text.lines() {
             let (field, value) = line.split_once(": ")?;
             match field {
                 "type" => name = Some(value),
                 "cbor" => cbor = Some(unhex(value)?),
-                "signed" => signed = Some(unhex(value)?),
                 "digest" => digest = Some(unhex32(value)?),
-                "signature" => signature = Some(unhex64(value)?),
-                "key" => key = Some(unhex32(value)?),
                 _ => return None,
             }
         }
-        Some(Vector {
-            name: leak(name?),
-            cbor: cbor?,
-            digest: digest?,
-            signature: signature?,
-            signed,
-            key: key?,
-        })
+        Some(Vector { name: leak(name?), cbor: cbor?, digest: digest? })
     }
-}
-
-/// A type whose signature is a field of the value itself, rather than the generic signature over
-/// the whole value: a `CrateRecord`, whose field 6 is over fields 0 to 5.
-///
-/// [`Vector::of_record`] builds such a value's golden vector from these, so the vector carries a
-/// signature a client checks the way the server made it.
-pub trait SelfSigned: Sized {
-    /// The bytes the value's own signature is over.
-    fn signed_bytes(&self) -> Vec<u8>;
-    /// This value with its signature field set to `key`'s signature over [`SelfSigned::signed_bytes`].
-    fn with_signature(self, key: &SigningKey) -> Self;
-    /// The value's own signature, as its field carries it.
-    fn own_signature(&self) -> Option<[u8; 64]>;
-}
-
-fn key_for(name: &str) -> SigningKey {
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&Sha256::digest(name.as_bytes()));
-    SigningKey::from_bytes(&seed)
 }
 
 /// A type's name as a `&'static str`, for a name read from a golden file.
@@ -370,11 +264,6 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 fn unhex32(text: &str) -> Option<[u8; 32]> {
     let bytes = unhex(text)?;
     <[u8; 32]>::try_from(bytes.as_slice()).ok()
-}
-
-fn unhex64(text: &str) -> Option<[u8; 64]> {
-    let bytes = unhex(text)?;
-    <[u8; 64]>::try_from(bytes.as_slice()).ok()
 }
 
 /// One type of the schema: its name, a vector of one value of it, and a round trip of one value.
@@ -419,7 +308,7 @@ pub fn round_trip<T: Wire + Named + Sample + PartialEq>(seed: u64) -> Result<(),
 /// Every type of the schema, one entry each, so a test walks all of them and the golden vectors
 /// are generated and checked from one list.
 ///
-/// The list is the schema's types: "Data shapes", section 8's calls and the digest newtypes'
+/// The list is the schema's types: "Data shapes", the calls and the digest newtypes'
 /// inputs. A type the doc adds is added here, and its golden file with it.
 #[macro_export]
 macro_rules! wire_types {
@@ -439,61 +328,14 @@ macro_rules! wire_types {
             ]
         }
     };
-    // The same list with a type whose signature is its own field: a `CrateRecord`'s vector is
-    // `Vector::of_record`, so its golden file carries the signature field 6 holds.
-    (signed $signed:ty; $($ty:ty),* $(,)?) => {
-        /// Every type of the schema, one entry each.
-        pub fn every() -> Vec<$crate::vectors::Entry> {
-            let mut entries = vec![
-                $crate::vectors::Entry {
-                    name: <$signed as $crate::Named>::NAME,
-                    vector: (|seed| $crate::vectors::Vector::of_record::<$signed>(seed))
-                        as fn(u64) -> $crate::vectors::Vector,
-                    round_trip: (|seed| $crate::vectors::round_trip::<$signed>(seed))
-                        as fn(u64) -> Result<(), String>,
-                    reencode: (|cbor| $crate::vectors::reencode::<$signed>(cbor))
-                        as fn(&[u8]) -> Result<Vec<u8>, String>,
-                },
-            ];
-            entries.extend(vec![
-                $($crate::vectors::Entry {
-                    name: <$ty as $crate::Named>::NAME,
-                    vector: (|seed| $crate::vectors::Vector::of::<$ty>(seed))
-                        as fn(u64) -> $crate::vectors::Vector,
-                    round_trip: (|seed| $crate::vectors::round_trip::<$ty>(seed))
-                        as fn(u64) -> Result<(), String>,
-                    reencode: (|cbor| $crate::vectors::reencode::<$ty>(cbor))
-                        as fn(&[u8]) -> Result<Vec<u8>, String>,
-                }),*
-            ]);
-            entries
-        }
-    };
 }
 
 wire_types! {
-    signed CrateRecord;
     // "Data shapes"
-    ExecPlatform,
-    SourceRef,
-    GitRef,
-    RootRef,
-    BuildSpec,
-    SourcePath,
-    ConfigEnvValue,
-    InputText,
-    EnvText,
-    NativeValue,
-    UnitSpec,
-    ProfileSpec,
     LocalPolicy,
-    Command,
-    RunSpec,
     Namespace,
     PrNamespace,
     PackRef,
-    RootManifest,
-    Capability,
     WorkKey,
     ItemKey,
     EdgeKey,
@@ -506,69 +348,26 @@ wire_types! {
     Why,
     ItemResult,
     BatchResult,
-    InputManifest,
-    Observation,
-    FileObservation,
-    DirObservation,
-    AbsentObservation,
-    LinkObservation,
-    TestVerdict,
-    RuntimeBundle,
     Reservation,
     Stage,
     JobEvent,
     StageEvent,
     AssignedEvent,
-    PublishedEvent,
-    ProgramEvent,
     RefusedEvent,
     OutputEvent,
     DoneEvent,
     Outcome,
-    ExecutorState,
-    StoreIdentity,
     EntryKey,
-    CrateKey,
-    CrateKeyInput,
-    FrontEndKey,
-    FrontEndUnit,
-    FrontEndKeyInput,
-    ConfigKey,
-    ConfigKeyInput,
     JobContent,
     JobContentInput,
-    TestBaseKey,
-    TestBaseKeyInput,
-    TestKey,
     WorkName,
     ExecutionId,
     Attempt,
-    // section 8
-    HelloRequest,
-    HelloAnswer,
-    Limits,
-    AuthRequest,
-    SignedCapability,
-    CacheLookupRequest,
-    CacheLookupAnswer,
-    CacheMissingRequest,
-    CacheMissingAnswer,
-    CachePublishRequest,
-    CachePublishAnswer,
-    ResultsLookupRequest,
-    ResultsLookupAnswer,
-    TestPass,
-    ResultsPublishRequest,
-    ResultsPublishAnswer,
+    // the calls
     Ack,
     JobRequest,
     JobAnswer,
     EventItem,
-    WorkersHelloRequest,
-    WorkersHelloAnswer,
-    WorkersNextRequest,
-    WorkersNextAnswer,
-    Assignment,
     WorkJoinRequest,
     WorkJoinAnswer,
     WorkLeaseRequest,
@@ -577,9 +376,4 @@ wire_types! {
     WorkersEventsRequest,
     WorkersEventsAnswer,
     WireError,
-}
-
-/// The key a type's golden vector is signed with.
-pub fn vector_key(name: &str) -> VerifyingKey {
-    key_for(name).verifying_key()
 }

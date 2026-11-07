@@ -1068,10 +1068,10 @@ pub(crate) fn generate<'db>(
                     Err(why) if cancelled.load(std::sync::atomic::Ordering::Acquire) => {
                         tracing::debug!(target: "blaze", %why, "dist: cancelled");
                     }
-                    Err(why) => dist.or_compile_here(format!(
-                        "unit {unit} (`{}` of {}): {why}",
-                        u.target.name, u.pkg_id
-                    ))?,
+                    Err(why) => dist.or_compile_here(
+                        format!("unit {unit} (`{}` of {})", u.target.name, u.pkg_id),
+                        why,
+                    )?,
                 }
             }
         }

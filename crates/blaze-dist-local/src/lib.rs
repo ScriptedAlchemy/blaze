@@ -21,6 +21,8 @@ pub enum Error {
     Io(io::Error),
     /// The peer sent an invalid/version-mismatched response.
     Protocol(String),
+    /// The unit's execution ended with nothing committed, as its terminal says.
+    Ended(blaze_wire::job_terminal_v2::TerminationV2),
 }
 
 impl From<io::Error> for Error {

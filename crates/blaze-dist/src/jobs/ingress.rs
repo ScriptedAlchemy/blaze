@@ -18,9 +18,8 @@ fn order(stage: &Stage) -> u8 {
         Stage::Compiled => 5,
         Stage::Published => 6,
         Stage::Linked => 7,
-        Stage::Tested => 8,
-        Stage::Reported => 9,
-        Stage::Done => 10,
+        Stage::Reported => 8,
+        Stage::Done => 9,
     }
 }
 
@@ -72,9 +71,6 @@ impl Execution {
                         ));
                     }
                     latest = next;
-                }
-                JobEvent::Published(_) | JobEvent::Program(_) | JobEvent::Verdict(_) if !lead => {
-                    return Err(Refusal::NotHolder);
                 }
                 JobEvent::Done(event) => {
                     if !lead {
@@ -129,7 +125,6 @@ mod tests {
                 id: 1,
                 deadline_ms: 100_000,
                 policy: LocalPolicy::Fallback,
-                test_timeout_ms: None,
                 state: SubscriberState::Attached,
             },
             ExecutionConfig::default(),
@@ -267,10 +262,6 @@ mod tests {
         assert_eq!(
             super::super::local_action(&LocalPolicy::Never, &typed.termination).unwrap(),
             LocalAction::Fail
-        );
-        assert_eq!(
-            super::super::local_action(&LocalPolicy::Race, &typed.termination).unwrap(),
-            LocalAction::BuildLocally
         );
         assert_eq!(
             super::super::local_action(

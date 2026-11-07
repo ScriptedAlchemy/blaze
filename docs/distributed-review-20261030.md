@@ -1,3 +1,9 @@
+---
+status: superseded
+summary: The fork's review of its distributed compile and cross-PR reuse, written against V1 before the rebase onto V2.
+date: 2026-10-31
+superseded_by: distributed.md
+---
 # Distributed compilation and cross-PR reuse review
 
 ## 2026-10-31: whole-fork integration follow-up
@@ -139,12 +145,12 @@ The persistent compiler artifact is a function instance: a non-generic root, a m
 generic function, closure, coroutine, or shim. Its entry contains machine code, relocations,
 data, unwind information, and optional debug information. Entries are sealed into packs.
 Cargo units describe configuration and dependency relationships; they are not the smallest
-compiled artifact. See [cached.rs](../crates/hir-ty-codegen/cached.rs), Entry, and
+compiled artifact. See cached.rs, Entry, and
 [stable.rs](../crates/hir-ty-codegen/stable.rs), StableNames::instance.
 
 Persistent invalidation is nevertheless conservative at the crate dependency-closure boundary.
 StableNames::spell_crate prefixes owned names with a ContentId. In
-[content.rs](../crates/ra-jit/src/content.rs), Contents::hash includes package source bytes,
+content.rs, Contents::hash includes package source bytes,
 generated inputs, configuration, environment inputs, and dependencies. Editing one
 function changes names throughout its crate and the local crates depending on it. Unchanged
 dependencies and unaffected workspace crates remain reusable across PRs. Within an already
@@ -181,9 +187,9 @@ environment_hash/keyed_environment, and the
 
 The definitions are in [shapes.rs](../crates/blaze-wire/src/shapes.rs),
 [assemble.rs on #18](https://github.com/ScriptedAlchemy/blaze/blob/dist/c2-buildspec/crates/blaze-spec/src/assemble.rs), front_end_key/config_key,
-[ra-jit-store](../crates/ra-jit-store/src/lib.rs), Identity, and
-[export.rs](../crates/hir-ty-codegen/export.rs), ExportContext::resolved.
-The compiler's [build.rs](../crates/ra-jit/build.rs) hashes relative source names and bytes,
+ra-jit-store, Identity, and
+export.rs, ExportContext::resolved.
+The compiler's build.rs hashes relative source names and bytes,
 features and target, rather than treating every Git commit as a different compiler.
 
 Supported paths are explicitly rebound through the Cargo-home, standard-library and checkout
@@ -205,7 +211,7 @@ The cache separates immutable data from mutable discovery. Sealed packs, key ind
 unit blobs are verified against their content digests. Per-project manifests and unit lists
 are mutable, with conditional publication. This is implemented in
 [store.rs](../crates/blaze-serve/src/store.rs), put_blob_from/put_list, and
-[remote.rs](../crates/ra-jit/src/remote.rs).
+remote.rs.
 
 The planned CrateKey-to-CrateRecord-to-PackRef lookup exists in the wire schema, but the
 production server does not implement its lookup or publish endpoints. Its
@@ -219,7 +225,7 @@ integration remain work to connect, not functionality demonstrated by schema tes
 The gaps are visible in the call graph:
 
 - Production code does not call D0's compile_batch or import_batch; their callers are in
-  [export/tests.rs](../crates/hir-ty-codegen/export/tests.rs).
+  export/tests.rs.
 - [Holder](../crates/blaze-dist/src/holder.rs) emits Effect::Compile(Plan), expecting an
   executor to return a sealed, uploaded Compiled result. That compiler adapter is absent.
   The [local CLI](../crates/blaze-dist-local/src/bin/blaze-dist-local.rs) configures no
@@ -242,7 +248,7 @@ transport settings are installed after producer preparation; forwarding does not
 BuildSpec or the source environment already recorded in producer descriptions. Saved replay
 retains its isolated service boundary and does not acquire an ambient worker remote.
 Default cache-off behavior is unchanged; not every replay participates in shared caching.
-The [frontend image](../crates/ra-jit/src/front_image.rs) is an optional prototype over encoded
+The frontend image is an optional prototype over encoded
 dependency parts, not a shared live frontend or proof that each worker's frontend cost is gone.
 
 ## Repairs from this review
@@ -268,9 +274,9 @@ The changes address concrete interactions needed by that architecture:
   embedded environment value changed. Proc-macro consumers retain conservative text inputs.
 - **T1 tests:** identify executables and recorded inputs by content/mode, retain symlink text
   and target observations, and revoke old passes after forced or filtered failures. See
-  [affected.rs](../crates/ra-jit/src/cargo/affected.rs),
-  [sandboxed.rs](../crates/ra-jit/src/cargo/sandboxed.rs), and
-  [run.rs](../crates/ra-jit/src/cargo/run.rs), test_with. The #18 follow-up shares this policy
+  affected.rs,
+  sandboxed.rs, and
+  run.rs, test_with. The #18 follow-up shares this policy
   with replay through cargo/spec/test_policy.rs::Policy and execute_inner, including retry,
   opt-out and pass-revocation behavior. cargo/spec.rs::admit_trace preserves native filenames.
 - **Owned producers and resolution:** preserve declared environment/removal boundaries and

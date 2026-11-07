@@ -1,3 +1,8 @@
+---
+status: record
+summary: Holders of a loading worker's memory: one V1 cold run.
+date: 2026-10-25
+---
 # Holders of the profiled run (cold-prof2), MB sampled by jemalloc
 
 Made by `harness/loadmem_holders.py` from the folded profiles at 3.9, 5.6, 13.1, 18.6 and 30.2 GB live. Raw profiles are not kept (150 MB).

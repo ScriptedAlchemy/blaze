@@ -1,3 +1,8 @@
+---
+status: record
+summary: The fork's cold lock resolution report under V1.
+date: 2026-10-29
+---
 # Owned cold lock resolution
 
 The application resolver now creates a missing `Cargo.lock` and resolves a stale

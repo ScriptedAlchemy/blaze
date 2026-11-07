@@ -26,9 +26,9 @@ use std::fmt;
 /// ordinary decoder never accepts a message the validator refuses.
 pub const MAX_DEPTH: u32 = 32;
 
-/// The limits a server holds every message to, as `Hello` answers them.
+/// The limits a server holds every message to.
 ///
-/// The fields are section 8's numbers: 16 MiB a request, 1 MiB an event, 4 GiB a blob, 4,096 items
+/// The fields: 16 MiB a request, 1 MiB an event, 4 GiB a blob, 4,096 items
 /// in a lookup, 65,536 in a batch, 4 KiB a string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Limits {
@@ -47,7 +47,7 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// The limits section 8 gives.
+    /// The documented limits.
     pub const DOCUMENTED: Limits = Limits {
         request: 16 << 20,
         event: 1 << 20,
@@ -56,60 +56,6 @@ impl Limits {
         batch_items: 65536,
         string: 4096,
     };
-}
-
-impl Wire for Limits {
-    fn encode(&self, e: &mut Encoder) {
-        e.map(6);
-        e.uint(0);
-        e.uint(u64::from(self.request));
-        e.uint(1);
-        e.uint(u64::from(self.event));
-        e.uint(2);
-        e.uint(self.blob);
-        e.uint(3);
-        e.uint(u64::from(self.lookup_items));
-        e.uint(4);
-        e.uint(u64::from(self.batch_items));
-        e.uint(5);
-        e.uint(u64::from(self.string));
-    }
-
-    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
-        r.map_start()?;
-        r.field(0)?;
-        let request = u32::decode(r)?;
-        r.field(1)?;
-        let event = u32::decode(r)?;
-        r.field(2)?;
-        let blob = r.uint()?;
-        r.field(3)?;
-        let lookup_items = u32::decode(r)?;
-        r.field(4)?;
-        let batch_items = u32::decode(r)?;
-        r.field(5)?;
-        let string = u32::decode(r)?;
-        r.map_end()?;
-        Ok(Limits { request, event, blob, lookup_items, batch_items, string })
-    }
-}
-
-impl crate::Named for Limits {
-    const NAME: &'static str = "Limits";
-}
-
-impl crate::vectors::Sample for Limits {
-    fn sample(g: &mut crate::vectors::Gen) -> Self {
-        // Every limit is at a boundary of its own head's width, as a limit would be.
-        Limits {
-            request: u32::sample(g),
-            event: u32::sample(g),
-            blob: u64::sample(g),
-            lookup_items: u32::sample(g),
-            batch_items: u32::sample(g),
-            string: u32::sample(g),
-        }
-    }
 }
 
 impl Default for Limits {
@@ -470,10 +416,8 @@ impl<'a> Reader<'a> {
         let at = self.pos;
         let len = self.length(2, "byte string", self.limits.blob)?;
         if len != n as u64 {
-            return Err(self.err_at(
-                ErrorKind::UnexpectedType { expected: "a byte string of its length" },
-                at,
-            ));
+            return Err(self
+                .err_at(ErrorKind::UnexpectedType { expected: "a byte string of its length" }, at));
         }
         self.take(len)
     }

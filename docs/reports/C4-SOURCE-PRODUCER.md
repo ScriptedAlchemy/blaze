@@ -1,3 +1,8 @@
+---
+status: record
+summary: The fork's owned producer of V1 sources, as measured on its branch.
+date: 2026-10-30
+---
 # C4 source producer boundary
 
 `ra-jit proc-macro-source <sysroot> <host-plan.json> <exclusive-output-dir>`

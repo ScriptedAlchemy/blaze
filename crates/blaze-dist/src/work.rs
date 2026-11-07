@@ -1,4 +1,4 @@
-//! The coordinator's work set of one execution: section 4's claimed discovery, "(b′)".
+//! The coordinator's work set of one execution: claimed discovery, "(b′)".
 //!
 //! Every executor of an execution loads the same front end and posts a [`RootSet`]. The lead's is
 //! authoritative; a helper that joins first is provisional and compiles speculatively. Work is
@@ -34,7 +34,7 @@ pub const UNKNOWN_NAME: &str = "unknown-name";
 /// its entry cannot name its callee, so it is `Local`.
 pub const UNNAMED_REQUEST: &str = "unnamed request";
 
-/// The work set's timings and sizes. The timings are section 4's starting values, to be
+/// The work set's timings and sizes. The timings are starting values, to be
 /// replaced by D1's measurement (**unverified**).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkConfig {

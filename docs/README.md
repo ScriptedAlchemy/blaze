@@ -13,6 +13,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 - [cargo.md](cargo.md): Every blaze command and setting: cargo's commands and flags, what a build does, sandboxing, manifests.
 - [const.md](const.md): Const evaluation: blaze's own interpreter for constants and const fns, and what it covers.
 - [contributing.md](contributing.md): How to build, test and change blaze: AI use, where new code goes, rules for code, working in parallel, landing.
+- [distributed.md](distributed.md): A build across several daemons on V2's one build: executors, leases, the shared cache of packs, the requester's fallback and the wire.
 - [fuzzing.md](fuzzing.md): The fuzzers: generated programs and edits, each held to blaze's own build from nothing (a warm daemon, a warm store), what a finding is, and what they do not cover.
 - [gc.md](gc.md): What blaze removes from disk and when: the collector of build dirs, shared std stores, temporaries and trash; the pacer that works harder as a volume fills, leases, records, roots and the grace, and why nothing in use is removed.
 - [harness.md](harness.md): The harnesses that test blaze (real crates' own tests, and blaze held to itself), what each checks, and how CI runs them.
@@ -509,7 +510,10 @@ Research, reports and measurements, true on their date and not brought up to dat
 - [v2/requests/cargo.md](v2/requests/cargo.md) (2026-10-30): The v2 lanes' requests filed under `cargo` (what one lane asked of the code another owns), each with its answer.
 - [v2/requests/cargo-harness.md](v2/requests/cargo-harness.md) (2026-10-30): The v2 lanes' requests filed under `cargo-harness` (what one lane asked of the code another owns), each with its answer.
 - [support.md](support.md) (2026-10-30): What blaze v1 supported, cell by cell, each pointing at the report or harness run behind it. v2 has none of these measurements yet.
+- [reports/CI-fork.md](reports/CI-fork.md) (2026-10-30): The fork's CI as it was before the fork retired its private runners.
+- [reports/C4-SOURCE-PRODUCER.md](reports/C4-SOURCE-PRODUCER.md) (2026-10-30): The fork's owned producer of V1 sources, as measured on its branch.
 - [platforms.md](platforms.md) (2026-10-30): The state of each platform under blaze v1 (rustc's link line, the splice, `blaze-engine weaken`), from v1's last CI run that covered them all. v2 has not been run on any platform yet.
+- [native-environment.md](native-environment.md) (2026-10-30): How the fork carried native compiler environments through its V1 BuildSpec; V2 has no such path.
 - [fn-cache.md](fn-cache.md) (2026-10-30): #[blaze::cache]: results of pure functions kept across runs, keyed by the code they reach. Its library crates were deleted on 2026-10-30.
 - [doc.md](doc.md) (2026-10-30): blaze doc as blaze v1 did it (the engine's doc.rs, over a workspace loaded into rust-analyzer): HTML documentation written from the front end's HIR, with no rustdoc. v2 has no `blaze doc` yet.
 - [v2/requests/vfs.md](v2/requests/vfs.md) (2026-10-29): The v2 lanes' requests filed under `vfs` (what one lane asked of the code another owns), each with its answer.
@@ -738,15 +742,26 @@ Research, reports and measurements, true on their date and not brought up to dat
 - [v2/requests/cargo-inbox-tests.md](v2/requests/cargo-inbox-tests.md) (2026-10-29): The v2 lanes' requests filed under `cargo-inbox-tests` (what one lane asked of the code another owns), each with its answer.
 - [v2/requests/cargo-dedup.md](v2/requests/cargo-dedup.md) (2026-10-29): The v2 lanes' requests filed under `cargo-dedup` (what one lane asked of the code another owns), each with its answer.
 - [v2/requests/cargo-cli3.md](v2/requests/cargo-cli3.md) (2026-10-29): The v2 lanes' requests filed under `cargo-cli3` (what one lane asked of the code another owns), each with its answer.
+- [reports/COLD-LOCK.md](reports/COLD-LOCK.md) (2026-10-29): The fork's cold lock resolution report under V1.
+- [reports/DSM-REVIEW.md](reports/DSM-REVIEW.md) (2026-10-28): The review of the distributed protocol's deterministic simulation.
 - [rename.md](rename.md) (2026-10-28): The rename from ra-jit and cargo blaze to blaze (#270), and what tools/rename.py changes.
 - [results.md](results.md) (2026-10-27): Results: every number with the harness, commit and report it came from.
+- [research/front-end-image.md](research/front-end-image.md) (2026-10-27): Research on a mapped front-end image for V1's workers.
 - [reports/WASM-PROC-MACROS.md](reports/WASM-PROC-MACROS.md) (2026-10-27): Proc macros built and run as WebAssembly.
+- [reports/SCRIPTEDITS.md](reports/SCRIPTEDITS.md) (2026-10-27): How the fork's V1 whole build judged edits of build scripts.
 - [reports/BSWASI.md](reports/BSWASI.md) (2026-10-27): Build scripts under WASI, an experiment, on the bench corpus.
+- [research/bazel-nativelink.md](research/bazel-nativelink.md) (2026-10-26): Research on Bazel with NativeLink for Rust, against the fork's V1 distributed design.
 - [reports/NIGHTLY.md](reports/NIGHTLY.md) (2026-10-26): blaze on the latest nightly: the 2026-10-25 handoff.
+- [reports/BUILDSCRIPT.md](reports/BUILDSCRIPT.md) (2026-10-26): Why every edit of the CLI went to cargo under V1, and what the fork tried.
+- [research/memory.md](research/memory.md) (2026-10-25): Research on whether the warm V1 daemon leaks, and what would shrink it.
+- [reports/loadmem/u7-a3-holders.md](reports/loadmem/u7-a3-holders.md) (2026-10-25): Holders of a loading worker's memory: one V1 run of unit u7.
+- [reports/loadmem/cold-prof2-holders.md](reports/loadmem/cold-prof2-holders.md) (2026-10-25): Holders of a loading worker's memory: one V1 cold run.
+- [reports/LOADMEM.md](reports/LOADMEM.md) (2026-10-25): What held a loading worker's memory under V1.
 - [research/warm-start.md](research/warm-start.md) (2026-10-24): A daemon's start on a warm store (#41): where helix's 105 s went and what brought it to 38 s.
 - [research/lean-frontend.md](research/lean-frontend.md) (2026-10-24): Where nushell's cold start, edits and heap go in the front end (#236), and the lean path ranked.
 - [research/concurrent-reads.md](research/concurrent-reads.md) (2026-10-24): The store's cache of unpacked blocks on a warm start, and ordered and hash maps for blaze's shared maps.
 - [research/codegen-units.md](research/codegen-units.md) (2026-10-24): Codegen units for whole-program builds (#176): how functions are cut into LLVM modules, and the times.
+- [reports/TRACEDECAY.md](reports/TRACEDECAY.md) (2026-10-24): blaze on tracedecay under V1, measured against cargo.
 - [research/disk.md](research/disk.md) (2026-10-23): What blaze keeps on disk against cargo on four projects, part by part, and the store before and after zstd.
 - [reports/CI.md](reports/CI.md) (2026-10-22): Where CI's fast tier's time went, and the merge queue.
 - [flat-syntax.md](flat-syntax.md) (2026-10-22): Flat syntax trees for files nobody edits (#42): the design and its memory and time, measured.

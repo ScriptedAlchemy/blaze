@@ -24,19 +24,13 @@ pub struct Blobs {
 }
 
 impl Blobs {
-    fn request(
-        &self,
-        method: &str,
-        path: &str,
-        extra: &str,
-        body: &[u8],
-    ) -> Result<(u16, Vec<u8>), Error> {
+    fn request(&self, method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), Error> {
         let mut stream = TcpStream::connect_timeout(&self.address, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
         stream.set_nodelay(true)?;
         let head = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n{extra}Content-Length: {}\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
             self.address,
             body.len()
         );
@@ -57,9 +51,12 @@ impl Blobs {
             .and_then(|it| it.parse().ok())
             .ok_or_else(|| Error::Protocol(format!("{method} {path}: no status")))?;
         if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
-            return Ok((status, unchunk(&reply[end + 4..]).ok_or_else(|| {
-                Error::Protocol(format!("{method} {path}: a broken chunked body"))
-            })?));
+            return Ok((
+                status,
+                unchunk(&reply[end + 4..]).ok_or_else(|| {
+                    Error::Protocol(format!("{method} {path}: a broken chunked body"))
+                })?,
+            ));
         }
         Ok((status, reply[end + 4..].to_vec()))
     }
@@ -68,7 +65,7 @@ impl Blobs {
     /// is there is whole.
     pub fn put_pack(&self, pack: &Pack) -> Result<(), Error> {
         let path = format!("/v1/blob/packs/{}.pack", hex(&pack.reference.pack));
-        let (status, body) = self.request("PUT", &path, "", &pack.bytes)?;
+        let (status, body) = self.request("PUT", &path, &pack.bytes)?;
         match status {
             200..=299 => Ok(()),
             _ => Err(Error::Protocol(format!(
@@ -81,7 +78,7 @@ impl Blobs {
     /// The bytes of the pack named `digest`; `None` if the server has none.
     pub fn pack(&self, digest: &Digest) -> Result<Option<Vec<u8>>, Error> {
         let path = format!("/v1/blob/packs/{}.pack", hex(digest));
-        let (status, body) = self.request("GET", &path, "", &[])?;
+        let (status, body) = self.request("GET", &path, &[])?;
         match status {
             200 => Ok(Some(body)),
             404 => Ok(None),
@@ -95,7 +92,7 @@ impl Blobs {
     /// The published list of the unit named `spec`; `None` if nobody published it.
     pub fn published(&self, spec: &Digest) -> Result<Option<Vec<u8>>, Error> {
         let path = format!("/v1/list/manifests/{}", hex(spec));
-        let (status, body) = self.request("GET", &path, "", &[])?;
+        let (status, body) = self.request("GET", &path, &[])?;
         match status {
             200 => Ok(Some(body)),
             404 => Ok(None),
@@ -110,7 +107,7 @@ impl Blobs {
     /// both name the same keys, so either reads the same (412 is not an error).
     pub fn publish(&self, spec: &Digest, list: &[u8]) -> Result<(), Error> {
         let path = format!("/v1/list/manifests/{}", hex(spec));
-        let (status, body) = self.request("PUT", &path, "If-None-Match: *\r\n", list)?;
+        let (status, body) = self.request("PUT", &path, list)?;
         match status {
             200..=299 | 412 => Ok(()),
             _ => Err(Error::Protocol(format!(

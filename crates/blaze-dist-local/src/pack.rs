@@ -76,7 +76,11 @@ pub fn read(bytes: &[u8], reference: &PackRef) -> Result<Vec<Value>, String> {
         return Err(format!("pack {name} is of format {}", reference.format));
     }
     if bytes.len() as u64 != reference.size {
-        return Err(format!("pack {name} is {} bytes, committed as {}", bytes.len(), reference.size));
+        return Err(format!(
+            "pack {name} is {} bytes, committed as {}",
+            bytes.len(),
+            reference.size
+        ));
     }
     let got: Digest = Sha256::digest(bytes).into();
     if got != reference.pack {

@@ -1,3 +1,8 @@
+---
+status: record
+summary: Why every edit of the CLI went to cargo under V1, and what the fork tried.
+date: 2026-10-26
+---
 # Why every edit of tracedecay's CLI went to cargo: its build script printed something else
 
 ## Ambient dependency environment follow-up, 2026-10-29

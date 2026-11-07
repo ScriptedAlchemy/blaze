@@ -14,21 +14,21 @@
 //!
 //! The caller then runs its one build with these values in front of its store: what is here it
 //! does not compile, and what is missing (a function the walk gave no executor, a batch an
-//! executor refused) it compiles itself, by the same code, and reports. A failure of the carrier
-//! is the caller's: its [`LocalPolicy`] says whether the build stops or compiles what is left.
+//! executor refused) it compiles itself, by the same code, and reports. When the path fails,
+//! [`decide`] says under the caller's [`LocalPolicy`] whether the build stops or compiles here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use blaze_dist::Ranges;
 use blaze_dist::holder::{BatchCompiler, Compiled, Holder, HolderConfig, Plan, StopWhy};
+use blaze_dist::jobs::{LocalAction, local_action};
+use blaze_dist::{Ranges, Refusal};
 use blaze_wire::{
-    Attempt, BuildSpec, Command as WireCommand, Digest, DoneEvent, EntryKey, EntryRef, ExecutionId,
-    ItemKey, ItemOutcome, ItemResult, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome,
-    PackRef, ProfileSpec, Reservation, RootRef, RootSet, Set, SourcePath, SourceRef, StoreIdentity,
-    Why, WorkKey, WorkName, WorkersEventsRequest, digest_of_encoded_name, encode,
+    Attempt, Digest, DoneEvent, EntryKey, EntryRef, ExecutionId, ItemKey, ItemOutcome, ItemResult,
+    JobEvent, JobRequest, LocalPolicy, Namespace, Outcome, PackRef, Reservation, RootSet, Set, Why,
+    WorkKey, WorkName, WorkersEventsRequest, digest_of_encoded_name, encode,
 };
 
 use crate::Error;
@@ -60,8 +60,13 @@ pub struct Config {
     pub claimant: Digest,
     /// [`platform`] of the host triple.
     pub platform: Digest,
-    /// What a failure of the distributed path means ([`Arrived`]'s caller reads it).
+    /// What a failure of the distributed path means ([`decide`]).
     pub local: LocalPolicy,
+    /// Whose build this is: the main line's, or a pull request's, which share no execution and
+    /// run on the executors of their namespace. Published units are shared whatever it is.
+    pub namespace: Namespace,
+    /// Which build of a pull request this is ([`JobRequest::source`]).
+    pub source: Digest,
     /// How long one unit may wait for its execution.
     pub deadline: Duration,
     /// The holder's timings.
@@ -127,6 +132,22 @@ pub struct Arrived {
     pub joined: bool,
 }
 
+impl Arrived {
+    /// Nothing yet, from `source`.
+    fn none(source: Source, execution: Option<u64>) -> Arrived {
+        Arrived {
+            values: BTreeMap::new(),
+            packs: Vec::new(),
+            source,
+            execution,
+            compiled_here: 0,
+            stored_here: 0,
+            grants: 0,
+            joined: false,
+        }
+    }
+}
+
 fn wire_name(unit: &Digest, name: &Digest) -> WorkName {
     WorkName::of(&WorkKey::Item(ItemKey { unit: *unit, stable: *name, env: [0; 32] }))
 }
@@ -139,52 +160,43 @@ pub fn root_set(unit: &Unit) -> RootSet {
         spec: unit.spec,
         roots: digest_of_encoded_name("blaze/root-set", &encode(&pairs)),
         count: pairs.len() as u64,
-        index: digest_of_encoded_name("blaze/pre-index", &encode(&Vec::<(WorkName, Digest)>::new())),
+        index: digest_of_encoded_name(
+            "blaze/pre-index",
+            &encode(&Vec::<(WorkName, Digest)>::new()),
+        ),
         inputs: [0; 32],
     }
 }
 
-/// The job of a unit. The spec's only identity is the unit's digest in its source: a V2 unit
-/// is named by what its walk computed from its sources, settings and toolchain, so nothing else
-/// here differs from one executor to the next, and an executor's own resolve stays its own.
-fn request(unit: &Unit, config: &Config, now: u64) -> Result<JobRequest, Error> {
-    let path = |text: &str| {
-        SourcePath::new(text.to_owned()).map_err(|e| Error::Protocol(format!("{text}: {e:?}")))
-    };
-    Ok(JobRequest {
-        spec: BuildSpec {
-            source: SourceRef::Root(RootRef { root: unit.spec }),
-            lock: unit.spec,
-            units: Vec::new(),
-            asked: Set::new(Vec::new()),
-            profile: ProfileSpec {
-                name: "unit".to_owned(),
-                opt_level: 0,
-                debug: 0,
-                debug_assertions: false,
-                overflow_checks: false,
-                panic: 0,
-                strip: 0,
-                split_debuginfo: 0,
-                backend: 0,
-                mir_opt: 0,
-                backend_opt: 0,
-                backend_emit: 0,
-            },
-            platform: config.platform,
-            rustflags: Vec::new(),
-            config_env: Set::new(Vec::new()),
-            script_env: Set::new(Vec::new()),
-            cwd: path(".")?,
-            command: WireCommand::Build,
-            toolchain: StoreIdentity(unit.spec),
-            workspace_manifest: path("Cargo.toml")?,
-        },
-        namespace: Namespace::Main,
+/// The job of a unit: what its executors agree on, and this subscriber's terms.
+fn request(unit: &Unit, config: &Config, now: u64) -> JobRequest {
+    JobRequest {
+        unit: unit.spec,
+        platform: config.platform,
+        namespace: config.namespace.clone(),
+        source: config.source,
         deadline_ms: now.saturating_add(config.deadline.as_millis() as u64),
         local: config.local.clone(),
-        test_timeout_ms: None,
-    })
+    }
+}
+
+/// What the requester does about `failure`, under `policy`: `Ok` compiles the unit here, by the
+/// one build; `Err` stops the build, naming what failed. A terminal goes by its contract
+/// ([`local_action`]): a verdict is taken, anything else builds here only if asked. A failure
+/// that names no outcome (the carrier gone, a pack that fails its check) is no verdict either.
+pub fn decide(policy: &LocalPolicy, failure: Error) -> Result<(), Error> {
+    let action = match &failure {
+        Error::Ended(termination) => local_action(policy, termination)
+            .map_err(|why| Error::Protocol(format!("the terminal is refused: {why:?}")))?,
+        Error::Io(_) | Error::Protocol(_) => match policy {
+            LocalPolicy::Never => LocalAction::Fail,
+            LocalPolicy::Fallback => LocalAction::BuildLocally,
+        },
+    };
+    match action {
+        LocalAction::BuildLocally => Ok(()),
+        LocalAction::Take | LocalAction::Fail => Err(failure),
+    }
 }
 
 struct Batches<'a> {
@@ -198,8 +210,8 @@ struct Batches<'a> {
 
 impl BatchCompiler for Batches<'_> {
     fn compile(&mut self, plan: &Plan) -> Result<Compiled, String> {
-        let ranges = Ranges::from_wire(&plan.grant.roots)
-            .ok_or("granted root ranges are not canonical")?;
+        let ranges =
+            Ranges::from_wire(&plan.grant.roots).ok_or("granted root ranges are not canonical")?;
         let indexes: Vec<u64> = ranges.indexes().collect();
         let mut names = Vec::with_capacity(indexes.len());
         for index in &indexes {
@@ -215,11 +227,17 @@ impl BatchCompiler for Batches<'_> {
                     let pack = Pack::of(grant.values)?;
                     // The result is posted after this returns: a committed pack exists whole.
                     self.blobs.put_pack(&pack).map_err(|e| e.to_string())?;
-                    (|name| ItemOutcome::Exported(EntryRef { entry: EntryKey(*name) }), vec![pack.reference])
+                    (
+                        |name| ItemOutcome::Exported(EntryRef { entry: EntryKey(*name) }),
+                        vec![pack.reference],
+                    )
                 }
                 Err(why) => {
                     tracing::warn!(target: "blaze", why, "a distributed grant goes back");
-                    (|_| ItemOutcome::Local(Why { why: "the batch was given back".to_owned() }), Vec::new())
+                    (
+                        |_| ItemOutcome::Local(Why { why: "the batch was given back".to_owned() }),
+                        Vec::new(),
+                    )
                 }
             };
         let item = |at: &usize| {
@@ -233,7 +251,9 @@ impl BatchCompiler for Batches<'_> {
         };
         let lost = |name: &WorkName| ItemResult {
             name: *name,
-            outcome: ItemOutcome::Lost(Why { why: "unknown-name: a V2 root set finds no names".to_owned() }),
+            outcome: ItemOutcome::Lost(Why {
+                why: "unknown-name: a V2 root set finds no names".to_owned(),
+            }),
             found: Set::new(Vec::new()),
             unnamed: Set::new(Vec::new()),
         };
@@ -249,6 +269,9 @@ impl BatchCompiler for Batches<'_> {
 
     fn release(&mut self, _names: &[WorkName]) {}
 }
+
+/// How long past a job's deadline its requester still waits for the coordinator to end it.
+const GRACE: Duration = Duration::from_secs(5);
 
 /// How a pack that is not on the server ends its error.
 const CANCELLED: &str = "the build was cancelled";
@@ -359,27 +382,23 @@ pub fn run(
     {
         match import(&config.blobs, &packs) {
             Ok(values) => {
-                return Ok(Arrived {
-                    values,
-                    packs,
-                    source: Source::Published,
-                    execution: None,
-                    compiled_here: 0,
-                    stored_here: 0,
-                    grants: 0,
-                    joined: false,
-                });
+                return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None) });
             }
             // A list naming a pack the server lost is an unpublished unit, not a failure.
             Err(Error::Protocol(why)) if why.ends_with(GONE) => {}
             Err(error) => return Err(error),
         }
     }
+    // A unit whose functions all stay with the build that links them (a release unit's, a folded
+    // group's) has nothing to distribute: its list above is all it can take.
+    if unit.names.is_empty() {
+        return Ok(Arrived::none(Source::Executed, None));
+    }
     let started = Instant::now();
     let mut client = Client::connect(&config.socket, random_id()?)?;
     let origin = client.welcome.now_ms;
     let now_ms = move || origin.saturating_add(started.elapsed().as_millis() as u64);
-    let job = request(unit, config, now_ms())?;
+    let job = request(unit, config, now_ms());
     let binding = loop {
         let submit = Command::Submit(carrier::submission(&job, NEED));
         match client.call(submit)? {
@@ -388,31 +407,29 @@ pub fn run(
                 if started.elapsed() > config.deadline {
                     return Err(Error::Protocol(format!("submit: {}", error.message)));
                 }
-                let _waiting = tracing::info_span!(target: "blaze", "dist: the coordinator is busy").entered();
+                let _waiting =
+                    tracing::info_span!(target: "blaze", "dist: the coordinator is busy").entered();
                 std::thread::sleep(Duration::from_millis(error.retry_after_ms.unwrap_or(100)));
             }
-            Answer::Error(error) => return Err(Error::Protocol(format!("submit: {}", error.message))),
+            Answer::Error(error) => {
+                return Err(Error::Protocol(format!("submit: {}", error.message)));
+            }
             other => return Err(Error::Protocol(format!("submit answered {other:?}"))),
         }
     };
     let content = binding.subscription.content;
     let execution = binding.subscription.execution;
-    let mut arrived = Arrived {
-        values: BTreeMap::new(),
-        packs: Vec::new(),
-        source: Source::Executed,
-        execution: Some(execution.0),
-        compiled_here: 0,
-        stored_here: 0,
-        grants: 0,
-        joined: false,
-    };
+    let mut arrived = Arrived::none(Source::Executed, Some(execution.0));
     let mut last_claim: Option<(String, Attempt, bool)> = None;
     let packs = loop {
         if cancelled.load(Ordering::Acquire) {
+            leave(&mut client, &binding);
             return Err(Error::Protocol(CANCELLED.to_owned()));
         }
-        if started.elapsed() > config.deadline {
+        // The coordinator's own deadline ends the execution first, and its terminal says so:
+        // this is for a coordinator that stopped ending anything.
+        if started.elapsed() > config.deadline.saturating_add(GRACE) {
+            leave(&mut client, &binding);
             return Err(Error::Protocol(format!(
                 "unit {}: its execution did not finish in {:?}",
                 hex(&unit.spec),
@@ -422,9 +439,14 @@ pub fn run(
         if let Some(packs) = committed(&mut client, content, execution)? {
             break packs;
         }
-        let claim = Command::Claim(carrier::Claim { content, execution, claimant: config.claimant });
-        let Answer::Claimed(claimed) = answer(&mut client, claim, "claim")? else {
-            return Err(Error::Protocol("claim answered something else".to_owned()));
+        let claim =
+            Command::Claim(carrier::Claim { content, execution, claimant: config.claimant });
+        let claimed = match client.call(claim)? {
+            Answer::Claimed(claimed) => claimed,
+            Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => {
+                return Err(ended(&mut client, &binding));
+            }
+            other => return Err(Error::Protocol(format!("claim answered {other:?}"))),
         };
         let Some(executor) = claimed.executor else {
             let _waiting =
@@ -447,8 +469,7 @@ pub fn run(
             &mut arrived,
         )?;
         match stopped {
-            StopWhy::Ended | StopWhy::Cancelled => {}
-            StopWhy::AttemptMoved => continue,
+            StopWhy::Ended | StopWhy::Cancelled | StopWhy::AttemptMoved => {}
             StopWhy::FrontEndDiffers => {
                 return Err(Error::Protocol(format!(
                     "unit {}: another executor's front end differs from this one's",
@@ -466,6 +487,26 @@ pub fn run(
     // The session's capacity goes back now, not at the end of its fixed lifetime.
     let _ = client.release();
     Ok(arrived)
+}
+
+/// This build no longer waits for its execution: when nobody else does, it ends, and its
+/// executors go back. A failure here costs what the coordinator's own deadline takes back.
+fn leave(client: &mut Client, binding: &Binding) {
+    let _ = client.call(Command::Cancel(binding.clone()));
+    let _ = client.release();
+}
+
+/// Why the execution ended with nothing committed: its terminal for this subscription.
+fn ended(client: &mut Client, binding: &Binding) -> Error {
+    match client.call(Command::Terminal(binding.subscription.clone())) {
+        Ok(Answer::Terminal(carrier::Terminal { value: Some(value), .. })) => {
+            Error::Ended(value.termination)
+        }
+        Ok(other) => {
+            Error::Protocol(format!("the execution ended and its terminal says {other:?}"))
+        }
+        Err(error) => error,
+    }
 }
 
 /// The packs of a finished compile phase, or `None` while it runs. An execution that ended
@@ -589,7 +630,9 @@ fn finish(
         });
         match client.call(ack) {
             Ok(Answer::KillAck(answer)) if !answer.accepted => {
-                let _waiting = tracing::info_span!(target: "blaze", "dist: the lead ending the execution").entered();
+                let _waiting =
+                    tracing::info_span!(target: "blaze", "dist: the lead ending the execution")
+                        .entered();
                 std::thread::sleep(config.poll);
             }
             _ => return,

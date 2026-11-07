@@ -1,14 +1,6 @@
-//! An additive, type-versioned terminal delivery, separate from v1 `JobEvent`.
-//!
-//! The v2 terminal endpoint returns one deterministic CBOR [`SubscriberTerminalV2`] map,
-//! not an added variant or field in the v1 stream. Its nested [`TerminationV2::version`]
-//! must be [`VERSION`]; consumers validate it and the outcome/reason pair before policy.
-//! The existing `Limits::event`, depth and collection limits still apply.
-//! This addition does not edit `BuildSpec` or `JobEvent`. Terminal version and the
-//! enclosing wire crate's schema/digest version are separate: C2's schema-2 integration
-//! changes general typed domains independently. These type names separate terminal
-//! identities in whichever schema codec is selected. See docs/distributed.md for framing,
-//! compatibility and the driver conversion boundary.
+//! A subscription's terminal delivery: one deterministic CBOR [`SubscriberTerminalV2`] map, whose
+//! nested [`TerminationV2::version`] must be [`VERSION`]; consumers validate it and the
+//! outcome/reason pair before policy. See docs/distributed.md for what a requester does with it.
 
 use crate::{Attempt, ExecutionId, Limits, Outcome, decode, wire_enum, wire_struct};
 

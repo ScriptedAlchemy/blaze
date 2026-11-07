@@ -1,3 +1,8 @@
+---
+status: record
+summary: How the fork's V1 whole build judged edits of build scripts.
+date: 2026-10-27
+---
 # SCRIPTEDITS: build scripts rerun across edits in the whole build
 
 This report records unit p05w of the distributed program on 2026-10-26, on branch

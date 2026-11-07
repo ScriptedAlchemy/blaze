@@ -39,10 +39,8 @@ fn names_in(text: &str) -> BTreeSet<String> {
 fn shape_sections() -> String {
     let doc = doc();
     let start = doc.find("## Data shapes").expect("the doc has no \"Data shapes\"");
-    let end = doc.find("What the server keeps on its own disk").expect("no end of \"Data shapes\"");
-    let calls = doc.find("### The shapes of the calls").expect("the doc has no call shapes");
-    let calls_end = doc.find("## 9. Upstream's objections").expect("no section 9");
-    format!("{}\n{}", &doc[start..end], &doc[calls..calls_end])
+    let end = doc.find("## What it does not do").expect("no end of the doc's shapes");
+    doc[start..end].to_owned()
 }
 
 #[test]
@@ -50,7 +48,7 @@ fn every_type_the_doc_names_is_in_the_crate() {
     let documented = names_in(&shape_sections());
     let in_crate: BTreeSet<String> =
         blaze_wire::vectors::every().iter().map(|entry| entry.name.to_owned()).collect();
-    assert!(documented.len() >= 80, "the doc's shapes were read as {} types", documented.len());
+    assert!(documented.len() >= 40, "the doc's shapes were read as {} types", documented.len());
     let missing: Vec<&String> = documented.difference(&in_crate).collect();
     assert!(missing.is_empty(), "the doc names types the crate does not have: {missing:?}");
 }
@@ -64,21 +62,13 @@ fn every_type_the_crate_has_is_in_the_doc() {
     // The payload structs of section 8's enum list are named in a sentence, not in a code block,
     // so they are checked by their own list.
     let payloads: BTreeSet<&str> = [
-        "GitRef",
-        "RootRef",
         "PrNamespace",
         "ItemKey",
         "EdgeKey",
         "EntryRef",
         "Why",
-        "FileObservation",
-        "DirObservation",
-        "AbsentObservation",
-        "LinkObservation",
         "StageEvent",
         "AssignedEvent",
-        "PublishedEvent",
-        "ProgramEvent",
         "RefusedEvent",
         "OutputEvent",
         "DoneEvent",
@@ -94,21 +84,13 @@ fn every_type_the_crate_has_is_in_the_doc() {
 fn the_payload_structs_are_the_ones_the_doc_names() {
     let doc = doc();
     for name in [
-        "GitRef",
-        "RootRef",
         "PrNamespace",
         "ItemKey",
         "EdgeKey",
         "EntryRef",
         "Why",
-        "FileObservation",
-        "DirObservation",
-        "AbsentObservation",
-        "LinkObservation",
         "StageEvent",
         "AssignedEvent",
-        "PublishedEvent",
-        "ProgramEvent",
         "RefusedEvent",
         "OutputEvent",
         "DoneEvent",

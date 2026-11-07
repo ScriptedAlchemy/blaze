@@ -1627,7 +1627,7 @@ pub struct Build<'a, B: Prepare> {
     why: bool,
 }
 
-/// A unit's functions as a work set for several executors (docs/distributed.md, section 4):
+/// A unit's functions as a work set for several executors (docs/distributed.md):
 /// made by [`Build::work_set`], its [`names`](WorkSet::names) the canonical root list every
 /// executor of a unit computes alike, since an instance's key covers all it is made from.
 ///
