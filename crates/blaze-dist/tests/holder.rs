@@ -147,10 +147,7 @@ fn review_a_fresh_rejected_finding_is_released() {
 #[test]
 fn result_acknowledgment_rejects_foreign_grants_and_conflicts() {
     let foreign = WorkName([99; 32]);
-    for (granted, conflicts) in [
-        (vec![foreign], Vec::new()),
-        (Vec::new(), vec![foreign]),
-    ] {
+    for (granted, conflicts) in [(vec![foreign], Vec::new()), (Vec::new(), vec![foreign])] {
         let (mut holder, id) = reporting(false);
         let mut effects = Vec::new();
         holder.step(
@@ -169,9 +166,11 @@ fn result_acknowledgment_rejects_foreign_grants_and_conflicts() {
         assert!(effects.iter().any(
             |effect| matches!(effect, Effect::Stop(StopWhy::Protocol(why)) if why.contains("foreign"))
         ));
-        assert!(!effects.iter().any(
-            |effect| matches!(effect, Effect::Send { call: Call::Lease(_), .. })
-        ));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send { call: Call::Lease(_), .. }))
+        );
     }
 }
 
