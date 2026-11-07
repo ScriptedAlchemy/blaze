@@ -527,10 +527,8 @@ impl Holder {
                 }
             }
             self.release(extra, out);
-            return self.stop(
-                StopWhy::Protocol("compiler batch without an active grant".into()),
-                out,
-            );
+            return self
+                .stop(StopWhy::Protocol("compiler batch without an active grant".into()), out);
         };
         if batch.generation != grant.lease.generation {
             // A compiler result for another lease is not an empty batch. Its

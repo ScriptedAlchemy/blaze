@@ -217,9 +217,9 @@ fn unexpected_compiler_completion_fences_and_releases_every_finding_once() {
     let (mut holder, batch) = compiling(false);
     let mut effects = Vec::new();
     holder.step(3, Event::Compiled(batch.clone()), &mut effects);
-    assert!(effects.iter().any(
-        |effect| matches!(effect, Effect::Send { call: Call::Result(_), .. })
-    ));
+    assert!(
+        effects.iter().any(|effect| matches!(effect, Effect::Send { call: Call::Result(_), .. }))
+    );
 
     let extra = WorkName([11; 32]);
     let mut duplicate = batch;
@@ -239,10 +239,7 @@ fn unexpected_compiler_completion_fences_and_releases_every_finding_once() {
         .copied()
         .collect();
     assert_eq!(released_names.len(), 2, "every retained name is released exactly once");
-    assert_eq!(
-        released_names.into_iter().collect::<BTreeSet<_>>(),
-        BTreeSet::from([FOUND, extra])
-    );
+    assert_eq!(released_names.into_iter().collect::<BTreeSet<_>>(), BTreeSet::from([FOUND, extra]));
     assert!(effects.iter().any(
         |effect| matches!(effect, Effect::Stop(StopWhy::Protocol(why)) if why.contains("active grant"))
     ));
