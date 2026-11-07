@@ -467,3 +467,7 @@ pub const FROM_SCRIPT: &str = include_str!(concat!(env!("OUT_DIR"), "/from_scrip
 
 /// A file included from the crate: it is an input of what compiles it, as its sources are.
 pub const INCLUDED: &str = include_str!("../included.txt");
+
+/// Through a proc macro, a unit of another target.
+#[pm::seen]
+pub const THROUGH_THE_MACRO: u32 = 1;

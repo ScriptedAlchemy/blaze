@@ -15,4 +15,5 @@ fn main() {
     let dropped = mathy::DROPPED.load(std::sync::atomic::Ordering::SeqCst);
     println!("caught {caught}, dropped {dropped}, script says {}", shapes::FROM_SCRIPT);
     println!("included {}", shapes::INCLUDED);
+    println!("{} {}", shapes::seen(), shapes::THROUGH_THE_MACRO);
 }

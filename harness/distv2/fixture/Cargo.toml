@@ -1,5 +1,5 @@
 [workspace]
-members = ["shapes", "mathy", "app"]
+members = ["pm", "shapes", "mathy", "app"]
 resolver = "2"
 
 [profile.dev]

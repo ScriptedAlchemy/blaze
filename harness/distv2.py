@@ -276,7 +276,7 @@ def main(given: Input) -> None:
         check(code == 0, f"solo builds: {text[-400:] if code else ''}")
         solo = run.behaviour("solo")
         print("     solo:", solo[0].strip().replace("\n", " | "), solo[1][:16], flush=True)
-        check("caught true" in solo[0] and "script says from the script" in solo[0], "the program unwinds across units and has its script's output")
+        check("caught true" in solo[0] and "script says from the script" in solo[0] and "seen by the macro" in solo[0], "the program unwinds across units and has its script's and its proc macro's output")
 
         a, a_log = run.build("a", wait=False)
         b, b_log = run.build("b", wait=False)
