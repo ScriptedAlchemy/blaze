@@ -81,90 +81,89 @@ fn drive(
             // Transport failure before acknowledgment must release them as well as
             // findings already retained from earlier successful batches.
             let mut unconfirmed = BTreeSet::new();
-            let result =
-                (|| -> Result<StopWhy, Error> {
-                    let mut effects = Vec::new();
-                    let mut stopped: Option<StopWhy> = None;
-                    holder.start(now_ms(), &mut effects);
-                    holder.step(now_ms(), Event::Loaded, &mut effects);
-                    loop {
-                        if effects.is_empty() {
-                            if let Some(why) = stopped.take() {
-                                if !working {
-                                    return Ok(why);
-                                }
-                                stopped = Some(why);
+            let result = (|| -> Result<StopWhy, Error> {
+                let mut effects = Vec::new();
+                let mut stopped: Option<StopWhy> = None;
+                holder.start(now_ms(), &mut effects);
+                holder.step(now_ms(), Event::Loaded, &mut effects);
+                loop {
+                    if effects.is_empty() {
+                        if let Some(why) = stopped.take() {
+                            if !working {
+                                return Ok(why);
                             }
-                            match completions.recv_timeout(config.poll) {
-                                Ok(Ok(batch)) => {
-                                    working = false;
-                                    if !holder.is_stopped() {
-                                        unconfirmed.extend(
-                                            batch.roots.iter().chain(&batch.names).flat_map(|item| {
-                                                item.found.iter().map(|found| found.name)
-                                            }),
-                                        );
-                                    }
-                                    // The stopped holder releases even findings from a
-                                    // compile that finished after cancellation.
-                                    holder.step(now_ms(), Event::Compiled(batch), &mut effects);
+                            stopped = Some(why);
+                        }
+                        match completions.recv_timeout(config.poll) {
+                            Ok(Ok(batch)) => {
+                                working = false;
+                                if !holder.is_stopped() {
+                                    unconfirmed.extend(
+                                        batch.roots.iter().chain(&batch.names).flat_map(|item| {
+                                            item.found.iter().map(|found| found.name)
+                                        }),
+                                    );
                                 }
-                                Ok(Err(error)) => {
-                                    working = false;
-                                    if stopped.is_none() {
-                                        return Err(Error::Protocol(error));
-                                    }
+                                // The stopped holder releases even findings from a
+                                // compile that finished after cancellation.
+                                holder.step(now_ms(), Event::Compiled(batch), &mut effects);
+                            }
+                            Ok(Err(error)) => {
+                                working = false;
+                                if stopped.is_none() {
+                                    return Err(Error::Protocol(error));
                                 }
-                                Err(RecvTimeoutError::Timeout) => {
-                                    if stopped.is_none() {
-                                        holder.step(now_ms(), Event::Tick, &mut effects);
-                                    }
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                if stopped.is_none() {
+                                    holder.step(now_ms(), Event::Tick, &mut effects);
                                 }
-                                Err(RecvTimeoutError::Disconnected) => {
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                return Err(Error::Protocol(
+                                    "compiler worker exited without a result".to_owned(),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    for effect in std::mem::take(&mut effects) {
+                        match effect {
+                            Effect::Stop(why) => stopped = Some(why),
+                            Effect::Release(names) => {
+                                for name in &names {
+                                    unconfirmed.remove(name);
+                                }
+                                tasks.send(CompilerTask::Release(names)).map_err(|_| {
+                                    Error::Protocol("compiler worker is unavailable".to_owned())
+                                })?;
+                            }
+                            Effect::Compile(plan) => {
+                                if working {
                                     return Err(Error::Protocol(
-                                        "compiler worker exited without a result".to_owned(),
+                                        "holder granted overlapping compiler batches".to_owned(),
                                     ));
                                 }
+                                tasks.send(CompilerTask::Compile(plan)).map_err(|_| {
+                                    Error::Protocol("compiler worker is unavailable".to_owned())
+                                })?;
+                                working = true;
                             }
-                            continue;
-                        }
-                        for effect in std::mem::take(&mut effects) {
-                            match effect {
-                                Effect::Stop(why) => stopped = Some(why),
-                                Effect::Release(names) => {
-                                    for name in &names {
-                                        unconfirmed.remove(name);
-                                    }
-                                    tasks.send(CompilerTask::Release(names)).map_err(|_| {
-                                        Error::Protocol("compiler worker is unavailable".to_owned())
-                                    })?;
+                            Effect::Send { id, call } if stopped.is_none() => {
+                                let is_result = matches!(call, Call::Result(_));
+                                let reply = transmit(&call, id)?;
+                                holder.step(now_ms(), Event::Reply { id, reply }, &mut effects);
+                                if is_result {
+                                    // The holder has either retained or released every
+                                    // discovery from this acknowledged result.
+                                    unconfirmed.clear();
                                 }
-                                Effect::Compile(plan) => {
-                                    if working {
-                                        return Err(Error::Protocol(
-                                            "holder granted overlapping compiler batches".to_owned(),
-                                        ));
-                                    }
-                                    tasks.send(CompilerTask::Compile(plan)).map_err(|_| {
-                                        Error::Protocol("compiler worker is unavailable".to_owned())
-                                    })?;
-                                    working = true;
-                                }
-                                Effect::Send { id, call } if stopped.is_none() => {
-                                    let is_result = matches!(call, Call::Result(_));
-                                    let reply = transmit(&call, id)?;
-                                    holder.step(now_ms(), Event::Reply { id, reply }, &mut effects);
-                                    if is_result {
-                                        // The holder has either retained or released every
-                                        // discovery from this acknowledged result.
-                                        unconfirmed.clear();
-                                    }
-                                }
-                                Effect::Send { .. } => {}
                             }
+                            Effect::Send { .. } => {}
                         }
                     }
-                })();
+                }
+            })();
 
             if result.is_err() {
                 if working {
