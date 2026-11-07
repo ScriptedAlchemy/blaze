@@ -395,6 +395,30 @@ impl Holder {
                 other => self.refused(other, &error, out),
             },
             (Phase::Reporting { result, root_items }, Reply::Result(Ok(answer))) => {
+                // A successful result may only acknowledge names carried by this batch.
+                // An unrelated conflict could otherwise release a retained finding from
+                // an earlier batch, while a foreign grant would be silently accepted.
+                let found: BTreeSet<WorkName> = result
+                    .items
+                    .iter()
+                    .flat_map(|item| item.found.iter().map(|f| f.name))
+                    .collect();
+                let processed: BTreeSet<WorkName> =
+                    result.items[root_items..].iter().map(|item| item.name).collect();
+                if !answer.granted.iter().all(|name| found.contains(name))
+                    || !answer
+                        .conflicts
+                        .iter()
+                        .all(|name| found.contains(name) || processed.contains(name))
+                {
+                    // Restore the in-flight batch so stop() releases all its retained
+                    // discoveries, in addition to previously accepted findings.
+                    self.phase = Phase::Reporting { result, root_items };
+                    return self.stop(
+                        StopWhy::Protocol("result acknowledgment names foreign work".into()),
+                        out,
+                    );
+                }
                 self.committed(&result, root_items, &answer, out);
                 self.lease(now, out);
             }

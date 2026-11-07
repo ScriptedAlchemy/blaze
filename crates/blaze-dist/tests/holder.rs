@@ -142,6 +142,39 @@ fn review_a_fresh_rejected_finding_is_released() {
     assert!(holder.findings().is_empty());
 }
 
+/// An acknowledgment cannot name findings unrelated to the committed batch:
+/// a foreign conflict would incorrectly release an older retained finding.
+#[test]
+fn result_acknowledgment_rejects_foreign_grants_and_conflicts() {
+    let foreign = WorkName([99; 32]);
+    for (granted, conflicts) in [
+        (vec![foreign], Vec::new()),
+        (Vec::new(), vec![foreign]),
+    ] {
+        let (mut holder, id) = reporting(false);
+        let mut effects = Vec::new();
+        holder.step(
+            4,
+            Event::Reply {
+                id,
+                reply: Reply::Result(Ok(WorkResultAnswer {
+                    granted: Set::new(granted),
+                    conflicts: Set::new(conflicts),
+                })),
+            },
+            &mut effects,
+        );
+        assert!(holder.is_stopped(), "foreign acknowledgment must fence the holder");
+        assert_eq!(released(&effects), BTreeSet::from([FOUND]));
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::Stop(StopWhy::Protocol(why)) if why.contains("foreign"))
+        ));
+        assert!(!effects.iter().any(
+            |effect| matches!(effect, Effect::Send { call: Call::Lease(_), .. })
+        ));
+    }
+}
+
 #[test]
 fn review_cancellation_releases_findings_in_an_unacknowledged_result() {
     let (mut holder, _) = reporting(false);
