@@ -374,7 +374,7 @@ fn attr_range(meta: ast::Meta<'_>, attr: ast::Attr<'_>) -> TextRange {
 }
 
 /// An identifier's name, without the `r#` of a raw one.
-fn unraw(text: &str) -> &str {
+pub(super) fn unraw(text: &str) -> &str {
     text.strip_prefix("r#").unwrap_or(text)
 }
 

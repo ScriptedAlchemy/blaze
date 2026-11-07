@@ -29,6 +29,7 @@ use syntax::{
 
 use super::{head_range_view as head_range, is_block, item_id};
 use crate::{
+    checks::ast_validation::unraw,
     cx::{Cx, item_range_view as item_range},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
@@ -534,7 +535,7 @@ fn enum_scope(cx: &Cx<'_, '_>, scope: &mut Scope, module: hir::Module, enum_: hi
         let Some(name) = variant.name() else { continue };
         let key =
             hir_def::nameres::binding_key_at(cx.db, source.file_id, name.syntax().text_range());
-        let name = scope.intern(name.text());
+        let name = scope.intern(unraw(name.text()));
         let node = variant.syntax();
         let (range, head) =
             (source.with_value(item_range(node)), source.with_value(head_range(node)));
@@ -764,11 +765,11 @@ fn import_bindings<'db>(
         let (name, written) = match &rename {
             Some(rename) if rename.underscore_token().is_some() => continue,
             Some(rename) => match rename.name() {
-                Some(it) => (scope.intern(it.text()), it.syntax().text_range()),
+                Some(it) => (scope.intern(unraw(it.text())), it.syntax().text_range()),
                 None => continue,
             },
             None => match &source_name {
-                Some(it) => (scope.intern(it.text()), it.syntax().text_range()),
+                Some(it) => (scope.intern(unraw(it.text())), it.syntax().text_range()),
                 None => continue,
             },
         };

@@ -93,6 +93,25 @@ For more information about this error, try `rustc --explain E0252`.
 }
 
 #[test]
+fn a_raw_identifier_binds_the_name_without_its_prefix() {
+    // `r#x` and `x` are one name to rustc, in an import as in an enum's variants.
+    let source = r#"mod a { pub fn x() {} }
+mod b { pub fn x() {} }
+use a::r#x;
+use b::x;
+use a::x as r#y;
+use b::x as y;
+enum E { r#V, V }
+fn main() { x(); }
+"#;
+    let stderr = ui("raw.rs", "2021", source);
+    assert_reports(
+        &stderr,
+        &[error(4, &["E0252", "`x`"]), error(6, &["E0252", "`y`"]), error(7, &["E0428", "`V`"])],
+    );
+}
+
+#[test]
 fn an_item_named_as_an_import_suggests_renaming_the_import() {
     // tests/ui/error-codes/E0255.rs
     let source = r#"use bar::foo;
