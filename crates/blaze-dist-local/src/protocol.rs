@@ -11,13 +11,14 @@
 use blaze_wire::job_terminal_v2::SubscriberTerminalV2;
 use blaze_wire::{
     Ack, Attempt, BatchResult, Bytes, Digest, EventItem, ExecutionId, JobContent, LocalPolicy,
+    PackRef,
     Reservation, Set, WireError, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
     WorkLeaseRequest, WorkResultAnswer, WorkersEventsAnswer, WorkersEventsRequest, wire_enum,
     wire_struct,
 };
 
 /// Carrier protocol version; not blaze-wire's global codec version.
-pub const TRANSPORT_VERSION: u32 = 2;
+pub const TRANSPORT_VERSION: u32 = 3;
 
 wire_struct! {
     /// Creates a lifetime with `resume: None, epoch: None`, where `nonce` makes a retried
@@ -151,6 +152,37 @@ wire_enum! {
         KillAck => 9 (KillAck),
         Terminal => 10 (Subscription),
         Release => 11 (Release),
+        Claim => 12 (Claim),
+        Packs => 13 (Packs),
+    }
+}
+wire_struct! {
+    /// An agent asks which assigned executor of this execution it runs (`Jobs::claim`).
+    Claim {
+        0 => content: JobContent,
+        1 => execution: ExecutionId,
+        2 => claimant: Digest,
+    }
+}
+wire_struct! {
+    /// The executor an agent runs, if one is assigned to it yet, and the attempt it serves.
+    Claimed {
+        0 => executor: Option<String>,
+        1 => attempt: Attempt,
+        2 => lead: bool,
+    }
+}
+wire_struct! {
+    /// Asks what the compile phase of this execution committed.
+    Packs {
+        0 => content: JobContent,
+        1 => execution: ExecutionId,
+    }
+}
+wire_struct! {
+    /// The packs of every committed result, or `None` while work is outstanding.
+    CommittedPacks {
+        0 => packs: Option<Vec<PackRef>>,
     }
 }
 wire_struct! {
@@ -200,6 +232,8 @@ wire_enum! {
         KillAck => 7 (KillAnswer),
         Terminal => 8 (Terminal),
         Error => 9 (WireError),
+        Claimed => 10 (Claimed),
+        Packs => 11 (CommittedPacks),
     }
 }
 wire_struct! {

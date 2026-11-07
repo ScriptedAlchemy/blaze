@@ -117,6 +117,9 @@ blaze-kernel.workspace = true
 blaze-usercode.workspace = true
 blaze-codegen.workspace = true
 blaze-store-check.workspace = true
+blaze-dist.workspace = true
+blaze-dist-local.workspace = true
+blaze-wire.workspace = true
 blaze-testsel.workspace = true
 blaze-lazy = { workspace = true, features = ["daemon"] }
 blaze-link.workspace = true

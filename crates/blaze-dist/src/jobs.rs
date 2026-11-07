@@ -15,7 +15,7 @@ use blaze_wire::job_terminal_v2::{
 };
 use blaze_wire::{
     AssignedEvent, Attempt, BatchResult, Digest, DoneEvent, EventItem, ExecutionId, JobAnswer,
-    JobContent, JobContentInput, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome,
+    JobContent, JobContentInput, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome, PackRef,
     Reservation, SourceRef, Stage, StageEvent, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
     WorkLeaseRequest, WorkResultAnswer, WorkersEventsAnswer, WorkersEventsRequest,
 };
@@ -160,6 +160,9 @@ pub struct Execution {
     attempt: Attempt,
     lead: Option<String>,
     helpers: BTreeSet<String>,
+    /// Which agent process runs each assigned executor of this attempt ([`Jobs::claim`]).
+    claims: BTreeMap<String, Digest>,
+    claims_attempt: Attempt,
     lead_heard: Millis,
     heard: BTreeMap<String, Millis>,
     losses: u32,
@@ -193,6 +196,8 @@ impl Execution {
             attempt: Attempt(1),
             lead: None,
             helpers: BTreeSet::new(),
+            claims: BTreeMap::new(),
+            claims_attempt: Attempt(0),
             lead_heard: now,
             heard: BTreeMap::new(),
             losses: 0,
@@ -937,6 +942,48 @@ impl Jobs {
         self.executions.remove(&execution);
         self.platforms.remove(&execution);
         true
+    }
+
+    /// An agent asks which assigned executor of `execution` it runs: the one it holds already,
+    /// else the lead or a helper of the current attempt nobody claimed, else `None` until
+    /// admission assigns one. A claim names who acts for an executor and grants nothing: every
+    /// work call stays fenced by the lease and attempt, and an attempt that moves forgets them
+    /// (an agent that died cannot keep an executor whose heartbeats stopped).
+    pub fn claim(
+        &mut self,
+        now: Millis,
+        execution: ExecutionId,
+        claimant: Digest,
+        out: &mut Vec<(ExecutionId, Effect)>,
+    ) -> Result<Option<(String, Attempt)>, Refusal> {
+        self.tick(now, out);
+        let e = self.executions.get_mut(&execution).ok_or(Refusal::NoExecution)?;
+        if let ExecState::Ended(_) = e.state() {
+            return Err(Refusal::Ended);
+        }
+        let attempt = e.attempt();
+        if e.claims_attempt != attempt {
+            e.claims.clear();
+            e.claims_attempt = attempt;
+        }
+        if let Some((executor, _)) = e.claims.iter().find(|(_, who)| **who == claimant) {
+            return Ok(Some((executor.clone(), attempt)));
+        }
+        let free =
+            e.executors().find(|executor| !e.claims.contains_key(*executor)).map(str::to_owned);
+        Ok(free.map(|executor| {
+            e.claims.insert(executor.clone(), claimant);
+            (executor, attempt)
+        }))
+    }
+
+    /// The packs of the results `execution` committed, once its compile phase is done: what an
+    /// executor imports. `None` while work is outstanding.
+    pub fn committed_packs(&self, execution: ExecutionId) -> Result<Option<Vec<PackRef>>, Refusal> {
+        let e = self.executions.get(&execution).ok_or(Refusal::NoExecution)?;
+        let Some(work) = e.work() else { return Ok(None) };
+        let report = work.report();
+        Ok(report.done.then(|| report.packs.into_iter().collect()))
     }
 
     /// `POST /v1/jobs`, with the reservation the server measured for its lead. An equal

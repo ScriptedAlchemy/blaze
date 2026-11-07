@@ -24,6 +24,7 @@ pub struct Client {
     nonce: Digest,
 }
 
+#[expect(clippy::needless_pass_by_value, reason = "a hello is sent once; its one caller gives it up")]
 fn connect(path: &Path, hello: LocalHello) -> Result<(UnixStream, LocalWelcome), Error> {
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;

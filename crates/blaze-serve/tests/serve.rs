@@ -201,7 +201,7 @@ fn answer_reader_respects_bodyless_responses() {
 /// out: the magic, the counts, a block header and an entry per value, then the values as they
 /// are (a value is a block of its own here, uncompressed).
 fn pack(values: &[(Digest, &[u8])]) -> Vec<u8> {
-    let mut out = b"rajitpk\x03".to_vec();
+    let mut out = blaze_wire::DIST_PACK_MAGIC.to_vec();
     out.extend_from_slice(&(values.len() as u32).to_le_bytes());
     out.extend_from_slice(&(values.len() as u32).to_le_bytes());
     for (_, value) in values {

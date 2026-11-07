@@ -3,9 +3,12 @@
 
 #![deny(missing_docs)]
 
+pub mod agent;
+pub mod blobs;
 pub mod client;
 pub mod coordinator;
 pub mod driver;
+pub mod pack;
 pub mod protocol;
 pub mod server;
 

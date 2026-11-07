@@ -15,14 +15,11 @@ doctest = false
 
 [dependencies]
 blaze-wire.workspace = true
-# The pack format and the store's crash-safe write: a blob is verified and named the way the
-# store names a pack, and it appears by the same `fsync`, `rename`, `fsync` the store uses.
-ra-jit-store.workspace = true
 anyhow.workspace = true
 sha2 = "0.10"
 ed25519-dalek = "2.2"
 getrandom = "0.3"
-zstd = "0.13.3"
+zstd.workspace = true
 # The HTTP/1.1 server: hyper is the stack the rest of blaze already uses, and its `server`
 # feature is the only thing this crate turns on that the tree did not have on.
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }

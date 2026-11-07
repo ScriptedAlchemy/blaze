@@ -121,7 +121,7 @@ macro_rules! sample_uint {
                     let v = g.edge_u64();
                     // A value in the type's range, keeping the edges where they fit.
                     let max = <$ty>::MAX as u64;
-                    if v <= max { v as $ty } else { (v % (max + 1)) as $ty }
+                    if v <= max { v as $ty } else { (v % max.saturating_add(1)) as $ty }
                 }
             }
         )*

@@ -8,6 +8,7 @@
 //! - [`compile`]: [`Front::compile`] and [`Front::fresh`]: diagnostics, codegen, the link,
 //!   the files cargo would write, a unit's record in the store.
 //! - [`codegen`]: a unit's codegen policy and roots, and its link.
+//! - [`dist`]: a unit's functions compiled across executors, when the request names them.
 //! - [`artifact`]: cargo's `compiler-artifact` of a unit.
 //! - [`script`]: a build script's run and what its directives do, as cargo applies them.
 //! - [`test`]: the tests of a build, on one queue, the reached ones only; with `--ub`, each
@@ -33,6 +34,7 @@ mod codegen;
 mod compile;
 mod configs;
 mod deps;
+mod dist;
 mod doc;
 mod error;
 pub(crate) mod files;

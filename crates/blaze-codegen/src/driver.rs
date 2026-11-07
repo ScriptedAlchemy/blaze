@@ -1627,6 +1627,54 @@ pub struct Build<'a, B: Prepare> {
     why: bool,
 }
 
+/// A unit's functions as a work set for several executors (docs/distributed.md, section 4):
+/// made by [`Build::work_set`], its [`names`](WorkSet::names) the canonical root list every
+/// executor of a unit computes alike, since an instance's key covers all it is made from.
+///
+/// Only dev functions a template stands alone for are work. A release function's imports are
+/// decided from the whole build's summaries and a folded group from all its members, so those
+/// stay with the build that links them, which reads the store for what it finds there.
+pub struct WorkSet<B: Prepare> {
+    nodes: Sorted<InstanceKey, Node<B>>,
+}
+
+impl<B: Prepare> WorkSet<B> {
+    /// The functions any executor may compile, sorted by key.
+    pub fn names(&self) -> Vec<InstanceKey> {
+        self.nodes
+            .iter()
+            .filter(|(_, node)| !node.spec.backend.is_release() && !node.spec.fold)
+            .map(|(key, _)| *key)
+            // alloc: per unit, sized by its functions
+            .collect()
+    }
+
+    /// Every function of the walk, work or not.
+    pub fn functions(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// What names the unit among executors: the digest of every function of its walk, whose
+    /// keys cover what each is made from. Equal digests are equal work.
+    pub fn digest(&self) -> ContentId {
+        let mut hasher = Hasher::new("blaze dist unit 1");
+        for (key, _) in self.nodes.iter() {
+            hasher.update(&key.0.0);
+        }
+        hasher.finish()
+    }
+}
+
+/// What [`Build::compile_granted`] made of a grant.
+#[derive(Debug)]
+pub struct GrantedValues {
+    /// What this executor compiled: its store's next values, and the others'.
+    pub compiled: Vec<Put>,
+    /// What was in its store already, for the executors that lack it.
+    pub stored: Vec<Put>,
+    pub stats: Stats,
+}
+
 /// The function a target names, if it names one.
 fn callee(target: &Target) -> Option<InstanceKey> {
     match target {
@@ -2638,6 +2686,103 @@ impl<'a, B: Prepare> Build<'a, B> {
             // alloc: per tier-up, sized by its units
             .collect();
         Ok(TieredUp { replaced, puts, stats, memo_used: used })
+    }
+
+    /// The functions of `roots` as work other executors may compile ([`WorkSet`]): the same
+    /// walk [`Build::run_with_statics`] makes, nothing read or compiled. `Err` is what the walk
+    /// refused, which the build itself then reports: no executor can agree on a broken unit.
+    pub fn work_set(
+        &self,
+        roots: &[(FrontInstance<B>, Origin)],
+        static_roots: &[FrontStatic<B>],
+        check: &[CheckRoot<FrontInstance<B>, FrontStatic<B>>],
+    ) -> Result<WorkSet<B>, Vec<CodegenError>> {
+        let mut errors = Vec::new();
+        let (nodes, _statics, _roots) =
+            self.walk(roots, static_roots, check, None, &mut errors);
+        if errors.is_empty() { Ok(WorkSet { nodes }) } else { Err(errors) }
+    }
+
+    /// The values of `granted`, functions of `work`, as the store would keep them: each from
+    /// `store` if it is there (template and side table, so an executor that lacks them can
+    /// take them from this one), else compiled by this build's one path ([`Self::dev`]'s
+    /// second half: the same flights, the memo and [`Self::compile_missing`]). A key `work`
+    /// does not name is an error: a grant is of the names the executors agreed on.
+    pub fn compile_granted(
+        &self,
+        work: &WorkSet<B>,
+        granted: &[InstanceKey],
+        store: &impl Lookup,
+    ) -> Result<GrantedValues, Vec<CodegenError>> {
+        let nodes = &work.nodes;
+        let mut out = Out::default();
+        // alloc: per grant, sized by its names
+        let mut stored = Vec::new();
+        // alloc: per grant, sized by its store misses
+        let mut items: Vec<(InstanceKey, (InstanceKey, Option<(Shape, B::Prepared)>))> = Vec::new();
+        for key in granted {
+            let Some(node) = nodes.get(key) else {
+                // alloc: an error
+                let what = format!("a granted function {key:?} is not of this unit's work set");
+                out.errors.push(error(*key, ItemKey(ContentId::default()), what));
+                continue;
+            };
+            let at = node.template_key();
+            let read = out.read(store, &at, &node.unit, |it| {
+                stored_function(it, *key, &node.refs, node.described.anchors.as_ref())
+            });
+            match read {
+                Read::Hit(made) => {
+                    let side = made.ok().and_then(|it| it.side).map(|id| keys::side(&id));
+                    for (key_of, kind) in
+                        [Some((at, Kind::Code)), side.map(|it| (it, Kind::Debug))].into_iter().flatten()
+                    {
+                        match store.read(&key_of) {
+                            // alloc: per grant, a value this executor gives to the others
+                            Ok(Some(bytes)) => {
+                                stored.push(Put { key: key_of, kind, bytes: bytes.to_vec() })
+                            }
+                            Ok(None) => out.errors.push(error(
+                                *key,
+                                node.unit.item,
+                                // alloc: an error
+                                format!("the store names {key_of:?} of `{}` and holds nothing under it", node.described.name),
+                            )),
+                            Err(why) => out.errors.push(error(*key, node.unit.item, why)),
+                        }
+                    }
+                }
+                Read::Miss => items.push((node.flight(), (*key, None))),
+                Read::Failed => {}
+            }
+        }
+        let name = |(key, _): &(InstanceKey, Option<(Shape, B::Prepared)>)| {
+            let node = &nodes[key];
+            (*key, node.unit.item, node.described.name.as_str())
+        };
+        let flown = self.fly(
+            items,
+            name,
+            |(key, own)| self.compile_missing(nodes, key, own),
+            &mut out.errors,
+        );
+        for it in flown {
+            match it {
+                Flown::Ran(piece) => out.absorb(piece),
+                Flown::Landed((key, own), shape) => {
+                    self.landed(nodes, key, shape, own.as_ref().map(|(own, _)| own), &mut out)
+                }
+            }
+        }
+        if self.frontend.stopped() {
+            // alloc: an error, once
+            return Err(vec![stopped()]);
+        }
+        let Finished { puts, stats, errors, .. } = out.finish(names_of::<_, _, B>(nodes, None));
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        Ok(GrantedValues { compiled: puts, stored, stats })
     }
 
     fn dev(&self, nodes: &Sorted<InstanceKey, Node<B>>, store: &impl Lookup, out: &mut Out) {

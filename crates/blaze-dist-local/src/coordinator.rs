@@ -553,6 +553,30 @@ impl Coordinator {
                     value: self.jobs.terminal(s.execution, s.subscriber).cloned(),
                 }))
             }
+            Command::Claim(c) => {
+                if self.jobs.execution(c.execution).is_none_or(|e| e.content != c.content) {
+                    return Err(Refusal::NoExecution.to_wire(None));
+                }
+                let claimed = self
+                    .jobs
+                    .claim(now, c.execution, c.claimant, out)
+                    .map_err(|r| r.to_wire(None))?;
+                let e = self.jobs.execution(c.execution).expect("claimed");
+                let lead = claimed.as_ref().is_some_and(|(who, _)| e.lead() == Some(who.as_str()));
+                Ok(Answer::Claimed(match claimed {
+                    Some((executor, attempt)) => {
+                        Claimed { executor: Some(executor), attempt, lead }
+                    }
+                    None => Claimed { executor: None, attempt: e.attempt(), lead },
+                }))
+            }
+            Command::Packs(p) => {
+                if self.jobs.execution(p.execution).is_none_or(|e| e.content != p.content) {
+                    return Err(Refusal::NoExecution.to_wire(None));
+                }
+                let packs = self.jobs.committed_packs(p.execution).map_err(|r| r.to_wire(None))?;
+                Ok(Answer::Packs(CommittedPacks { packs }))
+            }
             Command::Release(_) => Ok(Answer::Ack(Ack {})),
         }
     }

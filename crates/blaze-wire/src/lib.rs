@@ -52,6 +52,19 @@ pub type Digest = [u8; 32];
 /// The version of the schema this crate speaks. A change that adds a field is a new version.
 pub const VERSION: u32 = 4;
 
+/// The first eight bytes of a distributed pack: the store values one batch of work made
+/// (`blaze_dist_local::pack`), under one content digest. `blaze-serve` refuses any other bytes
+/// under a `packs/` name.
+pub const DIST_PACK_MAGIC: [u8; 8] = *b"blzdpk\0\x01";
+
+/// The format `PackRef::format` names for a pack that starts with [`DIST_PACK_MAGIC`].
+pub const DIST_PACK_FORMAT: u32 = 1;
+
+/// Whether `start`, a blob's first bytes, is a distributed pack of this format.
+pub fn is_dist_pack(start: &[u8]) -> bool {
+    start.starts_with(&DIST_PACK_MAGIC)
+}
+
 /// The word every digest's input starts with.
 const DIGEST_PREFIX: &str = "blaze/";
 

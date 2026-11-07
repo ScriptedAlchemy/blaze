@@ -137,6 +137,7 @@ impl Server {
 
     /// Run until shutdown. IO cannot block a timer: reads/writes are nonblocking and each
     /// connection gets a bounded frame budget per pass. Shutdown drops sockets and the registry.
+#[expect(clippy::needless_pass_by_value, reason = "the reactor owns its share of the stop flag for its life")]
     pub fn run(mut self, stop: Arc<AtomicBool>) -> Result<(), Error> {
         let mut connections = Vec::new();
         while !stop.load(Ordering::Acquire) {

@@ -9,8 +9,7 @@
 //! - `keys/<d>` and `units/<d>` are bytes that hash to `<d>`.
 //!
 //! A write goes to `.<name>.<pid>-<nanos>.tmp` in the same directory, is synced, renamed, and
-//! the directory synced, as the store writes its own files ([`ra_jit_store`]'s
-//! `name_file_whole`), so a partially written blob never appears under its name and a reader
+//! the directory synced, as the store writes its own files, so a partially written blob never appears under its name and a reader
 //! sees all of it or none.
 //!
 //! The existence set is what `missing` is answered from: the digests of the blobs the
@@ -266,7 +265,7 @@ impl Store {
             .write(true)
             .open(from)
             .map_err(|e| failed(&format!("writing {name}"), e))?;
-        ra_jit_store::name_file_whole(&file, from, &to)
+        name_file_whole(&file, from, &to)
             .map_err(|e| failed(&format!("naming {name}"), e))?;
         self.remember(&object, digest);
         Ok((verified, !existed))
@@ -511,10 +510,10 @@ impl Store {
                     format!("{} has no pack header: {e}", object.name),
                 )
             })?;
-            if ra_jit_store::pack_format(&start) != Some(ra_jit_store::FORMAT) {
+            if !blaze_wire::is_dist_pack(&start) {
                 return Err(Error::new(
                     blaze_wire::ErrorCode::Refused,
-                    format!("{} is not a pack of format {}", object.name, ra_jit_store::FORMAT),
+                    format!("{} is not a pack of format {}", object.name, blaze_wire::DIST_PACK_FORMAT),
                 ));
             }
             hash.update(start);
@@ -544,7 +543,7 @@ impl Store {
             if let Some(pause) = self.before_name.lock().unwrap().as_ref() {
                 pause();
             }
-            ra_jit_store::name_file_whole(&file, &partial, &to)
+            name_file_whole(&file, &partial, &to)
         })();
         if let Err(e) = write {
             _ = std::fs::remove_file(&partial);
@@ -604,6 +603,15 @@ pub(crate) fn temporary(to: &Path) -> PathBuf {
     let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
     let name = to.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
     to.with_file_name(format!(".{name}.{}-{nanos}-{sequence}.tmp", std::process::id()))
+}
+
+/// A file, written and closed by its caller, under its final name: synced, renamed, and the
+/// directory synced, so a crash leaves all of it under `to` or none of it.
+fn name_file_whole(file: &File, from: &Path, to: &Path) -> std::io::Result<()> {
+    file.sync_all()?;
+    std::fs::rename(from, to)?;
+    let parent = to.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+    File::open(parent)?.sync_all()
 }
 
 #[cfg(test)]
@@ -735,7 +743,7 @@ mod tests {
 
     /// A sealed pack of `values`, laid out as `harness/packs.py` lays one out.
     fn pack(values: &[(Digest, &[u8])]) -> Vec<u8> {
-        let mut out = b"rajitpk\x03".to_vec();
+        let mut out = blaze_wire::DIST_PACK_MAGIC.to_vec();
         out.extend_from_slice(&(values.len() as u32).to_le_bytes());
         out.extend_from_slice(&(values.len() as u32).to_le_bytes());
         for (_, value) in values {

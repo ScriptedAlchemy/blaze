@@ -421,6 +421,7 @@ impl Holder {
         }
     }
 
+#[expect(clippy::needless_pass_by_value, reason = "what the core refused with, whole; matched by its variants")]
     fn refused(&mut self, refusal: Option<Refusal>, error: &WireError, out: &mut Vec<Effect>) {
         let why = match refusal {
             Some(Refusal::AttemptMoved) => StopWhy::AttemptMoved,

@@ -28,7 +28,7 @@ use hir_ty_codegen::v2::{
     HirInstance, ItemHashes, LinkInputs, RootKind, Roots, Runs,
 };
 
-use super::{Job, Real, UnitReader, files::Mounted, graph::flag, script};
+use super::{Job, Real, UnitReader, dist, files::Mounted, graph::flag, script};
 use crate::serve::work::{Full, Linking, OutputFields};
 
 type KeptImage = crate::serve::work::Image<Real>;
@@ -1049,17 +1049,46 @@ pub(crate) fn generate<'db>(
     let verify = blaze_store_check::Setting::from_env(&job.input.config.invocation.env)
         .map_err(|it| it.to_string())?;
     let backends = Backends::default();
+    let dist = dist::Dist::of(&job.input.config.invocation.env, triple(job, u))?;
+    let mut arrived = None;
     let built = {
         let guard = blaze_cas::enter();
         let store = Reading { store: &job.input.store, guard: &guard };
-        Build::new(&backends, &frontend, &policy, &job.memo)
+        let mut build = Build::new(&backends, &frontend, &policy, &job.memo)
             .owned_by(&u.target.name)
             .verify_store(verify)
-            .explain_misses(true)
-            .run_with_statics(&asked, &roots.statics, &roots.check_roots(origin), &store)
+            .explain_misses(true);
+        let check = roots.check_roots(origin);
+        if let Some(dist) = &dist {
+            // A walk the build would refuse is reported by the build, below.
+            if let Ok(work) = build.work_set(&asked, &roots.statics, &check) {
+                let cancelled = &*job.input.cancelled;
+                match dist.run(&build, &work, &store, cancelled) {
+                    Ok(it) => arrived = Some(it),
+                    Err(why) if cancelled.load(std::sync::atomic::Ordering::Acquire) => {
+                        tracing::debug!(target: "blaze", %why, "dist: cancelled");
+                    }
+                    Err(why) => dist.or_compile_here(format!(
+                        "unit {unit} (`{}` of {}): {why}",
+                        u.target.name, u.pkg_id
+                    ))?,
+                }
+            }
+        }
+        match &arrived {
+            Some((_, it)) => {
+                let values = &it.values;
+                let overlay = dist::Overlay { store: &store, values };
+                build.run_with_statics(&asked, &roots.statics, &check, &overlay)
+            }
+            None => build.run_with_statics(&asked, &roots.statics, &check, &store),
+        }
     };
     match built {
         Ok(mut built) => {
+            if let (Some(dist), Some((spec, arrived))) = (&dist, arrived) {
+                dist.finish(&u.target.name, &mut built, &spec, arrived)?;
+            }
             built.puts.extend(profile);
             if let Some(slot) = job.counted.get(unit) {
                 // alloc: once per unit built, one entry per profile it used (none or one)

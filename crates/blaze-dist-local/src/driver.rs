@@ -11,6 +11,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
@@ -52,8 +53,28 @@ pub fn run_holder(
     now_ms: impl Fn() -> u64 + Send,
     compiler: &mut dyn BatchCompiler,
 ) -> Result<StopWhy, Error> {
+    let never = AtomicBool::new(false);
+    run_holder_until(client, socket, holder, content, executor, config, now_ms, compiler, &never)
+}
+
+/// [`run_holder`] for an executor that also watches the execution: once `leave` is set and no
+/// compile is running, the holder leaves as [`StopWhy::Ended`], with nothing retained. The
+/// watcher sets it when the compile phase is done, the only state in which leaving loses
+/// nothing: every result it reported is committed or was refused.
+#[allow(clippy::too_many_arguments)]
+pub fn run_holder_until(
+    client: &mut Client,
+    socket: &Path,
+    holder: &mut Holder,
+    content: JobContent,
+    executor: &str,
+    config: &DriverConfig,
+    now_ms: impl Fn() -> u64 + Send,
+    compiler: &mut dyn BatchCompiler,
+    leave: &AtomicBool,
+) -> Result<StopWhy, Error> {
     let mut pending: Option<u64> = None;
-    drive(holder, config, now_ms, compiler, |call, id| {
+    drive(holder, config, now_ms, compiler, leave, |call, id| {
         send(client, socket, content, executor, call, id, &mut pending, config)
     })
 }
@@ -70,6 +91,7 @@ fn drive(
     config: &DriverConfig,
     now_ms: impl Fn() -> u64 + Send,
     compiler: &mut dyn BatchCompiler,
+    leave: &AtomicBool,
     mut transmit: impl FnMut(&Call, u64) -> Result<Reply, Error> + Send,
 ) -> Result<StopWhy, Error> {
     std::thread::scope(|scope| {
@@ -115,6 +137,9 @@ fn drive(
                                 }
                             }
                             Err(RecvTimeoutError::Timeout) => {
+                                if !working && leave.load(Ordering::Acquire) {
+                                    return Ok(StopWhy::Ended);
+                                }
                                 if stopped.is_none() {
                                     holder.step(now_ms(), Event::Tick, &mut effects);
                                 }
@@ -383,6 +408,7 @@ mod tests {
             &DriverConfig { poll: Duration::from_millis(1), max_reconnects: 0 },
             || start.elapsed().as_millis() as u64,
             &mut compiler,
+            &AtomicBool::new(false),
             |call, _| {
                 Ok(match call {
                     Call::Events(_) => {
@@ -431,6 +457,7 @@ mod tests {
             &DriverConfig { poll: Duration::from_millis(1), max_reconnects: 0 },
             || start.elapsed().as_millis() as u64,
             &mut compiler,
+            &AtomicBool::new(false),
             |call, _| match call {
                 Call::Events(_) if active.load(Ordering::SeqCst) => {
                     Err(Error::Protocol("carrier disconnected while compiling".to_owned()))
@@ -469,6 +496,7 @@ mod tests {
             &DriverConfig { poll: Duration::from_millis(1), max_reconnects: 0 },
             || start.elapsed().as_millis() as u64,
             &mut compiler,
+            &AtomicBool::new(false),
             |call, _| match call {
                 Call::Events(_) => Ok(Reply::Events(Ok(WorkersEventsAnswer::CONTINUE))),
                 Call::Join(_) => {

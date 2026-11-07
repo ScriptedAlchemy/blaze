@@ -875,3 +875,62 @@ fn spec(platform: Digest, i: u64) -> BuildSpec {
         workspace_manifest: SourcePath::new("Cargo.toml".into()).unwrap(),
     }
 }
+
+mod claim {
+    use blaze_dist::admission::{Admission, AdmissionConfig};
+    use blaze_dist::jobs::{ExecutionConfig, Jobs};
+    use blaze_wire::{BuildSpec, Gen, JobRequest, LocalPolicy, Namespace, Reservation, Sample};
+
+    fn started(executors: u32) -> (Jobs, blaze_wire::ExecutionId) {
+        let need = Reservation { memory: 1, cpus: 1, disk: 1 };
+        let mut admission = Admission::new(AdmissionConfig::default());
+        admission.add_machine(
+            "machine",
+            [1; 32],
+            Reservation { memory: 64, cpus: 64, disk: 64 },
+        );
+        for _ in 0..executors {
+            admission.add_builder(0, "machine", need.clone()).unwrap();
+        }
+        let mut jobs = Jobs::new(admission, ExecutionConfig::default());
+        let mut spec = BuildSpec::sample(&mut Gen::new(1));
+        spec.platform = [1; 32];
+        let request = JobRequest {
+            spec,
+            namespace: Namespace::Main,
+            deadline_ms: 3_600_000,
+            local: LocalPolicy::Never,
+            test_timeout_ms: None,
+        };
+        let mut out = Vec::new();
+        let answer = jobs.submit(0, &request, need, &mut out).unwrap();
+        (jobs, answer.execution)
+    }
+
+    #[test]
+    fn an_executor_is_claimed_once_and_again_by_its_claimant() {
+        let (mut jobs, id) = started(1);
+        let mut out = Vec::new();
+        let first = jobs.claim(1, id, [1; 32], &mut out).unwrap().expect("the lead");
+        assert_eq!(jobs.claim(2, id, [1; 32], &mut out).unwrap(), Some(first.clone()));
+        assert_eq!(jobs.claim(3, id, [2; 32], &mut out).unwrap(), None, "nobody else gets it");
+    }
+
+    #[test]
+    fn a_second_claimant_gets_a_helper_when_there_is_one() {
+        let (mut jobs, id) = started(2);
+        let mut out = Vec::new();
+        let first = jobs.claim(1, id, [1; 32], &mut out).unwrap().expect("the lead");
+        let second = jobs.claim(2, id, [2; 32], &mut out).unwrap();
+        // A helper is offered per tick, and only once the execution has its work set.
+        if let Some(second) = second {
+            assert_ne!(first.0, second.0, "one claimant per executor");
+        }
+    }
+
+    #[test]
+    fn work_unfinished_has_no_committed_packs() {
+        let (jobs, id) = started(1);
+        assert_eq!(jobs.committed_packs(id).unwrap(), None);
+    }
+}

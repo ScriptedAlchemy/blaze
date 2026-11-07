@@ -32,10 +32,84 @@ fn unhex(text: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+/// The coordinator a machine's daemons build through: `EXECUTORS` builders of one host triple,
+/// each of the daemons' units one execution, until stdin closes or says `stop`. Its bounds are
+/// a whole build's: the carrier's defaults are one client's.
+fn coordinate(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let [path, triple, executors] = args else {
+        return Err("usage: blaze-dist-local coordinate SOCKET TRIPLE EXECUTORS".into());
+    };
+    let (triple, executors): (&str, u32) = (
+        triple.to_str().ok_or("TRIPLE is not text")?,
+        executors.to_str().ok_or("EXECUTORS is not text")?.parse()?,
+    );
+    let need = blaze_dist_local::agent::NEED;
+    let mut admission = Admission::new(AdmissionConfig {
+        queue_limit: 1 << 16,
+        busy_retry_ms: 100,
+        ..AdmissionConfig::default()
+    });
+    admission.add_machine(
+        "machine",
+        blaze_dist_local::agent::platform(triple),
+        blaze_wire::Reservation {
+            memory: u64::from(executors),
+            cpus: executors,
+            disk: u64::from(executors),
+        },
+    );
+    for _ in 0..executors {
+        admission.add_builder(0, "machine", need.clone()).ok_or("the machine has no room")?;
+    }
+    let jobs = Jobs::new(
+        admission,
+        ExecutionConfig {
+            work: blaze_dist::work::WorkConfig { grant_roots: 64, ..Default::default() },
+            ..Default::default()
+        },
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = stop.clone();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if line.is_ok_and(|line| line == "stop") {
+                break;
+            }
+        }
+        signal.store(true, Ordering::Release);
+    });
+    let server = Server::bind(
+        Path::new(path),
+        jobs,
+        Config {
+            max_connections: 1_024,
+            max_sessions: 1_024,
+            max_requests: 1 << 20,
+            replay_bytes: 1 << 30,
+            max_executions: 1 << 16,
+            max_events: 1 << 20,
+            event_bytes: 1 << 30,
+            work_bytes: 1 << 30,
+            session_ms: 6 * 3_600_000,
+            ..Config::default()
+        },
+        Arc::new(MonotonicClock::default()),
+        |_: Vec<(blaze_wire::ExecutionId, blaze_dist::jobs::Effect)>| {},
+    )?;
+    println!("ready {}", Path::new(path).display());
+    server.run(stop)?;
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).and_then(|it| it.to_str()) == Some("coordinate") {
+        return coordinate(&args[2..]);
+    }
     if args.len() != 3 {
-        return Err("usage: blaze-dist-local serve|hello|client SOCKET".into());
+        return Err(
+            "usage: blaze-dist-local serve|hello|client SOCKET, or coordinate SOCKET TRIPLE EXECUTORS".into()
+        );
     }
     let path = Path::new(&args[2]);
     match args[1].to_str() {
