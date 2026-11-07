@@ -56,10 +56,17 @@ impl Drop for Temporary {
 }
 
 fn read_key(at: &Path) -> Result<SigningKey, Error> {
-    let bytes = std::fs::read(at).map_err(|error| failed(&format!("reading {}", at.display()), error))?;
-    let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-        Error::internal(format!("{} is not the 32 bytes of a key", at.display()))
-    })?;
+    let bytes =
+        std::fs::read(at).map_err(|error| failed(&format!("reading {}", at.display()), error))?;
+    let seed: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::internal(format!("{} is not the 32 bytes of a key", at.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(at, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(SigningKey::from_bytes(&seed))
 }
 
@@ -93,8 +100,9 @@ pub(super) fn key_of(dir: &Path) -> Result<SigningKey, Error> {
         Ok(_) => read_key(&at),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut seed = [0; 32];
-            getrandom::fill(&mut seed)
-                .map_err(|error| Error::internal(format!("no randomness for the server's key: {error}")))?;
+            getrandom::fill(&mut seed).map_err(|error| {
+                Error::internal(format!("no randomness for the server's key: {error}"))
+            })?;
             install_key(dir, &seed)
         }
         Err(error) => Err(failed(&format!("reading {}", at.display()), error)),

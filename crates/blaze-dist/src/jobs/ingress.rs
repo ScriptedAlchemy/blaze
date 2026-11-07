@@ -3,10 +3,10 @@
 //! Validate the entire batch before publishing any of it. A rejected suffix must not leave
 //! an accepted prefix (or a sticky refusal) in the execution's public event stream.
 
-use blaze_wire::{JobEvent, Stage};
+use blaze_wire::{JobEvent, Outcome, Stage};
 
 use super::Execution;
-use crate::Refusal;
+use crate::{Millis, Refusal};
 
 fn order(stage: &Stage) -> u8 {
     match stage {
@@ -38,8 +38,14 @@ impl Execution {
         })
     }
 
-    pub(super) fn validate_events(&self, lead: bool, events: &[JobEvent]) -> Result<(), Refusal> {
+    pub(super) fn validate_events(
+        &self,
+        now: Millis,
+        lead: bool,
+        events: &[JobEvent],
+    ) -> Result<Option<Outcome>, Refusal> {
         let mut latest = self.reported_stage().map(order).unwrap_or(2);
+        let mut done = None;
         for (index, event) in events.iter().enumerate() {
             match event {
                 JobEvent::Assigned(_) => return Err(Refusal::NotHolder),
@@ -60,13 +66,7 @@ impl Execution {
                     if next < latest {
                         return Err(Refusal::Malformed("stage moved backwards".to_owned()));
                     }
-                    if next > order(&Stage::Compiled)
-                        && !self.work.as_ref().is_some_and(|work| {
-                            work.lead_joined()
-                                && work.is_done()
-                                && self.compiled == Some((self.attempt, work.root_epoch()))
-                        })
-                    {
+                    if next > order(&Stage::Compiled) && !self.success_ready() {
                         return Err(Refusal::Malformed(
                             "post-compile stage before authoritative work completion".to_owned(),
                         ));
@@ -76,18 +76,33 @@ impl Execution {
                 JobEvent::Published(_) | JobEvent::Program(_) | JobEvent::Verdict(_) if !lead => {
                     return Err(Refusal::NotHolder);
                 }
-                JobEvent::Done(_) => {
+                JobEvent::Done(event) => {
                     if !lead {
                         return Err(Refusal::NotHolder);
                     }
-                    if index + 1 != events.len() {
+                    if done.is_some() || index + 1 != events.len() {
                         return Err(Refusal::Malformed("Done must be the last event".to_owned()));
                     }
+                    if !matches!(
+                        event.outcome,
+                        Outcome::Passed | Outcome::Failed | Outcome::Refused
+                    ) {
+                        return Err(Refusal::Malformed("invalid worker verdict batch".to_owned()));
+                    }
+                    if event.outcome == Outcome::Passed
+                        && self.attached().any(|s| now <= s.deadline_ms)
+                        && !self.success_ready()
+                    {
+                        return Err(Refusal::Malformed(
+                            "success before authoritative completion".to_owned(),
+                        ));
+                    }
+                    done = Some(event.outcome.clone());
                 }
                 _ => {}
             }
         }
-        Ok(())
+        Ok(done)
     }
 }
 
@@ -99,7 +114,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::jobs::{Effect, ExecState, ExecutionConfig, LocalAction, Subscriber, SubscriberState};
+    use crate::jobs::{
+        Effect, ExecState, ExecutionConfig, LocalAction, Subscriber, SubscriberState,
+    };
     use crate::work::EndWhy;
 
     fn execution() -> Execution {
@@ -128,24 +145,17 @@ mod tests {
     }
 
     fn send(execution: &mut Execution, from: &str, events: Vec<JobEvent>) -> Result<(), Refusal> {
-        let request = WorkersEventsRequest {
-            execution: execution.id,
-            attempt: execution.attempt(),
-            events,
-        };
+        let request =
+            WorkersEventsRequest { execution: execution.id, attempt: execution.attempt(), events };
         execution.worker_events(1, from, &request, &mut Vec::new()).map(|_| ())
     }
 
     #[test]
     fn coordinator_stages_and_assignment_cannot_be_injected() {
         for from in ["lead", "helper"] {
-            for reserved in [
-                Stage::Queued,
-                Stage::Admitted,
-                Stage::Assigned,
-                Stage::Compiled,
-                Stage::Done,
-            ] {
+            for reserved in
+                [Stage::Queued, Stage::Admitted, Stage::Assigned, Stage::Compiled, Stage::Done]
+            {
                 let mut execution = execution();
                 let before = execution.events(0).to_vec();
                 assert_eq!(
@@ -239,20 +249,39 @@ mod tests {
             blaze_wire::decode(&blaze_wire::encode(verdict), &blaze_wire::Limits::default())
                 .unwrap();
         assert_eq!(decoded.outcome, Outcome::Lost);
+        let terminal = execution.terminal(1).unwrap();
+        let typed = blaze_wire::job_terminal_v2::decode_terminal(
+            &blaze_wire::encode(terminal),
+            &blaze_wire::Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(typed.termination.outcome, decoded.outcome);
         assert_eq!(
-            super::super::local_action(&LocalPolicy::Fallback, &decoded.outcome),
+            typed.termination.reason,
+            blaze_wire::job_terminal_v2::TerminationReasonV2::NoLead
+        );
+        assert_eq!(
+            super::super::local_action(&LocalPolicy::Fallback, &typed.termination).unwrap(),
             LocalAction::BuildLocally
         );
         assert_eq!(
-            super::super::local_action(&LocalPolicy::Never, &decoded.outcome),
+            super::super::local_action(&LocalPolicy::Never, &typed.termination).unwrap(),
             LocalAction::Fail
         );
         assert_eq!(
-            super::super::local_action(&LocalPolicy::Race, &decoded.outcome),
+            super::super::local_action(&LocalPolicy::Race, &typed.termination).unwrap(),
             LocalAction::BuildLocally
         );
         assert_eq!(
-            super::super::local_action(&LocalPolicy::Fallback, &Outcome::Failed),
+            super::super::local_action(
+                &LocalPolicy::Fallback,
+                &blaze_wire::job_terminal_v2::TerminationV2 {
+                    version: 2,
+                    outcome: Outcome::Failed,
+                    reason: blaze_wire::job_terminal_v2::TerminationReasonV2::Reported,
+                }
+            )
+            .unwrap(),
             LocalAction::Take
         );
     }

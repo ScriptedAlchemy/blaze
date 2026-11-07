@@ -71,7 +71,7 @@ impl TerminationV2 {
                 TerminationReasonV2::Reported => {
                     matches!(self.outcome, Outcome::Passed | Outcome::Failed | Outcome::Refused)
                 }
-                TerminationReasonV2::NoLead => self.outcome == Outcome::Failed,
+                TerminationReasonV2::NoLead => self.outcome == Outcome::Lost,
                 TerminationReasonV2::LeadLostTwice => self.outcome == Outcome::Lost,
                 TerminationReasonV2::Cancelled | TerminationReasonV2::Deadline => {
                     self.outcome == Outcome::Cancelled

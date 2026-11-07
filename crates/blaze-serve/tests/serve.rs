@@ -268,6 +268,10 @@ fn platform() -> blaze_wire::ExecPlatform {
         libc: None,
         linker: ("ld".into(), "0.1".into(), [0; 32]),
         cpu: "arm64".into(),
+        cc: None,
+        cxx: None,
+        ar: None,
+        native_root: None,
     }
 }
 

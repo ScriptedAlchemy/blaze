@@ -12,7 +12,7 @@ fn terminal() -> SubscriberTerminalV2 {
         subscriber: 3,
         termination: TerminationV2 {
             version: 2,
-            outcome: Outcome::Failed,
+            outcome: Outcome::Lost,
             reason: TerminationReasonV2::NoLead,
         },
     }
@@ -21,8 +21,8 @@ fn terminal() -> SubscriberTerminalV2 {
 #[test]
 fn terminal_v2_golden_and_roundtrip() {
     let value = terminal();
-    // {0:1, 1:2, 2:3, 3:{0:2, 1:[1,null], 2:[1,null]}}
-    let golden = [0xa4, 0, 1, 1, 2, 2, 3, 3, 0xa3, 0, 2, 1, 0x82, 1, 0xf6, 2, 0x82, 1, 0xf6];
+    // {0:1, 1:2, 2:3, 3:{0:2, 1:[3,null], 2:[1,null]}}
+    let golden = [0xa4, 0, 1, 1, 2, 2, 3, 3, 0xa3, 0, 2, 1, 0x82, 3, 0xf6, 2, 0x82, 1, 0xf6];
     assert_eq!(encode(&value), golden);
     assert_eq!(decode_terminal(&golden, &Limits::DOCUMENTED).unwrap(), value);
 }
@@ -36,6 +36,13 @@ fn terminal_v2_rejects_version_semantics_size_and_trailing_frames() {
         Err(TerminalDecodeError::InvalidTermination)
     ));
     value.termination.version = 2;
+    // The older unpublished local draft used Failed+NoLead. It is not an accepted
+    // alias of canonical Lost+NoLead and requires an explicitly pinned old codec.
+    value.termination.outcome = Outcome::Failed;
+    assert!(matches!(
+        decode_terminal(&encode(&value), &Limits::DOCUMENTED),
+        Err(TerminalDecodeError::InvalidTermination)
+    ));
     value.termination.outcome = Outcome::Passed;
     assert!(matches!(
         decode_terminal(&encode(&value), &Limits::DOCUMENTED),
@@ -60,7 +67,7 @@ fn terminal_v2_every_reason_roundtrips() {
         (TerminationReasonV2::Reported, Outcome::Passed),
         (TerminationReasonV2::Reported, Outcome::Failed),
         (TerminationReasonV2::Reported, Outcome::Refused),
-        (TerminationReasonV2::NoLead, Outcome::Failed),
+        (TerminationReasonV2::NoLead, Outcome::Lost),
         (TerminationReasonV2::LeadLostTwice, Outcome::Lost),
         (TerminationReasonV2::Cancelled, Outcome::Cancelled),
         (TerminationReasonV2::Deadline, Outcome::Cancelled),
