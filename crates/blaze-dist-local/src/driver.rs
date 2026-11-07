@@ -81,7 +81,7 @@ fn drive(
             // Transport failure before acknowledgment must release them as well as
             // findings already retained from earlier successful batches.
             let mut unconfirmed = BTreeSet::new();
-            let result = (|| -> Result<StopWhy, Error> {
+            let execute = || -> Result<StopWhy, Error> {
                 let mut effects = Vec::new();
                 let mut stopped: Option<StopWhy> = None;
                 holder.start(now_ms(), &mut effects);
@@ -163,7 +163,10 @@ fn drive(
                         }
                     }
                 }
-            })();
+            };
+            // A panicked transport must still clean up the compiler's retained findings.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(execute))
+                .unwrap_or_else(|_| Err(Error::Protocol("holder driver panicked".to_owned())));
 
             if result.is_err() {
                 if working {
@@ -193,7 +196,20 @@ fn drive(
         while let Ok(task) = receiver.recv() {
             match task {
                 CompilerTask::Compile(plan) => {
-                    if finished.send(compiler.compile(&plan)).is_err() {
+                    if let Err(undelivered) = finished.send(compiler.compile(&plan)) {
+                        // The IO driver may have disappeared while the caller compiled.
+                        // No one else can release the findings of an unreceived result.
+                        if let Ok(batch) = undelivered.0 {
+                            let names: BTreeSet<_> = batch
+                                .roots
+                                .iter()
+                                .chain(&batch.names)
+                                .flat_map(|item| item.found.iter().map(|found| found.name))
+                                .collect();
+                            if !names.is_empty() {
+                                compiler.release(&names.into_iter().collect::<Vec<_>>());
+                            }
+                        }
                         break;
                     }
                 }
@@ -450,6 +466,49 @@ mod tests {
         assert!(matches!(result, Err(Error::Protocol(_))));
         assert_eq!(compiler.released, vec![FOUND]);
         assert_eq!(compiler.calls.get(), 1);
+    }
+
+    #[test]
+    fn panicked_driver_releases_findings_before_and_after_compilation() {
+        for panic_during_compile in [true, false] {
+            let (mut holder, roots, grant) = test_holder();
+            let active = Arc::new(AtomicBool::new(false));
+            let mut compiler = SlowCompiler {
+                active: active.clone(),
+                released: Vec::new(),
+                caller: std::thread::current().id(),
+                calls: Rc::new(Cell::new(0)),
+            };
+            let start = Instant::now();
+            let mut leased = false;
+            let result = drive(
+                &mut holder,
+                &DriverConfig { poll: Duration::from_millis(1), max_reconnects: 0 },
+                || start.elapsed().as_millis() as u64,
+                &mut compiler,
+                |call, _| match call {
+                    Call::Events(_) if panic_during_compile && active.load(Ordering::SeqCst) => {
+                        panic!("heartbeat transport handler panicked")
+                    }
+                    Call::Events(_) => Ok(Reply::Events(Ok(WorkersEventsAnswer::CONTINUE))),
+                    Call::Join(_) => {
+                        Ok(Reply::Join(Ok(WorkJoinAnswer { roots: roots.clone(), fixed: true })))
+                    }
+                    Call::Lease(_) => {
+                        let next = (!leased).then_some(grant.clone());
+                        leased = true;
+                        Ok(Reply::Lease(Ok(WorkLeaseAnswer { grant: next })))
+                    }
+                    Call::Result(_) => panic!("result transport handler panicked"),
+                },
+            );
+            assert!(
+                matches!(&result, Err(Error::Protocol(why)) if why == "holder driver panicked"),
+                "{result:?}"
+            );
+            assert_eq!(compiler.calls.get(), 1, "{panic_during_compile}");
+            assert_eq!(compiler.released, vec![FOUND], "{panic_during_compile}");
+        }
     }
 
     #[test]
