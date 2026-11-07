@@ -53,6 +53,26 @@ fn canonicalize_roots<T>(named: &mut Vec<(blaze_wire::WorkName, Digest, T)>) -> 
     Ok(())
 }
 
+/// Retain one discovered request only while its work name maps to one code tuple.
+/// Conflicting identities must never compile through the first retained request.
+fn retain_finding<T>(
+    findings: &mut BTreeMap<blaze_wire::WorkName, (Digest, T)>,
+    found: &Found,
+    request: T,
+) -> Result<(), String> {
+    use std::collections::btree_map::Entry;
+    match findings.entry(found.name) {
+        Entry::Vacant(slot) => {
+            slot.insert((found.tuple, request));
+        }
+        Entry::Occupied(slot) if slot.get().0 != found.tuple => {
+            return Err("discovered work name maps to conflicting code identities".to_owned());
+        }
+        Entry::Occupied(_) => {}
+    }
+    Ok(())
+}
+
 /// One executor's batch compiler over a loaded front end: its canonical roots,
 /// the findings its committed batches discovered, and the receipts it sealed.
 pub struct Worker<'a, 'db> {
@@ -60,7 +80,7 @@ pub struct Worker<'a, 'db> {
     store: &'a store::Store,
     roots: RootSet,
     canonical: Vec<(blaze_wire::WorkName, LocalRequest)>,
-    findings: BTreeMap<blaze_wire::WorkName, LocalRequest>,
+    findings: BTreeMap<blaze_wire::WorkName, (Digest, LocalRequest)>,
     receipts: Vec<Receipt>,
     upload: Box<dyn FnMut(&str, &[u8]) -> Result<(), String> + 'a>,
 }
@@ -156,7 +176,7 @@ impl<'a, 'db> Worker<'a, 'db> {
         }
         let mut name_items = Vec::new();
         for name in &plan.compile {
-            match self.findings.get(name).cloned() {
+            match self.findings.get(name).map(|(_, request)| request.clone()) {
                 Some(request) => name_items.push(self.compile_one(*name, &request, &mut packs)?),
                 None => name_items.push(ItemResult {
                     name: *name,
@@ -194,9 +214,9 @@ impl<'a, 'db> Worker<'a, 'db> {
         for discovered in batch.discovered {
             match discovered.work {
                 Ok(work) => {
-                    let wire = wire_name(&work);
-                    self.findings.entry(wire).or_insert(discovered.request);
-                    found.push(Found { name: wire, tuple: work.tuple });
+                    let found_name = Found { name: wire_name(&work), tuple: work.tuple };
+                    retain_finding(&mut self.findings, &found_name, discovered.request)?;
+                    found.push(found_name);
                 }
                 Err(why) => unnamed.push((unnamed.len() as u32, why)),
             }
@@ -438,5 +458,20 @@ mod canonical_root_tests {
         assert_eq!(same.len(), 2);
         assert_eq!((same[0].0, same[0].1), (a, [9; 32]));
         assert_eq!((same[1].0, same[1].1), (b, [3; 32]));
+    }
+
+    #[test]
+    fn a_discovered_name_does_not_retain_an_incompatible_code_tuple() {
+        let name = blaze_wire::WorkName([7; 32]);
+        let original = Found { name, tuple: [2; 32] };
+        let conflict = Found { name, tuple: [3; 32] };
+        let mut findings = BTreeMap::new();
+        retain_finding(&mut findings, &original, "first").unwrap();
+        retain_finding(&mut findings, &original, "same-tuple").unwrap();
+        assert_eq!(
+            retain_finding(&mut findings, &conflict, "wrong-tuple"),
+            Err("discovered work name maps to conflicting code identities".to_owned())
+        );
+        assert_eq!(findings.get(&name), Some(&([2; 32], "first")));
     }
 }
