@@ -320,6 +320,26 @@ fn key_value(key: &str, value: &str) -> CfgAtom {
     CfgAtom::KeyValue { key: Symbol::intern(key), value: Symbol::intern(value) }
 }
 
+/// An integration test depends on its package's bins for their `CARGO_BIN_EXE_*`, and cargo
+/// passes `--extern` only for what can be linked. A bin of one name as the package's library is
+/// the default layout: as a crate of the test it would hide the library the test `use`s.
+#[test]
+fn a_tests_dependency_on_a_bin_is_no_crate_of_it() {
+    let mut all = units();
+    all.graph.units[LIB_TEST].dependencies.push(dep(BIN, "alpha", false));
+    all.graph.units[LIB_TEST].dependencies.push(dep(LIB, "alpha", false));
+    let built = lowered(&all).unwrap();
+    let db = built.lowered.db();
+    let named: Vec<_> = krate(&built, LIB_TEST)
+        .data(db)
+        .dependencies
+        .iter()
+        .filter(|it| it.name.as_str() == "alpha")
+        .map(|it| it.crate_id)
+        .collect();
+    assert_eq!(named, [krate(&built, LIB)], "the library, and the bin is not a crate of the test");
+}
+
 #[test]
 fn every_unit_that_compiles_is_a_crate() {
     let built = lowered(&units()).unwrap();
@@ -574,7 +594,12 @@ fn readers_of_two_run_classes_keep_their_keys_apart_by_the_runs_identities() {
     // Taking away the run identity brings back the clash and its diagnostic names the runs.
     let mut same = second.extra_data(db).clone(); // clone: remove the key's distinguishing input
     same.build_script_runs = first.extra_data(db).build_script_runs.clone(); // clone: test control
-    second.set_extra_data(built.lowered.served_db(), same);
+    built
+        .lowered
+        .served_db()
+        .batch(base_db::Trigger::named("the run identity taken away"), |db| {
+            second.set_extra_data(db, same);
+        });
     let clash = blaze_items::key::check_crate_keys(built.lowered.db()).unwrap_err().to_string();
     assert!(clash.contains("build-script runs") && clash.contains("release-run"), "{clash}");
 }

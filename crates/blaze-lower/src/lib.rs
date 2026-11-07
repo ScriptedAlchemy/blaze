@@ -783,7 +783,9 @@ fn lower_writes<T: blaze_query::Tree>(
         let mut dependencies = Vec::with_capacity(unit.dependencies.len());
         for dep in &unit.dependencies {
             let on = &units.graph.units[dep.index];
-            if on.mode == Mode::RunCustomBuild {
+            // A bin an integration test depends on for its `CARGO_BIN_EXE_*` is no crate of it:
+            // of one name as the package's library, it would hide the library from the test.
+            if on.mode == Mode::RunCustomBuild || !on.target.is_linkable() {
                 continue;
             }
             let Some(krate) = lowerings[dep.index].krate else {

@@ -128,6 +128,13 @@ impl Target {
         self.kind.iter().any(|it| it == "proc-macro")
     }
 
+    /// Whether another crate of the build can link it: cargo's `--extern`. A bin or an example,
+    /// which an integration test depends on for its `CARGO_BIN_EXE_*`, is none, nor a library
+    /// that is only a `cdylib` or a `staticlib`.
+    pub fn is_linkable(&self) -> bool {
+        self.kind.iter().any(|it| matches!(it.as_str(), "lib" | "rlib" | "dylib" | "proc-macro"))
+    }
+
     /// Whether it is a library of its package (any crate type), not an example's.
     pub fn is_lib(&self) -> bool {
         self.kind.iter().any(|it| {
