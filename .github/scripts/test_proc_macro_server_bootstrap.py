@@ -107,7 +107,7 @@ class MacroBootstrapTests(unittest.TestCase):
     def test_release_main_hands_exact_target_to_server(self):
         for target in ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"):
             with tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
                 compiler = root / "ra-jit"
                 compiler.write_bytes(b"owned compiler fixture")
                 out = root / "release"
