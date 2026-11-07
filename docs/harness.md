@@ -482,6 +482,22 @@ of a state), `engine.py` (the v2 adapter, the v1 one kept only for `proof.py`'s 
 cargo for fetching) and `report.py` (the
 result's shape).
 
+### Distributed builds
+
+`harness/distv2.py` runs [distributed builds](distributed.md) on real daemons, a real coordinator
+and a real cache server, over the fixture in `harness/distv2/fixture`: a build alone, two workers
+compiling one build (both must compile, and both programs must be the one built alone, byte for
+byte), a third daemon with an empty store taking what they published and compiling nothing, a
+rebuild with nothing changed, an edit and an edit of an included file, another pull request's
+checkout elsewhere with one crate edited, a worker killed in the middle, a worker stopped past its
+lease and resumed, a pack damaged on the server, and no coordinator with and without `fallback`.
+Every program is run, and what it prints covers a panic unwinding across units, a static of another
+crate and a build script's output. `{"args": ["--release"], "profile": "release", ...}` runs it
+under LLVM.
+
+`harness/forkfixes.py` holds the behaviour of the fixes the fork made to V1's front end
+(`harness/forkfixes/cases.py`): each case is a program, and what rustc 1.99 does with it.
+
 ## The fuzzer
 
 `fuzz/store.py` generates programs (`fuzz/gen.py`) and edits of them, and holds what a warm
@@ -498,12 +514,6 @@ bug of the daemon, the store or the splice goes in the harness of that area as a
 warm build has to give what blaze's build from nothing gives.
 
 ## Reproducing a failure
-
-The focused `answers` unit tests can also exercise an armed copied toolchain:
-set `RA_JIT_TEST_QUERY_TOOLCHAIN` to the directory made by
-`harness/norustc.py`'s `stand_ins`. The synthetic non-executable control always
-runs; the supplied copy also proves that owned print queries do not
-execute its compiler or Cargo wrappers. A zero-hit audit file is absent.
 
 Start from the script's last lines. Each daemon harness prints the path of the daemon's log
 and of the scratch copy of the source it was editing, for example

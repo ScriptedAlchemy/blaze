@@ -10,4 +10,9 @@ fn main() {
         }
     }
     println!("{} functions, {hash:016x}", all.len());
+    std::panic::set_hook(Box::new(|_| {}));
+    let caught = std::panic::catch_unwind(|| mathy::panics_here(n)).is_err();
+    let dropped = mathy::DROPPED.load(std::sync::atomic::Ordering::SeqCst);
+    println!("caught {caught}, dropped {dropped}, script says {}", shapes::FROM_SCRIPT);
+    println!("included {}", shapes::INCLUDED);
 }

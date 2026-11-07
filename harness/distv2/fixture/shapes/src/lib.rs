@@ -461,3 +461,9 @@ pub fn total<T: Area + Clone + Debug>(items: &[T]) -> (f64, Vec<String>, BTreeMa
     names.sort();
     (sum, names, seen)
 }
+
+/// What this crate's build script wrote: a unit's input that is no source file of it.
+pub const FROM_SCRIPT: &str = include_str!(concat!(env!("OUT_DIR"), "/from_script.txt"));
+
+/// A file included from the crate: it is an input of what compiles it, as its sources are.
+pub const INCLUDED: &str = include_str!("../included.txt");

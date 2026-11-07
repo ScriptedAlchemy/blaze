@@ -11,7 +11,10 @@ Input, one JSON value (`python3 harness/distv2.py '{...}'`):
     program      (optional) the path of the program, relative to its build directory's debug/;
                  default "app"
     run          (optional) the arguments it is run with; default ["11"]
-    faults       (optional) run the worker-loss and carrier-loss cases; default true
+    faults       (optional) run the fault cases; default true
+    profile      (optional) the directory under the target directory programs are in; default "debug"
+    stall_bound  (optional) seconds a daemon's loop may make no progress (`blaze serve --stall-bound`):
+                 an unoptimized blaze under test needs more than the default
 
 Checks, each on what the build itself reports (BLAZE_DIST_REPORT) and on running the program:
     solo         one daemon, no coordinator: the program the others are held to
@@ -20,8 +23,17 @@ Checks, each on what the build itself reports (BLAZE_DIST_REPORT) and on running
     cold cache   a third daemon with an empty store takes published units and compiles none
     warm         a build with nothing changed reports no execution
     edit         one edited function: only what it reaches is worked again
+    other PR     another checkout, in a pull request's namespace, with one crate edited: the
+                 units it shares with what was published come from the cache, and the edited
+                 ones compile; a newer revision of that pull request supersedes an older one
     worker lost  a daemon killed in the middle: the other finishes alone, same program
+    fenced       a daemon stopped past its lease and resumed: its work is taken back, it cannot
+                 commit after that, and both end with the program of a build alone
     no carrier   with no coordinator the build stops naming it; `fallback` compiles here
+    bad cache    a pack on the cache server damaged: the check refuses it, and `fallback` builds
+
+Every program is run: what it prints covers a panic unwinding across units, a static of another
+crate, and a build script's output.
 """
 from __future__ import annotations
 
@@ -51,6 +63,8 @@ class Input:
     program: str = "app"
     run: tuple[str, ...] = ("11",)
     faults: bool = True
+    profile: str = "debug"
+    stall_bound: int | None = None
 
 
 def load(text: str) -> Input:
@@ -92,6 +106,7 @@ class Run:
         self.port = free_port()
         self.daemons: list[Path] = []
         self.services: list[subprocess.Popen] = []
+        self.lease: list[str] = []
         self.sequence = 0
 
     def env(self, home: str, dist: bool, **extra) -> dict:
@@ -139,7 +154,7 @@ class Run:
         log = open(self.root / "logs" / "coordinator.log", "a")
         self.socket.unlink(missing_ok=True)
         coordinator = subprocess.Popen(
-            [self.given.dist_local, "coordinate", str(self.socket), triple, "64"],
+            [self.given.dist_local, "coordinate", str(self.socket), triple, "64", *self.lease],
             stdin=subprocess.PIPE,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -152,12 +167,33 @@ class Run:
         if not self.socket.exists():
             raise Failed("the coordinator did not bind")
 
-    def build(self, home: str, dist: bool = True, wait: bool = True, **extra):
+    def daemon(self, home: str) -> None:
+        """Starts `home`'s daemon with the given stall bound; a client would start it with the default."""
+        if self.given.stall_bound is None:
+            return
+        at = self.root / home / "v2.sock"
+        if at.exists() and daemon_pid(self, home):
+            return
+        log = open(self.root / "logs" / f"{home}.daemon.log", "a")
+        subprocess.Popen(
+            [self.given.blaze, "serve", "--stall-bound", str(self.given.stall_bound)],
+            cwd=self.project,
+            env=self.env(home, False),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        deadline = time.time() + 300
+        while time.time() < deadline and not daemon_pid(self, home):
+            time.sleep(0.2)
+
+    def build(self, home: str, dist: bool = True, wait: bool = True, project: Path | None = None, **extra):
+        self.daemon(home)
         self.sequence += 1
         log = open(self.root / "logs" / f"{home}.{self.sequence}.log", "w")
         process = subprocess.Popen(
             [self.given.blaze, "build", *self.given.args],
-            cwd=self.project,
+            cwd=project or self.project,
             env=self.env(home, dist, **extra),
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -169,18 +205,18 @@ class Run:
         code = process.wait()
         return code, Path(log.name).read_text()
 
-    def program(self, home: str) -> Path:
+    def program(self, home: str, project: Path | None = None) -> Path:
         out = subprocess.run(
             [self.given.blaze, "metadata", "--no-deps", "--format-version", "1"],
-            cwd=self.project,
+            cwd=project or self.project,
             env=self.env(home, False),
             capture_output=True,
             text=True,
         )
-        return Path(json.loads(out.stdout)["target_directory"]) / "debug" / self.given.program
+        return Path(json.loads(out.stdout)["target_directory"]) / self.given.profile / self.given.program
 
-    def behaviour(self, home: str) -> tuple[str, str]:
-        program = self.program(home)
+    def behaviour(self, home: str, project: Path | None = None) -> tuple[str, str]:
+        program = self.program(home, project)
         ran = subprocess.run([str(program), *self.given.run], capture_output=True, text=True, check=True)
         return ran.stdout, hashlib.sha256(program.read_bytes()).hexdigest()
 
@@ -224,6 +260,7 @@ def main(given: Input) -> None:
         check(code == 0, f"solo builds: {text[-400:] if code else ''}")
         solo = run.behaviour("solo")
         print("     solo:", solo[0].strip(), solo[1][:16], flush=True)
+        check("caught True" in solo[0] and "script says from the script" in solo[0], "the program unwinds across units and has its script's output")
 
         a, a_log = run.build("a", wait=False)
         b, b_log = run.build("b", wait=False)
@@ -276,6 +313,51 @@ def main(given: Input) -> None:
         check(run.behaviour("a")[0] != solo[0], "the edited program behaves as edited")
         edited.write_text(edited.read_text().replace('format!("3 edited:{sum}', 'format!("3:{sum}'))
 
+        # A file a unit includes is an input of its keys, and so a new unit: nothing stale is taken.
+        included = run.project / "shapes" / "included.txt"
+        keep = included.read_text()
+        included.write_text("changed by the edit")
+        code, text = run.build("cold")
+        check(code == 0, f"an edit of an included file builds: {text[-400:] if code else ''}")
+        check("included changed by the edit" in run.behaviour("cold")[0], "and the program has the new text, not a published one's")
+        included.write_text(keep)
+
+        # Another pull request's checkout, somewhere else, with one crate edited: what it shares
+        # by content comes from the cache, what it does not is compiled and published.
+        other = run.root / "project-pr"
+        shutil.copytree(run.project, other, ignore=shutil.ignore_patterns("target", ".git"))
+        homes.append("pr")
+        changed = other / "mathy" / "src" / "lib.rs"
+        changed.write_text(changed.read_text().replace('format!("5:{sum}', 'format!("5 pr:{sum}'))
+        code, text = run.build("pr", project=other, BLAZE_DIST_PR="17", BLAZE_DIST_SOURCE="rev1")
+        check(code == 0, f"another pull request builds: {text[-400:] if code else ''}")
+        rows = run.report("pr")
+        taken = [row for row in rows if row["source"] == "published"]
+        print(f"     pr: {len(taken)}/{len(rows)} units published already: {[row['unit'] for row in taken][:6]}", flush=True)
+        check(any(row["unit"] == "shapes" for row in taken), "the crate it shares came from the cache")
+        check(sums(taken, "tail_compiled") == 0 and sums(taken, "compiled_for_work") == 0, "and compiled nothing here")
+        check(any(row["unit"] == "mathy" and row["source"] == "executed" for row in rows), "the edited crate was built")
+        check(run.behaviour("pr", other)[0] != solo[0], "its program is the edited one")
+        before = len(run.report("pr"))
+        code, text = run.build("pr", project=other, BLAZE_DIST_PR="17", BLAZE_DIST_SOURCE="rev1")
+        check(code == 0 and len(run.report("pr")) == before, "nothing changed: no unit runs")
+
+        # A newer revision of the pull request while the older builds: the newer one finishes, and
+        # the older either finished first or stopped, naming why, with nothing of the newer lost.
+        older_at, newer_at = run.root / "project-older", run.root / "project-newer"
+        for at, edit in ((older_at, 'format!("6 older:{sum}'), (newer_at, 'format!("6 newer:{sum}')):
+            shutil.copytree(run.project, at, ignore=shutil.ignore_patterns("target", ".git"))
+            source = at / "mathy" / "src" / "lib.rs"
+            source.write_text(source.read_text().replace('format!("6:{sum}', edit))
+        homes.extend(["older", "newer"])
+        older, older_log = run.build("older", wait=False, project=older_at, BLAZE_DIST_PR="18", BLAZE_DIST_SOURCE="old")
+        time.sleep(0.2)
+        newer, newer_log = run.build("newer", wait=False, project=newer_at, BLAZE_DIST_PR="18", BLAZE_DIST_SOURCE="new")
+        code_newer, code_older = newer.wait(), older.wait()
+        check(code_newer == 0, f"the newer revision builds: {Path(newer_log).read_text()[-800:] if code_newer else ''}")
+        check("newer" not in run.behaviour("older", older_at)[0] if code_older == 0 else "distributed build failed" in Path(older_log).read_text(), "the older one finished as itself, or stopped naming the distributed path")
+        print(f"     older revision's build: exit {code_older}", flush=True)
+
         if given.faults:
             # A worker killed in the middle: its lease expires and the other finishes the unit.
             shutil.rmtree(run.root / "blobs", ignore_errors=True)
@@ -296,6 +378,63 @@ def main(given: Input) -> None:
             behaviour = run.behaviour("survivor")
             check("functions" in behaviour[0], f"the survivor's program runs: {behaviour[0].strip()}")
             edited.write_text(edited.read_text().replace('format!("7 lost:{sum}', 'format!("7:{sum}'))
+
+            # A worker stopped past its lease and then resumed: its lease is taken back, whatever
+            # it reports afterwards is refused, and both builds end with the same program.
+            shutil.rmtree(run.root / "blobs", ignore_errors=True)
+            for name in ("stalled", "healthy"):
+                homes.append(name)
+            run.coordinator.terminate()
+            run.coordinator.wait()
+            run.lease = ["2000"]
+            run.start_coordinator()
+            edited.write_text(edited.read_text().replace('format!("8:{sum}', 'format!("8 fence:{sum}'))
+            fenced_log = run.root / "logs" / "coordinator.log"
+            before_fence = len(fenced_log.read_text().splitlines())
+            expected, _ = run.build("alone", dist=False), homes.append("alone")
+            check(expected[0] == 0, f"the fence's control builds: {expected[1][-400:] if expected[0] else ''}")
+            control = run.behaviour("alone")
+            stalled, stalled_log = run.build("stalled", wait=False, BLAZE_DIST_DEADLINE_SECS="600")
+            healthy, healthy_log = run.build("healthy", wait=False, BLAZE_DIST_DEADLINE_SECS="600")
+            deadline = time.time() + 300
+            stopped = None
+            packs = run.root / "blobs" / "packs"
+            while time.time() < deadline and stalled.poll() is None and stopped is None:
+                pid = daemon_pid(run, "stalled")
+                # As the first batch is committed, the work is under leases of both.
+                if pid and packs.exists() and any(packs.glob("*.pack")):
+                    stopped = pid
+                    os.kill(pid, signal.SIGSTOP)
+                time.sleep(0.02)
+            if stopped:
+                time.sleep(8)
+                os.kill(stopped, signal.SIGCONT)
+            code_h, code_s = healthy.wait(), stalled.wait()
+            check(stopped is not None, "a worker was stopped in the middle of its build")
+            check(code_h == 0, f"the healthy worker finished: {Path(healthy_log).read_text()[-800:] if code_h else ''}")
+            check(code_s == 0, f"the resumed worker finished: {Path(stalled_log).read_text()[-800:] if code_s else ''}")
+            lines = fenced_log.read_text().splitlines()[before_fence:]
+            print(f"     coordinator: {len(lines)} lines, e.g. {lines[:3]}", flush=True)
+            check(any(("fenced" in it or "holder-lost" in it or "lead-lost" in it) for it in lines), "the coordinator took the stopped worker's work back")
+            for name in ("stalled", "healthy"):
+                check(run.behaviour(name)[1] == control[1], f"{name}'s program is the one built alone, byte for byte")
+            edited.write_text(edited.read_text().replace('format!("8 fence:{sum}', 'format!("8:{sum}'))
+
+            # A pack damaged on the cache server: the read refuses it, and the unit is not taken.
+            packs = run.root / "blobs" / "packs"
+            names = sorted(packs.glob("*.pack"), key=lambda it: it.stat().st_size)
+            if names:
+                target = names[-1]
+                raw = bytearray(target.read_bytes())
+                raw[len(raw) // 2] ^= 0xff
+                target.write_bytes(bytes(raw))
+                homes.append("damaged")
+                code, text = run.build("damaged", BLAZE_DIST_LOCAL="fallback")
+                check(code == 0, f"a damaged pack falls back: {text[-400:] if code else ''}")
+                check(run.behaviour("damaged")[1] == control[1], "and its program is the right one, byte for byte")
+                homes.append("damaged-never")
+                code, text = run.build("damaged-never", BLAZE_DIST_LOCAL="never")
+                check(code != 0 and "distributed build failed" in text, "under `never` it stops, naming it")
 
             # No carrier: a typed stop by default, the same compiler here when asked.
             run.coordinator.terminate()

@@ -286,3 +286,24 @@ pub fn all(n: u32) -> Vec<String> {
         sum39(n),
     ]
 }
+
+/// Panics in this crate, caught in the caller's: its cleanup and landing pads are this unit's
+/// compiled code, wherever an executor compiled it.
+pub fn panics_here(n: u32) -> u32 {
+    let _noted = Noted(n);
+    if n % 2 == 1 {
+        panic!("odd: {n}");
+    }
+    n
+}
+
+struct Noted(u32);
+
+impl Drop for Noted {
+    fn drop(&mut self) {
+        DROPPED.fetch_add(self.0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What every [`panics_here`] dropped, panic or no panic.
+pub static DROPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
