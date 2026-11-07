@@ -23,10 +23,6 @@ pub struct Config {
     /// Fixed session lifetime in monotonic milliseconds. Hello does not extend it; a client
     /// that outlives it creates a new session and resumes its subscriptions explicitly.
     pub session_ms: u64,
-    /// Maximum successful request IDs per session.
-    pub max_requests: usize,
-    /// Total request/response bytes retained per session.
-    pub replay_bytes: usize,
     /// Executions retained, including those awaiting stop acknowledgments.
     pub max_executions: usize,
     /// Maximum public event count per execution before new worker reports get Busy.
@@ -37,6 +33,12 @@ pub struct Config {
     pub max_subscribers: usize,
     /// Aggregate accepted result bytes per execution, bounding core findings/replay storage.
     pub work_bytes: usize,
+    /// The most roots one execution's set may count: a join only says how many, so this bounds
+    /// what the core's work set holds of them, not a message. A unit of a V2 build has one root
+    /// per function it distributes.
+    pub max_roots: u64,
+    /// The most grants one execution may make.
+    pub max_grants: u64,
     /// Terminal executions are retained at least this long, and until all stops are acked.
     pub terminal_ms: u64,
     /// Silent sockets time out; reconnecting within the session lifetime retains retries.
@@ -50,13 +52,13 @@ impl Default for Config {
             max_connections: 32,
             max_sessions: 32,
             session_ms: 300_000,
-            max_requests: 1_024,
-            replay_bytes: 8 << 20,
             max_executions: 128,
             max_events: 4_096,
             event_bytes: 8 << 20,
             max_subscribers: 256,
             work_bytes: 8 << 20,
+            max_roots: 4_096,
+            max_grants: 4_096,
             terminal_ms: 600_000,
             idle_ms: 30_000,
         }
@@ -66,10 +68,18 @@ impl Default for Config {
 struct Session {
     expires: u64,
     next: u64,
-    bytes: usize,
-    replies: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
+    /// The last request answered, its exact bytes and its answer's. A client has one request
+    /// outstanding at a time, so this is the only one it can retry: a session that polls for
+    /// hours keeps one answer, not every one.
+    last: Option<Answered>,
     /// The client's creation nonce, so a retried creation Hello returns this same lifetime.
     nonce: Digest,
+}
+
+struct Answered {
+    sequence: u64,
+    request: Vec<u8>,
+    reply: Vec<u8>,
 }
 
 /// Single-owner facade. A reactor owns it; no locks around individual core transitions.
@@ -236,8 +246,7 @@ impl Coordinator {
             Session {
                 expires: now.saturating_add(self.config.session_ms),
                 next: 1,
-                bytes: 0,
-                replies: BTreeMap::new(),
+                last: None,
                 nonce: hello.nonce,
             },
         );
@@ -278,25 +287,16 @@ impl Coordinator {
             .get(&request.session)
             .filter(|s| now <= s.expires)
             .ok_or_else(|| error(ErrorCode::NotFound, "session-expired"))?;
-        if let Some((old, reply)) = session.replies.get(&request.sequence) {
-            if old != &raw {
-                return Err(error(ErrorCode::Malformed, "sequence-reused"));
-            }
-            return Ok((reply.clone(), Vec::new()));
-        }
         if request.sequence != session.next {
-            return Err(error(ErrorCode::Conflict, "request-out-of-order"));
-        }
-        // Reserve the largest response before a side effect can occur. Never discover a
-        // replay-budget failure after submitting/committing the job.
-        if session.replies.len() >= self.config.max_requests
-            || session
-                .bytes
-                .saturating_add(raw.len())
-                .saturating_add(self.config.max_frame as usize)
-                > self.config.replay_bytes
-        {
-            return Err(error(ErrorCode::Busy, "replay-capacity: use a new session"));
+            // Only the last answer is kept: an earlier sequence is no request of a client that
+            // waits for each answer before its next, and is refused like one out of order.
+            return match &session.last {
+                Some(last) if last.sequence == request.sequence => match last.request == raw {
+                    true => Ok((last.reply.clone(), Vec::new())),
+                    false => Err(error(ErrorCode::Malformed, "sequence-reused")),
+                },
+                _ => Err(error(ErrorCode::Conflict, "request-out-of-order")),
+            };
         }
         // Apply deadlines before route-level retention checks. An expired execution is
         // retained terminal work, not a live coalescing target that may bypass capacity.
@@ -324,9 +324,9 @@ impl Coordinator {
         // Responses are bounded structurally by event pagination and request limits.
         // The server configuration is validated to leave room for all non-event answers.
         let session = self.sessions.get_mut(&request.session).expect("validated session");
-        session.bytes += raw.len() + reply.len();
         session.next += 1;
-        session.replies.insert(request.sequence, (raw, reply.clone()));
+        session.last =
+            Some(Answered { sequence: request.sequence, request: raw, reply: reply.clone() });
         // A release is terminal: its answer is journaled above, then the lifetime and its
         // journal are removed. Capacity and memory return at once, and nothing is kept to
         // revive. A release performs no core transition, so a client that never saw this
@@ -470,7 +470,7 @@ impl Coordinator {
             }
             Command::Join(r) => {
                 self.work(r.content, r.request.execution, r.request.attempt)?;
-                if r.request.roots.count > 4096 {
+                if r.request.roots.count > self.config.max_roots {
                     return Err(error(ErrorCode::Busy, "root-capacity"));
                 }
                 Ok(Answer::Join(
@@ -485,7 +485,7 @@ impl Coordinator {
                     .jobs
                     .execution(r.request.execution)
                     .and_then(|e| e.work())
-                    .is_some_and(|w| w.counters().grants >= 4096)
+                    .is_some_and(|w| w.counters().grants >= self.config.max_grants)
                 {
                     return Err(error(ErrorCode::Busy, "grant-retention-capacity"));
                 }
@@ -693,5 +693,50 @@ mod tests {
         assert!(c2.created);
         // The released label cannot be resumed or replayed.
         assert!(c.hello(0, &resume(a.session, c.epoch)).is_err());
+    }
+
+    /// A session that polls keeps one answer however many it is given: the last, which a retry
+    /// gets again byte for byte, while an earlier sequence is refused and reaches no core.
+    #[test]
+    fn a_session_keeps_only_its_last_answer() {
+        let mut c = coordinator(Config::default());
+        let welcome = c.hello(0, &hello([8; 32])).unwrap();
+        let mut job: JobRequest = blaze_wire::Sample::sample(&mut blaze_wire::Gen::new(9));
+        job.namespace = blaze_wire::Namespace::Main;
+        job.deadline_ms = 1_000;
+        let submit = Request {
+            epoch: welcome.epoch,
+            session: welcome.session,
+            sequence: 1,
+            command: Command::Submit(submission(
+                &job,
+                blaze_wire::Reservation { memory: 1, cpus: 1, disk: 1 },
+            )),
+        };
+        let (bound, _) = c.request(0, &submit).unwrap();
+        let ServerFrame::Response(Response { answer: Answer::Binding(binding), .. }) =
+            decode(&bound, &Limits::DOCUMENTED).unwrap()
+        else {
+            panic!("the job was not submitted")
+        };
+        let poll = |sequence| Request {
+            epoch: welcome.epoch,
+            session: welcome.session,
+            sequence,
+            command: Command::Terminal(binding.subscription.clone()),
+        };
+        let mut last = Vec::new();
+        for sequence in 2..=5_000 {
+            (last, _) = c.request(0, &poll(sequence)).unwrap();
+        }
+        let session = &c.sessions[&welcome.session];
+        assert_eq!(session.next, 5_001);
+        assert_eq!(session.last.as_ref().map(|it| it.sequence), Some(5_000));
+        assert_eq!(c.request(0, &poll(5_000)).unwrap().0, last);
+        let reused = Request { command: Command::Release(Release {}), ..poll(5_000) };
+        assert_eq!(c.request(0, &reused).unwrap_err().message, "sequence-reused");
+        let retired = c.request(0, &submit).unwrap_err();
+        assert_eq!(retired.code(), Some(ErrorCode::Conflict));
+        assert_eq!(c.jobs.executions().count(), 1);
     }
 }

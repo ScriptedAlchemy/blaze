@@ -700,10 +700,9 @@ fn bounded_retention_and_replay_identity_fail_closed() {
     f.at(22); // Retention starts when the reactor observes terminal, not at request decode.
     assert!(matches!(c.call(Command::Terminal(b.subscription)).unwrap(), Answer::Error(_)));
 
-    let f = Fixture::new(false, Config { max_requests: 1, ..Config::default() });
-    let mut c = f.client();
-    let b = submit(&mut c, 1000);
-    assert!(c.call(Command::Resume(b.subscription)).is_err());
+    // A retry of the last request is answered again with the same bytes, and a sequence reused
+    // with other bytes is refused.
+    let f = Fixture::new(false, Config::default());
     let mut stream = raw(&f);
     let w = create_raw(&f, &mut stream, [7; 32]);
     let mut r = Request {

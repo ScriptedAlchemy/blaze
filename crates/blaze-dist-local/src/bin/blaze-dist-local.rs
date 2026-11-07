@@ -75,12 +75,12 @@ fn coordinate(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Err
         Config {
             max_connections: 1_024,
             max_sessions: 1_024,
-            max_requests: 1 << 20,
-            replay_bytes: 1 << 30,
             max_executions: 1 << 16,
             max_events: 1 << 20,
             event_bytes: 1 << 30,
             work_bytes: 1 << 30,
+            max_roots: defaults.max_roots,
+            max_grants: 1 << 20,
             session_ms: 6 * 3_600_000,
             ..Config::default()
         },

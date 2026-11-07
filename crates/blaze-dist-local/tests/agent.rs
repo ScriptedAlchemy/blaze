@@ -39,6 +39,10 @@ impl Drop for World {
 }
 
 fn world(executors: u32, work: WorkConfig) -> World {
+    world_with(executors, work, CarrierConfig::default())
+}
+
+fn world_with(executors: u32, work: WorkConfig, carrier: CarrierConfig) -> World {
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("blobs");
     std::fs::create_dir_all(&store).unwrap();
@@ -63,14 +67,9 @@ fn world(executors: u32, work: WorkConfig) -> World {
     let jobs = Jobs::new(admission, ExecutionConfig { work, ..Default::default() });
     let tag: String = random_id().unwrap()[..6].iter().map(|b| format!("{b:02x}")).collect();
     let socket = PathBuf::from(format!("/tmp/blaze-agent-{tag}.sock"));
-    let server = Server::bind(
-        &socket,
-        jobs,
-        CarrierConfig::default(),
-        Arc::new(MonotonicClock::default()),
-        |_: Vec<_>| {},
-    )
-    .unwrap();
+    let server =
+        Server::bind(&socket, jobs, carrier, Arc::new(MonotonicClock::default()), |_: Vec<_>| {})
+            .unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let signal = stop.clone();
     std::thread::spawn(move || server.run(signal).unwrap());
@@ -369,4 +368,54 @@ fn a_unit_published_by_one_pull_request_is_taken_by_another() {
     assert_eq!(second.source, Source::Published, "another pull request schedules nothing");
     assert_eq!(second.compiled_here, 0);
     assert_eq!(second.values.len(), 3);
+}
+
+/// A unit of more functions than the carrier's own default allows is one a coordinator with the
+/// bounds of a build (`blaze-dist-local coordinate`) runs; with the defaults its join waits.
+#[test]
+fn a_unit_of_many_functions_is_run_under_a_builds_bounds() {
+    let carrier =
+        CarrierConfig { max_roots: 1 << 24, max_grants: 1 << 20, ..CarrierConfig::default() };
+    let world = world_with(1, WorkConfig { grant_roots: 1024, ..Default::default() }, carrier);
+    let names: Vec<Digest> = (0..5_000u32)
+        .map(|at| {
+            let mut it = [0; 32];
+            it[..4].copy_from_slice(&at.to_be_bytes());
+            it[4] = 0x5a;
+            it
+        })
+        .collect();
+    let unit = Unit { spec: [33; 32], names: names.clone() };
+    let never = AtomicBool::new(false);
+    let mut compiler = Compiler {
+        names,
+        log: Arc::new(Mutex::new(BTreeMap::new())),
+        who: 0,
+        entered: Arc::new(AtomicUsize::new(0)),
+        wait_for: 1,
+    };
+    let arrived =
+        agent::run(&config(&world.socket, &world.blobs), &unit, &mut compiler, &never).unwrap();
+    assert_eq!(arrived.values.len(), 5_000);
+    assert_eq!(arrived.compiled_here, 5_000);
+}
+
+/// An agent and its holder ask again and again in one session each, a grant of one name at a
+/// time here: every answer but the last is let go, so no number of asks fills a session.
+#[test]
+fn an_agent_that_waits_asks_in_one_session_however_often() {
+    let carrier = CarrierConfig { max_sessions: 4, ..CarrierConfig::default() };
+    let world = world_with(1, WorkConfig { grant_roots: 1, ..Default::default() }, carrier);
+    let unit = unit(34, 12);
+    let never = AtomicBool::new(false);
+    let mut compiler = Compiler {
+        names: unit.names.clone(),
+        log: Arc::new(Mutex::new(BTreeMap::new())),
+        who: 0,
+        entered: Arc::new(AtomicUsize::new(0)),
+        wait_for: 1,
+    };
+    let arrived =
+        agent::run(&config(&world.socket, &world.blobs), &unit, &mut compiler, &never).unwrap();
+    assert_eq!(arrived.values.len(), 12);
 }

@@ -103,10 +103,8 @@ impl Server {
             || config.max_frame > Limits::DOCUMENTED.request
             || config.max_connections == 0
             || config.max_sessions == 0
-            || config.max_requests == 0
             || config.session_ms == 0
             || config.idle_ms == 0
-            || config.replay_bytes < config.max_frame as usize * 2
             || config.max_subscribers == 0
             || config.max_executions == 0
             || config.max_events < 8

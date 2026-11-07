@@ -361,6 +361,10 @@ pub fn publish(
     blobs.publish(&unit.spec, &list_of(&packs))
 }
 
+/// How long an agent waits between asks at most, however long it has waited: what it asks is a
+/// state of the coordinator's that a wait of this does not miss by much.
+const POLL_MOST: Duration = Duration::from_millis(250);
+
 fn answer(client: &mut Client, command: Command, what: &str) -> Result<Answer, Error> {
     match client.call(command)? {
         Answer::Error(error) => {
@@ -421,6 +425,7 @@ pub fn run(
     let execution = binding.subscription.execution;
     let mut arrived = Arrived::none(Source::Executed, Some(execution.0));
     let mut last_claim: Option<(String, Attempt, bool)> = None;
+    let mut waited = config.poll;
     let packs = loop {
         if cancelled.load(Ordering::Acquire) {
             leave(&mut client, &binding);
@@ -451,9 +456,11 @@ pub fn run(
         let Some(executor) = claimed.executor else {
             let _waiting =
                 tracing::info_span!(target: "blaze", "dist: no executor assigned yet").entered();
-            std::thread::sleep(config.poll);
+            std::thread::sleep(waited);
+            waited = (waited * 2).min(POLL_MOST);
             continue;
         };
+        waited = config.poll;
         last_claim = Some((executor.clone(), claimed.attempt, claimed.lead));
         arrived.joined = true;
         let stopped = hold(
@@ -556,6 +563,7 @@ fn hold(
     let stopped = std::thread::scope(|scope| {
         let (leave, working) = (&leave, &working);
         let watching = scope.spawn(move || {
+            let mut waited = config.poll;
             while working.load(Ordering::Acquire) {
                 if cancelled.load(Ordering::Acquire) {
                     leave.store(true, Ordering::Release);
@@ -570,7 +578,8 @@ fn hold(
                     // The holder's own calls say what this is; its heartbeat ends it.
                     Err(_) => {}
                 }
-                std::thread::sleep(config.poll);
+                std::thread::sleep(waited);
+                waited = (waited * 2).min(POLL_MOST);
             }
             let _ = watcher.release();
         });
