@@ -205,6 +205,51 @@ fn of<'a>(
     }
 }
 
+/// cargo's `add_plugin_deps`: a script's run finds a shared library a build dependency's script
+/// built through the dynamic library path, what that script named with `rustc-link-search`. A
+/// fork's `saved-dynamic-app` needs it: its script links, and then fails to load the library.
+#[test]
+fn a_scripts_run_searches_where_its_build_dependencies_scripts_said() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut units = build(dir.path());
+    // z-sys's library (4), after its script's run (1), is a build dependency of p's script (2).
+    units.graph.units.push(unit(
+        Z,
+        target("z_sys", "lib", "/w/z-sys/src/lib.rs"),
+        Mode::Build,
+        &[1],
+    ));
+    units.plans.push(plan("-0003", &[]));
+    let to_library = {
+        let mut it = units.graph.units[3].dependencies[0].clone();
+        it.index = 4;
+        it
+    };
+    units.graph.units[2].dependencies.push(to_library);
+    let tools = PathBuf::from("/state/tools");
+    let scripts = slots(&units);
+    let z = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap();
+    assert!(z.dylib_search.plugin_search.is_empty(), "z-sys's script has no build dependency");
+    let out_dir = z.out_dir.to_string_lossy().into_owned();
+    let printed = format!("cargo:rustc-link-search=native={out_dir}/lib\n");
+    let env = script::inherited(&[], &units.plans[1], true);
+    let judged = script::judge(&z, &env, &value(0, &printed, ""), Some(&[]), None, false);
+    let output = judged.output.expect("the run succeeded");
+    let applied = script::Applied { package_id: Z.to_owned(), links: None, output, out_dir: out_dir.clone() };
+    assert!(scripts[1].set(applied).is_ok());
+
+    let p = script::script_unit(&of(&units, &scripts, &tools), 3).unwrap();
+    assert_eq!(
+        p.dylib_search.plugin_search,
+        [PathBuf::from(format!("native={out_dir}/lib"))],
+        "what p's build dependency's script named"
+    );
+    let env = blaze_build_script::env(&p, &[]).unwrap();
+    let var = if cfg!(target_os = "macos") { "DYLD_FALLBACK_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
+    let search = env.get(var).expect("the dynamic library path").to_string_lossy().into_owned();
+    assert!(search.contains(&format!("{out_dir}/lib")), "{search}");
+}
+
 #[test]
 fn a_scripts_directives_are_applied_as_cargo_applies_them() {
     let dir = tempfile::tempdir().unwrap();

@@ -412,10 +412,50 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
             host_deps: vec![profile_dir.join("deps")],
             host_root: Some(profile_dir),
             sysroot_libdir: PathBuf::new(),
-            plugin_search: Vec::new(),
+            plugin_search: plugin_search(of, run),
         },
         jobserver: None,
     })
+}
+
+/// Where the run of a script finds a shared library a build dependency's script built: what the
+/// scripts of its build dependencies, and of theirs, named with `rustc-link-search`
+/// (cargo's `add_plugin_deps`, from the `plugins` its `build_map` keeps: of what the script's
+/// compile links, in the order of their package ids). A proc macro or another script is not
+/// linked into it, so what those depend on is not looked through.
+fn plugin_search(of: &Of<'_>, run: usize) -> Vec<PathBuf> {
+    let units = of.units;
+    let Some(compile) = compile_of(units, run) else { return Vec::new() };
+    // alloc: setup, once per run: the walk of its build dependencies.
+    let mut seen = std::collections::BTreeSet::from([compile]);
+    let mut stack = vec![compile];
+    let mut found: Vec<(&str, &Applied)> = Vec::new();
+    while let Some(at) = stack.pop() {
+        let Some(unit) = units.graph.units.get(at) else { continue };
+        for dep in &unit.dependencies {
+            let Some(it) = units.graph.units.get(dep.index) else { continue };
+            let is_run = matches!(it.mode, Mode::RunCustomBuild);
+            if !is_run && (!it.target.is_lib() || it.target.is_proc_macro()) {
+                continue;
+            }
+            if !seen.insert(dep.index) {
+                continue;
+            }
+            if is_run {
+                if let Some(applied) = of.scripts.get(dep.index).and_then(|it| it.get()) {
+                    found.push((it.pkg_id.as_str(), applied));
+                }
+            } else {
+                stack.push(dep.index);
+            }
+        }
+    }
+    found.sort_by_key(|(pkg_id, _)| *pkg_id);
+    found
+        .into_iter()
+        .flat_map(|(_, applied)| &applied.output.library_paths)
+        .map(|it| it.path().to_owned())
+        .collect()
 }
 
 /// The target of `unit`, as `blaze_build_script` names it.
