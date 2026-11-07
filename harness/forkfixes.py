@@ -9,6 +9,7 @@ so that what v2 does is a result rather than a reading of its code. Input, one J
     scratch  a directory for the projects and the daemon's home; it is removed first
     only     (optional) the names of the cases to run
     stall_bound  (optional) seconds the daemon's loop may make no progress (`blaze serve --stall-bound`)
+    timeout  (optional) seconds a case's build or test may take, 1800 if not given
 
 Each case is `harness/forkfixes/cases.py`'s: its sources, and either the lines its program prints
 or the text its error has. Every case runs, and the report names each that did not do as stated.
@@ -41,7 +42,7 @@ def env_for(scratch: Path) -> dict:
     return env
 
 
-def run_case(blaze: str, scratch: Path, case: dict) -> tuple[bool, str]:
+def run_case(blaze: str, scratch: Path, case: dict, timeout: int) -> tuple[bool, str]:
     root = scratch / "cases" / case["name"]
     files = dict(case["files"])
     files.setdefault(
@@ -51,12 +52,12 @@ def run_case(blaze: str, scratch: Path, case: dict) -> tuple[bool, str]:
     write(root, files)
     env = env_for(scratch)
     if case.get("test"):
-        tested = subprocess.run([blaze, "test"], cwd=root, env=env, capture_output=True, text=True, timeout=1800)
+        tested = subprocess.run([blaze, "test"], cwd=root, env=env, capture_output=True, text=True, timeout=timeout)
         said = tested.stdout + tested.stderr
         return tested.returncode == 0 and case["test"] in said, said[-900:]
     target = scratch / "targets" / case["name"]
     env["CARGO_TARGET_DIR"] = str(target)
-    built = subprocess.run([blaze, "build"], cwd=root, env=env, capture_output=True, text=True, timeout=1800)
+    built = subprocess.run([blaze, "build"], cwd=root, env=env, capture_output=True, text=True, timeout=timeout)
     said = built.stdout + built.stderr
     if "error" in case:
         if built.returncode == 0:
@@ -100,7 +101,7 @@ def main(given: dict) -> int:
             if only and case["name"] not in only:
                 continue
             try:
-                ok, why = run_case(given["blaze"], scratch, case)
+                ok, why = run_case(given["blaze"], scratch, case, given.get("timeout", 1800))
             except subprocess.TimeoutExpired as timed_out:
                 ok, why = False, f"timed out: {timed_out.cmd}"
             results[case["name"]] = {"ok": ok, "why": why, "fixes": case["fixes"]}
