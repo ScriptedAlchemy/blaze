@@ -15,6 +15,8 @@ Input, one JSON value (`python3 harness/distv2.py '{...}'`):
     profile      (optional) the directory under the target directory programs are in; default "debug"
     stall_bound  (optional) seconds a daemon's loop may make no progress (`blaze serve --stall-bound`):
                  an unoptimized blaze under test needs more than the default
+    keep_solo    (optional) keep the solo daemon's home from a run before, which is what an
+                 unoptimized blaze takes longest over; default false
 
 Checks, each on what the build itself reports (BLAZE_DIST_REPORT) and on running the program:
     solo         one daemon, no coordinator: the program the others are held to
@@ -65,6 +67,7 @@ class Input:
     faults: bool = True
     profile: str = "debug"
     stall_bound: int | None = None
+    keep_solo: bool = False
 
 
 def load(text: str) -> Input:
@@ -100,7 +103,15 @@ class Run:
     def __init__(self, given: Input):
         self.given = given
         self.root = Path(given.scratch)
-        shutil.rmtree(self.root, ignore_errors=True)
+        if given.keep_solo and self.root.exists():
+            for it in self.root.iterdir():
+                if it.name not in ("solo", "project", "targets"):
+                    shutil.rmtree(it, ignore_errors=True) if it.is_dir() else it.unlink()
+            for it in (self.root / "targets").iterdir():
+                if it.name != "solo":
+                    shutil.rmtree(it, ignore_errors=True)
+        else:
+            shutil.rmtree(self.root, ignore_errors=True)
         (self.root / "logs").mkdir(parents=True)
         self.socket = Path("/tmp") / f"blzd-{os.getpid()}.sock"
         self.port = free_port()
@@ -194,7 +205,7 @@ class Run:
         process = subprocess.Popen(
             [self.given.blaze, "build", *self.given.args],
             cwd=project or self.project,
-            env=self.env(home, dist, **extra),
+            env={**self.env(home, dist, **extra), "CARGO_TARGET_DIR": str(self.target(home, project))},
             stdout=log,
             stderr=subprocess.STDOUT,
         )
@@ -205,15 +216,12 @@ class Run:
         code = process.wait()
         return code, Path(log.name).read_text()
 
+    def target(self, home: str, project: Path | None = None) -> Path:
+        """Each daemon's target directory of a checkout, as a person on that machine would have."""
+        return self.root / "targets" / home / (project or self.project).name
+
     def program(self, home: str, project: Path | None = None) -> Path:
-        out = subprocess.run(
-            [self.given.blaze, "metadata", "--no-deps", "--format-version", "1"],
-            cwd=project or self.project,
-            env=self.env(home, False),
-            capture_output=True,
-            text=True,
-        )
-        return Path(json.loads(out.stdout)["target_directory"]) / self.given.profile / self.given.program
+        return self.target(home, project) / self.given.profile / self.given.program
 
     def behaviour(self, home: str, project: Path | None = None) -> tuple[str, str]:
         program = self.program(home, project)
@@ -240,7 +248,7 @@ def daemon_pid(run: Run, home: str) -> int | None:
         [run.given.blaze, "status", "--json"], cwd=run.project, env=run.env(home, False), capture_output=True, text=True
     )
     try:
-        return json.loads(out.stdout).get("pid")
+        return (json.loads(out.stdout).get("daemon") or {}).get("pid")
     except json.JSONDecodeError:
         return None
 
@@ -249,18 +257,26 @@ def sums(rows: list[dict], name: str) -> int:
     return sum(row[name] for row in rows)
 
 
+def edit(path: Path, old: str, new: str) -> None:
+    text = path.read_text()
+    if old not in text:
+        raise Failed(f"{path} has no {old!r}")
+    path.write_text(text.replace(old, new))
+
+
 def main(given: Input) -> None:
     run = Run(given)
     run.project = run.root / "project"
-    shutil.copytree(given.project, run.project, ignore=shutil.ignore_patterns("target", ".git"))
+    shutil.copytree(given.project, run.project, ignore=shutil.ignore_patterns("target", ".git"), dirs_exist_ok=True)
     homes = ["solo", "a", "b", "cold"]
+    edited = run.project / "mathy" / "src" / "lib.rs"
     try:
         run.start_services()
         code, text = run.build("solo", dist=False)
         check(code == 0, f"solo builds: {text[-400:] if code else ''}")
         solo = run.behaviour("solo")
-        print("     solo:", solo[0].strip(), solo[1][:16], flush=True)
-        check("caught True" in solo[0] and "script says from the script" in solo[0], "the program unwinds across units and has its script's output")
+        print("     solo:", solo[0].strip().replace("\n", " | "), solo[1][:16], flush=True)
+        check("caught true" in solo[0] and "script says from the script" in solo[0], "the program unwinds across units and has its script's output")
 
         a, a_log = run.build("a", wait=False)
         b, b_log = run.build("b", wait=False)
@@ -280,9 +296,10 @@ def main(given: Input) -> None:
             and by_a[row["unit"]]["execution"] == row["execution"]
             and row["source"] == "executed"
         ]
+        print(f"     one execution of both: {sorted(row['unit'] for row in shared)}", flush=True)
         check(bool(shared), "at least one unit was one execution of both daemons")
         for name, behaviour in (("a", run.behaviour("a")), ("b", run.behaviour("b"))):
-            check(behaviour[0] == solo[0], f"worker {name}'s program behaves as solo's: {behaviour[0].strip()}")
+            check(behaviour[0] == solo[0], f"worker {name}'s program behaves as solo's")
             check(behaviour[1] == solo[1], f"worker {name}'s program is solo's, byte for byte")
         unexplained = [row for row in rows_a + rows_b if row["joined"] and row["tail_compiled"] > row["instances"]]
         check(not unexplained, "no unit compiled more than its functions")
@@ -291,6 +308,7 @@ def main(given: Input) -> None:
         check(code == 0, f"a third daemon builds from the cache: {text[-400:] if code else ''}")
         rows = run.report("cold")
         published = [row for row in rows if row["source"] == "published"]
+        print(f"     cold: {len(published)}/{len(rows)} published; compiled {sums(rows, 'tail_compiled')} of {sums(rows, 'instances')}", flush=True)
         check(len(published) == len(rows) and rows, f"every unit of the cold daemon was published: {len(published)}/{len(rows)}")
         tail = sums(rows, "tail_compiled")
         check(tail == 0, f"the cold daemon compiled nothing: {tail}")
@@ -302,8 +320,7 @@ def main(given: Input) -> None:
         check(code == 0 and len(run.report("cold")) == before, "a build with nothing changed runs no unit")
 
         # One function edited: what it reaches is worked again, by the same keys.
-        edited = run.project / "mathy" / "src" / "lib.rs"
-        edited.write_text(edited.read_text().replace('format!("3:{sum}', 'format!("3 edited:{sum}'))
+        edit(edited, 'format!("3:{sum}', 'format!("3 edited:{sum}')
         rows_before = len(run.report("a"))
         code, text = run.build("a")
         check(code == 0, f"an edit builds: {text[-400:] if code else ''}")
@@ -311,7 +328,7 @@ def main(given: Input) -> None:
         work = sums(new, "compiled_for_work") + sums(new, "tail_compiled")
         check(0 < work < sums(rows_a, "compiled_for_work") + sums(rows_b, "compiled_for_work"), f"the edit recompiled {work} functions, not the whole workspace")
         check(run.behaviour("a")[0] != solo[0], "the edited program behaves as edited")
-        edited.write_text(edited.read_text().replace('format!("3 edited:{sum}', 'format!("3:{sum}'))
+        edit(edited, 'format!("3 edited:{sum}', 'format!("3:{sum}')
 
         # A file a unit includes is an input of its keys, and so a new unit: nothing stale is taken.
         included = run.project / "shapes" / "included.txt"
@@ -327,13 +344,12 @@ def main(given: Input) -> None:
         other = run.root / "project-pr"
         shutil.copytree(run.project, other, ignore=shutil.ignore_patterns("target", ".git"))
         homes.append("pr")
-        changed = other / "mathy" / "src" / "lib.rs"
-        changed.write_text(changed.read_text().replace('format!("5:{sum}', 'format!("5 pr:{sum}'))
+        edit(other / "mathy" / "src" / "lib.rs", 'format!("5:{sum}', 'format!("5 pr:{sum}')
         code, text = run.build("pr", project=other, BLAZE_DIST_PR="17", BLAZE_DIST_SOURCE="rev1")
         check(code == 0, f"another pull request builds: {text[-400:] if code else ''}")
         rows = run.report("pr")
         taken = [row for row in rows if row["source"] == "published"]
-        print(f"     pr: {len(taken)}/{len(rows)} units published already: {[row['unit'] for row in taken][:6]}", flush=True)
+        print(f"     pr: {len(taken)}/{len(rows)} units published already: {sorted(row['unit'] for row in taken)}", flush=True)
         check(any(row["unit"] == "shapes" for row in taken), "the crate it shares came from the cache")
         check(sums(taken, "tail_compiled") == 0 and sums(taken, "compiled_for_work") == 0, "and compiled nothing here")
         check(any(row["unit"] == "mathy" and row["source"] == "executed" for row in rows), "the edited crate was built")
@@ -345,107 +361,105 @@ def main(given: Input) -> None:
         # A newer revision of the pull request while the older builds: the newer one finishes, and
         # the older either finished first or stopped, naming why, with nothing of the newer lost.
         older_at, newer_at = run.root / "project-older", run.root / "project-newer"
-        for at, edit in ((older_at, 'format!("6 older:{sum}'), (newer_at, 'format!("6 newer:{sum}')):
+        for at, change in ((older_at, 'format!("6 older:{sum}'), (newer_at, 'format!("6 newer:{sum}')):
             shutil.copytree(run.project, at, ignore=shutil.ignore_patterns("target", ".git"))
-            source = at / "mathy" / "src" / "lib.rs"
-            source.write_text(source.read_text().replace('format!("6:{sum}', edit))
-        homes.extend(["older", "newer"])
-        older, older_log = run.build("older", wait=False, project=older_at, BLAZE_DIST_PR="18", BLAZE_DIST_SOURCE="old")
+            edit(at / "mathy" / "src" / "lib.rs", 'format!("6:{sum}', change)
+        older, older_log = run.build("a", wait=False, project=older_at, BLAZE_DIST_PR="18", BLAZE_DIST_SOURCE="old")
         time.sleep(0.2)
-        newer, newer_log = run.build("newer", wait=False, project=newer_at, BLAZE_DIST_PR="18", BLAZE_DIST_SOURCE="new")
+        newer, newer_log = run.build("b", wait=False, project=newer_at, BLAZE_DIST_PR="18", BLAZE_DIST_SOURCE="new")
         code_newer, code_older = newer.wait(), older.wait()
         check(code_newer == 0, f"the newer revision builds: {Path(newer_log).read_text()[-800:] if code_newer else ''}")
-        check("newer" not in run.behaviour("older", older_at)[0] if code_older == 0 else "distributed build failed" in Path(older_log).read_text(), "the older one finished as itself, or stopped naming the distributed path")
-        print(f"     older revision's build: exit {code_older}", flush=True)
+        print(f"     the older revision's build: exit {code_older}", flush=True)
+        check("newer" not in run.behaviour("a", older_at)[0] if code_older == 0 else "distributed build failed" in Path(older_log).read_text(), "the older one finished as itself, or stopped naming the distributed path")
 
         if given.faults:
             # A worker killed in the middle: its lease expires and the other finishes the unit.
-            shutil.rmtree(run.root / "blobs", ignore_errors=True)
-            for name in ("lost", "survivor"):
-                homes.append(name)
-            edited.write_text(edited.read_text().replace('format!("7:{sum}', 'format!("7 lost:{sum}'))
-            lost, _ = run.build("lost", wait=False)
-            survivor, survivor_log = run.build("survivor", wait=False, BLAZE_DIST_DEADLINE_SECS="600")
-            deadline = time.time() + 120
-            while time.time() < deadline and not run.report("lost") and not run.report("survivor"):
+            edit(edited, 'format!("7:{sum}', 'format!("7 lost:{sum}')
+            mark = len(run.report("b")), len(run.report("a"))
+            lost, _ = run.build("a", wait=False)
+            survivor, survivor_log = run.build("b", wait=False, BLAZE_DIST_DEADLINE_SECS="1800")
+            deadline = time.time() + 1800
+            while time.time() < deadline and len(run.report("a")) == mark[1] and len(run.report("b")) == mark[0] and survivor.poll() is None:
                 time.sleep(0.01)
-            pid = daemon_pid(run, "lost")
-            if pid:
-                os.kill(pid, signal.SIGKILL)
+            pid = daemon_pid(run, "a")
+            check(pid is not None, "the worker to kill has a daemon")
+            os.kill(pid, signal.SIGKILL)
             lost.wait()
             code = survivor.wait()
             check(code == 0, f"the survivor finished: {Path(survivor_log).read_text()[-800:] if code else ''}")
-            behaviour = run.behaviour("survivor")
-            check("functions" in behaviour[0], f"the survivor's program runs: {behaviour[0].strip()}")
-            edited.write_text(edited.read_text().replace('format!("7 lost:{sum}', 'format!("7:{sum}'))
+            code, text = run.build("solo", dist=False)
+            check(code == 0, f"the control builds alone: {text[-400:] if code else ''}")
+            control = run.behaviour("solo")
+            check(run.behaviour("b") == control, "the survivor's program is the one built alone, byte for byte")
+            edit(edited, 'format!("7 lost:{sum}', 'format!("7:{sum}')
 
             # A worker stopped past its lease and then resumed: its lease is taken back, whatever
             # it reports afterwards is refused, and both builds end with the same program.
-            shutil.rmtree(run.root / "blobs", ignore_errors=True)
-            for name in ("stalled", "healthy"):
-                homes.append(name)
             run.coordinator.terminate()
             run.coordinator.wait()
             run.lease = ["2000"]
             run.start_coordinator()
-            edited.write_text(edited.read_text().replace('format!("8:{sum}', 'format!("8 fence:{sum}'))
+            edit(edited, 'format!("8:{sum}', 'format!("8 fence:{sum}')
+            code, text = run.build("solo", dist=False)
+            check(code == 0, f"the fence's control builds: {text[-400:] if code else ''}")
+            control = run.behaviour("solo")
             fenced_log = run.root / "logs" / "coordinator.log"
             before_fence = len(fenced_log.read_text().splitlines())
-            expected, _ = run.build("alone", dist=False), homes.append("alone")
-            check(expected[0] == 0, f"the fence's control builds: {expected[1][-400:] if expected[0] else ''}")
-            control = run.behaviour("alone")
-            stalled, stalled_log = run.build("stalled", wait=False, BLAZE_DIST_DEADLINE_SECS="600")
-            healthy, healthy_log = run.build("healthy", wait=False, BLAZE_DIST_DEADLINE_SECS="600")
-            deadline = time.time() + 300
-            stopped = None
             packs = run.root / "blobs" / "packs"
+            before_packs = set(packs.glob("*.pack"))
+            stalled, stalled_log = run.build("a", wait=False, BLAZE_DIST_DEADLINE_SECS="1800")
+            healthy, healthy_log = run.build("b", wait=False, BLAZE_DIST_DEADLINE_SECS="1800")
+            deadline = time.time() + 1800
+            stopped = None
             while time.time() < deadline and stalled.poll() is None and stopped is None:
-                pid = daemon_pid(run, "stalled")
-                # As the first batch is committed, the work is under leases of both.
-                if pid and packs.exists() and any(packs.glob("*.pack")):
-                    stopped = pid
-                    os.kill(pid, signal.SIGSTOP)
+                # As a new batch is committed, the work is under leases of both.
+                if set(packs.glob("*.pack")) - before_packs:
+                    stopped = daemon_pid(run, "a")
+                    if stopped:
+                        os.kill(stopped, signal.SIGSTOP)
                 time.sleep(0.02)
-            if stopped:
-                time.sleep(8)
-                os.kill(stopped, signal.SIGCONT)
-            code_h, code_s = healthy.wait(), stalled.wait()
             check(stopped is not None, "a worker was stopped in the middle of its build")
+            time.sleep(8)
+            os.kill(stopped, signal.SIGCONT)
+            code_h, code_s = healthy.wait(), stalled.wait()
             check(code_h == 0, f"the healthy worker finished: {Path(healthy_log).read_text()[-800:] if code_h else ''}")
             check(code_s == 0, f"the resumed worker finished: {Path(stalled_log).read_text()[-800:] if code_s else ''}")
             lines = fenced_log.read_text().splitlines()[before_fence:]
             print(f"     coordinator: {len(lines)} lines, e.g. {lines[:3]}", flush=True)
             check(any(("fenced" in it or "holder-lost" in it or "lead-lost" in it) for it in lines), "the coordinator took the stopped worker's work back")
-            for name in ("stalled", "healthy"):
-                check(run.behaviour(name)[1] == control[1], f"{name}'s program is the one built alone, byte for byte")
-            edited.write_text(edited.read_text().replace('format!("8 fence:{sum}', 'format!("8:{sum}'))
+            for name in ("a", "b"):
+                check(run.behaviour(name) == control, f"{name}'s program is the one built alone, byte for byte")
+            edit(edited, 'format!("8 fence:{sum}', 'format!("8:{sum}')
 
             # A pack damaged on the cache server: the read refuses it, and the unit is not taken.
-            packs = run.root / "blobs" / "packs"
-            names = sorted(packs.glob("*.pack"), key=lambda it: it.stat().st_size)
-            if names:
-                target = names[-1]
+            edit(edited, 'format!("2:{sum}', 'format!("2 damaged:{sum}')
+            before_packs = set(packs.glob("*.pack"))
+            code, text = run.build("a")
+            check(code == 0, f"a worker publishes what the next two take: {text[-400:] if code else ''}")
+            code, text = run.build("solo", dist=False)
+            check(code == 0, f"the control builds alone: {text[-400:] if code else ''}")
+            control = run.behaviour("solo")
+            for target in sorted(set(packs.glob("*.pack")) - before_packs):
                 raw = bytearray(target.read_bytes())
                 raw[len(raw) // 2] ^= 0xff
                 target.write_bytes(bytes(raw))
-                homes.append("damaged")
-                code, text = run.build("damaged", BLAZE_DIST_LOCAL="fallback")
-                check(code == 0, f"a damaged pack falls back: {text[-400:] if code else ''}")
-                check(run.behaviour("damaged")[1] == control[1], "and its program is the right one, byte for byte")
-                homes.append("damaged-never")
-                code, text = run.build("damaged-never", BLAZE_DIST_LOCAL="never")
-                check(code != 0 and "distributed build failed" in text, "under `never` it stops, naming it")
+            code, text = run.build("b", BLAZE_DIST_LOCAL="never")
+            check(code != 0 and "distributed build failed" in text, "under `never` a damaged pack stops the build, naming it")
+            code, text = run.build("cold", BLAZE_DIST_LOCAL="fallback")
+            check(code == 0, f"under `fallback` it compiles here: {text[-400:] if code else ''}")
+            check(run.behaviour("cold") == control, "and its program is the one built alone, byte for byte")
+            edit(edited, 'format!("2 damaged:{sum}', 'format!("2:{sum}')
 
             # No carrier: a typed stop by default, the same compiler here when asked.
             run.coordinator.terminate()
             run.coordinator.wait()
             run.socket.unlink(missing_ok=True)
-            edited.write_text(edited.read_text().replace('format!("9:{sum}', 'format!("9 down:{sum}'))
+            edit(edited, 'format!("9:{sum}', 'format!("9 down:{sum}')
             code, text = run.build("a")
             check(code != 0 and "distributed build failed" in text, "no carrier stops the build, naming it")
             code, text = run.build("a", BLAZE_DIST_LOCAL="fallback")
             check(code == 0, f"fallback compiles here: {text[-400:] if code else ''}")
-            check("functions" in run.behaviour("a")[0], "and the program runs")
+            check("functions" in run.behaviour("a")[0] and "caught true" in run.behaviour("a")[0], "and the program runs")
         print("distv2: every check passed", flush=True)
     finally:
         run.stop(homes)

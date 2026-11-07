@@ -54,6 +54,8 @@ def run_case(blaze: str, scratch: Path, case: dict) -> tuple[bool, str]:
         tested = subprocess.run([blaze, "test"], cwd=root, env=env, capture_output=True, text=True, timeout=1800)
         said = tested.stdout + tested.stderr
         return tested.returncode == 0 and case["test"] in said, said[-900:]
+    target = scratch / "targets" / case["name"]
+    env["CARGO_TARGET_DIR"] = str(target)
     built = subprocess.run([blaze, "build"], cwd=root, env=env, capture_output=True, text=True, timeout=1800)
     said = built.stdout + built.stderr
     if "error" in case:
@@ -62,10 +64,6 @@ def run_case(blaze: str, scratch: Path, case: dict) -> tuple[bool, str]:
         return (case["error"] in said), (said[-600:] if case["error"] not in said else "refused as stated")
     if built.returncode != 0:
         return False, f"it did not build, and rustc builds it:\n{said[-900:]}"
-    meta = subprocess.run(
-        [blaze, "metadata", "--no-deps", "--format-version", "1"], cwd=root, env=env, capture_output=True, text=True
-    )
-    target = Path(json.loads(meta.stdout)["target_directory"])
     program = target / "debug" / case.get("program", case["name"].replace("-", "_"))
     ran = subprocess.run([str(program)], capture_output=True, text=True, timeout=120)
     if ran.returncode != 0:

@@ -268,3 +268,65 @@ CASES.append(
         "prints": ["yes"],
     }
 )
+CASES.append(
+    {
+        # Found building blaze itself with `debug = 0`: rustc_type_ir's `TypeFlags` and
+        # `PathsToNested`, two bitflags of different widths, put two values under one store key.
+        "name": "two-derived-clones-with-no-debug-info",
+        "fixes": [],
+        "files": {
+            "Cargo.toml": '[package]\nname = "two_clones"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n\n[profile.dev]\ndebug = 0\n',
+            "src/main.rs": """#[derive(Clone, Copy)]
+pub struct Wide(u32);
+#[derive(Clone, Copy)]
+pub struct Narrow(u8);
+#[derive(Clone)]
+pub struct Holds(Wide);
+#[derive(Clone)]
+pub struct AlsoHolds(Narrow);
+fn main() {
+    let a = Holds(Wide(7)).clone();
+    let b = AlsoHolds(Narrow(5)).clone();
+    println!("{} {}", (a.0).0, (b.0).0);
+}
+""",
+        },
+        "prints": ["7 5"],
+    }
+)
+CASES.append(
+    {
+        # upstream's main made a polled-again future panic in the IR and not in the walk of its
+        # references, which refused every program with an `async fn`.
+        "name": "an-async-fn-and-polling-it-again",
+        "fixes": [],
+        "files": {MAIN: """use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+async fn inner(n: u32) -> u32 {
+    n + 1
+}
+
+async fn outer() -> u32 {
+    inner(1).await + inner(2).await
+}
+
+fn main() {
+    let mut context = Context::from_waker(Waker::noop());
+    let mut future = pin!(outer());
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(value) => println!("{value}"),
+        Poll::Pending => println!("pending"),
+    }
+    std::panic::set_hook(Box::new(|_| {}));
+    let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = future.as_mut().poll(&mut context);
+    }));
+    let said = again.err().and_then(|it| it.downcast_ref::<&str>().map(|it| it.to_string()));
+    println!("{said:?}");
+}
+"""},
+        "prints": ["5", 'Some("`async fn` resumed after completion")'],
+    }
+)
