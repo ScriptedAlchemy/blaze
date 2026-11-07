@@ -2,9 +2,9 @@
 //! [`Client`], hands its compile plans to the caller's batch compiler, and ticks it
 //! with the caller's clock until the holder leaves the execution.
 //!
-//! A scoped compiler worker owns compile and release calls, while the driver keeps
-//! servicing holder events and heartbeats. A cancelled batch still finishes in the
-//! worker; its unpublished findings are released before the driver returns.
+//! The caller thread owns compilation and release (including thread-local compiler state),
+//! while a scoped driver thread services holder events and heartbeats. A cancelled batch
+//! still finishes; its unpublished findings are released before the driver returns.
 //!
 //! Nothing here compiles by itself and nothing falls back: a transport failure is
 //! returned to the caller, whose `LocalPolicy` decides what happens next.
@@ -38,10 +38,10 @@ impl Default for DriverConfig {
     }
 }
 
-/// Run the holder to completion over a local carrier. The batch compiler must be
-/// Send: the worker borrows it for the lifetime of the driver, while the driver
-/// continues to tick and send heartbeats. No compiler or compiler fallback is
-/// started by the carrier. The caller's clock must share the coordinator's origin.
+/// Run the holder to completion over a local carrier. Compilation remains on the
+/// caller's thread: a compiler may own thread-local or non-Sync semantic state.
+/// The scoped driver thread ticks and sends heartbeats while it compiles. Nothing
+/// falls back to another compiler. The clock must share the coordinator's origin.
 pub fn run_holder(
     client: &mut Client,
     socket: &Path,
@@ -49,8 +49,8 @@ pub fn run_holder(
     content: JobContent,
     executor: &str,
     config: &DriverConfig,
-    now_ms: impl Fn() -> u64,
-    compiler: &mut (dyn BatchCompiler + Send),
+    now_ms: impl Fn() -> u64 + Send,
+    compiler: &mut dyn BatchCompiler,
 ) -> Result<StopWhy, Error> {
     let mut pending: Option<u64> = None;
     drive(holder, config, now_ms, compiler, |call, id| {
@@ -68,140 +68,143 @@ enum CompilerTask {
 fn drive(
     holder: &mut Holder,
     config: &DriverConfig,
-    now_ms: impl Fn() -> u64,
-    compiler: &mut (dyn BatchCompiler + Send),
-    mut transmit: impl FnMut(&Call, u64) -> Result<Reply, Error>,
+    now_ms: impl Fn() -> u64 + Send,
+    compiler: &mut dyn BatchCompiler,
+    mut transmit: impl FnMut(&Call, u64) -> Result<Reply, Error> + Send,
 ) -> Result<StopWhy, Error> {
     std::thread::scope(|scope| {
         let (tasks, receiver) = mpsc::channel::<CompilerTask>();
         let (finished, completions) = mpsc::channel::<Result<Compiled, String>>();
-        let worker = scope.spawn(move || {
-            while let Ok(task) = receiver.recv() {
-                match task {
-                    CompilerTask::Compile(plan) => {
-                        if finished.send(compiler.compile(&plan)).is_err() {
-                            break;
-                        }
-                    }
-                    CompilerTask::Release(names) => compiler.release(&names),
-                }
-            }
-        });
-
-        let mut working = false;
-        // The compiler retains new findings until the result is acknowledged.
-        // Transport failure before acknowledgment must release them as well as
-        // findings already retained from earlier successful batches.
-        let mut unconfirmed = BTreeSet::new();
-        let result =
-            (|| -> Result<StopWhy, Error> {
-                let mut effects = Vec::new();
-                let mut stopped: Option<StopWhy> = None;
-                holder.start(now_ms(), &mut effects);
-                holder.step(now_ms(), Event::Loaded, &mut effects);
-                loop {
-                    if effects.is_empty() {
-                        if let Some(why) = stopped.take() {
-                            if !working {
-                                return Ok(why);
-                            }
-                            stopped = Some(why);
-                        }
-                        match completions.recv_timeout(config.poll) {
-                            Ok(Ok(batch)) => {
-                                working = false;
-                                if !holder.is_stopped() {
-                                    unconfirmed.extend(
-                                        batch.roots.iter().chain(&batch.names).flat_map(|item| {
-                                            item.found.iter().map(|found| found.name)
-                                        }),
-                                    );
+        let driver = scope.spawn(move || {
+            let mut working = false;
+            // The compiler retains new findings until the result is acknowledged.
+            // Transport failure before acknowledgment must release them as well as
+            // findings already retained from earlier successful batches.
+            let mut unconfirmed = BTreeSet::new();
+            let result =
+                (|| -> Result<StopWhy, Error> {
+                    let mut effects = Vec::new();
+                    let mut stopped: Option<StopWhy> = None;
+                    holder.start(now_ms(), &mut effects);
+                    holder.step(now_ms(), Event::Loaded, &mut effects);
+                    loop {
+                        if effects.is_empty() {
+                            if let Some(why) = stopped.take() {
+                                if !working {
+                                    return Ok(why);
                                 }
-                                // The stopped holder releases even findings from a
-                                // compile that finished after cancellation.
-                                holder.step(now_ms(), Event::Compiled(batch), &mut effects);
+                                stopped = Some(why);
                             }
-                            Ok(Err(error)) => {
-                                working = false;
-                                if stopped.is_none() {
-                                    return Err(Error::Protocol(error));
+                            match completions.recv_timeout(config.poll) {
+                                Ok(Ok(batch)) => {
+                                    working = false;
+                                    if !holder.is_stopped() {
+                                        unconfirmed.extend(
+                                            batch.roots.iter().chain(&batch.names).flat_map(|item| {
+                                                item.found.iter().map(|found| found.name)
+                                            }),
+                                        );
+                                    }
+                                    // The stopped holder releases even findings from a
+                                    // compile that finished after cancellation.
+                                    holder.step(now_ms(), Event::Compiled(batch), &mut effects);
                                 }
-                            }
-                            Err(RecvTimeoutError::Timeout) => {
-                                if stopped.is_none() {
-                                    holder.step(now_ms(), Event::Tick, &mut effects);
+                                Ok(Err(error)) => {
+                                    working = false;
+                                    if stopped.is_none() {
+                                        return Err(Error::Protocol(error));
+                                    }
                                 }
-                            }
-                            Err(RecvTimeoutError::Disconnected) => {
-                                return Err(Error::Protocol(
-                                    "compiler worker exited without a result".to_owned(),
-                                ));
-                            }
-                        }
-                        continue;
-                    }
-                    for effect in std::mem::take(&mut effects) {
-                        match effect {
-                            Effect::Stop(why) => stopped = Some(why),
-                            Effect::Release(names) => {
-                                for name in &names {
-                                    unconfirmed.remove(name);
+                                Err(RecvTimeoutError::Timeout) => {
+                                    if stopped.is_none() {
+                                        holder.step(now_ms(), Event::Tick, &mut effects);
+                                    }
                                 }
-                                tasks.send(CompilerTask::Release(names)).map_err(|_| {
-                                    Error::Protocol("compiler worker is unavailable".to_owned())
-                                })?;
-                            }
-                            Effect::Compile(plan) => {
-                                if working {
+                                Err(RecvTimeoutError::Disconnected) => {
                                     return Err(Error::Protocol(
-                                        "holder granted overlapping compiler batches".to_owned(),
+                                        "compiler worker exited without a result".to_owned(),
                                     ));
                                 }
-                                tasks.send(CompilerTask::Compile(plan)).map_err(|_| {
-                                    Error::Protocol("compiler worker is unavailable".to_owned())
-                                })?;
-                                working = true;
                             }
-                            Effect::Send { id, call } if stopped.is_none() => {
-                                let is_result = matches!(call, Call::Result(_));
-                                let reply = transmit(&call, id)?;
-                                holder.step(now_ms(), Event::Reply { id, reply }, &mut effects);
-                                if is_result {
-                                    // The holder has either retained or released every
-                                    // discovery from this acknowledged result.
-                                    unconfirmed.clear();
+                            continue;
+                        }
+                        for effect in std::mem::take(&mut effects) {
+                            match effect {
+                                Effect::Stop(why) => stopped = Some(why),
+                                Effect::Release(names) => {
+                                    for name in &names {
+                                        unconfirmed.remove(name);
+                                    }
+                                    tasks.send(CompilerTask::Release(names)).map_err(|_| {
+                                        Error::Protocol("compiler worker is unavailable".to_owned())
+                                    })?;
                                 }
+                                Effect::Compile(plan) => {
+                                    if working {
+                                        return Err(Error::Protocol(
+                                            "holder granted overlapping compiler batches".to_owned(),
+                                        ));
+                                    }
+                                    tasks.send(CompilerTask::Compile(plan)).map_err(|_| {
+                                        Error::Protocol("compiler worker is unavailable".to_owned())
+                                    })?;
+                                    working = true;
+                                }
+                                Effect::Send { id, call } if stopped.is_none() => {
+                                    let is_result = matches!(call, Call::Result(_));
+                                    let reply = transmit(&call, id)?;
+                                    holder.step(now_ms(), Event::Reply { id, reply }, &mut effects);
+                                    if is_result {
+                                        // The holder has either retained or released every
+                                        // discovery from this acknowledged result.
+                                        unconfirmed.clear();
+                                    }
+                                }
+                                Effect::Send { .. } => {}
                             }
-                            Effect::Send { .. } => {}
                         }
                     }
-                }
-            })();
+                })();
 
-        if result.is_err() {
-            if working {
-                // The socket failed while compilation was running. Do not leave
-                // unreported findings in the caller's compiler after joining it.
-                if let Ok(Ok(batch)) = completions.recv() {
-                    unconfirmed.extend(
-                        batch
-                            .roots
-                            .iter()
-                            .chain(&batch.names)
-                            .flat_map(|item| item.found.iter().map(|found| found.name)),
-                    );
+            if result.is_err() {
+                if working {
+                    // The socket failed while compilation was running. Do not leave
+                    // unreported findings in the caller's compiler after joining it.
+                    if let Ok(Ok(batch)) = completions.recv() {
+                        unconfirmed.extend(
+                            batch
+                                .roots
+                                .iter()
+                                .chain(&batch.names)
+                                .flat_map(|item| item.found.iter().map(|found| found.name)),
+                        );
+                    }
+                }
+                unconfirmed.extend(holder.findings().keys().copied());
+                if !unconfirmed.is_empty() {
+                    let _ = tasks.send(CompilerTask::Release(unconfirmed.into_iter().collect()));
                 }
             }
-            unconfirmed.extend(holder.findings().keys().copied());
-            if !unconfirmed.is_empty() {
-                let _ = tasks.send(CompilerTask::Release(unconfirmed.into_iter().collect()));
+            drop(tasks);
+            result
+        });
+
+        // The actual exporter owns non-Send data: always execute and release on
+        // its originating thread, never move its database or resolver into a worker.
+        while let Ok(task) = receiver.recv() {
+            match task {
+                CompilerTask::Compile(plan) => {
+                    if finished.send(compiler.compile(&plan)).is_err() {
+                        break;
+                    }
+                }
+                CompilerTask::Release(names) => compiler.release(&names),
             }
         }
-        drop(tasks);
-        if worker.join().is_err() {
-            return Err(Error::Protocol("compiler worker panicked".to_owned()));
+        match driver.join() {
+            Ok(result) => result,
+            Err(_) => Err(Error::Protocol("holder driver panicked".to_owned())),
         }
-        result
     })
 }
 
@@ -281,7 +284,9 @@ fn reply(call: &Call, answer: Answer) -> Result<Reply, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeSet;
+    use std::rc::Rc;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -299,13 +304,19 @@ mod tests {
 
     const FOUND: WorkName = WorkName([7; 32]);
 
+    // The real exporter also holds non-Send semantic state. These tests prove
+    // its compile and release methods stay on the thread where it was created.
     struct SlowCompiler {
         active: Arc<AtomicBool>,
         released: Vec<WorkName>,
+        caller: std::thread::ThreadId,
+        calls: Rc<Cell<usize>>,
     }
 
     impl BatchCompiler for SlowCompiler {
         fn compile(&mut self, plan: &Plan) -> Result<Compiled, String> {
+            assert_eq!(std::thread::current().id(), self.caller);
+            self.calls.set(self.calls.get() + 1);
             self.active.store(true, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(120));
             self.active.store(false, Ordering::SeqCst);
@@ -325,6 +336,7 @@ mod tests {
         }
 
         fn release(&mut self, names: &[WorkName]) {
+            assert_eq!(std::thread::current().id(), self.caller);
             self.released.extend_from_slice(names);
         }
     }
@@ -359,7 +371,12 @@ mod tests {
         let (mut holder, roots, grant) = test_holder();
         let active = Arc::new(AtomicBool::new(false));
         let during = Arc::new(AtomicUsize::new(0));
-        let mut compiler = SlowCompiler { active: active.clone(), released: Vec::new() };
+        let mut compiler = SlowCompiler {
+            active: active.clone(),
+            released: Vec::new(),
+            caller: std::thread::current().id(),
+            calls: Rc::new(Cell::new(0)),
+        };
         let mut leased = false;
         let start = Instant::now();
         let why = drive(
@@ -394,6 +411,7 @@ mod tests {
         assert_eq!(why, StopWhy::Cancelled);
         assert!(during.load(Ordering::SeqCst) >= 2, "no heartbeat while compiling");
         assert_eq!(compiler.released, vec![FOUND]);
+        assert_eq!(compiler.calls.get(), 1);
         assert!(holder.is_stopped());
     }
 
@@ -401,7 +419,12 @@ mod tests {
     fn transport_failure_during_compile_releases_its_unreported_findings() {
         let (mut holder, roots, grant) = test_holder();
         let active = Arc::new(AtomicBool::new(false));
-        let mut compiler = SlowCompiler { active: active.clone(), released: Vec::new() };
+        let mut compiler = SlowCompiler {
+            active: active.clone(),
+            released: Vec::new(),
+            caller: std::thread::current().id(),
+            calls: Rc::new(Cell::new(0)),
+        };
         let start = Instant::now();
         let mut leased = false;
         let result = drive(
@@ -427,13 +450,19 @@ mod tests {
         );
         assert!(matches!(result, Err(Error::Protocol(_))));
         assert_eq!(compiler.released, vec![FOUND]);
+        assert_eq!(compiler.calls.get(), 1);
     }
 
     #[test]
     fn failed_result_acknowledgement_releases_new_findings() {
         let (mut holder, roots, grant) = test_holder();
         let active = Arc::new(AtomicBool::new(false));
-        let mut compiler = SlowCompiler { active, released: Vec::new() };
+        let mut compiler = SlowCompiler {
+            active,
+            released: Vec::new(),
+            caller: std::thread::current().id(),
+            calls: Rc::new(Cell::new(0)),
+        };
         let start = Instant::now();
         let mut leased = false;
         let result = drive(
@@ -456,5 +485,6 @@ mod tests {
         );
         assert!(matches!(result, Err(Error::Protocol(_))));
         assert_eq!(compiler.released, vec![FOUND]);
+        assert_eq!(compiler.calls.get(), 1);
     }
 }
