@@ -67,8 +67,10 @@ fn var<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
 }
 
 impl Dist {
-    /// What `env` asks for: `None` for a build of this daemon alone. `triple` is the unit's.
-    pub(super) fn of(env: &[(String, String)], triple: &str) -> Result<Option<Dist>, String> {
+    /// What `env` asks for: `None` for a build of this daemon alone. `host` is this machine's
+    /// triple: executors are machines, whatever the unit is compiled for, which its keys cover (a
+    /// proc macro's unit is `wasm32-wasip1`, and no machine is one).
+    pub(super) fn of(env: &[(String, String)], host: &str) -> Result<Option<Dist>, String> {
         let Some(socket) = var(env, SOCKET_VAR) else {
             if let Some(blobs) = var(env, BLOBS_VAR) {
                 return Err(format!("{BLOBS_VAR} is {blobs}, with no {SOCKET_VAR} to run its units"));
@@ -111,7 +113,7 @@ impl Dist {
                 socket: PathBuf::from(socket),
                 blobs: Blobs { address, timeout: Duration::from_secs(120) },
                 claimant,
-                platform: agent::platform(triple),
+                platform: agent::platform(host),
                 local,
                 namespace,
                 source,

@@ -1049,7 +1049,7 @@ pub(crate) fn generate<'db>(
     let verify = blaze_store_check::Setting::from_env(&job.input.config.invocation.env)
         .map_err(|it| it.to_string())?;
     let backends = Backends::default();
-    let dist = dist::Dist::of(&job.input.config.invocation.env, triple(job, u))?;
+    let dist = dist::Dist::of(&job.input.config.invocation.env, &job.input.config.host)?;
     let mut arrived = None;
     let built = {
         let guard = blaze_cas::enter();
