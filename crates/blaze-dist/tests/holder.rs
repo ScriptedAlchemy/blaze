@@ -190,9 +190,9 @@ fn a_wrong_generation_batch_releases_findings_and_fences_the_holder() {
     assert!(effects.iter().any(
         |effect| matches!(effect, Effect::Stop(StopWhy::Protocol(why)) if why.contains("generation"))
     ));
-    assert!(!effects.iter().any(
-        |effect| matches!(effect, Effect::Send { call: Call::Result(_), .. })
-    ));
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::Send { call: Call::Result(_), .. }))
+    );
 }
 
 /// A delayed heartbeat reply must not be invalidated by the next interval. A
