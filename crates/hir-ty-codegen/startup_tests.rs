@@ -345,6 +345,77 @@ pub fn root() -> usize { Block::<u8>::VALUE.width }
     assert_eq!(observed[0].1, observed[3].1);
 }
 
+/// Preparing an instance reads its body once and what it says is what is kept: nothing else
+/// reads a monomorphized body from the database, and a body of each instance of a program was
+/// the largest thing an 8 GiB bootstrap held. What is prepared is of the filled-in body.
+#[test]
+fn preparing_an_instance_keeps_no_monomorphized_body() {
+    use hir_ty::{
+        consteval::inputs::{BodyInput, BodyKind, prepare_constants},
+        db::HirDatabase,
+    };
+    use salsa::Database;
+    let source = r#"
+//- minicore: sized
+//- /src/main.rs crate:semantics
+trait Width { const WIDTH: usize; fn width() -> usize; }
+impl Width for u8 { const WIDTH: usize = 1; fn width() -> usize { 1 } }
+pub fn root<T: Width>() -> usize { T::WIDTH + T::width() }
+"#;
+    let mut db = RootDatabase::with_files(source);
+    hir_ty::mir::location::name_sources(&mut db, |_, _| Some("main.rs".to_owned()));
+    let krate =
+        *base_db::all_crates(&db).iter().find(|krate| krate.data(&db).origin.is_local()).unwrap();
+    let root = hir_def::nameres::crate_def_map(&db, krate)
+        .modules(&db)
+        .flat_map(|(_, module)| module.scope(&db).declarations())
+        .find_map(|item| match item {
+            hir_def::ModuleDefId::FunctionId(id)
+                if FunctionSignature::of(&db, id).name.as_str() == "root" =>
+            {
+                Some(id)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let environment =
+        ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate }.store();
+    let args = hir::attach_db(&db, || {
+        let interner = hir_ty::next_solver::DbInterner::new_with(&db, krate);
+        GenericArgs::new_from_slice(&[hir_ty::next_solver::Ty::new_uint(
+            interner,
+            rustc_type_ir::UintTy::U8,
+        )
+        .into()])
+        .store()
+    });
+    hir::attach_db(&db, || {
+        let input =
+            BodyInput::new(&db, BodyKind::Body(root.into()), args.clone(), environment.clone());
+        let prepared = prepare_constants(&db, input);
+        assert!(prepared.result.is_ok());
+        // Of the instance and not the generic body: `T::width` is `u8`'s, and `T::WIDTH` is one.
+        let [(BodyKind::Body(callee), _)] = prepared.callees[..] else {
+            panic!("{} callees", prepared.callees.len())
+        };
+        assert_ne!(callee, hir_ty::InferBodyId::from(root));
+        assert_eq!(prepared.selections.len(), 1);
+    });
+    const QUERY: &str = "monomorphized_runtime_mir_body_query";
+    let kept = |db: &mut RootDatabase| {
+        let db: &mut dyn Database = db;
+        db.memory_usage().queries.get(QUERY).map_or(0, |it| it.count())
+    };
+    // `WIDTH`'s body, which evaluating it reads, and which the interpreter asks for again. Not
+    // the instance's.
+    assert_eq!(kept(&mut db), 1, "a body of the instance was kept");
+    // The control: the count is of what the database keeps of this query.
+    hir::attach_db(&db, || {
+        db.monomorphized_runtime_mir_body(root.into(), args.clone(), environment.clone()).unwrap();
+    });
+    assert_eq!(kept(&mut db), 2);
+}
+
 #[test]
 fn startup_shim_reuses_code_and_rebinds_native_calls() {
     if std::env::var_os(CHILD).is_none() {

@@ -5556,11 +5556,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let roots = &roots[..];
         let start = stdx::time::Instant::now();
         let owned = &self.own_statics.crates;
+        let graph = self.names.semantic_graph();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let found = std::sync::Mutex::new(Vec::new());
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
         self.symbols.in_parallel(threads, &|db, symbols, _| {
-            let names = stable::StableNames::new(db, symbols, owned.clone(), true);
+            let names =
+                stable::StableNames::new(db, symbols, owned.clone(), true).sharing(graph.clone());
             let mut named = Vec::new();
             while let Some(&func) =
                 roots.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
@@ -5908,8 +5910,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let told = told.as_ref();
         let on_demand = self.on_demand;
         let (stored, roots_from_store) = (&self.stored_roots.clone(), self.roots_from_store());
+        let graph = self.names.semantic_graph();
         let run = |db: &dyn HirDatabase, symbols: &dyn SymbolResolver| {
-            let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate);
+            let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate)
+                .sharing(graph.clone());
             let usable = |name: &str| {
                 let Some(entries) = entries else { return false };
                 entries.usable(name, &|symbol, checked| symbols.importable(symbol, checked))
@@ -6240,10 +6244,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // Each thread names what it makes with names of its own, which it asks the same
             // of over and over: they are not made again for each part.
             let next = std::sync::atomic::AtomicUsize::new(0);
-            let listings = self.names.listings();
+            let (listings, graph) = (self.names.listings(), self.names.semantic_graph());
             let work = |db: &dyn HirDatabase, symbols: &dyn SymbolResolver, _: usize| {
                 let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate)
-                    .listing(listings.clone());
+                    .listing(listings.clone())
+                    .sharing(graph.clone());
                 let (mut stable_names, mut source_paths) = Default::default();
                 let mut kept = Kept::default();
                 let mut keeper = later::Keeper {

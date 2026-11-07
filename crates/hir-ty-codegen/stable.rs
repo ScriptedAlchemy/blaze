@@ -2,7 +2,11 @@
 //! that code compiled by one run can be found by the next. A crate of the checkout is named
 //! by what is written in it, so an edit makes other names of everything in it.
 
-use std::{cell::RefCell, fmt::Write};
+use std::{
+    cell::RefCell,
+    fmt::Write,
+    sync::{Arc, PoisonError, RwLock},
+};
 
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, ModuleDefId,
@@ -185,17 +189,77 @@ struct Listed {
 /// a shared call graph overlap, so a flattened copy per root is quadratic in the graph.
 struct SemanticComponent {
     contextual: bool,
-    constants: Box<[Box<str>]>,
-    sources: Box<[super::cached::SemanticSource]>,
+    constants: Box<[Arc<str>]>,
+    sources: Box<[Arc<super::cached::SemanticSource>]>,
     dependencies: Box<[usize]>,
     /// The digest of the complete closure, once it is asked for; `None` for a closure that is
     /// not canonical, which has two names for one file.
     digest: std::sync::OnceLock<Option<Box<str>>>,
 }
 
-/// The complete transitive provenance of an instance, by reference into the [`StableNames`]
-/// that made it, for as long as that view lives. Its closure is canonical. Ask that view for
-/// what is needed of it: [`StableNames::covers`], or [`StableNames::complete_inputs`] for the
+/// What decides how an instance is spelled, and so what its semantic node says.
+#[derive(PartialEq, Eq)]
+struct NamingOf {
+    owned: FxHashSet<Crate>,
+    by_content: bool,
+    frozen: FxHashMap<Crate, super::ContentId>,
+}
+
+/// The semantic call graph of one build, for every [`StableNames`] that spells as it does.
+///
+/// Every thread of a build names roots and callees with a view of its own, and those closures
+/// overlap: with a graph per view each thread walks the whole program and keeps its own copy of
+/// what the program observed, which is what passed an 8 GiB bound with one function compiled.
+/// A node is a pure function of its key and the [`NamingOf`], so one made by any thread is good
+/// for all, and a certificate's digest is of what its closure holds and not of how the graph
+/// was cut in components, so threads that race to the same closure agree. No lock is held while
+/// a node is made or a closure is walked.
+pub(super) struct SemanticGraph {
+    naming: NamingOf,
+    /// What is walked and not yet in a component; those are found by `certificates` first.
+    nodes: RwLock<FxHashMap<InstanceIn, Arc<SemanticNode>>>,
+    // Completed SCCs. Arena edges avoid recursive graph drops.
+    components: RwLock<Vec<Arc<SemanticComponent>>>,
+    certificates: RwLock<FxHashMap<InstanceIn, Result<usize, &'static str>>>,
+}
+
+impl SemanticGraph {
+    fn new(naming: NamingOf) -> Arc<Self> {
+        Arc::new(SemanticGraph {
+            naming,
+            nodes: RwLock::default(),
+            components: RwLock::default(),
+            certificates: RwLock::default(),
+        })
+    }
+
+    fn certificate(&self, key: &InstanceIn) -> Option<Result<usize, &'static str>> {
+        self.certificates.read().unwrap_or_else(PoisonError::into_inner).get(key).copied()
+    }
+
+    /// The first answer stands, for every view to go on with the same one.
+    fn settle(&self, key: InstanceIn, answer: Result<usize, &'static str>) {
+        self.certificates
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key)
+            .or_insert(answer);
+    }
+
+    fn component(&self, at: usize) -> Arc<SemanticComponent> {
+        self.components.read().unwrap_or_else(PoisonError::into_inner)[at].clone()
+    }
+
+    fn add_component(&self, component: SemanticComponent) -> usize {
+        let mut arena = self.components.write().unwrap_or_else(PoisonError::into_inner);
+        arena.push(Arc::new(component));
+        arena.len() - 1
+    }
+}
+
+/// The complete transitive provenance of an instance, by reference into the [`SemanticGraph`]
+/// of the [`StableNames`] that made it, for as long as that graph lives. Its closure is
+/// canonical. Ask that view for what is needed of it: [`StableNames::covers`], or [`StableNames::complete_inputs`] for the
 /// owned value an entry carries to the store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SemanticCertificate(usize);
@@ -204,7 +268,7 @@ pub(super) struct SemanticCertificate(usize);
 /// for one entry's callees, which are many, and goes with it: see [`StableNames::covers`].
 pub(super) struct SemanticCoverage {
     parent: Option<SemanticCertificate>,
-    reached: Option<FxHashSet<usize>>,
+    reached: Option<FxHashMap<usize, Arc<SemanticComponent>>>,
 }
 
 impl SemanticCoverage {
@@ -215,8 +279,8 @@ impl SemanticCoverage {
 
 struct SemanticNode {
     contextual: bool,
-    constants: Vec<String>,
-    sources: Vec<super::cached::SemanticSource>,
+    constants: Vec<Arc<str>>,
+    sources: Vec<Arc<super::cached::SemanticSource>>,
     children: Vec<InstanceIn>,
 }
 
@@ -247,9 +311,8 @@ pub(super) struct StableNames<'a, 'db> {
     missed: std::cell::Cell<&'static str>,
     /// How often each thing kept an instance from having a name.
     pub(super) misses: RefCell<FxHashMap<&'static str, usize>>,
-    // Completed SCCs belong to this naming view. Arena edges avoid recursive graph drops.
-    components: RefCell<Vec<SemanticComponent>>,
-    certificates: RefCell<FxHashMap<InstanceIn, Result<usize, &'static str>>>,
+    /// The view's own, until it joins one with [`Self::sharing`].
+    graph: Arc<SemanticGraph>,
     #[cfg(test)]
     semantic_visits: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -266,6 +329,11 @@ impl<'a, 'db> StableNames<'a, 'db> {
         StableNames {
             db,
             symbols,
+            graph: SemanticGraph::new(NamingOf {
+                owned: owned.clone(),
+                by_content,
+                frozen: FxHashMap::default(),
+            }),
             owned,
             by_content,
             cargo_home: symbols.cargo_home(),
@@ -279,8 +347,6 @@ impl<'a, 'db> StableNames<'a, 'db> {
             frozen: FxHashMap::default(),
             missed: std::cell::Cell::new(""),
             misses: RefCell::default(),
-            components: RefCell::default(),
-            certificates: RefCell::default(),
             #[cfg(test)]
             semantic_visits: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -300,7 +366,27 @@ impl<'a, 'db> StableNames<'a, 'db> {
 
     /// Names each crate of `frozen` by its id there, whatever is written in it now.
     pub(super) fn frozen(mut self, frozen: FxHashMap<Crate, super::ContentId>) -> Self {
+        self.graph = SemanticGraph::new(NamingOf {
+            owned: self.owned.clone(),
+            by_content: self.by_content,
+            frozen: frozen.clone(),
+        });
         self.frozen = frozen;
+        self
+    }
+
+    /// The graph of this view, for the other threads of a build to share with
+    /// [`Self::sharing`].
+    pub(super) fn semantic_graph(&self) -> Arc<SemanticGraph> {
+        self.graph.clone()
+    }
+
+    /// Walks `graph` in place of a graph of its own, when it is of names spelled as this view
+    /// spells them. Otherwise the view keeps its own: its nodes would not be the same.
+    pub(super) fn sharing(mut self, graph: Arc<SemanticGraph>) -> Self {
+        if graph.naming == self.graph.naming {
+            self.graph = graph;
+        }
         self
     }
 
@@ -361,8 +447,8 @@ impl<'a, 'db> StableNames<'a, 'db> {
         let mut name = self.raw_instance(instance)?;
         if let Some(certificate) = self.semantic_certificate(instance, environment)? {
             name.push_str(SEMANTIC_INPUTS);
-            let arena = self.components.borrow();
-            let digest = arena[certificate.0].digest.get().and_then(Option::as_deref);
+            let component = self.graph.component(certificate.0);
+            let digest = component.digest.get().and_then(Option::as_deref);
             name.push_str(digest.expect("a certificate's closure is canonical"));
         }
         Some(name)
@@ -377,15 +463,15 @@ impl<'a, 'db> StableNames<'a, 'db> {
     ) -> Option<Option<SemanticCertificate>> {
         self.db.unwind_if_revision_cancelled();
         let key = InstanceIn::new(instance.clone(), environment.clone());
-        let cached = self.certificates.borrow().get(&key).copied();
+        let cached = self.graph.certificate(&key);
         let result = cached.unwrap_or_else(|| {
             let result = self.semantic_closure(&key).ok_or_else(|| self.missed.get());
-            self.certificates.borrow_mut().insert(key, result);
+            self.graph.settle(key, result);
             result
         });
         match result {
             Ok(component) => {
-                if !self.components.borrow()[component].contextual {
+                if !self.graph.component(component).contextual {
                     return Some(None);
                 }
                 self.seal_component(component)?;
@@ -408,8 +494,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 *active.get_mut(&key.instance.def).unwrap() -= 1;
                 continue;
             }
-            let cached = self.certificates.borrow().get(&key).copied();
-            if let Some(cached) = cached {
+            if let Some(cached) = self.graph.certificate(&key) {
                 if let Err(why) = cached {
                     self.cache_semantic_failure(&key, &pending, why);
                     return self.miss(why);
@@ -424,7 +509,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
             if *depth > crate_def_map(self.db, key.env.krate).recursion_limit() as usize {
                 return self.miss("semantic instantiation recursion limit");
             }
-            let node = match self.semantic_node(&key) {
+            let node = match self.shared_node(&key) {
                 Some(node) => node,
                 None => {
                     self.cache_semantic_failure(&key, &pending, self.missed.get());
@@ -457,10 +542,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
             let mut dependencies = FxHashSet::default();
             let mut boundaries = FxHashSet::default();
             for &member in members {
-                let node = &mut nodes[member];
+                let node = &nodes[member];
                 contextual |= node.contextual;
-                constants.append(&mut node.constants);
-                sources.append(&mut node.sources);
+                constants.extend(node.constants.iter().cloned());
+                sources.extend(node.sources.iter().cloned());
                 for child in &node.children {
                     if let Some(&child) = index.get(child) {
                         let child = component_of[child];
@@ -475,21 +560,16 @@ impl<'a, 'db> StableNames<'a, 'db> {
             let mut children = Vec::new();
             for dependency in dependencies {
                 let child = complete[dependency].expect("semantic dependencies precede callers");
-                contextual |= self.components.borrow()[child].contextual;
+                contextual |= self.graph.component(child).contextual;
                 children.push(child);
             }
             for child in boundaries {
-                let cached = self
-                    .certificates
-                    .borrow()
-                    .get(&child)
-                    .copied()
-                    .expect("discovered semantic boundary");
+                let cached = self.graph.certificate(&child).expect("discovered semantic boundary");
                 let child = match cached {
                     Ok(child) => child,
                     Err(why) => return self.miss(why),
                 };
-                contextual |= self.components.borrow()[child].contextual;
+                contextual |= self.graph.component(child).contextual;
                 children.push(child);
             }
             constants.sort();
@@ -498,24 +578,39 @@ impl<'a, 'db> StableNames<'a, 'db> {
             sources.dedup();
             children.sort_unstable();
             children.dedup();
-            let certificate = {
-                let mut arena = self.components.borrow_mut();
-                let at = arena.len();
-                arena.push(SemanticComponent {
-                    contextual,
-                    constants: constants.into_iter().map(String::into_boxed_str).collect(),
-                    sources: sources.into_boxed_slice(),
-                    dependencies: children.into_boxed_slice(),
-                    digest: std::sync::OnceLock::new(),
-                });
-                at
-            };
+            let certificate = self.graph.add_component(SemanticComponent {
+                contextual,
+                constants: constants.into_boxed_slice(),
+                sources: sources.into_boxed_slice(),
+                dependencies: children.into_boxed_slice(),
+                digest: std::sync::OnceLock::new(),
+            });
             for &member in members {
-                self.certificates.borrow_mut().insert(keys[member].clone(), Ok(certificate));
+                self.graph.settle(keys[member].clone(), Ok(certificate));
             }
+            let mut walked = self.graph.nodes.write().unwrap_or_else(PoisonError::into_inner);
+            for &member in members {
+                walked.remove(&keys[member]);
+            }
+            drop(walked);
             complete[component] = Some(certificate);
         }
-        self.certificates.borrow().get(root).copied()?.ok()
+        match self.graph.certificate(root)? {
+            Ok(certificate) => Some(certificate),
+            // Another thread walked to where this one's closure fails first.
+            Err(why) => self.miss(why),
+        }
+    }
+
+    /// The node of `key`, made here unless another thread of the build has made it.
+    fn shared_node(&self, key: &InstanceIn) -> Option<Arc<SemanticNode>> {
+        let nodes = &self.graph.nodes;
+        if let Some(node) = nodes.read().unwrap_or_else(PoisonError::into_inner).get(key) {
+            return Some(node.clone());
+        }
+        let node = Arc::new(self.semantic_node(key)?);
+        let mut nodes = nodes.write().unwrap_or_else(PoisonError::into_inner);
+        Some(nodes.entry(key.clone()).or_insert(node).clone())
     }
 
     fn cache_semantic_failure(
@@ -524,12 +619,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
         pending: &[(InstanceIn, bool)],
         why: &'static str,
     ) {
-        let mut cache = self.certificates.borrow_mut();
-        cache.insert(failed.clone(), Err(why));
-        for (ancestor, exiting) in pending {
-            if *exiting {
-                cache.insert(ancestor.clone(), Err(why));
-            }
+        let ancestors = pending.iter().filter(|it| it.1).map(|it| &it.0);
+        for key in ancestors.chain([failed]) {
+            self.graph.nodes.write().unwrap_or_else(PoisonError::into_inner).remove(key);
+            self.graph.settle(key.clone(), Err(why));
         }
     }
 
@@ -537,9 +630,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
     /// What it reads is borrowed from the arena and gone when this returns: only the digest is
     /// kept. `None` for a closure that is not canonical.
     fn seal_component(&self, root: usize) -> Option<()> {
-        let arena = self.components.borrow();
-        let digest = arena[root].digest.get_or_init(|| {
-            let (constants, sources) = self.closure_values(&arena, root);
+        let component = self.graph.component(root);
+        let digest = component.digest.get_or_init(|| {
+            let closure = self.closure_components(root);
+            let (constants, sources) = closure_values(&closure);
             super::cached::SemanticInputs::canonical_parts(
                 constants.iter().copied(),
                 sources.iter().copied(),
@@ -558,40 +652,23 @@ impl<'a, 'db> StableNames<'a, 'db> {
         }
     }
 
-    /// The SCCs of `root`'s complete closure.
-    fn closure_components(&self, arena: &[SemanticComponent], root: usize) -> FxHashSet<usize> {
+    /// The SCCs of `root`'s complete closure. Each is held for as long as the answer is, and
+    /// the arena is not: a closure can be big, and other threads are adding to the arena.
+    fn closure_components(&self, root: usize) -> FxHashMap<usize, Arc<SemanticComponent>> {
         let mut pending = vec![root];
-        let mut seen = FxHashSet::default();
-        while let Some(component) = pending.pop() {
+        let mut seen = FxHashMap::default();
+        while let Some(at) = pending.pop() {
             self.db.unwind_if_revision_cancelled();
-            if !seen.insert(component) {
+            if seen.contains_key(&at) {
                 continue;
             }
             #[cfg(test)]
             self.semantic_flatten_visits.set(self.semantic_flatten_visits.get() + 1);
-            pending.extend(&arena[component].dependencies);
+            let component = self.graph.component(at);
+            pending.extend(&component.dependencies);
+            seen.insert(at, component);
         }
         seen
-    }
-
-    /// What `root`'s complete closure observed, sorted and without repeats, by reference.
-    fn closure_values<'c>(
-        &self,
-        arena: &'c [SemanticComponent],
-        root: usize,
-    ) -> (Vec<&'c str>, Vec<&'c super::cached::SemanticSource>) {
-        let mut constants = Vec::new();
-        let mut sources = Vec::new();
-        for component in self.closure_components(arena, root) {
-            let component = &arena[component];
-            constants.extend(component.constants.iter().map(|it| &**it));
-            sources.extend(component.sources.iter());
-        }
-        constants.sort_unstable();
-        constants.dedup();
-        sources.sort_unstable();
-        sources.dedup();
-        (constants, sources)
     }
 
     /// Whether everything `child`'s complete closure observed is in the closure of the parent
@@ -603,18 +680,17 @@ impl<'a, 'db> StableNames<'a, 'db> {
         child: SemanticCertificate,
     ) -> bool {
         let Some(parent) = coverage.parent else { return false };
-        let arena = self.components.borrow();
-        let reached =
-            coverage.reached.get_or_insert_with(|| self.closure_components(&arena, parent.0));
-        if reached.contains(&child.0) {
+        let reached = coverage.reached.get_or_insert_with(|| self.closure_components(parent.0));
+        if reached.contains_key(&child.0) {
             return true;
         }
-        let (constants, sources) = self.closure_values(&arena, parent.0);
-        self.closure_components(&arena, child.0).difference(reached).all(|&component| {
-            let component = &arena[component];
-            component.constants.iter().all(|it| constants.binary_search(&&**it).is_ok())
-                && component.sources.iter().all(|it| sources.binary_search(&it).is_ok())
-        })
+        let (constants, sources) = closure_values(reached);
+        self.closure_components(child.0).iter().filter(|(at, _)| !reached.contains_key(at)).all(
+            |(_, component)| {
+                component.constants.iter().all(|it| constants.binary_search(&&**it).is_ok())
+                    && component.sources.iter().all(|it| sources.binary_search(&&**it).is_ok())
+            },
+        )
     }
 
     /// The certificate as the owned value the store is given, for the one that gives it: it
@@ -623,8 +699,8 @@ impl<'a, 'db> StableNames<'a, 'db> {
         &self,
         certificate: SemanticCertificate,
     ) -> super::cached::SemanticInputs {
-        let arena = self.components.borrow();
-        let (constants, sources) = self.closure_values(&arena, certificate.0);
+        let closure = self.closure_components(certificate.0);
+        let (constants, sources) = closure_values(&closure);
         super::cached::SemanticInputs::new(
             constants.into_iter().map(str::to_owned).collect(),
             sources.into_iter().cloned().collect(),
@@ -650,7 +726,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
         self.crate_(&mut body, environment.krate)?;
         let mut node = SemanticNode {
             contextual,
-            constants: vec![format!("body {body}")],
+            constants: vec![Arc::from(format!("body {body}"))],
             sources: Vec::new(),
             children: Vec::new(),
         };
@@ -696,14 +772,14 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 }
             }
             self.args(&mut name, selection.arguments.as_ref())?;
-            node.constants.push(name);
+            node.constants.push(Arc::from(name));
         }
         for read in &prepared.source_names {
-            node.sources.push(super::cached::SemanticSource {
+            node.sources.push(Arc::new(super::cached::SemanticSource {
                 body: body.clone(),
                 file: self.file_path(read.file)?,
                 name: read.name.clone()?,
-            });
+            }));
         }
         node.contextual |= !node.sources.is_empty();
         let mut homes = super::home::Homes::default();
@@ -721,7 +797,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
             let environment = homes.home(self.db, &callee, environment);
             let mut edge = format!("{body} callee {} environment ", self.raw_instance(&callee)?);
             self.crate_(&mut edge, environment.krate)?;
-            node.constants.push(edge);
+            node.constants.push(Arc::from(edge));
             node.children.push(InstanceIn::new(callee, environment));
         }
         Some(node)
@@ -1493,6 +1569,23 @@ fn native_place(
     Some(u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes")))
 }
 
+/// What a complete closure observed, sorted and without repeats, by reference.
+fn closure_values(
+    closure: &FxHashMap<usize, Arc<SemanticComponent>>,
+) -> (Vec<&str>, Vec<&super::cached::SemanticSource>) {
+    let mut constants = Vec::new();
+    let mut sources = Vec::new();
+    for component in closure.values() {
+        constants.extend(component.constants.iter().map(|it| &**it));
+        sources.extend(component.sources.iter().map(|it| &**it));
+    }
+    constants.sort_unstable();
+    constants.dedup();
+    sources.sort_unstable();
+    sources.dedup();
+    (constants, sources)
+}
+
 /// Strongly connected components in caller-before-dependency order, without recursive DFS.
 fn semantic_components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
     let mut reverse = vec![Vec::new(); edges.len()];
@@ -1612,7 +1705,7 @@ mod semantic_tests {
             }
             assert_eq!(names.semantic_visits.get(), N);
             assert_eq!(names.semantic_flatten_visits.get(), 0);
-            let arena = names.components.borrow();
+            let arena = names.graph.components.read().unwrap();
             assert_eq!(arena.len(), N);
             assert!(arena.iter().all(|component| component.digest.get().is_none()));
             assert_eq!(
@@ -2029,16 +2122,14 @@ cycle.rs g 621069e58ee8a80a483aa7ea81b552696e20aa21240c699398e6db242df013e9 036b
         }
         in_view(&shared_call_graph(1), Some("graph.rs"), |view, _, _| {
             view(&mut |names| {
-                let mut add = |constants: &[&str], sources: Vec<_>, dependencies: &[usize]| {
-                    let mut arena = names.components.borrow_mut();
-                    arena.push(SemanticComponent {
+                let add = |constants: &[&str], sources: Vec<_>, dependencies: &[usize]| {
+                    SemanticCertificate(names.graph.add_component(SemanticComponent {
                         contextual: true,
-                        constants: constants.iter().map(|it| Box::from(*it)).collect(),
-                        sources: sources.into(),
+                        constants: constants.iter().map(|it| Arc::from(*it)).collect(),
+                        sources: sources.into_iter().map(Arc::new).collect(),
                         dependencies: dependencies.into(),
                         digest: Default::default(),
-                    });
-                    SemanticCertificate(arena.len() - 1)
+                    }))
                 };
                 let leaf = add(&["a", "b"], vec![source("f.rs", "/f.rs")], &[]);
                 let parent = add(&["c"], Vec::new(), &[leaf.0]);
@@ -2067,24 +2158,250 @@ cycle.rs g 621069e58ee8a80a483aa7ea81b552696e20aa21240c699398e6db242df013e9 036b
                     file: "f.rs".into(),
                     name: name.into(),
                 };
-                let mut arena = names.components.borrow_mut();
                 for (constant, name, dependencies) in
                     [("a", "/one.rs", &[][..]), ("b", "/two.rs", &[0][..]), ("c", "/one.rs", &[])]
                 {
-                    arena.push(SemanticComponent {
+                    names.graph.add_component(SemanticComponent {
                         contextual: true,
-                        constants: Box::new([Box::from(constant)]),
-                        sources: Box::new([source(name)]),
+                        constants: Box::new([Arc::from(constant)]),
+                        sources: Box::new([Arc::new(source(name))]),
                         dependencies: dependencies.into(),
                         digest: Default::default(),
                     });
                 }
-                drop(arena);
                 assert!(names.seal_component(2).is_some());
                 assert!(names.seal_component(0).is_some());
                 assert!(names.seal_component(1).is_none());
             });
         });
+    }
+
+    /// `body` with what makes the views of one build over `shared_call_graph(n)`, and its roots.
+    fn in_build<R>(
+        n: usize,
+        provider: Option<&'static str>,
+        body: impl FnOnce(
+            &RootDatabase,
+            &[Instance],
+            &hir_ty::traits::StoredParamEnvAndCrate,
+            [u8; 32],
+        ) -> R,
+    ) -> R {
+        let source = shared_call_graph(n);
+        let mut db = RootDatabase::with_files(&source);
+        hir_ty::mir::location::name_sources(&mut db, move |_, _| provider.map(Into::into));
+        hir::attach_db(&db, || {
+            let krate = *base_db::all_crates(&db)
+                .iter()
+                .find(|krate| krate.data(&db).origin.is_local())
+                .unwrap();
+            let functions = functions(&db, krate);
+            let environment = hir_ty::ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate,
+            }
+            .store();
+            let args = GenericArgs::new_from_slice(&[Ty::new_unit(
+                hir_ty::next_solver::DbInterner::new_with(&db, krate),
+            )
+            .into()])
+            .store();
+            let roots: Vec<_> = (0..n)
+                .map(|i| Instance {
+                    def: InstanceDef::Fn(functions[&format!("f{i}")]),
+                    args: args.clone(),
+                    checked: false,
+                })
+                .collect();
+            body(&db, &roots, &environment, Sha256::digest(source.as_bytes()).into())
+        })
+    }
+
+    fn name_all(
+        names: &StableNames<'_, '_>,
+        roots: &[Instance],
+        environment: &hir_ty::traits::StoredParamEnvAndCrate,
+    ) -> Vec<Option<String>> {
+        roots.iter().map(|root| names.instance_in(root, environment)).collect()
+    }
+
+    /// Every thread of a build names with a view of its own. Walking the graph once is what
+    /// keeps twenty threads from holding twenty copies of a whole program's observations, as
+    /// the bootstrap's roots did when they passed 8 GiB with one function compiled.
+    #[test]
+    fn the_views_of_a_build_walk_one_graph_and_name_as_a_view_alone_does() {
+        const N: usize = 64;
+        in_build(N, Some("graph.rs"), |db, roots, environment, identity| {
+            let symbols = crate::startup_tests::Symbols { db, identity };
+            let owned: FxHashSet<Crate> = base_db::all_crates(db).iter().copied().collect();
+            let new = || StableNames::new(db, &symbols, owned.clone(), true);
+            // The control: a view alone makes every node, as each of two views does.
+            let alone = new();
+            let expected = name_all(&alone, roots, environment);
+            assert!(expected.iter().all(|it| it.as_deref().is_some_and(has_semantic_inputs)));
+            assert_eq!(alone.semantic_visits.get(), N);
+            let other = new();
+            assert_eq!(name_all(&other, roots, environment), expected);
+            assert_eq!(other.semantic_visits.get(), N);
+            // Together: the first makes the graph, and the others make nothing of it.
+            let first = new();
+            let graph = first.semantic_graph();
+            assert_eq!(name_all(&first, roots, environment), expected);
+            let components = graph.components.read().unwrap().len();
+            for _ in 0..4 {
+                let view = new().sharing(graph.clone());
+                assert!(Arc::ptr_eq(&view.graph, &graph));
+                assert_eq!(name_all(&view, roots, environment), expected);
+                assert_eq!(view.semantic_visits.get(), 0, "a node made again");
+                assert_eq!(view.semantic_flatten_visits.get(), 0, "a digest worked out again");
+                assert_eq!(graph.components.read().unwrap().len(), components);
+                // The bytes for the store are the same from any view of the graph.
+                assert_eq!(
+                    sealed(&view, &roots[0], environment),
+                    sealed(&alone, &roots[0], environment)
+                );
+                let mut coverage = SemanticCoverage::of(
+                    view.semantic_certificate(&roots[0], environment).unwrap(),
+                );
+                let child = first.semantic_certificate(&roots[N - 1], environment).unwrap();
+                assert!(view.covers(&mut coverage, child.unwrap()));
+            }
+            assert!(graph.nodes.read().unwrap().is_empty(), "nodes are held by components alone");
+        });
+    }
+
+    /// A node says how its names are spelled: a view that spells otherwise must not read it.
+    #[test]
+    fn only_a_view_spelled_alike_joins_a_graph() {
+        in_build(4, Some("graph.rs"), |db, roots, environment, identity| {
+            let symbols = crate::startup_tests::Symbols { db, identity };
+            let owned: FxHashSet<Crate> = base_db::all_crates(db).iter().copied().collect();
+            let new =
+                |owned: FxHashSet<Crate>, content| StableNames::new(db, &symbols, owned, content);
+            let first = new(owned.clone(), true);
+            let graph = first.semantic_graph();
+            name_all(&first, roots, environment);
+            let frozen =
+                FxHashMap::from_iter(owned.iter().map(|&krate| (krate, crate::ContentId([7; 32]))));
+            for view in [
+                new(owned.clone(), false).sharing(graph.clone()),
+                new(FxHashSet::default(), true).sharing(graph.clone()),
+                new(owned.clone(), true).frozen(frozen).sharing(graph.clone()),
+            ] {
+                assert!(!Arc::ptr_eq(&view.graph, &graph));
+            }
+            let alike = new(owned.clone(), true).sharing(graph.clone());
+            assert!(Arc::ptr_eq(&alike.graph, &graph));
+            // Frozen by the same ids, the graph is for those who are frozen by them.
+            let ids =
+                FxHashMap::from_iter(owned.iter().map(|&krate| (krate, crate::ContentId([9; 32]))));
+            let frozen = new(owned.clone(), true).frozen(ids.clone());
+            let joined = new(owned.clone(), true).frozen(ids).sharing(frozen.semantic_graph());
+            assert!(Arc::ptr_eq(&joined.graph, &frozen.graph));
+        });
+    }
+
+    /// What one view finds has no certificate, the others of the build are told, without
+    /// walking to it, and are still told why.
+    #[test]
+    fn a_failure_found_by_one_view_is_a_failure_for_the_views_it_shares_with() {
+        in_build(8, None, |db, roots, environment, identity| {
+            let symbols = crate::startup_tests::Symbols { db, identity };
+            let owned: FxHashSet<Crate> = base_db::all_crates(db).iter().copied().collect();
+            let alone = StableNames::new(db, &symbols, owned.clone(), true);
+            let expected = name_all(&alone, roots, environment);
+            assert!(expected.iter().all(Option::is_none));
+            let first = StableNames::new(db, &symbols, owned.clone(), true);
+            let graph = first.semantic_graph();
+            assert_eq!(name_all(&first, roots, environment), expected);
+            let view = StableNames::new(db, &symbols, owned, true).sharing(graph.clone());
+            assert_eq!(name_all(&view, roots, environment), expected);
+            assert_eq!(view.semantic_visits.get(), 0);
+            assert!(!view.misses.borrow().is_empty(), "a view is told why");
+            assert!(graph.nodes.read().unwrap().is_empty(), "what failed is not held");
+        });
+    }
+
+    /// Threads racing over the roots in different orders name each as a view alone does: a
+    /// digest is of what a closure holds, however the threads cut it into components.
+    #[test]
+    fn threads_racing_over_one_graph_name_as_a_view_alone_does() {
+        const N: usize = 96;
+        const THREADS: usize = 8;
+        for provider in [Some("graph.rs"), None] {
+            in_build(N, provider, |db, roots, environment, identity| {
+                let owned: FxHashSet<Crate> = base_db::all_crates(db).iter().copied().collect();
+                let symbols = crate::startup_tests::Symbols { db, identity };
+                let alone = StableNames::new(db, &symbols, owned.clone(), true);
+                let expected = name_all(&alone, roots, environment);
+                let first = StableNames::new(db, &symbols, owned.clone(), true);
+                let graph = first.semantic_graph();
+                let start = std::sync::Barrier::new(THREADS);
+                // Not a `solving::Handle`, which is of the crate above and can't reach a view.
+                // What it is for is a thread that outlives its clone and keeps its solver
+                // cache; these end with this scope, and nothing here collects types.
+                let root = db;
+                std::thread::scope(|scope| {
+                    for thread in 0..THREADS {
+                        let (db, owned, graph) = (root.clone(), owned.clone(), graph.clone());
+                        let (start, expected) = (&start, &expected);
+                        scope.spawn(move || {
+                            hir::attach_db(&db, || {
+                                let symbols = crate::startup_tests::Symbols { db: &db, identity };
+                                let view =
+                                    StableNames::new(&db, &symbols, owned, true).sharing(graph);
+                                start.wait();
+                                // From the leaves, from the middle and from the top.
+                                let order: Vec<usize> =
+                                    (0..N).map(|i| (i + thread * N / THREADS) % N).collect();
+                                for at in order {
+                                    assert_eq!(
+                                        view.instance_in(&roots[at], environment),
+                                        expected[at],
+                                        "root {at} on thread {thread}"
+                                    );
+                                }
+                            });
+                        });
+                    }
+                });
+                assert_eq!(name_all(&first, roots, environment), expected);
+                assert!(graph.nodes.read().unwrap().is_empty());
+            });
+        }
+    }
+
+    /// What the views of a build hold past the database, once each has named every root.
+    fn views_bytes(n: usize, views: usize, shared: bool) -> isize {
+        in_build(n, Some("graph.rs"), |db, roots, environment, identity| {
+            let symbols = crate::startup_tests::Symbols { db, identity };
+            let owned: FxHashSet<Crate> = base_db::all_crates(db).iter().copied().collect();
+            let new = || StableNames::new(db, &symbols, owned.clone(), true);
+            // The queries and the interners of the first view stay in the database.
+            name_all(&new(), roots, environment);
+            let before = ra_jit_fuzz::live_bytes();
+            let graph = new().semantic_graph();
+            let held: Vec<_> = (0..views)
+                .map(|_| {
+                    let view = if shared { new().sharing(graph.clone()) } else { new() };
+                    name_all(&view, roots, environment);
+                    view
+                })
+                .collect();
+            let bytes = ra_jit_fuzz::live_bytes() - before;
+            drop(held);
+            bytes
+        })
+    }
+
+    /// The bootstrap's bound was passed by what each thread held of the same graph.
+    #[test]
+    fn a_graph_held_by_many_views_is_held_once() {
+        let one = views_bytes(256, 1, true);
+        let (shared, apart) = (views_bytes(256, 8, true), views_bytes(256, 8, false));
+        eprintln!("one view holds {one} bytes, eight together {shared}, eight apart {apart}");
+        assert!(apart > 6 * one, "the control: {apart} bytes apart, {one} of one view");
+        assert!(shared < 3 * one, "{shared} bytes of eight together, {one} of one view");
     }
 
     /// A fresh view after the provider changed or lost a file sees that in the complete value,

@@ -15,7 +15,7 @@ use crate::{
     InferBodyId,
     db::{GeneralConstId, HirDatabase, InternedClosureId, InternedCoroutineId},
     method_resolution::lookup_impl_const,
-    mir::{MirLowerError, Operand, OperandKind},
+    mir::{MirLowerError, Operand, OperandKind, monomorphized},
     next_solver::{
         ConstKind, DbInterner, GenericArgs, StoredGenericArgs, Ty, TyKind, TypingMode,
         UnevaluatedConst,
@@ -66,19 +66,18 @@ pub fn prepare_constants<'db>(
 ) -> PreparedConstants<'db> {
     let args = input.arguments(db).clone();
     let environment = input.environment(db).clone();
+    // This body is read once, here, and what it says is what this query keeps. It is not asked
+    // of the database's monomorphized bodies, which would keep a whole body of every instance
+    // of a program for as long as the build: more of the 8 GiB bootstrap than any other query,
+    // and nothing else reads them, as the code generator fills its own. A cycle comes out as
+    // the same `Loop` by `preparation_cycle`.
     let body = match input.kind(db) {
-        BodyKind::Body(owner) => {
-            db.monomorphized_runtime_mir_body(owner, args, environment.clone())
-        }
-        BodyKind::Closure(owner) => {
-            db.monomorphized_runtime_mir_body_for_closure(owner, args, environment.clone())
-        }
-        BodyKind::Coroutine(owner) => {
-            db.monomorphized_runtime_mir_body_for_coroutine(owner, args, environment.clone())
-        }
-        BodyKind::CoroutineByMove(owner) => db
-            .monomorphized_runtime_mir_body_for_coroutine_by_move(owner, args, environment.clone()),
-    };
+        BodyKind::Body(owner) => db.runtime_mir_body(owner),
+        BodyKind::Closure(owner) => db.runtime_mir_body_for_closure(owner),
+        BodyKind::Coroutine(owner) => db.runtime_mir_body_for_coroutine(owner),
+        BodyKind::CoroutineByMove(owner) => db.runtime_mir_body_for_coroutine_by_move(owner),
+    }
+    .and_then(|body| monomorphized(db, body, &args, &environment));
     let mut prepared = PreparedConstants {
         result: Ok(()),
         selections: Vec::new(),
