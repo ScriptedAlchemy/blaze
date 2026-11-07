@@ -1358,10 +1358,19 @@ fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String
         InstanceDef::VtableShim(func) => shim(2, Some(func)),
         InstanceDef::FnPointerShim => shim(3, None),
         InstanceDef::ReifyShim { receiver } => {
+            // A trait method without a body (one whose impl is the compiler's, `Clone::clone` of
+            // a tuple) has no code of its own: what the shim runs is the instance's arguments'
+            // (the fn item's type names `Self`) and its callees'.
             let adapted = match instance.args.as_ref().type_at(0).kind() {
                 TyKind::FnDef(def, _) => match def.0 {
-                    CallableDefId::FunctionId(func) => Some(func),
-                    CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => None,
+                    CallableDefId::FunctionId(func)
+                        if FunctionSignature::of(db, func).has_body() =>
+                    {
+                        Some(func)
+                    }
+                    CallableDefId::FunctionId(_)
+                    | CallableDefId::StructId(_)
+                    | CallableDefId::EnumVariantId(_) => None,
                 },
                 _ => None,
             };
