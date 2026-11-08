@@ -188,6 +188,7 @@ pub fn decide(policy: &LocalPolicy, failure: Error) -> Result<(), Error> {
     let action = match &failure {
         Error::Ended(termination) => local_action(policy, termination)
             .map_err(|why| Error::Protocol(format!("the terminal is refused: {why:?}")))?,
+        Error::Committed(_) => LocalAction::Fail,
         Error::Io(_) | Error::Protocol(_) => match policy {
             LocalPolicy::Never => LocalAction::Fail,
             LocalPolicy::Fallback => LocalAction::BuildLocally,
@@ -276,24 +277,31 @@ const GRACE: Duration = Duration::from_secs(5);
 /// How a pack that is not on the server ends its error.
 const CANCELLED: &str = "the build was cancelled";
 
-const GONE: &str = "was committed and is gone";
-
 /// Reads the packs named, each checked against what was committed.
 pub fn import(blobs: &Blobs, packs: &[PackRef]) -> Result<BTreeMap<Digest, (u8, Vec<u8>)>, Error> {
+    import_using(packs, |digest| blobs.pack(digest))
+}
+
+/// The retrieval boundary is injected so loss and corruption of a committed pack can be
+/// tested without replacing the real pack decoder or requiring a live cache server.
+fn import_using(
+    packs: &[PackRef],
+    mut fetch: impl FnMut(&Digest) -> Result<Option<Vec<u8>>, Error>,
+) -> Result<BTreeMap<Digest, (u8, Vec<u8>)>, Error> {
     let mut values = BTreeMap::new();
     for reference in packs {
         let name = hex(&reference.pack);
-        let bytes = blobs
-            .pack(&reference.pack)?
-            .ok_or_else(|| Error::Protocol(format!("pack {name} {GONE}")))?;
-        for value in read(&bytes, reference).map_err(Error::Protocol)? {
+        let bytes = fetch(&reference.pack)?.ok_or_else(|| {
+            Error::Committed(format!("pack {name} was committed and is gone"))
+        })?;
+        for value in read(&bytes, reference).map_err(Error::Committed)? {
             match values.entry(value.key) {
                 std::collections::btree_map::Entry::Vacant(at) => {
                     at.insert((value.kind, value.bytes));
                 }
                 std::collections::btree_map::Entry::Occupied(at) => {
                     if at.get() != &(value.kind, value.bytes) {
-                        return Err(Error::Protocol(format!(
+                        return Err(Error::Committed(format!(
                             "two values under the key {} in the packs of one unit, the second in {name}",
                             hex(&value.key)
                         )));
@@ -352,7 +360,7 @@ fn parse_list(list: &[u8]) -> Option<Vec<PackRef>> {
 fn published_packs(unit: &Unit, list: &[u8]) -> Result<Vec<PackRef>, Error> {
     parse_list(list).ok_or_else(|| {
         // alloc: a malformed published manifest's refusal
-        Error::Protocol(format!("unit {}: published pack list is not canonical", hex(&unit.spec)))
+        Error::Committed(format!("unit {}: published pack list is not canonical", hex(&unit.spec)))
     })
 }
 
@@ -397,14 +405,8 @@ pub fn run(
 ) -> Result<Arrived, Error> {
     if let Some(list) = config.blobs.published(&unit.spec)? {
         let packs = published_packs(unit, &list)?;
-        match import(&config.blobs, &packs) {
-            Ok(values) => {
-                return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None) });
-            }
-            // A list naming a pack the server lost is an unpublished unit, not a failure.
-            Err(Error::Protocol(why)) if why.ends_with(GONE) => {}
-            Err(error) => return Err(error),
-        }
+        let values = import(&config.blobs, &packs)?;
+        return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None) });
     }
     // A unit whose functions all stay with the build that links them (a release unit's, a folded
     // group's) has nothing to distribute: its list above is all it can take.
@@ -692,9 +694,37 @@ mod tests {
         ]; // alloc: corrupted manifest fixtures
         for bytes in noncanonical {
             assert!(
-                matches!(published_packs(&unit, &bytes), Err(Error::Protocol(_))),
+                matches!(published_packs(&unit, &bytes), Err(Error::Committed(_))),
                 "a damaged published manifest must be refused, not rebuilt"
             );
         }
     }
+    #[test]
+    fn a_committed_pack_missing_or_corrupt_must_not_rebuild_even_with_fallback() {
+        let reference = PackRef {
+            pack: [0x22; 32],
+            size: 10,
+            keys: [0x44; 32],
+            packed: None,
+            format: blaze_wire::DIST_PACK_FORMAT,
+        };
+        let missing = import_using(&[reference.clone()], |name| {
+            assert_eq!(*name, reference.pack);
+            Ok(None)
+        })
+        .unwrap_err();
+        assert!(matches!(&missing, Error::Committed(why) if why.contains(&hex(&reference.pack))));
+        assert!(matches!(decide(&LocalPolicy::Fallback, missing), Err(Error::Committed(_))));
+
+        let corrupt = import_using(&[reference], |_| {
+            Ok(Some(b"bad pack".to_vec())) // alloc: deliberately corrupt committed pack fixture
+        })
+        .unwrap_err();
+        assert!(matches!(decide(&LocalPolicy::Fallback, corrupt), Err(Error::Committed(_))));
+
+        let unit = Unit { spec: [0x33; 32], names: Vec::new() }; // alloc: test fixture
+        let malformed = published_packs(&unit, b"not a pack").unwrap_err();
+        assert!(matches!(decide(&LocalPolicy::Fallback, malformed), Err(Error::Committed(_))));
+    }
+
 }
