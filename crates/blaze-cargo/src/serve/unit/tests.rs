@@ -235,7 +235,8 @@ fn a_scripts_run_searches_where_its_build_dependencies_scripts_said() {
     let env = script::inherited(&[], &units.plans[1], true);
     let judged = script::judge(&z, &env, &value(0, &printed, ""), Some(&[]), None, false);
     let output = judged.output.expect("the run succeeded");
-    let applied = script::Applied { package_id: Z.to_owned(), links: None, output, out_dir: out_dir.clone() };
+    let applied =
+        script::Applied { package_id: Z.to_owned(), links: None, output, out_dir: out_dir.clone() };
     assert!(scripts[1].set(applied).is_ok());
 
     let p = script::script_unit(&of(&units, &scripts, &tools), 3).unwrap();
@@ -245,8 +246,12 @@ fn a_scripts_run_searches_where_its_build_dependencies_scripts_said() {
         "what p's build dependency's script named"
     );
     let env = blaze_build_script::env(&p, &[]).unwrap();
-    let var = if cfg!(target_os = "macos") { "DYLD_FALLBACK_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
-    let search = env.get(var).expect("the dynamic library path").to_string_lossy().into_owned();
+    // The variable is the unit's host's, a Linux one here, whatever machine runs the test.
+    let search = env
+        .get("LD_LIBRARY_PATH")
+        .expect("the dynamic library path")
+        .to_string_lossy()
+        .into_owned();
     assert!(search.contains(&format!("{out_dir}/lib")), "{search}");
 }
 

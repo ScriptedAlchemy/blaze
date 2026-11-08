@@ -360,12 +360,15 @@ fn entries_that_leave_the_package_are_refused_by_name() {
         assert!(error.what.contains(named), "{named}: {}", error.what);
         assert_eq!(error.at.as_deref(), Some(SERDE));
     };
-    refused(Entry::File("../x", b"", 0o644), "\"../x\"");
-    refused(Entry::File("/x", b"", 0o644), "\"/x\"");
-    refused(Entry::File("serde-1.0.218/x", b"", 0o644), "\"serde-1.0.218/x\"");
-    refused(Entry::File("serde-1.0.219/../x", b"", 0o644), "\"serde-1.0.219/../x\"");
-    refused(Entry::File("serde-1.0.219/./x", b"", 0o644), "\"serde-1.0.219/./x\"");
-    refused(Entry::File("serde-1.0.219//x", b"", 0o644), "\"serde-1.0.219//x\"");
+    // Named as blaze-fetch's `Names` names a refused entry. A `./` or `//` inside a name is no
+    // part of it, as cargo reads a path, so neither is refused.
+    refused(Entry::File("../x", b"", 0o644), "`../x` has a `..` in it");
+    refused(Entry::File("/x", b"", 0o644), "`/x` is absolute");
+    refused(
+        Entry::File("serde-1.0.218/x", b"", 0o644),
+        "`serde-1.0.218/x` is not under `serde-1.0.219`",
+    );
+    refused(Entry::File("serde-1.0.219/../x", b"", 0o644), "`serde-1.0.219/../x` has a `..` in it");
     refused(Entry::Link("serde-1.0.219/etc", "../../etc"), "\"serde-1.0.219/etc\"");
 }
 
@@ -376,14 +379,18 @@ fn a_path_twice_is_refused() {
         Entry::File("serde-1.0.219/src/lib.rs", b"b", 0o644),
     ])
     .unwrap_err();
-    assert!(error.what.contains("\"serde-1.0.219/src/lib.rs\" twice"), "{}", error.what);
+    assert!(error.what.contains("`src/lib.rs` is in the archive twice"), "{}", error.what);
 
     let error = fetch_crate(&[
         Entry::File("serde-1.0.219/src", b"a", 0o644),
         Entry::File("serde-1.0.219/src/lib.rs", b"b", 0o644),
     ])
     .unwrap_err();
-    assert!(error.what.contains("\"serde-1.0.219/src/lib.rs\""), "{}", error.what);
+    assert!(
+        error.what.contains("`src` is in the archive as a directory and as a file"),
+        "{}",
+        error.what
+    );
 }
 
 fn index_fetch() -> Fetch {

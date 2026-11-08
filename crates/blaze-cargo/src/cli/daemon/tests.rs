@@ -55,6 +55,8 @@ fn a_start_that_never_listens_names_the_socket() {
 
 #[test]
 fn the_status_as_json_has_every_field_with_or_without_a_daemon() {
+    // It names the release, which a test hands over itself: no other test runs first.
+    crate::release::for_tests();
     let place = StatusPlace {
         home: PathBuf::from("/h"),
         state: PathBuf::from("/h/v2"),
@@ -214,7 +216,7 @@ fn the_status_for_people() {
         status_lines(&building).ends_with(
             "builds: 1\n  #12 test -p blaze-api: [2m05s] compiling · mem 0 B · builds 412 units, 1 running\n    \
              blaze-worker-3: task (2 min 05 s) > unit bodies `app::main` in app (4 s)\n\
-             downloads: 1\n  llvm.tar.xz: 34.0 of 410.0 MB (8%)\n    from https://example.com/llvm.tar.xz\n"
+             downloads: 1\n  llvm.tar.xz: 34.0 MB of 410.0 MB (8%)\n    from https://example.com/llvm.tar.xz\n"
         ),
         "{}",
         status_lines(&building)
