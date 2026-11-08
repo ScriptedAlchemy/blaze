@@ -1,0 +1,879 @@
+original	rebased	status	reason	subject
+45449ae6844a6e115b5b7dc87d52c484e8697868	e8d02de1acf7f16b732d957e072f2c486ad90697	retained		docs: design for distributed cache, compile and tests (Rust, Linux and macOS)
+a819d0d4564fa1a5c77afb606fd1c7d97e069af4	b699a8b9e178996ca8e55fb8995b4a3c1e5cdb18	retained		docs: research on Bazel with NativeLink for Rust, against the distributed design
+cab971d8b9ab0a9eaa4342f6bfaef7d638b339ed	1a08dfa5dc2c2ecb7e07787357d479183bf62fca	retained		research: memory.md, does the warm daemon leak and what would shrink it
+99d07751910a91b8c13886ec4c1278d501deaa86	6edc5dcbebff15e0a63ee1c49522e164dedc6702	retained-partial	v1-harness	report: blaze on tracedecay, measured against cargo, and a memory-guarded harness
+2fd75c1661c3568f716db1f5b58e7c6183593fc2	ed9f59e3ed68d2e2e6377d8243e292b9dd20f2a3	retained		docs: distributed design, revision 2, after both reviews and G0
+02cd89e24e1cdd78147b44b7209629e8f0d3c447	-	superseded	v1-rajit	memory: RA_JIT_MEMORY_EVERY has a thread say what jemalloc counts while a workspace loads
+03cc9212e90011de18a6836dc8b3c643635ac2d0	-	superseded	v1-rajit	memory: with RA_JIT_MEMORY, say which condition made the first build one in full
+54f80fb44da93ba204dc5439785744225f8eff48	-	superseded	V1's memory reports and soft budgets: V2 has memory-budget.md's budgets and the daemon's memory line	memory: the ticks say how many functions Cranelift has compiled
+c7c5627768741962bd323be1dc9794fa109f14ea	-	superseded	v1-harness	harness: loadmem.py runs a load under the memory guard and writes its growth, loadmem_holders.py names who holds it
+64ee5fc3eec50ea84cea1155b6c0736947ccb6ae	5f4b48456ab0ec9f651d954b1c66002efc8fd3c7	retained		docs: LOADMEM.md, what holds the memory when a worker loads tracedecay
+98cf09e8a1017f62b7e0527c3a04f14c6012b422	c744f13fa85249699c12c85074925369a025ea3b	retained		docs: LOADMEM.md says what of the opt-level cause is read and what is not
+9875c09b08f55e2c7ca82c9f06451e3dc6bbf515	f37cae8238c4a19bdac1cb900a7e82c717fe9709	retained		docs: distributed design, revision 3, after both re-reviews
+b37ee16f6a665451c7eca768cb787384a254650b	e6e3d5590bf71a40dac12898052dcbb2c294dde8	retained		docs: distributed design, revision 3.1, after the focused check of revision 3
+f346f77c35510f35269c407d39d179e3b8b22133	-	superseded	v1-harness,v1-harness-dist;docs/harness not ported: docs/harness.md,harness/norustc.py	harness: one guarded, audited harness for the Phase 0 predicates (P0.1)
+2b6ab9065256f3bc68fb33547c6db98cd38ddf36	-	superseded	V1's memory reports and soft budgets: V2 has memory-budget.md's budgets and the daemon's memory line	memory: a report of the intern tables, what the daemon holds of its own, and jemalloc's pages
+0d4d6560b0eb79752c833a747b0df5b8ffb5b4ae	-	superseded	v1-rajit	memory: reclaim at idle in let_go — the types, the solver caches on every thread, the pages
+6eeac0516f9522ff2304f26d64798dff5d326a07	-	superseded	v1-harness	harness: memgrowth says when M1's line has too few samples, and what grew if anything
+6ef75aa62dfdf1c9deba61d00aada658db221e42	9360f48b00cfc5419159465bb638e3693e534a5a	retained-partial	v1-rajit	memory: the type GC runs only when no thread solves, and no solver cache outlives its handle
+3c01abc88764fad98cd5e2085de11b91616a577c	-	superseded	v1-harness	harness: memgrowth fits M1 to the samples it records and holds every edit and undoing to the unedited program
+5deca172287dfc6ba739c5b78d644731ebfc7d86	-	superseded	v1-harness,v1-rajit	harness: memgrowth reads the time of each type collection, and a line it cannot measure is unknown
+149b76ff3df635b4352b411975107bad5690eb65	-	superseded	V1's memory reports and soft budgets: V2 has memory-budget.md's budgets and the daemon's memory line	intern: the GC marks every value it reaches, whatever its strong count
+a91a20a94b07b89f122a72ac5d78c9518adacc0f	-	superseded	V1's memory reports and soft budgets: V2 has memory-budget.md's budgets and the daemon's memory line	intern: the GC marks from a work list, so its stack does not grow with the depth of a type
+4cf6468c584496dd33b68f85a70038bc52597b8b	-	superseded	V1's memory reports and soft budgets: V2 has memory-budget.md's budgets and the daemon's memory line	hir-ty: count the threads whose trait solver cache may hold goals
+8675c15d212047f53763279296b4571e02caf7c3	-	superseded	v1-rajit	memory: a handle lends its clone only to the solve, and the type GC waits for every solver cache
+5fe9f6a4e1675d5244add5461a47559c2d6aa80c	b352e36bf29acfd238dd5bcdda858586950f0889	retained		docs: memory.md says memgrowth's leak verdict can be unknown, and that it times each type collection
+f320a4216074f975bfd72cb6bded12cc073606be	-	superseded	V1's memory reports and soft budgets: V2 has memory-budget.md's budgets and the daemon's memory line	intern: the GC recurses up to 64 values deep before it uses its work list
+787be1573f73c59d12db6665d080d4cd391b9c35	a52bdb464e6cf91266aac147b52b7d504358cebb	retained		dist: name every call's request, answer and enum payload in section 8 (C1, a-M4)
+3e60be958e2d964e5f0c47943bcb241d03f006f6	50176a79f525f379c4512d90f8ff7c7ec96d30fd	retained-partial	regen	blaze-wire: the wire schema of docs/distributed.md, in deterministic CBOR (C1)
+d161ac120893fef2cf6f93630e6427f6fbc42062	8b7218cd9ba3cad67fda2ac5a4d4bfcf59d196ba	retained		blaze-wire: the verifier's required fixes, each with its regression (C1)
+8af63cfc661d42e52c2de224c6df209677a66b64	c823fc4566cd3c8fc2a87fd4aa0d90446ff91104	retained		blaze-wire: native tool digests, LLVM's passes and selection, and doc tests in the wire shapes (C2)
+eb99cfd6bb694c3e71a704d46735af8a3695a458	-	superseded	the V1 unit graph and blaze-spec: V2 has blaze-units	blaze-spec, units: the skeleton of C2's crates and the types of the unit graph
+e9d81cd0d6a45046a4c0371f39ff405080149438	-	superseded	v1-harness-dist;docs/harness not ported: docs/harness.md	harness/dist/buildspec.py: C2's differential harness, with a fake ra-jit for --self-test
+fcf2e03bd6942522c467aa47a66988e1f0ccf3ab	-	superseded	v1-harness-dist	harness/dist/buildspec.py: cargo checks the local expectations in --self-test; a spec command has its own timeout
+22adf1efc426cd86b41489de46467a08cc1bd497	-	superseded	v1-harness-dist	harness/dist/buildspec.py: a spec is run with `cargo spec --run FILE`, which no cargo command's spec can be mistaken for
+c9990646b4d7925ab269fb6f531ba0f38e438e34	-	superseded	regen,superseded-by-v2-units	blaze-spec: the spec assembly, the strict flag parser and the refusals (C2-S)
+e624008c2a42d91fb3ff7f9562ccd3e6b7f350b3	-	superseded	the V1 unit graph and blaze-spec: V2 has blaze-units	blaze-spec: recover unit resolution, native probing and reproduction candidates
+10552025bd2e605db4bb1cc7c6adb1853538b9d2	-	superseded	v1-rajit	cargo spec: compute wire specs using owned resolution and answer tables
+9485cfda9df159ff412b2e4a54d0a7fe9d351771	-	superseded	superseded-by-v2-units	units: use host profiles for proc macro libraries linked by doctests
+6e2c60081525cf097c82500aa680e5b6f7934e21	-	superseded	superseded-by-v2-units	units: probe proc macro sharing with its original host kind
+2018bb77486230226ed274888513c8bb1d153c40	-	superseded	superseded-by-v2-units	units: restore explicit target probe after differential regression
+ce2baa6b2abe5207821fba619bbd1388db9cd19d	-	superseded	superseded-by-v2-units	fix(spec): preserve Cargo test units and proc-macro host profiles
+5cce60fb3a33cdfbd7908745b73d6e57d99c9c4b	-	superseded	v1-harness-dist;docs/harness not ported: docs/harness.md	dist: the test inventory of tracedecay's Bazel, and the comparison against blaze (S2)
+52fc85c58fb890c505e6f10a545687f808aaf3a2	0f94df3b0347f7314cf41c4f628ba98858c00656	retained		docs: distributed.md scope is parity with Bazel and NativeLink (owner ruling, 2026-10-26)
+9e7a3f4208fd7c9e07fc208a9e9a3164c07143ed	-	superseded	superseded-by-v2-units,v1-rajit	fix(spec): share dev-dependency selection with unit graph diagnostics
+03c5e02dd84e3fec37016e1c2d09d5b8e1fbb938	5f6b6e9a495b158f77a93dac5541d695c9184647	retained-partial	v1-harness-dist	test(spec): cover dirty source identity and nested workspace replay
+9b8c69e527626484f5ac871dae2d3f98e5e87012	afcbb50a89a763ddd5ccab439073b8472278f1cd	retained-partial	superseded-by-v2-units,v1-harness-dist	test(metadata): keep the Cargo oracle in the development harness
+24dea7734ad6b7580b9c6f5b125c49697e466039	8cef70bf673568344a318fbc01cb135a4501664f	retained		style(wire): satisfy the repository formatting gate
+700c72579e1304e69b238494809bd3c58002a9b0	81563874e492fb74796973bedc98ccc2ad665d4a	retained		docs(spec): record the clean CLI integration check
+f4822a068282fe3c6cf10e3723d251623423286d	-	superseded	superseded-by-v2-units	fix(metadata): apply doctest host profiles before interning
+2e738a763837771be3f51ef948cd7ccee008cdd8	fd590653d11f3e72c51df63f9d22ccf791d0a4d0	retained-partial	superseded-by-v2-units	fix(metadata): probe the explicit target kind for host debuginfo
+138d5b24998faff6c596535e2a777e3283202e64	-	superseded	superseded-by-v2-units,v1-rajit	spec: preserve doctest intent, native tools and target reachability
+0000800eb854e94cd3822ac2ab7dd00db2e22521	-	superseded	superseded-by-v2-units	test(spec): index canonical asked sets through their slice
+5e0ee0cf5913f8bfff582eb1fd76660f98f946e2	-	superseded	superseded-by-v2-units	platform: match cc env_tool default after empty native variable
+6ad3764bfb98e46a0fdf702e167b347821d5b23d	-	superseded	superseded-by-v2-units	test(spec): write real manifests with canonical pinned lockfiles
+06513fb1764c47d89c59fb8c1d3131cfc52f4ff6	-	superseded	superseded-by-v2-units	test(spec): use unmatched target as linker refusal neighbour
+41ccbd6ef48ed90cda6f8dcb3a7a1cae4585b9c6	-	superseded	superseded-by-v2-units	test(spec): give doctest component cases selected library roots
+cec54d01736b8e6db901ef9ac6347ae7afbce840	665a28708fe8f311c815e0a190891a7437d7c43e	retained-partial	superseded-by-v2-units,v1-harness-dist,v1-rajit	wire v2: key the selected Cargo workspace location within its source
+16f77869c45d04862a27869c0a5ea1f1212bfa01	81321b0ac1356c2a30f422174524b0d00a7c60d2	retained-partial	superseded-by-v2-units,v1-harness-dist	wire v2: preserve literal and workspace-relative configuration values
+c64e515f0a6e19dad35d6d97204ebb675e92e556	4e86abbb8c9d1671627d88b22b3e2449885668c8	retained-partial	superseded-by-v2-units,v1-harness-dist,v1-rajit	wire v3: preserve native path bytes across generation and materialization
+cb5105b4b0ef4f42783a701e5afdcf353bb5d5f7	116547a9de17f918c5a020904ff19061b313eab3	retained-partial	superseded-by-v2-units	docs(wire): align current digest domain and scope Unix path fixtures
+26262f8f4747425890298ddb78f456c568fbc0b4	0befb88b9b725418121f275b5b11e304acde049c	retained-partial	superseded-by-v2-units,v1-rajit	spec: bound escaped paths by message budget and preserve native probe inputs
+8e6c423234d64c8f6a4117ed27b5a08aec2753e9	fd2bf8a87fd1c6e588dbb4e031aaead092f2ba37	retained-partial	superseded-by-v2-units,v1-harness-dist,v1-rajit	wire v4: carry native environment bytes and bounded free-form inputs
+7b234f79f654ba06bf6ee35cbb95d987f8ae1335	-	superseded	superseded-by-v2-units	test(spec): isolate native child environment from cargo toolchain overrides
+2b9f6b88cb8bfe20f9dbe89e295b13f63b773d2d	1ecb5e0e9f75c243bce2df5baf3dda3640e027e4	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	spec: preserve ambient origins and canonical native environment boundaries
+f8504bca823c7a9e21891671e4d79ce2e397b999	-	superseded	superseded-by-v2-units	spec: exempt ignored native variables and verify configured compiler selection
+78d6f2f5858c911dd4446287800e03592884b99f	-	superseded	the V1 unit graph and blaze-spec: V2 has blaze-units	metadata: resolve native manifests without serializing filesystem paths to JSON
+f3909d0395f0a1c45b96c301c5a528d111fd141a	-	superseded	the V1 unit graph and blaze-spec: V2 has blaze-units	metadata: cover locked Git siblings and preserve precise native dependency pins
+7317ab5e74cdd9cd3cdf1e90ee891feaebb6f73e	-	superseded	v1-nix	nix: the unit graphs of this branch's lock, so the flake evaluates
+59fc8e0a2c4fa74d0feb17dbff3309be76c68142	-	superseded	fork-ci,v1-harness-dist	nix-live: the FlakeHub cache is an optimization, and a gate cannot be deleted
+86d78fa7a09c074f89e9317820f9c3880c6e7463	-	superseded	v1-harness-dist	harness: the nix-live checker reads the cache policy's values, not its spellings
+f35a5e4738bc148466845c16f5d4f0007f593eeb	-	superseded	fork-ci,regen	nix: the store package names its artifact contract instead of failing the release floor
+8058a09e00f081b2aa502426490e46243a0d8fbb	-	superseded	superseded-by-v2-units	fix(spec): preserve wrapper settings and scope native probes to request cwd
+63ff001f7ff3681f01c760ac940ae37a168f3628	-	empty	format-only, nothing left after the replay	dist: format the four C1 credentials files on dist/main (#23)
+98f2569b07b396d22e283f7cc52d93dd17793106	566dff4edcee196a7719b7006ab303d79619cef0	retained-partial	regen,v1-harness,v1-rajit;docs/harness not ported: docs/cache.md	feat(cache): serve today’s cache layout over HTTP
+5c139bdccb60695cae7b27edbba7173917a42445	9d57d6c18e898f2831481c499d826be93cec85b4	retained-partial	v1-harness,v1-rajit;docs/harness not ported: docs/cache.md	fix(cache): address Sonnet review of PR21
+2bef75292f6cbf482fbe2d7ef0b5a0cbd0f3766b	78ad865906962dde8b53724d8b94b32999f2aba6	retained		fix(serve): own staging files through verification and install keys without replacement
+84554e7950a39b86ae23b0d6673881421f07fded	186be2f2948e5a541beafc50d003cdab88921ecd	retained		fix(serve): fail closed on unsupported or malformed conditional writes
+f9ba4958d4d53377bf5d165d3b36c68bd36c5c4d	970f2269150fa8bdeeb62d10acf877ca85eb75d4	retained		fix(serve): integrate cancellation-safe publication and strict write preconditions
+65eafa611c97d4101e900d8928b4bb2fc727fc26	c2ec961036db76921ece382bc631f6f373a3f1ad	retained		fix(serve): give staging names a sequence and return condition errors cleanly
+4a7030c18be6738606423b5d12fa39f96c87eb51	-	superseded	v1-rajit	fix(cache): require negotiated limits to fit wire digests
+6c9c9b85fb36090ed252e6226991425cd05acbfa	-	superseded	fork-ci	ci(serve): exercise HTTP publication and precondition regressions
+3dc17662898f82843b42a28ac37f0829ca514e7d	-	empty	format-only, nothing left after the replay	style(wire): carry formatting-only C1 fixes into cache server PR
+c890e4ca3e088cdd0a904d2d60fbb4773586a1a3	53c04f109366419440be55ab239666b49133869e	retained-partial	fork-ci,v1-rajit;docs/harness not ported: docs/cache.md	fix(cache): recover stale partials without poisoning remote traffic
+c65d04599b18ea0386fbafbf2d588433ca8e691b	-	superseded	fork-ci	fix(ci): quote Rust test filter in cache server workflow
+972164f01190d63dfff34e23a1506dbd5e4bc7cb	b0225d4f2dbd2764000ba2115d9ee2da6622e278	retained-partial	regen,v1-rajit;docs/harness not ported: docs/cache.md	feat(cache): bound peer leases and paginate immutable cache listings
+0690938f976386d1c8254d29162ec103323cbff8	241691f8853a8ec5e251d1aa065c873fcbf934c1	retained-partial	regen,v1-rajit;docs/harness not ported: docs/cache.md	fix(cache): bound stalled responses and recover transient service errors
+a84990bf4f0921aa99f30a67140d89844a5b549d	61f3e716f4a8cdd168ad7c87d98d4111fa4e4ad1	retained		fix(serve): do not count TCP flush as response write progress
+9dbe9437e5ec3ee70ce1040ca3d3ab2c6d0b9faa	2684a36fdb691c56d81333fd71f59257b7d0378b	retained		test(serve): pin stalled-write deadlines across read wakes and flushes
+0935e608ce4b5ae17a53669ffbc02215907e234d	1622c80fb3cd672f16d0485ac500088573b073da	retained-partial	fork-ci,v1-harness-dist,v1-nix	fix(ci): refresh cache-server Nix graphs and keep cache setup optional
+21b716ecdc767be53f67bb77c7724c0383e9ddb8	fe530f3f01cacc5981ff513d293d91e983de48da	retained		test(serve): prevent heartbeat coalescing in the stalled-write regression
+d4ede991ac1e8417e66d74a362061034c00fc0ed	83129dde125aab4df3e1c57f7db7e006ef9a0f67	retained-partial	v1-harness-dist	test(serve): make read-wake coverage deterministic and apply checker P2 fixes
+04bbedce2c96cd042c8db84b24fd9e1bb3af215c	-	superseded	fork-ci,regen	fix(nix): declare the store-native artifact contract for cache-server builds
+359b0a2c34073b2526f2bf5e3d1c0b3f8287b4ff	36b843b94cd734ab48de2c62ad168a531a531caf	retained		cache: preserve published objects during staging cleanup
+14bce852c003280fc5f5d3e5ff1f743842476599	5fa2f83156620ff3598ff43966e7be9b9d4cb97f	superseded	V1's memory reports and soft budgets: V2 has memory-budget.md's budgets and the daemon's memory line	memory: soft budgets with host-pressure admission and retry suppression (#7)
+c91ea318f0b83367963ded9bcce4e9c1e20175f2	f5837b304f52c8cb56b479b6ecdbfcc7189f05e9	retained-partial	v1-rajit,v1-root-doc;docs/harness not ported: docs/cargo.md,harness/coldbuild.py	whole build: each build links its programs into a directory of its own, so other features are not the program of a build before it
+936b2d88465cb5b96178287450062f9c1e47e0cc	585a0716f1fd6b13f12b6249ed3ae225601f0229	retained-partial	v1-rajit,v1-root-doc;docs/harness not ported: docs/cargo.md,harness/coldbuild.py	whole build: keep the invocation directory and active linked output
+d164c76f59716e09a883b714b8490cd0a0897b9c	-	superseded	v1-rajit	whole build test: provide the resolver's pinned lock file
+6b39c0b29ceac80af8a12a46517b43e803e00ff1	-	superseded	v1-rajit;docs/harness not ported: harness/coldbuild.py	whole build tests: cover absolute manifests and aged no-op reuse
+5182a692cd90900612157ca80a0cd98f5eac9b4e	-	superseded	fork-ci,v1-harness-dist,v1-nix	nix: the daemon's unit graph is the one the pinned Linux cargo makes of this Cargo.toml and Cargo.lock, and the binary cache is optional
+4e07d35492a1a3c7636a03c13f255221a193c60c	-	superseded	v1-harness-dist	harness: the nix workflow checker reads the cache's policy by value and a gate only at a command position
+99e484044bff497c83923af8dfb8b0f281429aa3	-	empty	format-only, nothing left after the replay	blaze-wire: rustfmt the four files the formatter gate fails on
+46712ebcd96f645193faa676ec633b7673605822	-	superseded	fork-ci,regen	nix: the dist package is built in an artifact mode, so its store loader is not a portable-floor failure
+84e6222c7661135759d71eab7b82a811ef5ba5cc	-	superseded	V1's whole-build scripts: V2 runs scripts through serve/unit/script.rs	scripts: the whole build asks cargo to run a build script again as cargo's own rules say, and runs it with the variables of the process that asks
+06cd0e416986b3a44181415a0ac2b41eaf078136	-	superseded	v1-harness,v1-rajit	scripts: a script cargo runs every build is run once for each build, and a load takes the scripts the check ran
+6b07ffc7e91ca3cd2119c0d481209dcd8b3fe149	-	superseded	v1-harness,v1-rajit	harness: scriptedits.py has probes of what cargo gives a script besides its variables
+c39f65861adcc8a41767d22d22a7e7dd3e025a9d	f9dbccfae5614fef2d8148fcca60e00e1f591409	retained-partial	v1-harness,v1-rajit,v1-root-doc;docs/harness not ported: docs/cargo.md,docs/harness.md,harness/ci.py	scripts: a script that says nothing of what it reads is run again for the files its package has, as cargo's walk lists them, and a run owed survives a load
+250ebe5d8be7ef626783aa04a29251ca76b8dc9e	-	superseded	v1-harness,v1-rajit	scripts: a workspace the scripts found stale stays so until it is loaded again; the probes say whether the build was the daemon's
+b6f60fcc346739712fe969e1800857a6eda27952	97d305945d1b8a26e00c8d7629899211d939798b	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md,docs/no-rustc.md,harness/ci.py	docs: the scripts report of P0.5, the harness in harness.md and ci.py, the plan and cargo.md say what the whole build does
+532657b6f2247a0373a6517549ca12586f780251	60cdd9bb1e84ebbecdf475557f2babbacab44cca	retained-partial	v1-harness,v1-root-doc;docs/harness not ported: docs/harness.md,harness/ci.py	harness: scriptedits.py has the daemon stopped between builds, the release profile, a feature and cargo:: lines; the report has 32 probes and a whole-build bug they found
+e2368b2cb2ba1dddc6fc160747c1285c21afd398	07bcc5f98a83bbab9db90be556fea65407cd660a	retained-partial	v1-harness,v1-root-doc;docs/harness not ported: docs/harness.md,harness/ci.py	harness: scriptedits.py has a directory that goes and a variable an undirected script is not run for; its report has the 34 probes
+b1af98c7084dac617abeb21a00d44340e0f5780a	28efa812959162b82ec91521c61a99443b5f0425	retained		docs: SCRIPTEDITS.md says how often the suite ran
+e990d888c4fcee4b4bb6dff6c4696955cccaca87	-	superseded	V1's whole-build scripts: V2 runs scripts through serve/unit/script.rs	scripts: the whole build compiles and runs its build scripts itself, with no cargo check
+83f7b1dc1005ab2d60ba0b2dfb3482fb98636762	-	superseded	v1-harness	harness: scriptedits.py has a probe for each finding of p05w-verify; tracedecay.py has the whole build's P0-A
+6bf3e8c15a6c4f84272834dc92f10ebcb5c690d6	89a2530fef0a755cd1f6051b9132f622687e7b01	retained-partial	v1-root-doc;docs/harness not ported: docs/cargo.md,docs/harness.md,docs/no-rustc.md	docs: SCRIPTEDITS.md says how blaze runs the scripts; no-rustc.md, cargo.md, harness.md and the changelog say so
+cf2799ba1d837ba6384c55c78c6d3e2c7a5d1b6b	-	superseded	V1's whole-build scripts: V2 runs scripts through serve/unit/script.rs	fix: retain non-UTF-8 build-script inputs listed by Git
+29ce4a5281cdc7e2b3b53dff7d1479a97e458c25	-	superseded	v1-rajit	fix: serialize script caches and preserve compiler and config inputs
+5d27000da7163056459e22f5847df33b16232808	-	superseded	v1-rajit	fix: run build-dependency scripts with host configuration
+c5874008defc12d3516eb18181601ddf78cfebe3	-	empty	format-only, nothing left after the replay	style: format inherited blaze-wire test and credential code
+a9ccbd5ecac8d24babb54e8d430c0ec3dd4b845f	-	superseded	v1-rajit	fix: release script cache locks before closing inherited descriptors
+91d58995c811c2b38bd2200916b8ab8a7a5a08cb	719e968a78bd70f7303ca816a6cdeaa450382dab	retained		docs: record script review validation and remaining concurrency gaps
+971f063f39c799620371472447f015b538ddce4a	c0cdd2821c8a175982843ad3a7eed87255c3ccdf	retained-partial	v1-rajit,v1-root-doc	scripts: a build holds the output of the scripts it judged until it is retired
+1394b98eeb05a75df0dc6e189d4d06036115ee29	5416f4dbe1f36a370c402ffa426412cf71eb0448	retained		docs: SCRIPTEDITS.md says what a build holds of a script, and what ran
+ac24007a65e81757934ce67bfd700c62047c1526	5e52315fbbdcb07aa90dd21b13204d47a9bd74b3	retained		docs: SCRIPTEDITS.md test counts
+167e5fdbddee2fea22aa35c340309efff5e49b2c	-	superseded	v1-harness,v1-rajit	scripts: log lines for a build's leases, a file barrier to hold a worker, and a retire that delays no client
+3e6a26a38add5465df072bc617fe4986bf8019e9	-	superseded	v1-harness	harness: leasebarrier.py names the library for the value, saves the clients' output and has a control for an archive that changes under one name
+84bcf44930322e3671ba2b157c20a1338e36d08a	-	superseded	v1-harness	harness: leasebarrier.py holds A at consume, puts B off behind the retire, and has a link control
+1d8952480baff0ad14e9d61d5c7a0b0c120dbe5f	-	superseded	v1-harness	harness: leasebarrier.py records the warm worker's stale link as a gap and orders by what it can observe
+04721719308c41a0993df2aa2426bd85fb120d43	5fc204fee234212c15c7ea3e5efd348dfe4ecb1b	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say what the lease runs on Linux showed, and what they did not
+ff9edac3ad753776f3af301931ebdf97d8822084	-	superseded	v1-harness,v1-rajit	scripts: one build at a time is mid-way through the scripts, and every consumer of their output has an owner
+67d3210c5f8a9e7d17e4f491fec2b6a860a1ca59	-	superseded	v1-harness	harness: leasebarrier.py has lost-wake, reload-busy and direct
+aa7c7877f2530a271643415cbfd2b778bec80963	-	superseded	v1-harness	harness: leasebarrier.py has coab and internal
+913ae47484639b2afcae3b9e1df79791c43d72c6	-	superseded	v1-harness	harness: leasebarrier.py internal is an editor's edit
+04d69ce761d4c83acfeb58b15ff0100a90e3cc7b	b084728ab2c9932d2f4396b4de8f6287480dcbfd	retained-partial	v1-rajit,v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say what a build holds of a script now, and what ran on Linux
+55cf3a45e932911cea7a2c3b81918807d1aec446	-	superseded	v1-harness,v1-rajit	scripts: a consumer reads a world, and a build that waits holds nothing that is not read
+8d696a6a81252d2805529b5c101644b10de40e64	-	superseded	v1-harness	harness: leasebarrier.py oracle env and an empty ws
+8fd30ff7e9a5a1d3bd0578bf1f663ef20936033b	-	superseded	v1-harness	harness: leasebarrier.py worlds and join use two checkouts of one repository
+b2f6ecc467f041b0dceaf1478644fd62698db4e7	-	superseded	v1-harness	harness: leasebarrier.py worlds and join start a worker by hand and join S with sync
+4a6bd18e35b390a32f730b8bbe9f3db1edd7e933	-	superseded	v1-harness	harness: leasebarrier.py edit sends the process's variables line a worker reads
+ae31fc5c1d32eff723374bb6096ea725535697a3	e6763e1069764dd3d61507ceba0e6102e5a592a3	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the consumer-world design, what ran on Linux and what did not
+2c95ea1cb542819ca8176e36b61f7bb2ca6eb118	-	superseded	v1-harness,v1-rajit	scripts: a run has a generation, a build keeps what it decided, and an operation has the admission
+7a0203c0141ab4e2eae138da673e5ebd325f14d7	-	superseded	v1-harness	harness: leasebarrier.py generation reads the edited worker binary; worlds and unrelated expectations
+f4afcacdefd13de718ebd025b6924108a69e3f63	-	superseded	v1-harness	harness: leasebarrier.py generation waits for the splice
+6f60559d1366adf2b396a86f6f7d8243f249cd83	-	superseded	v1-harness	harness: leasebarrier.py generation edits with what the executable has
+6b03abf1cf7973acb8fab6f358c9b2c13052680d	-	superseded	v1-harness	harness: leasebarrier.py generation: B builds the other program
+5dbde1a1096564554668a8f45522dc2578d2da34	7226cf435b406633481f1dbd0d7d644bc3d4191a	retained-partial	v1-rajit	scripts: a watch's registration and its exit are two functions, under one lock, tested in the interleavings
+0e580b5b8a3938113d6c3a7c0f82bf7a23fe81e7	b6148d574d756f1386ba9e56a3b41de385c50b95	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the generation design, what ran on Linux and what did not
+4ae2a363cbbbd20f948f7580cc019275d8106722	-	superseded	v1-harness,v1-rajit	scripts: a build that ran a script keeps the admission until it is retired; a world that moved is waited for, not counted
+beec3fad1cc7b5893024042ba45eaedeba617b8d	-	superseded	v1-harness	harness: leasebarrier.py once, once-failed and recovery use the guard per checkout and A's own GEN
+600411b94e2343c63e0d8ed873077acc9d7a7cd9	-	superseded	v1-harness	harness: leasebarrier.py once retires B as the daemon does, at its answer
+d592dd492bc0cfd742b79f58f9aec93eb8bde2d7	10a69394961f03b2f6c6fbdfe10fdb7e51dbfaa2	retained-partial	v1-rajit,v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the build-once and waiting-recovery design, what ran on Linux and what did not
+07863d99573a0064c5789de27fe88c592d0c3f9c	-	superseded	v1-harness,v1-rajit	scripts: a recovery's end wakes the worker after it has ended; a joined checkout's first scripts run with the joining request's variables
+9c79f6de0b1f3577cf7ba4fc571d39dd02376153	-	superseded	v1-rajit	scripts: the log has the whole message of a script that failed
+9592a229147584205dacc56fa914bb3ea8cac789	-	superseded	v1-harness	harness: leasebarrier.py once reads S's first run from its trail
+45b21ed2af4aa71b91e0095c78176109ff11e4ef	-	superseded	v1-harness	harness: leasebarrier.py recovery-detached rebuilds and links in the recovery's request; groups ignores the trails
+6bcfea42fb9c6902da1c010269393eed8a2b2b42	2b131913d28f82934f5ce821c436e3c57166c5ec	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the recovery's wake, the joined checkout's variables, what ran and what did not
+a884558e71b12bebbaba51172bb53179ea41bfe0	-	superseded	v1-harness,v1-rajit	scripts: a request judges the scripts of the checkouts it reads, not of every loaded one
+f674d924e8063fdaa9c84b316a905a7eb09c57aa	-	superseded	v1-rajit	scripts: a request judges only the checkouts it reads (types)
+c0a64de1f4890bf45ed88feac4887d8d9a032103	be58fc8f82c07bab664af93040050a0fb10026d3	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the request-scoped judgment
+8979d8ac6952910a7be3214a55b6e824e0dac8ae	-	superseded	v1-harness,v1-rajit	scripts: a request for a project that is not loaded judges the scripts of the checkout it will share packages with, and of no other
+0289375016dfdcdf754b052ef63b6a962f6ab266	-	superseded	v1-harness	harness: leasebarrier.py first-join-shared builds V from R's judged script; once-failed names S
+0acff47eebcde36d6e9cfd02d310238ad5619a2b	-	superseded	v1-harness	harness: leasebarrier.py first-join-shared checks the base's trail and the object
+da9c551ba32d3c6e3ab1c86209be706ec56b3841	5d493d2d6a245a5cf880d8e01ae6f4c11240816d	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the first join's relevance
+33142bb88f344b7d6be14a030c8319d94e32fd5a	-	superseded	v1-harness,v1-rajit	scripts: a project that is not loaded is judged through the loaded checkout the policy will read it through
+b09055d3630ba4344cd23d4fa3a9095aaa02b03e	12ca8fc50162a3f1cd62a4b8b4ad3b6ebd73c5ae	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the sharing policy of the first join
+b8a011fe228e1824277c23a85341ce9ad02bd5c4	-	superseded	v1-rajit	scripts: a build that has begun to link can be held by a test (inert without the barrier)
+578a108529b4543f49e14f267ef418df65b1ad98	-	superseded	v1-harness,v1-rajit	scripts: a view is taken only of the checkout whose scripts were judged for the request
+77e870d4d97303e72c80b1e91ea59807e9ff7ea7	-	superseded	v1-harness	harness: leasebarrier.py quick-choice retires R's build as the daemon does
+cc92886c27999360f69b396c77794fd4285b09fd	9bbf4e807f2141238864e8e34d5a0e53b6d36e0a	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the single choice of the checkout a project is read through
+cd2578e70d542470e1a76d0dfeff7a68fe177d30	-	superseded	v1-harness,v1-rajit	scripts: a project that joins is read through the checkout the request judged, or on its own
+d2ffc0968622d986121e688fb22e5513fbc6765d	0fa777e25421931170e8095181c157c4e34e3476	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the request's Sharing over the view and the join
+ec140fdf166e6bda45cb0d725a4dc59d57240a71	-	superseded	v1-harness,v1-rajit	scripts: a checkout whose manifests changed since it was loaded is no checkout to read another through
+310d39f4d42ce8a3ff9afecf1dee10b9718c369c	d069e94915d6c48ec82e18f4c31b31e6fdb34860	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say a candidate is certified by its watched files
+6e1439133e8669d5a48580570692e2b0920ed4b4	-	superseded	v1-harness,v1-rajit	scripts: the files a workspace's structure is read from are compared by content, not by size and time
+8c2e753b08baf9bdb2629c0323d921a91e0f081a	c3c4e782041dfef25c6c786c908054e3ae7259a4	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the structure of a workspace is compared by content
+a20ce241510fa88afce41a06f70404b08cf39295	-	superseded	v1-harness,v1-rajit	scripts: the scripts a manifest selects are compared with the loaded targets by the file each is
+c60a75493dec28e1bd540b9bb3acbd80581ea672	-	superseded	v1-harness	harness: leasebarrier.py selector-moves makes V's request the first after the load
+0958842863ce2b2e8b5d41b3f0e0467ce5bce6fe	ca2c65d68af25a94e1be7b7b1cae6ce182eddc81	retained-partial	docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md and harness.md say the selected script is compared by the file it is
+eed39779916a51747e8e27069ac499204e8d4297	-	superseded	v1-nix	nix: regenerate nix/units/daemon.json with nix/unit_graph.py
+865e83777d4a73f9286b1a6c41a4ef08e7107833	-	superseded	v1-harness,v1-rajit	scripts: the flags for rustc that cargo gives a build script's compile are applied (--cfg, -C debug-assertions), and an explicit --target gives it none
+3ee03806228e581625171b481197121af74014e6	-	superseded	v1-harness,v1-rajit	scripts: the client is told all of a script's failure, not its first line
+ce797a8f6dcb60c2813a4492963adbbb416cdec8	011a5fa43960d48f8eb9926bf8dfe668df64038c	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the host flags, the explicit target and the whole failure message
+9f5aac1235eb0b5c91e16c3ac2b822bad8fc7078	-	superseded	v1-harness	harness: leasebarrier.py native-only, link-strict and archive-strict
+b4ea9d0297ce919aeb9a4e776a9d12b2965fb647	-	superseded	v1-rajit	native: the inputs of a link are its identity; a change forces a full relink (adapted from the prepared repair/pr12-native-inputs)
+93ccc4f4e9a81fd90a69db403ec9aef33df10325	4fc2e24646c1d4d23eab05bd8f3a746f6e406c38	retained-partial	v1-root-doc;docs/harness not ported: docs/harness.md	docs: SCRIPTEDITS.md, harness.md and the changelog say the inputs of a link are its identity
+1582b3c22d612214153df2eda328e554c01fc850	-	superseded	v1-rajit	link: the log has the line cc is run with
+2695888a64ce70c3261168d7ab703384bda7b995	-	superseded	v1-harness,v1-rajit	a joined checkout's program is not linked with the daemon's crates
+4d48bfbe77a1bfcf726c18029b7497e1e1d58b08	feebd01838530bb7153af8935d96a691ffec9f6d	retained		docs: SCRIPTEDITS.md says the native gaps of first-join and generation are closed
+15fee9f15a642a4f8b66e8e44af6a701d82baea5	-	superseded	v1-harness	harness: tracedecay.py P0-A tells a cargo that only asks from one that builds
+490dd7389e67c14281fffd02c8cda1982396a35a	d0b7ad003edf1b5e79e9000b31444e9311cf8dc4	retained		docs: SCRIPTEDITS.md records the acceptance gate at 15fee9f1
+44a3f62cfe20b042e1a2fb8d0064341701bccc7b	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Retain structural source bytes through workspace resolution
+41a22d1addc8a67deee53f81e699b946b95a693a	-	superseded	v1-harness,v1-rajit	Track native linker script closures in the request environment
+5804ea211d2939523953dbeddefad012e28d9e3e	-	superseded	v1-harness	Fix native-closure witness script path and no-op assertion scope
+5a9d20e64563975393b9a483b659c721b9819d9d	-	superseded	v1-harness	Require daemon-owned builds in the native repair witnesses
+dad07451e3cdf6419a255a0dcae414f9f85b9a8b	-	superseded	V1's whole-build scripts: V2 runs scripts through serve/unit/script.rs	Probe byte-path filesystem support without dropping Unix coverage
+4ab10bb6dd1d1e2eb4b112edb1499b5c51a0e826	-	superseded	v1-rajit	Discover native linker scripts by content through symlinks
+d39a9dd92188d6cb72316a872468b57010698d21	-	superseded	v1-harness,v1-ra-project-model,v1-ra-rust-analyzer,v1-rajit	Own Cargo toolchain queries and std metadata loading
+adbe7e6d7cb907347d340f30c6ce3dc284739091	-	superseded	v1-rajit	Normalize split unstable-options in owned Cargo config queries
+9d9bc99cdde724cb72ca03be6f927e81844dd407	-	superseded	V2 builds std with blaze-units' stdlib, which never reads it as a member of a stable workspace	Read std manifest feature gates on its bootstrap channel
+ee23347c6490b8cd7158a924d13e071c1dfb56d2	-	superseded	fork-ci,v1-harness-dist	Keep the shared FlakeHub cache optional without weakening Nix gates
+5aa8d683d61c4eabc3f13e4bff7dedebd8786c46	-	superseded	docs/harness not ported: docs/no-rustc.md	Record the scoped zero-Cargo whole-build fixture result
+0fe2b575b0c0538d185c0a5e5947e5b00ee6f0e3	-	superseded	v1-harness,v1-rajit	Apply effective Cargo flags to owned rustc-print answers
+ba2263299067d85f9b9829e9c6d293aea7205e62	-	superseded	fork-ci,regen	Apply the reviewed Nix-native artifact contract to PR12
+33c1237945f6891c581d9d3fb72c0080ae2e1f68	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	Carry effective crate flags into owned backend target machines
+171e23ea8364f02a3c65bd9cea5aa715ee7e37a6	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Keep codegen-specific homes and separate output ownership in ISA witness
+27c4ec3fc7f00cfaa1862df67902b83a59121819	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Correct typed home access and validate machine settings and text-input roles
+9a878921e6358581daaa0455d982b3577e81b73a	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	Verify named CPU presets change emitted machine instructions
+12af6276ce92588588c9f9a3e1476b1334230804	-	superseded	v1-harness,v1-rajit	Keep toolchain print ownership independent of irrelevant codegen flags
+9316ea0cc5a319dcc603e3325039ed2df35a19f1	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Invalidate reuse when another worker replaces the published executable
+4df6dc1dced1dcee31056df1ce6cbdee5d99e49f	-	superseded	v1-rajit	Check exact publication artifacts in detached no-op reuse
+2124df6792e7745d08f330710f0e7db87cd40fc4	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	fix(build): track thin archive inputs and ordered target features
+13ac8095163cfcb7c720315860bdd6c0987e2244	-	superseded	ported as V2's own path: crates/blaze-cargo/src/serve/unit/dist.rs and Build::compile_granted replace the batch exporter	Add object-free compiler batch exports and checked receipts
+749925689f96ad88ff6d1f697412b414a51b7c60	-	superseded	fork-ci,v1-export,v1-harness,v1-harness-dist,v1-nix;docs/harness not ported: harness/ci.py	Repair the fmt gate: the export oracle moves to a harness, and the graphs are regenerated
+ec4000b1a45ff1b45d268d818f8c53066cf0207b	-	superseded	fork-ci,regen	Nix dist: a store-bound package, not a portable tarball
+31d66a91fae9c80a84ad89243a559ec7ba0f37fe	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	export: pin imported entries to admitted keys and settings
+14622b078257305fd3f6dd26f04d22fe61a20d39	4c4ecbb23d4654c9407380753c42faa8340cb693	retained-partial	regen,v1-root-doc	blaze-dist: the work set, holder, jobs and admission as sans-IO machines, with a deterministic simulation (dsm, WIP: not yet compiled)
+48e485329ac8dabc7be7870919cc40f5a216bca6	a5e43d009ab48613ec9d2f542f805717dc2b8788	retained		blaze-dist: a panic in a seed is that seed's failure; the commit path does not panic on a broken coordinator (dsm, WIP)
+4cbf2894aa352ac9855104944215720a03e96ee7	1799b414e1d7083d73de9b0fb233f38384bee319	retained		blaze-dist: fix lifecycle boundaries and make simulation replay observable
+79c80c7051f9f4fc4982b5ad83b70334c823fa78	f70fc24e87fe13826085dc163be7cf771452566e	retained		blaze-dist: keep simulated stalls finite for the progress invariant
+69da6757520abefcbc714c2fa2af2f152c97f393	68d210b2eb48939eb4c08596ef13f7ea6668412d	retained		Fix distributed assignment fencing and work lifecycle races
+fc565b0e7ab7c6d8185a2c394022e184ea99ba24	3ade63fb488b00e7e02def345d32921e4659e23e	retained-partial	v1-root-doc	blaze-dist: fence assignment stops and expire subscribers before completion
+187e2a39ea8b905d1837e51ed345fb59ae2d3fcd	305bdd7e56fa39f9604b822b97e725d42cc74fc0	retained-partial	v1-root-doc	blaze-dist: enforce worker ingress authority and preserve terminal classification
+e6b94be0cac4185defce4cb63573dee85535ec38	a2b69d45f2004dfae5ed694b85b1f8c5374244eb	retained		fix(dist): validate worker event batches before publication
+88613afa816aba9e46f854029fc3f42f0051cefb	150ef84107f4c1e3b87ac2f5774dcdf0b514acda	retained		fix(dist): enforce event authority and preserve infrastructure loss on the wire
+876b7883c7341a5b0e8ef1b89c2845e2cec26af2	-	superseded	fork-ci	ci(dist): run protocol regressions on distributed pull requests
+a65b058e864056ecb4c1ed66f12e189029f620a2	30e7d0cd092bd71e27fb6b9a2427e94624e47b0b	retained		style(dist): format worker-ingress regression coverage
+e1393a9ec78a6dd845a3356645f35aadf818eb44	75f3405035369c33eaf4e3cc6df7bf815583c1fd	retained-partial	fork-ci,regen,v1-root-doc	blaze-dist: route the protocol over bounded local Unix CBOR sessions
+71ccd8cca7407550a05eef36f0e6e5805e7a0348	357b0a58b09480d7c66bfac3e198021d06610532	retained		blaze-dist-local: keep response bounds explicit and name CLI test executables
+45c1df53e36757268e752fedc5007f5caa5ac70d	4b25f47547972dc3671344b16d4ad7c1d2bf584b	retained-partial	fork-ci,v1-harness-dist	blaze-dist-local: issue session lifetimes so expiry returns capacity
+1045af959981db189f5f8dd9f82b414bd9a36dad	-	superseded	v1-nix	nix: regenerate unit graphs on x86_64 Linux for this branch
+92981ed0a3279574d4af3bc7798c4ce2ee4206d4	9986e421d87c2bdaded822384255afc8a1430cb6	retained		blaze-dist-local: test label exhaustion and pending-request renewal
+213a76590be8a390a347a6c20b77bc7b3360cfdc	-	superseded	fork-ci,regen	nix: name the artifact contract so a store package is not held to the tarball floor
+07fceabd4d9de10e13e489939ffd9eb9e204ed75	ea098413498dd8358b7490aa5ec16f370ede46af	retained		blaze-dist-local: witness a committed lost answer at the session boundary
+1c5c64602cbaa56279bf3c95146271ab2dad84ef	1a14e93142d212255220d3ba3bd1b8adf99db15d	retained		dist: repair job admission accounting and reactor recovery
+750a3a37e72f16b153f60115f9787e50380c9d09	-	upstream-equivalent	git cherry: patch-equivalent to an upstream commit	chore: retain attribution for transient accept recovery
+6b29d2f982c5a0cc886deadf7128c5de3be23785	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	P0.6: the whole build on macOS arm64 (#255) (#8)
+5f92d863937801b92a94cb169c3f28fe29377c08	561bc3233de2f28e4550f71a6d127c83d1e9787c	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Repair PR12 print flags and publication digest reuse (#25)
+a52074026dcf685d739281cf4e2d2ea7db743d2e	dc878f7eb757c0d81f36cdcecca0bc84e7879948	retained-partial	v1-harness-dist,v1-rajit;docs/harness not ported: docs/cargo.md,docs/harness.md	T1: Bazel-parity test-result cache and flaky retries (#17)
+fa7bcabbd6194dff7a376339e3d8251d15a55fd1	61e86a3e969ad4c80fa42c305da35f561aefda4e	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	D3m: prototype mapped frozen front-end parts and record measurement limits (#16)
+9ff04fa87d950ab6fa5d3ad9ad1d7dae03f90f92	-	superseded	v1-rajit	answers: the print-ownership test clears the toolchain environment for every query
+c6217ed69b1e5c87cb96ff5103260e358f7e2e01	-	superseded	regen,superseded-by-v2-units,v1-harness,v1-harness-dist,v1-nix	C2: capture immutable source snapshots and structural reads
+b888ce8a57d9c8a5a104dcb17c6d6b7bea01d1cb	452ba8dcce21b59a94203702c6035b69c1b89c2f	retained-partial	v1-rajit	Fix C2 distributed fixtures and pagination handshakes
+4e2b3f9c9fdec93be467bb3661f6f7a519039fc9	-	superseded	v1-ra-project-model	Refresh project-model snapshots for codegen flags
+0affc1a226af8fc2fbe4555a81ca311cd75d6af9	-	superseded	superseded-by-v2-units	Preserve original invocations in CBOR replay recipes
+2f65b1818f20841863973c32b8a6766f7e940f2c	2f28ed08e2bc8b2efa0d72d435e07eb039992030	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Execute saved BuildSpecs from authenticated source snapshots
+b05520b40c1db5e873f360c9f854afd9b0022dbb	-	superseded	fork-ci	Run saved BuildSpec CI fixtures outside the repository config tree
+e48984d03f97193961c2fee51921d016a761ff41	8962d8c47dd2b7b3207e932bc6df3ae736b361a8	retained-partial	superseded-by-v2-units,v1-harness-dist,v1-rajit	Preserve complete saved-replay inputs in a versioned CBOR trace
+42cf2703d204ab622684967dfb1456dc8a69c330	-	superseded	v1-harness-dist	Keep native tools available to saved replay acceptance in Nix
+f33a356df8df1a265c1b94c0813a52c49edbbbd4	-	superseded	v1-rajit	Return structured refusals from saved BuildSpec generation
+1a30ace02c7163f15b9b3bb2897ff6fad7c5bfd5	-	superseded	v1-harness-dist	Exercise saved replay under an explicitly selected backend
+a27f16e9e03453caaa04cbc77c79467ac23a5a6a	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Confine saved replay configuration discovery to its source snapshot
+53574890135e021899d886ea29efa33c9c0cf382	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	Release recorder options before reading emitted LLVM code
+5dc4aa08f32f09ac8c9beb2d09e39f5332960531	-	superseded	superseded-by-v2-units	Read Linux kernel facts without assuming a coreutils layout
+7e91a68936b7a5701df6b1b2779dac44bbed201a	-	superseded	superseded-by-v2-units	Use available native tools in request-environment probe tests
+e3226e775e8903e27e0291c7ec158b3cdaea4b66	-	superseded	superseded-by-v2-units,v1-harness-dist	Match Cargo target selection for positional test filters
+d3ef1b57ca324b9b9ddb65209065e892caac6cbf	-	superseded	v1-harness-dist	Keep harness controls aligned with filtered test requests
+97655e29861517e2cb318ae3323b3269e6d375e2	72035513a31d4327881ffb31f8349be427460613	superseded	reverted in e83816c21: it uses unsafe V2 forbids in llvm/lower.rs; V2's release path is run by harness/distv2.py	Emit LLVM debug records without casting them to instructions
+1fd99ab1990a2a53b5a428cb4590df5941309b9e	649f2f7e88a23d41d79879d7f36680d81d031b31	superseded	its LLVM regression followed 97655e298 out; only harness/dist's V1 controls were left, which no-rustc removes	Repair acceptance controls and compile the LLVM regression
+083b6cbde1c6ca9d37b733136758fe0831f851af	-	superseded	superseded-by-v2-units	Allow saved test no-run requests without a doctest producer
+279248fbbb6aebc82219ea60aad539e12913e6d8	-	superseded	v1-harness-dist	Exercise both source and workspace aliasing in the harness fault
+0a4cac8483f664350cb13855fb5ed10e5e7b5b18	-	superseded	superseded-by-v2-units	Inspect the emitted test target kind in replay preflight coverage
+62fbb397b0650b39cff837add5d0f6a92127bd64	-	superseded	superseded-by-v2-units	Limit no-run doctest omission to implicit doctests
+a1f8aa9e896961c1d0a3b507a8af52a214f2eaf5	2e0c97d9251a35e8097020cf40582a9447f63d72	retained-partial	superseded-by-v2-units	Document implicit doctest omission for saved no-run requests
+26abf20488a82452338ed69ff0fc01c8000a0ca6	0edb00439676df880073bd486b08a9c09a2dcb6c	retained		Replace stale C2 test counts with the committed verification contract
+a9b890515e9a8ea0d34a1a955dbd2e7cc070124c	-	superseded	v1-rajit	Compile the owned libtest runtime with saved test executables
+b67afa7d38fc584b4b16f674cbae77089c0d010f	-	superseded	v1-harness-dist	Retain real saved test and worker configuration regressions
+9d9ddf5088b696d57d4e59d70dfa612a73df558b	-	superseded	superseded-by-v2-units	Bind compiler-located native libc and loader inputs
+28661edb99802213a6081f23342bb9bc1c77b9d7	0c86ff3e1ab8b6d1bdbc044cadc23beddea069c6	retained-partial	regen	Share native unit transport with explicit private descriptor redaction
+fe2dbcc143bfb3e8b958a1f0487e1e0b4646ae62	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Extend saved execution shapes and private compiler descriptions
+c4bb526bdcc030c692fa0fed9de3fb537ca16132	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	crossmachine: two machines on one host, the keys they agree on and the ones they do not (C4)
+dda447cae9bec08e0ebb55ce16c60fc94f812caf	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	keys: a crate and a file beside the checkout are named by the path that reaches them; a macro's key has no place of its machine (C4)
+8e1c49243bba236b094aed34c061c05f817e0e84	-	superseded	v1-harness-dist	crossmachine: nushell by name
+6ab96f9379c7455c68786343fc178eb8148c7d8a	-	superseded	v1-harness-dist	crossmachine: the unit's binaries are found under ~/code now
+baf4daa06f3c9ab579f55ec89ce653426781ccec	42d96bb451e7871956b38003fdfe3e868a7a11d4	retained-partial	v1-harness-dist	crossmachine: nothing under ~/dev
+72e1e0efd0ac8fe3d560d34e9d8ddc1773bde32a	0cbab635081d335265400a7e84767c9e94b1b289	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	keys: diagnose cross-machine gaps without unsafe cache hits
+eaeb3536f7ba4cfd8e7c4a532c189be22697b8b5	-	superseded	v1-harness-dist	crossmachine: a macro observes a path without emitting it
+4a572f96a3576a50b7c1d7984200ccd67b2108eb	-	superseded	v1-harness-dist	crossmachine: format the macro regression fixture
+4d1b66e655d83872ec62e08c7754a29714778b18	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	keys: cover vendor sources and preserve relocated literal tails
+fcefb5d4e0dd8daf6a159f20ef3ba6da6a67ecd8	-	superseded	v1-rajit	keys: memoize library source closure within one compilation
+b04e8ce2482de6b928866b913591d76caea2b964	0c28ec47940c40f0004ff25d791e8b01b25dd5cb	retained-partial	v1-harness-dist	cache: document vendor invalidation and literal relocation semantics
+3f8c374be2de95008d4b5fa5b338d8229f79643f	-	superseded	v1-harness-dist,v1-rajit	keys: discover included payloads before library identity memoization
+67446bbc901005b945efba260f6e5767961a62b9	8d2d2ae52796940d36adb771b311fcb12c6f67f1	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	cache: rebind stored path namespaces once and fingerprint diagnostic values
+7412c0a260d82ac1ce756247f574b23ee4050bbc	-	superseded	v1-rajit	style: satisfy the repository formatting gate
+fa6ef4e581a0e0080c72c97c709abc2c9e9a0ae9	1bc88f618cbb1915a6bb8beff85b2495ea900d0d	retained-partial	v1-rajit	keys: exercise payload discovery through an actual library source root
+1be555dfbfdb808d098ce2740360eb57158f6b7c	-	superseded	v1-rajit	keys: give the payload regression real filesystem anchors
+35b8f10bc330ce5d442d208a113e5c81b40789e4	-	superseded	v1-harness-dist,v1-rajit	keys: discover every expression-store owner before identity finalization
+cb5f82c9d45b4c6b39050c271c8242b7e6cbf2ae	-	superseded	v1-harness-dist,v1-rajit	crossmachine: preserve vendored panic paths and recognize complete warm statistics
+599387c880870e1468ab396255b33d0e4ddf6792	-	superseded	v1-harness-dist,v1-rajit	keys: memoize direct discovery and exercise same-daemon payload invalidation
+5f9a9bb5f0406a6b71c6049e7e49154162d64543	-	superseded	v1-harness-dist	crossmachine: rebuild the payload oracle after binary-only edits
+c05c71970d7c8cb32d960af634d6bf4f30d6dd5b	-	superseded	v1-rajit	keys: reload included revisions before invalidating warm code
+abfd34958f99800758f3e0e333dcc7572bbeed83	-	superseded	v1-harness-dist,v1-rajit	keys: reduce warm invalidation in one database and retain worker logs
+90f1d797e7494fa29e83ee4297aba58aef51cc7b	-	superseded	v1-harness-dist,v1-rajit	keys: retain warm watcher traces and assert daemon generation evidence
+62c8d1fdd2f8abdbd69feded601c960d07573895	-	superseded	v1-harness-dist,v1-rajit	keys: use path Display formatting in watcher diagnostics
+8f826db3788ade1051c306066b914a8ea93f8a1e	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	codegen: validate retained instance code against changed tracked inputs
+4bcdcd702fc2369813cb8707a2bc0c34cf48beca	-	superseded	v1-rajit	keys: assert lowered-body dependency in same-database reduction
+aaa1fccc80c7eb10fea4a0abc174bcb1465a704f	-	superseded	v1-rajit	keys: isolate MIR dependency in warm reduction
+77434978cf194872ecc55d001590b4a65bec02f7	-	superseded	v1-rajit	keys: use a trait-free MIR reduction for included literals
+1d3a515bf8ca331f6502d98551983a625138eb19	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	keys: trace retained codegen query execution in warm reduction
+9ca5f9370bfea184244f7b82e7084ab84ce016fa	-	superseded	v1-rajit	keys: trace actual included revision changes
+d80101d41a78eff1af4cd694098b6bdd7c6ae220	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	codegen: retain explicit tracked dependencies on included inputs
+e030c6c60d00e862878ccd0c229607e9a3398595	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	codegen: bind included dependencies to the instantiated definition
+91d19af4c31e9cd8f85801e7adc895a8d4654346	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	mir: retain included-input dependencies through body and MIR lowering
+f2f13b59653b0d8004514140ff0209393f46c42e	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	hir: attach included reads to relative body lowering
+cac6339efe3d77bf554fee2a1d415bd808baf2b3	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	keys: name codegen executions in retained warm traces
+f2151eddbdf2c3fe09645673b8cd697f048d1aa8	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	mir: track included inputs embedded from dependency code
+c30e4b554dae4f05f5fa1fab0191f85489f1bad7	-	superseded	v1-rajit	keys: route external-input edits through owning crate edit checks
+efbec259866332978e30345bccf5e3aef0a685b4	-	superseded	v1-rajit	keys: reject missing included inputs before warm build success
+01e23eb9b551c850861cfa803040d05264bc907a	-	superseded	v1-rajit	keys: include root in missing-input dependency scan
+3b61dd65338bde30f2920ae3caa798eb8deb0541	-	superseded	v1-harness-dist	crossmachine: accept expected daemon compilation errors without fallback
+3fab13edb663fcd3282a1ccdffc37551bd0e04c6	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	keys: distinguish current tracked include readers from watcher history
+ce310ae097195781f80db6aa0e07a20abd1d9ced	-	superseded	v1-harness-dist,v1-rajit	crossmachine: validate missing-input errors and obsolete reader edits
+b0171afb9fa7078c93726ec0427f10d1c31996b6	-	superseded	v1-harness-dist,v1-rajit	crossmachine: keep removed vendor inputs checksum-valid
+e2ea8e4c16daabcca72560397b76fffd2055c536	-	superseded	v1-harness-dist	crossmachine: cover two include readers and fail closed on worker state
+095e09f6eca9af95bc3d7effb116d54c782bad3d	-	superseded	v1-rajit	keys: discover current include owners only for tracked missing candidates
+b864c608a6a9fe79b4746b314c61c02e2117faa9	-	superseded	v1-rajit	keys: format focused missing-candidate controls
+36c6fc8cb80198d54f3d23a5a14d76a5493d7404	-	superseded	v1-harness-dist	crossmachine: reduce new nonfunction includes through real warm requests
+2ec010fb3f9b993088a21dc4c6d600575f95378b	-	superseded	v1-rajit	keys: prepare changed expression owners before missing-input sampling
+50aa15f0bc038d32ee07c8b8665a7e6713022ade	-	superseded	v1-rajit	keys: reproduce stale expansion-library identity across equal-size replacement
+43cb8a9f991b5efb671e5ab303ec1f3b443528f3	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	keys: replace macro handle and checkout metadata identities with content
+17032f8f8d281246e1502dc5844f9b706f48b563	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	macros: reload content-changed producer closures using immutable dylib generations
+7e3edafc14f27f38fc902604cad07850fe6ea0f1	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	macros: retain producer content lock and test equal-size input edits
+1254b31eef84b16f30ef58e29ae12e1912a41775	-	superseded	v1-nix	nix: regenerate PR15 units with pinned x86 Linux host resolution
+06923865c4090e38ba1d775b077a42dc0fa2fc2f	-	superseded	fork-ci,v1-harness-dist	ci: preserve Nix gates when the optional shared cache is unavailable
+991c948bc9630e142cc1e604b76badd85368a1dd	-	superseded	v1-harness-dist,v1-rajit	macros: propagate loaded expander generations into warm caller invalidation
+f838998d2d3d8cff14110f95da0f4625d1d1dfab	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	hir: expose loaded macro generation snapshots to the daemon
+e964550f37621174cc7cde43324ff162c208504a	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	keys: include loaded proc-macro content in caller identity closure
+7f402e6d998a13919fbf5225c7c002aba1a171b1	-	superseded	v1-harness-dist,v1-rajit	macros: witness transitive producer edits and unchanged warm caller reuse
+24c238fcd6264f4f131b7ed25e4416c262f53329	-	superseded	v1-rajit	macros: select producer artifacts by transitive content generation
+108ac750df0aa53355d43a47718391460a0e52fe	-	superseded	v1-rajit	macros: represent generation target with the project path type
+dace625c8269ebeddad3da36cdade7475055d9d8	-	superseded	v1-harness-dist,v1-rajit	macros: retain product tool provenance separately from the Cargo oracle
+44383badbe1b982749a7d36018a66dcb2d81ac71	-	superseded	fork-ci,regen	nix: use the reviewed store-bound artifact contract for Nix packages
+9487acde34b4f7b3851451fd7a018a6c302b00f2	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	macros: bound native generation lifetimes to live consumer handles
+2ac9deda13385f63e24f2273fab575a70f39d515	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	macros: format the scoped generation-lifetime milestone
+482065fe565e9ca6ccda9a025ca181f562bf0cc8	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	macros: share native server pools by load epoch
+5dfb81b310dc5fd3187a83463794979605c88640	-	superseded	v1-ra-load-cargo,v1-rajit	macros: expose shared snapshot cleanup through the loader
+1394bd33fea4ed6c913594dfb33fc46a2152df8a	-	superseded	v1-export	codegen: bind admitted entry paths in the local checkout
+8e1e3340576d1ba262f650eaaedfd1bd566d8675	-	superseded	v1-rajit	macros: key cached expansions by the loaded library generation
+f295a3e0af148e7f358d95744b9203a8b87db38e	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	macros: fail closed on producer inputs and lease owned generations
+f7e9f24fbcd1ae209e23f45cf2b40a5cdedf8830	-	superseded	v1-harness-dist,v1-rajit	macros: add cold loader and non-vacuous reload controls
+48f358ca5e2882ffa951886b3be485fc17780cda	-	superseded	v1-harness-dist,v1-rajit	macros: pin actual cold producer libraries and count only directories
+e701d288815d6bf9fa9e8c66810bfb13f57890aa	-	superseded	v1-harness-dist	harness: reject vacuous proc-macro mutation and reload controls
+2d9b313d7903872d64621a1b6656fb22eb70c37b	-	superseded	v1-rajit	fix: bind supplied macro artifacts to producer bytes
+7181ebfc03a1bc41344b3c5282d8f5e0f70ae014	-	superseded	v1-rajit	fix: load producer workspaces once
+f95be2a22f170a72576304f70d2465ff6fe64201	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	fix: recover producer leases and reject changed builds
+0d5357fff39507635b63f4eb34e8426f8d8b961a	-	superseded	v1-rajit	feat: describe owned macro roots from planned sources
+c79125136d69077395d87c861c5776a0a69260a2	-	superseded	v1-harness-dist,v1-rajit	fix: keep the supplied macro oracle in the harness
+5bb0b4a19e0ac7dd677ee96c8782a5ab78d38fe8	-	superseded	v1-harness-dist,v1-rajit	fix: retain macro proof through reloads and plain cargo builds
+37d982c421d06b554eb1e0c81b775d8193096d12	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	fix: retire producer directories before recursive removal
+97a653a8d9c0c1db6d2e74f68e64066b5e6fd8a3	44b9a9259946f9d5afc4d0e1977dda4260038d93	retained-partial	v1-harness-dist,v1-rajit	feat: compile source-only planned proc macro producers
+12a34f998241c1013f21632bbde9f62c012e71fa	1de6ee04c98eccb4141872b9fff7c5a645930467	retained-partial	v1-harness-dist	Verify source producers in blaze's own macro server
+766959ad06ecbee036b4234d6b7a826ceff0101b	-	superseded	v1-harness-dist,v1-rajit	Keep wrapper provenance errors out of compilation
+512bad262def4914f420539e01a8510a3e9d29ff	22dfa078791d5dc90d7a880e2507289e33d92701	superseded	the V1 unit graph and blaze-spec: V2 has blaze-units	Derive host source producers from the application plan
+ddaa87d1f180ee9caa5bc5478f676f2b24848259	28aedfb77a741d102ae451fa1cb9086b67b159e9	retained-partial	v1-harness-dist,v1-rajit	Run host producer build scripts through blaze
+db5fced0614264d8d2337d5c1cb68bc7d2aeebf1	-	superseded	v1-harness-dist,v1-rajit	Resolve producer provenance through directory symlinks
+a31441f8ee63ff82184ca1c811a94de4697e02e1	-	superseded	v1-harness,v1-harness-dist,v1-rajit	Read identity environments without Unicode panics
+623e738bab25ee3bf5ffe97ae328cb5ad742646e	-	superseded	V1's compiler-probe acceptance (hir::compiler_acceptance and the producers): gone; V2 checks with its own diagnostics, see harness/forkfixes.py	Check producer source probes through blaze
+13e9a54e024a7f55ae45bde4b51e501fa9e5c16e	5cf69875aa239a0d69edeab97219dc8c7d0a3aa0	retained-partial	v1-harness-dist,v1-rajit	Match Cargo's build-only script debug environment
+99ec031085ca955f1c355cfedda6f480c91cae05	-	superseded	v1-harness-dist,v1-rajit	Preserve producer child environments as native strings
+62f2fb9175140beb50a0c22874df68834fb77da0	-	superseded	v1-harness-dist,v1-rajit	Report source build syntax errors before linking
+af2ec482495fa99e9b95940a5ca919e8c89c657f	-	superseded	v1-harness,v1-harness-dist	Drive strict macro witness through the product CLI
+8c9c6c9e21fa84044a0cb259be6ecd03bf57dd5a	-	superseded	v1-rajit	Answer compiler queries without an external fallback
+49263eeda1258191a962a12165091f7353ffabf3	75ca6cc01afa3e38841f1fd8b7e27295e36e897d	retained-partial	v1-harness-dist,v1-rajit	Refuse undecided compiler probes before publishing producer cfgs
+98b6f791157e06306cbc5c453e0c6d584cd99809	-	superseded	v1-harness-dist,v1-rajit	Keep request environment values out of linker diagnostics
+76378cb5903400f8b37d1c5e1829e0bdfc8d917f	-	superseded	v1-rajit	Share script debug settings only for equal native units
+a351df3586999d69080935509cfd6ab384d6af5e	-	superseded	v1-harness-dist,v1-rajit	Reject syntax recovery roots in producer dependencies
+791e78025b8faf691b922ac2d98b8287b853f286	-	superseded	v1-rajit	Own workspace build plans without Cargo graph or config queries
+80a8430b4e2b8ade9fba2fb5a00cb74fb8327403	ea406749fe13f22f01d1702621ffe777e50ebcb9	retained-partial	v1-rajit	Carry native client environments through daemon builds
+05a881335ada28b90ffb267a3cdcb05689585337	-	superseded	v1-harness-dist,v1-rajit	Reuse immutable owned producer images after content validation
+94750c64997a382cb3f8577d7fbedf8c74cfa88a	-	superseded	v1-harness-dist,v1-rajit	Keep caller environments out of serialized producer plans
+ed2a0bbccfae314d8aa60ce2f858da18539385be	-	superseded	v1-rajit	Compile whole-build scripts over a separate host graph
+529bfe616bee9f4e4ed00d225cb242753c78c60c	-	superseded	v1-rajit	Answer compiler queries with Darwin deployment versions
+57674d98533e2da28ccea3c73a21b8a2ceebd84f	-	superseded	v1-ra-project-model,v1-rajit;docs/harness not ported: harness/norustc.py	Resolve sysroot tools directly and audit rustup processes
+c01489904087c434f4998e9a40670c3a8af95c06	-	superseded	v1-harness-dist	Keep registry producer witness green on explicit compiler gaps
+2cc5a4ab0b09dd0761cc2f067fec8e0eabd34ba6	-	superseded	v1-rajit	Do not serialize caller variables in temporary compiler probes
+bb32c561520ae9b5eb33c0770529c69752d064fc	-	superseded	v1-harness-dist,v1-rajit	Build nested host producers through script and image leases
+9a25e31c8ef369fd4b2d92c441d346a6f4cb833a	-	superseded	v1-rajit	Load workspace producers without compile-time Cargo handoff
+6e0c55c3be7ff14e328055a154e52453213e1e0a	-	superseded	fork-ci,v1-rajit	Fix producer image identity and native request environment filtering
+79bc5ce8c4cfe36cba83011f0ee24df162281349	534ce7890296fcb0a4d3b053f9f5b91dc478949c	retained-partial	v1-harness-dist,v1-rajit	Keep caller environment values off disk
+1014de93c884a288c61bcc3b918c0c0ea3cd902f	537581a2ced321847b314553adb7f64d47d0463d	retained-partial	v1-rajit	Fix replay transport and Cargo dep-info compatibility
+e32e547662df400647cba49f74ded256802421cf	-	superseded	v1-rajit	Build cold programs through owned producers and whole codegen
+d0ffff2f1a6f2eddb09f0932d5e66f0ae67994f8	-	superseded	v1-ra-project-model,v1-rajit;docs/harness not ported: docs/cargo.md,docs/no-rustc.md,docs/self-contained.md	Fix default rustup discovery and project-model regressions
+2388d3147601018bc44127767ed06c7980241c0a	b67b5a757cea70ca381eb50dd994188308ebb88d	retained-partial	fork-ci,v1-harness-dist,v1-rajit;docs/harness not ported: docs/cargo.md	Implement and verify owned LLVM output for proven empty libraries
+d60fe59cc19fecf38aabc1b2a944d9dafe4ed97e	-	superseded	the V1 unit graph and blaze-spec: V2 has blaze-units	Compare locked dependency graphs independently of Cargo.lock formatting
+73ea9443c0c2eda8acbd8447f702447c0d205102	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	Finish normal blocks before emitting cleanup landing pads
+269390aa4bfd181b1f04a45228c9e90ee3ad89d0	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Place current input discovery and source identities in vendored queries
+a16aadbe807ecdbfe5ae38ec9013b7c3f7abc99a	-	superseded	v1-rajit	Resolve installed toolchains for fresh owned CLI builds
+0774cfad85582e3610a68ae35249a5e84124748e	-	superseded	v1-nix	Refresh C4 Nix graph after toolchain discovery dependencies
+5c3ec4044c37ec4570a711213558b100f126e20c	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Preserve serving producer epochs and fail incomplete input comparisons
+48083980b500899b5ab237f97443ad6b124aafe2	-	superseded	v1-harness-dist;docs/harness not ported: docs/harness.md	Make the plain producer token-at-rest gate reproducible
+a6304f0a0b835046439c4f5c4c73971f22448234	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	Detect producer write-and-restore races and unblock link-only IR probes
+bd9344889df5d49ce74eec994a98b0bc14a64dca	-	superseded	v1-rajit	Keep one private environment key per freshness judgment
+c0a7c6c6b046fd963cf2de9ff7474a451a79be4f	822fb6214089b636563b5e2e32cd658e67bd9642	retained-partial	v1-harness-dist,v1-rajit	Validate capped warning options and require real probe parity
+b4b5aa1087d8e8d4890d910446ed8d21d8da889f	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	Bind supplied producer validation to loaded snapshot bytes
+815b01b11d1376bdfced35fa39939508405ec10c	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	Snapshot LLVM target options before mutating the recorder
+d2cafe0f5a8571cc0b865f30bcc9edb4fae8bacf	-	superseded	fork-ci,v1-harness,v1-harness-dist;docs/harness not ported: harness/norustc.py	Trace strict producer gates and run semantic regressions on the fork
+2952cbdb113b29b379f4b2e86396947636a8d3ad	-	superseded	V1's compiler-probe acceptance (hir::compiler_acceptance and the producers): gone; V2 checks with its own diagnostics, see harness/forkfixes.py	Validate metadata source with owned semantic queries
+ffb5c46097eac551f0fb83b76a87c6dd986ac18f	-	superseded	v1-rajit	Discover component-composed toolchains from installed release facts
+43c982519b978eeedfe8974b302dd937fa647f2e	-	superseded	v1-rajit	Require both installed toolchain version and commit facts
+155382e0b614dbd26426ced486bd13f11cbc1f46	58f42b15795ccfd63405b5f74c9d45089eaa128c	retained		Create the slow-test marker directory before recording execution
+cf529a630a67ddbe4f3f50e281bc485c08643134	-	in-v2	harness/forkfixes.py on a stage 1 of this branch: unresolved-paths (ok), unresolved-bare-value (ok)	Diagnose unresolved expression paths in metadata checks
+8637ff86be1ead1de6007f96ab5374f82ab2f37e	-	superseded	v1-harness-dist;docs/harness not ported: harness/norustc.py	Exclude toolchain macro servers from strict owned bootstrap
+8d68c1de1ae6cbabc65f8d2fcd33140204a50d8c	-	superseded	v1-harness,v1-rajit	Honor explicit expansion-server disable during workspace loading
+6b02dba4d36b5c3745357c9e748c7aeb5dc24fd3	-	superseded	fork-ci,v1-harness-dist	Keep fresh bootstrap and plain producer evidence auditable
+74eb2a2228d754efb9d71023f26c196ebce7e04f	-	superseded	v1-procmacro-srv	Bootstrap the proc-macro protocol without Serde derives
+80f5522cc2cad259be36e2e3295c4620d19df15e	-	superseded	fork-ci,v1-harness-dist;docs/harness not ported: docs/no-rustc.md	Require a complete server without borrowed bootstrap expansion
+a8a720d16cda365e2ed24877bd30b072f9044077	-	superseded	v1-harness-dist;docs/harness not ported: harness/norustc.py	Isolate owned bootstrap caches and use real witness host facts
+05e02a4b90bb55a414029f56ca6ffec522899427	-	superseded	v1-harness;docs/harness not ported: docs/cargo.md,harness/coldbuild.py	Exercise and describe the default owned program route
+bb7232ce813ef98b360a2f627facb3fc6e9574a6	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	Keep enclosing producer generations leased with live libraries
+e21707e6d3a042969f0b0b7a607069ba3b2eb4ae	-	superseded	v1-harness-dist	Require registry producer capability instead of accepting a refusal
+0a63be74b34ea3ed1746a20707ae31547337e9ad	-	superseded	v1-harness-dist	Name and pin the owned server in the strict macro witness
+8e3ead109413b1459fe5c3594b6ddad41b249b87	99aceca175ffdeb6f241680badfa20bd2373b694	superseded	the V1 unit graph and blaze-spec: V2 has blaze-units	Resolve cold metadata and preserve lock policy without Cargo retries
+332b204de698cd1e57c9c99f9667a366faa595bb	42c3a103a85191ed4a80c7606187212c731a4a89	retained		Record strict cold CLI and atomic-lock negative-control evidence
+d3b8099107789b7e7e3f6d999f872f6f44b49b1e	-	superseded	v1-rajit	Execute captured producer graphs without rediscovering Cargo units
+1f27302dfa8fc5a86921a9738f18febd56407ffa	-	superseded	regen	Share native unit transport with explicit private descriptor redaction
+42abdbad3b39ff682b20ae16dd745718058706b5	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Carry captured native compiler contexts over private stdin
+57e8883ae21d00824f7f80a763980d825d762eeb	9bf35a7cae96aecd7a808a2823aa4c7f85467f19	retained		Frame native Windows descriptor values as UTF-16LE
+0cd1177b51613361671b2052db82379b3ffdf9eb	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Bind typed native settings to compiler unit instances
+cfb7456830b0286b30f7d2ffe85aef5fabc8ad72	7d12fb2dda8d20306376b649312a3511614fe712	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Install private native units and preserve non-Unicode environment errors
+64a4bad30626a731150bc4ac3bdc8a8a00b3e15c	-	superseded	v1-rajit	Keep external native symbols stable across content edits
+c7595007bf6cd2643bc1158bc1e80d2988b29a12	-	superseded	regen	Provide strace in the pinned Linux audit environment
+96efc724a41c51c7faa555c825fc6bc3fdaebdbe	5d5e37067656c619b5afc6aa7086188fe6559271	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Preserve native source topology and private producer input identity
+fad80b396f93c572d41f3d24f61461124315d7c0	-	superseded	superseded-by-v2-units	Give canned native probes explicit pathname query answers
+d6aac5ebd645fd6ad1f20c412bee8c819c818c50	-	superseded	v1-rajit	Keep optional Cargo version queries inside the owned boundary
+200cb7d658a12b4fc15649a31a7f25141e3d17c2	-	superseded	fork-ci,v1-harness-dist;docs/harness not ported: harness/norustc.py	Require an owned runtime and zero compiler dispatch in C2 acceptance
+7e63dc97ce9e85d542f9b32d3c8fb6ceaf3f114e	-	superseded	regen	Provide the process sampler for guarded Linux validation
+7d30104286e03caf343df4213b444babe35b1c0a	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Read cargo configuration from a captured image
+d8dbd1df1b15b7aa23addb5a46239b9090ce7ce5	-	superseded	the V1 unit graph and blaze-spec: V2 has blaze-units	Skip the HTTP client for path-only locks and do not keep a failed one
+1323883637f403dccb6d9d77080318fe9d07a44d	-	superseded	superseded-by-v2-units	Name the replay layout by canonical directories
+a492f45cd5f8ca1292bee4278de5e4e654976912	-	superseded	v1-harness-dist	Run the older BuildSpec harness against snapshot replay
+54283316276a985dbe1455bd97c4c975825f2b64	-	superseded	v1-harness-dist	Move the bundle and plant a config above the replay in the saved-source test
+ece55bc0e0e1b50db407157fa8150e477512de09	9b5aba7f21b190d165faa74e67597dde69454137	retained-partial	superseded-by-v2-units	Keep a Cargo home outside the workspace in the snapshot as a mount
+73020994bebe12d8b53fbd514359832423653973	-	superseded	superseded-by-v2-units	Test that configuration above the original workspace is captured and replayed
+5d6131fe37fef059128f5225a097028f9985fd93	-	superseded	V1's compiler-probe acceptance (hir::compiler_acceptance and the producers): gone; V2 checks with its own diagnostics, see harness/forkfixes.py	Reject compiler probes that bind one name twice
+377a3673bb3fd5abc14f42178ad7a4e00b452ed1	-	superseded	v1-rajit	Place producer state under the resolved Cargo target directory
+47b6a115cf79d9765def1b6315b833c4e980edde	-	ported-pending	fixed on this branch in 634170a37; rerun harness/forkfixes.py: raw-duplicate-import (fail)	Normalize raw identifiers before checking duplicate import bindings
+f36949f1c58941fc3f63acb414297c36eb0f62af	-	ported-pending	fixed on this branch in 634170a37; rerun harness/forkfixes.py: raw-duplicate-import (fail)	Normalize raw identifiers before checking duplicate import bindings
+b96b5952189fef6fd8d52936a7d0cd132c633b44	-	pending	run harness/forkfixes.py: column-counts-scalars (timeout)	Count Rust source columns by Unicode scalar values
+33728405e0b395614300edae24d4662a81b8348c	-	superseded	superseded-by-v2-units	Bind native compiler and linker search roots to replay platforms
+10461db57ea303967c8277efd5bdc113f4135202	3e056cba7a04a913f8d561644247f9893a996c3e	retained-partial	superseded-by-v2-units,v1-harness-dist,v1-rajit	Execute owned Cargo selections with exact producer and runtime inputs
+e1af01b60a42171ac0e36a5c09e45f99390f279c	-	superseded	v1-harness-dist,v1-rajit	Preserve Cargo source naming in owned producers
+3fe22c3ffcbe41e78cea0e61a2c1c92689ef38d3	-	superseded	v1-harness-dist,v1-rajit	Preserve host cfgs in owned producer compiler descriptions
+6dfeb61fe7a35a7751d38d41cd2160ff31e9968b	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Keep build output provenance separate from OUT_DIR overrides
+c582ba51023e2c6360a2647c2ad6fb4330aeb687	-	superseded	v1-rajit	Track producer output trees independently of OUT_DIR overrides
+ddcf7b762c4cc3bb5dd0a83ddfa9b2c355f520ff	-	superseded	v1-harness-dist,v1-rajit	Preserve producer execution inputs separately from compiler policy
+c04bf07c7b24d88ba1fd98d33b735ef191c64a91	-	superseded	v1-rajit	Bind producer snapshots to actual build-script output directories
+e47b13c5133b16496c0c3e860a4ecc6244ecb643	-	superseded	superseded-by-v2-units	Run no program the requester shipped while reading the execution platform
+5e3bd78fe380061595a9ee4ec0b8f5967dd603c3	85cd4e01d9956f8434dca513808dd0c155c05763	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Replay the configuration from the files the capture read
+29dc31c88d2d04d7eaf966e5534f1594ce78e5bc	895333176937a9337638354ecd991fcee3985496	retained-partial	superseded-by-v2-units,v1-harness-dist,v1-rajit	Give a replayed program the environment Cargo gives one
+a47282674cdad2a415e5a9d7d5420dbb1b13b4c4	d45aad553e4bd66904ba72ae0fb1e8aee2f72df4	retained-partial	superseded-by-v2-units,v1-harness-dist,v1-rajit	Replay an option_env! of a variable the requester did not have as unset
+13455d8c0205268747047505597fd283d7a6a4da	5a8d845161eaddffea26d68a072fd0dafdc6f34b	retained-partial	superseded-by-v2-units	Give the snapshot manifest its own size budget and name the refusal
+ded0fca3743d43c3cbfe1243f8e1855dd5dc6351	-	superseded	v1-harness-dist	Harness: a requester's tool is never run, and a Cargo home above the workspace keeps its place
+e4af260e15cd80913d7c7e1c1376396fa0e2bb6c	-	superseded	superseded-by-v2-units	Test the order of the configuration layers a replay is made from
+4e1e1a13d59c5a3b9f95a3d511b2a65da9206e52	-	superseded	superseded-by-v2-units	Preserve native input authority through ancestor symlink prefixes
+6a03d902d635e86e90f37107e50ae7427a813b4f	-	superseded	fork-ci	Bootstrap an owned runtime before saved replay CI
+39ba0687370ab106f2c7653bb4d36a945362b90b	-	superseded	v1-rajit	Keep compiler diagnostics separate from function statistics
+fd51f88fc4e5d14f92d9b43862eb69ef9c0d360b	-	superseded	v1-rajit	Match linker-script input search order during replay
+cbe3b1a1136601438a1c6345fdab4ee84eaf0a33	-	superseded	V1's compiler-probe acceptance (hir::compiler_acceptance and the producers): gone; V2 checks with its own diagnostics, see harness/forkfixes.py	Answer a compiler probe "no" only for an error rustc certainly reports
+2f4e6047941aeacd9e36cc66feff4cc7860fd2e0	-	superseded	V1's compiler-probe acceptance (hir::compiler_acceptance and the producers): gone; V2 checks with its own diagnostics, see harness/forkfixes.py	Leave a compiler probe undecided when its body was never borrow checked
+a716ebae4ba7bb6e40b4b309c564d331b6ce780d	-	superseded	v1-rajit	Key producer images on what they read, and collect those no build leases
+406a7dbf446baf1b448bc8ce64a773ceda8ac257	-	superseded	in V2: crates/blaze-units/src/read.rs rust_versions takes rustc's release when no member names one	Resolve for the toolchain's rustc release when no member declares rust-version
+db6a10fe24a507ce193428193d4a2dea36babecd	-	superseded	fork-ci,v1-harness,v1-harness-dist;docs/harness not ported: harness/norustc.py	Reduce execution audit overhead with kernel syscall filtering
+5024624d61c8dfd4c0c61bd3692fb6200ffe27c8	-	superseded	v1-rajit	Keep a load's producer images leased until its client loads them
+b5de7ae4ca72a17e27c9cc3428bb227ea095d852	-	superseded	v1-rajit	Resolve a copied rustup proxy to its toolchain release
+a8a6bb5872167b3e7fb2c9f1fa2aaa3e77bf7969	-	superseded	v1-rajit	Keep the settled compiler explicit during owned resolution
+14043de98fe78994fc7c9ad2225987b6745fd39a	-	superseded	regen,v1-nix,v1-rajit	Index split standard-library archives for native consumers
+5f1ccf155458e0c98b0d7bf317eb42016cebfef0	-	superseded	v1-rajit	Preserve ELF symbol metadata across archive members
+23a91f470d55a5d08e319699960bdc845b1a394d	a93ee557384495c5bce346be91155fb37d931421	retained-partial	v1-harness-dist,v1-rajit	Export admitted native link requirements with library artifacts
+f715001f4100f061d4259674ef18fe89f96971db	0edc977170932d339f6bf2f0cf4239045b2af23d	pending	run harness/forkfixes.py: cdylib-allocates (not run)	Provide allocator shims for exported native libraries
+22ca333a823cb8e613fd1290b2d5e63b604aeb61	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	Release producer leases explicitly, so a forked child cannot keep them held
+6a0c68d1628c2dc9937b968cbf521190b9a29818	298eaa83e2eebc93d7924efe0bffb576dea45a7d	superseded	V1's whole-build scripts: V2 runs scripts through serve/unit/script.rs	script: rerun a build script in cargo's own OUT_DIR as cargo's run, under cargo 1.99's locks, and compare what cargo reads with the run the build had (u8-buildscript) (#5)
+e4f04854af120862755a211cddad7076001b2cae	-	superseded	v1-rajit	scripts: run a build script again after a build-dependency's script ran again, as cargo does
+c89e18e6f346e65707d60d84786a4a1737dc3701	-	superseded	v1-rajit	scripts: run a script for the host only for a package built for the host
+4518207434cdbdabda9fce71f087c905a8040cdc	-	superseded	v1-harness	harness: judge blaze's owned build in PR5's table, counting runs where the build ran the script
+35b41c736ebc4bfbd339af04b234f8fbb7b9a617	-	superseded	v1-rajit	Make native archive and Cargo lock tests portable in the pinned shell
+0fd1cca13cc7f64ffb5a6c5344dd620c15f724ff	-	superseded	superseded-by-v2-units	Keep native platform controls consistent across captured replay
+f2a16cfcaac6a4042e07349d68517f71876a3db7	-	superseded	v1-rajit	fix: use the workspace toolchain for owned planning
+8c9df6dbc83659784a814aa87f1180f583249e38	-	superseded	fork-ci,v1-harness-dist	ci: split C2 fixtures and saved backends across jobs
+fdc950284e62a8d66e969e03f58c2aaf8f1dcd8b	-	superseded	v1-rajit	toolchain: the settled-resolution test takes its sysroot from settle, not by reading RUSTC
+063d7f88afe65625644d618368181f2e5649ac44	c6c10d98d1498618e6128f1443ea701e32759476	retained-partial	superseded-by-v2-units,v1-harness-dist;docs/harness not ported: docs/reports/C2-NATIVE-CLOSURE.md	docs: clarify saved spec instructions and comments
+ab14ea91f4e94f107245335b5309c955ca29cb5d	11fb33fea73fb8567bbc7ed10e4801545fd5e8ec	retained-partial	v1-harness-dist	docs: simplify producer report and harness comments
+d1fbbf97d49f27d426f775319769ece9f241453f	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	fix: preserve native compiler reads and reject invalid Unicode
+c69fe89a60347f5ebac7d54a9958c475eba3cace	-	pending	run harness/forkfixes.py: a-required-feature-of-a-dependency (not run)	fix(metadata): honor required dependency features across host and target
+66f2572229d7b5b5832541243605841fc6720744	-	superseded	v1-rajit	fix: preserve driver and linker argument namespaces during replay
+97067a1758044b1a3a251b8e7eb552eb72b9c3d1	-	superseded	superseded-by-v2-units	fix: retain the validated worker PATH for producer execution
+e2c9bb4b72816f54fab8dcc258f20e6a3b810688	-	superseded	v1-rajit	test: cover raw receipts across canonical crate instances
+6228859ab87a52501b993a32ab6696f00397a7ae	52e7f119674506493f310bd066f1e17e9562b16b	superseded	ported as V2's own path: crates/blaze-cargo/src/serve/unit/dist.rs and Build::compile_granted replace the batch exporter	fix: align distributed cache, compiler exports, and test identities
+bf008bfc95f54fda0ad5a09fb8b316666260e15c	90453edda5d24d171a6080732824b16989ae82ed	retained-partial	fork-ci	ci: quote module filters and record owned cache integration
+fe682508a21ebfd2b45717cef1e9078a39cff634	35a0c1eece5678135d0b55048c38c30d1855ba1a	retained		docs: record final cross-PR cache review and acceptance boundaries
+6580a35a6c21de303bba71bda93a5c586f6c599c	e63b9ddda2b20a9bfee8f272dc3ef90b81845d28	retained-partial	v1-rajit	test: resolve process fixtures from the test toolchain PATH
+42baf57480e182c71cd98d2bdc6029231e9f24f1	-	superseded	superseded-by-v2-units	fix: report bounded native platform capture differences
+430d4f47578deb5d8ed615102aea2b5a9750f8bf	-	superseded	superseded-by-v2-units	fix: admit captured physical aliases without bypassing conflicts
+b1aaef44dd6c714b60e1caa5e8e343b3fd64903a	-	superseded	v1-harness-dist	test: identify published executable copies by contents
+8a7c2dedf8474608bd97c37b6f98cefb1ff8d4b3	-	superseded	superseded-by-v2-units,v1-rajit	fix: reuse native admission indexes within compiler operations
+d616be08bdc1d6647f0871afce8387acf22596a6	-	superseded	fork-ci	ci: retain Tango sample and CPU-time evidence
+262fa7e0f4fb0f178f4583966d12c0991400e2f4	-	superseded	v1-harness-dist	test: use valid reference and descriptor paths for raw filename coverage
+e442c970f22a561b971a39c78ed1319b8cff3d7c	-	superseded	v1-harness-dist	harness: keep the raw-filename descriptor out of the shared work directory
+a7cf7bd9064b23c8a288671dbeeca4608fc06fba	-	superseded	v1-rajit	whole build: lay out cargo's profile directory where it places a program
+738d3c8a329b2af172669e03540eaf4e7f52b5dc	-	superseded	v1-rajit	direct test: keep a bin in `deps` beside its tests, as cargo does
+b89d2357bff6ad7f50945872566774339a848174	-	superseded	v1-rajit	replay: a linker script's input may be absent from the link's working directory
+174ce6649dbdfabde3508f2b721d0bdbceac59ff	-	superseded	fork-ci	ci: the bundle's test sets (seed: dist, c2-contracts)
+b284d77b1a1ed3ea968709a51084cdf1923371d9	-	superseded	fork-ci,v1-harness-dist;docs/harness not ported: docs/harness.md	ci: reserve the fork cache budget for the shared bundle producer
+ba9ac95b37f39bcc874524ed01644cfd10be2908	-	superseded	fork-ci	ci: pr.yaml builds a commit once per platform into a verified bundle every check consumes
+141234dced6ccb4851792748bdbcea7f379bebe0	-	superseded	fork-ci	ci: bundle-check runs the platform-only validations once per platform (norustc_test, C2 contracts)
+4e2d47290d2d7752d509a304aaee7d9e1d05e8f4	-	superseded	fork-ci;docs/harness not ported: docs/harness.md	ci: consume shared test and benchmark bundles in server and bench checks
+c410959f0b7af1f5511bed63d0d7660c9e746650	e387cb6b7de62cc0f084f560b01e68a101536bda	retained-partial	fork-ci	ci: wire server and benchmark consumers into the shared caller
+b92781a879323c411c371a680bf837cee6e7b2b9	5a5522f33408a71de2b18e6544905b0a0a178d30	retained-partial	fork-ci	ci: prove consumers reject corrupted bundle executables and benchmark pairs
+000056fc3d7ebf7f1aeab59f30fd5cc4d35779ae	13084dbb0f0997e39c0782ee8fc9e8d1e34aaaf4	retained-partial	fork-ci;docs/harness not ported: docs/harness.md	ci: dist-review consumes the bundle once per platform; macOS lanes packed into four jobs
+7e34bb9adf084e793ed4023bebb395a81c820545	a70dc8ece30e58e73a82838728a3cf228faa1755	retained-partial	fork-ci,v1-harness-dist	ci: the empty probe keeps its debug ra-jit; consumers restore the Nix shell read-only
+c962df3810eeb6428305784ff61110722150f3d2	a591dfb343a2c1c48468a9b393aea93a680901e1	retained-partial	docs/harness not ported: docs/harness.md	docs: the fork's CI (pr.yaml and the build bundle) in harness.md and reports/CI-fork.md
+a1e12684824d5a81425761d67bdae8c4825444ad	-	superseded	fork-ci	ci: bundle-check's timeout has room for macOS's contract tests (34 to 45 min on PR18)
+c73ef788fe04fed496904c5cf698c9e0391de7c4	-	superseded	fork-ci	ci: the producer keeps the owned runtime's bootstrap evidence, which the checks no longer have
+7804f812c78845633e7ace221a2de09d08e9eb16	1ad2334f6d67f4f1795023b50872405a3f7a7370	retained-partial	fork-ci;docs/harness not ported: docs/harness.md	ci: the C2 runtime checks in two tiers; a pull request runs Linux alone, the full tier macOS too
+090d1457f2a63a0c7d1c0981f7ee73a4e9ca6798	-	superseded	docs/harness not ported: docs/harness.md	docs: saved_spec.py in the harness table, and a runbook for the C2 checks
+e36eeaea0a73c3244853fe6f198772677c3d6c55	562e3f7b1f92735b314ab3d064650c1c81853a83	retained-partial	fork-ci;docs/harness not ported: docs/harness.md	ci: a push to a pull request's branch no longer runs twice, and a closed pull request's runs are cancelled
+902d59b09de1bf3fac1acc8291b13d81c15cda77	-	superseded	v1-harness-dist	test: bound shared-cache phases by explicit daemon shutdown
+723ce21dd1b1a4a1799c808361b7c8fc8d0a8e78	c16459361cf7f0a0a296f426e9a2796d13feeae8	retained-partial	v1-rajit	fix: retain caller origins for Cargo loads and cache services
+955120c327dcb5385c7a8f51afd7c0ddf820703d	-	superseded	superseded-by-v2-units	native admission: a root spelled with `..` answers for the paths below it
+7cc8c7b3a937d7e3c23c626983e9dbece44d8893	-	superseded	superseded-by-v2-units	fix: walk observed parents below native search roots
+77da6d761d53ac030b39388f5291e721fc02f679	-	superseded	v1-rajit;docs/harness not ported: docs/cache.md	cargo: a build or run with its own store and remote is the one-shot owned build, not the daemon's
+71b9db827fbb61088ae0ed0687226aaf5083e60a	-	superseded	v1-rajit	Keep the settled compiler explicit during owned resolution
+411957aee23b79974e17b283ccf232cc1c4b1282	-	superseded	v1-rajit	fix: use the workspace toolchain for owned planning
+b0240241b7b8f5d831812c2aa33486c099b85b63	-	superseded	v1-rajit	toolchain: the settled-resolution test takes its sysroot from settle, not by reading RUSTC
+a04e9fd0eb273665aa1d11de3d6a9be58e70bae6	-	superseded	v1-rajit	Resolve a packaged rustup launcher on PATH to rustup's selected toolchain
+e05d1b5f00baffb86bfcad2dd324bad80c34310b	f7873e3bfc239874ecd73b82d005bab48eb774fa	retained-partial	v1-harness,v1-rajit	docs: simplify prose in merged fork contributions (#27)
+e5ab0983882d22a04a2acf25d84e0ae0ce11f2d0	6f63d48acf76a33f70881dde8bb0f23d152055c6	superseded	ported as V2's own path: crates/blaze-cargo/src/serve/unit/dist.rs and Build::compile_granted replace the batch exporter	fix: align distributed cache, compiler exports, and test identities (#28)
+80658c286c972cd0250d4c2f89a91e1b43c294d9	73cd1c54e82092ba4e0f42a060f7041666c1887a	retained-partial	fork-ci	bench: record the runner's CPU and the pair's digests beside every tango verdict
+da87a58d8170b98439f8394b6b5a20971c648dc5	-	superseded	fork-ci	ci: the bundle job saves sccache even when a newer push cancels it
+8be411141ef854d86285ec7d9ff1464990be5732	-	superseded	fork-ci	ci: toolchain/save's own steps run after a cancellation too
+1818e751e9e69e6f71891564ad414d15a23294f4	f7a28add557ed26b3b346477a80b8e852c77277a	retained-partial	fork-ci;docs/harness not ported: docs/harness.md	bench: fail only when the same benchmark is slow twice, and ask the runner for an A/A control first
+6ae5e5cb512bb34afaf5a443e264d332bc1dee6b	c8d4bd977bd3e53e4b4232d474fcc6c66271a942	retained-partial	fork-ci	ci: no blaze setting in a consumer's environment, and every C2 lane of a job runs and is recorded
+86e2a6c3f05ea4cfbe08ff8e5c8b18b80f4d80c1	e84904c09766b12ca1118563d4840e953ccb722f	retained		docs: align C2 execution status with owned replay implementation
+940a5582c99fdf7152cf1f134ec7f9ed1ceb43cc	-	superseded	superseded-by-v2-units	Read a bound platform in the environment a replay has
+4b9546e8dfde4601ab99efc47b58da62b981a7c6	-	superseded	v1-rajit	Preserve owned compiler diagnostics when a replay rejects stdin
+1f32f6b32a0bfe2be194043a8d1f2d11cd2b9233	-	superseded	v1-rajit	Report a producer build that stops reading its project, with what it said
+7974d14e092ac12ae509cc9d2d216cfe2b1efbcc	c4ee4cfee514c31cef710c214c4b2330de5a14ac	retained-partial	v1-rajit	scripts: carry no fingerprint to cargo's leg, and hold a daemon-made run's fingerprint to cargo's bytes
+ce5a92af0cddfa870a5e6b5f761e210b542cc37c	-	superseded	v1-rajit	scripts: the host pass takes a build that says no packages as the target pass does
+423e6e5d7fb2b197748146b2ac6d6daff163d024	-	superseded	v1-rajit	scripts: test continuation::consume's refusals of another script and directory
+b0e2f187952c2bba6e630b2f072178e41b710777	-	superseded	v1-harness,v1-rajit	scripts: run once the script of a package built alike for the host and the target, as cargo does
+98f1fc9ccfd10da4d686cc0c19717bc9a9f1fb81	-	superseded	v1-rajit	answers: resolve only a launcher blaze models through rustup's records
+83a5f8536e02b08c406f09d9ff8b58bfe74e2278	-	superseded	v1-rajit	Honor saved compiler policy when launching owned producers
+438e6fac99496ff6ca5804d3d4534ea841ed0834	-	superseded	v1-rajit	Use available test processes in pinned Linux validation
+4eec9cd14c1295c7e1a0f1aec4346b6c529a401d	-	superseded	v1-rajit	Check compiler probes with authoritative library configuration
+0034de280ac8f53e8b7e4edb160477bb4f0c1e6a	-	superseded	v1-rajit	Exclude producer output roots and preserve macro crate cfg
+79b46a2e1cacd06b1b9b398c646e8a374b5cd478	-	superseded	v1-ra-project-model	Include proc_macro cfg in Cargo consumer graphs
+95671437e3dd28c44b2ebdc4687e0d1fed163db7	-	superseded	v1-rajit	Carry proc_macro cfg through producer dependency leaves
+0b833a84da5b9b4c9916ffbf4474e2405f52ae65	-	superseded	v1-rajit	Complete producer cfg test setup for shared host units
+7a3dfa152677fba357dc767140ff213eb74f6497	1f8866d36f7d9a22bd17e52caf2112201522b95f	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	macros: start each generation's servers with the environment of its request
+c38130cc9e00de902d52b7140e8739acddaa8f44	-	superseded	v1-harness-dist	Fix private macro environment transitions and contradictory reload checks
+d7983e1bf6620e3dd4dc96af904136beeebf7d11	-	superseded	v1-rajit	answers: the compiler-probe load test names its project origin
+9267b545bdfd714b78882d7276907b758a782a91	-	superseded	v1-harness,v1-rajit;docs/harness not ported: docs/harness.md	scripts: a build script's run and compile for the target are not the host's when a links dependency's features differ
+ff1c8922ccc59a60de5aaf78b50b587a4ea507a4	a8d8d52c831545a5ff51e5a7b6815530b53c995f	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	Bound a replay's workspace walk at its snapshot, and name its record by content
+abfa380e1d21f628f1979cb5da7a3729407551d3	-	superseded	v1-harness;docs/harness not ported: docs/harness.md	scriptrerun: a carried run is refused once its stand-in names another executable or directory
+82054ca6fe6e6c7f219d6e92c9fd564257962555	c51b1e03eedf48f19c538374af5fbf276a304a70	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	macros: a request with other variables than the servers' loads its macros again
+cc33c1256f1ecf4cc8943756f5a3babfec2d313e	c0ec38e4bce1c08b98338e2c3b824e49038f4e49	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	macros: key a kept expansion on the whole environment of its server
+b6e96f61023fba515e0e4e8865d35f6a7b43bc67	d1dfc44931dbcde417e09d92bcbb4b034e892c4d	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	macros: an expander of servers with other variables is another expander
+77ebdc01d8b200f404e14f6525a9656a054be9d8	-	superseded	v1-harness-dist	saved_spec: the dynamic case links both legs without Nix's run-path flags
+6b08819ad75d55e7f4ae2fffcf7ea702575c38b8	-	superseded	v1-harness-dist,v1-rajit	link: a script's libraries are found where it wrote, not where it renamed OUT_DIR to
+88b220e61614e483dfa0c6fcc992a502c2e72c02	-	superseded	v1-ra-project-model,v1-rajit	build scripts: the description names where each script wrote, apart from its OUT_DIR
+377b13be812124a5d5f390855032a9c1388f2e49	-	superseded	v1-harness-dist	harness: release saved replay scratch after each C2 comparison
+6b9df318605a3d0d00c34298755c316664244e41	-	superseded	v1-rajit	build scripts: a described library's line carries what its script asked the linker for
+c502dffd674b2eb9c680bd2f21a4359cecda80db	cd09e8e8889c1c806dc52aba552538f4c5aff0ef	retained-partial	v1-rajit; harness/forkfixes.py: a-script-searches-where-its-build-dependencys-script-said (not run)	build scripts: a script's run searches where its build dependencies' scripts said
+06327c3ee31956ffffd64a65f721ceabc9a2983a	da3b8077c500ad270d210bf65f9fce4192fc335a	superseded	V1's native proc-macro servers: V2 runs proc macros on wasm	macros: the servers search where the workspace's build scripts had the linker look
+24dfaafddfad602d63d8e2ce30b4c3e19de623ec	-	superseded	v1-rajit	macros: the servers' search covers the workspaces a load is adding
+030159ce37b291e6c5a952dd47b9a4f6e31c5b74	-	superseded	v1-harness-dist	saved_spec: --only runs one case group
+2d3292ec71b37e4dd9d50c3b4c7ad4bc8ea5465a	-	superseded	fork-ci	ci: the C2 saved lanes keep the no-run replay's outputs as evidence
+3eb535cfccb7325c93eb78107066e0673cef753c	-	superseded	fork-ci,v1-harness-dist	Harden shared-build bundle extraction and Nix run-path controls
+89d814aa7e7102f8285697091a89de0b5d053f7c	-	superseded	fork-ci	Make bundle extraction robust against internal symlinks and zstd exit races
+f23051731c222114125887258602928c7fca7318	-	superseded	fork-ci	Fix shared bundle transport and recorded process fidelity
+e109f573573e192252e305165ab2d383191358fd	-	superseded	fork-ci	Close runtime CI coverage gaps and reject incomplete benchmark evidence
+845ec53cf4ef40e30a48f45950cbbb05b14233e6	-	superseded	v1-rajit	Drain compiler output while streaming private project input
+85c966986ec488e1abc0d18fc86f7f5ce709c951	-	superseded	fork-ci	Fix CI coverage, benchmark verdicts and bundle transport fidelity
+298da86f74eee6ae31f9c84ad3a11efb6df637ce	-	superseded	fork-ci	Quote the compiler test filter as a YAML command block
+38ad8741dfb3a6e8f82712dab9a4999c516f81d2	-	superseded	fork-ci	Keep bundle cache saves from exhausting runner disks
+b36efda1cf6c51454bc4af6b9df612772eb27086	-	superseded	fork-ci	Keep nested workspace test artifacts inside the bundle target root
+6ea17913b3af4388aaa0d4f6c331a516a1b5db86	-	superseded	fork-ci	Trust unsigned Nix cache paths when restoring the shell
+6c6a61792a82eb963589ba30a80a5b55d3c69e7e	-	superseded	fork-ci	Require observed cache replacements and run the complete prebuilt CLI suite
+fcab395f7935996b05e7db098792b4ca365806ff	-	superseded	fork-ci	Canonicalize the dispatch fixture's temporary root on macOS
+972fbe245765fe54032cc153757485d960c935a4	-	superseded	v1-rajit	Integrate verified production test and remote-recovery repairs
+937c36922a87ae1360ea10ca1e54b7f7aee92a1f	-	superseded	fork-ci,v1-harness-dist	Use target-salted Nix RPATH guard in C2 saved execution
+a82a71719521142c21c1cb96bb6e66f8655e564d	-	superseded	fork-ci	Run compiler pipe regressions in the saved replay gate
+0837390514f269adb6ee34d82ac432446acf2350	-	superseded	fork-ci	Keep the child namespace test filter inside a YAML command block
+6d9f528aa56aed8b0c987b13897e34b371ab5345	-	superseded	v1-rajit	doctests: a saved run names its doctests from the workspace root, as cargo does
+7083e236f89af4be4447df42c4100ccfb09fe2e2	-	superseded	superseded-by-v2-units,v1-rajit	fix: preserve repeated ancestor links in native captures
+751bb99284dfdad412e6f1f304ddc212b18d6015	-	superseded	fork-ci	bench: both builds pin function and loop alignment
+e4818bdd849262cc95639a36f304638eba979e18	-	superseded	v1-rajit	Preserve test-result integrity and recover failed remote manifest pulls
+b13ad6a7f178b4e4918d744fb058fb03bfd9a02c	-	superseded	fork-ci	bench: a slowdown is judged against the base measured against itself
+b8a15bed409456c28df58c9ecb5984107a4fc7f8	-	superseded	v1-only: native proc-macro server generations; V2 runs proc macros on wasm (rule proc-macros-on-wasm)	macros: a server's environment is named without where the server is on this machine
+b8c7c3a2b5cf85cd037424151e390f7d428477e2	-	superseded	fork-ci,v1-harness;docs/harness not ported: harness/unittests.py	Make harness verdicts reject incomplete builds and changed failure classes
+3c3496bcbdf13eb14f557ab0a3359af3e3fbc67d	-	superseded	v1-harness-dist	Require normal test failure status instead of accepting process signals
+16671e16a83f7ee465f2869ec3acef6b6d266b3e	-	superseded	fork-ci	Run harness verdict regression tests as a read-only PR gate
+dbe4869048fdf4844c7a4d39b5f01c77f028b904	-	superseded	v1-harness;docs/harness not ported: harness/unittests.py	Preserve distinct doctest identities and Rust 2024 result groups
+21430ebd9f572f8bb44ced250caa8a7c1a9b15e2	-	superseded	v1-harness,v1-rajit	Reject incomplete compiler source identities without losing native path fidelity
+9475980b7adb3c53fe3ad63dde72627d26a30bcb	-	superseded	v1-rajit	Keep cache publication separate from installed remote read state
+6c9bd0148c6095ae4569b2f59760fc72794b8ebf	-	superseded	v1-rajit	Recover failed lazy pack requests through existing keeper polling
+767ed750a2bf203b8ade71bab1f29c74907b032a	6837b86a135662bff52f382ea368830fafaebf73	retained-partial	fork-ci	Keep a pending heartbeat alive until its answer can fence a worker
+8cf8a9c79679741e84434eb6bc740cc2447b0c17	83e1941675983f1b9ee2dbb437b3e9d296bec2bd	retained		Format holder heartbeat regression fixtures to pinned Rust style
+dc059adba8126493b868a9ea2d4343cf49730765	949d82eefe9a94a8743472f5c69caa4325013b7e	retained		Apply pinned rustfmt to the passing holder fencing regressions
+a6c77f48cd512b62407ad38e54d55441938f2ae5	b3405bfa97f27718e157a7398356958f3da1777e	retained-partial	fork-ci	Validate compiler lease coverage before executing or publishing batches
+6b49e63d4e51d8d69e495d9e5b7144d149b8cefc	-	superseded	v1-harness,v1-rajit	Bind compiler cache identity to effective cfgs and exact Rust flags
+c53f09fa95cc66fde32ec666283b870e8abb2696	-	superseded	v1-rajit	Recover lazy cache packs after local eviction or truncation
+755c6ff5cdfc8c97cabaa73a422b226723132056	-	superseded	v1-rajit	Start remote publication shutdown grace when the signal arrives
+8b36d33b599a656f1017bc8cb56fe9bba2c7b38d	-	superseded	v1-harness	test: handle macOS rejection of invalid UTF-8 source filenames
+a7a4915fec09832f0f4db1b1af69f8956e443806	-	superseded	v1-rajit	test(remote): verify shutdown grace and exit behavior on Windows too
+5f3acf8094c0c2ac1a47810d1412c700e1403dde	-	superseded	v1-rajit	test(remote): compile shutdown regression suite on all supported hosts
+87d581c18b20aed092156ca5ccb505d9e7973a4c	-	superseded	fork-ci	ci(remote): exercise keeper shutdown on Linux macOS and Windows
+fb4e7ea5981faf4076d3ad36a7b052dabaa2cb30	-	superseded	v1-rajit	fix(cache): preserve physical symlink watches through stacked PRs
+f23b485d32bf73a1842dcfbeff8ff369eb98ff2f	-	superseded	v1-harness	test(cache): preserve external symlink cache invalidation regression
+4fd8836a58c17e352f6e0a231660f7783d84d02e	-	superseded	v1-harness	test: handle macOS rejection of invalid UTF-8 source filenames
+dd94358d6de82b3cd91c40ac53ea8fabcd5dc638	-	superseded	v1-rajit	fix(cache): preserve physical symlink watches through stacked PRs
+1c0e7d5bb58ba663d0aca9fc8a99a690be1ee9c6	-	superseded	v1-harness	test(cache): preserve external symlink cache invalidation regression
+48378bb8d7ba7fcc058c6d27e2a589f43863c677	-	superseded	v1-harness	test: handle macOS rejection of invalid UTF-8 source filenames
+e6f0205110a5fa08da96f45fef05bb33cb153865	-	superseded	v1-rajit	fix(cache): retain physical symlink watches in cfg-aware compiler identity
+19c24fdba84687d90f0c01acecb8491120d98dec	-	superseded	v1-harness	test(cache): preserve external symlink invalidation with cfg cache keys
+83ba822d43ecd7e586f261bd52cb0dd8104d60f5	-	superseded	v1-harness	test: handle macOS rejection of invalid UTF-8 source filenames
+ce779ed24d78a1aed4ca5dbf0772d589dd7f2228	-	superseded	v1-rajit	fix(cache): preserve physical symlink watches through stacked PRs
+707c218c675b77a97906e69bcefb9b4098765616	-	superseded	v1-harness	test(cache): preserve external symlink cache invalidation regression
+4e54e62ce39487f6117e05e5cb3cd85b16d14696	-	superseded	v1-harness	test: handle macOS rejection of invalid UTF-8 source filenames
+1048d80f3e0aa399f2adaa108c810dc2ec7329fa	-	superseded	v1-rajit	fix(cache): preserve physical symlink watches through stacked PRs
+52f2b967d2e8ce388de9bb2c6f1ba6ffbc9af264	-	superseded	v1-harness	test(cache): preserve external symlink cache invalidation regression
+274e0dcb3eb633187ba56b420b79a3afd3a045b4	-	superseded	v1-harness	test: handle macOS rejection of invalid UTF-8 source filenames
+007db1fe9d9378fd8c834f9503f266da364fbf1c	-	superseded	v1-rajit	fix(cache): watch physical referents of external source symlinks in integration stack
+e1d606371fbe1b008ee5640cf6c54bbe6e03eafc	-	superseded	v1-harness	test(cache): ensure external compiler source symlink referents trigger rebuilds
+2bb29617debd31579a7d0ce6c8a4218663ac59a0	-	superseded	v1-harness-dist	saved_spec: the refused type error is recognised by its code, not rustc's headline
+7a635c5e59001a21bc71d9a06aac24aac2b88030	-	superseded	v1-harness-dist	saved_spec: the doctest replay row has three times the row timeout
+a925696be1966fdb646d1abdfaf804a5ba42090b	-	superseded	v1-harness-dist,v1-rajit	Share replay-built std units with doctests
+db825393a626d3de8f006d9303e0767761c66af5	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	Emit Mach-O compact unwind to preserve panic handlers
+3e3a0df79c7ee0004a6bf3a7abf76cd3c68a953d	-	superseded	v1-harness-dist,v1-rajit	Keep unrelated Rust docs out of saved replay admission
+a0ab2409bf635ef0e7d67717daa408231207a0de	-	superseded	v1-rajit	toolchain: a RUSTC whose release cannot be read is refused with the reason
+63530fc3b1cf1672043453bca2fa2bf809552c26	-	superseded	v1-harness-dist	saved_spec: the doctest replay is held to leaving the worker's cache as it was
+e5a876bfcc450c5dc7f6ef862dd671b8ecb9af9f	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	bench: the store's benchmarks link the store alone, the code generator's go apart
+a5b0be8455a443c4acdba711e8e3bf2d6777c02b	-	superseded	fork-ci;docs/harness not ported: docs/harness.md	bench: a benchmark binary is judged only when its bytes differ from the base's
+c41e8a835f2bf5cb6567055ecc3e30f6d71c650c	-	superseded	superseded-by-v2-units;docs/harness not ported: docs/reports/C2-NATIVE-CLOSURE.md	native: bind an unreadable directory as an observation
+07fe1d09cc71128ade64d283ec4652dcfd60991e	-	superseded	fork-ci	bundle: one benchmark set per side of each split benchmark package, built location-independently
+8da859c9e8cf02f8ad69145ac4a1d5a46c88606b	-	superseded	fork-ci	bench: each benchmark binary is judged only when its bytes differ from the base's
+b918f8c593ee829349819b9ee5df475d2830a9e7	4c998de4560a428168c4c981af5f5012fc3e886f	retained-partial	docs/harness not ported: docs/harness.md	docs: the bench gate per benchmark package, and the identical-bytes rule
+b1b7a718c4b07c4a14ad6e0dca94cf4780da1f93	-	superseded	v1-nix	nix: unit graph regenerated for the split benchmark packages
+be9f319e4c544779356dd17c17e6285a105c3b75	-	superseded	v1-harness-dist	saved_spec: the external include is refused in the replay's words
+36b59984dde8ce896f89b8fe3a77b9b2786c5016	-	superseded	v1-harness	test: handle macOS rejection of invalid UTF-8 source filenames
+c32daedd428b55f5c6467c5825d870cfbb0eca27	-	superseded	fork-ci	ci: run source identity regressions on Linux macOS and Windows PRs
+fdeac1867b90d9fe10a1ea7351710a9be95cdf60	-	superseded	v1-harness,v1-rajit	fix(ra-jit): watch external file-symlink targets for source identity
+e471c72ac901ea14b1b0bfafdfba1573ab51ffba	-	superseded	fork-ci	ci: use platform-specific source identity executable suffix
+a37559b6e712c875098b10fb77a9d44f9c34dfcd	-	superseded	fork-ci	ci: correct runner suffix expression quoting
+79e8f0c7855bddcb3b435dff89d2479a09b31773	1544b0ddbafc3b3c3a9d544384755b27e58d2a3f	retained-partial	superseded-by-v2-units,v1-harness-dist,v1-rajit;docs/harness not ported: docs/harness.md,docs/no-rustc.md	link: strip = "symbols" (and "debuginfo") strips the program as rustc 1.99 does
+80d4af239e27764e3d8789021b5772f948c1fe42	-	superseded	v1-rajit	direct: a program keeps the objects its debug info is in
+8d3d78ad4df00a29c2ff38f01db7225620a5fbc3	b7185310bc39928cd23936d640f0deb20adbcb36	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	debuginfo: each crate is described as its own -C debuginfo says
+2b0369e0fafcf02a3f5dbb90dcd2d7dd92290584	f964764ad9e4b7b88e7ef5af0b1c1fc46ccbc46d	retained-partial	docs/harness not ported: docs/no-rustc.md	docs: cdylib, staticlib and dylib outputs are a gap of every owned build
+c7885a7a542d0ba1607de734dddcd05570853047	-	superseded	fork-ci	ci: validate stacked PRs and preserve integration push runs
+d92c83d43a9de4e3004b938ae9d741f754d3a19d	-	superseded	fork-ci	ci: restore compiler subprocess I/O regression gate
+e30e112ad50c1777518c9f5a635a52bf46ab54fe	-	superseded	v1-harness-dist	buildspec: an ELF program's loaded .debug_gdb_scripts is not what strip removes
+d11784a1ba2bd69170b6bbda23b6924807ccb416	-	superseded	fork-ci,v1-rajit	answers: a toolchain whose release blaze cannot read names the record it lacks
+dbb7c6df32d46bea105e09ab553bbb1b33154fb2	-	superseded	superseded-by-v2-units	native: a file relinked while it is read is the input when its bytes are the same
+e3fa5cad942284d798bd3492c0750d19fd590709	-	superseded	fork-ci	Validate lazy cache recovery across Linux, macOS, and Windows
+39eabb16d9f80a35910d41031aeb1daf4a930eb7	-	superseded	v1-rajit	answers: the record-gap test names its query so rustcsites.py reads no new start of rustc
+43eb8154fe04528e6e66d0efa5d662f4ef849b8a	-	superseded	fork-ci	serve-review: the owned CLI suite runs once, whole
+0b073917e77b96d7391cebafe134185bb9890822	-	superseded	fork-ci	ci: run remote recovery tests when remote.rs changes
+4c65f3d988e094d13c7c718bdafbf0a8f4ee22ca	-	superseded	fork-ci	ci: split slow C2 fast-tier lanes before 180-minute job timeout
+a63e9133eb1d14d649fded5b529e3ab4a8dcd4c8	-	superseded	v1-harness	test: handle macOS rejection of invalid UTF-8 source filenames
+9963cd72f5993f779dd8a65d0b6ed722029f6169	-	superseded	v1-rajit	fix(cache): preserve external source symlink watches in stacked identity
+e03bd477c9c9a69b638d4b58dbb788d4d1ac2cb7	-	superseded	v1-harness	test(cache): retain symlink referent invalidation control
+d37cf06bc8ad92473d1bcd312c80787dd26be794	-	superseded	fork-ci	ci: execute keeper recovery and publication regressions on all platforms
+daa7ea1b7ef2abb3f640e87066f928d0ff3e8dc5	-	superseded	v1-harness	test: handle macOS rejection of invalid UTF-8 source filenames
+e3a028df1eb3fa88db01723ab4dae84289eb1036	-	superseded	v1-rajit	fix(cache): preserve external source symlink watches in stacked identity
+807326e912e0e590175e5bd7b0e350fb260928e0	-	superseded	v1-harness	test(cache): retain symlink referent invalidation control
+515a88e39dda7e16d27ca2e7717c3e1c559cd7a0	-	superseded	fork-ci	ci: run each macOS full-tier C2 lane with a budget that fits it
+616b9346e512ef867fed01dac4ab0190448e4ec2	-	superseded	fork-ci	ci: run the holder regressions when blaze-wire or the lock file changes
+b634c9cd0d7853c34ba0d7474459872db9c501c4	-	superseded	fork-ci;docs/harness not ported: docs/harness.md	ci: start the longest macOS lanes first, and say what the lanes are now
+4460fede905f3e98a0bb5aa22306bfda6ad7e5b2	-	superseded	v1-root-doc	docs: note lazy remote cache eviction recovery in changelog
+eae354ba15a664070d4d6acd9b04e097ae2b8a6a	-	superseded	v1-rajit	fix(remote): keep shutdown deadlines independent of stderr
+ff124dd36eb7db30aacafeb16996ca40522163b8	-	superseded	v1-rajit	fix(remote): reject incomplete remote cache key records
+c7c2ce3034644b2e887d196e7b6cb0c45b18d477	-	superseded	v1-rajit	refactor(remote): tighten lazy cache recovery changes
+267c1d26c2e1be51a0a18c7679c83eed52b3157c	-	superseded	fork-ci	ci: report runner-capacity cancellations apart, and pass where issues are off
+721ac81c7e7e44ac87d2e8109ee87a344da82c3c	-	superseded	fork-ci	ci: distinguish unassigned cancellations from proven runner shortages
+296fd3bb5fa1b6ec45ab0e24fd579724d499b91e	-	superseded	fork-ci	ci: use explicit empty report strings
+41c3175ba588b6c1b70d607bf7d894fdc9ceb12e	b786244e9457f6c425e197ad7d4383c8f3f782dc	retained-partial	fork-ci	ci: route dist macOS bundles and C2 lanes to the private pool
+39bf3d4e1ba1040857a6c7165027bc43c82d2eb6	-	superseded	fork-ci	ci: let the private pool's controller spill dist macOS lanes to hosted macOS
+585dd0e0fcfa854fc132f584aebf673b0431c02f	-	superseded	fork-ci	ci: preserve private runner binding through dist workflows
+6e02c263101a4c06fc4ab8f539f7088bd306e785	-	superseded	v1-harness	fix(harness): recognize both ra-jit Mach-O symbol spellings
+da65d705b7ee1f4d338408c6a397c550669a9073	-	superseded	fork-ci	test(harness): exercise Mach-O unwind recovery on both macOS backends
+b3992830076a36fdab2fd595ff321dbb43054d36	-	superseded	fork-ci	fix(ci): derive landing repository from origin
+575aeac1630e11eb7f0009e18ec4faa1b34bfa0e	-	superseded	fork-ci,v1-harness	fix(ci): retain nightly failure summaries when issues are disabled
+d02443b70e0c12c99d6e2408aa8c0bea998a5a3f	-	superseded	fork-ci	test(ci): execute nightly issue reporting regressions on PRs
+7b17d4c7b781ae1f207036af643b6b29e9fca945	-	superseded	fork-ci	fix(ci): publish live latency history through a reviewed PR instead of protected main
+d660a12e9ad9ac7e7c98b05c9602106b9298ecaf	-	superseded	fork-ci	fix(ci): keep latency regression verdict when GitHub Issues are disabled
+6647a41a98d590901479cd1430af5652d4b994ed	-	superseded	fork-ci	fix(ci): use bot identity when opening benchmark history PRs
+c38b89ca3aa6606d0786123a9e2733c2560a608c	-	superseded	fork-ci	test(ci): ensure benchmark PR creation uses bot identity
+930b8a23b16e5ea39a9eb5ee2a92d1ed04561502	-	superseded	v1-harness	fix(harness): recognize global Mach-O code symbols and diagnose lookup failures
+fb4f0dd59d8c854e98339fc91a11147783246b87	-	superseded	fork-ci	fix(ci): distinguish absent history ref from remote lookup failures
+45a1d13eabdea2f5a4f33f26b1a585109ce9a830	-	superseded	fork-ci	ci: retire private Actions runners and use GitHub-hosted capacity (#70)
+257405fde41adb67c975a7c2db1251d711eb96e0	-	superseded	fork-ci	fix(ci): prevent duplicate benchmark history on workflow reruns
+0f44e1aac17fd2a32ab9d880baf2c79334d303a8	-	superseded	v1-harness	fix(macos): recognize qualified ra-jit answer symbols in unwind probe
+62de9574cb30fb2e37638c2b4518c26eeafbeba5	-	superseded	fork-ci;docs/harness not ported: docs/contributing.md	fix(ci): automatically retire superseded pull request runs
+16d792ff7fcfd960b588f87584bf157d7fea034b	-	superseded	v1-harness	fix(harness): keep macOS unwind probe target address-taken
+e1e5712f351a2509849f56f790b3e9e909edee92	-	superseded	v1-harness	test(harness): retain no-inline target when expanding unwind fixture
+9579853dec63d40837640b730a87de4ec8a02ff3	-	superseded	v1-harness	test(macos): probe the linked exported root after Mach-O splice
+23a9dddc9cf37e7622144c8a6ea9b391bb240cda	-	superseded	fork-ci	test(ci): canonicalize temporary bundle roots on macOS
+07ba2377a4c554d0700c2e58878f09ee7e2bd00f	-	superseded	v1-rajit	fix(link): honor configured native flags in live owned builds
+e61c8d4aa9ddb697f1554f5a6e5e928c2255e281	-	superseded	v1-harness	test(macos): force real unwindable frames in nocompact growth fixture
+3437dd43a76cd09c2d87bc39005271cd2e4e83d9	-	superseded	the V1 unit graph and blaze-spec: V2 has blaze-units	test(metadata): allocate collision-safe parallel scratch directories
+16847120823e68fb788e0054612a231efb21982f	1c79175c36e50884622be0721c3ebace238d6870	retained		test(server): read framed HTTP responses before TCP teardown
+8522d81d623ecbec06158792320663456392154c	-	superseded	fork-ci;docs/harness not ported: docs/benchmarks.md,harness/benchplatforms.py,harness/benchrunner.sh	ci: remove remaining private runner setup and routing (#72)
+1e5c81d6f034d02c28e9431d1be9334734bddaef	79a5477d2ff791e4dc21774ca4261edc467ef852	retained		dist: assign idle builders as helpers of a running execution
+13e8e77973c56b8a87968ff2185c2e7999f27a87	c57503259c5e43bf0a42f00288dc6ce43ccb2407	retained		dist: an assigned helper can replace a lost lead
+cf031d68b227ece8daa72fd2c0beb675c1f5d52e	d77f083452d044697066c4ba17113c8144e9e14f	retained		dist: distribute spare helpers fairly across running builds
+6b9f5d6c9f4f0f2f5ff0f0ff653135a7a4b59924	5d7fd00d7f95a542c11e19ab313f5f77f522efae	retained		dist: don't treat a reserved helper as a live heartbeat
+9de7e3cb3399fc2d41491532c857856e6bb41d78	04f7f08d725b5b9cb73336afa78ed8ae9b695172	retained		dist: one helper offer per execution per tick, fewest first
+bed7a34834481665d4964cb3842b2217ebb79c06	8cfb0c4218eb734c8d27f5732a2bcc08be6ea463	retained		fix(dist): apply rustfmt to helper liveness regression
+ab361fdded29e72a76182df2abb08214a693471d	-	superseded	fork-ci	security(ci): never execute stacked PR base under privileged token
+fb92b80882f2a2d0c413e94195650f7068cc9f1c	38dfc0d96b3c7f1532360c7abaffddc00b6bc78b	superseded	ported as V2's own path: crates/blaze-cargo/src/serve/unit/dist.rs and Build::compile_granted replace the batch exporter	dist: drive holders with the batch exporter (D0 two-worker compile)
+6e65e4637e6b94057f0cf9d1793dba01a786d6ca	05a6bfa7de39a1f2e7a27362871a72b6afa7bbda	superseded	ported as V2's own path: crates/blaze-cargo/src/serve/unit/dist.rs and Build::compile_granted replace the batch exporter	dist: BatchCompiler lives with the holder, not the Unix carrier
+84da678620d69670e298a028eea2ad63d8672244	-	superseded	v1-export,v1-rajit	dist: FromStore grants and the admitted closure (cross-build reuse)
+ef63344d55f5142668b49aef6046bf662524c5d8	be9823ece59a2402022870216cfa307d3296ea5b	retained		dist: the requester's local-owned fallback decision
+319a5c962ec47f5b1fdf32e57d503baa6d51aa42	-	superseded	v1-nix	fix(dist): refresh daemon unit graphs for holder compiler dependency
+44e721f699412a87b8740cac99b7e60039eb504b	-	superseded	v1-export	fix(dist): format FromStore worker implementation
+f97ea11eaedda4c9a930c431548bf9915d671780	20d773fac82444ffab7cba999df46c7d7cb96519	retained		fix(dist): honor requester fallback when Resume loses transport
+d5a874ad80fbc2bd9362be5878ada8ef7e20d541	-	superseded	v1-export	dist: authenticate transitive debug type blobs before admitting FromStore closure
+f91a4ae63f46189b30b2a16b76724b8dd4d00798	-	superseded	v1-export	fix(dist): format transitive debug type validation
+cac02b33edca0115ba740d1f3aecec29c6bb92d7	-	superseded	v1-export	fix(dist): treat vanished or damaged cached closure as a miss
+1c3d7769237a0e7745e4866fa54a4d32ae16cc5c	-	superseded	v1-export	fix(dist): treat vanished or corrupt sealed packs as cache misses
+389b5bb0e0f956dc63cbee17466223c9d83fb829	-	superseded	v1-export	fix(dist): continue past unrelated vanished or corrupt cache packs
+d09e63512b7f5b441425ea375ca628fe493b2c56	-	superseded	v1-export	fix(dist): format cache pack recovery and regression
+9d48c565b1c40ce7ea964812e679be16e7806da9	-	superseded	v1-export	fix(dist): format cache pack recovery and regression
+6a72d2b2efe59784e256fc5052201768bdbb2727	-	superseded	v1-export	test(dist): fix owned cache-pack key typing in eviction regression
+d11ad65789c80f80c4769b762adea3c2a66e740f	-	superseded	v1-export	style(dist): keep owned pack-key selection within rustfmt width
+8e03cd3c552a93c8054aaa2d1daa443963956fa2	-	superseded	v1-export	fix(dist): validate duplicate entries in the initial batch receipt
+78d4fe6656aa9d59ad73ce5e6807681354a0ca92	-	superseded	v1-export	test(dist): use owned pack names in merge regression assertion
+8c8d82e7c3f64dbae951daacba34ded95978107d	-	superseded	v1-export	style(dist): apply hosted rustfmt to receipt integrity regressions
+10938a24b7c35aea1ae0620ba5d347c811eaf906	-	superseded	v1-export	fix(dist): reject conflicting work identities before deduplicating receipts
+c028523389c0ce3357e270edee0222ff60deb66a	-	superseded	fork-ci	ci: add isolated private Linux capacity (#55)
+6e4d2db2ceb4cbaca25d14e06b5a09ace65878d3	-	superseded	fork-ci	ci: route owner native builds to private platform capacity (#56)
+4c5ee04a1f7b3dd93dc6cda16d4fe04ae2054697	-	superseded	fork-ci	fix(ci): preserve installed Rust tools during cache cleanup (#57)
+91434714674efddabf4569eaad35f2b596d38640	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix: make Windows fixture paths and linker response handling portable
+50b8153b0d6b4373f74279bcef71d86c21687d1c	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	test: preserve JSON escapes after normalized fixture paths
+59b3254b5f86f3343cd1771fd152720221155aca	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	test: match the platform source directory in diagnostics
+942351532d6af5b6de13d0c7beac4b91bca7fdfb	-	superseded	fork-ci	fix(ci): ship Blaze entrypoints with harness artifacts
+1a6796fe9b17ab5c8aefd3fbcc8050948829290a	-	superseded	v1-harness	fix(harness): poison compressed remote packs in their stored format
+68844039c25e41b7a4f3015d8444c7644470c226	1857bb5aef58ce62b8068eee51ccc2c090942812	retained-partial	fork-ci,v1-harness;docs/harness not ported: docs/benchmarks.md,docs/harness.md,harness/benchplatforms.py	fix(ci): keep a fork's pull request off the benchmark machines
+132a45d84cfca40a3e26b4994c7b2380ae05cdbb	-	superseded	fork-ci	ci: bind private reusable jobs to their source runner
+bb7daf5f5f9f8bd803837fdbb63762b5b2551cf7	-	superseded	fork-ci	ci: register hosted dist macOS dispatch on the default branch
+64bd46fe4a2c94e7a99ef1304ca56134fee85e39	-	superseded	fork-ci	ci: retire private Actions runners and use GitHub-hosted capacity (#69)
+2177d456a3d790a1c2b5e4e574fcd97bdf3c835e	-	superseded	fork-ci;docs/harness not ported: docs/benchmarks.md,harness/benchplatforms.py,harness/benchrunner.sh	ci: remove remaining private runner setup and routing (#71)
+706dc2655135a9e4cac6b8f800a6d460454ae832	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	test(manifest): expand metadata fixture paths with native Windows separators
+c2042807140c0a1745412da6c30d3b639c000fe0	-	superseded	v1-rajit	fix(link): preserve explicit padding in owned whole links
+804e2a47a19b61c6f3067c5b130acbdb8756e368	-	superseded	v1-export,v1-harness,v1-rajit;docs/harness not ported: harness/unittests.py	fix(test): isolate child output in the unit gate
+99a4e5fa219398fe9cd00f91e7cab824e86b26e3	-	superseded	v1-harness-dist	fix(harness): retain C2 run diagnostics before cleanup
+aac58b32622aa3481e626f2eca33c8c26ca4986e	-	superseded	fork-ci	fix(ci): use macOS 26 ARM64 runners
+12738507c4b842bd26c2fe54e246df9aea0c452c	155cdf0c304163380d8d6aaf3a491c87b4361fee	retained		docs: record local macOS validation for PR 68
+e10e91f11f24861ab25febaf185519719bd270cd	65403174551ab2f347fe1ad7033f2f9056e2129c	retained-partial	fork-ci	fix(release): preserve owned server bootstrap failures
+f3bc884926e14b065f7f3c4a498804cc30a2c2bb	-	superseded	fork-ci	fix(ci): exercise upstream release assets on forks
+14910d3b3439ab6ce1df94a63de68e7c35e765fd	-	superseded	fork-ci	test(install): validate the published release's actual toolchain
+2f61e0bb355d106c56eedff0f9ad7c934378dbb1	ee5f13f1784f37d098e12927ccfca575f7ae76f0	retained-partial	fork-ci	fix(ci): install native pull request candidates
+fa9e35370977982cdb0986b3599a670659d15c5b	-	superseded	v1-rajit	fix(owned): pin producer probe's source toolchain in launcher
+6c5f7b30ffca49601e911ee9341b4f21c7d2ea82	-	superseded	v1-rajit	fix(producers): bind probes to their source toolchain
+252d96c9cdd16dfa1d56ac3ad8e8b7c3aa08a3ce	f11d6c210947d7aa04d04adf8ff375cfbb2062e1	retained		docs: record combined producer probe verification
+2ed824e6a9cc401a513f4723977e3c6ff15ec0ae	-	superseded	fork-ci	ci(install): build portable PR candidates on release glibc baseline
+b1cdfffe6806564b6bab11b87edbbe9330d48cb4	-	superseded	docs/harness not ported: harness/benchplatforms.py	fix(ci): use macOS 26 for optional benchmark matrices
+04c9c6ea1ffdd44fda164e57bbf417340b431bb2	f66159a6f3396a699545a9d1eb9588785892b8a6	retained-partial	fork-ci	fix(ci): recognize selected source toolchain reports
+b7f288aa684df85763d4b0d8e4d1c24fea7555cb	-	pending	run harness/forkfixes.py: object-default-in-body (ok), caller-location-counts-display-width (not run), track-caller-through-function-pointers (not run)	fix(test): remove the unit failure allowlist and fix Rust semantics
+2fe9c366ac967008365aaa2578bd5e0c7c7cf09f	-	superseded	v1-harness	test(gate): isolate infrastructure failures from assertion failures
+a1f6fa2d4ad83d3319f7d1abb75c74a9dd36f18a	-	superseded	a performance change to V1's impl index; not behaviour, not ported	perf(hir): avoid rebuilding impl indexes for ordinary body edits
+64f4e9d844c552ada965cc8b72488acbf28b0219	-	in-v2	harness/forkfixes.py on a stage 1 of this branch: object-default-in-body (ok)	fix(hir): preserve inferred object defaults in type arguments and bodies
+2bf0ffa8f636a18a7971cd621828ad27fa1e9633	-	pending	run harness/forkfixes.py: track-caller-through-function-pointers (not run)	fix(mir): scope source names to the database and resolve caller shims
+e398058a92347f9ab6638f9fb2d32ec519c8dc7d	-	superseded	v1-ra-root,v1-rajit	fix(build): align standalone compiler workspaces with vendored dependencies
+cdb01e00b35704bf06d541bb07e4ed328f219d0f	-	pending	run harness/forkfixes.py: attribute-impl-in-function (timeout)	fix(hir): discover impls emitted by attributes inside functions
+bedc028f6a0ced673b9b6babd8ae7e40e0038958	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	fix(mir): reject unresolved filenames and preserve impl caller tracking
+1962d342b295e31d7f108ef287c1a3f7a28d744d	-	superseded	v1-rajit	fix(compiler): install source names for every loaded checkout
+e7bdb38cfd98e8df310c56ca679d11e1d5660fdb	-	superseded	v1-harness,v1-rajit	test(compiler): cover constant location filenames through compiled code
+227b78f87d5e321a3cc8f41bac0574c4638853a8	d1b52a77b44272a00ec2d768b16a97224b541d19	retained		docs: record completed Darwin Nix validation
+79fc0c0e44e5c63bc162c34cd89235f9e79c6ad9	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	fix(llvm): fold constant branches before fast instruction selection
+472bd660b47194fced3be1b30a824dff6de94865	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	fix(llvm): read Mach-O units by function atoms and unwind entries
+e2c2f3803f7ad6f9367bd743dd93f8c437d48165	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	fix(llvm): preserve debug locations on Mach-O
+f8bed03399660f6929517ecdccdcbdc2cedbc4cc	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	fix(llvm): index Mach-O unwind data and prove live cleanup coverage
+574814ff43fbed51e30179b52d493cf10c01d14b	a98847b49daafbd21a27c037ecca7674b09175ab	retained		docs: record clean LLVM gate and repaired unwind validation
+51b09677853a51bbc31e57fac8f1d012d3f9ef74	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	test(manifest): expand fixture paths using native Windows separators
+0722cf3f07b65d29bf27dfee0a72cd0b8e1f5511	-	superseded	fork-ci	test(ci): exercise Windows metadata parity before merging
+1163dde11fa38cea34d68e20163bb3cb025333cd	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix(config): use Cargo's platform-independent env annotation quoting
+26a7d3d4ef8217df391ca9ef46a126c68f859e56	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix(test): use non-verbatim Windows roots for Cargo CLI origin parity
+c4366823ac866b7c11dc12620135ff5687c920e3	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	style(test): format imported Windows fixture assertion
+1c94a5f9938b650735709e308258abc117ad5b84	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix(test): normalize verbatim Windows fixture root aliases
+f2a58568043e88e1c3ac7e9473ccee8409736c5e	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix(test): normalize Windows verbatim and ordinary fixture roots
+cd9ef52df83b0320a331b33ff3d07337d70bd8a6	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix(manifest): preserve Windows workspace membership and inherited Cargo paths
+6519ca037b484e6e0d410811c2c60eecc0b9dd5e	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix(manifest): preserve Windows workspace-member identity in profile lookup
+eb459015db60289f743df6a8b42b958dd4cb2bff	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix(ci): format manifest path changes
+91f5d2d0f6fff92d70260c2fa9500a045912d1e9	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix(manifest): retain Cargo's canonical Windows dependency path in metadata
+17f4dfd09619ac83675440c28e7c55db2ab61f61	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix(manifest): reconcile Windows workspace path identities and inherited path output
+0985116d4ff2dd02dfef2c8a7e00c556ca91afb4	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix(manifest): preserve Windows workspace-member identity in profile lookup
+26147bf8181b0fc68a6f6f629697f1da66ae81ad	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	fix(manifest): retain Cargo's canonical Windows dependency path in metadata
+04415e5741d06d3c6d5641d97b843d8acc645e84	-	superseded	Windows-only path identity in blaze-manifest: V2 has not been built on Windows (docs/platforms.md); not ported, and not checkable on this Mac	style(manifest): apply rustfmt to Windows parity regression tests
+d262a526098a46873c14b309f4fc774487cad87c	-	superseded	fork-ci	fix(ci): scope merge-queue landing to fork origin
+5e952d2c1829d1acc89be23142094a4fdcf1b5ab	-	superseded	fork-ci	fix(landing): enqueue via guarded GraphQL when gh auto-merge is disabled
+fc466e66a9b4d06197c70516c857df78d5d1b7cc	-	superseded	fork-ci	fix(landing): enqueue exclusively via guarded merge queue mutation
+4bdd28c5b3d03151b6fcaf9e728c172176eef4cc	-	superseded	fork-ci,v1-harness	fix(ci): retain nightly failure reports when repository issues are disabled
+549578254e563953f43be5fe77dac8e6a00fa691	-	superseded	fork-ci	fix(ci): preserve shell arguments and clean workflow lint
+f9992a19d703798486e1d48904f17a151bb5c850	-	in-v2	harness/forkfixes.py on a stage 1 of this branch: borrowed-object-keeps-its-lifetime (ok), borrowed-objects-stay-independent (ok), borrowed-object-is-not-static (ok)	fix(borrowck): preserve borrowed object lifetime defaults
+c01e99299b1c237b5d80ec32974db6ce617fabd1	-	superseded	superseded-by-v2-units,v1-ra-ide-db	test: repair strict workspace validation fixtures
+0f3715fa6fa63d6076edc69adc664e58aac27603	-	in-v2	harness/forkfixes.py on a stage 1 of this branch: borrowed-object-keeps-its-lifetime (ok), elided-object-through-a-call (ok)	fix(borrowck): carry object elision through call signatures
+f21ac97fd7ba14d8fb59bae7ae1461d4bb54f1b5	-	superseded	v1-rajit	fix(daemon): retain splice targets and diagnostic controls
+8dcf714204775b317526ad58cda2ba96ba801bbd	-	superseded	v1-harness;docs/harness not ported: harness/stress.py	test: keep validation reports in their run directories
+18f601c5db5acf6ca5012e7059cb1cfa7272cd53	-	superseded	v1-rajit	fix(link): preserve stand-in reachability checks
+ebb23abf54a0dd85497328546a93d9baf971c1ba	-	superseded	v1-rajit;docs/harness not ported: harness/worktrees.py	fix(daemon): widen joined checkouts before their first build
+3c9efb0deca04f2ae30e9d3f2fed2e0ca0ddfc00	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Materialize native callees missing from the owned link base
+677df6ff97121f4c970bbfbf9745dd17f76daebf	-	superseded	docs/harness not ported: harness/ci.py	test: run native callee regression in the fast tier
+40ec6b2d4ac1f2d7ffc3efad16215f7934095ae6	b76a46ab7ca68194d19f89999977e1506fadc11c	retained-partial	superseded-by-v2-units,v1-rajit;docs/harness not ported: harness/doctestonce.py	fix(doctests): capture canonical dependency contexts
+58481b2476bcb5e91cf90b7a297998073b8fd07a	925287b0d4379666e829b414bed6ada8fc27b233	retained		test(serve): read complete HTTP messages without waiting for EOF
+d50281b5ffbc1548fc6a57f74fa6f636540ba605	-	superseded	v1-rajit	fix(compiler): reject expansion failures before fresh codegen
+c679b28cb0080a0c48e4ee4178cccbf101b37bf2	-	superseded	superseded-by-v2-units,v1-harness-dist,v1-rajit;docs/harness not ported: harness/testselect.py	fix(test): let owned harnesses reject arguments and revoke cached passes
+06acc6947769ec26233e5ee209b34824b75d4edb	-	superseded	docs/harness not ported: harness/coldbuild.py	test: audit external tools and warm worker reuse in cold builds
+7ac901ce394199e99a06479b19827cbcdfd11216	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	test: synchronize owned prefetch and include hydration at real barriers
+d25708b54a035f8e25f2236c0f8dbe85b78e9174	-	superseded	v1-harness;docs/harness not ported: docs/harness.md	test: validate changed script inputs through owned generations
+ccf48e79927e7004c8abd82050ba5f8f3e4e5e04	-	superseded	superseded-by-v2-units,v1-ra-project-model,v1-rajit	fix: compile proc-macro unit tests as source test targets
+74023060778e72c27a9e8c0c3d3fe42ab37f1f09	-	superseded	v1-rajit	fix: hydrate generated includes before metadata-only checks
+39facd354afdd701a7c64675b0385d2b4ca72f4c	-	superseded	v1-harness;docs/harness not ported: harness/ci.py,harness/norustc.py	test: require owned execution across no-rustc audit scenarios
+a74c99d66970a9f8809a861347fd2da3ab6aaa39	-	superseded	v1-harness	test: audit owned checks and exercise native protocol replacement
+c26b33a5cbd1b9a7cd9bf0bc3aca502e6507190b	-	superseded	v1-harness-dist	test: preserve owned cache route and avoid quadratic C4 classification
+d66b8cde6316149c92d73fdcb9c3498380673b4c	-	superseded	v1-harness	fix(harness): initialize verdict mode and test owned admission
+de11d21b2d23d16b45b954a3ac7183910a9d50d1	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	fix: reuse cached C startup shims across builds
+fe5ccf056e90cc3b13bc2dd751cd9d80ad7bcfd0	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	diagnostics: identify missing transitive cache entries and imports
+821d9d5b14020a9e4c69febd9bb1a2e6b6b8c8b3	-	superseded	v1-harness-dist	test: retain C4 stores when validation fails
+e26811f320ce6438d30dc055a664e3729e7c10a5	-	pending	run harness/forkfixes.py: cdylib-allocates (not run)	fix: retain native allocator bindings in cached callers
+31d3716656314295ecd0cbff170054b2f6d3a51b	-	superseded	v1-rajit	fix: hydrate generated source before owned Cargo checks
+f3803b26c51ef7bbe39f7c5b829df4afca264b42	-	superseded	v1-harness;docs/harness not ported: harness/norustc.py	test: recognize wrapped owned type-error diagnostics
+f4ded16c2f5d45597cf2c4e9f597eb43617f1c18	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	fix(cache): bind portable includes to current native inputs
+1aced6ba7a608aea988804d45fc8084f3373dc77	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	Make cached library object emission deterministic
+4c7105b68286a1392b24cb857b7c02263c52fdf9	-	superseded	v1-rajit	fix: make shared library debug context and input ownership stable
+68cf52aa4d6b52c60d1511ea34e17653f7cdfad6	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	fix(frontend): track filename reads during standalone MIR evaluation
+89bba93cf0d9c1b63755434babcc2ca128e72962	-	superseded	v1-harness;docs/harness not ported: harness/norustc.py	fix: trace execveat in owned no-rustc execution audit
+2040f67bc7ce32dbc6eb33c53c0deb5ce41ad49e	-	superseded	v1-rajit	fix: preserve owned producer panic causes
+1e7a7c1c7749ef9369025f08de7721b9c4c11b64	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Return CTFE source-name observations with cached values
+f843c4ab17d727ac205be894e55fb7d6db06c820	-	superseded	V1's native capture and saved-replay inputs: V2 has no saved spec, private stdin or native unit; a unit's inputs are its walk's keys	fix(frontend): return current macro input provenance from tracked queries
+1c03dcf68087b62bef6da231281fe3876fef1a86	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Render persistent compiler refusals with stable source identities
+1c2647c61ead680a21046526f2800771dfcb8ea6	-	superseded	V1's emitted-object index and link line; V2 links with blaze-link, and a release program's unwinding across units is run by harness/distv2.py	Canonicalize cached debugger type graphs across allocation sharing
+864a5eb32b24fab59e763aa0d11e6f337c8c4750	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	fix(cache): preserve portable identities for typed constant roots
+2a126e24090a1774ccf5ecc5600b0ad4870dcb5b	-	superseded	v1-harness-dist	test(saved-spec): verify filename-derived array layouts in native replay
+7a2c49b86b8060b98d505a55cf8a59675e0113cf	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Keep portable patch tracking independent of requesting crates
+55a60872e636b2f15b5b3d824fbff0bfb1b93e23	-	superseded	fork-ci	ci(pgo): publish verified fork profiles through queue-reviewed pin PRs
+5b862a2bd4555bf3eee34adfffd19c8b56329135	-	superseded	v1-harness	test(cli): distinguish whole-build progress from program output
+47de5710d61798f61c0eda7f526d285512824d80	-	superseded	superseded-by-v2-units	Avoid redundant native capture and physical alias hashing
+2b733168dda9cbba051cf2a3c763ea6a12b05714	-	superseded	superseded-by-v2-units,v1-rajit	Provide Cargo scratch directories for owned integration targets
+e3f86bf90cbbbf9dc50ec65fa9b01e48cffc8813	-	superseded	v1-rajit	fix(doctest): preserve quiet presentation for owned runs
+5efa25180686540bb392c0e3372957f2a692fea6	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Canonicalize nested native symbol source identity
+0a5b75ecfb86fd1096878af35e6a38533777a5f7	-	superseded	v1-rajit	Bind direct test scratch paths to explicit host targets
+7ad5d31258a2d77ee19254896dc4385d038a931f	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Reuse enclosing CTFE observations for inline constants
+c42cba06f4bf2a5222e38accc93932f33e335848	-	superseded	v1-rajit	style(doctest): format wanted argument parsing
+57fca417f0634faeefaea0a4e087610fce55377d	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Track required associated constants as instance inputs
+59a5d6052a74093ced08b017781410d9259cdd78	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Prove scalar type-layout dependencies through const calls
+84ddd9032e1ecc228f468402c222f95dd723fc5f	-	superseded	v1-rajit	Match standalone doctest wrapper source locations
+032cd846ec39710af40a9133acedc9201a3f5b30	-	superseded	v1-export,v1-rajit	test: quote native Rust assembler labels in C linkage probes
+68bf420a707d28887f616fdcb51bbdf922412179	-	superseded	v1-export,v1-rajit	Keep native linkage probes compatible with Clang
+ed3c2180b8f54b7b31f534219233321718d543be	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Fence cached constants with concrete CTFE filename observations
+de92e0e76e0648e49d1fa03da4113e33a4e5ea78	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Seal transitive concrete callee observations into parent cache keys
+e701944dec2fbb0a42db03f0a11e74654dd752b4	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Keep compilation environments through native and patch instance indexes
+3291bf8367e8c3e97c912fa3717c123a272f49c4	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Enable the owned cache in native context admission regression
+a35fd69a6d1b02cfea1035ef24174d57f830e8af	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Prepare concrete anonymous type and repeat inputs before cache admission
+ac17b9fc702ef1af9726c106df8054a3acb59b96	-	superseded	superseded-by-v2-units,v1-rajit	Stage authenticated Cargo scratch directories before replay admission
+9ef85c2cbcecaf8e7a3bfa8143eee667778e5274	-	superseded	v1-harness-dist,v1-rajit	Apply shared source admission to cold owned builds
+c3f7585b3fb036ab02910828da63af85f239415c	-	superseded	the V1 unit graph and blaze-spec: V2 has blaze-units	Render documented library roots in doc-only Cargo graphs
+7c755393452a128f89290490c7b19fcee25dad1f	-	superseded	v1-rajit	Keep worker selection relative to its active worktree
+e749d42f2058f8cfe19f221fe344db8207e33f10	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	Memoize complete semantic graphs within each naming view
+493efa5ce1fa4b4469e2fee44e80ef91f77723ee	-	superseded	v1-rajit	Retain record environments before publishing provenance
+e81bfbbfee4bc8797f71614e30bb950640103519	-	superseded	superseded-by-v2-units	Reuse native capture storage during fresh replay validation
+7b6c633d61dfa78e4e1cbc42641601b9ad302b55	-	superseded	v1-harness	Prove first owned client waits at worker readiness barrier
+8244103c96e126d97f7d2e8bc10ca74d96b06bef	-	superseded	V1's compiler-probe acceptance (hir::compiler_acceptance and the producers): gone; V2 checks with its own diagnostics, see harness/forkfixes.py	Validate bootstrap probes against owned release features
+2784d65c4277a18ed1fa84181d2efe6245a19eef	-	superseded	v1-rajit	ra-jit: a proc-macro crate that expands no macros keeps a relocatable identity
+b217704cbfd0f265dc93a99f08edcfd8dd29cc89	-	superseded	v1-rajit	fix(ra-jit): validate owned bootstrap probes with pinned Rust 1.99 feature gates
+bd1ab5f1a4448a7c857ec133b84346f433cc569d	-	superseded	v1-rajit	style(ra-jit): apply Rust 1.99 formatter to owned feature policy tests
+2eed3bbb08211576326d42819773fc05a36f2bca	-	superseded	v1-only: V2 has no SemanticCertificate (grepped); no port applies	ra-jit: keep semantic certificates as a shared graph, not one flat copy per root
+eb6e869306bb7b1505d2cef8d7fd211be97f83d3	-	superseded	V1's key tracking of retained code and CTFE observations: V2 keys are hir-ty-identity's and blaze-codegen's, whose inputs harness/distv2.py's edit and byte-for-byte checks hold to one result	ra-jit: a constant that cannot use the owner's generics keeps its reads in the owner
+c35ce89a94ca751a755b763b2002a1616ed2cc99	-	superseded	fork-ci	Authorize pinned in-tree feature gates for owned proc-macro installer bootstrap
+bec070945ced5b80134d6875e22a32a379b4b854	-	pending	run harness/forkfixes.py: empty-array-promoted-through-iter-mut (not run), implied-bounds-through-fields (not run), self-of-an-impl-for-dyn (not run)	borrowck: accept what rustc accepts in the proc-macro server's dependencies
+8b09fbde05b6353fdf84e0b8e5af4437294a9c4f	-	superseded	v1-only: V2 has no SemanticGraph/StableNames or prepare_constants (grepped); no port applies	ra-jit: keep one semantic graph per build, and no monomorphized body per instance
+10ee37fb04ef3f26b4cd684e3da6a93b10fc3f83	-	superseded	fork-ci	fix(release): preserve scoped owned-server bootstrap policy
+bc318ca75a9bd8a6d89646f41d1ef86018283aed	-	superseded	fork-ci	fix(release): forward owned bootstrap target and discard unverified server
+f8b6086d90cc0331cf0407f51f9d34b6a3ce7c19	-	superseded	fork-ci	test(release): resolve temporary paths before asserting output arguments
+2d442364ead425d283556fce867c698037bb8085	-	superseded	v1-rajit	ra-jit: answer compiler probes under crate-scoped bootstrap
+b24958208b3bfff592beb252e13da15b403cb96c	-	superseded	v1-rajit	style: apply exact hosted rustfmt hunk to scoped bootstrap regression
+e89aa78bd6229a95de530d333f33e9e38eb534bf	-	superseded	v1-rajit	ra-jit: answer host target cfg under scoped bootstrap
+8001d8c5860005f0b8261fd34a31528a8e413272	9a0f7cfd82dc9479e29977554eafa0c0c50e6f0d	retained-partial	fork-ci	dist-local: keep holder heartbeats alive during owned batch compilation
+5c94f00f20a197c96a570308143ee07ffc5e098b	ee6c053960e77d9d64757252d3abcb3b3850a166	retained		style: apply hosted rustfmt to heartbeat-safe holder driver
+86e6c73be0341f533180466e80c125b30ef17e31	853ec708aad6e60ba21385ebf6e9fae798427645	retained		dist: keep non-Send exporter on its owner thread while the holder heartbeats
+56a3a6aa40324a6e53c2aea2580748f3051c455e	bef38c838b86c40d948388df9d9364b4757ed2cd	retained		style(dist): apply hosted rustfmt to owner-thread holder driver

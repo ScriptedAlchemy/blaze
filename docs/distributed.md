@@ -275,7 +275,9 @@ struct Attempt(u32);
 The carrier is a Unix socket: a four-byte big-endian length, then one CBOR value
 (`crates/blaze-dist-local/README.md`). `crates/blaze-dist-local/src/protocol.rs` wraps these with
 the sender's identity and adds `Claim`, which says which assigned executor an agent runs, and
-`Packs`, which says what the compile phase committed.
+`Packs`, which says what the compile phase committed. A session has one request outstanding at a
+time and keeps the answer to the last, which a retry after a lost connection gets again byte for
+byte, so one that polls for hours holds one answer, not every one.
 
 ```rust
 // A job: one unit of a build on one platform. Fields 0 to 2 are its content, what equal jobs share 
@@ -356,6 +358,9 @@ The cache server's calls are in `crates/blaze-serve/src/lib.rs`.
   otherwise, and its directory grows until it is removed.
 - **Distributed tests** are not wired: `blaze test` runs here, whatever the build did.
 - **Release functions** are shared only through a unit's published list, as above.
+- **A unit between its execution and its list** is compiled again. An execution ends when its
+  compile phase does, and its list is published once the build has made the rest of the unit
+  and linked it. A build that submits the same unit in between starts an execution of its own.
 
 ## How it is tested
 
@@ -364,5 +369,6 @@ including fencing and lost workers. `crates/blaze-dist-local/tests/` runs them o
 with the agent and a stand-in compiler against the real cache server.
 `harness/distv2.py` runs real daemons on a real workspace: two workers compiling one build, a
 third daemon reusing what they published, an edit, another pull request's checkout reusing it, a
-worker killed mid-build, a lost coordinator with and without `fallback`, and the programs each
-daemon linked run and compared byte for byte.
+worker killed mid-build, a worker stopped past its lease and resumed, a damaged pack, a lost
+coordinator with and without `fallback`, and the programs each daemon linked run and compared
+byte for byte.
