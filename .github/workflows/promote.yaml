@@ -121,6 +121,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: release smoke fixture regression
+        run: python3 -I .github/scripts/test_promote_smoke.py
       - name: a CARGO_HOME of its own
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
       # Build scripts, proc macros and tests run in a sandbox made of namespaces a user makes,
@@ -138,9 +140,12 @@ jobs:
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
           blaze --version | tee /dev/stderr | grep -F "blaze ${TAG#v} "
-          cd "$RUNNER_TEMP"
-          blaze new --quiet hello
-          cd hello
+          # V2's public CLI does not have "new". Test the actual build/run path
+          # against the same minimal source fixture used by install.yaml's no-Rust gate.
+          mkdir -p "$RUNNER_TEMP/hello/src"
+          cd "$RUNNER_TEMP/hello"
+          printf '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n' > Cargo.toml
+          printf 'fn main() {\n    println!("Hello, world!");\n}\n' > src/main.rs
           blaze run | grep -Fx "Hello, world!"
           blaze stop
       - name: what the projects build with
