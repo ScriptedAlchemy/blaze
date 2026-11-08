@@ -395,7 +395,7 @@ fn main() {
     let _ = r#matc;
 }
 "#;
-    assert_reports(&super::ui_fixture(fixture), &[error(4, &["E0425", "r#match"])]);
+    assert_reports(&super::ui_fixture(fixture), &[error(3, &["E0425", "r#match"])]);
 }
 
 #[test]
