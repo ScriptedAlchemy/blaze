@@ -299,9 +299,11 @@ impl Server {
                         )
                 }) =>
             {
-                if let (Some(unit), Some(packs)) =
-                    (self.coordinator.unit(request.execution), &publication.packs)
-                {
+                if let (Some(unit), Some(packs), Some(accepted)) = (
+                    self.coordinator.unit(request.execution),
+                    &publication.packs,
+                    publication.accepted_attempt,
+                ) {
                     let packs: Vec<String> =
                         packs.iter().map(|pack| crate::pack::hex(&pack.pack)).collect();
                     emit(
@@ -309,10 +311,7 @@ impl Server {
                         &[
                             ("unit_digest", json(&crate::pack::hex(&unit))),
                             ("execution", json(&request.execution.0)),
-                            (
-                                "attempt",
-                                json(&publication.accepted_attempt.unwrap_or(request.attempt).0),
-                            ),
+                            ("attempt", json(&accepted.0)),
                             ("packs", json(&packs)),
                         ],
                     );
