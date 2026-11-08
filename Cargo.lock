@@ -1808,6 +1808,7 @@ name = "blaze-serve"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "blaze-core",
  "blaze-wire",
  "bytes",
  "crc32fast",

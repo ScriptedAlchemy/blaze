@@ -131,8 +131,7 @@ impl Store {
             .write(true)
             .open(from)
             .map_err(|e| failed(&format!("writing {name}"), e))?;
-        self.name_file_whole(&file, from, &to)
-            .map_err(|e| failed(&format!("naming {name}"), e))?;
+        self.name_file_whole(&file, from, &to).map_err(|e| failed(&format!("naming {name}"), e))?;
         Ok(!existed)
     }
 
@@ -160,7 +159,9 @@ impl Store {
     /// verified before the existing atomic writer is entered, under the publication gate.
     /// False is a missing/different current list or a list whose packs are all still valid.
     pub fn repair_list(&self, name: &str, expected: &Digest, bytes: &[u8]) -> Result<bool, Error> {
-        self.repair_list_with(name, expected, bytes, |object, bytes| self.write_whole(object, bytes))
+        self.repair_list_with(name, expected, bytes, |object, bytes| {
+            self.write_whole(object, bytes)
+        })
     }
 
     // Keep authorization and the publication gate shared with the simulation's IO adapter.
@@ -381,7 +382,8 @@ impl Store {
             #[cfg(test)]
             if *self.publication_failure.lock().unwrap() == Some(step) {
                 return Err(std::io::Error::other(format!(
-                    "{}: injected {step:?} failure", to.display()
+                    "{}: injected {step:?} failure",
+                    to.display()
                 )));
             }
             // The core uses logical file slots so native paths need no UTF-8 conversion.
@@ -392,22 +394,24 @@ impl Store {
                 (Step::Rename, Effect::Rename { .. }) => {
                     std::fs::rename(from, to).map(|()| Done::Renamed)
                 }
-                (Step::DirectorySync, Effect::Sync { .. }) => to.parent()
+                (Step::DirectorySync, Effect::Sync { .. }) => to
+                    .parent()
                     .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))
                     .and_then(|parent| File::open(parent)?.sync_all())
                     .map(|()| Done::Synced),
                 _ => return Err(std::io::Error::other("invalid cache publication effect")),
             };
-            let done = result.map_err(|error| std::io::Error::new(
-                error.kind(), format!("{}: {step:?}: {error}", to.display())
-            ))?;
+            let done = result.map_err(|error| {
+                std::io::Error::new(error.kind(), format!("{}: {step:?}: {error}", to.display()))
+            })?;
             publication.complete(Completion { tag, done }).map_err(std::io::Error::other)?;
         }
         if publication.acknowledged() {
             Ok(())
         } else {
             Err(std::io::Error::other(format!(
-                "{}: cache publication exhausted its effect bound", to.display()
+                "{}: cache publication exhausted its effect bound",
+                to.display()
             )))
         }
     }

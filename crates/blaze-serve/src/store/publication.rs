@@ -75,7 +75,9 @@ impl Publication {
         Some(match self.step {
             Step::FileSync => Effect::Sync { file: self.staged.clone(), tag: Tag(0) },
             Step::Rename => Effect::Rename {
-                from: self.staged.clone(), to: self.published.clone(), tag: Tag(1),
+                from: self.staged.clone(),
+                to: self.published.clone(),
+                tag: Tag(1),
             },
             Step::DirectorySync => Effect::Sync { file: self.directory.clone(), tag: Tag(2) },
             Step::Acknowledged | Step::Failed => return None,
