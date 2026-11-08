@@ -5461,13 +5461,28 @@ impl<S: Steps> Jobs<S> {
                 }
             }
             Own::Look { job: id, path, key, executable } => {
-                let unchanged = matches!(
-                    (&done, &self.paths.placed[path as usize]),
-                    (Done::Stat(Some(meta)), Some(placement)) if placement.key == key && placement.meta == Some(*meta)
-                );
+                let rechecked =
+                    recheck_placed_output(&done, self.paths.placed[path as usize].as_ref(), key);
                 self.end_placing(id, path);
-                if !unchanged {
-                    self.place(w, id, path, key, executable);
+                match rechecked {
+                    Ok(true) => {}
+                    // A missing or modified output may be re-placed from its already verified
+                    // immutable store value. An IO refusal is not evidence of a cache miss.
+                    Ok(false) => self.place(w, id, path, key, executable),
+                    Err(why) => {
+                        self.paths.placed[path as usize] = None;
+                        let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
+                        if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                            job.refused_places.insert(path);
+                            job.over.get_or_insert((
+                                false,
+                                Some(ApiError::new(
+                                    format!("rechecking output {name} under {key:?}: {why}"),
+                                    Some(name),
+                                )),
+                            ));
+                        }
+                    }
                 }
             }
             Own::Write { job: id, path } | Own::Mode { job: id, path, .. } => {
@@ -6678,6 +6693,28 @@ fn output_readiness(
 /// removes its busy count, but cannot turn that path into an executable.
 fn refused_program_output(paths: &[u32], refused: &HashSet<u32, Global>) -> Option<u32> {
     paths.iter().copied().find(|path| refused.contains(path))
+}
+
+/// A recheck distinguishes a genuinely missing/changed output from an unreadable one.
+/// Only the former may be re-placed from the same immutable store key. A failed stat,
+/// unexpected completion, or directory refuses the output instead of hiding the error
+/// behind an attempted clone.
+fn recheck_placed_output(
+    done: &Done,
+    placed: Option<&Placement>,
+    key: blaze_cas::Key,
+) -> Result<bool, String> {
+    match done {
+        Done::Stat(None) => Ok(false),
+        Done::Stat(Some(meta)) if meta.dir => {
+            Err("the output path is a directory, not a regular file".to_owned()) // alloc: an error
+        }
+        Done::Stat(Some(meta)) => {
+            Ok(placed.is_some_and(|value| value.key == key && value.meta == Some(*meta)))
+        }
+        Done::Failed(error) => Err(format!("the output stat failed: {error}")), // alloc: an error
+        other => Err(format!("the output stat returned {other:?}, not a stat")), // alloc: an error
+    }
 }
 
 /// Complete only when the actual output was observed as a regular file under the key

@@ -571,6 +571,40 @@ fn a_failed_final_stat_cannot_authorize_running_a_build_script() {
     assert_eq!(refused_program_output(&[], &refused), None);
 }
 
+/// A stat that the OS refuses is not a missing cached output. Re-cloning after a
+/// permission or IO error would conceal that refusal and could run the old program.
+#[test]
+fn a_failed_output_recheck_refuses_instead_of_replacing_it() {
+    let key = blaze_cas::Key(ContentId([19; 32]));
+    let meta = Meta { len: 13, dir: false, modified_ns: 99 };
+    let placed = Placement { key, executable: true, meta: Some(meta) };
+
+    assert_eq!(recheck_placed_output(&Done::Stat(Some(meta)), Some(&placed), key), Ok(true));
+    assert_eq!(recheck_placed_output(&Done::Stat(None), Some(&placed), key), Ok(false));
+    assert_eq!(
+        recheck_placed_output(&Done::Stat(Some(Meta { len: 14, ..meta })), Some(&placed), key),
+        Ok(false),
+    );
+    assert_eq!(recheck_placed_output(&Done::Stat(Some(meta)), None, key), Ok(false));
+    assert_eq!(
+        recheck_placed_output(
+            &Done::Stat(Some(meta)),
+            Some(&placed),
+            blaze_cas::Key(ContentId([20; 32])),
+        ),
+        Ok(false),
+    );
+
+    for (done, expected) in [
+        (Done::Failed(blaze_core::IoError("stat denied".into())), "stat denied"),
+        (Done::Written, "not a stat"),
+        (Done::Stat(Some(Meta { dir: true, ..meta })), "directory"),
+    ] {
+        let why = recheck_placed_output(&done, Some(&placed), key).unwrap_err();
+        assert!(why.contains(expected), "{why}");
+    }
+}
+
 /// A path is not all there while any effect placing it is in flight (a placement, then its
 /// mode, then the look at what was placed): what a build script's run waits on before it runs
 /// its program.
