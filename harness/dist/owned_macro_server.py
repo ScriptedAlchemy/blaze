@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -77,6 +79,13 @@ def guarded_run(command, trace, *, cwd, env, blaze, memory_mib, timeout):
     row = {"code": child.returncode, "seconds": round(time.monotonic() - started, 3),
            "timed_out": timed_out, **watch.take()}
     Path(str(trace) + ".watchdog.json").write_text(json.dumps(row, indent=2) + "\n")
+    # Keep the compiler's final output before a watchdog/timeout raises. The caller
+    # cannot write build.log on that path, and the raw streams must remain available.
+    with Path(str(trace) + ".log").open("w") as report:
+        report.write("$ " + shlex.join(map(str, command)) + "\n")
+        for captured in (stdout, stderr):
+            with captured.open(errors="replace") as stream:
+                shutil.copyfileobj(stream, report)
     assert not timed_out, f"owned bootstrap timed out after {timeout}s"
     assert "watchdog" not in row, row
     return subprocess.CompletedProcess(command, child.returncode,
@@ -122,7 +131,9 @@ def main():
            "RUSTC_BOOTSTRAP": "1",
            "CARGO_TARGET_DIR": str(work / "target"),
            "RA_JIT_HOME": str(work / "home"), "RA_JIT_CACHE": str(work / "store"),
-           "RA_JIT_PROC_MACRO_SERVER": "0"}
+           "RA_JIT_PROC_MACRO_SERVER": "0",
+           # Attribute live allocator/database use without altering admission limits.
+           "RA_JIT_MEMORY": str(work / "memory"), "RA_JIT_MEMORY_EVERY": "5"}
     if args.default_sdk:
         env.pop("SDKROOT", None)
     executable = work / "blaze-proc-macro-srv"
