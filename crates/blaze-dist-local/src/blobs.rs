@@ -120,6 +120,16 @@ fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u
             fields.next()?.parse::<u16>().ok()
         })
         .ok_or_else(|| invalid("no HTTP/1 status"))?;
+    // A successful GET names committed data. Bad framing must not permit
+    // the caller to rebuild locally under that immutable cache key.
+    let invalid = |why: &str| {
+        let message = format!("{method} {path}: {why}");
+        if method == "GET" && status == 200 {
+            Error::Committed(message)
+        } else {
+            Error::Protocol(message)
+        }
+    };
     let mut length = None;
     let mut chunked = false;
     for line in head.split("\r\n").skip(1) {
@@ -147,6 +157,9 @@ fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u
             status,
             unchunk(body).ok_or_else(|| invalid("a broken chunked body"))?,
         ));
+    }
+    if method == "GET" && status == 200 && length.is_none() {
+        return Err(invalid("a successful GET has no explicit HTTP body length"));
     }
     if let Some(expected) = length {
         if body.len() != expected {
@@ -235,11 +248,13 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\na b c\nextra".as_slice(),
             b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nContent-Length: 6\r\n\r\na b c\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\na b c\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".as_slice(),
         ];
         for bytes in broken {
             assert!(matches!(
                 decode_response("GET", path, bytes),
-                Err(Error::Protocol(_))
+                Err(Error::Committed(_))
             ));
         }
 
@@ -255,9 +270,14 @@ mod tests {
         ] {
             assert!(matches!(
                 decode_response("GET", path, bytes),
-                Err(Error::Protocol(_))
+                Err(Error::Committed(_))
             ));
         }
+        // A legitimate 404 does not establish the existence of committed data.
+        assert_eq!(
+            decode_response("GET", path, b"HTTP/1.1 404 Not Found\r\n\r\nnot here").unwrap(),
+            (404, b"not here".to_vec())
+        );
     }
 
     #[test]
