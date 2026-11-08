@@ -183,7 +183,8 @@ fn request(unit: &Unit, config: &Config, now: u64) -> JobRequest {
 /// What the requester does about `failure`, under `policy`: `Ok` compiles the unit here, by the
 /// one build; `Err` stops the build, naming what failed. A terminal goes by its contract
 /// ([`local_action`]): a verdict is taken, anything else builds here only if asked. A failure
-/// that names no outcome (the carrier gone, a pack that fails its check) is no verdict either.
+/// that names no outcome (like a disconnected carrier) is no verdict. A missing or corrupt
+/// committed pack always fails, regardless of the requested local policy.
 pub fn decide(policy: &LocalPolicy, failure: Error) -> Result<(), Error> {
     let action = match &failure {
         Error::Ended(termination) => local_action(policy, termination)
@@ -274,7 +275,7 @@ impl BatchCompiler for Batches<'_> {
 /// How long past a job's deadline its requester still waits for the coordinator to end it.
 const GRACE: Duration = Duration::from_secs(5);
 
-/// How a pack that is not on the server ends its error.
+/// The reason reported when the caller cancels the distributed build.
 const CANCELLED: &str = "the build was cancelled";
 
 /// Reads the packs named, each checked against what was committed.
@@ -291,9 +292,8 @@ fn import_using(
     let mut values = BTreeMap::new();
     for reference in packs {
         let name = hex(&reference.pack);
-        let bytes = fetch(&reference.pack)?.ok_or_else(|| {
-            Error::Committed(format!("pack {name} was committed and is gone"))
-        })?;
+        let bytes = fetch(&reference.pack)?
+            .ok_or_else(|| Error::Committed(format!("pack {name} was committed and is gone")))?;
         for value in read(&bytes, reference).map_err(Error::Committed)? {
             match values.entry(value.key) {
                 std::collections::btree_map::Entry::Vacant(at) => {
@@ -699,6 +699,7 @@ mod tests {
             );
         }
     }
+
     #[test]
     fn a_committed_pack_missing_or_corrupt_must_not_rebuild_even_with_fallback() {
         let reference = PackRef {
@@ -726,5 +727,4 @@ mod tests {
         let malformed = published_packs(&unit, b"not a pack").unwrap_err();
         assert!(matches!(decide(&LocalPolicy::Fallback, malformed), Err(Error::Committed(_))));
     }
-
 }
