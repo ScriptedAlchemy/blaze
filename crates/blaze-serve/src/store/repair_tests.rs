@@ -1,10 +1,15 @@
-//! Conditional publication on the real store and atomic writer, with Hegel-drawn actor
-//! schedules, pack loss/corruption, and crashes on both sides of the native naming boundary.
+//! Conditional publication through Store's real authorization and the shared publication
+//! core. Sim owns the manifest's durability; native fixtures supply pack verification and
+//! reopening. Copying Sim's surviving manifest into the fixture is a simulated mount, not
+//! evidence that the host filesystem suffered power loss.
 
-use super::*;
+use blaze_core::sim::{Faults, Sim};
+use blaze_core::{Completion, Done, Driver, Effect, FileName, Tag, run_until_idle};
 use blaze_wire::{DIST_PACK_FORMAT, DIST_PACK_MAGIC, PackRef, pack_list};
 use hegel::generators as gs;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use super::*;
+use super::publication::{self, Publication, Step};
 
 fn digest(bytes: &[u8]) -> Digest {
     Sha256::digest(bytes).into()
@@ -140,13 +145,129 @@ fn two_native_cas_writers_cannot_both_replace_the_same_list() {
     assert_eq!(current(&store), results.into_iter().find(|(won, _)| *won).unwrap().1);
 }
 
+#[test]
+fn failed_native_publication_barriers_never_acknowledge_a_repair() {
+    for step in [Step::FileSync, Step::Rename, Step::DirectorySync] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (a, b) = (pack(1), pack(2));
+        put(&store, &b);
+        let old = pack_list::encode(&[a.0]);
+        let new = pack_list::encode(&[b.0]);
+        store.put_list(&name(), &old).unwrap();
+        *store.publication_failure.lock().unwrap() = Some(step);
+        let error = store.repair_list(&name(), &digest(&old), &new).unwrap_err();
+        assert!(error.message.contains(&format!("{step:?}")), "{error}");
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        // A directory-sync error is an uncertain commit, never an acknowledged one.
+        assert_eq!(current(&store), if step == Step::DirectorySync { new } else { old });
+        assert_eq!(std::fs::read_dir(dir.path().join("manifests")).unwrap().count(), 1);
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Plant {
     None,
     CasBypass,
+    Publication(publication::Plant),
 }
 
-fn scenario(ops: &[u8], plant: Plant) -> Result<(), String> {
+fn slot(name: &str) -> FileName {
+    FileName::new(name).unwrap()
+}
+
+fn finish(sim: &mut Sim, effect: Effect) -> Completion {
+    // alloc: the simulation drives one effect at a time, with Sim's bounded virtual wait.
+    let mut effects = vec![effect];
+    let mut result = None;
+    run_until_idle(sim, &mut effects, |completion, _| result = Some(completion)).unwrap();
+    result.expect("one submitted effect completed")
+}
+
+#[derive(Default)]
+struct Attempt {
+    ack: bool,
+    renamed: bool,
+    directory_synced: bool,
+    failed: Option<Step>,
+}
+
+/// The only simulated writer: stages unsynced bytes, then runs the production core's
+/// effects without inventing their order. Faults and power loss belong to this IO adapter.
+fn publish(sim: &mut Sim, bytes: &[u8], plan: u8, plant: Plant) -> Attempt {
+    let staged = slot("objects/.staged");
+    let fault = plan % 4;
+    // 0: return normally; 1: append in flight; 2: staged; 3: file synced;
+    // 4: renamed; 5: directory synced, response not yet delivered;
+    // 6/7/8: file sync / rename / directory sync submitted but not completed.
+    let crash_at = (plan / 4) % 9;
+    let mut attempt = Attempt::default();
+    sim.delete(&staged);
+    let append = Effect::Append {
+        file: staged.clone(),
+        bytes: bytes.to_vec(), // alloc: staged test record
+        tag: Tag(10),
+    };
+    if crash_at == 1 {
+        sim.submit(&mut vec![append]); // alloc: one pending effect, lost at power failure
+        return attempt;
+    }
+    assert_eq!(finish(sim, append).done, Done::Appended);
+    if crash_at == 2 {
+        return attempt;
+    }
+    let mut publication = match plant {
+        Plant::Publication(plant) => Publication::planted(plant),
+        _ => Publication::new(),
+    };
+    for _ in 0..Publication::MAX_STEPS {
+        let Some(effect) = publication.effect() else { break };
+        let step = publication.step();
+        let fail = matches!(
+            (fault, step),
+            (1, Step::FileSync) | (2, Step::Rename) | (3, Step::DirectorySync)
+        );
+        if fail {
+            match &effect {
+                Effect::Sync { file, .. } => sim.fail_syncs(file.clone()),
+                // Sim has no targeted rename-error switch. Removing its source makes
+                // the actual Rename effect fail before it can change the published name.
+                Effect::Rename { from, .. } => sim.delete(from),
+                _ => unreachable!(),
+            }
+        }
+        if matches!(
+            (crash_at, step),
+            (6, Step::FileSync) | (7, Step::Rename) | (8, Step::DirectorySync)
+        ) {
+            sim.submit(&mut vec![effect]); // alloc: an in-flight effect lost at power failure
+            return attempt;
+        }
+        let completion = finish(sim, effect);
+        let succeeded = !matches!(&completion.done, Done::Failed(_));
+        if step == Step::Rename && succeeded {
+            attempt.renamed = true;
+        }
+        if step == Step::DirectorySync && succeeded {
+            attempt.directory_synced = true;
+        }
+        if publication.complete(completion).is_err() {
+            attempt.failed = Some(step);
+            return attempt;
+        }
+        if matches!(
+            (crash_at, step),
+            (3, Step::FileSync) | (4, Step::Rename) | (5, Step::DirectorySync)
+        ) {
+            return attempt;
+        }
+    }
+    attempt.ack = publication.acknowledged();
+    attempt
+}
+
+fn scenario(ops: &[u16], seed: u64, plant: Plant) -> Result<(), String> {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path()).unwrap();
     let packs = [pack(1), pack(2), pack(3)];
@@ -156,16 +277,19 @@ fn scenario(ops: &[u8], plant: Plant) -> Result<(), String> {
     }
     let mut model = pack_list::encode(&[packs[0].0.clone()]);
     store.put_list(&name(), &model).unwrap();
+    let mut sim = Sim::new(seed, Faults::default());
+    let published = slot("objects/published");
+    sim.change(&published, &model);
     let mut expected = [digest(&model); 2];
     for raw in ops {
-        let op = raw % 8;
-        let pack_at = usize::from((raw / 8) % 3);
+        let op = (raw & 255) as u8 % 8;
+        let pack_at = usize::from(((raw & 255) / 8) % 3);
         match op {
             0 | 1 => expected[usize::from(op)] = digest(&model),
             2 | 3 => {
                 let actor = usize::from(op - 2);
                 let replacement = pack_list::encode(&[packs[pack_at].0.clone()]);
-                // The oracle uses its own byte snapshot, not Store's eligibility predicate.
+                // Independent authority oracle, using byte snapshots, not Store's predicate.
                 let old = pack_list::decode(&model).unwrap();
                 let mut missing = false;
                 let mut invalid_old = false;
@@ -175,61 +299,72 @@ fn scenario(ops: &[u8], plant: Plant) -> Result<(), String> {
                         None => missing = true,
                         Some(bytes)
                             if digest(bytes) != reference.pack
-                                || bytes.len() as u64 != reference.size =>
-                        {
-                            invalid_old = true
-                        }
+                                || bytes.len() as u64 != reference.size => invalid_old = true,
                         Some(_) => {}
                     }
                 }
-                let valid_new =
-                    disk[pack_at].as_ref().is_some_and(|bytes| *bytes == packs[pack_at].1);
+                let valid_new = disk[pack_at].as_ref().is_some_and(|bytes| *bytes == packs[pack_at].1);
                 let comparison = expected[actor] == digest(&model);
-                let should_write = comparison && !invalid_old && missing && valid_new;
-                let should_error = comparison && (invalid_old || (missing && !valid_new));
-                let crash = (raw / 24) % 3;
-                let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                if should_write && crash == 1 {
-                    let reached = reached.clone();
-                    *store.before_name.lock().unwrap() = Some(Box::new(move || {
-                        reached.store(true, Ordering::Relaxed);
-                        panic!("simulated loss before naming");
-                    }));
-                }
-                if should_write && crash == 2 {
-                    let reached = reached.clone();
-                    *store.after_name.lock().unwrap() = Some(Box::new(move || {
-                        reached.store(true, Ordering::Relaxed);
-                        panic!("simulated loss after naming");
-                    }));
-                }
+                let authorized = comparison && !invalid_old && missing && valid_new;
+                let validation_error = comparison && (invalid_old || (missing && !valid_new));
+                let plan = (raw >> 8) as u8;
+                let mut attempted = None;
                 store.bypass_comparison.store(matches!(plant, Plant::CasBypass), Ordering::Relaxed);
-                let actual = catch_unwind(AssertUnwindSafe(|| {
-                    store.repair_list(&name(), &expected[actor], &replacement)
-                }));
-                if should_write && crash != 0 {
-                    if actual.is_ok() || !reached.load(Ordering::Relaxed) {
-                        return Err("the native crash point was not reached".to_owned());
+                let actual = store.repair_list_with(
+                    &name(), &expected[actor], &replacement,
+                    |_, bytes| {
+                        let attempt = publish(&mut sim, bytes, plan, plant);
+                        let ack = attempt.ack;
+                        attempted = Some(attempt);
+                        if ack {
+                            Ok(())
+                        } else {
+                            Err(Error::internal("simulated IO failure or power loss"))
+                        }
+                    },
+                );
+                if attempted.is_some() != authorized {
+                    return Err(format!("publication authority violated at operation {raw}, seed {seed}"));
+                }
+                if let Some(attempt) = attempted {
+                    if attempt.ack && !attempt.directory_synced {
+                        return Err("repair acknowledged before the directory durability boundary".to_owned()); // alloc: oracle failure
                     }
-                    if crash == 2 {
-                        model = replacement
+                    let before_crash = sim.contents(&published);
+                    if matches!(attempt.failed, Some(Step::FileSync | Step::Rename))
+                        && before_crash != model
+                    {
+                        return Err("failed file sync or rename replaced the old record".to_owned()); // alloc: oracle failure
                     }
+                    // Sim retains a completed rename's namespace but still tears unsynced
+                    // Append data. Also explore a kernel losing the rename before directory
+                    // sync. This is a crash model extension, never another publication path.
+                    sim.crash();
+                    if plan >= 36 && attempt.renamed && !attempt.directory_synced {
+                        sim.change(&published, &model);
+                    }
+                    let surviving = sim.contents(&published);
+                    if surviving != model && surviving != replacement {
+                        return Err(format!("torn reopened record at operation {raw}, seed {seed}"));
+                    }
+                    if attempt.ack && surviving != replacement {
+                        return Err("acknowledged repair lost on power failure".to_owned()); // alloc: oracle failure
+                    }
+                    match actual {
+                        Ok(true) if attempt.ack => {}
+                        Err(_) if !attempt.ack => {}
+                        _ => return Err("repair response disagrees with its publication outcome".to_owned()), // alloc: oracle failure
+                    }
+                    model = surviving;
+                    // Mount the surviving simulated manifest for the real reopen/reader.
+                    std::fs::write(store.dir().join(name()), &model).unwrap();
                 } else {
                     match actual {
-                        Ok(Ok(wrote)) if wrote == should_write && !should_error => {
-                            if wrote {
-                                model = replacement
-                            }
-                        }
-                        Ok(Err(_)) if should_error => {}
-                        _ => {
-                            return Err(format!(
-                                "conditional repair violated its oracle at operation {raw}"
-                            ));
-                        }
+                        Ok(false) if !validation_error => {}
+                        Err(_) if validation_error => {}
+                        _ => return Err(format!("repair refusal violated its oracle at operation {raw}")),
                     }
                 }
-                // Reopen after every repair/crash: the visible file is old or completely new.
                 store = Store::open(dir.path()).unwrap();
             }
             4 => {
@@ -255,9 +390,7 @@ fn scenario(ops: &[u8], plant: Plant) -> Result<(), String> {
             _ => unreachable!(),
         }
         if current(&store) != model {
-            return Err(format!(
-                "reopened publication was torn or changed without authority at operation {raw}"
-            ));
+            return Err(format!("reopened publication changed without authority at operation {raw}"));
         }
     }
     Ok(())
@@ -265,20 +398,63 @@ fn scenario(ops: &[u8], plant: Plant) -> Result<(), String> {
 
 #[hegel::test(test_cases = 32)]
 fn conditional_publication_preserves_comparison_and_whole_file_integrity(tc: hegel::TestCase) {
-    let ops = tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(24));
-    scenario(&ops, Plant::None).unwrap();
+    let seed = tc.draw(gs::integers::<u64>());
+    let ops = tc.draw(gs::vecs(gs::integers::<u16>()).min_size(1).max_size(24));
+    scenario(&ops, seed, Plant::None).unwrap();
 }
 
 #[test]
 fn the_oracle_catches_the_comparison_bypass_plant() {
     // Both actors capture A. Actor 1 installs B, B's pack is lost, then delayed actor 0
-    // tries C under A's old comparison. B is stale, but it is not the record actor 0 owns.
-    assert!(scenario(&[4, 11, 12, 18], Plant::CasBypass).is_err());
+    // tries C under A's old comparison. B is stale but actor 0 does not own that comparison.
+    scenario(&[4, 11, 12, 18], 0, Plant::None).unwrap();
+    assert!(scenario(&[4, 11, 12, 18], 0, Plant::CasBypass)
+        .is_err_and(|why| why.contains("publication authority")));
 }
 
 #[test]
-fn a_crash_on_either_side_of_naming_reopens_one_whole_authorized_list() {
-    // Lose A, repair to B; run the real writer before-name and after-name crash points.
-    scenario(&[4, 34], Plant::None).unwrap();
-    scenario(&[4, 58], Plant::None).unwrap();
+fn a_lost_repair_response_preserves_the_reopened_cas_winner_and_comparison() {
+    // Actor 1 repairs A to B. Lose B's pack and let delayed actor 0 try C under A's
+    // comparison: it may win only if the simulated power loss really restored A.
+    for plan in [0, 3, 12, 16, 20, 52] {
+        scenario(&[4, (plan << 8) | 11, 12, 18], 0, Plant::None).unwrap();
+    }
+}
+
+#[test]
+fn failed_syncs_rename_and_every_crash_boundary_reopen_authorized_whole_lists() {
+    for seed in 0..4 {
+        for fault in 0..4 {
+            for cut in 0..9 {
+                for lose_rename in [0, 36] {
+                    let plan = fault + 4 * cut + lose_rename;
+                    scenario(&[4, (plan << 8) | 10], seed, Plant::None).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_oracle_catches_missing_file_sync_with_torn_appends() {
+    // Keep the completed rename (Sim's default), crash before the directory sync.
+    // The missing file sync must be exposed by Sim's torn data, not a phase assertion.
+    let found = (0..64).any(|seed| {
+        scenario(
+            &[4, (16 << 8) | 10], seed,
+            Plant::Publication(publication::Plant::NoFileSync),
+        ).is_err_and(|why| why.contains("torn reopened record"))
+    });
+    assert!(found, "the unsynced-data plant escaped the crash oracle");
+}
+
+#[test]
+fn the_oracle_catches_acknowledgement_before_directory_sync() {
+    // A directory sync would fail. Skipping it and returning success must be caught even
+    // though Sim retains the whole new record after the completed rename.
+    let result = scenario(
+        &[4, (3 << 8) | 10], 0,
+        Plant::Publication(publication::Plant::EarlyAck),
+    );
+    assert!(result.is_err_and(|why| why.contains("directory durability boundary")));
 }

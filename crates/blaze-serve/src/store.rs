@@ -24,6 +24,8 @@ use sha2::{Digest as _, Sha256};
 use crate::blob::{ObjectName, hex};
 use crate::error::{Error, failed};
 
+mod publication;
+
 /// The directory, shared by every connection.
 pub struct Store {
     dir: PathBuf,
@@ -31,9 +33,7 @@ pub struct Store {
     /// are immutable; a conditional repair may replace only an exactly matched stale list.
     publication: Mutex<()>,
     #[cfg(test)]
-    before_name: Mutex<Option<Box<dyn Fn() + Send>>>,
-    #[cfg(test)]
-    after_name: Mutex<Option<Box<dyn Fn() + Send>>>,
+    publication_failure: Mutex<Option<publication::Step>>,
     #[cfg(test)]
     bypass_comparison: std::sync::atomic::AtomicBool,
 }
@@ -57,9 +57,7 @@ impl Store {
             dir: dir.canonicalize()?,
             publication: Mutex::new(()),
             #[cfg(test)]
-            before_name: Mutex::new(None),
-            #[cfg(test)]
-            after_name: Mutex::new(None),
+            publication_failure: Mutex::new(None),
             #[cfg(test)]
             bypass_comparison: std::sync::atomic::AtomicBool::new(false),
         };
@@ -133,7 +131,8 @@ impl Store {
             .write(true)
             .open(from)
             .map_err(|e| failed(&format!("writing {name}"), e))?;
-        name_file_whole(&file, from, &to).map_err(|e| failed(&format!("naming {name}"), e))?;
+        self.name_file_whole(&file, from, &to)
+            .map_err(|e| failed(&format!("naming {name}"), e))?;
         Ok(!existed)
     }
 
@@ -161,6 +160,17 @@ impl Store {
     /// verified before the existing atomic writer is entered, under the publication gate.
     /// False is a missing/different current list or a list whose packs are all still valid.
     pub fn repair_list(&self, name: &str, expected: &Digest, bytes: &[u8]) -> Result<bool, Error> {
+        self.repair_list_with(name, expected, bytes, |object, bytes| self.write_whole(object, bytes))
+    }
+
+    // Keep authorization and the publication gate shared with the simulation's IO adapter.
+    fn repair_list_with(
+        &self,
+        name: &str,
+        expected: &Digest,
+        bytes: &[u8],
+        publish: impl FnOnce(&ObjectName, &[u8]) -> Result<(), Error>,
+    ) -> Result<bool, Error> {
         if bytes.len() > blaze_wire::Limits::DOCUMENTED.request as usize {
             return Err(Error::too_large("the replacement list exceeds the request limit"));
         }
@@ -201,7 +211,7 @@ impl Store {
                 ));
             }
         }
-        self.write_whole(&object, bytes)?;
+        publish(&object, bytes)?;
         Ok(true)
     }
 
@@ -347,22 +357,59 @@ impl Store {
             let mut file = File::options().write(true).create_new(true).open(&partial)?;
             file.try_lock().map_err(std::io::Error::from)?;
             file.write_all(bytes)?;
-            #[cfg(test)]
-            if let Some(pause) = self.before_name.lock().unwrap().as_ref() {
-                pause();
-            }
-            name_file_whole(&file, &partial, &to)?;
-            #[cfg(test)]
-            if let Some(crash) = self.after_name.lock().unwrap().as_ref() {
-                crash();
-            }
-            Ok(())
+            self.name_file_whole(&file, &partial, &to)
         })();
         if let Err(e) = write {
             _ = std::fs::remove_file(&partial);
             return Err(failed(&format!("writing {}", object.name), e));
         }
         Ok(())
+    }
+
+    /// Drive the publication core on the original handle and paths. In particular, do not
+    /// reopen the staged file by name or substitute a driver that changes Windows rename
+    /// semantics, creates directories, or syncs an ancestor instead of the original parent.
+    fn name_file_whole(&self, file: &File, from: &Path, to: &Path) -> std::io::Result<()> {
+        use blaze_core::{Completion, Done, Effect};
+        use publication::{Publication, Step};
+
+        let mut publication = Publication::new();
+        for _ in 0..Publication::MAX_STEPS {
+            let Some(effect) = publication.effect() else { break };
+            let tag = effect.tag();
+            let step = publication.step();
+            #[cfg(test)]
+            if *self.publication_failure.lock().unwrap() == Some(step) {
+                return Err(std::io::Error::other(format!(
+                    "{}: injected {step:?} failure", to.display()
+                )));
+            }
+            // The core uses logical file slots so native paths need no UTF-8 conversion.
+            // Rename here reports the atomic namespace change; the core separately asks
+            // for its durability barrier. Native's general Rename already bundles both.
+            let result = match (step, effect) {
+                (Step::FileSync, Effect::Sync { .. }) => file.sync_all().map(|()| Done::Synced),
+                (Step::Rename, Effect::Rename { .. }) => {
+                    std::fs::rename(from, to).map(|()| Done::Renamed)
+                }
+                (Step::DirectorySync, Effect::Sync { .. }) => to.parent()
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+                    .and_then(|parent| File::open(parent)?.sync_all())
+                    .map(|()| Done::Synced),
+                _ => return Err(std::io::Error::other("invalid cache publication effect")),
+            };
+            let done = result.map_err(|error| std::io::Error::new(
+                error.kind(), format!("{}: {step:?}: {error}", to.display())
+            ))?;
+            publication.complete(Completion { tag, done }).map_err(std::io::Error::other)?;
+        }
+        if publication.acknowledged() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "{}: cache publication exhausted its effect bound", to.display()
+            )))
+        }
     }
 
     fn object(&self, name: &str) -> Result<ObjectName, Error> {
@@ -411,15 +458,6 @@ pub(crate) fn temporary(to: &Path) -> PathBuf {
     let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
     let name = to.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
     to.with_file_name(format!(".{name}.{}-{nanos}-{sequence}.tmp", std::process::id()))
-}
-
-/// A file, written and closed by its caller, under its final name: synced, renamed, and the
-/// directory synced, so a crash leaves all of it under `to` or none of it.
-fn name_file_whole(file: &File, from: &Path, to: &Path) -> std::io::Result<()> {
-    file.sync_all()?;
-    std::fs::rename(from, to)?;
-    let parent = to.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
-    File::open(parent)?.sync_all()
 }
 
 #[cfg(test)]

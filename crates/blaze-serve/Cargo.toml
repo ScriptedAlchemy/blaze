@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-core.workspace = true
 blaze-wire.workspace = true
 anyhow.workspace = true
 sha2 = "0.10"
