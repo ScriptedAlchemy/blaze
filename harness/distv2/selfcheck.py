@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Small planted-bug controls for the acceptance oracles; starts no Blaze processes."""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+HARNESS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(HARNESS))
+from distv2 import evidence as e
+
+spec = importlib.util.spec_from_file_location("distv2_harness", HARNESS / "distv2.py")
+h = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = h
+spec.loader.exec_module(h)
+
+KEY, OTHER, UNIT = "11" * 32, "22" * 32, "33" * 32
+
+
+def row(**extra):
+    return {"unit": "mathy", "unit_digest": UNIT, "source": "executed", "execution": 7,
+            "attempt": 2, "joined": True, "grants": 1, "compiled_for_work": 1,
+            "tail_compiled": 0, "stored_for_work": 0, "work_compiled_keys": [KEY],
+            "tail_compiled_keys": [], **extra}
+
+
+def grant(**extra):
+    return {"event": "grant", "pid": 123, "unit_digest": UNIT, "execution": 7, "attempt": 2,
+            "holder": "a", "generation": 3, "seq": 4, "work": [KEY, OTHER], **extra}
+
+
+class Oracles(unittest.TestCase):
+    def test_duplicate_tail_and_cross_daemon_compiles_are_caught(self):
+        e.no_duplicate_compile([row(), row(work_compiled_keys=[OTHER])])
+        with self.assertRaises(e.Failed):
+            e.no_duplicate_compile([row(), row()])
+        with self.assertRaises(e.Failed):
+            e.compiled(row(tail_compiled=1, tail_compiled_keys=[KEY]))
+        with self.assertRaises(e.Failed):
+            e.compiled(row(compiled_for_work=0))
+        missing = row()
+        del missing["work_compiled_keys"]
+        with self.assertRaises(e.Failed):
+            e.compiled(missing)
+
+    def test_recovery_requires_every_name_in_same_execution_under_new_lease(self):
+        old = grant()
+        new = grant(holder="b", generation=5)
+        done = {**new, "event": "result_accepted"}
+        self.assertTrue(e.recovered([old, new, done], old))
+        self.assertFalse(e.recovered([old, new, done], old, accepted_after=3))
+        self.assertFalse(e.recovered([], old))
+        self.assertFalse(e.recovered([old, {**old, "event": "result_accepted"}], old))
+        self.assertFalse(e.recovered([old, new, {**done, "work": [KEY]}], old))
+        self.assertFalse(e.recovered([old, {**new, "execution": 8}, {**done, "execution": 8}], old))
+        self.assertFalse(e.recovered([old, {**new, "unit_digest": OTHER}, done], old))
+
+    def test_refusal_must_name_exact_stale_batch_and_real_reason(self):
+        old = grant()
+        refusal = {**old, "event": "result_refused", "refusal": "DeadLease"}
+        self.assertTrue(e.stale_refused([refusal], old))
+        for field, wrong in (("holder", "b"), ("generation", 4), ("seq", 5), ("attempt", 3),
+                             ("execution", 8), ("refusal", "Unknown")):
+            self.assertFalse(e.stale_refused([{**refusal, field: wrong}], old), field)
+        self.assertFalse(e.stale_refused([{**old, "event": "holder-lost"}], old))
+        self.assertTrue(e.accepted([{**old, "event": "result_accepted"}], old))
+
+    def test_cold_cache_rejects_no_evidence_or_any_work(self):
+        cold = row(source="published", execution=-1, joined=False, grants=0,
+                   compiled_for_work=0, work_compiled_keys=[])
+        e.cached([cold])
+        for bad in ([], [row()], [{**cold, "grants": 1}], [{**cold, "tail_compiled": 1, "tail_compiled_keys": [KEY]}]):
+            with self.assertRaises(e.Failed):
+                e.cached(bad)
+
+    def test_native_manifest_corruption_and_current_attempt_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blobs = Path(directory)
+            (blobs / "packs").mkdir()
+            (blobs / "manifests").mkdir()
+            # Synthetic oracle input, never used as acceptance evidence.
+            raw = b"blzdpk\0\x01" + bytes.fromhex(KEY) + b"\1" + (1).to_bytes(8, "little") + b"x"
+            name = hashlib.sha256(raw).hexdigest()
+            target = blobs / "packs" / f"{name}.pack"
+            target.write_bytes(raw)
+            manifest = blobs / "manifests" / UNIT
+            manifest.write_text(f"{name} {len(raw)} {OTHER}\n")
+            event = {"event": "published", "unit_digest": UNIT, "execution": 7, "attempt": 2, "packs": [name]}
+            done = {"event": "done", "execution": 7, "attempt": 2, "outcome": "Passed"}
+            e.publication(blobs, [row()], [event, done])
+            for bad in ([], [event], [done, event], [{**event, "attempt": 1}, done], [{**event, "packs": []}, done]):
+                with self.assertRaises(e.Failed):
+                    e.publication(blobs, [row()], bad)
+            with self.assertRaises(e.Failed):
+                e.publication(blobs, [row(work_compiled_keys=[OTHER])], [event, done])
+            target.write_bytes(raw[:-1] + b"y")
+            with self.assertRaises(e.Failed):
+                e.manifest(blobs, UNIT)
+            target.write_bytes(raw)
+            e.publication(blobs, [row()], [event, done])
+            manifest.unlink()
+            with self.assertRaises(e.Failed):
+                e.manifest(blobs, UNIT)
+
+    def test_live_jsonl_tolerates_only_an_unfinished_last_append(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events"
+            path.write_bytes(b'{"event":"grant"}\n{"ev')
+            self.assertEqual(e.jsonl(path, live=True), [{"event": "grant"}])
+            with self.assertRaises(e.Failed):
+                e.jsonl(path)
+            path.write_bytes(b'bad\n{"ev')
+            with self.assertRaises(e.Failed):
+                e.jsonl(path, live=True)
+
+    def test_resource_hints_and_json_file_input_without_starting_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = object.__new__(h.Run)
+            run.root = Path(directory)
+            run.socket, run.port = Path(directory) / "coordinator.sock", 12345
+            base = {"blaze": "/unused", "dist_local": "/unused", "serve": "/unused", "scratch": directory}
+            path = Path(directory) / "input.json"
+            path.write_text(json.dumps(base))
+            run.given = h.load(str(path))
+            with patch.dict(os.environ, {"BLAZE_CORES": "24", "BLAZE_DAEMON_MEMORY_GB": "48", "BLAZE_DIST_LOCAL": "fallback"}):
+                env = run.env("a", True)
+                self.assertEqual(env["BLAZE_CORES"], "24")
+                self.assertEqual(env["BLAZE_DAEMON_MEMORY_GB"], "48")
+                self.assertNotIn("BLAZE_DIST_LOCAL", env)
+                run.given = h.Input(**base, cores=12, daemon_memory_gb=32, env={"BLAZE_CORES": "10"})
+                env = run.env("b", True)
+                self.assertEqual(env["BLAZE_CORES"], "12")
+                self.assertEqual(env["BLAZE_DAEMON_MEMORY_GB"], "32")
+            with self.assertRaises(TypeError):
+                h.load(json.dumps({**base, "unrecognized": True}))
+            with self.assertRaises(e.Failed):
+                h.load(json.dumps({**base, "cores": 0}))
+            with self.assertRaises(e.Failed):
+                h.load(json.dumps({**base, "env": {"BLAZE_DIST_LOCAL": "fallback"}}))
+
+    def test_fault_wait_is_bounded_and_checks_evidence_before_child_exit(self):
+        run = object.__new__(h.Run)
+        run.root = Path("/unused")
+        run.given = h.Input("/unused", "/unused", "/unused", "/unused")
+        with patch.object(h.time, "monotonic", side_effect=[0, 0, 2]), patch.object(h.time, "sleep"):
+            with self.assertRaises(e.Failed):
+                run.until("missing grant", lambda: False, timeout=1)
+        dead = unittest.mock.Mock()
+        dead.poll.return_value = 0
+        self.assertTrue(run.until("already committed", lambda: True, [dead], timeout=1))
+
+    def test_cleanup_resumes_then_terminates_and_bounds_escalation(self):
+        child = unittest.mock.Mock(pid=123, stdin=None)
+        child.poll.return_value = None
+        child.wait.side_effect = [h.subprocess.TimeoutExpired("owned-child", 10), 0]
+        with patch.object(h.os, "killpg") as kill:
+            h.Run.terminate(child)
+        self.assertEqual(kill.call_args_list, [unittest.mock.call(123, h.signal.SIGCONT),
+                                              unittest.mock.call(123, h.signal.SIGTERM),
+                                              unittest.mock.call(123, h.signal.SIGKILL)])
+        self.assertEqual(child.wait.call_args_list, [unittest.mock.call(timeout=10), unittest.mock.call(timeout=10)])
+
+
+if __name__ == "__main__":
+    unittest.main()
