@@ -543,8 +543,8 @@ for each platform, each on a machine of its own kind.
 
 | Workflow | Event | What runs | Wall time |
 |---|---|---|---|
-| `blaze.yaml` (`gate`) | pull request | on Linux AArch64, on a 64-vCPU ix runner ([ix runners](#ix-runners)): blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`, `blaze test`, only the tests the change reached), from the newest release and the store main pushed to blaze's remote; on Linux AArch64 (ix), `blaze check --workspace --message-format short` with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from main's last green run's snapshot); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `harness/rustcsites.py`, actionlint over `.github/workflows` | 49 min on a store the release has not compiled into |
-| `blaze.yaml` (`warm`) | push to main | the same on Linux AArch64 (ix) and macOS, every test, then a push of the store for the runs after it, and `linux x64 (cross-compiled, not run)`, blaze cross-compiled for x86-64 and not run ([ix runners](#ix-runners); TODO(x86-64): no x86-64 tests). Its `linux arm64 / build` passing is what cuts a canary (`canary.yaml`); the whole run green, unit tests on every platform, is what stable needs besides the promotion gate ([release.md](release.md)). And on Linux AArch64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
+| `blaze.yaml` (`gate`) | pull request and merge group | on hosted Linux AArch64: blaze builds and tests itself through `harness/unittests.py`, the released blaze checks the workspace, the profile gate checks the build history, and the script and workflow jobs check the Python, rules, docs and runner policy. The store starts empty; the build hands its packs to the tests job. Lint baselines and the x86-64 cross build run outside `ci` until their existing blockers are settled | hosted runtime not measured in this integration |
+| `blaze.yaml` (`warm`) | push to main | the build and tests on hosted Linux AArch64 and macOS, with a fresh store per job; the AArch64 smoke job also runs. The existing canary and release workflows consume the resulting checks and artifacts | |
 | `blaze-platform.yaml` (`profile-gate`) | with each platform's build, but Windows | the profile's gate (`blaze debug gate`, [profiling.md](profiling.md#the-gate-what-a-profile-must-hold)) over the history the build's self-build wrote, with the blaze it made, held to `harness/profile-gate-known.toml`, and each fixture of `crates/blaze-profile/fixtures/gate/` failing its own check (`harness/profile_gate.py`); uploads the build's per-build summary as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`. No secret | a few min |
 | `profile-nightly.yaml` | nightly, by hand | `slower_between_commits` over main's last 10 summaries of one runner class, the newest against the rest (`harness/profile_trend.py`); fails naming each span 1.25 times and 50 ms slower or more | 5 min |
 | `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file | 2 min |
@@ -580,19 +580,12 @@ the runner's (gcc and glibc 2.39 on Ubuntu 24.04, Xcode's clang on macOS), so wh
 the tests link runs on the runner; the train's tiers still build with cargo in the flake's dev
 shell, against its glibc, and their harness jobs install Nix for that.
 
-A change reaches main through a **pull request** alone
-([contributing.md](contributing.md#landing-a-change)), merged directly once `ci` passes on it;
-there is no merge queue, and the branch need not be up to date with main (removed 2026-10-27:
-the queue's wait and its reruns on entries that later landed unchanged cost more than the rare
-pair of changes that pass alone and break together, which the train catches on main). The gate
-is the build and the unit tests, the released blaze checking the workspace, and the profile's
-gate over the build's own history: a change that does not build, breaks a unit test, leaves a
-workspace the release cannot load and check, or makes a gate check fail or stop running that the
-known list does not name, does not merge. What the harnesses find, they find on main, in the train, which says
-which commits since the last green train it came in with. Before the gate was this small, a
-merge-queue run took 35 to 45 minutes, nearly all of it harnesses (harness/ci.py's `quick-2`
-on every platform), and 51 of 140 queue runs on 2026-10-25 and 26 failed, most of them on
-entries that later landed unchanged.
+This fork's final integration must go through the **merge queue**. `blaze.yaml`
+handles both pull requests and `merge_group` events; `ci` is the aggregate gate.
+A pull request's passing checks provide early feedback. The queued merge-group
+commit must pass the required gate before main moves. The repository ruleset must
+enforce this: a workflow file alone cannot turn a queue on or remove bypass rights.
+Root verifies those settings before enqueueing the integrated branch.
 
 No check refuses a pull request for its formatting: `fmt.yaml` formats main after each push and
 commits the result as `fmt`. Run `blaze fmt --all` before pushing all the same, so that the
@@ -616,79 +609,26 @@ moves in when it is next changed. `harness/imports.py` runs in the workspace's P
 
 ### ix runners
 
-blaze's CI runs on indexable's own GitHub Actions runners, ix's
-([ix.dev/docs/runners](https://ix.dev/docs/runners)), with no switch to turn it off, and on
-Linux AArch64 alone: ix has no x86-64 capacity today (its runner plane refuses a job for an
-architecture it has no node for, and an `x64` job then waits a day), so every Linux job runs on
-`arm64`, builds there and tests there.
+This fork retired private and self-hosted Actions runners in main's #69/#71. V2's
+workflows use GitHub-hosted Ubuntu, macOS and Windows images; reusable platform jobs
+use their caller's hosted `os` input. Linux jobs remain AArch64 except the existing
+release and installation jobs that explicitly name x86-64 images. Native Linux x86-64
+unit-test coverage and a macOS workspace check remain gaps; the x86-64 cross job
+checks its ELF output but does not run it.
 
-**TODO(x86-64): blaze's x86-64 tests are missing.** No job runs blaze's tests on Linux x86-64
-until ix has x86-64 capacity; then `linux x64` comes back to `blaze.yaml`, the train,
-`focused.yaml`, promote.yaml's smoke and apps, install.yaml's installs and toolchain-bump's
-answers. Until then `linux x64 (cross-compiled, not run)` (`blaze.yaml`, every tier, not part of `ci`)
-cross-compiles `blaze` and `blaze-engine` for `x86_64-unknown-linux-gnu` on an ix AArch64
-runner, with Ubuntu's x86-64 cross gcc and glibc for C and the link, and qemu-user to run the
-x86-64 `llvm-config` the pinned LLVM's build script asks; it checks the binaries are x86-64 ELF
-and runs nothing.
+There are no runner snapshots. `.github/actions/blaze` keeps a job's store in
+`$RUNNER_TEMP/blaze-store`, and `.github/actions/nix` installs Nix when a job needs it.
+Hosted memory and time limits can refuse a cold build; no Cargo fallback is used.
+The optional benchmark matrices use the hosted labels of `harness/benchplatforms.py`
+([benchmarks.md](benchmarks.md#the-machines)).
 
-- The gate's build and unit tests (`linux arm64 / build`, `linux arm64 / tests`),
-  `workspace-check` and `lint-baselines` run on `[ix, arm64, ix-cpu-64, blaze-<job>]`: 64
-  vCPUs, and memory that grows on demand up to 256 GiB, where a hosted runner has 4 vCPUs and
-  16 GB. A cold build of blaze needs about 28 GB and on a hosted runner swapped for over an
-  hour; across main's last 150 runs before the move, hosted `linux x64 / build` passed 0 of 54
-  times (median 86.5 min to its failure).
-- Every job of `blaze-platform.yaml` for `linux-arm64` (the train's and `focused.yaml`'s
-  harnesses, smoke, the larger projects, the profile gate, the bench) runs on ix: 64 vCPUs for
-  the build, the unit tests and the projects, 16 for the rest, each with a label of its own.
-- The small jobs (`changes`, `scripts`, `actionlint`, `ci`, the train's verdict and release,
-  canary and release cuts, the profile trend, the bench workflows' matrix jobs, ...) run on
-  `[ix, arm64]`, ix's default size.
-- Clean-machine jobs and jobs holding a long-lived secret run on **cold** runners,
-  `[ix, arm64, ix-mode-cold]`: booted from the base image every time, never snapshotted and
-  never a seed, so nothing an earlier job left is there and nothing they leave reaches a later
-  one. The clean machines: install.yaml's installs and promote.yaml's smoke and apps. The
-  secrets (the bot token, Cloudflare's, crates.io's): fmt, site, the bench and live-latency
-  history commits, promote.yaml's and yank's metadata, release.yaml's notes-free jobs (crates,
-  publish, metadata), pgo's pin and toolchain-bump's branch and pull request.
-
-Every warm ix runner is a fork of the snapshot of the last green job on main with the same
-labels, its disk included: the checkout, `target/`, the toolchain, the pinned LLVM, `/nix/store`
-and blaze's store, which `.github/actions/blaze` keeps under `$HOME/.cache/blaze-ci/store` on a
-self-hosted runner (ix's scrub deletes `_work/_temp` before a snapshot) and bounds at 200G. The
-pull from the remote then fetches only what main pushed since. No swap is made on ix: its scrub
-refuses to snapshot a machine with swap on. The image is Ubuntu 24.04 with build-essential, git,
-gh, jq, python3 and Nix, and lacks some of what a hosted image has: `.github/actions/rustup`
-installs rustup when there is none, `.github/actions/nix` uses the image's Nix in place of
-Determinate's installer, and an `apt-get install` first fetches the package lists the image does
-not ship.
-
-A run off main never becomes a snapshot, and before every snapshot ix's scrub removes what a job
-could leave for the next (processes, the job's credentials, git credentials and logins, `/tmp`),
-since a fork's pull request restores the same snapshots. A pull request from a fork runs only
-once a maintainer approves it: the repository's fork pull request policy is
-`all_external_contributors`, and no workflow uses `pull_request_target`.
-
-What stays on GitHub's hosted runners, and why:
-
-- **One macOS job in the gate path, `macos arm64` in `blaze.yaml`'s `warm` tier**: blaze's
-  Mach-O output, its ad hoc signature, dyld and the macOS std are only exercised by running on
-  macOS, and blaze cannot cross-compile for `aarch64-apple-darwin` from Linux today (below). The
-  gate's `workspace-check` is Linux alone (TODO(macos): a cross `blaze check --target
-  aarch64-apple-darwin` once the SDK is in CI). The other macOS jobs run what users run on a
-  Mac: release.yaml's, llvm.yaml's and pgo.yaml's darwin builds, install.yaml's and
-  promote.yaml's macOS installs and smoke, toolchain-bump's and profile-nightly's macOS entries.
-- **Builds of what users run on Linux**: release.yaml, llvm.yaml's and pgo.yaml's builds and
-  install.yaml's archive (and the no-Rust containers that install it) run on hosted Ubuntu 22.04
-  so that the binaries ask for an old glibc (`build_release.py` refuses one newer than RHEL 9's
-  2.34); the ix image's glibc is 2.39. **TODO(sysroot)**: blaze has no `--sysroot`; it finds crt
-  objects and libc through `$CC_<triple> -print-search-dirs`, and the sysroot archives of
-  [toolchain-c.md](v2/plan/toolchain-c.md) are not built. A driver given one
-  (`CC_aarch64_unknown_linux_gnu="gcc --sysroot=<glibc 2.34 tree>"`) finds the old glibc's files,
-  but blaze-link then takes the ELF interpreter from inside that tree, as libc's directory is not
-  an FHS one (`crates/blaze-link/src/target.rs`, `fhs`), so the binaries would not run elsewhere. Once blaze links against an old glibc
-  sysroot, these move to ix.
-- Windows, which ix does not serve.
-- The bench workflows' measurements run on the machines `BENCH_RUNNERS` registers.
+`.github/scripts/check_runner_labels.py` and its unit tests run in `blaze.yaml`'s
+workflows job for pull requests and merge-group entries. They reject private literal
+labels, resolve literal matrices and runner inputs at workflow call sites, and refuse
+unresolved runner expressions in a pull-request or merge-group workflow. Trusted
+non-PR workflows can use runtime matrices or workflow-call inputs. Repository runner
+registration, fork-approval settings and rulesets are operator settings, not proved
+by these source checks.
 
 How far blaze cross-compiles today: `--target` takes one foreign triple; std is built from
 `library/` for it, Cranelift and LLVM emit for it, and blaze-link writes ELF and Mach-O itself,
@@ -804,18 +744,13 @@ main were cancelled.
 `ci` is the gate's job that says whether everything that ran passed, and it is the one check
 the branch rules require. A job that is renamed or split does not change it.
 
-The repository ruleset `main` (Settings, Rules) is active and holds the default branch to three
-rules: a change needs `ci` to have passed on its commit (not strict: the branch need not be up to
-date with main), the branch can't be deleted, and it can't be force-pushed. There is no merge
-queue (removed 2026-10-27). Repository admins bypass the
-rules (`bypass_actors`), for repairs; work lands through pull requests. A ruleset can't exempt the
-token a workflow runs with, so the workflows that commit to main (`fmt.yaml`, the train's
-`release`, `pgo.yaml`'s pin, `bench-readme.yaml`, `bench-bun.yaml`, `live-latency.yaml`) check
-out with the secret `BLAZE_BOT_TOKEN`, a fine-grained token of a repository admin (Contents
-read and write on this repository alone) that the admin bypass lets past; without it their push
-is refused. The release tag is made with the workflow's own token, which starts no workflow, and
-`release.yaml` is started on it by dispatch. `gh api repos/indexable-inc/blaze/rulesets/25516056`
-shows the rules, and Insights, Rule insights what they refused.
+The repository ruleset must require the merge queue and `ci`, prohibit force pushes
+and branch deletion, and restrict bypass rights. These settings were not read or
+changed by this local integration. The existing metadata workflows still use
+`BLAZE_BOT_TOKEN` to commit generated files to main; their bypass and interaction
+with queue-only protection require an operator's review before final integration.
+`land.py` also retains the older auto-merge interface; do not use it as proof that
+queue-only protection is enabled.
 
 What is known to be wrong is written down, says why, and does not fail the run. Once it comes
 out right, it fails the run until it is taken off the list:

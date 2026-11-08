@@ -46,7 +46,7 @@ env:
 jobs:
   unit-graphs:
     name: nix unit graphs are current
-    runs-on: [ix, arm64]
+    runs-on: ubuntu-24.04-arm
     # Two minutes on a warm nix store; a cold one builds the dev shell first (unit_graph.py
     # bounds that at an hour).
     timeout-minutes: 75
@@ -67,7 +67,7 @@ jobs:
     # capacity (docs/harness.md "ix runners").
     name: nix build (aarch64-linux)
     if: github.event_name != 'pull_request'
-    runs-on: [ix, arm64, ix-cpu-16, blaze-nix-live]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -113,7 +113,7 @@ jobs:
   demo:
     name: demo/life and blaze-live (linux)
     if: github.event_name != 'pull_request'
-    runs-on: [ix, arm64, ix-cpu-16, blaze-nix-live-demo]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7

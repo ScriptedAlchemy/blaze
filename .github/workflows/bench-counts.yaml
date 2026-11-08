@@ -1,13 +1,4 @@
-# Instruction counts per merge (docs/benchmarks.md "Instruction counts"): on every push to main, the
-# cheap subset of harness/bench.py (the stress corpus of harness/stress-corpus and two small
-# projects, the dev profile, three runs) on each platform's dedicated benchmark machine, the same
-# self-hosted runners bench-readme.yaml uses (harness/benchplatforms.py). Hardware counters need
-# a machine with a PMU the job may read: GitHub's hosted runners expose none, so this never runs
-# there. Each platform's line goes to docs/benchmarks/history/<platform>-merge.jsonl
-# (benchhistory.py build --suite merge), and `benchhistory.py check` judges it against the runs
-# before it: instructions first, with a 1% band (or three times their spread), wall time and
-# memory with their usual bands. The summary (regressed, improved and the geometric mean of
-# every change, rustc-perf's form) goes to the run's summary; a regression fails the run.
+# Optional hosted measurements; missing hardware counters remain an explicit gap.
 name: bench-counts
 on:
   push:
@@ -22,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 defaults:
   run:
@@ -33,8 +24,8 @@ env:
 
 jobs:
   platforms:
-    name: platforms with a registered runner
-    runs-on: [ix, arm64]
+    name: selected benchmark platforms
+    runs-on: ubuntu-24.04-arm
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       any: ${{ steps.matrix.outputs.any }}
@@ -49,11 +40,15 @@ jobs:
   counts:
     name: counts (${{ matrix.name }})
     needs: platforms
-    if: needs.platforms.outputs.any == 'true'
+    if: >-
+      needs.platforms.outputs.any == 'true' &&
+      github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
-    runs-on: ${{ matrix.labels }}
+    runs-on: ${{ matrix.label }}
+    permissions:
+      contents: read
     timeout-minutes: 120
     env:
       # Shared with bench-readme.yaml: blaze builds incrementally and the projects are cloned once.
@@ -76,6 +71,7 @@ jobs:
             sudo -n sysctl kernel.perf_event_paranoid=2 || echo "::warning::perf_event_paranoid stays above 2: no instruction counts"
           fi
       # blaze builds blaze (AGENTS.md rule blaze-builds-blaze), as bench-readme.yaml builds it.
+      - uses: ./.github/actions/nix
       - name: Build blaze
         run: |
           mkdir -p "$BENCH_HOME"
@@ -110,8 +106,12 @@ jobs:
   history:
     name: history and check
     needs: [platforms, counts]
-    if: always() && needs.platforms.outputs.any == 'true'
-    runs-on: [ix, arm64, ix-mode-cold]
+    if: >-
+      always() && needs.platforms.outputs.any == 'true' &&
+      github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -138,6 +138,7 @@ jobs:
           echo "regressed=$regressed" >> "$GITHUB_OUTPUT"
           cat "$RUNNER_TEMP/regressions.md" >> "$GITHUB_STEP_SUMMARY"
       # The README's and docs/benchmarks.md's trend charts, from the history just appended to.
+      - uses: ./.github/actions/nix
       - name: Trends
         run: python3 harness/benchcharts.py '{}'
       # Main may have moved during the run: bench_commit.py puts the commit on top, draws the

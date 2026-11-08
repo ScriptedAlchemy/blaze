@@ -57,8 +57,7 @@ runs:
       run: |
         # Without --no-toolchain: install.sh has blaze fetch its toolchain now (`blaze toolchain`),
         # as a user's install does, rather than at the first build.
-        # install.sh puts blaze in $CARGO_HOME/bin; GitHub's hosted images have that on PATH, ix's
-        # image does not.
+        # Make the installed entrypoints available to this and later steps.
         bin="${CARGO_HOME:-$HOME/.cargo}/bin"
         export PATH="$bin:$PATH"
         echo "$bin" >> "$GITHUB_PATH"
@@ -66,24 +65,9 @@ runs:
         said=$(blaze-engine --version)
         version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
         [ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }
-        if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
-          # On an ix runner (the only self-hosted runners that run this action; docs/harness.md
-          # "ix runners") the machine is a fork of the
-          # snapshot of its label set's last green job on main, its disk included, so a store
-          # under $HOME starts with what that job had and the pull below fetches only what is
-          # newer. Not under $RUNNER_TEMP: ix's scrub deletes _work/_temp before the snapshot.
-          # That disk lives on from job to job, so the store is collected (least recently used
-          # packs first) above a bound with room for a few releases' projects.
-          echo "BLAZE_CACHE=$HOME/.cache/blaze-ci/store" >> "$GITHUB_ENV"
-          echo "BLAZE_CACHE_MAX=200G" >> "$GITHUB_ENV"
-        else
-          echo "BLAZE_CACHE=$RUNNER_TEMP/blaze-store" >> "$GITHUB_ENV"
-          # No limit on the store: its default, a tenth of the free disk (about 3 GB on a hosted
-          # runner), left a third of main's packs unpulled ("318 left that do not fit under
-          # BLAZE_CACHE_MAX"), so a warm run still rebuilt what they held. A hosted runner's disk
-          # lives for one job, so nothing needs collecting.
-          echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
-        fi
+        # A hosted machine and its store live for this job alone.
+        echo "BLAZE_CACHE=$RUNNER_TEMP/blaze-store" >> "$GITHUB_ENV"
+        echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
         mkdir -p "$(grep -m1 '^BLAZE_CACHE=' "$GITHUB_ENV" | cut -d= -f2-)"
     # TODO(stage 0 after 3732f60733): remove these two steps once .github/blaze-version names a
     # release cut after 3732f60733 (the perf sampler, no signals). The pinned 0.20261105.4
@@ -128,7 +112,7 @@ runs:
     # (crates/blaze-cargo/src/cargo/directives.rs, SYSTEM). The same directory every run, so the
     # store's runs of the build scripts that read LLVM_SYS_231_PREFIX are found.
     # llvm.py takes JSON through typed_input, which needs Python 3.12; the oldest hosted Ubuntu has
-    # 3.10. An ix runner's python3 is new enough (blaze.yaml's runs of typed_input scripts).
+    # 3.10, so select Python explicitly.
     - if: inputs.llvm == 'true' && runner.environment == 'github-hosted'
       uses: actions/setup-python@v7
       with:
@@ -155,9 +139,7 @@ runs:
     # was 34.2 GB on 2026-10-30 (green) and passed 36.4 GB, still rising, on 2026-11-04 (run
     # 41755023516), when 20 GB of swap ran out and the runner was shut down. So 40 GB, as the disk
     # allows with 20 GB left for the store and target/, until the release the gate builds with
-    # bounds its own memory (#1376; docs/memory-budget.md). Not on an ix runner:
-    # its memory grows on demand up to 256 GiB, and ix's scrub refuses to snapshot a machine
-    # with swap on, so a job that turned it on would never become its label set's seed.
+    # bounds its own memory (#1376; docs/memory-budget.md).
     - name: swap
       if: runner.os == 'Linux' && runner.environment == 'github-hosted'
       shell: bash
