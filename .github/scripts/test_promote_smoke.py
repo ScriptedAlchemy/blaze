@@ -83,5 +83,18 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertNotIn("stop", commands)
 
 
+    def test_pr_smoke_uses_read_token_for_public_corpus(self):
+        import json
+
+        smoke = WORKFLOW.read_text().split("\n  smoke:\n", 1)[1].split("\n  apps:\n", 1)[0]
+        self.assertEqual(smoke.count("GH_TOKEN: ${{ github.event_name == 'pull_request' && github.token || secrets.BLAZE_BOT_TOKEN }}"), 1)
+        self.assertIn('if [ -z "$GH_TOKEN" ]; then', smoke)
+        self.assertIn('python3 -I harness/smoke.py', smoke)
+        corpus = json.loads((WORKFLOW.parents[2] / "harness/smoke/smoke.json").read_text())
+        self.assertTrue(corpus["projects"])
+        self.assertFalse([name for name, spec in corpus["projects"].items() if spec.get("private")])
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -155,7 +155,9 @@ jobs:
           if [ "${#packages[@]}" -gt 0 ]; then sudo apt-get update -qq && sudo apt-get install -y -qq "${packages[@]}"; fi
       - name: smoke corpus
         env:
-          GH_TOKEN: ${{ secrets.BLAZE_BOT_TOKEN }}
+          # Fork PRs have a read-only Actions token and no bot secret. The PR corpus is public.
+          # Real release promotion retains the bot token for its unchanged full corpus.
+          GH_TOKEN: ${{ github.event_name == 'pull_request' && github.token || secrets.BLAZE_BOT_TOKEN }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::error::the smoke corpus reads GitHub with the secret BLAZE_BOT_TOKEN, which this run does not have"
