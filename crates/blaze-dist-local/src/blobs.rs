@@ -216,10 +216,10 @@ fn publish_verdict(
         200..=299 => Ok(()),
         412 => match read_existing()? {
             Some(existing) if existing.as_slice() == proposed => Ok(()),
-            Some(_) => Err(Error::Protocol(format!(
+            Some(_) => Err(Error::Committed(format!(
                 "PUT {path}: 412: another publisher committed different packs under this unit key"
             ))),
-            None => Err(Error::Protocol(format!(
+            None => Err(Error::Committed(format!(
                 "PUT {path}: 412: publication was refused but the committed list is missing"
             ))),
         },
@@ -298,8 +298,15 @@ mod tests {
             assert_eq!(verdict.is_ok(), accepted, "unexpected conflict verdict: {verdict:?}");
             if let Err(error) = verdict {
                 assert!(
-                    matches!(&error, Error::Protocol(why) if why.contains(path)),
+                    matches!(&error, Error::Committed(why) if why.contains(path)),
                     "the refusal must name the conflicting unit: {error}"
+                );
+                assert!(
+                    matches!(
+                        crate::agent::decide(&blaze_wire::LocalPolicy::Fallback, error),
+                        Err(Error::Committed(_))
+                    ),
+                    "an immutable publication conflict must not authorize recompilation"
                 );
             }
         }
