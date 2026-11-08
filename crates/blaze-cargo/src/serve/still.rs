@@ -32,6 +32,9 @@ pub(super) struct Facts {
     pub(super) pool_idle: bool,
     /// The pool's jobs parked on a wait.
     pub(super) parked: usize,
+    /// The system's memory pressure caps admission ([`blaze_graph::pressure::Pressured::cap`]):
+    /// a ready task waits for the cap to pass, which it does on its own, on a turn of the loop.
+    pub(super) pressed: bool,
 }
 
 /// Why nothing can move the build.
@@ -111,7 +114,8 @@ fn why(facts: &Facts, stuck: impl FnOnce() -> bool) -> Option<Why> {
         return None;
     }
     if facts.on_pool == 0 {
-        return Some(Why::NoTask);
+        // A cap for memory pressure starts nothing until it passes, and it passes by itself.
+        return (!facts.pressed).then_some(Why::NoTask);
     }
     if facts.parked == 0 {
         return Some(Why::Lost { tasks: facts.on_pool });
@@ -193,5 +197,23 @@ mod tests {
         assert!(matches!(stillness.tick(4_000 * MS, &lost, || false, || true), Turn::Still { .. }));
         // Nothing open is nothing to move.
         assert_eq!(Stillness::default().tick(0, &lost, || false, || false), Turn::Holds);
+    }
+
+    /// A test build of 2026-11-07: another daemon's build pressed the machine's memory, the cap
+    /// held this build's ready tasks back with none running, and 2 s later it failed as still,
+    /// though the cap passes by itself 10 s after the system's last event. A cap is no stall;
+    /// a task lost under one still is.
+    #[test]
+    fn a_build_held_back_for_memory_pressure_is_not_still() {
+        let held = Facts { pool_idle: true, pressed: true, ..Facts::default() };
+        assert_eq!(run(held, false), None, "a cap passes by itself");
+        assert_eq!(
+            run(Facts { pressed: false, ..held }, false).map(|(_, turn)| turn),
+            Some(Turn::Still { quiet_ns: 2_000 * MS, why: Why::NoTask })
+        );
+        assert_eq!(
+            run(Facts { on_pool: 1, ..held }, false).map(|(_, turn)| turn),
+            Some(Turn::Still { quiet_ns: 2_000 * MS, why: Why::Lost { tasks: 1 } })
+        );
     }
 }

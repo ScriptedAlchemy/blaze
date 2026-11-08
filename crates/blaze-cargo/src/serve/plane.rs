@@ -857,6 +857,12 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.pressure.release_due(ns(at))
     }
 
+    /// Whether the system's memory pressure caps admission now: the cap passes by itself, on the
+    /// first [`Plane::poll`] past [`blaze_graph::pressure::HOLD_NS`] after the last event.
+    pub fn pressure_caps(&self) -> bool {
+        self.capped.is_some()
+    }
+
     /// What admission counts the daemon at (the most of what it held as the plane last heard
     /// and what its running tasks are granted), the budget it admits against (its allowance;
     /// `None` with no budget), and the pressure cap on it while there is one.

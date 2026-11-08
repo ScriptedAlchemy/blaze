@@ -2039,6 +2039,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             on_pool,
             pool_idle,
             parked,
+            pressed: self.plane.pressure_caps(),
         };
         let plane = &self.plane;
         let open = || {
