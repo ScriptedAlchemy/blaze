@@ -1548,6 +1548,10 @@ struct Build<S: Steps> {
     refused: Option<Refused>,
     /// Each unit's freshness by its place in the plan, once asked ([`Build::is_fresh`]).
     fresh: Vec<Option<bool>>,
+    /// Each compile result the loop has actually received, before running any dependent
+    /// build script. A plane run can arrive before the compile result that schedules
+    /// placement; an empty `busy` map alone does not prove its executable exists.
+    accounted: Vec<bool>,
     /// What became of each unit by its place in the plan, as its nodes settle: what the
     /// build's report of what it left unchecked is made of ([`Build::unchecked`]).
     verdicts: Vec<Verdict>,
@@ -4673,6 +4677,7 @@ impl<S: Steps> Jobs<S> {
             evaluation,
             refused: None,
             fresh: fresh_units,
+            accounted: vec![false; verdicts.len()], // alloc: once per build, a flag per unit
             verdicts,
             applying: applying.then_some(Applying { left: count, failed: false }),
         }));
@@ -4942,6 +4947,9 @@ impl<S: Steps> Jobs<S> {
         let streams = streams_units(&job.work);
         if let Stage::Units(build) = &mut job.stage {
             build.writer.compiled(unit);
+            if let Some(accounted) = build.accounted.get_mut(unit) {
+                *accounted = true;
+            }
         }
         let mut compiled = match result {
             Ok(compiled) => compiled,
@@ -6508,19 +6516,32 @@ fn unit_of(units: &Units, at: usize) -> Option<UnitOf> {
     })
 }
 
-/// Whether build script run `node` of `job` waits for its program: an output of the compile of
-/// its script has an effect placing it in flight.
+/// Whether a script waits on the build of its program: the compile result must be received
+/// by the loop before its output placement is considered complete. An empty `busy` map before
+/// that result is received is not evidence that the build-script executable exists.
 fn waits_for_program<S: Steps>(job: &Job<S>, node: NodeId) -> bool {
-    if job.busy.is_empty() {
-        return false;
-    }
     let Stage::Units(build) = &job.stage else { return false };
     let Some(compile) =
         build.unit(node).and_then(|run| super::unit::compile_of(&build.outputs.units, run))
     else {
         return false;
     };
-    build.outputs.of(compile).iter().any(|path| job.busy.contains_key(path))
+    program_awaits_placement(
+        build.accounted.get(compile).copied().unwrap_or(false),
+        build.outputs.of(compile),
+        &job.busy,
+    )
+}
+
+/// A script is runnable only after its compile result has scheduled every output, and the
+/// final mode/stat/clone effect for each output has completed. Neither condition implies the
+/// other: the task and its placement completions arrive on different event queues.
+fn program_awaits_placement(
+    accounted: bool,
+    paths: &[u32],
+    busy: &HashMap<u32, u32, Global>,
+) -> bool {
+    !accounted || paths.iter().any(|path| busy.contains_key(path))
 }
 
 fn script_ended<S: Steps>(w: &mut World<'_, S>, node: NodeId, ok: bool) {

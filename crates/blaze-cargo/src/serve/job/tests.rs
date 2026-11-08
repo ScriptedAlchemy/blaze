@@ -437,6 +437,43 @@ fn jobs_are_walked_in_the_order_they_started_whatever_their_slots() {
     assert!(jobs.jobs.get(key_of(stale)).is_none(), "an id of another generation finds nothing");
 }
 
+/// The scheduler may announce that a build-script run can start before the loop has
+/// processed its compiler result. No placement is in flight yet in that order: it must
+/// still wait, then wait again for every placement and executable-mode completion.
+#[test]
+fn a_script_waits_for_the_compile_result_and_every_output_placement() {
+    let mut busy = HashMap::new_in(std::alloc::Global);
+    let paths = [4, 5];
+    assert!(
+        program_awaits_placement(false, &paths, &busy),
+        "empty busy before the compiler result is not a runnable program"
+    );
+    busy.insert(4, 1);
+    busy.insert(5, 1);
+    assert!(
+        program_awaits_placement(true, &paths, &busy),
+        "the first output is still being placed"
+    );
+    busy.remove(&4);
+    assert!(
+        program_awaits_placement(true, &paths, &busy),
+        "another output's pending mode/clone keeps the run held"
+    );
+    busy.remove(&5);
+    assert!(
+        !program_awaits_placement(true, &paths, &busy),
+        "only an accounted, fully placed executable is runnable"
+    );
+    assert!(
+        program_awaits_placement(false, &[], &busy),
+        "no output paths cannot excuse an unobserved compiler result"
+    );
+    assert!(
+        !program_awaits_placement(true, &[], &busy),
+        "a legitimately output-free compile needs no placement wait"
+    );
+}
+
 /// A path is not all there while any effect placing it is in flight (a placement, then its
 /// mode, then the look at what was placed): what a build script's run waits on before it runs
 /// its program.
