@@ -535,6 +535,27 @@ fn an_immutable_store_conflict_refuses_programs_and_conflicting_outputs() {
     );
 }
 
+/// A completion for the wrong filesystem operation must never be counted as
+/// a successful executable chmod or output write. Otherwise the loop records an
+/// unexecutable or missing build-script binary as ready to run.
+#[test]
+fn output_placement_requires_the_matching_effect_completion() {
+    assert!(output_effect_completion(&Done::Written, false).is_ok());
+    assert!(output_effect_completion(&Done::Moded, true).is_ok());
+
+    for (done, mode, why) in [
+        (Done::Moded, false, "not Written"),
+        (Done::Written, true, "not Moded"),
+        (Done::Stat(None), false, "not Written"),
+        (Done::Cloned, true, "not Moded"),
+        (Done::Failed(blaze_core::IoError("chmod denied".into())), true, "chmod denied"),
+        (Done::Failed(blaze_core::IoError("write denied".into())), false, "write denied"),
+    ] {
+        let error = output_effect_completion(&done, mode).unwrap_err();
+        assert!(error.contains(why), "{error}");
+    }
+}
+
 #[test]
 fn a_failed_final_stat_cannot_authorize_running_a_build_script() {
     let key = blaze_cas::Key(ContentId([7; 32]));

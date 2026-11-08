@@ -5486,17 +5486,14 @@ impl<S: Steps> Jobs<S> {
                 }
             }
             Own::Write { job: id, path } | Own::Mode { job: id, path, .. } => {
-                let failed = match &done {
-                    Done::Failed(error) => {
-                        let name = &self.paths.names[path as usize];
-                        // alloc: an error, once
-                        Some(ApiError::new(
-                            format!("writing {name}: {error}"),
-                            Some(name.to_string()),
-                        ))
-                    }
-                    _ => None,
-                };
+                let failed =
+                    output_effect_completion(&done, matches!(&own, Own::Mode { .. }))
+                        .err()
+                        .map(|why| {
+                            let name = &self.paths.names[path as usize];
+                            // alloc: an error, once
+                            ApiError::new(format!("placing {name}: {why}"), Some(name.to_string()))
+                        });
                 let Some(job) = self.end_placing(id, path) else { return };
                 if let Some(error) = failed {
                     job.refused_places.insert(path);
@@ -6693,6 +6690,22 @@ fn output_readiness(
 /// removes its busy count, but cannot turn that path into an executable.
 fn refused_program_output(paths: &[u32], refused: &HashSet<u32, Global>) -> Option<u32> {
     paths.iter().copied().find(|path| refused.contains(path))
+}
+
+/// Only the effect's exact successful completion may advance an output placement.
+/// A different completed operation (not merely `Done::Failed`) cannot prove an
+/// executable was made executable or its auxiliary file was written.
+fn output_effect_completion(done: &Done, mode: bool) -> Result<(), String> {
+    match (mode, done) {
+        (false, Done::Written) | (true, Done::Moded) => Ok(()),
+        (_, Done::Failed(error)) => Err(format!("{error}")), // alloc: a failed effect
+        (false, other) => {
+            Err(format!("the output write returned {other:?}, not Written")) // alloc: an invalid completion
+        }
+        (true, other) => {
+            Err(format!("the executable mode change returned {other:?}, not Moded")) // alloc: an invalid completion
+        }
+    }
 }
 
 /// A recheck distinguishes a genuinely missing/changed output from an unreadable one.
