@@ -134,13 +134,13 @@ impl T for u8 {}
 fn main() {
     println!("{}", tracked());
     let p: fn() -> u32 = tracked;
-    println!("{}", p() != tracked());
+    println!("{}", p());
     println!("{}", 0u8.m());
     let d: &dyn T = &0u8;
     println!("{}", d.m() > 0);
 }
 """},
-        "prints": ["7", "true", "10", "true"],
+        "prints": ["7", "3", "10", "true"],
     },
     {
         "name": "empty-array-promoted-through-iter-mut",
@@ -212,7 +212,7 @@ fn main() {
 ''',
         },
         "program": "app",
-        "prints": ["12"],
+        "steps": [{"prints": ["12"]}, {"replay": True, "prints": ["12"]}],
     }
 )
 CASES.append(
@@ -220,17 +220,52 @@ CASES.append(
         "name": "a-required-feature-of-a-dependency",
         "fixes": ["c69fe89a6"],
         "files": {
-            "Cargo.toml": '[workspace]\nmembers = ["dep", "app"]\nresolver = "2"\n',
+            "Cargo.toml": '[workspace]\nmembers = ["dep", "hostdep", "app"]\ndefault-members = ["app"]\nresolver = "2"\n',
             "dep/Cargo.toml": '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nextra = []\n',
             "dep/src/lib.rs": '#[cfg(feature = "extra")]\npub const ON: bool = true;\n#[cfg(not(feature = "extra"))]\npub const ON: bool = false;\n',
-            "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nwanted = ["dep/extra"]\nmissing = ["dep/extra"]\n\n[dependencies]\ndep = { path = "../dep" }\n\n[[bin]]\nname = "app"\npath = "src/main.rs"\n\n[[bin]]\nname = "needs"\npath = "src/needs.rs"\nrequired-features = ["missing"]\n',
-            "app/src/main.rs": 'fn main() { println!("{}", dep::ON); }\n',
-            "app/src/needs.rs": 'fn main() { compile_error!("a bin whose required feature is off is not built"); }\n',
+            "hostdep/Cargo.toml": '[package]\nname = "hostdep"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nextra = []\n',
+            "hostdep/src/lib.rs": '#[cfg(feature = "extra")]\npub const ON: bool = true;\n#[cfg(not(feature = "extra"))]\npub const ON: bool = false;\n',
+            "app/Cargo.toml": '''[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dep = { path = "../dep" }
+
+[build-dependencies]
+hostdep = { path = "../hostdep", features = ["extra"] }
+
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[[bin]]
+name = "needs"
+path = "src/needs.rs"
+required-features = ["dep/extra"]
+
+[[bin]]
+name = "host-needs"
+path = "src/host.rs"
+required-features = ["hostdep/extra"]
+''',
+            "app/build.rs": 'fn main() { println!("cargo::rustc-env=HOST_ON={}", hostdep::ON); }\n',
+            "app/src/main.rs": 'fn main() { println!("{} {}", dep::ON, env!("HOST_ON")); }\n',
+            "app/src/needs.rs": 'fn main() { println!("target {} {}", dep::ON, env!("HOST_ON")); }\n',
+            "app/src/host.rs": 'fn main() { println!("host {} {}", dep::ON, env!("HOST_ON")); }\n',
         },
         "program": "app",
-        "prints": ["false"],
+        "steps": [
+            {"prints": ["false true"], "absent": ["needs"]},
+            {"program": "host-needs", "prints": ["host false true"], "absent": ["needs"]},
+            {"args": ["--bin", "needs"], "error": "dep/extra"},
+            {"args": ["--features", "dep/extra"], "program": "needs", "prints": ["target true true"]},
+            {"prints": ["false true"], "absent": ["needs"]},
+        ],
     }
 )
+
 CASES.append(
     {
         "name": "a-test-sees-the-library-beside-its-bin",
@@ -241,7 +276,7 @@ CASES.append(
             "src/main.rs": 'fn main() { println!("{}", both::answer()); }\n',
             "tests/it.rs": '#[test]\nfn sees_the_library() {\n    assert_eq!(both::answer(), 42);\n    assert!(!env!("CARGO_BIN_EXE_both").is_empty());\n}\n',
         },
-        "test": "test sees_the_library ... ok",
+        "test": "sees_the_library",
     }
 )
 CASES.append(
@@ -330,3 +365,25 @@ fn main() {
         "prints": ["5", 'Some("`async fn` resumed after completion")'],
     }
 )
+
+
+# Remove each claimed cause in the same daemon, then restore it. A rejection alone does not
+# prove duplicate-name checking, and a macro that emits no impl must change method lookup.
+for case in CASES:
+    if case["name"] == "raw-duplicate-import":
+        original = case["files"][MAIN]
+        distinct = original.replace("use b::x;", "use b::x as other;")
+        case["steps"] = [
+            {"error": "E0252"},
+            {"files": {MAIN: distinct}, "prints": []},
+            {"files": {MAIN: original}, "error": "E0252"},
+        ]
+    if case["name"] == "attribute-impl-in-function":
+        name = "app/src/main.rs"
+        original = case["files"][name]
+        without_impl = original.replace("impl Trait for u32 { fn value(&self) -> u16 { 2 } }", "")
+        case["steps"] = [
+            {"prints": ["2"]},
+            {"files": {name: without_impl}, "error": "E0599"},
+            {"files": {name: original}, "prints": ["2"]},
+        ]
