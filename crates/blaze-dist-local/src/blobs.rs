@@ -103,18 +103,12 @@ impl Blobs {
         }
     }
 
-    /// Publishes the list of the unit named `spec`. A list another agent published first stays:
-    /// both name the same keys, so either reads the same (412 is not an error).
+    /// Publishes the list of the unit named `spec`. Another agent may win the
+    /// first-writer race, but the same unit key must never name different packs.
     pub fn publish(&self, spec: &Digest, list: &[u8]) -> Result<(), Error> {
         let path = format!("/v1/list/manifests/{}", hex(spec));
         let (status, body) = self.request("PUT", &path, list)?;
-        match status {
-            200..=299 | 412 => Ok(()),
-            _ => Err(Error::Protocol(format!(
-                "PUT {path}: {status}: {}",
-                String::from_utf8_lossy(&body)
-            ))),
-        }
+        publish_verdict(status, &body, &path, list, || self.published(spec))
     }
 }
 
@@ -130,5 +124,77 @@ fn unchunk(mut body: &[u8]) -> Option<Vec<u8>> {
         }
         out.extend_from_slice(body.get(..len)?);
         body = body.get(len + 2..)?;
+    }
+}
+
+
+/// A first publisher wins the immutable key. A 412 proves that a value exists,
+/// not that the value is identical; look up and compare it before accepting.
+fn publish_verdict(
+    status: u16,
+    body: &[u8],
+    path: &str,
+    proposed: &[u8],
+    read_existing: impl FnOnce() -> Result<Option<Vec<u8>>, Error>,
+) -> Result<(), Error> {
+    match status {
+        200..=299 => Ok(()),
+        412 => match read_existing()? {
+            Some(existing) if existing.as_slice() == proposed => Ok(()),
+            Some(_) => Err(Error::Protocol(format!(
+                "PUT {path}: 412: another publisher committed different packs under this unit key"
+            ))),
+            None => Err(Error::Protocol(format!(
+                "PUT {path}: 412: publication was refused but the committed list is missing"
+            ))),
+        },
+        _ => Err(Error::Protocol(format!(
+            "PUT {path}: {status}: {}",
+            String::from_utf8_lossy(body)
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_first_writer_conflict_must_compare_the_immutable_manifest() {
+        let path = "/v1/list/manifests/test-unit";
+        let cases: [(Option<&[u8]>, bool); 3] = [
+            (Some(b"same"), true),
+            (Some(b"different"), false),
+            (None, false),
+        ];
+        for (committed, accepted) in cases {
+            let read = Cell::new(false);
+            let verdict = publish_verdict(412, b"", path, b"same", || {
+                read.set(true);
+                Ok(committed.map(|bytes| bytes.to_vec())) // alloc: test manifest fixture
+            });
+            assert!(read.get(), "412 must fetch the existing committed bytes");
+            assert_eq!(verdict.is_ok(), accepted, "unexpected conflict verdict: {verdict:?}");
+            if let Err(error) = verdict {
+                assert!(
+                    matches!(&error, Error::Protocol(why) if why.contains(path)),
+                    "the refusal must name the conflicting unit: {error}"
+                );
+            }
+        }
+        let read = Cell::new(false);
+        let result = publish_verdict(201, b"", path, b"same", || {
+            read.set(true);
+            panic!("an accepted PUT must not issue a GET");
+        });
+        assert!(result.is_ok());
+        assert!(!read.get());
+        assert!(matches!(
+            publish_verdict(500, b"unavailable", path, b"same", || {
+                panic!("a failed PUT must not issue a GET");
+            }),
+            Err(Error::Protocol(_))
+        ));
     }
 }
