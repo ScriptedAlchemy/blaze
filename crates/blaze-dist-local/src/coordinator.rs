@@ -614,6 +614,10 @@ impl Coordinator {
                         .execution(p.execution)
                         .expect("committed execution")
                         .attempt(),
+                    accepted_attempt: self
+                        .jobs
+                        .execution(p.execution)
+                        .and_then(|e| e.publication_attempt()),
                 }))
             }
             Command::Publication(p) => {
@@ -625,6 +629,7 @@ impl Coordinator {
                 Ok(Answer::Publication(Publication {
                     packs: execution.publication().map(|packs| packs.to_vec()),
                     attempt: execution.attempt(),
+                    accepted_attempt: execution.publication_attempt(),
                 }))
             }
             Command::DeliverPublication(p) => {

@@ -268,6 +268,139 @@ fn a_pack_the_server_lost_is_an_unpublished_unit() {
 }
 
 #[test]
+fn a_slow_phase_pack_download_keeps_the_original_lead_alive() {
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+
+    let world = world(1, WorkConfig::default());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let defaults = ExecutionConfig::default();
+    let delay = Duration::from_millis(defaults.heartbeat_ms * defaults.missed_heartbeats + 500);
+    let delayed = AtomicBool::new(false);
+    let unit = unit(44, 2);
+    let mut compiler = Compiler {
+        names: unit.names.clone(),
+        log: Arc::new(Mutex::new(BTreeMap::new())),
+        who: 0,
+        entered: Arc::new(AtomicUsize::new(0)),
+        wait_for: 1,
+    };
+    let mut cfg = config(&world.socket, &world.blobs);
+    cfg.blobs.address = address;
+    let result = std::thread::scope(|scope| {
+        let proxy = scope.spawn(|| {
+            let bound = std::time::Instant::now() + Duration::from_secs(120);
+            while !world.stop.load(Ordering::Acquire) && std::time::Instant::now() < bound {
+                let (mut client, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(why) if why.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(why) => panic!("proxy accept: {why}"),
+                };
+                client.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                client.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                let end = loop {
+                    let n = client.read(&mut buffer).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buffer[..n]);
+                    assert!(request.len() < 1 << 20);
+                    if let Some(at) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                };
+                let headers = std::str::from_utf8(&request[..end]).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map_or(0, |(_, value)| value.trim().parse().unwrap());
+                assert!(end + length < 1 << 20);
+                while request.len() < end + length {
+                    let n = client.read(&mut buffer).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                if request.starts_with(b"GET /v1/blob/packs/")
+                    && !delayed.swap(true, Ordering::AcqRel)
+                {
+                    // Cache IO is held beyond the actual default lead-loss window;
+                    // the independent Unix coordinator remains available to heartbeats.
+                    std::thread::sleep(delay);
+                }
+                let mut upstream = TcpStream::connect(world.blobs.address).unwrap();
+                upstream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                upstream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+                upstream.write_all(&request).unwrap();
+                std::io::copy(&mut upstream, &mut client).unwrap();
+            }
+        });
+        let result = agent::run(&cfg, &unit, &mut compiler, &AtomicBool::new(false));
+        world.stop.store(true, Ordering::Release);
+        proxy.join().unwrap();
+        result
+    })
+    .unwrap();
+    assert!(delayed.load(Ordering::Acquire), "the test must delay an actual phase pack GET");
+    assert_eq!(result.attempt, Some(1), "slow cache IO must not reassign a healthy lead");
+    assert_eq!(result.publication_attempt, Some(1));
+    assert_eq!(result.values.len(), 2);
+}
+
+#[test]
+fn deleting_a_completed_pack_regenerates_and_repairs_a_different_partition() {
+    // A holder may export verified neighboring values alongside a grant. Both pack
+    // partitions below contain exactly the same logical values for the same unit.
+    struct WithNeighbors(Vec<Digest>);
+    impl Granted for WithNeighbors {
+        fn compile(&mut self, names: &[usize]) -> Result<Grant, String> {
+            Ok(Grant {
+                values: self.0.iter().map(value_of).collect(),
+                compiled: names.len() as u64,
+                stored: 0,
+                compiled_keys: names.iter().map(|at| self.0[*at]).collect(),
+            })
+        }
+    }
+    let world = world(1, WorkConfig { grant_roots: 1, ..Default::default() });
+    let unit = unit(45, 2);
+    let never = AtomicBool::new(false);
+    let cfg = config(&world.socket, &world.blobs);
+    let first = agent::run(&cfg, &unit, &mut WithNeighbors(unit.names.clone()), &never).unwrap();
+    assert_eq!(first.packs.len(), 1);
+    let old = world.blobs.published(&unit.spec).unwrap().unwrap();
+    let missing = world
+        ._dir
+        .path()
+        .join("blobs/packs")
+        .join(format!("{}.pack", blaze_dist_local::pack::hex(&first.packs[0].pack)));
+    assert!(missing.is_file(), "delete an actual pack of a genuinely completed execution");
+    std::fs::remove_file(&missing).unwrap();
+    let mut compiler = Compiler {
+        names: unit.names.clone(),
+        log: Arc::new(Mutex::new(BTreeMap::new())),
+        who: 0,
+        entered: Arc::new(AtomicUsize::new(0)),
+        wait_for: 1,
+    };
+    let second = agent::run(&cfg, &unit, &mut compiler, &never).unwrap();
+    assert_ne!(first.execution, second.execution, "a terminal execution is not reused");
+    assert_eq!(second.values, first.values);
+    assert_eq!(second.packs.len(), 2, "regeneration deliberately changes the pack partition");
+    assert_ne!(world.blobs.published(&unit.spec).unwrap().unwrap(), old);
+    let mut cold = cfg;
+    cold.socket = PathBuf::from("/tmp/blaze-agent-no-coordinator-for-repaired-list.sock");
+    let restored = agent::run(&cold, &unit, &mut Vanishes, &never).unwrap();
+    assert_eq!(restored.source, Source::Published);
+    assert_eq!(restored.values, first.values);
+}
+
+#[test]
 fn a_cancelled_build_leaves_its_execution() {
     let world = world(0, WorkConfig::default());
     let unit = unit(5, 2);

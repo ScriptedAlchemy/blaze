@@ -47,6 +47,11 @@ impl Execution {
         let mut done = None;
         for (index, event) in events.iter().enumerate() {
             match event {
+                JobEvent::Refused(_) if self.publication.is_some() => {
+                    return Err(Refusal::Malformed(
+                        "refusal after full publication was accepted".to_owned(),
+                    ));
+                }
                 JobEvent::Assigned(_) => return Err(Refusal::NotHolder),
                 JobEvent::Stage(event) => {
                     if !lead

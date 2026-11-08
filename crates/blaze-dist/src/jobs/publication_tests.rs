@@ -207,12 +207,18 @@ fn a_lost_commit_reply_and_a_dead_lead_cannot_change_the_accepted_record() {
     let mut e = execution();
     let record = packs(7);
     e.commit_publication(1, "lead0", Attempt(1), &record, &mut Vec::new()).unwrap();
+    assert_eq!(e.publication_attempt(), Some(Attempt(1)));
     // A lost answer repeats the same transition, and publishes no second stage/event.
     let events = e.events(0).len();
     e.commit_publication(2, "lead0", Attempt(1), &record, &mut Vec::new()).unwrap();
     assert_eq!(e.events(0).len(), events);
     e.tick(18, &mut Vec::new());
     e.assign(18, "replacement", &[], &mut Vec::new()).unwrap();
+    assert_eq!(
+        e.publication_attempt(),
+        Some(Attempt(1)),
+        "acceptance provenance survives reassignment"
+    );
     assert_eq!(
         e.commit_publication(19, "lead0", Attempt(1), &packs(9), &mut Vec::new()),
         Err(Refusal::AttemptMoved)
@@ -227,5 +233,74 @@ fn a_lost_commit_reply_and_a_dead_lead_cannot_change_the_accepted_record() {
     let events = e.events(0).len();
     e.deliver_publication(21, &record, &mut Vec::new()).unwrap();
     assert_eq!(e.events(0).len(), events);
+    assert_eq!(e.state(), ExecState::Ended(Outcome::Passed));
+}
+
+#[hegel::test(test_cases = 16)]
+fn an_accepted_refusal_cannot_publish_success_after_reassignment(tc: hegel::TestCase) {
+    let replace = tc.draw(gs::integers::<u8>().max_value(1)) != 0;
+    let fallback = tc.draw(gs::integers::<u8>().max_value(1)) != 0;
+    let policy = if fallback { LocalPolicy::Fallback } else { LocalPolicy::Never };
+    let mut e = execution();
+    e.subscribers.get_mut(&1).unwrap().policy = policy.clone();
+    e.worker_events(
+        1,
+        "lead0",
+        &WorkersEventsRequest {
+            execution: e.id,
+            attempt: e.attempt(),
+            events: vec![JobEvent::Refused(blaze_wire::RefusedEvent {
+                function: "fixture".into(),
+                why: "refused".into(),
+            })],
+        },
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let now = if replace {
+        e.tick(18, &mut Vec::new());
+        e.assign(18, "replacement", &[], &mut Vec::new()).unwrap();
+        join(&mut e, 18);
+        19
+    } else {
+        2
+    };
+    let lead = e.lead().unwrap().to_owned();
+    assert_eq!(
+        e.commit_publication(now, &lead, e.attempt(), &packs(7), &mut Vec::new()),
+        Err(Refusal::Ended)
+    );
+    assert_eq!(e.state(), ExecState::Ended(Outcome::Refused));
+    assert!(e.publication().is_none(), "a refused unit must not leak a cache manifest");
+    let terminal = e.terminals.get(&1).unwrap();
+    assert_eq!(terminal.termination.outcome, Outcome::Refused);
+    assert_eq!(local_action(&policy, &terminal.termination).unwrap(), LocalAction::Take);
+    assert!(e.deliver_publication(now, &packs(7), &mut Vec::new()).is_err());
+    assert_eq!(e.state(), ExecState::Ended(Outcome::Refused));
+}
+
+#[test]
+fn a_late_refusal_batch_cannot_rewrite_an_accepted_manifest() {
+    let mut e = execution();
+    e.commit_publication(1, "lead0", e.attempt(), &packs(7), &mut Vec::new()).unwrap();
+    let before = e.events(0).len();
+    assert!(
+        e.worker_events(
+            2,
+            "lead0",
+            &WorkersEventsRequest {
+                execution: e.id,
+                attempt: e.attempt(),
+                events: vec![JobEvent::Refused(blaze_wire::RefusedEvent {
+                    function: "late".into(),
+                    why: "late".into()
+                })],
+            },
+            &mut Vec::new()
+        )
+        .is_err()
+    );
+    assert_eq!(e.events(0).len(), before, "the rejected batch has no accepted prefix");
+    e.deliver_publication(3, &packs(7), &mut Vec::new()).unwrap();
     assert_eq!(e.state(), ExecState::Ended(Outcome::Passed));
 }

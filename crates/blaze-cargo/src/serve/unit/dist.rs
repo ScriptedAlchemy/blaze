@@ -85,6 +85,13 @@ fn var<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
     env.iter().rev().find(|(it, _)| it == name).map(|(_, value)| value.as_str())
 }
 
+/// Backend observations join actual lease events by protocol WorkName, not task/store key.
+fn granted_work_names(unit: &blaze_wire::Digest, keys: &[InstanceKey]) -> Vec<String> {
+    keys.iter()
+        .map(|key| blaze_dist_local::pack::hex(&agent::wire_name(unit, &key.0.0).0))
+        .collect()
+}
+
 impl Dist {
     /// What `env` asks for: `None` for a build of this daemon alone. `host` is this machine's
     /// triple: executors are machines, whatever the unit is compiled for, which its keys cover (a
@@ -246,9 +253,10 @@ impl Dist {
             .map(|key| blaze_dist_local::pack::hex(&key.0.0))
             .collect();
         let line = format!(
-            "{{\"unit\":{name:?},\"source\":\"{source}\",\"execution\":{execution},\"joined\":{joined},\"grants\":{grants},\"compiled_for_work\":{compiled},\"stored_for_work\":{stored},\"arrived\":{values},\"tail_compiled\":{tail},\"from_store\":{hits},\"instances\":{instances},\"unit_digest\":\"{unit_digest}\",\"attempt\":{attempt},\"work_compiled_keys\":{work_keys},\"tail_compiled_keys\":{tail_keys}}}\n",
+            "{{\"unit\":{name:?},\"source\":\"{source}\",\"execution\":{execution},\"joined\":{joined},\"grants\":{grants},\"compiled_for_work\":{compiled},\"stored_for_work\":{stored},\"arrived\":{values},\"tail_compiled\":{tail},\"from_store\":{hits},\"instances\":{instances},\"unit_digest\":\"{unit_digest}\",\"attempt\":{attempt},\"publication_attempt\":{publication_attempt},\"work_compiled_keys\":{work_keys},\"tail_compiled_keys\":{tail_keys}}}\n",
             unit_digest = blaze_dist_local::pack::hex(&unit.spec),
             attempt = arrived.attempt.map_or(-1, |it| it as i64),
+            publication_attempt = arrived.publication_attempt.map_or(-1, |it| it as i64),
             work_keys = blaze_dist_local::telemetry::json(&work_keys),
             tail_keys = blaze_dist_local::telemetry::json(&tail_keys),
             execution = arrived.execution.map_or(-1, |it| it as i64),
@@ -406,8 +414,7 @@ where
                 .filter(|key| folded.binary_search(key).is_ok())
                 .map(hex)
                 .collect();
-            let work: Vec<_> =
-                keys.iter().map(|key| blaze_dist_local::pack::hex(&key.0.0)).collect();
+            let work = granted_work_names(&self.work.digest().0, &keys);
             blaze_dist_local::telemetry::emit(
                 "backend_work",
                 &[
@@ -481,6 +488,22 @@ mod tests {
     };
 
     struct Warm(BTreeMap<Key, Value>);
+
+    #[test]
+    fn backend_telemetry_joins_the_protocol_work_identity_not_raw_task_keys() {
+        let unit = [7; 32];
+        let raw = InstanceKey(ContentId([11; 32]));
+        let rendered = granted_work_names(&unit, &[raw]);
+        let granted = blaze_wire::WorkName::of(&blaze_wire::WorkKey::Item(blaze_wire::ItemKey {
+            unit,
+            stable: raw.0.0,
+            env: [0; 32],
+        }));
+        assert_eq!(rendered, vec![blaze_dist_local::pack::hex(&granted.0)]);
+        assert_ne!(rendered[0], blaze_dist_local::pack::hex(&raw.0.0));
+        assert_ne!(granted_work_names(&[8; 32], &[raw]), rendered);
+    }
+
     impl Lookup for Warm {
         fn read(&self, key: &Key) -> Result<Option<&[u8]>, String> {
             Ok(self.0.get(key).map(|value| value.bytes.as_slice()))

@@ -48,6 +48,8 @@ This is observation of the existing pipeline, not another compilation or protoco
 
 - `unit_digest`: lowercase 64-character digest used for `manifests/<digest>`.
 - `attempt`: final successful attempt number, or `-1` when no execution was joined.
+- `publication_attempt`: the attempt that first accepted the immutable manifest; it can be
+  older than `attempt` when a replacement lead delivers that accepted record.
 - `work_compiled_keys`, `tail_compiled_keys`: arrays of actual compiled **store template keys**
   as lowercase hex, counted by `compiled_for_work` and `tail_compiled`, respectively. Include every
   real compile, even a duplicate; do not deduplicate these arrays or include store hits. These let
@@ -63,8 +65,8 @@ buffered until unit completion). Concurrent writers must not interleave a record
 | `grant` | Agent, immediately before actual batch compilation: `pid` (daemon), `unit_digest`, `execution`, `attempt`, `holder`, `generation`, `seq`, `work` (exact granted WorkName hex digests, expanding root ranges against the fixed root set). |
 | `result_accepted` | Coordinator, only after an actual batch result commits: `execution`, `attempt`, `holder`, `generation`, `seq`, `work` (only successfully committed names). Retries may repeat the same identity. |
 | `result_refused` | Coordinator, after refusing an actual stale batch result: the same lease/batch identity and `refusal` (`DeadLease` or `AttemptMoved`, using the real typed reason). |
-| `done` | Coordinator, only after accepting a real terminal Done: `execution`, `attempt`, `outcome` (the actual outcome name, `Passed` for success). |
-| `published` | Publication owner, after the current attempt's full manifest is committed: `unit_digest`, `execution`, `attempt`, `packs` (all pack hex digests, including tail/mirroring). Emit only for an actual successful publication; reports finish after this boundary. |
+| `done` | Coordinator, only after accepting a real terminal Done: `unit_digest`, `execution`, `attempt`, `outcome` (the actual outcome name, `Passed` for success). |
+| `published` | Publication owner, after a full manifest is accepted: `unit_digest`, `execution`, `attempt` (the original accepting attempt), `packs` (accepted pack hex digests). Delivery can use an equivalent cache partition; the oracle verifies every pack hash and compares all logical key/kind/byte values, while requiring Done after acceptance. |
 
 An identity is `(execution, attempt, holder, generation, seq)`; `work` uses protocol WorkNames,
 while report arrays use store keys. Do not substitute unit names, ordinals, hashes of log messages,
@@ -121,7 +123,7 @@ before building stage 1. Set `release_fold` to true, `args` to `["--release"]`, 
 The proc macro executes 64 non-inlined wasm bodies with distinct constants against an independent
 loop oracle; the application and native dependencies exercise LLVM at release settings.
 
-`backend_work` events name the real daemon pid, unit digest, granted task IDs, raw compiled keys,
+`backend_work` events name the real daemon pid, unit digest, granted protocol WorkNames, raw compiled keys,
 and the intersection of those emissions with the canonical release and fold output keys. The
 oracle joins them to real accepted grant/lease events and final reports. Each backend kind must
 have two distinct emitting daemons within one successful unit/execution/attempt; merely planning

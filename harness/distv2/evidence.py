@@ -56,7 +56,8 @@ def validate_events(events: list[dict]) -> None:
             require(isinstance(event.get("refusal"), str), "result_refused: needs the typed refusal")
         if kind == "done":
             require(type(event.get("execution")) is int and type(event.get("attempt")) is int
-                    and isinstance(event.get("outcome"), str), "done: needs actual execution/attempt/outcome")
+                    and digest(event.get("unit_digest")) and isinstance(event.get("outcome"), str),
+                    "done: needs actual unit/execution/attempt/outcome")
         if kind == "published":
             require(digest(event.get("unit_digest")) and type(event.get("execution")) is int
                     and type(event.get("attempt")) is int and isinstance(event.get("packs"), list)
@@ -127,17 +128,38 @@ def stale_refused(events: list[dict], grant: dict) -> bool:
     )
 
 
-def pack_keys(raw: bytes) -> set[str]:
+def pack_values(raw: bytes) -> dict[str, tuple[int, bytes]]:
     require(raw.startswith(b"blzdpk\0\x01"), "stored pack has the wrong native header")
-    at, keys = 8, []
+    at, keys, values = 8, [], {}
     while at < len(raw):
         require(at + 41 <= len(raw), "stored pack ends inside a value header")
-        keys.append(raw[at:at + 32].hex())
+        key = raw[at:at + 32].hex()
+        keys.append(key)
+        kind = raw[at + 32]
         size = int.from_bytes(raw[at + 33:at + 41], "little")
+        values[key] = (kind, raw[at + 41:at + 41 + size])
         at += 41 + size
         require(at <= len(raw), "stored pack ends inside a value")
     require(keys == sorted(set(keys)), "stored pack keys are not strictly sorted")
-    return set(keys)
+    return values
+
+
+def pack_keys(raw: bytes) -> set[str]:
+    return set(pack_values(raw))
+
+
+def logical_outputs(blobs: Path, names) -> dict[str, tuple[int, bytes]]:
+    values = {}
+    for name in names:
+        require(digest(name), "publication needs native pack digests")
+        target = blobs / "packs" / f"{name}.pack"
+        require(target.is_file(), f"accepted publication pack {name} is missing")
+        raw = target.read_bytes()
+        require(hashlib.sha256(raw).hexdigest() == name, f"accepted publication pack {name} is corrupt")
+        for key, value in pack_values(raw).items():
+            require(key not in values or values[key] == value, f"publication disagrees under store key {key}")
+            values[key] = value
+    return values
 
 
 def manifest(blobs: Path, unit: str) -> tuple[dict[str, Path], set[str]]:
@@ -166,15 +188,20 @@ def publication(blobs: Path, rows: list[dict], events: list[dict]) -> None:
         packs, stored = manifest(blobs, row["unit_digest"])
         require(keys <= stored, f"{row['unit']}: compiled functions missing from actual full manifest")
         if row["source"] == "executed" and row["execution"] >= 0:
-            require("attempt" in row, f"{row['unit']}: report needs its final attempt")
+            accepted_attempt = row.get("publication_attempt")
+            require(type(accepted_attempt) is int and 0 <= accepted_attempt <= row["attempt"],
+                    f"{row['unit']}: report needs the actual accepting attempt")
+            actual = logical_outputs(blobs, packs)
             publications = [index for index, e in enumerate(events)
                 if e["event"] == "published" and e["unit_digest"] == row["unit_digest"]
-                and e["execution"] == row["execution"] and e["attempt"] == row["attempt"]
-                and set(e["packs"]) == set(packs)]
-            require(bool(publications), f"{row['unit']}: no current-attempt commit of the actual full manifest")
+                and e["execution"] == row["execution"] and e["attempt"] == accepted_attempt
+                and logical_outputs(blobs, e["packs"]) == actual]
+            require(bool(publications), f"{row['unit']}: no accepted full output equal to the verified cache manifest")
             done = [index for index, e in enumerate(events) if e["event"] == "done"
-                    and e["execution"] == row["execution"] and e["attempt"] == row["attempt"] and e["outcome"] == "Passed"]
-            require(bool(done) and min(done) > min(publications), f"{row['unit']}: Done preceded the full manifest commit or was not observed")
+                    and e["unit_digest"] == row["unit_digest"] and e["execution"] == row["execution"]
+                    and e["attempt"] == row["attempt"] and e["outcome"] == "Passed"]
+            require(any(index > min(publications) for index in done),
+                    f"{row['unit']}: Done preceded the full manifest commit or was not observed")
 
 
 def cached(rows: list[dict]) -> None:

@@ -147,6 +147,8 @@ pub struct Arrived {
     pub joined: bool,
     /// The final observed execution attempt, or None for a published-cache hit.
     pub attempt: Option<u64>,
+    /// The attempt that accepted the immutable full manifest, before any reassignment.
+    pub publication_attempt: Option<u64>,
     /// Actual emitted store keys of this agent's grant compiles, never store hits.
     pub compiled_keys: Vec<Digest>,
 }
@@ -164,12 +166,14 @@ impl Arrived {
             grants: 0,
             joined: false,
             attempt: None,
+            publication_attempt: None,
             compiled_keys: Vec::new(),
         }
     }
 }
 
-fn wire_name(unit: &Digest, name: &Digest) -> WorkName {
+/// The coordinator's work identity for an opaque compiler task in one unit.
+pub fn wire_name(unit: &Digest, name: &Digest) -> WorkName {
     WorkName::of(&WorkKey::Item(ItemKey { unit: *unit, stable: *name, env: [0; 32] }))
 }
 
@@ -454,14 +458,34 @@ fn execute(
             last_claim = Some((executor.clone(), claimed.attempt));
         }
         let published = publication(client, content, execution)?;
-        if let Some((packs, attempt)) = published {
+        if let Some((packs, attempt, accepted)) = published {
             arrived.attempt = Some(attempt.0);
-            arrived.values = import(&config.blobs, &packs)?;
-            arrived.packs = packs;
-            // A subscriber delivers the exact record accepted before the old lead died.
-            // It neither reruns the tail nor replaces the committed manifest.
-            mirror(config, unit, &arrived.packs)?;
-            deliver(client, content, execution, &arrived.packs)?;
+            arrived.publication_attempt = Some(accepted.0);
+            let mut take = || {
+                arrived.values = import(&config.blobs, &packs)?;
+                arrived.packs = packs;
+                // Delivery carries no new output authority, even after lead replacement.
+                mirror(config, unit, &arrived.packs)?;
+                deliver(client, binding, &arrived.packs)?;
+                Ok(())
+            };
+            if let Some(claimed) = &claimed
+                && claimed.lead
+                && let Some(executor) = &claimed.executor
+            {
+                heartbeat_during(
+                    config,
+                    content,
+                    execution,
+                    executor,
+                    claimed.attempt,
+                    now_ms,
+                    cancelled,
+                    |_| take(),
+                )?;
+            } else {
+                take()?;
+            }
             if let Some((executor, attempt)) = last_claim {
                 acknowledge(client, content, execution, &executor, attempt)?;
             }
@@ -506,7 +530,6 @@ fn execute(
                 waited = (waited * 2).min(POLL_MOST);
                 continue;
             }
-            arrived.values = import(&config.blobs, &packs)?;
             let committed = heartbeat_during(
                 config,
                 content,
@@ -516,6 +539,7 @@ fn execute(
                 now_ms,
                 cancelled,
                 |lost| {
+                    arrived.values = import(&config.blobs, &packs)?;
                     let extra = match granted.complete(&arrived.values) {
                         Ok(values) => values,
                         Err(why) => {
@@ -555,12 +579,18 @@ fn execute(
                     });
                     match client.call(commit)? {
                         Answer::Publication(carrier::Publication {
-                            packs: Some(packs), ..
+                            packs: Some(packs),
+                            accepted_attempt: Some(accepted),
+                            ..
                         }) => {
+                            arrived.publication_attempt = Some(accepted.0);
                             mirror(config, unit, &packs)?;
-                            deliver(client, content, execution, &packs)?;
+                            deliver(client, binding, &packs)?;
                             acknowledge(client, content, execution, &executor, claimed.attempt)?;
                             Ok(Some(packs))
+                        }
+                        Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => {
+                            Err(ended(client, binding))
                         }
                         Answer::Error(error)
                             if matches!(
@@ -652,13 +682,17 @@ fn publication(
     client: &mut Client,
     content: blaze_wire::JobContent,
     execution: ExecutionId,
-) -> Result<Option<(Vec<PackRef>, Attempt)>, Error> {
+) -> Result<Option<(Vec<PackRef>, Attempt, Attempt)>, Error> {
     match answer(
         client,
         Command::Publication(carrier::Packs { content, execution }),
         "publication",
     )? {
-        Answer::Publication(value) => Ok(value.packs.map(|packs| (packs, value.attempt))),
+        Answer::Publication(value) => match (value.packs, value.accepted_attempt) {
+            (Some(packs), Some(accepted)) => Ok(Some((packs, value.attempt, accepted))),
+            (None, None) => Ok(None),
+            _ => Err(Error::Protocol("publication lacks its acceptance provenance".to_owned())),
+        },
         other => Err(Error::Protocol(format!("publication answered {other:?}"))),
     }
 }
@@ -885,19 +919,29 @@ fn verdict(
     }
 }
 
-fn deliver(
-    client: &mut Client,
-    content: blaze_wire::JobContent,
-    execution: ExecutionId,
-    packs: &[PackRef],
-) -> Result<(), Error> {
+fn deliver(client: &mut Client, binding: &Binding, packs: &[PackRef]) -> Result<(), Error> {
     let command = Command::DeliverPublication(carrier::DeliverPublication {
-        content,
-        execution,
+        content: binding.subscription.content,
+        execution: binding.subscription.execution,
         packs: packs.to_vec(), // alloc: the bounded immutable delivery record
     });
-    match answer(client, command, "delivering the unit's publication")? {
-        Answer::Ack(_) => Ok(()),
+    match client.call(command)? {
+        Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => {
+            Err(ended(client, binding))
+        }
+        Answer::Ack(_) => match client.call(Command::Terminal(binding.subscription.clone()))? {
+            Answer::Terminal(carrier::Terminal { value: Some(value), .. })
+                if value.termination.is_valid() && value.termination.outcome == Outcome::Passed =>
+            {
+                Ok(())
+            }
+            Answer::Terminal(carrier::Terminal { value: Some(value), .. }) => {
+                Err(Error::Ended(value.termination))
+            }
+            other => Err(Error::Protocol(format!(
+                "publication delivery has no terminal verdict: {other:?}"
+            ))),
+        },
         other => Err(Error::Protocol(format!("publication delivery answered {other:?}"))),
     }
 }

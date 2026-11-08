@@ -176,6 +176,7 @@ pub struct Execution {
     /// The full manifest accepted while its publisher held the current lead attempt. It is
     /// immutable across retries and lead replacement; copying it to a cache is delivery.
     publication: Option<Vec<PackRef>>,
+    publication_attempt: Option<Attempt>,
     publication_delivered: bool,
     terminals: BTreeMap<u64, SubscriberTerminalV2>,
     refused: bool,
@@ -213,6 +214,7 @@ impl Execution {
             stages: Vec::new(),
             compiled: None,
             publication: None,
+            publication_attempt: None,
             publication_delivered: false,
             terminals: BTreeMap::new(),
             refused: false,
@@ -549,6 +551,11 @@ impl Execution {
         self.publication.as_deref()
     }
 
+    /// The attempt that first accepted the immutable full manifest, across lead replacement.
+    pub fn publication_attempt(&self) -> Option<Attempt> {
+        self.publication_attempt
+    }
+
     /// Atomically accepts one full output record from the current lead. This is the
     /// publication linearization point, not a liveness check preceding an unfenced PUT.
     /// A replacement lead can deliver the accepted record but cannot replace its contents.
@@ -570,6 +577,10 @@ impl Execution {
         if self.lead.as_deref() != Some(from) {
             return Err(Refusal::NotHolder);
         }
+        if self.refused {
+            self.end(now, Outcome::Refused, EndWhy::Reported, out);
+            return Err(Refusal::Ended);
+        }
         if packs.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(Refusal::Malformed("publication packs are not canonical".to_owned()));
         }
@@ -589,6 +600,7 @@ impl Execution {
             return Err(Refusal::Malformed("publication omits committed work".to_owned()));
         }
         self.publication = Some(packs.to_vec()); // alloc: one bounded full manifest per execution
+        self.publication_attempt = Some(attempt);
         self.lead_heard = now;
         self.heard.insert(from.to_owned(), now);
         self.stage(now, Stage::Published, out);
@@ -609,12 +621,13 @@ impl Execution {
             return Err(Refusal::Malformed("delivery names no accepted publication".to_owned()));
         }
         match &self.state {
-            ExecState::Ended(Outcome::Passed) if self.publication_delivered => return Ok(()),
+            ExecState::Ended(_) if self.publication_delivered => return Ok(()),
             ExecState::Ended(_) => return Err(Refusal::Ended),
             ExecState::Queued | ExecState::Running => {}
         }
         self.publication_delivered = true;
-        self.end(now, Outcome::Passed, EndWhy::Reported, out);
+        let outcome = if self.refused { Outcome::Refused } else { Outcome::Passed };
+        self.end(now, outcome, EndWhy::Reported, out);
         Ok(())
     }
 

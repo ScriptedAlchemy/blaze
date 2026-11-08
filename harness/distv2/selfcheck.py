@@ -26,7 +26,7 @@ KEY, OTHER, UNIT = "11" * 32, "22" * 32, "33" * 32
 
 def row(**extra):
     return {"unit": "mathy", "unit_digest": UNIT, "source": "executed", "execution": 7,
-            "attempt": 2, "joined": True, "grants": 1, "compiled_for_work": 1,
+            "attempt": 2, "publication_attempt": 2, "joined": True, "grants": 1, "compiled_for_work": 1,
             "tail_compiled": 0, "stored_for_work": 0, "work_compiled_keys": [KEY],
             "tail_compiled_keys": [], **extra}
 
@@ -265,7 +265,7 @@ class Oracles(unittest.TestCase):
             manifest = blobs / "manifests" / UNIT
             manifest.write_text(f"{name} {len(raw)} {OTHER}\n")
             event = {"event": "published", "unit_digest": UNIT, "execution": 7, "attempt": 2, "packs": [name]}
-            done = {"event": "done", "execution": 7, "attempt": 2, "outcome": "Passed"}
+            done = {"event": "done", "unit_digest": UNIT, "execution": 7, "attempt": 2, "outcome": "Passed"}
             e.publication(blobs, [row()], [event, done])
             for bad in ([], [event], [done, event], [{**event, "attempt": 1}, done], [{**event, "packs": []}, done]):
                 with self.assertRaises(e.Failed):
@@ -280,6 +280,43 @@ class Oracles(unittest.TestCase):
             manifest.unlink()
             with self.assertRaises(e.Failed):
                 e.manifest(blobs, UNIT)
+
+    def test_publication_keeps_accepting_attempt_and_compares_logical_pack_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blobs = Path(directory)
+            (blobs / "packs").mkdir()
+            (blobs / "manifests").mkdir()
+
+            def pack(values):
+                raw = b"blzdpk\0\x01" + b"".join(bytes.fromhex(key) + bytes((kind,))
+                    + len(value).to_bytes(8, "little") + value for key, kind, value in values)
+                name = hashlib.sha256(raw).hexdigest()
+                (blobs / "packs" / f"{name}.pack").write_bytes(raw)
+                return name, len(raw)
+
+            a = (KEY, 1, b"x")
+            b = (OTHER, 2, b"y")
+            merged, size = pack([a, b])
+            left, _ = pack([a])
+            right, _ = pack([b])
+            (blobs / "manifests" / UNIT).write_text(f"{merged} {size} {OTHER}\n")
+            published = {"event": "published", "unit_digest": UNIT, "execution": 7,
+                         "attempt": 1, "packs": [left, right]}
+            done = {"event": "done", "unit_digest": UNIT, "execution": 7, "attempt": 2, "outcome": "Passed"}
+            report = row(publication_attempt=1)
+            e.publication(blobs, [report], [published, done])
+            e.publication(blobs, [report], [{**done, "unit_digest": OTHER}, published, done])
+            # Same keys with different bytes or kind cannot masquerade as another partition.
+            for bad_values in ([a, (OTHER, 2, b"changed")], [a, (OTHER, 3, b"y")], [a]):
+                bad, _ = pack(bad_values)
+                with self.assertRaises(e.Failed):
+                    e.publication(blobs, [report], [{**published, "packs": [bad]}, done])
+            for bad_events in ([done, published], [{**published, "attempt": 2}, done],
+                               [published, {**done, "attempt": 1}]):
+                with self.assertRaises(e.Failed):
+                    e.publication(blobs, [report], bad_events)
+            with self.assertRaises(e.Failed):
+                e.publication(blobs, [row(publication_attempt=3)], [published, done])
 
     def test_live_jsonl_tolerates_only_an_unfinished_last_append(self):
         with tempfile.TemporaryDirectory() as directory:

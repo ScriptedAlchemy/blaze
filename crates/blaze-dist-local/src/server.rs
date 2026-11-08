@@ -144,7 +144,7 @@ impl Server {
         while !stop.load(Ordering::Acquire) {
             let now = self.coordinator.now(self.clock.now_ms());
             let timed = self.coordinator.tick(now);
-            Self::outcomes(&timed);
+            self.outcomes(&timed);
             self.effects.deliver(timed);
             // One accept per loop prevents an accept flood starving existing clients/timers.
             match self.accept() {
@@ -178,7 +178,7 @@ impl Server {
         // Deliver stops for every active subscription on orderly shutdown. No automatic ack.
         // Abrupt process death is fenced by the next daemon epoch, not replayed as success.
         let effects = self.coordinator.shutdown(self.clock.now_ms());
-        Self::outcomes(&effects);
+        self.outcomes(&effects);
         self.effects.deliver(effects);
         Ok(())
     }
@@ -309,7 +309,10 @@ impl Server {
                         &[
                             ("unit_digest", json(&crate::pack::hex(&unit))),
                             ("execution", json(&request.execution.0)),
-                            ("attempt", json(&request.attempt.0)),
+                            (
+                                "attempt",
+                                json(&publication.accepted_attempt.unwrap_or(request.attempt).0),
+                            ),
                             ("packs", json(&packs)),
                         ],
                     );
@@ -317,10 +320,10 @@ impl Server {
             }
             _ => {}
         }
-        Self::outcomes(effects);
+        self.outcomes(effects);
     }
 
-    fn outcomes(effects: &[(ExecutionId, Effect)]) {
+    fn outcomes(&self, effects: &[(ExecutionId, Effect)]) {
         if std::env::var_os("BLAZE_DIST_EVENTS").is_none() {
             return;
         }
@@ -329,9 +332,11 @@ impl Server {
             if let Effect::Event(item) = effect
                 && let blaze_wire::JobEvent::Done(done) = &item.event
             {
+                let Some(unit) = self.coordinator.unit(*execution) else { continue };
                 emit(
                     "done",
                     &[
+                        ("unit_digest", json(&crate::pack::hex(&unit))),
                         ("execution", json(&execution.0)),
                         ("attempt", json(&item.attempt.0)),
                         ("outcome", json(&format!("{:?}", done.outcome))),

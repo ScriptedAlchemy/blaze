@@ -4,6 +4,12 @@ summary: One attempt-owned distributed unit through its full output record, foll
 ---
 # A unit ends after its full output is published
 
+An accepted refusal prevents full-manifest commitment and retains a typed refused terminal
+under every local policy. Once the full output is accepted, late refusal batches are rejected
+without changing that record. Delivery checks the subscriber's actual terminal before an agent
+returns success. Acceptance keeps its original attempt separately from a replacement lead's
+delivery attempt; equivalent cache pack partitions must contain identical key/kind/byte values.
+
 A completed grant phase is not a completed unit. The unit's current lead keeps heartbeating
 while the ordinary `Build` finishes its tail, with the committed grant values ahead of its
 store. Helpers and subscribers that arrive during this interval wait for the full record.

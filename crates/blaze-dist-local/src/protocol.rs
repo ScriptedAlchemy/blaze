@@ -213,6 +213,7 @@ wire_struct! {
     Publication {
         0 => packs: Option<Vec<PackRef>>,
         1 => attempt: Attempt,
+        2 => accepted_attempt: Option<Attempt>,
     }
 }
 wire_struct! {
