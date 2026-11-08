@@ -555,18 +555,58 @@ fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
     read_linux_pressure(|path| std::fs::read_to_string(path), pressure_reserve().ok()?)
 }
 
+/// The least remaining memory at any limited ancestor of this process's cgroup.
+/// A container can exhaust its memory.max while the host's MemAvailable is large.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_headroom(groups: &str, read: &impl Fn(&str) -> std::io::Result<String>) -> Option<u64> {
+    groups
+        .lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once(':')?;
+            let (controllers, path) = rest.split_once(':')?;
+            let (prefix, limit, usage) = match controllers {
+                "" => ("", "memory.max", "memory.current"),
+                _ if controllers.split(',').any(|it| it == "memory") => {
+                    ("memory/", "memory.limit_in_bytes", "memory.usage_in_bytes")
+                }
+                _ => return None,
+            };
+            let mut at = path.trim_matches('/');
+            let mut remaining: Option<u64> = None;
+            loop {
+                let dir = if at.is_empty() { String::new() } else { format!("{at}/") };
+                let base = format!("/sys/fs/cgroup/{prefix}{dir}");
+                let max = read(&format!("{base}{limit}"))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u64>().ok());
+                let used = read(&format!("{base}{usage}"))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u64>().ok());
+                if let Some((max, used)) = max.zip(used) {
+                    let free = max.saturating_sub(used);
+                    remaining = Some(remaining.map_or(free, |prior| prior.min(free)));
+                }
+                if at.is_empty() {
+                    break remaining;
+                }
+                at = at.rsplit_once('/').map_or("", |(parent, _)| parent);
+            }
+        })
+        .min()
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn read_linux_pressure(
     read: impl Fn(&str) -> std::io::Result<String>,
     reserve: u64,
 ) -> Option<hir_ty_codegen::budget::Pressure> {
-    // Either source can be restricted independently. Read both before classifying, so
-    // an unavailable MemAvailable reading cannot hide critical pressure reported by PSI.
-    linux_pressure(
-        &read("/proc/meminfo").unwrap_or_default(),
-        &read("/proc/pressure/memory").unwrap_or_default(),
-        reserve,
-    )
+    // The host, PSI and cgroup can be unavailable independently: a readable
+    // critical signal must still stop admission when another source is missing.
+    let meminfo = read("/proc/meminfo").unwrap_or_default();
+    let psi = read("/proc/pressure/memory").unwrap_or_default();
+    let groups = read("/proc/self/cgroup").unwrap_or_default();
+    let cgroup_free = cgroup_headroom(&groups, &read);
+    linux_pressure_with_headroom(&meminfo, &psi, reserve, cgroup_free)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -578,14 +618,27 @@ pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
     hir_ty_codegen::budget::testing::pressure().unwrap_or_else(os_pressure)
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(test)]
 fn linux_pressure(
     meminfo: &str,
     psi: &str,
     reserve: u64,
 ) -> Option<hir_ty_codegen::budget::Pressure> {
+    linux_pressure_with_headroom(meminfo, psi, reserve, None)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_pressure_with_headroom(
+    meminfo: &str,
+    psi: &str,
+    reserve: u64,
+    cgroup_free: Option<u64>,
+) -> Option<hir_ty_codegen::budget::Pressure> {
     use hir_ty_codegen::budget::Pressure;
-    let available = kilobytes(meminfo, "MemAvailable:");
+    let available = match (kilobytes(meminfo, "MemAvailable:"), cgroup_free) {
+        (Some(host), Some(group)) => Some(host.min(group)),
+        (host, group) => host.or(group),
+    };
     let avg = |name: &str| -> Option<f64> {
         let row = psi.lines().find(|line| line.starts_with(name))?;
         let value = row.split_whitespace().find_map(|part| part.strip_prefix("avg10="))?;
@@ -675,6 +728,8 @@ mod tests {
                     let text = match path {
                         "/proc/meminfo" => meminfo,
                         "/proc/pressure/memory" => psi,
+                        "/proc/self/cgroup" => None,
+                        path if path.starts_with("/sys/fs/cgroup/") => None,
                         _ => panic!("unexpected pressure source: {path}"),
                     };
                     text.map(str::to_owned)
@@ -688,6 +743,48 @@ mod tests {
         assert_eq!(read(Some("MemAvailable: 1024 kB"), None), Some(Critical));
         assert_eq!(read(None, Some("some avg10=0\nfull avg10=0\n")), None);
         assert_eq!(read(None, None), None);
+    }
+
+    #[test]
+    fn linux_pressure_accounts_for_limited_parent_cgroups() {
+        use hir_ty_codegen::budget::Pressure::*;
+        let files = [
+            ("/proc/meminfo", "MemAvailable: 8388608 kB\n"),
+            ("/proc/pressure/memory", "some avg10=0 total=0\nfull avg10=0 total=0\n"),
+            ("/proc/self/cgroup", "0::/tenant/build\n"),
+            ("/sys/fs/cgroup/tenant/build/memory.max", "8589934592\n"),
+            ("/sys/fs/cgroup/tenant/build/memory.current", "2147483648\n"),
+            ("/sys/fs/cgroup/tenant/memory.max", "4294967296\n"),
+            ("/sys/fs/cgroup/tenant/memory.current", "3758096384\n"),
+        ];
+        let read = |path: &str| {
+            files
+                .iter()
+                .find(|(name, _)| *name == path)
+                .map(|(_, value)| (*value).to_owned())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        // The child has 6 GiB free, but its parent has only 512 MiB.
+        assert_eq!(cgroup_headroom("0::/tenant/build\n", &read), Some(512 << 20));
+        assert_eq!(read_linux_pressure(read, 1 << 30), Some(Critical));
+    }
+
+    #[test]
+    fn cgroup_headroom_understands_v1_and_ignores_unlimited_v2() {
+        let read = |path: &str| -> std::io::Result<String> {
+            let value = match path {
+                "/sys/fs/cgroup/memory/docker/a/memory.limit_in_bytes" => "2147483648",
+                "/sys/fs/cgroup/memory/docker/a/memory.usage_in_bytes" => "1610612736",
+                "/sys/fs/cgroup/memory/docker/memory.limit_in_bytes" => "max",
+                "/sys/fs/cgroup/memory/docker/memory.usage_in_bytes" => "0",
+                "/sys/fs/cgroup/unlimited/memory.max" => "max",
+                "/sys/fs/cgroup/unlimited/memory.current" => "1234",
+                _ => return Err(std::io::ErrorKind::NotFound.into()),
+            };
+            Ok(value.to_owned())
+        };
+        assert_eq!(cgroup_headroom("4:memory:/docker/a\n", &read), Some(512 << 20));
+        assert_eq!(cgroup_headroom("0::/unlimited\n", &read), None);
     }
 
     #[test]
