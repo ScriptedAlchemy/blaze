@@ -72,8 +72,10 @@ impl Dist {
     /// proc macro's unit is `wasm32-wasip1`, and no machine is one).
     pub(super) fn of(env: &[(String, String)], host: &str) -> Result<Option<Dist>, String> {
         let Some(socket) = var(env, SOCKET_VAR) else {
-            if let Some(blobs) = var(env, BLOBS_VAR) {
-                return Err(format!("{BLOBS_VAR} is {blobs}, with no {SOCKET_VAR} to run its units"));
+            for name in [BLOBS_VAR, LOCAL_VAR, REPORT_VAR, DEADLINE_VAR, PR_VAR, SOURCE_VAR] {
+                if let Some(value) = var(env, name) {
+                    return Err(format!("{name} is {value}, with no {SOCKET_VAR} to run its units")); // alloc: an error
+                }
             }
             return Ok(None);
         };
@@ -263,5 +265,32 @@ impl<B: Prepare, S: Lookup> Granted for Compiling<'_, '_, B, S> {
             compiled: stats.compiled as u64,
             stored: keys.len().saturating_sub(stats.compiled) as u64,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distributed_options_without_a_socket_are_refused_instead_of_silently_ignored() {
+        assert!(
+            matches!(Dist::of(&[], "aarch64-unknown-linux-gnu"), Ok(None)),
+            "without distributed settings a local build is intentional"
+        );
+        for (name, value) in [
+            (BLOBS_VAR, "127.0.0.1:4000"),
+            (LOCAL_VAR, "fallback"),
+            (REPORT_VAR, "dist.jsonl"),
+            (DEADLINE_VAR, "30"),
+            (PR_VAR, "81"),
+            (SOURCE_VAR, "revision"),
+        ] {
+            let env = [(name.to_owned(), value.to_owned())]; // alloc: test fixture
+            let why = Dist::of(&env, "aarch64-unknown-linux-gnu")
+                .err()
+                .expect("a distributed option cannot be ignored when the socket is missing");
+            assert!(why.contains(name) && why.contains(SOCKET_VAR), "{why}");
+        }
     }
 }
