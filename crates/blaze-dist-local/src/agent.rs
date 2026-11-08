@@ -339,7 +339,21 @@ fn parse_list(list: &[u8]) -> Option<Vec<PackRef>> {
             format: blaze_wire::DIST_PACK_FORMAT,
         });
     }
+    // The published list names a whole durable unit: reject malformed, reordered
+    // or duplicated records, not merely records whose pack bytes later fail.
+    let canonical = list_of(&packs); // alloc: once per published unit, to verify its wire form
+    if packs.windows(2).any(|pair| pair[0] >= pair[1]) || canonical.as_slice() != list {
+        return None;
+    }
     Some(packs)
+}
+
+/// A corrupted published manifest is an error, not permission to silently recompile.
+fn published_packs(unit: &Unit, list: &[u8]) -> Result<Vec<PackRef>, Error> {
+    parse_list(list).ok_or_else(|| {
+        // alloc: a malformed published manifest's refusal
+        Error::Protocol(format!("unit {}: published pack list is not canonical", hex(&unit.spec)))
+    })
 }
 
 /// Publishes what `unit` is made of for builds to come: `packs` and a pack of `extra`, what the
@@ -381,9 +395,8 @@ pub fn run(
     granted: &mut dyn Granted,
     cancelled: &AtomicBool,
 ) -> Result<Arrived, Error> {
-    if let Some(list) = config.blobs.published(&unit.spec)?
-        && let Some(packs) = parse_list(&list)
-    {
+    if let Some(list) = config.blobs.published(&unit.spec)? {
+        let packs = published_packs(unit, &list)?;
         match import(&config.blobs, &packs) {
             Ok(values) => {
                 return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None) });
@@ -645,6 +658,43 @@ fn finish(
                 std::thread::sleep(config.poll);
             }
             _ => return,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn published_pack_list_requires_exact_sorted_unique_records() {
+        let unit = Unit { spec: [0x33; 32], names: Vec::new() }; // alloc: test fixture
+        let first = PackRef {
+            pack: [0x11; 32],
+            size: 10,
+            keys: [0x44; 32],
+            packed: None,
+            format: blaze_wire::DIST_PACK_FORMAT,
+        };
+        let second = PackRef { pack: [0x22; 32], ..first.clone() };
+        let canonical = list_of(&[first.clone(), second.clone()]);
+        assert!(published_packs(&unit, &canonical).is_ok());
+        assert!(published_packs(&unit, b"").is_ok(), "an empty unit is canonical");
+
+        let noncanonical = [
+            canonical[..canonical.len() - 1].to_vec(),
+            [canonical.as_slice(), b"extra\n"].concat(),
+            [canonical.as_slice(), b"\n"].concat(),
+            list_of(&[second, first.clone()]),
+            list_of(&[first.clone(), first]),
+            b"not-a-pack\n".to_vec(),
+            vec![0xff],
+        ]; // alloc: corrupted manifest fixtures
+        for bytes in noncanonical {
+            assert!(
+                matches!(published_packs(&unit, &bytes), Err(Error::Protocol(_))),
+                "a damaged published manifest must be refused, not rebuilt"
+            );
         }
     }
 }
