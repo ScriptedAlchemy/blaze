@@ -45,7 +45,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ours || (github.event_name == 'pull_request' && github.event.pull_request.base.sha) || github.sha }}
+          # On a PR, benchmark this PR's version, not the possibly pre-V2 base.
+          # A before/after comparison against main uses the separately recorded main run.
+          ref: ${{ inputs.ours || (github.event_name == 'pull_request' && github.event.pull_request.head.sha) || github.sha }}
           path: ours
           persist-credentials: false
       - uses: actions/checkout@v7
@@ -53,8 +55,8 @@ jobs:
           repository: astral-experiments/blaze
           path: astral
           persist-credentials: false
-      # Inline, not ./ours/.github/actions/rustup: `ours` is the pull request's base, which may
-      # predate that action.
+      # Inline, not ./ours/.github/actions/rustup: a dispatch may explicitly measure
+      # an older ref, and that ref may predate the action.
       - name: rustup
         run: |
           if ! command -v rustup > /dev/null; then
