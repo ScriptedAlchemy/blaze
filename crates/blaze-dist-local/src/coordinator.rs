@@ -97,6 +97,7 @@ pub struct Coordinator {
     issued: u64,
     ended: BTreeMap<ExecutionId, u64>,
     work_bytes: BTreeMap<ExecutionId, usize>,
+    units: BTreeMap<ExecutionId, Digest>,
     last_now: u64,
 }
 
@@ -118,6 +119,7 @@ impl Coordinator {
             issued: 0,
             ended: BTreeMap::new(),
             work_bytes: BTreeMap::new(),
+            units: BTreeMap::new(),
             last_now: 0,
         }
     }
@@ -161,9 +163,24 @@ impl Coordinator {
             if self.jobs.forget_terminal(id) {
                 self.ended.remove(&id);
                 self.work_bytes.remove(&id);
+                self.units.remove(&id);
             }
         }
         effects
+    }
+
+    pub(crate) fn unit(&self, execution: ExecutionId) -> Option<Digest> {
+        self.units.get(&execution).copied()
+    }
+
+    pub(crate) fn committed_names(
+        &self,
+        result: &blaze_wire::BatchResult,
+    ) -> Vec<blaze_wire::WorkName> {
+        let Some(work) = self.jobs.execution(result.lease.execution).and_then(|e| e.work()) else {
+            return Vec::new();
+        };
+        work.committed_names(result)
     }
 
     /// Orderly reactor shutdown cancels active subscriptions and emits genuine stop effects.
@@ -403,6 +420,7 @@ impl Coordinator {
                     .jobs
                     .submit(now, &req, s.need.clone(), out)
                     .map_err(|(r, retry)| r.to_wire(retry))?;
+                self.units.insert(a.execution, req.unit);
                 self.jobs.tick(now, out);
                 Ok(Answer::Binding(Binding {
                     subscription: Subscription {
@@ -576,6 +594,47 @@ impl Coordinator {
                 }
                 let packs = self.jobs.committed_packs(p.execution).map_err(|r| r.to_wire(None))?;
                 Ok(Answer::Packs(CommittedPacks { packs }))
+            }
+            Command::CommitPublication(p) => {
+                self.work(p.content, p.execution, p.attempt)?;
+                if encode(&p.packs).len() > self.config.work_bytes {
+                    return Err(error(ErrorCode::Busy, "publication-retention-capacity"));
+                }
+                self.jobs
+                    .commit_publication(now, p.execution, &p.executor, p.attempt, &p.packs, out)
+                    .map_err(|r| r.to_wire(None))?;
+                Ok(Answer::Publication(Publication {
+                    packs: self
+                        .jobs
+                        .execution(p.execution)
+                        .and_then(|e| e.publication())
+                        .map(|packs| packs.to_vec()),
+                    attempt: self
+                        .jobs
+                        .execution(p.execution)
+                        .expect("committed execution")
+                        .attempt(),
+                }))
+            }
+            Command::Publication(p) => {
+                let execution = self
+                    .jobs
+                    .execution(p.execution)
+                    .filter(|e| e.content == p.content)
+                    .ok_or_else(|| Refusal::NoExecution.to_wire(None))?;
+                Ok(Answer::Publication(Publication {
+                    packs: execution.publication().map(|packs| packs.to_vec()),
+                    attempt: execution.attempt(),
+                }))
+            }
+            Command::DeliverPublication(p) => {
+                if self.jobs.execution(p.execution).is_none_or(|e| e.content != p.content) {
+                    return Err(Refusal::NoExecution.to_wire(None));
+                }
+                self.jobs
+                    .deliver_publication(now, p.execution, &p.packs, out)
+                    .map_err(|r| r.to_wire(None))?;
+                Ok(Answer::Ack(Ack {}))
             }
             Command::Release(_) => Ok(Answer::Ack(Ack {})),
         }

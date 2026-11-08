@@ -10,7 +10,9 @@ pub mod coordinator;
 pub mod driver;
 pub mod pack;
 pub mod protocol;
+pub mod result_gate;
 pub mod server;
+pub mod telemetry;
 
 use std::io;
 

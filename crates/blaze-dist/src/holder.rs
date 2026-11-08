@@ -75,6 +75,8 @@ pub enum Reply {
 pub struct Plan {
     /// The grant.
     pub grant: Grant,
+    /// The sequence the resulting batch will report; granted compilation never overlaps.
+    pub seq: u64,
     /// The granted names the holder resolves, through a finding or its pre-index, in the
     /// grant's set order. The others are answered `Lost` by the holder.
     pub compile: Vec<WorkName>,
@@ -485,7 +487,7 @@ impl Holder {
             );
         }
         self.phase = Phase::Compiling { grant: grant.clone(), lost };
-        out.push(Effect::Compile(Plan { grant, compile }));
+        out.push(Effect::Compile(Plan { grant, seq: self.seq + 1, compile }));
     }
 
     fn compiled(&mut self, now: Millis, batch: Compiled, out: &mut Vec<Effect>) {

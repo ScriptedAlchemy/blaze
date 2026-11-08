@@ -267,8 +267,8 @@ impl Server {
     }
 
     /// `GET`, `HEAD`, `PUT`, `DELETE /v1/list/<name>`: a manifest or a project's units.
-    /// A unit's list. A list is written once: what a second writer would put names the same
-    /// keys, so its `PUT` answers 412 and the first stays.
+    /// A unit's list is immutable by default. An exact If-Match permits repair only when
+    /// the current list has an absent pack and every replacement pack verifies.
     async fn list(
         &self,
         method: &Method,
@@ -297,7 +297,13 @@ impl Server {
             }
             Method::PUT => {
                 let bytes = self.read_whole(headers, body).await?;
-                let wrote = self.disk(move |store| store.put_list(&owned, &bytes)).await?;
+                let expected = manifest_match(headers)?;
+                let wrote = self
+                    .disk(move |store| match expected {
+                        Some(expected) => store.repair_list(&owned, &expected, &bytes),
+                        None => store.put_list(&owned, &bytes),
+                    })
+                    .await?;
                 Ok(empty(if wrote {
                     StatusCode::NO_CONTENT
                 } else {
@@ -524,6 +530,26 @@ fn error_answer(error: &Error) -> HttpResponse<Body> {
 
 fn method_not_allowed(method: &Method, allowed: &str) -> Error {
     Error::malformed(format!("{method} is not how this call is made: {allowed}"))
+}
+
+/// Only one quoted, lowercase SHA256 is a conditional repair token. Wildcards, weak
+/// tags, lists and repeated headers must not turn an immutable PUT into a broad overwrite.
+fn manifest_match(headers: &hyper::HeaderMap) -> Result<Option<blaze_wire::Digest>, Error> {
+    let mut values = headers.get_all(header::IF_MATCH).iter();
+    let Some(value) = values.next() else { return Ok(None) };
+    if values.next().is_some() {
+        return Err(Error::malformed("manifest repair takes exactly one If-Match header"));
+    }
+    let text = value.to_str().map_err(|_| Error::malformed("If-Match is not text"))?;
+    let digest = text
+        .strip_prefix('"')
+        .and_then(|text| text.strip_suffix('"'))
+        .filter(|text| text.len() == 64)
+        .and_then(|text| ObjectName::parse(&format!("manifests/{text}")))
+        .ok_or_else(|| {
+            Error::malformed("manifest repair If-Match must be one quoted lowercase SHA256")
+        })?;
+    Ok(Some(digest.digest))
 }
 
 fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
@@ -881,5 +907,115 @@ mod tests {
         }
         assert!(run.server.store().open_blob(&name).unwrap().is_none());
         assert_eq!(std::fs::read_dir(run.server.store().dir().join("packs")).unwrap().count(), 0);
+    }
+
+    fn manifest_ref(bytes: &[u8], digest: &str) -> blaze_wire::PackRef {
+        blaze_wire::PackRef {
+            pack: ObjectName::parse(&format!("packs/{digest}.pack")).unwrap().digest,
+            size: bytes.len() as u64,
+            keys: [3; 32],
+            packed: None,
+            format: blaze_wire::DIST_PACK_FORMAT,
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_manifest_repair_requires_one_exact_token_and_verified_replacement() {
+        use sha2::{Digest as _, Sha256};
+        let run = Running::start().await;
+        let (a, aname) = pack(b"old pack");
+        let (b, bname) = pack(b"replacement pack");
+        let old = blaze_wire::pack_list::encode(&[manifest_ref(&a, &aname)]);
+        let new = blaze_wire::pack_list::encode(&[manifest_ref(&b, &bname)]);
+        let path = format!("/v1/list/manifests/{}", hex(&[8; 32]));
+        assert_eq!(
+            run.request("PUT", &format!("/v1/blob/packs/{aname}.pack"), "", &a).await.0,
+            204
+        );
+        assert_eq!(run.request("PUT", &path, "", &old).await.0, 204);
+        std::fs::remove_file(run.server.store().dir().join(format!("packs/{aname}.pack"))).unwrap();
+        let expected: blaze_wire::Digest = Sha256::digest(&old).into();
+        let tag = format!("\"{}\"", hex(&expected));
+        for value in [
+            "*".to_owned(),
+            format!("W/{tag}"),
+            format!("{tag}, {tag}"),
+            tag.trim_matches('"').to_owned(),
+            format!("\"{}\"", "AB".repeat(32)),
+        ] {
+            let header = format!("If-Match: {value}\r\n");
+            assert_eq!(run.request("PUT", &path, &header, &new).await.0, 400, "{value}");
+            assert_eq!(run.request("GET", &path, "", &[]).await.2, old);
+        }
+        let repeated = format!("If-Match: {tag}\r\nIf-Match: {tag}\r\n");
+        assert_eq!(run.request("PUT", &path, &repeated, &new).await.0, 400);
+        let wrong = format!("If-Match: \"{}\"\r\n", hex(&[0; 32]));
+        assert_eq!(run.request("PUT", &path, &wrong, &new).await.0, 412);
+        let header = format!("If-Match: {tag}\r\n");
+        assert_eq!(
+            run.request("PUT", &path, &header, &new).await.0,
+            422,
+            "an absent replacement pack is refused"
+        );
+        assert_eq!(
+            run.request("PUT", &format!("/v1/blob/packs/{bname}.pack"), "", &b).await.0,
+            204
+        );
+        let mut corrupt = b.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(run.server.store().dir().join(format!("packs/{bname}.pack")), corrupt)
+            .unwrap();
+        assert_eq!(
+            run.request("PUT", &path, &header, &new).await.0,
+            422,
+            "a corrupt replacement is refused"
+        );
+        assert_eq!(run.request("GET", &path, "", &[]).await.2, old);
+        assert_eq!(
+            run.request("PUT", &format!("/v1/blob/packs/{bname}.pack"), "", &b).await.0,
+            204
+        );
+        assert_eq!(run.request("PUT", &path, &header, &new).await.0, 204);
+        assert_eq!(run.request("GET", &path, "", &[]).await.2, new);
+        let current: blaze_wire::Digest = Sha256::digest(&new).into();
+        let valid = format!("If-Match: \"{}\"\r\n", hex(&current));
+        assert_eq!(
+            run.request("PUT", &path, &valid, &old).await.0,
+            412,
+            "a valid current manifest stays immutable"
+        );
+        assert_eq!(run.request("PUT", &path, "", b"ordinary immutable publication\n").await.0, 412);
+        assert_eq!(run.request("GET", &path, "", &[]).await.2, new);
+    }
+
+    #[tokio::test]
+    async fn competing_http_repairs_have_one_atomic_comparison_winner() {
+        use sha2::{Digest as _, Sha256};
+        let run = Running::start().await;
+        let (a, aname) = pack(b"absent old pack");
+        let (b, bname) = pack(b"first complete replacement");
+        let (c, cname) = pack(b"second complete replacement");
+        for (name, bytes) in [(&bname, &b), (&cname, &c)] {
+            assert_eq!(
+                run.request("PUT", &format!("/v1/blob/packs/{name}.pack"), "", bytes).await.0,
+                204
+            );
+        }
+        let old = blaze_wire::pack_list::encode(&[manifest_ref(&a, &aname)]);
+        let left = blaze_wire::pack_list::encode(&[manifest_ref(&b, &bname)]);
+        let right = blaze_wire::pack_list::encode(&[manifest_ref(&c, &cname)]);
+        let path = format!("/v1/list/manifests/{}", hex(&[9; 32]));
+        assert_eq!(run.request("PUT", &path, "", &old).await.0, 204);
+        let expected: blaze_wire::Digest = Sha256::digest(&old).into();
+        let header = format!("If-Match: \"{}\"\r\n", hex(&expected));
+        let (a, b) = tokio::join!(
+            run.request("PUT", &path, &header, &left),
+            run.request("PUT", &path, &header, &right),
+        );
+        let mut statuses = [a.0, b.0];
+        statuses.sort();
+        assert_eq!(statuses, [204, 412]);
+        let visible = run.request("GET", &path, "", &[]).await.2;
+        assert!(visible == left || visible == right);
     }
 }

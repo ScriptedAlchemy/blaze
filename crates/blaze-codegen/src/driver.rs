@@ -102,6 +102,9 @@ pub struct Stats {
     /// waited ([`crate::flight`]): neither prepared nor compiled here.
     pub flown: usize,
     pub compiled: usize,
+    /// Store keys of templates emitted here, one per `compiled`, including repeated emits
+    /// of one key. Store, memo and flight hits, summaries and side-table writes add none.
+    pub compiled_keys: Vec<Key>,
     /// Functions that became thunks of a folded body.
     pub folded: usize,
     /// Imports of the release compiles that ran.
@@ -128,6 +131,7 @@ impl Stats {
             memo,
             flown,
             compiled,
+            compiled_keys,
             folded,
             imported,
             profiles,
@@ -139,6 +143,8 @@ impl Stats {
         self.memo += memo;
         self.flown += flown;
         self.compiled += compiled;
+        // alloc: one key per actual emission, retaining repeated emits of the same key.
+        self.compiled_keys.extend(compiled_keys);
         self.folded += folded;
         self.imported += imported;
         self.verified += verified;
@@ -742,6 +748,35 @@ struct Job<'n, B: Prepare> {
     unit: Unit,
     spec: &'n Spec,
     node: &'n Node<B>,
+}
+
+fn release_jobs<B: Prepare>(nodes: &Sorted<InstanceKey, Node<B>>) -> Vec<Job<'_, B>> {
+    nodes
+        .iter()
+        .filter(|(_, node)| node.spec.backend.is_release())
+        .map(|(key, node)| Job { name: *key, unit: node.unit.clone(), spec: &node.spec, node }) // clone: plain IDs
+        .collect() // alloc: per release plan, one job per release node
+}
+
+#[derive(Clone)] // clone: a grant takes its immutable decision, not another import plan.
+struct ReleaseTask {
+    name: InstanceKey,
+    imports: Imports,
+    refs: Vec<Target>,
+    blob_key: Key,
+}
+
+struct ReleasePlan<B: Prepare> {
+    tasks: Vec<ReleaseTask>,
+    prepared: HashMap<InstanceKey, B::Prepared>,
+    exports: HashMap<InstanceKey, B::Export>,
+}
+
+#[derive(Clone, Copy)]
+enum WorkTask {
+    Dev(InstanceKey),
+    Fold(usize),
+    Release(usize),
 }
 
 /// A body `function` built in that none of `keys` is: code its store key does not hold. Each
@@ -1631,22 +1666,42 @@ pub struct Build<'a, B: Prepare> {
 /// made by [`Build::work_set`], its [`names`](WorkSet::names) the canonical root list every
 /// executor of a unit computes alike, since an instance's key covers all it is made from.
 ///
-/// Only dev functions a template stands alone for are work. A release function's imports are
-/// decided from the whole build's summaries and a folded group from all its members, so those
-/// stay with the build that links them, which reads the store for what it finds there.
+/// Tasks are one standalone template, one complete folded group, or one release compile
+/// with the whole unit's import decision. Names are opaque grant IDs, not function IDs.
 pub struct WorkSet<B: Prepare> {
     nodes: Sorted<InstanceKey, Node<B>>,
+    tasks: Sorted<InstanceKey, WorkTask>,
+    groups: Vec<Group>,
+    release: Vec<ReleaseTask>,
+    summaries: Vec<Put>,
+    digest: ContentId,
 }
 
 impl<B: Prepare> WorkSet<B> {
-    /// The functions any executor may compile, sorted by key.
+    /// Canonical tasks sorted by grant ID; equal standalone templates get one grant.
     pub fn names(&self) -> Vec<InstanceKey> {
-        self.nodes
-            .iter()
-            .filter(|(_, node)| !node.spec.backend.is_release() && !node.spec.fold)
-            .map(|(key, _)| *key)
-            // alloc: per unit, sized by its functions
-            .collect()
+        self.tasks.keys.clone() // clone: the coordinator owns the task list.
+    }
+
+    /// Store keys of canonical release outputs, for matching actual emission evidence.
+    pub fn release_keys(&self) -> Vec<Key> {
+        let mut keys: Vec<_> = self.release.iter().map(|task| task.blob_key).collect(); // alloc: per evidence snapshot
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    /// Store keys of complete folded bundles: each body and every thunk.
+    pub fn folded_keys(&self) -> Vec<Key> {
+        let mut keys = Vec::new(); // alloc: per evidence snapshot
+        for group in &self.groups {
+            let body = group.key();
+            keys.push(keys::folded(&body));
+            keys.extend(group.stored.iter().map(|stored| keys::thunk(&body, stored)));
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        keys
     }
 
     /// Every function of the walk, work or not.
@@ -1654,14 +1709,10 @@ impl<B: Prepare> WorkSet<B> {
         self.nodes.len()
     }
 
-    /// What names the unit among executors: the digest of every function of its walk, whose
-    /// keys cover what each is made from. Equal digests are equal work.
+    /// The complete walk's input identity, including its static templates and roots. A list
+    /// of its stored values may be reused only by a build with this same identity.
     pub fn digest(&self) -> ContentId {
-        let mut hasher = Hasher::new("blaze dist unit 1");
-        for (key, _) in self.nodes.iter() {
-            hasher.update(&key.0.0);
-        }
-        hasher.finish()
+        self.digest
     }
 }
 
@@ -2441,18 +2492,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     // alloc: an error, once
                     return Err(vec![stopped()]);
                 }
-                let release: Vec<Job<'_, B>> = nodes
-                    .iter()
-                    .filter(|(_, node)| node.spec.backend.is_release())
-                    // clone: per build, a release job's unit (plain IDs)
-                    .map(|(key, node)| Job {
-                        name: *key,
-                        unit: node.unit.clone(),
-                        spec: &node.spec,
-                        node,
-                    })
-                    // alloc: per build, sized by its units
-                    .collect();
+                let release = release_jobs(&nodes);
                 {
                     let _span = tracing::info_span!(target: "blaze", "codegen release", functions = release.len()).entered();
                     self.release(&nodes, &release, store, &mut out);
@@ -2689,25 +2729,105 @@ impl<'a, B: Prepare> Build<'a, B> {
     }
 
     /// The functions of `roots` as work other executors may compile ([`WorkSet`]): the same
-    /// walk [`Build::run_with_statics`] makes, nothing read or compiled. `Err` is what the walk
+    /// walk and planners [`Build::run_with_statics`] uses. Summaries and masked IR are
+    /// prepared as needed, but no code is emitted. `Err` is what the walk
     /// refused, which the build itself then reports: no executor can agree on a broken unit.
     pub fn work_set(
         &self,
         roots: &[(FrontInstance<B>, Origin)],
         static_roots: &[FrontStatic<B>],
         check: &[CheckRoot<FrontInstance<B>, FrontStatic<B>>],
+        store: &impl Lookup,
     ) -> Result<WorkSet<B>, Vec<CodegenError>> {
         let mut errors = Vec::new();
-        let (nodes, _statics, _roots) =
-            self.walk(roots, static_roots, check, None, &mut errors);
-        if errors.is_empty() { Ok(WorkSet { nodes }) } else { Err(errors) }
+        let (nodes, statics, roots) = self.walk(roots, static_roots, check, None, &mut errors);
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let mut out = Out::default();
+        // alloc: per work set, canonical fold candidates and static escape roots.
+        let dev: Vec<_> =
+            nodes.iter().filter(|(_, n)| !n.spec.backend.is_release()).map(|(k, _)| *k).collect();
+        let (groups, _) = self.fold_plan(&nodes, &dev, &mut out.errors);
+        let outside_statics =
+            statics.values().flat_map(|it| it.refs.iter().filter_map(callee)).collect();
+        let jobs = release_jobs(&nodes);
+        let ReleasePlan { tasks: release, .. } =
+            self.release_plan(&nodes, &jobs, store, &outside_statics, &mut out);
+        let Finished { puts: summaries, errors, .. } = out.finish(names_of(&nodes, Some(&statics)));
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        // alloc: per work set, one grant per immutable output bundle.
+        let mut tasks = blaze_hash::HashMap::new_in(Global);
+        let grouped: HashSet<_> = groups.iter().flat_map(|g| g.members.iter().copied()).collect(); // alloc: per work set
+        let mut templates = blaze_hash::HashSet::new_in(Global); // alloc: per work set
+        for key in dev.iter().filter(|key| !grouped.contains(*key)) {
+            if templates.insert(nodes[key].template_key()) {
+                tasks.insert(*key, WorkTask::Dev(*key));
+            }
+        }
+        for (at, group) in groups.iter().enumerate() {
+            tasks.insert(group_flight(group), WorkTask::Fold(at));
+        }
+        for (at, task) in release.iter().enumerate() {
+            tasks.entry(InstanceKey(task.blob_key.0)).or_insert(WorkTask::Release(at));
+        }
+        let tasks = Sorted::of(tasks);
+        let mut digest = Hasher::new("blaze dist unit 3");
+        digest.update(&(nodes.len() as u64).to_le_bytes());
+        for (key, node) in nodes.iter() {
+            digest.id(&key.0).id(&node.template_key().0);
+            digest.update(&(node.refs.len() as u64).to_le_bytes());
+            for target in &node.refs {
+                crate::content::target_into(&mut digest, target);
+            }
+        }
+        digest.update(&(statics.len() as u64).to_le_bytes());
+        for ((item, instance), node) in statics.iter() {
+            let key =
+                keys::static_value(&definition(&node.described, &node.refs), &node.spec.settings());
+            digest.id(&item.0).id(instance).id(&key.0);
+            digest.update(&(node.refs.len() as u64).to_le_bytes());
+            for target in &node.refs {
+                crate::content::target_into(&mut digest, target);
+            }
+        }
+        digest.update(&(roots.len() as u64).to_le_bytes());
+        for root in roots {
+            digest.id(&root.0);
+        }
+        // Canonical plans are inputs too: summaries, import closure and whole group membership.
+        digest.update(&(summaries.len() as u64).to_le_bytes());
+        for put in &summaries {
+            digest.id(&put.key.0).part(&put.bytes);
+        }
+        digest.update(&(tasks.len() as u64).to_le_bytes());
+        for (name, task) in tasks.iter() {
+            digest.id(&name.0);
+            match *task {
+                WorkTask::Dev(key) => {
+                    digest.update(&[0]).id(&nodes[&key].template_key().0);
+                }
+                WorkTask::Fold(at) => {
+                    digest.update(&[1]).id(&group_flight(&groups[at]).0);
+                }
+                WorkTask::Release(at) => {
+                    let task = &release[at];
+                    digest.update(&[2]).id(&task.blob_key.0);
+                    for target in &task.refs {
+                        crate::content::target_into(&mut digest, target);
+                    }
+                }
+            }
+        }
+        Ok(WorkSet { nodes, tasks, groups, release, summaries, digest: digest.finish() })
     }
 
     /// The values of `granted`, functions of `work`, as the store would keep them: each from
-    /// `store` if it is there (template and side table, so an executor that lacks them can
-    /// take them from this one), else compiled by this build's one path ([`Self::dev`]'s
-    /// second half: the same flights, the memo and [`Self::compile_missing`]). A key `work`
-    /// does not name is an error: a grant is of the names the executors agreed on.
+    /// `store` if present, otherwise through the same dev/release/fold emitters as a local
+    /// build. Each grant exports its complete templates, summaries and debug side tables.
+    /// An unknown or repeated task ID is a refusal.
     pub fn compile_granted(
         &self,
         work: &WorkSet<B>,
@@ -2720,41 +2840,84 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut stored = Vec::new();
         // alloc: per grant, sized by its store misses
         let mut items: Vec<(InstanceKey, (InstanceKey, Option<(Shape, B::Prepared)>))> = Vec::new();
-        for key in granted {
-            let Some(node) = nodes.get(key) else {
-                // alloc: an error
-                let what = format!("a granted function {key:?} is not of this unit's work set");
-                out.errors.push(error(*key, ItemKey(ContentId::default()), what));
+        // alloc: per grant, selected whole groups, release tasks and output keys.
+        let mut groups = Vec::new();
+        let mut release = Vec::new();
+        let mut expected = Vec::new();
+        let mut seen = blaze_hash::HashSet::new_in(Global); // alloc: reject duplicate grants
+        for grant in granted {
+            if !seen.insert(*grant) {
+                out.errors.push(error(
+                    *grant,
+                    ItemKey(ContentId::default()),
+                    format!("duplicate task {grant:?} in one grant"), // alloc: error
+                ));
+                continue;
+            }
+            let Some(task) = work.tasks.get(grant) else {
+                out.errors.push(error(
+                    *grant,
+                    ItemKey(ContentId::default()),
+                    format!("granted task {grant:?} is not in this unit's canonical work plan"), // alloc: error
+                ));
                 continue;
             };
-            let at = node.template_key();
-            let read = out.read(store, &at, &node.unit, |it| {
-                stored_function(it, *key, &node.refs, node.described.anchors.as_ref())
-            });
-            match read {
-                Read::Hit(made) => {
-                    let side = made.ok().and_then(|it| it.side).map(|id| keys::side(&id));
-                    for (key_of, kind) in
-                        [Some((at, Kind::Code)), side.map(|it| (it, Kind::Debug))].into_iter().flatten()
-                    {
-                        match store.read(&key_of) {
-                            // alloc: per grant, a value this executor gives to the others
-                            Ok(Some(bytes)) => {
-                                stored.push(Put { key: key_of, kind, bytes: bytes.to_vec() })
-                            }
-                            Ok(None) => out.errors.push(error(
-                                *key,
-                                node.unit.item,
-                                // alloc: an error
-                                format!("the store names {key_of:?} of `{}` and holds nothing under it", node.described.name),
-                            )),
-                            Err(why) => out.errors.push(error(*key, node.unit.item, why)),
-                        }
+            let key =
+                match *task {
+                    WorkTask::Dev(key) => key,
+                    WorkTask::Fold(at) => {
+                        let group = &work.groups[at];
+                        expected.push((keys::folded(&group.key()), group.members[0]));
+                        expected.extend(
+                            group.members.iter().zip(&group.stored).map(|(member, stored)| {
+                                (keys::thunk(&group.key(), stored), *member)
+                            }),
+                        );
+                        groups.push(group);
+                        continue;
                     }
+                    WorkTask::Release(at) => {
+                        let task = &work.release[at];
+                        expected.push((task.blob_key, task.name));
+                        release.push(task.clone()); // clone: this grant's immutable import decision
+                        continue;
+                    }
+                };
+            let key = &key;
+            let node = &nodes[key];
+            let at = node.template_key();
+            expected.push((at, *key));
+            match out.read(store, &at, &node.unit, |it| {
+                stored_function(it, *key, &node.refs, node.described.anchors.as_ref())
+            }) {
+                Read::Hit(made) => {
+                    out.stats.stored += 1;
+                    out.made(&node.unit, &node.described.name, *key, Whence::Store(at), made);
                 }
                 Read::Miss => items.push((node.flight(), (*key, None))),
                 Read::Failed => {}
             }
+        }
+        if !out.errors.is_empty() {
+            return Err(out.finish(names_of::<_, _, B>(nodes, None)).errors);
+        }
+        // Ungrouped fold candidates retain the normal dev path's prepared-shape check
+        // before a memo flight is accepted.
+        let candidates: Vec<_> =
+            items.iter().map(|(_, (key, _))| *key).filter(|key| nodes[key].spec.fold).collect(); // alloc: selected fold candidates
+        let mut prepared: HashMap<_, _> = self
+            .prepare_all(nodes, &candidates, &mut out.errors)
+            .into_iter()
+            .filter_map(|(key, made)| match made {
+                Ok(made) => Some((key, made)),
+                Err(why) => {
+                    out.errors.push(why);
+                    None
+                }
+            })
+            .collect(); // alloc: selected fold candidates' IR
+        for (_, (key, own)) in &mut items {
+            *own = prepared.remove(key);
         }
         let name = |(key, _): &(InstanceKey, Option<(Shape, B::Prepared)>)| {
             let node = &nodes[key];
@@ -2772,6 +2935,85 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Flown::Landed((key, own), shape) => {
                     self.landed(nodes, key, shape, own.as_ref().map(|(own, _)| own), &mut out)
                 }
+            }
+        }
+        // Folded and release work use exactly the normal build's emitters and flights.
+        self.folded_refs(nodes, &groups, HashMap::new(), store, &mut out);
+        if !release.is_empty() {
+            for put in &work.summaries {
+                let first = &nodes[&work.release[0].name];
+                out.put(
+                    By::node(first.unit.instance.key(), &first.unit),
+                    put.key,
+                    put.kind,
+                    put.bytes.clone(),
+                ); // clone: summaries travel with release grants
+            }
+            self.release_tasks(
+                nodes,
+                &release_jobs(nodes),
+                ReleasePlan { tasks: release, prepared: HashMap::new(), exports: HashMap::new() },
+                store,
+                &mut out,
+            );
+        }
+        // Re-export warm hits and their side tables. Fresh/memo values are already puts.
+        let mut exported: blaze_hash::HashSet<_, Global> =
+            out.puts.iter().map(|(_, put)| put.key).collect(); // alloc: one mark per grant output
+        for (at, member) in expected {
+            let node = &nodes[&member];
+            if exported.insert(at) {
+                match store.read(&at) {
+                    Ok(Some(bytes)) => {
+                        stored.push(Put { key: at, kind: Kind::Code, bytes: bytes.to_vec() }); // alloc: grant export
+                    }
+                    Ok(None) => out.errors.push(error(
+                        member,
+                        node.unit.item,
+                        format!("granted output {at:?} of `{}` is missing", node.described.name),
+                    )), // alloc: error
+                    Err(why) => out.errors.push(error(member, node.unit.item, why)),
+                }
+            }
+        }
+        // Every referenced debug value must be in this output or its verified input store.
+        // A template-only memo landing cannot manufacture a missing table.
+        let mut sides = Vec::new(); // alloc: one debug reference per grant template
+        for put in out.puts.iter().map(|(_, put)| put).chain(stored.iter()) {
+            if put.kind != Kind::Code {
+                continue;
+            }
+            match blob::decode(&put.bytes) {
+                Ok(template) => sides.extend(template.side),
+                Err(why) => out.errors.push(error(
+                    InstanceKey(put.key.0),
+                    ItemKey(ContentId::default()),
+                    format!("granted template {:?} cannot be decoded: {why}", put.key), // alloc: error
+                )),
+            }
+        }
+        for side in sides {
+            let at = keys::side(&side);
+            if !exported.insert(at) {
+                continue;
+            }
+            let bytes = match store.read(&at) {
+                Ok(Some(bytes)) => Some(bytes),
+                Ok(None) => None,
+                Err(why) => {
+                    out.errors.push(error(InstanceKey(side), ItemKey(ContentId::default()), why));
+                    continue;
+                }
+            };
+            match bytes {
+                Some(bytes) => {
+                    stored.push(Put { key: at, kind: Kind::Debug, bytes: bytes.to_vec() })
+                } // alloc: grant export
+                None => out.errors.push(error(
+                    InstanceKey(side),
+                    ItemKey(ContentId::default()),
+                    format!("granted template names missing debug table {at:?}"),
+                )), // alloc: error
             }
         }
         if self.frontend.stopped() {
@@ -2792,63 +3034,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             .map(|(key, _)| *key)
             // alloc: per build, sized by its units
             .collect();
-        let mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)> = HashMap::new();
-
-        // Folding: every candidate's masked IR from its own IR, prepared in this build. No key
-        // known before preparing holds what a masked data object is told by (its positions'
-        // anchors, its file names), so a mask kept from another build or unit could name
-        // other data than the IR a group merges. Each form interned once in `self.masks`
-        // (hashed only when new).
-        // alloc: per build, sized by its units
-        let candidates_of: Vec<InstanceKey> =
-            dev.iter().filter(|key| nodes[*key].spec.fold).copied().collect();
-        // alloc: per build, sized by its units
-        let mut masks: Vec<(InstanceKey, Option<Masked>)> = Vec::with_capacity(candidates_of.len());
-        for (key, made) in self.prepare_all(nodes, &candidates_of, &mut out.errors) {
-            match made {
-                Ok((shape, made)) => {
-                    let node = &nodes[&key];
-                    masks.push((key, self.backend.masked(&node.unit, &made, &node.refs)));
-                    prepared.insert(key, (shape, made));
-                }
-                Err(why) => out.errors.push(why),
-            }
-        }
-        masks.sort_unstable_by_key(|it| it.0);
-        let forms = self.masks.table();
-        let masked: Vec<(InstanceKey, Option<Masking<'_>>)> = (masks.iter())
-            .map(|(key, it)| (*key, it.as_ref().map(|it| Masking::of(forms, it))))
-            // alloc: per build, sized by its units
-            .collect();
-        // alloc: per build, sized by its units
-        let mut candidates = Vec::new();
-        for (key, it) in &masked {
-            let (node, Some(it)) = (&nodes[key], it) else { continue };
-            let places = node.refs.len();
-            let beyond = it.constants.iter().find_map(|constant| match *constant {
-                fold::Constant::Place(at) if at as usize >= places => Some(at),
-                _ => None,
-            });
-            match beyond {
-                Some(at) => out.errors.push(error(
-                    *key,
-                    node.unit.item,
-                    // alloc: an error
-                    format!("its masked IR names place {at} of its {places} references"),
-                )),
-                // What its code is kept under: the body of a group it is first in is its
-                // code rewritten, so that body's key covers it (`fold::Group::first`), and its thunk's
-                // key does (`fold::Group::stored`).
-                None => candidates.push((
-                    *key,
-                    node.stored(),
-                    node.unit.instance.settings,
-                    *it,
-                    node.refs.as_slice(),
-                )),
-            }
-        }
-        let groups = fold::groups(&candidates, &fold::Limits::default());
+        let (groups, mut prepared) = self.fold_plan(nodes, &dev, &mut out.errors);
         // alloc: per build, sized by its units
         let grouped: HashSet<InstanceKey> =
             groups.iter().flat_map(|it| it.members.iter().copied()).collect();
@@ -2922,6 +3108,73 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
 
         self.folded(nodes, &groups, prepared, store, out);
+    }
+
+    /// The one grouping rule, shared by local builds and distributed work planning.
+    fn fold_plan(
+        &self,
+        nodes: &Sorted<InstanceKey, Node<B>>,
+        dev: &[InstanceKey],
+        errors: &mut Vec<CodegenError>,
+    ) -> (Vec<Group>, HashMap<InstanceKey, (Shape, B::Prepared)>) {
+        let mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)> = HashMap::new();
+
+        // Folding: every candidate's masked IR from its own IR, prepared in this build. No key
+        // known before preparing holds what a masked data object is told by (its positions'
+        // anchors, its file names), so a mask kept from another build or unit could name
+        // other data than the IR a group merges. Each form interned once in `self.masks`
+        // (hashed only when new).
+        // alloc: per build, sized by its units
+        let candidates_of: Vec<InstanceKey> =
+            dev.iter().filter(|key| nodes[*key].spec.fold).copied().collect();
+        // alloc: per build, sized by its units
+        let mut masks: Vec<(InstanceKey, Option<Masked>)> = Vec::with_capacity(candidates_of.len());
+        for (key, made) in self.prepare_all(nodes, &candidates_of, errors) {
+            match made {
+                Ok((shape, made)) => {
+                    let node = &nodes[&key];
+                    masks.push((key, self.backend.masked(&node.unit, &made, &node.refs)));
+                    prepared.insert(key, (shape, made));
+                }
+                Err(why) => errors.push(why),
+            }
+        }
+        masks.sort_unstable_by_key(|it| it.0);
+        let forms = self.masks.table();
+        let masked: Vec<(InstanceKey, Option<Masking<'_>>)> = (masks.iter())
+            .map(|(key, it)| (*key, it.as_ref().map(|it| Masking::of(forms, it))))
+            // alloc: per build, sized by its units
+            .collect();
+        // alloc: per build, sized by its units
+        let mut candidates = Vec::new();
+        for (key, it) in &masked {
+            let (node, Some(it)) = (&nodes[key], it) else { continue };
+            let places = node.refs.len();
+            let beyond = it.constants.iter().find_map(|constant| match *constant {
+                fold::Constant::Place(at) if at as usize >= places => Some(at),
+                _ => None,
+            });
+            match beyond {
+                Some(at) => errors.push(error(
+                    *key,
+                    node.unit.item,
+                    // alloc: an error
+                    format!("its masked IR names place {at} of its {places} references"),
+                )),
+                // What its code is kept under: the body of a group it is first in is its
+                // code rewritten, so that body's key covers it (`fold::Group::first`), and its thunk's
+                // key does (`fold::Group::stored`).
+                None => candidates.push((
+                    *key,
+                    node.stored(),
+                    node.unit.instance.settings,
+                    *it,
+                    node.refs.as_slice(),
+                )),
+            }
+        }
+        let groups = fold::groups(&candidates, &fold::Limits::default());
+        (groups, prepared)
     }
 
     /// The store check of `sampled`, dev functions whose templates the store gave
@@ -3119,6 +3372,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                     return;
                 }
                 out.stats.compiled += 1;
+                // alloc: evidence of this backend emission, never of a memo or flight hit.
+                out.stats.compiled_keys.push(node.template_key());
                 out.side(By::node(key, &node.unit), &mut emitted);
                 let Some(template) = out.template_of(
                     &node.unit,
@@ -3180,6 +3435,19 @@ impl<'a, B: Prepare> Build<'a, B> {
         &self,
         nodes: &Sorted<InstanceKey, Node<B>>,
         groups: &[Group],
+        prepared: HashMap<InstanceKey, (Shape, B::Prepared)>,
+        store: &impl Lookup,
+        out: &mut Out,
+    ) {
+        // alloc: per build, borrowed group selection shared with granted compilation.
+        let groups: Vec<_> = groups.iter().collect();
+        self.folded_refs(nodes, &groups, prepared, store, out);
+    }
+
+    fn folded_refs(
+        &self,
+        nodes: &Sorted<InstanceKey, Node<B>>,
+        groups: &[&Group],
         mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)>,
         store: &impl Lookup,
         out: &mut Out,
@@ -3188,7 +3456,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             |group: &Group, member: &InstanceKey| group.thunk_refs(&nodes[member].refs);
         // alloc: per build, sized by its groups
         let mut merging = Vec::new();
-        for group in groups {
+        for &group in groups {
             let key = group.key();
             out.folded
                 .push((key, folded_identity(group.members.iter().map(|it| nodes[it].subject()))));
@@ -3332,6 +3600,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             return (None, out);
         }
         out.stats.compiled += 1 + merged.thunks.len();
+        // alloc: the emitted body and each emitted thunk, under their store keys.
+        out.stats.compiled_keys.push(keys::folded(&key));
+        out.stats.compiled_keys.extend(group.stored.iter().map(|stored| keys::thunk(&key, stored)));
         out.stats.folded += group.members.len();
         out.side(By::folded(group.members[0], &first.unit), &mut merged.body);
         let body_at = keys::folded(&key);
@@ -3464,29 +3735,24 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
     }
 
-    fn release(
+    fn release_plan(
         &self,
         nodes: &Sorted<InstanceKey, Node<B>>,
         jobs: &[Job<'_, B>],
         store: &impl Lookup,
+        outside_statics: &blaze_hash::HashSet<InstanceKey, Global>,
         out: &mut Out,
-    ) {
+    ) -> ReleasePlan<B> {
         if jobs.is_empty() {
-            return;
+            return ReleasePlan {
+                tasks: Vec::new(),
+                prepared: HashMap::new(),
+                exports: HashMap::new(),
+            };
         }
         // alloc: per build, sized by its units
         let by_name: HashMap<InstanceKey, &Job<'_, B>> =
             jobs.iter().map(|job| (job.name, job)).collect();
-        let prepare = |names: &[InstanceKey],
-                       errors: &mut Vec<CodegenError>|
-         -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
-            self.until_stopped(names, errors, |name| {
-                let job = by_name[name];
-                let made = prepare_node(self.backend, self.frontend, &job.unit, job.spec, job.node);
-                (*name, made)
-            })
-        };
-
         // Every summary: stored, else from the IR, which is kept for the compile, else the one
         // another build of the memo made ([`crate::flight`]), by its store key: this build then
         // prepares the function only if it compiles or imports it. Sorted by key once, in
@@ -3506,6 +3772,12 @@ impl<'a, B: Prepare> Build<'a, B> {
                 });
                 match read {
                     Read::Hit(summary) => {
+                        out.put(
+                            By::node(job.name, &job.unit),
+                            keys::summary(&job.summarized()),
+                            Kind::Query,
+                            summary.encode(),
+                        );
                         summaries.insert(job.name, summary);
                     }
                     Read::Miss => unsummarized.push(job.name),
@@ -3513,18 +3785,6 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
             }
         }
-        let summarize = |made: Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)>,
-                         errors: &mut Vec<CodegenError>| {
-            self.until_stopped(made, errors, |(name, made)| {
-                let job = by_name[&name];
-                let summarized = made.and_then(|(_, mut made)| {
-                    let (summary, export) =
-                        self.backend.summarize(&job.unit, job.spec, &mut made, &job.node.refs)?;
-                    Ok((summary, export, made))
-                });
-                (name, summarized)
-            })
-        };
         let summary_flight =
             |name: &InstanceKey| InstanceKey(keys::summary(&by_name[name].summarized()).0);
         let flights = self.memo.flights();
@@ -3595,7 +3855,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         self.flown_summaries(&by_name, flown, &mut summaries, out);
         if self.frontend.stopped() {
             out.errors.push(stopped());
-            return;
+            return ReleasePlan { tasks: Vec::new(), prepared, exports };
         }
         // What only this build knows of a function: whether code outside it calls it, or
         // anything without a summary (another phase's unit, a static's value) refers to it.
@@ -3612,7 +3872,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     .filter(|(key, _)| !by_name.contains_key(*key))
                     .flat_map(|(_, node)| node.refs.iter().filter_map(callee)),
             )
-            .chain(self.static_callees.iter().copied())
+            .chain(outside_statics.iter().copied())
             // alloc: per build, sized by its units
             .collect();
         imports::close(&mut summaries, &outside);
@@ -3626,7 +3886,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     job.unit.item,
                     format!("deciding the imports: {why}"),
                 ));
-                return;
+                return ReleasePlan { tasks: Vec::new(), prepared, exports };
             }
         };
         let patchable = |key: &InstanceKey| nodes.get(key).is_some_and(|node| node.patchable);
@@ -3647,11 +3907,8 @@ impl<'a, B: Prepare> Build<'a, B> {
             Some(imports)
         };
 
-        // Each compile by its blob key: stored, else compiled with its imports' exports.
-        // alloc: per build, sized by its units
-        let mut missing = Vec::new();
-        // alloc: per build, the store hits the store check samples
-        let mut sampled = Vec::new();
+        // alloc: per release phase, the canonical decisions handed to every executor.
+        let mut tasks = Vec::with_capacity(jobs.len());
         for job in jobs {
             let Some(imports) = imports_of(&job.name) else {
                 if refused.contains(&job.name) || refused.contains(&job.unit.instance.key()) {
@@ -3689,6 +3946,62 @@ impl<'a, B: Prepare> Build<'a, B> {
                 &imported,
                 &imported_built_in,
             );
+            tasks.push(ReleaseTask { name: job.name, imports, refs, blob_key });
+        }
+        ReleasePlan { tasks, prepared, exports }
+    }
+
+    fn release(
+        &self,
+        nodes: &Sorted<InstanceKey, Node<B>>,
+        jobs: &[Job<'_, B>],
+        store: &impl Lookup,
+        out: &mut Out,
+    ) {
+        let plan = self.release_plan(nodes, jobs, store, &self.static_callees, out);
+        self.release_tasks(nodes, jobs, plan, store, out);
+    }
+
+    /// Execute canonical decisions with the existing release emitter and import exports.
+    fn release_tasks(
+        &self,
+        nodes: &Sorted<InstanceKey, Node<B>>,
+        jobs: &[Job<'_, B>],
+        plan: ReleasePlan<B>,
+        store: &impl Lookup,
+        out: &mut Out,
+    ) {
+        // alloc: per release phase, lookups include ungranted imports too.
+        let by_name: HashMap<InstanceKey, &Job<'_, B>> =
+            jobs.iter().map(|job| (job.name, job)).collect();
+        let prepare = |names: &[InstanceKey],
+                       errors: &mut Vec<CodegenError>|
+         -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
+            self.until_stopped(names, errors, |name| {
+                let job = by_name[name];
+                let made = prepare_node(self.backend, self.frontend, &job.unit, job.spec, job.node);
+                (*name, made)
+            })
+        };
+
+        let summarize = |made: Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)>,
+                         errors: &mut Vec<CodegenError>| {
+            self.until_stopped(made, errors, |(name, made)| {
+                let job = by_name[&name];
+                let summarized = made.and_then(|(_, mut made)| {
+                    let (summary, export) =
+                        self.backend.summarize(&job.unit, job.spec, &mut made, &job.node.refs)?;
+                    Ok((summary, export, made))
+                });
+                (name, summarized)
+            })
+        };
+        let ReleasePlan { tasks, mut prepared, mut exports } = plan;
+        // alloc: per release phase, store misses and verification samples.
+        let mut missing = Vec::new();
+        let mut sampled = Vec::new();
+        for ReleaseTask { name, imports, refs, blob_key } in tasks {
+            let job = by_name[&name];
             let key = job.unit.instance.key();
             match out.read(store, &blob_key, &job.unit, |it| {
                 stored_function(it, key, &refs, job.node.described.anchors.as_ref())
@@ -3795,6 +4108,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                 return (None, out);
             }
             out.stats.compiled += 1;
+            // alloc: evidence of this release emission; summaries are not compiles.
+            out.stats.compiled_keys.push(blob_key);
             out.stats.imported += imports.imported.len();
             out.side(By::node(job.name, &job.unit), &mut emitted);
             let Some(template) =
@@ -4134,6 +4449,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
             };
             out.stats.compiled += 1;
+            // alloc: evidence of this static emission, even if another emits the same key.
+            out.stats.compiled_keys.push(key);
             match StaticTemplate::of(&value, &node.refs) {
                 Ok(template) => {
                     out.put(

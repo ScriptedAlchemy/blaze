@@ -367,6 +367,62 @@ fn main() {
 )
 
 
+# Both crates compile distinct C symbols into an archive named `collision`. A
+# successful unique-name control proves the C toolchain and both wrappers work
+# before changing only the second archive's name; restoring it checks invalidation.
+CASES.append({
+    "name": "packages-own-same-named-native-archives",
+    "fixes": [],
+    "files": {
+        "Cargo.toml": '''[package]
+name = "native_archives"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+members = ["package_a", "package_b"]
+[dependencies]
+package_a = { path = "package_a" }
+package_b = { path = "package_b" }
+''',
+        MAIN: '''fn main() {
+    let a = package_a::value();
+    let b = package_b::value();
+    println!("{a} {b} {}", a + b);
+}
+''',
+        **{
+            f"package_{name}/{path}": content
+            for name, value in (("a", 11), ("b", 22))
+            for path, content in {
+                "Cargo.toml": f'''[package]
+name = "package_{name}"
+version = "0.1.0"
+edition = "2024"
+[build-dependencies]
+cc = "=1.4.3"
+''',
+                "build.rs": f'''fn main() {{
+    cc::Build::new().file("answer.c").compile("{"collision" if name == "a" else "separate"}");
+}}
+''',
+                "answer.c": f"int package_{name}_value(void) {{ return {value}; }}\n",
+                "src/lib.rs": f'''unsafe extern "C" {{ fn package_{name}_value() -> i32; }}
+pub fn value() -> i32 {{ unsafe {{ package_{name}_value() }} }}
+''',
+            }.items()
+        },
+    },
+    "program": "native_archives",
+    "steps": [
+        {"prints": ["11 22 33"]},
+        {"files": {"package_b/build.rs": 'fn main() { cc::Build::new().file("answer.c").compile("collision"); }\n'},
+         "prints": ["11 22 33"]},
+        {"files": {"package_b/build.rs": 'fn main() { cc::Build::new().file("answer.c").compile("separate"); }\n'},
+         "prints": ["11 22 33"]},
+    ],
+})
+
+
 # Remove each claimed cause in the same daemon, then restore it. A rejection alone does not
 # prove duplicate-name checking, and a macro that emits no impl must change method lookup.
 for case in CASES:

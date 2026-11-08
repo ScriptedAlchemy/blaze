@@ -70,10 +70,13 @@ An identity is `(execution, attempt, holder, generation, seq)`; `work` uses prot
 while report arrays use store keys. Do not substitute unit names, ordinals, hashes of log messages,
 or counters. Stale-fault acceptance stops an actual compiler process holding a grant, waits for
 replacement **accepted commits of every outstanding name in the same execution**, then resumes it
-and demands a refusal of that exact stale batch and no accepted commit from it. If the existing
-holder cancels/discards the batch without submitting it after resume, the strict stale-result
-stage is blocked: root must resolve how to exercise the real server refusal, not fabricate an event
-or weaken it to observing `holder-lost`. Worker-death recovery likewise requires real replacement
+and demands a refusal of that exact stale batch and no accepted commit from it. The explicit `BLAZE_DIST_TEST_RESULT_GATE` hook on the victim daemon captures the
+actual Holder-produced `Command::Result` immediately before transport. It selects only the current
+lead, and stops its driver and heartbeats at a bounded gate, so the coordinator advances its attempt
+before the resumed carrier is sent. The production path with this setting absent performs no capture
+or gate IO. The harness also releases a real captured result before expiry as a positive control.
+Both controls require the normal Client's actual answer and the coordinator's corresponding event;
+neither a discarded result nor a `holder-lost` event can satisfy the stale case. Worker-death recovery likewise requires real replacement
 commits; an unrelated completed unit is insufficient.
 
 The full manifest must name the current attempt's work plus its tail, with Done delayed until
@@ -82,3 +85,48 @@ in the shared event stream. The native list remains `pack_digest byte_size keys_
 `packs/<digest>.pack` remains the native `blzdpk\0\x01` format. The harness reads these actual files
 and chooses a referenced, verified pack to corrupt. Intact → corrupt/Never refusal → explicit
 Fallback correctness → restored/Never success is the causal control; no empty glob can pass it.
+
+
+## Explicit real-result test gate
+
+Set `BLAZE_DIST_TEST_RESULT_GATE` only on the victim daemon to a **new empty absolute directory**.
+The harness controls this setting directly and never inherits it or accepts it through input `env`.
+One current-lead holder wins an exclusive `claimed` creation after its real result exists. Before
+any send it writes the exact canonical `Command::Result` to `result.cbor`, then atomically names
+`ready.json`, a view of those same CBOR bytes with real pid, lease/batch identity, ordered WorkNames,
+`command_sha256` and the full wire JSON rendering under `command`. It appends `result_held` with
+the same identity, pid, work and hash to `BLAZE_DIST_EVENTS`. No authority is created by this record.
+
+The harness binds these values to an actual preceding `grant`, stops that process, and waits for
+replacement accepted commits covering every captured name in the same execution. Creating `release`
+and resuming the process lets the original unchanged result pass through `Client::call` and the
+normal server route. A fresh transport session, created before any request is pending, prevents an
+expired idle connection from hiding the work lease refusal; sessions carry no work authority. The
+real response is retained as `answer.cbor` and atomically named `answer.json` (`sha256`, `answer`).
+The stale case requires both the real typed DeadLease/AttemptMoved answer and `result_refused` for
+the captured identity, and still forbids any accepted commit of that identity. The positive stage
+uses a different edit and gate, releases without expiry, and requires Result plus `result_accepted`.
+
+The gate expires by the unit's finite deadline, including SIGSTOP time, using the deadline wait
+helper and a span naming the directory. Failure leaves `error.txt`, removes a partial temporary
+view, and never sends a fabricated answer or event. Run cleanup releases every owned gate before
+resuming and terminating children; captures remain in scratch as evidence. A claim is never reused.
+
+
+## LLVM and folded-group distribution
+
+After applying the release/fold driver and caller patches, apply the separate runtime extension
+before building stage 1. Set `release_fold` to true, `args` to `["--release"]`, and `profile` to
+`"release"` in a fresh typed input. Preserve root's measured resource settings and time bounds.
+The proc macro executes 64 non-inlined wasm bodies with distinct constants against an independent
+loop oracle; the application and native dependencies exercise LLVM at release settings.
+
+`backend_work` events name the real daemon pid, unit digest, granted task IDs, raw compiled keys,
+and the intersection of those emissions with the canonical release and fold output keys. The
+oracle joins them to real accepted grant/lease events and final reports. Each backend kind must
+have two distinct emitting daemons within one successful unit/execution/attempt; merely planning
+work, cached hits, another unit, or stale refused results cannot satisfy it. The existing raw-key,
+manifest, tail nonduplication, cold-cache, edit and executable-byte oracles still run. Missing
+folding opportunities or unsupported LLVM are failures, never skips or alternate backends.
+
+The extension has not run in the implementation lane. Root owns preflight, build and acceptance.

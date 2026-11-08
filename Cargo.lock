@@ -818,15 +818,18 @@ name = "blaze-dist"
 version = "0.0.0"
 dependencies = [
  "blaze-wire",
+ "hegeltest",
 ]
 
 [[package]]
 name = "blaze-dist-local"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "blaze-dist",
  "blaze-serve",
  "blaze-wire",
+ "hegeltest",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
@@ -1809,6 +1812,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "futures-util",
+ "hegeltest",
  "http-body-util",
  "hyper",
  "hyper-util",

@@ -1,4 +1,4 @@
-//! Local transport version 2. This carrier version is independent of the selected global
+//! Local transport version 4. This carrier version is independent of the selected global
 //! wire codec and terminal contract version 2. Every body is one canonical CBOR value.
 //!
 //! Version 2 changed who names a session. Version 1 echoed a client-chosen session ID in
@@ -6,7 +6,8 @@
 //! exhausted capacity in ordinary use. Version 2 has the daemon issue a monotonic session
 //! label and keeps the client's random nonce only to make a retried creation idempotent
 //! while that session is live. An older peer is refused by the version mismatch, not
-//! reinterpreted.
+//! reinterpreted. Version 4 adds attempt-owned full-manifest acceptance, its immutable
+//! publication lookup and idempotent delivery; grant completion alone never ends a unit.
 
 use blaze_wire::job_terminal_v2::SubscriberTerminalV2;
 use blaze_wire::{
@@ -17,7 +18,7 @@ use blaze_wire::{
 };
 
 /// Carrier protocol version; not blaze-wire's global codec version.
-pub const TRANSPORT_VERSION: u32 = 3;
+pub const TRANSPORT_VERSION: u32 = 4;
 
 wire_struct! {
     /// Creates a lifetime with `resume: None, epoch: None`, where `nonce` makes a retried
@@ -153,6 +154,9 @@ wire_enum! {
         Release => 11 (Release),
         Claim => 12 (Claim),
         Packs => 13 (Packs),
+        CommitPublication => 14 (CommitPublication),
+        Publication => 15 (Packs),
+        DeliverPublication => 16 (DeliverPublication),
     }
 }
 wire_struct! {
@@ -182,6 +186,33 @@ wire_struct! {
     /// The packs of every committed result, or `None` while work is outstanding.
     CommittedPacks {
         0 => packs: Option<Vec<PackRef>>,
+    }
+}
+wire_struct! {
+    /// Full output record, accepted atomically only from this execution's current lead.
+    /// Its immutable blobs must exist before this call; cache publication mirrors the record.
+    CommitPublication {
+        0 => content: JobContent,
+        1 => execution: ExecutionId,
+        2 => attempt: Attempt,
+        3 => executor: String,
+        4 => packs: Vec<PackRef>,
+    }
+}
+wire_struct! {
+    /// A driver mirrored exactly this accepted immutable record to the cache. No new
+    /// publication authority is acquired by delivery, including after lead replacement.
+    DeliverPublication {
+        0 => content: JobContent,
+        1 => execution: ExecutionId,
+        2 => packs: Vec<PackRef>,
+    }
+}
+wire_struct! {
+    /// The committed full manifest, or None while the lead still completes the unit.
+    Publication {
+        0 => packs: Option<Vec<PackRef>>,
+        1 => attempt: Attempt,
     }
 }
 wire_struct! {
@@ -233,6 +264,7 @@ wire_enum! {
         Error => 9 (WireError),
         Claimed => 10 (Claimed),
         Packs => 11 (CommittedPacks),
+        Publication => 12 (Publication),
     }
 }
 wire_struct! {

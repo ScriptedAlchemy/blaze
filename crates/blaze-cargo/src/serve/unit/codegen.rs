@@ -977,6 +977,21 @@ impl blaze_codegen::driver::Lookup for Reading<'_> {
     }
 }
 
+impl dist::Export for Reading<'_> {
+    fn value(&self, key: &blaze_cas::Key) -> Result<Option<blaze_dist_local::pack::Value>, String> {
+        self.store
+            .get(self.guard, key)
+            .map(|entry| {
+                entry.map(|entry| blaze_dist_local::pack::Value {
+                    key: key.0.0,
+                    kind: entry.kind.code(),
+                    bytes: entry.bytes.to_vec(),
+                })
+            })
+            .map_err(|corrupt| corrupt.to_string())
+    }
+}
+
 /// Whether a unit's link maps the dependency image: a dev executable, which runs on the
 /// daemon's code memory and takes edits. [`policy`] makes a unit live only when it
 /// [`runs_in_process`] (a binary's build or a test binary for the host that links the dev
@@ -1007,7 +1022,12 @@ pub(crate) fn generate<'db>(
     let u = job.unit(unit).map_err(|it| it.what)?;
     let toolchain = toolchain(job, unit)?;
     verify_target_data(triple(job, u), krate.workspace_data(reader.db())).map_err(|error| {
-        format!("unit {unit} (`{}` of {}), crate `{}`: {error}", u.target.name, u.pkg_id, krate.named(reader.db()))
+        format!(
+            "unit {unit} (`{}` of {}), crate `{}`: {error}",
+            u.target.name,
+            u.pkg_id,
+            krate.named(reader.db())
+        )
     })?; // alloc: an error's place
     // The process's code generator compiles for one toolchain: the first unit sets it up, and
     // a unit of another is refused here, naming both.
@@ -1051,6 +1071,7 @@ pub(crate) fn generate<'db>(
     let backends = Backends::default();
     let dist = dist::Dist::of(&job.input.config.invocation.env, &job.input.config.host)?;
     let mut arrived = None;
+    let mut completed = None;
     let built = {
         let guard = blaze_cas::enter();
         let store = Reading { store: &job.input.store, guard: &guard };
@@ -1060,28 +1081,41 @@ pub(crate) fn generate<'db>(
             .explain_misses(true);
         let check = roots.check_roots(origin);
         if let Some(dist) = &dist {
-            // A walk the build would refuse is reported by the build, below.
-            if let Ok(work) = build.work_set(&asked, &roots.statics, &check) {
+            // Planning may refuse a corrupt summary as well as the front-end walk.
+            let work = match build.work_set(&asked, &roots.statics, &check, &store) {
+                Ok(work) => work,
+                Err(errors) => return Ok(Err(refused(reader, mounted.root(), errors))),
+            };
+            {
                 let cancelled = &*job.input.cancelled;
-                match dist.run(&build, &work, &store, cancelled) {
-                    Ok(it) => arrived = Some(it),
-                    Err(why) if cancelled.load(std::sync::atomic::Ordering::Acquire) => {
-                        tracing::debug!(target: "blaze", %why, "dist: cancelled");
+                match dist.run(&mut build, &work, &store, cancelled, |build, overlay| {
+                    build.run_with_statics(&asked, &roots.statics, &check, overlay)
+                }) {
+                    Ok((spec, values, built)) => {
+                        arrived = Some((spec, values));
+                        completed = built;
                     }
-                    Err(why) => dist.or_compile_here(
+                    Err(dist::RunError::Compile(errors)) => {
+                        return Ok(Err(refused(reader, mounted.root(), errors)));
+                    }
+                    Err(why) if cancelled.load(std::sync::atomic::Ordering::Acquire) => {
+                        tracing::debug!(target: "blaze", ?why, "dist: cancelled");
+                    }
+                    Err(dist::RunError::Path(why)) => dist.or_compile_here(
                         format!("unit {unit} (`{}` of {})", u.target.name, u.pkg_id),
                         why,
                     )?,
                 }
             }
         }
-        match &arrived {
-            Some((_, it)) => {
+        match (completed, &arrived) {
+            (Some(built), _) => Ok(built),
+            (None, Some((_, it))) => {
                 let values = &it.values;
                 let overlay = dist::Overlay { store: &store, values };
                 build.run_with_statics(&asked, &roots.statics, &check, &overlay)
             }
-            None => build.run_with_statics(&asked, &roots.statics, &check, &store),
+            (None, None) => build.run_with_statics(&asked, &roots.statics, &check, &store),
         }
     };
     match built {
@@ -1416,7 +1450,8 @@ pub(crate) fn given(job: &Job, unit: u32) -> Result<Compile, String> {
 /// line before every library, as rustc puts a crate's code before the libraries; and the
 /// unit's link arguments and its rustflags' link options (`-C strip`, ...), which
 /// [`blaze_link::args::apply`] reads into the output and the libraries and directories after
-/// these.
+/// these. Bundled static libraries are bound using each declaring crate's search paths
+/// before combining the lists; unbundled libraries are found by the final link's paths.
 ///
 /// [`Graph::linked_in`]: super::graph::Graph::linked_in
 fn natives(
@@ -1424,7 +1459,8 @@ fn natives(
     unit: usize,
     krate: base_db::Crate,
     frontend: &HirFrontend<'_>,
-    triple: &str,
+    output: &Output,
+    sysroot: &std::path::Path,
 ) -> Result<Natives, String> {
     let unit = unit as u32;
     let mine = given(job, unit)?;
@@ -1442,11 +1478,15 @@ fn natives(
                 (&theirs, &theirs_flags)
             }
         };
+        let first = libs.len();
         libs.reserve(flags.libs.len() + compile.libs.len());
         for lib in &flags.libs {
             libs.push(link_lib(lib).map_err(|why| {
                 // alloc: error path
-                format!("{why}, in the rustflags of `{}`", job.units().graph.units[at as usize].pkg_id)
+                format!(
+                    "{why}, in the rustflags of `{}`",
+                    job.units().graph.units[at as usize].pkg_id
+                )
             })?);
         }
         for lib in &compile.libs {
@@ -1460,14 +1500,36 @@ fn natives(
         };
         if let Some(krate) = crate_of {
             libs.extend(frontend.linked(krate).map_err(|it| it.what)?);
-            assembled.extend(frontend.global_asm(krate, triple).map_err(|it| it.what)?);
+            assembled.extend(frontend.global_asm(krate, &output.triple).map_err(|it| it.what)?);
         }
+        bundle_natives(output, &mut libs[first..], flags, compile, sysroot).map_err(|error| {
+            // alloc: error path, retaining the declaring package alongside the resolver's paths
+            format!(
+                "{error}, bundling native libraries of `{}` ({})",
+                job.units().graph.units[at as usize].target.name,
+                job.units().graph.units[at as usize].pkg_id
+            )
+        })?;
     }
     let mut search = search_dirs(&own.search);
     search.extend(search_dirs(&mine.search));
     let mut args = own.args;
     args.extend(script_args(job, unit, &mine)?);
     Ok(Natives { libs, search, assembled, args, options: own.options })
+}
+
+/// Resolve only the bundled declarations while this crate's `-L`s are still associated
+/// with them. Rustflags precede build-script directories, as at the final link.
+fn bundle_natives(
+    output: &Output,
+    libs: &mut [NativeLib],
+    flags: &blaze_link::args::rustflags::Rustflags,
+    compile: &Compile,
+    sysroot: &std::path::Path,
+) -> Result<(), blaze_link::LinkError> {
+    let mut search = search_dirs(&flags.search);
+    search.extend(search_dirs(&compile.search));
+    blaze_link::target::bundle(output, libs, &search, sysroot)
 }
 
 /// What `unit`'s rustflags ask of a link ([`blaze_link::args::rustflags::Rustflags`]): its
@@ -1744,8 +1806,9 @@ fn link_at(
     output.sanitize = generated.policy.sanitize;
     let (assembled, located) = {
         let _span = tracing::info_span!(target: "blaze", "link natives", unit = %path).entered();
+        let sysroot = crate::toolchain::sysroot().ok_or(LinkCause::NoToolchain)?;
         let Natives { mut libs, mut search, assembled, args, options } =
-            natives(job, unit, krate, &generated.frontend, triple(job, u))?;
+            natives(job, unit, krate, &generated.frontend, &output, &sysroot)?;
         // What the rustflags' link options and the link arguments ask: set on the output, and
         // the arguments' libraries and directories after the rest, as rustc appends them to
         // the link line. One it does not implement stops the link, named.
@@ -1753,7 +1816,6 @@ fn link_at(
             .map_err(linker(LinkStep::Output))?;
         libs.extend(applied.libs);
         search.extend(applied.search);
-        let sysroot = crate::toolchain::sysroot().ok_or(LinkCause::NoToolchain)?;
         let located = blaze_link::target::locate(&mut output, &libs, &search, &sysroot)
             .map_err(linker(LinkStep::Locate))?;
         (assembled, located)
@@ -2510,4 +2572,3 @@ pub(crate) fn link_lib(value: &str) -> Result<NativeLib, String> {
     }
     Ok(NativeLib { name: name.to_owned(), kind, verbatim })
 }
-

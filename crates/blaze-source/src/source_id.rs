@@ -324,7 +324,7 @@ fn path_to_url(path: &Path) -> Result<Url> {
 /// path is that name, `file:///C:/a` as `Url::from_file_path` makes it.
 pub fn file_url(path: impl AsRef<Path>) -> Result<Url, ()> {
     let path = path.as_ref();
-    if !cfg!(windows) {
+    if !cfg!(windows) || matches!(path.components().next(), Some(std::path::Component::Prefix(_))) {
         return Url::from_file_path(path);
     }
     let text = path.to_str().ok_or(())?.replace('\\', "/");
@@ -1061,5 +1061,37 @@ mod tests {
             .with_precise_registry_version("serde".into(), "1.0.0".parse().unwrap(), "v1.0.5")
             .unwrap_err();
         assert!(format!("{err:#}").contains("try changing the version to `1.0.5`"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_file_url_tests {
+    use super::*;
+
+    #[test]
+    fn native_and_query_paths_name_the_same_source() {
+        let ordinary = Path::new(r"C:\workspace\crate with space");
+        let verbatim = Path::new(r"\\?\C:\workspace\crate with space");
+        let queried = Path::new("/C:/workspace/crate with space");
+        let want = SourceId::for_path(queried).unwrap();
+        for path in [ordinary, verbatim, queried] {
+            assert_eq!(SourceId::for_path(path).unwrap(), want, "{path:?}");
+            assert_eq!(url_file(&file_url(path).unwrap()).unwrap(), queried);
+        }
+        for path in [Path::new("relative/crate"), Path::new("C:relative")] {
+            assert!(file_url(path).is_err(), "{path:?} is not an absolute source");
+        }
+        let library = Path::new("/rustc/commit/library");
+        assert_eq!(url_file(&file_url(library).unwrap()).unwrap(), library);
+    }
+
+    #[test]
+    fn ordinary_and_verbatim_unc_paths_have_one_url() {
+        let ordinary = Path::new(r"\\server\share\crate with space");
+        let verbatim = Path::new(r"\\?\UNC\server\share\crate with space");
+        let url = file_url(ordinary).unwrap();
+        assert_eq!(file_url(verbatim).unwrap(), url);
+        assert_eq!(url.host_str(), Some("server"));
+        assert_eq!(url_file(&url).unwrap(), ordinary);
     }
 }

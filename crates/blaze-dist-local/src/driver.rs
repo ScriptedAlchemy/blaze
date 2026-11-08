@@ -31,11 +31,13 @@ pub struct DriverConfig {
     pub poll: Duration,
     /// Reconnects of one call before its IO error is the caller's.
     pub max_reconnects: u32,
+    /// Explicit acceptance-only gate for one real result; no capture or IO when absent.
+    pub result_gate: Option<crate::result_gate::ResultGate>,
 }
 
 impl Default for DriverConfig {
     fn default() -> Self {
-        Self { poll: Duration::from_millis(5), max_reconnects: 8 }
+        Self { poll: Duration::from_millis(5), max_reconnects: 8, result_gate: None }
     }
 }
 
@@ -245,29 +247,62 @@ fn send(
     pending: &mut Option<u64>,
     config: &DriverConfig,
 ) -> Result<Reply, Error> {
-    let mut reconnects = 0;
-    loop {
-        let answer = if *pending == Some(id) {
-            client.retry()
-        } else {
-            *pending = Some(id);
-            client.call(command(content, executor, call))
-        };
-        match answer {
-            Ok(answer) => {
-                *pending = None;
-                return reply(call, answer);
-            }
-            Err(Error::Io(error)) => {
-                reconnects += 1;
-                if reconnects > config.max_reconnects {
-                    return Err(Error::Io(error));
-                }
-                client.reconnect(socket)?;
-            }
-            Err(error) => return Err(error),
+    // Capture only after Holder produced its actual Call::Result. This driver thread is
+    // the heartbeat sender too, so an intentional gate cannot silently consume a fencing
+    // reply and discard the result before it reaches Client and the real coordinator.
+    let mut outgoing = None;
+    let captured = if *pending != Some(id)
+        && let Some(gate) = &config.result_gate
+    {
+        let request = command(content, executor, call);
+        let captured = gate.hold(&request)?;
+        outgoing = Some(request);
+        captured
+    } else {
+        None
+    };
+    let sent = (|| {
+        if captured.is_some() {
+            // The held command has not entered Client's pending state. Give this intentional
+            // delay a fresh transport lifetime, so an idle socket or expired local session
+            // cannot hide the coordinator's actual lease refusal. No worker heartbeat is sent
+            // and no lease or result field changes; transport sessions grant no work authority.
+            *client = Client::connect(socket, crate::server::random_id()?)?;
         }
+        let mut reconnects = 0;
+        loop {
+            let answer = if *pending == Some(id) {
+                client.retry()
+            } else {
+                *pending = Some(id);
+                client.call(match outgoing.take() {
+                    Some(request) => request,
+                    None => command(content, executor, call),
+                })
+            };
+            match answer {
+                Ok(answer) => {
+                    *pending = None;
+                    if let Some(capture) = &captured {
+                        capture.answer(&answer)?;
+                    }
+                    return reply(call, answer);
+                }
+                Err(Error::Io(error)) => {
+                    reconnects += 1;
+                    if reconnects > config.max_reconnects {
+                        return Err(Error::Io(error));
+                    }
+                    client.reconnect(socket)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })();
+    if let (Some(capture), Err(why)) = (&captured, &sent) {
+        capture.error(why)?;
     }
+    sent
 }
 
 fn command(content: JobContent, executor: &str, call: &Call) -> Command {
@@ -405,7 +440,11 @@ mod tests {
         let start = Instant::now();
         let why = drive(
             &mut holder,
-            &DriverConfig { poll: Duration::from_millis(1), max_reconnects: 0 },
+            &DriverConfig {
+                poll: Duration::from_millis(1),
+                max_reconnects: 0,
+                ..Default::default()
+            },
             || start.elapsed().as_millis() as u64,
             &mut compiler,
             &AtomicBool::new(false),
@@ -454,7 +493,11 @@ mod tests {
         let mut leased = false;
         let result = drive(
             &mut holder,
-            &DriverConfig { poll: Duration::from_millis(1), max_reconnects: 0 },
+            &DriverConfig {
+                poll: Duration::from_millis(1),
+                max_reconnects: 0,
+                ..Default::default()
+            },
             || start.elapsed().as_millis() as u64,
             &mut compiler,
             &AtomicBool::new(false),
@@ -493,7 +536,11 @@ mod tests {
         let mut leased = false;
         let result = drive(
             &mut holder,
-            &DriverConfig { poll: Duration::from_millis(1), max_reconnects: 0 },
+            &DriverConfig {
+                poll: Duration::from_millis(1),
+                max_reconnects: 0,
+                ..Default::default()
+            },
             || start.elapsed().as_millis() as u64,
             &mut compiler,
             &AtomicBool::new(false),

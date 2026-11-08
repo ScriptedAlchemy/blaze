@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::Error;
 use crate::pack::{Pack, hex};
 use blaze_wire::Digest;
+use sha2::{Digest as _, Sha256};
 
 /// The most bytes one pack or list may be: what a client reads before refusing.
 const MOST: u64 = 16 << 30;
@@ -25,12 +26,24 @@ pub struct Blobs {
 
 impl Blobs {
     fn request(&self, method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), Error> {
+        self.request_matching(method, path, body, None)
+    }
+
+    fn request_matching(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        previous: Option<&Digest>,
+    ) -> Result<(u16, Vec<u8>), Error> {
         let mut stream = TcpStream::connect_timeout(&self.address, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
         stream.set_nodelay(true)?;
+        let condition =
+            previous.map(|digest| format!("If-Match: \"{}\"\r\n", hex(digest))).unwrap_or_default();
         let head = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n{condition}\r\n",
             self.address,
             body.len()
         );
@@ -98,6 +111,23 @@ impl Blobs {
             404 => Ok(None),
             _ => Err(Error::Protocol(format!(
                 "GET {path}: {status}: {}",
+                String::from_utf8_lossy(&body)
+            ))),
+        }
+    }
+
+    /// Repair a list whose referenced pack is gone, only if its bytes still equal `previous`.
+    /// The server additionally verifies absent old bytes and every new pack under its lock;
+    /// a different valid list is never replaced. False is a raced comparison, not success.
+    pub fn repair(&self, spec: &Digest, previous: &[u8], list: &[u8]) -> Result<bool, Error> {
+        let path = format!("/v1/list/manifests/{}", hex(spec));
+        let previous: Digest = Sha256::digest(previous).into();
+        let (status, body) = self.request_matching("PUT", &path, list, Some(&previous))?;
+        match status {
+            200..=299 => Ok(true),
+            412 => Ok(false),
+            _ => Err(Error::Protocol(format!(
+                "PUT {path} repairing a missing pack: {status}: {}",
                 String::from_utf8_lossy(&body)
             ))),
         }

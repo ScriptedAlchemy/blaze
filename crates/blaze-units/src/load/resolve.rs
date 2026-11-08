@@ -150,7 +150,7 @@ pub(crate) fn resolved<'r, 'db, R>(
             .map(|it| (it.manifest_path.as_path(), &*it.manifest, it.locked_source.as_deref())),
     );
     for (path, manifest, source) in all {
-        match read_of(path, manifest, source, lock.as_ref()) {
+        match read_of(path, manifest, source, lock.as_ref(), ctx.files()) {
             Ok(read) => {
                 ids.push(read.summary.package_id());
                 reads.insert(read.summary.package_id(), read);
@@ -272,6 +272,7 @@ pub(crate) fn resolved<'r, 'db, R>(
                     &package.manifest,
                     package.locked_source.as_deref(),
                     Some(&whole),
+                    ctx.files(),
                 ) {
                     Ok(read) => {
                         ids.push(read.summary.package_id());
@@ -391,13 +392,14 @@ fn prepare<F: Files>(
 }
 
 /// What the resolve reads of a package, its checksum the lock file's.
-fn read_of(
+fn read_of<F: Files>(
     path: &Path,
     manifest: &Manifest,
     source: Option<&str>,
     lock: Option<&Resolve>,
+    files: &F,
 ) -> anyhow::Result<Read> {
-    let mut package = export_package(path, manifest);
+    let mut package = export_package(path, manifest, files)?;
     if let Some(source) = source {
         package.set_source(source.to_owned());
     }

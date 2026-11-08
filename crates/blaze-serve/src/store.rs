@@ -27,10 +27,15 @@ use crate::error::{Error, failed};
 /// The directory, shared by every connection.
 pub struct Store {
     dir: PathBuf,
-    /// A list's write holds this across its look and its rename: a list is written once.
+    /// Serializes publication's comparison, validation and atomic rename. Ordinary lists
+    /// are immutable; a conditional repair may replace only an exactly matched stale list.
     publication: Mutex<()>,
     #[cfg(test)]
     before_name: Mutex<Option<Box<dyn Fn() + Send>>>,
+    #[cfg(test)]
+    after_name: Mutex<Option<Box<dyn Fn() + Send>>>,
+    #[cfg(test)]
+    bypass_comparison: std::sync::atomic::AtomicBool,
 }
 
 impl Store {
@@ -53,6 +58,10 @@ impl Store {
             publication: Mutex::new(()),
             #[cfg(test)]
             before_name: Mutex::new(None),
+            #[cfg(test)]
+            after_name: Mutex::new(None),
+            #[cfg(test)]
+            bypass_comparison: std::sync::atomic::AtomicBool::new(false),
         };
         store.sweep_temporaries(std::time::Duration::from_secs(3600))?;
         Ok(store)
@@ -144,6 +153,70 @@ impl Store {
             return Ok(false);
         }
         self.write_whole(&object, bytes)?;
+        Ok(true)
+    }
+
+    /// Repair an exactly matched manifest only when at least one of its packs is absent.
+    /// Existing corrupt packs and malformed lists are refused. Every replacement pack is
+    /// verified before the existing atomic writer is entered, under the publication gate.
+    /// False is a missing/different current list or a list whose packs are all still valid.
+    pub fn repair_list(&self, name: &str, expected: &Digest, bytes: &[u8]) -> Result<bool, Error> {
+        if bytes.len() > blaze_wire::Limits::DOCUMENTED.request as usize {
+            return Err(Error::too_large("the replacement list exceeds the request limit"));
+        }
+        let object = self.object(name)?;
+        if object.is_blob() {
+            return Err(Error::malformed(format!("{name} is a blob, not a manifest")));
+        }
+        let _gate = self.publication.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(current) =
+            self.read_small(name, u64::from(blaze_wire::Limits::DOCUMENTED.request))?
+        else {
+            return Ok(false);
+        };
+        let same = <Digest>::from(Sha256::digest(&current)) == *expected;
+        #[cfg(test)]
+        let same = same || self.bypass_comparison.load(Ordering::Relaxed);
+        if !same {
+            return Ok(false);
+        }
+        let old = blaze_wire::pack_list::decode(&current)
+            .map_err(|why| Error::malformed(format!("the current {name}: {why}")))?;
+        let mut missing = false;
+        for pack in &old {
+            // Do not stop at the first absence: a different old pack that is present but
+            // corrupt is a refusal, not permission to erase evidence by replacing the list.
+            missing |= !self.verify_pack(pack)?;
+        }
+        if !missing {
+            return Ok(false);
+        }
+        let replacement = blaze_wire::pack_list::decode(bytes)
+            .map_err(|why| Error::malformed(format!("the replacement {name}: {why}")))?;
+        for pack in &replacement {
+            if !self.verify_pack(pack)? {
+                return Err(Error::new(
+                    blaze_wire::ErrorCode::Refused,
+                    format!("the replacement {name} names absent pack {}", hex(&pack.pack)),
+                ));
+            }
+        }
+        self.write_whole(&object, bytes)?;
+        Ok(true)
+    }
+
+    /// True is a whole present pack, false is absence. Corruption is always an error.
+    fn verify_pack(&self, pack: &blaze_wire::PackRef) -> Result<bool, Error> {
+        let name = format!("packs/{}.pack", hex(&pack.pack));
+        let object = self.object(&name)?;
+        let Some((file, size)) = self.open_blob(&name)? else { return Ok(false) };
+        if size != pack.size {
+            return Err(Error::new(
+                blaze_wire::ErrorCode::Refused,
+                format!("{name} has {size} bytes, its list names {}", pack.size),
+            ));
+        }
+        self.verify_reader(&object, file)?;
         Ok(true)
     }
 
@@ -278,7 +351,12 @@ impl Store {
             if let Some(pause) = self.before_name.lock().unwrap().as_ref() {
                 pause();
             }
-            name_file_whole(&file, &partial, &to)
+            name_file_whole(&file, &partial, &to)?;
+            #[cfg(test)]
+            if let Some(crash) = self.after_name.lock().unwrap().as_ref() {
+                crash();
+            }
+            Ok(())
         })();
         if let Err(e) = write {
             _ = std::fs::remove_file(&partial);
@@ -514,3 +592,6 @@ mod tests {
         assert!(Store::open(dir.path()).is_err());
     }
 }
+
+#[cfg(test)]
+mod repair_tests;

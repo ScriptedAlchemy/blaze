@@ -11,7 +11,9 @@
 //!
 //! A pack's name is the SHA-256 of its bytes, and a pack is checked against its name before it
 //! becomes visible, so a name only ever holds what it says. A list's name is its unit's digest;
-//! a list is written once, and a second writer's `PUT` answers 412: both name the same keys.
+//! a list is written once, and a second writer's `PUT` answers 412. Conditional repair uses
+//! one exact quoted SHA256 `If-Match`, and can replace only a matched list whose pack is
+//! absent after every replacement pack verifies; a valid or corrupt old list is never erased.
 //!
 //! # What it does not do
 //!

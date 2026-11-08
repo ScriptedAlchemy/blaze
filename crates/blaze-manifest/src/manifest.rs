@@ -291,10 +291,17 @@ pub(crate) fn resolve_relative_path(
             old_root.display(),
             new_root.display()
         )),
-        Some(path) => Ok(path
-            .to_str()
-            .ok_or_else(|| anyhow!("`{label}` resolved to non-UTF value (`{}`)", path.display()))?
-            .to_owned()),
+        Some(path) => {
+            let relative = path.to_str().ok_or_else(|| {
+                anyhow!("`{label}` resolved to non-UTF value (`{}`)", path.display())
+            })?;
+            // Inherited package metadata uses portable separators on every host.
+            if matches!(label, "readme" | "license-file") {
+                Ok(relative.replace(std::path::MAIN_SEPARATOR, "/"))
+            } else {
+                Ok(relative.to_owned())
+            }
+        }
     }
 }
 
@@ -1797,4 +1804,32 @@ supported tools: {}",
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod inherited_path_tests {
+    use super::resolve_relative_path;
+
+    #[test]
+    fn inherited_manifest_paths_keep_portable_separators() {
+        let root = std::env::temp_dir().join("blaze-inherited-path-test");
+        let member = root.join("member");
+        for (label, path, expected) in [
+            ("readme", "docs/README.md", "../docs/README.md"),
+            ("license-file", "legal/LICENSE.txt", "../legal/LICENSE.txt"),
+        ] {
+            assert_eq!(resolve_relative_path(label, &root, &member, path).unwrap(), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_literal_backslash_in_an_inherited_unix_filename_is_kept() {
+        let root = std::env::temp_dir().join("blaze-inherited-path-test");
+        let member = root.join("member");
+        assert_eq!(
+            resolve_relative_path("readme", &root, &member, r"docs\README.md").unwrap(),
+            r"../docs\README.md"
+        );
+    }
 }

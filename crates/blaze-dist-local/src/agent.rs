@@ -9,8 +9,10 @@
 //!    whether the compile phase is done. A batch is sealed into a pack and uploaded before its
 //!    result is posted, so a committed result's bytes exist; a lease that moved is refused by the
 //!    core, whatever this process believes.
-//! 3. Once done it reads every committed pack, checking each against what was committed
-//!    ([`crate::pack::read`]), and the lead ends the execution.
+//! 3. The current lead reads the committed packs, completes the ordinary unit build, and
+//!    uploads its remaining values. The coordinator accepts its full manifest atomically
+//!    against the lead attempt; only then is that immutable record mirrored to the cache.
+//!    Helpers and late subscribers read that complete record instead of compiling a tail.
 //!
 //! The caller then runs its one build with these values in front of its store: what is here it
 //! does not compile, and what is missing (a function the walk gave no executor, a batch an
@@ -38,6 +40,7 @@ use crate::driver::{DriverConfig, run_holder_until};
 use crate::pack::{Pack, Value, hex, read};
 use crate::protocol::{self as carrier, Answer, Binding, Command};
 use crate::server::random_id;
+use blaze_wire::pack_list::{decode as parse_list, encode as list_of};
 
 /// What every executor of a machine reserves: one holder's bookkeeping, not its compile, which
 /// the daemon's own budget admits.
@@ -90,6 +93,16 @@ pub trait Granted {
     /// `Err` gives the batch back: another executor or the final build gets to it, and a real
     /// compile error is reported there, by the build that links the unit.
     fn compile(&mut self, names: &[usize]) -> Result<Grant, String>;
+
+    /// Complete the unit through its ordinary build with the committed phase values in
+    /// front of its store. Only the current lead runs this tail; other subscribers take
+    /// its full manifest. Returned values are uploaded before the manifest is committed.
+    fn complete(
+        &mut self,
+        _values: &BTreeMap<Digest, (u8, Vec<u8>)>,
+    ) -> Result<Vec<Value>, String> {
+        Ok(Vec::new())
+    }
 }
 
 /// One grant's values.
@@ -100,6 +113,8 @@ pub struct Grant {
     pub compiled: u64,
     /// How many it found in its own store.
     pub stored: u64,
+    /// Actual emitted store keys, in emission order, including repeated compiles.
+    pub compiled_keys: Vec<Digest>,
 }
 
 /// How a unit's values arrived.
@@ -130,6 +145,10 @@ pub struct Arrived {
     pub grants: u64,
     /// Whether this agent held an executor of the execution at all.
     pub joined: bool,
+    /// The final observed execution attempt, or None for a published-cache hit.
+    pub attempt: Option<u64>,
+    /// Actual emitted store keys of this agent's grant compiles, never store hits.
+    pub compiled_keys: Vec<Digest>,
 }
 
 impl Arrived {
@@ -144,6 +163,8 @@ impl Arrived {
             stored_here: 0,
             grants: 0,
             joined: false,
+            attempt: None,
+            compiled_keys: Vec::new(),
         }
     }
 }
@@ -206,6 +227,7 @@ struct Batches<'a> {
     compiled: u64,
     stored: u64,
     grants: u64,
+    compiled_keys: Vec<Digest>,
 }
 
 impl BatchCompiler for Batches<'_> {
@@ -218,12 +240,33 @@ impl BatchCompiler for Batches<'_> {
             let at = usize::try_from(*index).ok().filter(|at| *at < self.unit.names.len());
             names.push(at.ok_or_else(|| format!("granted root {index} is outside the root set"))?);
         }
+        if std::env::var_os("BLAZE_DIST_EVENTS").is_some() {
+            let work: Vec<String> = names
+                .iter()
+                .map(|at| hex(&wire_name(&self.unit.spec, &self.unit.names[*at]).0))
+                .chain(plan.grant.names.iter().map(|name| hex(&name.0)))
+                .collect();
+            crate::telemetry::emit(
+                "grant",
+                &[
+                    ("pid", crate::telemetry::json(&std::process::id())),
+                    ("unit_digest", crate::telemetry::json(&hex(&self.unit.spec))),
+                    ("execution", crate::telemetry::json(&plan.grant.lease.execution.0)),
+                    ("attempt", crate::telemetry::json(&plan.grant.lease.attempt.0)),
+                    ("holder", crate::telemetry::json(&plan.grant.lease.holder)),
+                    ("generation", crate::telemetry::json(&plan.grant.lease.generation)),
+                    ("seq", crate::telemetry::json(&plan.seq)),
+                    ("work", crate::telemetry::json(&work)),
+                ],
+            );
+        }
         self.grants += 1;
         let (outcome, packs): (fn(&Digest) -> ItemOutcome, Vec<PackRef>) =
             match self.granted.compile(&names) {
                 Ok(grant) => {
                     self.compiled += grant.compiled;
                     self.stored += grant.stored;
+                    self.compiled_keys.extend(grant.compiled_keys);
                     let pack = Pack::of(grant.values)?;
                     // The result is posted after this returns: a committed pack exists whole.
                     self.blobs.put_pack(&pack).map_err(|e| e.to_string())?;
@@ -305,62 +348,6 @@ pub fn import(blobs: &Blobs, packs: &[PackRef]) -> Result<BTreeMap<Digest, (u8, 
     Ok(values)
 }
 
-/// One line per pack of a unit's published list.
-fn list_of(packs: &[PackRef]) -> Vec<u8> {
-    let mut out = String::new();
-    for it in packs {
-        out.push_str(&format!("{} {} {}\n", hex(&it.pack), it.size, hex(&it.keys)));
-    }
-    out.into_bytes()
-}
-
-fn unhex(text: &str) -> Option<Digest> {
-    let mut out = [0; 32];
-    if text.len() != 64 {
-        return None;
-    }
-    for (at, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(text.get(at * 2..at * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
-
-fn parse_list(list: &[u8]) -> Option<Vec<PackRef>> {
-    let text = std::str::from_utf8(list).ok()?;
-    let mut packs = Vec::new();
-    for line in text.lines() {
-        let mut fields = line.split(' ');
-        let (pack, size, keys) = (fields.next()?, fields.next()?, fields.next()?);
-        packs.push(PackRef {
-            pack: unhex(pack)?,
-            size: size.parse().ok()?,
-            keys: unhex(keys)?,
-            packed: None,
-            format: blaze_wire::DIST_PACK_FORMAT,
-        });
-    }
-    Some(packs)
-}
-
-/// Publishes what `unit` is made of for builds to come: `packs` and a pack of `extra`, what the
-/// build made beyond its work set (its statics, its release functions). Only after the unit
-/// linked: a list names a whole unit, or the next build would believe a part.
-pub fn publish(
-    blobs: &Blobs,
-    unit: &Unit,
-    mut packs: Vec<PackRef>,
-    extra: Vec<Value>,
-) -> Result<(), Error> {
-    if !extra.is_empty() {
-        let pack = Pack::of(extra).map_err(Error::Protocol)?;
-        blobs.put_pack(&pack)?;
-        packs.push(pack.reference);
-    }
-    packs.sort();
-    packs.dedup();
-    blobs.publish(&unit.spec, &list_of(&packs))
-}
-
 /// How long an agent waits between asks at most, however long it has waited: what it asks is a
 /// state of the coordinator's that a wait of this does not miss by much.
 const POLL_MOST: Duration = Duration::from_millis(250);
@@ -381,9 +368,8 @@ pub fn run(
     granted: &mut dyn Granted,
     cancelled: &AtomicBool,
 ) -> Result<Arrived, Error> {
-    if let Some(list) = config.blobs.published(&unit.spec)?
-        && let Some(packs) = parse_list(&list)
-    {
+    if let Some(list) = config.blobs.published(&unit.spec)? {
+        let packs = parse_list(&list).map_err(Error::Protocol)?;
         match import(&config.blobs, &packs) {
             Ok(values) => {
                 return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None) });
@@ -392,11 +378,6 @@ pub fn run(
             Err(Error::Protocol(why)) if why.ends_with(GONE) => {}
             Err(error) => return Err(error),
         }
-    }
-    // A unit whose functions all stay with the build that links them (a release unit's, a folded
-    // group's) has nothing to distribute: its list above is all it can take.
-    if unit.names.is_empty() {
-        return Ok(Arrived::none(Source::Executed, None));
     }
     let started = Instant::now();
     let mut client = Client::connect(&config.socket, random_id()?)?;
@@ -421,56 +402,198 @@ pub fn run(
             other => return Err(Error::Protocol(format!("submit answered {other:?}"))),
         }
     };
+    let result = execute(config, unit, granted, cancelled, started, &now_ms, &binding, &mut client);
+    if result.is_err() {
+        leave(&mut client, &binding);
+    } else {
+        let _ = client.release();
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute(
+    config: &Config,
+    unit: &Unit,
+    granted: &mut dyn Granted,
+    cancelled: &AtomicBool,
+    started: Instant,
+    now_ms: &(impl Fn() -> u64 + Sync),
+    binding: &Binding,
+    client: &mut Client,
+) -> Result<Arrived, Error> {
     let content = binding.subscription.content;
     let execution = binding.subscription.execution;
     let mut arrived = Arrived::none(Source::Executed, Some(execution.0));
-    let mut last_claim: Option<(String, Attempt, bool)> = None;
     let mut waited = config.poll;
-    let packs = loop {
+    let mut last_claim = None;
+    loop {
         if cancelled.load(Ordering::Acquire) {
-            leave(&mut client, &binding);
             return Err(Error::Protocol(CANCELLED.to_owned()));
         }
-        // The coordinator's own deadline ends the execution first, and its terminal says so:
-        // this is for a coordinator that stopped ending anything.
         if started.elapsed() > config.deadline.saturating_add(GRACE) {
-            leave(&mut client, &binding);
             return Err(Error::Protocol(format!(
                 "unit {}: its execution did not finish in {:?}",
                 hex(&unit.spec),
                 config.deadline
             )));
         }
-        if let Some(packs) = committed(&mut client, content, execution)? {
-            break packs;
-        }
+        // Claim before reading phase completion: even a subscriber arriving after that
+        // phase must know whether it is the current lead or a reader of the lead's tail.
         let claim =
             Command::Claim(carrier::Claim { content, execution, claimant: config.claimant });
         let claimed = match client.call(claim)? {
-            Answer::Claimed(claimed) => claimed,
-            Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => {
-                return Err(ended(&mut client, &binding));
-            }
+            Answer::Claimed(claimed) => Some(claimed),
+            Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => None,
             other => return Err(Error::Protocol(format!("claim answered {other:?}"))),
         };
+        if let Some(claimed) = &claimed
+            && let Some(executor) = &claimed.executor
+        {
+            arrived.attempt = Some(claimed.attempt.0);
+            last_claim = Some((executor.clone(), claimed.attempt));
+        }
+        let published = publication(client, content, execution)?;
+        if let Some((packs, attempt)) = published {
+            arrived.attempt = Some(attempt.0);
+            arrived.values = import(&config.blobs, &packs)?;
+            arrived.packs = packs;
+            // A subscriber delivers the exact record accepted before the old lead died.
+            // It neither reruns the tail nor replaces the committed manifest.
+            mirror(config, unit, &arrived.packs)?;
+            deliver(client, content, execution, &arrived.packs)?;
+            if let Some((executor, attempt)) = last_claim {
+                acknowledge(client, content, execution, &executor, attempt)?;
+            }
+            return Ok(arrived);
+        }
+        let Some(claimed) = claimed else { return Err(ended(client, binding)) };
         let Some(executor) = claimed.executor else {
             let _waiting =
-                tracing::info_span!(target: "blaze", "dist: no executor assigned yet").entered();
+                tracing::info_span!(target: "blaze", "dist: waiting for a unit's publication")
+                    .entered();
             std::thread::sleep(waited);
             waited = (waited * 2).min(POLL_MOST);
             continue;
         };
-        waited = config.poll;
-        last_claim = Some((executor.clone(), claimed.attempt, claimed.lead));
         arrived.joined = true;
+        if claimed.lead {
+            // A replacement must agree on the retained root set before taking the tail,
+            // even when all work committed before it acquired the lead attempt.
+            let join = Command::Join(carrier::Join {
+                content,
+                executor: executor.clone(),
+                request: blaze_wire::WorkJoinRequest {
+                    execution,
+                    attempt: claimed.attempt,
+                    roots: root_set(unit),
+                    rejected: Set::new(Vec::new()),
+                },
+            });
+            match answer(client, join, "the lead joining the unit")? {
+                Answer::Join(_) => {}
+                other => return Err(Error::Protocol(format!("join answered {other:?}"))),
+            }
+        }
+        if let Some(packs) = committed(client, content, execution)? {
+            if !claimed.lead {
+                // The helper's work is committed, but the whole unit is not. It must not
+                // independently compile the tail during the lead's publication window.
+                let _waiting =
+                    tracing::info_span!(target: "blaze", "dist: the lead completing the unit")
+                        .entered();
+                std::thread::sleep(waited);
+                waited = (waited * 2).min(POLL_MOST);
+                continue;
+            }
+            arrived.values = import(&config.blobs, &packs)?;
+            let committed = heartbeat_during(
+                config,
+                content,
+                execution,
+                &executor,
+                claimed.attempt,
+                now_ms,
+                cancelled,
+                |lost| {
+                    let extra = match granted.complete(&arrived.values) {
+                        Ok(values) => values,
+                        Err(why) => {
+                            if !lost.load(Ordering::Acquire) {
+                                let _ = verdict(
+                                    client,
+                                    content,
+                                    execution,
+                                    &executor,
+                                    claimed.attempt,
+                                    Outcome::Failed,
+                                );
+                            }
+                            return Err(Error::Protocol(format!("unit {}: {why}", hex(&unit.spec))));
+                        }
+                    };
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(Error::Protocol(CANCELLED.to_owned()));
+                    }
+                    if lost.load(Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    let mut packs = packs;
+                    if !extra.is_empty() {
+                        let pack = Pack::of(extra).map_err(Error::Protocol)?;
+                        config.blobs.put_pack(&pack)?;
+                        packs.push(pack.reference);
+                    }
+                    packs.sort();
+                    packs.dedup();
+                    let commit = Command::CommitPublication(carrier::CommitPublication {
+                        content,
+                        execution,
+                        attempt: claimed.attempt,
+                        executor: executor.clone(),
+                        packs,
+                    });
+                    match client.call(commit)? {
+                        Answer::Publication(carrier::Publication {
+                            packs: Some(packs), ..
+                        }) => {
+                            mirror(config, unit, &packs)?;
+                            deliver(client, content, execution, &packs)?;
+                            acknowledge(client, content, execution, &executor, claimed.attempt)?;
+                            Ok(Some(packs))
+                        }
+                        Answer::Error(error)
+                            if matches!(
+                                Refusal::of(&error),
+                                Some(Refusal::AttemptMoved | Refusal::NotHolder)
+                            ) =>
+                        {
+                            Ok(None)
+                        }
+                        other => Err(Error::Protocol(format!("publication answered {other:?}"))),
+                    }
+                },
+            )?;
+            let Some(packs) = committed else {
+                // This attempt was fenced during its tail. Uploaded immutable blobs are
+                // harmless; only a current lead may make their manifest visible.
+                continue;
+            };
+            arrived.values = import(&config.blobs, &packs)?;
+            arrived.packs = packs;
+            return Ok(arrived);
+        }
+        waited = config.poll;
         let stopped = hold(
             config,
             unit,
-            &binding,
+            binding,
             &executor,
+            claimed.lead,
+            config.deadline.saturating_sub(started.elapsed()),
             execution,
             claimed.attempt,
-            &now_ms,
+            now_ms,
             granted,
             cancelled,
             &mut arrived,
@@ -485,21 +608,134 @@ pub fn run(
             }
             StopWhy::Protocol(why) => return Err(Error::Protocol(why)),
         }
-    };
-    arrived.values = import(&config.blobs, &packs)?;
-    arrived.packs = packs;
-    if let Some((executor, attempt, lead)) = last_claim {
-        finish(&mut client, config, content, execution, &executor, attempt, lead, &now_ms);
     }
-    // The session's capacity goes back now, not at the end of its fixed lifetime.
-    let _ = client.release();
-    Ok(arrived)
+}
+
+fn mirror(config: &Config, unit: &Unit, packs: &[PackRef]) -> Result<(), Error> {
+    let expected = list_of(packs);
+    config.blobs.publish(&unit.spec, &expected)?;
+    // A comparison can race another repair. Each retry rereads and verifies the actual list;
+    // only the server can replace it, atomically against these exact previous bytes.
+    for _ in 0..4 {
+        let got = config.blobs.published(&unit.spec)?.ok_or_else(|| {
+            Error::Protocol(format!(
+                "unit {}: its cache accepted publication but has no list",
+                hex(&unit.spec)
+            ))
+        })?;
+        if got == expected {
+            return Ok(());
+        }
+        let actual = parse_list(&got)
+            .map_err(|why| Error::Protocol(format!("unit {}: {why}", hex(&unit.spec))))?;
+        match import(&config.blobs, &actual) {
+            Ok(values) if values == import(&config.blobs, packs)? => return Ok(()),
+            Err(Error::Protocol(why)) if why.ends_with(GONE) => {
+                let _ = config.blobs.repair(&unit.spec, &got, &expected)?;
+            }
+            Err(why) => return Err(why),
+            Ok(_) => {
+                return Err(Error::Protocol(format!(
+                    "unit {}: the existing cache list differs from its accepted full output",
+                    hex(&unit.spec)
+                )));
+            }
+        }
+    }
+    Err(Error::Protocol(format!(
+        "unit {}: its cache list changed during four conditional repair attempts",
+        hex(&unit.spec)
+    )))
+}
+
+fn publication(
+    client: &mut Client,
+    content: blaze_wire::JobContent,
+    execution: ExecutionId,
+) -> Result<Option<(Vec<PackRef>, Attempt)>, Error> {
+    match answer(
+        client,
+        Command::Publication(carrier::Packs { content, execution }),
+        "publication",
+    )? {
+        Answer::Publication(value) => Ok(value.packs.map(|packs| (packs, value.attempt))),
+        other => Err(Error::Protocol(format!("publication answered {other:?}"))),
+    }
+}
+
+/// Compilation stays on the compiler's thread while a scoped driver keeps the lead alive
+/// through the unit's tail. Fencing is checked atomically by CommitPublication afterward.
+#[allow(clippy::too_many_arguments)]
+fn heartbeat_during<T>(
+    config: &Config,
+    content: blaze_wire::JobContent,
+    execution: ExecutionId,
+    executor: &str,
+    attempt: Attempt,
+    now_ms: &(impl Fn() -> u64 + Sync),
+    cancelled: &AtomicBool,
+    complete: impl FnOnce(&AtomicBool) -> Result<T, Error>,
+) -> Result<T, Error> {
+    struct End<'a>(&'a AtomicBool);
+    impl Drop for End<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let finished = AtomicBool::new(false);
+    let lost = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let (finished, lost) = (&finished, &lost);
+        let heartbeat = scope.spawn(move || {
+            let mut client = match Client::connect(&config.socket, random_id()?) {
+                Ok(client) => client,
+                Err(error) => {
+                    lost.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            };
+            let bound = now_ms().saturating_add(config.deadline.as_millis() as u64);
+            let mut next = now_ms();
+            while !finished.load(Ordering::Acquire)
+                && !cancelled.load(Ordering::Acquire)
+                && now_ms() <= bound
+            {
+                if now_ms() >= next {
+                    let command = Command::WorkerEvents(carrier::WorkerEvents {
+                        content,
+                        executor: executor.to_owned(),
+                        request: WorkersEventsRequest { execution, attempt, events: Vec::new() },
+                    });
+                    match client.call(command) {
+                        Ok(Answer::WorkerEvents(answer)) if answer.verdict == 0 => {}
+                        _ => {
+                            lost.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                    next = now_ms().saturating_add(config.holder.heartbeat_ms);
+                }
+                std::thread::sleep(config.poll.min(Duration::from_millis(50)));
+            }
+            let _ = client.release();
+            Ok::<(), Error>(())
+        });
+        let end = End(finished);
+        let result = complete(lost);
+        drop(end);
+        let _ = heartbeat.join();
+        result
+    })
 }
 
 /// This build no longer waits for its execution: when nobody else does, it ends, and its
 /// executors go back. A failure here costs what the coordinator's own deadline takes back.
 fn leave(client: &mut Client, binding: &Binding) {
-    let _ = client.call(Command::Cancel(binding.clone()));
+    let current = match client.call(Command::Resume(binding.subscription.clone())) {
+        Ok(Answer::Binding(current)) => current,
+        _ => binding.clone(),
+    };
+    let _ = client.call(Command::Cancel(current));
     let _ = client.release();
 }
 
@@ -536,6 +772,8 @@ fn hold(
     unit: &Unit,
     binding: &Binding,
     executor: &str,
+    lead: bool,
+    gate_timeout: Duration,
     execution: ExecutionId,
     attempt: Attempt,
     now_ms: &(impl Fn() -> u64 + Sync),
@@ -557,9 +795,26 @@ fn hold(
     let mut watcher = Client::connect(&config.socket, random_id()?)?;
     let leave = AtomicBool::new(false);
     let working = AtomicBool::new(true);
-    let driver = DriverConfig::default();
-    let mut batches =
-        Batches { unit, blobs: &config.blobs, granted, compiled: 0, stored: 0, grants: 0 };
+    let driver = DriverConfig {
+        // A lead's intentional silence moves the attempt. A same-attempt helper can
+        // legitimately receive Ended after the survivor finishes, which is not the
+        // stale-attempt refusal this acceptance probe is intended to demonstrate.
+        result_gate: if lead {
+            crate::result_gate::ResultGate::from_env(gate_timeout)?
+        } else {
+            None
+        },
+        ..DriverConfig::default()
+    };
+    let mut batches = Batches {
+        unit,
+        blobs: &config.blobs,
+        granted,
+        compiled: 0,
+        stored: 0,
+        grants: 0,
+        compiled_keys: Vec::new(),
+    };
     let stopped = std::thread::scope(|scope| {
         let (leave, working) = (&leave, &working);
         let watching = scope.spawn(move || {
@@ -601,50 +856,71 @@ fn hold(
     arrived.compiled_here += batches.compiled;
     arrived.stored_here += batches.stored;
     arrived.grants += batches.grants;
+    arrived.compiled_keys.extend(batches.compiled_keys);
     let _ = client.release();
     Ok(stopped)
 }
 
-/// The lead ends the execution, and every holder gives its executor back. A stop nobody asked
-/// for yet is refused, so a helper asks until the lead's end reached it, within a bound; past
-/// it the coordinator's own lease and deadline take the executor back.
-#[allow(clippy::too_many_arguments)]
-fn finish(
+/// The final verdict follows the full manifest commit and successful cache delivery.
+fn verdict(
     client: &mut Client,
-    config: &Config,
     content: blaze_wire::JobContent,
     execution: ExecutionId,
     executor: &str,
     attempt: Attempt,
-    lead: bool,
-    now_ms: &impl Fn() -> u64,
-) {
-    if lead {
-        let done = JobEvent::Done(DoneEvent { outcome: Outcome::Passed, counters: Vec::new() });
-        let events = Command::WorkerEvents(carrier::WorkerEvents {
-            content,
-            executor: executor.to_owned(),
-            request: WorkersEventsRequest { execution, attempt, events: vec![done] },
-        });
-        let _ = client.call(events);
-    }
-    let bound = now_ms().saturating_add(10_000);
-    while now_ms() < bound {
-        let ack = Command::KillAck(carrier::KillAck {
-            content,
-            executor: executor.to_owned(),
+    outcome: Outcome,
+) -> Result<(), Error> {
+    let events = Command::WorkerEvents(carrier::WorkerEvents {
+        content,
+        executor: executor.to_owned(),
+        request: WorkersEventsRequest {
             execution,
             attempt,
-            alive: true,
-        });
-        match client.call(ack) {
-            Ok(Answer::KillAck(answer)) if !answer.accepted => {
-                let _waiting =
-                    tracing::info_span!(target: "blaze", "dist: the lead ending the execution")
-                        .entered();
-                std::thread::sleep(config.poll);
-            }
-            _ => return,
-        }
+            events: vec![JobEvent::Done(DoneEvent { outcome, counters: Vec::new() })],
+        },
+    });
+    match answer(client, events, "ending the published unit")? {
+        Answer::WorkerEvents(_) => Ok(()),
+        other => Err(Error::Protocol(format!("the final verdict answered {other:?}"))),
+    }
+}
+
+fn deliver(
+    client: &mut Client,
+    content: blaze_wire::JobContent,
+    execution: ExecutionId,
+    packs: &[PackRef],
+) -> Result<(), Error> {
+    let command = Command::DeliverPublication(carrier::DeliverPublication {
+        content,
+        execution,
+        packs: packs.to_vec(), // alloc: the bounded immutable delivery record
+    });
+    match answer(client, command, "delivering the unit's publication")? {
+        Answer::Ack(_) => Ok(()),
+        other => Err(Error::Protocol(format!("publication delivery answered {other:?}"))),
+    }
+}
+
+fn acknowledge(
+    client: &mut Client,
+    content: blaze_wire::JobContent,
+    execution: ExecutionId,
+    executor: &str,
+    attempt: Attempt,
+) -> Result<(), Error> {
+    let ack = Command::KillAck(carrier::KillAck {
+        content,
+        executor: executor.to_owned(),
+        execution,
+        attempt,
+        alive: true,
+    });
+    match client.call(ack)? {
+        // Delivery already requested every assignment's stop. A false acknowledgment
+        // means that this old assignment was retired or replaced; it must not free the new one.
+        Answer::KillAck(_) => Ok(()),
+        Answer::Error(error) if Refusal::of(&error) == Some(Refusal::NoExecution) => Ok(()),
+        other => Err(Error::Protocol(format!("kill acknowledgment answered {other:?}"))),
     }
 }

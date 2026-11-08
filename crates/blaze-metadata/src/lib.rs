@@ -655,11 +655,13 @@ fn resolving_with<R>(
     // The registry packages the resolve picks that the lock file does not pin.
     let picked: Vec<Package>;
 
-    let mut serialized: Vec<SerializedPackage<'_>> =
-        ws.members().map(|(path, m)| export_package(path, m)).collect();
+    let mut serialized: Vec<SerializedPackage<'_>> = ws
+        .members()
+        .map(|(path, m)| export_package(path, m, ctx.files()))
+        .collect::<Result<_>>()?;
     let member_count = serialized.len();
     for package in path_packages.iter().chain(&fetched) {
-        let mut it = export_package(&package.manifest_path, &package.manifest);
+        let mut it = export_package(&package.manifest_path, &package.manifest, ctx.files())?;
         if let Some(source) = &package.locked_source {
             it.set_source(source.clone());
         }
@@ -752,7 +754,7 @@ fn resolving_with<R>(
         locked_ids(&whole).into_iter().filter(|id| !reads.contains_key(id)).collect();
     picked = fetch(&unread, whole.checksums(), &ctx, &sources)?;
     for package in &picked {
-        let mut it = export_package(&package.manifest_path, &package.manifest);
+        let mut it = export_package(&package.manifest_path, &package.manifest, ctx.files())?;
         if let Some(source) = &package.locked_source {
             it.set_source(source.clone());
         }

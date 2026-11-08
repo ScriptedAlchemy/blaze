@@ -87,6 +87,17 @@ impl Files for Disk {
     }
 
     fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        #[cfg(windows)]
+        if path.to_str().is_some_and(|text| {
+            matches!(text.as_bytes(), [b'/', drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
+        }) {
+            let native = blaze_source::file_url(path)
+                .and_then(|url| url.to_file_path())
+                .map_err(|()| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!(
+                    "`{}` is not a native Windows drive path", path.display()
+                )))?;
+            return native.canonicalize();
+        }
         path.canonicalize()
     }
 }
@@ -547,5 +558,18 @@ pub(crate) mod tests {
             assert_eq!(ours, theirs, "{pattern}");
         }
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_disk_path_tests {
+    use super::*;
+
+    #[test]
+    fn rooted_drive_paths_canonicalize_through_the_disk_adapter() {
+        let scratch = stdx::tempfile::NamedTempDir::new("blaze-drive-path-").unwrap();
+        let ordinary = dunce::canonicalize(scratch.path()).unwrap();
+        let rooted = blaze_source::SourceId::for_path(&ordinary).unwrap().local_path().unwrap();
+        assert_eq!(Disk.canonicalize(&rooted).unwrap(), scratch.path());
     }
 }

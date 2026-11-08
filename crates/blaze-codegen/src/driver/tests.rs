@@ -6,9 +6,9 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+use blaze_core::lock::Lock;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
-use blaze_core::lock::Lock;
 
 use super::*;
 use crate::{
@@ -274,9 +274,13 @@ struct Machine {
     statics: AtomicUsize,
     /// The body byte of each function emitted, in the order emitted.
     emitted_bodies: Lock<Vec<u8>>,
+    /// Which units actually reached the backend, independently of the driver's evidence.
+    emitted_instances: Lock<Vec<InstanceKey>>,
     /// Added to each prepared function's shape when not 0: IR that differs from another
     /// machine's under the same key, as a key missing an input would let through.
     salt: u8,
+    /// Emit content-addressed debug bytes, including on templates shared through the memo.
+    emit_debug: bool,
     /// A code the release compile of each function of this body byte says it built in, which
     /// nothing of the build is: as a backend that built in a body its key misses would.
     unkept: Option<(u8, CodeHash)>,
@@ -290,7 +294,9 @@ impl Default for Machine {
             summarized: AtomicUsize::new(0),
             statics: AtomicUsize::new(0),
             emitted_bodies: Lock::new("test.codegen.driver.emitted_bodies", Vec::new()),
+            emitted_instances: Lock::new("test.codegen.driver.emitted_instances", Vec::new()),
             salt: 0,
+            emit_debug: false,
             unkept: None,
         }
     }
@@ -411,6 +417,7 @@ impl Prepare for Machine {
     ) -> Result<Emitted, CodegenError> {
         self.emitted.fetch_add(1, Ordering::Relaxed);
         self.emitted_bodies.lock().push(prepared.body);
+        self.emitted_instances.lock().push(unit.instance.key());
         let mut relocs: Vec<crate::Relocation> = (0..prepared.refs)
             .map(|at| crate::Relocation {
                 at: 2 + 5 * at as u32,
@@ -464,6 +471,7 @@ impl Prepare for Machine {
                 span: blaze_format::SpanRef { anchor: own[0], index: 2 },
             });
         }
+        let side = self.emit_debug.then(|| vec![prepared.body, prepared.refs as u8]);
         let function = CompiledFunction {
             key: unit.instance.key(),
             arch: unit.arch,
@@ -472,13 +480,13 @@ impl Prepare for Machine {
             relocs: relocs.into(),
             data: Vec::new(),
             inlined,
-            side: None,
+            side: side.as_ref().map(|bytes| ContentId::of("test driver debug 1", bytes)),
             unwind: None,
             lines,
             coverage: None,
             profile: None,
         };
-        Ok(Emitted { function, side: None, extra })
+        Ok(Emitted { function, side, extra })
     }
 
     fn masked(&self, _: &Unit, _: &Prepared, _: &crate::template::Refs) -> Option<Masked> {
@@ -615,6 +623,24 @@ fn a_cold_build_compiles_once_per_shape_and_a_warm_one_compiles_nothing() {
     assert_eq!(cold.functions.len(), 5);
     assert_eq!(cold.roots.len(), 1);
     assert_eq!(cold.symbols, vec![(cold.roots[0], "main".to_owned())]);
+    assert_eq!(cold.stats.compiled_keys.len(), cold.stats.compiled);
+    let mut reported = cold.stats.compiled_keys.clone();
+    reported.sort_unstable();
+    let mut emitted: Vec<_> = machine
+        .emitted_instances
+        .lock()
+        .iter()
+        .map(|instance| cold.kernel.iter().find(|entry| entry.instance == *instance).unwrap().key)
+        .collect();
+    emitted.sort_unstable();
+    assert_eq!(reported, emitted, "only the units actually emitted have compile evidence");
+
+    let memo_machine = Machine::default();
+    let from_memo = build(&program, &memo_machine, &policy, &memo, &store).unwrap();
+    assert_eq!(memo_machine.emitted.load(Ordering::Relaxed), 0);
+    assert!(from_memo.stats.memo + from_memo.stats.flown > 0);
+    assert_eq!(from_memo.stats.compiled, 0);
+    assert!(from_memo.stats.compiled_keys.is_empty(), "memo and flight landings are not emits");
 
     store.keep(&cold.puts);
     let warm_machine = Machine::default();
@@ -622,6 +648,8 @@ fn a_cold_build_compiles_once_per_shape_and_a_warm_one_compiles_nothing() {
     assert_eq!(warm_machine.prepared.load(Ordering::Relaxed), 0);
     assert_eq!(warm_machine.emitted.load(Ordering::Relaxed), 0);
     assert_eq!(warm.stats.stored, 5);
+    assert_eq!(warm.stats.compiled, 0);
+    assert!(warm.stats.compiled_keys.is_empty(), "store hits are not emits");
     assert_eq!(warm.functions, cold.functions);
 }
 
@@ -828,6 +856,23 @@ fn statics_are_kept_by_which_they_are() {
     // Equal values, two statics, each compiled: a cold build reads the store before either.
     assert_eq!(built.statics.len(), 2);
     assert_eq!(machine.statics.load(Ordering::Relaxed), 2);
+    assert_eq!(built.stats.compiled_keys.len(), built.stats.compiled);
+    assert_eq!(
+        built.stats.compiled,
+        machine.emitted.load(Ordering::Relaxed) + machine.statics.load(Ordering::Relaxed)
+    );
+    let static_keys: Vec<_> = built
+        .puts
+        .iter()
+        .filter(|put| blob::decode_static(&put.bytes).is_ok())
+        .map(|put| put.key)
+        .collect();
+    assert_eq!(static_keys.len(), 1, "equal static values share their template's store key");
+    assert_eq!(
+        built.stats.compiled_keys.iter().filter(|key| **key == static_keys[0]).count(),
+        2,
+        "both actual emissions remain visible under the repeated key"
+    );
     let caller = built.functions.iter().find(|it| it.code[0] == 0x44).unwrap();
     let statics =
         caller.relocs.iter().filter(|it| matches!(it.target, Target::Static { .. })).count();
@@ -836,6 +881,8 @@ fn statics_are_kept_by_which_they_are() {
     let warm = Machine::default();
     let again = build(&program, &warm, &policy, &Memo::new(), &store).unwrap();
     assert_eq!(warm.statics.load(Ordering::Relaxed), 0);
+    assert_eq!(again.stats.compiled, 0);
+    assert!(again.stats.compiled_keys.is_empty());
     assert_eq!(again.statics, built.statics);
 }
 
@@ -869,6 +916,15 @@ fn a_release_build_summarizes_decides_and_keeps_by_imports() {
     let cold = build(&program, &machine, &policy, &Memo::new(), &store).unwrap();
     assert_eq!(machine.summarized.load(Ordering::Relaxed), 5);
     assert_eq!(cold.functions.len(), 5);
+    assert_eq!(cold.stats.compiled_keys.len(), cold.stats.compiled);
+    assert_eq!(cold.stats.compiled, machine.emitted.load(Ordering::Relaxed));
+    let mut code_keys: Vec<_> =
+        cold.puts.iter().filter(|put| put.kind == Kind::Code).map(|put| put.key).collect();
+    code_keys.sort_unstable();
+    let mut reported = cold.stats.compiled_keys.clone();
+    reported.sort_unstable();
+    assert_eq!(reported, code_keys, "release blob keys exclude the summaries that were written");
+    assert_eq!(cold.puts.iter().filter(|put| put.kind == Kind::Query).count(), 5);
     assert!(cold.functions.iter().all(|it| it.arch == Arch::X86_64));
     // What the backend called of its own accord is kept by name, though no reference lists it.
     assert!(cold.functions.iter().all(|it| it.relocs.targets().contains(&bcmp())));
@@ -878,6 +934,9 @@ fn a_release_build_summarizes_decides_and_keeps_by_imports() {
     let again = build(&program, &warm, &policy, &Memo::new(), &store).unwrap();
     assert_eq!(warm.prepared.load(Ordering::Relaxed), 0);
     assert_eq!(warm.summarized.load(Ordering::Relaxed), 0);
+    assert_eq!(warm.emitted.load(Ordering::Relaxed), 0);
+    assert_eq!(again.stats.compiled, 0);
+    assert!(again.stats.compiled_keys.is_empty());
     assert_eq!(again.functions, cold.functions);
 }
 
@@ -1500,6 +1559,7 @@ fn a_level_without_its_backend_names_the_function() {
     assert_eq!(errors[0].item, item(1));
 }
 
+mod distributed;
 mod flight;
 mod folded;
 mod later;
@@ -1991,4 +2051,93 @@ fn one_key_of_two_origins_has_one_id_whichever_was_described_first() {
     assert_eq!(member_first.1, dependency_first.1, "one ID either way");
     assert!(member_first.2.is_some());
     assert_eq!(member_first.2, dependency_first.2, "one live identity either way");
+}
+
+#[test]
+fn distributed_unit_identity_covers_static_templates() {
+    let mut program = Program::default();
+    program.statics.insert(7, (0xaa, None));
+    let dev = policy(OptLevel::O0, Mode::Output);
+    let identity = |program: &Program, policy: &Policy| {
+        let machine = Machine::default();
+        let memo = Memo::new();
+        let work = Build::new(&machine, program, policy, &memo)
+            .work_set(&[], &[7], &[], &Store::default())
+            .unwrap();
+        assert!(work.names().is_empty(), "a static-only unit has no dev functions");
+        work.digest()
+    };
+    let original = identity(&program, &dev);
+    program.statics.insert(9, (0xff, None));
+    assert_eq!(identity(&program, &dev), original, "an unreachable static changes nothing");
+    program.statics.insert(7, (0xbb, None));
+    assert_ne!(identity(&program, &dev), original, "another value must not take the old list");
+    program.statics.insert(7, (0xaa, Some(".other".to_owned())));
+    assert_ne!(identity(&program, &dev), original, "the stored static includes its section");
+    program.statics.insert(7, (0xaa, None));
+    assert_ne!(
+        identity(&program, &policy(OptLevel::O3, Mode::Output)),
+        original,
+        "static settings are inputs even when the function list is empty"
+    );
+}
+
+#[test]
+fn distributed_unit_identity_covers_root_selection() {
+    let mut program = Program::default();
+    program.function(1, 0x11, &[2]);
+    program.function(2, 0x22, &[]);
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let machine = Machine::default();
+    let memo = Memo::new();
+    let build = Build::new(&machine, &program, &policy, &memo);
+    let single = build.work_set(&[(1, member())], &[], &[], &Store::default()).unwrap();
+    let both =
+        build.work_set(&[(1, member()), (2, member())], &[], &[], &Store::default()).unwrap();
+    assert_eq!(single.names(), both.names(), "the two walks reach the same functions");
+    assert_ne!(single.digest(), both.digest(), "their root sets are different");
+    assert_eq!(
+        single.digest(),
+        build.work_set(&[(1, member())], &[], &[], &Store::default()).unwrap().digest(),
+        "the walk identity is deterministic"
+    );
+}
+
+#[test]
+fn distributed_work_grants_each_shared_template_once() {
+    let mut program = program();
+    program.function(3, 0x22, &[4]);
+    program.functions.get_mut(&2).unwrap().anchors =
+        Some(std::array::from_fn(|table| ContentId([0x20 + table as u8; 32])));
+    program.functions.get_mut(&3).unwrap().anchors =
+        Some(std::array::from_fn(|table| ContentId([0x30 + table as u8; 32])));
+    let (machine, memo, policy) =
+        (Machine::default(), Memo::new(), policy(OptLevel::O0, Mode::Output));
+    let mut build = Build::new(&machine, &program, &policy, &memo);
+    let work = build.work_set(&[(1, member())], &[], &[], &Store::default()).unwrap();
+    assert_eq!(work.functions(), 4, "two distinct instances share one relative template");
+    let names = work.names();
+    assert_eq!(names.len(), 3, "the shared template is granted to one holder only");
+    let mut store = Store::default();
+    let granted = build.compile_granted(&work, &names, &store).unwrap();
+    store.keep(&granted.compiled);
+    store.keep(&granted.stored);
+    let emitted = machine.emitted.load(Ordering::Relaxed);
+    let built = build.run(&[(1, member())], &store).unwrap();
+    assert_eq!(built.stats.compiled, 0, "the other instance binds the shared stored template");
+    assert_eq!(machine.emitted.load(Ordering::Relaxed), emitted);
+}
+
+#[test]
+fn adding_stats_retains_repeated_compiled_keys() {
+    let key = Key(ContentId([9; 32]));
+    let mut total = Stats::default();
+    total.compiled = 1;
+    total.compiled_keys.push(key);
+    let mut next = Stats::default();
+    next.compiled = 1;
+    next.compiled_keys.push(key);
+    total.add(next);
+    assert_eq!(total.compiled, 2);
+    assert_eq!(total.compiled_keys, vec![key, key], "two emits must not become one claim");
 }

@@ -36,6 +36,158 @@ def grant(**extra):
             "holder": "a", "generation": 3, "seq": 4, "work": [KEY, OTHER], **extra}
 
 
+def fixture_cbor(value):
+    """Canonical synthetic input for oracle selfchecks only, never acceptance artifacts."""
+    def head(major, argument):
+        if argument < 24:
+            return bytes((major << 5 | argument,))
+        size = next(size for size in (1, 2, 4, 8) if argument < 1 << (size * 8))
+        return bytes((major << 5 | {1: 24, 2: 25, 4: 26, 8: 27}[size],)) + argument.to_bytes(size, "big")
+    if value is None:
+        return b"\xf6"
+    if type(value) is int:
+        return head(0, value)
+    if isinstance(value, bytes):
+        return head(2, len(value)) + value
+    if isinstance(value, str):
+        raw = value.encode()
+        return head(3, len(raw)) + raw
+    if isinstance(value, list):
+        return head(4, len(value)) + b"".join(fixture_cbor(item) for item in value)
+    if isinstance(value, dict):
+        return head(5, len(value)) + b"".join(fixture_cbor(key) + fixture_cbor(item) for key, item in sorted(value.items()))
+    raise TypeError(type(value))
+
+
+def fixture_wire_view(value):
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, list):
+        return [fixture_wire_view(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): fixture_wire_view(item) for key, item in value.items()}
+    return value
+
+
+def fixture_capture(gate, old):
+    command = [7, {0: bytes.fromhex(UNIT), 1: old["holder"], 2: {
+        0: {0: old["execution"], 1: old["attempt"], 2: old["holder"], 3: old["generation"]},
+        1: old["seq"], 2: [{0: bytes.fromhex(name), 1: [0, {0: bytes.fromhex(name)}], 2: [], 3: []} for name in old["work"]],
+        3: [], 4: [], 5: []}}]
+    raw = fixture_cbor(command)
+    (gate / "result.cbor").write_bytes(raw)
+    held = {**old, "event": "result_held", "command_sha256": hashlib.sha256(raw).hexdigest()}
+    ready = {**held, "command": fixture_wire_view(command)}
+    (gate / "ready.json").write_text(json.dumps(ready))
+    return ready, [old, held]
+
+
+def fixture_answer(gate, value):
+    raw = fixture_cbor(value)
+    (gate / "answer.cbor").write_bytes(raw)
+    (gate / "answer.json").write_text(json.dumps({"sha256": hashlib.sha256(raw).hexdigest(), "answer": fixture_wire_view(value)}))
+
+
+class ResultGateOracles(unittest.TestCase):
+    def test_capture_requires_exact_real_grant_carrier_and_product_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate, old = Path(directory), grant()
+            ready, events = fixture_capture(gate, old)
+            captured = e.held_result(gate, events, old["pid"])
+            self.assertEqual(e.lease(captured), e.lease(old))
+            self.assertEqual(captured["capture_sha256"], ready["command_sha256"])
+            self.assertIsNone(e.held_result(gate, events[:1], old["pid"]))
+            for field, value in (("holder", "other"), ("generation", 30), ("seq", 40), ("attempt", 20), ("execution", 70), ("work", [KEY])):
+                with self.assertRaises(e.Failed, msg=field):
+                    e.held_result(gate, [{**old, field: value}, events[1]], old["pid"])
+            with self.assertRaises(e.Failed):
+                e.held_result(gate, events, old["pid"] + 1)
+            accepted = {**old, "event": "result_accepted"}
+            with self.assertRaises(e.Failed):
+                e.held_result(gate, [*events, accepted], old["pid"])
+            ready["command"][1]["2"]["0"]["3"] += 1
+            (gate / "ready.json").write_text(json.dumps(ready))
+            with self.assertRaises(e.Failed):
+                e.held_result(gate, events, old["pid"])
+            fixture_capture(gate, old)
+            (gate / "result.cbor").write_bytes(b"corrupt")
+            with self.assertRaises(e.Failed):
+                e.held_result(gate, events, old["pid"])
+
+    def test_client_answer_and_unchanged_carrier_are_required_in_both_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate, old = Path(directory), grant()
+            _, events = fixture_capture(gate, old)
+            captured = e.held_result(gate, events, old["pid"])
+            self.assertFalse(e.gate_answer(gate, captured, refused=True))
+            fixture_answer(gate, [5, {0: [], 1: []}])
+            self.assertTrue(e.gate_answer(gate, captured, refused=False))
+            with self.assertRaises(e.Failed):
+                e.gate_answer(gate, captured, refused=True)
+            for token in ("dead-lease", "attempt-moved"):
+                fixture_answer(gate, [9, {0: 6, 1: f"{token}: actual typed reason", 2: None}])
+                self.assertTrue(e.gate_answer(gate, captured, refused=True))
+            for token in ("ended", "holder-lost", "unknown"):
+                fixture_answer(gate, [9, {0: 6, 1: f"{token}: wrong reason", 2: None}])
+                with self.assertRaises(e.Failed):
+                    e.gate_answer(gate, captured, refused=True)
+            fixture_answer(gate, [9, {0: 6, 1: "dead-lease: actual typed reason", 2: None}])
+            (gate / "answer.cbor").write_bytes(b"corrupt")
+            with self.assertRaises(e.Failed):
+                e.gate_answer(gate, captured, refused=True)
+            fixture_answer(gate, [9, {0: 6, 1: "dead-lease: actual typed reason", 2: None}])
+            (gate / "result.cbor").write_bytes(b"changed after capture")
+            with self.assertRaises(e.Failed):
+                e.gate_answer(gate, captured, refused=True)
+
+    def test_product_gate_failure_is_not_mistaken_for_a_missing_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = Path(directory)
+            self.assertIsNone(e.held_result(gate, [], 123))
+            (gate / "error.txt").write_text("release timed out")
+            with self.assertRaises(e.Failed):
+                e.held_result(gate, [], 123)
+            with self.assertRaises(e.Failed):
+                e.gate_answer(gate, grant(), refused=True)
+
+    def test_gate_configuration_is_daemon_only_and_cleanup_releases_before_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = object.__new__(h.Run)
+            run.root, run.project = Path(directory), Path(directory)
+            (run.root / "logs").mkdir()
+            run.given = h.Input("/unused", "/unused", "/unused", directory)
+            run.daemons, run.result_gates = {}, []
+            run.socket, run.port = run.root / "coordinator.sock", 12345
+            run.until = unittest.mock.Mock()
+            child = unittest.mock.Mock(pid=123)
+            child.poll.return_value = None
+            gate = run.root / "gate"
+            with patch.object(h.subprocess, "Popen", return_value=child) as start:
+                run.daemon("a", result_gate=gate)
+            self.assertEqual(start.call_args.kwargs["env"]["BLAZE_DIST_TEST_RESULT_GATE"], str(gate))
+            self.assertNotIn("BLAZE_DIST_TEST_RESULT_GATE", run.env("a", True))
+            with self.assertRaises(e.Failed):
+                run.daemon("a", result_gate=run.root / "another")
+            run.clients, run.services, run.suspended = [], [], {123}
+            def resumed(pid, signal):
+                self.assertTrue((gate / "release").is_file(), "cleanup resumed before releasing the gate")
+            with patch.object(h.os, "kill", side_effect=resumed), patch.object(h.Run, "terminate"):
+                run.stop()
+            self.assertTrue((gate / "release").exists())
+
+    def test_a_failed_release_write_still_resumes_and_terminates_owned_children(self):
+        run = object.__new__(h.Run)
+        run.result_gates, run.suspended = [Path("/unused/gate")], {123}
+        run.clients, run.services = [], []
+        child = unittest.mock.Mock(pid=123)
+        run.daemons, run.socket = {"a": child}, Path("/unused/socket")
+        with patch.object(Path, "touch", side_effect=OSError("no space")), patch.object(Path, "unlink"), patch.object(h.os, "kill") as resume, patch.object(h.Run, "terminate") as terminate:
+            with self.assertRaises(e.Failed):
+                run.stop()
+        resume.assert_called_once_with(123, h.signal.SIGCONT)
+        terminate.assert_called_once_with(child)
+
+
 class Oracles(unittest.TestCase):
     def test_duplicate_tail_and_cross_daemon_compiles_are_caught(self):
         e.no_duplicate_compile([row(), row(work_compiled_keys=[OTHER])])
@@ -187,6 +339,32 @@ class Oracles(unittest.TestCase):
                                               unittest.mock.call(123, h.signal.SIGKILL)])
         self.assertEqual(child.wait.call_args_list, [unittest.mock.call(timeout=10), unittest.mock.call(timeout=10)])
 
+
+
+
+class ReleaseFoldEvidence(unittest.TestCase):
+    def test_actual_kinds_need_two_accepted_holders(self):
+        grants = [grant(pid=pid, holder=str(pid), seq=pid, work=[key])
+                  for pid, key in ((123, KEY), (124, OTHER))]
+        events = [*grants, *[{**g, "event": "result_accepted"} for g in grants]]
+        for g in grants:
+            events.append({"event": "backend_work", "pid": g["pid"], "unit_digest": UNIT,
+                           "work": g["work"], "compiled_keys": g["work"],
+                           "release_keys": g["work"], "folded_keys": g["work"]})
+        rows = [row(compiled_for_work=2, work_compiled_keys=[KEY, OTHER])]
+        e.release_fold(rows, events)
+        for plant in ("one_holder", "no_accept", "planned_only", "unreported"):
+            changed = json.loads(json.dumps(events))
+            if plant == "one_holder":
+                changed = [event for event in changed if event.get("pid") != 124 and event.get("holder") != "124"]
+            elif plant == "no_accept":
+                changed = [event for event in changed if event["event"] != "result_accepted"]
+            elif plant == "planned_only":
+                changed[-1]["compiled_keys"] = []
+            else:
+                changed[-1]["compiled_keys"].append("ff" * 32)
+            with self.subTest(plant=plant), self.assertRaises(e.Failed):
+                e.release_fold(rows, changed)
 
 if __name__ == "__main__":
     unittest.main()

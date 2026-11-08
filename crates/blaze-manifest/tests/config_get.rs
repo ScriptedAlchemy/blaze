@@ -3,9 +3,8 @@
 //! once with the runs of the case's `case.json` after its `CONFIG_RUNS`, and kept as blaze's own
 //! expected output).
 
-// `expected.json` is what cargo printed on Linux: `/` in the paths of the files it read and
-// POSIX shell quoting. On Windows cargo prints `\` there, which these were not recorded with.
-#![cfg(unix)]
+#[path = "support/paths.rs"]
+mod fixture_paths;
 
 use std::path::{Path, PathBuf};
 
@@ -31,7 +30,7 @@ fn copy_dir(from: &Path, to: &Path) {
 fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
     let root = scratch.join(fixture.file_name().unwrap());
     copy_dir(fixture, &root);
-    let root = root.canonicalize().unwrap();
+    let root = dunce::canonicalize(root).unwrap();
     let case: serde_json::Value = match std::fs::read_to_string(fixture.join("case.json")) {
         Ok(text) => serde_json::from_str(&text).unwrap(),
         Err(_) => serde_json::json!({}),
@@ -56,9 +55,7 @@ fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
         env.push((k.clone(), v.as_str().unwrap().replace("$ROOT", &root_text)));
     }
     let cwd = root.join(case["cwd"].as_str().unwrap_or(""));
-    let normalize = |text: String| {
-        text.replace(&home.display().to_string(), "$CARGO_HOME").replace(&root_text, "$ROOT")
-    };
+    let normalize = |text: String| fixture_paths::normalize(&text, &root, &home);
     let expected: Vec<serde_json::Value> =
         serde_json::from_str(&std::fs::read_to_string(fixture.join("expected.json")).unwrap())
             .unwrap();

@@ -2,9 +2,8 @@
 //! from the directory its `fixture.json` names, against what cargo 1.99 printed for it
 //! (`expected.json`, recorded once and kept as blaze's own expected output).
 
-// `expected.json` is what cargo printed on Linux: `/` in its paths and `file:///` ids of
-// them. On Windows cargo prints `\` and `file:///C:/` there, which these were not recorded with.
-#![cfg(unix)]
+#[path = "support/paths.rs"]
+mod fixture_paths;
 
 use std::path::{Path, PathBuf};
 
@@ -59,7 +58,7 @@ fn error_text(err: &anyhow::Error, cwd: &Path) -> String {
 fn read(fixture: &Path, scratch: &Path) -> String {
     let root = scratch.join(fixture.file_name().unwrap());
     copy_dir(fixture, &root);
-    let root = root.canonicalize().unwrap();
+    let root = dunce::canonicalize(root).unwrap();
     let home = scratch.join("cargo-home");
     std::fs::create_dir_all(&home).unwrap();
     let cwd = match std::fs::read_to_string(fixture.join("fixture.json")) {
@@ -86,8 +85,7 @@ fn read(fixture: &Path, scratch: &Path) -> String {
             .serialize(&mut serde_json::Serializer::with_formatter(&mut out, formatter))?;
         anyhow::Ok(String::from_utf8(out)?)
     })();
-    let root = root.display().to_string();
-    let home = home.canonicalize().unwrap().display().to_string();
+    let home = home.canonicalize().unwrap();
     let text = match result {
         Ok(json) => json,
         Err(err) => {
@@ -100,12 +98,12 @@ fn read(fixture: &Path, scratch: &Path) -> String {
             String::from_utf8(out).unwrap()
         }
     };
-    let builds = blaze_manifest::home::builds(&blaze_home).display().to_string();
-    let text = text.replace(&builds, "$BLAZE_HOME/build");
+    let builds = blaze_manifest::home::builds(&blaze_home);
+    let text = fixture_paths::normalize_path(&text, &builds, "$BLAZE_HOME/build");
     // The build directory's id is a digest of where the scratch copy is: `<name>-ID` in what
     // is kept.
     let text = workspace_ids(&text);
-    text.replace(&root, "$ROOT").replace(&home, "$CARGO_HOME") + "\n"
+    fixture_paths::normalize(&text, &root, &home) + "\n"
 }
 
 /// `text` with each `$BLAZE_HOME/build/<name>-<32 hex digits>` as `$BLAZE_HOME/build/<name>-ID`.

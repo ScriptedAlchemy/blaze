@@ -10,6 +10,7 @@ use cargo_platform::Platform;
 use semver::VersionReq;
 use serde::Serialize;
 
+use crate::files::Files;
 use crate::source::SourceId;
 
 pub use blaze_resolve::DepKind;
@@ -116,8 +117,21 @@ impl Dependency {
         self.kind != DepKind::Development
     }
 
-    pub fn serialized(&self) -> SerializedDependency<'_> {
-        SerializedDependency {
+    pub fn serialized<F: Files>(&self, _files: &F) -> anyhow::Result<SerializedDependency<'_>> {
+        let path = self.source_id.local_path();
+        #[cfg(windows)]
+        let path = path
+            .map(|path| {
+                _files.canonicalize(&path).with_context(|| {
+                    format!(
+                        "the path dependency `{}` at `{}` could not be canonicalized",
+                        self.name,
+                        path.display()
+                    )
+                })
+            })
+            .transpose()?;
+        Ok(SerializedDependency {
             name: &self.name,
             source: (!self.source_id.is_path()).then(|| self.source_id.as_url().to_string()),
             req: match &self.req {
@@ -132,8 +146,8 @@ impl Dependency {
             artifact: self.artifact.as_ref(),
             target: self.platform.as_ref(),
             registry: self.registry_id.map(|id| id.url().to_string()),
-            path: self.source_id.local_path(),
-        }
+            path,
+        })
     }
 }
 
@@ -515,5 +529,48 @@ mod tests {
             })
             .collect();
         agree(&features, &deps);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_metadata_path_tests {
+    use super::*;
+    use std::{borrow::Cow, path::Path};
+
+    #[test]
+    fn dependency_metadata_uses_its_reader_and_reports_a_missing_identity() {
+        enum View {
+            Present,
+            Missing,
+        }
+        impl Files for View {
+            fn read(&self, _: &Path) -> std::io::Result<Cow<'_, [u8]>> {
+                panic!("serializing metadata must not read files")
+            }
+            fn kind(&self, _: &Path) -> Option<crate::files::FileKind> {
+                panic!("the supplied view owns canonicalization")
+            }
+            fn list(&self, _: &Path) -> std::io::Result<Vec<(String, bool)>> {
+                panic!("serializing metadata must not list directories")
+            }
+            fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+                assert_eq!(path, Path::new("/C:/view/helper"));
+                match self {
+                    View::Present => Ok(PathBuf::from("/C:/canonical/helper")),
+                    View::Missing => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                }
+            }
+        }
+        let source = SourceId::for_path(Path::new("/C:/view/helper")).unwrap();
+        let dependency = Dependency::parse("helper", None, source).unwrap();
+        assert_eq!(
+            dependency.serialized(&View::Present).unwrap().path,
+            Some(PathBuf::from("/C:/canonical/helper"))
+        );
+        let error = dependency.serialized(&View::Missing).err().unwrap().to_string();
+        assert!(
+            error.contains("helper") && error.contains("could not be canonicalized"),
+            "{error}"
+        );
     }
 }

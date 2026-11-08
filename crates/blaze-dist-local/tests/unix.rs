@@ -1144,3 +1144,160 @@ fn a_silent_helpers_lease_is_fenced_and_its_root_regranted() {
     assert!(matches!(c.call(Command::Result(second)).unwrap(), Answer::Result(_)));
     done_passed(&mut c, content, &b, &lead);
 }
+
+/// The acceptance gate intercepts a real Holder-produced result, after the real server
+/// issued its lease. Removing the expiry lets that exact carrier commit; adding expiry
+/// and a replacement commit makes that same carrier receive the real typed DeadLease.
+#[test]
+fn the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls() {
+    use blaze_dist::holder::{BatchCompiler, Compiled, Holder, HolderConfig, Plan};
+    use blaze_dist_local::{
+        driver::{DriverConfig, run_holder_until},
+        result_gate::ResultGate,
+    };
+    use blaze_wire::{EntryKey, EntryRef};
+
+    struct Compiler;
+    impl BatchCompiler for Compiler {
+        fn compile(&mut self, plan: &Plan) -> Result<Compiled, String> {
+            let ranges = blaze_dist::Ranges::from_wire(&plan.grant.roots).unwrap();
+            Ok(Compiled {
+                generation: plan.grant.lease.generation,
+                roots: ranges
+                    .indexes()
+                    .map(|index| ItemResult {
+                        name: WorkName([index as u8 + 9; 32]),
+                        outcome: ItemOutcome::Exported(EntryRef {
+                            entry: EntryKey([index as u8 + 20; 32]),
+                        }),
+                        found: Set::new(Vec::new()),
+                        unnamed: Set::new(Vec::new()),
+                    })
+                    .collect(),
+                names: Vec::new(),
+                packs: Vec::new(),
+                returned_roots: blaze_dist::Ranges::new(),
+                returned_names: Vec::new(),
+            })
+        }
+        fn release(&mut self, _: &[WorkName]) {}
+    }
+
+    for expired in [false, true] {
+        let f = Fixture::with_workers(
+            2,
+            ExecutionConfig {
+                heartbeat_ms: 1_000_000,
+                work: blaze_dist::work::WorkConfig {
+                    grant_roots: 1,
+                    lease_ms: 20,
+                    progress_first_ms: 1_000_000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let (lead, helper) = (f.executors[0].clone(), f.executors[1].clone());
+        let mut control = f.client();
+        let binding = submit(&mut control, 100_000);
+        let content = binding.subscription.content;
+        join_as(&mut control, content, &binding, &lead);
+        let directory = tempfile::tempdir().unwrap();
+        let gate_path = directory.path().to_owned();
+        let config = DriverConfig {
+            result_gate: Some(ResultGate::new(gate_path.clone(), Duration::from_secs(3)).unwrap()),
+            ..Default::default()
+        };
+        let leave = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let mut client = f.client();
+            let mut holder = Holder::new(
+                &helper,
+                binding.subscription.execution,
+                binding.attempt,
+                two_roots(),
+                Set::new(Vec::new()),
+                Default::default(),
+                HolderConfig { heartbeat_ms: 5, retry_ms: 100, idle_ms: 5 },
+            );
+            let clock = f.clock.clone();
+            let (socket, executor, config, leave) = (&f.path, &helper, &config, &leave);
+            let worker = scope.spawn(move || {
+                run_holder_until(
+                    &mut client,
+                    socket,
+                    &mut holder,
+                    content,
+                    executor,
+                    config,
+                    || clock.now_ms(),
+                    &mut Compiler,
+                    leave,
+                )
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !gate_path.join("ready.json").is_file() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the real Holder never produced its gated result"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let bytes = std::fs::read(gate_path.join("result.cbor")).unwrap();
+            let Command::Result(captured) = decode::<Command>(&bytes, &Limits::DOCUMENTED).unwrap()
+            else {
+                panic!("capture was not Client::Result")
+            };
+            assert_eq!(captured.executor, helper);
+            assert_eq!(captured.request.lease.holder, helper);
+            assert_eq!(captured.request.lease.execution, binding.subscription.execution);
+            assert!(f.effects.lock().unwrap().iter().any(|(_, effect)| matches!(effect, Effect::Work(blaze_dist::work::Effect::Granted { holder, generation, .. }) if holder == &helper && *generation == captured.request.lease.generation)), "capture did not name an actually issued lease");
+            if expired {
+                f.at(21);
+                // The lead stayed assigned, but its work-set membership also expired.
+                join_as(&mut control, content, &binding, &lead);
+                let replacement = lease_as(&mut control, content, &binding, &lead);
+                assert!(replacement.lease.generation > captured.request.lease.generation);
+                let mut result = captured.clone();
+                result.executor = lead.clone();
+                result.request.lease = replacement.lease;
+                assert!(matches!(
+                    control.call(Command::Result(result)).unwrap(),
+                    Answer::Result(_)
+                ));
+            }
+            // Complete the other root before releasing the held one. The positive result
+            // now has no next batch to compile; the stale result still must be submitted.
+            let other = lease_as(&mut control, content, &binding, &lead);
+            let mut result = captured.clone();
+            result.executor = lead.clone();
+            result.request.lease = other.lease;
+            result.request.seq = if expired { 2 } else { 1 };
+            result.request.items[0].name = WorkName([10; 32]);
+            assert!(matches!(control.call(Command::Result(result)).unwrap(), Answer::Result(_)));
+            leave.store(true, Ordering::Release);
+            std::fs::write(gate_path.join("release"), b"").unwrap();
+            worker.join().unwrap().unwrap();
+            let answer = decode::<Answer>(
+                &std::fs::read(gate_path.join("answer.cbor")).unwrap(),
+                &Limits::DOCUMENTED,
+            )
+            .unwrap();
+            if expired {
+                let Answer::Error(error) = answer else {
+                    panic!("a stale result was accepted: {answer:?}")
+                };
+                assert_eq!(blaze_dist::Refusal::of(&error), Some(blaze_dist::Refusal::DeadLease));
+            } else {
+                assert!(matches!(answer, Answer::Result(_)), "{answer:?}");
+            }
+            let committed = f.effects.lock().unwrap().iter().any(|(_, effect)| matches!(effect, Effect::Work(blaze_dist::work::Effect::Committed { by, .. }) if by.holder == helper && by.generation == captured.request.lease.generation && by.seq == captured.request.seq));
+            assert_eq!(committed, !expired, "only the unexpired captured identity may commit");
+            assert_eq!(
+                std::fs::read(gate_path.join("result.cbor")).unwrap(),
+                bytes,
+                "the gate never rewrites the real carrier"
+            );
+        });
+    }
+}

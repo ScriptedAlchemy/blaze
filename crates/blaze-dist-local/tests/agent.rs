@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use blaze_dist::admission::{Admission, AdmissionConfig};
 use blaze_dist::holder::HolderConfig;
-use blaze_dist::jobs::{ExecutionConfig, Jobs};
+use blaze_dist::jobs::{CompletionMode, ExecutionConfig, Jobs};
 use blaze_dist::work::WorkConfig;
 use blaze_dist_local::Error;
 use blaze_dist_local::agent::{self, Grant, Granted, NEED, Source, Unit};
@@ -64,7 +64,10 @@ fn world_with(executors: u32, work: WorkConfig, carrier: CarrierConfig) -> World
     for _ in 0..executors {
         admission.add_builder(0, "machine", NEED).unwrap();
     }
-    let jobs = Jobs::new(admission, ExecutionConfig { work, ..Default::default() });
+    let jobs = Jobs::new(
+        admission,
+        ExecutionConfig { work, completion: CompletionMode::PublishedWork, ..Default::default() },
+    );
     let tag: String = random_id().unwrap()[..6].iter().map(|b| format!("{b:02x}")).collect();
     let socket = PathBuf::from(format!("/tmp/blaze-agent-{tag}.sock"));
     let server =
@@ -133,6 +136,7 @@ impl Granted for Compiler {
             values: names.iter().map(|at| value_of(&self.names[*at])).collect(),
             compiled: names.len() as u64,
             stored: 0,
+            compiled_keys: names.iter().map(|at| self.names[*at]).collect(),
         })
     }
 }
@@ -194,19 +198,18 @@ fn a_batch_given_back_leaves_its_names_to_the_build() {
     let arrived =
         agent::run(&config(&world.socket, &world.blobs), &unit, &mut Vanishes, &never).unwrap();
     assert!(arrived.values.is_empty(), "nothing was committed: the final build compiles them");
-    agent::publish(&world.blobs, &unit, arrived.packs, Vec::new()).unwrap();
 }
 
 #[test]
-fn a_unit_with_no_work_asks_the_coordinator_nothing() {
-    let world = world(0, WorkConfig::default());
+fn a_unit_with_no_names_still_has_one_tail_owner() {
+    let world = world(1, WorkConfig::default());
     let unit = Unit { spec: [31; 32], names: Vec::new() };
-    let unreachable = Path::new("/tmp/blaze-agent-nothing-here.sock");
     let never = AtomicBool::new(false);
     let arrived =
-        agent::run(&config(unreachable, &world.blobs), &unit, &mut Vanishes, &never).unwrap();
+        agent::run(&config(&world.socket, &world.blobs), &unit, &mut Vanishes, &never).unwrap();
     assert!(arrived.values.is_empty());
-    assert_eq!((arrived.source, arrived.execution), (Source::Executed, None));
+    assert_eq!(arrived.source, Source::Executed);
+    assert!(arrived.execution.is_some());
 }
 
 #[test]
@@ -221,11 +224,11 @@ fn a_published_unit_schedules_nothing() {
         entered: Arc::new(AtomicUsize::new(0)),
         wait_for: 1,
     };
-    let first =
-        agent::run(&config(&world.socket, &world.blobs), &unit, &mut compiler, &never).unwrap();
-    assert_eq!(first.compiled_here, 3);
     let extra = Value { key: [200; 32], kind: 2, bytes: b"a static".to_vec() };
-    agent::publish(&world.blobs, &unit, first.packs, vec![extra.clone()]).unwrap();
+    let mut complete = WithTail { compiler: &mut compiler, extra: extra.clone() };
+    let first =
+        agent::run(&config(&world.socket, &world.blobs), &unit, &mut complete, &never).unwrap();
+    assert_eq!(first.compiled_here, 3);
 
     // No coordinator is reachable at this socket: a published unit never asks it.
     let unreachable = Path::new("/tmp/blaze-agent-nothing-here.sock");
@@ -363,7 +366,6 @@ fn a_unit_published_by_one_pull_request_is_taken_by_another() {
     let first = agent::run(&of_pr(1, 1), &unit, &mut compiler, &never).unwrap();
     assert_eq!(first.source, Source::Executed);
     assert_eq!(first.compiled_here, 3);
-    agent::publish(&world.blobs, &unit, first.packs, Vec::new()).unwrap();
     let second = agent::run(&of_pr(2, 9), &unit, &mut compiler, &never).unwrap();
     assert_eq!(second.source, Source::Published, "another pull request schedules nothing");
     assert_eq!(second.compiled_here, 0);
@@ -418,4 +420,95 @@ fn an_agent_that_waits_asks_in_one_session_however_often() {
     let arrived =
         agent::run(&config(&world.socket, &world.blobs), &unit, &mut compiler, &never).unwrap();
     assert_eq!(arrived.values.len(), 12);
+}
+
+/// A warm local tail hit still belongs to the manifest sent to an empty subscriber.
+struct WithTail<'a> {
+    compiler: &'a mut Compiler,
+    extra: Value,
+}
+
+impl Granted for WithTail<'_> {
+    fn compile(&mut self, names: &[usize]) -> Result<Grant, String> {
+        self.compiler.compile(names)
+    }
+
+    fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, String> {
+        Ok(vec![self.extra.clone()])
+    }
+}
+
+#[test]
+fn a_late_subscriber_waits_for_the_one_leads_full_tail() {
+    use std::sync::mpsc;
+
+    struct Paused {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        tails: Arc<AtomicUsize>,
+        extra: Value,
+    }
+    impl Granted for Paused {
+        fn compile(&mut self, _: &[usize]) -> Result<Grant, String> {
+            panic!("empty work set")
+        }
+        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, String> {
+            assert_eq!(self.tails.fetch_add(1, Ordering::SeqCst), 0);
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(Duration::from_secs(20)).unwrap();
+            Ok(vec![self.extra.clone()])
+        }
+    }
+    struct Reader;
+    impl Granted for Reader {
+        fn compile(&mut self, _: &[usize]) -> Result<Grant, String> {
+            panic!("late subscriber compiled")
+        }
+        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, String> {
+            panic!("late subscriber ran a second tail")
+        }
+    }
+    let world = world(2, WorkConfig::default());
+    let unit = Unit { spec: [82; 32], names: Vec::new() };
+    let extra = value_of(&[83; 32]);
+    let tails = Arc::new(AtomicUsize::new(0));
+    let (entered, completing) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let never = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let (world, unit, never) = (&world, &unit, &never);
+        let mut compiler =
+            Paused { entered, release: gate, tails: tails.clone(), extra: extra.clone() };
+        let lead = scope.spawn(move || {
+            agent::run(&config(&world.socket, &world.blobs), unit, &mut compiler, never).unwrap()
+        });
+        completing.recv_timeout(Duration::from_secs(20)).unwrap();
+        // Force a submission in the formerly racy interval: phase done, tail still paused.
+        let mut observer = Client::connect(&world.socket, random_id().unwrap()).unwrap();
+        let request = blaze_wire::JobRequest {
+            unit: unit.spec,
+            platform: agent::platform(TRIPLE),
+            namespace: Namespace::Main,
+            source: [0; 32],
+            deadline_ms: observer.welcome.now_ms + 120_000,
+            local: LocalPolicy::Never,
+        };
+        let Answer::Binding(joined) =
+            observer.call(Command::Submit(submission(&request, NEED))).unwrap()
+        else {
+            panic!()
+        };
+        let reader = scope.spawn(move || {
+            agent::run(&config(&world.socket, &world.blobs), unit, &mut Reader, never).unwrap()
+        });
+        release.send(()).unwrap();
+        let first = lead.join().unwrap();
+        let second = reader.join().unwrap();
+        assert_eq!(first.execution, Some(joined.subscription.execution.0));
+        assert_eq!(second.values, first.values);
+        assert_eq!(second.values.get(&extra.key), Some(&(extra.kind, extra.bytes.clone())));
+        assert_eq!(second.compiled_here, 0);
+        assert_eq!(tails.load(Ordering::SeqCst), 1);
+        let _ = observer.release();
+    });
 }

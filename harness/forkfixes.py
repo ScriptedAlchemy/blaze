@@ -100,7 +100,7 @@ def write(root: Path, files: dict[str, str]) -> None:
 def env_for(scratch: Path, home: str = "home") -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CARGO", "RUST", "BLAZE_"))}
     # The installed library and the root's assigned resources are inputs, not harness defaults.
-    for name in ("BLAZE_LIBRARY", "BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB"):
+    for name in ("BLAZE_LIBRARY", "BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB", "BLAZE_HUGE_PAGES"):
         if name in os.environ:
             env[name] = os.environ[name]
     env.update(BLAZE_HOME=str(scratch / home), TMPDIR=str(scratch / "tmp"), RUST_BACKTRACE="0")
@@ -310,7 +310,7 @@ def main(given: Input) -> int:
         before = provenance(given)
         save(scratch / "provenance.json", before)
         save(scratch / "environment.json", {name: daemon.env.get(name) for name in (
-            "BLAZE_HOME", "BLAZE_LIBRARY", "BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB",
+            "BLAZE_HOME", "BLAZE_LIBRARY", "BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB", "BLAZE_HUGE_PAGES",
             "LLVM_SYS_231_PREFIX", "XDG_CACHE_HOME", "TMPDIR", "RUST_BACKTRACE")})
         daemon.start()
         for case in selected:

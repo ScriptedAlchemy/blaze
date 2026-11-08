@@ -88,9 +88,13 @@ impl SerializedPackage<'_> {
 }
 
 /// The package of the manifest at `manifest_path` as `cargo metadata` prints it.
-pub fn export_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> SerializedPackage<'a> {
+pub fn export_package<'a, F: Files>(
+    manifest_path: &'a Path,
+    m: &'a Manifest,
+    files: &F,
+) -> anyhow::Result<SerializedPackage<'a>> {
     let meta = &m.metadata;
-    SerializedPackage {
+    Ok(SerializedPackage {
         name: &m.package_id.name,
         version: &m.package_id.version,
         id: m.package_id.to_spec(),
@@ -99,7 +103,11 @@ pub fn export_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> Serialize
         description: meta.description.as_deref(),
         source: (!m.package_id.source_id.is_path())
             .then(|| m.package_id.source_id.as_url().to_string()),
-        dependencies: m.dependencies.iter().map(|d| d.serialized()).collect(),
+        dependencies: m
+            .dependencies
+            .iter()
+            .map(|d| d.serialized(files))
+            .collect::<anyhow::Result<_>>()?,
         targets: m.targets.iter().filter_map(|t| t.serialized()).collect(),
         features: m
             .features
@@ -125,12 +133,15 @@ pub fn export_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> Serialize
             min_opt_level: None,
             mostly_unused: it.mostly_unused.as_ref(),
         }),
-    }
+    })
 }
 
 /// What `cargo metadata --no-deps` prints for the workspace.
 pub fn export_no_deps<'a, F: Files>(ws: &'a Workspace<'_, F>) -> anyhow::Result<ExportInfo<'a>> {
-    let packages = ws.members().map(|(path, m)| export_package(path, m)).collect();
+    let packages = ws
+        .members()
+        .map(|(path, m)| export_package(path, m, ws.files()))
+        .collect::<anyhow::Result<_>>()?;
     export(ws, packages, None)
 }
 

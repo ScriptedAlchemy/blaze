@@ -40,15 +40,18 @@ def validate_events(events: list[dict]) -> None:
     for event in events:
         kind = event.get("event")
         require(isinstance(kind, str), "BLAZE_DIST_EVENTS: event needs its type")
-        if kind in ("grant", "result_accepted", "result_refused"):
+        if kind in ("grant", "result_held", "result_accepted", "result_refused"):
             lease(event)
-        if kind in ("grant", "result_accepted"):
+        if kind in ("grant", "result_held", "result_accepted"):
             work = event.get("work")
             require(isinstance(work, list) and all(digest(k) for k in work), f"{kind}: work must name exact WorkName digests")
             require(len(work) == len(set(work)), f"{kind}: duplicate work names")
         if kind == "grant":
             require(type(event.get("pid")) is int and event["pid"] > 0 and digest(event.get("unit_digest")),
                     "grant: needs the real daemon pid and unit_digest")
+        if kind == "result_held":
+            require(type(event.get("pid")) is int and event["pid"] > 0 and digest(event.get("command_sha256")),
+                    "result_held: needs the real daemon pid and canonical command digest")
         if kind == "result_refused":
             require(isinstance(event.get("refusal"), str), "result_refused: needs the typed refusal")
         if kind == "done":
@@ -179,3 +182,103 @@ def cached(rows: list[dict]) -> None:
     for row in rows:
         require(row["source"] == "published" and row["execution"] == -1 and not row["joined"], f"{row['unit']}: cold build scheduled work")
         require(row["grants"] == 0 and row["stored_for_work"] == 0 and not compiled(row), f"{row['unit']}: cold build did work")
+
+
+def held_result(gate: Path, events: list[dict], pid: int) -> dict | None:
+    """Bind a product-written capture to its issued grant; readiness alone is insufficient.
+
+    The Command JSON is Blaze's own rendering of its canonical CBOR, retained beside that
+    exact CBOR and its hash. Native driver tests decode the saved CBOR and compare the real
+    sent command and response. No carrier, lease or acceptance event is made by this harness.
+    """
+    if (gate / "error.txt").exists():
+        raise Failed(f"{gate}: the product result gate failed: {(gate / 'error.txt').read_text()}")
+    ready = gate / "ready.json"
+    if not ready.exists():
+        return None
+    captured = json.loads(ready.read_text())
+    require(isinstance(captured, dict) and captured.get("event") == "result_held", f"{gate}: no real result capture")
+    validate_events([captured])
+    require(captured["pid"] == pid, f"{gate}: the capture names another daemon")
+    raw = (gate / "result.cbor").read_bytes()
+    require(0 < len(raw) <= 16 << 20 and hashlib.sha256(raw).hexdigest() == captured["command_sha256"],
+            f"{gate}: captured CBOR disagrees with its product-written digest")
+    command = captured.get("command")
+    require(isinstance(command, list) and len(command) == 2 and command[0] == 7 and raw.startswith(b"\x82\x07"),
+            f"{gate}: capture must be an actual Command::Result")
+    try:
+        submission = command[1]
+        batch = submission["2"]
+        issued = batch["0"]
+        actual = {"execution": issued["0"], "attempt": issued["1"], "holder": issued["2"],
+                  "generation": issued["3"], "seq": batch["1"]}
+        work = [item["0"] for item in batch["2"]]
+        valid = (digest(submission["0"]) and submission["1"] == issued["2"]
+                 and batch["4"] == [] and batch["5"] == [])
+    except (KeyError, TypeError, IndexError) as why:
+        raise Failed(f"{gate}: malformed actual Result view") from why
+    require(valid and lease(actual) == lease(captured) and work == captured["work"] and bool(work),
+            f"{gate}: captured identity/items differ from its real Result carrier")
+    matching = [e for e in events if e["event"] == "grant" and e["pid"] == pid and lease(e) == lease(captured)]
+    require(bool(matching) and all(e["work"] == work for e in matching), f"{gate}: capture has no matching actual issued grant")
+    if not any(e["event"] == "result_held" and e["pid"] == pid and e["work"] == work and lease(e) == lease(captured)
+               and e["command_sha256"] == captured["command_sha256"] for e in events):
+        return None  # ready.json is named immediately before the real append becomes visible.
+    grant = {**matching[-1], "capture_sha256": captured["command_sha256"]}
+    require(not accepted(events, grant), f"{gate}: the gate did not hold an uncommitted result")
+    return grant
+
+
+def gate_answer(gate: Path, grant: dict, *, refused: bool) -> bool:
+    """Require the normal Client's saved answer as well as the coordinator's event."""
+    if (gate / "error.txt").exists():
+        raise Failed(f"{gate}: the product result gate failed: {(gate / 'error.txt').read_text()}")
+    path = gate / "answer.json"
+    if not path.exists():
+        return False
+    require(hashlib.sha256((gate / "result.cbor").read_bytes()).hexdigest() == grant["capture_sha256"],
+            f"{gate}: the captured result changed before its answer")
+    view = json.loads(path.read_text())
+    raw = (gate / "answer.cbor").read_bytes()
+    require(isinstance(view, dict) and digest(view.get("sha256")) and hashlib.sha256(raw).hexdigest() == view["sha256"],
+            f"{gate}: answer CBOR disagrees with its product-written digest")
+    answer = view.get("answer")
+    tag = 9 if refused else 5
+    require(isinstance(answer, list) and len(answer) == 2 and answer[0] == tag and raw.startswith(bytes((0x82, tag))),
+            f"{gate}: expected the normal Client's {'refusal' if refused else 'accepted Result'} answer")
+    if refused:
+        error = answer[1]
+        require(isinstance(error, dict) and error.get("0") == 6 and isinstance(error.get("1"), str)
+                and error["1"].split(": ", 1)[0] in ("dead-lease", "attempt-moved"),
+                f"{gate}: the actual answer must carry DeadLease or AttemptMoved")
+    return True
+
+
+def release_fold(rows: list[dict], events: list[dict]) -> None:
+    """Planned kinds count only when joined to raw emissions and accepted real grants."""
+    holders: dict[str, dict[tuple, set[int]]] = {"release_keys": {}, "folded_keys": {}}
+    emitted = [event for event in events if event.get("event") == "backend_work"]
+    require(bool(emitted), "release/fold acceptance needs backend_work emission evidence")
+    for event in emitted:
+        actual = event.get("compiled_keys")
+        require(isinstance(actual, list) and all(digest(key) for key in actual), "backend_work needs raw emitted store keys")
+        matching = [grant for grant in events if grant.get("event") == "grant"
+                    and grant["pid"] == event.get("pid") and grant["unit_digest"] == event.get("unit_digest")
+                    and sorted(grant["work"]) == sorted(event.get("work", [])) and accepted(events, grant)]
+        if not matching:
+            continue  # A failed/stale attempt cannot supply successful emission evidence.
+        for grant in matching:
+            reports = [row for row in rows if row["unit_digest"] == grant["unit_digest"]
+                       and row["execution"] == grant["execution"] and row["attempt"] == grant["attempt"]]
+            reported = {key for row in reports for key in row["work_compiled_keys"]}
+            require(set(actual) <= reported, "backend emission was absent from final work reports")
+            identity = (grant["unit_digest"], grant["execution"], grant["attempt"])
+            for kind in holders:
+                keys = event.get(kind)
+                require(isinstance(keys, list) and all(digest(key) for key in keys), f"backend_work needs {kind}")
+                require(set(keys) <= set(actual), f"{kind} includes an uncompiled planned key")
+                if keys:
+                    holders[kind].setdefault(identity, set()).add(grant["pid"])
+    for kind, units in holders.items():
+        require(any(len(pids) >= 2 for pids in units.values()),
+                f"two real holders must emit {kind} in one successful unit/execution/attempt")

@@ -103,8 +103,38 @@ pub struct Workspace<'c, F: Files> {
     warnings: Vec<String>,
 }
 
+// Reconcile file-URL aliases with the workspace's identity through its own reader. A query
+// view returns its rooted path; Disk returns the native canonical path. External paths keep
+// their existing membership rules.
+fn normalize_member_path<F: Files>(files: &F, path: &Path, root: &Path) -> PathBuf {
+    let path = normalize_path(path);
+    if cfg!(windows)
+        && !path.starts_with(root)
+        && let Ok(canonical) = files.canonicalize(&path)
+        && canonical.starts_with(root)
+    {
+        return canonical;
+    }
+    path
+}
+
 impl<'c, F: Files> Workspace<'c, F> {
     pub fn new(manifest_path: &Path, ctx: &'c Context<F>) -> anyhow::Result<Workspace<'c, F>> {
+        // `has_root`: on Windows the daemon names `C:\a` as `/C:/a`, which has no prefix.
+        if !manifest_path.has_root() {
+            bail!(
+                "manifest_path:{manifest_path:?} is not an absolute path. Please provide an absolute path."
+            )
+        }
+        #[cfg(windows)]
+        let manifest_path = ctx.files().canonicalize(manifest_path).with_context(|| {
+            format!(
+                "the workspace manifest `{}` could not be canonicalized",
+                manifest_path.display()
+            )
+        })?;
+        #[cfg(windows)]
+        let manifest_path = manifest_path.as_path();
         let mut ws = Workspace {
             ctx,
             current_manifest: manifest_path.to_owned(),
@@ -119,12 +149,6 @@ impl<'c, F: Files> Workspace<'c, F> {
             custom_metadata: None,
             warnings: Vec::new(),
         };
-        // `has_root`: on Windows the daemon names `C:\a` as `/C:/a`, which has no prefix.
-        if !manifest_path.has_root() {
-            bail!(
-                "manifest_path:{manifest_path:?} is not an absolute path. Please provide an absolute path."
-            )
-        }
         ws.root_manifest = ws.find_root(manifest_path)?;
         ws.target_dir = ctx.config.target_dir()?;
         ws.build_dir = ctx.config.build_dir(ws.root_manifest())?;
@@ -227,7 +251,15 @@ impl<'c, F: Files> Workspace<'c, F> {
     }
 
     pub fn is_member(&self, manifest_path: &Path) -> bool {
-        self.member_set.contains(manifest_path)
+        self.member_set.contains(&normalize_member_path(
+            self.ctx.files(),
+            manifest_path,
+            self.root(),
+        ))
+    }
+
+    pub(crate) fn files(&self) -> &F {
+        self.ctx.files()
     }
 
     /// The member packages with their manifest paths, in cargo's order.
@@ -343,10 +375,11 @@ impl<'c, F: Files> Workspace<'c, F> {
 
         if let Some(default) = default_members_paths {
             for (path, default_member_glob) in default {
-                let normalized_path = normalize_path(&path);
-                let manifest_path = normalized_path.join("Cargo.toml");
+                let manifest_path =
+                    normalize_member_path(self.ctx.files(), &path.join("Cargo.toml"), self.root());
+                let normalized_path = manifest_path.parent().unwrap();
                 if !self.member_set.contains(&manifest_path) {
-                    let exclude = members_paths.iter().any(|(m, _)| *m == normalized_path)
+                    let exclude = members_paths.iter().any(|(m, _)| m == normalized_path)
                         && workspace_config.is_excluded(&normalized_path);
                     if exclude {
                         continue;
@@ -375,7 +408,7 @@ impl<'c, F: Files> Workspace<'c, F> {
         root_manifest: &Path,
         is_path_dep: bool,
     ) -> anyhow::Result<()> {
-        let manifest_path = normalize_path(manifest_path);
+        let manifest_path = normalize_member_path(self.ctx.files(), manifest_path, self.root());
         if self.member_set.contains(&manifest_path) {
             return Ok(());
         }
@@ -614,5 +647,86 @@ impl<'c, F: Files> Workspace<'c, F> {
             let rendered = Renderer::plain().render(&[report]);
             self.warnings.push(rendered.strip_prefix("warning: ").unwrap_or(&rendered).to_owned());
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_member_path_tests {
+    use super::*;
+    use crate::{Config, metadata::export_no_deps};
+
+    #[test]
+    fn path_dependencies_and_member_lookups_share_the_workspace_identity() {
+        let scratch = stdx::tempfile::NamedTempDir::new("blaze-member-identity-").unwrap();
+        let root = scratch.path().join("workspace");
+        for (path, contents) in [
+            ("Cargo.toml", "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n"),
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             [dependencies]\nhelper = { path = \"../tools/helper\" }\n",
+            ),
+            ("app/src/lib.rs", ""),
+            ("tools/helper/Cargo.toml", "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n"),
+            ("tools/helper/src/lib.rs", ""),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        let home = scratch.path().join("cargo-home");
+        std::fs::create_dir(&home).unwrap();
+        let env = [
+            ("CARGO_HOME".to_owned(), home.display().to_string()),
+            ("__CARGO_TEST_ROOT".to_owned(), scratch.path().display().to_string()),
+            ("BLAZE_HOME".to_owned(), scratch.path().join("blaze-home").display().to_string()),
+        ];
+        let ctx = Context::new(Config::load(&root, env, &[]).unwrap());
+        let workspace = Workspace::new(&root.join("Cargo.toml"), &ctx).unwrap();
+        assert_eq!(workspace.members().count(), 2);
+        let helper = root.join("tools/helper");
+        let ordinary = dunce::canonicalize(&helper).unwrap();
+        let rooted = SourceId::for_path(&ordinary).unwrap().local_path().unwrap();
+        for path in [&helper, &ordinary, &rooted] {
+            assert!(workspace.is_member(&path.join("Cargo.toml")), "{path:?}");
+        }
+        assert!(!workspace.is_member(&scratch.path().join("outside/Cargo.toml")));
+        let metadata = serde_json::to_value(export_no_deps(&workspace).unwrap()).unwrap();
+        let app = metadata["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["name"] == "app")
+            .unwrap();
+        assert_eq!(app["dependencies"][0]["path"], serde_json::json!(helper));
+    }
+
+    #[test]
+    fn alias_reconciliation_uses_the_supplied_files_reader() {
+        struct View;
+        impl Files for View {
+            fn read(&self, _: &Path) -> std::io::Result<std::borrow::Cow<'_, [u8]>> {
+                panic!("identity must not read file bytes")
+            }
+            fn kind(&self, _: &Path) -> Option<crate::files::FileKind> {
+                panic!("the view owns canonicalization")
+            }
+            fn list(&self, _: &Path) -> std::io::Result<Vec<(String, bool)>> {
+                panic!("identity must not list directories")
+            }
+            fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+                assert_eq!(path, Path::new(r"C:\workspace\member\Cargo.toml"));
+                Ok(PathBuf::from("/C:/workspace/member/Cargo.toml"))
+            }
+        }
+        assert_eq!(
+            normalize_member_path(
+                &View,
+                Path::new(r"C:\workspace\member\Cargo.toml"),
+                Path::new("/C:/workspace"),
+            ),
+            Path::new("/C:/workspace/member/Cargo.toml")
+        );
     }
 }

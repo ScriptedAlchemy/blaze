@@ -143,7 +143,9 @@ impl Server {
         let mut connections = Vec::new();
         while !stop.load(Ordering::Acquire) {
             let now = self.coordinator.now(self.clock.now_ms());
-            self.effects.deliver(self.coordinator.tick(now));
+            let timed = self.coordinator.tick(now);
+            Self::outcomes(&timed);
+            self.effects.deliver(timed);
             // One accept per loop prevents an accept flood starving existing clients/timers.
             match self.accept() {
                 Ok((stream, _)) => {
@@ -176,6 +178,7 @@ impl Server {
         // Deliver stops for every active subscription on orderly shutdown. No automatic ack.
         // Abrupt process death is fenced by the next daemon epoch, not replayed as success.
         let effects = self.coordinator.shutdown(self.clock.now_ms());
+        Self::outcomes(&effects);
         self.effects.deliver(effects);
         Ok(())
     }
@@ -242,6 +245,102 @@ impl Server {
         !(c.closing && c.output.is_empty())
     }
 
+    fn evidence(&self, command: &Command, reply: &[u8], effects: &[(ExecutionId, Effect)]) {
+        if std::env::var_os("BLAZE_DIST_EVENTS").is_none() {
+            return;
+        }
+        use crate::telemetry::{emit, json};
+        let Ok(ServerFrame::Response(response)) = decode::<ServerFrame>(reply, &Limits::DOCUMENTED)
+        else {
+            return;
+        };
+        match (command, &response.answer) {
+            (Command::Result(result), answer) => {
+                let request = &result.request;
+                let mut fields = vec![
+                    ("execution", json(&request.lease.execution.0)),
+                    ("attempt", json(&request.lease.attempt.0)),
+                    ("holder", json(&request.lease.holder)),
+                    ("generation", json(&request.lease.generation)),
+                    ("seq", json(&request.seq)),
+                ];
+                match answer {
+                    Answer::Result(_) if effects.iter().any(|(execution, effect)| {
+                        *execution == request.lease.execution && matches!(effect,
+                            Effect::Work(blaze_dist::work::Effect::Committed { by, .. } | blaze_dist::work::Effect::Replayed { by })
+                                if by.holder == request.lease.holder && by.generation == request.lease.generation && by.seq == request.seq)
+                    }) => {
+                        let work: Vec<String> = self.coordinator.committed_names(request)
+                            .iter().map(|name| crate::pack::hex(&name.0)).collect();
+                        fields.push(("work", json(&work)));
+                        emit("result_accepted", &fields);
+                    }
+                    Answer::Error(error) => {
+                        if let Some(why @ (blaze_dist::Refusal::DeadLease | blaze_dist::Refusal::AttemptMoved)) = blaze_dist::Refusal::of(error) {
+                            fields.push(("refusal", json(&format!("{why:?}"))));
+                            emit("result_refused", &fields);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (Command::CommitPublication(request), Answer::Publication(publication))
+                if effects.iter().any(|(execution, effect)| {
+                    *execution == request.execution
+                        && matches!(
+                            effect,
+                            Effect::Event(blaze_wire::EventItem {
+                                event: blaze_wire::JobEvent::Stage(blaze_wire::StageEvent {
+                                    stage: blaze_wire::Stage::Published,
+                                    ..
+                                }),
+                                ..
+                            })
+                        )
+                }) =>
+            {
+                if let (Some(unit), Some(packs)) =
+                    (self.coordinator.unit(request.execution), &publication.packs)
+                {
+                    let packs: Vec<String> =
+                        packs.iter().map(|pack| crate::pack::hex(&pack.pack)).collect();
+                    emit(
+                        "published",
+                        &[
+                            ("unit_digest", json(&crate::pack::hex(&unit))),
+                            ("execution", json(&request.execution.0)),
+                            ("attempt", json(&request.attempt.0)),
+                            ("packs", json(&packs)),
+                        ],
+                    );
+                }
+            }
+            _ => {}
+        }
+        Self::outcomes(effects);
+    }
+
+    fn outcomes(effects: &[(ExecutionId, Effect)]) {
+        if std::env::var_os("BLAZE_DIST_EVENTS").is_none() {
+            return;
+        }
+        use crate::telemetry::{emit, json};
+        for (execution, effect) in effects {
+            if let Effect::Event(item) = effect
+                && let blaze_wire::JobEvent::Done(done) = &item.event
+            {
+                emit(
+                    "done",
+                    &[
+                        ("execution", json(&execution.0)),
+                        ("attempt", json(&item.attempt.0)),
+                        ("outcome", json(&format!("{:?}", done.outcome))),
+                    ],
+                );
+            }
+        }
+    }
+
     fn handle(&mut self, now: u64, c: &mut Connection, body: &[u8]) -> (Vec<u8>, bool) {
         let decoded = decode::<ClientFrame>(body, &Limits::DOCUMENTED);
         match decoded {
@@ -261,6 +360,7 @@ impl Server {
                 let releases = matches!(request.command, Command::Release(_));
                 match self.coordinator.request(now, &request) {
                     Ok((reply, effects)) => {
+                        self.evidence(&request.command, &reply, &effects);
                         self.effects.deliver(effects);
                         (reply, releases)
                     }

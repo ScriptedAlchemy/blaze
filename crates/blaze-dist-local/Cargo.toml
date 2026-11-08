@@ -13,12 +13,14 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-core.workspace = true
 blaze-dist = { path = "../blaze-dist" }
 blaze-wire.workspace = true
 sha2 = "0.10"
 tracing.workspace = true
 
 [dev-dependencies]
+hegeltest.workspace = true
 blaze-serve.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
 tempfile.workspace = true

@@ -26,6 +26,7 @@ pub mod calls;
 mod cbor;
 pub mod job_terminal_v2;
 pub mod json;
+pub mod pack_list;
 pub mod shapes;
 pub mod vectors;
 

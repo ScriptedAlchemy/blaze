@@ -12,6 +12,7 @@ Input, one JSON value (`python3 harness/distv2.py '{...}'`):
                  default "app"
     run          (optional) the arguments it is run with; default ["11"]
     faults       (optional) run the fault cases; default true
+    release_fold (optional) require two real holders for both LLVM and folded work; default false
     profile      (optional) the directory under the target directory programs are in; default "debug"
     stall_bound  (optional) seconds a daemon's loop may make no progress (`blaze serve --stall-bound`):
                  an unoptimized blaze under test needs more than the default
@@ -73,6 +74,7 @@ class Input:
     run: tuple[str, ...] = ("11",)
     faults: bool = True
     profile: str = "debug"
+    release_fold: bool = False
     stall_bound: int | None = None
     timeout: int = 3600
     command_timeout: int = 60
@@ -95,6 +97,10 @@ def load(text: str) -> Input:
         raise Failed("env must map strings to strings")
     if any(name.startswith("BLAZE_DIST_") for name in given.env):
         raise Failed("env must not override BLAZE_DIST_*: distribution and policies are controlled case inputs")
+    if type(given.release_fold) is not bool:
+        raise Failed("release_fold must be boolean")
+    if given.release_fold and ("--release" not in given.args or given.profile != "release"):
+        raise Failed('release_fold requires args ["--release"] and profile "release"')
     return given
 
 
@@ -130,6 +136,7 @@ class Run:
         self.clients: list[tuple[subprocess.Popen, float, str]] = []
         self.client_homes: dict[int, str] = {}
         self.suspended: set[int] = set()
+        self.result_gates: list[Path] = []
         self.lease: list[str] = []
         self.sequence = 0
         self.artifacts: list[dict] = []
@@ -263,17 +270,24 @@ class Run:
         self.services.append(coordinator)
         self.until("coordinator binds its socket", self.socket.exists, [coordinator], timeout=30)
 
-    def daemon(self, home: str) -> None:
+    def daemon(self, home: str, result_gate: Path | None = None) -> None:
         """Own every daemon explicitly, including ones whose startup fails."""
         if home in self.daemons and self.daemons[home].poll() is None:
+            if result_gate is not None:
+                raise Failed(f"{home}: cannot install a result gate on an already running daemon")
             return
+        gate_env = {}
+        if result_gate is not None:
+            result_gate.mkdir(parents=True, exist_ok=False)
+            self.result_gates.append(result_gate)
+            gate_env["BLAZE_DIST_TEST_RESULT_GATE"] = str(result_gate.resolve())
         # Status is only for this run's private home, never a shared daemon.
         log = open(self.root / "logs" / f"{home}.daemon.log", "a")
         args = [self.given.blaze, "serve"]
         if self.given.stall_bound is not None:
             args += ["--stall-bound", str(self.given.stall_bound)]
         with log:
-            daemon = subprocess.Popen(args, cwd=self.project, env=self.env(home, False),
+            daemon = subprocess.Popen(args, cwd=self.project, env=self.env(home, False, **gate_env),
                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         self.daemons[home] = daemon
         self.until(f"{home} daemon becomes ready", lambda: daemon_pid(self, home) == daemon.pid, [daemon], timeout=300)
@@ -317,13 +331,19 @@ class Run:
         return ran.stdout, raw_hash
 
     def stop(self) -> None:
+        failures = []
+        # Release test gates before resuming stopped processes; retain all capture evidence.
+        for gate in self.result_gates:
+            try:
+                (gate / "release").touch()
+            except OSError as why:
+                failures.append(f"result gate {gate}: {why}")
         # A failure while a daemon is SIGSTOPped must not strand it or its client.
         for pid in self.suspended:
             try:
                 os.kill(pid, signal.SIGCONT)
             except ProcessLookupError:
                 pass
-        failures = []
         for process in [*(p for p, _, _ in self.clients), *self.daemons.values(), *self.services]:
             try:
                 self.terminate(process)
@@ -332,6 +352,18 @@ class Run:
         self.socket.unlink(missing_ok=True)
         if failures:
             raise Failed("owned-process cleanup failed: " + "; ".join(failures))
+
+    def held_result(self, home: str, process: subprocess.Popen, gate: Path, after: int, *, suspend: bool) -> dict:
+        pid = self.daemons[home].pid
+        grant = self.until(f"{home} captures an actual uncommitted Result carrier",
+                           lambda: evidence.held_result(gate, self.events()[after:], pid), [process])
+        if suspend:
+            os.kill(pid, signal.SIGSTOP)
+            self.suspended.add(pid)
+            self.until(f"{home} acknowledges SIGSTOP with its real result held",
+                       lambda: stopped_status(pid), [process], timeout=self.given.command_timeout)
+        check(not evidence.accepted(self.events()[after:], grant), "the exact captured result remains uncommitted at its gate")
+        return grant
 
     def suspend_grant(self, home: str, process: subprocess.Popen, after: int) -> dict:
         pid = self.daemons[home].pid
@@ -397,6 +429,25 @@ def control(run: Run, project: Path | None = None) -> tuple[str, str]:
 
 
 def faults(run: Run, edited: Path) -> None:
+    # Positive causal control: capture a real result and release it before its lease expires.
+    # This uses the default long lease; the stale case below adds expiry and replacement.
+    edit(edited, 'format!("9:{sum}', 'format!("9 gated valid:{sum}')
+    wanted = control(run)
+    valid_gate = run.root / "gates" / "valid-result"
+    run.daemon("a", result_gate=valid_gate)
+    mark = len(run.events())
+    valid, valid_log = run.build("a", wait=False)
+    grant = run.held_result("a", valid, valid_gate, mark, suspend=False)
+    (valid_gate / "release").touch()
+    run.until("the released valid Result is accepted by the real coordinator and Client",
+              lambda: evidence.accepted(run.events()[mark:], grant)
+              and evidence.gate_answer(valid_gate, grant, refused=False), [valid])
+    code = run.wait(valid)
+    check(code == 0, f"the valid-result control finishes: {Path(valid_log).read_text()[-800:] if code else ''}")
+    check(not evidence.stale_refused(run.events()[mark:], grant), "the valid captured result was not refused as stale")
+    check(run.behaviour("a") == wanted, "the released valid-result artifact equals solo in bytes and behavior")
+    edit(edited, 'format!("9 gated valid:{sum}', 'format!("9:{sum}')
+
     # Freeze a known uncommitted grant before killing: a completed unit/report is no evidence
     # that the victim had outstanding work. Give the survivor the exact same edited input.
     edit(edited, 'format!("7:{sum}', 'format!("7 lost:{sum}')
@@ -426,19 +477,25 @@ def faults(run: Run, edited: Path) -> None:
     run.start_coordinator()
     edit(edited, 'format!("8:{sum}', 'format!("8 fence:{sum}')
     wanted = control(run)
-    run.daemon("a")
+    stale_gate = run.root / "gates" / "stale-result"
+    run.daemon("a", result_gate=stale_gate)
     run.daemon("b")
     mark = len(run.events())
     stalled, stalled_log = run.build("a", wait=False)
+    # The victim reaches its real result before the survivor submits, so the selected
+    # holder is this execution's lead. Its silence advances the attempt even if the
+    # survivor publishes Done before SIGCONT and the stale submission.
+    grant = run.held_result("a", stalled, stale_gate, mark, suspend=True)
     healthy, healthy_log = run.build("b", wait=False)
-    grant = run.suspend_grant("a", stalled, mark)
     run.until("replacement commits while stale holder remains stopped",
               lambda: evidence.recovered(run.events()[mark:], grant), [healthy])
     check(not evidence.accepted(run.events()[mark:], grant), "the stopped lease was uncommitted when its work was taken back")
+    (stale_gate / "release").touch()
     os.kill(grant["pid"], signal.SIGCONT)
     run.suspended.remove(grant["pid"])
-    run.until("resumed holder's actual stale result is explicitly refused",
-              lambda: evidence.stale_refused(run.events()[mark:], grant), [stalled])
+    run.until("resumed holder's actual stale result is explicitly refused by coordinator and Client",
+              lambda: evidence.stale_refused(run.events()[mark:], grant)
+              and evidence.gate_answer(stale_gate, grant, refused=True), [stalled])
     code_h, code_s = run.wait(healthy), run.wait(stalled)
     check(code_h == 0, f"the healthy worker finishes: {Path(healthy_log).read_text()[-800:] if code_h else ''}")
     check(code_s == 0, f"the resumed worker finishes: {Path(stalled_log).read_text()[-800:] if code_s else ''}")
@@ -562,6 +619,9 @@ def main(given: Input) -> None:
         print(f"     one execution of both: {sorted(row['unit'] for row in shared)}", flush=True)
         check(bool(shared), "both daemons actually compile the same unit in the same execution and attempt")
         evidence.publication(run.root / "blobs", rows_a + rows_b, run.events())
+        if given.release_fold:
+            evidence.release_fold(rows_a + rows_b, run.events())
+            check(True, "two holders actually emitted LLVM work and two holders emitted folded bundles in shared executions")
         check(True, "no granted template was recompiled in the tail or by another daemon; every raw emitted key was committed in the full manifest")
         for name, behaviour in (("a", run.behaviour("a")), ("b", run.behaviour("b"))):
             check(behaviour[0] == solo[0], f"worker {name}'s program behaves as solo's")

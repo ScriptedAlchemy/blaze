@@ -63,9 +63,9 @@ use std::sync::Arc;
 
 use blaze_codegen::settings::{Sanitize, Sanitizers};
 use blaze_codegen::{Arch, NativeLib, NativeLibKind};
+use blaze_core::lock::Lock;
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
-use blaze_core::lock::Lock;
 use smallvec::SmallVec;
 use std::alloc::Global;
 
@@ -160,6 +160,72 @@ pub fn locate(
     // clone: once per link, the rpaths the output owns
     output.rpaths.extend(output.link.rpaths.iter().cloned());
     Ok(located)
+}
+
+/// Bind bundled static libraries to the files found with their declaring crate's search
+/// paths, before combining that crate's libraries with the rest of a program's link line.
+/// The absolute, verbatim names keep two packages' same-named archives distinct. Unbundled
+/// libraries keep their names for [`locate`] to resolve with the final link's search paths.
+pub fn bundle(
+    output: &Output,
+    libs: &mut [NativeLib],
+    search: &[PathBuf],
+    sysroot: &Path,
+) -> Result<(), LinkError> {
+    bundle_with(&CACHE, &System, output, libs, search, sysroot)
+}
+
+fn bundle_with<A: Ask>(
+    cache: &Cache,
+    ask: &A,
+    output: &Output,
+    libs: &mut [NativeLib],
+    search: &[PathBuf],
+    sysroot: &Path,
+) -> Result<(), LinkError> {
+    let target = Target::parse(&output.triple)?;
+    let bundled = |lib: &NativeLib| {
+        matches!(lib.kind, NativeLibKind::Static { bundle: true, .. })
+            && (lib.verbatim || !target.provided_by_rust(&lib.name))
+    };
+    if !libs.iter().any(bundled) {
+        return Ok(());
+    }
+    let found = cache.found(ask, target, Some(sysroot))?;
+    let line = Line {
+        cache,
+        output,
+        search,
+        found: &found,
+        out: Vec::new(),
+        listings: RefCell::default(),
+    };
+    for lib in libs.iter_mut().filter(|lib| bundled(lib)) {
+        let (path, _) = line.find(&lib.name, lib.kind, lib.verbatim)?;
+        // alloc: once per bundled declaration, the path carried into the final link
+        let path = std::path::absolute(&path).map_err(|error| {
+            // alloc: error path
+            fail(format!(
+                "the bundled native library `{}` at {}: {error}",
+                lib.name,
+                path.display()
+            ))
+        })?;
+        // alloc: once per bundled declaration, the exact path carried into the final link
+        lib.name = path
+            .to_str()
+            .ok_or_else(|| {
+                // alloc: error path; NativeLib names must be UTF-8, never lossily rebound
+                fail(format!(
+                    "the bundled native library `{}` has a non-UTF-8 path: {}",
+                    lib.name,
+                    path.display()
+                ))
+            })?
+            .to_owned();
+        lib.verbatim = true;
+    }
+    Ok(())
 }
 
 /// The release channel in the sanitizer runtimes' names, as rustc's `CFG_RELEASE_CHANNEL`
@@ -1563,6 +1629,18 @@ impl Line<'_> {
             return Err(fail("a native library with no name".to_owned()));
         }
         let files = files(self.output.format, name, kind, verbatim)?;
+        // A bundled archive is already selected by its declaring crate. Resolve its exact
+        // path even on a target with no search directories (wasm32-unknown-unknown).
+        if let [(file, kind)] = files.as_slice()
+            && Path::new(file).is_absolute()
+        {
+            let path = Path::new(file);
+            return match path.is_file() {
+                // alloc: once per exact native input on the final link line
+                true => Ok((path.to_path_buf(), *kind)),
+                false => Err(not_found(name, &files, std::iter::empty(), &[])),
+            };
+        }
         let framework = matches!(kind, NativeLibKind::Framework);
         for dir in self.dirs(framework) {
             for (file, kind) in &files {

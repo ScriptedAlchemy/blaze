@@ -8,7 +8,7 @@ use std::sync::{
 };
 
 use blaze_dist::admission::{Admission, AdmissionConfig};
-use blaze_dist::jobs::{ExecutionConfig, Jobs};
+use blaze_dist::jobs::{CompletionMode, ExecutionConfig, Jobs};
 use blaze_dist_local::coordinator::Config;
 use blaze_dist_local::server::{MonotonicClock, Server};
 
@@ -56,6 +56,7 @@ fn coordinate(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Err
         admission,
         ExecutionConfig {
             work: blaze_dist::work::WorkConfig { grant_roots: 64, lease_ms, ..defaults },
+            completion: CompletionMode::PublishedWork,
             ..Default::default()
         },
     );

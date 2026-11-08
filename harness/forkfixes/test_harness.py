@@ -41,13 +41,14 @@ class HarnessChecks(unittest.TestCase):
             self.assertEqual(evidence.read_text(), "kept")
 
     def test_environment_preserves_library_and_assigned_resources_without_delegation(self):
-        env = {"BLAZE_LIBRARY": "/library", "BLAZE_CORES": "12", "BLAZE_DAEMON_MEMORY_GB": "64",
+        env = {"BLAZE_LIBRARY": "/library", "BLAZE_CORES": "12", "BLAZE_DAEMON_MEMORY_GB": "64", "BLAZE_HUGE_PAGES": "off",
                "BLAZE_DIST_SOCKET": "foreign", "RUSTC": "foreign", "CARGO_TARGET_DIR": "foreign"}
         with tempfile.TemporaryDirectory() as directory, patch.dict(runner.os.environ, env, clear=True):
             actual = runner.env_for(Path(directory))
         self.assertEqual(actual["BLAZE_LIBRARY"], "/library")
         self.assertEqual(actual["BLAZE_CORES"], "12")
         self.assertEqual(actual["BLAZE_DAEMON_MEMORY_GB"], "64")
+        self.assertEqual(actual["BLAZE_HUGE_PAGES"], "off")
         self.assertFalse({"BLAZE_DIST_SOCKET", "RUSTC", "CARGO_TARGET_DIR"} & actual.keys())
 
     def test_timeout_keeps_full_output_and_bounds_kill_and_reap(self):

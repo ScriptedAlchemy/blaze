@@ -44,6 +44,9 @@ pub struct ExecutionConfig {
 pub enum CompletionMode {
     /// Success requires the current lead's agreed, completed work set.
     WorkProtocol,
+    /// Work completion is followed by an attempt-owned full-manifest commit. The execution
+    /// remains live through the lead's tail and the cache mirror of that immutable commit.
+    PublishedWork,
     /// Admission established that no compile work is required (for example verified cached
     /// artifacts or an already-built test shard). The lead still reports the final verdict.
     /// This is a driver decision, not a worker claim or inference from an empty unit.
@@ -170,6 +173,10 @@ pub struct Execution {
     events: Vec<EventItem>,
     stages: Vec<(Stage, Millis)>,
     compiled: Option<(Attempt, u64)>,
+    /// The full manifest accepted while its publisher held the current lead attempt. It is
+    /// immutable across retries and lead replacement; copying it to a cache is delivery.
+    publication: Option<Vec<PackRef>>,
+    publication_delivered: bool,
     terminals: BTreeMap<u64, SubscriberTerminalV2>,
     refused: bool,
     state: ExecState,
@@ -205,6 +212,8 @@ impl Execution {
             events: Vec::new(),
             stages: Vec::new(),
             compiled: None,
+            publication: None,
+            publication_delivered: false,
             terminals: BTreeMap::new(),
             refused: false,
             state: ExecState::Queued,
@@ -534,14 +543,97 @@ impl Execution {
         Ok(answer)
     }
 
-    /// Current-attempt/root-epoch authority, not a worker's Compiled notification.
-    fn success_ready(&self) -> bool {
+    /// The full output record, if a current-attempt lead committed one. Readers may take it
+    /// before its cache mirror is delivered; every named immutable blob was uploaded first.
+    pub fn publication(&self) -> Option<&[PackRef]> {
+        self.publication.as_deref()
+    }
+
+    /// Atomically accepts one full output record from the current lead. This is the
+    /// publication linearization point, not a liveness check preceding an unfenced PUT.
+    /// A replacement lead can deliver the accepted record but cannot replace its contents.
+    pub fn commit_publication(
+        &mut self,
+        now: Millis,
+        from: &str,
+        attempt: Attempt,
+        packs: &[PackRef],
+        out: &mut Vec<Effect>,
+    ) -> Result<(), Refusal> {
+        self.tick(now, out);
+        if matches!(self.state, ExecState::Ended(_)) {
+            return Err(Refusal::Ended);
+        }
+        if attempt != self.attempt {
+            return Err(Refusal::AttemptMoved);
+        }
+        if self.lead.as_deref() != Some(from) {
+            return Err(Refusal::NotHolder);
+        }
+        if packs.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Refusal::Malformed("publication packs are not canonical".to_owned()));
+        }
+        if let Some(committed) = &self.publication {
+            return if committed == packs {
+                Ok(())
+            } else {
+                Err(Refusal::Malformed("publication changed after its commit".to_owned()))
+            };
+        }
+        if !self.work_ready() {
+            return Err(Refusal::Malformed("publication before work completion".to_owned()));
+        }
+        if self.work.as_ref().is_some_and(|work| {
+            work.report().packs.iter().any(|pack| packs.binary_search(pack).is_err())
+        }) {
+            return Err(Refusal::Malformed("publication omits committed work".to_owned()));
+        }
+        self.publication = Some(packs.to_vec()); // alloc: one bounded full manifest per execution
+        self.lead_heard = now;
+        self.heard.insert(from.to_owned(), now);
+        self.stage(now, Stage::Published, out);
+        Ok(())
+    }
+
+    /// A subscriber delivered the exact accepted record to the shared cache. Delivery is
+    /// idempotent and carries no new output authority, so a helper can finish it after the
+    /// lead dies. A terminal outcome is never resurrected or replaced.
+    pub fn deliver_publication(
+        &mut self,
+        now: Millis,
+        packs: &[PackRef],
+        out: &mut Vec<Effect>,
+    ) -> Result<(), Refusal> {
+        self.tick(now, out);
+        if self.publication.as_deref() != Some(packs) {
+            return Err(Refusal::Malformed("delivery names no accepted publication".to_owned()));
+        }
+        match &self.state {
+            ExecState::Ended(Outcome::Passed) if self.publication_delivered => return Ok(()),
+            ExecState::Ended(_) => return Err(Refusal::Ended),
+            ExecState::Queued | ExecState::Running => {}
+        }
+        self.publication_delivered = true;
+        self.end(now, Outcome::Passed, EndWhy::Reported, out);
+        Ok(())
+    }
+
+    fn work_ready(&self) -> bool {
         self.config.completion == CompletionMode::NoCompileWork
             || self.work.as_ref().is_some_and(|work| {
                 work.is_done()
                     && work.lead_joined()
                     && self.compiled == Some((self.attempt, work.root_epoch()))
             })
+    }
+
+    /// A full manifest remains authoritative after lead replacement, even before that lead
+    /// rejoins the completed work set: it delivers this record rather than compiling again.
+    fn success_ready(&self) -> bool {
+        match self.config.completion {
+            CompletionMode::PublishedWork => self.publication_delivered,
+            CompletionMode::WorkProtocol | CompletionMode::NoCompileWork => self.work_ready(),
+        }
     }
 
     /// `GET /v1/jobs/<execution>/events?from=N`: the items after sequence `from`.
@@ -1095,6 +1187,41 @@ impl Jobs {
         answer
     }
 
+    /// Commit a full manifest with the same attempt fencing as work results. The record
+    /// survives lead replacement, while the normal assignment effects remain authoritative.
+    pub fn commit_publication(
+        &mut self,
+        now: Millis,
+        execution: ExecutionId,
+        from: &str,
+        attempt: Attempt,
+        packs: &[PackRef],
+        out: &mut Vec<(ExecutionId, Effect)>,
+    ) -> Result<(), Refusal> {
+        self.tick(now, out);
+        let e = self.executions.get_mut(&execution).ok_or(Refusal::NoExecution)?;
+        let mut log = Vec::new();
+        let answer = e.commit_publication(now, from, attempt, packs, &mut log);
+        self.after(now, execution, log, out);
+        answer
+    }
+
+    /// Records delivery of the immutable full manifest and ends its execution once.
+    pub fn deliver_publication(
+        &mut self,
+        now: Millis,
+        execution: ExecutionId,
+        packs: &[PackRef],
+        out: &mut Vec<(ExecutionId, Effect)>,
+    ) -> Result<(), Refusal> {
+        self.tick(now, out);
+        let e = self.executions.get_mut(&execution).ok_or(Refusal::NoExecution)?;
+        let mut log = Vec::new();
+        let answer = e.deliver_publication(now, packs, &mut log);
+        self.after(now, execution, log, out);
+        answer
+    }
+
     /// `POST /v1/workers/events` for `execution`.
     pub fn worker_events(
         &mut self,
@@ -1185,7 +1312,7 @@ impl Jobs {
             .values()
             .filter(|e| {
                 matches!(e.state(), ExecState::Running)
-                    && e.config.completion == CompletionMode::WorkProtocol
+                    && e.config.completion != CompletionMode::NoCompileWork
                     && e.lead().is_some()
                     && e.work().is_some_and(|w| !w.is_done())
             })
@@ -1357,3 +1484,6 @@ mod retention_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod publication_tests;

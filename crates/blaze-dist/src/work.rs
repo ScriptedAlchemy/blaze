@@ -1260,6 +1260,34 @@ impl WorkSet {
         }
     }
 
+    /// Names actually committed by this exact result, for the driver's observation. This
+    /// inspects only the bounded grant, not a copy of the entire execution's root table.
+    pub fn committed_names(&self, request: &BatchResult) -> Vec<WorkName> {
+        let Some(issued) = self.leases.get(&request.lease.generation) else { return Vec::new() };
+        let Ok((roots, names, _, _)) = shape(issued, request) else { return Vec::new() };
+        let accepted = |slot: &Slot, item: &ItemResult| {
+            matches!(slot,
+            Slot::Done(Terminal::Committed { outcome, by })
+                if matches!(outcome, ItemOutcome::Exported(_) | ItemOutcome::FromStore(_))
+                    && *outcome == item.outcome && by.holder == request.lease.holder
+                    && by.generation == request.lease.generation && by.seq == request.seq)
+        };
+        let root_count = roots.len() as usize;
+        roots
+            .indexes()
+            .zip(&request.items[..root_count])
+            .filter_map(|(index, item)| {
+                self.roots
+                    .get(index as usize)
+                    .filter(|slot| accepted(&slot.state, item))
+                    .map(|_| item.name)
+            })
+            .chain(names.iter().zip(&request.items[root_count..]).filter_map(|(name, item)| {
+                self.names.get(name).filter(|slot| accepted(&slot.state, item)).map(|_| item.name)
+            }))
+            .collect() // alloc: at most one work name per item of the bounded result
+    }
+
     /// Every work item's state now.
     pub fn report(&self) -> Report {
         let terminal = |slot: &Slot| match slot {

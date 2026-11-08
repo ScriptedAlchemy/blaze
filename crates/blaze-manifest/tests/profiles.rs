@@ -3,14 +3,14 @@
 //! `PROFILE_RUNS`, and kept as blaze's own expected output): the profile blaze-manifest computes for every unit,
 //! the warnings about profiles and the error when cargo refused the profiles, against cargo's.
 
-// `expected.json` is what cargo printed on Linux: its unit graph names Linux paths, put in a
-// JSON text as they are, which a Windows path's `\` is not.
-#![cfg(unix)]
 #![allow(dead_code, reason = "the walk module, of which the test uses `main`")]
 #![feature(allocator_api)]
 
 #[path = "support/profiles_walk.rs"]
 mod walk;
+
+#[path = "support/paths.rs"]
+mod fixture_paths;
 
 use std::path::Path;
 
@@ -60,7 +60,7 @@ fn check(fixture: &Path, scratch: &Path) -> (usize, Vec<String>) {
     let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
     let root = scratch.join(&name);
     copy_dir(fixture, &root);
-    let root = root.canonicalize().unwrap();
+    let root = dunce::canonicalize(root).unwrap();
     let home = scratch.join("cargo-home");
     std::fs::create_dir_all(&home).unwrap();
     let home = home.canonicalize().unwrap();
@@ -70,9 +70,7 @@ fn check(fixture: &Path, scratch: &Path) -> (usize, Vec<String>) {
     };
     let cwd = root.join(case["cwd"].as_str().unwrap_or(""));
     let root_text = root.display().to_string();
-    let normalize = |text: &str| {
-        text.replace(&home.display().to_string(), "$CARGO_HOME").replace(&root_text, "$ROOT")
-    };
+    let normalize = |text: &str| fixture_paths::normalize(text, &root, &home);
     let expected: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(fixture.join("expected.json")).unwrap())
             .unwrap();
@@ -87,7 +85,11 @@ fn check(fixture: &Path, scratch: &Path) -> (usize, Vec<String>) {
         }
         let graph = match &run["graph"] {
             serde_json::Value::Null => String::new(),
-            graph => graph.to_string().replace("$ROOT", &root_text),
+            graph => {
+                let mut graph = graph.clone();
+                fixture_paths::expand(&mut graph, &root, &home);
+                graph.to_string()
+            }
         };
         let output = walk::main(&cwd, env, host, &args, &graph);
         let what = format!("{name} `{}`", args.join(" "));

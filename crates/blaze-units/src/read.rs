@@ -299,7 +299,7 @@ pub fn path_packages<F: Files>(
     let mut queue = patch_paths(root);
     queue.extend(replace_paths(replace));
     for (path, m) in ws.members() {
-        queue.extend(path_dependencies(&export_package(path, m)));
+        queue.extend(path_dependencies(&export_package(path, m, ctx.files())?));
     }
     let mut read = Vec::new(); // alloc: the path packages, once per load
     while let Some(dir) = queue.pop() {
@@ -312,7 +312,7 @@ pub fn path_packages<F: Files>(
         let EitherManifest::Real(manifest) = read_manifest(&manifest_path, source, ctx)? else {
             bail!("{} is a path dependency with no package", manifest_path.display());
         };
-        queue.extend(path_dependencies(&export_package(&manifest_path, &manifest)));
+        queue.extend(path_dependencies(&export_package(&manifest_path, &manifest, ctx.files())?));
         read.push(Package { manifest_path, manifest, locked_source: None });
     }
     Ok(read)

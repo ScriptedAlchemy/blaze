@@ -8,8 +8,8 @@ use object::write::Object as Builder;
 use object::{Architecture, BinaryFormat, Endianness, SectionKind};
 
 use super::{
-    Ask, Cache, Located, Target, caseless, fhs, listing, loader, locate_with, output_with,
-    parse_version, reactor_with, rpaths, top_level_string,
+    Ask, Cache, Located, Target, bundle_with, caseless, fhs, listing, loader, locate_with,
+    output_with, parse_version, reactor_with, rpaths, top_level_string,
 };
 use crate::{Debug, Format, LinkError, NativeKind, Output, OutputKind, Platform, Searched};
 
@@ -245,6 +245,93 @@ const SHARED: NativeKind = NativeKind::Shared { as_needed: true };
 const ARCHIVED: NativeKind = NativeKind::Archive { whole: false };
 
 #[test]
+fn unbundled_libraries_keep_the_final_links_search_paths() {
+    let cache = Cache::new();
+    let answers = Answers::new();
+    let output = shared(&cache, &answers, "wasm32-unknown-unknown").unwrap();
+    let (a, b) = (temp("bundle-final"), temp("bundle-owner"));
+    touch(&a.join("libcollision.a"), ARCHIVE);
+    touch(&b.join("private.a"), ARCHIVE);
+    let exact = NativeLib {
+        name: "private.a".into(),
+        kind: NativeLibKind::Static { whole: true, bundle: true },
+        verbatim: true,
+    };
+    let unbundled = NativeLib {
+        name: "collision".into(),
+        kind: NativeLibKind::Static { whole: false, bundle: false },
+        verbatim: false,
+    };
+    let dynamic = dylib("collision");
+    let framework =
+        NativeLib { name: "Security".into(), kind: NativeLibKind::Framework, verbatim: false };
+    let mut libs = [exact, unbundled.clone(), dynamic.clone(), framework.clone()];
+    bundle_with(&cache, &answers, &output, &mut libs, &[b.clone()], Path::new("/no-toolchain"))
+        .unwrap();
+    assert_eq!(&libs[1..], &[unbundled, dynamic, framework]);
+    let located = locate_plain(&cache, &answers, &output, &libs[..3], &[a.clone()]).unwrap();
+    assert_eq!(
+        line(&located),
+        [
+            (b.join("private.a"), NativeKind::Archive { whole: true }),
+            (a.join("libcollision.a"), ARCHIVED),
+        ]
+    );
+    assert_eq!(
+        line(&locate_plain(&cache, &answers, &output, &libs[..1], &[]).unwrap()),
+        [(b.join("private.a"), NativeKind::Archive { whole: true })],
+        "an exact bundled path needs no final search directory"
+    );
+    assert_eq!(answers.asked(), 0, "binding runs no compiler or linker");
+}
+
+#[test]
+fn missing_bundled_libraries_keep_native_resolution_errors() {
+    let cache = Cache::new();
+    let answers = Answers::new();
+    let output = shared(&cache, &answers, "wasm32-unknown-unknown").unwrap();
+    let (owner, other) = (temp("bundle-missing"), temp("bundle-other"));
+    let mut libs = [static_lib("collision", false)];
+    let search = [owner.clone()];
+    let before = locate_plain(&cache, &answers, &output, &libs, &search).unwrap_err();
+    let bound =
+        bundle_with(&cache, &answers, &output, &mut libs, &search, Path::new("/no-toolchain"))
+            .unwrap_err();
+    assert_eq!(bound.what, before.what);
+    assert!(bound.what.contains("libcollision.a") && bound.what.contains(owner.to_str().unwrap()));
+
+    touch(&owner.join("libcollision.a"), ARCHIVE);
+    touch(&other.join("libcollision.a"), ARCHIVE);
+    bundle_with(&cache, &answers, &output, &mut libs, &search, Path::new("/no-toolchain")).unwrap();
+    std::fs::remove_file(owner.join("libcollision.a")).unwrap();
+    let gone = locate_plain(&cache, &answers, &output, &libs, &[other]).unwrap_err();
+    assert!(gone.what.contains(owner.join("libcollision.a").to_str().unwrap()));
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_bundled_search_paths_become_exact_absolute_inputs() {
+    let cache = Cache::new();
+    let answers = Answers::new();
+    let output = shared(&cache, &answers, "wasm32-unknown-unknown").unwrap();
+    let dir = temp("bundle-relative");
+    touch(&dir.join("librelative.a"), ARCHIVE);
+    // Reach the temporary directory from cwd without changing the process-wide cwd.
+    let mut relative = PathBuf::new();
+    for _ in std::env::current_dir().unwrap().ancestors().skip(1) {
+        relative.push("..");
+    }
+    relative.push(dir.strip_prefix("/").unwrap());
+    assert!(!relative.is_absolute());
+    let mut libs = [static_lib("relative", false)];
+    bundle_with(&cache, &answers, &output, &mut libs, &[relative], Path::new("/no-toolchain"))
+        .unwrap();
+    assert!(Path::new(&libs[0].name).is_absolute());
+    let located = locate_plain(&cache, &answers, &output, &libs, &[]).unwrap();
+    assert_eq!(std::fs::read(&located[0].path).unwrap(), ARCHIVE);
+}
+
+#[test]
 fn a_linux_executable_is_entered_at_start_and_interpreted_by_its_libcs_loader() {
     for (triple, target, arch) in [
         ("x86_64-unknown-linux-gnu", Target::LinuxX86_64, Arch::X86_64),
@@ -384,15 +471,11 @@ fn a_wasm64_command_links_no_c_runtime_and_its_rust_runtime_provides_c() {
     // No wasi-libc: an empty toolchain is enough, and the `libc` crate's `c` is not searched
     // for, where any other library still is.
     let empty = temp("wasm64-sysroot");
-    let located = locate_with(
-        &Cache::new(),
-        &Answers::new(),
-        &output,
-        &[dylib("c"), static_lib("c", false)],
-        &[],
-        &empty,
-    )
-    .unwrap();
+    let mut libraries = [dylib("c"), static_lib("c", false)];
+    bundle_with(&Cache::new(), &Answers::new(), &output, &mut libraries, &[], &empty).unwrap();
+    assert_eq!(libraries, [dylib("c"), static_lib("c", false)]);
+    let located =
+        locate_with(&Cache::new(), &Answers::new(), &output, &libraries, &[], &empty).unwrap();
     assert!(located.is_empty(), "{located:?}");
     let error = locate_with(
         &Cache::new(),

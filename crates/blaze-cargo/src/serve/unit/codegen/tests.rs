@@ -18,22 +18,112 @@ use blaze_codegen::InstanceKey;
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
 #[test]
+fn bundled_archives_keep_the_declaring_crates_search_paths() {
+    use std::path::Path;
+
+    use blaze_build_script::apply::Compile;
+    use blaze_link::args::rustflags::Rustflags;
+
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("a");
+    let b = root.path().join("b");
+    for (dir, bytes) in [(&a, b"package a"), (&b, b"package b")] {
+        std::fs::create_dir(dir).unwrap();
+        std::fs::write(dir.join("libcollision.a"), bytes).unwrap();
+    }
+    // This target needs no C runtime, so the test exercises the real lookup and final
+    // line without consulting the host's C driver or starting a build.
+    let mut output = blaze_link::target::output(
+        "wasm32-unknown-unknown",
+        Some(("packages.wasm".into(), Vec::new())),
+        blaze_link::Debug::None,
+        false,
+    )
+    .unwrap();
+    let sysroot = Path::new("/no-blaze-toolchain");
+    let flags = Rustflags::default();
+    let mut bundled = Vec::new();
+    for dir in [&a, &b] {
+        let compile = Compile {
+            // A crate-only search path must not shadow a native path.
+            search: vec![
+                format!("crate={}", a.display()).into(),
+                format!("native={}", dir.display()).into(),
+                format!("native={}", a.display()).into(),
+            ],
+            libs: vec!["static=collision".into()],
+            ..Compile::default()
+        };
+        let mut libs =
+            compile.libs.iter().map(|lib| super::link_lib(lib).unwrap()).collect::<Vec<_>>();
+        super::bundle_natives(&output, &mut libs, &flags, &compile, sysroot).unwrap();
+        bundled.extend(libs);
+    }
+    for search in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
+        let located = blaze_link::target::locate(&mut output, &bundled, &search, sysroot).unwrap();
+        assert_eq!(
+            located.iter().map(|it| it.path.clone()).collect::<Vec<_>>(),
+            [a.join("libcollision.a"), b.join("libcollision.a")]
+        );
+        assert_eq!(std::fs::read(&located[0].path).unwrap(), b"package a");
+        assert_eq!(std::fs::read(&located[1].path).unwrap(), b"package b");
+
+        // Planted old behavior: flatten declarations without binding their paths. The
+        // oracle must see the second archive disappear, whichever final directory wins.
+        let unbound = [
+            super::link_lib("static=collision").unwrap(),
+            super::link_lib("static=collision").unwrap(),
+        ];
+        let lost = blaze_link::target::locate(&mut output, &unbound, &search, sysroot).unwrap();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].path, search[0].join("libcollision.a"));
+    }
+
+    // Rustflags' native paths precede a script's; neither crate-only nor dependency-only
+    // paths participate. The same binding covers -l and #[link] declarations.
+    let flags = Rustflags {
+        search: vec![
+            format!("dependency={}", a.display()).into(),
+            format!("native={}", b.display()).into(),
+        ],
+        ..Rustflags::default()
+    };
+    let compile = Compile { search: vec![a], ..Compile::default() };
+    let mut libs = [super::link_lib("static:+whole-archive=collision").unwrap()];
+    super::bundle_natives(&output, &mut libs, &flags, &compile, sysroot).unwrap();
+    let located = blaze_link::target::locate(&mut output, &libs, &[], sysroot).unwrap();
+    assert_eq!(located[0].path, b.join("libcollision.a"));
+    assert_eq!(located[0].kind, blaze_link::NativeKind::Archive { whole: true });
+}
+
+#[test]
 fn a_crate_layout_override_is_refused_before_codegen_can_reuse_another_layouts_key() {
     let target = blaze_lower::target_data(HOST).unwrap();
     let mut workspace = base_db::CrateWorkspaceData {
-        target: Ok(target), toolchain: None, const_eval: Default::default(),
+        target: Ok(target),
+        toolchain: None,
+        const_eval: Default::default(),
     };
     assert_eq!(super::verify_target_data(HOST, &workspace), Ok(()));
     let original = workspace.target.clone(); // clone: restore the layout after each control
     workspace.target.as_mut().unwrap().data_layout = "e-p:32:32".into();
     let error = super::verify_target_data(HOST, &workspace).unwrap_err();
-    assert!(error.contains(HOST) && error.contains("e-p:32:32") && error.contains("toolchain key"), "{error}");
+    assert!(
+        error.contains(HOST) && error.contains("e-p:32:32") && error.contains("toolchain key"),
+        "{error}"
+    );
     workspace.target = original;
     assert_eq!(super::verify_target_data(HOST, &workspace), Ok(()));
     workspace.target.as_mut().unwrap().has_thumb_interworking = true;
-    assert!(super::verify_target_data(HOST, &workspace).is_err(), "the target's other layout facts count too");
+    assert!(
+        super::verify_target_data(HOST, &workspace).is_err(),
+        "the target's other layout facts count too"
+    );
     workspace.target = Err("the crate's target could not be loaded".into());
-    assert_eq!(super::verify_target_data(HOST, &workspace).unwrap_err(), "the crate's target could not be loaded");
+    assert_eq!(
+        super::verify_target_data(HOST, &workspace).unwrap_err(),
+        "the crate's target could not be loaded"
+    );
 }
 
 fn profile(name: &str, opt_level: &str, backend: Option<&str>) -> Profile {
