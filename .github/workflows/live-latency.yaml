@@ -77,7 +77,7 @@ jobs:
     needs: latency
     # The programs that did run are recorded even when another failed.
     if: always() && github.ref == 'refs/heads/main'
-    runs-on: [ix, arm64, ix-mode-cold]
+    runs-on: ubuntu-24.04-arm
     env:
       GH_TOKEN: ${{ github.token }}
     steps:

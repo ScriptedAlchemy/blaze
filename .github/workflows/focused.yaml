@@ -78,7 +78,7 @@ jobs:
     name: focused
     needs: [linux-arm64, macos, windows]
     if: always()
-    runs-on: [ix, arm64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
       - env:

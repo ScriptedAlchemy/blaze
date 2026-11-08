@@ -48,7 +48,7 @@ jobs:
   # Validate the build against the trusted dispatch commit before consuming its artifact.
   blaze:
     name: blaze
-    runs-on: [ix, arm64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     outputs:
       run-id: ${{ steps.build.outputs.run-id }}
@@ -62,7 +62,7 @@ jobs:
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (hosted runner is arm64)
           enable-cache: false
       - id: build
         if: inputs.build-run != ''
@@ -78,7 +78,7 @@ jobs:
   test:
     name: ${{ inputs.suite }}
     needs: blaze
-    runs-on: [ix, arm64, ix-cpu-32, blaze-downstream]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
     defaults:
       run:
@@ -100,7 +100,7 @@ jobs:
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (hosted runner is arm64)
           enable-cache: false
       - name: blaze (a release)
         if: inputs.build-run == ''
@@ -152,7 +152,7 @@ jobs:
     name: uv copy-on-write (Btrfs)
     needs: [blaze, test]
     if: ${{ !cancelled() && inputs.suite == 'uv' }}
-    runs-on: [ix, arm64, ix-cpu-16, blaze-downstream-uv-cow]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -173,7 +173,7 @@ jobs:
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (hosted runner is arm64)
           enable-cache: false
       - name: the copy-on-write tests on Btrfs
         run: |

@@ -35,8 +35,8 @@ env:
 jobs:
   build:
     name: build both blazes
-    runs-on: [ix, arm64, ix-cpu-64, blaze-rival-build]
-    # A cold build of ours by blaze, then Astral's (on a 64-vCPU AArch64 ix runner).
+    runs-on: ubuntu-24.04-arm
+    # A cold build of ours by blaze, then Astral's (on hosted AArch64).
     timeout-minutes: 300
     outputs:
       ours: ${{ steps.commits.outputs.ours }}
@@ -54,7 +54,7 @@ jobs:
           path: astral
           persist-credentials: false
       # Inline, not ./ours/.github/actions/rustup: `ours` is the pull request's base, which may
-      # predate that action. ix's image has no rustup.
+      # predate that action.
       - name: rustup
         run: |
           if ! command -v rustup > /dev/null; then
@@ -72,7 +72,7 @@ jobs:
       # .github/blaze-version names, with its own Rust, and the pinned LLVM below /usr/local/lib
       # (a build script in blaze's sandbox names only system directories of libraries), as
       # .github/actions/blaze sets them up; that action's paths are the workspace's, and this
-      # checkout is under ours/. No swap: an ix runner's memory grows on demand.
+      # checkout is under ours/. Hosted memory limits apply to this cold build.
       - name: our blaze
         working-directory: ours
         run: |
@@ -100,7 +100,7 @@ jobs:
   measure:
     name: rival (${{ matrix.project }})
     needs: build
-    runs-on: [ix, arm64, ix-cpu-16, blaze-rival-measure]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 330
     strategy:
       fail-fast: false
@@ -138,7 +138,7 @@ jobs:
                          env=dict(RUSTUP_TOOLCHAIN=os.environ["ASTRAL_TOOLCHAIN"])),
                     dict(name="cargo", kind="cargo", bin="", commit=tc, env=dict(RUSTUP_TOOLCHAIN=tc))],
               projects=[os.environ["PROJECT"]], work=f"{tmp}/work", out="rival-out", runs=5, tests=True, interleave=False,
-              machine="ix runner (aarch64, 16 vCPU, memory on demand, shared node)")))
+              machine="GitHub-hosted ubuntu-24.04-arm")))
           PY
           python3 -u harness/rival.py "$RUNNER_TEMP/input.json"
       - if: always()
@@ -152,7 +152,7 @@ jobs:
     name: rival report
     needs: measure
     if: always()
-    runs-on: [ix, arm64]
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
         with:

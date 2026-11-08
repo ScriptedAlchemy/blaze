@@ -34,7 +34,7 @@ env:
 jobs:
   notes:
     name: version and notes
-    runs-on: [ix, arm64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     outputs:
       version: ${{ steps.notes.outputs.version }}
@@ -61,7 +61,7 @@ jobs:
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (hosted runner is arm64)
           enable-cache: false
       - run: |
           uv run --frozen python harness/library.py archive "{\"out\": \"$RUNNER_TEMP/library\"}"
@@ -183,7 +183,7 @@ jobs:
     # Off: it would publish 60 permanent `blaze-*` names and `blaze`, both retired (#270);
     # whether and under which names blaze goes to crates.io is decided after the rename.
     if: false
-    runs-on: [ix, arm64, ix-mode-cold]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 340
     steps:
       - uses: actions/checkout@v7
@@ -211,14 +211,14 @@ jobs:
   # release ahead of it would show users only that refusal (0.20261105.1, schema 5, page 1).
   explore-page:
     name: ix.dev/explore reads this schema
-    runs-on: [ix, arm64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (hosted runner is arm64)
           enable-cache: false
       - run: uv run --frozen python .github/scripts/explore_page.py '{}'
 
@@ -226,7 +226,7 @@ jobs:
     name: GitHub release
     needs: [notes, build, explore-page]
     if: github.ref_type == 'tag'
-    runs-on: [ix, arm64, ix-mode-cold]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     permissions:
       contents: write
@@ -240,7 +240,7 @@ jobs:
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (hosted runner is arm64)
           enable-cache: false
       # SHA256SUMS and B3SUMS, `<hex>  <name>` a line as sha256sum and b3sum write them; BLAKE3 is
       # the uv workspace's `blake3`, so the runner needs no system package for it.
@@ -301,7 +301,7 @@ jobs:
     name: pointers and latest.json
     needs: publish
     if: github.ref_type == 'tag'
-    runs-on: [ix, arm64, ix-mode-cold]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     # One at a time across release.yaml, promote.yaml and yank.yaml: each writes the pointers and
     # latest.json from the releases as they are when it runs, so the last one to run is right. A

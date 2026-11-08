@@ -2,9 +2,9 @@
 # and a release of main when it is all green. What runs where, and how long it takes, is in
 # docs/harness.md ("CI").
 #
-#   every harness of harness/ci.py's full tier, on Linux AArch64 (ix), macOS arm64 and
+#   every harness of harness/ci.py's full tier, on hosted Linux AArch64, macOS arm64 and
 #       Windows x86-64, each profile picking its producer (dev Cranelift, release LLVM); `blaze` on small projects (AArch64, macOS) and the larger ones (AArch64); and the ripgrep
-#       bench (not blocking). No Linux x86-64 until ix has x86-64 capacity. nix-live.yaml (the flake's builds, the demo and live edits on macOS)
+#       bench (not blocking). Native Linux x86-64 coverage remains outstanding. nix-live.yaml (the flake's builds, the demo and live edits on macOS)
 #       runs on the same pushes in a workflow of its own: a cold nix build takes up to two hours,
 #       and in the train's run it held main's next train that long
 #   green: when main has changes since the last release, the tag v0.YYYYMMDD.N (today's next
@@ -41,8 +41,7 @@ env:
   BLAZE_CORES: all
 
 jobs:
-  # TODO(x86-64): no Linux x86-64 platform until ix has x86-64 capacity (docs/harness.md "ix
-  # runners"); its small projects and the ripgrep bench run on Linux AArch64 meanwhile.
+  # Native Linux x86-64 coverage remains outstanding; small projects and the bench run on AArch64.
   linux-arm64:
     name: linux arm64
     uses: ./.github/workflows/blaze-platform.yaml
@@ -76,7 +75,7 @@ jobs:
     name: train
     needs: [linux-arm64, macos, windows]
     if: always()
-    runs-on: [ix, arm64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
       - env:
@@ -92,7 +91,7 @@ jobs:
     name: release
     needs: train
     if: needs.train.result == 'success' && github.ref == 'refs/heads/main'
-    runs-on: [ix, arm64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     permissions:
       contents: write
@@ -110,7 +109,7 @@ jobs:
     name: train issue
     needs: [train, release]
     if: always() && github.ref == 'refs/heads/main'
-    runs-on: [ix, arm64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     permissions:
       issues: write
