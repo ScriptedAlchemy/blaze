@@ -455,8 +455,7 @@ fn heartbeat_resend_does_not_grow_independent_pending_heartbeats() {
 #[test]
 fn a_lost_result_cannot_retain_findings_the_coordinator_would_ignore() {
     let (mut holder, mut batch) = compiling(false);
-    batch.roots[0].outcome =
-        ItemOutcome::Lost(blaze_wire::Why { why: "unresolvable".to_owned() });
+    batch.roots[0].outcome = ItemOutcome::Lost(blaze_wire::Why { why: "unresolvable".to_owned() });
     let mut effects = Vec::new();
     holder.step(3, Event::Compiled(batch), &mut effects);
     assert!(holder.is_stopped(), "malformed Lost result must fence its holder");
