@@ -40,11 +40,16 @@ impl Blobs {
         // Read one byte past the cap: reaching an exact read limit is not EOF.
         // A truncated manifest must never masquerade as a complete published unit.
         let mut reply = Vec::new();
-        stream.take(MOST + 1).read_to_end(&mut reply)?;
+        stream.take(MOST + 1).read_to_end(&mut reply).map_err(|error| {
+            read_failure(method, path, &reply, error)
+        })?;
         if reply.len() as u64 > MOST {
-            return Err(Error::Protocol(format!(
-                "{method} {path}: HTTP reply exceeds {MOST} bytes"
-            )));
+            let message = format!("{method} {path}: HTTP reply exceeds {MOST} bytes");
+            return Err(if committed_get_head(method, &reply) {
+                Error::Committed(message)
+            } else {
+                Error::Protocol(message)
+            });
         }
         decode_response(method, path, &reply)
     }
@@ -102,6 +107,29 @@ impl Blobs {
     }
 }
 
+/// A GET whose response already started with HTTP 200 names committed data.
+/// A read error at that point must never turn into permission to rebuild locally
+/// under the immutable key. Earlier IO failures remain subject to local policy.
+fn committed_get_head(method: &str, reply: &[u8]) -> bool {
+    if method != "GET" {
+        return false;
+    }
+    let remaining = reply.strip_prefix(b"HTTP/1.1 200")
+        .or_else(|| reply.strip_prefix(b"HTTP/1.0 200"));
+    remaining.is_some_and(|after| {
+        after.is_empty() || matches!(after[0], b' ' | b'\r' | b'\n')
+    })
+}
+
+fn read_failure(method: &str, path: &str, reply: &[u8], error: std::io::Error) -> Error {
+    if committed_get_head(method, reply) {
+        // alloc: an error path names the committed key and the interrupted transport.
+        Error::Committed(format!("{method} {path}: interrupted committed HTTP 200 reply: {error}"))
+    } else {
+        Error::Io(error)
+    }
+}
+
 /// Decode a complete HTTP/1.1 response after the peer has closed its connection.
 /// Never treat a short body as a complete persisted manifest or pack.
 fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u8>), Error> {
@@ -109,8 +137,22 @@ fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u
     let end = reply
         .windows(4)
         .position(|it| it == b"\r\n\r\n")
-        .ok_or_else(|| invalid("no HTTP head"))?;
-    let head = std::str::from_utf8(&reply[..end]).map_err(|_| invalid("the head is not text"))?;
+        .ok_or_else(|| {
+            if committed_get_head(method, reply) {
+                // alloc: an incomplete committed reply cannot authorize local recompilation.
+                Error::Committed(format!("{method} {path}: truncated committed HTTP 200 headers"))
+            } else {
+                invalid("no HTTP head")
+            }
+        })?;
+    let head = std::str::from_utf8(&reply[..end]).map_err(|_| {
+        if committed_get_head(method, reply) {
+            // alloc: a corrupt committed reply must not be treated as a cache miss.
+            Error::Committed(format!("{method} {path}: committed HTTP 200 headers are not text"))
+        } else {
+            invalid("the head is not text")
+        }
+    })?;
     let status = head
         .split("\r\n")
         .next()
@@ -302,6 +344,47 @@ mod tests {
             decode_response("GET", path, b"HTTP/1.1 404 Not Found\r\n\r\nnot here").unwrap(),
             (404, b"not here".to_vec())
         );
+    }
+
+    #[test]
+    fn an_interrupted_committed_get_cannot_authorize_local_recompilation() {
+        let path = "/v1/list/manifests/test-unit";
+        for bytes in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\npartial".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\npart".as_slice(),
+        ] {
+            let refused = read_failure(
+                "GET", path, bytes, std::io::Error::from(std::io::ErrorKind::TimedOut),
+            );
+            assert!(
+                matches!(&refused, Error::Committed(why) if why.contains(path)),
+                "partial HTTP 200 must be a committed-state refusal: {refused}"
+            );
+            assert!(matches!(
+                crate::agent::decide(&blaze_wire::LocalPolicy::Fallback, refused),
+                Err(Error::Committed(_))
+            ));
+        }
+        for bytes in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nSome-Header: \xff\r\n\r\n".as_slice(),
+        ] {
+            assert!(matches!(decode_response("GET", path, bytes), Err(Error::Committed(_))));
+        }
+        // Before an HTTP 200 is observed, a transport failure can follow the
+        // caller's explicit local policy. Neither 404 nor a PUT is proof of a
+        // committed GET, and a successful GET must not be misclassified as 404.
+        for (method, partial) in [
+            ("GET", b"HTTP/1.1 404 Not Found\r\n".as_slice()),
+            ("GET", b"".as_slice()),
+            ("PUT", b"HTTP/1.1 200 OK".as_slice()),
+        ] {
+            assert!(matches!(
+                read_failure(method, path, partial, std::io::Error::from(std::io::ErrorKind::TimedOut)),
+                Error::Io(_)
+            ));
+        }
     }
 
     #[test]
