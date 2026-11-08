@@ -69,6 +69,7 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         worked: None,
         busy: HashMap::new_in(std::alloc::Global),
         refused_places: HashSet::new_in(std::alloc::Global),
+        refused_store_keys: HashSet::new_in(std::alloc::Global),
         held: Vec::new(),
         look: 0,
         awaiting: None,
@@ -505,28 +506,33 @@ fn an_output_placement_failure_must_not_announce_a_test_executable() {
     assert_eq!(output_readiness(&paths, &busy, &refused, false), OutputReadiness::Ready);
 }
 
-/// A content-key mismatch or compiler refusal is terminal even when an independent
-/// output is already present and has no placement effects left in flight.
+/// An ordinary failed unit does not suppress independent work, but a committed store
+/// collision forbids executing any program from the job, including one placed earlier.
 #[test]
-fn a_refused_compiler_or_store_result_cannot_run_an_earlier_executable() {
+fn an_immutable_store_conflict_refuses_programs_and_conflicting_outputs() {
     let mut job = job(Vec::new());
     let paths = [4, 5];
     let busy = HashMap::new_in(std::alloc::Global);
     let refused = HashSet::new_in(std::alloc::Global);
-    assert!(!job_execution_refused(&job.over));
-    assert_eq!(output_readiness(&paths, &busy, &refused, false), OutputReadiness::Ready);
+    let bad_key = blaze_cas::Key(ContentId([7; 32]));
+    let other_key = blaze_cas::Key(ContentId([8; 32]));
 
-    job.over = Some((false, Some(ApiError::new(
-        "the store holds other bytes under a compiled output's key".into(), None
-    ))));
-    assert!(job_execution_refused(&job.over));
+    job.over = Some((false, Some(ApiError::new("an independent unit failed".into(), None))));
+    assert!(job.refused_store_keys.is_empty());
     assert_eq!(
-        output_readiness(&paths, &busy, &refused, job_execution_refused(&job.over)),
-        OutputReadiness::Refused,
-        "an already placed test binary cannot run after any committed-key mismatch",
+        output_readiness(&paths, &busy, &refused, !job.refused_store_keys.is_empty()),
+        OutputReadiness::Ready,
+        "keep-going must preserve independent test executables after an ordinary compiler failure"
     );
-    job.over = Some((true, None));
-    assert!(!job_execution_refused(&job.over));
+
+    job.refused_store_keys.insert(bad_key);
+    assert!(job.refused_store_keys.contains(&bad_key));
+    assert!(!job.refused_store_keys.contains(&other_key));
+    assert_eq!(
+        output_readiness(&paths, &busy, &refused, !job.refused_store_keys.is_empty()),
+        OutputReadiness::Refused,
+        "an earlier placed test executable cannot run after any immutable key collision",
+    );
 }
 
 #[test]

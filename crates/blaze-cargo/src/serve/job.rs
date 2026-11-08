@@ -1864,6 +1864,9 @@ struct Job<S: Steps> {
     /// This job's outputs whose placement or final verification failed. No build script may
     /// execute one of them after the last in-flight placement is removed from `busy`.
     refused_places: HashSet<u32, Global>,
+    /// Immutable store keys this job could not put: those keys already held other bytes.
+    /// A store conflict forbids running any program in this job, even one placed earlier.
+    refused_store_keys: HashSet<blaze_cas::Key, Global>,
     /// Build scripts' runs the plane started whose programs are not yet all placed: each
     /// starts once its compile's outputs have nothing in flight ([`Jobs::run_script`]).
     held: Vec<NodeId>,
@@ -2954,6 +2957,7 @@ impl<S: Steps> Jobs<S> {
             worked: None,
             busy: HashMap::new_in(Global),
             refused_places: HashSet::new_in(Global),
+            refused_store_keys: HashSet::new_in(Global),
             held: Vec::new(), // alloc: none until a run waits for its program
             look: 0,
             awaiting: None,
@@ -4834,18 +4838,16 @@ impl<S: Steps> Jobs<S> {
             w.plane.ended(w.now, node, Outcome::Failed { why });
             return;
         };
-        // A refused compiler result or store key is terminal for this job. The store may
-        // already contain different bytes under that key; no run may execute those bytes.
+        // A store key collision makes the compiled program's bytes untrustworthy.
+        // Other compiler errors leave independent units running (keep-going).
         if let Some(job) = self.jobs.get(key_of(id))
-            && job_execution_refused(&job.over)
+            && !job.refused_store_keys.is_empty()
         {
-            let cause = job
-                .over
-                .as_ref()
-                .and_then(|(_, error)| error.as_ref())
-                .map_or("a compiler result was refused", |error| error.what.as_str());
             // alloc: one failed run node
-            let why = format!("{} cannot start: {cause}", run_named(job, node));
+            let why = format!(
+                "{} cannot start: this job's immutable store refused a compiled value key",
+                run_named(job, node)
+            );
             w.plane.ended(w.now, node, Outcome::Failed { why });
             return;
         }
@@ -5076,6 +5078,7 @@ impl<S: Steps> Jobs<S> {
             match w.store.put(put.key, put.kind, &put.bytes) {
                 Ok(ticket) => self.put.add(ticket),
                 Err(mismatch) => {
+                    job.refused_store_keys.insert(mismatch.key);
                     let error = mismatched("the store", kind, mismatch);
                     job.over.get_or_insert((false, Some(error)));
                 }
@@ -5091,6 +5094,7 @@ impl<S: Steps> Jobs<S> {
         for put in compiled.share {
             let kind = put.kind;
             if let Err(mismatch) = w.std.put(put.key, put.kind, &put.bytes) {
+                job.refused_store_keys.insert(mismatch.key);
                 let error = mismatched("the standard library's shared store", kind, mismatch);
                 job.over.get_or_insert((false, Some(error)));
             }
@@ -5113,6 +5117,13 @@ impl<S: Steps> Jobs<S> {
         let ids = outputs.as_ref().map_or(&[][..], |it| it.of(unit));
         for output in compiled.outputs {
             let path = self.paths.find(ids, &output.path);
+            if let Some(job) = self.jobs.get_mut(key_of(id))
+                && job.refused_store_keys.contains(&output.key)
+            {
+                // Never clone the unrelated bytes already committed under this key.
+                job.refused_places.insert(path);
+                continue;
+            }
             if self.paths.files[path as usize].is_none() {
                 // alloc: an error, once
                 let error = ApiError::new(
@@ -5256,13 +5267,13 @@ impl<S: Steps> Jobs<S> {
     fn release_ready(&mut self, w: &mut World<'_, S>) {
         for &id in &self.order {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
-            let Job { stage: Stage::Units(build), busy, refused_places, over, .. } = job else { continue };
+            let Job { stage: Stage::Units(build), busy, refused_places, refused_store_keys, .. } = job else { continue };
             let mut at = 0;
             while at < build.ready.len() {
                 let (unit, artifact) = build.ready[at];
                 match output_readiness(
                     build.outputs.of(unit as usize), busy, refused_places,
-                    job_execution_refused(over),
+                    !refused_store_keys.is_empty(),
                 ) {
                     OutputReadiness::Pending => {
                         at += 1;
@@ -6646,19 +6657,13 @@ enum OutputReadiness {
     Ready,
 }
 
-/// A failed unit or store-key mismatch is a terminal refusal, not permission to run
-/// an earlier compiled program merely because its placement completed first.
-fn job_execution_refused(over: &Option<(bool, Option<ApiError>)>) -> bool {
-    matches!(over.as_ref(), Some((false, _)))
-}
-
 fn output_readiness(
     paths: &[u32],
     busy: &HashMap<u32, u32, Global>,
     refused: &HashSet<u32, Global>,
-    job_failed: bool,
+    store_refused: bool,
 ) -> OutputReadiness {
-    if job_failed {
+    if store_refused {
         OutputReadiness::Refused
     } else if paths.iter().any(|path| busy.contains_key(path)) {
         OutputReadiness::Pending
