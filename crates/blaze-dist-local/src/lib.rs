@@ -23,6 +23,8 @@ pub enum Error {
     Protocol(String),
     /// Committed distributed data is missing or corrupt; never fall back under its key.
     Committed(String),
+    /// The caller cancelled the build; never recompile it under local fallback.
+    Cancelled(String),
     /// The unit's execution ended with nothing committed, as its terminal says.
     Ended(blaze_wire::job_terminal_v2::TerminationV2),
 }

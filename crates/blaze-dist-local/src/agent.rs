@@ -189,7 +189,7 @@ pub fn decide(policy: &LocalPolicy, failure: Error) -> Result<(), Error> {
     let action = match &failure {
         Error::Ended(termination) => local_action(policy, termination)
             .map_err(|why| Error::Protocol(format!("the terminal is refused: {why:?}")))?,
-        Error::Committed(_) => LocalAction::Fail,
+        Error::Committed(_) | Error::Cancelled(_) => LocalAction::Fail,
         Error::Io(_) | Error::Protocol(_) => match policy {
             LocalPolicy::Never => LocalAction::Fail,
             LocalPolicy::Fallback => LocalAction::BuildLocally,
@@ -277,6 +277,16 @@ const GRACE: Duration = Duration::from_secs(5);
 
 /// The reason reported when the caller cancels the distributed build.
 const CANCELLED: &str = "the build was cancelled";
+
+/// A cancelled request is terminal even if the carrier or local policy permits a retry.
+fn ensure_not_cancelled(unit: &Unit, cancelled: &AtomicBool) -> Result<(), Error> {
+    if cancelled.load(Ordering::Acquire) {
+        let reason = format!("unit {}: {CANCELLED}", hex(&unit.spec)); // alloc: terminal reason
+        Err(Error::Cancelled(reason))
+    } else {
+        Ok(())
+    }
+}
 
 /// Reads the packs named, each checked against what was committed.
 pub fn import(blobs: &Blobs, packs: &[PackRef]) -> Result<BTreeMap<Digest, (u8, Vec<u8>)>, Error> {
@@ -403,14 +413,17 @@ pub fn run(
     granted: &mut dyn Granted,
     cancelled: &AtomicBool,
 ) -> Result<Arrived, Error> {
+    ensure_not_cancelled(unit, cancelled)?;
     if let Some(list) = config.blobs.published(&unit.spec)? {
         let packs = published_packs(unit, &list)?;
         let values = import(&config.blobs, &packs)?;
+        ensure_not_cancelled(unit, cancelled)?;
         return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None) });
     }
     // A unit whose functions all stay with the build that links them (a release unit's, a folded
     // group's) has nothing to distribute: its list above is all it can take.
     if unit.names.is_empty() {
+        ensure_not_cancelled(unit, cancelled)?;
         return Ok(Arrived::none(Source::Executed, None));
     }
     let started = Instant::now();
@@ -419,10 +432,12 @@ pub fn run(
     let now_ms = move || origin.saturating_add(started.elapsed().as_millis() as u64);
     let job = request(unit, config, now_ms());
     let binding = loop {
+        ensure_not_cancelled(unit, cancelled)?;
         let submit = Command::Submit(carrier::submission(&job, NEED));
         match client.call(submit)? {
             Answer::Binding(binding) => break binding,
             Answer::Error(error) if error.code() == Some(blaze_wire::ErrorCode::Busy) => {
+                ensure_not_cancelled(unit, cancelled)?;
                 if started.elapsed() > config.deadline {
                     return Err(Error::Protocol(format!("submit: {}", error.message)));
                 }
@@ -442,9 +457,9 @@ pub fn run(
     let mut last_claim: Option<(String, Attempt, bool)> = None;
     let mut waited = config.poll;
     let packs = loop {
-        if cancelled.load(Ordering::Acquire) {
+        if let Err(error) = ensure_not_cancelled(unit, cancelled) {
             leave(&mut client, &binding);
-            return Err(Error::Protocol(CANCELLED.to_owned()));
+            return Err(error);
         }
         // The coordinator's own deadline ends the execution first, and its terminal says so:
         // this is for a coordinator that stopped ending anything.
@@ -502,6 +517,10 @@ pub fn run(
         }
     };
     arrived.values = import(&config.blobs, &packs)?;
+    if let Err(error) = ensure_not_cancelled(unit, cancelled) {
+        leave(&mut client, &binding);
+        return Err(error);
+    }
     arrived.packs = packs;
     if let Some((executor, attempt, lead)) = last_claim {
         finish(&mut client, config, content, execution, &executor, attempt, lead, &now_ms);
@@ -667,6 +686,20 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_cancellation_cannot_trigger_local_recompilation() {
+        let unit = Unit { spec: [0x42; 32], names: Vec::new() }; // alloc: cancellation fixture
+        let cancelled = AtomicBool::new(false);
+        assert!(ensure_not_cancelled(&unit, &cancelled).is_ok());
+        cancelled.store(true, Ordering::Release);
+        let refused = ensure_not_cancelled(&unit, &cancelled).unwrap_err();
+        assert!(matches!(&refused, Error::Cancelled(why) if why.contains(&hex(&unit.spec))));
+        assert!(matches!(
+            decide(&LocalPolicy::Fallback, refused),
+            Err(Error::Cancelled(_))
+        ));
+    }
 
     #[test]
     fn published_pack_list_requires_exact_sorted_unique_records() {
