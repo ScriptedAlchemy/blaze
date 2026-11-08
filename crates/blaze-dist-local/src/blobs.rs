@@ -95,7 +95,9 @@ impl Blobs {
     /// first-writer race, but the same unit key must never name different packs.
     pub fn publish(&self, spec: &Digest, list: &[u8]) -> Result<(), Error> {
         let path = format!("/v1/list/manifests/{}", hex(spec));
-        let (status, body) = self.request("PUT", &path, list)?;
+        // After sending a publication, a lost response cannot tell us whether
+        // the server committed the immutable key. It cannot authorize fallback.
+        let (status, body) = publication_response(&path, self.request("PUT", &path, list))?;
         publish_verdict(status, &body, &path, list, || self.published(spec))
     }
 }
@@ -203,6 +205,20 @@ fn unchunk(mut body: &[u8]) -> Option<Vec<u8>> {
 }
 
 
+/// The reply may be lost after the server has committed an immutable manifest.
+/// A transport/framing failure is therefore an unknown publication outcome,
+/// never evidence that it is safe to rebuild under the same key.
+fn publication_response(
+    path: &str,
+    response: Result<(u16, Vec<u8>), Error>,
+) -> Result<(u16, Vec<u8>), Error> {
+    response.map_err(|error| {
+        Error::Committed(format!(
+            "PUT {path}: publication outcome unknown after request failure: {error}"
+        ))
+    })
+}
+
 /// A first publisher wins the immutable key. A 412 proves that a value exists,
 /// not that the value is identical; look up and compare it before accepting.
 fn publish_verdict(
@@ -286,6 +302,31 @@ mod tests {
             decode_response("GET", path, b"HTTP/1.1 404 Not Found\r\n\r\nnot here").unwrap(),
             (404, b"not here".to_vec())
         );
+    }
+
+    #[test]
+    fn a_lost_publication_reply_cannot_authorize_local_recompilation() {
+        let path = "/v1/list/manifests/test-unit";
+        for error in [
+            Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            Error::Protocol("the publication reply was truncated".to_owned()),
+        ] {
+            let refused = publication_response(path, Err(error)).unwrap_err();
+            assert!(
+                matches!(&refused, Error::Committed(why)
+                    if why.contains(path) && why.contains("outcome unknown")),
+                "the failed publication must identify the uncertain immutable key: {refused}"
+            );
+            assert!(
+                matches!(
+                    crate::agent::decide(&blaze_wire::LocalPolicy::Fallback, refused),
+                    Err(Error::Committed(_))
+                ),
+                "a lost publication acknowledgement cannot authorize local recompilation"
+            );
+        }
+
+        assert_eq!(publication_response(path, Ok((201, Vec::new()))).unwrap().0, 201);
     }
 
     #[test]
