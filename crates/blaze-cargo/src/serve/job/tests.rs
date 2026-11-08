@@ -68,6 +68,7 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         placed: blaze_cas::PlacedBytes::default(),
         worked: None,
         busy: HashMap::new_in(std::alloc::Global),
+        refused_places: HashSet::new_in(std::alloc::Global),
         held: Vec::new(),
         look: 0,
         awaiting: None,
@@ -472,6 +473,43 @@ fn a_script_waits_for_the_compile_result_and_every_output_placement() {
         !program_awaits_placement(true, &[], &busy),
         "a legitimately output-free compile needs no placement wait"
     );
+}
+
+
+#[test]
+fn a_failed_final_stat_cannot_authorize_running_a_build_script() {
+    let key = blaze_cas::Key(ContentId([7; 32]));
+    let file = Meta { len: 13, dir: false, modified_ns: 99 };
+    let valid = || Some(Placement { key, executable: true, meta: None });
+
+    let mut placed = valid();
+    assert!(verify_placed_output(Done::Stat(Some(file)), &mut placed, key).is_ok());
+    assert_eq!(placed.as_ref().and_then(|it| it.meta), Some(file));
+
+    for (done, reason) in [
+        (Done::Stat(None), "absent"),
+        (Done::Stat(Some(Meta { dir: true, ..file })), "directory"),
+        (Done::Failed(blaze_core::IoError("stat denied".into())), "stat denied"),
+        (Done::Written, "final stat returned"),
+    ] {
+        let mut placed = valid();
+        let why = verify_placed_output(done, &mut placed, key).unwrap_err();
+        assert!(why.contains(reason), "{why}");
+        assert!(placed.is_none(), "failed verification cannot remain a cached placement");
+    }
+
+    let mut wrong_key = Some(Placement {
+        key: blaze_cas::Key(ContentId([8; 32])), executable: true, meta: None
+    });
+    let why = verify_placed_output(Done::Stat(Some(file)), &mut wrong_key, key).unwrap_err();
+    assert!(why.contains("expected key"), "{why}");
+    assert!(wrong_key.is_none(), "a different cached value may not be treated as this output");
+
+    let mut refused = HashSet::new_in(std::alloc::Global);
+    refused.insert(8);
+    assert_eq!(refused_program_output(&[7, 8], &refused), Some(8));
+    assert_eq!(refused_program_output(&[7, 9], &refused), None);
+    assert_eq!(refused_program_output(&[], &refused), None);
 }
 
 /// A path is not all there while any effect placing it is in flight (a placement, then its
