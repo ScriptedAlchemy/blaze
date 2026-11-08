@@ -322,7 +322,7 @@ mod tests {
         // verification GET must not become an ordinary transport error that
         // LocalPolicy::Fallback uses to compile again under that key.
         for read_error in [
-            Error::Io(io::Error::new(io::ErrorKind::TimedOut, "verification timed out")),
+            Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "verification timed out")),
             Error::Protocol("verification response was malformed".to_owned()),
         ] {
             let refused = publish_verdict(412, b"", path, b"same", || Err(read_error))
