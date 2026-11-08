@@ -24,10 +24,19 @@ pub(crate) fn resident() -> Option<u64> {
     Some(held_by(std::process::id())? >> 20)
 }
 
-/// Bytes of memory a process holds: its resident set, where `/proc` says it.
+/// Bytes held by a process: resident pages plus its swapped-out private pages.
+/// Swapping does not free the allocation: counting RSS alone would let pressure
+/// make the soft budget admit more work as the kernel evicts the process's pages.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn held_by(pid: u32) -> Option<u64> {
-    kilobytes(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?, "VmRSS:")
+    proc_footprint(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?)
+}
+
+/// Read both counters from the same status snapshot. An absent or malformed
+/// counter is unknown, not zero; checked addition also refuses a corrupt total.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn proc_footprint(status: &str) -> Option<u64> {
+    kilobytes(status, "VmRSS:")?.checked_add(kilobytes(status, "VmSwap:")?)
 }
 
 /// Bytes of memory a process of this user owns: its physical footprint, which is what
@@ -319,7 +328,7 @@ pub(crate) fn checkpoint(step: &str) {
         return;
     }
     let live = live().map(|it| format!(", {} MB live", it >> 20)).unwrap_or_default();
-    eprintln!("memory after {step}: {} MB resident{live}", resident().unwrap_or(0));
+    eprintln!("memory after {step}: {} MB footprint{live}", resident().unwrap_or(0));
 }
 
 /// What the daemon holds that no ingredient of the database counts: the checkouts it has
@@ -601,6 +610,31 @@ fn linux_pressure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swapped_pages_remain_in_the_process_budget() {
+        let resident = "VmRSS: 4096 kB\nVmSwap: 0 kB\n";
+        let swapped = "VmRSS: 1024 kB\nVmSwap: 3072 kB\n";
+        assert_eq!(proc_footprint(resident), Some(4096 << 10));
+        assert_eq!(proc_footprint(swapped), proc_footprint(resident));
+        assert!(kilobytes(swapped, "VmRSS:") < proc_footprint(swapped));
+    }
+
+    #[test]
+    fn process_footprint_refuses_unknown_or_overflowing_counters() {
+        for status in [
+            "",
+            "VmRSS: 4096 kB\n",
+            "VmSwap: 4096 kB\n",
+            "VmRSS: 4096 kB\nVmSwap: unknown kB\n",
+            "VmRSS: unknown kB\nVmSwap: 0 kB\n",
+            "VmRSS: 18446744073709551615 kB\nVmSwap: 0 kB\n",
+            "VmRSS: 18014398509481983 kB\nVmSwap: 1 kB\n",
+        ] {
+            assert_eq!(proc_footprint(status), None, "{status}");
+        }
+        assert_eq!(proc_footprint("VmRSS: 0 kB\nVmSwap: 0 kB\n"), Some(0));
+    }
 
     #[test]
     fn linux_pressure_uses_available_reserve_and_both_psi_signals() {
