@@ -24,7 +24,8 @@ Input, one JSON value (`python3 harness/distv2.py '{...}'`):
 Checks, each on what the build itself reports (BLAZE_DIST_REPORT) and on running the program:
     solo         one daemon, no coordinator: the program the others are held to
     two workers  two daemons build at once: every unit done once by agreement, both compile, both
-                 programs behave as solo's; no store key is compiled twice, including the tail
+                 programs behave as solo's; granted templates are not recompiled in the tail
+                 or by another daemon, and raw emitted keys are all published
     cold cache   a third daemon with an empty store takes published units and compiles none
     warm         a build with nothing changed reports no execution
     edit         one edited function: only what it reaches is worked again
@@ -307,14 +308,10 @@ class Run:
     def behaviour(self, home: str, project: Path | None = None) -> tuple[str, str]:
         program = self.program(home, project)
         raw_hash = file_hash(program)
-        saved = self.root / "artifacts" / raw_hash
-        saved.parent.mkdir(exist_ok=True)
-        if not saved.exists():
-            shutil.copy2(program, saved)
         ran = subprocess.run([str(program), *self.given.run], capture_output=True, text=True,
                              timeout=self.given.command_timeout)
         self.artifacts.append({"home": home, "project": str(project or self.project), "path": str(program),
-                               "sha256": raw_hash, "retained": str(saved), "stdout": ran.stdout, "stderr": ran.stderr, "exit": ran.returncode})
+                               "sha256": raw_hash, "stdout": ran.stdout, "stderr": ran.stderr, "exit": ran.returncode})
         (self.root / "artifacts.json").write_text(json.dumps(self.artifacts, indent=2) + "\n")
         check(ran.returncode == 0, f"{home} artifact runs successfully (exit {ran.returncode}; see artifacts.json)")
         return ran.stdout, raw_hash
@@ -565,7 +562,7 @@ def main(given: Input) -> None:
         print(f"     one execution of both: {sorted(row['unit'] for row in shared)}", flush=True)
         check(bool(shared), "both daemons actually compile the same unit in the same execution and attempt")
         evidence.publication(run.root / "blobs", rows_a + rows_b, run.events())
-        check(True, "no store key was compiled twice, including the tail; every compiled key was committed in the full manifest")
+        check(True, "no granted template was recompiled in the tail or by another daemon; every raw emitted key was committed in the full manifest")
         for name, behaviour in (("a", run.behaviour("a")), ("b", run.behaviour("b"))):
             check(behaviour[0] == solo[0], f"worker {name}'s program behaves as solo's")
             check(behaviour[1] == solo[1], f"worker {name}'s program is solo's, byte for byte")

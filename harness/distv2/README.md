@@ -6,8 +6,8 @@ Python evidence oracles with small synthetic inputs; passing it is not distribut
 
 A run needs a **new, empty scratch directory**. Earlier runs, logs and artifacts are never wiped.
 It retains `provenance.json` (source commit/tree/patch, fixture digest, all three binary hashes,
-input and effective resources), `source.patch`, child logs, reports, events, executable copies by
-SHA-256, `artifacts.json` (output/exit/hash), and the actual server's packs/manifests. Source and
+input and effective resources), `source.patch`, child logs, reports, events,
+`artifacts.json` (original path/output/exit/hash), and the actual server's packs/manifests. Source and
 binaries must remain fixed during acceptance. A failed stage stops all owned processes, including
 suspended workers; each build and fault-evidence wait has a bound. Idle daemons exit between
 stages so the run keeps at most two front ends resident. No compiler or daemon runs in preflight.

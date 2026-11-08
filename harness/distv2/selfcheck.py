@@ -50,6 +50,26 @@ class Oracles(unittest.TestCase):
         with self.assertRaises(e.Failed):
             e.compiled(missing)
 
+    def test_local_static_repeats_preserve_counts_but_cannot_hide_cross_daemon_work(self):
+        repeated = row(tail_compiled=2, tail_compiled_keys=[OTHER, OTHER])
+        self.assertEqual(e.compiled(repeated), {KEY, OTHER})
+        self.assertEqual(repeated["tail_compiled_keys"], [OTHER, OTHER])
+        tail_only = row(compiled_for_work=0, work_compiled_keys=[], tail_compiled=2,
+                        tail_compiled_keys=[OTHER, OTHER])
+        self.assertEqual(e.compiled(tail_only), {OTHER})
+        published = row(source="published", execution=-1, joined=False, grants=0,
+                        compiled_for_work=0, work_compiled_keys=[])
+        e.no_duplicate_compile([repeated, published])
+        for bad in (row(compiled_for_work=2, work_compiled_keys=[KEY, KEY]),
+                    {**repeated, "tail_compiled": 1}):
+            with self.assertRaises(e.Failed):
+                e.compiled(bad)
+        for peer in (row(work_compiled_keys=[OTHER]),
+                     row(execution=8, attempt=3, compiled_for_work=0, work_compiled_keys=[],
+                         tail_compiled=1, tail_compiled_keys=[OTHER])):
+            with self.assertRaises(e.Failed):
+                e.no_duplicate_compile([repeated, peer])
+
     def test_recovery_requires_every_name_in_same_execution_under_new_lease(self):
         old = grant()
         new = grant(holder="b", generation=5)

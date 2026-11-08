@@ -62,17 +62,22 @@ def validate_events(events: list[dict]) -> None:
 
 def compiled(row: dict) -> set[str]:
     """Counters must name the actual store keys; duplicate compilation cannot hide in a sum."""
-    keys = []
+    emitted = []
     for field, count in (("work_compiled_keys", "compiled_for_work"), ("tail_compiled_keys", "tail_compiled")):
         require(field in row, f"{row.get('unit')}: report needs {field}; see distv2/README.md")
         values = row[field]
         require(isinstance(values, list) and all(digest(k) for k in values), f"{field}: expected store key digests")
         require(len(values) == row[count], f"{field}: keys disagree with {count}")
-        keys.extend(values)
-    require(len(keys) == len(set(keys)), f"{row['unit']}: a function was compiled twice, including the tail")
+        emitted.append(values)
+    work, tail = emitted
+    require(len(work) == len(set(work)), f"{row['unit']}: a granted template was compiled twice")
+    require(not set(work).intersection(tail), f"{row['unit']}: granted work was compiled again in the tail")
+    # Distinct static instances may emit identical content keys in the local tail.
+    # Keep those raw emissions in the report and its counter. Only occupancy is
+    # compared across daemons and against the immutable published manifest.
     require(digest(row.get("unit_digest")), f"{row['unit']}: report needs unit_digest")
     require(type(row.get("attempt")) is int, f"{row['unit']}: report needs its final attempt")
-    return set(keys)
+    return set(work).union(tail)
 
 
 def no_duplicate_compile(rows: list[dict]) -> None:
