@@ -482,27 +482,51 @@ fn an_output_placement_failure_must_not_announce_a_test_executable() {
     let mut busy = HashMap::new_in(std::alloc::Global);
     let mut refused = HashSet::new_in(std::alloc::Global);
 
-    assert_eq!(output_readiness(&paths, &busy, &refused), OutputReadiness::Ready);
+    assert_eq!(output_readiness(&paths, &busy, &refused, false), OutputReadiness::Ready);
 
     busy.insert(4, 1);
-    assert_eq!(output_readiness(&paths, &busy, &refused), OutputReadiness::Pending);
+    assert_eq!(output_readiness(&paths, &busy, &refused, false), OutputReadiness::Pending);
 
     refused.insert(5);
     assert_eq!(
-        output_readiness(&paths, &busy, &refused),
+        output_readiness(&paths, &busy, &refused, false),
         OutputReadiness::Pending,
         "the other output is still in flight"
     );
 
     busy.remove(&4);
     assert_eq!(
-        output_readiness(&paths, &busy, &refused),
+        output_readiness(&paths, &busy, &refused, false),
         OutputReadiness::Refused,
         "completion of the final effect cannot turn a refused test binary into TestReady"
     );
 
     refused.clear();
-    assert_eq!(output_readiness(&paths, &busy, &refused), OutputReadiness::Ready);
+    assert_eq!(output_readiness(&paths, &busy, &refused, false), OutputReadiness::Ready);
+}
+
+/// A content-key mismatch or compiler refusal is terminal even when an independent
+/// output is already present and has no placement effects left in flight.
+#[test]
+fn a_refused_compiler_or_store_result_cannot_run_an_earlier_executable() {
+    let mut job = job(Vec::new());
+    let paths = [4, 5];
+    let busy = HashMap::new_in(std::alloc::Global);
+    let refused = HashSet::new_in(std::alloc::Global);
+    assert!(!job_execution_refused(&job.over));
+    assert_eq!(output_readiness(&paths, &busy, &refused, false), OutputReadiness::Ready);
+
+    job.over = Some((false, Some(ApiError::new(
+        "the store holds other bytes under a compiled output's key".into(), None
+    ))));
+    assert!(job_execution_refused(&job.over));
+    assert_eq!(
+        output_readiness(&paths, &busy, &refused, job_execution_refused(&job.over)),
+        OutputReadiness::Refused,
+        "an already placed test binary cannot run after any committed-key mismatch",
+    );
+    job.over = Some((true, None));
+    assert!(!job_execution_refused(&job.over));
 }
 
 #[test]

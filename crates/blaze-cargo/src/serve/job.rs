@@ -4834,6 +4834,21 @@ impl<S: Steps> Jobs<S> {
             w.plane.ended(w.now, node, Outcome::Failed { why });
             return;
         };
+        // A refused compiler result or store key is terminal for this job. The store may
+        // already contain different bytes under that key; no run may execute those bytes.
+        if let Some(job) = self.jobs.get(key_of(id))
+            && job_execution_refused(&job.over)
+        {
+            let cause = job
+                .over
+                .as_ref()
+                .and_then(|(_, error)| error.as_ref())
+                .map_or("a compiler result was refused", |error| error.what.as_str());
+            // alloc: one failed run node
+            let why = format!("{} cannot start: {cause}", run_named(job, node));
+            w.plane.ended(w.now, node, Outcome::Failed { why });
+            return;
+        }
         // A run a broken write refused ([`Refused`]) never runs its user code. The plane hands
         // a run over here, never through [`Jobs::post`], so its refusal is checked here: one
         // after a `links` dependency's run whose write broke (cargo's run-to-run edge), which
@@ -5241,11 +5256,14 @@ impl<S: Steps> Jobs<S> {
     fn release_ready(&mut self, w: &mut World<'_, S>) {
         for &id in &self.order {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
-            let Job { stage: Stage::Units(build), busy, refused_places, .. } = job else { continue };
+            let Job { stage: Stage::Units(build), busy, refused_places, over, .. } = job else { continue };
             let mut at = 0;
             while at < build.ready.len() {
                 let (unit, artifact) = build.ready[at];
-                match output_readiness(build.outputs.of(unit as usize), busy, refused_places) {
+                match output_readiness(
+                    build.outputs.of(unit as usize), busy, refused_places,
+                    job_execution_refused(over),
+                ) {
                     OutputReadiness::Pending => {
                         at += 1;
                         continue;
@@ -6628,12 +6646,21 @@ enum OutputReadiness {
     Ready,
 }
 
+/// A failed unit or store-key mismatch is a terminal refusal, not permission to run
+/// an earlier compiled program merely because its placement completed first.
+fn job_execution_refused(over: &Option<(bool, Option<ApiError>)>) -> bool {
+    matches!(over.as_ref(), Some((false, _)))
+}
+
 fn output_readiness(
     paths: &[u32],
     busy: &HashMap<u32, u32, Global>,
     refused: &HashSet<u32, Global>,
+    job_failed: bool,
 ) -> OutputReadiness {
-    if paths.iter().any(|path| busy.contains_key(path)) {
+    if job_failed {
+        OutputReadiness::Refused
+    } else if paths.iter().any(|path| busy.contains_key(path)) {
         OutputReadiness::Pending
     } else if refused_program_output(paths, refused).is_some() {
         OutputReadiness::Refused
