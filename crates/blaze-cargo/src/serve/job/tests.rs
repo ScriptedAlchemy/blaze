@@ -477,6 +477,35 @@ fn a_script_waits_for_the_compile_result_and_every_output_placement() {
 
 
 #[test]
+fn an_output_placement_failure_must_not_announce_a_test_executable() {
+    let paths = [4, 5];
+    let mut busy = HashMap::new_in(std::alloc::Global);
+    let mut refused = HashSet::new_in(std::alloc::Global);
+
+    assert_eq!(output_readiness(&paths, &busy, &refused), OutputReadiness::Ready);
+
+    busy.insert(4, 1);
+    assert_eq!(output_readiness(&paths, &busy, &refused), OutputReadiness::Pending);
+
+    refused.insert(5);
+    assert_eq!(
+        output_readiness(&paths, &busy, &refused),
+        OutputReadiness::Pending,
+        "the other output is still in flight"
+    );
+
+    busy.remove(&4);
+    assert_eq!(
+        output_readiness(&paths, &busy, &refused),
+        OutputReadiness::Refused,
+        "completion of the final effect cannot turn a refused test binary into TestReady"
+    );
+
+    refused.clear();
+    assert_eq!(output_readiness(&paths, &busy, &refused), OutputReadiness::Ready);
+}
+
+#[test]
 fn a_failed_final_stat_cannot_authorize_running_a_build_script() {
     let key = blaze_cas::Key(ContentId([7; 32]));
     let file = Meta { len: 13, dir: false, modified_ns: 99 };

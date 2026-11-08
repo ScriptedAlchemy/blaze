@@ -5117,17 +5117,34 @@ impl<S: Steps> Jobs<S> {
                 self.place(w, id, path, output.key, output.executable);
                 continue;
             }
+            // clone: the driver's effect owns the file's name, once per output.
+            // Refuse an absent path before minting an own-effect tag, which would be orphaned.
+            let Some(file) = self.paths.files[path as usize].clone() else {
+                let name = self.paths.names[path as usize].to_string(); // alloc: an output failure
+                if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                    job.refused_places.insert(path);
+                    job.over.get_or_insert((
+                        false,
+                        Some(ApiError::new(
+                            format!("{name} has no file for the output recheck"),
+                            Some(name),
+                        )),
+                    ));
+                }
+                continue;
+            };
             let look = Own::Look { job: id, path, key: output.key, executable: output.executable };
             let tag = self.own_tag(look);
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
             match tag {
                 Ok(tag) => {
-                    // clone: the driver's effect owns the file's name, once per output
-                    let Some(file) = self.paths.files[path as usize].clone() else { continue };
                     self.begin_placing(id, path);
                     w.effects.push(Effect::Stat { file, tag });
                 }
-                Err(error) => _ = job.over.get_or_insert((false, Some(error))),
+                Err(error) => {
+                    job.refused_places.insert(path);
+                    job.over.get_or_insert((false, Some(error)));
+                }
             }
         }
     }
@@ -5224,13 +5241,22 @@ impl<S: Steps> Jobs<S> {
     fn release_ready(&mut self, w: &mut World<'_, S>) {
         for &id in &self.order {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
-            let Job { stage: Stage::Units(build), busy, .. } = job else { continue };
+            let Job { stage: Stage::Units(build), busy, refused_places, .. } = job else { continue };
             let mut at = 0;
             while at < build.ready.len() {
                 let (unit, artifact) = build.ready[at];
-                if build.outputs.of(unit as usize).iter().any(|path| busy.contains_key(path)) {
-                    at += 1;
-                    continue;
+                match output_readiness(build.outputs.of(unit as usize), busy, refused_places) {
+                    OutputReadiness::Pending => {
+                        at += 1;
+                        continue;
+                    }
+                    OutputReadiness::Refused => {
+                        // A failed placement has no pending effect left, but must never make
+                        // a test executable runnable. The job already carries the error.
+                        build.ready.remove(at);
+                        continue;
+                    }
+                    OutputReadiness::Ready => {}
                 }
                 build.ready.remove(at);
                 if let Some(it) = build.artifacts.get(artifact as usize) {
@@ -6591,6 +6617,29 @@ fn program_awaits_placement(
     busy: &HashMap<u32, u32, Global>,
 ) -> bool {
     !accounted || paths.iter().any(|path| busy.contains_key(path))
+}
+
+/// Whether a test executable may be reported as ready. A failed placement removes the
+/// in-flight count but does not authorize execution: the job reports its placement error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputReadiness {
+    Pending,
+    Refused,
+    Ready,
+}
+
+fn output_readiness(
+    paths: &[u32],
+    busy: &HashMap<u32, u32, Global>,
+    refused: &HashSet<u32, Global>,
+) -> OutputReadiness {
+    if paths.iter().any(|path| busy.contains_key(path)) {
+        OutputReadiness::Pending
+    } else if refused_program_output(paths, refused).is_some() {
+        OutputReadiness::Refused
+    } else {
+        OutputReadiness::Ready
+    }
 }
 
 /// Which of a compiled program's outputs this job refused to place. A failed final stat
