@@ -58,7 +58,9 @@ jobs:
       matrix:
         os: [ubuntu-24.04-arm, macos-15]
     env:
-      BLAZE_REPO: ${{ github.repository }}
+      # The public installer always downloads indexable-inc/blaze releases, including on forks.
+      # Compare channels with the same release source, not this fork's empty release list.
+      BLAZE_REPO: indexable-inc/blaze
       # A release the workflow was started for, or the one just published.
       BLAZE_VERSION: ${{ inputs.version || (github.event_name == 'release' && github.event.release.tag_name) || '' }}
     steps:

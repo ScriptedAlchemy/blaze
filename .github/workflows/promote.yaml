@@ -86,10 +86,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           WANTED: ${{ inputs.tag }}
+          # PRs on a fork validate the public canary, not a release the fork never published.
+          # Promotion/metadata writes on main still use this repository.
+          BLAZE_RELEASE_REPO: ${{ github.event_name == 'pull_request' && 'indexable-inc/blaze' || github.repository }}
         run: |
           jq -n --arg tag "$WANTED" '{tag: $tag}' > "$RUNNER_TEMP/which.json"
           python3 -I .github/scripts/promote.py which "$RUNNER_TEMP/which.json"
-          echo "stable=$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName)" >> "$GITHUB_OUTPUT"
+          echo "stable=$(gh release view -R "$BLAZE_RELEASE_REPO" --json tagName -q .tagName)" >> "$GITHUB_OUTPUT"
       - id: apps
         env:
           WANTED: ${{ inputs.apps }}
