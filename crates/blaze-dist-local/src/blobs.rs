@@ -214,14 +214,22 @@ fn publish_verdict(
 ) -> Result<(), Error> {
     match status {
         200..=299 => Ok(()),
-        412 => match read_existing()? {
-            Some(existing) if existing.as_slice() == proposed => Ok(()),
-            Some(_) => Err(Error::Committed(format!(
-                "PUT {path}: 412: another publisher committed different packs under this unit key"
-            ))),
-            None => Err(Error::Committed(format!(
-                "PUT {path}: 412: publication was refused but the committed list is missing"
-            ))),
+        412 => {
+            // The refused PUT proves an immutable key was already claimed. If the
+            // subsequent GET fails, that uncertainty is not a cache miss and must
+            // never authorize a local rebuild under the same key.
+            let existing = read_existing().map_err(|error| {
+                Error::Committed(format!("PUT {path}: 412: cannot read the committed list: {error}"))
+            })?;
+            match existing {
+                Some(existing) if existing.as_slice() == proposed => Ok(()),
+                Some(_) => Err(Error::Committed(format!(
+                    "PUT {path}: 412: another publisher committed different packs under this unit key"
+                ))),
+                None => Err(Error::Committed(format!(
+                    "PUT {path}: 412: publication was refused but the committed list is missing"
+                ))),
+            }
         },
         _ => Err(Error::Protocol(format!(
             "PUT {path}: {status}: {}",
@@ -309,6 +317,28 @@ mod tests {
                     "an immutable publication conflict must not authorize recompilation"
                 );
             }
+        }
+        // A 412 means another writer already claimed the unit key. A failed
+        // verification GET must not become an ordinary transport error that
+        // LocalPolicy::Fallback uses to compile again under that key.
+        for read_error in [
+            Error::Io(io::Error::new(io::ErrorKind::TimedOut, "verification timed out")),
+            Error::Protocol("verification response was malformed".to_owned()),
+        ] {
+            let refused = publish_verdict(412, b"", path, b"same", || Err(read_error))
+                .unwrap_err();
+            assert!(
+                matches!(&refused, Error::Committed(why) if why.contains(path)
+                    && why.contains("cannot read the committed list")),
+                "a refused immutable publication must stay committed: {refused}"
+            );
+            assert!(
+                matches!(
+                    crate::agent::decide(&blaze_wire::LocalPolicy::Fallback, refused),
+                    Err(Error::Committed(_))
+                ),
+                "failed verification must not authorize local recompilation"
+            );
         }
         let read = Cell::new(false);
         let result = publish_verdict(201, b"", path, b"same", || {
