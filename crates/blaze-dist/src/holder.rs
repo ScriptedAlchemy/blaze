@@ -560,7 +560,14 @@ impl Holder {
             grant.names.iter().filter(|name| !lost.contains_key(name) && !returned.contains(name));
         let valid_items = valid_returns
             && batch.roots.len() as u64 == granted_roots.len() - batch.returned_roots.len()
-            && batch.names.iter().map(|item| &item.name).eq(expected_names);
+            && batch.names.iter().map(|item| &item.name).eq(expected_names)
+            // An unresolvable item could not have discovered anything. The coordinator
+            // deliberately does not register findings of Lost items, so publishing
+            // them would retain requests that have no corresponding acknowledgment.
+            && batch.roots.iter().chain(&batch.names).all(|item| {
+                !matches!(&item.outcome, ItemOutcome::Lost(_))
+                    || (item.found.is_empty() && item.unnamed.is_empty())
+            });
         if !valid_items {
             // An extra result used to disappear in the zip below. It may carry
             // compiler-retained discoveries even though no valid report names it.

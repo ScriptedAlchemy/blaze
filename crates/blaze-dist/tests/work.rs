@@ -525,3 +525,21 @@ fn a_malformed_result_is_refused_and_its_lease_revoked() {
     assert_eq!(g2.roots.as_slice(), &[(0, 2)]);
     assert!(g2.lease.generation > g.lease.generation);
 }
+
+#[test]
+fn a_lost_item_cannot_discover_unacknowledged_names() {
+    let mut w = set(WorkConfig { grant_roots: 1, ..small() });
+    let roots = rootset(1, 1);
+    join(&mut w, 0, "lead", &roots).unwrap();
+    let grant = lease(&mut w, 0, "lead").unwrap();
+    let mut item = lost(name(100), "unresolvable");
+    item.found = Set::new(vec![Found { name: name(7), tuple: [7; 32] }]);
+    let mut effects = Vec::new();
+    assert!(matches!(
+        w.result(1, "lead", &result(&grant, 1, vec![item], Vec::new()), &mut effects),
+        Err(Refusal::Malformed(_))
+    ));
+    assert!(!w.report().names.contains_key(&name(7)));
+    let retried = lease(&mut w, 2, "lead").unwrap();
+    assert_eq!(retried.roots.as_slice(), &[(0, 1)]);
+}

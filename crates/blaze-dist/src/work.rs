@@ -1316,6 +1316,14 @@ fn shape(
     if req.items.len() != want {
         return Err(format!("{} items for {want} processed", req.items.len()));
     }
+    // A Lost item cannot carry discoveries: none are registered or acknowledged
+    // by result_inner. Reject the entire result before committing any root.
+    if req.items.iter().any(|item| {
+        matches!(&item.outcome, ItemOutcome::Lost(_))
+            && (!item.found.is_empty() || !item.unnamed.is_empty())
+    }) {
+        return Err("lost item carries unacknowledgeable discoveries".to_owned());
+    }
     let roots_done = processed_roots.len() as usize;
     for (item, name) in req.items[roots_done..].iter().zip(&processed_names) {
         if item.name != *name {
