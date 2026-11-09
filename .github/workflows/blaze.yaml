@@ -112,6 +112,10 @@ jobs:
       # Some scripts ask rustc for the host when imported: after the toolchain is installed. In
       # the workspace's Python, which has its helpers (tools/typed-input) for the scripts that use them.
       - run: uv run --frozen python harness/imports.py
+      # This is only the distributed acceptance oracle's planted-bug selfcheck,
+      # NOT the real two-daemon execution required for V2 acceptance.
+      - name: distributed acceptance oracle negative controls
+        run: uv run --frozen python harness/distv2/selfcheck.py
       # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
       - run: python3 harness/rustcsites.py
       # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates.
