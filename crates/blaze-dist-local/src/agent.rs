@@ -702,6 +702,23 @@ fn publication(
     }
 }
 
+/// A successful tail is not publishable when its independent heartbeat worker failed.
+/// Preserve a compiler or committed-data refusal over a concurrent heartbeat error.
+fn completion_with_heartbeat<T>(
+    execution: ExecutionId,
+    completed: Result<T, Error>,
+    heartbeats: std::thread::Result<Result<(), Error>>,
+) -> Result<T, Error> {
+    let value = completed?;
+    heartbeats.map_err(|_| {
+        Error::Protocol(format!(
+            "distributed execution {}: lead heartbeat thread panicked",
+            execution.0
+        ))
+    })??;
+    Ok(value)
+}
+
 /// Compilation stays on the compiler's thread while a scoped driver keeps the lead alive
 /// through the unit's tail. Fencing is checked atomically by CommitPublication afterward.
 #[allow(clippy::too_many_arguments)]
@@ -747,6 +764,11 @@ fn heartbeat_during<T>(
                     });
                     match client.call(command) {
                         Ok(Answer::WorkerEvents(answer)) if answer.verdict == 0 => {}
+                        Err(error) => {
+                            lost.store(true, Ordering::Release);
+                            let _ = client.release();
+                            return Err(error);
+                        }
                         _ => {
                             lost.store(true, Ordering::Release);
                             break;
@@ -762,8 +784,8 @@ fn heartbeat_during<T>(
         let end = End(finished);
         let result = complete(lost);
         drop(end);
-        let _ = heartbeat.join();
-        result
+        let observed = heartbeat.join();
+        completion_with_heartbeat(execution, result, observed)
     })
 }
 
@@ -977,6 +999,47 @@ fn acknowledge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hegel::generators as gs;
+
+    #[hegel::test(test_cases = 64)]
+    fn a_failed_heartbeat_cannot_publish_a_successful_tail(tc: hegel::TestCase) {
+        let completion = tc.draw(gs::integers::<u8>()) % 3;
+        let heartbeat_kind = tc.draw(gs::integers::<u8>()) % 3;
+        let completed = match completion {
+            0 => Ok(7),
+            1 => Err(Error::Committed("the native pack was corrupt".to_owned())),
+            _ => Err(Error::Protocol("the compiler's tail failed".to_owned())),
+        };
+        let heartbeat: std::thread::Result<Result<(), Error>> = match heartbeat_kind {
+            0 => Ok(Ok(())),
+            1 => Ok(Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "the heartbeat carrier disconnected",
+            )))),
+            _ => Err(Box::new("planted heartbeat panic")),
+        };
+        let observed = completion_with_heartbeat(ExecutionId(9), completed, heartbeat);
+        match (completion, heartbeat_kind, observed) {
+            (0, 0, Ok(7)) => {}
+            (0, 1, Err(Error::Io(_))) => {}
+            (0, 2, Err(Error::Protocol(why))) if why.contains("heartbeat thread panicked") => {}
+            (1, _, Err(Error::Committed(_))) => {}
+            (2, _, Err(Error::Protocol(why))) if why.contains("compiler's tail failed") => {}
+            other => panic!("a result lost its cause or heartbeat failure became success: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dropped_heartbeat_failure_is_caught() {
+        let failed = Ok(Err(Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        ))));
+        assert!(matches!(
+            completion_with_heartbeat(ExecutionId(2), Ok(1), failed),
+            Err(Error::Io(_))
+        ));
+        // The original unchecked join would return Ok(1).
+    }
 
     #[test]
     fn caller_cancellation_cannot_trigger_local_recompilation() {
