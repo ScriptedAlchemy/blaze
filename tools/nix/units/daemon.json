@@ -815,16 +815,19 @@
    },
    {
     "dependencies": [
-     "blaze-wire"
+     "blaze-wire",
+     "hegeltest"
     ],
     "name": "blaze-dist",
     "version": "0.0.0"
    },
    {
     "dependencies": [
+     "blaze-core",
      "blaze-dist",
      "blaze-serve",
      "blaze-wire",
+     "hegeltest",
      "sha2 0.10.9",
      "tempfile",
      "tokio",
@@ -1803,10 +1806,12 @@
    {
     "dependencies": [
      "anyhow",
+     "blaze-core",
      "blaze-wire",
      "bytes",
      "crc32fast",
      "futures-util",
+     "hegeltest",
      "http-body-util",
      "hyper",
      "hyper-util",
@@ -23170,6 +23175,10 @@
     "blaze-dist-local@0.0.0 lib blaze_dist_local build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
       {
        "name": "blaze_dist",
        "unit": "blaze-dist@0.0.0 lib blaze_dist build"
@@ -48087,6 +48096,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_dist",
        "unit": "blaze-dist@0.0.0 lib blaze_dist build"
       },
@@ -72699,6 +72712,10 @@
     "blaze-dist-local@0.0.0 lib blaze_dist_local build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
       {
        "name": "blaze_dist",
        "unit": "blaze-dist@0.0.0 lib blaze_dist build"
@@ -97597,6 +97614,10 @@
     "blaze-dist-local@0.0.0 lib blaze_dist_local build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
       {
        "name": "blaze_dist",
        "unit": "blaze-dist@0.0.0 lib blaze_dist build"
