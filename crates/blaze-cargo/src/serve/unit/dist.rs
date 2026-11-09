@@ -286,10 +286,34 @@ pub(super) struct Overlay<'a, S> {
     pub(super) values: &'a BTreeMap<[u8; 32], (u8, Vec<u8>)>,
 }
 
+/// A committed distributed key is immutable, even when this daemon already has a local
+/// entry under it. Check before codegen consumes that entry or a tail exports it.
+fn committed_agrees(
+    key: &Key,
+    values: &BTreeMap<[u8; 32], (u8, Vec<u8>)>,
+    kind: Option<u8>,
+    bytes: &[u8],
+    origin: &str,
+) -> Result<(), String> {
+    if let Some((committed_kind, committed_bytes)) = values.get(&key.0.0) {
+        if kind.is_some_and(|kind| kind != *committed_kind)
+            || bytes != committed_bytes.as_slice()
+        {
+            return Err(format!( // alloc: a typed refusal naming the conflicting immutable key
+                "committed distributed key {key:?} disagrees with {origin}: two values under one immutable key"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl<S: Lookup> Lookup for Overlay<'_, S> {
     fn read(&self, key: &Key) -> Result<Option<&[u8]>, String> {
         match self.store.read(key)? {
-            Some(bytes) => Ok(Some(bytes)),
+            Some(bytes) => {
+                committed_agrees(key, self.values, None, bytes, "the local store")?;
+                Ok(Some(bytes))
+            }
             None => Ok(self.values.get(&key.0.0).map(|(_, bytes)| bytes.as_slice())),
         }
     }
@@ -315,6 +339,13 @@ impl<S: Lookup> Lookup for Recording<'_, S> {
 impl<S: Export> Recording<'_, S> {
     fn value(&self, key: &Key) -> Result<Value, String> {
         if let Some(value) = self.overlay.store.value(key)? {
+            committed_agrees(
+                key,
+                self.overlay.values,
+                Some(value.kind),
+                &value.bytes,
+                "the local store's exported kind and bytes",
+            )?;
             return Ok(value);
         }
         self.overlay
@@ -330,6 +361,13 @@ impl<S: Export> Recording<'_, S> {
         // alloc: one owned value per consumed or produced key, moved into one output pack
         let mut values = BTreeMap::new();
         for put in &built.puts {
+            committed_agrees(
+                &put.key,
+                self.overlay.values,
+                Some(put.kind.code()),
+                &put.bytes,
+                "the completed unit's output",
+            )?;
             values.insert(
                 put.key,
                 Value { key: put.key.0.0, kind: put.kind.code(), bytes: put.bytes.clone() },
@@ -512,6 +550,76 @@ mod tests {
     impl Export for Warm {
         fn value(&self, key: &Key) -> Result<Option<Value>, String> {
             Ok(self.0.get(key).cloned())
+        }
+    }
+
+    /// The former Overlay returned the local value first without comparing it with the
+    /// committed pack. A divergent local hit must never influence the completed build.
+    #[test]
+    fn committed_pack_values_refuse_local_hits_and_outputs_that_disagree() {
+        let key = Key(ContentId([0x71; 32]));
+        for marker in 0..16u8 {
+            let expected = vec![marker, 0x40, 0x50]; // alloc: deterministic cache-collision fixture
+            let committed = BTreeMap::from([(key.0.0, (Kind::Query.code(), expected.clone()))]);
+            let local = Warm(
+                [(key, Value { key: key.0.0, kind: Kind::Query.code(), bytes: expected.clone() })]
+                    .into(),
+            );
+            let recording = Recording {
+                overlay: Overlay { store: &local, values: &committed },
+                seen: RefCell::new(BTreeSet::new()),
+            };
+            assert_eq!(recording.read(&key).unwrap(), Some(expected.as_slice()));
+            assert_eq!(recording.value(&key).unwrap().bytes, expected);
+            assert!(recording.export(&Built::default()).is_ok());
+
+            let mut different = expected.clone();
+            different[1] ^= 1;
+            let corrupt = Warm(
+                [(key, Value { key: key.0.0, kind: Kind::Query.code(), bytes: different.clone() })]
+                    .into(),
+            );
+            let recording = Recording {
+                overlay: Overlay { store: &corrupt, values: &committed },
+                seen: RefCell::new(BTreeSet::new()),
+            };
+            let refused = recording.read(&key).unwrap_err();
+            assert!(refused.contains("committed distributed key"), "{refused}");
+            assert!(recording.value(&key).is_err(), "a local export cannot hide the conflict");
+
+            // Even equal bytes with another kind are not the same immutable store value.
+            let wrong_kind = Warm(
+                [(key, Value { key: key.0.0, kind: Kind::Debug.code(), bytes: expected.clone() })]
+                    .into(),
+            );
+            let recording = Recording {
+                overlay: Overlay { store: &wrong_kind, values: &committed },
+                seen: RefCell::new(BTreeSet::new()),
+            };
+            assert!(recording.value(&key).is_err(), "an exported local kind must also agree");
+
+            let empty = Warm(BTreeMap::new());
+            let recording = Recording {
+                overlay: Overlay { store: &empty, values: &committed },
+                seen: RefCell::new(BTreeSet::new()),
+            };
+            assert_eq!(recording.read(&key).unwrap(), Some(expected.as_slice()));
+            for (kind, bytes, accepted) in [
+                (Kind::Query, expected.clone(), true),
+                (Kind::Query, different, false),
+                (Kind::Debug, expected.clone(), false),
+            ] {
+                let built = Built {
+                    puts: vec![Put { key, kind, bytes }],
+                    ..Built::default()
+                };
+                let exported = recording.export(&built);
+                assert_eq!(
+                    exported.is_ok(),
+                    accepted,
+                    "the tail must refuse a conflicting put before immutable publication"
+                );
+            }
         }
     }
 
