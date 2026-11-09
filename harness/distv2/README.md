@@ -80,5 +80,7 @@ The full manifest must name the current attempt's work plus its tail, with Done 
 publication/mirroring. Acceptance checks that successful Done follows the actual manifest commit
 in the shared event stream. The native list remains `pack_digest byte_size keys_digest` per line;
 `packs/<digest>.pack` remains the native `blzdpk\0\x01` format. The harness reads these actual files
-and chooses a referenced, verified pack to corrupt. Intact → corrupt/Never refusal → explicit
-Fallback correctness → restored/Never success is the causal control; no empty glob can pass it.
+and chooses a referenced, verified pack to corrupt. Intact → corrupt/Never refusal → corrupt/explicit Fallback refusal → restored/Never
+success is the causal control. Published or corrupt immutable data never grants permission to
+recompile, even when Fallback was requested; only a missing carrier is a separate, permitted
+explicit Fallback case. No empty glob can pass this control.

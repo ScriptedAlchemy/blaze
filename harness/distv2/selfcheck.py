@@ -129,6 +129,29 @@ class Oracles(unittest.TestCase):
             with self.assertRaises(e.Failed):
                 e.manifest(blobs, UNIT)
 
+    def test_committed_pack_refusal_rejects_fallback_and_unrelated_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / f"{KEY}.pack"
+            artifact = Path(directory) / "app"
+            consumer = unittest.mock.Mock()
+            consumer.program.return_value = artifact
+            refused = (1, f"distributed build failed: committed pack {KEY} is corrupt")
+            consumer.build.return_value = refused
+            for policy in ("never", "fallback"):
+                home = f"corrupt-{policy}"
+                h.committed_pack_refused(consumer, home, policy, target)
+                consumer.build.assert_called_with(home, BLAZE_DIST_LOCAL=policy)
+            for bad in ((0, refused[1]), (1, "distributed build failed: unrelated"),
+                        (1, f"ordinary build error on {KEY}")):
+                consumer.build.return_value = bad
+                with self.assertRaises(e.Failed):
+                    h.committed_pack_refused(consumer, "bad", "fallback", target)
+            consumer.build.return_value = refused
+            artifact.write_bytes(b"incorrect locally rebuilt output")
+            with self.assertRaises(e.Failed):
+                h.committed_pack_refused(consumer, "bad-artifact", "fallback", target)
+
+
     def test_live_jsonl_tolerates_only_an_unfinished_last_append(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events"

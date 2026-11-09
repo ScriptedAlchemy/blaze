@@ -36,7 +36,7 @@ Checks, each on what the build itself reports (BLAZE_DIST_REPORT) and on running
     fenced       a daemon stopped past its lease and resumed: its work is taken back, it cannot
                  commit after that, and both end with the program of a build alone
     no carrier   with no coordinator the build stops naming it; `fallback` compiles here
-    bad cache    a pack on the cache server damaged: the check refuses it, and `fallback` builds
+    bad cache    a committed pack damaged: both `never` and `fallback` refuse it, without recompilation
 
 Every program is run: what it prints covers a panic unwinding across units, a static of another
 crate, and a build script's output.
@@ -396,6 +396,14 @@ def control(run: Run, project: Path | None = None) -> tuple[str, str]:
     return run.behaviour("solo", project)
 
 
+def committed_pack_refused(run: Run, home: str, policy: str, target: Path) -> None:
+    """Neither local policy may recompile an already-published, corrupted key."""
+    code, text = run.build(home, BLAZE_DIST_LOCAL=policy)
+    check(code != 0 and "distributed build failed" in text and target.stem in text,
+          f"{policy} must refuse committed pack {target.stem} by name, not recompile it")
+    check(not run.program(home).exists(), f"{policy} must emit no artifact from a corrupt committed pack")
+
+
 def faults(run: Run, edited: Path) -> None:
     # Freeze a known uncommitted grant before killing: a completed unit/report is no evidence
     # that the victim had outstanding work. Give the survivor the exact same edited input.
@@ -475,14 +483,10 @@ def faults(run: Run, edited: Path) -> None:
         "damaged_sha256": file_hash(target)}, indent=2) + "\n")
     check(file_hash(target) != target.stem, f"changed real stored pack {target.name}; its hash now disagrees")
     try:
-        code, text = run.build("corrupt-never", BLAZE_DIST_LOCAL="never")
-        check(code != 0 and "distributed build failed" in text and target.stem in text,
-              "explicit never refuses the damaged referenced pack, naming its digest")
-        check(not run.program("corrupt-never").exists(), "never produced no artifact from the corrupt cache")
-        check(file_hash(target) != target.stem, "never left the same corruption in place for the fallback control")
-        code, text = run.build("corrupt-fallback", BLAZE_DIST_LOCAL="fallback")
-        check(code == 0, f"explicit fallback builds with the same damaged pack: {text[-800:] if code else ''}")
-        check(run.behaviour("corrupt-fallback") == wanted, "fallback's artifact equals solo despite the damaged cache")
+        for home, policy in (("corrupt-never", "never"), ("corrupt-fallback", "fallback")):
+            committed_pack_refused(run, home, policy, target)
+            check(file_hash(target) != target.stem,
+                  f"{policy} left the same immutable-key corruption in place; no repair was attempted")
     finally:
         # Restore only this harness's byte fault, preserving all manifests and other evidence.
         target.write_bytes(original)
