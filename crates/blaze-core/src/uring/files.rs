@@ -55,6 +55,99 @@ pub(super) const SIZED: u8 = 1;
 const READING: u8 = 7;
 /// A read of a file no request keeps, waiting for room among [`LOADS`].
 const QUEUED: u8 = 8;
+/// All bytes of a whole-file write completed: sync, rename, then sync its directory.
+const COMMITTING: u8 = 9;
+
+#[cfg(test)]
+mod tests;
+
+/// The whole-file write's SQEs and completion transition, shared with the simulated kernel.
+mod whole {
+    #![blaze::sans_io]
+    #![deny(blaze::sans_io_core)]
+
+    use super::*;
+
+    pub(super) fn sqes(
+        hot: &Hot,
+        cold: &Cold,
+        bytes: &[u8],
+        names: [*const u8; 3],
+        ud: impl Fn(usize) -> u64,
+        sqes: &mut [Sqe; LINKS],
+    ) -> usize {
+        let [temporary, dir] = cold.slots;
+        let [temp, target, parent] = names;
+        match hot.phase {
+            UNLINKING => {
+                sqes[0] = unlink(temp, 0, ud(0));
+                1
+            }
+            COMMITTING => {
+                sqes[0] = on_slot(OP_FSYNC, temporary, SQE_IO_LINK, ud(3));
+                sqes[1] = two_names(OP_RENAMEAT, temp, target, SQE_IO_LINK, ud(4));
+                sqes[2] = on_slot(OP_FSYNC, dir, 0, ud(5));
+                3
+            }
+            _ => {
+                let mut n = 0;
+                if hot.phase == OPENING {
+                    sqes[0] = open(parent, DIR, 0, dir, SQE_IO_LINK, ud(0));
+                    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL;
+                    sqes[1] = open(temp, flags, 0o644, temporary, SQE_IO_LINK, ud(1));
+                    n = 2;
+                }
+                let done = hot.done as usize;
+                // Linux can import less than SQE.len (MAX_RW_COUNT) and still run the
+                // linked suffix. Publish only after completions account for every byte.
+                sqes[n] = Sqe {
+                    off: hot.done,
+                    addr: bytes[done..].as_ptr() as u64,
+                    len: (bytes.len() - done).min(u32::MAX as usize) as u32,
+                    ..on_slot(OP_WRITE, temporary, 0, ud(2))
+                };
+                n + 1
+            }
+        }
+    }
+
+    /// Called only after every CQE of this phase arrived, and its opens succeeded.
+    pub(super) fn advance(
+        hot: &mut Hot,
+        cold: &mut Cold,
+        len: usize,
+        results: [i32; LINKS],
+    ) -> Step {
+        if hot.phase == UNLINKING {
+            return Step::Ends(failed(-(cold.at as i32)));
+        }
+        let failure = if hot.phase == COMMITTING {
+            (3..5).find_map(|link| (results[link] < 0).then_some((link, results[link])))
+        } else {
+            let wrote = results[2];
+            match wrote {
+                res if res < 0 => Some((2, res)),
+                0 if hot.done < len as u64 => Some((2, -libc::EIO)),
+                _ => {
+                    hot.done += wrote as u64;
+                    hot.phase = if hot.done < len as u64 { OPENED } else { COMMITTING };
+                    return Step::Again;
+                }
+            }
+        };
+        if let Some((link, res)) = failure {
+            hot.phase = UNLINKING;
+            // Keep the original failure across cleanup: low half errno, high half link.
+            cold.at = u64::from(res.unsigned_abs()) | (link as u64) << 32;
+            return Step::Again;
+        }
+        if results[5] < 0 {
+            Step::Ends(failed(results[5]))
+        } else {
+            Step::Ends(Some(Done::Written))
+        }
+    }
+}
 
 /// The most reads of files no request keeps that hold a descriptor at once (fewer where the
 /// table, sized to `RLIMIT_NOFILE`, is smaller): a batch of 50 000 opens whose reads wait
@@ -322,9 +415,8 @@ impl Uring {
         Ok(())
     }
 
-    /// Starts [`Effect::Write`] `tag` of `bytes` over `file`: the chain that opens its
-    /// directory, makes its temporary next to it, writes, syncs and renames it over the file
-    /// and syncs the directory.
+    /// Starts [`Effect::Write`] `tag` of `bytes` over `file`: opens its directory and makes
+    /// its temporary next to it, finishes the writes, then links sync/rename/directory-sync.
     pub(super) fn write(&mut self, tag: Tag, file: FileName, bytes: Vec<u8>) -> io::Result<()> {
         let mut hot = Hot::new(tag, Kind::Write, 0);
         hot.flags |= MAKE;
@@ -774,30 +866,11 @@ impl Uring {
                 sqes[1] = write;
                 2
             }
-            (Kind::Write, UNLINKING) | (Kind::Clone, UNLINKING) => {
-                sqes[0] = unlink(name(if hot.kind == Kind::Write { 0 } else { 1 }), 0, ud(0));
+            (Kind::Clone, UNLINKING) => {
+                sqes[0] = unlink(name(1), 0, ud(0));
                 1
             }
-            (Kind::Write, _) => {
-                let [temporary, dir] = cold.slots;
-                let mut n = 0;
-                if hot.phase == OPENING {
-                    sqes[0] = open(name(2), DIR, 0, dir, SQE_IO_LINK, ud(0));
-                    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL;
-                    sqes[1] = open(name(0), flags, 0o644, temporary, SQE_IO_LINK, ud(1));
-                    n = 2;
-                }
-                sqes[n] = Sqe {
-                    off: hot.done,
-                    addr: rest,
-                    len: left,
-                    ..on_slot(OP_WRITE, temporary, SQE_IO_LINK, ud(2))
-                };
-                sqes[n + 1] = on_slot(OP_FSYNC, temporary, SQE_IO_LINK, ud(3));
-                sqes[n + 2] = two_names(OP_RENAMEAT, name(0), name(1), SQE_IO_LINK, ud(4));
-                sqes[n + 3] = on_slot(OP_FSYNC, dir, 0, ud(5));
-                n + 4
-            }
+            (Kind::Write, _) => whole::sqes(hot, cold, buf, [name(0), name(1), name(2)], ud, sqes),
             (Kind::Rename, _) => {
                 let [to_dir, from_dir] = cold.slots;
                 let two = cold.names[3] != cold.names[2];
@@ -1000,8 +1073,14 @@ impl Uring {
 
     fn wrote(&mut self, id: Id, hot: Hot, results: [i32; LINKS]) -> Step {
         if hot.phase == UNLINKING {
-            // The temporary is gone, or never renamed: the old file is as it was.
-            return Step::Ends(failed(-(self.ops.cold(id).at as i32)));
+            let at = self.ops.cold(id).at;
+            let what = match at >> 32 {
+                2 => "writing temporary",
+                3 => "syncing temporary",
+                4 => "renaming temporary",
+                _ => unreachable!("a whole-file write's failed link"),
+            };
+            return self.failed_on(id, what, 0, -(at as u32 as i32));
         }
         if hot.phase == OPENING {
             let dir = results[0];
@@ -1017,22 +1096,15 @@ impl Uring {
                 return self.failed_on(id, "making", 0, results[1]);
             }
         }
-        let [_, _, wrote, synced, renamed, dir] = results;
+        if hot.phase == COMMITTING && results[3] >= 0 && results[4] >= 0 && results[5] < 0 {
+            return self.failed_on(id, "syncing directory", 2, results[5]);
+        }
         let len = self.ops.buf(id).len();
-        let put = hot.done as usize;
-        // A short write breaks the chain; the rest is asked again, with the links after it.
-        if wrote > 0 && put + (wrote as usize) < len {
-            self.progress(id, wrote);
-            self.ops.get_mut(id).expect("in flight").phase = OPENED;
-            return Step::Again;
-        }
-        let wrote = if wrote == 0 && put < len { -libc::EIO } else { wrote };
-        if let Some(res) = [wrote, synced, renamed].into_iter().find(|it| *it < 0) {
-            self.ops.get_mut(id).expect("in flight").phase = UNLINKING;
-            self.ops.cold_mut(id).at = u64::from(res.unsigned_abs());
-            return Step::Again;
-        }
-        if dir < 0 { Step::Ends(failed(dir)) } else { Step::Ends(Some(Done::Written)) }
+        // Keep the mutable columns' borrows separate: `Hot` is copied back after the step.
+        let mut next = hot;
+        let step = whole::advance(&mut next, self.ops.cold_mut(id), len, results);
+        *self.ops.get_mut(id).expect("in flight") = next;
+        step
     }
 
     fn renamed(&mut self, id: Id, hot: Hot, results: [i32; LINKS]) -> Step {

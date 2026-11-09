@@ -2664,14 +2664,20 @@ impl Store {
                 }
             }
             (
-                _,
+                op,
                 PlacedFile::Probing(waiting)
                 | PlacedFile::Checking(waiting)
                 | PlacedFile::Writing(waiting),
                 done,
             ) => {
+                let phase = match op {
+                    Op::Probe { .. } => "probing",
+                    Op::Check { .. } => "checking",
+                    Op::MakeFile { .. } => "writing",
+                    _ => unreachable!("a whole placed file's pending operation"),
+                };
                 // alloc: an error, once per place that fails
-                let why = format!("{file}: {}", describe(&done));
+                let why = format!("{phase} {file}: {}", describe(&done));
                 self.refuse_waiting(waiting, &why);
             }
             (_, state, _) => _ = self.files.insert(content, state),
@@ -2914,9 +2920,7 @@ impl Store {
                 self.rechecked(content, waiter, &why, &done, effects)
             }
             Op::Commit { asked, to, staged, bytes } => match done {
-                Done::Renamed => {
-                    self.placed.push(Placed { tag: asked, to, result: Ok(()), bytes })
-                }
+                Done::Renamed => self.placed.push(Placed { tag: asked, to, result: Ok(()), bytes }),
                 done => {
                     // Refused (on Windows, a `to` that is read-only or open without sharing
                     // its delete): a success only if `to` already holds the value's bytes.

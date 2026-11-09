@@ -9,6 +9,8 @@ use super::*;
 use crate::read::Found;
 
 mod model_check;
+#[cfg(target_os = "linux")]
+mod native_placement;
 mod place_race;
 
 fn name(it: &str) -> FileName {
@@ -49,7 +51,8 @@ fn drive(sim: &mut Sim, store: &mut Store, effects: &mut Vec<Effect>) -> Vec<Tic
         if store.owns(completion.tag) {
             durable.extend(store.complete(completion, effects));
         }
-    }).expect("the effects end");
+    })
+    .expect("the effects end");
     durable
 }
 
@@ -476,7 +479,8 @@ fn drive_holding(
             return;
         }
         store.complete(completion, effects);
-    }).expect("the effects end");
+    })
+    .expect("the effects end");
 }
 
 /// Every map a commit asks for before its batch's moves are made.
@@ -1605,7 +1609,8 @@ fn a_map_that_comes_after_a_lost_move_broke_the_store_changes_nothing() {
             store.complete(completion, effects);
             head_asked |= store.tags.ops.values().any(|op| matches!(op, Op::WriteHead));
         }
-    }).expect("the effects end");
+    })
+    .expect("the effects end");
     assert!(!head_asked, "a commit in flight at the break writes no head");
     assert!(
         store.committing(),
@@ -2183,7 +2188,8 @@ fn the_first_place_after_an_open_looks_at_and_seals_the_placed_file_without_foll
             _ = store.complete(completion, effects);
             of_file(&effects[before..], &mut seen);
         }
-    }).expect("the effects end");
+    })
+    .expect("the effects end");
     assert_eq!(store.placed()[0].result, Ok(()));
     assert_eq!(seen, ["Lstat", "Map", "Seal", "Clone"], "the kept file's effects, in order");
 }
@@ -2521,7 +2527,8 @@ fn drive_all(sim: &mut Sim, stores: &mut [&mut Store], effects: &mut Vec<Effect>
         if let Some(store) = stores.iter_mut().find(|it| it.owns(completion.tag)) {
             store.complete(completion, effects);
         }
-    }).expect("the effects end");
+    })
+    .expect("the effects end");
 }
 
 /// A get as a daemon makes it of a shared store: a miss looks again, and gets once that look
@@ -2663,7 +2670,8 @@ fn refused(sim: &mut Sim) -> Broken {
             store.complete(completion, effects);
         }
         asked.extend(effects.iter().map(|it| format!("{it:?}")));
-    }).expect("the effects end");
+    })
+    .expect("the effects end");
     assert!(!store.ready());
     assert_eq!(asked, Vec::<String>::new(), "nothing is read from a store that is refused");
     let Broken { file, what } = store.broken().expect("refused");
@@ -3050,7 +3058,8 @@ fn a_driver_may_hand_over_mappings_by_itself() {
             store.complete(completion, effects);
         }
         maps.extend(effects.extract_if(.., |it| matches!(it, Effect::Map { .. })));
-    }).expect("the effects end");
+    })
+    .expect("the effects end");
     assert!(!store.ready());
     for effect in maps {
         let Effect::Map { file, .. } = effect else { unreachable!() };
@@ -3311,7 +3320,8 @@ fn a_pack_left_behind_by_a_crash_is_removed_at_the_next_open() {
             store.complete(completion, effects);
         }
         effects.retain(|it| !matches!(it, Effect::Remove { .. }));
-    }).expect("the effects end");
+    })
+    .expect("the effects end");
     let gone: Vec<FileName> =
         store.tiers[0].packs.iter().filter(|it| it.removed).map(|it| it.file.clone()).collect();
     assert!(!gone.is_empty() && gone.iter().all(|it| sim.exists(it)), "the removes were dropped");

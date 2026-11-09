@@ -44,10 +44,10 @@ pub(super) enum Kind {
     WriteAt,
     /// Its kept file ([`Hot::of`]) synced.
     Sync,
-    /// A whole file as one linked chain: its directory (named third) opened into slot 1 and
+    /// A whole file: its directory (named third) opened into slot 1 and
     /// the temporary (named first) made into slot 0, written, synced, renamed over the path
-    /// (named second) and the directory synced. A short write asks the chain again from the
-    /// write; one that fails after the temporary was made unlinks it.
+    /// (named second) and the directory synced. Writes finish before a separate linked
+    /// sync/rename/sync commit; one that fails after the temporary was made unlinks it.
     Write,
     /// The first name renamed over the second, linked after the opens of the directories of
     /// each (named third and fourth) and before their syncs.
@@ -176,7 +176,7 @@ impl Hot {
 pub(super) struct Cold {
     /// The offset of a read or a write at one, the length a truncate cuts to; for a request
     /// making directories, how far into its path they are made; for a whole file's write
-    /// unlinking its temporary, why it failed.
+    /// unlinking its temporary, why it failed (errno in the low half, failed link in the high).
     pub at: u64,
     /// The descriptors it owns, closed when it ends: a spawn's pipe, a clone's two files, a
     /// map's file, a kept file's until it is put in the table.
