@@ -8,9 +8,10 @@
 //! appears: a reader sees all of it or none.
 
 use std::{
-    collections::BTreeMap,
+    cmp::Reverse,
+    collections::BinaryHeap,
     fs::File,
-    io::{Read, Seek, Write},
+    io::{BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -27,6 +28,59 @@ use crate::error::{Error, failed};
 
 mod publication;
 
+/// One native record's header; ordering starts with its key for the merge frontier.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct NativeEntry {
+    key: Digest,
+    kind: u8,
+    length: u64,
+    offset: u64,
+}
+
+fn native_refusal(name: &str, why: &str) -> Error {
+    Error::new(blaze_wire::ErrorCode::Refused, format!("{name}: {why}"))
+}
+
+/// Read just a header. Validate the end before any skip or value comparison, so even
+/// u64::MAX lengths cannot overflow or seek past the verified file's boundary.
+fn native_entry(
+    reader: &mut impl Read,
+    name: &str,
+    offset: u64,
+    size: u64,
+) -> Result<Option<NativeEntry>, Error> {
+    if offset == size {
+        return Ok(None);
+    }
+    let mut header = [0; 41];
+    reader.read_exact(&mut header)
+        .map_err(|e| native_refusal(name, &format!("ends inside a native value header: {e}")))?;
+    let length = u64::from_le_bytes(header[33..].try_into().expect("eight length bytes"));
+    let value_offset = offset
+        .checked_add(header.len() as u64)
+        .ok_or_else(|| native_refusal(name, "native value offset overflows u64"))?;
+    if length > size.saturating_sub(value_offset) || value_offset > size {
+        return Err(native_refusal(name, "ends inside a native value"));
+    }
+    Ok(Some(NativeEntry {
+        key: header[..32].try_into().expect("32 key bytes"),
+        kind: header[32],
+        length,
+        offset: value_offset,
+    }))
+}
+
+fn native_keys_hasher(count: usize) -> Sha256 {
+    let mut hash = Sha256::new();
+    // The wire v5 digest domain, followed by the same array head and byte strings
+    // Pack::of hashes. Streaming avoids allocating a CBOR array proportional to keys.
+    hash.update(format!("blaze/blaze/dist-pack-keys/v{}\0", blaze_wire::VERSION)); // alloc: fixed-size wire domain
+    let mut head = blaze_wire::Encoder::new();
+    head.array(count);
+    hash.update(head.into_bytes());
+    hash
+}
+
 /// The directory, shared by every connection.
 pub struct Store {
     dir: PathBuf,
@@ -37,6 +91,10 @@ pub struct Store {
     publication_failure: Mutex<Option<publication::Step>>,
     #[cfg(test)]
     bypass_comparison: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    bypass_mirrors: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    verification_peak: std::sync::atomic::AtomicUsize,
 }
 
 impl Store {
@@ -61,6 +119,10 @@ impl Store {
             publication_failure: Mutex::new(None),
             #[cfg(test)]
             bypass_comparison: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            bypass_mirrors: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            verification_peak: std::sync::atomic::AtomicUsize::new(0),
         };
         store.sweep_temporaries(std::time::Duration::from_secs(3600))?;
         Ok(store)
@@ -139,6 +201,16 @@ impl Store {
     /// Writes the list `name`, if nothing is there. `false` is another writer having written
     /// first: a list is written once.
     pub fn put_list(&self, name: &str, bytes: &[u8]) -> Result<bool, Error> {
+        self.put_list_with(name, bytes, |object, bytes| self.write_whole(object, bytes))
+    }
+
+    // The simulation supplies publication IO, keeping the real first-writer predicate.
+    fn put_list_with(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        publish: impl FnOnce(&ObjectName, &[u8]) -> Result<(), Error>,
+    ) -> Result<bool, Error> {
         if bytes.len() > blaze_wire::Limits::DOCUMENTED.request as usize {
             return Err(Error::too_large("the list exceeds the request limit"));
         }
@@ -157,7 +229,7 @@ impl Store {
         let packs = blaze_wire::pack_list::decode(bytes)
             .map_err(|why| Error::malformed(format!("the new {name}: {why}")))?;
         self.verify_manifest_packs(name, &packs, true)?;
-        self.write_whole(&object, bytes)?;
+        publish(&object, bytes)?;
         Ok(true)
     }
 
@@ -213,22 +285,22 @@ impl Store {
         Ok(true)
     }
 
-    /// Check a full manifest's native values, including duplicate keys that appear
-    /// in different packs. A matching pack SHA and per-pack key commitment cannot
-    /// legitimize two different values stored under the same immutable key.
-    /// Returns whether any pack is absent (only permitted while inspecting an old
-    /// list for an explicit conditional repair).
+    /// Validate each native pack, then merge its ordered records to compare equal keys.
+    /// The request limit bounds the frontier to one record per manifest line, independent
+    /// of the number of keys in a unit. Only two files and fixed byte buffers are live.
+    /// Work is linear in pack bytes plus O(records * log(packs)) frontier operations.
+    /// Reopened content names remain stable under the caller's publication gate: every
+    /// Store blob replacement takes that gate, and the janitor only removes temporaries.
     fn verify_manifest_packs(
         &self,
         name: &str,
         packs: &[blaze_wire::PackRef],
         require_all: bool,
     ) -> Result<bool, Error> {
-        // alloc: one bounded entry for each distinct key in a committed list.
-        let mut seen: BTreeMap<Digest, (Digest, u8, u64, u64)> = BTreeMap::new();
+        let mut frontier = BinaryHeap::new(); // alloc: one pending record per bounded manifest line
         let mut missing = false;
-        for pack in packs {
-            if !self.verify_pack(pack, &mut seen)? {
+        for (at, pack) in packs.iter().enumerate() {
+            if !self.verify_pack(pack)? {
                 if require_all {
                     return Err(Error::new(
                         blaze_wire::ErrorCode::Refused,
@@ -236,120 +308,150 @@ impl Store {
                     ));
                 }
                 missing = true;
+            } else if let Some(entry) = self.native_entry_at(pack, 8)? {
+                frontier.push(Reverse((entry, at)));
+            }
+        }
+        #[cfg(test)]
+        self.verification_peak.fetch_max(frontier.len(), Ordering::Relaxed);
+        let mut previous: Option<(NativeEntry, usize)> = None;
+        while let Some(Reverse((entry, at))) = frontier.pop() {
+            if let Some((prior, prior_at)) = previous
+                && prior.key == entry.key
+            {
+                self.compare_native_values(&packs[prior_at], prior, &packs[at], entry)?;
+            }
+            previous = Some((entry, at));
+            if let Some(next) = self.native_entry_at(&packs[at], entry.offset + entry.length)? {
+                frontier.push(Reverse((next, at)));
             }
         }
         Ok(missing)
     }
 
-    /// True is a present native pack whose bytes and key commitment both match its
-    /// immutable list, and whose repeated keys agree byte-for-byte with earlier
-    /// packs in this manifest. Entries are compared by streaming, not by loading
-    /// potentially huge values into memory or trusting another digest commitment.
-    fn verify_pack(
-        &self,
-        pack: &blaze_wire::PackRef,
-        seen: &mut BTreeMap<Digest, (Digest, u8, u64, u64)>,
-    ) -> Result<bool, Error> {
+    /// True is a whole present native pack; false is absence. CBOR's batch limit
+    /// bounds wire arrays, not the opaque records in a native blob (Pack::of has no
+    /// such cap). Count ordered records first, then hash their CBOR encoding without
+    /// retaining keys or values. The blob byte limit bounds both scans.
+    fn verify_pack(&self, pack: &blaze_wire::PackRef) -> Result<bool, Error> {
         let name = format!("packs/{}.pack", hex(&pack.pack));
         let object = self.object(&name)?;
         let Some((mut file, size)) = self.open_blob(&name)? else { return Ok(false) };
-        if size != pack.size {
-            return Err(Error::new(
-                blaze_wire::ErrorCode::Refused,
-                format!("{name} has {size} bytes, its list names {}", pack.size),
+        if size != pack.size || size > blaze_wire::Limits::DOCUMENTED.blob {
+            return Err(native_refusal(
+                &name,
+                &format!(
+                    "has {size} bytes, its list names {}; the wire blob limit is {}",
+                    pack.size,
+                    blaze_wire::Limits::DOCUMENTED.blob,
+                ),
             ));
         }
-        // Check the complete immutable byte digest, then the native record boundaries
-        // and independent keys digest. Keep only keys, never the potentially huge values.
         self.verify_reader(&object, &mut file)?;
-        file.rewind().map_err(|e| failed(&format!("rewinding {name}"), e))?;
-        let refuse = |why: &str| {
-            Error::new(blaze_wire::ErrorCode::Refused, format!("{name}: {why}"))
-        };
-        let mut magic = [0; 8];
-        file.read_exact(&mut magic)
-            .map_err(|e| refuse(&format!("cannot read its native header: {e}")))?;
-        if magic != blaze_wire::DIST_PACK_MAGIC {
-            return Err(refuse("has no native pack header"));
+        file.seek(SeekFrom::Start(8)).map_err(|e| failed(&format!("rewinding {name}"), e))?;
+        let mut reader = BufReader::new(file); // alloc: one fixed-capacity native scan buffer
+        let mut count = 0;
+        let mut previous = None;
+        let mut offset = 8;
+        while let Some(entry) = native_entry(&mut reader, &name, offset, size)? {
+            if previous.is_some_and(|key| key >= entry.key) {
+                return Err(native_refusal(&name, "native entries have duplicate or unordered keys"));
+            }
+            previous = Some(entry.key);
+            count += 1;
+            offset = entry.offset + entry.length;
+            reader.seek_relative(entry.length as i64)
+                .map_err(|e| failed(&format!("skipping a value in {name}"), e))?;
         }
-        let mut keys: Vec<Digest> = Vec::new(); // alloc: bounded pack key verification
-        loop {
-            let mut key = [0; 32];
-            let read = file.read(&mut key[..1])
-                .map_err(|e| refuse(&format!("cannot read a key: {e}")))?;
-            if read == 0 {
-                break;
-            }
-            file.read_exact(&mut key[1..])
-                .map_err(|e| refuse(&format!("ends inside a key: {e}")))?;
-            let mut kind_and_size = [0; 9];
-            file.read_exact(&mut kind_and_size)
-                .map_err(|e| refuse(&format!("ends inside a value header: {e}")))?;
-            let length = u64::from_le_bytes(
-                kind_and_size[1..].try_into().expect("eight bytes after the kind"),
-            );
-            if keys.last().is_some_and(|previous| previous >= &key) {
-                return Err(refuse("native entries have duplicate or unordered keys"));
-            }
-            if keys.len() >= blaze_wire::Limits::DOCUMENTED.batch_items as usize {
-                return Err(refuse("native key count exceeds the wire batch limit"));
-            }
-            let value_offset = file.stream_position()
-                .map_err(|e| refuse(&format!("cannot locate a native value: {e}")))?;
-            if let Some(&(prior_pack, prior_kind, prior_len, prior_offset)) = seen.get(&key) {
-                if kind_and_size[0] != prior_kind || length != prior_len {
-                    return Err(refuse(&format!(
-                        "immutable key {} has conflicting kinds or lengths across packs {} and {}",
-                        hex(&key), hex(&prior_pack), hex(&pack.pack),
-                    )));
-                }
-                let prior_name = format!("packs/{}.pack", hex(&prior_pack));
-                let Some((mut prior, _)) = self.open_blob(&prior_name)? else {
-                    return Err(refuse(&format!(
-                        "previously verified pack {prior_name} vanished while comparing key {}",
-                        hex(&key),
-                    )));
-                };
-                prior.seek(std::io::SeekFrom::Start(prior_offset))
-                    .map_err(|e| refuse(&format!("cannot locate previous value for {}: {e}", hex(&key))))?;
-                let mut old_bytes = [0u8; 8192];
-                let mut new_bytes = [0u8; 8192];
-                let mut remaining = length;
-                while remaining > 0 {
-                    let chunk = usize::try_from(remaining.min(8192)).expect("bounded chunk");
-                    prior.read_exact(&mut old_bytes[..chunk])
-                        .map_err(|e| refuse(&format!("cannot read previous value for {}: {e}", hex(&key))))?;
-                    file.read_exact(&mut new_bytes[..chunk])
-                        .map_err(|e| refuse(&format!("cannot read repeated value for {}: {e}", hex(&key))))?;
-                    if old_bytes[..chunk] != new_bytes[..chunk] {
-                        return Err(refuse(&format!(
-                            "immutable key {} has conflicting bytes across packs {} and {}",
-                            hex(&key), hex(&prior_pack), hex(&pack.pack),
-                        )));
-                    }
-                    remaining -= chunk as u64;
-                }
-            } else {
-                let copied = std::io::copy(
-                    &mut (&mut file).take(length),
-                    &mut std::io::sink(),
-                )
-                .map_err(|e| refuse(&format!("cannot read a value: {e}")))?;
-                if copied != length {
-                    return Err(refuse("ends inside a native value"));
-                }
-                seen.insert(key, (pack.pack, kind_and_size[0], length, value_offset));
-            }
-            keys.push(key);
+        reader.seek(SeekFrom::Start(8)).map_err(|e| failed(&format!("rewinding {name}"), e))?;
+        let mut hash = native_keys_hasher(count);
+        offset = 8;
+        while let Some(entry) = native_entry(&mut reader, &name, offset, size)? {
+            // A Digest is a CBOR byte string of 32 bytes, not an array of integers.
+            hash.update([0x58, 32]);
+            hash.update(entry.key);
+            offset = entry.offset + entry.length;
+            reader.seek_relative(entry.length as i64)
+                .map_err(|e| failed(&format!("skipping a value in {name}"), e))?;
         }
-        let committed = blaze_wire::digest_of_encoded_name(
-            "blaze/dist-pack-keys",
-            &blaze_wire::encode(&keys),
-        );
-        if committed != pack.keys {
-            return Err(refuse("native keys differ from the immutable list commitment"));
+        if Digest::from(hash.finalize()) != pack.keys {
+            return Err(native_refusal(
+                &name,
+                "native keys differ from the immutable list commitment",
+            ));
         }
         Ok(true)
+    }
+
+    fn native_entry_at(
+        &self,
+        pack: &blaze_wire::PackRef,
+        offset: u64,
+    ) -> Result<Option<NativeEntry>, Error> {
+        if offset == pack.size {
+            return Ok(None);
+        }
+        let name = format!("packs/{}.pack", hex(&pack.pack));
+        let mut file = self.verified_pack_file(&name)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| failed(&format!("locating a record in {name}"), e))?;
+        native_entry(&mut file, &name, offset, pack.size)
+    }
+
+    fn verified_pack_file(&self, name: &str) -> Result<File, Error> {
+        self.open_blob(name)?.map(|(file, _)| file).ok_or_else(|| {
+            native_refusal(name, "previously verified pack vanished under the publication gate")
+        })
+    }
+
+    fn compare_native_values(
+        &self,
+        prior_pack: &blaze_wire::PackRef,
+        prior: NativeEntry,
+        pack: &blaze_wire::PackRef,
+        entry: NativeEntry,
+    ) -> Result<(), Error> {
+        #[cfg(test)]
+        if self.bypass_mirrors.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let name = format!("packs/{}.pack", hex(&pack.pack));
+        let conflict = |why| {
+            native_refusal(
+                &name,
+                &format!(
+                    "immutable key {} has conflicting {why} across packs {} and {}",
+                    hex(&entry.key),
+                    hex(&prior_pack.pack),
+                    hex(&pack.pack),
+                ),
+            )
+        };
+        if prior.kind != entry.kind || prior.length != entry.length {
+            return Err(conflict("kinds or lengths"));
+        }
+        let prior_name = format!("packs/{}.pack", hex(&prior_pack.pack));
+        let mut old = self.verified_pack_file(&prior_name)?;
+        let mut new = self.verified_pack_file(&name)?;
+        old.seek(SeekFrom::Start(prior.offset))
+            .map_err(|e| failed(&format!("locating a value in {prior_name}"), e))?;
+        new.seek(SeekFrom::Start(entry.offset))
+            .map_err(|e| failed(&format!("locating a value in {name}"), e))?;
+        let mut old_bytes = [0; 8192];
+        let mut new_bytes = [0; 8192];
+        let mut remaining = entry.length;
+        while remaining > 0 {
+            let chunk = remaining.min(old_bytes.len() as u64) as usize;
+            old.read_exact(&mut old_bytes[..chunk])
+                .map_err(|e| failed(&format!("reading a value in {prior_name}"), e))?;
+            new.read_exact(&mut new_bytes[..chunk])
+                .map_err(|e| failed(&format!("reading a value in {name}"), e))?;
+            if old_bytes[..chunk] != new_bytes[..chunk] {
+                return Err(conflict("bytes"));
+            }
+            remaining -= chunk as u64;
+        }
+        Ok(())
     }
 
     /// Removes the temporary files of writes that were stopped, once they are older than the
