@@ -287,7 +287,8 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
 
 /// `then` of the inputs of `unit`'s record key: the one place they are gathered, so the key
 /// and its parts as `blaze why` names them ([`RecordInputs::parts`]) cannot differ.
-fn with_record_inputs<T>(
+/// The unit's key-coverage tests use this same collection path.
+pub(super) fn with_record_inputs<T>(
     job: &Job,
     unit: usize,
     identity: ContentId,

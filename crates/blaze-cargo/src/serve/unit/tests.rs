@@ -2435,6 +2435,326 @@ fn each_maker_of_a_record_moves_its_key() {
     }
 }
 
+/// The parent record and the native inputs selected by the same job's linked crates.
+struct NativeLinkKey {
+    key: blaze_cas::Key,
+    parts: Vec<blaze_kernel::Part>,
+    identities: [ContentId; 4],
+    checks: [ContentId; 2],
+    parent_flags: Vec<String>,
+    linked: Vec<(String, String)>,
+    archives: Vec<(PathBuf, Vec<u8>)>,
+}
+
+/// Two linked libraries and an unrelated package, with an unchanged binary parent. Only
+/// the libraries' native search flags vary. Lower actual VFS sources before gathering the
+/// parent's record inputs, so neither a fabricated crate identity nor a hand-built key
+/// vector can hide an input already covered by the front end.
+fn native_link_key(
+    dir: &std::path::Path,
+    search: [&[&std::path::Path]; 2],
+    unlinked: &std::path::Path,
+) -> NativeLinkKey {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    use blaze_core::{
+        FileName,
+        sim::{Faults, Sim},
+    };
+    use blaze_units::query::{BuildConfig, Command, Invocation, Mount, Origin};
+    use blaze_vfs::{Op, Vfs};
+
+    let (mut vfs, _) = Vfs::recover(FileName::new("native-link-key.vfs").unwrap(), 0, &[]);
+    let names = ["a", "b", "unlinked", "parent"];
+    let mut files = Vec::new();
+    let mut all = Vec::new();
+    let mut packages = Vec::new();
+    let mut plans = Vec::new();
+    for (at, name) in names.iter().enumerate() {
+        let id = match at == 3 {
+            true => format!("path+file:///w/{name}#0.1.0"),
+            false => format!("registry+https://github.com/rust-lang/crates.io-index#{name}@0.1.0"),
+        };
+        let source = format!("{name}/src/lib.rs");
+        files.push(Op::Write {
+            mode: blaze_vfs::Mode::Regular,
+            path: format!("{name}/Cargo.toml"),
+            bytes: format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n").into_bytes(),
+        });
+        files.push(Op::Write {
+            mode: blaze_vfs::Mode::Regular,
+            path: source.clone(),
+            bytes: if at == 3 { b"fn main() {}\n".to_vec() } else { b"pub fn f() {}\n".to_vec() },
+        });
+        let kind = if at == 3 { "bin" } else { "lib" };
+        let mut u = unit(&id, target(name, kind, &format!("/w/{source}")), Mode::Build, &[]);
+        if at == 3 {
+            u.dependencies = (0..2)
+                .map(|index| UnitDep {
+                    index,
+                    extern_crate_name: names[index].to_owned(),
+                    public: None,
+                    noprelude: None,
+                    nounused: None,
+                    dev: false,
+                })
+                .collect();
+        }
+        all.push(u);
+        let mut pkg = package(&id, name, &format!("/w/{name}"));
+        if at < 3 {
+            pkg.is_member = false;
+            pkg.source = Some("(registry+https://github.com/rust-lang/crates.io-index)".into());
+        }
+        packages.push(pkg);
+        let mut p = plan(&format!("-{at:04}"), &[]);
+        if at < 3 {
+            p.rustflags.push("-lstatic=collision".to_owned());
+            let paths = if at < 2 { search[at] } else { std::slice::from_ref(&unlinked) };
+            for path in paths {
+                p.rustflags.push(format!("-Lnative={}", path.display()));
+            }
+        } else {
+            p.rustflags.push(format!("-Lnative={}", dir.join("parent-only").display()));
+        }
+        plans.push(p);
+    }
+    let root = vfs.apply(vfs.empty(), &files).unwrap();
+    let units = Arc::new(Units {
+        graph: UnitGraph { version: 1, units: all, roots: vec![3] },
+        plans,
+        packages,
+        lock: None,
+        warnings: Vec::new(),
+        target_dir: dir.join("target").to_str().unwrap().to_owned(),
+        build_dir: dir.join("build").to_str().unwrap().to_owned(),
+        finished: String::new(),
+        link_dirs: Vec::new(),
+        sandboxed_tests: false,
+        native: Vec::new(),
+    });
+    let config = Arc::new(BuildConfig {
+        invocation: Invocation {
+            command: Command::Build,
+            args: Vec::new(),
+            root: "/w".to_owned(),
+            cwd: "/w".to_owned(),
+            env: Vec::new(),
+            files: Vec::new(),
+        },
+        mounts: vec![Mount { at: "/w".to_owned(), origin: Origin::View, under: String::new() }],
+        host: HOST.to_owned(),
+        library: "/rustc/abc/library".to_owned(),
+        std: "/s/std".to_owned(),
+        builds: "/s/build".to_owned(),
+        sources: "/s/sources".to_owned(),
+        blaze: String::new(),
+    });
+    let files = vfs.reader();
+    let mut lowered = blaze_lower::lower(blaze_lower::Lower {
+        units: &units,
+        config: &config,
+        files: &files,
+        root,
+        host_cpu: None,
+    })
+    .unwrap();
+    let identities = std::array::from_fn(|at| lowered.identity(at).unwrap());
+    let db = Arc::new(blaze_query::Database::new(blaze_query::Config::memory()));
+    let queries = db.open_with(blaze_vfs::View { root }, &config.encode());
+    let mut sim = Sim::new(1, Faults::default());
+    let store = super::deps::tests::opened(&mut sim);
+    let input = crate::serve::work::JobInput {
+        db,
+        queries,
+        root,
+        files,
+        config,
+        units,
+        native: Arc::from([]),
+        store: store.reader(),
+        std: store.reader(),
+        macros: super::deps::tests::no_macros(),
+        color: false,
+        short: false,
+        width: None,
+        verbose: 0,
+        refused: None,
+        goal: crate::serve::work::Goal::Build,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    };
+    let shared = Arc::new(super::Shared {
+        state: dir.to_path_buf(),
+        launcher: "/opt/blaze/bin/blaze".into(),
+        tools: dir.join("tools"),
+        memos: super::memo::Memos::new(),
+        host_cpu: None,
+        selectors: Default::default(),
+        dev_runs: super::run::inproc::DevRuns::new(dir.join("inproc")),
+    });
+    let job = super::Job::new(input, lowered.crates().clone(), shared, None).unwrap();
+    let (key, parts, linked) = compile::with_record_inputs(&job, 3, identities[3], |inputs| {
+        Ok((inputs.key(3)?, inputs.parts(3)?, inputs.linked_rustflag_libs.clone()))
+    })
+    .unwrap();
+
+    // These leaves read no environment or dependencies: their real image, bodies and
+    // diagnostic-outcome keys are their check identities, independent of native -L.
+    let db = lowered.db();
+    let krates = [lowered.krate(0).unwrap(), lowered.krate(1).unwrap()];
+    let images = hir_def::deps::keys(db, &krates, super::deps::front_end().unwrap());
+    let checks = std::array::from_fn(|at| {
+        let flags = compile::unit_lint_flags(&job, at).unwrap();
+        let inputs = blaze_diagnostics::cache::Inputs::of(db, &flags);
+        let bodies = blaze_diagnostics::cache::bodies_key(images[&krates[at]], &[], inputs.borrowck);
+        blaze_diagnostics::cache::key(bodies, &inputs)
+    });
+
+    // The resolver fixture uses files with different bytes under the same archive basename;
+    // no C compiler, host C runtime or object-code generation is needed to prove selection.
+    let mut output = blaze_link::target::output(
+        "wasm32-unknown-unknown",
+        Some(("native-key.wasm".into(), Vec::new())),
+        blaze_link::Debug::None,
+        false,
+    )
+    .unwrap();
+    let sysroot = std::path::Path::new("/no-blaze-toolchain");
+    let mut bundled = Vec::new();
+    for at in job.graph.linked_in(3) {
+        let flags = codegen::link_rustflags(&job, at).unwrap();
+        let mut libs =
+            flags.libs.iter().map(|lib| codegen::link_lib(lib).unwrap()).collect::<Vec<_>>();
+        blaze_link::target::bundle(
+            &output,
+            &mut libs,
+            &codegen::search_dirs(&flags.search),
+            sysroot,
+        )
+        .unwrap();
+        bundled.extend(libs);
+    }
+    let archives = blaze_link::target::locate(&mut output, &bundled, &[], sysroot)
+        .unwrap()
+        .into_iter()
+        .map(|native| {
+            let bytes = std::fs::read(&native.path).unwrap();
+            (native.path, bytes)
+        })
+        .collect();
+    NativeLinkKey {
+        key,
+        parts,
+        identities,
+        checks,
+        parent_flags: job.plan(3).unwrap().rustflags.clone(),
+        linked,
+        archives,
+    }
+}
+
+#[test]
+fn a_linked_crates_native_search_path_moves_only_the_parents_link_key_part() {
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("a");
+    let b = root.path().join("b");
+    for (dir, bytes) in [(&a, b"package a"), (&b, b"package b")] {
+        std::fs::create_dir(dir).unwrap();
+        std::fs::write(dir.join("libcollision.a"), bytes).unwrap();
+    }
+    let before = native_link_key(root.path(), [&[&a], &[&b]], &a);
+    let after = native_link_key(root.path(), [&[&b], &[&b]], &a);
+    assert_eq!(
+        before.identities, after.identities,
+        "all Rust sources and crate identities stay fixed"
+    );
+    assert_eq!(before.checks, after.checks, "neither dependency check identity covers native -L");
+    assert_eq!(before.parent_flags, after.parent_flags, "the parent's own plan is unchanged");
+    assert!(before.archives.iter().any(|(path, bytes)| {
+        path == &a.join("libcollision.a") && bytes == b"package a"
+    }));
+    assert!(!after.archives.iter().any(|(path, _)| path == &a.join("libcollision.a")));
+    assert!(after.archives.iter().any(|(path, bytes)| {
+        path == &b.join("libcollision.a") && bytes == b"package b"
+    }));
+    // Keep this first: omitting dependency -L from the production collector must fail on
+    // equal parent keys for different required archives, before any shape assertion below.
+    assert_ne!(
+        before.key, after.key,
+        "changing only a linked crate's -L selects different required archives and must \
+         invalidate its parent's record"
+    );
+    assert_eq!(before.parts.len(), after.parts.len());
+    let changed = before
+        .parts
+        .iter()
+        .zip(&after.parts)
+        .filter_map(|(a, b)| {
+            assert_eq!(a.name, b.name);
+            (a != b).then_some(a.name.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(changed, ["the `-l`s and `-L`s in the rustflags of the crates it links"]);
+
+    let package_a = "registry+https://github.com/rust-lang/crates.io-index#a@0.1.0";
+    let package_b = "registry+https://github.com/rust-lang/crates.io-index#b@0.1.0";
+    assert_eq!(
+        before.linked,
+        [
+            (package_b.to_owned(), "static=collision".to_owned()),
+            (package_b.to_owned(), format!("-L native={}", b.display())),
+            (package_a.to_owned(), "static=collision".to_owned()),
+            (package_a.to_owned(), format!("-L native={}", a.display())),
+        ],
+        "libraries and directories keep their declaring packages and graph link order"
+    );
+
+    let restored = native_link_key(root.path(), [&[&a], &[&b]], &a);
+    assert_eq!(restored.key, before.key, "reverting only -L restores the original parent key");
+    assert_eq!(restored.parts, before.parts);
+    assert_eq!(restored.archives, before.archives);
+
+    let unrelated = native_link_key(root.path(), [&[&a], &[&b]], &b);
+    assert_eq!(unrelated.key, before.key, "an unlinked package's native flags are no parent input");
+    assert_eq!(unrelated.parts, before.parts);
+    assert_eq!(unrelated.linked, before.linked);
+    assert_eq!(unrelated.archives, before.archives);
+
+    let ordered = native_link_key(root.path(), [&[&a, &b], &[&b]], &a);
+    let reversed = native_link_key(root.path(), [&[&b, &a], &[&b]], &a);
+    assert_eq!(ordered.checks, reversed.checks);
+    assert_ne!(
+        ordered.archives, reversed.archives,
+        "the first native directory selects the archive"
+    );
+    assert_ne!(ordered.key, reversed.key, "native directory order is part of the parent key");
+    let paths = |key: &NativeLinkKey| {
+        key.linked.iter()
+            .filter(|(package, flag)| package == package_a && flag.starts_with("-L "))
+            .map(|(_, flag)| flag.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        paths(&ordered),
+        [format!("-L native={}", a.display()), format!("-L native={}", b.display())]
+    );
+    assert_eq!(
+        paths(&reversed),
+        [format!("-L native={}", b.display()), format!("-L native={}", a.display())]
+    );
+
+    let swapped = native_link_key(root.path(), [&[&b], &[&a]], &a);
+    assert_eq!(swapped.checks, before.checks);
+    assert_ne!(
+        swapped.archives, before.archives,
+        "each archive stays in its declaring crate's link position"
+    );
+    assert_ne!(
+        swapped.key, before.key,
+        "swapping the same directories between declaring packages changes the key"
+    );
+}
+
 /// Rule 18 for the sealed checks of a reached-only crate: when `l` gains `#[blaze::sealed]`,
 /// `d`'s record key moves, so a record of `d` built while its graph had no sealed trait (no check
 /// of its own, so no refusal) is never served for the sealed graph, and `d` is checked again and
