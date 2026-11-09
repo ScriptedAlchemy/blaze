@@ -238,8 +238,9 @@ into `/fast/projects/blaze-v2-linux-state/target-stage1`, with 8 workers and
 Keep source frozen until this build settles. **There is no functional stage1 result yet.**
 
 Peer cache commits `b41983d99`, `b79cc9403`, `4720cff5b` and `0e2a7cc2d` were preserved by
-fast-forward. Their Rust/Hegel tests remain **UNRUN**, assigned to a separate audit lane; the
-earlier focused receipts do not verify those changes.
+fast-forward. Their Rust/Hegel tests remain **UNRUN**. A separate lane audits producer
+compatibility; root owns runtime verification. The earlier focused receipts do not verify
+those changes.
 
 Still owed: actual 2.739 GB kernel/CAS placement; ELF personality/LSDA and native
 archive/resolver/`-L` key regression; upstream macro wasm/no_std fixtures; functional stage1 and
@@ -247,5 +248,4 @@ integration; all actual two-holder distv2 release/fold/cache/loss/stale-refusal/
 policy/artifact gates; full forkfixes and the map's ten owed rows; `debug = 0` candidate
 reproduction; and Windows native evidence. No map rows are settled by this append. Draft PR 81
 stays draft until acceptance and protections are satisfied; landing remains queue-only, with no
-force push, main push or Cargo/rustc bootstrap. Root owns the central docs checks and tests;
-this documentation lane only read receipts and edited this record.
+force push, main push or Cargo/rustc bootstrap.
