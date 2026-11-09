@@ -82,6 +82,48 @@ fn first_publication_cannot_name_missing_or_corrupt_packs(tc: hegel::TestCase) {
     }
 }
 
+
+#[hegel::test(test_cases = 32)]
+fn first_writer_requires_equal_values_for_keys_mirrored_across_packs(tc: hegel::TestCase) {
+    let conflict = tc.draw(gs::integers::<u8>().max_value(1)) == 1;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let (first, original) = pack(1);
+    let (_, other) = pack(2);
+    // The second pack includes the first key/value and a distinct key. Both
+    // packs are individually canonical and have valid SHA and key commitments.
+    // The only mutation, when planted, changes the repeated value's bytes.
+    let mut combined = original.clone();
+    combined.extend_from_slice(&other[DIST_PACK_MAGIC.len()..]);
+    if conflict {
+        combined[DIST_PACK_MAGIC.len() + 32 + 1 + 8] ^= 0x10;
+    }
+    let second = PackRef {
+        pack: digest(&combined),
+        size: combined.len() as u64,
+        keys: blaze_wire::digest_of_encoded_name(
+            "blaze/dist-pack-keys",
+            &blaze_wire::encode(&vec![[1; 32], [2; 32]]),
+        ),
+        packed: None,
+        format: DIST_PACK_FORMAT,
+    };
+    put(&store, &(first.clone(), original));
+    put(&store, &(second.clone(), combined));
+    let mut refs = vec![first, second];
+    refs.sort();
+    let list = pack_list::encode(&refs);
+    let result = store.put_list(&name(), &list);
+    if conflict {
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("conflicting bytes"), "{error}");
+        assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+    } else {
+        assert!(result.unwrap(), "byte-identical overlap is a valid published list");
+        assert_eq!(current(&store), list);
+    }
+}
+
 #[test]
 fn first_publication_refuses_forged_keys_and_truncated_native_values() {
     let dir = tempfile::tempdir().unwrap();

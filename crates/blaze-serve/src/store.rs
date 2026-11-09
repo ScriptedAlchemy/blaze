@@ -8,6 +8,7 @@
 //! appears: a reader sees all of it or none.
 
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
@@ -155,14 +156,7 @@ impl Store {
         // atomic name, so concurrent PUTs cannot change the verified packs.
         let packs = blaze_wire::pack_list::decode(bytes)
             .map_err(|why| Error::malformed(format!("the new {name}: {why}")))?;
-        for pack in &packs {
-            if !self.verify_pack(pack)? {
-                return Err(Error::new(
-                    blaze_wire::ErrorCode::Refused,
-                    format!("the new {name} names absent pack {}", hex(&pack.pack)),
-                ));
-            }
-        }
+        self.verify_manifest_packs(name, &packs, true)?;
         self.write_whole(&object, bytes)?;
         Ok(true)
     }
@@ -206,32 +200,56 @@ impl Store {
         }
         let old = blaze_wire::pack_list::decode(&current)
             .map_err(|why| Error::malformed(format!("the current {name}: {why}")))?;
-        let mut missing = false;
-        for pack in &old {
-            // Do not stop at the first absence: a different old pack that is present but
-            // corrupt is a refusal, not permission to erase evidence by replacing the list.
-            missing |= !self.verify_pack(pack)?;
-        }
+        // Inspect every present old pack, even when another is missing: a
+        // conflicting immutable key is not a repairable cache miss.
+        let missing = self.verify_manifest_packs(name, &old, false)?;
         if !missing {
             return Ok(false);
         }
         let replacement = blaze_wire::pack_list::decode(bytes)
             .map_err(|why| Error::malformed(format!("the replacement {name}: {why}")))?;
-        for pack in &replacement {
-            if !self.verify_pack(pack)? {
-                return Err(Error::new(
-                    blaze_wire::ErrorCode::Refused,
-                    format!("the replacement {name} names absent pack {}", hex(&pack.pack)),
-                ));
-            }
-        }
+        self.verify_manifest_packs(name, &replacement, true)?;
         publish(&object, bytes)?;
         Ok(true)
     }
 
+    /// Check a full manifest's native values, including duplicate keys that appear
+    /// in different packs. A matching pack SHA and per-pack key commitment cannot
+    /// legitimize two different values stored under the same immutable key.
+    /// Returns whether any pack is absent (only permitted while inspecting an old
+    /// list for an explicit conditional repair).
+    fn verify_manifest_packs(
+        &self,
+        name: &str,
+        packs: &[blaze_wire::PackRef],
+        require_all: bool,
+    ) -> Result<bool, Error> {
+        // alloc: one bounded entry for each distinct key in a committed list.
+        let mut seen: BTreeMap<Digest, (Digest, u8, u64, u64)> = BTreeMap::new();
+        let mut missing = false;
+        for pack in packs {
+            if !self.verify_pack(pack, &mut seen)? {
+                if require_all {
+                    return Err(Error::new(
+                        blaze_wire::ErrorCode::Refused,
+                        format!("{name} names absent pack {}", hex(&pack.pack)),
+                    ));
+                }
+                missing = true;
+            }
+        }
+        Ok(missing)
+    }
+
     /// True is a present native pack whose bytes and key commitment both match its
-    /// immutable list. A valid pack SHA alone does not prove the separately committed keys.
-    fn verify_pack(&self, pack: &blaze_wire::PackRef) -> Result<bool, Error> {
+    /// immutable list, and whose repeated keys agree byte-for-byte with earlier
+    /// packs in this manifest. Entries are compared by streaming, not by loading
+    /// potentially huge values into memory or trusting another digest commitment.
+    fn verify_pack(
+        &self,
+        pack: &blaze_wire::PackRef,
+        seen: &mut BTreeMap<Digest, (Digest, u8, u64, u64)>,
+    ) -> Result<bool, Error> {
         let name = format!("packs/{}.pack", hex(&pack.pack));
         let object = self.object(&name)?;
         let Some((mut file, size)) = self.open_blob(&name)? else { return Ok(false) };
@@ -276,13 +294,51 @@ impl Store {
             if keys.len() >= blaze_wire::Limits::DOCUMENTED.batch_items as usize {
                 return Err(refuse("native key count exceeds the wire batch limit"));
             }
-            let copied = std::io::copy(
-                &mut (&mut file).take(length),
-                &mut std::io::sink(),
-            )
-            .map_err(|e| refuse(&format!("cannot read a value: {e}")))?;
-            if copied != length {
-                return Err(refuse("ends inside a native value"));
+            let value_offset = file.stream_position()
+                .map_err(|e| refuse(&format!("cannot locate a native value: {e}")))?;
+            if let Some(&(prior_pack, prior_kind, prior_len, prior_offset)) = seen.get(&key) {
+                if kind_and_size[0] != prior_kind || length != prior_len {
+                    return Err(refuse(&format!(
+                        "immutable key {} has conflicting kinds or lengths across packs {} and {}",
+                        hex(&key), hex(&prior_pack), hex(&pack.pack),
+                    )));
+                }
+                let prior_name = format!("packs/{}.pack", hex(&prior_pack));
+                let Some((mut prior, _)) = self.open_blob(&prior_name)? else {
+                    return Err(refuse(&format!(
+                        "previously verified pack {prior_name} vanished while comparing key {}",
+                        hex(&key),
+                    )));
+                };
+                prior.seek(std::io::SeekFrom::Start(prior_offset))
+                    .map_err(|e| refuse(&format!("cannot locate previous value for {}: {e}", hex(&key))))?;
+                let mut old_bytes = [0u8; 8192];
+                let mut new_bytes = [0u8; 8192];
+                let mut remaining = length;
+                while remaining > 0 {
+                    let chunk = usize::try_from(remaining.min(8192)).expect("bounded chunk");
+                    prior.read_exact(&mut old_bytes[..chunk])
+                        .map_err(|e| refuse(&format!("cannot read previous value for {}: {e}", hex(&key))))?;
+                    file.read_exact(&mut new_bytes[..chunk])
+                        .map_err(|e| refuse(&format!("cannot read repeated value for {}: {e}", hex(&key))))?;
+                    if old_bytes[..chunk] != new_bytes[..chunk] {
+                        return Err(refuse(&format!(
+                            "immutable key {} has conflicting bytes across packs {} and {}",
+                            hex(&key), hex(&prior_pack), hex(&pack.pack),
+                        )));
+                    }
+                    remaining -= chunk as u64;
+                }
+            } else {
+                let copied = std::io::copy(
+                    &mut (&mut file).take(length),
+                    &mut std::io::sink(),
+                )
+                .map_err(|e| refuse(&format!("cannot read a value: {e}")))?;
+                if copied != length {
+                    return Err(refuse("ends inside a native value"));
+                }
+                seen.insert(key, (pack.pack, kind_and_size[0], length, value_offset));
             }
             keys.push(key);
         }
