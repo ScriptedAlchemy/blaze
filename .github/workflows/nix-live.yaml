@@ -29,6 +29,8 @@ on:
       - "**/Cargo.lock"
       - "**/Cargo.toml"
       - ".github/workflows/nix-live.yaml"
+      - ".github/scripts/refresh_nix_graphs.py"
+      - ".github/scripts/test_refresh_nix_graphs.py"
   workflow_dispatch:
 
 # A newer push to main or to the pull request cancels the run before it, so what it says is of
@@ -56,11 +58,30 @@ jobs:
       - uses: ./.github/actions/nix
         with:
           cache: true
-      - run: python3 tools/nix/unit_graph.py
-      - name: tools/nix/units is what unit_graph.py writes
+      - name: graph refresh isolation regressions
+        run: python3 .github/scripts/test_refresh_nix_graphs.py
+      - id: graphs
+        run: python3 tools/nix/unit_graph.py
+      - id: current
+        name: tools/nix/units is what unit_graph.py writes
         run: |
           git diff --stat -- tools/nix/units
           git diff --exit-code -- tools/nix/units || { echo "::error::tools/nix/units is stale: run tools/nix/unit_graph.py and commit the result"; exit 1; }
+
+      # A failed locked gate stays failed. Resolve in a clean, detached worktree and
+      # export a source-bound patch for review, never commit it or build with it here.
+      - id: refresh
+        name: export complete stale graph repair
+        if: ${{ failure() && (steps.graphs.outcome == 'failure' || steps.current.outcome == 'failure') }}
+        run: |
+          python3 .github/scripts/refresh_nix_graphs.py "{\"out\": \"$RUNNER_TEMP/nix-graph-refresh\"}"
+      - name: keep source-bound graph repair
+        if: ${{ failure() && steps.refresh.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: nix-graph-refresh-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/nix-graph-refresh
+          if-no-files-found: error
 
   nix:
     # aarch64-linux, on ix: TODO(x86-64) the x86_64-linux build comes back once ix has x86-64
