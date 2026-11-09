@@ -114,7 +114,7 @@ pub(super) struct SourceToDefCache<'db> {
     pub(super) file_to_def_cache: HashMap<FileId, SmallVec<[ModuleId; 1]>, Global>,
     pub(super) included_file_cache: HashMap<EditionedFileId, Option<MacroCallId>, Global>,
     /// The crates a file is taken to be a module of, of those it may be, when any is.
-    pub(super) within: Option<Arc<HashSet<Crate, Global>>>,
+    within: Option<Arc<HashSet<Crate, Global>>>,
 }
 
 /// The crates `file` may be a module of, asked in two rounds. `first`: each crate `within`, in
@@ -144,6 +144,15 @@ fn crates_of<'a>(
 }
 
 impl<'db> SourceToDefCache<'db> {
+    pub(super) fn set_within(&mut self, within: Option<Arc<HashSet<Crate, Global>>>) {
+        if self.within != within {
+            // File answers depend on the preferred crates; dyn maps already key their container.
+            self.file_to_def_cache.clear();
+            self.included_file_cache.clear();
+        }
+        self.within = within;
+    }
+
     pub(super) fn get_or_insert_include_for(
         &mut self,
         db: &Db,
@@ -350,13 +359,9 @@ impl<'db> SourceToDefCache<'db> {
         }
     }
 
-    /// Leaves `self` to the next `Semantics` on this thread. A cache that answered for some
-    /// crates only (`within`) leaves no file answers.
+    /// Leaves `self` to the next `Semantics` on this thread, with unscoped file answers only.
     pub(super) fn give(mut self, db: &Db) {
-        if self.within.is_some() {
-            self.file_to_def_cache.clear();
-            self.included_file_cache.clear();
-        }
+        self.set_within(None);
         if self.dynmap_cache.len() > CARRIED_DYN_MAPS {
             self.dynmap_cache.clear();
         }
