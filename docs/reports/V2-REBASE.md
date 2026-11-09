@@ -249,3 +249,42 @@ policy/artifact gates; full forkfixes and the map's ten owed rows; `debug = 0` c
 reproduction; and Windows native evidence. No map rows are settled by this append. Draft PR 81
 stays draft until acceptance and protections are satisfied; landing remains queue-only, with no
 force push, main push or Cargo/rustc bootstrap.
+
+
+### Stage1 bootstrap and first native compilation — 19:03 UTC
+
+The later `stage1-full-o2-8a956b7de-listening.json` receipt records **exit 0** at
+19:03:31 UTC, after 7,758.23 seconds (129m15s), on clean source
+`8a956b7def8fd9218d17f495abe984888b7bf44d`, tree
+`aebc2f5c4afda5d9d2fe3d3c7fde10c198432591`. Pinned B0 and the semantic O2
+configuration above were unchanged. Four protocol-attempt telemetry assignments were
+losslessly widened to `u64`, and the test gate's IO-error formatter and its local callers
+were changed to borrow the error. The focused `blaze-dist-local --lib` check passed in
+85.32 seconds before this bootstrap.
+
+The resulting native compiler binaries both report the full source SHA:
+
+| Artifact | Bytes | SHA256 |
+| --- | ---: | --- |
+| `blaze` | 1,156,849,640 | `9250f3e7f5ba69bfc60be33e9807a650664ba3156a5286fa741729c7c21d37b0` |
+| `blaze-engine` | 1,156,849,648 | `a8e3d9abb6f8f8878393e79e90d097f6afbb85edc6a95bf533b28b159ce88d14` |
+| `blaze-dist-local` | 149,827,664 | `34a08f3f50f462e888e3174c578130013baa7c5098e17ecaf294bdc7854b445c` |
+| `blaze-serve` | 150,624,392 | `3eae94f5f5348da36777b59466e08a5de25cfd78e2155acf4b00edcddcf27adc` |
+
+The earlier attempt on `0e2a7cc2d` failed on four telemetry type errors. Its later
+watchdog exit 76 was separately traced to synchronous `image make` exceeding 120 seconds
+on the main loop with all eight workers idle. The expensive inner operation remains
+unproven. A documented 1,800-second daemon stall bound was used for the successful run;
+this is not a fix for unbounded checkpoint construction. Another launcher attempt failed
+before compilation because its operator read the ready pipe's `State` byte as readiness;
+the corrected run waited for a confirmed listener and reused the existing daemon.
+
+**A successful bootstrap is not functional compiler acceptance.** The new compiler then
+built the guarded-stack fixture at default dev settings, without the O2 workaround.
+`stage1-native-stack-8a956b7de.json` records **exit 101** after 98.96 seconds: the `libc`
+and `corosensei` build scripts encountered Inkwell's `value.is_instruction()` assertion
+at `instruction_value.rs:186`. Retained panic rows identify `release summarize`, with
+caught job failures and empty recorded stack/PC arrays. No fixture executable ran.
+This is the next compiler blocker; the assertion and debug metadata must be preserved.
+The native ELF/CAS/archive, macro, cache/Hegel, distributed and fork replay acceptance
+gates above remain owed. B0 has not been promoted or replaced.
