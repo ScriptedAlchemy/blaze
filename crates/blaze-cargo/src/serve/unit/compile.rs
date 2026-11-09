@@ -1417,7 +1417,11 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
 /// mount's file there, not a path under a mount's directory: `target/` is under the
 /// workspace's, and the view has none of its outputs. A file the database has no text of is
 /// left out, and [`assemble`] names it as unread.
-pub(super) fn unmounted(reader: &UnitReader, mounted: &Mounted, diags: &[Diag]) -> Vec<(String, String)> {
+pub(super) fn unmounted(
+    reader: &UnitReader,
+    mounted: &Mounted,
+    diags: &[Diag],
+) -> Vec<(String, String)> {
     let db = reader.db();
     let names: Vec<&str> = blaze_diagnostics::emit::Sources::default()
         .unread(diags)
@@ -1763,10 +1767,9 @@ fn held(job: &Job, unit: usize, kept: &mut Compiled) -> Result<(), Failed> {
                     output.key.0
                 )),
                 // alloc: error path
-                Err(corrupt) => Err(format!(
-                    "reading the output {:x} from the store: {corrupt}",
-                    output.key.0
-                )),
+                Err(corrupt) => {
+                    Err(format!("reading the output {:x} from the store: {corrupt}", output.key.0))
+                }
             },
         };
         let runs_from = artifact::uplifted(path, plan);

@@ -2606,7 +2606,8 @@ fn native_link_key(
     let checks = std::array::from_fn(|at| {
         let flags = compile::unit_lint_flags(&job, at).unwrap();
         let inputs = blaze_diagnostics::cache::Inputs::of(db, &flags);
-        let bodies = blaze_diagnostics::cache::bodies_key(images[&krates[at]], &[], inputs.borrowck);
+        let bodies =
+            blaze_diagnostics::cache::bodies_key(images[&krates[at]], &[], inputs.borrowck);
         blaze_diagnostics::cache::key(bodies, &inputs)
     });
 
@@ -2670,13 +2671,19 @@ fn a_linked_crates_native_search_path_moves_only_the_parents_link_key_part() {
     );
     assert_eq!(before.checks, after.checks, "neither dependency check identity covers native -L");
     assert_eq!(before.parent_flags, after.parent_flags, "the parent's own plan is unchanged");
-    assert!(before.archives.iter().any(|(path, bytes)| {
-        path == &a.join("libcollision.a") && bytes == b"package a"
-    }));
+    assert!(
+        before
+            .archives
+            .iter()
+            .any(|(path, bytes)| { path == &a.join("libcollision.a") && bytes == b"package a" })
+    );
     assert!(!after.archives.iter().any(|(path, _)| path == &a.join("libcollision.a")));
-    assert!(after.archives.iter().any(|(path, bytes)| {
-        path == &b.join("libcollision.a") && bytes == b"package b"
-    }));
+    assert!(
+        after
+            .archives
+            .iter()
+            .any(|(path, bytes)| { path == &b.join("libcollision.a") && bytes == b"package b" })
+    );
     // Keep this first: omitting dependency -L from the production collector must fail on
     // equal parent keys for different required archives, before any shape assertion below.
     assert_ne!(
@@ -2729,7 +2736,8 @@ fn a_linked_crates_native_search_path_moves_only_the_parents_link_key_part() {
     );
     assert_ne!(ordered.key, reversed.key, "native directory order is part of the parent key");
     let paths = |key: &NativeLinkKey| {
-        key.linked.iter()
+        key.linked
+            .iter()
             .filter(|(package, flag)| package == package_a && flag.starts_with("-L "))
             .map(|(_, flag)| flag.clone())
             .collect::<Vec<_>>()
