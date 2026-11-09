@@ -140,7 +140,11 @@ fn first_publication_refuses_forged_keys_and_truncated_native_values() {
     let (mut alien, mut alien_bytes) = pack(3);
     alien_bytes[0] ^= 1;
     alien.pack = digest(&alien_bytes);
-    store.put_blob(&path(&alien), &alien_bytes).unwrap();
+    // Public blob PUT must reject alien headers itself. Seed a pre-existing
+    // malformed object directly to verify that manifest publication independently
+    // refuses it, even with a matching content digest and keys commitment.
+    assert!(store.put_blob(&path(&alien), &alien_bytes).is_err());
+    std::fs::write(store.dir().join(path(&alien)), &alien_bytes).unwrap();
     let error = store.put_list(&name(), &pack_list::encode(&[alien])).unwrap_err();
     assert!(error.to_string().contains("native pack header"), "{error}");
     assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
@@ -197,7 +201,8 @@ fn only_an_exact_stale_list_can_be_repaired_and_the_replacement_survives_reopen(
     drop(store);
     let store = Store::open(dir.path()).unwrap();
     assert_eq!(current(&store), new);
-    assert!(store.verify_pack(&b.0).unwrap());
+    // Reopen through the same full-manifest verifier used by production publication.
+    assert!(!store.verify_manifest_packs(&name(), &[b.0.clone()], true).unwrap());
     assert!(!store.repair_list(&name(), &digest(&old), &old).unwrap());
 }
 
