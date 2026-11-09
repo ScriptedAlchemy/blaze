@@ -183,3 +183,69 @@ python3 harness/forkfixes.py '{"blaze":"'"$T"'/debug/blaze","scratch":"'"$PWD"'/
   rows say so).
 - **What made one turn of the loop take 120 s** (`LOOP_STALLED`) is not known; `--stall-bound`
   works around it.
+
+## Linux verification record — 2026-11-09
+
+This append records the Linux receipts in `/fast/projects/blaze-v2-linux-state/logs`; the Mac
+evidence and commands above remain historical. These Linux runs use pinned B0 release
+`0.20261105.4` (`e930296`), compiler SHA256
+`eb866cfc027826eb155e93d4f7495990186eea83b06d369aa54b2fe483f63463`, with full semantic dev O2
+configuration SHA256 `5b9ad09806f2e40a7894ecbe30df4ad0f85081706852b369f005f449f217a54e`,
+preserving debug assertions, overflow checks and unwind.
+
+### Completed native evidence
+
+- **Narrow ABI cause/removal/restoration:** `narrow-abi-d76fb4004-canonical-sequence.json` records
+  both native poisoned-slot tests passing on source `d76fb400478a75adc10646945efe9cdbccf5b03c`,
+  tree `b50a6b318b2e98853c02314478ba000471ad485c`:
+  `tests::func::abi::narrow::narrow_call_slots_respect_operand_width` and
+  `tests::func::abi::narrow::narrow_return_slots_respect_operand_width`. Executable SHA256:
+  `2b2bb35b6ca835123b2008f19e54ddf0babbcb799421f011b0afe358a2cc042a`.
+  `narrow-abi-d76fb4004-causal-sequence.json` records negative-equivalent source
+  `23ad666824e5171bd74320123efdf89fb47f1269`, restoring only the old full-width slot loads:
+  both tests executed and failed at assertions; executable SHA256
+  `c3479f91d134de74187d445e75b270d644f2163381f0d416633d0c022f5da8cd`.
+  Restoring the source rebuilt the exact initial executable bytes, but the B0 CLI returned 101
+  before executing them: the daemon exited after an oversized image write with `ENOENT`, leaving
+  no daemon for the test code-memory launch. **That launcher outcome remains failed.**
+  `narrow-abi-d76fb4004-restored-direct.json` records direct invocation of the byte-identical
+  restored executable: both tests passed at 13:41 UTC. `narrow-abi-causal-proof-complete.json`
+  closes this native ABI causal proof, explicitly without claiming the pinned B0 launcher fixed.
+- **Whole-write simulation and progress:** `whole-write-287d3725c-focused.json` records three
+  actual Rust tests passing on source `287d3725c3d33b683e46fd1f86196d67da8871cc`, tree
+  `35c4f1e36183c7d9be30ea05a32d4901ec665e51`: Hegel fault/crash simulation (128 configured
+  cases), the planted early-publication oracle, and scalar progress past `MAX_RW_COUNT`.
+  The 182,346,392-byte core executable has SHA256
+  `108fa86f42349d1eacde328cfbd2d1deb6c3af655eda9f1293d24dcc298b663b`.
+- **Small native io_uring:** `whole-write-native-small-287d3725c.json` records three tests passing
+  by direct invocation of that same core ELF: `uring::tests::a_linked_write_whose_rename_fails_leaves_the_old`
+  (old-file preservation on failed rename, whole 3 MiB/empty writes and cross-directory rename),
+  `uring::tests::aligned_writes_read_back_equal`, and
+  `uring::tests::warm_writes_and_renames_allocate_nothing`. These results do not establish actual
+  2.739 GB kernel writes or CAS-rooted placement. Python oracle selfchecks and source
+  classifications are not runtime acceptance evidence.
+
+### Bootstrap and handoff frontier
+
+`stage1-full-o2-0e2a7cc2d.json` records the single heavy bootstrap started at 13:49 UTC, still
+running at this receipt: frozen clean `/fast/projects/blaze` at
+`0e2a7cc2d0cf40469554462d8e209b4defdd5cb2`, tree `97b84bd5d98f24f7211f14d8773fd543d474cb1c`.
+The B0 compiler/configuration above builds `blaze-engine`, `blaze-dist-local` and `blaze-serve`
+into `/fast/projects/blaze-v2-linux-state/target-stage1`, with 8 workers and
+`BLAZE_DAEMON_MEMORY_GB=36`. At admission, about 69.4 GiB was available, guest memory was
+93.35 GiB, the cgroup limit/high were 109.81/107.81 GiB with no OOM, and `/fast` ZFS had
+412 GiB free. The memory setting is not a total RSS cap; link/query accounting remains a gap.
+Keep source frozen until this build settles. **There is no functional stage1 result yet.**
+
+Peer cache commits `b41983d99`, `b79cc9403`, `4720cff5b` and `0e2a7cc2d` were preserved by
+fast-forward. Their Rust/Hegel tests remain **UNRUN**, assigned to a separate audit lane; the
+earlier focused receipts do not verify those changes.
+
+Still owed: actual 2.739 GB kernel/CAS placement; ELF personality/LSDA and native
+archive/resolver/`-L` key regression; upstream macro wasm/no_std fixtures; functional stage1 and
+integration; all actual two-holder distv2 release/fold/cache/loss/stale-refusal/local-owned
+policy/artifact gates; full forkfixes and the map's ten owed rows; `debug = 0` candidate
+reproduction; and Windows native evidence. No map rows are settled by this append. Draft PR 81
+stays draft until acceptance and protections are satisfied; landing remains queue-only, with no
+force push, main push or Cargo/rustc bootstrap. Root owns the central docs checks and tests;
+this documentation lane only read receipts and edited this record.
