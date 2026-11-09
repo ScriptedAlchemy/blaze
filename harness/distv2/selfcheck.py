@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -187,6 +188,53 @@ class Oracles(unittest.TestCase):
                 h.load(json.dumps({**base, "cores": 0}))
             with self.assertRaises(e.Failed):
                 h.load(json.dumps({**base, "env": {"BLAZE_DIST_LOCAL": "fallback"}}))
+            for field, unsafe in (("program", "../outside"), ("program", "/tmp/not-built"),
+                                  ("profile", "debug/../../outside"), ("profile", "")):
+                with self.subTest(field=field, unsafe=unsafe), self.assertRaises(e.Failed):
+                    h.load(json.dumps({**base, field: unsafe}))
+
+    def test_provenance_rejects_untracked_source_while_preserving_tracked_patch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repo"
+            repository.mkdir()
+            def git(*args):
+                return subprocess.check_output(["git", "-C", str(repository), *args], stderr=subprocess.PIPE)
+            git("init", "-q")
+            tracked = repository / "tracked.rs"
+            tracked.write_text("original\n")
+            git("add", "tracked.rs")
+            git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "-qm", "fixture")
+            commit, tree, patch_bytes = h.source_state(repository, 10)
+            self.assertEqual(commit, git("rev-parse", "HEAD").decode().strip())
+            self.assertEqual(tree, git("rev-parse", "HEAD^{tree}").decode().strip())
+            self.assertEqual(patch_bytes, b"")
+            untracked = repository / "injected.rs"
+            untracked.write_text("untracked compilation input\n")
+            with self.assertRaises(e.Failed):
+                h.source_state(repository, 10)
+            untracked.unlink()
+            tracked.write_text("changed\n")
+            new_commit, new_tree, patch_bytes = h.source_state(repository, 10)
+            self.assertEqual((new_commit, new_tree), (commit, tree))
+            self.assertIn(b"changed", patch_bytes)
+
+    def test_artifact_path_cannot_escape_target_even_through_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = object.__new__(h.Run)
+            run.root = Path(directory)
+            run.project = run.root / "project"
+            run.given = h.Input("/unused", "/unused", "/unused", directory)
+            executable = run.target("solo") / "debug" / "app"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"built output")
+            self.assertEqual(run.program("solo"), executable.resolve())
+            executable.unlink()
+            outside = run.root / "unrelated-program"
+            outside.write_bytes(b"not the build output")
+            executable.symlink_to(outside)
+            with self.assertRaises(e.Failed):
+                run.program("solo")
 
     def test_fault_wait_is_bounded_and_checks_evidence_before_child_exit(self):
         run = object.__new__(h.Run)

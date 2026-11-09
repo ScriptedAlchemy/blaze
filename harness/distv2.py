@@ -95,6 +95,12 @@ def load(text: str) -> Input:
         raise Failed("env must map strings to strings")
     if any(name.startswith("BLAZE_DIST_") for name in given.env):
         raise Failed("env must not override BLAZE_DIST_*: distribution and policies are controlled case inputs")
+    for name in ("profile", "program"):
+        value = getattr(given, name)
+        if (not isinstance(value, str) or not value or "\0" in value
+                or any(part in ("", ".", "..") for part in value.split("/"))
+                or Path(value).is_absolute()):
+            raise Failed(f"{name} must be a relative path below the build target")
     return given
 
 
@@ -113,6 +119,21 @@ def free_port() -> int:
 def host_triple(blaze: str, env: dict, timeout: int) -> str:
     out = subprocess.run([blaze, "toolchain", "--json"], env=env, capture_output=True, text=True, check=True, timeout=timeout)
     return json.loads(out.stdout)["host"]
+
+
+def source_state(repository: Path, timeout: int) -> tuple[str, str, bytes]:
+    """Bind acceptance to HEAD, its tracked patch, and the absence of untracked source."""
+    def git(*args: str) -> bytes:
+        return subprocess.check_output(["git", "-C", str(repository), *args], timeout=timeout)
+
+    commit = git("rev-parse", "HEAD").decode().strip()
+    tree = git("rev-parse", "HEAD^{tree}").decode().strip()
+    # git diff HEAD includes staged and unstaged tracked changes but not untracked source.
+    # An untracked module could alter a compiled binary without changing that patch.
+    untracked = [os.fsdecode(name) for name in git("ls-files", "--others", "--exclude-standard", "-z").split(b"\0") if name]
+    if untracked:
+        raise Failed(f"untracked source is absent from the provenance patch: {untracked[:8]} ({len(untracked)} files)")
+    return commit, tree, git("diff", "HEAD", "--binary")
 
 
 class Run:
@@ -136,9 +157,7 @@ class Run:
 
     def provenance(self) -> None:
         repository = HERE.parent
-        def git(*args):
-            return subprocess.check_output(["git", "-C", str(repository), *args], timeout=self.given.command_timeout)
-        diff = git("diff", "HEAD", "--binary")
+        commit, tree, diff = source_state(repository, self.given.command_timeout)
         (self.root / "source.patch").write_bytes(diff)
         identities = {}
         for name in ("blaze", "dist_local", "serve"):
@@ -150,8 +169,8 @@ class Run:
         for path in files:
             if path.is_file() and not {"target", ".git"}.intersection(path.relative_to(project).parts):
                 fixture.update(str(path.relative_to(project)).encode() + b"\0" + path.read_bytes())
-        record = {"input": dataclasses.asdict(self.given), "commit": git("rev-parse", "HEAD").decode().strip(),
-                  "tree": git("rev-parse", "HEAD^{tree}").decode().strip(), "patch_sha256": hashlib.sha256(diff).hexdigest(),
+        record = {"input": dataclasses.asdict(self.given), "commit": commit,
+                  "tree": tree, "patch_sha256": hashlib.sha256(diff).hexdigest(),
                   "binaries": identities, "fixture_sha256": fixture.hexdigest(),
                   "resources": {k: v for k, v in self.env("solo", False).items()
                                 if k in ("BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB")}}
@@ -303,7 +322,11 @@ class Run:
         return self.root / "targets" / home / (project or self.project).name
 
     def program(self, home: str, project: Path | None = None) -> Path:
-        return self.target(home, project) / self.given.profile / self.given.program
+        target = self.target(home, project).resolve()
+        executable = (target / self.given.profile / self.given.program).resolve()
+        if not executable.is_relative_to(target):
+            raise Failed(f"artifact {executable} escapes build target {target}")
+        return executable
 
     def behaviour(self, home: str, project: Path | None = None) -> tuple[str, str]:
         program = self.program(home, project)
@@ -665,12 +688,10 @@ def main(given: Input) -> None:
         for name, identity in run.identities.items():
             check(file_hash(Path(identity["path"])) == identity["sha256"], f"{name} binary did not change during acceptance")
         provenance = json.loads((run.root / "provenance.json").read_text())
-        current_commit = subprocess.check_output(["git", "-C", str(HERE.parent), "rev-parse", "HEAD"],
-                                                 timeout=given.command_timeout).decode().strip()
-        current_diff = subprocess.check_output(["git", "-C", str(HERE.parent), "diff", "HEAD", "--binary"],
-                                               timeout=given.command_timeout)
-        check(current_commit == provenance["commit"] and hashlib.sha256(current_diff).hexdigest() == provenance["patch_sha256"],
-              "source commit and patch did not change during acceptance")
+        current_commit, current_tree, current_diff = source_state(HERE.parent, given.command_timeout)
+        check(current_commit == provenance["commit"] and current_tree == provenance["tree"]
+              and hashlib.sha256(current_diff).hexdigest() == provenance["patch_sha256"],
+              "source commit, tree and patch did not change during acceptance")
         print("distv2: every check passed" if given.faults else "distv2: non-fault checks passed; fault acceptance NOT RUN", flush=True)
     finally:
         run.stop()

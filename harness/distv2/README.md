@@ -8,7 +8,10 @@ A run needs a **new, empty scratch directory**. Earlier runs, logs and artifacts
 It retains `provenance.json` (source commit/tree/patch, fixture digest, all three binary hashes,
 input and effective resources), `source.patch`, child logs, reports, events,
 `artifacts.json` (original path/output/exit/hash), and the actual server's packs/manifests. Source and
-binaries must remain fixed during acceptance. A failed stage stops all owned processes, including
+binaries must remain fixed during acceptance. The source snapshot refuses non-ignored untracked
+files (which git diff HEAD cannot cover), and artifact paths including symlinks must remain
+inside their declared build target so an unrelated executable cannot satisfy the oracle.
+A failed stage stops all owned processes, including
 suspended workers; each build and fault-evidence wait has a bound. Idle daemons exit between
 stages so the run keeps at most two front ends resident. No compiler or daemon runs in preflight.
 
