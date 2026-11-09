@@ -92,6 +92,41 @@ fn granted_work_names(unit: &blaze_wire::Digest, keys: &[InstanceKey]) -> Vec<St
         .collect()
 }
 
+/// Check every local and imported immutable key before mutating `built` or reporting
+/// success. No malformed entry may leave a prefix of committed puts behind.
+fn verify_imported_values(
+    name: &str,
+    built: &Built,
+    committed: &BTreeMap<[u8; 32], (u8, Vec<u8>)>,
+) -> Result<BTreeMap<Key, usize>, String> {
+    let mut local = BTreeMap::new(); // alloc: one index per existing output key
+    for (at, put) in built.puts.iter().enumerate() {
+        if let Some(previous) = local.insert(put.key, at)
+            && (built.puts[previous].kind != put.kind
+                || built.puts[previous].bytes.as_slice() != put.bytes.as_slice())
+        {
+            return Err(format!(
+                "the completed unit `{name}` produced differing local values under {:?}",
+                put.key
+            ));
+        }
+    }
+    for (raw, (code, bytes)) in committed {
+        let key = Key(ContentId(*raw));
+        let kind = Kind::from_code(*code)
+            .ok_or_else(|| format!("a committed value of `{name}` under {key:?} has kind {code}"))?;
+        if let Some(&at) = local.get(&key)
+            && (built.puts[at].kind != kind
+                || built.puts[at].bytes.as_slice() != bytes.as_slice())
+        {
+            return Err(format!(
+                "the local and committed values of `{name}` differ under {key:?}"
+            ));
+        }
+    }
+    Ok(local)
+}
+
 impl Dist {
     /// What `env` asks for: `None` for a build of this daemon alone. `host` is this machine's
     /// triple: executors are machines, whatever the unit is compiled for, which its keys cover (a
@@ -215,24 +250,15 @@ impl Dist {
         unit: &Unit,
         arrived: Arrived,
     ) -> Result<(), String> {
+        // Validate the entire incoming set, including duplicates in the local output,
+        // before appending even one value or publishing a success report.
+        let local = verify_imported_values(name, built, &arrived.values)?;
         self.report(name, unit, built, &arrived);
-        let mut local: BTreeMap<Key, usize> =
-            built.puts.iter().enumerate().map(|(at, put)| (put.key, at)).collect(); // alloc: one index per local put
-        for (key, (kind, bytes)) in arrived.values {
-            let kind = Kind::from_code(kind)
-                .ok_or_else(|| format!("a committed value of `{name}` has the kind {kind}"))?;
-            let key = Key(ContentId(key));
-            match local.get(&key).copied() {
-                Some(at) if built.puts[at].kind != kind || built.puts[at].bytes != bytes => {
-                    return Err(format!(
-                        "the local and committed values of `{name}` differ under {key:?}"
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    local.insert(key, built.puts.len());
-                    built.puts.push(Put { key, kind, bytes });
-                }
+        for (raw, (code, bytes)) in arrived.values {
+            let key = Key(ContentId(raw));
+            if !local.contains_key(&key) {
+                let kind = Kind::from_code(code).expect("every committed kind was checked above");
+                built.puts.push(Put { key, kind, bytes });
             }
         }
         Ok(())
@@ -368,10 +394,26 @@ impl<S: Export> Recording<'_, S> {
                 &put.bytes,
                 "the completed unit's output",
             )?;
-            values.insert(
-                put.key,
-                Value { key: put.key.0.0, kind: put.kind.code(), bytes: put.bytes.clone() },
-            );
+            match values.entry(put.key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(Value {
+                        key: put.key.0.0,
+                        kind: put.kind.code(),
+                        bytes: put.bytes.clone(),
+                    });
+                }
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    let previous = slot.get();
+                    if previous.kind != put.kind.code()
+                        || previous.bytes.as_slice() != put.bytes.as_slice()
+                    {
+                        return Err(format!(
+                            "the completed unit produced differing outputs under {:?}",
+                            put.key
+                        ));
+                    }
+                }
+            }
         }
         let mut pending = self.seen.borrow().clone(); // clone: the bounded key set, not value bytes
         for function in &built.functions {
@@ -406,6 +448,33 @@ impl<S: Export> Recording<'_, S> {
         }
         Ok(values.into_values().collect())
     }
+}
+
+/// A refused grant must not mutate the values retained for the next grant. Check
+/// both earlier grants and repetitions *within this one* before saving any result.
+fn remember_granted(
+    kept: &mut BTreeMap<[u8; 32], (u8, Vec<u8>)>,
+    values: &[Value],
+) -> Result<(), String> {
+    let mut additions = BTreeMap::<[u8; 32], (u8, &[u8])>::new(); // alloc: one borrowed key per grant
+    for value in values {
+        let conflict = |kind: u8, bytes: &[u8]| {
+            kind != value.kind || bytes != value.bytes.as_slice()
+        };
+        if kept.get(&value.key).is_some_and(|(kind, bytes)| conflict(*kind, bytes)) ||
+            additions.get(&value.key).is_some_and(|(kind, bytes)| conflict(*kind, bytes))
+        {
+            return Err(format!(
+                "successive or repeated grants disagree under {}",
+                blaze_dist_local::pack::hex(&value.key)
+            ));
+        }
+        additions.entry(value.key).or_insert((value.kind, value.bytes.as_slice()));
+    }
+    for (key, (kind, bytes)) in additions {
+        kept.entry(key).or_insert_with(|| (kind, bytes.to_vec())); // alloc: one retained value per new grant key
+    }
+    Ok(())
 }
 
 struct Compiling<'a, 'b, B: Prepare, S, F> {
@@ -475,20 +544,7 @@ where
             .chain(stored)
             .map(|it| Value { key: it.key.0.0, kind: it.kind.code(), bytes: it.bytes })
             .collect();
-        for value in &values {
-            match self.kept.get(&value.key) {
-                Some((kind, bytes)) if *kind != value.kind || *bytes != value.bytes => {
-                    return Err(format!(
-                        "successive grants disagree under {}",
-                        blaze_dist_local::pack::hex(&value.key)
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    self.kept.insert(value.key, (value.kind, value.bytes.clone()));
-                }
-            }
-        }
+        remember_granted(&mut self.kept, &values)?;
         Ok(Grant {
             values,
             compiled: stats.compiled as u64,
@@ -619,6 +675,105 @@ mod tests {
                     accepted,
                     "the tail must refuse a conflicting put before immutable publication"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn conflicting_local_puts_and_committed_imports_never_partially_apply() {
+        let key = Key(ContentId([0x20; 32]));
+        let added = [0x10; 32]; // alloc: deterministic prefix that must not be appended
+        let conflicting = [0xf0; 32];
+        let original = Built {
+            puts: vec![Put { key, kind: Kind::Query, bytes: vec![1, 2] }],
+            ..Built::default()
+        };
+        let good = BTreeMap::from([
+            (added, (Kind::Query.code(), vec![3])),
+            (key.0.0, (Kind::Query.code(), vec![1, 2])),
+        ]);
+        assert!(verify_imported_values("unit", &original, &good).is_ok());
+
+        for bad in [
+            BTreeMap::from([
+                (added, (Kind::Query.code(), vec![3])),
+                (conflicting, (Kind::Query.code(), vec![4])),
+                (key.0.0, (Kind::Debug.code(), vec![1, 2])),
+            ]),
+            BTreeMap::from([
+                (added, (Kind::Query.code(), vec![3])),
+                (conflicting, (255, vec![4])),
+            ]),
+        ] {
+            let before = original.puts.iter().map(|it| (it.key, it.kind, it.bytes.clone())).collect::<Vec<_>>();
+            assert!(verify_imported_values("unit", &original, &bad).is_err());
+            assert_eq!(
+                original.puts.iter().map(|it| (it.key, it.kind, it.bytes.clone())).collect::<Vec<_>>(),
+                before,
+                "a refused late imported value must leave every local put untouched"
+            );
+        }
+
+        let duplicate = Built {
+            puts: vec![
+                Put { key, kind: Kind::Query, bytes: vec![1, 2] },
+                Put { key, kind: Kind::Query, bytes: vec![1, 3] },
+            ],
+            ..Built::default()
+        };
+        assert!(verify_imported_values("unit", &duplicate, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn repeated_grant_keys_are_atomic_and_immutable() {
+        for marker in 0..16u8 {
+            let existing = [0x80; 32];
+            let fresh = [0x10; 32];
+            let later = [0xf0; 32];
+            let mut kept = BTreeMap::from([(existing, (Kind::Query.code(), vec![marker]))]);
+            let before = kept.clone();
+            let batch = [
+                Value { key: fresh, kind: Kind::Query.code(), bytes: vec![2] },
+                Value { key: later, kind: Kind::Query.code(), bytes: vec![3] },
+                Value { key: later, kind: Kind::Debug.code(), bytes: vec![3] },
+            ];
+            assert!(remember_granted(&mut kept, &batch).is_err());
+            assert_eq!(kept, before, "no prefix of a failed grant may enter the next grant");
+
+            let repeated = [
+                Value { key: fresh, kind: Kind::Query.code(), bytes: vec![marker] },
+                Value { key: fresh, kind: Kind::Query.code(), bytes: vec![marker] },
+            ];
+            remember_granted(&mut kept, &repeated).unwrap();
+            assert_eq!(kept[&fresh], (Kind::Query.code(), vec![marker]));
+            assert_eq!(kept[&existing], before[&existing]);
+        }
+    }
+
+    #[test]
+    fn duplicate_tail_puts_must_agree_before_publication() {
+        let key = Key(ContentId([0x52; 32]));
+        let empty = Warm(BTreeMap::new());
+        let committed = BTreeMap::new();
+        let recording = Recording {
+            overlay: Overlay { store: &empty, values: &committed },
+            seen: RefCell::new(BTreeSet::new()),
+        };
+        for marker in 0..16u8 {
+            let first = Put { key, kind: Kind::Query, bytes: vec![marker] };
+            let same = Put { key, kind: Kind::Query, bytes: vec![marker] };
+            let accepted = Built { puts: vec![first, same], ..Built::default() };
+            assert_eq!(recording.export(&accepted).unwrap().len(), 1);
+
+            for other in [
+                Put { key, kind: Kind::Debug, bytes: vec![marker] },
+                Put { key, kind: Kind::Query, bytes: vec![marker ^ 1] },
+            ] {
+                let conflicting = Built {
+                    puts: vec![Put { key, kind: Kind::Query, bytes: vec![marker] }, other],
+                    ..Built::default()
+                };
+                assert!(recording.export(&conflicting).unwrap_err().contains("differing outputs"));
             }
         }
     }
