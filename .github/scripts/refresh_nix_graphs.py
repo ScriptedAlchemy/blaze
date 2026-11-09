@@ -111,6 +111,13 @@ def refresh(root: Path, request: Request, execute: Run = run) -> None:
     (out / "refresh.patch").write_bytes(patch)
     # The receipt is last: consumers must not accept a partial export.
     (out / "source.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    # A source-bound textual diff is also recoverable from the CI log when an
+    # Actions artifact cannot be transferred to the publishing connector.
+    print(f"BLAZE_NIX_PATCH_BEGIN {source} {tree}", flush=True)
+    sys.stdout.write(patch.decode("utf-8"))
+    if patch and not patch.endswith(b"\n"):
+        print()
+    print(f"BLAZE_NIX_PATCH_END {source}", flush=True)
     print(f"exported Nix metadata for {source} to {out}; commit and revalidate the locked source gate")
 
 
