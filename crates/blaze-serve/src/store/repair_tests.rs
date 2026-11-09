@@ -93,6 +93,16 @@ fn first_publication_refuses_forged_keys_and_truncated_native_values() {
     assert!(error.to_string().contains("keys"), "{error}");
     assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
 
+    // A correct content hash and key commitment cannot legitimize another format's
+    // bytes: this is a native pack, not any eight-byte header followed by records.
+    let (mut alien, mut alien_bytes) = pack(3);
+    alien_bytes[0] ^= 1;
+    alien.pack = digest(&alien_bytes);
+    store.put_blob(&path(&alien), &alien_bytes).unwrap();
+    let error = store.put_list(&name(), &pack_list::encode(&[alien])).unwrap_err();
+    assert!(error.to_string().contains("native pack header"), "{error}");
+    assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+
     // A correct SHA and magic header do not prove complete native records.
     let mut truncated = DIST_PACK_MAGIC.to_vec();
     truncated.extend_from_slice(&[7; 32]);
@@ -238,7 +248,7 @@ fn failed_native_publication_barriers_never_acknowledge_a_repair() {
         let old = pack_list::encode(&[a.0]);
         let new = pack_list::encode(&[b.0]);
         // Seed legacy stale state: new first-writer PUTs must reject absent packs.
-    std::fs::write(store.dir().join(name()), &old).unwrap();
+        std::fs::write(store.dir().join(name()), &old).unwrap();
         *store.publication_failure.lock().unwrap() = Some(step);
         let error = store.repair_list(&name(), &digest(&old), &new).unwrap_err();
         assert!(error.message.contains(&format!("{step:?}")), "{error}");

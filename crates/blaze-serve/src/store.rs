@@ -251,6 +251,9 @@ impl Store {
         let mut magic = [0; 8];
         file.read_exact(&mut magic)
             .map_err(|e| refuse(&format!("cannot read its native header: {e}")))?;
+        if magic != blaze_wire::DIST_PACK_MAGIC {
+            return Err(refuse("has no native pack header"));
+        }
         let mut keys: Vec<Digest> = Vec::new(); // alloc: bounded pack key verification
         loop {
             let mut key = [0; 32];
