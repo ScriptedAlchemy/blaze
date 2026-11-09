@@ -17,10 +17,11 @@ const HTTP_FRAMING_ROOM: u64 = 16 << 20;
 /// A peer cannot send unbounded headers even when the blob itself is large.
 const HTTP_HEADER_LIMIT: usize = 64 << 10;
 
-/// A raw pack GET may carry a documented blob; a manifest, PUT response or
-/// other reply may carry at most the ordinary request body limit.
-fn response_body_limit(method: &str, path: &str) -> u64 {
-    if method == "GET" && path.starts_with("/v1/blob/") {
+/// Only a successful pack GET may carry a documented blob. A missing
+/// pack, an HTTP error, a manifest or a PUT reply has the smaller
+/// request-body budget: an error response is never a multi-GiB blob.
+fn response_body_limit(method: &str, path: &str, status: u16) -> u64 {
+    if method == "GET" && status == 200 && path.starts_with("/v1/blob/") {
         Limits::DOCUMENTED.blob
     } else {
         u64::from(Limits::DOCUMENTED.request)
@@ -201,7 +202,7 @@ fn read_response(
             break decode_head(method, path, &reply)?;
         }
     };
-    let most = response_body_limit(method, path).saturating_add(HTTP_FRAMING_ROOM);
+    let most = response_body_limit(method, path, head.status).saturating_add(HTTP_FRAMING_ROOM);
     // A fixed-length response has no chunk framing. Refuse its first excess
     // byte instead of spending the remaining blob allowance on an invalid body.
     let most = head.length.map_or(most, |length| most.min(head.body as u64 + length as u64));
@@ -295,7 +296,7 @@ fn decode_head(method: &str, path: &str, reply: &[u8]) -> Result<ResponseHead, E
             chunked = true;
         }
     }
-    let limit = response_body_limit(method, path);
+    let limit = response_body_limit(method, path, status);
     if length.is_some_and(|expected| expected as u64 > limit) {
         return Err(invalid("Content-Length exceeds the documented response body limit"));
     }
@@ -321,7 +322,7 @@ fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u
         }
     };
     let body = &reply[body..];
-    let limit = response_body_limit(method, path);
+    let limit = response_body_limit(method, path, status);
     if chunked {
         let decoded = unchunk(body, limit)
             .ok_or_else(|| invalid("a broken or oversized chunked body"))?;
@@ -502,7 +503,7 @@ mod tests {
                 consumed: 0,
                 budget: HTTP_HEADER_LIMIT + 4,
             };
-            let most = response_body_limit("GET", path) + HTTP_FRAMING_ROOM;
+            let most = response_body_limit("GET", path, 200) + HTTP_FRAMING_ROOM;
             let mut reply = Vec::new(); // alloc: the bounded planted-bug fixture
             (&mut stream).take(most + 1).read_to_end(&mut reply).unwrap();
         });
@@ -515,7 +516,7 @@ mod tests {
         assert_eq!(read_response(&mut stream, "GET", path).unwrap(), (200, Vec::new()));
 
         for path in [path, "/v1/list/manifests/unit"] {
-            let length = response_body_limit("GET", path) + 1;
+            let length = response_body_limit("GET", path, 200) + 1;
             let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n");
             let reply = format!("{head}must not read this body");
             let mut stream = Budgeted {
@@ -578,16 +579,62 @@ mod tests {
     }
 
     #[test]
+    fn error_responses_to_blob_gets_cannot_claim_blob_sized_bodies() {
+        let path = "/v1/blob/packs/test.pack";
+        let small = u64::from(Limits::DOCUMENTED.request);
+        assert_eq!(response_body_limit("GET", path, 200), Limits::DOCUMENTED.blob);
+        for status in [404, 500] {
+            assert_eq!(response_body_limit("GET", path, status), small);
+            let claimed = small + 1;
+            let head = format!(
+                "HTTP/1.1 {status} Error\r\nContent-Length: {claimed}\r\n\r\n"
+            );
+            // Even a peer sending its response one byte at a time must be
+            // refused before any body bytes can be read.
+            let mut stream = Budgeted {
+                bytes: head.as_bytes(),
+                fragment: 1,
+                consumed: 0,
+                budget: head.len(),
+            };
+            let error = read_response(&mut stream, "GET", path).unwrap_err();
+            assert!(matches!(
+                error,
+                Error::Protocol(why) if why.contains("documented response body limit")
+            ));
+            assert_eq!(stream.consumed, head.len());
+
+            // Chunked bodies use the same status-aware decoded limit,
+            // independent of their wire framing.
+            let chunked = format!(
+                "HTTP/1.1 {status} Error\r\nTransfer-Encoding: chunked\r\n\r\n{claimed:x}\r\n"
+            );
+            assert!(matches!(
+                decode_response("GET", path, chunked.as_bytes()),
+                Err(Error::Protocol(why)) if why.contains("oversized chunked body")
+            ));
+        }
+        // A real successful blob GET is not incorrectly capped at the
+        // manifest/error limit; it still needs the full documented blob budget.
+        let large = small + 1;
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {large}\r\n\r\n");
+        assert_eq!(
+            decode_head("GET", path, head.as_bytes()).unwrap().length,
+            Some(large as usize)
+        );
+    }
+
+    #[test]
     fn committed_reply_bounds_follow_the_native_wire_contract() {
         let blob = "/v1/blob/packs/abc.pack";
         let manifest = "/v1/list/manifests/abc";
-        assert_eq!(response_body_limit("GET", blob), Limits::DOCUMENTED.blob);
+        assert_eq!(response_body_limit("GET", blob, 200), Limits::DOCUMENTED.blob);
         assert_eq!(
-            response_body_limit("GET", manifest),
+            response_body_limit("GET", manifest, 200),
             u64::from(Limits::DOCUMENTED.request)
         );
         assert_eq!(
-            response_body_limit("PUT", blob),
+            response_body_limit("PUT", blob, 200),
             u64::from(Limits::DOCUMENTED.request)
         );
         // A successful GET with a forged oversize length is a committed-data
