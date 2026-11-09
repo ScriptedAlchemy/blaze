@@ -9,7 +9,7 @@
 
 use std::{
     fs::File,
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -229,18 +229,67 @@ impl Store {
         Ok(true)
     }
 
-    /// True is a whole present pack, false is absence. Corruption is always an error.
+    /// True is a present native pack whose bytes and key commitment both match its
+    /// immutable list. A valid pack SHA alone does not prove the separately committed keys.
     fn verify_pack(&self, pack: &blaze_wire::PackRef) -> Result<bool, Error> {
         let name = format!("packs/{}.pack", hex(&pack.pack));
         let object = self.object(&name)?;
-        let Some((file, size)) = self.open_blob(&name)? else { return Ok(false) };
+        let Some((mut file, size)) = self.open_blob(&name)? else { return Ok(false) };
         if size != pack.size {
             return Err(Error::new(
                 blaze_wire::ErrorCode::Refused,
                 format!("{name} has {size} bytes, its list names {}", pack.size),
             ));
         }
-        self.verify_reader(&object, file)?;
+        // Check the complete immutable byte digest, then the native record boundaries
+        // and independent keys digest. Keep only keys, never the potentially huge values.
+        self.verify_reader(&object, &mut file)?;
+        file.rewind().map_err(|e| failed(&format!("rewinding {name}"), e))?;
+        let refuse = |why: &str| {
+            Error::new(blaze_wire::ErrorCode::Refused, format!("{name}: {why}"))
+        };
+        let mut magic = [0; 8];
+        file.read_exact(&mut magic)
+            .map_err(|e| refuse(&format!("cannot read its native header: {e}")))?;
+        let mut keys: Vec<Digest> = Vec::new(); // alloc: bounded pack key verification
+        loop {
+            let mut key = [0; 32];
+            let read = file.read(&mut key[..1])
+                .map_err(|e| refuse(&format!("cannot read a key: {e}")))?;
+            if read == 0 {
+                break;
+            }
+            file.read_exact(&mut key[1..])
+                .map_err(|e| refuse(&format!("ends inside a key: {e}")))?;
+            let mut kind_and_size = [0; 9];
+            file.read_exact(&mut kind_and_size)
+                .map_err(|e| refuse(&format!("ends inside a value header: {e}")))?;
+            let length = u64::from_le_bytes(
+                kind_and_size[1..].try_into().expect("eight bytes after the kind"),
+            );
+            if keys.last().is_some_and(|previous| previous >= &key) {
+                return Err(refuse("native entries have duplicate or unordered keys"));
+            }
+            if keys.len() >= blaze_wire::Limits::DOCUMENTED.batch_items as usize {
+                return Err(refuse("native key count exceeds the wire batch limit"));
+            }
+            let copied = std::io::copy(
+                &mut (&mut file).take(length),
+                &mut std::io::sink(),
+            )
+            .map_err(|e| refuse(&format!("cannot read a value: {e}")))?;
+            if copied != length {
+                return Err(refuse("ends inside a native value"));
+            }
+            keys.push(key);
+        }
+        let committed = blaze_wire::digest_of_encoded_name(
+            "blaze/dist-pack-keys",
+            &blaze_wire::encode(&keys),
+        );
+        if committed != pack.keys {
+            return Err(refuse("native keys differ from the immutable list commitment"));
+        }
         Ok(true)
     }
 
@@ -528,28 +577,13 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// A sealed pack of `values`, laid out as `harness/packs.py` lays one out.
+    /// A native pack of sorted keys and opaque values, as the distributed agent emits.
     fn pack(values: &[(Digest, &[u8])]) -> Vec<u8> {
         let mut out = blaze_wire::DIST_PACK_MAGIC.to_vec();
-        out.extend_from_slice(&(values.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(values.len() as u32).to_le_bytes());
-        for (_, value) in values {
-            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-        }
-        for (block, (key, value)) in values.iter().enumerate() {
+        for (key, value) in values {
             out.extend_from_slice(key);
-            out.extend_from_slice(&(block as u32).to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            let mut crc = crc32fast::Hasher::new();
-            crc.update(key);
-            crc.update(&(value.len() as u32).to_le_bytes());
-            crc.update(value);
-            out.extend_from_slice(&crc.finalize().to_le_bytes());
-        }
-        for (_, value) in values {
+            out.push(0);
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
             out.extend_from_slice(value);
         }
         out

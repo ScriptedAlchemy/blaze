@@ -642,6 +642,9 @@ mod tests {
     /// Bytes the server takes as a pack, with the digest that names them.
     fn pack(rest: &[u8]) -> (Vec<u8>, String) {
         let mut bytes = blaze_wire::DIST_PACK_MAGIC.to_vec();
+        bytes.extend_from_slice(&[1; 32]);
+        bytes.push(0);
+        bytes.extend_from_slice(&(rest.len() as u64).to_le_bytes());
         bytes.extend_from_slice(rest);
         let name = {
             use sha2::Digest as _;
@@ -923,7 +926,10 @@ mod tests {
         blaze_wire::PackRef {
             pack: ObjectName::parse(&format!("packs/{digest}.pack")).unwrap().digest,
             size: bytes.len() as u64,
-            keys: [3; 32],
+            keys: blaze_wire::digest_of_encoded_name(
+                "blaze/dist-pack-keys",
+                &blaze_wire::encode(&vec![[1; 32]]),
+            ),
             packed: None,
             format: blaze_wire::DIST_PACK_FORMAT,
         }

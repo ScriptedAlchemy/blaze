@@ -50,11 +50,14 @@ fn current(store: &Store) -> Vec<u8> {
 
 #[hegel::test(test_cases = 32)]
 fn first_publication_cannot_name_missing_or_corrupt_packs(tc: hegel::TestCase) {
-    let failure = tc.draw(gs::integers::<u8>().max_value(3));
+    let failure = tc.draw(gs::integers::<u8>().max_value(4));
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let (a, b) = (pack(1), pack(2));
     let mut references = vec![a.0.clone(), b.0.clone()];
+    if failure == 4 {
+        references[0].keys = [0x99; 32];
+    }
     references.sort();
     let list = pack_list::encode(&references);
     if failure != 1 {
@@ -77,6 +80,39 @@ fn first_publication_cannot_name_missing_or_corrupt_packs(tc: hegel::TestCase) {
             "refused first publication must not name an immutable manifest"
         );
     }
+}
+
+#[test]
+fn first_publication_refuses_forged_keys_and_truncated_native_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let (mut reference, bytes) = pack(1);
+    store.put_blob(&path(&reference), &bytes).unwrap();
+    reference.keys = [0x99; 32];
+    let error = store.put_list(&name(), &pack_list::encode(&[reference])).unwrap_err();
+    assert!(error.to_string().contains("keys"), "{error}");
+    assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+
+    // A correct SHA and magic header do not prove complete native records.
+    let mut truncated = DIST_PACK_MAGIC.to_vec();
+    truncated.extend_from_slice(&[7; 32]);
+    truncated.push(0);
+    truncated.extend_from_slice(&8u64.to_le_bytes());
+    truncated.push(7);
+    let reference = PackRef {
+        pack: digest(&truncated),
+        size: truncated.len() as u64,
+        keys: blaze_wire::digest_of_encoded_name(
+            "blaze/dist-pack-keys",
+            &blaze_wire::encode(&vec![[7; 32]]),
+        ),
+        packed: None,
+        format: DIST_PACK_FORMAT,
+    };
+    store.put_blob(&path(&reference), &truncated).unwrap();
+    let error = store.put_list(&name(), &pack_list::encode(&[reference])).unwrap_err();
+    assert!(error.to_string().contains("native value"), "{error}");
+    assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
 }
 
 #[test]
