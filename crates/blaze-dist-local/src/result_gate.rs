@@ -68,7 +68,7 @@ impl ResultGate {
         match OpenOptions::new().write(true).create_new(true).open(self.directory.join("claimed")) {
             Ok(file) => drop(file),
             Err(why) if why.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
-            Err(why) => return Err(gate_io(&self.directory, why)),
+            Err(why) => return Err(gate_io(&self.directory, &why)),
         }
         let capture = Capture { directory: self.directory.clone() }; // alloc: one retained test capture
         let request = &submission.request;
@@ -118,7 +118,7 @@ impl ResultGate {
                         )));
                     }
                     Err(why) if why.kind() == io::ErrorKind::NotFound => {}
-                    Err(why) => return Err(gate_io(&self.directory, why)),
+                    Err(why) => return Err(gate_io(&self.directory, &why)),
                 }
                 let next = Deadline::at(
                     now.saturating_add(Duration::from_millis(5)).min(self.deadline.get()),
@@ -158,7 +158,7 @@ impl Capture {
             if created {
                 let _ = fs::remove_file(&temporary);
             }
-            return Err(gate_io(&target, why));
+            return Err(gate_io(&target, &why));
         }
         Ok(())
     }
@@ -183,7 +183,7 @@ impl Capture {
     }
 }
 
-fn gate_io(path: &Path, why: io::Error) -> Error {
+fn gate_io(path: &Path, why: &io::Error) -> Error {
     Error::Io(io::Error::new(why.kind(), format!("test result gate {}: {why}", path.display())))
 }
 
