@@ -150,6 +150,19 @@ impl Store {
         if object.path(&self.dir).exists() {
             return Ok(false);
         }
+        // A first writer must not publish a missing, corrupt or noncanonical
+        // pack list. Keep validation under the same publication lock as the
+        // atomic name, so concurrent PUTs cannot change the verified packs.
+        let packs = blaze_wire::pack_list::decode(bytes)
+            .map_err(|why| Error::malformed(format!("the new {name}: {why}")))?;
+        for pack in &packs {
+            if !self.verify_pack(pack)? {
+                return Err(Error::new(
+                    blaze_wire::ErrorCode::Refused,
+                    format!("the new {name} names absent pack {}", hex(&pack.pack)),
+                ));
+            }
+        }
         self.write_whole(&object, bytes)?;
         Ok(true)
     }
@@ -477,7 +490,8 @@ mod tests {
         let dir = scratch();
         let store = Store::open(dir.path()).unwrap();
         let name = format!("manifests/{}", hex(&[1; 32]));
-        assert!(store.put_list(&name, b"published\n").unwrap());
+        // Legacy persisted names remain janitor fixtures, not valid new PUTs.
+        std::fs::write(store.dir().join(&name), b"published\n").unwrap();
         let published = store.dir().join(&name);
         let stale = temporary(&published);
         std::fs::write(&stale, b"abandoned\n").unwrap();
@@ -597,9 +611,22 @@ mod tests {
         let dir = scratch();
         let store = Store::open(dir.path()).expect("a store");
         let name = &format!("manifests/{}", hex(&[1; 32]));
-        assert!(store.put_list(name, b"first\n").expect("a write"));
-        assert!(!store.put_list(name, b"second\n").expect("a write"));
-        assert_eq!(store.read_small(name, 100).unwrap().unwrap(), b"first\n");
+        let bytes = pack(&[([1; 32], b"first")]);
+        let digest = digest(&bytes);
+        store.put_blob(&format!("packs/{}.pack", hex(&digest)), &bytes).unwrap();
+        let first = blaze_wire::pack_list::encode(&[blaze_wire::PackRef {
+            pack: digest,
+            size: bytes.len() as u64,
+            keys: blaze_wire::digest_of_encoded_name(
+                "blaze/dist-pack-keys",
+                &blaze_wire::encode(&vec![[1; 32]]),
+            ),
+            packed: None,
+            format: blaze_wire::DIST_PACK_FORMAT,
+        }]);
+        assert!(store.put_list(name, &first).expect("a write"));
+        assert!(!store.put_list(name, b"").expect("a second write"));
+        assert_eq!(store.read_small(name, 1000).unwrap().unwrap(), first);
     }
 
     #[test]

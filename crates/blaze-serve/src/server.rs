@@ -865,16 +865,26 @@ mod tests {
     async fn http_list_is_written_once_and_a_second_writer_is_told() {
         let run = Running::start().await;
         let path = format!("/v1/list/manifests/{}", hex(&[7; 32]));
+        let (first_bytes, first_name) = pack(b"first");
+        let (second_bytes, second_name) = pack(b"second");
+        for (bytes, name) in [(&first_bytes, &first_name), (&second_bytes, &second_name)] {
+            assert_eq!(
+                run.request("PUT", &format!("/v1/blob/packs/{name}.pack"), "", bytes).await.0,
+                204
+            );
+        }
+        let first = blaze_wire::pack_list::encode(&[manifest_ref(&first_bytes, &first_name)]);
+        let second = blaze_wire::pack_list::encode(&[manifest_ref(&second_bytes, &second_name)]);
         let (a, b) = tokio::join!(
-            run.request("PUT", &path, "", b"first\n"),
-            run.request("PUT", &path, "", b"second\n"),
+            run.request("PUT", &path, "", &first),
+            run.request("PUT", &path, "", &second),
         );
         let mut statuses = [a.0, b.0];
         statuses.sort();
         assert_eq!(statuses, [204, 412]);
         let (status, _, body) = run.request("GET", &path, "", &[]).await;
         assert_eq!(status, 200);
-        assert!(body == b"first\n" || body == b"second\n");
+        assert!(body == first || body == second);
         for path in [
             "/v1/blob/packs/../key",
             "/v1/list/manifests/../key",
@@ -1005,7 +1015,9 @@ mod tests {
         let left = blaze_wire::pack_list::encode(&[manifest_ref(&b, &bname)]);
         let right = blaze_wire::pack_list::encode(&[manifest_ref(&c, &cname)]);
         let path = format!("/v1/list/manifests/{}", hex(&[9; 32]));
-        assert_eq!(run.request("PUT", &path, "", &old).await.0, 204);
+        // Seed a preexisting list with a lost pack; the new PUT path rejects it.
+        std::fs::write(run.server.store().dir().join(format!("manifests/{}", hex(&[9; 32]))), &old)
+            .unwrap();
         let expected: blaze_wire::Digest = Sha256::digest(&old).into();
         let header = format!("If-Match: \"{}\"\r\n", hex(&expected));
         let (a, b) = tokio::join!(

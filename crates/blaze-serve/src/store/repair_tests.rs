@@ -48,6 +48,46 @@ fn current(store: &Store) -> Vec<u8> {
     store.read_small(&name(), 1 << 20).unwrap().unwrap()
 }
 
+#[hegel::test(test_cases = 32)]
+fn first_publication_cannot_name_missing_or_corrupt_packs(tc: hegel::TestCase) {
+    let failure = tc.draw(gs::integers::<u8>().max_value(3));
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let (a, b) = (pack(1), pack(2));
+    let mut references = vec![a.0.clone(), b.0.clone()];
+    references.sort();
+    let list = pack_list::encode(&references);
+    if failure != 1 {
+        put(&store, &a);
+    }
+    if failure != 2 {
+        put(&store, &b);
+    }
+    if failure == 3 {
+        std::fs::write(store.dir().join(path(&b.0)), b"corrupted pack").unwrap();
+    }
+    let outcome = store.put_list(&name(), &list);
+    if failure == 0 {
+        assert!(outcome.unwrap(), "a complete verified first publication must succeed");
+        assert_eq!(current(&store), list);
+    } else {
+        assert!(outcome.is_err(), "missing or corrupt packs must refuse first publication");
+        assert!(
+            store.read_small(&name(), 1 << 20).unwrap().is_none(),
+            "refused first publication must not name an immutable manifest"
+        );
+    }
+}
+
+#[test]
+fn malformed_first_publication_does_not_claim_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    assert!(store.put_list(&name(), b"not a pack list\n").is_err());
+    assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+    assert!(store.put_list(&name(), b"").unwrap(), "an empty canonical list is valid");
+}
+
 #[test]
 fn only_an_exact_stale_list_can_be_repaired_and_the_replacement_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -80,7 +120,8 @@ fn absent_or_corrupt_replacements_and_corrupt_old_packs_leave_the_old_list_untou
     let (a, b, c) = (pack(1), pack(2), pack(3));
     let old = pack_list::encode(&[a.0.clone()]);
     let new = pack_list::encode(&[b.0.clone()]);
-    store.put_list(&name(), &old).unwrap();
+    // Seed legacy stale state: new first-writer PUTs must reject absent packs.
+    std::fs::write(store.dir().join(name()), &old).unwrap();
     assert!(store.repair_list(&name(), &digest(&old), &new).is_err());
     assert_eq!(current(&store), old);
     put(&store, &b);
@@ -109,7 +150,8 @@ fn absent_or_corrupt_replacements_and_corrupt_old_packs_leave_the_old_list_untou
 fn malformed_old_or_new_lists_are_explicit_refusals() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
-    store.put_list(&name(), b"not a pack list\n").unwrap();
+    // Persisted malformed legacy state is a recovery fixture, not a valid PUT.
+    std::fs::write(store.dir().join(name()), b"not a pack list\n").unwrap();
     assert!(store.repair_list(&name(), &digest(b"not a pack list\n"), b"").is_err());
     assert_eq!(current(&store), b"not a pack list\n");
     let old = pack_list::encode(&[pack(1).0]);
@@ -128,7 +170,8 @@ fn two_native_cas_writers_cannot_both_replace_the_same_list() {
     put(&store, &b);
     put(&store, &c);
     let old = pack_list::encode(&[a.0]);
-    store.put_list(&name(), &old).unwrap();
+    // Seed legacy stale state: new first-writer PUTs must reject absent packs.
+    std::fs::write(store.dir().join(name()), &old).unwrap();
     let expected = digest(&old);
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let results = std::thread::scope(|scope| {
@@ -158,7 +201,8 @@ fn failed_native_publication_barriers_never_acknowledge_a_repair() {
         put(&store, &b);
         let old = pack_list::encode(&[a.0]);
         let new = pack_list::encode(&[b.0]);
-        store.put_list(&name(), &old).unwrap();
+        // Seed legacy stale state: new first-writer PUTs must reject absent packs.
+    std::fs::write(store.dir().join(name()), &old).unwrap();
         *store.publication_failure.lock().unwrap() = Some(step);
         let error = store.repair_list(&name(), &digest(&old), &new).unwrap_err();
         assert!(error.message.contains(&format!("{step:?}")), "{error}");
