@@ -82,7 +82,10 @@ before the resumed carrier is sent. The production path with this setting absent
 or gate IO. The harness also releases a real captured result before expiry as a positive control.
 Both controls require the normal Client's actual answer and the coordinator's corresponding event;
 neither a discarded result nor a `holder-lost` event can satisfy the stale case. Worker-death recovery likewise requires real replacement
-commits; an unrelated completed unit is insufficient.
+commits; an unrelated completed unit is insufficient. The oracle accepts each
+replacement result only after its matching grant in the shared event stream,
+and the fenced case requires a new exact-batch refusal after SIGCONT (a prior
+refusal cannot prove the resumed worker submitted a stale result).
 
 The full manifest must name the current attempt's work plus its tail, with Done delayed until
 publication/mirroring. Acceptance checks that successful Done follows the actual manifest commit

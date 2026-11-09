@@ -522,10 +522,11 @@ def faults(run: Run, edited: Path) -> None:
               lambda: evidence.recovered(run.events()[mark:], grant), [healthy])
     check(not evidence.accepted(run.events()[mark:], grant), "the stopped lease was uncommitted when its work was taken back")
     (stale_gate / "release").touch()
+    resumed_at = len(run.events()) - mark
     os.kill(grant["pid"], signal.SIGCONT)
     run.suspended.remove(grant["pid"])
     run.until("resumed holder's actual stale result is explicitly refused by coordinator and Client",
-              lambda: evidence.stale_refused(run.events()[mark:], grant)
+              lambda: evidence.stale_refused(run.events()[mark:], grant, refused_after=resumed_at)
               and evidence.gate_answer(stale_gate, grant, refused=True), [stalled])
     code_h, code_s = run.wait(healthy), run.wait(stalled)
     check(code_h == 0, f"the healthy worker finishes: {Path(healthy_log).read_text()[-800:] if code_h else ''}")
