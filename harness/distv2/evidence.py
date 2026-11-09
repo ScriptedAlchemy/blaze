@@ -124,24 +124,54 @@ def stale_refused(events: list[dict], grant: dict) -> bool:
     )
 
 
-def pack_keys(raw: bytes) -> set[str]:
+def pack_entries(raw: bytes) -> dict[str, bytes]:
+    """Parse the native pack independently, fingerprinting kind and exact value bytes."""
     require(raw.startswith(b"blzdpk\0\x01"), "stored pack has the wrong native header")
-    at, keys = 8, []
+    at, entries = 8, {}
+    previous = ""
     while at < len(raw):
         require(at + 41 <= len(raw), "stored pack ends inside a value header")
-        keys.append(raw[at:at + 32].hex())
+        key = raw[at:at + 32].hex()
+        require(key > previous, "stored pack keys are not strictly sorted")
         size = int.from_bytes(raw[at + 33:at + 41], "little")
-        at += 41 + size
-        require(at <= len(raw), "stored pack ends inside a value")
-    require(keys == sorted(set(keys)), "stored pack keys are not strictly sorted")
-    return set(keys)
+        end = at + 41 + size
+        require(end <= len(raw), "stored pack ends inside a value")
+        # Include kind and length; a content collision under a store key is forbidden.
+        entries[key] = hashlib.sha256(raw[at + 32:end]).digest()
+        at, previous = end, key
+    return entries
+
+
+def pack_keys(raw: bytes) -> set[str]:
+    return set(pack_entries(raw))
+
+
+def pack_keys_digest(keys: set[str]) -> str:
+    """Independent PackRef.keys oracle for blaze_wire's v5 canonical CBOR digest."""
+    count = len(keys)
+    if count < 24:
+        head = bytes([0x80 | count])
+    elif count < 256:
+        head = b"\x98" + bytes([count])
+    elif count < 65536:
+        head = b"\x99" + count.to_bytes(2, "big")
+    elif count < (1 << 32):
+        head = b"\x9a" + count.to_bytes(4, "big")
+    else:
+        head = b"\x9b" + count.to_bytes(8, "big")
+    # blaze_wire::digest_of_encoded_name("blaze/dist-pack-keys", encode(&Vec<Digest>)).
+    h = hashlib.sha256(b"blaze/blaze/dist-pack-keys/v5\0" + head)
+    for key in sorted(keys):
+        h.update(b"\x58\x20")  # canonical CBOR byte string of length 32
+        h.update(bytes.fromhex(key))
+    return h.hexdigest()
 
 
 def manifest(blobs: Path, unit: str) -> tuple[dict[str, Path], set[str]]:
     require(digest(unit), "manifest needs the real unit digest")
     path = blobs / "manifests" / unit
     require(path.is_file(), f"unit {unit}: no actual published manifest at {path}")
-    packs, keys = {}, set()
+    packs, keys, values = {}, set(), {}
     for line in path.read_text().splitlines():
         fields = line.split()
         require(len(fields) == 3, f"{path}: malformed native manifest line {line!r}")
@@ -151,8 +181,16 @@ def manifest(blobs: Path, unit: str) -> tuple[dict[str, Path], set[str]]:
         require(target.is_file(), f"{path}: referenced pack {target} is missing")
         raw = target.read_bytes()
         require(len(raw) == int(size) and hashlib.sha256(raw).hexdigest() == name, f"{target}: stored bytes disagree with manifest")
-        keys.update(pack_keys(raw))
         require(name not in packs, f"{path}: duplicate pack {name}")
+        entries = pack_entries(raw)
+        require(pack_keys_digest(set(entries)) == key_digest,
+                f"{target}: manifest PackRef.keys digest disagrees with the native pack's keys")
+        for key, fingerprint in entries.items():
+            previous = values.get(key)
+            require(previous is None or previous == fingerprint,
+                    f"{path}: immutable store key {key} has different values across published packs")
+            values[key] = fingerprint
+        keys.update(entries)
         packs[name] = target
     return packs, keys
 

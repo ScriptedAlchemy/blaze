@@ -112,7 +112,7 @@ class Oracles(unittest.TestCase):
             target = blobs / "packs" / f"{name}.pack"
             target.write_bytes(raw)
             manifest = blobs / "manifests" / UNIT
-            manifest.write_text(f"{name} {len(raw)} {OTHER}\n")
+            manifest.write_text(f"{name} {len(raw)} {e.pack_keys_digest({KEY})}\n")
             event = {"event": "published", "unit_digest": UNIT, "execution": 7, "attempt": 2, "packs": [name]}
             done = {"event": "done", "execution": 7, "attempt": 2, "outcome": "Passed"}
             e.publication(blobs, [row()], [event, done])
@@ -129,6 +129,49 @@ class Oracles(unittest.TestCase):
             manifest.unlink()
             with self.assertRaises(e.Failed):
                 e.manifest(blobs, UNIT)
+
+    def test_native_manifest_checks_key_digests_and_immutable_values_across_packs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blobs = Path(directory)
+            (blobs / "packs").mkdir()
+            (blobs / "manifests").mkdir()
+            manifest = blobs / "manifests" / UNIT
+
+            def put(pairs):
+                raw = bytearray(b"blzdpk\0\x01")
+                for key, payload in sorted(pairs.items()):
+                    raw.extend(bytes.fromhex(key))
+                    raw.extend(b"\x01")
+                    raw.extend(len(payload).to_bytes(8, "little"))
+                    raw.extend(payload)
+                raw = bytes(raw)
+                name = hashlib.sha256(raw).hexdigest()
+                (blobs / "packs" / f"{name}.pack").write_bytes(raw)
+                return f"{name} {len(raw)} {e.pack_keys_digest(set(pairs))}"
+
+            first = put({KEY: b"first"})
+            conflict = put({KEY: b"different bytes under the same immutable key"})
+            manifest.write_text(first + "\n" + conflict + "\n")
+            with self.assertRaisesRegex(e.Failed, "different values across published packs"):
+                e.manifest(blobs, UNIT)
+
+            # Repeating the same immutable value in differently packed files is allowed.
+            overlap = put({KEY: b"first", OTHER: b"an independent value"})
+            manifest.write_text(first + "\n" + overlap + "\n")
+            packs, keys = e.manifest(blobs, UNIT)
+            self.assertEqual((len(packs), keys), (2, {KEY, OTHER}))
+
+            # A pack's SHA-256 does not prove its separately committed key-set digest.
+            fields = overlap.split()
+            fields[2] = KEY
+            manifest.write_text(first + "\n" + " ".join(fields) + "\n")
+            with self.assertRaisesRegex(e.Failed, "PackRef.keys digest"):
+                e.manifest(blobs, UNIT)
+
+            self.assertEqual(e.pack_keys_digest({KEY}),
+                             "847bea1103f30c14e239416b59d188feda5a64bcf4d9f7c591ade9df9a6530e1")
+            self.assertEqual(e.pack_keys_digest({f"{n:02x}" * 32 for n in range(24)}),
+                             "a46647a51115be67ab1dfdc94e7d0ec25d91e06dec049bc0ca9e94bab12a6327")
 
     def test_committed_pack_refusal_rejects_fallback_and_unrelated_failures(self):
         with tempfile.TemporaryDirectory() as directory:
