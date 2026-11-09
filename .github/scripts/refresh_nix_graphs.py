@@ -72,11 +72,22 @@ def refresh(root: Path, request: Request, execute: Run = run) -> None:
         try:
             # Resolve the complete standalone graph, preserving locked versions where possible.
             # Cargo metadata does not compile; no compiler is used to bootstrap Blaze here.
+            # A detached worktree shares CI's shallow object database; Nix
+            # rejects git+file flakes without revCount there. Supply the shell
+            # from the checkout, with its pins identical to this source tree,
+            # while executing all metadata operations in the isolated worktree.
+            for name in ("flake.nix", "flake.lock", "harness/toolchain"):
+                if (root / name).read_bytes() != (work / name).read_bytes():
+                    raise ValueError(f"{name}: checkout differs from the source tree")
             execute([
-                "nix", "develop", str(work), "--command", "cargo", "metadata",
+                "nix", "develop", str(root), "--command", "cargo", "metadata",
                 "--format-version", "1", "--manifest-path", "demo/life/Cargo.toml",
             ], work)
-            execute([sys.executable, "tools/nix/unit_graph.py"], work)
+            # IN_NIX_SHELL makes unit_graph.py invoke pinned cargo directly,
+            # avoiding a second evaluation of the shallow detached worktree.
+            execute([
+                "nix", "develop", str(root), "--command", "python3", "tools/nix/unit_graph.py",
+            ], work)
             changed = set(execute(["git", "diff", "--name-only", "-z"], work).decode().split("\0")) - {""}
             if changed - set(FILES):
                 raise ValueError(f"graph refresh changed unrelated files: {sorted(changed - set(FILES))}")

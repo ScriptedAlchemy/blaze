@@ -24,6 +24,10 @@ class RefreshTests(unittest.TestCase):
             (directory / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
             (directory / "Cargo.lock").write_text('version=4\n[[package]]\nname="fixture"\nversion="0.1.0"\n')
         (self.root / "untouched").write_text("original\n")
+        (self.root / "flake.nix").write_text("{}\n")
+        (self.root / "flake.lock").write_text("{}\n")
+        (self.root / "harness").mkdir()
+        (self.root / "harness/toolchain").write_text("nightly-2026-10-27\n")
         self.graphs(self.root)
         self.git("add", ".")
         self.git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
@@ -46,14 +50,16 @@ class RefreshTests(unittest.TestCase):
             target.write_text(json.dumps(graph) + "\n")
 
     def metadata(self, command, cwd):
-        self.commands.append(command)
+        self.commands.append((command, cwd))
         if command[0] == "git":
             return refresh.run(command, cwd)
-        if command[0] == "nix":
-            self.assertEqual(command[1:], ["develop", str(cwd), "--command", "cargo", "metadata", "--format-version", "1", "--manifest-path", "demo/life/Cargo.toml"])
+        self.assertEqual(command[:4], ["nix", "develop", str(self.root), "--command"])
+        self.assertNotEqual(cwd, self.root)
+        if command[4] == "cargo":
+            self.assertEqual(command[4:], ["cargo", "metadata", "--format-version", "1", "--manifest-path", "demo/life/Cargo.toml"])
             (cwd / "demo/life/Cargo.lock").write_text('version=4\n[[package]]\nname="fixture"\nversion="0.1.1"\n')
         else:
-            self.assertEqual(command[1:], ["tools/nix/unit_graph.py"])
+            self.assertEqual(command[4:], ["python3", "tools/nix/unit_graph.py"])
             self.graphs(cwd)
         return b""
 
@@ -63,6 +69,11 @@ class RefreshTests(unittest.TestCase):
         original.write_text("dirty output from failed gate\n")
         before = self.git("diff", "--binary")
         refresh.refresh(self.root, refresh.Request(self.out), self.metadata)
+        # The real CI checkout may be shallow; the detached worktree must
+        # never become the Nix flake input that asks Git for revCount.
+        nix = [(cmd, cwd) for cmd, cwd in self.commands if cmd[0] == "nix"]
+        self.assertEqual([cmd[4] for cmd, _ in nix], ["cargo", "python3"])
+        self.assertTrue(all(cmd[2] == str(self.root) and cwd != self.root for cmd, cwd in nix))
         receipt = json.loads((self.out / "source.json").read_text())
         self.assertEqual(receipt["source_commit"], self.git("rev-parse", "HEAD").decode().strip())
         self.assertEqual(receipt["source_tree"], self.git("rev-parse", "HEAD^{tree}").decode().strip())
@@ -83,7 +94,7 @@ class RefreshTests(unittest.TestCase):
         for fault in ("unrelated", "mismatched", "missing-platform", "process"):
             with self.subTest(fault=fault):
                 def faulty(command, cwd):
-                    if command[0] == "git" or command[0] == "nix":
+                    if command[0] == "git" or (command[0] == "nix" and command[4] == "cargo"):
                         return self.metadata(command, cwd)
                     if fault == "process":
                         raise subprocess.CalledProcessError(1, command)
@@ -104,6 +115,13 @@ class RefreshTests(unittest.TestCase):
                 self.assertFalse(self.out.exists())
                 self.assertEqual(self.git("worktree", "list", "--porcelain").count(b"worktree "), 1)
                 self.assertEqual(self.git("diff"), b"")
+
+    def test_changed_shell_pin_refuses_metadata_export(self):
+        (self.root / "harness/toolchain").write_text("nightly-2026-10-28\n")
+        with self.assertRaisesRegex(ValueError, "harness/toolchain: checkout differs"):
+            refresh.refresh(self.root, refresh.Request(self.out), self.metadata)
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.git("worktree", "list", "--porcelain").count(b"worktree "), 1)
 
     def test_request_and_destination_are_strict(self):
         for text in ('{}', '{"out":"relative"}', '{"out":null}', '{"out":"/tmp/a","skip_locked":true}', '[]'):
