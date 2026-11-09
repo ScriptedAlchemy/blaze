@@ -91,13 +91,15 @@ fn absent_or_corrupt_replacements_and_corrupt_old_packs_leave_the_old_list_untou
     assert_eq!(current(&store), old);
     put(&store, &a);
     put(&store, &c);
-    let old_two = pack_list::encode(&[a.0.clone(), b.0.clone()]);
+    let mut references = [a.0.clone(), b.0.clone()];
+    references.sort();
+    let old_two = pack_list::encode(&references);
     std::fs::write(store.dir().join(name()), &old_two).unwrap();
     std::fs::remove_file(store.dir().join(path(&a.0))).unwrap();
-    assert!(
-        store.repair_list(&name(), &digest(&old_two), &pack_list::encode(&[c.0])).is_err(),
-        "one absent pack must not hide another corrupt old pack"
-    );
+    let refused = store.repair_list(&name(), &digest(&old_two), &pack_list::encode(&[c.0]))
+        .unwrap_err();
+    assert!(refused.to_string().contains(&path(&b.0)),
+        "one absent pack must not hide another corrupt old pack: {refused}");
     assert_eq!(current(&store), old_two);
 }
 

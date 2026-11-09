@@ -8,7 +8,10 @@ A run needs a **new, empty scratch directory**. Earlier runs, logs and artifacts
 It retains `provenance.json` (source commit/tree/patch, fixture digest, all three binary hashes,
 input and effective resources), `source.patch`, child logs, reports, events,
 `artifacts.json` (original path/output/exit/hash), and the actual server's packs/manifests. Source and
-binaries must remain fixed during acceptance. A failed stage stops all owned processes, including
+binaries must remain fixed during acceptance. The source snapshot refuses non-ignored untracked
+files (which git diff HEAD cannot cover), and artifact paths including symlinks must remain
+inside their declared build target so an unrelated executable cannot satisfy the oracle.
+A failed stage stops all owned processes, including
 suspended workers; each build and fault-evidence wait has a bound. Idle daemons exit between
 stages so the run keeps at most two front ends resident. No compiler or daemon runs in preflight.
 
@@ -85,9 +88,10 @@ The full manifest must name the current attempt's work plus its tail, with Done 
 publication/mirroring. Acceptance checks that successful Done follows the actual manifest commit
 in the shared event stream. The native list remains `pack_digest byte_size keys_digest` per line;
 `packs/<digest>.pack` remains the native `blzdpk\0\x01` format. The harness reads these actual files
-and chooses a referenced, verified pack to corrupt. Intact → corrupt/Never refusal → explicit
-Fallback correctness → restored/Never success is the causal control; no empty glob can pass it.
-
+and chooses a referenced, verified pack to corrupt. Intact → corrupt/Never refusal → corrupt/explicit Fallback refusal → restored/Never
+success is the causal control. Published or corrupt immutable data never grants permission to
+recompile, even when Fallback was requested; only a missing carrier is a separate, permitted
+explicit Fallback case. No empty glob can pass this control.
 
 ## Explicit real-result test gate
 

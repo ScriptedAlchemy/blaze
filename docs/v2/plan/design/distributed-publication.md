@@ -40,10 +40,15 @@ executions while no list was available and let every subscriber compile a separa
 A heartbeat followed by an unfenced mutable PUT was also rejected: fencing can change between
 those two operations. Attempt-checked acceptance and immutable delivery separate those roles.
 
-Every wait remains bounded by the subscription deadline. Cancellation leaves its subscription;
-missing/corrupt bytes and carrier failures remain typed failures, and only explicit
-`LocalPolicy::Fallback` permits the same local build to continue. Real compiler refusals retain
-the lead's original diagnostics.
+Every wait remains bounded by the subscription deadline. Cancellation leaves its subscription
+and is terminal under every local policy. Missing or corrupt committed packs, malformed published
+manifests, ambiguous publication acknowledgements and failed first-writer verification are also
+terminal, including under `LocalPolicy::Fallback`. An unavailable carrier before commitment may
+follow that explicit local policy. Real compiler refusals retain the lead's original diagnostics.
+A first-writer conflict accepts different pack partitions only after verifying identical logical
+keys, kinds and bytes; the existing manifest stays immutable. The cache server's conditional
+repair API and durability simulation remain available for explicit repair of absent packs, but
+an agent never recompiles or repairs a published absence as a cache-miss recovery path.
 
 The Hegel simulation in `blaze-dist/src/jobs/publication_tests.rs` draws actor steps, virtual
 clock advances, early verdicts, failed mirrors, retries and lead replacement. Its oracle is

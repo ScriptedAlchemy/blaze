@@ -54,7 +54,7 @@ Python 3.11+, stdlib.
 import datetime, glob, json, os, re, subprocess, sys, tempfile, time, typing
 from dataclasses import dataclass, fields
 
-REPO = os.environ.get("GITHUB_REPOSITORY", "indexable-inc/blaze")
+REPO = os.environ.get("BLAZE_RELEASE_REPO") or os.environ.get("GITHUB_REPOSITORY", "indexable-inc/blaze")
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATED = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
 

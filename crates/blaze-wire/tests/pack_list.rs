@@ -30,6 +30,7 @@ fn malformed_lists_never_become_empty_cache_entries() {
         good.replace('a', "A"),
         good.replacen('a', "", 1),
         good.clone() + &good,
+        good.clone() + &good.replace("ab", "aa"),
     ];
     for bytes in cases {
         assert!(pack_list::decode(bytes.as_bytes()).is_err(), "accepted {bytes:?}");

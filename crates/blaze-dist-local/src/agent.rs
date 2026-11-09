@@ -208,11 +208,13 @@ fn request(unit: &Unit, config: &Config, now: u64) -> JobRequest {
 /// What the requester does about `failure`, under `policy`: `Ok` compiles the unit here, by the
 /// one build; `Err` stops the build, naming what failed. A terminal goes by its contract
 /// ([`local_action`]): a verdict is taken, anything else builds here only if asked. A failure
-/// that names no outcome (the carrier gone, a pack that fails its check) is no verdict either.
+/// that names no outcome (like a disconnected carrier) is no verdict. A missing or corrupt
+/// committed pack always fails, regardless of the requested local policy.
 pub fn decide(policy: &LocalPolicy, failure: Error) -> Result<(), Error> {
     let action = match &failure {
         Error::Ended(termination) => local_action(policy, termination)
             .map_err(|why| Error::Protocol(format!("the terminal is refused: {why:?}")))?,
+        Error::Committed(_) | Error::Cancelled(_) => LocalAction::Fail,
         Error::Io(_) | Error::Protocol(_) => match policy {
             LocalPolicy::Never => LocalAction::Fail,
             LocalPolicy::Fallback => LocalAction::BuildLocally,
@@ -320,27 +322,45 @@ impl BatchCompiler for Batches<'_> {
 /// How long past a job's deadline its requester still waits for the coordinator to end it.
 const GRACE: Duration = Duration::from_secs(5);
 
-/// How a pack that is not on the server ends its error.
+/// The reason reported when the caller cancels the distributed build.
 const CANCELLED: &str = "the build was cancelled";
 
-const GONE: &str = "was committed and is gone";
+/// A cancelled request is terminal even if the carrier or local policy permits a retry.
+fn ensure_not_cancelled(unit: &Unit, cancelled: &AtomicBool) -> Result<(), Error> {
+    if cancelled.load(Ordering::Acquire) {
+        let reason = format!("unit {}: {CANCELLED}", hex(&unit.spec)); // alloc: terminal reason
+        Err(Error::Cancelled(reason))
+    } else {
+        Ok(())
+    }
+}
 
 /// Reads the packs named, each checked against what was committed.
 pub fn import(blobs: &Blobs, packs: &[PackRef]) -> Result<BTreeMap<Digest, (u8, Vec<u8>)>, Error> {
+    import_using(packs, |digest| blobs.pack(digest))
+}
+
+/// The retrieval boundary is injected so loss and corruption of a committed pack can be
+/// tested without replacing the real pack decoder or requiring a live cache server.
+fn import_using(
+    packs: &[PackRef],
+    mut fetch: impl FnMut(&Digest) -> Result<Option<Vec<u8>>, Error>,
+) -> Result<BTreeMap<Digest, (u8, Vec<u8>)>, Error> {
     let mut values = BTreeMap::new();
     for reference in packs {
         let name = hex(&reference.pack);
-        let bytes = blobs
-            .pack(&reference.pack)?
-            .ok_or_else(|| Error::Protocol(format!("pack {name} {GONE}")))?;
-        for value in read(&bytes, reference).map_err(Error::Protocol)? {
+        let bytes = fetch(&reference.pack).map_err(|error| {
+            Error::Committed(format!("pack {name}: committed retrieval failed: {error}"))
+        })?
+            .ok_or_else(|| Error::Committed(format!("pack {name} was committed and is gone")))?;
+        for value in read(&bytes, reference).map_err(Error::Committed)? {
             match values.entry(value.key) {
                 std::collections::btree_map::Entry::Vacant(at) => {
                     at.insert((value.kind, value.bytes));
                 }
                 std::collections::btree_map::Entry::Occupied(at) => {
                     if at.get() != &(value.kind, value.bytes) {
-                        return Err(Error::Protocol(format!(
+                        return Err(Error::Committed(format!(
                             "two values under the key {} in the packs of one unit, the second in {name}",
                             hex(&value.key)
                         )));
@@ -350,6 +370,13 @@ pub fn import(blobs: &Blobs, packs: &[PackRef]) -> Result<BTreeMap<Digest, (u8, 
         }
     }
     Ok(values)
+}
+
+/// A corrupted published manifest cannot authorize recompilation.
+fn published_packs(unit: &Unit, list: &[u8]) -> Result<Vec<PackRef>, Error> {
+    parse_list(list).map_err(|why| {
+        Error::Committed(format!("unit {}: published pack list is not canonical: {why}", hex(&unit.spec)))
+    })
 }
 
 /// How long an agent waits between asks at most, however long it has waited: what it asks is a
@@ -372,16 +399,12 @@ pub fn run(
     granted: &mut dyn Granted,
     cancelled: &AtomicBool,
 ) -> Result<Arrived, Error> {
+    ensure_not_cancelled(unit, cancelled)?;
     if let Some(list) = config.blobs.published(&unit.spec)? {
-        let packs = parse_list(&list).map_err(Error::Protocol)?;
-        match import(&config.blobs, &packs) {
-            Ok(values) => {
-                return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None) });
-            }
-            // A list naming a pack the server lost is an unpublished unit, not a failure.
-            Err(Error::Protocol(why)) if why.ends_with(GONE) => {}
-            Err(error) => return Err(error),
-        }
+        let packs = published_packs(unit, &list)?;
+        let values = import(&config.blobs, &packs)?;
+        ensure_not_cancelled(unit, cancelled)?;
+        return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None) });
     }
     let started = Instant::now();
     let mut client = Client::connect(&config.socket, random_id()?)?;
@@ -389,10 +412,12 @@ pub fn run(
     let now_ms = move || origin.saturating_add(started.elapsed().as_millis() as u64);
     let job = request(unit, config, now_ms());
     let binding = loop {
+        ensure_not_cancelled(unit, cancelled)?;
         let submit = Command::Submit(carrier::submission(&job, NEED));
         match client.call(submit)? {
             Answer::Binding(binding) => break binding,
             Answer::Error(error) if error.code() == Some(blaze_wire::ErrorCode::Busy) => {
+                ensure_not_cancelled(unit, cancelled)?;
                 if started.elapsed() > config.deadline {
                     return Err(Error::Protocol(format!("submit: {}", error.message)));
                 }
@@ -407,6 +432,7 @@ pub fn run(
         }
     };
     let result = execute(config, unit, granted, cancelled, started, &now_ms, &binding, &mut client);
+    let result = ensure_not_cancelled(unit, cancelled).and(result);
     if result.is_err() {
         leave(&mut client, &binding);
     } else {
@@ -432,9 +458,7 @@ fn execute(
     let mut waited = config.poll;
     let mut last_claim = None;
     loop {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(Error::Protocol(CANCELLED.to_owned()));
-        }
+        ensure_not_cancelled(unit, cancelled)?;
         if started.elapsed() > config.deadline.saturating_add(GRACE) {
             return Err(Error::Protocol(format!(
                 "unit {}: its execution did not finish in {:?}",
@@ -464,8 +488,10 @@ fn execute(
             let mut take = || {
                 arrived.values = import(&config.blobs, &packs)?;
                 arrived.packs = packs;
+                ensure_not_cancelled(unit, cancelled)?;
                 // Delivery carries no new output authority, even after lead replacement.
                 mirror(config, unit, &arrived.packs)?;
+                ensure_not_cancelled(unit, cancelled)?;
                 deliver(client, binding, &arrived.packs)?;
                 Ok(())
             };
@@ -540,6 +566,7 @@ fn execute(
                 cancelled,
                 |lost| {
                     arrived.values = import(&config.blobs, &packs)?;
+                    ensure_not_cancelled(unit, cancelled)?;
                     let extra = match granted.complete(&arrived.values) {
                         Ok(values) => values,
                         Err(why) => {
@@ -556,9 +583,7 @@ fn execute(
                             return Err(Error::Protocol(format!("unit {}: {why}", hex(&unit.spec))));
                         }
                     };
-                    if cancelled.load(Ordering::Acquire) {
-                        return Err(Error::Protocol(CANCELLED.to_owned()));
-                    }
+                    ensure_not_cancelled(unit, cancelled)?;
                     if lost.load(Ordering::Acquire) {
                         return Ok(None);
                     }
@@ -570,6 +595,7 @@ fn execute(
                     }
                     packs.sort();
                     packs.dedup();
+                    ensure_not_cancelled(unit, cancelled)?;
                     let commit = Command::CommitPublication(carrier::CommitPublication {
                         content,
                         execution,
@@ -584,7 +610,9 @@ fn execute(
                             ..
                         }) => {
                             arrived.publication_attempt = Some(accepted.0);
+                            ensure_not_cancelled(unit, cancelled)?;
                             mirror(config, unit, &packs)?;
+                            ensure_not_cancelled(unit, cancelled)?;
                             deliver(client, binding, &packs)?;
                             acknowledge(client, content, execution, &executor, claimed.attempt)?;
                             Ok(Some(packs))
@@ -610,6 +638,7 @@ fn execute(
                 continue;
             };
             arrived.values = import(&config.blobs, &packs)?;
+            ensure_not_cancelled(unit, cancelled)?;
             arrived.packs = packs;
             return Ok(arrived);
         }
@@ -644,38 +673,10 @@ fn execute(
 fn mirror(config: &Config, unit: &Unit, packs: &[PackRef]) -> Result<(), Error> {
     let expected = list_of(packs);
     config.blobs.publish(&unit.spec, &expected)?;
-    // A comparison can race another repair. Each retry rereads and verifies the actual list;
-    // only the server can replace it, atomically against these exact previous bytes.
-    for _ in 0..4 {
-        let got = config.blobs.published(&unit.spec)?.ok_or_else(|| {
-            Error::Protocol(format!(
-                "unit {}: its cache accepted publication but has no list",
-                hex(&unit.spec)
-            ))
-        })?;
-        if got == expected {
-            return Ok(());
-        }
-        let actual = parse_list(&got)
-            .map_err(|why| Error::Protocol(format!("unit {}: {why}", hex(&unit.spec))))?;
-        match import(&config.blobs, &actual) {
-            Ok(values) if values == import(&config.blobs, packs)? => return Ok(()),
-            Err(Error::Protocol(why)) if why.ends_with(GONE) => {
-                let _ = config.blobs.repair(&unit.spec, &got, &expected)?;
-            }
-            Err(why) => return Err(why),
-            Ok(_) => {
-                return Err(Error::Protocol(format!(
-                    "unit {}: the existing cache list differs from its accepted full output",
-                    hex(&unit.spec)
-                )));
-            }
-        }
-    }
-    Err(Error::Protocol(format!(
-        "unit {}: its cache list changed during four conditional repair attempts",
-        hex(&unit.spec)
-    )))
+    // A 412 is accepted only after the existing and proposed full outputs were
+    // verified equal, even if their native pack partitions differ. Missing or
+    // corrupt committed packs refuse delivery; they never start another compile.
+    Ok(())
 }
 
 fn publication(
@@ -966,5 +967,93 @@ fn acknowledge(
         Answer::KillAck(_) => Ok(()),
         Answer::Error(error) if Refusal::of(&error) == Some(Refusal::NoExecution) => Ok(()),
         other => Err(Error::Protocol(format!("kill acknowledgment answered {other:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caller_cancellation_cannot_trigger_local_recompilation() {
+        let unit = Unit { spec: [0x42; 32], names: Vec::new() }; // alloc: cancellation fixture
+        let cancelled = AtomicBool::new(false);
+        assert!(ensure_not_cancelled(&unit, &cancelled).is_ok());
+        cancelled.store(true, Ordering::Release);
+        let refused = ensure_not_cancelled(&unit, &cancelled).unwrap_err();
+        assert!(matches!(&refused, Error::Cancelled(why) if why.contains(&hex(&unit.spec))));
+        assert!(matches!(
+            decide(&LocalPolicy::Fallback, refused),
+            Err(Error::Cancelled(_))
+        ));
+    }
+
+    #[test]
+    fn published_pack_list_requires_exact_sorted_unique_records() {
+        let unit = Unit { spec: [0x33; 32], names: Vec::new() }; // alloc: test fixture
+        let first = PackRef {
+            pack: [0x11; 32],
+            size: 10,
+            keys: [0x44; 32],
+            packed: None,
+            format: blaze_wire::DIST_PACK_FORMAT,
+        };
+        let second = PackRef { pack: [0x22; 32], ..first.clone() };
+        let canonical = list_of(&[first.clone(), second.clone()]);
+        assert!(published_packs(&unit, &canonical).is_ok());
+        assert!(published_packs(&unit, b"").is_ok(), "an empty unit is canonical");
+
+        let noncanonical = [
+            canonical[..canonical.len() - 1].to_vec(),
+            [canonical.as_slice(), b"extra\n"].concat(),
+            [canonical.as_slice(), b"\n"].concat(),
+            list_of(&[second, first.clone()]),
+            list_of(&[first.clone(), first]),
+            b"not-a-pack\n".to_vec(),
+            vec![0xff],
+        ]; // alloc: corrupted manifest fixtures
+        for bytes in noncanonical {
+            assert!(
+                matches!(published_packs(&unit, &bytes), Err(Error::Committed(_))),
+                "a damaged published manifest must be refused, not rebuilt"
+            );
+        }
+    }
+
+    #[test]
+    fn a_committed_pack_missing_or_corrupt_must_not_rebuild_even_with_fallback() {
+        let reference = PackRef {
+            pack: [0x22; 32],
+            size: 10,
+            keys: [0x44; 32],
+            packed: None,
+            format: blaze_wire::DIST_PACK_FORMAT,
+        };
+        let missing = import_using(&[reference.clone()], |name| {
+            assert_eq!(*name, reference.pack);
+            Ok(None)
+        })
+        .unwrap_err();
+        assert!(matches!(&missing, Error::Committed(why) if why.contains(&hex(&reference.pack))));
+        assert!(matches!(decide(&LocalPolicy::Fallback, missing), Err(Error::Committed(_))));
+
+        for error in [
+            Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            Error::Protocol("GET returned 500".to_owned()),
+        ] {
+            let mut error = Some(error);
+            let failed = import_using(&[reference.clone()], |_| Err(error.take().unwrap())).unwrap_err();
+            assert!(matches!(decide(&LocalPolicy::Fallback, failed), Err(Error::Committed(_))));
+        }
+
+        let corrupt = import_using(&[reference], |_| {
+            Ok(Some(b"bad pack".to_vec())) // alloc: deliberately corrupt committed pack fixture
+        })
+        .unwrap_err();
+        assert!(matches!(decide(&LocalPolicy::Fallback, corrupt), Err(Error::Committed(_))));
+
+        let unit = Unit { spec: [0x33; 32], names: Vec::new() }; // alloc: test fixture
+        let malformed = published_packs(&unit, b"not a pack").unwrap_err();
+        assert!(matches!(decide(&LocalPolicy::Fallback, malformed), Err(Error::Committed(_))));
     }
 }

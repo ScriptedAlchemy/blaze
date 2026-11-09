@@ -3,16 +3,16 @@ name: install
 # site/install.sh, run as a user runs it, on each platform it installs on: from the newest release
 # (the nightly build before the first), into a CARGO_HOME of its own, toolchain included; then
 # `blaze` in a new project; then each channel and pin form (`--channel`, BLAZE_CHANNEL,
-# `--version stable|canary|V`) against the release GitHub says it is. And this commit's build, installed in a Debian
+# `--version stable|canary|V`) against the published release-service channel pointers. And this commit's build, installed in a Debian
 # container with no Rust at all, which runs `blaze run` in a project written by hand. On a
 # change to the script, on each release once it is published, weekly (a release's assets or
 # GitHub's redirects can change under it) and by hand. Not a check the merge queue requires.
 on:
   push:
     branches: [main]
-    paths: ["site/install.sh", ".github/workflows/install.yaml"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/test_install_channels.py"]
   pull_request:
-    paths: ["site/install.sh", ".github/workflows/install.yaml"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/test_install_channels.py"]
   release:
     types: [published]
   schedule:
@@ -47,6 +47,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: shellcheck -s sh site/install.sh
+      - name: installer channel workflow regressions
+        run: python3 -I .github/scripts/test_install_channels.py
 
   install:
     name: ${{ matrix.os }}
@@ -58,7 +60,8 @@ jobs:
       matrix:
         os: [ubuntu-24.04-arm, macos-15]
     env:
-      BLAZE_REPO: ${{ github.repository }}
+      # The installer and channel assertions read this same published release service.
+      BLAZE_RELEASES: https://blaze-releases.ix.dev
       # A release the workflow was started for, or the one just published.
       BLAZE_VERSION: ${{ inputs.version || (github.event_name == 'release' && github.event.release.tag_name) || '' }}
     steps:
@@ -94,17 +97,29 @@ jobs:
           if sh site/install.sh --version 0.0.0-none > out.txt 2>&1; then cat out.txt; exit 1; fi
           cat out.txt
           grep -F "there is no blaze release 0.0.0-none" out.txt
-      # The channels (docs/release.md), each against the release GitHub's API says it is:
-      # stable is the latest release, canary the newest dated one, prerelease or not. Without
-      # the toolchain: what is checked is which release came.
+      # Query the same published channel pointers as site/install.sh, not GitHub's
+      # unrelated release listing (a fork may have no GitHub releases at all).
+      # Keep every channel/pin check; only omit the repeated toolchain download.
       - name: channels
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
-          stable=$(gh release view -R "$BLAZE_REPO" --json tagName -q .tagName)
-          canary=$(gh release list -R "$BLAZE_REPO" --limit 100 --json tagName -q '.[].tagName' |
-            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1)
+          releases="${BLAZE_RELEASES:-https://blaze-releases.ix.dev}"
+          releases="${releases%/}"
+          case "$releases" in
+            https://*) ;;
+            *) echo "::error::release origin must use HTTPS: $releases"; exit 1 ;;
+          esac
+          channel_version() {
+            value=$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "$releases/channels/$1") || return
+            value=$(printf '%s' "$value" | tr -d ' \r\n')
+            if ! printf '%s\n' "$value" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::$releases/channels/$1 does not contain a release version" >&2
+              return 1
+            fi
+            printf '%s\n' "$value"
+          }
+          stable=$(channel_version stable)
+          canary=$(channel_version canary)
           echo "stable $stable, canary v$canary"
           # installs VERSION SAID COMMAND...: the command installs VERSION and says SAID.
           installs() {

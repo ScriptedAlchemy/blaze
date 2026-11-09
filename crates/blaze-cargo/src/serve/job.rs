@@ -1548,6 +1548,10 @@ struct Build<S: Steps> {
     refused: Option<Refused>,
     /// Each unit's freshness by its place in the plan, once asked ([`Build::is_fresh`]).
     fresh: Vec<Option<bool>>,
+    /// Each compile result the loop has actually received, before running any dependent
+    /// build script. A plane run can arrive before the compile result that schedules
+    /// placement; an empty `busy` map alone does not prove its executable exists.
+    accounted: Vec<bool>,
     /// What became of each unit by its place in the plan, as its nodes settle: what the
     /// build's report of what it left unchecked is made of ([`Build::unchecked`]).
     verdicts: Vec<Verdict>,
@@ -1857,6 +1861,12 @@ struct Job<S: Steps> {
     /// Of `placing`, how many are in flight at each path ([`Paths`] id): a file with one is
     /// not yet all there.
     busy: HashMap<u32, u32, Global>,
+    /// This job's outputs whose placement or final verification failed. No build script may
+    /// execute one of them after the last in-flight placement is removed from `busy`.
+    refused_places: HashSet<u32, Global>,
+    /// Immutable store keys this job could not put: those keys already held other bytes.
+    /// A store conflict forbids running any program in this job, even one placed earlier.
+    refused_store_keys: HashSet<blaze_cas::Key, Global>,
     /// Build scripts' runs the plane started whose programs are not yet all placed: each
     /// starts once its compile's outputs have nothing in flight ([`Jobs::run_script`]).
     held: Vec<NodeId>,
@@ -2946,6 +2956,8 @@ impl<S: Steps> Jobs<S> {
             placed: blaze_cas::PlacedBytes::default(),
             worked: None,
             busy: HashMap::new_in(Global),
+            refused_places: HashSet::new_in(Global),
+            refused_store_keys: HashSet::new_in(Global),
             held: Vec::new(), // alloc: none until a run waits for its program
             look: 0,
             awaiting: None,
@@ -4673,6 +4685,7 @@ impl<S: Steps> Jobs<S> {
             evaluation,
             refused: None,
             fresh: fresh_units,
+            accounted: vec![false; verdicts.len()], // alloc: once per build, a flag per unit
             verdicts,
             applying: applying.then_some(Applying { left: count, failed: false }),
         }));
@@ -4825,6 +4838,19 @@ impl<S: Steps> Jobs<S> {
             w.plane.ended(w.now, node, Outcome::Failed { why });
             return;
         };
+        // A store key collision makes the compiled program's bytes untrustworthy.
+        // Other compiler errors leave independent units running (keep-going).
+        if let Some(job) = self.jobs.get(key_of(id))
+            && !job.refused_store_keys.is_empty()
+        {
+            // alloc: one failed run node
+            let why = format!(
+                "{} cannot start: this job's immutable store refused a compiled value key",
+                run_named(job, node)
+            );
+            w.plane.ended(w.now, node, Outcome::Failed { why });
+            return;
+        }
         // A run a broken write refused ([`Refused`]) never runs its user code. The plane hands
         // a run over here, never through [`Jobs::post`], so its refusal is checked here: one
         // after a `links` dependency's run whose write broke (cargo's run-to-run edge), which
@@ -4847,6 +4873,27 @@ impl<S: Steps> Jobs<S> {
             #[cfg(test)]
             HELD_RUNS.with_borrow_mut(|it| it.push(node));
             job.held.push(node);
+            return;
+        }
+
+        // A failed clone, mode or final stat has no placement left in flight. An empty busy
+        // map cannot turn a failed executable into a runnable one.
+        if let Some(job) = self.jobs.get(key_of(id))
+            && let Stage::Units(build) = &job.stage
+            && let Some(path) = build
+                .unit(node)
+                .and_then(|run| super::unit::compile_of(&build.outputs.units, run))
+                .and_then(|compile| {
+                    refused_program_output(build.outputs.of(compile), &job.refused_places)
+                })
+        {
+            let name = &self.paths.names[path as usize];
+            // alloc: once for an output that could not be placed
+            let why = format!(
+                "{} cannot start: its compiled program at {name} failed placement or verification",
+                run_named(job, node)
+            );
+            w.plane.ended(w.now, node, Outcome::Failed { why });
             return;
         }
         // A fresh unit's run replays what it kept: said before it can end.
@@ -4942,6 +4989,9 @@ impl<S: Steps> Jobs<S> {
         let streams = streams_units(&job.work);
         if let Stage::Units(build) = &mut job.stage {
             build.writer.compiled(unit);
+            if let Some(accounted) = build.accounted.get_mut(unit) {
+                *accounted = true;
+            }
         }
         let mut compiled = match result {
             Ok(compiled) => compiled,
@@ -5028,6 +5078,7 @@ impl<S: Steps> Jobs<S> {
             match w.store.put(put.key, put.kind, &put.bytes) {
                 Ok(ticket) => self.put.add(ticket),
                 Err(mismatch) => {
+                    job.refused_store_keys.insert(mismatch.key);
                     let error = mismatched("the store", kind, mismatch);
                     job.over.get_or_insert((false, Some(error)));
                 }
@@ -5043,6 +5094,7 @@ impl<S: Steps> Jobs<S> {
         for put in compiled.share {
             let kind = put.kind;
             if let Err(mismatch) = w.std.put(put.key, put.kind, &put.bytes) {
+                job.refused_store_keys.insert(mismatch.key);
                 let error = mismatched("the standard library's shared store", kind, mismatch);
                 job.over.get_or_insert((false, Some(error)));
             }
@@ -5065,6 +5117,13 @@ impl<S: Steps> Jobs<S> {
         let ids = outputs.as_ref().map_or(&[][..], |it| it.of(unit));
         for output in compiled.outputs {
             let path = self.paths.find(ids, &output.path);
+            if let Some(job) = self.jobs.get_mut(key_of(id))
+                && job.refused_store_keys.contains(&output.key)
+            {
+                // Never clone the unrelated bytes already committed under this key.
+                job.refused_places.insert(path);
+                continue;
+            }
             if self.paths.files[path as usize].is_none() {
                 // alloc: an error, once
                 let error = ApiError::new(
@@ -5072,6 +5131,7 @@ impl<S: Steps> Jobs<S> {
                     Some(output.path),
                 );
                 if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                    job.refused_places.insert(path);
                     job.over.get_or_insert((false, Some(error)));
                 }
                 continue;
@@ -5083,17 +5143,34 @@ impl<S: Steps> Jobs<S> {
                 self.place(w, id, path, output.key, output.executable);
                 continue;
             }
+            // clone: the driver's effect owns the file's name, once per output.
+            // Refuse an absent path before minting an own-effect tag, which would be orphaned.
+            let Some(file) = self.paths.files[path as usize].clone() else {
+                let name = self.paths.names[path as usize].to_string(); // alloc: an output failure
+                if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                    job.refused_places.insert(path);
+                    job.over.get_or_insert((
+                        false,
+                        Some(ApiError::new(
+                            format!("{name} has no file for the output recheck"),
+                            Some(name),
+                        )),
+                    ));
+                }
+                continue;
+            };
             let look = Own::Look { job: id, path, key: output.key, executable: output.executable };
             let tag = self.own_tag(look);
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
             match tag {
                 Ok(tag) => {
-                    // clone: the driver's effect owns the file's name, once per output
-                    let Some(file) = self.paths.files[path as usize].clone() else { continue };
                     self.begin_placing(id, path);
                     w.effects.push(Effect::Stat { file, tag });
                 }
-                Err(error) => _ = job.over.get_or_insert((false, Some(error))),
+                Err(error) => {
+                    job.refused_places.insert(path);
+                    job.over.get_or_insert((false, Some(error)));
+                }
             }
         }
     }
@@ -5120,6 +5197,7 @@ impl<S: Steps> Jobs<S> {
         let Some(file) = self.paths.files[path as usize].clone() else {
             let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
             // alloc: an error, once
+            job.refused_places.insert(path);
             job.over.get_or_insert((
                 false,
                 Some(ApiError::new(
@@ -5141,6 +5219,7 @@ impl<S: Steps> Jobs<S> {
                     format!("the store has nothing under {key:?} to place at {name}"),
                     Some(name),
                 );
+                job.refused_places.insert(path);
                 job.over.get_or_insert((false, Some(error)));
             }
         }
@@ -5188,13 +5267,25 @@ impl<S: Steps> Jobs<S> {
     fn release_ready(&mut self, w: &mut World<'_, S>) {
         for &id in &self.order {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
-            let Job { stage: Stage::Units(build), busy, .. } = job else { continue };
+            let Job { stage: Stage::Units(build), busy, refused_places, refused_store_keys, .. } = job else { continue };
             let mut at = 0;
             while at < build.ready.len() {
                 let (unit, artifact) = build.ready[at];
-                if build.outputs.of(unit as usize).iter().any(|path| busy.contains_key(path)) {
-                    at += 1;
-                    continue;
+                match output_readiness(
+                    build.outputs.of(unit as usize), busy, refused_places,
+                    !refused_store_keys.is_empty(),
+                ) {
+                    OutputReadiness::Pending => {
+                        at += 1;
+                        continue;
+                    }
+                    OutputReadiness::Refused => {
+                        // A failed placement has no pending effect left, but must never make
+                        // a test executable runnable. The job already carries the error.
+                        build.ready.remove(at);
+                        continue;
+                    }
+                    OutputReadiness::Ready => {}
                 }
                 build.ready.remove(at);
                 if let Some(it) = build.artifacts.get(artifact as usize) {
@@ -5228,7 +5319,16 @@ impl<S: Steps> Jobs<S> {
         executable: bool,
     ) {
         // clone: the driver's effect owns the file's name, once per placement
-        let Some(file) = self.paths.files[path as usize].clone() else { return };
+        let Some(file) = self.paths.files[path as usize].clone() else {
+            let name = self.paths.names[path as usize].to_string(); // alloc: a failed output
+            if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                job.refused_places.insert(path);
+                job.over.get_or_insert((false, Some(ApiError::new(
+                    format!("{name} has no file to verify after placement"), Some(name)
+                ))));
+            }
+            return;
+        };
         match self.own_tag(Own::Record { job: id, path, key }) {
             Ok(tag) => {
                 self.begin_placing(id, path);
@@ -5237,6 +5337,7 @@ impl<S: Steps> Jobs<S> {
             }
             Err(error) => {
                 if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                    job.refused_places.insert(path);
                     job.over.get_or_insert((false, Some(error)));
                 }
             }
@@ -5256,6 +5357,7 @@ impl<S: Steps> Jobs<S> {
                     Ok(tag) => w.effects.push(Effect::Mode { file: to, mode: 0o755, tag }),
                     Err(error) => {
                         if let Some(job) = self.end_placing(id, path) {
+                            job.refused_places.insert(path);
                             job.over.get_or_insert((false, Some(error)));
                         }
                     }
@@ -5269,6 +5371,7 @@ impl<S: Steps> Jobs<S> {
                         // alloc: an error, once
                         let error =
                             ApiError::new(format!("placing /{to}: {why}"), Some(format!("/{to}")));
+                        job.refused_places.insert(path);
                         job.over.get_or_insert((false, Some(error)));
                     }
                 }
@@ -5341,38 +5444,59 @@ impl<S: Steps> Jobs<S> {
     fn completed(&mut self, w: &mut World<'_, S>, own: Own, done: Done) {
         match own {
             Own::Record { job: id, path, key } => {
-                self.end_placing(id, path);
-                match (done, &mut self.paths.placed[path as usize]) {
-                    (Done::Stat(Some(meta)), Some(placement)) if placement.key == key => {
-                        placement.meta = Some(meta)
+                let failed = verify_placed_output(
+                    done, &mut self.paths.placed[path as usize], key
+                ).err();
+                if let Some(why) = failed {
+                    let name = self.paths.names[path as usize].to_string(); // alloc: an output failure
+                    if let Some(job) = self.end_placing(id, path) {
+                        job.refused_places.insert(path);
+                        job.over.get_or_insert((false, Some(ApiError::new(
+                            format!("verifying the placed output {name} under {key:?}: {why}"),
+                            Some(name),
+                        ))));
                     }
-                    (_, placement) => *placement = None,
+                } else {
+                    self.end_placing(id, path);
                 }
             }
             Own::Look { job: id, path, key, executable } => {
-                let unchanged = matches!(
-                    (&done, &self.paths.placed[path as usize]),
-                    (Done::Stat(Some(meta)), Some(placement)) if placement.key == key && placement.meta == Some(*meta)
-                );
+                let rechecked =
+                    recheck_placed_output(&done, self.paths.placed[path as usize].as_ref(), key);
                 self.end_placing(id, path);
-                if !unchanged {
-                    self.place(w, id, path, key, executable);
+                match rechecked {
+                    Ok(true) => {}
+                    // A missing or modified output may be re-placed from its already verified
+                    // immutable store value. An IO refusal is not evidence of a cache miss.
+                    Ok(false) => self.place(w, id, path, key, executable),
+                    Err(why) => {
+                        self.paths.placed[path as usize] = None;
+                        let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
+                        if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                            job.refused_places.insert(path);
+                            job.over.get_or_insert((
+                                false,
+                                Some(ApiError::new(
+                                    format!("rechecking output {name} under {key:?}: {why}"),
+                                    Some(name),
+                                )),
+                            ));
+                        }
+                    }
                 }
             }
             Own::Write { job: id, path } | Own::Mode { job: id, path, .. } => {
-                let failed = match &done {
-                    Done::Failed(error) => {
-                        let name = &self.paths.names[path as usize];
-                        // alloc: an error, once
-                        Some(ApiError::new(
-                            format!("writing {name}: {error}"),
-                            Some(name.to_string()),
-                        ))
-                    }
-                    _ => None,
-                };
+                let failed =
+                    output_effect_completion(&done, matches!(&own, Own::Mode { .. }))
+                        .err()
+                        .map(|why| {
+                            let name = &self.paths.names[path as usize];
+                            // alloc: an error, once
+                            ApiError::new(format!("placing {name}: {why}"), Some(name.to_string()))
+                        });
                 let Some(job) = self.end_placing(id, path) else { return };
                 if let Some(error) = failed {
+                    job.refused_places.insert(path);
                     job.over.get_or_insert((false, Some(error)));
                 } else if let Own::Mode { key, .. } = own {
                     self.record(w, id, path, key, true);
@@ -6508,19 +6632,128 @@ fn unit_of(units: &Units, at: usize) -> Option<UnitOf> {
     })
 }
 
-/// Whether build script run `node` of `job` waits for its program: an output of the compile of
-/// its script has an effect placing it in flight.
+/// Whether a script waits on the build of its program: the compile result must be received
+/// by the loop before its output placement is considered complete. An empty `busy` map before
+/// that result is received is not evidence that the build-script executable exists.
 fn waits_for_program<S: Steps>(job: &Job<S>, node: NodeId) -> bool {
-    if job.busy.is_empty() {
-        return false;
-    }
     let Stage::Units(build) = &job.stage else { return false };
     let Some(compile) =
         build.unit(node).and_then(|run| super::unit::compile_of(&build.outputs.units, run))
     else {
         return false;
     };
-    build.outputs.of(compile).iter().any(|path| job.busy.contains_key(path))
+    program_awaits_placement(
+        build.accounted.get(compile).copied().unwrap_or(false),
+        build.outputs.of(compile),
+        &job.busy,
+    )
+}
+
+/// A script is runnable only after its compile result has scheduled every output, and the
+/// final mode/stat/clone effect for each output has completed. Neither condition implies the
+/// other: the task and its placement completions arrive on different event queues.
+fn program_awaits_placement(
+    accounted: bool,
+    paths: &[u32],
+    busy: &HashMap<u32, u32, Global>,
+) -> bool {
+    !accounted || paths.iter().any(|path| busy.contains_key(path))
+}
+
+/// Whether a test executable may be reported as ready. A failed placement removes the
+/// in-flight count but does not authorize execution: the job reports its placement error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputReadiness {
+    Pending,
+    Refused,
+    Ready,
+}
+
+fn output_readiness(
+    paths: &[u32],
+    busy: &HashMap<u32, u32, Global>,
+    refused: &HashSet<u32, Global>,
+    store_refused: bool,
+) -> OutputReadiness {
+    if store_refused {
+        OutputReadiness::Refused
+    } else if paths.iter().any(|path| busy.contains_key(path)) {
+        OutputReadiness::Pending
+    } else if refused_program_output(paths, refused).is_some() {
+        OutputReadiness::Refused
+    } else {
+        OutputReadiness::Ready
+    }
+}
+
+/// Which of a compiled program's outputs this job refused to place. A failed final stat
+/// removes its busy count, but cannot turn that path into an executable.
+fn refused_program_output(paths: &[u32], refused: &HashSet<u32, Global>) -> Option<u32> {
+    paths.iter().copied().find(|path| refused.contains(path))
+}
+
+/// Only the effect's exact successful completion may advance an output placement.
+/// A different completed operation (not merely `Done::Failed`) cannot prove an
+/// executable was made executable or its auxiliary file was written.
+fn output_effect_completion(done: &Done, mode: bool) -> Result<(), String> {
+    match (mode, done) {
+        (false, Done::Written) | (true, Done::Moded) => Ok(()),
+        (_, Done::Failed(error)) => Err(format!("{error}")), // alloc: a failed effect
+        (false, other) => {
+            Err(format!("the output write returned {other:?}, not Written")) // alloc: an invalid completion
+        }
+        (true, other) => {
+            Err(format!("the executable mode change returned {other:?}, not Moded")) // alloc: an invalid completion
+        }
+    }
+}
+
+/// A recheck distinguishes a genuinely missing/changed output from an unreadable one.
+/// Only the former may be re-placed from the same immutable store key. A failed stat,
+/// unexpected completion, or directory refuses the output instead of hiding the error
+/// behind an attempted clone.
+fn recheck_placed_output(
+    done: &Done,
+    placed: Option<&Placement>,
+    key: blaze_cas::Key,
+) -> Result<bool, String> {
+    match done {
+        Done::Stat(None) => Ok(false),
+        Done::Stat(Some(meta)) if meta.dir => {
+            Err("the output path is a directory, not a regular file".to_owned()) // alloc: an error
+        }
+        Done::Stat(Some(meta)) => {
+            Ok(placed.is_some_and(|value| value.key == key && value.meta == Some(*meta)))
+        }
+        Done::Failed(error) => Err(format!("the output stat failed: {error}")), // alloc: an error
+        other => Err(format!("the output stat returned {other:?}, not a stat")), // alloc: an error
+    }
+}
+
+/// Complete only when the actual output was observed as a regular file under the key
+/// placed. A missing file, a directory, an IO failure or an unexpected completion refuses it.
+fn verify_placed_output(
+    done: Done,
+    placed: &mut Option<Placement>,
+    key: blaze_cas::Key,
+) -> Result<(), String> {
+    let why = match (done, placed.as_mut()) {
+        (Done::Stat(Some(meta)), Some(value)) if value.key == key && !meta.dir => {
+            value.meta = Some(meta);
+            return Ok(());
+        }
+        (Done::Stat(None), _) => "the file was absent after placement".to_owned(), // alloc: an error
+        (Done::Stat(Some(meta)), _) if meta.dir => {
+            "the output is a directory, not a regular file".to_owned() // alloc: an error
+        }
+        (Done::Stat(Some(_)), _) => {
+            "the recorded output no longer has the expected key".to_owned() // alloc: an error
+        }
+        (Done::Failed(error), _) => format!("its final stat failed: {error}"), // alloc: an error
+        (other, _) => format!("its final stat returned {other:?}"), // alloc: an error
+    };
+    *placed = None;
+    Err(why)
 }
 
 fn script_ended<S: Steps>(w: &mut World<'_, S>, node: NodeId, ok: bool) {

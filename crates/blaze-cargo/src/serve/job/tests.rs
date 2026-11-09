@@ -68,6 +68,8 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         placed: blaze_cas::PlacedBytes::default(),
         worked: None,
         busy: HashMap::new_in(std::alloc::Global),
+        refused_places: HashSet::new_in(std::alloc::Global),
+        refused_store_keys: HashSet::new_in(std::alloc::Global),
         held: Vec::new(),
         look: 0,
         awaiting: None,
@@ -435,6 +437,193 @@ fn jobs_are_walked_in_the_order_they_started_whatever_their_slots() {
     assert_eq!(roots(&jobs), [0, 1, 3, 4, 5]);
     let stale = JobId { slot: 9, generation: 1 };
     assert!(jobs.jobs.get(key_of(stale)).is_none(), "an id of another generation finds nothing");
+}
+
+/// The scheduler may announce that a build-script run can start before the loop has
+/// processed its compiler result. No placement is in flight yet in that order: it must
+/// still wait, then wait again for every placement and executable-mode completion.
+#[test]
+fn a_script_waits_for_the_compile_result_and_every_output_placement() {
+    let mut busy = HashMap::new_in(std::alloc::Global);
+    let paths = [4, 5];
+    assert!(
+        program_awaits_placement(false, &paths, &busy),
+        "empty busy before the compiler result is not a runnable program"
+    );
+    busy.insert(4, 1);
+    busy.insert(5, 1);
+    assert!(
+        program_awaits_placement(true, &paths, &busy),
+        "the first output is still being placed"
+    );
+    busy.remove(&4);
+    assert!(
+        program_awaits_placement(true, &paths, &busy),
+        "another output's pending mode/clone keeps the run held"
+    );
+    busy.remove(&5);
+    assert!(
+        !program_awaits_placement(true, &paths, &busy),
+        "only an accounted, fully placed executable is runnable"
+    );
+    assert!(
+        program_awaits_placement(false, &[], &busy),
+        "no output paths cannot excuse an unobserved compiler result"
+    );
+    assert!(
+        !program_awaits_placement(true, &[], &busy),
+        "a legitimately output-free compile needs no placement wait"
+    );
+}
+
+
+#[test]
+fn an_output_placement_failure_must_not_announce_a_test_executable() {
+    let paths = [4, 5];
+    let mut busy = HashMap::new_in(std::alloc::Global);
+    let mut refused = HashSet::new_in(std::alloc::Global);
+
+    assert_eq!(output_readiness(&paths, &busy, &refused, false), OutputReadiness::Ready);
+
+    busy.insert(4, 1);
+    assert_eq!(output_readiness(&paths, &busy, &refused, false), OutputReadiness::Pending);
+
+    refused.insert(5);
+    assert_eq!(
+        output_readiness(&paths, &busy, &refused, false),
+        OutputReadiness::Pending,
+        "the other output is still in flight"
+    );
+
+    busy.remove(&4);
+    assert_eq!(
+        output_readiness(&paths, &busy, &refused, false),
+        OutputReadiness::Refused,
+        "completion of the final effect cannot turn a refused test binary into TestReady"
+    );
+
+    refused.clear();
+    assert_eq!(output_readiness(&paths, &busy, &refused, false), OutputReadiness::Ready);
+}
+
+/// An ordinary failed unit does not suppress independent work, but a committed store
+/// collision forbids executing any program from the job, including one placed earlier.
+#[test]
+fn an_immutable_store_conflict_refuses_programs_and_conflicting_outputs() {
+    let mut job = job(Vec::new());
+    let paths = [4, 5];
+    let busy = HashMap::new_in(std::alloc::Global);
+    let refused = HashSet::new_in(std::alloc::Global);
+    let bad_key = blaze_cas::Key(ContentId([7; 32]));
+    let other_key = blaze_cas::Key(ContentId([8; 32]));
+
+    job.over = Some((false, Some(ApiError::new("an independent unit failed".into(), None))));
+    assert!(job.refused_store_keys.is_empty());
+    assert_eq!(
+        output_readiness(&paths, &busy, &refused, !job.refused_store_keys.is_empty()),
+        OutputReadiness::Ready,
+        "keep-going must preserve independent test executables after an ordinary compiler failure"
+    );
+
+    job.refused_store_keys.insert(bad_key);
+    assert!(job.refused_store_keys.contains(&bad_key));
+    assert!(!job.refused_store_keys.contains(&other_key));
+    assert_eq!(
+        output_readiness(&paths, &busy, &refused, !job.refused_store_keys.is_empty()),
+        OutputReadiness::Refused,
+        "an earlier placed test executable cannot run after any immutable key collision",
+    );
+}
+
+/// A completion for the wrong filesystem operation must never be counted as
+/// a successful executable chmod or output write. Otherwise the loop records an
+/// unexecutable or missing build-script binary as ready to run.
+#[test]
+fn output_placement_requires_the_matching_effect_completion() {
+    assert!(output_effect_completion(&Done::Written, false).is_ok());
+    assert!(output_effect_completion(&Done::Moded, true).is_ok());
+
+    for (done, mode, why) in [
+        (Done::Moded, false, "not Written"),
+        (Done::Written, true, "not Moded"),
+        (Done::Stat(None), false, "not Written"),
+        (Done::Cloned, true, "not Moded"),
+        (Done::Failed(blaze_core::IoError("chmod denied".into())), true, "chmod denied"),
+        (Done::Failed(blaze_core::IoError("write denied".into())), false, "write denied"),
+    ] {
+        let error = output_effect_completion(&done, mode).unwrap_err();
+        assert!(error.contains(why), "{error}");
+    }
+}
+
+#[test]
+fn a_failed_final_stat_cannot_authorize_running_a_build_script() {
+    let key = blaze_cas::Key(ContentId([7; 32]));
+    let file = Meta { len: 13, dir: false, modified_ns: 99 };
+    let valid = || Some(Placement { key, executable: true, meta: None });
+
+    let mut placed = valid();
+    assert!(verify_placed_output(Done::Stat(Some(file)), &mut placed, key).is_ok());
+    assert_eq!(placed.as_ref().and_then(|it| it.meta), Some(file));
+
+    for (done, reason) in [
+        (Done::Stat(None), "absent"),
+        (Done::Stat(Some(Meta { dir: true, ..file })), "directory"),
+        (Done::Failed(blaze_core::IoError("stat denied".into())), "stat denied"),
+        (Done::Written, "final stat returned"),
+    ] {
+        let mut placed = valid();
+        let why = verify_placed_output(done, &mut placed, key).unwrap_err();
+        assert!(why.contains(reason), "{why}");
+        assert!(placed.is_none(), "failed verification cannot remain a cached placement");
+    }
+
+    let mut wrong_key = Some(Placement {
+        key: blaze_cas::Key(ContentId([8; 32])), executable: true, meta: None
+    });
+    let why = verify_placed_output(Done::Stat(Some(file)), &mut wrong_key, key).unwrap_err();
+    assert!(why.contains("expected key"), "{why}");
+    assert!(wrong_key.is_none(), "a different cached value may not be treated as this output");
+
+    let mut refused = HashSet::new_in(std::alloc::Global);
+    refused.insert(8);
+    assert_eq!(refused_program_output(&[7, 8], &refused), Some(8));
+    assert_eq!(refused_program_output(&[7, 9], &refused), None);
+    assert_eq!(refused_program_output(&[], &refused), None);
+}
+
+/// A stat that the OS refuses is not a missing cached output. Re-cloning after a
+/// permission or IO error would conceal that refusal and could run the old program.
+#[test]
+fn a_failed_output_recheck_refuses_instead_of_replacing_it() {
+    let key = blaze_cas::Key(ContentId([19; 32]));
+    let meta = Meta { len: 13, dir: false, modified_ns: 99 };
+    let placed = Placement { key, executable: true, meta: Some(meta) };
+
+    assert_eq!(recheck_placed_output(&Done::Stat(Some(meta)), Some(&placed), key), Ok(true));
+    assert_eq!(recheck_placed_output(&Done::Stat(None), Some(&placed), key), Ok(false));
+    assert_eq!(
+        recheck_placed_output(&Done::Stat(Some(Meta { len: 14, ..meta })), Some(&placed), key),
+        Ok(false),
+    );
+    assert_eq!(recheck_placed_output(&Done::Stat(Some(meta)), None, key), Ok(false));
+    assert_eq!(
+        recheck_placed_output(
+            &Done::Stat(Some(meta)),
+            Some(&placed),
+            blaze_cas::Key(ContentId([20; 32])),
+        ),
+        Ok(false),
+    );
+
+    for (done, expected) in [
+        (Done::Failed(blaze_core::IoError("stat denied".into())), "stat denied"),
+        (Done::Written, "not a stat"),
+        (Done::Stat(Some(Meta { dir: true, ..meta })), "directory"),
+    ] {
+        let why = recheck_placed_output(&done, Some(&placed), key).unwrap_err();
+        assert!(why.contains(expected), "{why}");
+    }
 }
 
 /// A path is not all there while any effect placing it is in flight (a placement, then its

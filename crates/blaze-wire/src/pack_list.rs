@@ -75,6 +75,9 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<PackRef>, String> {
         if fields.next().is_some() {
             return Err(bad("unexpected fields after the keys digest"));
         }
+        if seen.last().is_some_and(|previous| *previous > pack) {
+            return Err(bad("the pack digests are not strictly sorted"));
+        }
         if !seen.insert(pack) {
             return Err(bad("the pack digest occurs more than once"));
         }

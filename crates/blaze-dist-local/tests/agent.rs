@@ -241,19 +241,17 @@ fn a_published_unit_schedules_nothing() {
 }
 
 #[test]
-fn a_pack_the_server_lost_is_an_unpublished_unit() {
+fn a_committed_pack_the_server_lost_refuses_without_compiling() {
     let world = world(1, WorkConfig::default());
     let unit = unit(4, 2);
     let never = AtomicBool::new(false);
-    let gone = Pack::of(vec![value_of(&[9; 32])]).unwrap();
-    // Named by a list and never uploaded.
-    let list = format!(
-        "{} {} {}\n",
-        blaze_dist_local::pack::hex(&gone.reference.pack),
-        gone.reference.size,
-        blaze_dist_local::pack::hex(&gone.reference.keys)
-    );
-    world.blobs.publish(&unit.spec, list.as_bytes()).unwrap();
+    let pack = Pack::of(vec![value_of(&[9; 32])]).unwrap();
+    world.blobs.put_pack(&pack).unwrap();
+    let list = blaze_wire::pack_list::encode(&[pack.reference.clone()]);
+    world.blobs.publish(&unit.spec, &list).unwrap();
+    let path = world._dir.path().join("blobs/packs")
+        .join(format!("{}.pack", blaze_dist_local::pack::hex(&pack.reference.pack)));
+    std::fs::remove_file(&path).unwrap();
     let mut compiler = Compiler {
         names: unit.names.clone(),
         log: Arc::new(Mutex::new(BTreeMap::new())),
@@ -261,10 +259,22 @@ fn a_pack_the_server_lost_is_an_unpublished_unit() {
         entered: Arc::new(AtomicUsize::new(0)),
         wait_for: 1,
     };
-    let arrived =
-        agent::run(&config(&world.socket, &world.blobs), &unit, &mut compiler, &never).unwrap();
-    assert_eq!(arrived.source, Source::Executed, "the work was done again");
-    assert_eq!(arrived.values.len(), 2);
+    for policy in [LocalPolicy::Never, LocalPolicy::Fallback] {
+        let error = agent::run(&config(&world.socket, &world.blobs), &unit, &mut compiler, &never)
+            .unwrap_err();
+        assert!(matches!(&error, Error::Committed(why)
+            if why.contains(&blaze_dist_local::pack::hex(&pack.reference.pack))), "{error}");
+        assert!(agent::decide(&policy, error).is_err());
+    }
+    assert_eq!(compiler.entered.load(Ordering::SeqCst), 0, "a committed absence must not compile");
+    assert!(compiler.log.lock().unwrap().is_empty());
+    assert_eq!(world.blobs.published(&unit.spec).unwrap().unwrap(), list);
+    // Remove only the fault: the same manifest is readable again without any compilation.
+    world.blobs.put_pack(&pack).unwrap();
+    let restored = agent::run(&config(&world.socket, &world.blobs), &unit, &mut compiler, &never)
+        .unwrap();
+    assert_eq!(restored.source, Source::Published);
+    assert_eq!(compiler.entered.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -353,7 +363,7 @@ fn a_slow_phase_pack_download_keeps_the_original_lead_alive() {
 }
 
 #[test]
-fn deleting_a_completed_pack_regenerates_and_repairs_a_different_partition() {
+fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
     // A holder may export verified neighboring values alongside a grant. Both pack
     // partitions below contain exactly the same logical values for the same unit.
     struct WithNeighbors(Vec<Digest>);
@@ -374,34 +384,41 @@ fn deleting_a_completed_pack_regenerates_and_repairs_a_different_partition() {
     let first = agent::run(&cfg, &unit, &mut WithNeighbors(unit.names.clone()), &never).unwrap();
     assert_eq!(first.packs.len(), 1);
     let old = world.blobs.published(&unit.spec).unwrap().unwrap();
-    let missing = world
-        ._dir
-        .path()
-        .join("blobs/packs")
-        .join(format!("{}.pack", blaze_dist_local::pack::hex(&first.packs[0].pack)));
-    assert!(missing.is_file(), "delete an actual pack of a genuinely completed execution");
-    std::fs::remove_file(&missing).unwrap();
-    let mut compiler = Compiler {
-        names: unit.names.clone(),
-        log: Arc::new(Mutex::new(BTreeMap::new())),
-        who: 0,
-        entered: Arc::new(AtomicUsize::new(0)),
-        wait_for: 1,
-    };
-    let second = agent::run(&cfg, &unit, &mut compiler, &never).unwrap();
-    assert_ne!(first.execution, second.execution, "a terminal execution is not reused");
-    assert_eq!(second.values, first.values);
-    assert_eq!(second.packs.len(), 2, "regeneration deliberately changes the pack partition");
-    assert_ne!(world.blobs.published(&unit.spec).unwrap().unwrap(), old);
+    let mut split = Vec::new();
+    for name in &unit.names {
+        let pack = Pack::of(vec![value_of(name)]).unwrap();
+        world.blobs.put_pack(&pack).unwrap();
+        split.push(pack.reference);
+    }
+    split.sort();
+    let proposed = blaze_wire::pack_list::encode(&split);
+    assert_ne!(proposed, old, "the first-writer check must compare actual different partitions");
+    world.blobs.publish(&unit.spec, &proposed).unwrap();
+    assert_eq!(world.blobs.published(&unit.spec).unwrap().unwrap(), old, "the first writer remains immutable");
+    assert_eq!(agent::import(&world.blobs, &split).unwrap(), first.values);
+
+    // Same key sets cannot hide a different value or kind behind a different partition.
+    for kind in [1, 2] {
+        let mut values: Vec<_> = unit.names.iter().map(value_of).collect();
+        values[0].kind = kind;
+        if kind == 1 {
+            values[0].bytes.push(99);
+        }
+        let wrong = Pack::of(values).unwrap();
+        world.blobs.put_pack(&wrong).unwrap();
+        let refused = world.blobs.publish(&unit.spec,
+            &blaze_wire::pack_list::encode(&[wrong.reference])).unwrap_err();
+        assert!(matches!(agent::decide(&LocalPolicy::Fallback, refused), Err(Error::Committed(_))));
+    }
     let mut cold = cfg;
-    cold.socket = PathBuf::from("/tmp/blaze-agent-no-coordinator-for-repaired-list.sock");
+    cold.socket = PathBuf::from("/tmp/blaze-agent-no-coordinator-for-existing-list.sock");
     let restored = agent::run(&cold, &unit, &mut Vanishes, &never).unwrap();
     assert_eq!(restored.source, Source::Published);
     assert_eq!(restored.values, first.values);
 }
 
 #[test]
-fn a_cancelled_build_leaves_its_execution() {
+fn an_already_cancelled_build_never_submits_an_execution() {
     let world = world(0, WorkConfig::default());
     let unit = unit(5, 2);
     let config = config(&world.socket, &world.blobs);
@@ -427,9 +444,9 @@ fn a_cancelled_build_leaves_its_execution() {
     let cancelled = AtomicBool::new(true);
     let error = agent::run(&config, &unit, &mut Vanishes, &cancelled).unwrap_err();
     assert!(error.to_string().contains("cancelled"), "{error}");
-    // Nobody waits for the agent's any more, so it ended: this build of the unit starts another
-    // (`before + 2`), rather than joining it (`before + 1`).
-    assert_eq!(execution_of(unit.spec), before + 2);
+    assert!(matches!(agent::decide(&LocalPolicy::Fallback, error), Err(Error::Cancelled(_))));
+    // Cancellation is checked before cache access or submission, so there is no intervening job.
+    assert_eq!(execution_of(unit.spec), before + 1);
 }
 
 #[test]

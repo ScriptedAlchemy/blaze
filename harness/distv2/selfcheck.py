@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -263,7 +264,7 @@ class Oracles(unittest.TestCase):
             target = blobs / "packs" / f"{name}.pack"
             target.write_bytes(raw)
             manifest = blobs / "manifests" / UNIT
-            manifest.write_text(f"{name} {len(raw)} {OTHER}\n")
+            manifest.write_text(f"{name} {len(raw)} {e.pack_keys_digest({KEY})}\n")
             event = {"event": "published", "unit_digest": UNIT, "execution": 7, "attempt": 2, "packs": [name]}
             done = {"event": "done", "unit_digest": UNIT, "execution": 7, "attempt": 2, "outcome": "Passed"}
             e.publication(blobs, [row()], [event, done])
@@ -299,7 +300,7 @@ class Oracles(unittest.TestCase):
             merged, size = pack([a, b])
             left, _ = pack([a])
             right, _ = pack([b])
-            (blobs / "manifests" / UNIT).write_text(f"{merged} {size} {OTHER}\n")
+            (blobs / "manifests" / UNIT).write_text(f"{merged} {size} {e.pack_keys_digest({KEY, OTHER})}\n")
             published = {"event": "published", "unit_digest": UNIT, "execution": 7,
                          "attempt": 1, "packs": [left, right]}
             done = {"event": "done", "unit_digest": UNIT, "execution": 7, "attempt": 2, "outcome": "Passed"}
@@ -317,6 +318,72 @@ class Oracles(unittest.TestCase):
                     e.publication(blobs, [report], bad_events)
             with self.assertRaises(e.Failed):
                 e.publication(blobs, [row(publication_attempt=3)], [published, done])
+
+    def test_native_manifest_checks_key_digests_and_immutable_values_across_packs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blobs = Path(directory)
+            (blobs / "packs").mkdir()
+            (blobs / "manifests").mkdir()
+            manifest = blobs / "manifests" / UNIT
+
+            def put(pairs):
+                raw = bytearray(b"blzdpk\0\x01")
+                for key, payload in sorted(pairs.items()):
+                    raw.extend(bytes.fromhex(key))
+                    raw.extend(b"\x01")
+                    raw.extend(len(payload).to_bytes(8, "little"))
+                    raw.extend(payload)
+                raw = bytes(raw)
+                name = hashlib.sha256(raw).hexdigest()
+                (blobs / "packs" / f"{name}.pack").write_bytes(raw)
+                return f"{name} {len(raw)} {e.pack_keys_digest(set(pairs))}"
+
+            first = put({KEY: b"first"})
+            conflict = put({KEY: b"different bytes under the same immutable key"})
+            manifest.write_text(first + "\n" + conflict + "\n")
+            with self.assertRaisesRegex(e.Failed, "different values across published packs"):
+                e.manifest(blobs, UNIT)
+
+            # Repeating the same immutable value in differently packed files is allowed.
+            overlap = put({KEY: b"first", OTHER: b"an independent value"})
+            manifest.write_text(first + "\n" + overlap + "\n")
+            packs, keys = e.manifest(blobs, UNIT)
+            self.assertEqual((len(packs), keys), (2, {KEY, OTHER}))
+
+            # A pack's SHA-256 does not prove its separately committed key-set digest.
+            fields = overlap.split()
+            fields[2] = KEY
+            manifest.write_text(first + "\n" + " ".join(fields) + "\n")
+            with self.assertRaisesRegex(e.Failed, "PackRef.keys digest"):
+                e.manifest(blobs, UNIT)
+
+            self.assertEqual(e.pack_keys_digest({KEY}),
+                             "847bea1103f30c14e239416b59d188feda5a64bcf4d9f7c591ade9df9a6530e1")
+            self.assertEqual(e.pack_keys_digest({f"{n:02x}" * 32 for n in range(24)}),
+                             "a46647a51115be67ab1dfdc94e7d0ec25d91e06dec049bc0ca9e94bab12a6327")
+
+    def test_committed_pack_refusal_rejects_fallback_and_unrelated_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / f"{KEY}.pack"
+            artifact = Path(directory) / "app"
+            consumer = unittest.mock.Mock()
+            consumer.program.return_value = artifact
+            refused = (1, f"distributed build failed: committed pack {KEY} is corrupt")
+            consumer.build.return_value = refused
+            for policy in ("never", "fallback"):
+                home = f"corrupt-{policy}"
+                h.committed_pack_refused(consumer, home, policy, target)
+                consumer.build.assert_called_with(home, BLAZE_DIST_LOCAL=policy)
+            for bad in ((0, refused[1]), (1, "distributed build failed: unrelated"),
+                        (1, f"ordinary build error on {KEY}")):
+                consumer.build.return_value = bad
+                with self.assertRaises(e.Failed):
+                    h.committed_pack_refused(consumer, "bad", "fallback", target)
+            consumer.build.return_value = refused
+            artifact.write_bytes(b"incorrect locally rebuilt output")
+            with self.assertRaises(e.Failed):
+                h.committed_pack_refused(consumer, "bad-artifact", "fallback", target)
+
 
     def test_live_jsonl_tolerates_only_an_unfinished_last_append(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -353,6 +420,53 @@ class Oracles(unittest.TestCase):
                 h.load(json.dumps({**base, "cores": 0}))
             with self.assertRaises(e.Failed):
                 h.load(json.dumps({**base, "env": {"BLAZE_DIST_LOCAL": "fallback"}}))
+            for field, unsafe in (("program", "../outside"), ("program", "/tmp/not-built"),
+                                  ("profile", "debug/../../outside"), ("profile", "")):
+                with self.subTest(field=field, unsafe=unsafe), self.assertRaises(e.Failed):
+                    h.load(json.dumps({**base, field: unsafe}))
+
+    def test_provenance_rejects_untracked_source_while_preserving_tracked_patch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repo"
+            repository.mkdir()
+            def git(*args):
+                return subprocess.check_output(["git", "-C", str(repository), *args], stderr=subprocess.PIPE)
+            git("init", "-q")
+            tracked = repository / "tracked.rs"
+            tracked.write_text("original\n")
+            git("add", "tracked.rs")
+            git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "-qm", "fixture")
+            commit, tree, patch_bytes = h.source_state(repository, 10)
+            self.assertEqual(commit, git("rev-parse", "HEAD").decode().strip())
+            self.assertEqual(tree, git("rev-parse", "HEAD^{tree}").decode().strip())
+            self.assertEqual(patch_bytes, b"")
+            untracked = repository / "injected.rs"
+            untracked.write_text("untracked compilation input\n")
+            with self.assertRaises(e.Failed):
+                h.source_state(repository, 10)
+            untracked.unlink()
+            tracked.write_text("changed\n")
+            new_commit, new_tree, patch_bytes = h.source_state(repository, 10)
+            self.assertEqual((new_commit, new_tree), (commit, tree))
+            self.assertIn(b"changed", patch_bytes)
+
+    def test_artifact_path_cannot_escape_target_even_through_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = object.__new__(h.Run)
+            run.root = Path(directory)
+            run.project = run.root / "project"
+            run.given = h.Input("/unused", "/unused", "/unused", directory)
+            executable = run.target("solo") / "debug" / "app"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"built output")
+            self.assertEqual(run.program("solo"), executable.resolve())
+            executable.unlink()
+            outside = run.root / "unrelated-program"
+            outside.write_bytes(b"not the build output")
+            executable.symlink_to(outside)
+            with self.assertRaises(e.Failed):
+                run.program("solo")
 
     def test_fault_wait_is_bounded_and_checks_evidence_before_child_exit(self):
         run = object.__new__(h.Run)
