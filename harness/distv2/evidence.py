@@ -102,25 +102,30 @@ def accepted(events: list[dict], grant: dict) -> bool:
 
 
 def recovered(events: list[dict], grant: dict, accepted_after: int = 0) -> bool:
-    """Every outstanding name was actually committed under a replacement lease."""
-    replacements = {
-        lease(e): e for e in events
-        if e["event"] == "grant" and e["unit_digest"] == grant["unit_digest"]
-        and e["execution"] == grant["execution"]
-        and (e["attempt"], e["holder"], e["generation"]) != (grant["attempt"], grant["holder"], grant["generation"])
-    }
+    """Every outstanding name was committed under a replacement grant before acceptance."""
+    replacements: dict[tuple, set[str]] = {}
     done = set()
     for index, event in enumerate(events):
-        if index >= accepted_after and event["event"] == "result_accepted" and lease(event) in replacements:
-            require(set(event["work"]) <= set(replacements[lease(event)]["work"]), "accepted result names work outside its grant")
-            done.update(event["work"])
+        if (event["event"] == "grant" and event["unit_digest"] == grant["unit_digest"]
+                and event["execution"] == grant["execution"]
+                and (event["attempt"], event["holder"], event["generation"])
+                    != (grant["attempt"], grant["holder"], grant["generation"])):
+            replacements[lease(event)] = set(event["work"])
+        elif index >= accepted_after and event["event"] == "result_accepted":
+            allowed = replacements.get(lease(event))
+            if allowed is not None:
+                require(set(event["work"]) <= allowed, "accepted result names work outside its grant")
+                done.update(event["work"])
     return bool(grant["work"]) and set(grant["work"]) <= done
 
 
-def stale_refused(events: list[dict], grant: dict) -> bool:
+def stale_refused(events: list[dict], grant: dict, refused_after: int = 0) -> bool:
+    """Only a refusal observed after the stale holder resumes proves fencing."""
     return any(
-        e["event"] == "result_refused" and lease(e) == lease(grant)
-        and e["refusal"] in ("DeadLease", "AttemptMoved") for e in events
+        index >= refused_after and event["event"] == "result_refused"
+        and lease(event) == lease(grant)
+        and event["refusal"] in ("DeadLease", "AttemptMoved")
+        for index, event in enumerate(events)
     )
 
 

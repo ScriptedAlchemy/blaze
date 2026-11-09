@@ -76,7 +76,11 @@ class Oracles(unittest.TestCase):
         new = grant(holder="b", generation=5)
         done = {**new, "event": "result_accepted"}
         self.assertTrue(e.recovered([old, new, done], old))
+        # A matching acceptance logged before its replacement grant is not a recovery.
+        self.assertFalse(e.recovered([old, done, new], old))
         self.assertFalse(e.recovered([old, new, done], old, accepted_after=3))
+        with self.assertRaisesRegex(e.Failed, "outside its grant"):
+            e.recovered([old, new, {**done, "work": [KEY, "44" * 32]}], old)
         self.assertFalse(e.recovered([], old))
         self.assertFalse(e.recovered([old, {**old, "event": "result_accepted"}], old))
         self.assertFalse(e.recovered([old, new, {**done, "work": [KEY]}], old))
@@ -87,6 +91,9 @@ class Oracles(unittest.TestCase):
         old = grant()
         refusal = {**old, "event": "result_refused", "refusal": "DeadLease"}
         self.assertTrue(e.stale_refused([refusal], old))
+        # Earlier refusals cannot stand in for the resumed victim's submission.
+        self.assertFalse(e.stale_refused([refusal], old, refused_after=1))
+        self.assertTrue(e.stale_refused([refusal, refusal], old, refused_after=1))
         for field, wrong in (("holder", "b"), ("generation", 4), ("seq", 5), ("attempt", 3),
                              ("execution", 8), ("refusal", "Unknown")):
             self.assertFalse(e.stale_refused([{**refusal, field: wrong}], old), field)
