@@ -403,6 +403,23 @@ impl<S: Export> Recording<'_, S> {
                 &put.bytes,
                 "the completed unit's output",
             )?;
+            // New puts take precedence below, including over keys already read by the
+            // tail. Refuse a local contradiction before publishing a remote manifest,
+            // not later when the completed unit finally inserts its puts into the CAS.
+            if let Some(bytes) = self.overlay.store.read(&put.key)? {
+                let kind = self.overlay.store.kind(&put.key)?.ok_or_else(|| {
+                    format!( // alloc: a refusal naming the inconsistent local entry
+                        "the local store has bytes but no kind for output key {:?}",
+                        put.key
+                    )
+                })?;
+                if kind != put.kind.code() || bytes != put.bytes.as_slice() {
+                    return Err(format!( // alloc: a refusal naming the conflicting output
+                        "the completed unit's output under {:?} disagrees with the local store: two values under one immutable key",
+                        put.key
+                    ));
+                }
+            }
             match values.entry(put.key) {
                 std::collections::btree_map::Entry::Vacant(slot) => {
                     slot.insert(Value {
@@ -692,6 +709,54 @@ mod tests {
                     accepted,
                     "the tail must refuse a conflicting put before immutable publication"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn tail_outputs_cannot_hide_local_cache_values_before_publication() {
+        let key = Key(ContentId([0x61; 32]));
+        let fresh = Key(ContentId([0x11; 32]));
+        let committed = BTreeMap::new();
+        for marker in 0..16u8 {
+            let expected = vec![marker, 0x40]; // alloc: deterministic local-cache fixture
+            let local = Warm(
+                [(key, Value { key: key.0.0, kind: Kind::Query.code(), bytes: expected.clone() })]
+                    .into(),
+            );
+            for consumed in [false, true] {
+                let recording = Recording {
+                    overlay: Overlay { store: &local, values: &committed },
+                    seen: RefCell::new(BTreeSet::new()),
+                };
+                if consumed {
+                    assert_eq!(recording.read(&key).unwrap(), Some(expected.as_slice()));
+                }
+                for (kind, bytes, accepted) in [
+                    (Kind::Query, expected.clone(), true),
+                    (Kind::Query, vec![marker ^ 1, 0x40], false),
+                    (Kind::Debug, expected.clone(), false),
+                ] {
+                    let built = Built {
+                        puts: vec![
+                            Put { key: fresh, kind: Kind::Query, bytes: vec![0x22] },
+                            Put { key, kind, bytes },
+                        ],
+                        ..Built::default()
+                    };
+                    let exported = recording.export(&built);
+                    assert_eq!(exported.is_ok(), accepted, "consumed={consumed}");
+                    if accepted {
+                        let exported = exported.unwrap();
+                        assert_eq!(exported.len(), 2);
+                        let value = exported.iter().find(|value| value.key == key.0.0).unwrap();
+                        assert_eq!(value.kind, Kind::Query.code());
+                        assert_eq!(value.bytes, expected);
+                    } else {
+                        assert!(exported.unwrap_err().contains("disagrees with the local store"));
+                    }
+                    assert_eq!(local.read(&key).unwrap(), Some(expected.as_slice()));
+                }
             }
         }
     }
