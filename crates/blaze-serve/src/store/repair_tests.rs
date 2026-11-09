@@ -11,6 +11,10 @@ use hegel::generators as gs;
 use super::publication::{self, Publication, Step};
 use super::*;
 
+// Exercise the existing producer and importer, rather than a second codec fixture.
+#[path = "../../../blaze-dist-local/src/pack.rs"]
+mod native_pack;
+
 fn digest(bytes: &[u8]) -> Digest {
     Sha256::digest(bytes).into()
 }
@@ -82,7 +86,6 @@ fn first_publication_cannot_name_missing_or_corrupt_packs(tc: hegel::TestCase) {
     }
 }
 
-
 #[hegel::test(test_cases = 32)]
 fn first_writer_requires_equal_values_for_keys_mirrored_across_packs(tc: hegel::TestCase) {
     let conflict = tc.draw(gs::integers::<u8>().max_value(1)) == 1;
@@ -146,7 +149,7 @@ fn first_publication_refuses_forged_keys_and_truncated_native_values() {
     assert!(store.put_blob(&path(&alien), &alien_bytes).is_err());
     std::fs::write(store.dir().join(path(&alien)), &alien_bytes).unwrap();
     let error = store.put_list(&name(), &pack_list::encode(&[alien])).unwrap_err();
-    assert!(error.to_string().contains("native pack header"), "{error}");
+    assert!(error.to_string().contains("not a pack of format"), "{error}");
     assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
 
     // A correct SHA and magic header do not prove complete native records.
@@ -169,6 +172,65 @@ fn first_publication_refuses_forged_keys_and_truncated_native_values() {
     let error = store.put_list(&name(), &pack_list::encode(&[reference])).unwrap_err();
     assert!(error.to_string().contains("native value"), "{error}");
     assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+}
+
+#[test]
+fn native_record_boundaries_and_order_are_checked_before_publication() {
+    let producer = native_pack::Pack::of(vec![
+        native_pack::Value { key: [1; 32], kind: 255, bytes: Vec::new() },
+        native_pack::Value { key: [2; 32], kind: 0, bytes: Vec::new() },
+    ])
+    .unwrap();
+    for fault in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut bytes = producer.bytes.clone();
+        match fault {
+            0 => bytes[49..81].copy_from_slice(&[1; 32]), // duplicate key
+            1 => {
+                // Reversed records, with an otherwise valid header and SHA.
+                for at in 0..41 {
+                    bytes.swap(8 + at, 49 + at);
+                }
+            }
+            2 => bytes[41..49].copy_from_slice(&u64::MAX.to_le_bytes()),
+            3 => bytes.truncate(8 + 31), // partial key
+            4 => bytes.truncate(8 + 40), // partial length
+            _ => unreachable!(),
+        }
+        let reference = PackRef {
+            pack: digest(&bytes),
+            size: bytes.len() as u64,
+            ..producer.reference.clone()
+        };
+        assert!(native_pack::read(&bytes, &reference).is_err());
+        store.put_blob(&path(&reference), &bytes).unwrap();
+        let error = store.put_list(&name(), &pack_list::encode(&[reference])).unwrap_err();
+        let why = if fault < 2 { "unordered keys" } else { "native value" };
+        assert!(error.to_string().contains(why), "{error}");
+        assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+    }
+}
+
+#[test]
+fn an_old_missing_pack_cannot_hide_conflicting_present_native_partitions() {
+    for conflict in 1..=3 {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let packs = native_partitions(3, conflict);
+        assert!(!partitions_agree(&packs));
+        let mut references = vec![pack(250).0]; // alloc: missing old pack plus conflicting present packs
+        for pack in packs {
+            store.put_blob(&path(&pack.reference), &pack.bytes).unwrap();
+            references.push(pack.reference);
+        }
+        references.sort();
+        let old = pack_list::encode(&references);
+        std::fs::write(store.dir().join(name()), &old).unwrap();
+        let error = store.repair_list(&name(), &digest(&old), b"").unwrap_err();
+        assert!(error.to_string().contains("conflicting"), "{error}");
+        assert_eq!(current(&store), old);
+    }
 }
 
 #[test]
@@ -311,6 +373,7 @@ fn failed_native_publication_barriers_never_acknowledge_a_repair() {
 enum Plant {
     None,
     CasBypass,
+    MirrorsBypass,
     Publication(publication::Plant),
 }
 
@@ -550,6 +613,191 @@ fn scenario(ops: &[u16], seed: u64, plant: Plant) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Full output plus its even/odd partitions: every key is mirrored, while the
+/// manifest's SHA order has no relationship to the order of the keys it contains.
+fn native_partitions(count: usize, conflict: u8) -> Vec<native_pack::Pack> {
+    let values: Vec<_> = (0..count)
+        .map(|i| {
+            let mut key = [0; 32];
+            key[24..].copy_from_slice(&(i as u64).to_be_bytes());
+            native_pack::Value {
+                key,
+                kind: (i % 256) as u8,
+                // alloc: one repeated value crosses two comparison-buffer boundaries
+                bytes: vec![i as u8; if i == count / 2 { 16385 } else { 1 }],
+            }
+        })
+        .collect(); // alloc: real producer inputs owned by this bounded test
+    let mut halves = [Vec::new(), Vec::new()]; // alloc: alternate native pack partitions
+    for (i, value) in values.iter().enumerate() {
+        let mut value = value.clone();
+        if i == count / 2 {
+            match conflict {
+                1 => value.kind ^= 1,
+                2 => value.bytes.push(0),
+                3 => *value.bytes.last_mut().unwrap() ^= 1,
+                _ => {}
+            }
+        }
+        halves[i % 2].push(value);
+    }
+    let mut packs = vec![native_pack::Pack::of(values).unwrap()]; // alloc: three producer outputs
+    for half in halves {
+        packs.push(native_pack::Pack::of(half).unwrap());
+    }
+    packs.sort_by_key(|pack| pack.reference.pack);
+    packs.dedup_by_key(|pack| pack.reference.pack);
+    packs
+}
+
+/// Use the real import codec as the semantic oracle; the server's comparison is
+/// never consulted to decide whether a producer's partitions contain one value.
+fn partitions_agree(packs: &[native_pack::Pack]) -> bool {
+    let mut values = std::collections::BTreeMap::new(); // alloc: bounded logical-output oracle
+    for pack in packs {
+        for value in native_pack::read(&pack.bytes, &pack.reference).unwrap() {
+            let content = (value.kind, value.bytes);
+            if let Some(previous) = values.insert(value.key, content.clone())
+                && previous != content
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn native_partition_scenario(
+    count: usize,
+    conflict: u8,
+    repair: bool,
+    plan: u8,
+    seed: u64,
+    plant: Plant,
+) -> Result<(), String> {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let packs = native_partitions(count, conflict);
+    let valid = partitions_agree(&packs);
+    let references: Vec<_> = packs.iter().map(|pack| pack.reference.clone()).collect(); // alloc: test manifest
+    for pack in &packs {
+        store.put_blob(&path(&pack.reference), &pack.bytes).unwrap();
+    }
+    let new = pack_list::encode(&references);
+    let old = pack_list::encode(&[pack(250).0]); // absent old pack authorizes only a valid repair
+    let mut sim = Sim::new(seed, Faults::default());
+    let published = slot("objects/published");
+    if repair {
+        sim.change(&published, &old);
+        std::fs::write(store.dir().join(name()), &old).unwrap();
+    }
+    store.bypass_mirrors.store(matches!(plant, Plant::MirrorsBypass), Ordering::Relaxed);
+    let mut attempted = None;
+    let publish = |_: &ObjectName, bytes: &[u8]| {
+        let attempt = publish(&mut sim, bytes, plan, plant);
+        let ack = attempt.ack;
+        attempted = Some(attempt);
+        if ack {
+            Ok(())
+        } else {
+            Err(Error::internal("simulated IO failure or power loss"))
+        }
+    };
+    let outcome = if repair {
+        store.repair_list_with(&name(), &digest(&old), &new, publish)
+    } else {
+        store.put_list_with(&name(), &new, publish)
+    };
+    if attempted.is_some() != valid {
+        return Err("partition oracle: publication admitted conflicting immutable values".to_owned()); // alloc: oracle failure
+    }
+    let before = if repair { old } else { Vec::new() };
+    if let Some(attempt) = attempted {
+        if attempt.ack && !attempt.directory_synced {
+            return Err("partition oracle: acknowledged before directory sync".to_owned()); // alloc: oracle failure
+        }
+        if outcome.is_ok() != attempt.ack {
+            return Err("partition oracle: response disagrees with durability".to_owned()); // alloc: oracle failure
+        }
+        sim.crash();
+        if plan >= 36 && attempt.renamed && !attempt.directory_synced {
+            sim.change(&published, &before);
+        }
+        let surviving = sim.contents(&published);
+        if surviving != before && surviving != new {
+            return Err("partition oracle: torn reopened manifest".to_owned()); // alloc: oracle failure
+        }
+        if attempt.ack && surviving != new {
+            return Err("partition oracle: acknowledged manifest lost".to_owned()); // alloc: oracle failure
+        }
+        if !surviving.is_empty() {
+            std::fs::write(store.dir().join(name()), &surviving).unwrap();
+        }
+        let reopened = Store::open(dir.path()).unwrap();
+        let actual = reopened.read_small(&name(), 1 << 20).unwrap();
+        let expected = if surviving.is_empty() { None } else { Some(surviving) };
+        if actual != expected {
+            return Err("partition oracle: reopen changed manifest bytes".to_owned()); // alloc: oracle failure
+        }
+    } else if outcome.is_ok()
+        || store.read_small(&name(), 1 << 20).unwrap() != if repair { Some(before) } else { None }
+    {
+        return Err("partition oracle: refused validation changed the manifest".to_owned()); // alloc: oracle failure
+    }
+    let pending = store.verification_peak.load(Ordering::Relaxed);
+    assert!(
+        pending <= references.len(),
+        "retained {pending} records for {} packs",
+        references.len(),
+    );
+    if valid {
+        assert_eq!(pending, packs.iter().filter(|pack| pack.bytes.len() > 8).count());
+    }
+    Ok(())
+}
+
+#[hegel::test(test_cases = 32)]
+fn native_partitions_preserve_values_through_publication_faults_and_reopen(tc: hegel::TestCase) {
+    let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(24));
+    let conflict = tc.draw(gs::integers::<u8>().max_value(3));
+    let repair = tc.draw(gs::integers::<u8>().max_value(1)) == 1;
+    let plan = tc.draw(gs::integers::<u8>().max_value(71));
+    let seed = tc.draw(gs::integers::<u64>());
+    native_partition_scenario(count, conflict, repair, plan, seed, Plant::None).unwrap();
+}
+
+#[test]
+fn native_packs_are_not_wire_batches_and_frontier_memory_depends_only_on_pack_count() {
+    // The real producer emits more than 65,536 opaque records in one blob. An
+    // aggregate batch cap would also reject its equivalent two-pack partition.
+    native_partition_scenario(
+        blaze_wire::Limits::DOCUMENTED.batch_items as usize + 1,
+        0,
+        false,
+        0,
+        0,
+        Plant::None,
+    )
+    .unwrap();
+    // Check CBOR array-head transitions against Pack::of/read's commitments.
+    for count in [0, 1, 23, 24, 255, 256] {
+        native_partition_scenario(count, 0, true, 0, 0, Plant::None).unwrap();
+    }
+}
+
+#[test]
+fn the_partition_oracle_catches_removing_cross_pack_comparison() {
+    for repair in [false, true] {
+        for conflict in 1..=3 {
+            native_partition_scenario(3, conflict, repair, 0, 0, Plant::None).unwrap();
+            assert!(
+                native_partition_scenario(3, conflict, repair, 0, 0, Plant::MirrorsBypass)
+                    .is_err_and(|why| why.contains("admitted conflicting immutable values"))
+            );
+        }
+    }
 }
 
 #[hegel::test(test_cases = 32)]
