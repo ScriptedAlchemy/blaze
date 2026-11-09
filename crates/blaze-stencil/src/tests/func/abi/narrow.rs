@@ -35,16 +35,12 @@ fn link(mk: &Mk, funcs: &[ir::Function]) -> Exec {
     let codes: Vec<Code> = funcs
         .iter()
         .map(|func| {
-            crate::compile(func, &mk.target)
-                .unwrap_or_else(|e| panic!("{e}\n{}", func.display()))
+            crate::compile(func, &mk.target).unwrap_or_else(|e| panic!("{e}\n{}", func.display()))
         })
         .collect();
     // alloc: the test executor's borrowed unit descriptions.
-    let units: Vec<Unit<'_>> = codes
-        .iter()
-        .zip(funcs)
-        .map(|(code, func)| Unit::Stencil(code, &func.signature))
-        .collect();
+    let units: Vec<Unit<'_>> =
+        codes.iter().zip(funcs).map(|(code, func)| Unit::Stencil(code, &func.signature)).collect();
     let isa = exec::host_isa();
     Exec::link_typed(&Link { isa: &*isa, units: &units, data: &[], host: &[] })
 }
@@ -78,11 +74,9 @@ fn narrow_call_slots_respect_operand_width() {
         for tail in [false, true] {
             for indirect in [false, true] {
                 for ty in [I8, I16, I32] {
-                    for extension in [
-                        ArgumentExtension::None,
-                        ArgumentExtension::Uext,
-                        ArgumentExtension::Sext,
-                    ] {
+                    for extension in
+                        [ArgumentExtension::None, ArgumentExtension::Uext, ArgumentExtension::Sext]
+                    {
                         let wide = mk.sig_of(&[I64; 8], &[I64]);
                         let mut narrow = wide.clone();
                         narrow.params[position] = param(ty, extension);
@@ -152,7 +146,11 @@ fn narrow_call_slots_respect_operand_width() {
                             assert_eq!(&area[1..3], &[word; 2], "the poison was materialized");
                             let mut expected = sentinels;
                             expected[position] = want;
-                            assert_eq!(&area[4..], &expected, "all eight ABI words, including i64s");
+                            assert_eq!(
+                                &area[4..],
+                                &expected,
+                                "all eight ABI words, including i64s"
+                            );
                         }
                     }
                 }
@@ -165,11 +163,8 @@ fn narrow_call_slots_respect_operand_width() {
 fn narrow_return_slots_respect_operand_width() {
     let Some(mk) = host_mk() else { return };
     for ty in [I8, I16, I32] {
-        for extension in [
-            ArgumentExtension::None,
-            ArgumentExtension::Uext,
-            ArgumentExtension::Sext,
-        ] {
+        for extension in [ArgumentExtension::None, ArgumentExtension::Uext, ArgumentExtension::Sext]
+        {
             let wide = mk.sig_of(&[I64], &[I64]);
             let caller = mk.func(0, wide.clone(), |b, v| {
                 let callee = import(b, FUNCS, 1, wide.clone(), true);

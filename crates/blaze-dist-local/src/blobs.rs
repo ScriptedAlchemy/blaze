@@ -53,9 +53,10 @@ impl Blobs {
         // Read one byte past the cap: reaching an exact read limit is not EOF.
         // A truncated manifest must never masquerade as a complete published unit.
         let mut reply = Vec::new();
-        stream.take(MOST + 1).read_to_end(&mut reply).map_err(|error| {
-            read_failure(method, path, &reply, error)
-        })?;
+        stream
+            .take(MOST + 1)
+            .read_to_end(&mut reply)
+            .map_err(|error| read_failure(method, path, &reply, error))?;
         if reply.len() as u64 > MOST {
             let message = format!("{method} {path}: HTTP reply exceeds {MOST} bytes");
             return Err(if committed_get_head(method, &reply) {
@@ -134,7 +135,11 @@ impl Blobs {
         // the server committed the immutable key. It cannot authorize fallback.
         let (status, body) = publication_response(&path, self.request("PUT", &path, list))?;
         publish_verdict(
-            status, &body, &path, list, || self.published(spec),
+            status,
+            &body,
+            &path,
+            list,
+            || self.published(spec),
             |existing, proposed| {
                 let existing = blaze_wire::pack_list::decode(existing).map_err(Error::Committed)?;
                 let proposed = blaze_wire::pack_list::decode(proposed).map_err(Error::Committed)?;
@@ -151,11 +156,9 @@ fn committed_get_head(method: &str, reply: &[u8]) -> bool {
     if method != "GET" {
         return false;
     }
-    let remaining = reply.strip_prefix(b"HTTP/1.1 200")
-        .or_else(|| reply.strip_prefix(b"HTTP/1.0 200"));
-    remaining.is_some_and(|after| {
-        after.is_empty() || matches!(after[0], b' ' | b'\r' | b'\n')
-    })
+    let remaining =
+        reply.strip_prefix(b"HTTP/1.1 200").or_else(|| reply.strip_prefix(b"HTTP/1.0 200"));
+    remaining.is_some_and(|after| after.is_empty() || matches!(after[0], b' ' | b'\r' | b'\n'))
 }
 
 fn read_failure(method: &str, path: &str, reply: &[u8], error: std::io::Error) -> Error {
@@ -171,17 +174,14 @@ fn read_failure(method: &str, path: &str, reply: &[u8], error: std::io::Error) -
 /// Never treat a short body as a complete persisted manifest or pack.
 fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u8>), Error> {
     let invalid = |why: &str| Error::Protocol(format!("{method} {path}: {why}"));
-    let end = reply
-        .windows(4)
-        .position(|it| it == b"\r\n\r\n")
-        .ok_or_else(|| {
-            if committed_get_head(method, reply) {
-                // alloc: an incomplete committed reply cannot authorize local recompilation.
-                Error::Committed(format!("{method} {path}: truncated committed HTTP 200 headers"))
-            } else {
-                invalid("no HTTP head")
-            }
-        })?;
+    let end = reply.windows(4).position(|it| it == b"\r\n\r\n").ok_or_else(|| {
+        if committed_get_head(method, reply) {
+            // alloc: an incomplete committed reply cannot authorize local recompilation.
+            Error::Committed(format!("{method} {path}: truncated committed HTTP 200 headers"))
+        } else {
+            invalid("no HTTP head")
+        }
+    })?;
     let head = std::str::from_utf8(&reply[..end]).map_err(|_| {
         if committed_get_head(method, reply) {
             // alloc: a corrupt committed reply must not be treated as a cache miss.
@@ -214,8 +214,7 @@ fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u
     let mut length = None;
     let mut chunked = false;
     for line in head.split("\r\n").skip(1) {
-        let (name, value) =
-            line.split_once(':').ok_or_else(|| invalid("malformed HTTP header"))?;
+        let (name, value) = line.split_once(':').ok_or_else(|| invalid("malformed HTTP header"))?;
         if name.eq_ignore_ascii_case("content-length") {
             let bytes =
                 value.trim().parse::<usize>().map_err(|_| invalid("invalid Content-Length"))?;
@@ -234,10 +233,7 @@ fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u
         if length.is_some() {
             return Err(invalid("ambiguous HTTP body framing"));
         }
-        return Ok((
-            status,
-            unchunk(body).ok_or_else(|| invalid("a broken chunked body"))?,
-        ));
+        return Ok((status, unchunk(body).ok_or_else(|| invalid("a broken chunked body"))?));
     }
     if method == "GET" && status == 200 && length.is_none() {
         return Err(invalid("a successful GET has no explicit HTTP body length"));
@@ -283,7 +279,6 @@ fn unchunk(mut body: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-
 /// The reply may be lost after the server has committed an immutable manifest.
 /// A transport/framing failure is therefore an unknown publication outcome,
 /// never evidence that it is safe to rebuild under the same key.
@@ -315,13 +310,17 @@ fn publish_verdict(
             // subsequent GET fails, that uncertainty is not a cache miss and must
             // never authorize a local rebuild under the same key.
             let existing = read_existing().map_err(|error| {
-                Error::Committed(format!("PUT {path}: 412: cannot read the committed list: {error}"))
+                Error::Committed(format!(
+                    "PUT {path}: 412: cannot read the committed list: {error}"
+                ))
             })?;
             match existing {
                 Some(existing) if existing.as_slice() == proposed => Ok(()),
                 Some(existing) => {
                     let same = equivalent(&existing, proposed).map_err(|error| {
-                        Error::Committed(format!("PUT {path}: 412: cannot verify committed packs: {error}"))
+                        Error::Committed(format!(
+                            "PUT {path}: 412: cannot verify committed packs: {error}"
+                        ))
                     })?;
                     if same {
                         Ok(())
@@ -335,11 +334,10 @@ fn publish_verdict(
                     "PUT {path}: 412: publication was refused but the committed list is missing"
                 ))),
             }
-        },
-        _ => Err(Error::Protocol(format!(
-            "PUT {path}: {status}: {}",
-            String::from_utf8_lossy(body)
-        ))),
+        }
+        _ => {
+            Err(Error::Protocol(format!("PUT {path}: {status}: {}", String::from_utf8_lossy(body))))
+        }
     }
 }
 
@@ -352,39 +350,29 @@ mod tests {
     fn an_http_reply_must_end_at_its_declared_body_boundary() {
         let path = "/v1/list/manifests/unit";
         let fixed = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\na b c\n";
-        assert_eq!(
-            decode_response("GET", path, fixed).unwrap(),
-            (200, b"a b c\n".to_vec())
-        );
+        assert_eq!(decode_response("GET", path, fixed).unwrap(), (200, b"a b c\n".to_vec()));
         let broken = [
             b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\na b\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\na b c\nextra".as_slice(),
             b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nContent-Length: 6\r\n\r\na b c\n".as_slice(),
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n"
+                .as_slice(),
             b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\na b c\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".as_slice(),
         ];
         for bytes in broken {
-            assert!(matches!(
-                decode_response("GET", path, bytes),
-                Err(Error::Committed(_))
-            ));
+            assert!(matches!(decode_response("GET", path, bytes), Err(Error::Committed(_))));
         }
 
         let chunks = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
-        assert_eq!(
-            decode_response("GET", path, chunks).unwrap(),
-            (200, b"abcde".to_vec())
-        );
+        assert_eq!(decode_response("GET", path, chunks).unwrap(), (200, b"abcde".to_vec()));
         for bytes in [
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXY0\r\n\r\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n".as_slice(),
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nextra".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nextra"
+                .as_slice(),
         ] {
-            assert!(matches!(
-                decode_response("GET", path, bytes),
-                Err(Error::Committed(_))
-            ));
+            assert!(matches!(decode_response("GET", path, bytes), Err(Error::Committed(_))));
         }
         // A legitimate 404 does not establish the existence of committed data.
         assert_eq!(
@@ -402,7 +390,10 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\npart".as_slice(),
         ] {
             let refused = read_failure(
-                "GET", path, bytes, std::io::Error::from(std::io::ErrorKind::TimedOut),
+                "GET",
+                path,
+                bytes,
+                std::io::Error::from(std::io::ErrorKind::TimedOut),
             );
             assert!(
                 matches!(&refused, Error::Committed(why) if why.contains(path)),
@@ -428,7 +419,12 @@ mod tests {
             ("PUT", b"HTTP/1.1 200 OK".as_slice()),
         ] {
             assert!(matches!(
-                read_failure(method, path, partial, std::io::Error::from(std::io::ErrorKind::TimedOut)),
+                read_failure(
+                    method,
+                    path,
+                    partial,
+                    std::io::Error::from(std::io::ErrorKind::TimedOut)
+                ),
                 Error::Io(_)
             ));
         }
@@ -462,17 +458,21 @@ mod tests {
     #[test]
     fn a_first_writer_conflict_must_compare_the_immutable_manifest() {
         let path = "/v1/list/manifests/test-unit";
-        let cases: [(Option<&[u8]>, bool); 3] = [
-            (Some(b"same"), true),
-            (Some(b"different"), false),
-            (None, false),
-        ];
+        let cases: [(Option<&[u8]>, bool); 3] =
+            [(Some(b"same"), true), (Some(b"different"), false), (None, false)];
         for (committed, accepted) in cases {
             let read = Cell::new(false);
-            let verdict = publish_verdict(412, b"", path, b"same", || {
-                read.set(true);
-                Ok(committed.map(|bytes| bytes.to_vec())) // alloc: test manifest fixture
-            }, |_, _| Ok(false));
+            let verdict = publish_verdict(
+                412,
+                b"",
+                path,
+                b"same",
+                || {
+                    read.set(true);
+                    Ok(committed.map(|bytes| bytes.to_vec())) // alloc: test manifest fixture
+                },
+                |_, _| Ok(false),
+            );
             assert!(read.get(), "412 must fetch the existing committed bytes");
             assert_eq!(verdict.is_ok(), accepted, "unexpected conflict verdict: {verdict:?}");
             if let Err(error) = verdict {
@@ -496,10 +496,17 @@ mod tests {
             Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "verification timed out")),
             Error::Protocol("verification response was malformed".to_owned()),
         ] {
-            let refused = publish_verdict(412, b"", path, b"same", || Err(read_error), |_, _| {
-                panic!("a failed GET cannot verify logical equivalence");
-            })
-                .unwrap_err();
+            let refused = publish_verdict(
+                412,
+                b"",
+                path,
+                b"same",
+                || Err(read_error),
+                |_, _| {
+                    panic!("a failed GET cannot verify logical equivalence");
+                },
+            )
+            .unwrap_err();
             assert!(
                 matches!(&refused, Error::Committed(why) if why.contains(path)
                     && why.contains("cannot read the committed list")),
@@ -517,25 +524,45 @@ mod tests {
             Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
             Error::Protocol("committed packs could not be decoded".to_owned()),
         ] {
-            let refused = publish_verdict(412, b"", path, b"proposed partition",
+            let refused = publish_verdict(
+                412,
+                b"",
+                path,
+                b"proposed partition",
                 || Ok(Some(b"existing partition".to_vec())),
-                |_, _| Err(verify_error)).unwrap_err();
+                |_, _| Err(verify_error),
+            )
+            .unwrap_err();
             assert!(matches!(
                 crate::agent::decide(&blaze_wire::LocalPolicy::Fallback, refused),
                 Err(Error::Committed(_))
             ));
         }
         let read = Cell::new(false);
-        let result = publish_verdict(201, b"", path, b"same", || {
-            read.set(true);
-            panic!("an accepted PUT must not issue a GET");
-        }, |_, _| panic!("an accepted PUT needs no partition comparison"));
+        let result = publish_verdict(
+            201,
+            b"",
+            path,
+            b"same",
+            || {
+                read.set(true);
+                panic!("an accepted PUT must not issue a GET");
+            },
+            |_, _| panic!("an accepted PUT needs no partition comparison"),
+        );
         assert!(result.is_ok());
         assert!(!read.get());
         assert!(matches!(
-            publish_verdict(500, b"unavailable", path, b"same", || {
-                panic!("a failed PUT must not issue a GET");
-            }, |_, _| panic!("a failed PUT cannot verify equivalence")),
+            publish_verdict(
+                500,
+                b"unavailable",
+                path,
+                b"same",
+                || {
+                    panic!("a failed PUT must not issue a GET");
+                },
+                |_, _| panic!("a failed PUT cannot verify equivalence")
+            ),
             Err(Error::Protocol(_))
         ));
     }

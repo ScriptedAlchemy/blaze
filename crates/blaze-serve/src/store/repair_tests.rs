@@ -96,10 +96,12 @@ fn absent_or_corrupt_replacements_and_corrupt_old_packs_leave_the_old_list_untou
     let old_two = pack_list::encode(&references);
     std::fs::write(store.dir().join(name()), &old_two).unwrap();
     std::fs::remove_file(store.dir().join(path(&a.0))).unwrap();
-    let refused = store.repair_list(&name(), &digest(&old_two), &pack_list::encode(&[c.0]))
-        .unwrap_err();
-    assert!(refused.to_string().contains(&path(&b.0)),
-        "one absent pack must not hide another corrupt old pack: {refused}");
+    let refused =
+        store.repair_list(&name(), &digest(&old_two), &pack_list::encode(&[c.0])).unwrap_err();
+    assert!(
+        refused.to_string().contains(&path(&b.0)),
+        "one absent pack must not hide another corrupt old pack: {refused}"
+    );
     assert_eq!(current(&store), old_two);
 }
 

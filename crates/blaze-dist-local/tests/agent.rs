@@ -249,7 +249,10 @@ fn a_committed_pack_the_server_lost_refuses_without_compiling() {
     world.blobs.put_pack(&pack).unwrap();
     let list = blaze_wire::pack_list::encode(&[pack.reference.clone()]);
     world.blobs.publish(&unit.spec, &list).unwrap();
-    let path = world._dir.path().join("blobs/packs")
+    let path = world
+        ._dir
+        .path()
+        .join("blobs/packs")
         .join(format!("{}.pack", blaze_dist_local::pack::hex(&pack.reference.pack)));
     std::fs::remove_file(&path).unwrap();
     let mut compiler = Compiler {
@@ -262,8 +265,11 @@ fn a_committed_pack_the_server_lost_refuses_without_compiling() {
     for policy in [LocalPolicy::Never, LocalPolicy::Fallback] {
         let error = agent::run(&config(&world.socket, &world.blobs), &unit, &mut compiler, &never)
             .unwrap_err();
-        assert!(matches!(&error, Error::Committed(why)
-            if why.contains(&blaze_dist_local::pack::hex(&pack.reference.pack))), "{error}");
+        assert!(
+            matches!(&error, Error::Committed(why)
+            if why.contains(&blaze_dist_local::pack::hex(&pack.reference.pack))),
+            "{error}"
+        );
         assert!(agent::decide(&policy, error).is_err());
     }
     assert_eq!(compiler.entered.load(Ordering::SeqCst), 0, "a committed absence must not compile");
@@ -271,8 +277,8 @@ fn a_committed_pack_the_server_lost_refuses_without_compiling() {
     assert_eq!(world.blobs.published(&unit.spec).unwrap().unwrap(), list);
     // Remove only the fault: the same manifest is readable again without any compilation.
     world.blobs.put_pack(&pack).unwrap();
-    let restored = agent::run(&config(&world.socket, &world.blobs), &unit, &mut compiler, &never)
-        .unwrap();
+    let restored =
+        agent::run(&config(&world.socket, &world.blobs), &unit, &mut compiler, &never).unwrap();
     assert_eq!(restored.source, Source::Published);
     assert_eq!(compiler.entered.load(Ordering::SeqCst), 0);
 }
@@ -394,7 +400,11 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
     let proposed = blaze_wire::pack_list::encode(&split);
     assert_ne!(proposed, old, "the first-writer check must compare actual different partitions");
     world.blobs.publish(&unit.spec, &proposed).unwrap();
-    assert_eq!(world.blobs.published(&unit.spec).unwrap().unwrap(), old, "the first writer remains immutable");
+    assert_eq!(
+        world.blobs.published(&unit.spec).unwrap().unwrap(),
+        old,
+        "the first writer remains immutable"
+    );
     assert_eq!(agent::import(&world.blobs, &split).unwrap(), first.values);
 
     // Same key sets cannot hide a different value or kind behind a different partition.
@@ -406,8 +416,10 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
         }
         let wrong = Pack::of(values).unwrap();
         world.blobs.put_pack(&wrong).unwrap();
-        let refused = world.blobs.publish(&unit.spec,
-            &blaze_wire::pack_list::encode(&[wrong.reference])).unwrap_err();
+        let refused = world
+            .blobs
+            .publish(&unit.spec, &blaze_wire::pack_list::encode(&[wrong.reference]))
+            .unwrap_err();
         assert!(matches!(agent::decide(&LocalPolicy::Fallback, refused), Err(Error::Committed(_))));
     }
     let mut cold = cfg;

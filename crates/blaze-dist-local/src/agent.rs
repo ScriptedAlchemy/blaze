@@ -349,9 +349,10 @@ fn import_using(
     let mut values = BTreeMap::new();
     for reference in packs {
         let name = hex(&reference.pack);
-        let bytes = fetch(&reference.pack).map_err(|error| {
-            Error::Committed(format!("pack {name}: committed retrieval failed: {error}"))
-        })?
+        let bytes = fetch(&reference.pack)
+            .map_err(|error| {
+                Error::Committed(format!("pack {name}: committed retrieval failed: {error}"))
+            })?
             .ok_or_else(|| Error::Committed(format!("pack {name} was committed and is gone")))?;
         for value in read(&bytes, reference).map_err(Error::Committed)? {
             match values.entry(value.key) {
@@ -375,7 +376,10 @@ fn import_using(
 /// A corrupted published manifest cannot authorize recompilation.
 fn published_packs(unit: &Unit, list: &[u8]) -> Result<Vec<PackRef>, Error> {
     parse_list(list).map_err(|why| {
-        Error::Committed(format!("unit {}: published pack list is not canonical: {why}", hex(&unit.spec)))
+        Error::Committed(format!(
+            "unit {}: published pack list is not canonical: {why}",
+            hex(&unit.spec)
+        ))
     })
 }
 
@@ -982,10 +986,7 @@ mod tests {
         cancelled.store(true, Ordering::Release);
         let refused = ensure_not_cancelled(&unit, &cancelled).unwrap_err();
         assert!(matches!(&refused, Error::Cancelled(why) if why.contains(&hex(&unit.spec))));
-        assert!(matches!(
-            decide(&LocalPolicy::Fallback, refused),
-            Err(Error::Cancelled(_))
-        ));
+        assert!(matches!(decide(&LocalPolicy::Fallback, refused), Err(Error::Cancelled(_))));
     }
 
     #[test]
@@ -1042,7 +1043,8 @@ mod tests {
             Error::Protocol("GET returned 500".to_owned()),
         ] {
             let mut error = Some(error);
-            let failed = import_using(&[reference.clone()], |_| Err(error.take().unwrap())).unwrap_err();
+            let failed =
+                import_using(&[reference.clone()], |_| Err(error.take().unwrap())).unwrap_err();
             assert!(matches!(decide(&LocalPolicy::Fallback, failed), Err(Error::Committed(_))));
         }
 

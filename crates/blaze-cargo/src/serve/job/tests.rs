@@ -476,7 +476,6 @@ fn a_script_waits_for_the_compile_result_and_every_output_placement() {
     );
 }
 
-
 #[test]
 fn an_output_placement_failure_must_not_announce_a_test_executable() {
     let paths = [4, 5];
@@ -578,9 +577,8 @@ fn a_failed_final_stat_cannot_authorize_running_a_build_script() {
         assert!(placed.is_none(), "failed verification cannot remain a cached placement");
     }
 
-    let mut wrong_key = Some(Placement {
-        key: blaze_cas::Key(ContentId([8; 32])), executable: true, meta: None
-    });
+    let mut wrong_key =
+        Some(Placement { key: blaze_cas::Key(ContentId([8; 32])), executable: true, meta: None });
     let why = verify_placed_output(Done::Stat(Some(file)), &mut wrong_key, key).unwrap_err();
     assert!(why.contains("expected key"), "{why}");
     assert!(wrong_key.is_none(), "a different cached value may not be treated as this output");

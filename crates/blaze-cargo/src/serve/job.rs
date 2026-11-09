@@ -316,12 +316,25 @@ pub struct Step<S: Steps> {
 
 /// What a batch's tasks do, each with what it owns.
 pub(super) enum Does<S: Steps> {
-    Library { steps: Arc<S>, kept: Vec<(String, String)> },
-    Plan { steps: Arc<S>, db: Arc<Database>, queries: ViewId },
+    Library {
+        steps: Arc<S>,
+        kept: Vec<(String, String)>,
+    },
+    Plan {
+        steps: Arc<S>,
+        db: Arc<Database>,
+        queries: ViewId,
+    },
     /// Task `at` fetches `fetches[at]`, or reads it where it is on the disk.
-    Fetch { steps: Arc<S>, fetches: Arc<[Fetch]> },
+    Fetch {
+        steps: Arc<S>,
+        fetches: Arc<[Fetch]>,
+    },
     /// The local mounts at `ats` read again, what is under them maybe changed.
-    Locals { steps: Arc<S>, ats: Vec<String> },
+    Locals {
+        steps: Arc<S>,
+        ats: Vec<String>,
+    },
     /// The units' pinned native inputs laid out, before the lowering ([`Steps::native`]).
     /// One digest's layout, for every input of it: `input` is one of them.
     Native {
@@ -470,8 +483,12 @@ impl<S: Steps> plane::Work for Step<S> {
         }
         .entered();
         match &self.does {
-            Does::Library { steps, kept } => self.settle(steps.library(kept).map_err(Failed::Error), Value::Library),
-            Does::Plan { steps, db, queries } => self.settle(steps.plan(db, *queries), Value::Planned),
+            Does::Library { steps, kept } => {
+                self.settle(steps.library(kept).map_err(Failed::Error), Value::Library)
+            }
+            Does::Plan { steps, db, queries } => {
+                self.settle(steps.plan(db, *queries), Value::Planned)
+            }
             Does::Fetch { steps, fetches } => match &fetches[at].kind {
                 FetchKind::Local { .. } => {
                     let read = steps.local(&fetches[at]).map_err(Failed::Error);
@@ -484,10 +501,13 @@ impl<S: Steps> plane::Work for Step<S> {
                     self.settle(fetched, |it| Value::Fetched(fetches.clone(), arg, it))
                 }
             },
-            Does::Locals { steps, ats } => self.settle(steps.locals(ats).map_err(Failed::Error), Value::Locals),
-            Does::Native { steps, input, key } => {
-                self.settle(steps.native(input, &self.cancelled).map_err(Failed::Error), |it| Value::Native(*key, it))
+            Does::Locals { steps, ats } => {
+                self.settle(steps.locals(ats).map_err(Failed::Error), Value::Locals)
             }
+            Does::Native { steps, input, key } => self
+                .settle(steps.native(input, &self.cancelled).map_err(Failed::Error), |it| {
+                    Value::Native(*key, it)
+                }),
             Does::Lower { steps, input, kept, leases, checkout, builds } => {
                 // Its build dirs' leases, before anything is built into them: here, on the pool.
                 // The lock is held only to read and store the field, never across the lease's
@@ -690,8 +710,7 @@ impl<S: Steps> plane::Work for Step<S> {
                         "the kept front end to store was taken before its task ran",
                         None,
                     );
-                    return self
-                        .settle(Err(Failed::Error(error)), |it| Value::StoredKept(None, it));
+                    return self.settle(Err(Failed::Error(error)), |it| Value::StoredKept(None, it));
                 };
                 let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     steps.store_kept(&mut front)
@@ -3054,10 +3073,19 @@ impl<S: Steps> Jobs<S> {
         // Paths outside the view read where they are on the disk ([`Mounts::mount_local`]):
         // each the watch can't vouch for is read again before the view's configuration takes
         // its mount, so the build reads what is on the disk now, never a stale copy.
-        let ats = w.mounts.stale_locals(|dir, generation| blaze_vfs::outside::unchanged_since(std::path::Path::new(dir), generation));
+        let ats = w.mounts.stale_locals(|dir, generation| {
+            blaze_vfs::outside::unchanged_since(std::path::Path::new(dir), generation)
+        });
         if !ats.is_empty() {
             let work = Step::of(&job.cancelled, Does::Locals { steps: w.steps.clone(), ats }); // clone: a refcount, once
-            let fresh = lone(w.plane, NodeKind::Fetch, "paths outside the view, read again", Pool::Io, None, kinds::FETCH);
+            let fresh = lone(
+                w.plane,
+                NodeKind::Fetch,
+                "paths outside the view, read again",
+                Pool::Io,
+                None,
+                kinds::FETCH,
+            );
             job.stage = Stage::Locals(fresh.first(), opened);
             self.add(w, id, fresh, Some(work), false);
             return;
@@ -3507,7 +3535,8 @@ impl<S: Steps> Jobs<S> {
                 let fetch = &fetches[at as usize];
                 if let Err(why) = w.mounts.mount_local(w.vfs, read) {
                     // clone: a failed read's names, once per path
-                    self.fetch_failed.insert(fetch.at.clone(), ApiError::new(why, Some(fetch.what.clone())));
+                    self.fetch_failed
+                        .insert(fetch.at.clone(), ApiError::new(why, Some(fetch.what.clone())));
                 }
             }
             Value::Local(fetches, at, Err(error)) => {
@@ -3644,12 +3673,18 @@ impl<S: Steps> Jobs<S> {
                 let read = match job.take_value(node) {
                     Some(Value::Locals(read)) => read,
                     // alloc: an error, once
-                    _ => Err(ApiError::new(format!("reading the paths outside the view again: {why}"), None)),
+                    _ => Err(ApiError::new(
+                        format!("reading the paths outside the view again: {why}"),
+                        None,
+                    )),
                 };
                 let mounted = read.and_then(|reads| {
                     reads.into_iter().try_for_each(|read| {
                         let at = read.at.clone(); // clone: an error's place, once per path
-                        w.mounts.mount_local(w.vfs, read).map(drop).map_err(|why| ApiError::new(why, Some(at)))
+                        w.mounts
+                            .mount_local(w.vfs, read)
+                            .map(drop)
+                            .map_err(|why| ApiError::new(why, Some(at)))
                     })
                 });
                 match mounted {
@@ -3867,18 +3902,19 @@ impl<S: Steps> Jobs<S> {
                     // Owned, so no borrow of `self` outlives the check into the `end` below.
                     let kept = match fetch.kind {
                         // clone: an error's text, only when it is under one
-                        FetchKind::Local { .. } => {
-                            [&self.setup.sources, &self.setup.views]
-                                .into_iter()
-                                .find(|it| super::unit::files::under(&fetch.at, it).is_some())
-                                .cloned()
-                        }
+                        FetchKind::Local { .. } => [&self.setup.sources, &self.setup.views]
+                            .into_iter()
+                            .find(|it| super::unit::files::under(&fetch.at, it).is_some())
+                            .cloned(),
                         _ => None,
                     };
                     if let Some(kept) = kept {
                         let error = ApiError::new(
                             // alloc: an error, once
-                            format!("the load asked to read {} where it is on the disk, but it is under {kept}, which blaze keeps and mounts itself", fetch.at),
+                            format!(
+                                "the load asked to read {} where it is on the disk, but it is under {kept}, which blaze keeps and mounts itself",
+                                fetch.at
+                            ),
                             Some(fetch.at.clone()), // clone: an error, once
                         );
                         self.end(w, id, false, Some(error));
@@ -5267,12 +5303,19 @@ impl<S: Steps> Jobs<S> {
     fn release_ready(&mut self, w: &mut World<'_, S>) {
         for &id in &self.order {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
-            let Job { stage: Stage::Units(build), busy, refused_places, refused_store_keys, .. } = job else { continue };
+            let Job {
+                stage: Stage::Units(build), busy, refused_places, refused_store_keys, ..
+            } = job
+            else {
+                continue;
+            };
             let mut at = 0;
             while at < build.ready.len() {
                 let (unit, artifact) = build.ready[at];
                 match output_readiness(
-                    build.outputs.of(unit as usize), busy, refused_places,
+                    build.outputs.of(unit as usize),
+                    busy,
+                    refused_places,
                     !refused_store_keys.is_empty(),
                 ) {
                     OutputReadiness::Pending => {
@@ -5323,9 +5366,13 @@ impl<S: Steps> Jobs<S> {
             let name = self.paths.names[path as usize].to_string(); // alloc: a failed output
             if let Some(job) = self.jobs.get_mut(key_of(id)) {
                 job.refused_places.insert(path);
-                job.over.get_or_insert((false, Some(ApiError::new(
-                    format!("{name} has no file to verify after placement"), Some(name)
-                ))));
+                job.over.get_or_insert((
+                    false,
+                    Some(ApiError::new(
+                        format!("{name} has no file to verify after placement"),
+                        Some(name),
+                    )),
+                ));
             }
             return;
         };
@@ -5444,17 +5491,19 @@ impl<S: Steps> Jobs<S> {
     fn completed(&mut self, w: &mut World<'_, S>, own: Own, done: Done) {
         match own {
             Own::Record { job: id, path, key } => {
-                let failed = verify_placed_output(
-                    done, &mut self.paths.placed[path as usize], key
-                ).err();
+                let failed =
+                    verify_placed_output(done, &mut self.paths.placed[path as usize], key).err();
                 if let Some(why) = failed {
                     let name = self.paths.names[path as usize].to_string(); // alloc: an output failure
                     if let Some(job) = self.end_placing(id, path) {
                         job.refused_places.insert(path);
-                        job.over.get_or_insert((false, Some(ApiError::new(
-                            format!("verifying the placed output {name} under {key:?}: {why}"),
-                            Some(name),
-                        ))));
+                        job.over.get_or_insert((
+                            false,
+                            Some(ApiError::new(
+                                format!("verifying the placed output {name} under {key:?}: {why}"),
+                                Some(name),
+                            )),
+                        ));
                     }
                 } else {
                     self.end_placing(id, path);
@@ -5486,14 +5535,13 @@ impl<S: Steps> Jobs<S> {
                 }
             }
             Own::Write { job: id, path } | Own::Mode { job: id, path, .. } => {
-                let failed =
-                    output_effect_completion(&done, matches!(&own, Own::Mode { .. }))
-                        .err()
-                        .map(|why| {
-                            let name = &self.paths.names[path as usize];
-                            // alloc: an error, once
-                            ApiError::new(format!("placing {name}: {why}"), Some(name.to_string()))
-                        });
+                let failed = output_effect_completion(&done, matches!(&own, Own::Mode { .. }))
+                    .err()
+                    .map(|why| {
+                        let name = &self.paths.names[path as usize];
+                        // alloc: an error, once
+                        ApiError::new(format!("placing {name}: {why}"), Some(name.to_string()))
+                    });
                 let Some(job) = self.end_placing(id, path) else { return };
                 if let Some(error) = failed {
                     job.refused_places.insert(path);
@@ -6488,7 +6536,12 @@ fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<St
                 None,
             ));
         }
-        Work::Lock(_) => return Err(ApiError::new("a lock job ends once its plan is made, answering nothing more", None)),
+        Work::Lock(_) => {
+            return Err(ApiError::new(
+                "a lock job ends once its plan is made, answering nothing more",
+                None,
+            ));
+        }
     };
     Ok(Step::of(&job.cancelled, does))
 }
@@ -6750,7 +6803,7 @@ fn verify_placed_output(
             "the recorded output no longer has the expected key".to_owned() // alloc: an error
         }
         (Done::Failed(error), _) => format!("its final stat failed: {error}"), // alloc: an error
-        (other, _) => format!("its final stat returned {other:?}"), // alloc: an error
+        (other, _) => format!("its final stat returned {other:?}"),            // alloc: an error
     };
     *placed = None;
     Err(why)
