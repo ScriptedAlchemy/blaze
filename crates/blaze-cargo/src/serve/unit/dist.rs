@@ -79,6 +79,8 @@ pub(super) enum RunError {
 /// Store reads with their real kind, for exporting warm tail hits as well as fresh puts.
 pub(super) trait Export: Lookup {
     fn value(&self, key: &Key) -> Result<Option<Value>, String>;
+    /// Read the kind without cloning a possibly large local value.
+    fn kind(&self, key: &Key) -> Result<Option<u8>, String>;
 }
 
 fn var<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -333,11 +335,18 @@ fn committed_agrees(
     Ok(())
 }
 
-impl<S: Lookup> Lookup for Overlay<'_, S> {
+impl<S: Export> Lookup for Overlay<'_, S> {
     fn read(&self, key: &Key) -> Result<Option<&[u8]>, String> {
         match self.store.read(key)? {
             Some(bytes) => {
-                committed_agrees(key, self.values, None, bytes, "the local store")?;
+                if self.values.contains_key(&key.0.0) {
+                    let kind = self.store.kind(key)?.ok_or_else(|| {
+                        format!("the local store has bytes but no kind for committed distributed key {key:?}")
+                    })?;
+                    committed_agrees(
+                        key, self.values, Some(kind), bytes, "the local store's kind and bytes",
+                    )?;
+                }
                 Ok(Some(bytes))
             }
             None => Ok(self.values.get(&key.0.0).map(|(_, bytes)| bytes.as_slice())),
@@ -352,7 +361,7 @@ pub(super) struct Recording<'a, S> {
     seen: RefCell<BTreeSet<Key>>,
 }
 
-impl<S: Lookup> Lookup for Recording<'_, S> {
+impl<S: Export> Lookup for Recording<'_, S> {
     fn read(&self, key: &Key) -> Result<Option<&[u8]>, String> {
         let bytes = self.overlay.read(key)?;
         if bytes.is_some() {
@@ -607,6 +616,10 @@ mod tests {
         fn value(&self, key: &Key) -> Result<Option<Value>, String> {
             Ok(self.0.get(key).cloned())
         }
+
+        fn kind(&self, key: &Key) -> Result<Option<u8>, String> {
+            Ok(self.0.get(key).map(|value| value.kind))
+        }
     }
 
     /// The former Overlay returned the local value first without comparing it with the
@@ -652,6 +665,10 @@ mod tests {
                 overlay: Overlay { store: &wrong_kind, values: &committed },
                 seen: RefCell::new(BTreeSet::new()),
             };
+            assert!(
+                recording.read(&key).unwrap_err().contains("committed distributed key"),
+                "a warm hit with the right bytes but wrong kind must stop before compilation"
+            );
             assert!(recording.value(&key).is_err(), "an exported local kind must also agree");
 
             let empty = Warm(BTreeMap::new());
