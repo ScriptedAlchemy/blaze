@@ -77,7 +77,7 @@ fn konst(bits: i64, ty: ir::Type, ext: Option<bool>) -> u64 {
     }
 }
 
-/// `value` into general register `dst`, extended to 64 bits as `ext` says.
+/// `value` into general register `dst`, extended to 64 bits as `ext` says, zero otherwise.
 fn to_gpr(
     cx: &mut Cx<'_, '_, X64>,
     inst: ir::Inst,
@@ -87,10 +87,10 @@ fn to_gpr(
 ) -> Result<(), Error> {
     let ty = cx.func.dfg.value_type(value);
     match cx.loc(value) {
-        Loc::Slot(off) => match ext {
-            Some(signed) => asm::load_ext(cx.buf, dst, slot(off), ty.bits(), signed),
-            None => asm::load(cx.buf, dst, slot(off)),
-        },
+        Loc::Slot(off) => {
+            // Stencils write only the value's width; the rest of a reused slot is not its bits.
+            asm::load_ext(cx.buf, dst, slot(off), ty.bits(), ext.unwrap_or(false));
+        }
         Loc::Const(bits) => asm::imm(cx.buf, dst, konst(bits, ty, ext)),
         Loc::Dead => return Err(no_place(inst, value)),
     }

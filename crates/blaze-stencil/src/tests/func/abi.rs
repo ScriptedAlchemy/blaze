@@ -44,6 +44,9 @@ pub const FAMILIES: &[fn(&Mk) -> Family] = &[
 
 use types::{F16, F32, F64, F128, I8, I16, I32, I64, I128};
 
+#[cfg(all(unix, target_arch = "x86_64"))]
+mod narrow;
+
 fn p(ty: ir::Type) -> AbiParam {
     AbiParam::new(ty)
 }

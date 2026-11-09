@@ -201,12 +201,23 @@ impl Exec {
     /// Links `link`'s units for the host. A name that resolves to nothing or a relocation out
     /// of range panics naming it: the tests link only what they made.
     pub fn link(link: &Link<'_>) -> Exec {
+        Self::link_with_trampolines(link, true)
+    }
+
+    /// Links for typed [`Exec::call`]s only, without generating Cranelift trampolines.
+    #[cfg(target_arch = "x86_64")]
+    pub fn link_typed(link: &Link<'_>) -> Exec {
+        Self::link_with_trampolines(link, false)
+    }
+
+    fn link_with_trampolines(link: &Link<'_>, trampolines: bool) -> Exec {
         let units = link.units.len();
         let tramp_sig = tramp_signature(link.isa);
         let tramp_code: Vec<Result<Compiled, String>> = link
             .units
             .iter()
             .enumerate()
+            .filter(|_| trampolines)
             .map(|(i, unit)| {
                 let sig = match unit {
                     Unit::Stencil(_, sig) | Unit::Cranelift(_, sig) => *sig,
