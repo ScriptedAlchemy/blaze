@@ -168,12 +168,14 @@
      "blaze-mem",
      "blaze-protocol",
      "blaze-query",
+     "blaze-report",
      "blaze-serde",
      "blaze-vfs",
      "libc",
      "memchr",
      "serde",
-     "sonic-rs"
+     "sonic-rs",
+     "uds_windows"
     ],
     "name": "blaze-api",
     "version": "0.0.0"
@@ -241,10 +243,10 @@
      "crossbeam-deque",
      "crossbeam-queue",
      "libc",
-     "parking_lot",
      "serde",
      "serde_json",
-     "stdx"
+     "stdx",
+     "windows-sys 0.61.2"
     ],
     "name": "blaze-graph",
     "version": "0.0.0"
@@ -264,12 +266,12 @@
      "blake3",
      "blake3-servil",
      "blaze-check",
+     "blaze-core",
      "blaze-hash",
      "blaze-mem",
      "blaze-radix",
      "blaze-rng",
      "blaze-serde",
-     "parking_lot",
      "serde",
      "smallvec",
      "thin-vec"
@@ -291,8 +293,7 @@
     "dependencies": [
      "blaze-inproc-rt",
      "blaze-mem",
-     "crossbeam-channel",
-     "parking_lot"
+     "crossbeam-channel"
     ],
     "name": "blaze-inproc",
     "version": "0.0.0"
@@ -332,6 +333,7 @@
    },
    {
     "dependencies": [
+     "blaze-hash",
      "blaze-serde",
      "serde"
     ],
@@ -359,7 +361,6 @@
      "hashbrown 0.17.1",
      "indexmap",
      "intern",
-     "parking_lot",
      "serde",
      "smallvec",
      "thin-vec",
@@ -388,6 +389,16 @@
      "blaze-check"
     ],
     "name": "blaze-reclaim",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "serde",
+     "sonic-rs",
+     "toml",
+     "unicode-width"
+    ],
+    "name": "blaze-report",
     "version": "0.0.0"
    },
    {
@@ -431,7 +442,6 @@
      "blaze-reclaim",
      "blaze-serde",
      "hashbrown 0.17.1",
-     "parking_lot",
      "serde",
      "smallvec"
     ],
@@ -977,6 +987,12 @@
     "version": "0.22.14"
    },
    {
+    "checksum": "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223",
+    "name": "fastrand",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "2.5.0"
+   },
+   {
     "checksum": "1ca7d44d22004409a61c393afb3369c8f7bb74abcae49fe249ee01dcc3002113",
     "dependencies": [
      "bytes",
@@ -1330,13 +1346,13 @@
    {
     "dependencies": [
      "blaze-check",
+     "blaze-core",
      "blaze-format",
      "blaze-hash",
      "blaze-ids",
      "blaze-image",
      "blaze-mem",
-     "blaze-phf",
-     "parking_lot"
+     "blaze-phf"
     ],
     "name": "intern",
     "version": "0.0.0"
@@ -1549,6 +1565,15 @@
     "name": "memmap2",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.9.11"
+   },
+   {
+    "checksum": "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a",
+    "dependencies": [
+     "autocfg"
+    ],
+    "name": "memoffset",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.9.1"
    },
    {
     "checksum": "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316",
@@ -2542,6 +2567,15 @@
     "version": "1.0.154"
    },
    {
+    "checksum": "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c",
+    "dependencies": [
+     "serde_core"
+    ],
+    "name": "serde_spanned",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.1.2"
+   },
+   {
     "checksum": "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba",
     "name": "shlex",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -2694,9 +2728,9 @@
    },
    {
     "dependencies": [
+     "blaze-core",
      "itertools",
      "libc",
-     "parking_lot",
      "stacker",
      "tracing"
     ],
@@ -2724,6 +2758,19 @@
     "name": "syn",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "3.0.9"
+   },
+   {
+    "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd",
+    "dependencies": [
+     "fastrand",
+     "getrandom 0.4.3",
+     "once_cell",
+     "rustix 1.1.5",
+     "windows-sys 0.61.2"
+    ],
+    "name": "tempfile",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "3.27.0"
    },
    {
     "checksum": "d6a4b9ba8738cb4a4f399d37e266becfd475e75eb73425b87a05a2f2039ba63e",
@@ -2801,6 +2848,21 @@
     "version": "1.54.0"
    },
    {
+    "checksum": "c5ffcdf8f50436dbbfd675c1fe1b8e0854f42b7defea8584bdebe1aee900e561",
+    "dependencies": [
+     "indexmap",
+     "serde_core",
+     "serde_spanned",
+     "toml_datetime",
+     "toml_parser",
+     "toml_writer",
+     "winnow"
+    ],
+    "name": "toml",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.2.0+spec-1.1.0"
+   },
+   {
     "checksum": "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053",
     "dependencies": [
      "serde_core"
@@ -2829,6 +2891,12 @@
     "name": "toml_parser",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "1.1.5+spec-1.1.0"
+   },
+   {
+    "checksum": "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a",
+    "name": "toml_writer",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.2.0+spec-1.1.0"
    },
    {
     "checksum": "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100",
@@ -2876,6 +2944,17 @@
     "version": "0.5.1"
    },
    {
+    "checksum": "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e",
+    "dependencies": [
+     "memoffset",
+     "tempfile",
+     "windows-sys 0.61.2"
+    ],
+    "name": "uds_windows",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.2.1"
+   },
+   {
     "checksum": "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f",
     "name": "unicode-general-category",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -2900,10 +2979,10 @@
     "version": "1.13.3"
    },
    {
-    "checksum": "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254",
+    "checksum": "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557",
     "name": "unicode-width",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "0.2.2"
+    "version": "0.2.3"
    },
    {
     "checksum": "7cc1186384beb7dd8eedea376413fd654937285ea6c9cfbb928dc3043ea4b606",
@@ -4250,6 +4329,23 @@
    },
    "version": "0.0.0"
   },
+  "blaze-report@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "Everything blaze says to a person or an agent as data (a Report: severity, headline, rule, where, facts, what it blocks, fixes, log, causes) and the one renderer of it: a terminal's, plain lines, JSON",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-report",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-report",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "blaze-rng@0.0.0": {
    "authors": "blaze contributors",
    "description": "blaze v2's one seeded SplitMix64, for tests, simulations and jitter; no dependencies, so the crates below blaze-ids use it too",
@@ -5252,6 +5348,23 @@
     "kind": "registry"
    },
    "version": "0.22.14"
+  },
+  "fastrand@2.5.0": {
+   "authors": "Stjepan Glavina <stjepang@gmail.com>",
+   "description": "A simple and fast random number generator",
+   "homepage": "",
+   "license": "Apache-2.0 OR MIT",
+   "license_file": "",
+   "links": null,
+   "name": "fastrand",
+   "readme": "README.md",
+   "repository": "https://github.com/smol-rs/fastrand",
+   "rust_version": "1.63",
+   "source": {
+    "checksum": "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223",
+    "kind": "registry"
+   },
+   "version": "2.5.0"
   },
   "faststr@0.2.34": {
    "authors": "Volo Team <volo@cloudwego.io>",
@@ -6272,6 +6385,23 @@
     "kind": "registry"
    },
    "version": "0.9.11"
+  },
+  "memoffset@0.9.1": {
+   "authors": "Gilad Naaman <gilad.naaman@gmail.com>",
+   "description": "offset_of functionality for Rust structs.",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "memoffset",
+   "readme": "README.md",
+   "repository": "https://github.com/Gilnaa/memoffset",
+   "rust_version": "",
+   "source": {
+    "checksum": "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a",
+    "kind": "registry"
+   },
+   "version": "0.9.1"
   },
   "miniz_oxide@0.8.9": {
    "authors": "Frommi <daniil.liferenko@gmail.com>:oyvindln <oyvindln@users.noreply.github.com>:Rich Geldreich richgel99@gmail.com",
@@ -7973,6 +8103,23 @@
    },
    "version": "1.0.154"
   },
+  "serde_spanned@1.1.2": {
+   "authors": "",
+   "description": "Serde-compatible spanned Value",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "serde_spanned",
+   "readme": "README.md",
+   "repository": "https://github.com/toml-rs/toml",
+   "rust_version": "1.85",
+   "source": {
+    "checksum": "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c",
+    "kind": "registry"
+   },
+   "version": "1.1.2"
+  },
   "shlex@2.0.1": {
    "authors": "comex <comexk@gmail.com>:Fenhl <fenhl@fenhl.net>:Adrian Taylor <adetaylor@chromium.org>:Alex Touchet <alextouchet@outlook.com>:Daniel Parks <dp+git@oxidized.org>:Garrett Berg <googberg@gmail.com>",
    "description": "Split a string into shell words, like Python's shlex.",
@@ -8279,6 +8426,23 @@
    },
    "version": "3.0.9"
   },
+  "tempfile@3.27.0": {
+   "authors": "Steven Allen <steven@stebalien.com>:The Rust Project Developers:Ashley Mannix <ashleymannix@live.com.au>:Jason White <me@jasonwhite.io>",
+   "description": "A library for managing temporary files and directories.",
+   "homepage": "https://stebalien.com/projects/tempfile-rs/",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "tempfile",
+   "readme": "README.md",
+   "repository": "https://github.com/Stebalien/tempfile",
+   "rust_version": "1.63",
+   "source": {
+    "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd",
+    "kind": "registry"
+   },
+   "version": "3.27.0"
+  },
   "thin-vec@0.2.21": {
    "authors": "Aria Beingessner <a.beingessner@gmail.com>",
    "description": "A Vec that takes up less space on the stack.",
@@ -8415,6 +8579,23 @@
    },
    "version": "1.54.0"
   },
+  "toml@1.2.0+spec-1.1.0": {
+   "authors": "",
+   "description": "A native Rust encoder and decoder of TOML-formatted files and streams. Provides\nimplementations of the standard Serialize/Deserialize traits for TOML data to\nfacilitate deserializing and serializing Rust structures.\n",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "toml",
+   "readme": "README.md",
+   "repository": "https://github.com/toml-rs/toml",
+   "rust_version": "1.85",
+   "source": {
+    "checksum": "c5ffcdf8f50436dbbfd675c1fe1b8e0854f42b7defea8584bdebe1aee900e561",
+    "kind": "registry"
+   },
+   "version": "1.2.0+spec-1.1.0"
+  },
   "toml_datetime@1.1.2+spec-1.1.0": {
    "authors": "",
    "description": "A TOML-compatible datetime type",
@@ -8465,6 +8646,23 @@
     "kind": "registry"
    },
    "version": "1.1.5+spec-1.1.0"
+  },
+  "toml_writer@1.2.0+spec-1.1.0": {
+   "authors": "",
+   "description": "A low-level interface for writing out TOML\n",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "toml_writer",
+   "readme": "README.md",
+   "repository": "https://github.com/toml-rs/toml",
+   "rust_version": "1.85",
+   "source": {
+    "checksum": "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a",
+    "kind": "registry"
+   },
+   "version": "1.2.0+spec-1.1.0"
   },
   "tracing-core@0.1.36": {
    "authors": "Tokio Contributors <team@tokio.rs>",
@@ -8551,6 +8749,23 @@
    },
    "version": "0.5.1"
   },
+  "uds_windows@1.2.1": {
+   "authors": "Azure IoT Edge Devs:Harald Hoyer <harald@redhat.com>",
+   "description": "Unix Domain Sockets for Windows!",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "uds_windows",
+   "readme": "README.md",
+   "repository": "https://github.com/haraldh/rust_uds_windows",
+   "rust_version": "1.85",
+   "source": {
+    "checksum": "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e",
+    "kind": "registry"
+   },
+   "version": "1.2.1"
+  },
   "unicode-general-category@1.1.0": {
    "authors": "YesLogic Pty. Ltd. <info@yeslogic.com>",
    "description": "Fast lookup of the Unicode General Category property for char",
@@ -8619,7 +8834,7 @@
    },
    "version": "1.13.3"
   },
-  "unicode-width@0.2.2": {
+  "unicode-width@0.2.3": {
    "authors": "kwantam <kwantam@gmail.com>:Manish Goregaokar <manishsmail@gmail.com>",
    "description": "Determine displayed width of `char` and `str` types\naccording to Unicode Standard Annex #11 rules.\n",
    "homepage": "https://github.com/unicode-rs/unicode-width",
@@ -8631,10 +8846,10 @@
    "repository": "https://github.com/unicode-rs/unicode-width",
    "rust_version": "1.66",
    "source": {
-    "checksum": "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254",
+    "checksum": "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557",
     "kind": "registry"
    },
-   "version": "0.2.2"
+   "version": "0.2.3"
   },
   "uuid@1.28.0": {
    "authors": "Ashley Mannix<ashleymannix@live.com.au>:Dylan DPC<dylan.dpc@gmail.com>:Hunar Roop Kahlon<hunar.roop@gmail.com>",
@@ -10201,6 +10416,10 @@
        "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
+      },
+      {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
@@ -10425,10 +10644,6 @@
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
-      },
-      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       },
@@ -10544,6 +10759,10 @@
        "unit": "blake3@1.8.7 lib blake3 build"
       },
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
@@ -10562,10 +10781,6 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -10673,10 +10888,6 @@
       {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -10789,6 +11000,10 @@
     "blaze-protocol@0.0.0 lib blaze_protocol build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
@@ -10928,10 +11143,6 @@
        "unit": "intern@0.0.0 lib intern build"
       },
       {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
-      },
-      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       },
@@ -11008,6 +11219,43 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_reclaim"
+    },
+    "blaze-report@0.0.0 lib blaze_report build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      },
+      {
+       "name": "sonic_rs",
+       "unit": "sonic-rs@0.5.10 lib sonic_rs build"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.2.0+spec-1.1.0 lib toml build"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-report@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_report"
     },
     "blaze-rng@0.0.0 lib blaze_rng build": {
      "crate_type": "lib",
@@ -11164,10 +11412,6 @@
       {
        "name": "hashbrown",
        "unit": "hashbrown@0.17.1 lib hashbrown build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -13704,6 +13948,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
@@ -13726,10 +13974,6 @@
       {
        "name": "blaze_phf",
        "unit": "blaze-phf@0.0.0 lib blaze_phf build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -16442,6 +16686,35 @@
      "src": "src/lib.rs",
      "target": "serde_json"
     },
+    "serde_spanned@1.1.2 lib serde_spanned build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
     "shlex@2.0.1 lib shlex build host": {
      "crate_type": "lib",
      "deps": [],
@@ -16826,16 +17099,16 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "itertools",
        "unit": "itertools@0.15.0 lib itertools build"
       },
       {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "stacker",
@@ -17087,6 +17360,137 @@
      "src": "src/lib.rs",
      "target": "thiserror"
     },
+    "toml@1.2.0+spec-1.1.0 lib toml build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
+    "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
     "tracing-core@0.1.36 lib tracing_core build": {
      "crate_type": "lib",
      "deps": [
@@ -17129,7 +17533,7 @@
      ],
      "edition": "2018",
      "features": [
-      "release_max_level_info",
+      "release_max_level_debug",
       "std"
      ],
      "kind": "lib",
@@ -17300,6 +17704,29 @@
      },
      "src": "src/lib.rs",
      "target": "unicode_segmentation"
+    },
+    "unicode-width@0.2.3 lib unicode_width build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "cjk",
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "unicode-width@0.2.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "unicode_width"
     },
     "uuid@1.28.0 lib uuid build": {
      "crate_type": "lib",
@@ -17616,6 +18043,26 @@
      },
      "src": "src/lib.rs",
      "target": "winit"
+    },
+    "winnow@1.0.4 lib winnow build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
     },
     "zerocopy@0.8.63 custom-build build-script-build build host": {
      "crate_type": "bin",
@@ -18467,6 +18914,10 @@
        "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
+      },
+      {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
@@ -18691,10 +19142,6 @@
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
-      },
-      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       },
@@ -18810,6 +19257,10 @@
        "unit": "blake3@1.8.7 lib blake3 build"
       },
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
@@ -18828,10 +19279,6 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -18939,10 +19386,6 @@
       {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -19055,6 +19498,10 @@
     "blaze-protocol@0.0.0 lib blaze_protocol build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
@@ -19194,10 +19641,6 @@
        "unit": "intern@0.0.0 lib intern build"
       },
       {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
-      },
-      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       },
@@ -19274,6 +19717,43 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_reclaim"
+    },
+    "blaze-report@0.0.0 lib blaze_report build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      },
+      {
+       "name": "sonic_rs",
+       "unit": "sonic-rs@0.5.10 lib sonic_rs build"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.2.0+spec-1.1.0 lib toml build"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-report@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_report"
     },
     "blaze-rng@0.0.0 lib blaze_rng build": {
      "crate_type": "lib",
@@ -19430,10 +19910,6 @@
       {
        "name": "hashbrown",
        "unit": "hashbrown@0.17.1 lib hashbrown build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -21924,6 +22400,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
@@ -21946,10 +22426,6 @@
       {
        "name": "blaze_phf",
        "unit": "blaze-phf@0.0.0 lib blaze_phf build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -24621,6 +25097,35 @@
      "src": "src/lib.rs",
      "target": "serde_json"
     },
+    "serde_spanned@1.1.2 lib serde_spanned build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
     "shlex@2.0.1 lib shlex build host": {
      "crate_type": "lib",
      "deps": [],
@@ -25175,16 +25680,16 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "itertools",
        "unit": "itertools@0.15.0 lib itertools build"
       },
       {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "stacker",
@@ -25542,6 +26047,137 @@
      "src": "src/lib.rs",
      "target": "thiserror"
     },
+    "toml@1.2.0+spec-1.1.0 lib toml build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
+    "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
     "tracing-core@0.1.36 lib tracing_core build": {
      "crate_type": "lib",
      "deps": [
@@ -25584,7 +26220,7 @@
      ],
      "edition": "2018",
      "features": [
-      "release_max_level_info",
+      "release_max_level_debug",
       "std"
      ],
      "kind": "lib",
@@ -25755,6 +26391,29 @@
      },
      "src": "src/lib.rs",
      "target": "unicode_segmentation"
+    },
+    "unicode-width@0.2.3 lib unicode_width build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "cjk",
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "unicode-width@0.2.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "unicode_width"
     },
     "uuid@1.28.0 lib uuid build": {
      "crate_type": "lib",
@@ -26625,6 +27284,26 @@
      },
      "src": "src/lib.rs",
      "target": "winit"
+    },
+    "winnow@1.0.4 lib winnow build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
     },
     "x11-dl@2.21.0 custom-build build-script-build build host": {
      "crate_type": "bin",
@@ -27660,6 +28339,10 @@
        "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
+      },
+      {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
@@ -27884,10 +28567,6 @@
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
-      },
-      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       },
@@ -27999,6 +28678,10 @@
        "unit": "blake3@1.8.7 lib blake3 build"
       },
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
@@ -28017,10 +28700,6 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -28128,10 +28807,6 @@
       {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -28244,6 +28919,10 @@
     "blaze-protocol@0.0.0 lib blaze_protocol build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
@@ -28383,10 +29062,6 @@
        "unit": "intern@0.0.0 lib intern build"
       },
       {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
-      },
-      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       },
@@ -28463,6 +29138,43 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_reclaim"
+    },
+    "blaze-report@0.0.0 lib blaze_report build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      },
+      {
+       "name": "sonic_rs",
+       "unit": "sonic-rs@0.5.10 lib sonic_rs build"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.2.0+spec-1.1.0 lib toml build"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-report@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_report"
     },
     "blaze-rng@0.0.0 lib blaze_rng build": {
      "crate_type": "lib",
@@ -28619,10 +29331,6 @@
       {
        "name": "hashbrown",
        "unit": "hashbrown@0.17.1 lib hashbrown build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -31179,6 +31887,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
@@ -31201,10 +31913,6 @@
       {
        "name": "blaze_phf",
        "unit": "blaze-phf@0.0.0 lib blaze_phf build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -33917,6 +34625,35 @@
      "src": "src/lib.rs",
      "target": "serde_json"
     },
+    "serde_spanned@1.1.2 lib serde_spanned build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
     "shlex@2.0.1 lib shlex build host": {
      "crate_type": "lib",
      "deps": [],
@@ -34301,16 +35038,16 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "itertools",
        "unit": "itertools@0.15.0 lib itertools build"
       },
       {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "stacker",
@@ -34562,6 +35299,137 @@
      "src": "src/lib.rs",
      "target": "thiserror"
     },
+    "toml@1.2.0+spec-1.1.0 lib toml build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
+    "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
     "tracing-core@0.1.36 lib tracing_core build": {
      "crate_type": "lib",
      "deps": [
@@ -34604,7 +35472,7 @@
      ],
      "edition": "2018",
      "features": [
-      "release_max_level_info",
+      "release_max_level_debug",
       "std"
      ],
      "kind": "lib",
@@ -34775,6 +35643,29 @@
      },
      "src": "src/lib.rs",
      "target": "unicode_segmentation"
+    },
+    "unicode-width@0.2.3 lib unicode_width build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "cjk",
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "unicode-width@0.2.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "unicode_width"
     },
     "uuid@1.28.0 lib uuid build": {
      "crate_type": "lib",
@@ -35091,6 +35982,26 @@
      },
      "src": "src/lib.rs",
      "target": "winit"
+    },
+    "winnow@1.0.4 lib winnow build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
     },
     "zerocopy@0.8.63 custom-build build-script-build build host": {
      "crate_type": "bin",
@@ -35942,6 +36853,10 @@
        "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
+      },
+      {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
@@ -36166,10 +37081,6 @@
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
-      },
-      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       },
@@ -36285,6 +37196,10 @@
        "unit": "blake3@1.8.7 lib blake3 build"
       },
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
@@ -36303,10 +37218,6 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -36414,10 +37325,6 @@
       {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -36530,6 +37437,10 @@
     "blaze-protocol@0.0.0 lib blaze_protocol build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
@@ -36669,10 +37580,6 @@
        "unit": "intern@0.0.0 lib intern build"
       },
       {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
-      },
-      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       },
@@ -36749,6 +37656,43 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_reclaim"
+    },
+    "blaze-report@0.0.0 lib blaze_report build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      },
+      {
+       "name": "sonic_rs",
+       "unit": "sonic-rs@0.5.10 lib sonic_rs build"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.2.0+spec-1.1.0 lib toml build"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-report@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_report"
     },
     "blaze-rng@0.0.0 lib blaze_rng build": {
      "crate_type": "lib",
@@ -36905,10 +37849,6 @@
       {
        "name": "hashbrown",
        "unit": "hashbrown@0.17.1 lib hashbrown build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -39419,6 +40359,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
@@ -39441,10 +40385,6 @@
       {
        "name": "blaze_phf",
        "unit": "blaze-phf@0.0.0 lib blaze_phf build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -42116,6 +43056,35 @@
      "src": "src/lib.rs",
      "target": "serde_json"
     },
+    "serde_spanned@1.1.2 lib serde_spanned build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
     "shlex@2.0.1 lib shlex build host": {
      "crate_type": "lib",
      "deps": [],
@@ -42670,16 +43639,16 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "itertools",
        "unit": "itertools@0.15.0 lib itertools build"
       },
       {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
-      },
-      {
-       "name": "parking_lot",
-       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "stacker",
@@ -43037,6 +44006,137 @@
      "src": "src/lib.rs",
      "target": "thiserror"
     },
+    "toml@1.2.0+spec-1.1.0 lib toml build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
+    "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
     "tracing-core@0.1.36 lib tracing_core build": {
      "crate_type": "lib",
      "deps": [
@@ -43079,7 +44179,7 @@
      ],
      "edition": "2018",
      "features": [
-      "release_max_level_info",
+      "release_max_level_debug",
       "std"
      ],
      "kind": "lib",
@@ -43250,6 +44350,29 @@
      },
      "src": "src/lib.rs",
      "target": "unicode_segmentation"
+    },
+    "unicode-width@0.2.3 lib unicode_width build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "cjk",
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "unicode-width@0.2.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "unicode_width"
     },
     "uuid@1.28.0 lib uuid build": {
      "crate_type": "lib",
@@ -44120,6 +45243,26 @@
      },
      "src": "src/lib.rs",
      "target": "winit"
+    },
+    "winnow@1.0.4 lib winnow build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
     },
     "x11-dl@2.21.0 custom-build build-script-build build host": {
      "crate_type": "bin",
