@@ -273,12 +273,15 @@ impl BatchCompiler for Batches<'_> {
                     self.compiled += grant.compiled;
                     self.stored += grant.stored;
                     self.compiled_keys.extend(grant.compiled_keys);
-                    let pack = Pack::of(grant.values)?;
-                    // The result is posted after this returns: a committed pack exists whole.
-                    self.blobs.put_pack(&pack).map_err(|e| e.to_string())?;
+                    let mut references = Vec::new(); // alloc: one reference per bounded pack
+                    // Every pack is uploaded before this grant's result is posted.
+                    for pack in Pack::batches(grant.values)? {
+                        self.blobs.put_pack(&pack).map_err(|e| e.to_string())?;
+                        references.push(pack.reference);
+                    }
                     (
                         |name| ItemOutcome::Exported(EntryRef { entry: EntryKey(*name) }),
-                        vec![pack.reference],
+                        references,
                     )
                 }
                 Err(why) => {
@@ -593,9 +596,10 @@ fn execute(
                     }
                     let mut packs = packs;
                     if !extra.is_empty() {
-                        let pack = Pack::of(extra).map_err(Error::Protocol)?;
-                        config.blobs.put_pack(&pack)?;
-                        packs.push(pack.reference);
+                        for pack in Pack::batches(extra).map_err(Error::Protocol)? {
+                            config.blobs.put_pack(&pack)?;
+                            packs.push(pack.reference);
+                        }
                     }
                     packs.sort();
                     packs.dedup();
