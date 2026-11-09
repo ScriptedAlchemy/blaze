@@ -482,13 +482,13 @@ fn execute(
         if let Some(claimed) = &claimed
             && let Some(executor) = &claimed.executor
         {
-            arrived.attempt = Some(claimed.attempt.0);
+            arrived.attempt = Some(u64::from(claimed.attempt.0));
             last_claim = Some((executor.clone(), claimed.attempt));
         }
         let published = publication(client, content, execution)?;
         if let Some((packs, attempt, accepted)) = published {
-            arrived.attempt = Some(attempt.0);
-            arrived.publication_attempt = Some(accepted.0);
+            arrived.attempt = Some(u64::from(attempt.0));
+            arrived.publication_attempt = Some(u64::from(accepted.0));
             let mut take = || {
                 arrived.values = import(&config.blobs, &packs)?;
                 arrived.packs = packs;
@@ -613,7 +613,7 @@ fn execute(
                             accepted_attempt: Some(accepted),
                             ..
                         }) => {
-                            arrived.publication_attempt = Some(accepted.0);
+                            arrived.publication_attempt = Some(u64::from(accepted.0));
                             ensure_not_cancelled(unit, cancelled)?;
                             mirror(config, unit, &packs)?;
                             ensure_not_cancelled(unit, cancelled)?;
