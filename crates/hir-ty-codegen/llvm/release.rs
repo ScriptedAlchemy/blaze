@@ -920,8 +920,8 @@ mod tests {
         builder.switch_to_block(block);
         builder.seal_block(block);
         let value = builder.block_params(block)[0];
-        builder.ins().stack_store(value, slot, 0);
-        let value = builder.ins().stack_load(types::I64, slot, 0);
+        builder.ins().stack_store(types::I64, value, slot, 0);
+        let value = builder.ins().stack_load(types::I64, types::I64, slot, 0);
         builder.ins().return_(&[value]);
         builder.finalize(isa.frontend_config());
 
