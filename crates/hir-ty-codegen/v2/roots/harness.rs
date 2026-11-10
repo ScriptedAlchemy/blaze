@@ -331,8 +331,9 @@ fn harness_main(db: &Db, krate: Crate) -> Result<FunctionId, String> {
 
 impl HirFrontend<'_> {
     /// The module of a test harness for `krate`, to add to the end of the text of its root
-    /// file ([`Self::on_disk`] gives the text before); `None` when `krate` has no `cfg(test)`
-    /// (a test with `harness = false`), whose `main` is its own. `fork_server` is
+    /// file ([`Self::on_disk`] gives the text before); `None` when `krate` has no `cfg(test)`.
+    /// The caller requests this only for a manifest target with a harness; `cfg(test)` also
+    /// applies to targets with `harness = false`, whose `main` is their own. `fork_server` is
     /// `blaze_usercode::test::fork_server`, asked for the module that records what each test
     /// ran when a binary built in `mode` has jump-table slots ([`exec::records`]): the text
     /// differs by mode, so a harness written for one is written again for another.

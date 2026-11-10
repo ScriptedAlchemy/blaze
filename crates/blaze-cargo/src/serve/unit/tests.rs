@@ -110,6 +110,162 @@ fn package(id: &str, name: &str, dir: &str) -> PackagePlan {
 const P: &str = "path+file:///w/p#0.1.0";
 const Z: &str = "path+file:///w/z-sys#0.1.0";
 
+/// cfg(test) keeps test-only source enabled independently of whether the
+/// manifest requests libtest. A plain bench keeps its disk root and starts its own main;
+/// a harnessed test gets a separate root containing libtest's generated module.
+#[test]
+fn a_harness_false_bench_keeps_its_main_through_writing_and_root_selection() {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    use blaze_core::{
+        FileName,
+        sim::{Faults, Sim},
+    };
+    use blaze_units::query::{BuildConfig, Command, Invocation, Mount, Origin};
+    use blaze_vfs::{Op, Vfs};
+    use hir_ty_codegen::v2::{HARNESS_MODULE, Kind, RootKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut vfs, _) = Vfs::recover(FileName::new("plain-bench.vfs").unwrap(), 0, &[]);
+    let manifest = b"[package]\nname = \"p\"\nversion = \"0.1.0\"\n[[bench]]\nname = \"plain\"\nharness = false\n";
+    let plain = b"#[cfg(test)]\nfn main() {}\n";
+    let root = vfs
+        .apply(
+            vfs.empty(),
+            &[
+                Op::Write {
+                    mode: blaze_vfs::Mode::Regular,
+                    path: "Cargo.toml".into(),
+                    bytes: manifest.to_vec(),
+                },
+                Op::Write {
+                    mode: blaze_vfs::Mode::Regular,
+                    path: "benches/plain.rs".into(),
+                    bytes: plain.to_vec(),
+                },
+                Op::Write {
+                    mode: blaze_vfs::Mode::Regular,
+                    path: "src/lib.rs".into(),
+                    bytes: b"#[test]\nfn ordinary() {}\n".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+    let mut plain_plan = plan("-plain", &[]);
+    plain_plan.harness = false;
+    let units = Arc::new(Units {
+        graph: UnitGraph {
+            version: 1,
+            units: vec![
+                unit(P, target("plain", "bench", "/w/benches/plain.rs"), Mode::Test, &[]),
+                unit(P, target("p", "lib", "/w/src/lib.rs"), Mode::Test, &[]),
+            ],
+            roots: vec![0, 1],
+        },
+        plans: vec![plain_plan, plan("-harness", &[])],
+        packages: vec![package(P, "p", "/w")],
+        lock: None,
+        warnings: Vec::new(),
+        target_dir: dir.path().join("target").to_str().unwrap().into(),
+        build_dir: dir.path().join("build").to_str().unwrap().into(),
+        finished: String::new(),
+        link_dirs: Vec::new(),
+        sandboxed_tests: false,
+        native: Vec::new(),
+    });
+    let config = Arc::new(BuildConfig {
+        invocation: Invocation {
+            command: Command::Build,
+            args: Vec::new(),
+            root: "/w".into(),
+            cwd: "/w".into(),
+            env: Vec::new(),
+            files: Vec::new(),
+        },
+        mounts: vec![Mount { at: "/w".into(), origin: Origin::View, under: String::new() }],
+        host: HOST.into(),
+        library: "/rustc/abc/library".into(),
+        std: "/s/std".into(),
+        builds: "/s/build".into(),
+        sources: "/s/sources".into(),
+        blaze: String::new(),
+    });
+    let files = vfs.reader();
+    let mut lowered = blaze_lower::lower(blaze_lower::Lower {
+        units: &units,
+        config: &config,
+        files: &files,
+        root,
+        host_cpu: None,
+    })
+    .unwrap();
+    let db = Arc::new(blaze_query::Database::new(blaze_query::Config::memory()));
+    let queries = db.open_with(blaze_vfs::View { root }, &config.encode());
+    let mut sim = Sim::new(1, Faults::default());
+    let store = super::deps::tests::opened(&mut sim);
+    let input = crate::serve::work::JobInput {
+        db,
+        queries,
+        root,
+        files,
+        config,
+        units,
+        native: Arc::from([]),
+        store: store.reader(),
+        std: store.reader(),
+        macros: super::deps::tests::no_macros(),
+        color: false,
+        short: false,
+        width: None,
+        verbose: 0,
+        refused: None,
+        goal: crate::serve::work::Goal::Build,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    };
+    let shared = Arc::new(super::Shared {
+        state: dir.path().into(),
+        launcher: "/opt/blaze/bin/blaze".into(),
+        tools: dir.path().join("tools"),
+        memos: super::memo::Memos::new(),
+        host_cpu: None,
+        selectors: Default::default(),
+        dev_runs: super::run::inproc::DevRuns::new(dir.path().join("inproc")),
+    });
+    let job = super::Job::new(input, lowered.crates().clone(), shared, None).unwrap();
+    let plain_crate = lowered.krate(0).unwrap();
+    let normal_crate = lowered.krate(1).unwrap();
+    let before = lowered.identity(0).unwrap();
+    // This is the real writer, not a test of its boolean predicate. Removing its harness
+    // gate reproduces NotAnAlias for the bench's valid on-disk root.
+    super::harness::write(&mut lowered, &job, [0, 1]).unwrap();
+    assert_eq!(lowered.identity(0).unwrap(), before);
+    let text = |krate: base_db::Crate| {
+        let file = krate.data(lowered.db()).root_file_id;
+        lowered.db().file_text(file).text(lowered.db()).to_owned()
+    };
+    assert_eq!(text(plain_crate).as_bytes(), plain);
+    assert!(text(normal_crate).contains(HARNESS_MODULE));
+    let reader = super::UnitReader { front: Arc::new(lowered), checks: Arc::default() };
+    let roots = codegen::test_roots(&job, &reader, 0).unwrap();
+    assert!(roots.tests.is_empty());
+    let [start, ..] = roots.roots.as_slice() else { panic!("the bench has a main") };
+    assert!(matches!(start.0, Kind::Start(_)), "the bench starts its own main");
+    let normal = codegen::test_roots(&job, &reader, 1).unwrap();
+    assert_eq!(normal.tests.iter().map(|it| it.name.as_str()).collect::<Vec<_>>(), ["ordinary"]);
+    // The old executable selection asks for libtest although cfg(test) is legitimate.
+    assert!(
+        codegen::frontend_over(
+            reader.db(),
+            reader.paths(),
+            reader.spellings(),
+            &job.mounted,
+            codegen::build_time(&job, 0)
+        )
+        .roots(plain_crate, RootKind::Test)
+        .is_err()
+    );
+}
+
 /// `z-sys` (links `z`) with a build script, and `p`, whose script reads `z`'s metadata.
 fn build(dir: &std::path::Path) -> Units {
     let out = dir.join("debug/build");

@@ -214,10 +214,11 @@ fn a_program_without_main_is_refused_as_rustc_refuses_it() {
     assert!(what.contains("E0131"), "{what}");
 }
 
-/// A test target with `harness = false` has no `cfg(test)`: its `main` is its own.
+/// A test target with `harness = false` still has `cfg(test)`: its `main` is its own.
 #[test]
 fn a_test_without_a_harness_is_an_executable() {
-    let (db, _, roots) = roots("//- /main.rs crate:main\nfn main() {}\n", RootKind::Test);
+    let (db, _, roots) =
+        roots("//- /main.rs crate:main cfg:test\nfn main() {}\n", RootKind::Executable);
     let main = test_items::function(db, fixture::test_crate(&db), "main");
     assert_eq!(roots.roots[0], HirInstance(Kind::Start(main)));
     assert!(roots.tests.is_empty());

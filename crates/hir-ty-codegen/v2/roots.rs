@@ -5,7 +5,7 @@
 //!   ([`Kind::Start`]), unless `#![no_main]`; and the program's kept symbols ([`kept`]).
 //! - A test harness (`--test`, the crate has `cfg(test)`): the same with the harness's `main`
 //!   ([`harness`]), and each `#[test]` and `#[bench]` function, listed as libtest lists them.
-//!   A test target with `harness = false` has no `cfg(test)` and is an executable.
+//!   A test target with `harness = false` still has `cfg(test)` and is an executable.
 //! - A `cdylib`: the program's kept symbols and the allocator shim.
 //! - A library: what another crate names of it and the crate's own kept symbols; what a program
 //!   reaches past those it compiles itself, so a library's roots are only what is worth having
