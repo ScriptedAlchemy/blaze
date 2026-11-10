@@ -618,11 +618,7 @@ mod tests {
             let (says, sql) = rest.split_once('\n').unwrap();
             let view = find(name).unwrap();
             assert_eq!(view.title, says.strip_prefix("-- says: ").unwrap(), "{name}");
-            assert_eq!(
-                view.sql,
-                sql.trim_end_matches(|c: char| c.is_ascii_whitespace()),
-                "{name}"
-            );
+            assert_eq!(view.sql, sql.trim_end_matches(|c: char| c.is_ascii_whitespace()), "{name}");
             count += 1;
         }
         assert_eq!(count, VIEWS.len());
@@ -666,7 +662,10 @@ mod tests {
             (" -- name: wanted\n-- says: indented\nSELECT 1", "has no `-- name:` section"),
             ("-- name: wanted", "not followed by its `-- says:` line"),
             ("-- name: wanted\nSELECT 1", "not followed by its `-- says:` line"),
-            ("-- name: wanted\n\n-- says: delayed\nSELECT 1", "not followed by its `-- says:` line"),
+            (
+                "-- name: wanted\n\n-- says: delayed\nSELECT 1",
+                "not followed by its `-- says:` line",
+            ),
             ("-- name: wanted\n-- says: no SQL line", "has no SQL line after it"),
             ("-- name: wanted_more\n-- says: wrong name\nSELECT 1", "no declaration in VIEWS"),
             (
@@ -920,11 +919,21 @@ mod tests {
         "row_number",
         "regexp_extract",
         "ends_with",
+        "floor",
+        "nullif",
     ];
+
+    struct Identifier {
+        name: String,
+        called: bool,
+        quoted: bool,
+        start: usize,
+        end: usize,
+    }
 
     /// The identifiers of `sql` outside comments, strings, numbers and `$`/`@` names, each with
     /// whether a `(` follows it.
-    fn identifiers(sql: &str) -> Vec<(String, bool)> {
+    fn identifiers(sql: &str) -> Vec<Identifier> {
         let bytes = sql.as_bytes();
         let mut out = Vec::new();
         let mut at = 0;
@@ -938,8 +947,6 @@ mod tests {
                     at += 1;
                 }
                 at += 1;
-            } else if c == b'"' {
-                panic!("quoted identifiers are not used: {sql}");
             } else if c.is_ascii_digit() || c == b'$' || c == b'@' {
                 at += 1;
                 while at < bytes.len()
@@ -949,16 +956,48 @@ mod tests {
                 {
                     at += 1;
                 }
-            } else if c.is_ascii_alphabetic() || c == b'_' {
+            } else if c == b'"' || c.is_ascii_alphabetic() || c == b'_' {
                 let start = at;
-                while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+                let quoted = c == b'"';
+                let name = if quoted {
                     at += 1;
-                }
+                    let mut part = at;
+                    let mut name = String::new();
+                    loop {
+                        assert!(at < bytes.len(), "unterminated quoted identifier: {sql}");
+                        if bytes[at] != b'"' {
+                            at += 1;
+                            continue;
+                        }
+                        name.push_str(&sql[part..at]);
+                        at += 1;
+                        if bytes.get(at) != Some(&b'"') {
+                            break;
+                        }
+                        name.push('"');
+                        at += 1;
+                        part = at;
+                    }
+                    name.to_ascii_lowercase()
+                } else {
+                    while at < bytes.len()
+                        && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_')
+                    {
+                        at += 1;
+                    }
+                    sql[start..at].to_ascii_lowercase()
+                };
                 let mut next = at;
                 while next < bytes.len() && bytes[next].is_ascii_whitespace() {
                     next += 1;
                 }
-                out.push((sql[start..at].to_ascii_lowercase(), bytes.get(next) == Some(&b'(')));
+                out.push(Identifier {
+                    name,
+                    called: bytes.get(next) == Some(&b'('),
+                    quoted,
+                    start,
+                    end: at,
+                });
             } else {
                 at += 1;
             }
@@ -970,18 +1009,29 @@ mod tests {
     fn aliases(sql: &str) -> BTreeSet<String> {
         let words = identifiers(sql);
         let mut out = BTreeSet::new();
-        for (i, (word, paren)) in words.iter().enumerate() {
-            if word != "as" {
-                continue;
-            }
-            // `name AS (` or `name AS SELECT`: a common table expression's or a view's body.
-            let body = *paren || words.get(i + 1).is_some_and(|(it, _)| it == "select");
-            let named = match body {
-                true => i.checked_sub(1).and_then(|it| words.get(it)),
-                false => words.get(i + 1),
-            };
-            if let Some((name, _)) = named {
-                out.insert(name.clone());
+        for (i, word) in words.iter().enumerate() {
+            if !word.quoted && word.name == "as" {
+                // A parenthesized AS body names its preceding common table expression.
+                let body = word.called
+                    || words.get(i + 1).is_some_and(|it| !it.quoted && it.name == "select");
+                let named = match body {
+                    true => i.checked_sub(1).and_then(|it| words.get(it)),
+                    false => words.get(i + 1),
+                };
+                if let Some(name) = named {
+                    out.insert(name.name.clone());
+                }
+            } else if word.quoted || !KEYWORDS.contains(&word.name.as_str()) {
+                // SQL also permits implicit aliases after a parenthesized expression or
+                // subquery, and after the table immediately following FROM or JOIN.
+                let after_expression = sql[..word.start].trim_end().ends_with(')');
+                let after_table = i >= 2
+                    && !words[i - 2].quoted
+                    && matches!(words[i - 2].name.as_str(), "from" | "join")
+                    && sql[words[i - 1].end..word.start].chars().all(char::is_whitespace);
+                if after_expression || after_table {
+                    out.insert(word.name.clone());
+                }
             }
         }
         out
@@ -989,17 +1039,19 @@ mod tests {
 
     fn check(what: &str, sql: &str, known: &BTreeSet<String>) {
         let named = aliases(sql);
-        for (word, called) in identifiers(sql) {
-            if called {
+        for word in identifiers(sql) {
+            let name = word.name.as_str();
+            let keyword = !word.quoted && KEYWORDS.contains(&name);
+            if word.called {
                 assert!(
-                    FUNCTIONS.contains(&word.as_str()) || KEYWORDS.contains(&word.as_str()),
-                    "{what} calls `{word}`, which is no function the SQL files use (add it to FUNCTIONS if DuckDB has it)"
+                    FUNCTIONS.contains(&name) || keyword,
+                    "{what} calls `{name}`, which is no function the SQL files use (add it to FUNCTIONS if DuckDB has it)"
                 );
                 continue;
             }
             assert!(
-                KEYWORDS.contains(&word.as_str()) || known.contains(&word) || named.contains(&word),
-                "{what} names `{word}`, which is no column or table of the schema, keyword, or name it gives"
+                keyword || known.contains(&word.name) || named.contains(&word.name),
+                "{what} names `{name}`, which is no column or table of the schema, keyword, or name it gives"
             );
         }
     }
@@ -1031,5 +1083,33 @@ mod tests {
         let caught = std::panic::catch_unwind(|| check("bad", "SELECT dur_sn FROM spans", &known));
         assert!(caught.is_err());
         check("good", "SELECT dur_ns AS ms FROM spans WHERE ms > 1", &known);
+    }
+
+    #[test]
+    fn the_check_resolves_aliases_and_still_refuses_unknown_columns_and_functions() {
+        let known = BTreeSet::from(["spans".to_owned(), "dur_ns".to_owned(), "crate".to_owned()]);
+        for sql in [
+            "SELECT r.dur_ns, h.dur_ns FROM (SELECT dur_ns FROM spans) r \
+             ASOF JOIN (SELECT dur_ns FROM spans) h ON r.dur_ns >= h.dur_ns",
+            r#"WITH tasks AS (SELECT dur_ns, "crate" FROM spans)
+               SELECT t."crate" AS "crate", floor(t.dur_ns / nullif(t.dur_ns, 0))
+               FROM tasks t LEFT JOIN spans s ON t.dur_ns = s.dur_ns"#,
+            r#"SELECT dur_ns AS "value ""quoted""", "value ""quoted""" FROM spans"#,
+        ] {
+            check("good", sql, &known);
+        }
+        for sql in [
+            "SELECT r.dur_sn FROM (SELECT dur_ns FROM spans) r",
+            "SELECT t.dur_ns FROM spans s",
+            r#"SELECT s."dur_sn" FROM spans s"#,
+            r#"SELECT "where" FROM spans"#,
+            "SELECT not_a_sql_function(dur_ns) FROM spans",
+            r#"SELECT "dur_ns FROM spans"#,
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| check("bad", sql, &known)).is_err(),
+                "the schema check accepted {sql}"
+            );
+        }
     }
 }
