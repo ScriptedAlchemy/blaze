@@ -990,6 +990,13 @@ impl dist::Export for Reading<'_> {
             })
             .map_err(|corrupt| corrupt.to_string())
     }
+
+    fn kind(&self, key: &blaze_cas::Key) -> Result<Option<u8>, String> {
+        self.store
+            .get(self.guard, key)
+            .map(|entry| entry.map(|entry| entry.kind.code()))
+            .map_err(|corrupt| corrupt.to_string())
+    }
 }
 
 /// Whether a unit's link maps the dependency image: a dev executable, which runs on the

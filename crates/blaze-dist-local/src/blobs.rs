@@ -9,11 +9,24 @@ use std::time::Duration;
 
 use crate::Error;
 use crate::pack::{Pack, hex};
-use blaze_wire::Digest;
+use blaze_wire::{Digest, Limits};
 use sha2::{Digest as _, Sha256};
 
-/// The most bytes one pack or list may be: what a client reads before refusing.
-const MOST: u64 = 16 << 30;
+/// Extra room for HTTP framing (including chunked transfers), not for value bytes.
+const HTTP_FRAMING_ROOM: u64 = 16 << 20;
+/// A peer cannot send unbounded headers even when the blob itself is large.
+const HTTP_HEADER_LIMIT: usize = 64 << 10;
+
+/// Only a successful pack GET may carry a documented blob. A missing
+/// pack, an HTTP error, a manifest or a PUT reply has the smaller
+/// request-body budget: an error response is never a multi-GiB blob.
+fn response_body_limit(method: &str, path: &str, status: u16) -> u64 {
+    if method == "GET" && status == 200 && path.starts_with("/v1/blob/") {
+        Limits::DOCUMENTED.blob
+    } else {
+        u64::from(Limits::DOCUMENTED.request)
+    }
+}
 
 /// Where packs are kept.
 #[derive(Clone, Debug)]
@@ -50,22 +63,7 @@ impl Blobs {
         stream.write_all(head.as_bytes())?;
         stream.write_all(body)?;
         stream.flush()?;
-        // Read one byte past the cap: reaching an exact read limit is not EOF.
-        // A truncated manifest must never masquerade as a complete published unit.
-        let mut reply = Vec::new();
-        stream
-            .take(MOST + 1)
-            .read_to_end(&mut reply)
-            .map_err(|error| read_failure(method, path, &reply, error))?;
-        if reply.len() as u64 > MOST {
-            let message = format!("{method} {path}: HTTP reply exceeds {MOST} bytes");
-            return Err(if committed_get_head(method, &reply) {
-                Error::Committed(message)
-            } else {
-                Error::Protocol(message)
-            });
-        }
-        decode_response(method, path, &reply)
+        read_response(&mut stream, method, path)
     }
 
     /// Puts `pack` under its name. The server hashes it before it is visible, so a pack that
@@ -170,9 +168,71 @@ fn read_failure(method: &str, path: &str, reply: &[u8], error: std::io::Error) -
     }
 }
 
-/// Decode a complete HTTP/1.1 response after the peer has closed its connection.
-/// Never treat a short body as a complete persisted manifest or pack.
-fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u8>), Error> {
+/// Read the head within its own budget, then apply the validated body framing.
+/// Never let a blob's much larger allowance become an allowance for headers.
+fn read_response(
+    stream: &mut impl std::io::Read,
+    method: &str,
+    path: &str,
+) -> Result<(u16, Vec<u8>), Error> {
+    let mut reply = Vec::new(); // alloc: this response, bounded before each read
+    let mut buffer = [0u8; 8192];
+    let head = loop {
+        // Include the delimiter, but no bytes beyond the largest valid head.
+        let room = HTTP_HEADER_LIMIT + 4 - reply.len();
+        if room == 0 {
+            let message = format!("{method} {path}: HTTP headers exceed {HTTP_HEADER_LIMIT} bytes");
+            return Err(if committed_get_head(method, &reply) {
+                Error::Committed(message)
+            } else {
+                Error::Protocol(message)
+            });
+        }
+        let amount = room.min(buffer.len());
+        let read = stream
+            .read(&mut buffer[..amount])
+            .map_err(|error| read_failure(method, path, &reply, error))?;
+        if read == 0 {
+            return decode_response(method, path, &reply);
+        }
+        // Only the last three old bytes can start a delimiter crossing reads.
+        let from = reply.len().saturating_sub(3);
+        reply.extend_from_slice(&buffer[..read]);
+        if reply[from..].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            break decode_head(method, path, &reply)?;
+        }
+    };
+    let most = response_body_limit(method, path, head.status).saturating_add(HTTP_FRAMING_ROOM);
+    // A fixed-length response has no chunk framing. Refuse its first excess
+    // byte instead of spending the remaining blob allowance on an invalid body.
+    let most = head.length.map_or(most, |length| most.min(head.body as u64 + length as u64));
+    if reply.len() as u64 <= most {
+        stream
+            .take(most + 1 - reply.len() as u64)
+            .read_to_end(&mut reply)
+            .map_err(|error| read_failure(method, path, &reply, error))?;
+    }
+    if reply.len() as u64 > most {
+        let message = format!("{method} {path}: HTTP reply exceeds {most} bytes");
+        return Err(if method == "GET" && head.status == 200 {
+            Error::Committed(message)
+        } else {
+            Error::Protocol(message)
+        });
+    }
+    decode_response(method, path, &reply)
+}
+
+struct ResponseHead {
+    status: u16,
+    body: usize,
+    length: Option<usize>,
+    chunked: bool,
+}
+
+/// The same header validation is used before receiving a body and when decoding
+/// a complete response, so an oversized declared length is refused before EOF.
+fn decode_head(method: &str, path: &str, reply: &[u8]) -> Result<ResponseHead, Error> {
     let invalid = |why: &str| Error::Protocol(format!("{method} {path}: {why}"));
     let end = reply.windows(4).position(|it| it == b"\r\n\r\n").ok_or_else(|| {
         if committed_get_head(method, reply) {
@@ -182,6 +242,14 @@ fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u
             invalid("no HTTP head")
         }
     })?;
+    if end > HTTP_HEADER_LIMIT {
+        let message = format!("{method} {path}: HTTP headers exceed {HTTP_HEADER_LIMIT} bytes");
+        return Err(if committed_get_head(method, reply) {
+            Error::Committed(message)
+        } else {
+            Error::Protocol(message)
+        });
+    }
     let head = std::str::from_utf8(&reply[..end]).map_err(|_| {
         if committed_get_head(method, reply) {
             // alloc: a corrupt committed reply must not be treated as a cache miss.
@@ -228,15 +296,43 @@ fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u
             chunked = true;
         }
     }
-    let body = &reply[end + 4..];
-    if chunked {
-        if length.is_some() {
-            return Err(invalid("ambiguous HTTP body framing"));
-        }
-        return Ok((status, unchunk(body).ok_or_else(|| invalid("a broken chunked body"))?));
+    let limit = response_body_limit(method, path, status);
+    if length.is_some_and(|expected| expected as u64 > limit) {
+        return Err(invalid("Content-Length exceeds the documented response body limit"));
     }
-    if method == "GET" && status == 200 && length.is_none() {
+    if chunked && length.is_some() {
+        return Err(invalid("ambiguous HTTP body framing"));
+    }
+    if method == "GET" && status == 200 && length.is_none() && !chunked {
         return Err(invalid("a successful GET has no explicit HTTP body length"));
+    }
+    Ok(ResponseHead { status, body: end + 4, length, chunked })
+}
+
+/// Decode a complete HTTP/1.1 response after the peer has closed its connection.
+/// Never treat a short body as a complete persisted manifest or pack.
+fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u8>), Error> {
+    let ResponseHead { status, body, length, chunked } = decode_head(method, path, reply)?;
+    let invalid = |why: &str| {
+        let message = format!("{method} {path}: {why}");
+        if method == "GET" && status == 200 {
+            Error::Committed(message)
+        } else {
+            Error::Protocol(message)
+        }
+    };
+    let body = &reply[body..];
+    let limit = response_body_limit(method, path, status);
+    if chunked {
+        let decoded = unchunk(body, limit)
+            .ok_or_else(|| invalid("a broken or oversized chunked body"))?;
+        if decoded.len() as u64 > limit {
+            return Err(invalid("chunked body exceeds the documented response body limit"));
+        }
+        return Ok((status, decoded));
+    }
+    if body.len() as u64 > limit {
+        return Err(invalid("HTTP body exceeds the documented response body limit"));
     }
     if let Some(expected) = length {
         if body.len() != expected {
@@ -246,7 +342,7 @@ fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u
     Ok((status, body.to_vec()))
 }
 
-fn unchunk(mut body: &[u8]) -> Option<Vec<u8>> {
+fn unchunk(mut body: &[u8], limit: u64) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     loop {
         let end = body.windows(2).position(|it| it == b"\r\n")?;
@@ -267,6 +363,11 @@ fn unchunk(mut body: &[u8]) -> Option<Vec<u8>> {
             }) {
                 return Some(out);
             }
+            return None;
+        }
+        // Check before extending: a rejected response may not allocate its
+        // over-limit decoded body first, even within the framing allowance.
+        if len as u64 > limit.saturating_sub(out.len() as u64) {
             return None;
         }
         let data = body.get(..len)?;
@@ -345,6 +446,219 @@ fn publish_verdict(
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::io::Read as _;
+
+    /// A socket surrogate that panics if a refusal consumes bytes past its
+    /// budget. A decode-only check after read_to_end cannot satisfy this oracle.
+    struct Budgeted<'a> {
+        bytes: &'a [u8],
+        fragment: usize,
+        consumed: usize,
+        budget: usize,
+    }
+
+    impl std::io::Read for Budgeted<'_> {
+        fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+            if self.bytes.is_empty() || into.is_empty() {
+                return Ok(0);
+            }
+            assert!(self.consumed < self.budget, "read past the early-refusal budget");
+            let n = into.len()
+                .min(self.fragment)
+                .min(self.bytes.len())
+                .min(self.budget - self.consumed);
+            into[..n].copy_from_slice(&self.bytes[..n]);
+            self.bytes = &self.bytes[n..];
+            self.consumed += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn response_limits_stop_the_reader_before_buffering_a_hostile_reply() {
+        let path = "/v1/blob/packs/test.pack";
+        let mut oversized = b"HTTP/1.1 200 OK\r\nX-Long: ".to_vec(); // alloc: bounded hostile head
+        oversized.resize(2 * HTTP_HEADER_LIMIT, b'a');
+        for fragment in [1, 3, 8192] {
+            let mut stream = Budgeted {
+                bytes: &oversized,
+                fragment,
+                consumed: 0,
+                budget: HTTP_HEADER_LIMIT + 4,
+            };
+            let error = read_response(&mut stream, "GET", path).unwrap_err();
+            assert!(matches!(&error, Error::Committed(why) if why.contains("headers exceed")));
+            assert!(stream.consumed <= HTTP_HEADER_LIMIT + 4);
+            assert!(matches!(
+                crate::agent::decide(&blaze_wire::LocalPolicy::Fallback, error),
+                Err(Error::Committed(_))
+            ));
+        }
+        // Plant the previous buffering order: this bounded reader must catch it
+        // before it can spend the blob allowance on header bytes.
+        let caught = std::panic::catch_unwind(|| {
+            let mut stream = Budgeted {
+                bytes: &oversized,
+                fragment: 8192,
+                consumed: 0,
+                budget: HTTP_HEADER_LIMIT + 4,
+            };
+            let most = response_body_limit("GET", path, 200) + HTTP_FRAMING_ROOM;
+            let mut reply = Vec::new(); // alloc: the bounded planted-bug fixture
+            (&mut stream).take(most + 1).read_to_end(&mut reply).unwrap();
+        });
+        assert!(caught.is_err(), "the oracle must catch checking the head only after EOF");
+
+        let mut boundary = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX: ".to_vec();
+        boundary.resize(HTTP_HEADER_LIMIT, b'a'); // alloc: one exactly legal header
+        boundary.extend_from_slice(b"\r\n\r\n");
+        let mut stream = boundary.as_slice();
+        assert_eq!(read_response(&mut stream, "GET", path).unwrap(), (200, Vec::new()));
+
+        for path in [path, "/v1/list/manifests/unit"] {
+            let length = response_body_limit("GET", path, 200) + 1;
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n");
+            let reply = format!("{head}must not read this body");
+            let mut stream = Budgeted {
+                bytes: reply.as_bytes(),
+                fragment: head.len(),
+                consumed: 0,
+                budget: head.len(),
+            };
+            assert!(matches!(
+                read_response(&mut stream, "GET", path),
+                Err(Error::Committed(why)) if why.contains("documented response body limit")
+            ));
+            assert_eq!(stream.consumed, head.len());
+        }
+        // The same oracle catches reading past a valid declared length before
+        // rejecting surplus bytes. The single excess byte proves the refusal.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n";
+        let mut reply = head.to_vec(); // alloc: a small fixed-length overrun fixture
+        reply.extend_from_slice(b"abcd");
+        let mut stream = Budgeted {
+            bytes: &reply,
+            fragment: head.len(),
+            consumed: 0,
+            budget: head.len() + 2,
+        };
+        assert!(matches!(read_response(&mut stream, "GET", path), Err(Error::Committed(_))));
+        assert_eq!(stream.consumed, head.len() + 2);
+    }
+
+    #[test]
+    fn fragmented_replies_preserve_body_boundaries_and_committed_refusals() {
+        let path = "/v1/list/manifests/unit";
+        for reply in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc".as_slice(),
+            b"HTTP/1.1 404 Not Found\r\n\r\nabsent".as_slice(),
+        ] {
+            for fragment in [1, 2, 7, 8192] {
+                let mut stream = Budgeted {
+                    bytes: reply,
+                    fragment,
+                    consumed: 0,
+                    budget: reply.len(),
+                };
+                match decode_response("GET", path, reply) {
+                    Ok(expected) => {
+                        assert_eq!(read_response(&mut stream, "GET", path).unwrap(), expected);
+                    }
+                    Err(Error::Committed(_)) => assert!(matches!(
+                        read_response(&mut stream, "GET", path), Err(Error::Committed(_))
+                    )),
+                    Err(other) => panic!("unexpected fixture refusal: {other}"),
+                }
+            }
+        }
+        let chunks = b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+        assert_eq!(unchunk(chunks, 5).unwrap(), b"abcde");
+        assert!(unchunk(chunks, 4).is_none(), "check the decoded budget before appending");
+    }
+
+    #[test]
+    fn error_responses_to_blob_gets_cannot_claim_blob_sized_bodies() {
+        let path = "/v1/blob/packs/test.pack";
+        let small = u64::from(Limits::DOCUMENTED.request);
+        assert_eq!(response_body_limit("GET", path, 200), Limits::DOCUMENTED.blob);
+        for status in [404, 500] {
+            assert_eq!(response_body_limit("GET", path, status), small);
+            let claimed = small + 1;
+            let head = format!(
+                "HTTP/1.1 {status} Error\r\nContent-Length: {claimed}\r\n\r\n"
+            );
+            // Even a peer sending its response one byte at a time must be
+            // refused before any body bytes can be read.
+            let mut stream = Budgeted {
+                bytes: head.as_bytes(),
+                fragment: 1,
+                consumed: 0,
+                budget: head.len(),
+            };
+            let error = read_response(&mut stream, "GET", path).unwrap_err();
+            assert!(matches!(
+                error,
+                Error::Protocol(why) if why.contains("documented response body limit")
+            ));
+            assert_eq!(stream.consumed, head.len());
+
+            // Chunked bodies use the same status-aware decoded limit,
+            // independent of their wire framing.
+            let chunked = format!(
+                "HTTP/1.1 {status} Error\r\nTransfer-Encoding: chunked\r\n\r\n{claimed:x}\r\n"
+            );
+            assert!(matches!(
+                decode_response("GET", path, chunked.as_bytes()),
+                Err(Error::Protocol(why)) if why.contains("oversized chunked body")
+            ));
+        }
+        // A real successful blob GET is not incorrectly capped at the
+        // manifest/error limit; it still needs the full documented blob budget.
+        let large = small + 1;
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {large}\r\n\r\n");
+        assert_eq!(
+            decode_head("GET", path, head.as_bytes()).unwrap().length,
+            Some(large as usize)
+        );
+    }
+
+    #[test]
+    fn committed_reply_bounds_follow_the_native_wire_contract() {
+        let blob = "/v1/blob/packs/abc.pack";
+        let manifest = "/v1/list/manifests/abc";
+        assert_eq!(response_body_limit("GET", blob, 200), Limits::DOCUMENTED.blob);
+        assert_eq!(
+            response_body_limit("GET", manifest, 200),
+            u64::from(Limits::DOCUMENTED.request)
+        );
+        assert_eq!(
+            response_body_limit("PUT", blob, 200),
+            u64::from(Limits::DOCUMENTED.request)
+        );
+        // A successful GET with a forged oversize length is a committed-data
+        // refusal, never permission to compile again under that immutable key.
+        let claimed = u64::from(Limits::DOCUMENTED.request) + 1;
+        let oversized =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {claimed}\r\n\r\n");
+        let refused = decode_response("GET", manifest, oversized.as_bytes()).unwrap_err();
+        assert!(matches!(
+            &refused,
+            Error::Committed(why) if why.contains("documented response body limit")
+        ));
+        assert!(matches!(
+            crate::agent::decide(&blaze_wire::LocalPolicy::Fallback, refused),
+            Err(Error::Committed(_))
+        ));
+        let mut excessive_headers = b"HTTP/1.1 200 OK\r\nX-Long: ".to_vec();
+        excessive_headers.extend(std::iter::repeat_n(b'a', HTTP_HEADER_LIMIT));
+        excessive_headers.extend_from_slice(b"\r\n\r\n");
+        assert!(matches!(
+            decode_response("GET", manifest, &excessive_headers),
+            Err(Error::Committed(_))
+        ));
+    }
 
     #[test]
     fn an_http_reply_must_end_at_its_declared_body_boundary() {

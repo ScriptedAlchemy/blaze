@@ -79,6 +79,8 @@ pub(super) enum RunError {
 /// Store reads with their real kind, for exporting warm tail hits as well as fresh puts.
 pub(super) trait Export: Lookup {
     fn value(&self, key: &Key) -> Result<Option<Value>, String>;
+    /// Read the kind without cloning a possibly large local value.
+    fn kind(&self, key: &Key) -> Result<Option<u8>, String>;
 }
 
 fn var<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -333,11 +335,18 @@ fn committed_agrees(
     Ok(())
 }
 
-impl<S: Lookup> Lookup for Overlay<'_, S> {
+impl<S: Export> Lookup for Overlay<'_, S> {
     fn read(&self, key: &Key) -> Result<Option<&[u8]>, String> {
         match self.store.read(key)? {
             Some(bytes) => {
-                committed_agrees(key, self.values, None, bytes, "the local store")?;
+                if self.values.contains_key(&key.0.0) {
+                    let kind = self.store.kind(key)?.ok_or_else(|| {
+                        format!("the local store has bytes but no kind for committed distributed key {key:?}")
+                    })?;
+                    committed_agrees(
+                        key, self.values, Some(kind), bytes, "the local store's kind and bytes",
+                    )?;
+                }
                 Ok(Some(bytes))
             }
             None => Ok(self.values.get(&key.0.0).map(|(_, bytes)| bytes.as_slice())),
@@ -352,7 +361,7 @@ pub(super) struct Recording<'a, S> {
     seen: RefCell<BTreeSet<Key>>,
 }
 
-impl<S: Lookup> Lookup for Recording<'_, S> {
+impl<S: Export> Lookup for Recording<'_, S> {
     fn read(&self, key: &Key) -> Result<Option<&[u8]>, String> {
         let bytes = self.overlay.read(key)?;
         if bytes.is_some() {
@@ -394,6 +403,23 @@ impl<S: Export> Recording<'_, S> {
                 &put.bytes,
                 "the completed unit's output",
             )?;
+            // New puts take precedence below, including over keys already read by the
+            // tail. Refuse a local contradiction before publishing a remote manifest,
+            // not later when the completed unit finally inserts its puts into the CAS.
+            if let Some(bytes) = self.overlay.store.read(&put.key)? {
+                let kind = self.overlay.store.kind(&put.key)?.ok_or_else(|| {
+                    format!( // alloc: a refusal naming the inconsistent local entry
+                        "the local store has bytes but no kind for output key {:?}",
+                        put.key
+                    )
+                })?;
+                if kind != put.kind.code() || bytes != put.bytes.as_slice() {
+                    return Err(format!( // alloc: a refusal naming the conflicting output
+                        "the completed unit's output under {:?} disagrees with the local store: two values under one immutable key",
+                        put.key
+                    ));
+                }
+            }
             match values.entry(put.key) {
                 std::collections::btree_map::Entry::Vacant(slot) => {
                     slot.insert(Value {
@@ -607,6 +633,10 @@ mod tests {
         fn value(&self, key: &Key) -> Result<Option<Value>, String> {
             Ok(self.0.get(key).cloned())
         }
+
+        fn kind(&self, key: &Key) -> Result<Option<u8>, String> {
+            Ok(self.0.get(key).map(|value| value.kind))
+        }
     }
 
     /// The former Overlay returned the local value first without comparing it with the
@@ -652,6 +682,10 @@ mod tests {
                 overlay: Overlay { store: &wrong_kind, values: &committed },
                 seen: RefCell::new(BTreeSet::new()),
             };
+            assert!(
+                recording.read(&key).unwrap_err().contains("committed distributed key"),
+                "a warm hit with the right bytes but wrong kind must stop before compilation"
+            );
             assert!(recording.value(&key).is_err(), "an exported local kind must also agree");
 
             let empty = Warm(BTreeMap::new());
@@ -675,6 +709,54 @@ mod tests {
                     accepted,
                     "the tail must refuse a conflicting put before immutable publication"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn tail_outputs_cannot_hide_local_cache_values_before_publication() {
+        let key = Key(ContentId([0x61; 32]));
+        let fresh = Key(ContentId([0x11; 32]));
+        let committed = BTreeMap::new();
+        for marker in 0..16u8 {
+            let expected = vec![marker, 0x40]; // alloc: deterministic local-cache fixture
+            let local = Warm(
+                [(key, Value { key: key.0.0, kind: Kind::Query.code(), bytes: expected.clone() })]
+                    .into(),
+            );
+            for consumed in [false, true] {
+                let recording = Recording {
+                    overlay: Overlay { store: &local, values: &committed },
+                    seen: RefCell::new(BTreeSet::new()),
+                };
+                if consumed {
+                    assert_eq!(recording.read(&key).unwrap(), Some(expected.as_slice()));
+                }
+                for (kind, bytes, accepted) in [
+                    (Kind::Query, expected.clone(), true),
+                    (Kind::Query, vec![marker ^ 1, 0x40], false),
+                    (Kind::Debug, expected.clone(), false),
+                ] {
+                    let built = Built {
+                        puts: vec![
+                            Put { key: fresh, kind: Kind::Query, bytes: vec![0x22] },
+                            Put { key, kind, bytes },
+                        ],
+                        ..Built::default()
+                    };
+                    let exported = recording.export(&built);
+                    assert_eq!(exported.is_ok(), accepted, "consumed={consumed}");
+                    if accepted {
+                        let exported = exported.unwrap();
+                        assert_eq!(exported.len(), 2);
+                        let value = exported.iter().find(|value| value.key == key.0.0).unwrap();
+                        assert_eq!(value.kind, Kind::Query.code());
+                        assert_eq!(value.bytes, expected);
+                    } else {
+                        assert!(exported.unwrap_err().contains("disagrees with the local store"));
+                    }
+                    assert_eq!(local.read(&key).unwrap(), Some(expected.as_slice()));
+                }
             }
         }
     }
