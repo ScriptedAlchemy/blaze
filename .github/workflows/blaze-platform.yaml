@@ -1,8 +1,9 @@
 # One platform of blaze.yaml: its unit tests, one build of blaze with both producers, and the
 # harnesses of the tier against that build, split into parts (harness/ci.py) that each run on a
 # machine of their own. The tiers `gate` (the merge gate's, blaze.yaml) and `warm` (a push to
-# main, which writes the caches the other runs read) are the unit tests and the build alone;
-# `full` is the release train's (train.yaml). Each platform builds on its own kind of machine,
+# main, which writes the caches the other runs read) also require real distributed acceptance
+# on Linux AArch64 after the build. `full` is the release train's (train.yaml).
+# Each platform builds on its own kind of machine,
 # so nothing is cross-compiled or emulated.
 #
 # Every platform runs on the GitHub-hosted image passed as os. Main's #69/#71
@@ -35,6 +36,10 @@ on:
         description: harness/bench.py on ripgrep against the stored baseline (not required)
         type: boolean
         default: false
+      microbench:
+        description: the workspace's benchmark harnesses, using this run's source-built Blaze
+        type: boolean
+        default: false
       smoke:
         description: the std cases of the smoke corpus (harness/smoke.py), in every tier
         type: boolean
@@ -43,6 +48,10 @@ on:
         description: "a JSON list of ci.py's harnesses (focused.yaml): these alone in place of the tier's parts, and no unit tests"
         type: string
         default: ""
+    outputs:
+      distributed_acceptance:
+        description: true only after dev and release distributed builds and their fault checks pass
+        value: ${{ jobs.distributed.outputs.accepted }}
 
 env:
   # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
@@ -241,12 +250,16 @@ jobs:
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
+      # Bind the binaries to this exact clean checkout before another job can run them.
+      - name: source and binary identity
+        run: |
+          $PYTHON .github/scripts/dist_build_identity.py '{"command": "seal", "binaries": "target/release"}'
       # The binaries run each other from next to themselves. A tar keeps them executable.
       - name: Pack
         working-directory: target/release
         run: |
           exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
-          tar -cf blaze.tar blaze-engine$exe blaze$exe
+          tar -cf blaze.tar blaze-engine$exe blaze$exe blaze-build.json
       - uses: actions/upload-artifact@v7
         with:
           name: blaze-${{ inputs.platform }}
@@ -276,6 +289,129 @@ jobs:
       # Why the daemon ended, when it did (the client does not say).
       - if: failure()
         uses: ./.github/actions/daemon-log
+
+  # The self-build is shared with the existing tests, profile gate and benchmark jobs. Only
+  # the coordinator and cache server are built here, by that Stage 1 in its own daemon home.
+  # The fixture's two workers share this runner's resources and verified reflink filesystem;
+  # their stores and targets are private, as distv2.py requires for cold-cache evidence.
+  distributed:
+    name: distributed acceptance (dev, release)
+    needs: build
+    if: inputs.harnesses == '' && inputs.platform == 'linux-arm64'
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 330
+    permissions:
+      contents: read
+    outputs:
+      accepted: ${{ steps.accepted.outputs.accepted }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Host/toolchain setup only: no second self-build. This also verifies reflinks and
+      # memlock, and stops its pinned seed before the isolated source-built daemon starts.
+      - uses: ./.github/actions/blaze
+        with:
+          job: distributed
+          llvm: true
+          reflink: "true"
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: ${{ runner.temp }}/dist-binaries
+      - name: verify the source-built Blaze handoff
+        id: handoff
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist-evidence"
+          tar -xf "$RUNNER_TEMP/dist-binaries/blaze.tar" -C "$RUNNER_TEMP/dist-binaries"
+          jq -n --arg bin "$RUNNER_TEMP/dist-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          cp "$RUNNER_TEMP/dist-binaries/blaze-build.json" "$RUNNER_TEMP/dist-evidence/stage1-build.json"
+      - name: build the coordinator and cache server with Stage 1
+        id: services
+        timeout-minutes: 60
+        env:
+          BLAZE_HOME: ${{ runner.temp }}/blaze-fs/dist-builder
+          BLAZE_CACHE: ${{ runner.temp }}/blaze-fs/dist-builder/v2/store
+          BLAZE_DAEMON_MEMORY_GB: "12"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/blaze-fs/dist-service-build
+        run: |
+          "$RUNNER_TEMP/dist-binaries/blaze" --ignore-pin build --release --locked -p blaze-dist-local -p blaze-serve --bins \
+            2>&1 | tee "$RUNNER_TEMP/dist-evidence/services-build.log"
+      - name: stop the isolated Stage 1 builder
+        if: always() && steps.handoff.outcome == 'success' && steps.services.outcome != 'skipped'
+        env:
+          BLAZE_HOME: ${{ runner.temp }}/blaze-fs/dist-builder
+        run: '"$RUNNER_TEMP/dist-binaries/blaze" --ignore-pin stop'
+      - name: bind the four acceptance programs to the same source
+        run: |
+          jq -n --arg bin "$RUNNER_TEMP/dist-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          for program in blaze-dist-local blaze-serve; do
+            cp "$RUNNER_TEMP/blaze-fs/dist-service-build/release/$program" "$RUNNER_TEMP/dist-binaries/$program"
+          done
+          jq -n --arg bin "$RUNNER_TEMP/dist-binaries" '{command: "seal", binaries: $bin, services: true}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          cp "$RUNNER_TEMP/dist-binaries/blaze-build.json" "$RUNNER_TEMP/dist-evidence/acceptance-build.json"
+          # The disposable fixture has no committed lock files. Run.env strips inherited
+          # BLAZE_* settings, so its explicit input must allow writing those fixture locks.
+          jq -n --arg bin "$RUNNER_TEMP/dist-binaries" --arg scratch "$RUNNER_TEMP/blaze-fs/dist-dev" \
+            '{blaze: ($bin + "/blaze"), dist_local: ($bin + "/blaze-dist-local"), serve: ($bin + "/blaze-serve"),
+              scratch: $scratch, faults: true, cores: 2, daemon_memory_gb: 6,
+              env: {BLAZE_LOCK: "write"}}' \
+            > "$RUNNER_TEMP/dist-evidence/dev-input.json"
+          jq --arg scratch "$RUNNER_TEMP/blaze-fs/dist-release" \
+            '. + {scratch: $scratch, args: ["--release"], profile: "release", release_fold: true}' \
+            "$RUNNER_TEMP/dist-evidence/dev-input.json" > "$RUNNER_TEMP/dist-evidence/release-input.json"
+      # Every case uses actual compilation, publication and lease evidence. Never disable
+      # faults or substitute distv2/selfcheck.py here: that checks only planted oracle bugs.
+      - name: dev two-worker, cold-cache, cross-PR and fault acceptance
+        timeout-minutes: 120
+        run: |
+          python3 harness/distv2.py "$RUNNER_TEMP/dist-evidence/dev-input.json" \
+            2>&1 | tee "$RUNNER_TEMP/dist-evidence/dev.log"
+      - name: release and folded-group two-worker and fault acceptance
+        timeout-minutes: 120
+        run: |
+          python3 harness/distv2.py "$RUNNER_TEMP/dist-evidence/release-input.json" \
+            2>&1 | tee "$RUNNER_TEMP/dist-evidence/release.log"
+      - name: both complete fault runs used unchanged binaries and source
+        id: accepted
+        run: |
+          jq -n --arg bin "$RUNNER_TEMP/dist-binaries" '{command: "verify", binaries: $bin, services: true}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          for profile in dev release; do
+            grep -Fxq 'distv2: every check passed' "$RUNNER_TEMP/dist-evidence/$profile.log" \
+              || { echo "::error::distributed $profile run has no complete fault acceptance"; exit 1; }
+          done
+          echo 'accepted=true' >> "$GITHUB_OUTPUT"
+      - name: keep distributed evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: distributed-${{ inputs.platform }}
+          path: |
+            ${{ runner.temp }}/dist-evidence
+            ${{ runner.temp }}/blaze-fs/dist-*/provenance.json
+            ${{ runner.temp }}/blaze-fs/dist-*/source.patch
+            ${{ runner.temp }}/blaze-fs/dist-*/artifacts.json
+            ${{ runner.temp }}/blaze-fs/dist-*/corruption.json
+            ${{ runner.temp }}/blaze-fs/dist-*/logs
+            ${{ runner.temp }}/blaze-fs/dist-*/gates
+            ${{ runner.temp }}/blaze-fs/dist-*/blobs/manifests
+            ${{ runner.temp }}/blaze-fs/dist-builder/v2/serve.log
+          retention-days: 14
+          if-no-files-found: error
+
+  microbench:
+    name: workspace microbenchmarks
+    if: inputs.microbench && inputs.harnesses == ''
+    needs: build
+    uses: ./.github/workflows/bench.yaml
+    with:
+      artifact: blaze-${{ inputs.platform }}
+      platform: ${{ inputs.platform }}
+      os: ${{ inputs.os }}
 
   # The profile's gate (crates/blaze-profile/src/gate.rs, docs/profiling.md "The gate") over the
   # history the build job's self-build wrote, run by the blaze this tree built and held to
