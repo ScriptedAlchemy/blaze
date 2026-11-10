@@ -10,6 +10,8 @@ Every wait is bounded. A failed startup runs no cases; a case timeout stops the 
 cases cannot overlap the daemon's cancelled work. `results.json` is checkpointed after each
 case, including failures and cases not reached. `run.json` records setup/cleanup failures;
 only a zero exit with every selected case ok is an acceptance result.
+Compiler rejections require an error-level machine diagnostic and a failed build verdict;
+cached replay must reproduce every reported artifact byte for byte in a new target directory.
 """
 from __future__ import annotations
 
@@ -78,7 +80,9 @@ def provenance(given: Input) -> dict:
     if engine.is_file():
         binaries.append(engine)
     # Include this lane's fixtures even when the compiler came from a separate frozen tree.
-    harness = [Path(__file__).resolve(), *sorted((HERE / "forkfixes").glob("*.py"))]
+    harness = [Path(__file__).resolve(), HERE / "storelib.py",
+               *sorted((HERE / "forkfixes").glob("*.py")),
+               *sorted((HERE.parent / "tools" / "typed-input" / "src").rglob("*.py"))]
     return {
         "source": str(source), "head": git("rev-parse", "HEAD").strip(),
         "git_tree": git("rev-parse", "HEAD^{tree}").strip(),
@@ -103,7 +107,10 @@ def env_for(scratch: Path, home: str = "home") -> dict[str, str]:
     for name in ("BLAZE_LIBRARY", "BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB", "BLAZE_HUGE_PAGES"):
         if name in os.environ:
             env[name] = os.environ[name]
-    env.update(BLAZE_HOME=str(scratch / home), TMPDIR=str(scratch / "tmp"), RUST_BACKTRACE="0")
+    # Every fixture is new and has no lockfile. CI's default lock policy must not refuse
+    # dependency resolution before the compiler behaviour under test is reached.
+    env.update(BLAZE_HOME=str(scratch / home), BLAZE_LOCK="write",
+               TMPDIR=str(scratch / "tmp"), RUST_BACKTRACE="0")
     (scratch / "tmp").mkdir(parents=True, exist_ok=True)
     return env
 
@@ -157,6 +164,39 @@ def said(log: Path) -> str:
     return "\n".join(log.with_suffix(suffix).read_text(errors="replace") for suffix in (".stdout", ".stderr"))
 
 
+def diagnosed(output: str, expected: str) -> bool:
+    """An error's code or message, never a quoted source line or an unrelated process log."""
+    for message in messages(output, "compiler-message"):
+        diagnostic = message.get("message")
+        if not isinstance(diagnostic, dict) or diagnostic.get("level") != "error":
+            continue
+        code = diagnostic.get("code")
+        if expected.startswith("E") and expected[1:].isdigit():
+            if isinstance(code, dict) and code.get("code") == expected:
+                return True
+        elif isinstance(diagnostic.get("message"), str) and expected in diagnostic["message"]:
+            return True
+    return False
+
+
+def artifact_hashes(output: str, executable: str, target: Path) -> dict[str, str]:
+    """Every reported output must exist; relative paths make restored outputs comparable."""
+    paths = {executable}
+    for built in messages(output, "compiler-artifact"):
+        paths.update(built.get("filenames", ()))
+    hashes = {}
+    for name in sorted(paths):
+        path = Path(name)
+        try:
+            relative = path.relative_to(target)
+        except ValueError as error:
+            raise Failed(f"reported artifact is outside the requested target directory {target}: {path}") from error
+        if not path.is_file():
+            raise Failed(f"reported artifact does not exist: {path}")
+        hashes[str(relative)] = sha256(path)
+    return hashes
+
+
 class Daemon:
     def __init__(self, given: Input, scratch: Path):
         self.given, self.scratch = given, scratch
@@ -169,7 +209,7 @@ class Daemon:
         return env_for(self.scratch, self.home)
 
     def status(self, log: Path, timeout: float = 10) -> int | None:
-        result = command([self.given.blaze, "status", "--json"], self.scratch, self.env, log, timeout)
+        result = command([self.given.blaze, "--ignore-pin", "status", "--json"], self.scratch, self.env, log, timeout)
         if result["returncode"] != 0:
             raise Failed(f"daemon status exited {result['returncode']}: {log}.*")
         status = blaze_status_of(log.with_suffix(".stdout").read_text())
@@ -178,7 +218,7 @@ class Daemon:
     def start(self) -> None:
         self.generation += 1
         log = self.scratch / "logs" / f"daemon-{self.generation}"
-        argv = [self.given.blaze, "serve"]
+        argv = [self.given.blaze, "--ignore-pin", "serve"]
         if self.given.stall_bound is not None:
             argv += ["--stall-bound", str(self.given.stall_bound)]
         with log.with_suffix(".log").open("w") as out:
@@ -210,7 +250,7 @@ class Daemon:
         if self.process is None:
             return
         try:
-            result = command([self.given.blaze, "stop"], self.scratch, self.env,
+            result = command([self.given.blaze, "--ignore-pin", "stop"], self.scratch, self.env,
                              self.scratch / "logs" / f"stop-{self.generation}", 60)
             if result["returncode"] != 0:
                 raise Failed(f"blaze stop exited {result['returncode']}")
@@ -225,8 +265,8 @@ class Daemon:
     def replay(self) -> None:
         self.stop()
         # A new home has no daemon image or query state, only the first run's immutable store.
-        store = Path(self.env["BLAZE_HOME"]) / "v2" / "store"
-        self.home = "replay-home"
+        store = (Path(self.env["BLAZE_HOME"]) / "v2" / "store").resolve(strict=True)
+        self.home = f"replay-home-{self.generation}"
         target = Path(self.env["BLAZE_HOME"]) / "v2" / "store"
         target.parent.mkdir(parents=True)
         target.symlink_to(store, target_is_directory=True)
@@ -241,7 +281,8 @@ def run_case(daemon: Daemon, case: dict) -> tuple[bool, str]:
     write(root, files)
     save(root / "sources.json", {name: sha256(root / name) for name in sorted(files)})
     logs = scratch / "logs" / case["name"]
-    steps = case.get("steps", [{key: case[key] for key in ("prints", "error", "test") if key in case}])
+    steps = case.get("steps", [{key: case[key] for key in ("prints", "diagnostic", "error", "test") if key in case}])
+    previous_artifacts = None
     for index, step in enumerate(steps):
         if "files" in step:
             files.update(step["files"])
@@ -251,15 +292,27 @@ def run_case(daemon: Daemon, case: dict) -> tuple[bool, str]:
         daemon.check(log.with_name(f"{index}-before"))
         if step.get("replay"):
             daemon.replay()
-        target = scratch / "targets" / case["name"] / ("replay" if step.get("replay") else "initial")
-        argv = [given.blaze, "test" if "test" in step else "build", "--target-dir", str(target),
+        target = scratch / "targets" / case["name"] / (f"replay-{index}" if step.get("replay") else "initial")
+        env = daemon.env.copy()
+        for name, value in step.get("env", {}).items():
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = value
+        argv = [given.blaze, "--ignore-pin", "test" if "test" in step else "build", "--target-dir", str(target),
                 "--message-format=json", *(["--reached"] if "test" in step else []), *step.get("args", ())]
-        result = command(argv, root, daemon.env, log, given.timeout)
+        result = command(argv, root, env, log, given.timeout)
         daemon.check(log.with_name(f"{index}-after"))
         output = said(log)
+        if "diagnostic" in step:
+            finished = messages(output, "build-finished")
+            if (result["returncode"] <= 0 or not diagnosed(output, step["diagnostic"])
+                    or len(finished) != 1 or finished[0].get("success") is not False):
+                return False, f"step {index}: expected compiler diagnostic {step['diagnostic']!r} and a failed build verdict, exit {result['returncode']}; {log}.*"
+            continue
         if "error" in step:
             if result["returncode"] <= 0 or step["error"] not in output:
-                return False, f"step {index}: expected diagnostic {step['error']!r}, exit {result['returncode']}; {log}.*"
+                return False, f"step {index}: expected CLI refusal {step['error']!r}, exit {result['returncode']}; {log}.*"
             continue
         if result["returncode"] != 0:
             return False, f"step {index}: build/test exited {result['returncode']}; {log}.*"
@@ -278,17 +331,16 @@ def run_case(daemon: Daemon, case: dict) -> tuple[bool, str]:
         executable = artifact(output, program)
         if not executable:
             return False, f"step {index}: build reported no executable for {program}; {log}.*"
-        paths = {executable}
-        for built in messages(output, "compiler-artifact"):
-            paths.update(built.get("filenames", ()))
-        save(log.with_name(f"{index}-artifacts.json"), {
-            path: sha256(Path(path)) for path in sorted(paths) if Path(path).is_file()
-        })
+        hashes = artifact_hashes(output, executable, target)
+        save(log.with_name(f"{index}-artifacts.json"), {"target": str(target), "sha256": hashes})
+        if step.get("replay") and (previous_artifacts is None or hashes != previous_artifacts):
+            return False, f"step {index}: store replay changed the artifact set or bytes; {logs}/*-artifacts.json"
         ran_log = logs / f"{index}-run"
-        ran = command([executable], root, daemon.env, ran_log, 120)
+        ran = command([executable], root, env, ran_log, 120)
         got = ran_log.with_suffix(".stdout").read_text().splitlines()
         if ran["returncode"] != 0 or got != step["prints"]:
             return False, f"step {index}: exit {ran['returncode']}, printed {got!r}, expected {step['prints']!r}; {ran_log}.*"
+        previous_artifacts = hashes
     return True, f"{len(steps)} steps as stated; {logs}"
 
 
@@ -310,7 +362,7 @@ def main(given: Input) -> int:
         before = provenance(given)
         save(scratch / "provenance.json", before)
         save(scratch / "environment.json", {name: daemon.env.get(name) for name in (
-            "BLAZE_HOME", "BLAZE_LIBRARY", "BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB", "BLAZE_HUGE_PAGES",
+            "BLAZE_HOME", "BLAZE_LIBRARY", "BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB", "BLAZE_HUGE_PAGES", "BLAZE_LOCK",
             "LLVM_SYS_231_PREFIX", "XDG_CACHE_HOME", "TMPDIR", "RUST_BACKTRACE")})
         daemon.start()
         for case in selected:

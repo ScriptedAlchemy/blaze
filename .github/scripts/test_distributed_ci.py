@@ -148,7 +148,8 @@ class AcceptanceGateTests(unittest.TestCase):
     def test_aggregate_requires_real_acceptance_for_every_code_tier(self):
         base = {"changes": {"result": "success", "outputs": {"tier": "gate"}},
                 "scripts": {"result": "success", "outputs": {}},
-                "linux-arm64": {"result": "success", "outputs": {"distributed_acceptance": "true"}}}
+                "linux-arm64": {"result": "success", "outputs": {
+                    "distributed_acceptance": "true", "forkfixes_acceptance": "true"}}}
         cases = [("gate passes", base, True)]
         warm = copy.deepcopy(base)
         warm["changes"]["outputs"]["tier"] = "warm"
@@ -157,7 +158,9 @@ class AcceptanceGateTests(unittest.TestCase):
         docs["changes"]["outputs"]["tier"] = "none"
         docs["linux-arm64"] = {"result": "skipped", "outputs": {}}
         cases.append(("docs need no build", docs, True))
-        for missing in ({}, {"distributed_acceptance": ""}, {"distributed_acceptance": "false"}):
+        for missing in ({}, {"distributed_acceptance": ""}, {"distributed_acceptance": "false"},
+                        {"distributed_acceptance": "true"}, {"forkfixes_acceptance": "true"},
+                        {"distributed_acceptance": "true", "forkfixes_acceptance": "false"}):
             changed = copy.deepcopy(base)
             changed["linux-arm64"]["outputs"] = missing
             cases.append((f"missing acceptance {missing}", changed, False))
@@ -207,6 +210,26 @@ class AcceptanceGateTests(unittest.TestCase):
                 _, env = self.shell_fixture(Path(directory), code=23)
                 done = self.run_shell(PLATFORM, step, env)
                 self.assertEqual(done.returncode, 23, done.stdout + done.stderr)
+
+    def test_source_built_protocol_test_failure_reaches_ci(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, env = self.shell_fixture(root)
+            binaries = root / "dist-binaries"
+            binaries.mkdir()
+            blaze = binaries / "blaze"
+            blaze.write_text("#!/bin/sh\nprintf '%s\\n' 'a protocol test failed'\nexit 23\n")
+            blaze.chmod(0o700)
+            done = self.run_shell(PLATFORM, "distributed protocol and carrier tests with Stage 1", env)
+            self.assertEqual(done.returncode, 23, done.stdout + done.stderr)
+
+    def test_fork_migration_harness_failure_reaches_ci(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, env = self.shell_fixture(root, code=23)
+            (root / "forkfixes-evidence").mkdir()
+            done = self.run_shell(PLATFORM, "every fork migration fixture with Stage 1", env)
+            self.assertEqual(done.returncode, 23, done.stdout + done.stderr)
 
     def test_ci_generated_inputs_keep_explicit_lock_policy_in_child_environment(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -52,6 +52,9 @@ on:
       distributed_acceptance:
         description: true only after dev and release distributed builds and their fault checks pass
         value: ${{ jobs.distributed.outputs.accepted }}
+      forkfixes_acceptance:
+        description: true only after every Linux fork migration fixture passes with this source-built Blaze
+        value: ${{ jobs.forkfixes.outputs.accepted }}
 
 env:
   # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
@@ -299,7 +302,7 @@ jobs:
     needs: build
     if: inputs.harnesses == '' && inputs.platform == 'linux-arm64'
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 330
+    timeout-minutes: 355
     permissions:
       contents: read
     outputs:
@@ -338,6 +341,23 @@ jobs:
         run: |
           "$RUNNER_TEMP/dist-binaries/blaze" --ignore-pin build --release --locked -p blaze-dist-local -p blaze-serve --bins \
             2>&1 | tee "$RUNNER_TEMP/dist-evidence/services-build.log"
+      # These protocol, publication and transport crates are not in unittests.py's crate
+      # list. Run their real default library/integration targets, including Hegel controls,
+      # with the same Stage 1 that builds the acceptance services. Cached test passes alone
+      # do not satisfy this lane: verify reruns the tests and compares the result.
+      - name: distributed protocol and carrier tests with Stage 1
+        id: protocol-tests
+        timeout-minutes: 75
+        env:
+          BLAZE_HOME: ${{ runner.temp }}/blaze-fs/dist-builder
+          BLAZE_CACHE: ${{ runner.temp }}/blaze-fs/dist-builder/v2/store
+          BLAZE_DAEMON_MEMORY_GB: "12"
+          BLAZE_TESTS: verify
+          CARGO_TARGET_DIR: ${{ runner.temp }}/blaze-fs/dist-service-build
+        run: |
+          "$RUNNER_TEMP/dist-binaries/blaze" --ignore-pin test --release --locked \
+            -p blaze-wire -p blaze-dist -p blaze-dist-local -p blaze-serve --lib --tests --no-fail-fast \
+            2>&1 | tee "$RUNNER_TEMP/dist-evidence/protocol-tests.log"
       - name: stop the isolated Stage 1 builder
         if: always() && steps.handoff.outcome == 'success' && steps.services.outcome != 'skipped'
         env:
@@ -400,6 +420,69 @@ jobs:
             ${{ runner.temp }}/blaze-fs/dist-*/gates
             ${{ runner.temp }}/blaze-fs/dist-*/blobs/manifests
             ${{ runner.temp }}/blaze-fs/dist-builder/v2/serve.log
+          retention-days: 14
+          if-no-files-found: error
+
+  # The fork's retained compiler and build semantics have explicit expectations. One
+  # source-built compiler runs every fixture; a filtered or incomplete run has no receipt.
+  forkfixes:
+    name: fork migration acceptance
+    needs: build
+    if: inputs.harnesses == '' && inputs.platform == 'linux-arm64'
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 180
+    outputs:
+      accepted: ${{ steps.accepted.outputs.accepted }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/blaze
+        with:
+          job: forkfixes
+          llvm: true
+          reflink: "true"
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: ${{ runner.temp }}/forkfixes-binaries
+      - name: verify the fork migration compiler and prepare its input
+        run: |
+          mkdir -p "$RUNNER_TEMP/forkfixes-evidence"
+          tar -xf "$RUNNER_TEMP/forkfixes-binaries/blaze.tar" -C "$RUNNER_TEMP/forkfixes-binaries"
+          jq -n --arg bin "$RUNNER_TEMP/forkfixes-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          cp "$RUNNER_TEMP/forkfixes-binaries/blaze-build.json" "$RUNNER_TEMP/forkfixes-evidence/stage1-build.json"
+          jq -n --arg blaze "$RUNNER_TEMP/forkfixes-binaries/blaze" \
+            --arg scratch "$RUNNER_TEMP/blaze-fs/forkfixes" --arg source "$PWD" \
+            '{blaze: $blaze, scratch: $scratch, source: $source, timeout: 1800}' \
+            > "$RUNNER_TEMP/forkfixes-evidence/input.json"
+      - name: every fork migration fixture with Stage 1
+        timeout-minutes: 165
+        env:
+          BLAZE_DAEMON_MEMORY_GB: "12"
+        run: |
+          python3 harness/forkfixes.py "$RUNNER_TEMP/forkfixes-evidence/input.json" \
+            2>&1 | tee "$RUNNER_TEMP/forkfixes-evidence/acceptance.log"
+      - name: all migration fixtures used unchanged binaries and source
+        id: accepted
+        run: |
+          jq -n --arg bin "$RUNNER_TEMP/forkfixes-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          jq -n --arg scratch "$RUNNER_TEMP/blaze-fs/forkfixes" '{scratch: $scratch}' \
+            | python3 .github/scripts/forkfixes_acceptance.py -
+          echo 'accepted=true' >> "$GITHUB_OUTPUT"
+      - name: keep migration evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: forkfixes-${{ inputs.platform }}
+          path: |
+            ${{ runner.temp }}/forkfixes-evidence
+            ${{ runner.temp }}/blaze-fs/forkfixes/*.json
+            ${{ runner.temp }}/blaze-fs/forkfixes/logs
+            ${{ runner.temp }}/blaze-fs/forkfixes/cases
+            ${{ runner.temp }}/blaze-fs/forkfixes/*/v2/serve.log
           retention-days: 14
           if-no-files-found: error
 

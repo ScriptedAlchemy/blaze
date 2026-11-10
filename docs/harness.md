@@ -496,7 +496,23 @@ crate and a build script's output. `{"args": ["--release"], "profile": "release"
 under LLVM.
 
 `harness/forkfixes.py` holds the behaviour of the fixes the fork made to V1's front end
-(`harness/forkfixes/cases.py`): each case is a program, and what rustc 1.99 does with it.
+(`harness/forkfixes/cases.py`): each case states its expected output, executed test or compiler
+diagnostic. Blaze builds and runs each one; no reference compiler is invoked. A compiler
+rejection needs an error-level JSON diagnostic and a failed `build-finished` verdict. Edit
+sequences remove and restore the cause, and caller-environment sequences set, change and unset
+inputs while the daemon stays alive. The native-library replay starts a new daemon on the
+same store with an empty target directory, must compile nothing, and must reproduce every
+reported artifact byte for byte. Results, complete logs and source, harness and binary hashes
+remain in the required empty `scratch` directory. A passing run settles only its selected
+cases; the rebase map still requires a result on a named compiler tree. Every Blaze invocation
+uses `--ignore-pin` to retain the requested compiler, and the fresh fixture environment sets
+`BLAZE_LOCK=write` so CI can resolve its new lockfiles.
+
+The Linux AArch64 platform job runs the full suite after its source build, using that build's
+verified compiler artifact. Its acceptance receipt requires every current case and migration
+mapping to pass, unchanged source and binaries, and successful cleanup. A filtered run or missing
+result cannot satisfy the merge gate. Native Windows compiler and bootstrap behavior still needs
+a Windows run; the portable fixtures make no such claim.
 
 ## The fuzzer
 
@@ -537,7 +553,7 @@ For a CI failure, the last line of the harness step lists which scripts failed.
 
 ## CI
 
-CI is a **merge gate** that takes minutes, and a **release train** that runs everything else on
+CI is a **merge gate** for pull requests and the merge queue, and a **release train** on
 main after the merge and releases main when it is green. Both call `blaze-platform.yaml` once
 for each platform, each on a machine of its own kind.
 
@@ -546,6 +562,8 @@ for each platform, each on a machine of its own kind.
 | `blaze.yaml` (`gate`) | pull request and merge group | on hosted Linux AArch64: blaze builds and tests itself through `harness/unittests.py`, the released blaze checks the workspace, the profile gate checks the build history, and the script and workflow jobs check the Python, rules, docs and runner policy. The store starts empty; the build hands its packs to the tests job. Lint baselines and the x86-64 cross build run outside `ci` until their existing blockers are settled | hosted runtime not measured in this integration |
 | `blaze.yaml` (`warm`) | push to main | the build and tests on hosted Linux AArch64 and macOS, with a fresh store per job; the AArch64 smoke job also runs. The existing canary and release workflows consume the resulting checks and artifacts | |
 | `blaze-platform.yaml` (`profile-gate`) | with each platform's build, but Windows | the profile's gate (`blaze debug gate`, [profiling.md](profiling.md#the-gate-what-a-profile-must-hold)) over the history the build's self-build wrote, with the blaze it made, held to `harness/profile-gate-known.toml`, and each fixture of `crates/blaze-profile/fixtures/gate/` failing its own check (`harness/profile_gate.py`); uploads the build's per-build summary as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`. No secret | a few min |
+| `blaze-platform.yaml` (`distributed`) | after the Linux AArch64 source build | the source-built compiler runs the distributed crates' tests, builds the services, and runs `harness/distv2.py` in dev and release with every fault check; a complete receipt is required by `ci` | runtime not yet measured |
+| `blaze-platform.yaml` (`forkfixes`) | after the Linux AArch64 source build | all `harness/forkfixes.py` semantic migration cases with that same compiler; complete case, mapping and provenance evidence is required by `ci` | runtime not yet measured |
 | `profile-nightly.yaml` | nightly, by hand | `slower_between_commits` over main's last 10 summaries of one runner class, the newest against the rest (`harness/profile_trend.py`); fails naming each span 1.25 times and 50 ms slower or more | 5 min |
 | `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file | 2 min |
 | `train.yaml` | push to main, by hand | everything below, then a release or the train's issue | about 45 min |
@@ -556,7 +574,8 @@ change runs the two scripts alone. `.github/scripts/gate_changes.py` (the `chang
 those files, and why each: the crates (`crates/`, with their test data and the LLVM pin
 `crates/hir-ty-codegen/llvm.json`), the vendored crates
 (`vendor/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`, the
-pinned nightly (`harness/toolchain`), `harness/unittests.py`, `.github/scripts/llvm.py`
+pinned nightly (`harness/toolchain`), `harness/unittests.py`, the distributed and fork migration
+harnesses and their fixtures, `.github/scripts/llvm.py`
 (which fetches the pinned LLVM), the profile gate's script and known list
 (`harness/profile_gate.py`, `harness/profile-gate-known.toml`) and the flake that pins its
 DuckDB (`flake.nix`, `flake.lock`), the release of blaze that builds blaze (`.github/blaze-version`,

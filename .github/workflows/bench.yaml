@@ -23,6 +23,13 @@ on:
         required: true
   workflow_dispatch:
     # By hand, build Stage 1 explicitly; PRs and main reuse blaze-platform.yaml's build.
+    inputs:
+      os:
+        description: the hosted Linux ARM64 runner for a standalone benchmark
+        type: choice
+        options: [ubuntu-24.04-arm]
+        default: ubuntu-24.04-arm
+        required: true
 
 permissions:
   contents: read
@@ -50,7 +57,7 @@ defaults:
 jobs:
   tango:
     name: tango
-    runs-on: ${{ inputs.os || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ inputs.os }}
     # Includes a source bootstrap only for workflow_dispatch; normal CI shares the build.
     timeout-minutes: 240
     steps:

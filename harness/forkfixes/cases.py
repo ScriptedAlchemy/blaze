@@ -7,19 +7,19 @@ CASES = [
         "name": "raw-duplicate-import",
         "fixes": ["47b6a115c", "f36949f1c"],
         "files": {MAIN: "mod a { pub fn x() {} }\nmod b { pub fn x() {} }\nuse a::r#x;\nuse b::x;\nfn main() { x(); }\n"},
-        "error": "E0252",
+        "diagnostic": "E0252",
     },
     {
         "name": "unresolved-paths",
         "fixes": ["cf529a630"],
         "files": {MAIN: "mod m {}\nfn main() { let _ = m::missing; }\n"},
-        "error": "E0425",
+        "diagnostic": "E0425",
     },
     {
         "name": "unresolved-bare-value",
         "fixes": ["cf529a630"],
         "files": {MAIN: "fn main() { let _ = missing_value; }\n"},
-        "error": "E0425",
+        "diagnostic": "E0425",
     },
     {
         "name": "attribute-impl-in-function",
@@ -75,7 +75,7 @@ impl Trait for i32 {}
 fn wrong<'a, 'b>(_: &'a dyn Trait, y: &'b dyn Trait) -> &'a dyn Trait { y }
 fn main() { let (a, b) = (1, 2); let _ = wrong(&a, &b); }
 """},
-        "error": "lifetime may not live long enough",
+        "diagnostic": "lifetime may not live long enough",
     },
     {
         "name": "borrowed-object-is-not-static",
@@ -85,7 +85,7 @@ impl Trait for i32 {}
 fn static_object(x: &dyn Trait) -> &(dyn Trait + 'static) { x }
 fn main() { let a = 1; let _ = static_object(&a); }
 """},
-        "error": "lifetime may not live long enough",
+        "diagnostic": "lifetime may not live long enough",
     },
     {
         "name": "elided-object-through-a-call",
@@ -100,7 +100,7 @@ fn local_call<'a>() -> Holder<'a> {
 }
 fn main() { let _ = local_call().value; }
 """},
-        "error": "E0515",
+        "diagnostic": "E0515",
     },
     {
         "name": "column-counts-scalars",
@@ -137,10 +137,20 @@ fn main() {
     println!("{}", p());
     println!("{}", 0u8.m());
     let d: &dyn T = &0u8;
-    println!("{}", d.m() > 0);
+    println!("{}", d.m());
+    let method: fn(&u8) -> u32 = <u8 as T>::m;
+    println!("{}", method(&0u8));
+    let plain: &dyn U = &0u8;
+    println!("{}", plain.n());
+    println!("{}", 0u8.n());
+}
+trait U { fn n(&self) -> u32; }
+impl U for u8 {
+    #[track_caller]
+    fn n(&self) -> u32 { Location::caller().line() }
 }
 """},
-        "prints": ["7", "3", "10", "true"],
+        "prints": ["7", "3", "10", "12", "4", "22", "17"],
     },
     {
         "name": "empty-array-promoted-through-iter-mut",
@@ -259,7 +269,7 @@ required-features = ["hostdep/extra"]
         "steps": [
             {"prints": ["false true"], "absent": ["needs"]},
             {"program": "host-needs", "prints": ["host false true"], "absent": ["needs"]},
-            {"args": ["--bin", "needs"], "error": "dep/extra"},
+            {"args": ["--bin", "needs"], "error": "target `needs` in package `app` requires the features: `dep/extra`"},
             {"args": ["--features", "dep/extra"], "program": "needs", "prints": ["target true true"]},
             {"prints": ["false true"], "absent": ["needs"]},
         ],
@@ -286,14 +296,31 @@ CASES.append(
         "files": {
             "Cargo.toml": '[workspace]\nmembers = ["dep", "app"]\nresolver = "2"\n',
             "dep/Cargo.toml": '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n',
-            "dep/build.rs": 'fn main() {\n    let out = std::env::var("OUT_DIR").unwrap();\n    println!("cargo::rustc-link-search=native={out}/found");\n}\n',
-            "dep/src/lib.rs": "",
+            "dep/build.rs": '''fn main() {
+    let out = std::env::var("OUT_DIR").unwrap();
+    let found = std::path::Path::new(&out).join("found");
+    std::fs::create_dir_all(&found).unwrap();
+    std::fs::write(found.join("from-dependency"), "exact path").unwrap();
+    println!("cargo::rustc-env=SEARCH_PATH={}", found.display());
+    println!("cargo::rustc-env=EMITS_SEARCH=yes");
+    println!("cargo::rustc-link-search=native={}", found.display());
+    println!("cargo::rerun-if-changed=build.rs");
+}
+''',
+            "dep/src/lib.rs": '''pub fn search_path() -> &'static str { env!("SEARCH_PATH") }
+pub fn emits_search() -> bool { env!("EMITS_SEARCH") == "yes" }
+''',
             "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n\n[build-dependencies]\ndep = { path = "../dep" }\n',
             "app/build.rs": '''fn main() {
     let var = if cfg!(target_os = "macos") { "DYLD_FALLBACK_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
-    let search = std::env::var(var).unwrap();
-    assert!(search.contains("/found"), "{var} is {search}");
-    println!("cargo::rustc-env=SEEN=yes");
+    let search = std::env::var_os(var).unwrap_or_default();
+    let expected = std::path::Path::new(dep::search_path());
+    let seen = std::env::split_paths(&search).any(|path| path == expected);
+    assert_eq!(seen, dep::emits_search(), "{var} is {search:?}; expected {expected:?}");
+    if seen {
+        assert_eq!(std::fs::read_to_string(expected.join("from-dependency")).unwrap(), "exact path");
+    }
+    println!("cargo::rustc-env=SEEN={}", if seen { "yes" } else { "no" });
     println!("cargo::rerun-if-changed=build.rs");
 }
 ''',
@@ -301,6 +328,32 @@ CASES.append(
         },
         "program": "app",
         "prints": ["yes"],
+    }
+)
+CASES.append(
+    {
+        # Only each request receives these overrides. Changing and removing them must
+        # invalidate both the compiled option_env! and the build script's captured output.
+        "name": "caller-environment-changes-and-becomes-unset",
+        "fixes": ["80a8430b4", "a47282674"],
+        "files": {
+            MAIN: '''fn main() {
+    println!("{} {}", option_env!("FORKFIXES_CALLER_VALUE").unwrap_or("unset"), env!("SCRIPT_VALUE"));
+}
+''',
+            "build.rs": '''fn main() {
+    println!("cargo::rerun-if-env-changed=FORKFIXES_CALLER_VALUE");
+    println!("cargo::rustc-env=SCRIPT_VALUE={}", std::env::var("FORKFIXES_CALLER_VALUE").unwrap_or_else(|_| "unset".to_owned()));
+}
+''',
+        },
+        "steps": [
+            {"env": {"FORKFIXES_CALLER_VALUE": None}, "prints": ["unset unset"]},
+            {"env": {"FORKFIXES_CALLER_VALUE": "first"}, "prints": ["first first"]},
+            {"env": {"FORKFIXES_CALLER_VALUE": "second"}, "prints": ["second second"]},
+            {"env": {"FORKFIXES_CALLER_VALUE": None}, "prints": ["unset unset"]},
+            {"env": {"FORKFIXES_CALLER_VALUE": "first"}, "prints": ["first first"]},
+        ],
     }
 )
 CASES.append(
@@ -423,16 +476,16 @@ pub fn value() -> i32 {{ unsafe {{ package_{name}_value() }} }}
 })
 
 
-# Remove each claimed cause in the same daemon, then restore it. A rejection alone does not
-# prove duplicate-name checking, and a macro that emits no impl must change method lookup.
+# Remove each claimed cause in the same daemon, then restore it. This distinguishes a
+# semantic rejection from an unrelated failure and exercises invalidation of accepted inputs.
 for case in CASES:
     if case["name"] == "raw-duplicate-import":
         original = case["files"][MAIN]
         distinct = original.replace("use b::x;", "use b::x as other;")
         case["steps"] = [
-            {"error": "E0252"},
+            {"diagnostic": "E0252"},
             {"files": {MAIN: distinct}, "prints": []},
-            {"files": {MAIN: original}, "error": "E0252"},
+            {"files": {MAIN: original}, "diagnostic": "E0252"},
         ]
     if case["name"] == "attribute-impl-in-function":
         name = "app/src/main.rs"
@@ -440,6 +493,25 @@ for case in CASES:
         without_impl = original.replace("impl Trait for u32 { fn value(&self) -> u16 { 2 } }", "")
         case["steps"] = [
             {"prints": ["2"]},
-            {"files": {name: without_impl}, "error": "E0599"},
+            {"files": {name: without_impl}, "diagnostic": "E0599"},
             {"files": {name: original}, "prints": ["2"]},
+        ]
+    if case["name"] == "empty-array-promoted-through-iter-mut":
+        original = case["files"][MAIN]
+        nonempty = original.replace("[].iter_mut()", "[1u8].iter_mut()")
+        case["steps"] = [
+            {"prints": ["0"]},
+            {"files": {MAIN: nonempty}, "diagnostic": "E0515"},
+            {"files": {MAIN: original}, "prints": ["0"]},
+        ]
+    if case["name"] == "a-script-searches-where-its-build-dependencys-script-said":
+        name = "dep/build.rs"
+        original = case["files"][name]
+        without_search = original.replace('EMITS_SEARCH=yes', 'EMITS_SEARCH=no').replace(
+            '    println!("cargo::rustc-link-search=native={}", found.display());\n', ""
+        )
+        case["steps"] = [
+            {"prints": ["yes"]},
+            {"files": {name: without_search}, "prints": ["no"]},
+            {"files": {name: original}, "prints": ["yes"]},
         ]

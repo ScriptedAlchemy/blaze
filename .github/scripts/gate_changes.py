@@ -52,6 +52,11 @@ CODE = (
     "harness/distv2/",
     ".github/scripts/dist_build_identity.py",
     ".github/scripts/test_distributed_ci.py",
+    # The fork's semantic migration fixtures and their complete-run receipt.
+    "harness/forkfixes.py",
+    "harness/forkfixes/",
+    ".github/scripts/forkfixes_acceptance.py",
+    ".github/scripts/test_forkfixes_ci.py",
     # What fetches and checks the pinned LLVM for the build (.github/actions/blaze). No Nix:
     # neither job reads the flake.
     ".github/scripts/llvm.py",
