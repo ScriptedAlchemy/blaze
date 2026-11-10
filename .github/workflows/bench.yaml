@@ -46,21 +46,22 @@ jobs:
       # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version
       # names, with the pinned LLVM, from the store main's build job pushed, and the store as the
       # blaze users get compiles it. The bench binary is a release build of blaze-bench's `store`
-      # bench target, found where blaze writes a target's program: `target/release/deps/store-<hash>`.
+      # bench target, placed with the store on the job's reflink filesystem.
       - uses: ./.github/actions/blaze
         with:
           job: build
           llvm: true
+          reflink: "true"
       # The base first, in the same checkout, so that the change's build reuses whatever of
       # it the change did not touch. A base without the benchmarks has nothing to pair with.
       - name: Build the base
         if: github.event_name == 'pull_request'
         run: |
           build_store() {
-            blaze build --release --locked -p blaze-bench --bench store
+            blaze build --release --locked -p blaze-bench --bench store --target-dir "$CARGO_TARGET_DIR"
             # The newest: the base's build left one of another hash beside it.
-            exe=$(find target/release/deps -maxdepth 1 -type f -perm -u+x -name 'store-*' -exec ls -t {} + | head -n 1)
-            [ -n "$exe" ] || { echo "::error::blaze build -p blaze-bench --bench store made no target/release/deps/store-<hash>"; exit 1; }
+            exe=$(find "$CARGO_TARGET_DIR/release/deps" -maxdepth 1 -type f -perm -u+x -name 'store-*' -exec ls -t {} + | head -n 1)
+            [ -n "$exe" ] || { echo "::error::blaze build -p blaze-bench --bench store made no $CARGO_TARGET_DIR/release/deps/store-<hash>"; exit 1; }
             cp "$exe" "$1"
           }
           git checkout -q --detach ${{ github.event.pull_request.base.sha }}
@@ -76,10 +77,10 @@ jobs:
       - name: Build the change
         run: |
           build_store() {
-            blaze build --release --locked -p blaze-bench --bench store
+            blaze build --release --locked -p blaze-bench --bench store --target-dir "$CARGO_TARGET_DIR"
             # The newest: the base's build left one of another hash beside it.
-            exe=$(find target/release/deps -maxdepth 1 -type f -perm -u+x -name 'store-*' -exec ls -t {} + | head -n 1)
-            [ -n "$exe" ] || { echo "::error::blaze build -p blaze-bench --bench store made no target/release/deps/store-<hash>"; exit 1; }
+            exe=$(find "$CARGO_TARGET_DIR/release/deps" -maxdepth 1 -type f -perm -u+x -name 'store-*' -exec ls -t {} + | head -n 1)
+            [ -n "$exe" ] || { echo "::error::blaze build -p blaze-bench --bench store made no $CARGO_TARGET_DIR/release/deps/store-<hash>"; exit 1; }
             cp "$exe" "$1"
           }
           build_store "$RUNNER_TEMP/bench-head"
