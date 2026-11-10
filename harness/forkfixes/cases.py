@@ -308,6 +308,7 @@ CASES.append(
         # Found building blaze itself with `debug = 0`: rustc_type_ir's `TypeFlags` and
         # `PathsToNested`, two bitflags of different widths, put two values under one store key.
         "name": "two-derived-clones-with-no-debug-info",
+        "program": "two_clones",
         "fixes": [],
         "files": {
             "Cargo.toml": '[package]\nname = "two_clones"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n\n[profile.dev]\ndebug = 0\n',
