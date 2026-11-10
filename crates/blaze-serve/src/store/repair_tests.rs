@@ -808,6 +808,9 @@ fn the_partition_oracle_catches_removing_cross_pack_comparison() {
     }
 }
 
+/// The invariant: a conditional repair requires the current committed digest,
+/// an absent old pack, and verified replacement bytes; no stale writer may replace
+/// the winner, and each acknowledged repair survives a crash and reopen as a whole manifest.
 #[hegel::test(test_cases = 32)]
 fn conditional_publication_preserves_comparison_and_whole_file_integrity(tc: hegel::TestCase) {
     let seed = tc.draw(gs::integers::<u64>());

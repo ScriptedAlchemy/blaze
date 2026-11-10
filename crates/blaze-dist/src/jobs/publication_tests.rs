@@ -174,6 +174,9 @@ fn scenario(ops: &[u8], plant: Plant) -> Result<(), String> {
     Ok(())
 }
 
+/// The invariant: a published-work execution reports success only after full output
+/// is uploaded, its immutable manifest is accepted unchanged, and delivery to
+/// subscribers completes; a later attempt cannot replace the accepted record.
 #[hegel::test(test_cases = 128)]
 fn every_success_has_one_immutable_full_manifest(tc: hegel::TestCase) {
     let ops = tc.draw(gs::vecs(gs::integers::<u8>().max_value(9)).min_size(1).max_size(128));
