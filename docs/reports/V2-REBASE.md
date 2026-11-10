@@ -324,10 +324,12 @@ The checkpoint includes these repairs with validation still pending:
 
 **The 23-test result applies to source `2e4533db8`, not this checkpoint's newer peer
 producer.** Peer commit `d3e176c2e` now partitions native output through `Pack::batches`
-and limits individual `Pack::of` calls. The old 65,537-key single-pack setup in
-`native_packs_are_not_wire_batches_and_frontier_memory_depends_only_on_pack_count`
-therefore needs a deliberate port before rerunning the merged suite. The test remains
-present and enabled; no result on the older producer is claimed for the merged tree.
+and limits individual `Pack::of` calls. After upstream merge `4cec9d37c`, the fixture
+uses `Pack::batches` for both the full output and its even/odd mirrors. The renamed
+`native_output_spans_wire_batches_and_frontier_memory_depends_only_on_pack_count`
+still covers all 65,537 logical keys and the existing corruption and durability oracles.
+The port's runtime result is pending; no result on the older producer is claimed for
+the merged tree.
 The complete merged Rust check/test gate remains pending.
 
 No corrected stage1 native reproduction, two-worker release/fold compilation, cross-PR
