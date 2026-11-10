@@ -209,6 +209,12 @@ fails on a stale `DIGEST`) and commit. The next build copies the changed library
 Nothing checks it against upstream file by file: the integration tests (smoke, the rustc
 comparison harnesses, real crates) are what hold blaze's behaviour to the nightly's.
 
+When the library must be fetched, `BLAZE_LIBRARY_FROM` names an explicit library source.
+Otherwise `BLAZE_RELEASES` selects the directory or HTTPS mirror containing the current
+release's `v<version>/library-<digest>.tar.xz`, including on a clean home. Without either
+override, blaze copies its matching build checkout or downloads its own release's library.
+Every route verifies the library's digest before using it.
+
 ## How far behind it gets, and how long a bump takes
 
 Measured 2026-10-27, on the first bump the workflow made.

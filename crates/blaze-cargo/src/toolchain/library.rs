@@ -175,13 +175,14 @@ pub fn fetch() -> Result<Library, String> {
             .to_owned()
     })?;
     let given = super::given_var(FROM_VAR).map_err(|it| it.to_string())?;
-    let from = match (given, Library::ours_at(checkout())) {
-        (Some(given), _) => given,
-        (None, Some(_)) => checkout().to_string_lossy().into_owned(),
-        // The release this blaze is: its version, which only the engine's build.rs knows
-        // (`BLAZE_RELEASE`), so that no release changes this crate.
-        (None, None) => format!("{}/v{}", crate::release::RELEASES, crate::release::get().version),
-    };
+    let releases = super::given_var("BLAZE_RELEASES").map_err(|it| it.to_string())?;
+    let local = Library::ours_at(checkout());
+    let from = source(
+        given.as_deref(),
+        releases.as_deref(),
+        local.as_ref().map(|it| it.dir.as_path()),
+        crate::release::get().version,
+    )?;
     let fetched = fetch_into(&dir, &from, digest()).map_err(|e| {
         format!(
             "blaze compiles the standard library from its own source (digest {}), which it \
@@ -192,6 +193,35 @@ pub fn fetch() -> Result<Library, String> {
         )
     })?;
     Ok(FETCHED.get_or_init(|| fetched).clone())
+}
+
+/// An explicit library source wins, then the selected release source, then this build's
+/// matching checkout. A release mirror is authoritative even on the build machine.
+fn source(
+    given: Option<&str>,
+    releases: Option<&str>,
+    checkout: Option<&Path>,
+    version: &str,
+) -> Result<String, String> {
+    if let Some(given) = given {
+        return Ok(given.to_owned()); // alloc: one library fetch's source
+    }
+    let base = match releases {
+        Some(base) => base,
+        None => match checkout {
+            Some(path) => return Ok(path.to_string_lossy().into_owned()),
+            None => crate::release::RELEASES,
+        },
+    };
+    if !base.contains("://") {
+        return Ok(Path::new(base).join(format!("v{version}")).to_string_lossy().into_owned());
+    }
+    if !base.starts_with("https://") {
+        return Err(format!(
+            "`BLAZE_RELEASES` is {base}, which is not an https:// address or a directory"
+        ));
+    }
+    Ok(format!("{}/v{version}", base.trim_end_matches('/')))
 }
 
 /// The name of the archive of the library with `digest` among a release's assets.
@@ -360,6 +390,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn library_source_follows_the_selected_release_on_a_clean_home() {
+        let local = Path::new("/checkout/library");
+        for (given, releases, checkout, want) in [
+            (Some("/explicit"), Some("/mirror"), Some(local), "/explicit"),
+            (None, Some("/mirror"), Some(local), "/mirror/v1"),
+            (
+                None,
+                Some("https://mirror.invalid/releases/"),
+                None,
+                "https://mirror.invalid/releases/v1",
+            ),
+            (None, None, Some(local), "/checkout/library"),
+        ] {
+            assert_eq!(source(given, releases, checkout, "1").unwrap(), want);
+        }
+        assert_eq!(
+            source(None, None, None, "1").unwrap(),
+            format!("{}/v1", crate::release::RELEASES)
+        );
+        assert!(source(None, Some("http://mirror.invalid"), None, "1").is_err());
+    }
+
+    #[test]
     fn the_library_is_the_one_its_digest_says() {
         assert_eq!(
             digest_of(&checkout()).unwrap(),
@@ -411,8 +464,9 @@ mod tests {
         assert!(!into.exists());
 
         // The library is fetched whole, and found there after with nothing fetched.
-        archived(&one, &want, &good);
-        let fetched = fetch_into(&into, good.to_str().unwrap(), &want).unwrap();
+        let release = source(None, Some(good.to_str().unwrap()), None, "1").unwrap();
+        archived(&one, &want, Path::new(&release));
+        let fetched = fetch_into(&into, &release, &want).unwrap();
         assert_eq!((fetched.dir.as_path(), fetched.digest.as_str()), (into.as_path(), &*want));
         assert_eq!(digest_of(&into).unwrap(), want);
         std::fs::remove_dir_all(&good).unwrap();
