@@ -288,3 +288,49 @@ caught job failures and empty recorded stack/PC arrays. No fixture executable ra
 This is the next compiler blocker; the assertion and debug metadata must be preserved.
 The native ELF/CAS/archive, macro, cache/Hegel, distributed and fork replay acceptance
 gates above remain owed. B0 has not been promoted or replaced.
+
+
+### Cache proof and pending compiler repairs — checkpoint 2026-11-10
+
+`cache-repair-2e4533db8-positive.json` records **23 passed, 0 failed** on clean source
+`2e4533db84c8e04f76998b794f39d8b17213ae1a`, tree
+`549f9baa5435b455cf02c02daddbc0cae60d3601`, using the same pinned B0 and semantic O2
+configuration above. The command completed at 20:38:49 UTC on November 9, in 723.65
+seconds; the tests themselves took 13.48 seconds. It exercised publication sync/crash
+boundaries and reopen, conflicting native partitions, malformed headers and key commitments,
+missing and corrupt packs, native CAS writers, a lost response, the 65,537-key old-producer
+case, and planted missing-sync, early-acknowledgement and comparison-bypass controls.
+This is actual focused Rust/Hegel evidence, not full distributed acceptance.
+
+The earlier combined `check --lib --tests` on source `339db5dc6` failed after 45m16s.
+Two genuine regression API errors were fixed in `f510617ef`: the fork's Cranelift
+stack-load/store builders require an explicit pointer type. The remaining 27 diagnostics
+name declarations or imports already present in their valid scopes. A reduced cold fixture
+passed production-library check (28.81s), combined library/test check (24.02s), and library
+test compilation with `--no-run` (79.62s); it did not reproduce those diagnostics.
+
+The checkpoint includes these repairs with validation still pending:
+
+- `3d5af16c8`: insert LLVM 23 debug declarations as `LLVMDbgRecordRef`, preserving debug
+  metadata and the instruction assertion; actual LLVM regression/control/restoration and
+  a newly rebuilt compiler's default-dev guarded-stack reproduction remain **UNRUN**.
+- `51cda5fd0`: invalidate context-dependent file and include answers when the preferred
+  crate set changes. Real warmed Semantics regressions and a defect-restoring control are
+  authored but **UNRUN**. Causation for the 27 diagnostics is not yet established by execution.
+- `b4a06705c`: report an exited seed daemon's actual startup failure before checking signal
+  inheritance. Bash syntax, ShellCheck and whitespace checks passed. The hosted rerun and
+  pinned seed's Azure `io_uring` compatibility remain unresolved; this diagnostic change
+  does not make CI green.
+
+**The 23-test result applies to source `2e4533db8`, not this checkpoint's newer peer
+producer.** Peer commit `d3e176c2e` now partitions native output through `Pack::batches`
+and limits individual `Pack::of` calls. The old 65,537-key single-pack setup in
+`native_packs_are_not_wire_batches_and_frontier_memory_depends_only_on_pack_count`
+therefore needs a deliberate port before rerunning the merged suite. The test remains
+present and enabled; no result on the older producer is claimed for the merged tree.
+The complete merged Rust check/test gate remains pending.
+
+No corrected stage1 native reproduction, two-worker release/fold compilation, cross-PR
+cache reuse, worker-loss recovery, real fenced stale-result refusal, local-owned fallback,
+artifact equality, full forkfixes, or fixed-point bootstrap is claimed by this checkpoint.
+The map's ten owed rows are unchanged. PR 81 remains draft and B0 remains unpromoted.
