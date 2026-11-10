@@ -332,6 +332,13 @@ The port's runtime result is pending; no result on the older producer is claimed
 the merged tree.
 The complete merged Rust check/test gate remains pending.
 
+Peer repair `a26baec6a` subsequently preserved the byte-bounded native format's
+compatibility with historical whole packs while keeping new uploads partitioned.
+The large publication fixture now includes both the current batches and a historical
+whole blob, alongside the even/odd mirrors. This retains server-side coverage for
+65,537-record legacy packs as well as the current producer's output. Runtime proof
+on this combined tree remains pending.
+
 No corrected stage1 native reproduction, two-worker release/fold compilation, cross-PR
 cache reuse, worker-loss recovery, real fenced stale-result refusal, local-owned fallback,
 artifact equality, full forkfixes, or fixed-point bootstrap is claimed by this checkpoint.

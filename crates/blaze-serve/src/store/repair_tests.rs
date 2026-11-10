@@ -643,7 +643,14 @@ fn native_partitions(count: usize, conflict: u8) -> Vec<native_pack::Pack> {
         }
         halves[i % 2].push(value);
     }
+    // A byte-bounded historical whole pack must agree with the current producer's
+    // partitions, even when it exceeds the newer upload item target.
+    let whole = (count > blaze_wire::Limits::DOCUMENTED.batch_items as usize)
+        .then(|| native_pack::Pack::of(values.clone()).unwrap()); // alloc: bounded legacy compatibility fixture
     let mut packs = native_pack::Pack::batches(values).unwrap(); // alloc: bounded producer outputs
+    if let Some(whole) = whole {
+        packs.push(whole);
+    }
     for half in halves {
         packs.extend(native_pack::Pack::batches(half).unwrap());
     }
@@ -771,7 +778,8 @@ fn native_partitions_preserve_values_through_publication_faults_and_reopen(tc: h
 #[test]
 fn native_output_spans_wire_batches_and_frontier_memory_depends_only_on_pack_count() {
     // The real producer partitions more than 65,536 records into bounded packs.
-    // Validation must admit the whole output and its equivalent even/odd partition.
+    // Validation must admit the output's current batches, historical whole blob,
+    // and equivalent even/odd partitions without retaining all their records.
     native_partition_scenario(
         blaze_wire::Limits::DOCUMENTED.batch_items as usize + 1,
         0,
