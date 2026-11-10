@@ -7,6 +7,15 @@
 # glibc on Ubuntu, Xcode's clang on macOS), so what the build links runs on the runner as it is.
 # No shared remote: the v2 blaze pinned since 0.20261105.0 has no `blaze cache build|pull|push`
 # (its `blaze cache` is `gc` alone), so every run starts from an empty store until v2 has a remote.
+# Fork bootstrap (Linux X64 only): the pinned ix.dev release 0.20261105.4 (built from e930296025)
+# cannot start its daemon on Azure hosted kernels — its io_uring provided-buffer registration
+# predates the ReservedCheck probe (64512a199, e0692c35b) for Ubuntu linux-azure's inverted
+# reserved-word check, so `blaze serve` exits with EINVAL on every hosted Linux job. Until ix.dev
+# publishes a release cut after that probe, Linux X64 jobs install .github/blaze-version-linux
+# from this fork's own GitHub release of the same name (built by the pinned blaze from this
+# branch's source; BLAZE_RELEASES in site/install.sh), never cargo or rustc. Other platforms
+# keep the ix.dev pin. Delete .github/blaze-version-linux and this fork's release when
+# .github/blaze-version names an ix.dev release that starts on hosted Linux.
 name: blaze
 description: the release of blaze .github/blaze-version names, its toolchain, and an empty store
 inputs:
@@ -103,7 +112,19 @@ runs:
         bin="${CARGO_HOME:-$HOME/.cargo}/bin"
         export PATH="$bin:$PATH"
         echo "$bin" >> "$GITHUB_PATH"
-        sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
+        # Fork bootstrap (see header): Linux X64 installs this fork's own release, whose daemon
+        # starts on Azure kernels; BLAZE_RELEASES also steers the toolchain/library fetch that
+        # install.sh runs in this same shell. Every other platform keeps the ix.dev pin.
+        bootstrap=false
+        if [ "$RUNNER_OS-$RUNNER_ARCH" = "Linux-X64" ] && [ -f .github/blaze-version-linux ]; then
+          bootstrap=true
+          export BLAZE_RELEASES="https://github.com/ScriptedAlchemy/blaze/releases/download"
+          want="$(cat .github/blaze-version-linux)"
+        else
+          want="$(cat .github/blaze-version)"
+        fi
+        echo "bootstrap=$bootstrap" >> "$GITHUB_OUTPUT"
+        sh site/install.sh --version "$want" --verbose
         said=$(blaze-engine --version)
         version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
         [ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }
@@ -120,8 +141,10 @@ runs:
     # sampler::platform::check() leaves the sampler off when SIGRTMIN+6's action is not SIG_DFL,
     # and SIG_IGN is inherited across fork and exec: every later step's bash sources BASH_ENV,
     # so the daemon it starts inherits the ignored signal. Linux only: macOS has no RTMIN.
+    # The fork bootstrap release is cut after 3732f60733 and has no signal sampler, so these
+    # two steps run only for the ix.dev pin (on Linux, that is ARM64 until it has a bootstrap).
     - name: SIGRTMIN+6 ignored (the pinned release's signal sampler off)
-      if: runner.os == 'Linux'
+      if: runner.os == 'Linux' && steps.install.outputs.bootstrap != 'true'
       shell: bash
       run: |
         env_file="$RUNNER_TEMP/blaze-sigrtmin6.sh"
@@ -130,7 +153,7 @@ runs:
     # The cause, shown: the release's daemon, started from a step whose bash read BASH_ENV, has
     # SIGRTMIN+6 (signal 40, bit 39 of SigIgn) ignored and says its sampler is off.
     - name: the release's daemon has its sampler off
-      if: runner.os == 'Linux'
+      if: runner.os == 'Linux' && steps.install.outputs.bootstrap != 'true'
       shell: bash
       run: |
         log="$RUNNER_TEMP/blaze-sigcheck.log"
