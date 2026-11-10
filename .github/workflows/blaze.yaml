@@ -230,6 +230,7 @@ jobs:
         uses: ./.github/actions/blaze
         with:
           job: cross-x86_64
+          reflink: ${{ runner.os == 'Linux' && runner.environment == 'github-hosted' }}
       - run: blaze build --release --locked -p blaze-engine --target x86_64-unknown-linux-gnu
       - name: an x86-64 ELF, not run
         run: |
@@ -319,6 +320,7 @@ jobs:
         with:
           job: check
           llvm: true
+          reflink: ${{ runner.os == 'Linux' && runner.environment == 'github-hosted' }}
       - run: blaze check --workspace --message-format short
       # astlog's rules (tools/astlog/rules) over the crates and tools, each file on its own: a
       # finding of an error rule fails the job (tools/astlog/README.md#rules-in-blaze).
@@ -357,6 +359,7 @@ jobs:
         with:
           job: build
           llvm: true
+          reflink: ${{ runner.os == 'Linux' && runner.environment == 'github-hosted' }}
       - name: blaze build --release (the build job's)
         run: |
           python3 harness/unittests.py '{"build": true}'
