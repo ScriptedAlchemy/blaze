@@ -886,6 +886,7 @@
      "intern",
      "ix-prof",
      "libmimalloc-sys",
+     "llvm-sys",
      "lzma-rust2",
      "serde_json",
      "stdx",
@@ -1608,6 +1609,7 @@
      "blaze-graph",
      "blaze-hash",
      "blaze-ids",
+     "blaze-mem",
      "blaze-serde",
      "blaze-v2-proof",
      "bytes",
@@ -26024,6 +26026,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
        "name": "blaze_serde",
@@ -50946,6 +50952,10 @@
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
       {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
@@ -75557,6 +75567,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
        "name": "blaze_serde",
@@ -100463,6 +100477,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
        "name": "blaze_serde",
