@@ -231,11 +231,12 @@ jobs:
         with:
           job: cross-x86_64
           reflink: "true"
-      - run: blaze build --release --locked -p blaze-engine --target x86_64-unknown-linux-gnu
+      - run: blaze build --release --locked -p blaze-engine --target x86_64-unknown-linux-gnu --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
       - name: an x86-64 ELF, not run
         run: |
           for bin in blaze-engine blaze; do
-            f="target/x86_64-unknown-linux-gnu/release/$bin"
+            f="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/x86_64-unknown-linux-gnu/release/$bin"
+            [ -x "$f" ] || { echo "::error::the cross build made no executable $f"; exit 1; }
             file "$f" | tee /dev/stderr | grep -q 'ELF 64-bit LSB .*x86-64' || { echo "::error::$f is not an x86-64 ELF"; exit 1; }
           done
       # Why the daemon ended, when it did (the client does not say).
@@ -319,15 +320,19 @@ jobs:
       - uses: ./.github/actions/blaze
         with:
           job: check
-          reflink: "true"
           llvm: true
-      - run: blaze check --workspace --message-format short
+          reflink: "true"
+      - run: blaze check --workspace --message-format short --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
       # astlog's rules (tools/astlog/rules) over the crates and tools, each file on its own: a
       # finding of an error rule fails the job (tools/astlog/README.md#rules-in-blaze).
-      - run: blaze build -p astlog
-      - run: >-
-          PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py
-          '{"astlog": "target/debug/astlog", "rules": "tools/astlog/rules", "paths": ["crates", "tools"], "exclude": ["crates/harness"]}'
+      - run: blaze build -p astlog --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
+      - run: |
+          astlog="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/debug/astlog"
+          [ -x "$astlog" ] || { echo "::error::the build made no executable $astlog"; exit 1; }
+          jq -n --arg astlog "$astlog" \
+            '{astlog: $astlog, rules: "tools/astlog/rules", paths: ["crates", "tools"], exclude: ["crates/harness"]}' \
+            > "$RUNNER_TEMP/astlog.json"
+          PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py "$RUNNER_TEMP/astlog.json"
       # Why the daemon ended, when it did (the client does not say).
       - if: failure()
         uses: ./.github/actions/daemon-log
@@ -358,18 +363,29 @@ jobs:
         uses: ./.github/actions/blaze
         with:
           job: build
-          reflink: "true"
           llvm: true
+          reflink: "true"
       - name: blaze build --release (the build job's)
         run: |
           python3 harness/unittests.py '{"build": true}'
       # The release's daemon ends first; the tree's blaze runs its own, from a home of its own.
       - run: blaze stop
-      - env:
-          BLAZE_HOME: ${{ runner.temp }}/tree-blaze-home
-        run: >-
-          target/release/blaze check --workspace --target aarch64-unknown-linux-gnu
-          --message-format short --baselines crates/blaze-lints/baselines
+      - name: a separate tree daemon home on the reflink filesystem
+        run: |
+          tree_home="$BLAZE_HOME/tree-blaze-home"
+          mkdir -p "$tree_home"
+          device=$(stat -c %d "$CARGO_TARGET_DIR")
+          for path in "$tree_home" "$XDG_CACHE_HOME/blaze/std" "$BLAZE_CACHE" "$CARGO_TARGET_DIR"; do
+            [ "$(stat -f -c %T "$path")" = btrfs ] && [ "$(stat -c %d "$path")" = "$device" ] \
+              || { echo "::error::tree daemon path $path must share Btrfs device $device with target $CARGO_TARGET_DIR"; exit 1; }
+          done
+          echo "BLAZE_HOME=$tree_home" >> "$GITHUB_ENV"
+      - run: |
+          blaze="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release/blaze"
+          [ -x "$blaze" ] || { echo "::error::the build made no executable $blaze"; exit 1; }
+          "$blaze" check --workspace --target aarch64-unknown-linux-gnu \
+            --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}" \
+            --message-format short --baselines crates/blaze-lints/baselines
       # Why the daemon ended, when it did (the client does not say).
       - if: failure()
         uses: ./.github/actions/daemon-log
