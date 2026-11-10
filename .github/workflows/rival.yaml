@@ -15,7 +15,7 @@ on:
         description: "The ref measured as our blaze (a PR's branch, for its before/after against main's run)"
         default: ""
   pull_request:
-    paths: ["harness/rival.py", ".github/workflows/rival.yaml"]
+    paths: ["harness/rival.py", ".github/workflows/rival.yaml", ".github/actions/blaze/**", ".github/actions/reflink/**"]
 
 concurrency:
   group: rival-${{ github.ref }}-${{ inputs.ours }}
@@ -75,19 +75,25 @@ jobs:
         with:
           job: rival
           llvm: "true"
+          reflink: "true"
       - name: our blaze
         run: |
-          blaze build --locked --release -p blaze-engine
+          blaze build --locked --release -p blaze-engine --target-dir "$CARGO_TARGET_DIR"
           blaze stop
           mkdir -p bins/ours
-          find target/release -maxdepth 1 -type f -perm -u+x -exec cp {} bins/ours/ \;
+          find "$CARGO_TARGET_DIR/release" -maxdepth 1 -type f -perm -u+x -exec cp {} bins/ours/ \;
       - name: Astral's blaze
         working-directory: astral
+        # A distinct target: cargo must not overwrite our blaze's output directory.
+        env:
+          CARGO_TARGET_DIR: ${{ env.BLAZE_HOME }}/build/astral
         run: |
           tc=$(cat harness/toolchain)
           rustup toolchain install "$tc" --profile minimal -c rust-src
-          cargo +"$tc" build --locked --release -p ra-jit
-          mkdir -p ../bins/astral && find target/release -maxdepth 1 -type f -perm -u+x -exec cp {} ../bins/astral/ \;
+          cargo +"$tc" build --locked --release -p ra-jit --target-dir "$CARGO_TARGET_DIR"
+          mkdir -p ../bins/astral && find "$CARGO_TARGET_DIR/release" -maxdepth 1 -type f -perm -u+x -exec cp {} ../bins/astral/ \;
+      - if: failure()
+        uses: ./.github/actions/daemon-log
       - run: tar -czf bins.tar.gz bins
       - uses: actions/upload-artifact@v7
         with:

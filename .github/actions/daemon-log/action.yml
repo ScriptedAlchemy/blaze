@@ -9,12 +9,13 @@ runs:
   steps:
     - shell: bash
       run: |
+        root="${BLAZE_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/blaze}"
         found=
-        for log in "${XDG_CACHE_HOME:-$HOME/.cache}"/blaze/*/serve.log "${XDG_CACHE_HOME:-$HOME/.cache}"/blaze/serve.log; do
+        for log in "$root"/*/serve.log "$root"/serve.log; do
           [ -f "$log" ] || continue
           found=1
           echo "::group::$log (last 200 lines)"
           tail -n 200 "$log"
           echo "::endgroup::"
         done
-        [ -n "$found" ] || echo "no blaze daemon log under ${XDG_CACHE_HOME:-$HOME/.cache}/blaze"
+        [ -n "$found" ] || echo "no blaze daemon log under $root"
