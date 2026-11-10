@@ -47,16 +47,11 @@ fn canonical(mut values: Vec<Value>) -> Result<Vec<Value>, String> {
 impl Pack {
     /// The pack of `values`, in key order whatever order they came in, so two executors that
     /// made the same values name the same pack. Two values under one key with different bytes
-    /// are an error: a key covers all its value depends on.
+    /// are an error: a key covers all its value depends on. Native records are not a
+    /// CBOR array: the blob byte limit, not the wire batch item limit, bounds this format.
+    /// Use [`Self::batches`] to partition new uploads without refusing older whole packs.
     pub fn of(values: Vec<Value>) -> Result<Pack, String> {
         let values = canonical(values)?;
-        if values.len() > Limits::DOCUMENTED.batch_items as usize {
-            return Err(format!(
-                "a native pack has {} keys, exceeding the {}-key batch limit",
-                values.len(),
-                Limits::DOCUMENTED.batch_items
-            ));
-        }
         let size = values.iter().try_fold(DIST_PACK_MAGIC.len(), |size: usize, value| {
             size.checked_add(41)?.checked_add(value.bytes.len())
         }).ok_or_else(|| "the pack's total byte length overflows usize".to_owned())?;
@@ -81,8 +76,9 @@ impl Pack {
         Ok(Pack { bytes, reference })
     }
 
-    /// Publish all of a grant or tail without exceeding a native pack's key or
-    /// byte limits. This partitions the same work; it never drops or recompiles a
+    /// Publish all of a grant or tail within the producer's item and byte targets.
+    /// These partitioning targets do not change the persisted native format's limits.
+    /// This partitions the same work; it never drops or recompiles a
     /// value. The manifest already supports multiple sorted pack references.
     pub fn batches(values: Vec<Value>) -> Result<Vec<Pack>, String> {
         Self::batches_with_limits(values, Limits::DOCUMENTED.batch_items as usize, 64 << 20)
@@ -137,6 +133,8 @@ fn keys_digest(keys: impl Iterator<Item = Digest>) -> Digest {
 
 /// The values of `bytes`, which must be the pack `reference` names: its digest, size, format
 /// and keys are all checked before a value is returned, and the values must be in key order.
+/// A native pack is an opaque byte-bounded blob, not a CBOR batch: older producers may
+/// have committed more records than the current upload partitioning target permits.
 pub fn read(bytes: &[u8], reference: &PackRef) -> Result<Vec<Value>, String> {
     let name = hex(&reference.pack);
     if reference.format != DIST_PACK_FORMAT {
@@ -161,9 +159,6 @@ pub fn read(bytes: &[u8], reference: &PackRef) -> Result<Vec<Value>, String> {
     let mut values = Vec::new();
     while !rest.is_empty() {
         let short = || format!("pack {name} ends inside a value");
-        if values.len() >= Limits::DOCUMENTED.batch_items as usize {
-            return Err(format!("pack {name} exceeds the {}-key batch limit", Limits::DOCUMENTED.batch_items));
-        }
         let (key, after) = rest.split_first_chunk::<32>().ok_or_else(short)?;
         let (kind, after) = after.split_first().ok_or_else(short)?;
         let (len, after) = after.split_first_chunk::<8>().ok_or_else(short)?;
@@ -233,6 +228,53 @@ mod tests {
         assert!(Pack::batches_with_limits(vec![value(1, b"a"), value(1, b"b")], 1, usize::MAX)
             .unwrap_err().contains("two values"), "conflicting keys on different partitions refuse");
         assert!(Pack::batches_with_limits(vec![value(1, b"a")], 0, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn large_native_packs_remain_readable_while_new_uploads_stay_partitioned() {
+        let target = Limits::DOCUMENTED.batch_items as usize;
+        let values: Vec<_> = (0..=target)
+            .map(|i| {
+                let mut key = [0; 32];
+                key[24..].copy_from_slice(&(i as u64).to_be_bytes());
+                Value { key, kind: (i % 256) as u8, bytes: vec![i as u8] } // alloc: bounded fixture
+            })
+            .collect(); // alloc: the full 65,537-record compatibility fixture
+        // Encode the historical whole-pack layout independently of Pack::of, so
+        // restoring either the reader's or producer's erroneous item cap fails.
+        let mut bytes = DIST_PACK_MAGIC.to_vec(); // alloc: one historical native blob
+        for value in &values {
+            bytes.extend_from_slice(&value.key);
+            bytes.push(value.kind);
+            bytes.extend_from_slice(&(value.bytes.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&value.bytes);
+        }
+        let reference = PackRef {
+            pack: Sha256::digest(&bytes).into(),
+            size: bytes.len() as u64,
+            keys: keys_digest(values.iter().map(|value| value.key)),
+            packed: None,
+            format: DIST_PACK_FORMAT,
+        };
+        let legacy = Pack { bytes, reference };
+        assert_eq!(read(&legacy.bytes, &legacy.reference).unwrap(), values);
+        assert_eq!(Pack::of(values.clone()).unwrap(), legacy);
+
+        let batches = Pack::batches(values.clone()).unwrap();
+        assert_eq!(batches.len(), 2, "new uploads still obey their item target");
+        let mut recovered = Vec::new(); // alloc: full logical-output comparison
+        for batch in &batches {
+            assert!(batch.reference.size <= Limits::DOCUMENTED.blob);
+            let decoded = read(&batch.bytes, &batch.reference).unwrap();
+            assert!(decoded.len() <= target);
+            recovered.extend(decoded);
+        }
+        assert_eq!(recovered, values, "partitioning cannot drop or change native values");
+
+        // Removing the unrelated item cap must not remove the native byte cap.
+        let mut oversized = legacy.reference.clone();
+        oversized.size = Limits::DOCUMENTED.blob + 1;
+        assert!(read(&legacy.bytes, &oversized).unwrap_err().contains("blob limit"));
     }
 
     #[test]
