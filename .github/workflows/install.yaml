@@ -10,9 +10,9 @@ name: install
 on:
   push:
     branches: [main]
-    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/test_install_channels.py"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
   pull_request:
-    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/test_install_channels.py"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
   release:
     types: [published]
   schedule:
@@ -51,6 +51,8 @@ jobs:
         run: python3 -I .github/scripts/test_install_channels.py
       - name: release userspace regressions
         run: python3 -I .github/scripts/test_install_archive.py
+      - name: no-Rust installer oracle regressions
+        run: python3 -I .github/scripts/test_install_without_rust.py
 
   install:
     name: ${{ matrix.os }}
@@ -209,7 +211,8 @@ jobs:
   no-rust:
     name: no Rust installed, ${{ matrix.system }}
     needs: archive
-    # Hosted, as the archive it installs is x86-64 and built there (TODO(sysroot) above).
+    # Prepare the verified filesystem on the host before entering a fresh matrix userspace.
+    # No host compiler or toolchain is mounted in that userspace.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -220,68 +223,39 @@ jobs:
           - { system: Debian 12, image: "debian:bookworm-slim", packages: apt }
           - { system: Ubuntu 22.04, image: "ubuntu:22.04", packages: apt }
           - { system: RHEL 9, image: "registry.access.redhat.com/ubi9/ubi", packages: dnf }
-    container: ${{ matrix.image }}
-    # As in `docker run`: the runner's /github/home belongs to its own user, and the daemon
-    # keeps nothing in a directory another user can replace things in.
-    env:
-      HOME: /root
     steps:
-      - if: matrix.packages == 'apt'
-        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates gcc libc6-dev
-      - if: matrix.packages == 'dnf'
-        run: dnf install -y -q gcc tar gzip && dnf clean all
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: archive
-      - name: no rustup, cargo or rustc
+      - name: user namespaces for Blaze's sandbox
         run: |
-          for tool in rustup cargo rustc; do
-            if command -v "$tool"; then echo "::error::$tool is on PATH"; exit 1; fi
-          done
-      - name: install, then blaze run in a project written by hand
-        shell: sh
-        run: |
-          set -eu
-          began=$(date +%s.%N)
-          BLAZE_ARCHIVE="$PWD/blaze-commit-x86_64-unknown-linux-gnu.tar.gz" sh < site/install.sh
-          export PATH="$HOME/.cargo/bin:$PATH"
-          mkdir -p "$RUNNER_TEMP/hello/src"
-          cd "$RUNNER_TEMP/hello"
-          printf '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n' > Cargo.toml
-          printf 'fn main() {\n    println!("Hello, world!");\n}\n' > src/main.rs
-          blaze run > out.txt 2> err.txt || { cat err.txt; exit 1; }
-          ended=$(date +%s.%N)
-          cat err.txt out.txt
-          grep -Fx "Hello, world!" out.txt
-          if grep -e "blaze: bug:" -e "the daemon has no part" err.txt; then
-            echo "::error::the build was not blaze's"; exit 1
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          echo "${{ matrix.system }}, from install.sh to Hello, world!: $(echo "$ended - $began" | awk '{ printf "%.1f s", $1 - $3 }')" | tee -a "$GITHUB_STEP_SUMMARY"
-          du -sh "$HOME/.blaze/toolchains" "$HOME/.cargo/bin" | tee -a "$GITHUB_STEP_SUMMARY"
-          for tool in rustup cargo rustc; do
-            if command -v "$tool"; then echo "::error::$tool is on PATH after installing"; exit 1; fi
-          done
-          blaze stop
-      # A derive from crates.io: blaze builds it and expands it in process on its own evaluator
-      # (blaze-macro-eval), on this system's glibc; an edit after is the daemon's.
-      - name: proc macros, by blaze's evaluator
-        shell: sh
+      - uses: ./.github/actions/reflink
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - name: install this commit, run its program and edit its proc macro project
+        env:
+          IMAGE: ${{ matrix.image }}
+          PACKAGES: ${{ matrix.packages }}
+          SYSTEM: ${{ matrix.system }}
+          MATRIX_INDEX: ${{ strategy.job-index }}
         run: |
-          set -eu
-          export PATH="$HOME/.cargo/bin:$PATH"
-          mkdir -p "$RUNNER_TEMP/derive/src"
-          cd "$RUNNER_TEMP/derive"
-          printf '[package]\nname = "derive"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\n' > Cargo.toml
-          printf '#[derive(serde::Serialize)]\nstruct Point {\n    x: i32,\n}\n\nfn serializable<T: serde::Serialize>(_: &T) -> &str {\n    "derived"\n}\n\nfn main() {\n    println!("{} {}", serializable(&Point { x: 1 }), 1);\n}\n' > src/main.rs
-          blaze run > out.txt 2> err.txt || { cat err.txt; exit 1; }
-          cat err.txt out.txt
-          grep -Fx "derived 1" out.txt
-          sed -i 's/serializable(&Point { x: 1 }), 1)/serializable(\&Point { x: 2 }), 2)/' src/main.rs
-          blaze run > out.txt 2>> err.txt || { cat err.txt; exit 1; }
-          cat err.txt out.txt
-          grep -Fx "derived 2" out.txt
-          if grep -e "blaze: bug:" -e "the daemon has no part" -e "did not make the proc macro" err.txt; then
-            echo "::error::the proc macros were not blaze's"; exit 1
-          fi
-          blaze stop
+          jq -n --arg workspace "$PWD" --arg temporary "$RUNNER_TEMP" \
+            --arg image "$IMAGE" --arg packages "$PACKAGES" --arg system "$SYSTEM" \
+            --arg blaze_home "$BLAZE_HOME" --arg cache_home "$XDG_CACHE_HOME" \
+            --arg store "$BLAZE_CACHE" --arg target "$CARGO_TARGET_DIR" \
+            --arg summary "$GITHUB_STEP_SUMMARY" \
+            --arg name "blaze-install-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$MATRIX_INDEX" \
+            --argjson uid "$(id -u)" --argjson gid "$(id -g)" \
+            '{workspace:$workspace, temporary:$temporary, image:$image, packages:$packages,
+              system:$system, blaze_home:$blaze_home, cache_home:$cache_home, store:$store,
+              target:$target, summary:$summary, name:$name, uid:$uid, gid:$gid}' \
+            > "$RUNNER_TEMP/install-without-rust.json"
+          uv run --frozen --no-dev python .github/scripts/install_without_rust.py "$RUNNER_TEMP/install-without-rust.json"
+      - if: failure()
+        uses: ./.github/actions/daemon-log
