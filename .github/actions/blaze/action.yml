@@ -86,6 +86,17 @@ runs:
     # The callers opt in together with their target-path consumers.
     - if: inputs.reflink == 'true'
       uses: ./.github/actions/reflink
+    # CI tools and artifacts also use ./target; its path must resolve to the same
+    # reflink device as the store, rather than the checkout's ext4 filesystem.
+    - name: checkout target uses the verified reflink filesystem
+      if: inputs.reflink == 'true'
+      shell: bash
+      run: |
+        [ ! -e target ] && [ ! -L target ] || { echo "::error::checkout target already exists before reflink setup"; exit 1; }
+        ln -s "$CARGO_TARGET_DIR" target
+        store_dev=$(stat -Lc %d "$BLAZE_HOME/v2/store")
+        target_dev=$(stat -Lc %d target)
+        [ "$store_dev" = "$target_dev" ] || { echo "::error::checkout target and store are on different devices"; exit 1; }
     # The release .github/blaze-version names, not the newest canary: canaries come every 40
     # minutes, sooner than a cold run (about an hour) ends and pushes, so with the newest every
     # run whose canary changed blaze's sources would be cold. A pull request that moves the gate

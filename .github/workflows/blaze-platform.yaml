@@ -111,6 +111,7 @@ jobs:
         with:
           job: tests
           llvm: true
+          reflink: ${{ runner.os == 'Linux' && 'true' || 'false' }}
       # What this run's build job compiled, which main's remote has only once main pushes it:
       # a pull request's build pushes nowhere.
       - if: env.BLAZE == 'true' && (inputs.tier == 'gate' || inputs.tier == 'warm')
@@ -179,6 +180,7 @@ jobs:
         with:
           job: build
           llvm: true
+          reflink: ${{ runner.os == 'Linux' && 'true' || 'false' }}
       # The packs the store has before the build, so that what it adds can be handed on.
       - if: env.BLAZE == 'true'
         run: find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-pulled.txt"
@@ -217,8 +219,10 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       # What the build added to the store, for the tests job (`needs: build`), which pulls the
-      # same keys; a hard link each, since the store and the runner's temporary directory are
-      # one disk. packs.txt lists them, so that a build that added none still hands over a list.
+      # same keys. The reflink store and artifact staging directory can be on
+      # different devices on Linux, so copy the immutable packs for handoff.
+      # The receiving test job verifies their SHA-256 before admission.
+      # packs.txt lists them, so a build that added none still hands over a list.
       - id: handoff
         if: env.BLAZE == 'true' && inputs.harnesses == '' && (inputs.tier == 'gate' || inputs.tier == 'warm')
         run: |
@@ -226,7 +230,7 @@ jobs:
           mkdir -p "$dir"
           find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-built.txt"
           comm -13 "$RUNNER_TEMP/packs-pulled.txt" "$RUNNER_TEMP/packs-built.txt" > "$dir/packs.txt"
-          while read -r pack; do ln "$BLAZE_CACHE/$pack" "$dir/$pack"; done < "$dir/packs.txt"
+          while read -r pack; do cp "$BLAZE_CACHE/$pack" "$dir/$pack"; done < "$dir/packs.txt"
           echo "$(wc -l < "$dir/packs.txt" | tr -d ' ') packs, $(du -sh "$dir" | cut -f1), for the tests job" | tee -a "$GITHUB_STEP_SUMMARY"
       # Packs are compressed already.
       - if: steps.handoff.outcome == 'success'

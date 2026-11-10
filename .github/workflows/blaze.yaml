@@ -230,6 +230,7 @@ jobs:
         uses: ./.github/actions/blaze
         with:
           job: cross-x86_64
+          reflink: "true"
       - run: blaze build --release --locked -p blaze-engine --target x86_64-unknown-linux-gnu
       - name: an x86-64 ELF, not run
         run: |
@@ -318,6 +319,7 @@ jobs:
       - uses: ./.github/actions/blaze
         with:
           job: check
+          reflink: "true"
           llvm: true
       - run: blaze check --workspace --message-format short
       # astlog's rules (tools/astlog/rules) over the crates and tools, each file on its own: a
@@ -356,6 +358,7 @@ jobs:
         uses: ./.github/actions/blaze
         with:
           job: build
+          reflink: "true"
           llvm: true
       - name: blaze build --release (the build job's)
         run: |
