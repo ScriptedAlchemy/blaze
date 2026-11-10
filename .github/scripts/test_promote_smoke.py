@@ -10,14 +10,16 @@ import unittest
 WORKFLOW = Path(__file__).resolve().parents[1] / "workflows" / "promote.yaml"
 
 
-def smoke_step():
+def smoke_step(name="what it installed runs"):
     lines = WORKFLOW.read_text().splitlines()
-    heading = "      - name: what it installed runs"
+    heading = f"      - name: {name}"
     if lines.count(heading) != 1:
-        raise AssertionError("promote needs exactly one installed-release smoke step")
+        raise AssertionError(f"promote needs exactly one {name} smoke step")
     at = lines.index(heading) + 1
+    if lines[at] == "        if: runner.os == 'Linux'":
+        at += 1
     if lines[at] != "        run: |":
-        raise AssertionError("installed-release smoke must have a shell script")
+        raise AssertionError(f"{name} smoke must have a shell script")
     body = []
     for line in lines[at + 1:]:
         if line and not line.startswith("          "):
@@ -82,6 +84,45 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertIn("run", commands)
         self.assertNotIn("stop", commands)
 
+
+    def test_linux_smoke_raises_memlock_before_starting_released_daemon(self):
+        smoke = WORKFLOW.read_text().split("\n  smoke:\n", 1)[1].split("\n  apps:\n", 1)[0]
+        for name in ("locked memory for released daemon", "locked memory inherited by smoke"):
+            self.assertEqual(smoke.count(f"      - name: {name}"), 1)
+        self.assertLess(smoke.index("      - name: locked memory for released daemon"),
+                        smoke.index("      - name: locked memory inherited by smoke"))
+        self.assertLess(smoke.index("      - name: locked memory inherited by smoke"),
+                        smoke.index("      - name: what it installed runs"))
+
+        # Exercise the actual workflow shell with fake process tools. Losing the
+        # prlimit call, or targeting anything other than Runner.Worker, fails.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / "commands"
+            scripts = {
+                "pgrep": '#!/bin/sh\n[ "$*" = "-o -f Runner.Worker" ] || exit 23\necho 4242\n',
+                "sudo": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$MEMLOCK_CALLS"\n[ "$*" = "prlimit --pid 4242 --memlock=unlimited:unlimited" ]\n',
+                "prlimit": '#!/bin/sh\n[ "$*" = "--pid 4242 --memlock" ]\n',
+            }
+            for name, contents in scripts.items():
+                path = root / name
+                path.write_text(contents)
+                path.chmod(0o700)
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                       MEMLOCK_CALLS=str(commands))
+            done = subprocess.run(["bash", "-eo", "pipefail", "-c",
+                                   smoke_step("locked memory for released daemon")],
+                                  env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual(commands.read_text().splitlines(),
+                             ["prlimit --pid 4242 --memlock=unlimited:unlimited"])
+
+        inherited = smoke_step("locked memory inherited by smoke")
+        for reported, expected in [("unlimited", 0), ("8192", 1)]:
+            done = subprocess.run(["bash", "-eo", "pipefail", "-c",
+                                   f'ulimit() {{ echo {reported}; }}\n' + inherited],
+                                  text=True, capture_output=True, timeout=10)
+            self.assertEqual(done.returncode == 0, expected == 0, done.stderr)
 
     def test_pr_smoke_uses_read_token_for_public_corpus(self):
         import json

@@ -133,6 +133,20 @@ jobs:
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
             sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
           fi
+      # The released Linux daemon registers io_uring buffers before its first build.
+      # On hosted ARM the default locked-memory limit killed it with ENOMEM before
+      # it could listen (smoke 42770290671, serve.log). Match the build gate's
+      # Runner.Worker limit so every later step and spawned daemon inherit it.
+      - name: locked memory for released daemon
+        if: runner.os == 'Linux'
+        run: |
+          worker=$(pgrep -o -f Runner.Worker) || { echo "::error::released smoke: no Runner.Worker to raise RLIMIT_MEMLOCK"; exit 1; }
+          sudo prlimit --pid "$worker" --memlock=unlimited:unlimited
+          prlimit --pid "$worker" --memlock
+      - name: locked memory inherited by smoke
+        if: runner.os == 'Linux'
+        run: |
+          [ "$(ulimit -l)" = unlimited ] || { echo "::error::released smoke: RLIMIT_MEMLOCK is $(ulimit -l) KiB, expected unlimited"; exit 1; }
       # As a user installs it: the toolchain blaze downloads included.
       - name: install ${{ env.TAG }}
         run: sh site/install.sh --version "$TAG"
