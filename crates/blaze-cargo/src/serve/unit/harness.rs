@@ -159,9 +159,36 @@ pub(super) fn reached(job: &Job, waits: &Waits, loaded: &[u32], ready: &[u32]) -
     written
 }
 
-/// Whether `unit`'s crate is built with `cfg(test)`, as blaze-lower makes it: a test, or a check
-/// of one (`cargo check --tests`).
+/// A test or check-of-tests gets an appended harness only when its unit's plan enables it.
+/// With `harness = false` (notably blaze-bench's benches) lowering deliberately keeps the root
+/// as its original file rather than an alias. Appending there would refuse the whole unit.
+fn wants_harness(mode: &Mode, checked_as_test: bool, harness: bool) -> bool {
+    harness && (mode == &Mode::Test || checked_as_test)
+}
+
+/// Whether `unit` should get an appended harness, agreeing with blaze-lower's root aliasing.
 fn tested(job: &Job, unit: usize) -> bool {
-    job.unit(unit).is_ok_and(|it| it.mode == Mode::Test)
-        || job.plan(unit).is_ok_and(|it| it.checked_as_test)
+    match (job.unit(unit), job.plan(unit)) {
+        (Ok(unit), Ok(plan)) => wants_harness(&unit.mode, plan.checked_as_test, plan.harness),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Mode, wants_harness};
+
+    /// A harness-disabled bench/test must not be offered a module to append: its crate root
+    /// is the on-disk file, not an alias, even though it is compiled with `cfg(test)`.
+    #[test]
+    fn harness_disabled_test_leaves_unaliased_root_alone() {
+        assert!(!wants_harness(&Mode::Test, false, false), "a harness=false bench");
+        assert!(
+            !wants_harness(&Mode::Build, true, false),
+            "a checked-as-test unit without a harness"
+        );
+        assert!(!wants_harness(&Mode::Build, false, true), "an ordinary build");
+        assert!(wants_harness(&Mode::Test, false, true), "a test with a harness");
+        assert!(wants_harness(&Mode::Build, true, true), "a check of tests with a harness");
+    }
 }
