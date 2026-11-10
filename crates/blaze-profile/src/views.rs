@@ -897,7 +897,9 @@ mod tests {
     const FUNCTIONS: &[&str] = &[
         "any_value",
         "arg_max",
+        "arg_min",
         "array_to_string",
+        "avg",
         "count",
         "lag",
         "lead",
@@ -915,6 +917,7 @@ mod tests {
         "greatest",
         "coalesce",
         "string_agg",
+        "split_part",
         "regexp_matches",
         "row_number",
         "regexp_extract",
@@ -1005,7 +1008,7 @@ mod tests {
         out
     }
 
-    /// The names `sql` gives with `AS`: columns, tables and the common table expressions.
+    /// The column, table and common-table-expression names `sql` declares.
     fn aliases(sql: &str) -> BTreeSet<String> {
         let words = identifiers(sql);
         let mut out = BTreeSet::new();
