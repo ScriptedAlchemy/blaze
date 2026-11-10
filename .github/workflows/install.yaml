@@ -10,9 +10,9 @@ name: install
 on:
   push:
     branches: [main]
-    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/test_install_channels.py"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/test_install_channels.py"]
   pull_request:
-    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/test_install_channels.py"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/test_install_channels.py"]
   release:
     types: [published]
   schedule:
@@ -49,6 +49,8 @@ jobs:
       - run: shellcheck -s sh site/install.sh
       - name: installer channel workflow regressions
         run: python3 -I .github/scripts/test_install_channels.py
+      - name: release userspace regressions
+        run: python3 -I .github/scripts/test_install_archive.py
 
   install:
     name: ${{ matrix.os }}
@@ -140,19 +142,23 @@ jobs:
           if sh site/install.sh --channel nightly > out.txt 2>&1; then cat out.txt; exit 1; fi
           grep -F "blaze has no channel nightly." out.txt
 
-  # This commit's build, as the release builds it: on the release's Ubuntu, so that it asks for
-  # the glibc a release asks for, and with no PGO,
+  # This commit's build, as the release builds it: in the release's Ubuntu userspace, so that
+  # it asks for the glibc a release asks for, and with no PGO,
   # as release.yaml builds it: with a profile older than the crates the build sat silent past
   # every crate for 50 minutes and more, at random (04:27Z and 07:02Z on 2026-10-28).
   # build_release.py refuses a binary that asks for a glibc newer than RHEL 9's.
-  # Build on Ubuntu 22.04 for the release's old glibc requirement.
+  # Keep Ubuntu 22.04's compiler and libraries while using the 24.04 host's kernel: the pinned
+  # stage 0 predates blaze-core's ReservedCheck repair for linux-azure 6.8's inverted check of
+  # io_uring buffer-ring reserved words. A container changes userspace, not the host kernel.
   archive:
     name: this commit's build
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     # A clean build of blaze by blaze, as a release's: about 97 minutes on this runner.
     timeout-minutes: 330
     steps:
       - uses: actions/checkout@v7
+      - name: isolated bootstrap and registry directory
+        run: echo "CARGO_HOME=$RUNNER_TEMP/archive-cargo" >> "$GITHUB_ENV"
       # The release's own recipe, and the recipe is what it checks: the stage 0
       # .github/blaze-version names (blaze builds blaze, never cargo or rustc), the pinned LLVM,
       # and a store of this job's own that nothing pushes, so a clean build (release.yaml).
@@ -160,13 +166,27 @@ jobs:
         with:
           job: install-archive
           llvm: true
+          reflink: "true"
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
           enable-cache: false
-      - run: |
-          uv run --frozen --no-dev python .github/scripts/build_release.py \
-            '{"target": "x86_64-unknown-linux-gnu", "out": "shipped", "pgo": "off"}'
+      - name: build the release in Ubuntu 22.04 userspace
+        run: |
+          jq -n \
+            --arg workspace "$PWD" --arg temporary "$RUNNER_TEMP" --arg home "$HOME" \
+            --arg cargo_home "${CARGO_HOME:-$HOME/.cargo}" \
+            --arg blaze_home "$BLAZE_HOME" --arg cache_home "$XDG_CACHE_HOME" \
+            --arg store "$BLAZE_CACHE" --arg target "$CARGO_TARGET_DIR" \
+            --arg llvm "$LLVM_SYS_231_PREFIX" --arg bash_env "$BASH_ENV" \
+            --arg uv "$(command -v uv)" \
+            --arg name "blaze-install-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --argjson uid "$(id -u)" --argjson gid "$(id -g)" \
+            '{workspace:$workspace, temporary:$temporary, home:$home, cargo_home:$cargo_home,
+              blaze_home:$blaze_home, cache_home:$cache_home, store:$store, target:$target,
+              llvm:$llvm, bash_env:$bash_env, uv:$uv, name:$name, uid:$uid, gid:$gid}' \
+            > "$RUNNER_TEMP/install-archive.json"
+          uv run --frozen --no-dev python .github/scripts/install_archive.py "$RUNNER_TEMP/install-archive.json"
         timeout-minutes: 300
       - name: archive
         run: |
