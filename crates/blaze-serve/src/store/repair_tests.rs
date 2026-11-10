@@ -643,9 +643,9 @@ fn native_partitions(count: usize, conflict: u8) -> Vec<native_pack::Pack> {
         }
         halves[i % 2].push(value);
     }
-    let mut packs = vec![native_pack::Pack::of(values).unwrap()]; // alloc: three producer outputs
+    let mut packs = native_pack::Pack::batches(values).unwrap(); // alloc: bounded producer outputs
     for half in halves {
-        packs.push(native_pack::Pack::of(half).unwrap());
+        packs.extend(native_pack::Pack::batches(half).unwrap());
     }
     packs.sort_by_key(|pack| pack.reference.pack);
     packs.dedup_by_key(|pack| pack.reference.pack);
@@ -769,9 +769,9 @@ fn native_partitions_preserve_values_through_publication_faults_and_reopen(tc: h
 }
 
 #[test]
-fn native_packs_are_not_wire_batches_and_frontier_memory_depends_only_on_pack_count() {
-    // The real producer emits more than 65,536 opaque records in one blob. An
-    // aggregate batch cap would also reject its equivalent two-pack partition.
+fn native_output_spans_wire_batches_and_frontier_memory_depends_only_on_pack_count() {
+    // The real producer partitions more than 65,536 records into bounded packs.
+    // Validation must admit the whole output and its equivalent even/odd partition.
     native_partition_scenario(
         blaze_wire::Limits::DOCUMENTED.batch_items as usize + 1,
         0,
