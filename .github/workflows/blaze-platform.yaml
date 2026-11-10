@@ -111,6 +111,9 @@ jobs:
         with:
           job: tests
           llvm: true
+          # Placement clones blocks; hosted ext4 cannot (os error 95), which a cold fork
+          # store hits when the seed rebuilds std. Hosted Linux gets the reflink Btrfs.
+          reflink: ${{ runner.os == 'Linux' && runner.environment == 'github-hosted' }}
       # What this run's build job compiled, which main's remote has only once main pushes it:
       # a pull request's build pushes nowhere.
       - if: env.BLAZE == 'true' && (inputs.tier == 'gate' || inputs.tier == 'warm')
@@ -179,6 +182,9 @@ jobs:
         with:
           job: build
           llvm: true
+          # Placement clones blocks; hosted ext4 cannot (os error 95), which a cold fork
+          # store hits when the seed rebuilds std. Hosted Linux gets the reflink Btrfs.
+          reflink: ${{ runner.os == 'Linux' && runner.environment == 'github-hosted' }}
       # The packs the store has before the build, so that what it adds can be handed on.
       - if: env.BLAZE == 'true'
         run: find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-pulled.txt"
