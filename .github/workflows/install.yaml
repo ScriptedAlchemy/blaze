@@ -66,6 +66,8 @@ jobs:
       BLAZE_VERSION: ${{ inputs.version || (github.event_name == 'release' && github.event.release.tag_name) || '' }}
     steps:
       - uses: actions/checkout@v7
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/reflink
       # Here and not in the job's env, which has no runner context.
       - name: a CARGO_HOME of its own
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
@@ -139,6 +141,8 @@ jobs:
           installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain --channel canary --version "$stable"
           if sh site/install.sh --channel nightly > out.txt 2>&1; then cat out.txt; exit 1; fi
           grep -F "blaze has no channel nightly." out.txt
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   # This commit's build, as the release builds it: on the release's Ubuntu, so that it asks for
   # the glibc a release asks for, and with no PGO,
@@ -160,13 +164,17 @@ jobs:
         with:
           job: install-archive
           llvm: true
+          reflink: "true"
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
           enable-cache: false
       - run: |
+          jq -n --arg target_dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}" \
+            '{target: "x86_64-unknown-linux-gnu", out: "shipped", pgo: "off", target_dir: $target_dir}' \
+            > "$RUNNER_TEMP/build-release.json"
           uv run --frozen --no-dev python .github/scripts/build_release.py \
-            '{"target": "x86_64-unknown-linux-gnu", "out": "shipped", "pgo": "off"}'
+            "$RUNNER_TEMP/build-release.json"
         timeout-minutes: 300
       - name: archive
         run: |
@@ -200,28 +208,46 @@ jobs:
           - { system: Debian 12, image: "debian:bookworm-slim", packages: apt }
           - { system: Ubuntu 22.04, image: "ubuntu:22.04", packages: apt }
           - { system: RHEL 9, image: "registry.access.redhat.com/ubi9/ubi", packages: dnf }
-    container: ${{ matrix.image }}
-    # As in `docker run`: the runner's /github/home belongs to its own user, and the daemon
-    # keeps nothing in a directory another user can replace things in.
-    env:
-      HOME: /root
+    # Prepare storage on the host, then bind it into the same no-Rust images. The images
+    # keep their normal Docker isolation; no mount capability is granted to user code.
     steps:
-      - if: matrix.packages == 'apt'
-        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates gcc libc6-dev
-      - if: matrix.packages == 'dnf'
-        run: dnf install -y -q gcc tar gzip && dnf clean all
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/reflink
       - uses: actions/download-artifact@v8
         with:
           name: archive
+      - name: no-Rust image with the verified Blaze filesystem
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/no-rust"
+          touch "$RUNNER_TEMP/no-rust/summary.md"
+          docker run -d --name blaze-no-rust \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/work,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/no-rust,target=/tmp/blaze-install" \
+            --mount "type=bind,source=$RUNNER_TEMP/blaze-fs,target=$RUNNER_TEMP/blaze-fs" \
+            --workdir /work --env HOME=/root --env GITHUB_STEP_SUMMARY=/tmp/blaze-install/summary.md \
+            --env RUNNER_TEMP=/tmp/blaze-install --env BLAZE_CORES --env BLAZE_LOCK \
+            --env XDG_CACHE_HOME --env BLAZE_HOME --env BLAZE_CACHE --env CARGO_TARGET_DIR \
+            "$IMAGE" sleep infinity
+          # The preflight created these as the host runner; the image's root daemon must
+          # own its state and every ancestor inside the bind mount (socket::private_dir).
+          docker exec blaze-no-rust chown -R 0:0 "$RUNNER_TEMP/blaze-fs"
+      - if: matrix.packages == 'apt'
+        run: docker exec blaze-no-rust sh -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates gcc libc6-dev'
+      - if: matrix.packages == 'dnf'
+        run: docker exec blaze-no-rust sh -c 'dnf install -y -q gcc tar gzip && dnf clean all'
       - name: no rustup, cargo or rustc
         run: |
+          docker exec -i blaze-no-rust sh -s <<'SH'
+          set -eu
           for tool in rustup cargo rustc; do
             if command -v "$tool"; then echo "::error::$tool is on PATH"; exit 1; fi
           done
+          SH
       - name: install, then blaze run in a project written by hand
-        shell: sh
         run: |
+          docker exec -i blaze-no-rust sh -s <<'SH'
           set -eu
           began=$(date +%s.%N)
           BLAZE_ARCHIVE="$PWD/blaze-commit-x86_64-unknown-linux-gnu.tar.gz" sh < site/install.sh
@@ -243,11 +269,12 @@ jobs:
             if command -v "$tool"; then echo "::error::$tool is on PATH after installing"; exit 1; fi
           done
           blaze stop
+          SH
       # A derive from crates.io: blaze builds it and expands it in process on its own evaluator
       # (blaze-macro-eval), on this system's glibc; an edit after is the daemon's.
       - name: proc macros, by blaze's evaluator
-        shell: sh
         run: |
+          docker exec -i blaze-no-rust sh -s <<'SH'
           set -eu
           export PATH="$HOME/.cargo/bin:$PATH"
           mkdir -p "$RUNNER_TEMP/derive/src"
@@ -265,3 +292,23 @@ jobs:
             echo "::error::the proc macros were not blaze's"; exit 1
           fi
           blaze stop
+          SH
+      - name: daemon log in the no-Rust image
+        if: failure()
+        run: |
+          docker exec -i blaze-no-rust sh -s <<'SH'
+          for log in "$BLAZE_HOME"/*/serve.log "$BLAZE_HOME"/serve.log; do
+            [ -f "$log" ] || continue
+            echo "::group::$log (last 200 lines)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          done
+          SH
+      - name: no-Rust smoke summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/no-rust/summary.md" ]; then
+            cat "$RUNNER_TEMP/no-rust/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: always()
+        run: docker rm -f blaze-no-rust

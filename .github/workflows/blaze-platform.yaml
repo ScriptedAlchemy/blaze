@@ -50,6 +50,8 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
+  # The Linux reflink action replaces this with its verified Btrfs target.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
   # Every test `blaze test` runs is in a sandbox, which Windows does not have yet.
   BLAZE_SANDBOX: ${{ startsWith(inputs.os, 'windows') && 'off' || '' }}
   # Git Bash on Windows has `python` and no `python3`.
@@ -111,18 +113,19 @@ jobs:
         with:
           job: tests
           llvm: true
+          reflink: ${{ runner.os == 'Linux' }}
       # What this run's build job compiled, which main's remote has only once main pushes it:
       # a pull request's build pushes nowhere.
       - if: env.BLAZE == 'true' && (inputs.tier == 'gate' || inputs.tier == 'warm')
         uses: actions/download-artifact@v8
         with:
           name: store-${{ inputs.platform }}
-          path: ${{ runner.temp }}/handoff
+          path: ${{ env.BLAZE_CACHE }}/handoff
       # Each pack is named by the hash of its bytes, which is checked here before the store
       # has it (and again by the daemon as it opens the store).
       - if: env.BLAZE == 'true' && (inputs.tier == 'gate' || inputs.tier == 'warm')
         name: the build job's packs into the store
-        working-directory: ${{ runner.temp }}/handoff
+        working-directory: ${{ env.BLAZE_CACHE }}/handoff
         run: |
           while read -r pack; do
             [ -f "$pack" ] || { echo "::error::the build job's pack $pack is not in its artifact"; exit 1; }
@@ -179,6 +182,9 @@ jobs:
         with:
           job: build
           llvm: true
+          reflink: ${{ runner.os == 'Linux' }}
+      # The legacy SHA-named pack handoff does not cover V2's pack-000000 and store metadata;
+      # a V2 transfer needs its own import contract, not just a wider filename glob.
       # The packs the store has before the build, so that what it adds can be handed on.
       - if: env.BLAZE == 'true'
         run: find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-pulled.txt"
@@ -217,12 +223,12 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       # What the build added to the store, for the tests job (`needs: build`), which pulls the
-      # same keys; a hard link each, since the store and the runner's temporary directory are
-      # one disk. packs.txt lists them, so that a build that added none still hands over a list.
+      # same keys; stage beside the packs so hard links stay on their filesystem. packs.txt
+      # lists them, so that a build that added none still hands over a list.
       - id: handoff
         if: env.BLAZE == 'true' && inputs.harnesses == '' && (inputs.tier == 'gate' || inputs.tier == 'warm')
         run: |
-          dir="$RUNNER_TEMP/handoff"
+          dir="$BLAZE_CACHE/handoff"
           mkdir -p "$dir"
           find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-built.txt"
           comm -13 "$RUNNER_TEMP/packs-pulled.txt" "$RUNNER_TEMP/packs-built.txt" > "$dir/packs.txt"
@@ -233,21 +239,25 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: store-${{ inputs.platform }}
-          path: ${{ runner.temp }}/handoff
+          path: ${{ env.BLAZE_CACHE }}/handoff
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
       # The binaries run each other from next to themselves. A tar keeps them executable.
       - name: Pack
-        working-directory: target/release
+        working-directory: ${{ env.CARGO_TARGET_DIR }}/release
         run: |
           exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
+          for bin in blaze-engine blaze; do
+            [ -x "$bin$exe" ] || { echo "::error::the build made no executable $PWD/$bin$exe"; exit 1; }
+          done
           tar -cf blaze.tar blaze-engine$exe blaze$exe
       - uses: actions/upload-artifact@v7
         with:
           name: blaze-${{ inputs.platform }}
-          path: target/release/blaze.tar
+          path: ${{ env.CARGO_TARGET_DIR }}/release/blaze.tar
           retention-days: 3
+          if-no-files-found: error
       # ci.py and focused.py run in the repository's Python workspace (pyproject.toml, uv.lock),
       # and the harnesses in the Python that runs them: they read their input with typed_input.
       - if: inputs.tier == 'fast' || inputs.tier == 'full'
@@ -294,6 +304,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/reflink
       # The pinned DuckDB (flake.nix), which `blaze debug gate` runs: blaze never links one.
       - uses: ./.github/actions/nix
       - id: duckdb
@@ -301,13 +313,17 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}
-          path: ${{ runner.temp }}/blaze
+          path: ${{ env.CARGO_TARGET_DIR }}/release
       - uses: actions/download-artifact@v8
         with:
           name: profile-${{ inputs.platform }}
           path: ${{ runner.temp }}/profile
-      - working-directory: ${{ runner.temp }}/blaze
-        run: tar -xf blaze.tar
+      - working-directory: ${{ env.CARGO_TARGET_DIR }}/release
+        run: |
+          tar -xf blaze.tar
+          for bin in blaze-engine blaze; do
+            [ -x "$bin" ] || { echo "::error::the build artifact has no executable $PWD/$bin"; exit 1; }
+          done
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
@@ -317,7 +333,7 @@ jobs:
           DUCKDB: ${{ steps.duckdb.outputs.path }}
           PLATFORM: ${{ inputs.platform }}
         run: |
-          jq -n --arg blaze "$RUNNER_TEMP/blaze/blaze" --arg duckdb "$DUCKDB" --arg history "$RUNNER_TEMP/profile" \
+          jq -n --arg blaze "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release/blaze" --arg duckdb "$DUCKDB" --arg history "$RUNNER_TEMP/profile" \
             --arg platform "$PLATFORM" --arg runner "$RUNNER_CLASS" --arg commit "$GITHUB_SHA" --arg out "$RUNNER_TEMP/profile-gate" \
             '{blaze: $blaze, duckdb: $duckdb, history: $history, platform: $platform, runner: $runner, commit: $commit, out: $out}' \
             > "$RUNNER_TEMP/profile-gate.json"
@@ -357,6 +373,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/reflink
+      # These harnesses choose targets and homes under their temporary workspaces.
+      - if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/blaze-fs/tmp" "$BLAZE_HOME/projects"
+          echo "TMPDIR=$RUNNER_TEMP/blaze-fs/tmp" >> "$GITHUB_ENV"
+          echo "BLAZE_PROJECTS=$BLAZE_HOME/projects" >> "$GITHUB_ENV"
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
@@ -379,11 +403,15 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}
-          path: target/release
+          path: ${{ env.CARGO_TARGET_DIR }}/release
       - name: blaze
-        working-directory: target/release
+        working-directory: ${{ env.CARGO_TARGET_DIR }}/release
         run: |
           tar -xf blaze.tar
+          exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
+          for bin in blaze-engine blaze; do
+            [ -x "$bin$exe" ] || { echo "::error::the build artifact has no executable $PWD/$bin$exe"; exit 1; }
+          done
           if [ "$RUNNER_OS" = Windows ]; then bin="$(cygpath -w "$PWD")\\blaze-engine.exe"; else bin="$PWD/blaze-engine"; fi
           echo "BLAZE_BIN=$bin" >> "$GITHUB_ENV"
       # The harnesses run in the Python of the repository's workspace, as ci.py and focused.py do.
@@ -393,12 +421,12 @@ jobs:
           enable-cache: false
       - if: inputs.harnesses == ''
         run: |
-          uv run --frozen --no-dev python harness/ci.py run '{"part": "${{ matrix.part }}"}'
+          env -u CARGO_TARGET_DIR uv run --frozen --no-dev python harness/ci.py run '{"part": "${{ matrix.part }}"}'
       - if: inputs.harnesses != ''
         env:
           HARNESSES: ${{ inputs.harnesses }}
         run: |
-          uv run --frozen --no-dev python harness/focused.py run "{\"harnesses\": $HARNESSES}"
+          env -u CARGO_TARGET_DIR uv run --frozen --no-dev python harness/focused.py run "{\"harnesses\": $HARNESSES}"
       # What the daemons said when a harness failed (each harness's daemon logs in a temporary
       # home of its own: `serve.log` there or in its `v2/`), and the report of a process that
       # crashed on macOS.
@@ -431,6 +459,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/reflink
       # With Nix: the build's programs ask for the dev shell's glibc, from the Nix store.
       - uses: ./.github/actions/toolchain
         with:
@@ -438,13 +468,25 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}
-          path: target/release
-      - run: tar -xf blaze.tar
-        working-directory: target/release
+          path: ${{ env.CARGO_TARGET_DIR }}/release
+      - run: |
+          tar -xf blaze.tar
+          for bin in blaze-engine blaze; do
+            [ -x "$bin" ] || { echo "::error::the build artifact has no executable $PWD/$bin"; exit 1; }
+          done
+        working-directory: ${{ env.CARGO_TARGET_DIR }}/release
       - name: smoke corpus (std)
+        env:
+          BLAZE_HOME: ${{ env.BLAZE_HOME || format('{0}/blaze-home', runner.temp) }}
         run: |
-          BLAZE_HOME="$RUNNER_TEMP/blaze-home" $PYTHON harness/smoke.py \
-            "{\"groups\": [\"std\"], \"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"work\": \"$RUNNER_TEMP/smoke\"}"
+          work="$RUNNER_TEMP/smoke"
+          if [ "$RUNNER_OS" = Linux ]; then work="$BLAZE_HOME/smoke"; fi
+          $PYTHON harness/smoke.py \
+            "{\"groups\": [\"std\"], \"blaze\": \"${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release/blaze\", \"work\": \"$work\"}"
+      - if: failure()
+        uses: ./.github/actions/daemon-log
+        env:
+          BLAZE_HOME: ${{ env.BLAZE_HOME || format('{0}/blaze-home', runner.temp) }}
 
   # `blaze` in place of cargo on projects at pinned commits, and the flags and the daemon's
   # life. Incremental compilation is left to the profile,
@@ -464,22 +506,34 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/reflink
+      # These harnesses choose targets and homes under their temporary workspaces.
+      - if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/blaze-fs/tmp" "$BLAZE_HOME/projects"
+          echo "TMPDIR=$RUNNER_TEMP/blaze-fs/tmp" >> "$GITHUB_ENV"
+          echo "BLAZE_PROJECTS=$BLAZE_HOME/projects" >> "$GITHUB_ENV"
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}
-          path: target/release
-      - run: tar -xf blaze.tar
-        working-directory: target/release
+          path: ${{ env.CARGO_TARGET_DIR }}/release
+      - run: |
+          tar -xf blaze.tar
+          for bin in blaze-engine blaze; do
+            [ -x "$bin" ] || { echo "::error::the build artifact has no executable $PWD/$bin"; exit 1; }
+          done
+        working-directory: ${{ env.CARGO_TARGET_DIR }}/release
       - name: blaze against cargo
         working-directory: harness
         # Under the job's limit, so that a run that hangs leaves time to keep what it logged.
         timeout-minutes: 40
         run: |
           if [ "${{ matrix.group }}" = checks ]; then what=--only-checks; else what="--only-projects ${{ matrix.group }}"; fi
-          BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" env -u CARGO_INCREMENTAL $PYTHON blaze_cli.py $what
+          BLAZE_BIN="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release/blaze-engine" env -u CARGO_INCREMENTAL $PYTHON blaze_cli.py $what
       - name: what was running, and the daemons' logs
         if: failure()
         run: ps -eo pid,ppid,etime,args > /tmp/blaze-cargo-processes.txt
@@ -491,6 +545,8 @@ jobs:
             /tmp/blaze-cargo-processes.txt
             /tmp/blaze-cargo-*/home-*/*.log
             /tmp/blaze-cargo-*/home-*/*/*/log
+            ${{ env.TMPDIR || '/tmp' }}/blaze-cargo-*/home-*/serve.log
+            ${{ env.TMPDIR || '/tmp' }}/blaze-cargo-*/home-*/v2/serve.log
           if-no-files-found: ignore
 
   # The larger projects as they are published, natively on hosted AArch64: what the
@@ -515,21 +571,33 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/reflink
+      # These harnesses choose targets and homes under their temporary workspaces.
+      - if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/blaze-fs/tmp" "$BLAZE_HOME/projects"
+          echo "TMPDIR=$RUNNER_TEMP/blaze-fs/tmp" >> "$GITHUB_ENV"
+          echo "BLAZE_PROJECTS=$BLAZE_HOME/projects" >> "$GITHUB_ENV"
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}
-          path: target/release
-      - run: tar -xf blaze.tar
-        working-directory: target/release
+          path: ${{ env.CARGO_TARGET_DIR }}/release
+      - run: |
+          tar -xf blaze.tar
+          for bin in blaze-engine blaze; do
+            [ -x "$bin" ] || { echo "::error::the build artifact has no executable $PWD/$bin"; exit 1; }
+          done
+        working-directory: ${{ env.CARGO_TARGET_DIR }}/release
       - name: blaze
         working-directory: harness
         run: |
           if [ "${{ matrix.projects }}" = checks ]; then what=--only-checks; else what="--only-projects ${{ matrix.projects }}"; fi
           status=0
-          BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" $PYTHON blaze_cli.py $what || status=$?
+          BLAZE_BIN="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release/blaze-engine" $PYTHON blaze_cli.py $what || status=$?
           cat BLAZE-CLI*.md
           exit $status
 
@@ -547,19 +615,31 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/reflink
+      # These harnesses choose targets and homes under their temporary workspaces.
+      - if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/blaze-fs/tmp" "$BLAZE_HOME/projects"
+          echo "TMPDIR=$RUNNER_TEMP/blaze-fs/tmp" >> "$GITHUB_ENV"
+          echo "BLAZE_PROJECTS=$BLAZE_HOME/projects" >> "$GITHUB_ENV"
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}
-          path: target/release
-      - run: tar -xf blaze.tar
-        working-directory: target/release
+          path: ${{ env.CARGO_TARGET_DIR }}/release
+      - run: |
+          tar -xf blaze.tar
+          for bin in blaze-engine blaze; do
+            [ -x "$bin" ] || { echo "::error::the build artifact has no executable $PWD/$bin"; exit 1; }
+          done
+        working-directory: ${{ env.CARGO_TARGET_DIR }}/release
       - name: Bench
         working-directory: harness
         run: |
-          export BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" BLAZE_LLVM_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine"
+          export BLAZE_BIN="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release/blaze-engine" BLAZE_LLVM_BIN="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release/blaze-engine"
           $PYTHON bench.py ripgrep --out "$RUNNER_TEMP/bench.json"
           $PYTHON bench.py --compare bench-baseline.json "$RUNNER_TEMP/bench.json" --threshold 200
       - uses: actions/upload-artifact@v7
