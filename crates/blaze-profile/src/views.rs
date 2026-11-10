@@ -90,43 +90,46 @@ const BEFORE: Arg = Arg {
 const AFTER: Arg =
     Arg { name: "after", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM key_parts)") };
 
-// Each entry is a constant of its own (`const { .. }`): one evaluation scanning EXAMPLES for every
-// view at once ran past the const evaluator's step bound.
-pub const VIEWS: &[View] = &[
-    const { view("slowest_queries", &[BUILD, LIMIT]) },
-    const { view("slower_between_commits", &[EARLIER, LATER, LIMIT]) },
-    const { view("memo_hit_rate_per_query_kind", &[BUILD, LIMIT]) },
-    const { view("critical_path", &[ENDED_BUILD, LIMIT]) },
-    const { view("allocations_per_query_kind", &[BUILD]) },
-    const { view("what_reran", &[BUILD, LIMIT]) },
-    const { view("why_reran", &[BUILD, LIMIT]) },
-    const { view("untracked_reads", &[BUILD, LIMIT]) },
-    const { view("cycle_reruns", &[BUILD, LIMIT]) },
-    const { view("key_part_diff", &[BEFORE, AFTER, LIMIT]) },
-    const { view("task_memory", &[BUILD]) },
-    const { view("memory_timeline", &[BUILD]) },
-    const { view("memory_peak_tasks", &[BUILD, LIMIT]) },
-    const { view("memory_at_peak", &[BUILD]) },
-    const { view("memory_sites", &[BUILD, LIMIT]) },
-    const { view("admission_waits", &[BUILD, LIMIT]) },
-    const { view("busiest_threads", &[BUILD, LIMIT]) },
-    const { view("longest_gaps", &[BUILD, LIMIT]) },
-    const { view("top_cpu_stacks", &[BUILD, LIMIT]) },
-    const { view("time_by_span_name", &[BUILD]) },
-    const { view("frame_copies_per_query_kind", &[BUILD, LIMIT]) },
-    const { view("jobs_by_stack_high_water", &[BUILD, LIMIT]) },
-    const { view("utilization_per_second", &[ENDED_BUILD]) },
-    const { view("uncovered_time", &[ENDED_BUILD]) },
-    const { view("worker_states", &[ENDED_BUILD]) },
-    const { view("uncovered_per_worker", &[ENDED_BUILD]) },
-    const { view("raw_blocks", &[ENDED_BUILD, LIMIT]) },
-    const { view("reexecution_per_query_kind", &[BUILD, LIMIT]) },
-    const { view("footprint_per_build", &[LIMIT]) },
-    const { view("derive_panics_per_build", &[LIMIT]) },
-    const { view("errors_by_kind", &[ENDED_BUILD]) },
-    const { view("link_regions", &[BUILD]) },
-    const { view("link_code", &[BUILD]) },
-];
+// Scan EXAMPLES once: rescanning its prefix for every view exceeded stage 0's const-eval bound,
+// even with separate inline consts. The declarations keep their order, independent of SQL order.
+pub const VIEWS: &[View] = &catalogue(
+    EXAMPLES,
+    [
+        view("slowest_queries", &[BUILD, LIMIT]),
+        view("slower_between_commits", &[EARLIER, LATER, LIMIT]),
+        view("memo_hit_rate_per_query_kind", &[BUILD, LIMIT]),
+        view("critical_path", &[ENDED_BUILD, LIMIT]),
+        view("allocations_per_query_kind", &[BUILD]),
+        view("what_reran", &[BUILD, LIMIT]),
+        view("why_reran", &[BUILD, LIMIT]),
+        view("untracked_reads", &[BUILD, LIMIT]),
+        view("cycle_reruns", &[BUILD, LIMIT]),
+        view("key_part_diff", &[BEFORE, AFTER, LIMIT]),
+        view("task_memory", &[BUILD]),
+        view("memory_timeline", &[BUILD]),
+        view("memory_peak_tasks", &[BUILD, LIMIT]),
+        view("memory_at_peak", &[BUILD]),
+        view("memory_sites", &[BUILD, LIMIT]),
+        view("admission_waits", &[BUILD, LIMIT]),
+        view("busiest_threads", &[BUILD, LIMIT]),
+        view("longest_gaps", &[BUILD, LIMIT]),
+        view("top_cpu_stacks", &[BUILD, LIMIT]),
+        view("time_by_span_name", &[BUILD]),
+        view("frame_copies_per_query_kind", &[BUILD, LIMIT]),
+        view("jobs_by_stack_high_water", &[BUILD, LIMIT]),
+        view("utilization_per_second", &[ENDED_BUILD]),
+        view("uncovered_time", &[ENDED_BUILD]),
+        view("worker_states", &[ENDED_BUILD]),
+        view("uncovered_per_worker", &[ENDED_BUILD]),
+        view("raw_blocks", &[ENDED_BUILD, LIMIT]),
+        view("reexecution_per_query_kind", &[BUILD, LIMIT]),
+        view("footprint_per_build", &[LIMIT]),
+        view("derive_panics_per_build", &[LIMIT]),
+        view("errors_by_kind", &[ENDED_BUILD]),
+        view("link_regions", &[BUILD]),
+        view("link_code", &[BUILD]),
+    ],
+);
 
 /// The view named `name`.
 pub fn find(name: &str) -> Result<&'static View, ViewError> {
@@ -140,8 +143,7 @@ const NAME: &[u8] = b"-- name: ";
 const SAYS: &[u8] = b"-- says: ";
 
 const fn view(name: &'static str, args: &'static [Arg]) -> View {
-    let (title, sql) = section(EXAMPLES, name);
-    View { name, title, sql, args }
+    View { name, title: "", sql: "", args }
 }
 
 const fn starts(hay: &[u8], at: usize, needle: &[u8]) -> bool {
@@ -158,13 +160,16 @@ const fn starts(hay: &[u8], at: usize, needle: &[u8]) -> bool {
     true
 }
 
-/// Where the next line starting `needle` begins, from `from` on, or the end of `hay`.
+/// Where the next line starting `needle` begins, from the line at `from`, or the end of `hay`.
 const fn line_starting(hay: &[u8], needle: &[u8], mut from: usize) -> usize {
     while from < hay.len() {
-        if (from == 0 || hay[from - 1] == b'\n') && starts(hay, from, needle) {
+        if starts(hay, from, needle) {
             return from;
         }
-        from += 1;
+        from = line_end(hay, from);
+        if from < hay.len() {
+            from += 1;
+        }
     }
     hay.len()
 }
@@ -185,35 +190,57 @@ const fn cut(text: &'static str, from: usize, to: usize) -> &'static str {
     }
 }
 
-/// The `-- says:` line and the SQL of the section `-- name: <name>` of `file`: a compile error
-/// when there is none, or it has no `-- says:` line first.
-const fn section(file: &'static str, name: &'static str) -> (&'static str, &'static str) {
+/// Fill each declaration from one pass over the sections, checking the catalogue at compile time.
+const fn catalogue<const N: usize>(file: &'static str, mut views: [View; N]) -> [View; N] {
     let bytes = file.as_bytes();
+    let mut found = [false; N];
     let mut at = line_starting(bytes, NAME, 0);
-    loop {
-        if at == bytes.len() {
-            panic!("sql/examples.sql has no `-- name:` section for a view of VIEWS");
-        }
+    while at < bytes.len() {
         let named = at + NAME.len();
         let end = line_end(bytes, named);
-        if end - named == name.len() && starts(bytes, named, name.as_bytes()) {
-            break;
+        let says = end + 1;
+        if !starts(bytes, says, SAYS) {
+            panic!(
+                "a view's `-- name:` line in sql/examples.sql is not followed by its `-- says:` line"
+            );
         }
-        at = line_starting(bytes, NAME, end);
+        let says_end = line_end(bytes, says);
+        if says_end == bytes.len() {
+            panic!("a view's `-- says:` line in sql/examples.sql has no SQL line after it");
+        }
+        let sql = says_end + 1;
+        let next = line_starting(bytes, NAME, sql);
+        let mut sql_end = next;
+        while sql_end > sql && bytes[sql_end - 1].is_ascii_whitespace() {
+            sql_end -= 1;
+        }
+        let mut i = 0;
+        while i < N {
+            let name = views[i].name;
+            if end - named == name.len() && starts(bytes, named, name.as_bytes()) {
+                if found[i] {
+                    panic!("sql/examples.sql repeats a `-- name:` section of VIEWS");
+                }
+                found[i] = true;
+                views[i].title = cut(file, says + SAYS.len(), says_end);
+                views[i].sql = cut(file, sql, sql_end);
+                break;
+            }
+            i += 1;
+        }
+        if i == N {
+            panic!("sql/examples.sql has a `-- name:` section with no declaration in VIEWS");
+        }
+        at = next;
     }
-    let says = line_end(bytes, at) + 1;
-    if !starts(bytes, says, SAYS) {
-        panic!(
-            "a view's `-- name:` line in sql/examples.sql is not followed by its `-- says:` line"
-        );
+    let mut i = 0;
+    while i < N {
+        if !found[i] {
+            panic!("sql/examples.sql has no `-- name:` section for a view of VIEWS");
+        }
+        i += 1;
     }
-    let says_end = line_end(bytes, says);
-    let sql = says_end + 1;
-    let mut sql_end = line_starting(bytes, NAME, sql);
-    while sql_end > sql && bytes[sql_end - 1].is_ascii_whitespace() {
-        sql_end -= 1;
-    }
-    (cut(file, says + SAYS.len(), says_end), cut(file, sql, sql_end))
+    views
 }
 
 #[derive(Debug, PartialEq)]
@@ -579,6 +606,89 @@ mod tests {
                 "{} is one statement DuckDB can wrap in COPY",
                 view.name
             );
+        }
+    }
+
+    #[test]
+    fn full_catalogue_preserves_section_bytes_including_late_views() {
+        // An independent, runtime split of the real file checks the production const's slices.
+        let mut count = 0;
+        for section in EXAMPLES.split("\n-- name: ").skip(1) {
+            let (name, rest) = section.split_once('\n').unwrap();
+            let (says, sql) = rest.split_once('\n').unwrap();
+            let view = find(name).unwrap();
+            assert_eq!(view.title, says.strip_prefix("-- says: ").unwrap(), "{name}");
+            assert_eq!(
+                view.sql,
+                sql.trim_end_matches(|c: char| c.is_ascii_whitespace()),
+                "{name}"
+            );
+            count += 1;
+        }
+        assert_eq!(count, VIEWS.len());
+        assert_eq!(count, 33, "exercise the full catalogue that exceeded stage 0's bound");
+        assert!(VIEWS[27..].iter().map(|view| view.name).eq([
+            "reexecution_per_query_kind",
+            "footprint_per_build",
+            "derive_panics_per_build",
+            "errors_by_kind",
+            "link_regions",
+            "link_code",
+        ]));
+    }
+
+    #[test]
+    fn catalogue_keeps_utf8_bytes_and_declaration_order() {
+        const FILE: &str = concat!(
+            "préface\n",
+            "-- name: é_more\n-- says: résumé 🦀  \n",
+            "SELECT '🦀' -- name: inline\n \t\r\n",
+            "-- name: é\n-- says: dernière\nSELECT 'é'\u{a0}",
+        );
+        const VIEWS: [View; 2] = catalogue(FILE, [view("é", &[BUILD]), view("é_more", &[])]);
+        assert_eq!(VIEWS[0].name, "é");
+        assert_eq!(VIEWS[0].title, "dernière");
+        assert_eq!(VIEWS[0].sql, "SELECT 'é'\u{a0}", "only ASCII whitespace is trimmed");
+        assert_eq!(VIEWS[0].args.len(), 1);
+        assert_eq!(VIEWS[0].args[0].name, BUILD.name);
+        assert_eq!(VIEWS[0].args[0].ty, BUILD.ty);
+        assert_eq!(VIEWS[0].args[0].default, BUILD.default);
+        assert_eq!(VIEWS[1].name, "é_more");
+        assert_eq!(VIEWS[1].title, "résumé 🦀  ");
+        assert_eq!(VIEWS[1].sql, "SELECT '🦀' -- name: inline");
+        assert!(VIEWS[1].args.is_empty());
+    }
+
+    #[test]
+    fn catalogue_refuses_missing_and_malformed_headers() {
+        for (file, reason) in [
+            ("", "has no `-- name:` section"),
+            (" -- name: wanted\n-- says: indented\nSELECT 1", "has no `-- name:` section"),
+            ("-- name: wanted", "not followed by its `-- says:` line"),
+            ("-- name: wanted\nSELECT 1", "not followed by its `-- says:` line"),
+            ("-- name: wanted\n\n-- says: delayed\nSELECT 1", "not followed by its `-- says:` line"),
+            ("-- name: wanted\n-- says: no SQL line", "has no SQL line after it"),
+            ("-- name: wanted_more\n-- says: wrong name\nSELECT 1", "no declaration in VIEWS"),
+            (
+                "-- name: wanted\n-- says: first\nSELECT 1\n-- name: wanted\n-- says: twice\nSELECT 2",
+                "repeats a `-- name:` section",
+            ),
+        ] {
+            let error = std::panic::catch_unwind(|| catalogue(file, [view("wanted", &[])]))
+                .expect_err(file);
+            let message = error
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| error.downcast_ref::<String>().map(String::as_str));
+            assert!(message.is_some_and(|it| it.contains(reason)), "{file:?}: {message:?}");
+        }
+    }
+
+    #[test]
+    fn cut_refuses_either_boundary_inside_a_utf8_character() {
+        for (from, to) in [(1, 2), (0, 1)] {
+            let error = std::panic::catch_unwind(|| cut("é", from, to));
+            assert!(error.is_err(), "cut {from}..{to} inside é must fail UTF-8 validation");
         }
     }
 
