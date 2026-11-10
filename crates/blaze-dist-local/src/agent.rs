@@ -226,6 +226,19 @@ pub fn decide(policy: &LocalPolicy, failure: Error) -> Result<(), Error> {
     }
 }
 
+/// After a full manifest has been accepted, a delivery, heartbeat or cache
+/// failure cannot authorize compiling the immutable unit again. Preserve an
+/// explicit caller cancellation and an already typed committed-data refusal.
+fn after_publication<T>(unit: &Unit, result: Result<T, Error>) -> Result<T, Error> {
+    result.map_err(|error| match error {
+        Error::Committed(_) | Error::Cancelled(_) => error,
+        other => Error::Committed(format!(
+            "unit {}: immutable publication already accepted: {other}",
+            hex(&unit.spec)
+        )),
+    })
+}
+
 struct Batches<'a> {
     unit: &'a Unit,
     blobs: &'a Blobs,
@@ -502,7 +515,7 @@ fn execute(
                 deliver(client, binding, &arrived.packs)?;
                 Ok(())
             };
-            if let Some(claimed) = &claimed
+            let completed = if let Some(claimed) = &claimed
                 && claimed.lead
                 && let Some(executor) = &claimed.executor
             {
@@ -515,12 +528,16 @@ fn execute(
                     now_ms,
                     cancelled,
                     |_| take(),
-                )?;
+                )
             } else {
-                take()?;
-            }
+                take()
+            };
+            after_publication(unit, completed)?;
             if let Some((executor, attempt)) = last_claim {
-                acknowledge(client, content, execution, &executor, attempt)?;
+                after_publication(
+                    unit,
+                    acknowledge(client, content, execution, &executor, attempt),
+                )?;
             }
             return Ok(arrived);
         }
@@ -563,6 +580,7 @@ fn execute(
                 waited = (waited * 2).min(POLL_MOST);
                 continue;
             }
+            let publication_accepted = AtomicBool::new(false);
             let committed = heartbeat_during(
                 config,
                 content,
@@ -611,19 +629,31 @@ fn execute(
                         executor: executor.clone(),
                         packs,
                     });
-                    match client.call(commit)? {
+                    // The commit may have succeeded even if its reply was lost.
+                    // A transport failure cannot permit a local rebuild under
+                    // this unit's immutable key.
+                    let reply = client.call(commit).map_err(|error| {
+                        Error::Committed(format!(
+                            "unit {}: publication commit outcome unknown: {error}",
+                            hex(&unit.spec)
+                        ))
+                    })?;
+                    match reply {
                         Answer::Publication(carrier::Publication {
                             packs: Some(packs),
                             accepted_attempt: Some(accepted),
                             ..
                         }) => {
+                            publication_accepted.store(true, Ordering::Release);
                             arrived.publication_attempt = Some(u64::from(accepted.0));
-                            ensure_not_cancelled(unit, cancelled)?;
-                            mirror(config, unit, &packs)?;
-                            ensure_not_cancelled(unit, cancelled)?;
-                            deliver(client, binding, &packs)?;
-                            acknowledge(client, content, execution, &executor, claimed.attempt)?;
-                            Ok(Some(packs))
+                            after_publication(unit, (|| {
+                                ensure_not_cancelled(unit, cancelled)?;
+                                mirror(config, unit, &packs)?;
+                                ensure_not_cancelled(unit, cancelled)?;
+                                deliver(client, binding, &packs)?;
+                                acknowledge(client, content, execution, &executor, claimed.attempt)?;
+                                Ok(Some(packs))
+                            })())
                         }
                         Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => {
                             Err(ended(client, binding))
@@ -636,10 +666,20 @@ fn execute(
                         {
                             Ok(None)
                         }
-                        other => Err(Error::Protocol(format!("publication answered {other:?}"))),
+                        other => Err(Error::Committed(format!(
+                            "unit {}: publication commit outcome unknown: {other:?}",
+                            hex(&unit.spec)
+                        ))),
                     }
                 },
-            )?;
+            );
+            // A failed heartbeat after successful publication is not evidence
+            // the manifest was never accepted by the coordinator.
+            let committed = if publication_accepted.load(Ordering::Acquire) {
+                after_publication(unit, committed)?
+            } else {
+                committed?
+            };
             let Some(packs) = committed else {
                 // This attempt was fenced during its tail. Uploaded immutable blobs are
                 // harmless; only a current lead may make their manifest visible.
@@ -1043,6 +1083,43 @@ mod tests {
             Err(Error::Io(_))
         ));
         // The original unchecked join would return Ok(1).
+    }
+
+    #[test]
+    fn errors_after_publication_cannot_rebuild_an_immutable_unit() {
+        let unit = Unit { spec: [0x71; 32], names: Vec::new() }; // alloc: immutable unit fixture
+        for error in [
+            Error::Io(std::io::ErrorKind::ConnectionReset.into()),
+            Error::Protocol("delivery was refused".to_owned()),
+        ] {
+            // A prior Protocol/Io error would have triggered Fallback despite
+            // the coordinator having accepted this unit's immutable manifest.
+            let refused = after_publication(&unit, Err::<(), _>(error)).unwrap_err();
+            assert!(matches!(
+                &refused,
+                Error::Committed(why) if why.contains(&hex(&unit.spec))
+                    && why.contains("already accepted")
+            ));
+            assert!(matches!(decide(&LocalPolicy::Fallback, refused), Err(Error::Committed(_))));
+        }
+        let already_committed =
+            after_publication(&unit, Err::<(), _>(Error::Committed("bad pack".to_owned())))
+                .unwrap_err();
+        assert!(matches!(
+            already_committed,
+            Error::Committed(why) if why == "bad pack"
+        ));
+        let cancelled =
+            after_publication(&unit, Err::<(), _>(Error::Cancelled("caller stopped".to_owned())))
+                .unwrap_err();
+        assert!(matches!(cancelled, Error::Cancelled(_)));
+        assert_eq!(after_publication(&unit, Ok(42)).unwrap(), 42);
+        // Control: the old classification would have permitted this rebuild.
+        assert!(decide(
+            &LocalPolicy::Fallback,
+            Error::Protocol("delivery was refused".to_owned()),
+        )
+        .is_ok());
     }
 
     #[test]
