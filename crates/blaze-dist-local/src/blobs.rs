@@ -437,7 +437,13 @@ fn publish_verdict(
             }
         }
         _ => {
-            Err(Error::Protocol(format!("PUT {path}: {status}: {}", String::from_utf8_lossy(body))))
+            // A non-success status is not proof that the server left the
+            // immutable key unclaimed: publication may have committed before
+            // a subsequent error response. Refuse local recompilation.
+            Err(Error::Committed(format!(
+                "PUT {path}: {status}: publication outcome unknown: {}",
+                String::from_utf8_lossy(body)
+            )))
         }
     }
 }
@@ -866,18 +872,35 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(!read.get());
-        assert!(matches!(
-            publish_verdict(
-                500,
+        // Only explicit accepted publication and a verified 412 establish the
+        // immutable outcome. Other statuses may arrive after a server committed
+        // but failed before returning its acknowledgement.
+        for status in [301, 400, 429, 500, 503] {
+            let refused = publish_verdict(
+                status,
                 b"unavailable",
                 path,
                 b"same",
-                || {
-                    panic!("a failed PUT must not issue a GET");
-                },
-                |_, _| panic!("a failed PUT cannot verify equivalence")
-            ),
-            Err(Error::Protocol(_))
-        ));
+                || panic!("an unknown PUT outcome cannot issue a GET"),
+                |_, _| panic!("an unknown PUT outcome cannot verify equivalence"),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&refused, Error::Committed(why)
+                    if why.contains(path) && why.contains("outcome unknown")),
+                "unexpected publication refusal: {refused}"
+            );
+            assert!(matches!(
+                crate::agent::decide(&blaze_wire::LocalPolicy::Fallback, refused),
+                Err(Error::Committed(_))
+            ));
+        }
+        // Control: the old Protocol classification would authorize exactly
+        // the forbidden local rebuild after this uncertain publication.
+        assert!(crate::agent::decide(
+            &blaze_wire::LocalPolicy::Fallback,
+            Error::Protocol("unknown publication outcome".to_owned()),
+        )
+        .is_ok());
     }
 }
