@@ -5,7 +5,7 @@ date: 2026-10-30
 ---
 # CI on the fork: one build per platform, every check consumes it (2026-10-30)
 
-What upstream's CI does is in [harness.md](../harness.md#ci) and [CI.md](CI.md). This is the
+What upstream's CI does is in [harness.md](../harness.md#ci) and [CI.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/reports/CI.md). This is the
 fork's (ScriptedAlchemy/blaze), whose integration branches are `dist/*` and whose pull requests
 go to `dist/c4-keys`: what I measured, the design that follows from it, and the contract the
 checks are written against.

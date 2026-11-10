@@ -417,10 +417,10 @@ design quotes from roadmap.md, ci-runner.md, benchmarks.md and research/codegen-
 |---|---|---|---|
 | ripgrep cold 16.8 to 17.4 s with an empty store, 3.98 to 3.99 s warm store, 4.01 to 4.02 s warm remote; nushell 78.9 s, 31.3 s, 31.5 s; helix 87.0 to 89.7 s, 25.5 to 25.7 s, 26.0 to 26.3 s | no-rustc.md, "The cold start without rustc" | dev-aws-8, 96 cores pinned; ranges over the runs recorded, run count not stated | no: "every crate ra-jit's and linked by ra-jit" |
 | of nushell's 31 s warm: resolving 3.8 s, asking the store about roots 3 s, writing the object 7 s, listing 4.7 s, link 1 s | same | same; one breakdown | no |
-| a fresh machine building cargo 0.92.0: 152.4 s no remote, 117.1 s with packs, 94.4 s with packs and cargo's units; lazy 100.2 s | [reports/REMOTE.md](REMOTE.md) | loopback MinIO, one run each, no spread | **yes**: cargo ran rustc for dependencies and link lines, and three refused functions were compiled by rustc. Not all-blaze evidence |
-| nushell body edit 258 ms; ready from nothing 52.1 s; 5.2 GB ready, 7.5 GB after its base, 11.2 GB peak | [roadmap.md](../roadmap.md), [ci-runner.md](../ci-runner.md) | machine and session not stated; n not stated; no spread | no |
-| about 2 ms of thread time a function, 21.2 s on 16 cores for nushell's 165,752 | [roadmap.md](../roadmap.md) | 16 cores; n not stated; no spread | no |
-| sandbox about 16 ms a process on Linux | [ci-runner.md](../ci-runner.md):388 (354 ms for 20 runs against 26 ms bare) | one measurement, no spread | no |
+| a fresh machine building cargo 0.92.0: 152.4 s no remote, 117.1 s with packs, 94.4 s with packs and cargo's units; lazy 100.2 s | [reports/REMOTE.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/reports/REMOTE.md) | loopback MinIO, one run each, no spread | **yes**: cargo ran rustc for dependencies and link lines, and three refused functions were compiled by rustc. Not all-blaze evidence |
+| nushell body edit 258 ms; ready from nothing 52.1 s; 5.2 GB ready, 7.5 GB after its base, 11.2 GB peak | [roadmap.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/roadmap.md), [ci-runner.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/ci-runner.md) | machine and session not stated; n not stated; no spread | no |
+| about 2 ms of thread time a function, 21.2 s on 16 cores for nushell's 165,752 | [roadmap.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/roadmap.md) | 16 cores; n not stated; no spread | no |
+| sandbox about 16 ms a process on Linux | [ci-runner.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/ci-runner.md):388 (354 ms for 20 runs against 26 ms bare) | one measurement, no spread | no |
 | slot sizes on Linux x86-64, 16 cores pinned: ripgrep to axum 1.4 to 2.0 GB, helix 5.7, nushell 7.1, bevy 15.2, biome 19.3, bun 24.5 GB | [research/memory.md](../research/memory.md), from benchmarks.md | per-project rows of one bench run | no |
 
 Revision 1's "eager fetch beats lazy" (94.4 against 100.2 s) is withdrawn as a conclusion: one
@@ -454,7 +454,7 @@ run each, hybrid.
 Written as Rust. On the wire each struct is a CBOR map keyed by the small unsigned integers in the
 comments, every key present (an absent `Option` is CBOR `null`), in ascending key order, the
 encoding of RFC 8949 section 4.2.1 (shortest heads, definite lengths, no floats, no tags), as
-[roadmap.md](../roadmap.md#8-the-agent-api) requires. An enum is a two-element array `[discriminant,
+[roadmap.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/roadmap.md#8-the-agent-api) requires. An enum is a two-element array `[discriminant,
 payload]`, the discriminant the integer in its comment and the payload a map, or `null` for a unit
 variant. A tuple is an array of its elements in order. A `Vec` marked **set** is sorted by the bytes
 of each element's encoding and has no duplicates; any other `Vec` keeps its order. Strings are
@@ -1353,7 +1353,7 @@ How, by platform:
   **unverified**). Until E2 lands, the Mac Studio runs trusted builders only, and a
   pull request's macOS leg runs on a hosted macOS runner (section 5).
 - **Stronger, the owner's choice:** a microVM per executor restored from a trusted snapshot, as
-  [ci-runner.md](../ci-runner.md) designs with ix (Firecracker on Linux, Virtualization.framework on
+  [ci-runner.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/ci-runner.md) designs with ix (Firecracker on Linux, Virtualization.framework on
   macOS). It adds a kernel boundary and a cold-start cost that was not measured here
   (**unverified**). The contract above does not change; only how rule 1 to 6 are enforced.
 
@@ -1454,7 +1454,7 @@ compiles could use NativeLink's existing entries, which are rustc's.
 **Per crate.** A publish cuts packs by home crate and adds one `CrateRecord` generation per
 `CrateKey`; a build looks up its crates in one batch and fetches only the packs it lacks, before
 the build. Per function is 165,752 lookups on nushell, 18.6 s serially at gRPC's 112 us unary
-median ([ci-runner.md](../ci-runner.md), #226; the median **reported**). Per project manifest
+median ([ci-runner.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/ci-runner.md), #226; the median **reported**). Per project manifest
 fetches every pack any build pushed.
 
 A dependency crate with many generic instances (an `alloc` in every program's types) gets
@@ -2384,7 +2384,7 @@ Each tier has a default, a command and a harness check (the owner's requirement,
 - **Encoding.** Deterministic CBOR as in "Data shapes", a validator that refuses any message not
   in that form (naming the first offence), JSON only as a rendering (`Accept: application/json`,
   `--json`). One crate, `crates/blaze-wire`, holds the schema for this API and the agent API
-  ([roadmap.md](../roadmap.md#8-the-agent-api)). minicbor is named by the roadmap and is not in
+  ([roadmap.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/roadmap.md#8-the-agent-api)). minicbor is named by the roadmap and is not in
   `Cargo.lock` yet (**read**).
 - **Transport.** HTTP/1.1 on the `hyper` and `rustls` already in the tree, `application/cbor`;
   inside the tailnet WireGuard encrypts, outside it TLS. An event stream is a chunked body of
@@ -2750,7 +2750,7 @@ byte strings, and a `Vec<u8>` is an array of integers as any `Vec` is.
 |---|---|
 | Windows | blaze builds nothing on Windows yet ([usage.md](../usage.md), **read**) |
 | JS, Python | Rust only, by scope |
-| release and dist (thin LTO) | blaze has no LTO; its release programs ran at 1.02 to 1.35 times cargo's release run time on the bench apps ([research/codegen-units.md](../research/codegen-units.md), **read**, run time, not build time) |
+| release and dist (thin LTO) | blaze has no LTO; its release programs ran at 1.02 to 1.35 times cargo's release run time on the bench apps ([research/codegen-units.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/research/codegen-units.md), **read**, run time, not build time) |
 | Clippy | a rustc driver, which blaze never runs |
 | Linux ARM | no ARM worker in the fleet |
 | tests that run rustc or cargo | section 6: the owner's `rustc-tests` gate; its default keeps them here, the compatibility lane (S4) would move them |

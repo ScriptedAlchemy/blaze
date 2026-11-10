@@ -47,7 +47,7 @@ that had loaded the 58.3 GB worker, so they cost what item 5 says; the test runs
 2.6 to 5.2 GB (RSS).
 
 On Linux: **unverified**; nothing here ran there. The docs say the whole build works there on small
-projects ([self-contained.md](../self-contained.md)). What would have to be true there is at the end
+projects ([self-contained.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/self-contained.md)). What would have to be true there is at the end
 of item 7.
 
 ## What was measured
@@ -482,7 +482,7 @@ each of these would have to be true and measured with this harness and the watch
    is loading, with the daemon's footprint read as `VmRSS` and no compressed memory to hide the rest
    (gaps 1 and 2). The host needs at least the 58.3 GB seen here, **unverified** for Linux.
 2. The whole build (`BLAZE_WHOLE_BUILD=1`) builds tracedecay, with the build scripts. The docs say it
-   does on small projects there ([self-contained.md](../self-contained.md)); on this Mac it does not
+   does on small projects there ([self-contained.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/self-contained.md)); on this Mac it does not
    even for hello-world (gap 4).
 3. The CLI's build script prints the same thing twice, or blaze stops reading that as a reason to use
    cargo (gap 3), so that an edit is the daemon's.

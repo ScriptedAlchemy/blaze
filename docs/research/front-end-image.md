@@ -85,7 +85,7 @@ frozen key (including cfg, environment and build-script output), not across key 
   in the heap, which `crate_local_def_map` memoizes (`hir-def/src/nameres.rs:485`) (**read**).
   What the store hands over is a copy: `Store::get` returns a `Vec<u8>` out of a zstd block of at
   least 128 KiB, through a 32 MiB cache of unpacked blocks
-  ([concurrent-reads.md](concurrent-reads.md)), and `FrozenDefMaps` keeps it, an `Arc<[u8]>` of
+  ([concurrent-reads.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/research/concurrent-reads.md)), and `FrozenDefMaps` keeps it, an `Arc<[u8]>` of
   every served crate, in a salsa input for as long as the worker lives (**read**; this prototype
   changes that byte owner to an owned buffer or an `Arc`-owned mapping range).
 - **Flat syntax trees** (#42, [flat-syntax.md](../flat-syntax.md)): arrays in preorder, 14 bytes an

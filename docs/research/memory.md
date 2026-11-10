@@ -18,9 +18,9 @@ measurement, **reported** marks an issue or pull request's claim, and **unverifi
 marks an inference. [Section 5](#5-proposed-measurements) proposes measurements
 for the open questions.
 
-This page adds to [daemon-memory.md](daemon-memory.md), which covers the heap,
+This page adds to [daemon-memory.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/research/daemon-memory.md), which covers the heap,
 salsa's `lru`, the allocator and shared debug types, and
-[lean-frontend.md](lean-frontend.md), which covers allocation owners and interned
+[lean-frontend.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/research/lean-frontend.md), which covers allocation owners and interned
 arguments.
 
 ## Short version
@@ -31,7 +31,7 @@ arguments.
   its own base (7.87 to 7.36 GB on nushell) (**read**, [benchmarks.md](../benchmarks.md#how-much-memory-and-disk-it-takes),
   [#197](https://github.com/indexable-inc/blaze/pull/197)). Nothing has run for thousands of
   edits: the longest recorded soak is 345 steps, and its author wrote that its slopes say nothing yet
-  ([SOAK.md](../reports/SOAK.md)) (**reported**).
+  ([SOAK.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/reports/SOAK.md)) (**reported**).
 - **#261's jump (8.9 to 23.3 GB over two edits) is unexplained.** It is most like a build in
   full, which peaks at 23 to 27 GB on biome ([#242](https://github.com/indexable-inc/blaze/issues/242)),
   or an allocator that keeps its high-water mark, not a leak (**unverified**: the report has no

@@ -529,7 +529,7 @@ The run built `k8-opt`, the release configuration, which blaze's design keeps on
 ### cargo
 
 - A per-user compiled artifact cache is an open issue, rust-lang/cargo#5931 (**read**, `gh issue
-  view`, open, updated 2026-10-06). [rust-compiler-2026.md](rust-compiler-2026.md) covers cargo's
+  view`, open, updated 2026-10-06). [rust-compiler-2026.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/research/rust-compiler-2026.md) covers cargo's
   build-dir.
 
 ## 7. Each mechanism against blaze

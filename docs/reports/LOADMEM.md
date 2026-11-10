@@ -79,7 +79,7 @@ measurement, named) or **unverified** (our inference). No fix is made here; the 
 
 - **Read:** `crates/ra-jit/src/{main,memory}.rs`, `crates/ra-jit/src/cargo/daemon.rs`,
   `crates/hir-ty-codegen/{mod,cached}.rs`, the MIR queries of the vendored `hir-ty`;
-  [memory.md](../research/memory.md), [lean-frontend.md](../research/lean-frontend.md);
+  [memory.md](../research/memory.md), [lean-frontend.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/research/lean-frontend.md);
   u1's `results.jsonl`, status files and logs, and u1b's footprint traces and the worker logs of its
   two killed runs (read-only; they are theirs).
 - **Ran:** a cold `blaze build --locked -p tracedecay-cli` in a worker under the memory guard,
@@ -236,7 +236,7 @@ Not measured on this Mac with these instruments, so the answer is **unverified**
 
 | Project | Worker at ready | After its base or edits | Source |
 |---|---|---|---|
-| nushell 0.108.0 | 5.2 GB | 7.1 GB after 65 builds (peak 11.2 GB in the base) | Linux x86-64, 16 cores pinned; [memory.md](../research/memory.md), [lean-frontend.md](../research/lean-frontend.md) (**read** there) |
+| nushell 0.108.0 | 5.2 GB | 7.1 GB after 65 builds (peak 11.2 GB in the base) | Linux x86-64, 16 cores pinned; [memory.md](../research/memory.md), [lean-frontend.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/research/lean-frontend.md) (**read** there) |
 | helix | 4.2 GB | 5.7 GB | same |
 | bevy | 8.2 GB | 15.2 GB | same |
 | biome | 6.9 GB | 19.3 GB | same |
@@ -811,8 +811,8 @@ there. The raw files of the profiled run are in `/Users/bytedance/dev/blaze-targ
 ## Sources
 
 The method of attributing a heap profile to salsa ingredients is `harness/heap.py` and
-`heapfold.py` (andrewgazelka, #36 to #39, [lean-frontend.md](../research/lean-frontend.md) and
-[daemon-memory.md](../research/daemon-memory.md)); the question and the 56 GB are u1's, and the
+`heapfold.py` (andrewgazelka, #36 to #39, [lean-frontend.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/research/lean-frontend.md) and
+[daemon-memory.md](https://github.com/ScriptedAlchemy/blaze/blob/99056680d4eb9fa1b744fb469dc9e3a135314bda/docs/research/daemon-memory.md)); the question and the 56 GB are u1's, and the
 watchdog's rule for macOS swap (growth, not free space alone) is u1b's `harness/tracedecay.py`,
 which I read and did not copy. The first-person "I" is the session that did the work.
 
