@@ -124,6 +124,32 @@ class ReleaseSmokeTests(unittest.TestCase):
                                   text=True, capture_output=True, timeout=10)
             self.assertEqual(done.returncode == 0, expected == 0, done.stderr)
 
+    def test_linux_release_smoke_places_store_and_std_on_verified_reflink(self):
+        smoke = WORKFLOW.read_text().split("\n  smoke:\n", 1)[1].split("\n  apps:\n", 1)[0]
+        swap = "      - name: swap before reflink placement"
+        reflink = "      - if: runner.os == 'Linux'\n        uses: ./.github/actions/reflink"
+        install = "      - name: install ${{ env.TAG }}"
+        self.assertEqual(smoke.count(swap), 1)
+        self.assertEqual(smoke.count(reflink), 1)
+
+        def protected(text):
+            return swap in text and reflink in text and install in text and (
+                text.index(swap) < text.index(reflink) < text.index(install))
+
+        self.assertTrue(protected(smoke))
+        # Planted regression: a Linux release tested on ext4 must be rejected
+        # before it hits the seeded compiler's strict FICLONE placement.
+        self.assertFalse(protected(smoke.replace(reflink, "", 1)))
+        shell = smoke_step("swap before reflink placement")
+        self.assertIn('[ "$gb" -ge 20 ]', shell)
+        self.assertIn('sudo swapon "$swap"', shell)
+        preflight = (WORKFLOW.parents[1] / "actions/reflink/action.yml").read_text()
+        self.assertIn("FICLONE", preflight)
+        self.assertIn("FS_IOC_FIEMAP", preflight)
+        self.assertIn("BLAZE_HOME=home", preflight)
+        self.assertIn("XDG_CACHE_HOME=cache", preflight)
+        self.assertIn('home="${BLAZE_HOME:-$HOME/.cache/blaze}"', smoke)
+
     def test_pr_smoke_uses_read_token_for_public_corpus(self):
         import json
 
