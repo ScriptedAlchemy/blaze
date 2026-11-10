@@ -87,7 +87,8 @@ fn race(case: Race, plant: bool) -> Result<(), String> {
                 false => continue,
             }
         }
-        sim.poll(&mut done, Duration::from_secs(60));
+        let until = blaze_core::wait::Deadline::after(sim.now(), Duration::from_secs(60));
+        sim.poll(&mut done, until);
         for completion in done.drain(..) {
             seen += 1;
             if let Some(store) = stores.iter_mut().find(|store| store.owns(completion.tag)) {
