@@ -74,10 +74,14 @@ reports any real error. When the path itself fails, `agent::decide` says what th
 |---|---|---|
 | a verdict was reported by the execution | taken | taken |
 | the execution ended without one (no lead, lost twice, cancelled, past its deadline) | the build stops, naming it | compiled here |
-| the coordinator or the cache server is gone, or a pack fails its check | the build stops, naming it | compiled here |
+| the coordinator or cache server is unavailable before commitment | the build stops, naming it | compiled here |
+| the final compiler or output exporter refuses the unit | the build stops with the original diagnostic | the build stops with the original diagnostic |
+| committed packs are missing or corrupt, or publication delivery fails after acceptance | the build stops, naming it | the build stops, naming it |
 
 Compiled here is the same build the daemon runs alone. A cancelled build leaves its execution, and
-an execution ends when its last subscriber leaves.
+an execution ends when its last subscriber leaves. A caller's own cancellation is terminal under
+both policies. A full manifest accepted by the coordinator is immutable: a later worker failure
+or refusal cannot replace it or turn it into permission to compile again.
 
 ## Pull requests and the shared cache
 
@@ -374,7 +378,8 @@ byte for byte.
 
 The Linux AArch64 lane of `.github/workflows/blaze-platform.yaml` requires this real harness after
 its current-tree build. It verifies the build artifact's commit, tree and binary SHA-256 identities,
-uses that Blaze to build the coordinator and cache server in an isolated home, and runs both dev
+uses that Blaze to build the coordinator and cache server in an isolated home, runs the protocol
+and carrier crates' library and integration tests with their Hegel controls, and runs both dev
 and release with faults enabled. Release also requires two holders to emit actual LLVM and folded
 work. The workers have private stores and targets on the runner's verified reflink filesystem;
 each receives two cores and a 6 GiB daemon memory hint. These are resource hints, not whole-process

@@ -97,6 +97,7 @@ pub trait Granted {
     /// Complete the unit through its ordinary build with the committed phase values in
     /// front of its store. Only the current lead runs this tail; other subscribers take
     /// its full manifest. Returned values are uploaded before the manifest is committed.
+    /// An error is a final compiler/export refusal under every local policy.
     fn complete(
         &mut self,
         _values: &BTreeMap<Digest, (u8, Vec<u8>)>,
@@ -209,12 +210,13 @@ fn request(unit: &Unit, config: &Config, now: u64) -> JobRequest {
 /// one build; `Err` stops the build, naming what failed. A terminal goes by its contract
 /// ([`local_action`]): a verdict is taken, anything else builds here only if asked. A failure
 /// that names no outcome (like a disconnected carrier) is no verdict. A missing or corrupt
-/// committed pack always fails, regardless of the requested local policy.
+/// committed pack and a final compiler/export refusal always fail, regardless of the
+/// requested local policy.
 pub fn decide(policy: &LocalPolicy, failure: Error) -> Result<(), Error> {
     let action = match &failure {
         Error::Ended(termination) => local_action(policy, termination)
             .map_err(|why| Error::Protocol(format!("the terminal is refused: {why:?}")))?,
-        Error::Committed(_) | Error::Cancelled(_) => LocalAction::Fail,
+        Error::Committed(_) | Error::Refused(_) | Error::Cancelled(_) => LocalAction::Fail,
         Error::Io(_) | Error::Protocol(_) => match policy {
             LocalPolicy::Never => LocalAction::Fail,
             LocalPolicy::Fallback => LocalAction::BuildLocally,
@@ -228,10 +230,10 @@ pub fn decide(policy: &LocalPolicy, failure: Error) -> Result<(), Error> {
 
 /// After a full manifest has been accepted, a delivery, heartbeat or cache
 /// failure cannot authorize compiling the immutable unit again. Preserve an
-/// explicit caller cancellation and an already typed committed-data refusal.
+/// explicit caller cancellation, a compiler refusal and an already typed committed-data refusal.
 fn after_publication<T>(unit: &Unit, result: Result<T, Error>) -> Result<T, Error> {
     result.map_err(|error| match error {
-        Error::Committed(_) | Error::Cancelled(_) => error,
+        Error::Committed(_) | Error::Refused(_) | Error::Cancelled(_) => error,
         other => Error::Committed(format!(
             "unit {}: immutable publication already accepted: {other}",
             hex(&unit.spec)
@@ -451,13 +453,40 @@ pub fn run(
             other => return Err(Error::Protocol(format!("submit answered {other:?}"))),
         }
     };
-    let result = execute(config, unit, granted, cancelled, started, &now_ms, &binding, &mut client);
+    // alloc: one claim per observed attempt, retained until its local work has stopped
+    let mut assignments = BTreeSet::new();
+    let result = execute(
+        config,
+        unit,
+        granted,
+        cancelled,
+        started,
+        &now_ms,
+        &binding,
+        &mut client,
+        &mut assignments,
+    );
     let result = ensure_not_cancelled(unit, cancelled).and(result);
     if result.is_err() {
         leave(&mut client, &binding);
-    } else {
-        let _ = client.release();
     }
+    // execute has joined every compiler/heartbeat scope. Its claims now name
+    // actual stopped work, including a failed tail and superseded attempts.
+    // The coordinator accepts only the matching pending stop: a false ACK can
+    // never free a live or newer assignment. Preserve the original failure if
+    // cleanup loses its carrier; successful publication still requires its ACK.
+    let acknowledged = assignments.iter().try_for_each(|(executor, attempt)| {
+        acknowledge(
+            &mut client,
+            binding.subscription.content,
+            binding.subscription.execution,
+            executor,
+            *attempt,
+        )
+    });
+    let result =
+        result.and_then(|arrived| after_publication(unit, acknowledged).map(|()| arrived));
+    let _ = client.release();
     result
 }
 
@@ -471,12 +500,12 @@ fn execute(
     now_ms: &(impl Fn() -> u64 + Sync),
     binding: &Binding,
     client: &mut Client,
+    assignments: &mut BTreeSet<(String, Attempt)>,
 ) -> Result<Arrived, Error> {
     let content = binding.subscription.content;
     let execution = binding.subscription.execution;
     let mut arrived = Arrived::none(Source::Executed, Some(execution.0));
     let mut waited = config.poll;
-    let mut last_claim = None;
     loop {
         ensure_not_cancelled(unit, cancelled)?;
         if started.elapsed() > config.deadline.saturating_add(GRACE) {
@@ -499,7 +528,7 @@ fn execute(
             && let Some(executor) = &claimed.executor
         {
             arrived.attempt = Some(u64::from(claimed.attempt.0));
-            last_claim = Some((executor.clone(), claimed.attempt));
+            assignments.insert((executor.clone(), claimed.attempt));
         }
         let published = publication(client, content, execution)?;
         if let Some((packs, attempt, accepted)) = published {
@@ -533,12 +562,6 @@ fn execute(
                 take()
             };
             after_publication(unit, completed)?;
-            if let Some((executor, attempt)) = last_claim {
-                after_publication(
-                    unit,
-                    acknowledge(client, content, execution, &executor, attempt),
-                )?;
-            }
             return Ok(arrived);
         }
         let Some(claimed) = claimed else { return Err(ended(client, binding)) };
@@ -592,29 +615,29 @@ fn execute(
                 |lost| {
                     arrived.values = import(&config.blobs, &packs)?;
                     ensure_not_cancelled(unit, cancelled)?;
-                    let extra = match granted.complete(&arrived.values) {
-                        Ok(values) => values,
-                        Err(why) => {
-                            if !lost.load(Ordering::Acquire) {
-                                let _ = verdict(
-                                    client,
-                                    content,
-                                    execution,
-                                    &executor,
-                                    claimed.attempt,
-                                    Outcome::Failed,
-                                );
-                            }
-                            return Err(Error::Protocol(format!("unit {}: {why}", hex(&unit.spec))));
+                    let mut refuse = |why| {
+                        if !lost.load(Ordering::Acquire) {
+                            let _ = verdict(
+                                client,
+                                content,
+                                execution,
+                                &executor,
+                                claimed.attempt,
+                                Outcome::Failed,
+                            );
                         }
+                        Error::Refused(format!("unit {}: {why}", hex(&unit.spec)))
                     };
+                    let extra = granted.complete(&arrived.values).map_err(&mut refuse)?;
                     ensure_not_cancelled(unit, cancelled)?;
                     if lost.load(Ordering::Acquire) {
                         return Ok(None);
                     }
                     let mut packs = packs;
                     if !extra.is_empty() {
-                        for pack in Pack::batches(extra).map_err(Error::Protocol)? {
+                        for pack in Pack::batches(extra)
+                            .map_err(|why| refuse(format!("full output cannot be packed: {why}")))?
+                        {
                             config.blobs.put_pack(&pack)?;
                             packs.push(pack.reference);
                         }
@@ -651,7 +674,6 @@ fn execute(
                                 mirror(config, unit, &packs)?;
                                 ensure_not_cancelled(unit, cancelled)?;
                                 deliver(client, binding, &packs)?;
-                                acknowledge(client, content, execution, &executor, claimed.attempt)?;
                                 Ok(Some(packs))
                             })())
                         }
@@ -841,7 +863,6 @@ fn leave(client: &mut Client, binding: &Binding) {
         _ => binding.clone(),
     };
     let _ = client.call(Command::Cancel(current));
-    let _ = client.release();
 }
 
 /// Why the execution ended with nothing committed: its terminal for this subscription.
@@ -966,7 +987,7 @@ fn hold(
     Ok(stopped)
 }
 
-/// The final verdict follows the full manifest commit and successful cache delivery.
+/// Report a compiler verdict before publication. Accepted full output is completed by delivery.
 fn verdict(
     client: &mut Client,
     content: blaze_wire::JobContent,
@@ -984,7 +1005,7 @@ fn verdict(
             events: vec![JobEvent::Done(DoneEvent { outcome, counters: Vec::new() })],
         },
     });
-    match answer(client, events, "ending the published unit")? {
+    match answer(client, events, "reporting the unit's compiler verdict")? {
         Answer::WorkerEvents(_) => Ok(()),
         other => Err(Error::Protocol(format!("the final verdict answered {other:?}"))),
     }
@@ -1032,8 +1053,9 @@ fn acknowledge(
         alive: true,
     });
     match client.call(ack)? {
-        // Delivery already requested every assignment's stop. A false acknowledgment
-        // means that this old assignment was retired or replaced; it must not free the new one.
+        // Only a pending stop of this exact assignment is accepted. A false ACK
+        // may mean another subscriber still owns the execution, or this token
+        // was retired or replaced; it must not free a live/newer assignment.
         Answer::KillAck(_) => Ok(()),
         Answer::Error(error) if Refusal::of(&error) == Some(Refusal::NoExecution) => Ok(()),
         other => Err(Error::Protocol(format!("kill acknowledgment answered {other:?}"))),
@@ -1045,6 +1067,9 @@ mod tests {
     use super::*;
     use hegel::generators as gs;
 
+    /// The invariant: a final compiler refusal retains its diagnostic and remains terminal
+    /// under every local policy despite a concurrent heartbeat failure; a successful tail
+    /// cannot hide a failed or panicking heartbeat worker.
     #[hegel::test(test_cases = 64)]
     fn a_failed_heartbeat_cannot_publish_a_successful_tail(tc: hegel::TestCase) {
         let completion = tc.draw(gs::integers::<u8>()) % 3;
@@ -1052,7 +1077,7 @@ mod tests {
         let completed = match completion {
             0 => Ok(7),
             1 => Err(Error::Committed("the native pack was corrupt".to_owned())),
-            _ => Err(Error::Protocol("the compiler's tail failed".to_owned())),
+            _ => Err(Error::Refused("the compiler's tail failed".to_owned())),
         };
         let heartbeat: std::thread::Result<Result<(), Error>> = match heartbeat_kind {
             0 => Ok(Ok(())),
@@ -1068,21 +1093,40 @@ mod tests {
             (0, 1, Err(Error::Io(_))) => {}
             (0, 2, Err(Error::Protocol(why))) if why.contains("heartbeat thread panicked") => {}
             (1, _, Err(Error::Committed(_))) => {}
-            (2, _, Err(Error::Protocol(why))) if why.contains("compiler's tail failed") => {}
+            (2, _, Err(Error::Refused(why))) if why.contains("compiler's tail failed") => {
+                for policy in [LocalPolicy::Never, LocalPolicy::Fallback] {
+                    assert!(matches!(
+                        decide(&policy, Error::Refused(why.clone())),
+                        Err(Error::Refused(retained)) if retained == why
+                    ));
+                }
+            }
             other => panic!("a result lost its cause or heartbeat failure became success: {other:?}"),
         }
     }
 
     #[test]
-    fn a_dropped_heartbeat_failure_is_caught() {
+    fn the_oracle_catches_a_dropped_heartbeat_failure() {
         let failed = Ok(Err(Error::Io(std::io::Error::from(
             std::io::ErrorKind::ConnectionRefused,
         ))));
-        assert!(matches!(
-            completion_with_heartbeat(ExecutionId(2), Ok(1), failed),
-            Err(Error::Io(_))
-        ));
-        // The original unchecked join would return Ok(1).
+        let rejects_failed_heartbeat = |result| matches!(result, Err(Error::Io(_)));
+        assert!(rejects_failed_heartbeat(completion_with_heartbeat(
+            ExecutionId(2),
+            Ok(1),
+            failed,
+        )));
+        // Plant the original unchecked join, which returned the successful tail alone.
+        assert!(!rejects_failed_heartbeat(Ok(1)));
+    }
+
+    #[test]
+    fn the_oracle_catches_a_compiler_refusal_reclassified_as_transport_loss() {
+        let why = "fixture::tail: conflicting output under one immutable key";
+        let refuses_rebuild = |failure| decide(&LocalPolicy::Fallback, failure).is_err();
+        assert!(refuses_rebuild(Error::Refused(why.to_owned())));
+        // Plant the previous classification of the exact same compiler diagnostic.
+        assert!(!refuses_rebuild(Error::Protocol(why.to_owned())));
     }
 
     #[test]
