@@ -400,12 +400,18 @@ jobs:
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
           echo "$NEEDS" | jq -e 'all(.[]; .result != "failure" and .result != "cancelled")' > /dev/null \
             || { echo "::error::a required check failed or was cancelled"; exit 1; }
-          # Skipped dependent jobs and absent receipts cannot stand for runtime acceptance.
+          # Every applicable job must succeed; skipped code-tier checks and absent receipts
+          # cannot stand for runtime acceptance. Mac runs only on warm/main.
           echo "$NEEDS" | jq -e '
             .changes.result == "success" and
+            .scripts.result == "success" and
+            .workflows.result == "success" and
             (.changes.outputs.tier == "none" or
               ((.changes.outputs.tier == "gate" or .changes.outputs.tier == "warm") and
                .["linux-arm64"].result == "success" and
+               .["linux-6-8"].result == "success" and
+               .["workspace-check"].result == "success" and
+               (.changes.outputs.tier != "warm" or .macos.result == "success") and
                .["linux-arm64"].outputs.distributed_acceptance == "true" and
                .["linux-arm64"].outputs.forkfixes_acceptance == "true"))
           ' > /dev/null || { echo "::error::this code change lacks distributed dev/release fault or fork migration acceptance"; exit 1; }

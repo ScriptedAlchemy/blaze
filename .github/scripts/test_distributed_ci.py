@@ -148,15 +148,25 @@ class AcceptanceGateTests(unittest.TestCase):
     def test_aggregate_requires_real_acceptance_for_every_code_tier(self):
         base = {"changes": {"result": "success", "outputs": {"tier": "gate"}},
                 "scripts": {"result": "success", "outputs": {}},
+                "workflows": {"result": "success"},
+                "linux-6-8": {"result": "success"},
+                "workspace-check": {"result": "success"},
+                "macos": {"result": "skipped"},
                 "linux-arm64": {"result": "success", "outputs": {
                     "distributed_acceptance": "true", "forkfixes_acceptance": "true"}}}
         cases = [("gate passes", base, True)]
         warm = copy.deepcopy(base)
         warm["changes"]["outputs"]["tier"] = "warm"
+        warm["macos"]["result"] = "success"
         cases.append(("warm passes", warm, True))
+        missing_warm_macos = copy.deepcopy(warm)
+        missing_warm_macos["macos"]["result"] = "skipped"
+        cases.append(("warm with skipped macOS", missing_warm_macos, False))
         docs = copy.deepcopy(base)
         docs["changes"]["outputs"]["tier"] = "none"
         docs["linux-arm64"] = {"result": "skipped", "outputs": {}}
+        docs["linux-6-8"]["result"] = "skipped"
+        docs["workspace-check"]["result"] = "skipped"
         cases.append(("docs need no build", docs, True))
         for missing in ({}, {"distributed_acceptance": ""}, {"distributed_acceptance": "false"},
                         {"distributed_acceptance": "true"}, {"forkfixes_acceptance": "true"},
@@ -165,7 +175,9 @@ class AcceptanceGateTests(unittest.TestCase):
             changed["linux-arm64"]["outputs"] = missing
             cases.append((f"missing acceptance {missing}", changed, False))
         for job, result in (("linux-arm64", "skipped"), ("linux-arm64", "cancelled"),
-                            ("scripts", "failure"), ("scripts", "cancelled"), ("changes", "skipped")):
+                            ("scripts", "failure"), ("scripts", "cancelled"), ("scripts", "skipped"),
+                            ("workflows", "skipped"), ("linux-6-8", "skipped"),
+                            ("workspace-check", "skipped"), ("changes", "skipped")):
             changed = copy.deepcopy(base)
             changed[job]["result"] = result
             cases.append((f"{job} {result}", changed, False))
