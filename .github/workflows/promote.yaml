@@ -147,6 +147,32 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           [ "$(ulimit -l)" = unlimited ] || { echo "::error::released smoke: RLIMIT_MEMLOCK is $(ulimit -l) KiB, expected unlimited"; exit 1; }
+      # The released seed refuses cross-filesystem/copy placement on ext4, even for
+      # the minimal hello fixture (smoke 42776665338). Use the build gate's same
+      # verified Linux Btrfs reflink volume for the store, standard library and
+      # all targets before installing or running the release. No copy fallback.
+      # Reserve swap first, as .github/actions/reflink requires; use exactly the
+      # build action's disk budget, keeping 40 GiB for volume and host.
+      - name: swap before reflink placement
+        if: runner.os == 'Linux'
+        run: |
+          disk=/
+          avail=$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')
+          if [ -d /mnt ]; then
+            other=$(df -B1 --output=avail /mnt | tail -n 1 | tr -d ' ')
+            if [ "$other" -gt "$avail" ]; then disk=/mnt; avail=$other; fi
+          fi
+          swap="${disk%/}/blaze.swap"
+          avail=$(( avail / 1024 / 1024 / 1024 ))
+          gb=$(( avail - 40 < 40 ? avail - 40 : 40 ))
+          [ "$gb" -ge 20 ] || { echo "::error::smoke swap: $disk has ${avail} GiB free, need 20 GiB swap plus 40 GiB volume/host"; exit 1; }
+          sudo fallocate -l "${gb}G" "$swap"
+          sudo chmod 600 "$swap"
+          sudo mkswap "$swap" > /dev/null
+          sudo swapon "$swap"
+          free -g
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/reflink
       # As a user installs it: the toolchain blaze downloads included.
       - name: install ${{ env.TAG }}
         run: sh site/install.sh --version "$TAG"
@@ -195,8 +221,9 @@ jobs:
           out="$RUNNER_TEMP/blaze-recorded"
           mkdir -p "$out"
           # Parquet and logs only: the verdict reads every .json among the artifacts as results.
-          [ ! -d "$HOME/.cache/blaze/v2/profile" ] || rsync -a --include='*/' --include='*.parquet' --exclude='*' "$HOME/.cache/blaze/v2/profile/" "$out/profile/"
-          [ ! -f "$HOME/.cache/blaze/v2/serve.log" ] || cp "$HOME/.cache/blaze/v2/serve.log" "$out/serve.log"
+          home="${BLAZE_HOME:-$HOME/.cache/blaze}"
+          [ ! -d "$home/v2/profile" ] || rsync -a --include='*/' --include='*.parquet' --exclude='*' "$home/v2/profile/" "$out/profile/"
+          [ ! -f "$home/v2/serve.log" ] || cp "$home/v2/serve.log" "$out/serve.log"
           du -sh "$out"
       - if: failure()
         uses: actions/upload-artifact@v7
