@@ -755,8 +755,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             0,
         );
         let location = marks.debug.builder.create_debug_location(self.context, 0, 0, scope, None);
-        marks.debug.builder.insert_declare_at_end(alloca, Some(variable), None, location, block);
-        Ok(())
+        super::declare_local(self.module, &marks.debug.builder, alloca, variable, location, block)
     }
 
     /// 1. Allocas for the stack slots, in a block ahead of the entry block.

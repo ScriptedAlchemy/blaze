@@ -8,7 +8,7 @@ use blaze_alloc_count::assert_at_most;
 use expect_test::expect_file;
 use hir_expand::HirFileId;
 use hir_expand::fixture;
-use syntax::view::{self, AstNode as _};
+use syntax::view::{self, AstNode as _, HasName as _};
 
 use super::{HasSourceView, Semantics};
 use crate::ModuleDef;
@@ -450,6 +450,153 @@ pub fn inner() {
             ),
             "`crate::d` in m.rs resolves to `a`'s function `d`"
         );
+    });
+}
+
+const CRATE_CONTEXT_FIXTURE: &str = r#"
+//- /src/lib.rs crate:production
+mod shared;
+//- /src/shared.rs
+pub struct Common;
+#[cfg(test)]
+pub struct TestOnly;
+pub mod nested {
+    pub fn common() { let _: super::Common; }
+    #[cfg(test)]
+    pub fn test_only() { let _: super::TestOnly; }
+}
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+include!("included.rs");
+//- /src/included.rs
+pub mod generated {
+    pub fn common() { let _: super::Common; }
+}
+//- /tests/lib.rs crate:test:unit cfg:test new_source_root:local
+#[path = "../src/shared.rs"]
+mod shared;
+"#;
+
+/// Each sequence uses a fresh database, then drops and recreates real `Semantics` without
+/// changing its revision. `None` is unscoped (production); `Some` prefers production or test.
+fn check_warm_crate_contexts(
+    file: &str,
+    check: impl Fn(&Semantics<'_>, EditionedFileId, crate::Crate, bool),
+) {
+    for contexts in [
+        &[Some(true), Some(true)][..], // Cold test control, then the same preference again.
+        &[None, None, Some(true), Some(true), Some(false), Some(false), Some(true), None, None][..],
+    ] {
+        let fx = fixture::db(CRATE_CONTEXT_FIXTURE);
+        let file = fx.file_at(file);
+        let production_root = fx.file_at("/src/lib.rs");
+        let test_root = fx.file_at("/tests/lib.rs");
+        let db = fx.into_db();
+        blaze_query::db::attach(&db, || {
+            let crates = base_db::all_crates(&db);
+            let krate = |root: EditionedFileId| -> crate::Crate {
+                crates
+                    .iter()
+                    .copied()
+                    .find(|it| it.data(&db).root_file_id == root.file_id(&db))
+                    .expect("the fixture's crate root")
+                    .into()
+            };
+            let (production, test) = (krate(production_root), krate(test_root));
+            let revision = db.nonce_and_revision();
+            for &context in contexts {
+                let is_test = context == Some(true);
+                let expected = if is_test { test } else { production };
+                let vsema = match context {
+                    None => Semantics::new(&db),
+                    Some(_) => {
+                        let crates = blaze_hash::HashSet::from_iter_in(
+                            [expected.base()],
+                            std::alloc::Global,
+                        );
+                        let within = std::sync::Arc::new(crates); // alloc: this test instance's preferred crates
+                        Semantics::new_within(&db, within)
+                    }
+                };
+                // Positive warm control within each instance as well as across instances.
+                for _ in 0..2 {
+                    check(&vsema, file, expected, is_test);
+                }
+                drop(vsema);
+                assert_eq!(db.nonce_and_revision(), revision, "no input changed between contexts");
+            }
+        });
+    }
+}
+
+#[test]
+fn warm_file_resolution_tracks_the_preferred_crate() {
+    check_warm_crate_contexts("/src/shared.rs", |vsema, file, expected, is_test| {
+        let db = vsema.db;
+        let root = vsema.parse(file).syntax();
+        let module = vsema.file_to_module_def(file.file_id(db)).expect("shared.rs is a module");
+        assert_eq!(module.krate(db), expected, "the file belongs to the current context");
+        let strukt = |name| {
+            root.descendants()
+                .filter_map(view::Struct::cast)
+                .find(|it| it.name().is_some_and(|it| it.text() == name))
+                .expect("the shared file's struct")
+        };
+        let common = vsema.to_def(strukt("Common")).expect("Common is in both contexts");
+        assert_eq!(common.module(db), module);
+        let nested = root.descendants().find_map(view::Module::cast).expect("mod nested");
+        let nested = vsema.to_def(nested).expect("nested is in both contexts");
+        assert_eq!(nested.parent(db), Some(module));
+        let path = |text| {
+            root.descendants()
+                .filter_map(view::Path::cast)
+                .find(|it| it.syntax().text() == text)
+                .expect("the nested function's path")
+        };
+        let common_path = path("super::Common");
+        assert_eq!(vsema.scope(common_path.syntax()).expect("a common scope").module(), nested);
+        let resolution = |it| crate::PathResolution::Def(ModuleDef::Adt(crate::Adt::Struct(it)));
+        assert_eq!(vsema.resolve_path(common_path), Some(resolution(common)));
+        let test_only = vsema.to_def(strukt("TestOnly"));
+        assert_eq!(test_only.is_some(), is_test, "TestOnly exists only with cfg(test)");
+        if let Some(test_only) = test_only {
+            assert_eq!(test_only.module(db), module);
+        }
+        assert_eq!(vsema.resolve_path(path("super::TestOnly")), test_only.map(resolution));
+    });
+}
+
+#[test]
+fn warm_include_resolution_tracks_the_preferred_crate() {
+    check_warm_crate_contexts("/src/included.rs", |vsema, file, expected, _| {
+        let db = vsema.db;
+        let root = vsema.parse(file).syntax();
+        let token = root
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|it| it.text() == "Common")
+            .expect("the included super::Common token");
+        // Query the include mapping before any file-to-module lookup can populate it.
+        let mapped = vsema.descend_into_macros_exact(token);
+        assert!(!mapped.is_empty(), "the include token maps into its expansion");
+        for token in mapped {
+            let parent = token.parent().expect("a mapped token has a parent");
+            assert!(vsema.hir_file_for(parent).is_macro(), "the token is in an include expansion");
+            let path = parent
+                .ancestors()
+                .filter_map(view::Path::cast)
+                .find(|it| it.qualifier().is_some())
+                .expect("the mapped parent path");
+            let scope = vsema.scope(path.syntax()).expect("the included function has a scope");
+            assert_eq!(scope.krate(), expected, "the include belongs to the current context");
+            let Some(crate::PathResolution::Def(ModuleDef::Adt(crate::Adt::Struct(common)))) =
+                vsema.resolve_path(path)
+            else {
+                panic!("the included super::Common resolves to a struct");
+            };
+            assert_eq!(common.module(db).krate(db), expected);
+            assert_eq!(scope.module().parent(db), Some(common.module(db)));
+        }
     });
 }
 

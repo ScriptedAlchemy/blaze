@@ -80,7 +80,7 @@ impl<'db> Semantics<'db> {
     /// is in any.
     pub fn new_within(db: &'db Db, crates: Arc<HashSet<base_db::Crate, Global>>) -> Semantics<'db> {
         let mut imp = SemanticsImpl::new(db);
-        imp.s2d_cache.get_mut().within = Some(crates);
+        imp.s2d_cache.get_mut().set_within(Some(crates));
         Semantics { db, imp, roots: RefCell::new(ROOTS.take()) }
     }
 

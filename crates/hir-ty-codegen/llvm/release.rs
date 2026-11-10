@@ -894,6 +894,145 @@ mod tests {
         Machinery::new(Machine::create(crate::Target::x86_64_linux(), optimization).unwrap())
     }
 
+    /// A named stack local used Inkwell's instruction wrapper for LLVM 23's DbgRecord.
+    /// This path is active in default-dev prelink lowering (the Stage1 panic's span).
+    /// Exercise the actual prelink path, then inspect LLVM's record and instruction lists
+    /// separately. Restoring Inkwell's `insert_declare_at_end` call must fail this test.
+    #[test]
+    fn named_stack_locals_are_debug_records_not_instructions() {
+        use cranelift_codegen::ir::{AbiParam, InstBuilder, StackSlotData, StackSlotKind, types};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+        use inkwell::{llvm_sys::LLVMDbgRecordKind, values::AsValueRef as _};
+
+        let target = crate::Target::x86_64_linux();
+        let isa = crate::isa_for(target).unwrap();
+        let wants = Wants::new(target, &**isa);
+        let mut signature = ir::Signature::new(isa.default_call_conv());
+        signature.params.push(AbiParam::new(types::I64));
+        signature.returns.push(AbiParam::new(types::I64));
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), signature);
+        let slot =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let mut frontend = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut frontend);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+        let value = builder.block_params(block)[0];
+        builder.ins().stack_store(types::I64, value, slot, 0);
+        let value = builder.ins().stack_load(types::I64, types::I64, slot, 0);
+        builder.ins().return_(&[value]);
+        builder.finalize(isa.frontend_config());
+
+        for (named, debug) in [(false, true), (true, false), (true, true)] {
+            let named = if named { std::slice::from_ref(&slot) } else { &[] };
+            let linked = prelink(
+                &wants,
+                &func,
+                named,
+                Hint::None,
+                debug,
+                false,
+                Optimization::NONE,
+                &|_| false,
+                &Sanitize::default(),
+                Sanitizers::NONE,
+                None,
+                Features::BASELINE,
+                false,
+            )
+            .unwrap();
+            let context = Context::create();
+            for (bytes, expected) in [
+                (&linked.own, usize::from(debug && !named.is_empty())),
+                (&linked.export, 0),
+            ] {
+                let buffer = MemoryBuffer::create_from_memory_range_copy(bytes, "debug local");
+                let module = Module::parse_bitcode_from_buffer(&buffer, &context).unwrap();
+                module.verify().unwrap();
+                // alloc: the real LLVM IR is included in assertion failures
+                let text = module.print_to_string().to_string();
+                let function = module.get_function(OWN).unwrap();
+                let (mut instructions, mut records) = (0, 0);
+                for block in function.get_basic_block_iter() {
+                    for instruction in block.get_instructions() {
+                        instructions += 1;
+                        // SAFETY: this is a live instruction of `module`. Its debug records
+                        // are owned by that same module; nothing mutates it during the walk.
+                        let mut record = unsafe {
+                            core::LLVMGetFirstDbgRecord(instruction.as_value_ref())
+                        };
+                        while !record.is_null() {
+                            // SAFETY: `record` is a live DbgRecord from LLVM's record list,
+                            // never cast to a value or passed to an instruction API.
+                            unsafe {
+                                assert_eq!(
+                                    core::LLVMDbgRecordGetKind(record),
+                                    LLVMDbgRecordKind::LLVMDbgRecordDeclare,
+                                    "{text}",
+                                );
+                                let storage = core::LLVMDbgVariableRecordGetValue(record, 0);
+                                assert!(!storage.is_null());
+                                assert!(!core::LLVMIsAAllocaInst(storage).is_null(), "{text}");
+                                assert!(
+                                    !core::LLVMDbgVariableRecordGetVariable(record).is_null()
+                                );
+                                assert!(!core::LLVMDbgRecordGetDebugLoc(record).is_null());
+                                record = core::LLVMGetNextDbgRecord(record);
+                            }
+                            records += 1;
+                        }
+                    }
+                }
+                assert_eq!(records, expected, "{text}");
+                assert_eq!(instructions, linked.size, "{text}");
+                assert_eq!(
+                    text.contains("!DILocalVariable(name: \"0\""),
+                    expected == 1,
+                    "{text}",
+                );
+            }
+        }
+
+        // Unsupported old-format IR must be refused before LLVM's record-only insertion
+        // API is called, with the local's storage and its function named in the error.
+        let context = Context::create();
+        let module = context.create_module("legacy debug local");
+        let lines = Debug::of(&module, target, false).unwrap().unwrap();
+        let own = Defined {
+            name: OWN,
+            func: &func,
+            pointees: &[],
+            named: std::slice::from_ref(&slot),
+            weights: None,
+            marked: true,
+        };
+        let function =
+            Lowering::add(&context, &module, target, &own, false, Features::BASELINE).unwrap();
+        // SAFETY: `module` is live, local to this test, and not being walked or compiled.
+        unsafe { core::LLVMSetIsNewDbgInfoFormat(module.as_mut_ptr(), 0) };
+        let refused = Lowering::define(
+            &context,
+            &module,
+            target,
+            function,
+            &own,
+            &HashMap::new_in(Global),
+            &HashSet::new_in(Global),
+            None,
+            None,
+            &HashMap::new_in(Global),
+            &HashMap::new_in(Global),
+            Some(&lines),
+        )
+        .unwrap_err();
+        lines.finish();
+        let Unhandled::Llvm(message) = refused else { panic!("{refused:?}") };
+        assert!(message.contains("alloca") && message.contains(OWN), "{message}");
+        assert!(message.contains("debug-record format is required"), "{message}");
+    }
+
     /// Calls its request 1 twice with one constant and its request 2 with two, takes the
     /// address of its request 3, calls the symbol 4 and never reads its second parameter.
     const CALLER: &str = r#"

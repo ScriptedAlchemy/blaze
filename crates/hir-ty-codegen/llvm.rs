@@ -20,7 +20,8 @@
 //! - this file: the passes kept per target machine ([`Kept`]) and the report they keep
 //!   ([`report`]), the diagnostic handler ([`diagnosed`]), the process's command-line options, the host CPU, the byte GEPs the
 //!   lowering builds ([`byte_offset`]), and the handful of inkwell calls that are `unsafe`
-//!   (deleting a function nothing uses, wrapping a raw call site);
+//!   (deleting a function nothing uses, wrapping a raw call site), and local-variable debug
+//!   records, which LLVM 23 returns as `DbgRecord`s rather than instructions;
 //! - [`rebase`] and [`release`]: walks of a module's raw IR (use lists, constant expressions,
 //!   call operands) that inkwell has no type for. Through inkwell each value read would also be
 //!   classified into its enum, one or two more calls into LLVM per operand.
@@ -629,6 +630,64 @@ fn in_bounds_byte_offset<'ctx>(
     // for any `by`, of the one context `'ctx`. `inbounds` is a statement about the program
     // being compiled, not about this process.
     unsafe { builder.build_in_bounds_gep(context.i8_type(), base, &[by], "") }
+}
+
+/// Declares where a local lives without treating LLVM's debug record as an instruction.
+/// Inkwell 0.11's `insert_declare_at_end` casts the returned `LLVMDbgRecordRef` to an
+/// `LLVMValueRef`, which violates `InstructionValue::new`'s contract on LLVM 23.
+fn declare_local<'ctx>(
+    module: &Module<'ctx>,
+    builder: &inkwell::debug_info::DebugInfoBuilder<'ctx>,
+    storage: PointerValue<'ctx>,
+    variable: inkwell::debug_info::DILocalVariable<'ctx>,
+    location: inkwell::debug_info::DILocation<'ctx>,
+    block: inkwell::basic_block::BasicBlock<'ctx>,
+) -> Result<(), Unhandled> {
+    use inkwell::{
+        llvm_sys::{core, debuginfo},
+        values::{AnyValue as _, AsValueRef as _},
+    };
+
+    let function = block.get_parent().ok_or_else(|| {
+        // alloc: the error names the storage whose declaration was refused
+        Unhandled::Llvm(format!(
+            "debug declaration of `{}` has no containing function",
+            storage.print_to_string().to_string_lossy(),
+        ))
+    })?;
+    let refused = |why| {
+        // alloc: the error names the storage and function whose declaration was refused
+        Unhandled::Llvm(format!(
+            "debug declaration of `{}` in function `{}`: {why}",
+            storage.print_to_string().to_string_lossy(),
+            function.get_name().to_string_lossy(),
+        ))
+    };
+    // SAFETY: `module` owns the live IR being lowered; this only reads its debug format.
+    if unsafe { core::LLVMIsNewDbgInfoFormat(module.as_mut_ptr()) } == 0 {
+        return Err(refused("LLVM debug-record format is required"));
+    }
+    // alloc: an empty expression allocates nothing
+    let expression = builder.create_expression(Vec::new());
+    // SAFETY: the builder, storage, variable, location and block belong to the module being
+    // lowered and its context, which outlive this call, as for inkwell's insertion API.
+    // The module uses the debug-record format (checked above). LLVM owns the returned
+    // record; it is NOT an LLVMValueRef and must never go through a value-kind query or an
+    // InstructionValue constructor, even when the caller only discards that wrapper.
+    let record = unsafe {
+        debuginfo::LLVMDIBuilderInsertDeclareRecordAtEnd(
+            builder.as_mut_ptr(),
+            storage.as_value_ref(),
+            variable.as_mut_ptr(),
+            expression.as_mut_ptr(),
+            location.as_mut_ptr(),
+            block.as_mut_ptr(),
+        )
+    };
+    if record.is_null() {
+        return Err(refused("LLVM returned no debug declaration record"));
+    }
+    Ok(())
 }
 
 /// The indexed profile `LLVMBlazeWriteProfile` writes of `records` (name, hash, counts), as
