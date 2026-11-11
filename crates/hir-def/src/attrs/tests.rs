@@ -2397,7 +2397,7 @@ fn no_two_attr_flags_share_a_bit() {
         }
         owner[bit] = Some(name);
     }
-    // The two this lane added keep the bits their commit says.
-    assert_eq!(AttrFlags::BLAZE_ACYCLIC.bits(), 1 << 125);
+    // The merged allocation leaves bit 125 to multiversion and moves acyclic to 108.
+    assert_eq!(AttrFlags::BLAZE_ACYCLIC.bits(), 1 << 108);
     assert_eq!(AttrFlags::BLAZE_PROGRAM_LIFETIME.bits(), 1 << 126);
 }
