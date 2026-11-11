@@ -588,6 +588,25 @@ fn a_walk_over_kept_describes_builds_what_a_fresh_walk_builds(tc: hegel::TestCas
 
 const WHOLE: Run = Run { live: false, static_root: false, check: None };
 
+/// The invariant: removing a formerly reached function after a dyn-fact edit refuses its
+/// stale handle without panicking, and the kept and fresh builds still agree on every list
+/// and delta. A patch may ask again of the removed function before its reach graph settles.
+#[test]
+fn a_removed_function_after_a_dyn_fact_edit_refuses_its_stale_handle() {
+    let mut program = Program::default();
+    for (id, calls) in [(1, &[2, 3][..]), (2, &[3][..]), (3, &[][..])] {
+        let function = program.function(id, 0x10 + id as u8, calls);
+        if id == 1 {
+            function.symbol = Some("main".to_owned());
+        } else {
+            (function.foreign, function.over_editable) = (true, true);
+        }
+        program.bodies.insert(id, (id % 3, false));
+    }
+    let edits = [(Edit::DynFact, (1, 0)), (Edit::RemoveFunction, (1, 0))];
+    assert_eq!(first_difference(program, WHOLE, &edits, None), None);
+}
+
 /// The replay of the Hegel failure: two front-end instances share a target, while a
 /// body edit makes two callers share an IR shape with different repeated-reference positions.
 #[test]

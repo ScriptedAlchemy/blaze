@@ -274,7 +274,10 @@ impl Frontend for Program {
         id: &u32,
         requester: &Origin,
     ) -> Result<Described<u32, u32>, CodegenError> {
-        let function = &self.functions[id];
+        let function = self.functions.get(id).ok_or_else(|| {
+            // alloc: the model's refusal names the removed function.
+            error(InstanceKey(ContentId::default()), item(*id), format!("f{id} is no longer defined"))
+        })?;
         // Against the program's dyn facts, a call through a `dyn` is direct: one more
         // reference, last, and another code, as the facts its body read key it.
         let direct = self.devirtualized(*id);
