@@ -2177,6 +2177,8 @@ mod thunks;
 
 mod eh_frame_reach;
 
+mod interposition;
+
 /// The state's columns, read and written as a stage does.
 mod columns {
     use blaze_codegen::Line;
