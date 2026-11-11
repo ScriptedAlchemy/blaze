@@ -1797,7 +1797,7 @@ pub struct WorkSet<B: Prepare> {
 impl<B: Prepare> WorkSet<B> {
     /// Canonical tasks sorted by grant ID; equal standalone templates get one grant.
     pub fn names(&self) -> Vec<InstanceKey> {
-        self.tasks.keys.clone() // clone: the coordinator owns the task list.
+        self.tasks.keys().copied().collect() // alloc: the coordinator owns the task list.
     }
 
     /// Store keys of canonical release outputs, for matching actual emission evidence.
@@ -2954,7 +2954,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         self.static_callees =
             statics.values().flat_map(|it| it.refs.iter().filter_map(callee)).collect();
         if !out.errors.is_empty() {
-            let errors = out.finish(names_of(&nodes, Some(&statics))).errors;
+            let errors = out.finish(names_of::<_, _, B>(&nodes, Some(&statics))).errors;
             // A refused build is still the last run, as one whose compiles failed is: a lazy or
             // live compile after it never reads an earlier build's walk.
             // alloc: once per build, the walk its `Later` holds
@@ -3035,7 +3035,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             Err(why) => {
                 let item = nodes.get(&why.unit()).map_or(why.item(), |it| it.unit.item);
                 out.errors.push(error(why.unit(), item, why.to_string()));
-                return Err(out.finish(names_of(&nodes, Some(&statics))).errors);
+                return Err(out.finish(names_of::<_, _, B>(&nodes, Some(&statics))).errors);
             }
         };
         out.statics.sort_by_key(|it| (it.item, it.instance));
@@ -3127,7 +3127,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             used,
             kernel,
             misses,
-        } = out.finish(names_of(&nodes, Some(&statics)));
+        } = out.finish(names_of::<_, _, B>(&nodes, Some(&statics)));
         // alloc: once per build, the walk its `Later` and the kept walk share
         let nodes = Arc::new(nodes);
         // clone: a reference count, once per build
@@ -3332,7 +3332,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         let jobs = release_jobs(&nodes);
         let ReleasePlan { tasks: release, .. } =
             self.release_plan(&nodes, &jobs, store, &outside_statics, &mut out);
-        let Finished { puts: summaries, errors, .. } = out.finish(names_of(&nodes, Some(&statics)));
+        let Finished { puts: summaries, errors, .. } =
+            out.finish(names_of::<_, _, B>(&nodes, Some(&statics)));
         if !errors.is_empty() {
             return Err(errors);
         }
