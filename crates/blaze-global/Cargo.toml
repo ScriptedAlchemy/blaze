@@ -34,6 +34,7 @@ toml.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+rcgen.workspace = true
 
 [features]
 default = ["net"]

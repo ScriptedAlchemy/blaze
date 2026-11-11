@@ -18,9 +18,10 @@
 //! - [`say`]: cargo's own lines (`error: ...`, `warning: ...`) as diagnostics.
 //! - [`release`]: what a build lets go of its front end once nothing still to compile reads it.
 //!
-//! The front end is written by the loop alone, through the job's [`UnitWriter`], and read by
-//! each task through the [`UnitReader`] it was posted with, a shared reference: no worker
-//! locks to read it, and a write waits for every reader before it (`work`'s docs).
+//! The loop owns input writes through the job's [`UnitWriter`]; release moves its exclusive
+//! database and frozen plan to one accounted worker. Each reading task uses the [`UnitReader`]
+//! it was posted with: no worker locks to read, and writes and release wait for every prior
+//! reader (`work`'s docs).
 //!
 //! Nothing here runs rustc or cargo, and nothing user code runs is outside the sandbox but
 //! what `BLAZE_SANDBOX=off` and the manifest's opt-outs take out (docs/cargo.md).
@@ -302,7 +303,9 @@ impl Steps for Real {
             .in_scope(|| {});
             return;
         }
-        release.release(&mut kept.lowered);
+        if let Some(plan) = release.plan(blaze_graph::admission::Pressure::now()) {
+            plan.run(&mut kept.lowered);
+        }
     }
 
     fn lower(&self, input: &JobInput, kept: Option<KeptLowered>) -> Result<FrontEnd<Real>, Failed> {
@@ -459,6 +462,7 @@ impl Steps for Real {
                 );
                 let writer = UnitWriter {
                     session,
+                    crates: Arc::clone(lowered.crates()),
                     front: Held::new(Arc::new(lowered), "a job's front end"),
                     job,
                     waits,
@@ -472,6 +476,7 @@ impl Steps for Real {
                     broken: false,
                     retractions,
                     release,
+                    final_release: release::FinalRelease::default(),
                 };
                 Ok((writer, puts, misses))
             },
@@ -826,6 +831,8 @@ pub struct UnitWriter {
     /// What the front end's database keeps of the store ([`deps::session`]), declared first
     /// as in [`KeptLowered`].
     session: deps::Session,
+    /// Immutable unit descriptions also validate results arriving while `front` is away.
+    crates: Arc<blaze_lower::Crates>,
     front: Held<Arc<Lowered>>,
     job: Arc<Job>,
     waits: graph::Waits,
@@ -851,6 +858,23 @@ pub struct UnitWriter {
     retractions: u64,
     /// What the build lets go of its front end as its units compile ([`release`]).
     release: release::Release,
+    /// Every input write must precede the final release that permits publication.
+    final_release: release::FinalRelease,
+}
+
+/// The database's only owner and a release plan taken on the loop. Readers and input
+/// application stay blocked in its writer until this task gives the database back.
+pub struct FrontRelease {
+    front: Held<Arc<Lowered>>,
+    plan: release::Plan<base_db::Crate>,
+}
+
+/// A release that finished successfully, carrying the database and only that plan's result.
+pub struct ReleasedFront {
+    front: Held<Arc<Lowered>>,
+    pressed: bool,
+    ended: bool,
+    after: blaze_graph::admission::Pressure,
 }
 
 /// `broke`, a failure or a panic of a step of an apply for each of the units `ready`, kept
@@ -864,31 +888,91 @@ fn broke_each(into: &mut Vec<Broke>, broke: &Broke, ready: &[u32], itself: bool)
 }
 
 impl Writer<Real> for UnitWriter {
+    type Release = FrontRelease;
+    type Released = ReleasedFront;
+
+    fn take_release(&mut self) -> Option<FrontRelease> {
+        if !self.waiting() {
+            return None;
+        }
+        let front = self.front.it.as_mut()?;
+        Arc::get_mut(front)?;
+        let plan = self.release.plan()?;
+        let front = self.front.it.take().expect("the exclusive front end was just checked");
+        Some(FrontRelease { front: Held::new(front, "a front end being released"), plan })
+    }
+
+    fn release(work: FrontRelease) -> Result<ReleasedFront, ApiError> {
+        let FrontRelease { mut front, plan } = work;
+        let (pressed, ended) = (plan.pressed, plan.ended);
+        let Some(lowered) = Arc::get_mut(&mut front) else {
+            return Err(ApiError::new(
+                "the front end release owns the database exclusively, but another reader is alive",
+                None,
+            ));
+        };
+        let after = plan.run(lowered);
+        Ok(ReleasedFront { front, pressed, ended, after })
+    }
+
+    fn released(&mut self, released: ReleasedFront) -> Result<(), (ApiError, ReleasedFront)> {
+        if self.front.it.is_some() {
+            let error = ApiError::new(
+                "the front end release returned to a writer that already owns a database",
+                None,
+            );
+            return Err((error, released));
+        }
+        let ReleasedFront { front, pressed, ended, after } = released;
+        self.front = front;
+        self.release.released(pressed, after);
+        self.final_release.released(
+            ended,
+            !self.runs.is_empty() || !self.macros.is_empty() || !self.msls.is_empty(),
+        );
+        Ok(())
+    }
+
+    fn ending(&mut self) {
+        if self.final_release.request(
+            !self.runs.is_empty() || !self.macros.is_empty() || !self.msls.is_empty(),
+        ) {
+            self.release.end();
+        }
+    }
+
     fn reader(&self) -> Option<UnitReader> {
         (!self.waiting())
             .then(|| UnitReader { front: Arc::clone(&self.front), checks: self.session.checks() })
     }
 
     fn ran(&mut self, run: usize, ran: Ran) -> Result<(), ApiError> {
-        self.front.check_ran(run, &ran).map_err(lower_error)?;
+        self.crates.check_ran(run, &ran).map_err(lower_error)?;
+        self.final_release.written();
         self.runs.push((run, ran));
         Ok(())
     }
 
     fn macros(&mut self, unit: usize, macros: ProcMacroLoadResult) -> Result<(), ApiError> {
-        self.front.check_macros(unit).map_err(lower_error)?;
+        self.crates.check_macros(unit).map_err(lower_error)?;
+        self.final_release.written();
         self.macros.push((unit, macros));
         Ok(())
     }
 
     fn gpu_msl(&mut self, unit: usize, msl: Vec<u8>) -> Result<(), ApiError> {
         self.front.check_gpu_msl(unit).map_err(lower_error)?;
+        self.final_release.written();
         self.msls.push((unit, msl));
         Ok(())
     }
 
     fn waiting(&self) -> bool {
-        !self.runs.is_empty() || !self.macros.is_empty() || !self.msls.is_empty() || self.release.due()
+        self.front.it.is_none()
+            || !self.runs.is_empty()
+            || !self.macros.is_empty()
+            || !self.msls.is_empty()
+            || self.release.due()
     }
 
     fn began(&mut self, unit: usize) {
@@ -919,15 +1003,22 @@ impl Writer<Real> for UnitWriter {
     /// the units made ready or reached by a loaded proc macro ([`deps::serve`]), in a front end
     /// kept or fresh.
     fn apply(&mut self) -> Result<bool, ApiError> {
+        // Reclamation runs only on a worker. This also covers a later pressure request
+        // queued while an earlier frozen plan owns the database.
+        if self.front.it.is_none() || self.release.due() {
+            return Ok(false);
+        }
         if !self.waiting() {
             return Ok(true);
         }
         let Some(lowered) = Arc::get_mut(&mut self.front) else { return Ok(false) };
-        // First, with the readers stopped for it or for the writes below: what the crates
-        // finished so far keep ([`release`]).
-        self.release.release(lowered);
         if self.runs.is_empty() && self.macros.is_empty() && self.msls.is_empty() {
             return Ok(true);
+        }
+        if self.final_release.applied() {
+            // These writes arrived after ending was requested. Their MIR must go too;
+            // the next worker plan is taken only after this apply has finished.
+            self.release.end();
         }
         self.ready.clear();
         // alloc: once an apply, the units it writes, named on its `maintain` span
@@ -1078,7 +1169,7 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn tables(&mut self) -> Result<Vec<(&'static str, u64, u64)>, Failed> {
-        let Some(lowered) = Arc::get_mut(&mut self.front) else {
+        let Some(lowered) = self.front.it.as_mut().and_then(Arc::get_mut) else {
             let what =
                 "the front end's tables are measured with no task reading it, and one still does";
             return Err(ApiError::new(what, None).into());
@@ -1104,7 +1195,9 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn run_log(&self) -> blaze_query::db::Taken {
-        blaze_query::db::take_log_in(self.front.db())
+        self.front.it.as_ref().map_or_else(blaze_query::db::Taken::default, |front| {
+            blaze_query::db::take_log_in(front.db())
+        })
     }
 
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic> {
@@ -1150,13 +1243,11 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn keep(mut self) -> Result<KeptLowered, ApiError> {
-        // The writes still asked for are applied. With none, only that no reader is alive is
-        // asked: a release that is due stays for the task that stores the front end.
-        let applied = match self.runs.is_empty() && self.macros.is_empty() {
-            true => Arc::get_mut(&mut self.front).is_some(),
-            false => self.apply()?,
-        };
-        if !applied {
+        if !self.final_release.ready() {
+            let what = "the front end cannot be kept before its final worker release completes";
+            return Err(self.refused(what));
+        }
+        if !self.apply()? {
             let what = "the front end is kept for the head's next build with no task reading it, and one still does";
             return Err(self.refused(what));
         }
@@ -1164,12 +1255,6 @@ impl Writer<Real> for UnitWriter {
             let what = "the front end is not kept for the head's next build: a write to it panicked, and it may be half written";
             return Err(self.refused(what));
         }
-        // The build is over: what its finished crates keep goes, and every MIR it made, of a
-        // check as of any build, so the kept front end holds none of it into the build after
-        // the next (a check's MIR, kept, grew the heap by every check). Not here, on the loop
-        // before the build's answer: the release is kept with the front end and run by the
-        // task that stores it, after the answer ([`Steps::release_kept`]).
-        self.release.end();
         let UnitWriter { session, front, job, deps, retractions, release, .. } = self;
         let Some(lowered) = Arc::into_inner(front.into_inner()) else {
             let what = "the front end is kept for the head's next build, and another holder of it is still alive";

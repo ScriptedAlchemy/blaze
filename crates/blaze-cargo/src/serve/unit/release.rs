@@ -7,7 +7,7 @@
 //!
 //! A drop needs the front end's database exclusive (a value is read in place, `blaze_query`'s
 //! row rule 3), so it is a write of the job's [`super::UnitWriter`] as a build script's run is,
-//! applied by `Writer::apply` once no reader is alive:
+//! handed to one worker once no reader is alive, before `Writer::apply` applies other writes:
 //!
 //! - **With another write.** A wave of build scripts' runs or proc macros' loads already stops
 //!   the readers; the crates finished by then are let go with it, at no stop of their own.
@@ -18,17 +18,13 @@
 //!   ends first; none is cancelled), and the front end's values kept by bytes are swept under
 //!   the squeeze's caps too ([`blaze_query::db::Storage::sweep_values`]), not only at the next
 //!   view.
-//! - **Once the front end is kept**, its build over: every MIR goes then, of every goal and
+//! - **Before the front end is kept**, its build over: every MIR goes then, of every goal and
 //!   under any limit or none ([`Release::end`]). MIR is the request's: a value of the build
 //!   that made it, read again by the next build only as its memo (verified against, made
 //!   again where read), so nothing of it outlives the build that made it. This release is
-//!   never on the loop and never before the build's answer: it is kept with the front end
-//!   and run by the task that stores the front end, which holds it alone as the writer did
-//!   (`Steps::release_kept`). It only lowers memory, so the checkout's next build never waits
-//!   for it: a request that waits for the front end has it handed back unreleased, and that
-//!   build's own releases, at the latest its end's, let the MIR go. When blaze is past its
-//!   limit's line the release runs all the same, before that build is given the front end:
-//!   memory short stays a reason that stops for nothing but the answer.
+//!   never on the loop: the final worker plan completes before the writer keeps its front
+//!   end, with any late writes applied and released through the same handoff. Later pressure
+//!   releases of the kept front end run on its storing worker (`Steps::release_kept`).
 //!
 //! A value let go keeps its memo, so a read of it later in the build, or by the next build of
 //! the head, makes it again and backdates it: nothing read can differ, a re-read costs time and
@@ -198,6 +194,50 @@ pub(crate) struct Release<K = Crate> {
     ended: bool,
 }
 
+/// Publication waits for a final plan after every input write. UnitWriter and the daemon
+/// carrier's fake writer share this production policy; the fake models ownership only.
+#[derive(Default)]
+pub(crate) struct FinalRelease {
+    requested: bool,
+    ready: bool,
+}
+
+impl FinalRelease {
+    /// Schedule final release now only if no input write still has to apply.
+    pub(crate) fn request(&mut self, pending: bool) -> bool {
+        self.requested = true;
+        self.ready = false;
+        !pending
+    }
+
+    /// An accepted input invalidates any prior final plan immediately.
+    pub(crate) fn written(&mut self) {
+        self.ready = false;
+    }
+
+    /// A nonempty batch of inputs is being applied exclusively. A requested final plan
+    /// must follow this batch, including writes arriving after an older plan was taken.
+    pub(crate) fn applied(&mut self) -> bool {
+        self.ready = false;
+        self.requested
+    }
+
+    pub(crate) fn released(&mut self, ended: bool, pending: bool) {
+        self.ready |= ended && !pending;
+    }
+
+    pub(crate) fn ready(&self) -> bool {
+        self.ready
+    }
+
+    /// The former early-keep state, planted by the shared-policy and carrier controls.
+    #[cfg(test)]
+    pub(crate) fn reuse_older_plan_for_test(&mut self) {
+        self.requested = false;
+        self.ready = true;
+    }
+}
+
 /// What one release lets go of, told by [`Release::plan`].
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Plan<K> {
@@ -226,12 +266,15 @@ impl Release<Crate> {
         self.compiled_under(unit, Pressure::now);
     }
 
-    /// With the front end exclusive (no reader alive): lets go of what the finished crates
+}
+
+impl Plan<Crate> {
+    /// On a worker with the front end exclusive (no reader alive): lets go of what the finished crates
     /// keep, and of every MIR when no unit is open or memory made this release due, then under
     /// memory pressure sweeps the values kept by bytes under the squeeze's caps. A span names
     /// what it let go and what blaze held before and after (rule 16).
-    pub(crate) fn release(&mut self, lowered: &mut Lowered) {
-        let Some(Plan { crates, mir, pressed, ended }) = self.plan() else { return };
+    pub(crate) fn run(self, lowered: &mut Lowered) -> Pressure {
+        let Plan { crates, mir, pressed, ended } = self;
         RELEASES.fetch_add(1, Ordering::Relaxed);
         let before = Pressure::now();
         let span = tracing::info_span!(
@@ -256,9 +299,11 @@ impl Release<Crate> {
         );
         let _release = span.enter();
         let db = lowered.served_db();
-        let dropped = hir::evict::drop_crates_after_store(db, &crates, mir);
+        let dropped = tracing::info_span!(target: "blaze", "front end values released")
+            .in_scope(|| hir::evict::drop_crates_after_store(db, &crates, mir));
         if pressed {
-            db.storage_mut().sweep_values(&Squeeze::caps(before));
+            tracing::info_span!(target: "blaze", "front end value caps swept")
+                .in_scope(|| db.storage_mut().sweep_values(&Squeeze::caps(before)));
         }
         // The build is over: what neither it nor the build before it read of the front end's
         // evictable values goes, the results of revisions no edit since has asked for. Only
@@ -270,11 +315,9 @@ impl Release<Crate> {
         // What was let go goes back to the system now, not when mimalloc's purge delay and the
         // next page taken get to it: this thread's heaps and every freed page at once, each
         // other thread's heaps as it next allocates or idles (memcap5).
-        blaze_mem::tag::give_back_heap();
+        tracing::info_span!(target: "blaze", "front end allocator pages returned")
+            .in_scope(blaze_mem::tag::give_back_heap);
         let after = Pressure::now();
-        if pressed {
-            self.squeeze.released(after);
-        }
         span.record("bodies", dropped.bodies);
         span.record("inference", dropped.inference);
         span.record("mir_dropped", dropped.mir);
@@ -290,7 +333,8 @@ impl Release<Crate> {
         // the total alone, from counters.
         let storage = if pressed {
             let mut usage = Vec::new(); // alloc: the release's report, an entry an ingredient
-            db.storage().memory_usage(&mut usage);
+            tracing::info_span!(target: "blaze", "front end storage measured")
+                .in_scope(|| db.storage().memory_usage(&mut usage));
             Holders::of(usage)
         } else {
             Holders::total(db.storage().held_bytes())
@@ -313,10 +357,11 @@ impl Release<Crate> {
                 storage,
             }
         );
+        after
     }
 }
 
-/// The line a release says ([`Release::release`]): why it ran, what it let go and how much
+/// The line a release says ([`Plan::run`]): why it ran, what it let go and how much
 /// blaze held before and after it, against the limit, then what the query storage holds.
 pub(crate) struct Said {
     pub(crate) crates: usize,
@@ -496,11 +541,18 @@ impl<K: Copy + Eq + Hash> Release<K> {
         self.pressed = true;
     }
 
-    /// The build is over and its front end is kept, no reader alive: the next release lets go
-    /// of every MIR, of a check as of any build, under any limit or none. What a build made of
-    /// MIR is the build's: kept, it is only what the next build would verify its memos
-    /// against, which needs the memo alone. That release is run after the build's answer, by
-    /// the task that stores the kept front end (the module's list).
+    /// The frozen plan completed. This updates the squeeze's last measure only: pressure,
+    /// completed units and the build's end reported after the plan was taken remain due.
+    pub(crate) fn released(&mut self, pressed: bool, after: Pressure) {
+        if pressed {
+            self.squeeze.released(after);
+        }
+    }
+
+    /// The build is over and its front end is about to be kept, no reader alive: the next
+    /// release lets go of every MIR, of a check as of any build, under any limit or none. What
+    /// a build made of MIR is the build's: kept, it is only what the next build would verify
+    /// its memos against, which needs the memo alone.
     pub(crate) fn end(&mut self) {
         self.ended = true;
     }

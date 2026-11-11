@@ -42,6 +42,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 /// The kinds of the daemon's own tasks, for their estimates and their subsystems' budgets.
 pub use blaze_graph::admission::kinds;
+pub use blaze_graph::plane::Parked;
 
 /// The kinds of the loop's tasks, past every one of [`kinds`]: they hold none of the daemon's
 /// memory, so only their times are learned.
@@ -1385,6 +1386,36 @@ impl<W: Work, P: Predict> Plane<W, P> {
         work: Option<W>,
         reads: bool,
     ) -> Result<(), Error> {
+        self.add_with_admission(at, request, fresh, work, reads, false)
+    }
+
+    /// One exclusive front-end release or discard, with its real predicted grant. These
+    /// tasks own their state, so they ask for no reader.
+    pub fn add_reclaim(
+        &mut self,
+        at: Duration,
+        request: RequestId,
+        fresh: Fresh,
+        work: W,
+    ) -> Result<(), Error> {
+        assert!(
+            matches!(fresh.tasks.as_slice(), [Task::Thread {
+                kind: kinds::FRONT_RELEASE | kinds::FRONT_DISCARD, arg: 0,
+            }]),
+            "reclamation admission takes one exclusive front end release or discard"
+        );
+        self.add_with_admission(at, request, fresh, Some(work), false, true)
+    }
+
+    fn add_with_admission(
+        &mut self,
+        at: Duration,
+        request: RequestId,
+        fresh: Fresh,
+        work: Option<W>,
+        reads: bool,
+        reclaim: bool,
+    ) -> Result<(), Error> {
         let Fresh { nodes, tasks, keys, sizes, over, count } = fresh;
         let work = work.map(Arc::new); // alloc: one per batch, shared by its tasks
         assert_eq!(tasks.len() as u32, count, "a batch is added with every node it was made for");
@@ -1399,7 +1430,12 @@ impl<W: Work, P: Predict> Plane<W, P> {
                 Batch { tasks, keys, sizes, over, live: count, work, reads, request: request.0 },
             );
         }
-        match self.step(PlaneInput::AddNodes { at_ns: ns(at), request, nodes }) {
+        let input = if reclaim {
+            PlaneInput::Reclaim { at_ns: ns(at), request, nodes }
+        } else {
+            PlaneInput::AddNodes { at_ns: ns(at), request, nodes }
+        };
+        match self.step(input) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.batches.remove(&first.0);
@@ -1492,6 +1528,38 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.step(input).unwrap_or_else(|error| {
             panic!("the plane refused the end of task {}: {error}", task.id)
         });
+    }
+
+    /// An admitted task has not been posted because its writer is exclusive. Give its
+    /// actual grant and worker slot back, and retain the graph's exact continuation token.
+    pub fn park(&mut self, at: Duration, task: Posting) -> Option<Parked> {
+        self.step(PlaneInput::Park { at_ns: ns(at), id: task.id })
+            .unwrap_or_else(|error| panic!("the plane refused to park task {}: {error}", task.id));
+        // Another completion can have failed/cancelled the request since it emitted Post.
+        // Park then settles this unposted task and legitimately retains no continuation.
+        self.graph.parked(task.id)
+    }
+
+    /// Its writer is ready again. The task goes through ordinary admission and gets a new
+    /// posting with the current grant; the old posting is never run directly.
+    pub fn resume(&mut self, at: Duration, parked: Parked) {
+        // A sibling's fail-fast refusal may already have skipped this continuation. A live
+        // task, including a reused id, still goes through the graph's generation check.
+        if self.graph.state(parked.id).is_none_or(NodeState::settled) {
+            return;
+        }
+        self.step(PlaneInput::Resume { at_ns: ns(at), parked })
+            .unwrap_or_else(|error| panic!("the plane refused to resume task {}: {error}", parked.id));
+    }
+
+    /// A write or cancellation refuses the exact parked task. Its grant was returned by
+    /// `park`, so this is not another `Done` and cannot subtract that grant twice.
+    pub fn refuse_parked(&mut self, at: Duration, parked: Parked, why: String) {
+        if self.graph.state(parked.id).is_none_or(NodeState::settled) {
+            return;
+        }
+        self.step(PlaneInput::RefuseParked { at_ns: ns(at), parked, why })
+            .unwrap_or_else(|error| panic!("the plane refused parked task {}: {error}", parked.id));
     }
 
     /// Takes the thread tasks that ended into the plane, then measures: what each running task
@@ -1654,6 +1722,13 @@ impl<W: Work, P: Predict> Plane<W, P> {
     #[cfg(test)]
     pub(super) fn runner_mut(&mut self) -> &mut Runner<W> {
         &mut self.runner
+    }
+
+    /// Teach a real measured forecast for an admission control without allocating that
+    /// peak in the test process. Ordinary prediction and graph refusal still decide it.
+    #[cfg(test)]
+    pub(super) fn observe_for_test(&mut self, kind: TaskKind, key: Key, peak: u64) {
+        self.predict.observe(kind, Some(key), 1, peak);
     }
 
     /// How many loop tasks run ([`Happened::Run`], not yet [`Plane::ended`]).
@@ -2188,6 +2263,50 @@ mod tests {
         plane.ended(Duration::from_millis(5), looped, Outcome::Built);
         let last = observed.lock().last().copied();
         assert_eq!(last, Some((loops::SCRIPT_RUN, None, 5_000_000, 0)));
+    }
+
+    /// A Post can already be queued when another completion fails its request or the
+    /// client cancels. Parking that unposted task returns its grant and terminally settles
+    /// it; there is then no continuation token for the daemon to retain or expect.
+    #[test]
+    fn parking_an_unposted_task_after_cancel_or_failure_settles_without_a_token() {
+        for cancel in [false, true] {
+            let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
+            let history = blaze_history::History::new(blaze_history::Config::default());
+            let mut plane = Plane::new(config, history, Runner::Inline(Inline::new(17))).unwrap();
+            let request = plane.open(Duration::ZERO, false, false);
+            let mut fresh = plane.fresh(2, 2, 0);
+            for name in ["a", "b"] {
+                plane.push(&mut fresh, NodeRef {
+                    kind: NodeKind::Bodies, name, deps: &[], pool: Pool::Work,
+                    cost: 1, key: None, memory: 1,
+                }, Task::Thread { kind: kinds::UNIT_BODIES, arg: 0 });
+            }
+            plane.add(Duration::ZERO, request, fresh, Some(Each(built)), true).unwrap();
+            plane.close(Duration::ZERO, request);
+            let mut happened = Vec::new();
+            plane.happened(&mut happened);
+            let posts: Vec<_> = happened.into_iter().filter_map(|it| match it {
+                Happened::Post { task, .. } => Some(task),
+                _ => None,
+            }).collect();
+            assert_eq!(posts.len(), 2, "both tasks were admitted but neither was posted");
+            let (waiting, other) = (posts[0], posts[1]);
+            if cancel {
+                plane.cancel(Duration::ZERO, request);
+            } else {
+                plane.refuse(Duration::ZERO, other, "the other completion failed".to_owned());
+            }
+            let before = plane.granted();
+            assert!(plane.park(Duration::ZERO, waiting).is_none());
+            assert_eq!(plane.granted(), before - waiting.granted);
+            assert!(plane.graph.state(waiting.id).is_none_or(NodeState::settled));
+            if cancel {
+                assert!(plane.park(Duration::ZERO, other).is_none());
+            }
+            assert_eq!(plane.granted(), 0, "each actual grant was returned exactly once");
+            assert_eq!(plane.runner.running(), 0, "no worker ever received either posting");
+        }
     }
 
     /// Many programs built at once (the 211 test binaries of a `blaze test --workspace`) run

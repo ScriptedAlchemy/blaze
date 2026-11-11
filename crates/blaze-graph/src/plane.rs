@@ -35,6 +35,12 @@
 //! granted memory fits (a program never measured, `admission::kinds::PROGRAM`). A task whose
 //! prediction alone is more than the budget fails before it starts, saying so; so does one
 //! that cannot fit while nothing runs. Nothing is retried with less at once.
+//! A [`PlaneInput::Reclaim`] returns exclusively owned values: it bypasses a temporary cap
+//! and a held compile reservation only with no positive grant running, under the full ceiling,
+//! machine allowance and recorded room. Its positive grant excludes other positive grants
+//! until it stops; zero-memory work still uses the normal thread limits. The reservation is
+//! kept for the compile. Unposted work can [`PlaneInput::Park`] while its input is exclusively
+//! owned elsewhere, returning its grant and thread without becoming ready until resumed.
 //!
 //! A request may be cancelled ([`Plane::cancel`]): what of it has not started is skipped, what
 //! runs is let finish, and it finishes failed. A plane lives as long as the daemon: a request
@@ -57,6 +63,10 @@
 //! [`Plane::step_into`] appends to the caller's buffer of outputs.
 
 #![forbid(unsafe_code)]
+
+#[cfg(test)]
+#[path = "plane_tests/reclaim.rs"]
+mod reclaim_tests;
 
 use blaze_hash::hash_map::Entry;
 use std::{
@@ -84,6 +94,17 @@ use crate::{
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct RequestId(pub u32);
+
+/// One parked, unposted task. Its generation fences a continuation after cancellation or
+/// reuse of either its task slot or node id. Only [`Plane::parked`] obtains a live token;
+/// deserialized tokens are checked again by [`PlaneInput::Resume`] and
+/// [`PlaneInput::RefuseParked`] before anything changes.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Parked {
+    pub id: NodeId,
+    pub(crate) task: u64,
+    pub(crate) epoch: u64,
+}
 
 impl fmt::Display for RequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -207,6 +228,16 @@ pub enum PlaneInput {
     /// again, each in its own request (skipped, of a request cancelled, or failed and not
     /// keeping going).
     Yielded { at_ns: u64, id: NodeId },
+    /// An admitted task has not been posted: return its grant and thread, but keep it off
+    /// ready heaps until its exclusive input is available. Only an unkeyed, single-member
+    /// work task may park. Its continuation is [`Plane::parked`], never an id looked up again
+    /// after a wait.
+    Park { at_ns: u64, id: NodeId },
+    /// The exact parked task's input is available: it becomes ready for normal admission.
+    Resume { at_ns: u64, parked: Parked },
+    /// The exact parked task cannot continue. Preserve its failure without giving back a
+    /// second grant or inventing a worker completion for work that never ran.
+    RefuseParked { at_ns: u64, parked: Parked, why: String },
     /// Nodes of the request, besides those it had. Their deps are nodes of the same request.
     Add { at_ns: u64, request: RequestId, nodes: Vec<Spec> },
     /// [`PlaneInput::Add`] of a run of ids as columns, one allocation a column rather than
@@ -214,6 +245,11 @@ pub enum PlaneInput {
     /// [`Event::Nodes`] of the columns, before anything else, says them all in place of an
     /// [`Event::Node`] a node.
     AddNodes { at_ns: u64, request: RequestId, nodes: Nodes },
+    /// One unkeyed, dependency-free `Store` node on `Work`, with a positive memory prediction.
+    /// Its owner has excluded readers before adding it. It runs alone among positive grants,
+    /// under the full configured/ledger bounds but past temporary pressure and a held compile
+    /// reservation, so returning the values cannot wait for the memory they must return.
+    Reclaim { at_ns: u64, request: RequestId, nodes: Nodes },
     /// No more nodes are added to the request but by [`PlaneInput::Done`].
     Close { at_ns: u64, request: RequestId },
     /// The task the plane asked to run as `id` is done, on the thread group `group` where the
@@ -275,6 +311,10 @@ impl PlaneInput {
             PlaneInput::Open { at_ns, .. }
             | PlaneInput::Add { at_ns, .. }
             | PlaneInput::AddNodes { at_ns, .. }
+            | PlaneInput::Reclaim { at_ns, .. }
+            | PlaneInput::Park { at_ns, .. }
+            | PlaneInput::Resume { at_ns, .. }
+            | PlaneInput::RefuseParked { at_ns, .. }
             | PlaneInput::Close { at_ns, .. }
             | PlaneInput::Done { at_ns, .. }
             | PlaneInput::Held { at_ns, .. }
@@ -389,6 +429,24 @@ impl Nodes {
 
     pub fn deps(&self, at: usize) -> &[NodeId] {
         &self.deps[self.deps_at[at] as usize..self.deps_at[at + 1] as usize]
+    }
+
+    fn check_reclaim(&self, request: RequestId) -> Result<(), Error> {
+        let why = if self.len() != 1 {
+            Some("exactly one node is required")
+        } else if self.kinds[0] != NodeKind::Store || self.pools[0] != Pool::Work {
+            Some("the node must be Store work")
+        } else if self.keys[0].is_some() || !self.deps(0).is_empty() {
+            Some("the node must be unkeyed and dependency-free")
+        } else if self.memory[0] == 0 {
+            Some("the memory prediction must be positive")
+        } else {
+            None
+        };
+        match why {
+            Some(why) => Err(Error::InvalidReclaim { request: request.0, first: self.first, why }),
+            None => Ok(()),
+        }
     }
 
     /// The node at `at` as a [`Spec`].
@@ -727,6 +785,10 @@ const DONE: u8 = 2;
 const STARTED: u8 = 4;
 const GROUP: u8 = 8;
 const OPEN: u8 = 16;
+/// An explicitly admitted reclamation node, never a key's shared task.
+const RECLAIM: u8 = 32;
+/// Unposted work that returned its grant, held off the ready heap by its exact continuation.
+const PARKED: u8 = 64;
 
 /// What adding, readying, starting and settling a node read: 64 bytes, one cache line, found
 /// by its slot.
@@ -761,6 +823,7 @@ const _: () = assert!(size_of::<NodeRow>() == 64);
 struct NodeCold {
     memory: u64,
     done_at: u64,
+    /// Its start time under STARTED, or the unique continuation sequence under PARKED.
     started_at: u64,
     /// The longest chain of measured run times through its request's nodes to it, its own
     /// included, once it settled ([`RequestStats::critical_path_ns`]).
@@ -1046,6 +1109,8 @@ pub struct Plane<M = NoMemo> {
     flight: ByKey<TaskHandle>,
     running: [usize; 2],
     granted: u64,
+    /// The one reclamation task holding a positive grant, until its accounting transition.
+    reclaim: Option<TaskHandle>,
     held: u64,
     /// What admission charges against the budget: the grants and the live bytes, or the
     /// footprint and the grants not yet in it (`crate::footprint`).
@@ -1167,6 +1232,7 @@ impl<M: Memo> Plane<M> {
             flight: ByKey::default(),
             running: [0; 2],
             granted: 0,
+            reclaim: None,
             held: 0,
             charge: Charge::new(),
             purge: false,
@@ -1255,11 +1321,8 @@ impl<M: Memo> Plane<M> {
     /// Whether the ready node `id` is held back for memory alone now: its task asks memory
     /// that does not fit beside what is granted and held, it may not start alone, and a thread
     /// of its pool is free. `false` for a node not ready, a task with no memory, or a plane
-    /// with no budget.
+    /// with no budget except the exclusion while reclamation runs.
     pub fn waits_for_memory(&self, id: NodeId) -> bool {
-        let (Some(free), Some(whole)) = (self.memory_free(), self.budget_now()) else {
-            return false;
-        };
         let Some(&node) = self.index.get(&id) else { return false };
         let m = node.index() as usize;
         if self.states[m] != NodeState::Ready {
@@ -1271,11 +1334,21 @@ impl<M: Memo> Plane<M> {
         }
         let t = &self.tasks[row_of(task)];
         let p = pool_at(t.pool);
+        if t.running || t.memory == 0 || self.running[p] >= self.threads_of(p) {
+            return false;
+        }
+        if self.cold[m].flags & RECLAIM != 0 {
+            return self.granted != 0 || t.memory > self.reclaim_budget();
+        }
+        if self.reclaim.is_some() {
+            return true;
+        }
+        let (Some(free), Some(whole)) = (self.memory_free(), self.budget_now()) else {
+            return false;
+        };
         let alone = self.granted == 0 && self.cap.is_none() && self.charge.alone_ok();
-        !t.running
-            && t.memory > free
+        t.memory > free
             && !(t.memory <= whole && alone)
-            && self.running[p] < self.threads_of(p)
     }
 
     /// The bytes of what the process holds besides its granted tasks (a front end kept, values
@@ -1350,6 +1423,26 @@ impl<M: Memo> Plane<M> {
         }
         let row = &self.tasks[row_of(task)];
         Some(Admitted { granted: row.memory, passed: row.passed, pool: row.pool })
+    }
+
+    /// The exact parked task after a successful [`PlaneInput::Park`]. A cancellation may
+    /// already have retired it. Keep this token across the wait, never reacquire one then.
+    pub fn parked(&self, id: NodeId) -> Option<Parked> {
+        let &node = self.index.get(&id)?;
+        if !self.node_slots.live(node) {
+            return None;
+        }
+        let me = node.index();
+        let task = self.rows[me as usize].task;
+        if !self.task_slots.live(task) || self.cold[me as usize].flags & PARKED == 0
+            || self.states[me as usize] != NodeState::Waiting
+        {
+            return None;
+        }
+        let t = &self.tasks[row_of(task)];
+        (!t.running && t.runner == me).then_some(Parked {
+            id, task: task.to_bits(), epoch: self.cold[me as usize].started_at,
+        })
     }
 
     /// Whether `request` is known and not finished: one [`Plane::cancel_into`] takes.
@@ -1559,8 +1652,32 @@ impl<M: Memo> Plane<M> {
             }
             PlaneInput::Yielded { id, .. } => {
                 let task = self.running_task(id)?;
-                self.charge.ended(task, None);
-                self.yielded(at, task, out, touched);
+                self.yielded(at, task, false, out, touched);
+            }
+            PlaneInput::Park { id, .. } => {
+                let task = self.running_task(id)?;
+                let t = self.tasks[row_of(task)];
+                if t.keyed || t.pool != Pool::Work || t.first != t.runner || t.last != t.runner {
+                    return Err(Error::NotParkable(id));
+                }
+                self.yielded(at, task, true, out, touched);
+            }
+            PlaneInput::Resume { parked, .. } => {
+                let task = self.parked_task(parked)?;
+                let me = self.tasks[row_of(task)].runner;
+                self.cold[me as usize].flags &= !PARKED;
+                self.make_ready(me, pool_at(self.tasks[row_of(task)].pool));
+                self.moved(at, me, NodeState::Ready, out);
+                touched.push(self.rows[me as usize].request);
+            }
+            PlaneInput::RefuseParked { parked, why, .. } => {
+                let task = self.parked_task(parked)?;
+                let me = self.tasks[row_of(task)].runner;
+                self.rows[me as usize].task = NO_TASK;
+                self.cold[me as usize].flags &= !PARKED;
+                self.free_task(task);
+                self.settle(at, me, NodeState::Failed { why }, out);
+                touched.push(self.rows[me as usize].request);
             }
             PlaneInput::Add { request, nodes, .. } => {
                 let r = self.open_request(request)?;
@@ -1572,29 +1689,11 @@ impl<M: Memo> Plane<M> {
                 touched.push(r);
             }
             PlaneInput::AddNodes { request, nodes, .. } => {
-                let r = self.open_request(request)?;
-                if self.requests[r as usize].closed {
-                    return Err(Error::Closed);
-                }
-                self.check(r, &nodes)?;
-                // The batch's record goes before any of its nodes moves; it takes the columns
-                // once the nodes are added from them, into the place kept for it.
-                let record_at = out.len();
-                if !nodes.is_empty() {
-                    // Empty, so allocating nothing: the place the record takes below.
-                    let kept = Event::Nodes {
-                        first: 0,
-                        kinds: Vec::new(),    // alloc: none, empty
-                        names: String::new(), // alloc: none, empty
-                        name_at: Vec::new(),  // alloc: none, empty
-                        deps: Vec::new(),     // alloc: none, empty
-                        deps_at: Vec::new(),  // alloc: none, empty
-                    };
-                    out.push(said(request, at, kept));
-                    self.add_with(at, r, nodes.len(), |place| nodes.parts(place), out);
-                    out[record_at] = said(request, at, nodes.record());
-                }
-                touched.push(r);
+                self.add_nodes(at, request, nodes, false, out, touched)?;
+            }
+            PlaneInput::Reclaim { request, nodes, .. } => {
+                nodes.check_reclaim(request)?;
+                self.add_nodes(at, request, nodes, true, out, touched)?;
             }
             PlaneInput::Close { request, .. } => {
                 let r = self.open_request(request)?;
@@ -1645,6 +1744,50 @@ impl<M: Memo> Plane<M> {
             PlaneInput::Cap { bytes, .. } => self.cap = bytes,
         }
         Ok(())
+    }
+
+    fn add_nodes(
+        &mut self,
+        at: u64,
+        request: RequestId,
+        nodes: Nodes,
+        reclaim: bool,
+        out: &mut Vec<PlaneOutput>,
+        touched: &mut Vec<u32>,
+    ) -> Result<(), Error> {
+        let r = self.open_request(request)?;
+        if self.requests[r as usize].closed {
+            return Err(Error::Closed);
+        }
+        self.check(r, &nodes)?;
+        // The batch's record precedes every move, taking its columns after their nodes do.
+        let record_at = out.len();
+        if !nodes.is_empty() {
+            let kept = Event::Nodes {
+                first: 0,
+                kinds: Vec::new(),    // alloc: none, empty
+                names: String::new(), // alloc: none, empty
+                name_at: Vec::new(),  // alloc: none, empty
+                deps: Vec::new(),     // alloc: none, empty
+                deps_at: Vec::new(),  // alloc: none, empty
+            };
+            out.push(said(request, at, kept));
+            self.add_with(at, r, nodes.len(), |place| nodes.parts(place), out);
+            if reclaim {
+                let me = self.index[&nodes.first()].index();
+                self.cold[me as usize].flags |= RECLAIM;
+            }
+            out[record_at] = said(request, at, nodes.record());
+        }
+        touched.push(r);
+        Ok(())
+    }
+
+    fn parked_task(&self, parked: Parked) -> Result<TaskHandle, Error> {
+        match self.parked(parked.id) {
+            Some(current) if current == parked => Ok(TaskHandle::from_bits(parked.task)),
+            _ => Err(Error::NotParked(parked.id)),
+        }
     }
 
     /// The task the plane asked to run as `id`, running. A `Done` or `Yielded` of a task that
@@ -2377,7 +2520,11 @@ impl<M: Memo> Plane<M> {
         if t.running {
             return;
         }
-        self.unready(me, pool_at(t.pool));
+        if self.cold[me as usize].flags & PARKED != 0 {
+            self.cold[me as usize].flags &= !PARKED;
+        } else {
+            self.unready(me, pool_at(t.pool));
+        }
         self.drop_if_empty(task);
     }
 
@@ -2433,13 +2580,18 @@ impl<M: Memo> Plane<M> {
         &mut self,
         at: u64,
         task: TaskHandle,
+        park: bool,
         out: &mut Vec<PlaneOutput>,
         touched: &mut Vec<u32>,
     ) {
         let t = self.tasks[row_of(task)];
         let p = pool_at(t.pool);
+        self.charge.ended(task, None);
         self.running[p] -= 1;
         self.granted -= t.memory;
+        if self.reclaim == Some(task) {
+            self.reclaim = None;
+        }
         if t.yielding {
             self.yielding[p] -= 1;
             self.yielding_memory -= t.memory;
@@ -2469,8 +2621,14 @@ impl<M: Memo> Plane<M> {
                     self.moved(at, member, NodeState::Skipped { because }, out);
                 }
                 None => {
-                    self.make_ready(member, p);
-                    self.moved(at, member, NodeState::Ready, out);
+                    if park {
+                        self.cold[member as usize].started_at = self.seq();
+                        self.cold[member as usize].flags |= PARKED;
+                        self.moved(at, member, NodeState::Waiting, out);
+                    } else {
+                        self.make_ready(member, p);
+                        self.moved(at, member, NodeState::Ready, out);
+                    }
                 }
             }
             member = next;
@@ -2492,6 +2650,9 @@ impl<M: Memo> Plane<M> {
         let p = pool_at(t.pool);
         self.running[p] -= 1;
         self.granted -= t.memory;
+        if self.reclaim == Some(task) {
+            self.reclaim = None;
+        }
         if t.yielding {
             self.tasks[row_of(task)].yielding = false;
             self.yielding[p] -= 1;
@@ -2545,8 +2706,8 @@ impl<M: Memo> Plane<M> {
     /// configured budget (the daemon's ceiling), held to the pressure cap while there is one
     /// ([`PlaneInput::Cap`], [`crate::pressure::budget_under`]), no more than the machine's
     /// ledger allows ([`PlaneInput::Allowance`]) and, between its turns, the room it records
-    /// of this daemon ([`Plane::room`]). Every admission decision reads it; only [`too_big`]
-    /// reads the configured budget alone.
+    /// of this daemon ([`Plane::room`]). Ordinary admission reads it; reclamation alone ignores
+    /// the temporary cap ([`Plane::reclaim_budget`]), and [`too_big`] reads the configured budget.
     pub fn budget_now(&self) -> Option<u64> {
         Some(self.budget_at_turn()?.min(self.room))
     }
@@ -2557,6 +2718,14 @@ impl<M: Memo> Plane<M> {
     fn budget_at_turn(&self) -> Option<u64> {
         let budget = self.config.budget.as_ref()?;
         Some(crate::pressure::budget_under(budget.bytes, self.cap).min(self.allowance))
+    }
+
+    /// Reclamation returns the held footprint. Its whole positive prediction must fit the
+    /// configured ceiling and the ledger's actual reservation, even with a temporary cap of 0.
+    fn reclaim_budget(&self) -> u64 {
+        self.config.budget.as_ref().map_or(u64::MAX, |budget| budget.bytes)
+            .min(self.allowance)
+            .min(self.room)
     }
 
     /// The task that holds back the others, while it is still to start and wanted by a
@@ -2586,8 +2755,9 @@ impl<M: Memo> Plane<M> {
         self.room_short = false;
         for pool in [Pool::Io, Pool::Work] {
             let (p, limit) = (pool_at(pool), self.threads(pool));
-            if self.config.budget.is_none() {
+            if self.config.budget.is_none() && self.reclaim.is_none() && self.hold.is_none() {
                 // With no budget the first ready node of the request whose turn it is starts.
+                // A waiting reclamation can establish a hold even here; keep that turn.
                 while self.running[p] < limit {
                     let Some(r) = self.active[p].iter().copied().min_by_key(|&r| self.turn(r, p))
                     else {
@@ -2597,10 +2767,12 @@ impl<M: Memo> Plane<M> {
                         break;
                     }
                     let me = self.requests[r as usize].ready[p][0].node;
+                    if self.cold[me as usize].flags & RECLAIM != 0 {
+                        // Its exclusive grant still needs admission without a configured budget.
+                        break;
+                    }
                     self.start(at, me, out);
                 }
-                self.yield_for(p, out);
-                continue;
             }
             while self.running[p] < limit {
                 let mut order = std::mem::take(&mut self.order);
@@ -2759,7 +2931,7 @@ impl<M: Memo> Plane<M> {
     }
 
     /// The node of request `r` whose task starts next on pool `p`, as memory allows; the tasks
-    /// of it that did not fit, before that one, are added to `passed`. Only with a budget.
+    /// of it that did not fit, before that one, are added to `passed`.
     ///
     /// A task that fits the budget at all (one over it was refused as it was added,
     /// [`too_big`]) never waits for good: once no task granted memory runs it starts, alone,
@@ -2781,19 +2953,21 @@ impl<M: Memo> Plane<M> {
     /// than what is allowed, and the turn it waits for is taken at once
     /// ([`Plane::turn_wanted`]).
     ///
-    /// Under a pressure cap ([`PlaneInput::Cap`]) the budget is the cap and no task
-    /// starts alone: there the wait does end, as the pressure passes or what is held is let go.
+    /// Under a pressure cap ([`PlaneInput::Cap`]) ordinary work cannot start alone. Reclamation
+    /// is the operation that returns what is held: it alone bypasses the cap and hold, with a
+    /// full grant under the ceiling and ledger bounds, and excludes other positive grants.
     fn pick(&mut self, r: u32, p: usize, passed: &mut Vec<TaskHandle>) -> Pick {
-        let free = self.memory_free().expect("a budget");
-        let whole = self.budget_now().expect("a budget");
-        let ceiling = self.config.budget.as_ref().expect("a budget").bytes;
+        let free = self.memory_free().unwrap_or(u64::MAX);
+        let whole = self.budget_now().unwrap_or(u64::MAX);
+        let ceiling = self.config.budget.as_ref().map_or(u64::MAX, |budget| budget.bytes);
+        let reclaim_budget = self.reclaim_budget();
         // Not under pressure: there waiting does make room ([`PlaneInput::Cap`]). Nor while the
         // allocator may keep memory a purge gives back: the task would grow into it
         // ([`Charge::alone_ok`]); a purge is asked ([`Plane::purge_due`]) and a reading after
         // it lets the task start.
         let alone = self.granted == 0 && self.cap.is_none() && self.charge.alone_ok();
         // The same two as the ledger's next turn leaves them: the room lifted.
-        let whole_at_turn = self.budget_at_turn().expect("a budget");
+        let whole_at_turn = self.budget_at_turn().unwrap_or(u64::MAX);
         let free_at_turn = whole_at_turn.saturating_sub(self.charged());
         let fits_at_turn = |memory: u64| {
             memory <= free_at_turn
@@ -2818,35 +2992,57 @@ impl<M: Memo> Plane<M> {
             let me = heap[at].node;
             let task = self.rows[me as usize].task;
             let memory = self.tasks[row_of(task)].memory;
-            match hold {
-                // Only it, and what takes no memory, may start until it does.
-                Some(held) if held != task => {
-                    if memory == 0 {
-                        picked = me;
-                        break;
-                    }
-                }
-                // A task granted less than it asks starts only at a turn, where the room does
-                // not bind: between two it would be granted the room, not what is allowed.
-                _ if memory <= free
-                    || (alone
-                        && (memory <= whole
-                            || (memory >= ceiling && whole > 0 && whole == whole_at_turn))) =>
-                {
+            if self.cold[me as usize].flags & RECLAIM != 0 {
+                if self.granted == 0 && self.reclaim.is_none() && memory <= reclaim_budget {
                     picked = me;
                     break;
                 }
-                Some(_) => {
+                if unfit == NONE {
                     unfit = me;
-                    room_short |= fits_at_turn(memory);
                 }
-                None => {
-                    if unfit == NONE {
-                        unfit = me;
+                // Reclamation ignores the pressure cap, but still needs a ledger turn
+                // when only the temporary room, not its allowance, holds it back.
+                room_short |= self.granted == 0
+                    && self.reclaim.is_none()
+                    && memory <= ceiling.min(self.allowance);
+                if counts && hold.is_none() {
+                    passed.push(task);
+                }
+            } else if self.reclaim.is_some() && memory > 0 {
+                if unfit == NONE {
+                    unfit = me;
+                }
+            } else {
+                match hold {
+                    // Only it, and what takes no memory, may start until it does.
+                    Some(held) if held != task => {
+                        if memory == 0 {
+                            picked = me;
+                            break;
+                        }
                     }
-                    room_short |= fits_at_turn(memory);
-                    if counts {
-                        passed.push(task);
+                    // A reduced grant uses the allowance at a ledger turn, never the
+                    // smaller temporary room between turns.
+                    _ if self.config.budget.is_none() || memory <= free
+                        || (alone
+                            && (memory <= whole
+                                || (memory >= ceiling && whole > 0 && whole == whole_at_turn))) =>
+                    {
+                        picked = me;
+                        break;
+                    }
+                    Some(_) => {
+                        unfit = me;
+                        room_short |= fits_at_turn(memory);
+                    }
+                    None => {
+                        if unfit == NONE {
+                            unfit = me;
+                        }
+                        room_short |= fits_at_turn(memory);
+                        if counts {
+                            passed.push(task);
+                        }
                     }
                 }
             }
@@ -2872,7 +3068,7 @@ impl<M: Memo> Plane<M> {
             // ([`Plane::turn_wanted`]); letting go of a kept front end for it made every build lower its program anew (a one-line edit of a
             // one-file program took 25 s: the daemon's log said "a task waits for 0.03 GiB").
             let memory = self.tasks[row_of(self.rows[unfit as usize].task)].memory;
-            let at_turn = self.budget_at_turn().expect("a budget");
+            let at_turn = self.budget_at_turn().unwrap_or(u64::MAX);
             let free_at_turn = at_turn.saturating_sub(self.charged());
             let held_besides = self.held.saturating_sub(self.granted);
             let by_grants = at_turn.saturating_sub(self.granted);
@@ -2886,13 +3082,19 @@ impl<M: Memo> Plane<M> {
     fn start(&mut self, at: u64, me: u32, out: &mut Vec<PlaneOutput>) {
         let m = me as usize;
         let task = self.rows[m].task;
-        if let Some(whole) = self.budget_now()
+        let reclaim = self.cold[m].flags & RECLAIM != 0;
+        if !reclaim && let Some(whole) = self.budget_now()
             && self.tasks[row_of(task)].memory > whole
         {
             // A task predicted the whole ceiling, alone under a smaller allowance ([`Plane::pick`]):
             // granted what is allowed, which is what it gives back as it ends or yields, and
             // what it is predicted from then on if it runs again.
             self.tasks[row_of(task)].memory = whole;
+        }
+        if reclaim {
+            debug_assert!(self.reclaim.is_none() && self.granted == 0);
+            debug_assert!(self.tasks[row_of(task)].memory <= self.reclaim_budget());
+            self.reclaim = Some(task);
         }
         let t = self.tasks[row_of(task)];
         self.asked = self.asked.max(t.memory);

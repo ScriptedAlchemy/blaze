@@ -5,8 +5,9 @@
 //! machine's roots and its name.
 //!
 //! A [`Channel`] is the seam: the client and server state machines speak HTTP through one,
-//! so the simulation tests drive them through a channel that passes bytes as they are, which
-//! nothing outside the tests can make.
+//! so most simulation tests drive them through a channel that passes bytes as they are, which
+//! nothing outside the tests can make. The bundle tests in `tests/tls.rs` instead drive the
+//! real TLS channels and certificate verification through the same seeded IO driver.
 
 use std::{
     io::{Read as _, Write as _},

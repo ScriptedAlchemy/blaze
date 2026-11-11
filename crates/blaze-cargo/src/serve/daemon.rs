@@ -1776,6 +1776,16 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn observe_task_for_test(
+        &mut self,
+        kind: blaze_graph::admission::TaskKind,
+        key: blaze_graph::Key,
+        peak: u64,
+    ) {
+        self.plane.observe_for_test(kind, key, peak);
+    }
+
     /// The standard library's store, shared with this build's other daemons.
     pub fn std_store(&self) -> &Store {
         &self.std

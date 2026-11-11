@@ -56,6 +56,7 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         idle: false,
         closed: false,
         finished: true,
+        pending_history: None,
         cancelled: Arc::new(AtomicBool::new(false)),
         stage: Stage::Over,
         value: None,
@@ -79,6 +80,7 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         runs: 0,
         durable: blaze_cas::Tickets::default(),
         storing: None,
+        releasing: 0,
         stored: blaze_cas::Tickets::default(),
         stored_of: None,
         durable_since: None,
@@ -124,6 +126,50 @@ fn a_builds_history_row_names_its_request_its_command_and_its_workspace() {
     let stalled = agents.row(RequestId(42), None, blaze_profile::history::Outcome::Stalled);
     assert_eq!((stalled.outcome, stalled.hits), (blaze_profile::history::Outcome::Stalled, None));
     assert_eq!(command_line(&Work::Snapshot), "snapshot");
+}
+
+fn history_after_handoff(cancelled: bool, failed: bool, old_outcome: bool) -> bool {
+    let mut job = job(Vec::new());
+    job.pending_history = Some((
+        RequestId(77), RequestStats::default(), profile_history::Outcome::Ok, true,
+    ));
+    job.cancelled.store(cancelled, Ordering::Release);
+    if failed {
+        fail_over(&mut job.over, ApiError::new("the release failed after the main request", None));
+    }
+    let ended = if old_outcome {
+        // Plant the former saved-outcome behavior at the actual row construction boundary.
+        let (request, stats, outcome, logs) = job.pending_history.take().unwrap();
+        job.ended(request, Some(stats), outcome, logs)
+    } else {
+        job.take_history().unwrap()
+    };
+    let expected = if cancelled {
+        profile_history::Outcome::Cancelled
+    } else if failed {
+        profile_history::Outcome::Failed
+    } else {
+        profile_history::Outcome::Ok
+    };
+    ended.row.build_id == 77 && ended.row.outcome == expected && job.take_history().is_none()
+}
+
+/// The invariant: a delayed history row uses the exact completed handoff's failure or
+/// cancellation outcome, emits once, and never preserves an earlier successful compile verdict.
+#[test]
+fn pending_history_uses_the_completed_handoff_outcome() {
+    for cancelled in [false, true] {
+        for failed in [false, true] {
+            assert!(history_after_handoff(cancelled, failed, false));
+        }
+    }
+}
+
+#[test]
+fn the_oracle_catches_history_before_handoff_failure() {
+    for (cancelled, failed) in [(false, true), (true, false)] {
+        assert!(!history_after_handoff(cancelled, failed, true));
+    }
 }
 
 /// A request patched in place is one whose every link was spliced or left unchanged: a first

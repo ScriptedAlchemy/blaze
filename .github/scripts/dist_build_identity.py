@@ -69,7 +69,7 @@ def binaries(directory: Path, services: bool) -> dict[str, str]:
     if services:
         names += ["blaze-dist-local", "blaze-serve"]
     suffix = ".exe" if sys.platform == "win32" else ""
-    result = {}
+    result: dict[str, str] = {}
     for stem in names:
         name = stem + suffix
         path = directory / name
@@ -80,11 +80,11 @@ def binaries(directory: Path, services: bool) -> dict[str, str]:
     return result
 
 
-def identity(directory: Path, services: bool) -> dict:
+def identity(directory: Path, services: bool) -> dict[str, object]:
     return {"schema": 1, "source": source(), "binaries": binaries(directory, services)}
 
 
-def verify(record: object, actual: dict) -> None:
+def verify(record: object, actual: dict[str, object]) -> None:
     if not isinstance(record, dict) or set(record) != {"schema", "source", "binaries"}:
         raise Refused("build identity must contain exactly schema, source and binaries")
     if type(record["schema"]) is not int or record["schema"] != 1:

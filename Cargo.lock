@@ -1175,6 +1175,7 @@ dependencies = [
  "hir-ty",
  "hir-ty-borrowck",
  "memchr",
+ "rcgen",
  "ring",
  "rustls",
  "rustls-native-certs",

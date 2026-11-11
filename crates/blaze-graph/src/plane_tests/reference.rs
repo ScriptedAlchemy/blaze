@@ -2,20 +2,22 @@
 //! structs of `Vec`s, ready sets as `BTreeSet`s. Kept unchanged but for its imports and visibility, as the
 //! model [`crate::plane::Plane`] is compared with step by step (`plane_tests`), and for the one
 //! [`Event::Nodes`] a batch of columns is said in, and for the idle class: idle requests,
-//! [`PlaneInput::Promote`], [`PlaneOutput::Yield`] and [`PlaneInput::Yielded`].
+//! [`PlaneInput::Promote`], [`PlaneOutput::Yield`] and [`PlaneInput::Yielded`], the bounded
+//! reclamation lane and parked continuations. The model keeps its own slot generations and
+//! ledger bounds; it shares neither admission predicates nor token checks with the columns.
 
 #![forbid(unsafe_code)]
 
 use std::{cmp::Reverse, collections::BTreeSet};
 
 use blaze_hash::{HashMap, HashSet};
-use blaze_protocol::events::{Event, Level, NodeState, Record};
+use blaze_protocol::events::{Event, Level, NodeKind, NodeState, Record};
 use std::alloc::Global;
 
 use crate::{
     machine::{Error, NodeId, Outcome, Pool, Spec},
     plane::{
-        Counts, Key, Memo, NoMemo, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
+        Counts, Key, Memo, NoMemo, Parked, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
     },
 };
 
@@ -50,9 +52,12 @@ struct Node {
     group: Option<u32>,
     /// It failed open ([`Outcome::FailedOpen`]): under keep-going what waits for it runs.
     open: bool,
+    reclaim: bool,
+    parked: Option<u64>,
 }
 
 struct Task {
+    generation: u32,
     key: Option<Key>,
     pool: Pool,
     memory: u64,
@@ -109,9 +114,13 @@ pub(crate) struct Plane<M = NoMemo> {
     flight: HashMap<Key, usize, Global>, // alloc: a test's model
     running: [usize; 2],
     granted: u64,
+    reclaim: Option<usize>,
     held: u64,
     /// The pressure cap on the budget ([`PlaneInput::Cap`]).
     cap: Option<u64>,
+    allowance: u64,
+    room: u64,
+    allowed: bool,
     /// The virtual time of each pool: that of the request not idle that started a task last.
     vclock: [u128; 2],
     /// The same, of the idle requests.
@@ -172,8 +181,12 @@ impl<M: Memo> Plane<M> {
             flight: HashMap::new_in(Global), // alloc: a test's model
             running: [0; 2],
             granted: 0,
+            reclaim: None,
             held: 0,
             cap: None,
+            allowance: u64::MAX,
+            room: u64::MAX,
+            allowed: false,
             vclock: [0; 2],
             idle_vclock: [0; 2],
             idle_running: Vec::new(),
@@ -197,6 +210,17 @@ impl<M: Memo> Plane<M> {
     /// The memory granted to the tasks running now.
     pub(crate) fn granted(&self) -> u64 {
         self.granted
+    }
+
+    pub(crate) fn parked(&self, id: NodeId) -> Option<Parked> {
+        let &me = self.index.get(&id)?;
+        let node = &self.nodes[me];
+        let epoch = node.parked?;
+        let task = node.task?;
+        let it = &self.tasks[task];
+        (node.state == NodeState::Waiting && !it.running && it.runner == me).then_some(Parked {
+            id, task: (u64::from(it.generation) << 32) | task as u64, epoch,
+        })
     }
 
     /// The state of `id`, if it was added.
@@ -260,6 +284,7 @@ impl<M: Memo> Plane<M> {
         if self.hold == Some(task) {
             self.hold = None;
         }
+        self.tasks[task].generation += 1;
         self.free_tasks.push(task);
     }
 
@@ -333,6 +358,34 @@ impl<M: Memo> Plane<M> {
                 self.add(at, r, nodes, false, &mut out);
                 touched.push(r);
             }
+            PlaneInput::Reclaim { request, nodes, .. } => {
+                let given: Vec<Spec> = (0..nodes.len()).map(|at| nodes.spec(at)).collect();
+                let why = match given.as_slice() {
+                    [node] if node.kind != NodeKind::Store || node.pool != Pool::Work => {
+                        Some("the node must be Store work")
+                    }
+                    [node] if node.key.is_some() || !node.deps.is_empty() => {
+                        Some("the node must be unkeyed and dependency-free")
+                    }
+                    [node] if node.memory == 0 => Some("the memory prediction must be positive"),
+                    [_] => None,
+                    _ => Some("exactly one node is required"),
+                };
+                if let Some(why) = why {
+                    return Err(Error::InvalidReclaim { request: request.0, first: nodes.first(), why });
+                }
+                let r = self.open_request(request)?;
+                if self.requests[r].closed {
+                    return Err(Error::Closed);
+                }
+                let first = nodes.first();
+                let record = nodes_record(first, &given);
+                let given = self.check(r, given)?;
+                out.push(said(request, at, record));
+                self.add(at, r, given, false, &mut out);
+                self.nodes[self.index[&first]].reclaim = true;
+                touched.push(r);
+            }
             PlaneInput::Close { request, .. } => {
                 let r = self.open_request(request)?;
                 if self.requests[r].closed {
@@ -361,9 +414,11 @@ impl<M: Memo> Plane<M> {
                 touched.push(r);
             }
             PlaneInput::Held { bytes, .. } => self.held = bytes,
-            // The machine's ledger is not modelled: the differential tests never give one, and
-            // a plane never told an allowance grants up to its budget alone.
-            PlaneInput::Allowance { .. } => {}
+            PlaneInput::Allowance { bytes, .. } => {
+                self.allowance = bytes;
+                self.room = u64::MAX;
+                self.allowed = true;
+            }
             PlaneInput::Cap { bytes, .. } => self.cap = bytes,
             // Admission by footprint is not modelled: the differential tests give no footprint
             // and no realized bytes, and a plane never given one charges `max(granted, held)`
@@ -384,10 +439,43 @@ impl<M: Memo> Plane<M> {
             }
             PlaneInput::Yielded { id, .. } => {
                 let task = self.running_task(id)?;
-                self.yielded(at, task, &mut out, &mut touched);
+                self.yielded(at, task, false, &mut out, &mut touched);
+            }
+            PlaneInput::Park { id, .. } => {
+                let task = self.running_task(id)?;
+                let t = &self.tasks[task];
+                if t.key.is_some() || t.pool != Pool::Work || t.members.as_slice() != [t.runner] {
+                    return Err(Error::NotParkable(id));
+                }
+                self.yielded(at, task, true, &mut out, &mut touched);
+            }
+            PlaneInput::Resume { parked, .. } => {
+                let task = self.parked_task(parked)?;
+                let me = self.tasks[task].runner;
+                self.nodes[me].parked = None;
+                self.make_ready(me, pool_at(self.tasks[task].pool));
+                self.moved(at, me, NodeState::Ready, &mut out);
+                touched.push(self.nodes[me].request);
+            }
+            PlaneInput::RefuseParked { parked, why, .. } => {
+                let task = self.parked_task(parked)?;
+                let me = self.tasks[task].runner;
+                self.nodes[me].task = None;
+                self.nodes[me].parked = None;
+                self.tasks[task].members.clear();
+                self.free_task(task);
+                self.settle(at, me, NodeState::Failed { why }, &mut out);
+                touched.push(self.nodes[me].request);
             }
         }
         self.after(at, out, touched)
+    }
+
+    fn parked_task(&self, parked: Parked) -> Result<usize, Error> {
+        if self.parked(parked.id) != Some(parked) {
+            return Err(Error::NotParked(parked.id));
+        }
+        Ok(self.nodes[self.index[&parked.id]].task.expect("a parked task"))
     }
 
     /// The task the plane asked to run as `id`, running.
@@ -412,6 +500,7 @@ impl<M: Memo> Plane<M> {
         &mut self,
         at: u64,
         task: usize,
+        park: bool,
         out: &mut Vec<PlaneOutput>,
         touched: &mut Vec<usize>,
     ) {
@@ -421,6 +510,9 @@ impl<M: Memo> Plane<M> {
         t.yielding = false;
         self.running[p] -= 1;
         self.granted -= memory;
+        if self.reclaim == Some(task) {
+            self.reclaim = None;
+        }
         if yielding {
             self.yielding[p] -= 1;
             self.yielding_memory -= memory;
@@ -445,8 +537,13 @@ impl<M: Memo> Plane<M> {
                     self.moved(at, member, NodeState::Skipped { because }, out);
                 }
                 None => {
-                    self.make_ready(member, p);
-                    self.moved(at, member, NodeState::Ready, out);
+                    if park {
+                        self.nodes[member].parked = Some(self.seq());
+                        self.moved(at, member, NodeState::Waiting, out);
+                    } else {
+                        self.make_ready(member, p);
+                        self.moved(at, member, NodeState::Ready, out);
+                    }
                 }
             }
         }
@@ -514,6 +611,9 @@ impl<M: Memo> Plane<M> {
         self.settle_deferred(at, &mut out, &mut touched);
         self.last_ns = at;
         self.dispatch(at, &mut out);
+        if std::mem::take(&mut self.allowed) {
+            self.room = self.allowance.min(self.granted.max(self.held));
+        }
         touched.sort_unstable_by_key(|&r| self.requests[r].seq);
         touched.dedup();
         for r in touched {
@@ -669,6 +769,8 @@ impl<M: Memo> Plane<M> {
                 task: None,
                 group: None,
                 open: false,
+                reclaim: false,
+                parked: None,
             };
             if me == self.nodes.len() {
                 self.nodes.push(node);
@@ -805,7 +907,8 @@ impl<M: Memo> Plane<M> {
             self.deferred.push((me, NodeState::Failed { why }));
             return;
         }
-        let made = Task {
+        let mut made = Task {
+            generation: 1,
             key,
             pool: spec.pool,
             memory: spec.memory,
@@ -817,6 +920,7 @@ impl<M: Memo> Plane<M> {
         };
         let task = match self.free_tasks.pop() {
             Some(task) => {
+                made.generation = self.tasks[task].generation + 1;
                 self.tasks[task] = made;
                 task
             }
@@ -905,6 +1009,7 @@ impl<M: Memo> Plane<M> {
         if t.running {
             return;
         }
+        self.nodes[me].parked = None;
         let (p, r) = (pool_at(t.pool), self.nodes[me].request);
         let entry = self.entry(me);
         self.requests[r].ready[p].remove(&entry);
@@ -932,6 +1037,9 @@ impl<M: Memo> Plane<M> {
         let members = std::mem::take(&mut t.members);
         self.running[pool] -= 1;
         self.granted -= memory;
+        if self.reclaim == Some(task) {
+            self.reclaim = None;
+        }
         if yielding {
             self.yielding[pool] -= 1;
             self.yielding_memory -= memory;
@@ -957,10 +1065,15 @@ impl<M: Memo> Plane<M> {
         }
     }
 
-    /// The configured budget, held to the pressure cap while there is one.
+    /// All ordinary bounds, including what the machine reserved at its last locked turn.
     fn budget_now(&self) -> Option<u64> {
         let budget = self.config.budget.as_ref()?.bytes;
-        Some(self.cap.map_or(budget, |cap| budget.min(cap)))
+        Some(self.cap.map_or(budget, |cap| budget.min(cap)).min(self.allowance).min(self.room))
+    }
+
+    fn reclaim_budget(&self) -> u64 {
+        [self.config.budget.as_ref().map_or(u64::MAX, |it| it.bytes), self.allowance, self.room]
+            .into_iter().min().expect("three bounds")
     }
 
     fn memory_free(&self) -> Option<u64> {
@@ -1120,22 +1233,31 @@ impl<M: Memo> Plane<M> {
     /// The node of request `r` whose task starts next on pool `p`, as memory allows; the tasks
     /// of it that did not fit, before that one, are added to `passed`.
     fn pick(&mut self, r: usize, p: usize, passed: &mut Vec<usize>) -> Pick {
-        let Some(free) = self.memory_free() else {
-            return match self.requests[r].ready[p].first() {
-                Some(&(_, _, me)) => Pick::Start(me),
-                None => Pick::None,
-            };
-        };
+        let free = self.memory_free().unwrap_or(u64::MAX);
         // A task that fits the budget starts once nothing granted memory runs, whatever the
         // process holds besides: waiting could never make room for it. Under pressure it
         // could, so none does.
-        let whole = self.budget_now().expect("a budget");
+        let whole = self.budget_now().unwrap_or(u64::MAX);
+        let ceiling = self.config.budget.as_ref().map_or(u64::MAX, |it| it.bytes);
+        let reclaim_budget = self.reclaim_budget();
         let alone = self.granted == 0 && self.cap.is_none();
         let hold = self.hold();
         let counts = !self.requests[r].idle;
         for &(_, _, me) in &self.requests[r].ready[p] {
             let task = self.nodes[me].task.expect("a ready node's task");
             let memory = self.tasks[task].memory;
+            if self.nodes[me].reclaim {
+                if self.granted == 0 && self.reclaim.is_none() && memory <= reclaim_budget {
+                    return Pick::Start(me);
+                }
+                if counts && hold.is_none() {
+                    passed.push(task);
+                }
+                continue;
+            }
+            if self.reclaim.is_some() && memory > 0 {
+                continue;
+            }
             match hold {
                 // Only it, and what takes no memory, may start until it does.
                 Some(held) if held != task => {
@@ -1143,7 +1265,11 @@ impl<M: Memo> Plane<M> {
                         return Pick::Start(me);
                     }
                 }
-                _ if memory <= free || (memory <= whole && alone) => return Pick::Start(me),
+                _ if self.config.budget.is_none() || memory <= free
+                    || (alone && (memory <= whole || (memory >= ceiling && whole > 0))) =>
+                {
+                    return Pick::Start(me);
+                }
                 Some(_) => {}
                 None => {
                     if counts {
@@ -1157,6 +1283,11 @@ impl<M: Memo> Plane<M> {
 
     fn start(&mut self, at: u64, me: usize, out: &mut Vec<PlaneOutput>) {
         let task = self.nodes[me].task.expect("a ready node's task");
+        if self.nodes[me].reclaim {
+            self.reclaim = Some(task);
+        } else if let Some(budget) = self.budget_now() {
+            self.tasks[task].memory = self.tasks[task].memory.min(budget);
+        }
         let p = pool_at(self.tasks[task].pool);
         for at_member in 0..self.tasks[task].members.len() {
             let member = self.tasks[task].members[at_member];

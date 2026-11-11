@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-61 invariants, 17 refinements, 5 reference models.
-By level: 54 tested, 24 simulated, 0 model-checked, 0 proved.
+73 invariants, 18 refinements, 5 reference models.
+By level: 57 tested, 34 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -22,6 +22,26 @@ By level: 54 tested, 24 simulated, 0 model-checked, 0 proved.
   Controls: `shared_memory_dropped_and_file_cache_kept`.
 - **`a_kept_answer_is_said_again_only_while_a_walk_would_say_the_same`** *tested* (`crates/blaze-cargo/src/serve/job/noop/tests.rs`): the lane says a kept answer again only when a walk of every unit would say the same of the state the request is asked in, with every output in place and no other job under way: no input a build reads changed since the answer was kept. Over any run of edits of the checkout's files and its lock file, of a traced header, a listed directory, a path dependency and the layout profiles outside it, of the request's environment, features, profile and colors, of touches, deleted outputs, other jobs and requests, with the watches confirmed in time or late; and of a `//` comment at a line's end, in the source (its unit keyed by code text or, a lint reading comments, by bytes; its build warning of the commented line or not) and in a file the build script reads by its bytes. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_lane_that_ignores_an_edited_file`, `a_lane_that_ignores_the_lock_file`, `a_lane_that_does_not_compare_the_environment`, `a_lane_that_ignores_the_features_and_the_profile`, `a_lane_that_ignores_how_the_request_is_rendered`, `a_lane_that_ignores_a_traced_file_outside_the_view`, `a_lane_that_does_not_see_a_deleted_output`, `a_kept_walk_that_listed_a_directory`, `a_kept_build_that_made_something`, `a_lane_that_answers_beside_another_job`, `a_lane_that_trusts_an_unwatched_path_dependency`, `a_lane_that_does_not_see_layout_profiles_appear`, `a_replayed_script_that_writes_on_every_walk`, `a_foreign_write_taken_for_the_walks_echo`, `a_request_not_held_for_the_watches_round`, `a_lane_keyed_by_code_text_that_misses_a_token_change`, `a_lane_that_takes_bytes_something_reads_for_still`, `a_replayed_diagnostic_with_stale_quoted_text`.
+- **`pending_history_uses_the_completed_handoff_outcome`** *tested* (`crates/blaze-cargo/src/serve/job/tests.rs`): a delayed history row uses the exact completed handoff's failure or cancellation outcome, emits once, and never preserves an earlier successful compile verdict.
+  Controls: `history_before_handoff_failure`.
+- **`worker_release_keeps_the_loop_responsive_and_publication_fenced`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): an exclusive final release stays on its admitted worker, keeps the loop responsive, and gates publication until that exact state returns and the store commits.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`parked_successors_allow_release_with_one_work_slot`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): a successor admitted before Did gives its real grant and the only Work slot back while the writer is exclusive, then runs only after ordinary readmission.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`cancellation_at_each_handoff_boundary_retires_the_build`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): cancel before transfer, while the worker is held, and after its result returns each retire Stage::Units, preserve exclusive ownership, and publish no front end.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`release_failure_and_panic_preserve_the_cause_and_keep_serving`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): release errors and panics consume their exclusive state on the worker, keep the first cause, publish nothing from that state, and fail only their owning build.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`refused_release_uses_one_accounted_discard`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): refusal before a worker starts retains ownership for one independently accounted discard; refusing that discard is terminal, named, and never resets a forecast.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`orphaned_worker_result_is_discarded_after_job_removal`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): removing a stalled job before consuming its worker result does not drop the owned state on the loop or attach it to another job; its one discard stays accounted.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`late_write_requires_another_final_release`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): a write arriving during or just after a taken final plan remains queued, applies only after ownership returns, and uses UnitWriter's production FinalRelease policy to require a new final release before keep.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`completion_preserves_later_pressure_finished_crates_and_end`** *tested* (`crates/blaze-cargo/src/serve/unit/release/tests.rs`): completing one frozen worker plan changes only its squeeze measure; later pressure, completed crates and end requests survive in the next exact plan.
+  Controls: `completion_erasing_later_pressure`, `completion_erasing_later_finished_crates`, `completion_erasing_a_later_end`, `reusing_a_final_plan_before_a_late_write`.
+- **`final_release_policy_requires_completion_after_every_late_write`** *tested* (`crates/blaze-cargo/src/serve/unit/release/tests.rs`): the production FinalRelease policy schedules the final plan after all writes and accepts only its completion, including a late write on either side of return.
+  Controls: `completion_erasing_later_pressure`, `completion_erasing_later_finished_crates`, `completion_erasing_a_later_end`, `reusing_a_final_plan_before_a_late_write`.
 - **`a_records_diagnostics_kept_as_places_point_at_the_same_tokens_in_every_text_of_its_key`** *simulated* (`crates/blaze-cargo/src/serve/unit/tests.rs`): a record's diagnostics kept as places, replayed over any text of the same code text (a comment at a line's end, spaces before one, a comment after the last line added or taken away), point at the very tokens the check pointed at, and over the text they were made of are the diagnostics the check gave, byte for byte, through the record's encoding.
   Controls: `a_diagnostic_rendered_at_stale_offsets`.
 - **`every_recomputed_step_ends_in_a_terminal_reason`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): every recomputed step of a build has a reason whose chain ends in a terminal reason other than `Unexplained`.
@@ -122,6 +142,10 @@ By level: 54 tested, 24 simulated, 0 model-checked, 0 proved.
   Controls: `admission_by_grants_only`, `a_gate_that_never_purges`, `a_purge_read_before_it_lands`, `a_purge_read_purged_though_a_task_freed_in_its_lag`.
 - **`live_grants_fit_the_machine_budget_after_any_crash`** *tested* (`crates/blaze-graph/src/ledger/tests.rs`): whatever crashes, restarts and pid reuse, the live daemons' grants never sum past the machine budget, nor does what they may grant with no turn (each one's room: its charge and its lease), none grants or has room the ledger does not hold for it, none admits while the others' charges fill the machine, and every task that fits starts.
   Controls: `a_read_modify_write_without_the_lock`, `a_prune_that_ignores_start_time`, `an_allowance_that_leaves_out_a_daemon`, `a_lease_the_ledger_does_not_record`.
+- **`reclamation_preserves_full_grants_reservations_and_worker_limits`** *simulated* (`crates/blaze-graph/src/plane_tests/reclaim.rs`): reclamation bypasses temporary pressure only with a full positive grant, preserves a held compile's later opportunity, and excludes every other positive grant until its actual completion or yield. Cancellation alone returns no running capacity.
+  Controls: `reclamation_treated_as_ordinary_work`, `a_reclamation_grant_clamped_to_the_pressure_cap`, `a_lost_held_compile_reservation`, `positive_work_overlapping_reclamation`, `a_reclamation_hold_bypassed_without_a_budget`, `reclamation_spending_unreserved_machine_room`, `a_park_that_eagerly_readmits_unposted_work`, `a_stale_continuation_replaced_with_the_current_token`, `a_rejected_reclamation_prefix_entering_the_plane`.
+- **`reclamation_refuses_invalid_shapes_and_respects_actual_machine_bounds`** *simulated* (`crates/blaze-graph/src/plane_tests/reclaim.rs`): even cleanup fits the configured ceiling, the current machine allowance and its recorded reservation. A malformed reclamation changes no state, event or clock.
+  Controls: `reclamation_treated_as_ordinary_work`, `a_reclamation_grant_clamped_to_the_pressure_cap`, `a_lost_held_compile_reservation`, `positive_work_overlapping_reclamation`, `a_reclamation_hold_bypassed_without_a_budget`, `reclamation_spending_unreserved_machine_room`, `a_park_that_eagerly_readmits_unposted_work`, `a_stale_continuation_replaced_with_the_current_token`, `a_rejected_reclamation_prefix_entering_the_plane`.
 - **`a_worker_that_cannot_park_stops_the_pool_and_its_scoped_waiter_fails_with_the_wait`** *tested* (`crates/blaze-graph/src/pool.rs`): a pool whose worker cannot park stops with the park's error, and a thread that waits on a scope of it fails with that error, naming the worker and the wait, within a bound: none waits for jobs no worker is left to run.
   Controls: `a_worker_that_ends_silently`, `a_sandboxed_process_on_the_ring`.
 - **`a_sandboxed_process_parks_its_workers_with_no_io_uring`** *tested* (`crates/blaze-graph/src/pool.rs`): a process the sandbox launcher marked, under a filter that refuses io_uring as the sandbox's does, parks and wakes its pool's workers and runs a parallel loop to its end on the direct driver, and makes no ring.
@@ -244,6 +268,11 @@ By level: 54 tested, 24 simulated, 0 model-checked, 0 proved.
 
 - **`the_worked_example_finds_what_the_in_tree_lint_finds`** *tested* (`crates/blaze-ext-host/src/tests.rs`): over the same source, the extension `panic-in-drop` reports exactly what blaze's own `blaze::panic_in_drop` does: the same messages at the same places.
   Controls: `an_extension_that_misses_a_finding`, `a_result_that_depends_on_an_address`.
+
+### blaze-graph
+
+- **`parked_unposted_work_releases_the_lane_without_losing_its_continuation`** *simulated* (`crates/blaze-graph/src/plane_tests/reclaim.rs`): an admitted but unposted successor gives its exact grant and worker back once while its front input is reclaimed. Only its saved task generation and park epoch can resume or refuse it; a missing, repeated or stale continuation cannot run it.
+  Controls: `reclamation_treated_as_ordinary_work`, `a_reclamation_grant_clamped_to_the_pressure_cap`, `a_lost_held_compile_reservation`, `positive_work_overlapping_reclamation`, `a_reclamation_hold_bypassed_without_a_budget`, `reclamation_spending_unreserved_machine_room`, `a_park_that_eagerly_readmits_unposted_work`, `a_stale_continuation_replaced_with_the_current_token`, `a_rejected_reclamation_prefix_entering_the_plane`.
 
 ### blaze-ids
 

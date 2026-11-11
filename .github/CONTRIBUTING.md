@@ -9,6 +9,7 @@ The long version, with the rules for code and how to change the vendored rust-an
 git clone https://github.com/indexable-inc/blaze
 cd blaze
 sh site/install.sh --version "$(cat .github/blaze-version)"   # stage 0: the pinned release of blaze, with its own Rust
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 blaze build --release --locked -p blaze-engine               # blaze builds blaze; it fetches the pinned LLVM itself
 ```
 
@@ -23,6 +24,8 @@ blaze test --release --locked -p blaze-engine -p hir-ty -p hir-def -p parser -p 
 
 `python3 harness/unittests.py` is what CI runs: `blaze test --workspace`, every test of every
 crate, held to `harness/known-failures.toml`, the one list of tests that may fail.
+The platform needs a Blaze bootstrap and its native C/C++ tools. A bootstrap failure is work
+to fix; the unit-test helper has no Cargo mode.
 
 The real gate is real crates' own test suites passing under blaze, and tests that state their
 expected result: see [docs/harness.md](../docs/harness.md). Run what fits your change and say in the pull request

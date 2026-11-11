@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod memory;
-mod reference;
+pub(super) mod reference;
 
 use std::sync::Arc;
 

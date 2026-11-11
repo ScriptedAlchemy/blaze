@@ -4,6 +4,8 @@
 
 #![forbid(unsafe_code)]
 
+mod release;
+
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -55,6 +57,9 @@ const INDEX: &str =
     "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/de/p/dep";
 /// How many turns a test gives the daemon before it says it hangs.
 const TURNS: usize = 100_000;
+
+/// Tests that change the process-wide subsystem budget serialize that one setting.
+static BUDGET_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// How long [`Client::wait_for_the_pool`] turns the daemon while the process's worker pool runs
 /// other tests' jobs before it says what it waited for.
@@ -109,6 +114,16 @@ thread_local! {
     static ANEW: Cell<usize> = const { Cell::new(0) };
     /// How many kept front ends were stored ([`Steps::store_kept`]).
     static STORES: Cell<usize> = const { Cell::new(0) };
+    /// The exclusive-release carrier is enabled only by its focused simulation.
+    static RELEASE_FRONTS: Cell<bool> = const { Cell::new(false) };
+    static RELEASE_ON_COMPILED: Cell<bool> = const { Cell::new(false) };
+    static RELEASES_TAKEN: Cell<usize> = const { Cell::new(0) };
+    static RELEASES_RUN: Cell<usize> = const { Cell::new(0) };
+    static RELEASES_INSTALLED: Cell<usize> = const { Cell::new(0) };
+    static FRONT_DROPS: RefCell<Vec<(String, Option<blaze_graph::admission::TaskKind>)>> = const { RefCell::new(Vec::new()) };
+    static FRONT_EVENTS: RefCell<Vec<(&'static str, usize)>> = const { RefCell::new(Vec::new()) };
+    static FAILS_RELEASE: Cell<bool> = const { Cell::new(false) };
+    static PANICS_RELEASE: Cell<bool> = const { Cell::new(false) };
     /// The checkout whose kept front end leaves nothing for the store: a job that puts
     /// nothing new, and may still have read what another job put.
     static PUTS_NOTHING: RefCell<String> = const { RefCell::new(String::new()) };
@@ -622,7 +637,7 @@ impl Steps for Fake {
                 FakeInputs { checkout, ..FakeInputs::default() }
             }
         };
-        let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new(), broke: Vec::new() };
+        let writer = FakeWriter::new(inputs);
         Ok(FrontEnd {
             front: Arc::new(FakeFront { goal: job.goal }),
             writer,
@@ -660,6 +675,17 @@ pub(super) struct FakeInputs {
     runs: Vec<usize>,
     stored: bool,
     checkout: String,
+    drop_probe: Option<FrontDrop>,
+}
+
+struct FrontDrop(String);
+
+impl Drop for FrontDrop {
+    fn drop(&mut self) {
+        FRONT_DROPS.with_borrow_mut(|it| {
+            it.push((self.0.clone(), super::job::ACTIVE_RECLAIM_TASK.get())); // clone: a focused ownership control
+        });
+    }
 }
 
 /// The fakes' front end has no database: their images store no library trees.
@@ -672,9 +698,33 @@ impl KeptDb for FakeInputs {
 /// The front end written as the real one is: each write asked for waits until no reader of
 /// the inputs is alive.
 pub(super) struct FakeWriter {
-    inputs: Arc<FakeInputs>,
+    inputs: Option<Arc<FakeInputs>>,
     asked: Vec<usize>,
     broke: Vec<Broke>,
+    release: bool,
+    ending: bool,
+    final_release: super::unit::release::FinalRelease,
+}
+
+impl FakeWriter {
+    fn new(mut inputs: FakeInputs) -> FakeWriter {
+        if RELEASE_FRONTS.get() && inputs.drop_probe.is_none() {
+            inputs.drop_probe = Some(FrontDrop(inputs.checkout.clone())); // clone: a focused ownership control
+        }
+        FakeWriter {
+            inputs: Some(Arc::new(inputs)),
+            asked: Vec::new(),
+            broke: Vec::new(),
+            release: false,
+            ending: false,
+            final_release: super::unit::release::FinalRelease::default(),
+        }
+    }
+}
+
+pub(super) struct FakeRelease {
+    inputs: Arc<FakeInputs>,
+    ending: bool,
 }
 
 /// A shared reference to the inputs, as the loop posted a task with it.
@@ -705,12 +755,64 @@ impl Kept for FakeImage {
 }
 
 impl Writer<Fake> for FakeWriter {
+    type Release = FakeRelease;
+    type Released = FakeRelease;
+
+    fn take_release(&mut self) -> Option<FakeRelease> {
+        if !self.release {
+            return None;
+        }
+        Arc::get_mut(self.inputs.as_mut()?)?;
+        self.release = false;
+        let ending = std::mem::take(&mut self.ending);
+        RELEASES_TAKEN.set(RELEASES_TAKEN.get() + 1);
+        Some(FakeRelease { inputs: self.inputs.take().unwrap(), ending })
+    }
+
+    fn release(work: FakeRelease) -> Result<FakeRelease, ApiError> {
+        assert!(!PANICS_RELEASE.get(), "serve-test: front end release panics");
+        if FAILS_RELEASE.get() {
+            return Err(ApiError::new("serve-test: front end release fails", None));
+        }
+        assert_eq!(Arc::strong_count(&work.inputs), 1, "release must own the only database reference");
+        RELEASES_RUN.set(RELEASES_RUN.get() + 1);
+        Ok(work)
+    }
+
+    fn released(&mut self, work: FakeRelease) -> Result<(), (ApiError, FakeRelease)> {
+        if self.inputs.is_some() {
+            return Err((ApiError::new("serve-test: release returned twice", None), work));
+        }
+        self.inputs = Some(work.inputs);
+        self.final_release.released(work.ending, !self.asked.is_empty());
+        RELEASES_INSTALLED.set(RELEASES_INSTALLED.get() + 1);
+        Ok(())
+    }
+
+    fn compiled(&mut self, _: usize) {
+        self.release |= RELEASE_ON_COMPILED.get();
+    }
+
+    fn pressed(&mut self) {
+        self.release |= RELEASE_FRONTS.get();
+    }
+
+    fn ending(&mut self) {
+        if RELEASE_FRONTS.get() {
+            if self.final_release.request(!self.asked.is_empty()) {
+                self.release = true;
+                self.ending = true;
+            }
+        }
+    }
+
     fn reader(&self) -> Option<FakeReader> {
-        (!self.waiting()).then(|| FakeReader(Arc::clone(&self.inputs)))
+        (!self.waiting()).then(|| FakeReader(Arc::clone(self.inputs.as_ref().unwrap())))
     }
 
     fn ran(&mut self, run: usize, _: blaze_lower::Ran) -> Result<(), ApiError> {
         ASKED.with(|it| it.set(it.get() + 1));
+        self.final_release.written();
         self.asked.push(run);
         Ok(())
     }
@@ -727,7 +829,7 @@ impl Writer<Fake> for FakeWriter {
     }
 
     fn waiting(&self) -> bool {
-        !self.asked.is_empty()
+        self.inputs.is_none() || self.release || !self.asked.is_empty()
     }
 
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError> {
@@ -738,7 +840,18 @@ impl Writer<Fake> for FakeWriter {
         None // the fakes offer no goal
     }
 
+    fn run_log(&self) -> blaze_query::db::Taken {
+        if RELEASE_FRONTS.get() {
+            assert!(self.inputs.is_some(), "history read the front end while release owned it");
+            FRONT_EVENTS.with_borrow_mut(|it| it.push(("history", RELEASES_INSTALLED.get())));
+        }
+        blaze_query::db::Taken::default()
+    }
+
     fn apply(&mut self) -> Result<bool, ApiError> {
+        if self.inputs.is_none() || self.release {
+            return Ok(false);
+        }
         if self.asked.is_empty() {
             return Ok(true);
         }
@@ -748,7 +861,11 @@ impl Writer<Fake> for FakeWriter {
                 None,
             ));
         }
-        let Some(inputs) = Arc::get_mut(&mut self.inputs) else { return Ok(false) };
+        let Some(inputs) = self.inputs.as_mut().and_then(Arc::get_mut) else { return Ok(false) };
+        if self.final_release.applied() {
+            self.release = true;
+            self.ending = true;
+        }
         for run in self.asked.drain(..) {
             let applied = applying_fallible(run, "a build script's run", || {
                 assert_ne!(PANICS_RUN.get(), Some(run), "serve-test: the run's write panics");
@@ -774,20 +891,29 @@ impl Writer<Fake> for FakeWriter {
     }
 
     fn tables(&mut self) -> Result<Vec<(&'static str, u64, u64)>, Failed> {
-        match Arc::get_mut(&mut self.inputs) {
+        match self.inputs.as_mut().and_then(Arc::get_mut) {
             Some(inputs) => Ok(vec![("run", inputs.runs.len() as u64, 0)]),
             None => Err(ApiError::new("a task still reads the front end", None).into()),
         }
     }
 
     fn keep(mut self) -> Result<FakeInputs, ApiError> {
+        if RELEASE_FRONTS.get() {
+            FRONT_EVENTS.with_borrow_mut(|it| it.push(("keep", RELEASES_INSTALLED.get())));
+        }
+        if RELEASE_FRONTS.get() && !self.final_release.ready() {
+            return Err(ApiError::new("serve-test: keep preceded the final release", None));
+        }
         if !self.apply()? {
             return Err(ApiError::new(
                 "the fakes' runs are kept while a task still reads them",
                 None,
             ));
         }
-        let mut inputs = Arc::into_inner(self.inputs).ok_or_else(|| {
+        let inputs = self.inputs.take().ok_or_else(|| {
+            ApiError::new("serve-test: keep while the release owns the front end", None)
+        })?;
+        let mut inputs = Arc::into_inner(inputs).ok_or_else(|| {
             ApiError::new("the fakes' inputs are kept while a task still holds them", None)
         })?;
         // Kept again: what this build left is not stored yet, as a real front end's is not.
@@ -1322,7 +1448,7 @@ impl Front<Fake> for FakeFront {
     ) -> Result<Vec<Response>, Failed> {
         assert_eq!(self.goal, Goal::Check, "the documentation only checks its units");
         writer.apply()?;
-        let Some(inputs) = Arc::get_mut(&mut writer.inputs) else {
+        let Some(inputs) = writer.inputs.as_mut().and_then(Arc::get_mut) else {
             return Err(ApiError::new("a task still reads the front end", None).into());
         };
         let page = format!("{no_deps} {private} {:?}", inputs.runs).into_bytes();
@@ -4052,11 +4178,7 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
     let codegen = answered(run(Does::CodegenInputs { front: front.clone() }, reading()));
     assert_eq!(codegen, Response::CodegenInputs(Vec::new()));
 
-    let writer = FakeWriter {
-        inputs: Arc::new(FakeInputs { runs: vec![1, 2, 3], ..FakeInputs::default() }),
-        asked: Vec::new(),
-        broke: Vec::new(),
-    };
+    let writer = FakeWriter::new(FakeInputs { runs: vec![1, 2, 3], ..FakeInputs::default() });
     let tables = Does::Tables { front: front.clone(), images: Vec::new() };
     let tables = answered(run(tables, Readers { writer: Some(writer), ..Readers::default() }));
     assert_eq!(tables, Response::Tables(vec![Table { name: "run".into(), elements: 3, bytes: 0 }]));
@@ -4477,6 +4599,7 @@ fn the_memory_limit_is_told_by_flag_then_variable_and_a_bad_one_is_an_error() {
 /// under `BLAZE_DAEMON_MEMORY_GB=48` no release was ever due and the daemon grew to 49 GiB.
 #[test]
 fn a_daemon_started_under_a_budget_makes_it_the_limit_releases_are_decided_against() {
+    let _budget = BUDGET_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     use blaze_graph::admission::{self, share};
     use blaze_mem::Tag;
     // Far past what any test holds, so no other daemon's release in this process is made due,
