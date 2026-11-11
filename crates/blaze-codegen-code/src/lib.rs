@@ -330,6 +330,18 @@ pub const FRONT_END_HOOKS: &[&str] = &["Machine", "Foreign"];
 /// the front end stores.
 pub const FRONT_END_REVIEWED: &[Hook] = &[
     Hook {
+        package: "blaze-explore",
+        hook: "Source",
+        why: "`Daemon` answers explorer clients with the profile's schema, live feeds and SQL: \
+              observations of builds, never a value the front end stores",
+    },
+    Hook {
+        package: "blaze-explore",
+        hook: "Live",
+        why: "`Feed` sends recorded profile and task rows to explorer clients: the front end \
+              neither reads that feed nor evaluates a constant through it",
+    },
+    Hook {
         package: "blaze-cargo",
         hook: "ImageStore",
         why: "`Images` gets and puts, by key, the images and other values the front end makes, \
@@ -390,12 +402,20 @@ pub const RECORD_CUT: &[Cut] = &[
         package: "blaze-explore",
         why: "the explorer's server, started by `serve::observe` on the first request for it: it serves \
               the history, spans and SQL of builds to a browser and hands blaze-cargo nothing back",
-        named_in: &[NamedIn {
-            package: "blaze-cargo",
-            file: "src/serve/observe.rs",
-            why: "starts the explorer for `blaze explore` and encodes `blaze debug sql`'s Arrow IPC: \
-                  answers to a client about finished builds, past every record",
-        }],
+        named_in: &[
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/serve/observe.rs",
+                why: "starts the explorer for `blaze explore` and encodes `blaze debug sql`'s Arrow IPC: \
+                      answers to a client about finished builds, past every record",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/serve/plane.rs",
+                why: "publishes the plane's observed task records to the explorer's task table: \
+                      nothing from the table decides what a unit makes",
+            },
+        ],
     },
     Cut {
         package: "blaze-history",
@@ -428,6 +448,12 @@ pub const RECORD_CUT: &[Cut] = &[
         why: "the client's rendering of what the daemon answered (`cli::live`, `cli::inspect`): it \
               shows records and makes none; the daemon (`serve`) does not call it",
         named_in: &[
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/daemon.rs",
+                why: "renders a daemon status answer's builds with `Board` on the client: \
+                      what the daemon already answered, never a unit's record",
+            },
             NamedIn {
                 package: "blaze-cargo",
                 file: "src/cli/print.rs",
@@ -473,6 +499,18 @@ pub const RECORD_HOOKS: &[&str] = &["Holders", "Predict"];
 /// Implementations of [`RECORD`]'s hooks past its closure, reviewed: none changes a byte of a
 /// record.
 pub const RECORD_REVIEWED: &[Hook] = &[
+    Hook {
+        package: "blaze-explore",
+        hook: "Source",
+        why: "`Daemon` serves profile metadata, SQL and live feeds to explorer clients: \
+              answers about builds, never input to a unit's record",
+    },
+    Hook {
+        package: "blaze-explore",
+        hook: "Live",
+        why: "`Feed` copies recorded profile and task rows into an explorer session: \
+              what a client sees, never what the unit made",
+    },
     Hook {
         package: "blaze-engine",
         hook: "Tree",
@@ -572,6 +610,12 @@ pub const HOOK_TRAITS: &[&str] = &[
 
 /// Implementations of [`HOOK_TRAITS`] past the closure, reviewed: none changes the bytes made.
 pub const REVIEWED_HOOKS: &[Hook] = &[
+    Hook {
+        package: "blaze-profile",
+        hook: "Probe",
+        why: "`Recorder` reports a contended lock's clock, thread, spans and wait events: \
+              profiling of the code generator's execution, never the bytes it makes",
+    },
     Hook {
         package: "blaze-diagnostics",
         hook: "DiagnosticHost",
