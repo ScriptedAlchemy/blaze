@@ -588,6 +588,37 @@ fn a_walk_over_kept_describes_builds_what_a_fresh_walk_builds(tc: hegel::TestCas
 
 const WHOLE: Run = Run { live: false, static_root: false, check: None };
 
+/// The replay of the Hegel failure: two front-end instances share a target, while a
+/// body edit makes two callers share an IR shape with different repeated-reference positions.
+#[test]
+fn a_body_edit_keeps_each_call_when_other_instances_share_code() {
+    let calls: &[&[u32]] = &[
+        &[2, 3, 4, 5, 6, 7, 8],
+        &[3, 5, 6, 8],
+        &[4, 5, 6, 7, 8],
+        &[5, 6, 7, 8],
+        &[6, 7, 8],
+        &[7, 8],
+        &[7, 8],
+        &[],
+    ];
+    let mut program = Program::default();
+    for (at, calls) in calls.iter().enumerate() {
+        let id = at as u32 + 1;
+        let function = program.function(id, 0x10 + id as u8, calls);
+        if id == 1 {
+            function.symbol = Some("main".to_owned());
+        } else if id != 7 {
+            (function.foreign, function.over_editable) = (true, true);
+        }
+        if id == 6 || id == 7 {
+            (function.code_of, function.body) = (Some(6), 0x16);
+        }
+        program.bodies.insert(id, (id % 3, false));
+    }
+    assert_eq!(first_difference(program, WHOLE, &[(Edit::Body, (1, 1))], None), None);
+}
+
 /// The control of the refinement for a changed function: an edit of 4's body gives it a new
 /// key, which its caller's places name. A driver that takes its kept describe without asking
 /// the front end builds 4 under its old key, and the oracle says so; the driver that asks

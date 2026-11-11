@@ -1709,6 +1709,43 @@ fn a_template_key_covers_which_place_is_the_function_itself() {
     assert_eq!(shape.own_place(None), shape);
 }
 
+/// Equal resolved references must not collapse a distinct call after a callee edit.
+/// Both memo and store reuse give the fresh build, while consistent renaming still shares.
+#[test]
+fn a_template_keeps_distinct_calls_when_a_shared_callee_changes() {
+    let [a, b, c, d] = [1, 2, 3, 4].map(|n| Target::Direct(InstanceKey(ContentId([n; 32]))));
+    let key = |refs: &[Target]| placed(InstanceKey(ContentId::default()), refs, None);
+    assert_eq!(key(&[a.clone(), a.clone(), b.clone()]), key(&[c.clone(), c, d]));
+    assert_ne!(key(&[a.clone(), a.clone()]), key(&[a, b]));
+
+    let mut program = Program::default();
+    program.function(1, 0x11, &[2]).symbol = Some("main".to_owned());
+    program.function(2, 0x20, &[3, 4]);
+    program.function(3, 0x30, &[]).code_of = Some(3);
+    program.function(4, 0x30, &[]).code_of = Some(3);
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let (memo, mut store) = (Memo::new(), Store::default());
+    let cold = build(&program, &Machine::default(), &policy, &memo, &store).unwrap();
+    store.keep(&cold.puts);
+    let calls = |built: &Built| {
+        built.functions.iter().find(|it| it.code.first() == Some(&0x20)).unwrap().relocs.clone()
+    };
+    assert_eq!(calls(&cold).get(0).unwrap().target, calls(&cold).get(1).unwrap().target);
+
+    program.functions.get_mut(&4).unwrap().body = 0x31;
+    let fresh =
+        build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    assert_ne!(calls(&fresh).get(0).unwrap().target, calls(&fresh).get(1).unwrap().target);
+    let from_memo =
+        build(&program, &Machine::default(), &policy, &memo, &Store::default()).unwrap();
+    let from_store = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
+    for restored in [from_memo, from_store] {
+        assert_eq!(restored.functions, fresh.functions);
+        assert_eq!(restored.digests, fresh.digests);
+        assert_eq!(restored.id, fresh.id);
+    }
+}
+
 /// A stored template's function, read in place, is the one decoding it and instantiating
 /// gives, and bytes that are no template are the outer error.
 #[test]

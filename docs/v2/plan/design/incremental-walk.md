@@ -11,6 +11,14 @@ one-line body edit: `unit codegen` 507 ms, of it `codegen walk` 340, `templates`
 
 ## What is kept, and what keys it
 
+Template keys and memo shapes must cover which resolved reference positions name the same
+target: `Template` records the first equal position. Distinct front-end instances can resolve
+to one code key, so reference kinds and the self position alone are insufficient. Hash each
+position's first equal position, without hashing the target's identity, in one shared rule.
+The store key domain changes; old templates remain under their old keys. The cost is one
+linear pass and a task-frame map, released on return. A repeated-target regression checks
+memo and store reuse against a fresh build; the kept-walk Hegel refinement checks edits.
+
 | Kept | Key | Lives |
 |---|---|---|
 | a describe, a count | instance, requester, `Facing` | the database (memo) |

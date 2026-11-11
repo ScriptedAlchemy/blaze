@@ -386,7 +386,7 @@ pub fn stored(key: InstanceKey, built_in: &[InstanceKey]) -> InstanceKey {
     InstanceKey(hasher.finish())
 }
 
-pub const PLACED_DOMAIN: &str = "blaze v2 placed 2";
+pub const PLACED_DOMAIN: &str = "blaze v2 placed 3";
 
 /// What a unit's code is kept under: [`stored`], the kind of each of its references, by
 /// place, and which place is the function itself (`own`, [`crate::template::own_place`] of
@@ -394,13 +394,15 @@ pub const PLACED_DOMAIN: &str = "blaze v2 placed 2";
 /// references, and two bodies of one key can have other places (a fact of the arguments the
 /// key leaves out adds a call), so how many there are and what each is are keyed; which callee
 /// or symbol is at a place is not, as a template takes any, but for the function itself, which
-/// its template holds as its own and never as a place (rule 21).
+/// its template holds as its own and never as a place. Which positions have equal targets
+/// is keyed too: the template uses the first equal position (rule 21).
 pub fn placed(stored: InstanceKey, refs: &[Target], own: Option<u32>) -> InstanceKey {
     let mut hasher = Hasher::new(PLACED_DOMAIN);
     hasher.id(&stored.0).update(&(refs.len() as u64).to_le_bytes());
     for target in refs {
         hasher.update(&[place_kind(target)]);
     }
+    hasher.id(&crate::template::reference_aliases(refs));
     match own {
         Some(at) => hasher.update(&[1]).update(&at.to_le_bytes()),
         None => hasher.update(&[0]),
@@ -878,7 +880,13 @@ fn prepare_node<B: Prepare>(
 ) -> Result<(Shape, B::Prepared), CodegenError> {
     let (shape, made) = backend.prepare(frontend, unit, spec, &node.instance, &node.refs)?;
     let own = own_place(unit.instance.key(), &node.refs);
-    Ok((shape.relative(node.described.anchors.is_some()).own_place(own), made))
+    Ok((
+        shape
+            .relative(node.described.anchors.is_some())
+            .own_place(own)
+            .reference_aliases(&node.refs),
+        made,
+    ))
 }
 
 /// `why`, the refusal of the function called `name`, with its message naming it where it does

@@ -381,6 +381,13 @@ impl Shape {
         hasher.id(&self.0).update(&at.to_le_bytes());
         Shape(hasher.finish())
     }
+
+    /// The template's first-equal reference positions, as the store key also covers.
+    pub(crate) fn reference_aliases(self, refs: &Refs) -> Shape {
+        let mut hash = blaze_ids::Hasher::new("blaze v2 aliased shape 1");
+        hash.id(&self.0).id(&crate::template::reference_aliases(refs));
+        Shape(hash.finish())
+    }
 }
 
 pub const RELATIVE_SHAPE_DOMAIN: &str = "blaze v2 relative shape 1";

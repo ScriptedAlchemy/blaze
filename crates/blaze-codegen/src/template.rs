@@ -30,8 +30,25 @@ use crate::{
 };
 
 /// What an instance refers to, in the order its front end lists them: every function, static
-/// and outside symbol, each once. Never a [`Target::Data`] or [`Target::Position`].
+/// and outside symbol. Distinct front-end instances may resolve to equal targets;
+/// [`reference_aliases`] keys that equality pattern. Never a [`Target::Data`] or [`Target::Position`].
 pub type Refs = [Target];
+
+/// The equality pattern of resolved references, independent of their target identities.
+/// A template uses the first equal position, so `[a, a]` and `[a, b]` are different
+/// templates even when their IR and reference kinds agree.
+pub(crate) fn reference_aliases(refs: &Refs) -> ContentId {
+    frame::task(Tag::Codegen, |frame| {
+        let mut first = blaze_hash::HashMap::new_in(frame);
+        let mut hash = Hasher::new("blaze v2 reference aliases 1");
+        hash.update(&(refs.len() as u64).to_le_bytes());
+        for (at, target) in refs.iter().enumerate() {
+            let at = *first.entry(target).or_insert(at as u64);
+            hash.update(&at.to_le_bytes());
+        }
+        hash.finish()
+    })
+}
 
 /// What a relocation of a template points at.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -535,8 +552,8 @@ fn place(refs: &Refs, target: &Target) -> Result<u32, TemplateError> {
 /// non-generic body in a library and in its `--test` crate, `hir-ty-mir`'s `unwind::is_panic`,
 /// its recursive call at place 5), and their templates differ there. So every key a template is
 /// kept or shared under holds this place (`driver::placed`, the memo's
-/// [`crate::backend::Shape::own_place`]), rule 21. `refs` lists each target once, so there is
-/// at most one.
+/// [`crate::backend::Shape::own_place`]), rule 21. When several references resolve to the
+/// function itself, the first equal position is used.
 pub fn own_place(own: InstanceKey, refs: &Refs) -> Option<u32> {
     let at = refs.iter().position(|it| matches!(it, Target::Direct(key) if *key == own))?;
     Some(u32::try_from(at).expect("an instance refers to fewer than 2^32 things"))
