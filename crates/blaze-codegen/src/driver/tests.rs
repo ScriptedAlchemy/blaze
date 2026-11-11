@@ -195,10 +195,9 @@ impl Program {
         }
     }
 
-    /// An edit of what a describe of `id` reads: a new revision, which `id` changed at.
-    fn touch(&mut self, id: u32) {
+    /// A write of a describe's input, body or dyn fact: its group and durability cover both.
+    fn wrote_input(&mut self, id: u32) {
         self.engine.revision += 1;
-        self.engine.changed.insert(id, self.engine.revision);
         if self.engine.durable.contains(&id) {
             self.engine.high += 1;
         }
@@ -207,10 +206,16 @@ impl Program {
         }
     }
 
+    /// An edit of what a describe of `id` reads: a new revision, which `id` changed at.
+    fn touch(&mut self, id: u32) {
+        self.wrote_input(id);
+        self.engine.changed.insert(id, self.engine.revision);
+    }
+
     /// An edit of the dyn fact the body of `id` reads: a new revision, which the fact changed
     /// at.
     fn touch_fact(&mut self, id: u32) {
-        self.engine.revision += 1;
+        self.wrote_input(id);
         self.engine.facts.insert(id, self.engine.revision);
     }
 

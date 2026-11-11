@@ -588,6 +588,34 @@ fn a_walk_over_kept_describes_builds_what_a_fresh_walk_builds(tc: hegel::TestCas
 
 const WHOLE: Run = Run { live: false, static_root: false, check: None };
 
+/// The invariant: the views of a function's inputs cover its dyn facts, so removing the
+/// last fact's target drops its code from both the kept and fresh builds, even when the
+/// function is skipped until its group or durable inputs are written.
+#[test]
+fn removing_a_dyn_target_updates_its_callers_group_and_durable_views() {
+    for durable in [false, true] {
+        let mut program = Program::default();
+        program.function(1, 0x11, &[2, 3]).symbol = Some("main".to_owned()); // alloc: fixture entry symbol
+        program.function(2, 0x12, &[3]);
+        let leaf = program.function(3, 0x13, &[]);
+        (leaf.foreign, leaf.over_editable) = (true, true);
+        if durable {
+            program.engine.durable.insert(2);
+        } else {
+            program.engine.groups.insert(2, 0);
+        }
+        for id in 1..=3 {
+            program.bodies.insert(id, (id % 3, false));
+        }
+        let edits = [
+            (Edit::AddFunction, (0, 0)),
+            (Edit::DynFact, (1, 3)),
+            (Edit::RemoveFunction, (3, 0)),
+        ];
+        assert_eq!(first_difference(program, WHOLE, &edits, None), None, "durable={durable}");
+    }
+}
+
 /// The invariant: removing a formerly reached function after a dyn-fact edit refuses its
 /// stale handle without panicking, and the kept and fresh builds still agree on every list
 /// and delta. A patch may ask again of the removed function before its reach graph settles.
@@ -597,7 +625,7 @@ fn a_removed_function_after_a_dyn_fact_edit_refuses_its_stale_handle() {
     for (id, calls) in [(1, &[2, 3][..]), (2, &[3][..]), (3, &[][..])] {
         let function = program.function(id, 0x10 + id as u8, calls);
         if id == 1 {
-            function.symbol = Some("main".to_owned());
+            function.symbol = Some("main".to_owned()); // alloc: fixture entry symbol
         } else {
             (function.foreign, function.over_editable) = (true, true);
         }
