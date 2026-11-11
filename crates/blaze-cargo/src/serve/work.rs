@@ -10,13 +10,13 @@
 //!   the network or the disk; they touch no state of the loop.
 //! - **On a worker of the plane**: [`Steps::lower`], [`Front::compile`], [`Front::reach`],
 //!   [`Front::ub_tests`], [`Front::evaluate`], [`Front::codegen_inputs`], [`Front::tables`],
-//!   [`Front::pack`].
+//!   [`Front::pack`], and the exclusive [`Writer::release`].
 //!   They read the front end through the [`Steps::Reader`] the loop made as it posted the task, the
 //!   VFS's reader and the store through [`JobInput`], and give back what the loop writes
 //!   ([`Compiled::puts`]); a [`Failed::Again`] goes back to the loop, which posts it again
 //!   with a new reader. No worker locks to read.
 //! - **On the loop**: [`Front::fresh`], [`Front::script`], [`Front::tests`], [`Front::run`],
-//!   every [`Writer`] and every [`Runs`] method. User code runs as
+//!   the other [`Writer`] methods and every [`Runs`] method. User code runs as
 //!   [`blaze_core::Effect::Spawn`]s of the loop's driver, in the sandbox its
 //!   [`blaze_core::Confine`] makes, never on a thread of its own.
 //!
@@ -35,10 +35,12 @@
 //! A build script's output ([`Writer::ran`]) and a proc macro's load ([`Writer::macros`]) are
 //! writes, and so is letting go of what a unit that compiled leaves in the front end for no task
 //! to come ([`Writer::compiled`]; the daemon's `unit::release`), which waits only when memory is
-//! short or no unit is open. Each is checked as it is asked for and applied by [`Writer::apply`], on the loop,
-//! once no reader is alive: every reader is one of a task posted before the write was asked
-//! for, and from then until it is applied the loop posts no reading task of that job, but
-//! holds it and posts it after, with a reader of what the write made. That wait is the stop.
+//! short or no unit is open. Inputs are checked as they arrive and applied by [`Writer::apply`]
+//! on the loop once no reader is alive. A release instead transfers the exclusive database
+//! and frozen plan through [`Writer::take_release`] to one accounted worker, then returns
+//! through [`Writer::released`]. Until that handoff and every queued write finish, reading
+//! tasks are parked with their grants and worker slots returned; they resume through normal
+//! admission with a reader of what the writes made. That wait is the stop.
 //! Tasks of the job that don't read (build scripts and the program's runs, store puts and
 //! placements, fetches, the plan) and every other job's tasks keep going meanwhile. Each
 //! write asked while readers run waits with the others, and `apply` applies them all as one,
@@ -710,9 +712,26 @@ pub trait Kept: Send + 'static {
     fn rest(&mut self);
 }
 
-/// What of a job's front end only the loop writes. Its writes are asked for, then applied
-/// together by [`Writer::apply`] once no [`Steps::Reader`] of it is alive (the module's docs).
+/// The loop's front-end owner. Input writes are applied together by [`Writer::apply`] once
+/// no reader is alive; release temporarily transfers exclusive state to an accounted worker.
 pub trait Writer<S: Steps>: Send + 'static {
+    /// Exclusive state and a frozen release plan, transferred to one existing plane task.
+    type Release: Send + 'static;
+    /// The exclusively owned state after that release, returned only on success.
+    type Released: Send + 'static;
+    /// Takes a release that is due once no reader is alive. While it is away, no reader,
+    /// apply or keep may use the front end; new writes and pressure remain queued here.
+    fn take_release(&mut self) -> Option<Self::Release>;
+    /// On a worker, executes only the taken plan. A failure or panic must not return a
+    /// partly released database for publication. The plane catches a panic as a job failure.
+    fn release(work: Self::Release) -> Result<Self::Released, ApiError>;
+    /// Returns the state from that one release, without clearing writes or pressure that
+    /// arrived while it ran. Called only for the exact release node this writer owns. A
+    /// refusal returns ownership too, so the daemon can discard it on an accounted worker.
+    fn released(&mut self, released: Self::Released) -> Result<(), (ApiError, Self::Released)>;
+    /// The build is ready to keep its front end. Its final release goes through the same
+    /// worker handoff as a release during the build; keep follows only once it completes.
+    fn ending(&mut self) {}
     /// A reader of the front end as it stands, for one task about to be posted; none while a
     /// write is asked for and not applied, when the loop holds the task instead.
     fn reader(&self) -> Option<S::Reader>;
@@ -729,7 +748,7 @@ pub trait Writer<S: Steps>: Send + 'static {
     ) -> Result<(), ApiError>;
     /// Whether a write was asked for and is not applied yet, or the front end asks to let go
     /// of what nothing still to compile reads (the daemon's `unit::release`): either way the
-    /// loop posts no reading task of the job until [`Writer::apply`] applied it.
+    /// loop posts no reading task until the release returned and [`Writer::apply`] applied it.
     fn waiting(&self) -> bool;
     /// On the loop, as unit `unit`'s first task starts: it is open until [`Writer::compiled`].
     fn began(&mut self, unit: usize) {

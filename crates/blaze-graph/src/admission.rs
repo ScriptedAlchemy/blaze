@@ -83,6 +83,10 @@ pub mod kinds {
     /// What a build left for the store (dependency images, check outcomes, goals) written from
     /// its front end as it is kept, before the build answers.
     pub const STORE_KEPT: TaskKind = TaskKind(0x1_000f);
+    /// Exclusive front-end values released before readers or final publication resume.
+    pub const FRONT_RELEASE: TaskKind = TaskKind(0x1_0010);
+    /// One bounded disposal of front-end state whose release cannot be installed.
+    pub const FRONT_DISCARD: TaskKind = TaskKind(0x1_0011);
 }
 
 /// The name of one of the daemon's own task kinds ([`kinds`]), as a profile's `task` span
@@ -105,6 +109,8 @@ pub const fn name_of(kind: TaskKind) -> Option<&'static str> {
         kinds::UNIT_STORE => "unit store",
         kinds::PROGRAM_LINK => "program link",
         kinds::STORE_KEPT => "store kept",
+        kinds::FRONT_RELEASE => "front end release",
+        kinds::FRONT_DISCARD => "front end discard",
         _ => return None,
     })
 }
@@ -124,7 +130,7 @@ pub const fn tag_of(kind: TaskKind) -> Tag {
         kinds::UNIT_BODIES => Tag::Infer,
         kinds::UNIT_LINK | kinds::PROGRAM_LINK => Tag::Link,
         kinds::LOWER | kinds::UB_TESTS | kinds::EVALUATE => Tag::Mir,
-        kinds::WALK | TaskKind(4) => Tag::Query,
+        kinds::WALK | kinds::FRONT_RELEASE | kinds::FRONT_DISCARD | TaskKind(4) => Tag::Query,
         TaskKind(1..=3) | TaskKind(5..=6) => Tag::Vfs,
         TaskKind(0x1000..0x2000) => Tag::Nameres,
         TaskKind(0x2000..0x2200) => Tag::Parse,

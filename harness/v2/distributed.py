@@ -30,22 +30,26 @@ import sys
 import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path[:0] = [str(HERE), str(HERE.parent), str(ROOT / ".github/scripts")]
 import clone_out
-import dist_build_identity as identity
 import report
 from engine import EngineSpec
 from typed_input import fail, parse
+
+# The CI helper lives outside the Python workspace's import roots; its runtime import
+# uses the explicit sibling path above, as other v2 adapters import legacy helpers.
+identity: Any = importlib.import_module("dist_build_identity")
 
 # `distv2` is also the package holding the existing evidence oracles. Load its CLI under
 # another name so its own `from distv2 import evidence` still names that package.
 spec = importlib.util.spec_from_file_location("distributed_acceptance", HERE.parent / "distv2.py")
 if spec is None or spec.loader is None:
     raise RuntimeError("cannot load the distv2 acceptance harness")
-distv2 = importlib.util.module_from_spec(spec)
+distv2: Any = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = distv2
 spec.loader.exec_module(distv2)
 
@@ -65,8 +69,8 @@ class Input:
 
 def verified_build(directory: Path, initial: object | None = None) -> object:
     """Use the CI verifier, including its clean-source and exact executable-set rules."""
-    sealed = json.loads((directory / identity.MANIFEST).read_text())
-    actual = identity.identity(directory, services=True)
+    sealed: object = json.loads((directory / identity.MANIFEST).read_text())
+    actual: dict[str, object] = identity.identity(directory, services=True)
     identity.verify(sealed, actual)
     if initial is not None:
         # A new seal between profiles cannot replace the identity this run started with.
@@ -84,10 +88,11 @@ def require_reflink(directory: Path) -> None:
         raise ValueError(f"scratch {directory} did not prove reflink placement: {why}") from why
 
 
-def profile_input(given: Input, blaze: Path, evidence: Path, name: str):
+def profile_input(given: Input, blaze: Path, evidence: Path, name: str) -> Any:
     # Unlike the underlying standalone harness, this ledger adapter accepts no ambient
-    # resource fallback. Keep its positive-value validation in the shared input loader.
-    if given.cores is None or given.daemon_memory_gb is None:
+    # resource fallback: require exact positive ints here, then let the legacy loader
+    # validate and construct its own Input without duplicating that schema.
+    if any(type(value) is not int or value <= 0 for value in (given.cores, given.daemon_memory_gb)):
         raise ValueError("cores and daemon_memory_gb must be explicit positive integers")
     scratch = evidence / name
     return distv2.load(json.dumps({
@@ -110,13 +115,13 @@ def profile_input(given: Input, blaze: Path, evidence: Path, name: str):
     }))
 
 
-def accept(name: str, given, directory: Path, initial: object, log: Path) -> list[str]:
-    errors = []
+def accept(name: str, given: Any, directory: Path, initial: object, log: Path) -> list[str]:
+    errors: list[str] = []
     previous_handler = signal.getsignal(signal.SIGTERM)
     with log.open("x") as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         try:
             verified_build(directory, initial)
-            returned = distv2.main(given)
+            returned: object = distv2.main(given)
             if returned is not None:
                 raise ValueError(f"distv2.main returned {returned!r} instead of completing its checks")
         except (SystemExit, Exception) as why:
@@ -155,7 +160,9 @@ def main(given: Input) -> None:
         (evidence / "build-identity.json").write_text(json.dumps(initial, indent=2) + "\n")
         with (evidence / "reflink.log").open("x") as output, contextlib.redirect_stdout(output):
             require_reflink(evidence)
-        profiles = [(name, profile_input(given, blaze, evidence, name)) for name in ("dev", "release")]
+        profiles: list[tuple[str, Any]] = [
+            (name, profile_input(given, blaze, evidence, name)) for name in ("dev", "release")
+        ]
     except (SystemExit, Exception) as why:
         rep.add("distributed-prerequisites", "error", str(why))
         rep.finish()

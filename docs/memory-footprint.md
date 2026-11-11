@@ -148,6 +148,64 @@ Design: [v2/plan/design/store-pool.md](v2/plan/design/store-pool.md).
   malloc to mimalloc (its macOS zone override) for accounting comes after step 1 measures how much
   system malloc a release build uses.
 
+## Exclusive release and bounded cleanup
+
+The source now moves front-end release off the daemon loop. The pinned `0.20261105.4`
+bootstrap binary still performs that work synchronously; changing this source does not
+repair that already published binary. The source change addresses the loop ownership and
+scheduling boundary, without changing the watchdog, memory ceilings, or admission forecasts.
+Its hosted execution and memory/stall results are still pending.
+
+`UnitWriter` waits for its last reader, freezes one release plan, and transfers the database's
+sole owner to a task on the existing Work pool. The writer retains immutable crate descriptors
+for validating arriving build-script and proc-macro inputs, which remain queued while the
+database is away. It supplies no new reader, applies no input, and permits no final keep until
+the exact worker result returns. Completion updates only the taken plan's squeeze measure;
+later pressure, finished crates, and end requests remain pending. The production `FinalRelease`
+policy invalidates an older final plan when another input arrives and schedules a new final
+plan after that input applies. History reads the returned database before keep and reflects a
+release failure or cancellation that occurred after the main compile request ended.
+
+The plane's `Reclaim` input accepts one unkeyed, dependency-free Store node on the Work pool,
+with a positive predicted memory grant. It may bypass a temporary pressure cap and a held
+compile's starvation reservation, but preserves that reservation and starts only with no
+other positive grants. Its full grant must fit the configured budget, machine allowance,
+and recorded room. While reclamation runs, other positive-grant tasks wait; zero-memory work
+may proceed. Accounting and this exclusion remain until the actual completion or yield,
+including cancellation of a running task. Release and discard have separate learned costs;
+neither refusal resets a forecast.
+
+A successor can already be admitted when the loop learns that its predecessor made release
+due. Holding that unposted successor with its grant and Work slot would deadlock release,
+even with a single worker and no memory budget. The loop therefore uses `Park` to return its
+actual grant and slot. It retains a token fenced by task generation and park epoch, then uses
+`Resume` for ordinary admission after the writer is ready. A failed write uses `RefuseParked`
+with its original cause. If cancellation or fail-fast failure already ended the request,
+successful parking can settle the task without leaving a continuation token.
+
+The handoff retains an ownership cell independently of the job's lifetime. Admission refusal
+before the worker starts, cancellation after its final flag check, and a reply arriving after
+job removal therefore cannot silently drop transferred state on the loop. Each pending or
+returned state gets one separately measured `FRONT_DISCARD` continuation. A worker error or
+panic never installs a partly released database, and a late or duplicate result cannot attach
+to another owner. If that single discard is itself refused or fails, the original error is
+retained and the terminal cleanup failure is named. Any remaining owned state is then dropped
+on the loop under the unchanged watchdog; there is no further cleanup task or forecast reset.
+That is an explicit limit of this repair. Ordinary cancellation before transfer, destruction
+of a locally held nonkept or pack writer, and process shutdown are also outside its promise
+to move release destruction off the loop.
+
+The aggregate `front end release` span now contains separate spans for releasing values,
+sweeping value caps, returning allocator pages, and measuring storage. The required unit
+controls use the actual daemon and plane on the simulation driver, with held worker tasks,
+measured refusal forecasts, exact ownership probes, and planted old behavior. They cover
+one-worker successor progress with and without a budget, each cancellation boundary, worker
+failure and panic, orphan disposal, discard refusal, and final publication after late writes.
+Direct production-policy controls in `serve/unit/release/tests.rs` cover frozen-plan completion
+and `FinalRelease`; adjacent plane and job controls cover terminal parking and delayed-history
+outcomes. These are required tests, with no known-failure exemption. Source review is not a
+runtime pass receipt.
+
 ## Acceptance
 
 On the Mac, with `BLAZE_DAEMON_MEMORY_GB=48`, a tree-built blaze builds blaze's own tree, and:

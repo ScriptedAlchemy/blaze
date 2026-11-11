@@ -3,6 +3,8 @@
 //! no server should (damaged, truncated, reordered and oversized frames), and the outside
 //! peer [`Sim::dial`] makes, for requests no client sends.
 
+mod tls;
+
 use std::{ffi::OsString, time::Duration};
 
 use blaze_cas::{Config, Fetched, Key, Kind, Store};
@@ -17,7 +19,7 @@ use crate::{
     BundleId, BundleSpec, Client, Download, Downloaded, Endpoint, GotBundle, Locked, Manifest,
     Public, Published, Record, Secrets, Server, Signed, Trust, client, http, record_key,
     sign::tests::publisher,
-    tls::clear::Clears,
+    tls::{Channels, clear::Clears},
     wire::{self, BODY_MOST, CHUNKED_FROM, SendWindow},
 };
 
@@ -63,9 +65,9 @@ fn public(key: Key, kind: Kind) -> Public {
 }
 
 /// The cache's server on a store of its own.
-struct Cache {
+struct Cache<C: Channels = Clears> {
     store: Store,
-    server: Server<Clears>,
+    server: Server<C>,
 }
 
 /// What a server the test plays does with a request: sends `bytes`, then hangs up when
@@ -144,12 +146,12 @@ impl Raw {
     }
 }
 
-struct World {
+struct World<C: Channels = Clears, S: Channels = Clears> {
     sim: Sim,
     effects: Vec<Effect>,
     mine: Store,
-    client: Client<Clears>,
-    cache: Option<Cache>,
+    client: Client<C>,
+    cache: Option<Cache<S>>,
     raw: Option<Raw>,
     download: Option<Download>,
     fetched: Vec<(Key, Fetched)>,
@@ -206,8 +208,10 @@ impl World {
         });
         world
     }
+}
 
-    fn cache(&mut self) -> &mut Cache {
+impl<C: Channels, S: Channels> World<C, S> {
+    fn cache(&mut self) -> &mut Cache<S> {
         self.cache.as_mut().expect("a world with the cache's server")
     }
 

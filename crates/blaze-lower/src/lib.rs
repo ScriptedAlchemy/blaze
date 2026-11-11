@@ -249,6 +249,32 @@ impl Crates {
     pub fn is_proc_macro(&self, unit: usize) -> bool {
         self.units.get(unit).is_some_and(|it| it.proc_macro)
     }
+
+    /// Whether the immutable unit descriptions accept this build script's result. This
+    /// needs no database reader, so a result can be checked while the database is released.
+    pub fn check_ran(&self, run: usize, ran: &Ran) -> Result<(), LowerError> {
+        checked(self, run, ran).map(drop)
+    }
+
+    /// Whether `unit` is the build of a proc macro's module, whose expanders may be loaded.
+    /// As [`Crates::check_ran`], this reads only the descriptions made by lowering.
+    pub fn check_macros(&self, unit: usize) -> Result<(), LowerError> {
+        let Some(lowering) = self.units.get(unit) else {
+            return Err(LowerError::new(format!("the build has no unit {unit}")));
+        };
+        match (lowering.krate, lowering.proc_macro) {
+            (Some(_), true) => Ok(()),
+            _ => Err(LowerError::at(
+                // alloc: error path
+                format!(
+                    "{} builds no proc macro's module, so gives no crate expanders: only a `proc-macro` target's \
+                     build unit does",
+                    lowering.what
+                ),
+                lowering.what.clone(),
+            )),
+        }
+    }
 }
 
 /// One unit as lowered.
@@ -995,7 +1021,7 @@ impl Lowered {
     /// of this build, its `OUT_DIR` the one cargo names, every cfg as `--cfg` takes it. Asked
     /// as the run ends, before its write waits for the readers to finish.
     pub fn check_ran(&self, run: usize, ran: &Ran) -> Result<(), LowerError> {
-        checked(&self.crates, run, ran).map(drop)
+        self.crates.check_ran(run, ran)
     }
 
     /// Unit `unit`'s identity in the front end: of its crate (its root file's path, data,
@@ -1268,21 +1294,7 @@ impl Lowered {
     /// Whether [`Lowered::macros`] would take expanders for unit `unit`: the unit that builds a
     /// proc macro's module ([`Unit::gives_expanders`]).
     pub fn check_macros(&self, unit: usize) -> Result<(), LowerError> {
-        let Some(lowering) = self.crates.units.get(unit) else {
-            return Err(LowerError::new(format!("the build has no unit {unit}")));
-        };
-        match (lowering.krate, lowering.proc_macro) {
-            (Some(_), true) => Ok(()),
-            _ => Err(LowerError::at(
-                // alloc: error path
-                format!(
-                    "{} builds no proc macro's module, so gives no crate expanders: only a `proc-macro` target's \
-                     build unit does",
-                    lowering.what
-                ),
-                lowering.what.clone(),
-            )),
-        }
+        self.crates.check_macros(unit)
     }
 
     /// The expanders of proc-macro unit `unit` once it is built (or why it has none), for the

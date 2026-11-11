@@ -11,10 +11,33 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-15 invariants, 0 refinements, 1 reference models.
-By level: 3 tested, 12 simulated, 0 model-checked, 0 proved.
+27 invariants, 1 refinements, 1 reference models.
+By level: 6 tested, 22 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
+
+### blaze-cargo
+
+- **`pending_history_uses_the_completed_handoff_outcome`** *tested* (`crates/blaze-cargo/src/serve/job/tests.rs`): a delayed history row uses the exact completed handoff's failure or cancellation outcome, emits once, and never preserves an earlier successful compile verdict.
+  Controls: `history_before_handoff_failure`.
+- **`worker_release_keeps_the_loop_responsive_and_publication_fenced`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): an exclusive final release stays on its admitted worker, keeps the loop responsive, and gates publication until that exact state returns and the store commits.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`parked_successors_allow_release_with_one_work_slot`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): a successor admitted before Did gives its real grant and the only Work slot back while the writer is exclusive, then runs only after ordinary readmission.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`cancellation_at_each_handoff_boundary_retires_the_build`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): cancel before transfer, while the worker is held, and after its result returns each retire Stage::Units, preserve exclusive ownership, and publish no front end.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`release_failure_and_panic_preserve_the_cause_and_keep_serving`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): release errors and panics consume their exclusive state on the worker, keep the first cause, publish nothing from that state, and fail only their owning build.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`refused_release_uses_one_accounted_discard`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): refusal before a worker starts retains ownership for one independently accounted discard; refusing that discard is terminal, named, and never resets a forecast.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`orphaned_worker_result_is_discarded_after_job_removal`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): removing a stalled job before consuming its worker result does not drop the owned state on the loop or attach it to another job; its one discard stays accounted.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`late_write_requires_another_final_release`** *simulated* (`crates/blaze-cargo/src/serve/tests/release.rs`): a write arriving during or just after a taken final plan remains queued, applies only after ownership returns, and uses UnitWriter's production FinalRelease policy to require a new final release before keep.
+  Controls: `inline_release`, `a_held_successor_grant`, `a_late_result_dropped_on_the_loop`, `keep_after_an_older_final_release`.
+- **`completion_preserves_later_pressure_finished_crates_and_end`** *tested* (`crates/blaze-cargo/src/serve/unit/release/tests.rs`): completing one frozen worker plan changes only its squeeze measure; later pressure, completed crates and end requests survive in the next exact plan.
+  Controls: `completion_erasing_later_pressure`, `completion_erasing_later_finished_crates`, `completion_erasing_a_later_end`, `reusing_a_final_plan_before_a_late_write`.
+- **`final_release_policy_requires_completion_after_every_late_write`** *tested* (`crates/blaze-cargo/src/serve/unit/release/tests.rs`): the production FinalRelease policy schedules the final plan after all writes and accepts only its completion, including a late write on either side of return.
+  Controls: `completion_erasing_later_pressure`, `completion_erasing_later_finished_crates`, `completion_erasing_a_later_end`, `reusing_a_final_plan_before_a_late_write`.
 
 ### blaze-core
 
@@ -51,6 +74,10 @@ By level: 3 tested, 12 simulated, 0 model-checked, 0 proved.
 
 - **`live_grants_fit_the_machine_budget_after_any_crash`** *tested* (`crates/blaze-graph/src/ledger/tests.rs`): whatever crashes, restarts and pid reuse, the live daemons' grants never sum past the machine budget, none grants room the ledger does not hold for it, none admits while the others' charges fill the machine, and every task that fits starts.
   Controls: `a_read_modify_write_without_the_lock`, `a_prune_that_ignores_start_time`, `an_allowance_that_leaves_out_a_daemon`.
+- **`reclamation_preserves_full_grants_reservations_and_worker_limits`** *simulated* (`crates/blaze-graph/src/plane_tests/reclaim.rs`): reclamation bypasses temporary pressure only with a full positive grant, preserves a held compile's later opportunity, and excludes every other positive grant until its actual completion or yield. Cancellation alone returns no running capacity.
+  Controls: `reclamation_treated_as_ordinary_work`, `a_reclamation_grant_clamped_to_the_pressure_cap`, `a_lost_held_compile_reservation`, `positive_work_overlapping_reclamation`, `a_reclamation_hold_bypassed_without_a_budget`, `reclamation_spending_unreserved_machine_room`, `a_park_that_eagerly_readmits_unposted_work`, `a_stale_continuation_replaced_with_the_current_token`, `a_rejected_reclamation_prefix_entering_the_plane`.
+- **`reclamation_refuses_invalid_shapes_and_respects_actual_machine_bounds`** *simulated* (`crates/blaze-graph/src/plane_tests/reclaim.rs`): even cleanup fits the configured ceiling, the current machine allowance and its recorded reservation. A malformed reclamation changes no state, event or clock.
+  Controls: `reclamation_treated_as_ordinary_work`, `a_reclamation_grant_clamped_to_the_pressure_cap`, `a_lost_held_compile_reservation`, `positive_work_overlapping_reclamation`, `a_reclamation_hold_bypassed_without_a_budget`, `reclamation_spending_unreserved_machine_room`, `a_park_that_eagerly_readmits_unposted_work`, `a_stale_continuation_replaced_with_the_current_token`, `a_rejected_reclamation_prefix_entering_the_plane`.
 
 ### blaze-profile
 
@@ -63,6 +90,13 @@ By level: 3 tested, 12 simulated, 0 model-checked, 0 proved.
 
 - **`conditional_publication_preserves_comparison_and_whole_file_integrity`** *simulated* (`crates/blaze-serve/src/store/repair_tests.rs`): a conditional repair requires the current committed digest, an absent old pack, and verified replacement bytes; no stale writer may replace the winner, and each acknowledged repair survives a crash and reopen as a whole manifest.
   Controls: `the_comparison_bypass_plant`, `missing_file_sync_with_torn_appends`, `acknowledgement_before_directory_sync`.
+
+## Refinements
+
+### blaze-graph
+
+- **`parked_unposted_work_releases_the_lane_without_losing_its_continuation`** *simulated* (`crates/blaze-graph/src/plane_tests/reclaim.rs`): an admitted but unposted successor gives its exact grant and worker back once while its front input is reclaimed. Only its saved task generation and park epoch can resume or refuse it; a missing, repeated or stale continuation cannot run it.
+  Controls: `reclamation_treated_as_ordinary_work`, `a_reclamation_grant_clamped_to_the_pressure_cap`, `a_lost_held_compile_reservation`, `positive_work_overlapping_reclamation`, `a_reclamation_hold_bypassed_without_a_budget`, `reclamation_spending_unreserved_machine_room`, `a_park_that_eagerly_readmits_unposted_work`, `a_stale_continuation_replaced_with_the_current_token`, `a_rejected_reclamation_prefix_entering_the_plane`.
 
 ## Reference models
 

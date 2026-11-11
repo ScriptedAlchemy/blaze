@@ -56,7 +56,7 @@ on:
         description: true only after every Linux fork migration fixture passes with this source-built Blaze
         value: ${{ jobs.forkfixes.outputs.accepted }}
       protocol_tests:
-        description: true only after all distributed library and integration tests pass with this source-built Blaze
+        description: true only after distributed targets and daemon release controls pass with this source-built Blaze
         value: ${{ jobs.distributed-tests.outputs.accepted }}
 
 env:
@@ -309,7 +309,8 @@ jobs:
     needs: build
     if: inputs.harnesses == '' && inputs.platform == 'linux-arm64'
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 90
+    # Two independently bounded test groups, plus setup, shutdown and evidence retention.
+    timeout-minutes: 170
     outputs:
       accepted: ${{ steps.accepted.outputs.accepted }}
     steps:
@@ -345,8 +346,48 @@ jobs:
           BLAZE_TESTS: verify
         run: |
           "$RUNNER_TEMP/protocol-binaries/blaze" --ignore-pin test --release --locked \
-            -p blaze-wire -p blaze-dist -p blaze-dist-local -p blaze-serve --lib --tests --no-fail-fast \
+            -p blaze-wire -p blaze-dist -p blaze-dist-local -p blaze-serve -p blaze-global -p blaze-graph --lib --tests --no-fail-fast \
             2>&1 | tee "$RUNNER_TEMP/protocol-evidence/tests.log"
+      - name: daemon release and scheduler controls with Stage 1
+        id: release
+        timeout-minutes: 75
+        env:
+          BLAZE_HOME: ${{ runner.temp }}/blaze-fs/protocol-tests
+          BLAZE_CACHE: ${{ runner.temp }}/blaze-fs/protocol-tests/v2/store
+          CARGO_TARGET_DIR: ${{ runner.temp }}/blaze-fs/protocol-target
+          BLAZE_DAEMON_MEMORY_GB: "12"
+          BLAZE_TESTS: verify
+          CARGO_TERM_COLOR: never
+        run: |
+          "$RUNNER_TEMP/protocol-binaries/blaze" --ignore-pin test --release --locked \
+            --lib -p blaze-cargo --no-fail-fast -- serve:: \
+            2>&1 | tee "$RUNNER_TEMP/protocol-evidence/release.log"
+          cases=(
+            worker_release_keeps_the_loop_responsive_and_publication_fenced
+            parked_successors_allow_release_with_one_work_slot
+            cancellation_at_each_handoff_boundary_retires_the_build
+            release_failure_and_panic_preserve_the_cause_and_keep_serving
+            refused_release_uses_one_accounted_discard
+            orphaned_worker_result_is_discarded_after_job_removal
+            late_write_requires_another_final_release
+            completion_preserves_later_pressure_finished_crates_and_end
+            final_release_policy_requires_completion_after_every_late_write
+            parking_an_unposted_task_after_cancel_or_failure_settles_without_a_token
+            pending_history_uses_the_completed_handoff_outcome
+            the_oracle_catches_inline_release
+            the_oracle_catches_a_held_successor_grant
+            the_oracle_catches_a_late_result_dropped_on_the_loop
+            the_oracle_catches_keep_after_an_older_final_release
+            the_oracle_catches_completion_erasing_later_pressure
+            the_oracle_catches_completion_erasing_later_finished_crates
+            the_oracle_catches_completion_erasing_a_later_end
+            the_oracle_catches_reusing_a_final_plan_before_a_late_write
+            the_oracle_catches_history_before_handoff_failure
+          )
+          for case_name in "${cases[@]}"; do
+            grep -Eq "^test .*::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/protocol-evidence/release.log" \
+              || { echo "::error::missing executed daemon release control: $case_name"; exit 1; }
+          done
       - name: stop the protocol test daemon
         if: always() && steps.handoff.outcome == 'success' && steps.protocol.outcome != 'skipped'
         env:
@@ -356,11 +397,16 @@ jobs:
         id: accepted
         env:
           PROTOCOL_TEST_OUTCOME: ${{ steps.protocol.outcome }}
+          RELEASE_TEST_OUTCOME: ${{ steps.release.outcome }}
         run: |
           test "$PROTOCOL_TEST_OUTCOME" = success \
             || { echo "::error::the complete protocol test run did not succeed"; exit 1; }
+          test "$RELEASE_TEST_OUTCOME" = success \
+            || { echo "::error::the daemon release control run did not succeed"; exit 1; }
           test -s "$RUNNER_TEMP/protocol-evidence/tests.log" \
             || { echo "::error::the complete protocol test run has no retained log"; exit 1; }
+          test -s "$RUNNER_TEMP/protocol-evidence/release.log" \
+            || { echo "::error::the daemon release control run has no retained log"; exit 1; }
           jq -n --arg bin "$RUNNER_TEMP/protocol-binaries" '{command: "verify", binaries: $bin}' \
             | python3 .github/scripts/dist_build_identity.py -
           echo 'accepted=true' >> "$GITHUB_OUTPUT"

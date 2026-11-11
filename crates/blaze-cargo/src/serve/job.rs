@@ -57,6 +57,15 @@ thread_local! {
     /// reason it gave the plane: what a test sees of a refused dependent, which no response
     /// says on its own.
     pub(super) static REFUSED_UNITS: std::cell::RefCell<Vec<(usize, String)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// The old admitted-but-unposted hold, planted only to prove the release-progress oracle.
+    pub(super) static KEEP_READER_GRANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static PARKED_READERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static RECLAIM_ATTEMPTS: std::cell::RefCell<Vec<TaskKind>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: a focused carrier test's record
+    pub(super) static ACTIVE_RECLAIM_TASK: std::cell::Cell<Option<TaskKind>> = const { std::cell::Cell::new(None) };
+    pub(super) static INLINE_RELEASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static CANCEL_RELEASE_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static STALL_RELEASE_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static DROP_LATE_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 use std::{
@@ -108,7 +117,7 @@ use super::{
     image::{Images, Parts},
     mounts::Mounts,
     observe::Ended,
-    plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
+    plane::{self, Did, Fresh, Happened, Parked, Plane, Posting, Task, kinds, loops},
     work::{
         Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library,
         Linking, LocalRead, Phase, Readers, RunPuts, Runs, Selection, Source, Steps, Writer,
@@ -161,6 +170,32 @@ pub enum Value<S: Steps> {
     /// What a kept front end left for the store ([`Steps::store_kept`]), and the front end
     /// given back: none when its store panicked, as it may be half written.
     StoredKept(Option<S::KeptFront>, Result<Vec<super::work::KeptPut>, ApiError>),
+    /// An exact owner's exclusive release or discard result. The identity outlives a job
+    /// removed by a stall, so its late state still takes the bounded discard path.
+    Released {
+        owner: Arc<ReleaseOwner>,
+        value: Result<Option<<S::Writer as Writer<S>>::Released>, ApiError>,
+    },
+}
+
+/// The immutable owner of one front-end handoff, also carried by its worker's reply. The
+/// cancellation identity fences a later job even if its external id is reused.
+pub struct ReleaseOwner {
+    id: JobId,
+    checkout: String,
+    cancelled: Arc<AtomicBool>,
+}
+
+enum FrontState<S: Steps> {
+    Pending(<S::Writer as Writer<S>>::Release),
+    Returned(<S::Writer as Writer<S>>::Released),
+}
+
+enum ReclaimWork<S: Steps> {
+    Release(<S::Writer as Writer<S>>::Release),
+    /// Only the error/late-result path allocates this list: normally one owned state,
+    /// at most the pending input and returned output of the exact failed handoff.
+    Discard(Vec<FrontState<S>>),
 }
 
 /// What jobs tell the session, in order.
@@ -421,6 +456,12 @@ pub(super) enum Does<S: Steps> {
         kept: Lock<Option<S::KeptFront>>,
         checkout: String,
     },
+    /// An exclusive front end and its frozen plan, taken exactly once by this task.
+    Release {
+        work: Arc<Lock<Option<ReclaimWork<S>>>>,
+        owner: Arc<ReleaseOwner>,
+        discard: bool,
+    },
 }
 
 impl<S: Steps> Step<S> {
@@ -480,6 +521,7 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Pack { .. } => tracing::info_span!("pack"),
             Does::Doc { .. } => tracing::info_span!("doc"),
             Does::StoreKept { checkout, .. } => tracing::info_span!(target: "blaze", "store kept front end", checkout = %checkout),
+            Does::Release { owner, discard, .. } => tracing::info_span!(target: "blaze", "reclaim front end", checkout = %owner.checkout, discard = *discard),
         }
         .entered();
         match &self.does {
@@ -729,6 +771,62 @@ impl<S: Steps> plane::Work for Step<S> {
                 };
                 self.settle(stored.map_err(Failed::Error), |it| Value::StoredKept(front, it))
             }
+            Does::Release { work, owner, discard } => {
+                let checkout = &owner.checkout;
+                let returned = |value| Value::Released { owner: Arc::clone(owner), value };
+                let Some(work) = work.lock().take() else {
+                    let what = format!("the front end release of {checkout} was taken before its task ran"); // alloc: an error, once
+                    return self.settle(Err(Failed::Error(ApiError::new(what, None))), returned);
+                };
+                #[cfg(test)]
+                let previous = ACTIVE_RECLAIM_TASK.replace(Some(if *discard {
+                    kinds::FRONT_DISCARD
+                } else {
+                    kinds::FRONT_RELEASE
+                }));
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match work {
+                        ReclaimWork::Release(work) => {
+                            if self.cancelled.load(Ordering::Acquire) {
+                                drop(work);
+                                return Ok(None);
+                            }
+                            let front = S::Writer::release(work)?;
+                            if self.cancelled.load(Ordering::Acquire) {
+                                drop(front);
+                                Ok(None)
+                            } else {
+                                Ok(Some(front))
+                            }
+                        }
+                        ReclaimWork::Discard(states) => {
+                            // Drop the exclusive database on this accounted worker, including
+                            // the case where its release never got as far as starting.
+                            for state in states {
+                                match state {
+                                    FrontState::Pending(front) => drop(front),
+                                    FrontState::Returned(front) => drop(front),
+                                }
+                            }
+                            Ok(None)
+                        }
+                    }
+                }));
+                #[cfg(test)]
+                ACTIVE_RECLAIM_TASK.set(previous);
+                let released = match caught {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let panic = plane::panicked(&*payload);
+                        let action = if *discard { "discarding" } else { "releasing" };
+                        let what = format!(
+                            "blaze {panic}, {action} the front end of {checkout}; its partly released database is not kept"
+                        ); // alloc: a panic, once
+                        Err(ApiError::new(what, Some(checkout.clone()))) // clone: an error, once
+                    }
+                };
+                self.settle(released.map_err(Failed::Error), returned)
+            }
         }
     }
 }
@@ -837,6 +935,18 @@ fn lower_cost_key(checkout: &str) -> Key {
 /// tree's store refuses no other's early ([`stores_too_much`]).
 fn store_cost_key(checkout: &str) -> Key {
     let mut hasher = blaze_ids::Hasher::new("blaze v2 kept front end store cost 1");
+    hasher.update(checkout.as_bytes());
+    Key(hasher.finish().0)
+}
+
+pub(super) fn release_cost_key(checkout: &str) -> Key {
+    let mut hasher = blaze_ids::Hasher::new("blaze v2 front end release cost 1");
+    hasher.update(checkout.as_bytes());
+    Key(hasher.finish().0)
+}
+
+pub(super) fn discard_cost_key(checkout: &str) -> Key {
+    let mut hasher = blaze_ids::Hasher::new("blaze v2 front end discard cost 1");
     hasher.update(checkout.as_bytes());
     Key(hasher.finish().0)
 }
@@ -1535,14 +1645,51 @@ struct Fetching {
     prep: Prep,
 }
 
+/// A reader waiting for an exclusive write. It holds no worker slot or memory grant.
+enum HeldReading {
+    Parked(Parked),
+    #[cfg(test)]
+    Admitted(Posting, bool),
+}
+
+impl HeldReading {
+    fn park<S: Steps>(w: &mut World<'_, S>, task: Posting, again: bool) -> Option<Self> {
+        #[cfg(test)]
+        if KEEP_READER_GRANT.get() {
+            return Some(Self::Admitted(task, again));
+        }
+        let _ = again;
+        let parked = w.plane.park(w.now, task)?;
+        #[cfg(test)]
+        PARKED_READERS.set(PARKED_READERS.get() + 1);
+        Some(Self::Parked(parked))
+    }
+
+    fn id(&self) -> NodeId {
+        match self {
+            Self::Parked(parked) => parked.id,
+            #[cfg(test)]
+            Self::Admitted(task, _) => task.id,
+        }
+    }
+
+    fn refuse<S: Steps>(self, w: &mut World<'_, S>, why: String) {
+        match self {
+            Self::Parked(parked) => w.plane.refuse_parked(w.now, parked, why),
+            #[cfg(test)]
+            Self::Admitted(task, _) => w.plane.refuse(w.now, task, why),
+        }
+    }
+}
+
 struct Build<S: Steps> {
     input: JobInput,
     front: Arc<S::Front>,
     /// The front end, written only here, on the loop: each task that reads it is posted with
     /// a reader made from it then, and a write waits for those readers to end.
     writer: S::Writer,
-    /// Reading tasks the plane asked to post while a write waited, posted once it is applied.
-    held: Vec<(Posting, bool)>,
+    /// Reading tasks parked while a write waited, readmitted once it is applied.
+    held: Vec<HeldReading>,
     /// Node `first + at` is of unit `units[at]`: one node a phase of its compile, a unit's
     /// nodes one after another ([`Phase`]), and one for a build script's run.
     first: NodeId,
@@ -1577,6 +1724,17 @@ struct Build<S: Steps> {
     /// Of a build of only the units a view's front end applies ([`Jobs::next`]): how far it
     /// is, as its nodes settle; none for a build the job ends with.
     applying: Option<Applying>,
+    /// Its units ended, but queued writes or an exclusive worker release still own the
+    /// front end. Completion is resumed by `apply_writes` only after those are done.
+    completing: Option<Completing>,
+}
+
+#[derive(Clone, Copy)]
+enum Completing {
+    Apply { ok: bool },
+    Build { ok: bool },
+    /// End-of-build diagnostics were checked once; the final release precedes keeping.
+    Keep { ok: bool, runs: bool, pack: bool },
 }
 
 /// Why the daemon lets go of the front ends it keeps ([`Jobs::let_go`]).
@@ -1853,6 +2011,9 @@ struct Job<S: Steps> {
     idle: bool,
     closed: bool,
     finished: bool,
+    /// The main request ended before its final release completed. Its history reads the
+    /// returned run log before keep, with any cancellation or release failure reflected.
+    pending_history: Option<(RequestId, RequestStats, profile_history::Outcome)>,
     cancelled: Arc<AtomicBool>,
     stage: Stage<S>,
     /// The value of the node its stage waits on, given before the node settles.
@@ -1913,6 +2074,9 @@ struct Job<S: Steps> {
     /// The store of its kept front end under way ([`Jobs::store_kept`]): the job is not
     /// reported done before it ends.
     storing: Option<Storing<S>>,
+    /// Its exclusive handoffs, counted through cancellation and a bounded discard. Normally
+    /// one; a duplicate late owned reply is also disposed of before this job can finish.
+    releasing: usize,
     /// The tickets of what its kept front end left for the store, each a put's own or that of
     /// the put that kept its value already, and of every put the loop made before it ended
     /// (what it may have read, [`Jobs::wind_up`]); and the checkout its front end is of. The job
@@ -1975,6 +2139,15 @@ struct Storing<S: Steps> {
     root: u32,
     checkout: String,
     value: Option<(Option<S::KeptFront>, Result<Vec<super::work::KeptPut>, ApiError>)>,
+}
+
+struct Releasing<S: Steps> {
+    owner: Arc<ReleaseOwner>,
+    request: RequestId,
+    /// Retained even if add/admission refuses the task before its worker takes the state.
+    work: Arc<Lock<Option<ReclaimWork<S>>>>,
+    discard: bool,
+    value: Option<Result<Option<<S::Writer as Writer<S>>::Released>, ApiError>>,
 }
 
 /// A job's lowering waiting for its root's front end, which is being stored
@@ -2413,6 +2586,19 @@ impl<S: Steps> Job<S> {
         }
     }
 
+    fn take_history(&mut self) -> Option<Ended> {
+        let (request, stats, outcome) = self.pending_history.take()?;
+        let outcome = match (
+            self.cancelled.load(Ordering::Acquire),
+            matches!(self.over, Some((false, _))),
+        ) {
+            (true, _) => profile_history::Outcome::Cancelled,
+            (false, true) => profile_history::Outcome::Failed,
+            (false, false) => outcome,
+        };
+        Some(self.ended(request, Some(stats), outcome))
+    }
+
     /// The history's rows of its plane request `request` ([`Job::row`]): its own, each image
     /// its units linked, and its units' crate graph.
     fn ended(
@@ -2663,7 +2849,7 @@ pub struct Jobs<S: Steps> {
     /// What a run of user code says, a buffer reused by each of its calls.
     out: Vec<Response>,
     /// The tasks a write held, a buffer reused by each [`Jobs::apply_writes`].
-    posts: Vec<(Posting, bool)>,
+    posts: Vec<HeldReading>,
     /// The jobs that end, a buffer reused by each [`Jobs::wind_up`].
     over: Vec<(JobId, bool, Option<ApiError>)>,
     /// The requests held back for memory, and the tasks granted memory running that they
@@ -2688,6 +2874,11 @@ pub struct Jobs<S: Steps> {
     /// The plane requests of kept front ends' stores ([`Jobs::store_kept`]), until each
     /// finishes: a store is part of its job's build, never a build of its own.
     store_requests: HashSet<RequestId, Global>,
+    /// Reclamation requests are part of the owning build, not independent build rows.
+    release_requests: HashSet<RequestId, Global>,
+    /// Exact owned handoffs, independent of a job's lifetime or its ordinary batch lookup.
+    /// A stalled job may go away before its worker reply; its state still has one owner here.
+    releasing: HashMap<NodeId, Releasing<S>, Global>,
     /// When, on the injected clock, a step of the store's commit last answered
     /// ([`Store::commit_steps`] moved): a wait for it to make puts durable gives up only once
     /// the commit has stood still for [`DURABLE_WITHIN`] ([`gave_up`]), so a large commit that
@@ -2799,6 +2990,8 @@ impl<S: Steps> Jobs<S> {
             held_leases: Vec::new(), // alloc: none until a stall
             lowering: Vec::new(), // alloc: none until a job lowers while its root's front end is stored
             store_requests: HashSet::new_in(Global),
+            release_requests: HashSet::new_in(Global),
+            releasing: HashMap::new_in(Global),
             store_heard: Duration::ZERO,
             commit_steps: 0,
             recheck: None,
@@ -3000,6 +3193,8 @@ impl<S: Steps> Jobs<S> {
             runs: 0,
             durable: blaze_cas::Tickets::default(),
             storing: None,
+            releasing: 0,
+            pending_history: None,
             stored: blaze_cas::Tickets::default(),
             stored_of: None,
             durable_since: None,
@@ -3063,6 +3258,13 @@ impl<S: Steps> Jobs<S> {
             && w.plane.is_open(storing.request)
         {
             w.plane.promote(w.now, storing.request);
+        }
+        for releasing in self.releasing.values() {
+            if Arc::ptr_eq(&job.cancelled, &releasing.owner.cancelled)
+                && w.plane.is_open(releasing.request)
+            {
+                w.plane.promote(w.now, releasing.request);
+            }
         }
     }
 
@@ -3249,7 +3451,9 @@ impl<S: Steps> Jobs<S> {
                     return;
                 }
                 let Some(this) = build.writer.reader() else {
-                    build.held.push((task, again));
+                    if let Some(held) = HeldReading::park(w, task, again) {
+                        build.held.push(held);
+                    }
                     return;
                 };
                 let images = match task.kind == kinds::UNIT_LINK || task.kind == kinds::PROGRAM_LINK
@@ -3358,10 +3562,21 @@ impl<S: Steps> Jobs<S> {
         }
         let order = std::mem::take(&mut self.order);
         let mut posts = std::mem::take(&mut self.posts);
+        let mut finishes = Vec::new(); // alloc: once per completed build or applied view
         for &id in &order {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
+            if job.releasing != 0 {
+                continue;
+            }
+            if !matches!(job.stage, Stage::Units(_)) && let Some(row) = job.take_history() {
+                self.rows.push(row);
+            }
             let Stage::Units(build) = &mut job.stage else { continue };
-            if !build.writer.waiting() && build.held.is_empty() {
+            if !build.writer.waiting() && build.held.is_empty() && build.completing.is_none() {
+                continue;
+            }
+            if let Some(release) = build.writer.take_release() {
+                self.release_front(w, id, release);
                 continue;
             }
             let applied = build.writer.apply();
@@ -3410,20 +3625,30 @@ impl<S: Steps> Jobs<S> {
                 }
                 (Ok(true), _) => {
                     posts.append(&mut build.held);
+                    if build.completing.is_some() {
+                        finishes.push(id);
+                    }
                     continue;
                 }
                 (Ok(false), _) => continue,
             };
-            for (task, _) in build.held.drain(..) {
-                w.plane.refuse(w.now, task, why.clone()); // clone: a write that broke, once per task it held
+            for held in build.held.drain(..) {
+                held.refuse(w, why.clone()); // clone: a write that broke, once per task it held
             }
             self.end(w, id, false, None);
         }
         self.order = order;
-        for (task, again) in posts.drain(..) {
-            self.post(w, task, again);
+        for held in posts.drain(..) {
+            match held {
+                HeldReading::Parked(parked) => w.plane.resume(w.now, parked),
+                #[cfg(test)]
+                HeldReading::Admitted(task, again) => self.post(w, task, again),
+            }
         }
         self.posts = posts;
+        for id in finishes {
+            self.finish_units(w, id);
+        }
     }
 
     /// What the plane did.
@@ -3597,6 +3822,7 @@ impl<S: Steps> Jobs<S> {
                     storing.value = Some((front, stored));
                 }
             }
+            Value::Released { owner, value } => self.returned_front(w, node, owner, value),
             value => {
                 if let Some(job) =
                     self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id)))
@@ -3615,9 +3841,14 @@ impl<S: Steps> Jobs<S> {
         why: Option<String>,
         skipped: Option<NodeId>,
     ) {
+        if self.releasing.contains_key(&node) {
+            self.released_front(w, node, ok, why);
+            return;
+        }
         let Some(id) = self.batches.job_of(node) else { return };
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         if let Stage::Units(build) = &mut job.stage {
+            build.held.retain(|it| it.id() != node);
             build.settled(node, ok, why.as_deref(), skipped);
         }
         // Its store settles after the job is over: what it left for the store is put still.
@@ -4255,6 +4486,246 @@ impl<S: Steps> Jobs<S> {
         self.add(w, id, fresh, Some(work), false);
     }
 
+    /// Moves the exclusive front end to one accounted worker task. Its request is separate
+    /// from the compile request, which may already be closed. Cancelling the build leaves
+    /// this bounded cleanup task to finish; it gives back no database for a cancelled job.
+    fn release_front(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        release: <S::Writer as Writer<S>>::Release,
+    ) {
+        let job = self.jobs.get(key_of(id)).expect("only a live job takes a writer's release");
+        let Stage::Units(build) = &job.stage else {
+            unreachable!("only a build takes a writer's release")
+        };
+        assert_eq!(job.releasing, 0, "a writer transfers its front end only once at a time");
+        // alloc: one handoff identity; its worker, result and bounded cleanup share it.
+        let owner = Arc::new(ReleaseOwner {
+            id,
+            checkout: build.input.config.invocation.root.clone(),
+            cancelled: Arc::clone(&job.cancelled),
+        });
+        self.reclaim_front(w, owner, ReclaimWork::Release(release));
+    }
+
+    /// One ownership-preserving admission. A refused release retains its input in `work`
+    /// and gets exactly one discard continuation. A refused discard has no further retry.
+    fn reclaim_front(
+        &mut self,
+        w: &mut World<'_, S>,
+        owner: Arc<ReleaseOwner>,
+        state: ReclaimWork<S>,
+    ) {
+        let discard = matches!(state, ReclaimWork::Discard(_));
+        let job = self.jobs.get_mut(key_of(owner.id))
+            .filter(|job| Arc::ptr_eq(&job.cancelled, &owner.cancelled));
+        let idle = job.is_some_and(|job| {
+            job.releasing += 1;
+            job.idle
+        });
+        let request = w.plane.open(w.now, false, idle);
+        let checkout = &owner.checkout;
+        let action = if discard { "discarding the front end of " } else { "releasing the front end of " };
+        let name = named(action, checkout);
+        let mut fresh = w.plane.fresh(1, name.len(), 0);
+        let mut release_node = node(NodeKind::Store, &name, &[], Pool::Work, None);
+        // Even a release measured at zero uses a positive grant, so a pressure cap cannot
+        // turn it into unaccounted work. Larger predictions and measured refusals still apply.
+        release_node.memory = 1;
+        let (kind, learn) = if discard {
+            (kinds::FRONT_DISCARD, discard_cost_key(checkout))
+        } else {
+            (kinds::FRONT_RELEASE, release_cost_key(checkout))
+        };
+        #[cfg(test)]
+        RECLAIM_ATTEMPTS.with_borrow_mut(|it| it.push(kind));
+        w.plane.push_learned(&mut fresh, release_node, one(kind), learn);
+        let node = fresh.first();
+        // alloc: one cell per handoff. The loop retains ownership if admission removes the
+        // unstarted batch; the worker takes it before doing any release or destruction.
+        let cell = Arc::new(Lock::new("serve.job.release.front", Some(state)));
+        let work = Step::of(&owner.cancelled, Does::Release {
+            work: Arc::clone(&cell),
+            owner: Arc::clone(&owner),
+            discard,
+        });
+        #[cfg(test)]
+        if !discard && INLINE_RELEASE.get() {
+            // The former loop execution, planted to prove a held-worker oracle notices it.
+            drop(plane::Work::run(&work, 0, Readers::default()));
+        }
+        self.release_requests.insert(request);
+        self.releasing.insert(node, Releasing {
+            owner, request, work: cell, discard, value: None,
+        });
+        let added = w.plane.add_reclaim(w.now, request, fresh, work);
+        w.plane.close(w.now, request);
+        if let Err(error) = added {
+            let why = format!("the plane refused admission: {error}"); // alloc: a refused handoff
+            self.released_front(w, node, false, Some(why));
+        }
+    }
+
+    /// Keep a result with its exact handoff before settlement. Duplicate and unmatched
+    /// owned replies take the same one-discard path, even after a stall removed the job.
+    fn returned_front(
+        &mut self,
+        w: &mut World<'_, S>,
+        node: NodeId,
+        owner: Arc<ReleaseOwner>,
+        value: Result<Option<<S::Writer as Writer<S>>::Released>, ApiError>,
+    ) {
+        #[cfg(test)]
+        if matches!(&value, Ok(Some(_))) {
+            if CANCEL_RELEASE_RETURN.replace(false) {
+                self.cancel_job(w, owner.id);
+            }
+            if STALL_RELEASE_RETURN.replace(false) {
+                self.stalled(w, &ApiError::new("serve-test: stall after the worker returned", None));
+            }
+        }
+        if let Some(releasing) = self.releasing.get_mut(&node)
+            && Arc::ptr_eq(&releasing.owner, &owner)
+            && releasing.value.is_none()
+        {
+            releasing.value = Some(value);
+            return;
+        }
+        let error = ApiError::new(
+            "the front end release returned an unmatched or duplicate owned result",
+            Some(owner.checkout.clone()), // clone: a malformed handoff's identity
+        );
+        self.reclaim_failed(w, &owner, error, false);
+        match value {
+            Ok(Some(front)) => {
+                // alloc: one exceptional result, not a retry of its release.
+                self.reclaim_front(w, owner, ReclaimWork::Discard(vec![FrontState::Returned(front)]));
+            }
+            Err(error) => self.reclaim_failed(w, &owner, error, false),
+            Ok(None) => {}
+        }
+    }
+
+    /// The exact release node settled. Its successful state returns to the writer before
+    /// another write, reader or final keep; a failure ends only this job, preserving its cause.
+    fn released_front(
+        &mut self,
+        w: &mut World<'_, S>,
+        node: NodeId,
+        ok: bool,
+        why: Option<String>,
+    ) {
+        let Some(releasing) = self.releasing.remove(&node) else { return };
+        let Releasing { owner, work, discard, value, .. } = releasing;
+        if let Some(job) = self.jobs.get_mut(key_of(owner.id))
+            .filter(|job| Arc::ptr_eq(&job.cancelled, &owner.cancelled))
+        {
+            job.releasing = job.releasing.checked_sub(1)
+                .expect("each exact handoff is retired once");
+        }
+        // Taking the backup is constant work: the database itself goes to the discard task.
+        let pending = work.lock().take();
+        let mut states = Vec::new(); // alloc: none unless ownership needs the discard path
+        match pending {
+            Some(ReclaimWork::Release(front)) => states.push(FrontState::Pending(front)),
+            Some(ReclaimWork::Discard(mut held)) => states.append(&mut held),
+            None => {}
+        }
+        let answered = value.is_some();
+        let (mut returned, mut error) = match value {
+            Some(Ok(front)) => (front, None),
+            Some(Err(error)) => (None, Some(error)),
+            None => (None, None),
+        };
+        let cancelled = owner.cancelled.load(Ordering::Acquire);
+        if error.is_none()
+            && (!ok || !answered || (!discard && returned.is_none() && !cancelled))
+        {
+            let why = why.as_deref().unwrap_or("no exclusive database was returned");
+            let what = format!("the front end release of {} did not complete: {why}", owner.checkout); // alloc: a failed handoff
+            error = Some(ApiError::new(what, Some(owner.checkout.clone())));
+        }
+        if !discard && error.is_none() && !states.is_empty() {
+            error = Some(ApiError::new(
+                "the front end release settled without consuming its exclusive input",
+                Some(owner.checkout.clone()), // clone: an inconsistent handoff's identity
+            ));
+        }
+        if !discard && ok && error.is_none() && states.is_empty() && !cancelled
+            && let Some(job) = self.jobs.get_mut(key_of(owner.id))
+                .filter(|job| Arc::ptr_eq(&job.cancelled, &owner.cancelled))
+            && let Stage::Units(build) = &mut job.stage
+            && let Some(front) = returned.take()
+        {
+            match build.writer.released(front) {
+                Ok(()) => return,
+                Err((why, front)) => {
+                    error = Some(why);
+                    returned = Some(front);
+                }
+            }
+        }
+        #[cfg(test)]
+        if !discard && cancelled && DROP_LATE_RETURN.get() {
+            drop(returned.take());
+        }
+        if let Some(front) = returned {
+            states.push(FrontState::Returned(front));
+        }
+        if discard {
+            if error.is_some() || !states.is_empty() {
+                let why = error.as_ref().map_or("its worker did not consume the owned state", |it| it.what.as_str());
+                let what = format!(
+                    "the single bounded front end discard of {} did not complete: {why}; no further cleanup task is retried{}",
+                    owner.checkout,
+                    if states.is_empty() { "" } else { "; the remaining owned state is dropped on the loop" },
+                ); // alloc: the explicitly terminal cleanup limit
+                self.reclaim_failed(w, &owner, ApiError::new(what, Some(owner.checkout.clone())), true);
+                // This is the named terminal limit, not another admission or a reset of its
+                // measured cost. The watchdog remains armed during this unavoidable drop.
+                let _span = tracing::info_span!(target: "blaze", "terminal front end discard", checkout = %owner.checkout).entered();
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(states)));
+                if let Err(payload) = caught {
+                    let what = format!("blaze {}, in the terminal front end discard", plane::panicked(&*payload));
+                    self.reclaim_failed(w, &owner, ApiError::new(what, Some(owner.checkout.clone())), true);
+                }
+            }
+            return;
+        }
+        if let Some(error) = error {
+            self.reclaim_failed(w, &owner, error, false);
+        }
+        if !states.is_empty() {
+            self.reclaim_front(w, owner, ReclaimWork::Discard(states));
+        }
+    }
+
+    /// Preserve a build's original failure; a terminal cleanup failure adds its own cause.
+    /// A late handoff cannot fail or attach to a different incarnation of the owner.
+    fn reclaim_failed(
+        &mut self,
+        w: &mut World<'_, S>,
+        owner: &ReleaseOwner,
+        error: ApiError,
+        cleanup: bool,
+    ) {
+        let Some(job) = self.jobs.get_mut(key_of(owner.id))
+            .filter(|job| Arc::ptr_eq(&job.cancelled, &owner.cancelled))
+        else {
+            eprintln!("blaze serve: {}", error.what);
+            return;
+        };
+        if cleanup && let Some((ok, Some(original))) = &mut job.over {
+            *ok = false;
+            original.what.push_str("; ");
+            original.what.push_str(&error.what);
+        } else {
+            fail_over(&mut job.over, error);
+        }
+        self.end(w, owner.id, false, None);
+    }
+
     /// What job `id`'s build left for the store, written from its front end as it is kept
     /// ([`Steps::store_kept`]) by one task of a plane request of its own, as the job's other
     /// tasks are done with it. The front end is the root's again once the puts are made
@@ -4738,6 +5209,7 @@ impl<S: Steps> Jobs<S> {
             accounted: vec![false; verdicts.len()], // alloc: once per build, a flag per unit
             verdicts,
             applying: applying.then_some(Applying { left: count, failed: false }),
+            completing: None,
         }));
         if count > 0 {
             self.add(w, id, nodes, Some(work), true);
@@ -5589,7 +6061,7 @@ impl<S: Steps> Jobs<S> {
         // A kept front end's store is part of its job's build, which was marked as it finished.
         // Its node settled before its request finishes, which clears the job's `storing`: the
         // set says, not the job.
-        if self.store_requests.remove(&request) {
+        if self.store_requests.remove(&request) || self.release_requests.remove(&request) {
             // No job looks at a store's request: its live model goes as it finishes.
             w.plane.forget(request);
             return;
@@ -5621,7 +6093,11 @@ impl<S: Steps> Jobs<S> {
         };
         #[cfg(test)]
         ENDED_ROWS.with_borrow_mut(|it| it.push(command_line(&job.work))); // alloc: a test's record
-        self.rows.push(job.ended(request, Some(stats), outcome));
+        if job.releasing == 0 && !matches!(job.stage, Stage::Units(_)) {
+            self.rows.push(job.ended(request, Some(stats), outcome));
+        } else {
+            job.pending_history = Some((request, stats, outcome));
+        }
         w.macros.flush();
         // The snapshot waits on the last ticket; a verdict the store refuses fails the job.
         let published = w.macros.keeps().publish(w.store, proc_macro_api::kept::take_puts());
@@ -5644,8 +6120,6 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         let ok = ok && job.over.is_none();
-        let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
-        let pack = ok && matches!(job.work, Work::Pack { .. } | Work::Doc { .. });
         if let Stage::Units(build) = &job.stage
             && build.applying.is_some()
         {
@@ -5663,42 +6137,80 @@ impl<S: Steps> Jobs<S> {
             self.end(w, id, false, Some(error));
             return;
         }
-        // What a failed build left unchecked, before its `Built` and the job's end.
-        if let Stage::Units(build) = &job.stage
-            && let Some(unchecked) = build.unchecked(!keeps_going(&job.work))
-        {
-            w.said.push(Said::Report(id, Response::Unchecked(unchecked)));
+        if let Stage::Units(build) = &mut job.stage {
+            build.completing = Some(Completing::Build { ok });
         }
-        let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
-        let Build { input, front, mut writer, artifacts, evaluation, root, units, .. } = *build;
-        // A lint over every configuration denied (`blaze::dead` at `deny`) fails the build as
-        // a unit's denied lint does.
-        let mut denied = false;
-        match writer.finished(ok, &units) {
-            Ok(warnings) => {
-                for warning in warnings {
-                    denied |= warning.level == blaze_api::Level::Error;
-                    w.said.push(Said::Report(id, Response::Diagnostic(warning)));
+    }
+
+    /// Completes a build or an applied view only with its front end back and every queued
+    /// write applied. End diagnostics run once; the final release then uses the same handoff.
+    fn finish_units(&mut self, w: &mut World<'_, S>, id: JobId) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        if job.releasing != 0 {
+            return;
+        }
+        let Stage::Units(build) = &mut job.stage else { return };
+        if build.writer.waiting() {
+            return;
+        }
+        let Some(completing) = build.completing else { return };
+        if let Completing::Apply { ok } = completing {
+            self.units_applied_ready(w, id, ok);
+            return;
+        }
+        if let Completing::Build { ok } = completing {
+            let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
+            let pack = ok && matches!(job.work, Work::Pack { .. } | Work::Doc { .. });
+            // What a failed build left unchecked, before its `Built` and the job's end.
+            if let Some(unchecked) = build.unchecked(!keeps_going(&job.work)) {
+                w.said.push(Said::Report(id, Response::Unchecked(unchecked)));
+            }
+            // A lint over every configuration denied fails the build as a denied unit does.
+            let mut denied = false;
+            match build.writer.finished(ok, &build.units) {
+                Ok(warnings) => {
+                    for warning in warnings {
+                        denied |= warning.level == blaze_api::Level::Error;
+                        w.said.push(Said::Report(id, Response::Diagnostic(warning)));
+                    }
+                }
+                Err(error) => {
+                    self.end(w, id, false, Some(error));
+                    return;
                 }
             }
-            Err(error) => {
-                self.end(w, id, false, Some(error));
-                return;
+            let (ok, runs, pack) = (ok && !denied, runs && !denied, pack && !denied);
+            let served = match build.writer.served() {
+                Ok(it) => it,
+                Err(error) => {
+                    self.end(w, id, false, Some(error));
+                    return;
+                }
+            };
+            if build.input.verbose > 0 {
+                for note in served.iter().filter_map(noted).chain(build.writer.goals_noted()) {
+                    w.said.push(Said::Report(id, Response::Diagnostic(note)));
+                }
+            }
+            job.served = served;
+            build.completing = Some(Completing::Keep { ok, runs, pack });
+            if build.root.is_some() && !pack {
+                build.writer.ending();
+                if let Some(release) = build.writer.take_release() {
+                    self.release_front(w, id, release);
+                    return;
+                }
+                if build.writer.waiting() {
+                    return;
+                }
             }
         }
-        let (ok, runs, pack) = (ok && !denied, runs && !denied, pack && !denied);
-        let served = match writer.served() {
-            Ok(it) => it,
-            Err(error) => {
-                self.end(w, id, false, Some(error));
-                return;
-            }
-        };
-        if input.verbose > 0 {
-            for note in served.iter().filter_map(noted).chain(writer.goals_noted()) {
-                w.said.push(Said::Report(id, Response::Diagnostic(note)));
-            }
+        let Some(Completing::Keep { ok, runs, pack }) = build.completing else { return };
+        if let Some(row) = job.take_history() {
+            self.rows.push(row);
         }
+        let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
+        let Build { input, front, writer, artifacts, evaluation, root, .. } = *build;
         // A pack's front end is not kept: recording its expansions changes its proc macros; nor
         // is the documentation's, which sets `cfg(doc)`.
         let packing = match pack {
@@ -5719,9 +6231,6 @@ impl<S: Steps> Jobs<S> {
                 None
             }
         };
-        if let Some(job) = self.jobs.get_mut(key_of(id)) {
-            job.served = served;
-        }
         let profile = input.units.finished.clone(); // clone: the report owns it, once per build
         let members = input.units.packages.iter().filter(|it| it.is_member).count();
         let members = u32::try_from(members).unwrap_or(u32::MAX);
@@ -5849,6 +6358,14 @@ impl<S: Steps> Jobs<S> {
     /// every one of them built: what its front end found wrong once all of it ran said, and the
     /// view handed to [`Jobs::applied`].
     fn units_applied(&mut self, w: &mut World<'_, S>, id: JobId, ok: bool) {
+        let _ = w;
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let Stage::Units(build) = &mut job.stage else { return };
+        build.completing = Some(Completing::Apply { ok });
+    }
+
+    /// The applied view's release and writes have finished; it may be handed to readers.
+    fn units_applied_ready(&mut self, w: &mut World<'_, S>, id: JobId, ok: bool) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
         let Build { input, front, mut writer, root, units, .. } = *build;
@@ -6026,7 +6543,7 @@ impl<S: Steps> Jobs<S> {
             );
         }
         match &job.stage {
-            Stage::Units(build) if build.held.iter().any(|(task, _)| task.id == node) => {
+            Stage::Units(build) if build.held.iter().any(|it| it.id() == node) => {
                 Some("a task held until its job's write is applied (Jobs::apply_writes)")
             }
             _ => None,
@@ -6077,6 +6594,7 @@ impl<S: Steps> Jobs<S> {
                 // found with no task to run is ended too, never left waiting.
                 jobs.get(key_of(*id)).is_some_and(|it| {
                     !it.idle || (it.request.is_some() && !it.finished) || it.storing.is_some()
+                        || it.releasing != 0
                 })
             })
             .collect(); // alloc: once a stall
@@ -6166,12 +6684,17 @@ impl<S: Steps> Jobs<S> {
         self.native_let_go(id, true);
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.cancelled.store(true, Ordering::Release);
-        job.over.get_or_insert((false, None));
-        if matches!(job.stage, Stage::Snapshot { .. }) {
-            job.stage = Stage::Over;
+        match &mut job.over {
+            Some((ok, _)) => *ok = false,
+            None => job.over = Some((false, None)),
         }
         refuse_held(w, &mut job.stage);
         end_held_runs(w, job, "was cancelled");
+        // Its worker release is owned separately and still counted. The build itself must
+        // retire even if its compile request finished before this cancellation arrived.
+        if matches!(job.stage, Stage::Units(_) | Stage::Snapshot { .. }) {
+            job.stage = Stage::Over;
+        }
         if let (Some(request), false) = (job.request, job.finished) {
             // Finished at the plane, its word not yet read here: nothing is left to cancel.
             if w.plane.is_open(request) {
@@ -6308,6 +6831,8 @@ impl<S: Steps> Jobs<S> {
                 && job.placing == 0
                 && job.runs == 0
                 && job.storing.is_none()
+                && job.releasing == 0
+                && !matches!(job.stage, Stage::Units(_))
                 && !matches!(job.stage, Stage::Runs(..)))
             {
                 continue;
@@ -6661,8 +7186,8 @@ fn stage_name<S: Steps>(stage: &Stage<S>) -> &'static str {
 /// The reading tasks a job held for a write ended unposted: the job is over or cancelled.
 fn refuse_held<S: Steps>(w: &mut World<'_, S>, stage: &mut Stage<S>) {
     if let Stage::Units(build) = stage {
-        for (task, _) in build.held.drain(..) {
-            w.plane.refuse(w.now, task, "cancelled".to_owned()); // alloc: a cancel, once per task held
+        for held in build.held.drain(..) {
+            held.refuse(w, "cancelled".to_owned()); // alloc: a cancel, once per task held
         }
     }
 }

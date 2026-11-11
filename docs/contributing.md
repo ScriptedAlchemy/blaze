@@ -236,11 +236,12 @@ files are, what they hold, the DuckDB queries that answer each question and the 
   with the commits since the last green one ([harness.md](harness.md#ci)). The gate letting a
   change through is not the harnesses passing on it.
 - blaze builds in the flake's dev shell, against the LLVM it pins:
-  `nix develop -c cargo build -p blaze-engine --release` ([LLVM](#llvm)).
+  `nix develop -c blaze build --locked -p blaze-engine --release` ([LLVM](#llvm)).
 - `blaze fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
   pull request's diff should be its change), and
-  `cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
-  `python3 harness/unittests.py`, the one `cargo test` CI runs, with the failures it expects).
+  `blaze test --release --locked -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
+  `python3 harness/unittests.py`, CI's Blaze selection with the failures it expects). This helper
+  refuses the old Cargo option; a platform without a Blaze bootstrap remains unsupported.
   A test that fails is new unless `harness/known-failures.toml` lists it with an owner:
   `uv run --frozen harness/failures.py '{"run": {"runner": "blaze", "packages": [...]}}'` runs the
   crates you touched and says which failures are new ([harness.md](harness.md#ci)).

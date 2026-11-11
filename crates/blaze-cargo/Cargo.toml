@@ -136,6 +136,7 @@ libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
 libc.workspace = true
 
 [dev-dependencies]
+hegeltest.workspace = true
 # Counts allocations for the budget tests (`serve/unit/test/tests.rs` installs it).
 blaze-alloc-count.workspace = true
 # The front end's code identity held to what building it read (`tests/front_end_identity.rs`).

@@ -2,7 +2,145 @@ use blaze_graph::admission::Pressure;
 use blaze_mem::Tag;
 use blaze_query::db::MemoryUsage;
 
-use super::{Finished, Holders, Plan, Release, Rows, Said};
+use super::{FinalRelease, Finished, Holders, Plan, Release, Rows, Said};
+use hegel::{TestCase, generators as gs};
+
+#[derive(Clone, Copy)]
+enum CompletionPlant {
+    None,
+    Pressure,
+    Finished,
+    End,
+}
+
+fn completed_plan(
+    compiles: bool,
+    pressed: bool,
+    ended: bool,
+    open: bool,
+    count: usize,
+    plant: CompletionPlant,
+) -> Result<(), String> {
+    let fine = || Pressure { held: 1, limit: 1000, over: None };
+    let mut release = Release::of(
+        Finished::new((0..count + 2).map(|it| Some(it as u32)).collect()), compiles,
+    );
+    release.began(0);
+    release.compiled_under(0, fine);
+    release.pressed();
+    let frozen = release.plan().ok_or("the first plan was not frozen")?;
+    for unit in 1..=count {
+        release.began(unit);
+        release.compiled_under(unit, fine);
+    }
+    if open {
+        release.began(count + 1);
+    }
+    if pressed {
+        release.pressed();
+    }
+    if ended {
+        release.end();
+    }
+    release.released(frozen.pressed, fine());
+    match plant {
+        CompletionPlant::None => {}
+        CompletionPlant::Pressure => release.pressed = false,
+        CompletionPlant::Finished => release.finished.ready.clear(),
+        CompletionPlant::End => release.ended = false,
+    }
+    if release.due() != (pressed || ended || (compiles && !open)) {
+        return Err("completion erased a later release request".to_owned());
+    }
+    let expected = if compiles {
+        Some(Plan {
+            crates: (1..=count).map(|it| it as u32).collect(),
+            mir: pressed || ended || !open, pressed, ended,
+        })
+    } else {
+        (pressed || ended).then(|| Plan { crates: Vec::new(), mir: true, pressed, ended })
+    };
+    let next = release.plan();
+    if next != expected {
+        return Err(format!("completion changed the later plan: {next:?}, expected {expected:?}"));
+    }
+    Ok(())
+}
+
+/// The invariant: completing one frozen worker plan changes only its squeeze measure;
+/// later pressure, completed crates and end requests survive in the next exact plan.
+#[hegel::test(test_cases = 64)]
+fn completion_preserves_later_pressure_finished_crates_and_end(tc: TestCase) {
+    completed_plan(
+        tc.draw(gs::booleans()), tc.draw(gs::booleans()), tc.draw(gs::booleans()),
+        tc.draw(gs::booleans()), usize::from(tc.draw(gs::integers::<u8>().max_value(3))) + 1,
+        CompletionPlant::None,
+    ).unwrap();
+}
+
+#[test]
+fn the_oracle_catches_completion_erasing_later_pressure() {
+    assert!(completed_plan(false, true, false, true, 1, CompletionPlant::Pressure).is_err());
+}
+
+#[test]
+fn the_oracle_catches_completion_erasing_later_finished_crates() {
+    assert!(completed_plan(true, false, false, false, 1, CompletionPlant::Finished).is_err());
+}
+
+#[test]
+fn the_oracle_catches_completion_erasing_a_later_end() {
+    assert!(completed_plan(false, false, true, true, 1, CompletionPlant::End).is_err());
+}
+
+fn final_policy(pending_before: bool, after_return: bool, reuse_old: bool) -> Result<(), &'static str> {
+    let mut final_release = FinalRelease::default();
+    if final_release.request(pending_before) == pending_before {
+        return Err("a final plan was scheduled before its prior inputs applied");
+    }
+    if pending_before {
+        final_release.written();
+        if !final_release.applied() {
+            return Err("applying prior inputs lost the standing final request");
+        }
+    }
+    if after_return {
+        final_release.released(true, false);
+        final_release.written();
+    } else {
+        final_release.written();
+        final_release.released(true, true);
+    }
+    if final_release.ready() || !final_release.applied() {
+        return Err("a late input lost its required newer final plan");
+    }
+    if reuse_old {
+        final_release.reuse_older_plan_for_test();
+    }
+    final_release.released(false, false);
+    if final_release.ready() {
+        return Err("an older or nonfinal plan authorized keep after a late input");
+    }
+    final_release.released(true, false);
+    if !final_release.ready() {
+        return Err("the final plan after the last write did not authorize keep");
+    }
+    Ok(())
+}
+
+/// The invariant: the production FinalRelease policy schedules the final plan after all
+/// writes and accepts only its completion, including a late write on either side of return.
+#[hegel::test(test_cases = 32)]
+fn final_release_policy_requires_completion_after_every_late_write(tc: TestCase) {
+    final_policy(tc.draw(gs::booleans()), tc.draw(gs::booleans()), false).unwrap();
+}
+
+#[test]
+fn the_oracle_catches_reusing_a_final_plan_before_a_late_write() {
+    for after_return in [false, true] {
+        assert!(final_policy(false, after_return, true).unwrap_err().contains("authorized keep"));
+    }
+}
 
 /// A crate is finished once every unit of it compiled, never before, and once; a unit is open
 /// from its first task to its compile's end, and a build script's run (no crate) or a unit

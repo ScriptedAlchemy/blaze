@@ -5,14 +5,15 @@ usage: unittests.py [CONFIG]
 
 CONFIG is one JSON object, inline, in a file, or `-` for standard input, `{}` when left out:
 
-    {"cargo": false, "build": false, "args": ["<test argument>", ...], "max_mb": 0}
+    {"build": false, "args": ["<test argument>", ...], "max_mb": 0}
 
 `max_mb`, when not 0, fails the run when the machine had more than that many megabytes of memory
 and swap in use at once while it ran (docs/memory-budget.md, the check in CI).
 
 Runs `blaze test --release --no-fail-fast` of CRATES with their default features, blaze-engine's
-`native` (LLVM among them) included (blaze tests blaze, AGENTS.md rule blaze-builds-blaze;
-`"cargo": true`: plain `cargo test`, on Windows, which has no release of blaze to test with yet), one run in the root workspace, with `args` after its own.
+`native` (LLVM among them) included (blaze tests blaze, AGENTS.md rule blaze-builds-blaze),
+one run in the root workspace, with `args` after its own. A platform without a Blaze
+bootstrap cannot run this helper; the removed `cargo` configuration field is refused.
 `"build": true` is CI's build job: `blaze build` of the same packages with the same profile and
 features, so that each library it compiles has the key the test build asks for (a crate of the
 workspace is keyed by its features, by whether it is of a package named, `CARGO_PRIMARY_PACKAGE`,
@@ -23,7 +24,7 @@ the run is passed on as it comes, so a CI log shows a slow build while it is slo
 output is kept in `target/known-failures/unittests.log` and held to harness/known-failures.toml
 by harness/failures.py: a failing test that is not listed there fails the run, and so does a
 listed test that passes or no longer exists (take it out), and a test binary that does not
-finish; so does the cargo run failing before any of its tests failed. Each listed failure has an
+finish; so does Blaze failing before any of its tests failed. Each listed failure has an
 owner and a cause. `blaze-diagnostics` is the daemon's errors (its diagnostics are the verdict).
 """
 import dataclasses, json, os, re, shutil, signal, subprocess, sys, threading, time, typing
@@ -239,8 +240,6 @@ def read(proc, seen, failed, kept):
 
 @dataclasses.dataclass(frozen=True)
 class Config:
-    # Plain `cargo test`, where there is no release of blaze to test with (Windows).
-    cargo: bool = False
     # `blaze build` of what the tests are built on, and no tests: CI's build job.
     build: bool = False
     # Passed after the command's own arguments.
@@ -275,23 +274,16 @@ def config(argv: list[str]) -> Config:
 
 def main():
     cfg = config(sys.argv[1:])
-    plain, args = cfg.cargo, cfg.args
-    if cfg.build and plain:
-        sys.exit("unittests.py: `build` is blaze's build, not cargo's")
     packages = [f"-p{c}" for c in CRATES]
-    if plain:
-        command = ["cargo", "test", "--release", "--no-fail-fast", *packages, *args]
-    else:
-        verb = ["build"] if cfg.build else ["test", "--no-fail-fast"]
-        command = ["blaze", *verb, "--release", "--locked", *packages, *args]
+    verb = ["build"] if cfg.build else ["test", "--no-fail-fast"]
+    command = ["blaze", *verb, "--release", "--locked", *packages, *cfg.args]
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
     # blaze's frames are larger than rustc's, and blaze-diagnostics' 5204-arm test overflows the
     # 2 MiB a test thread has, which aborts its whole program
     # (https://github.com/indexable-inc/blaze/issues/894). Not a `--skip`: an argument to the
     # tests has blaze run every test, not those an edit reached.
-    if not plain:
-        env.setdefault("RUST_MIN_STACK", str(16 << 20))
+    env.setdefault("RUST_MIN_STACK", str(16 << 20))
     seen, failed = set(), set()
     watch_dirs = [ROOT, *(d for d in [os.environ.get("BLAZE_CACHE"), "/mnt"] if d)]
     log = os.path.join(env["CARGO_TARGET_DIR"], "known-failures", "unittests.log")
@@ -311,7 +303,7 @@ def main():
     if cfg.build:
         sys.exit(status or (1 if over else 0))
     print(f"\n{len(seen)} tests, {len(failed)} failed; held to harness/known-failures.toml:", flush=True)
-    context = failures.Context("cargo" if plain else "blaze", "release", failures.this_os())
+    context = failures.Context("blaze", "release", failures.this_os())
     try:
         held = failures.check([failures.Path(log)], context, report=failures.Path(log).with_suffix(".json"))
     except failures.Refused as e:

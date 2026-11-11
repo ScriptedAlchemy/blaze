@@ -108,6 +108,20 @@ A build is many jobs, so two revisions' builds overlap. The first job of a newer
 `BLAZE_DIST_SOURCE` cancels the older revision's executions that nothing else waits for, and a job
 of a source its pull request has replaced is refused (`Refusal::Superseded`).
 
+## The signed global cache
+
+`blaze-global` has a separate signed-record and bundle client over TLS. Its library tests
+exercise publication and an empty-store download through the real TLS channels, with controls
+for an untrusted certificate, a wrong server name, an untrusted or damaged manifest signature,
+an untrusted standalone value signature, and a value that differs from its signed manifest.
+A trusted manifest authorizes its exact listed records. The network and disk completions come from
+`blaze-core`'s seeded simulation. The required source-built protocol job runs these tests.
+
+The compiler daemon does not yet drive that bundle client, and `blaze-global::PINNED` has no
+publisher keys. A trusted service and publisher policy, daemon integration, a real cached-tree
+build, and causal evidence that remote IO stays off the critical path are still needed for D11.
+The distributed pack-cache acceptance described above does not establish those properties.
+
 ## Data shapes
 
 Every value on the wire is deterministic CBOR: a struct is a map of small integers with every key
