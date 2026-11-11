@@ -145,6 +145,10 @@ blaze-cas = { workspace = true, features = ["test-hooks"] }
 tokio = { workspace = true, features = ["net"] }
 lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
 tempfile.workspace = true
+# A local TLS mirror for the library downloader's real redirect path, trusted only by its child test.
+base64.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 uds_windows.workspace = true

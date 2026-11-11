@@ -385,6 +385,10 @@ pub fn built_commit() -> &'static str {
     upstream_commit(UPSTREAM).expect("library/UPSTREAM has a commit: harness/library.py import")
 }
 
+#[cfg(all(test, unix))]
+#[path = "library/download_tests.rs"]
+mod download_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,7 +398,9 @@ mod tests {
         let local = Path::new("/checkout/library");
         for (given, releases, checkout, want) in [
             (Some("/explicit"), Some("/mirror"), Some(local), "/explicit"),
-            (None, Some("/mirror"), Some(local), "/mirror/v1"),
+            (None, Some("/mirror"), Some(local), "/checkout/library"),
+            (None, Some("/mirror"), None, "/mirror/v1"),
+            (None, Some("https://unavailable.invalid"), Some(local), "/checkout/library"),
             (
                 None,
                 Some("https://mirror.invalid/releases/"),
@@ -476,7 +482,15 @@ mod tests {
         let copy = work.path().join("home/library/copy/library");
         let said = fetch_into(&copy, lying.to_str().unwrap(), &want).unwrap_err().to_string();
         assert!(said.contains("is not the library blaze was built with"), "{said}");
-        let copied = fetch_into(&copy, one.to_str().unwrap(), &want).unwrap();
+        let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        unavailable.set_nonblocking(true).unwrap();
+        let mirror = format!("https://{}", unavailable.local_addr().unwrap());
+        let selected = source(None, Some(&mirror), Some(&one), "0.0.0-dev").unwrap();
+        assert_eq!(Path::new(&selected), one);
+        let copied = fetch_into(&copy, &selected, &want).unwrap();
         assert_eq!(digest_of(&copied.dir).unwrap(), want);
+        assert!(
+            matches!(unavailable.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+        );
     }
 }
