@@ -52,7 +52,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 99);
+    assert_eq!(blaze_lints().len(), 102);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -243,7 +243,6 @@ fn counts_are_rustcs() {
             "blaze::pedantic_perf",
             "blaze::edition",
             "blaze::internal",
-            "blaze::edition",
             "blaze::reach",
             "blaze::proc_macro",
         ]
