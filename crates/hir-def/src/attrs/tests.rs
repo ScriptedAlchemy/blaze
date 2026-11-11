@@ -259,6 +259,7 @@ fn old_match_attr_flags(
                     "blaze" if &*second_segment == "may" => attr_flags.insert(AttrFlags::MAY),
                     "blaze" if &*second_segment == "multiversion" => {
                         attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION)
+                    }
                     "blaze" if &*second_segment == "drop" => {
                         // The words of the list, as `tt_has_token` finds them.
                         let text = tt.syntax().text().to_string();
