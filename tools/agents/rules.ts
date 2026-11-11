@@ -510,6 +510,22 @@ export const rules = [
 		reason: "Andrew, 2026-11-10, when a design for fractional shares was being bent around const generic arithmetic: \"we have our own thing and should be able to do proper const generics\".",
 		link: "docs/v2/plan/design/edition.md",
 	},
+	{
+		id: "reflection-first",
+		skill: "compiler-correctness",
+		line: "Derive a property of a type or a function with blaze's compile-time reflection, not an auto trait, a proc macro or a special case in the compiler, wherever reflection is the more powerful; where reflection cannot yet say something that is possible, improve the language until it can.",
+		info: "A property that follows from the shape of a type or the body of a function (it holds no capability, it cannot own itself, every field is in its key, it is serializable) is written once as compile-time Rust over reflected code (docs/v2/plan/design/comptime.md) and stated as a trait with a blanket impl over what the reflection finds: it can ask the real question (does a shared, mutable pointer lead back to this type), is decided per instance, and its refusal names the field path. An auto trait can only say \"every field has it\" and fails with no reason; a proc macro is opaque to blaze (`blaze::proc_macro`); a check built into the compiler serves one property. Use those only where reflection is not the more powerful, and say why. When reflection cannot express what is needed (a bound that depends on a const expression, a body it cannot read, a type it cannot name), that is the work: extend reflection or the language with the smallest general primitive (`own-the-language`, `library-over-language`), never ship the weaker approximation in its place.",
+		reason: "Andrew, 2026-11-10, choosing how `Acyclic` is derived: \"prefer our const time reflection over auto trait if more powerful and if something doesn't work but is possible improve the language\".",
+		link: "docs/v2/plan/design/comptime.md",
+	},
+	{
+		id: "verified-compiler",
+		skill: "testing",
+		line: "The goal is a formally verified blaze: one executable Lean semantics of MIR is the specification, every MIR pass is proved or translation-validated against it, proofs are checked in the gate, and what is still trusted is listed.",
+		info: "blaze is to be a compiler whose correctness is proved, not only tested. The order that works in practice: (1) one specification of what MIR does, written in Lean as an executable semantics (an interpreter over a deep embedding of MIR), held to the tree by running it against blaze's MIR evaluator and blaze-built code on generated programs; it is the one meaning every proof refers to (`one-concept-one-home`); (2) user code is proved against it: the functional models `hir-ty-lean` emits are derived from, and proved or checked equal to, the semantics of the body they model, so a proof is about what blaze compiles and not a hand-written copy; (3) each MIR transformation is correct against it: a small pass by a Lean theorem that its output refines its input, a large one by translation validation (a checker, itself proved sound, that accepts each run's before and after), run in the gate on real crates; (4) then lowering to LIR and to machine code against machine models, the front end's rules, and the daemon's state machines by refinement from their reference models (`invariants-are-stated`). Nothing counts as proved until Lean has checked it in the gate with only its allowed axioms and no `sorry`; `docs/v2/plan/invariants.md` gives each claim its level, and docs/v2/plan/design/formal-verification.md lists the trusted base (the Lean kernel, the semantics' agreement with hardware, each unverified pass) and shrinks it. A change to MIR's meaning changes the Lean semantics in the same pull request.",
+		reason: "Andrew, 2026-11-10, the day the first Lean proof in the tree was checked: \"what is the best way to do this in practice for real formal verified ... the goal ... to have our own compiler be formally verified\".",
+		link: "docs/v2/plan/design/formal-verification.md",
+	},
 ] as const satisfies readonly Rule[];
 
 /**
