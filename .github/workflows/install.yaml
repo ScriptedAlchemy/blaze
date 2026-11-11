@@ -10,9 +10,9 @@ name: install
 on:
   push:
     branches: [main]
-    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_container.py", ".github/scripts/test_install_container.py", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
   pull_request:
-    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_container.py", ".github/scripts/test_install_container.py", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
   release:
     types: [published]
   schedule:
@@ -49,6 +49,8 @@ jobs:
       - run: shellcheck -s sh site/install.sh
       - name: installer channel workflow regressions
         run: python3 -I .github/scripts/test_install_channels.py
+      - name: environment-cleared container identity regressions
+        run: python3 -I .github/scripts/test_install_container.py
       - name: release userspace regressions
         run: python3 -I .github/scripts/test_install_archive.py
       - name: no-Rust installer oracle regressions

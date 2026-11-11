@@ -47,6 +47,16 @@ CODE = (
     "harness/unittests.py",
     "harness/failures.py",
     "harness/known-failures.toml",
+    # Genuine distributed acceptance, including fixture sources and its evidence oracles.
+    "harness/distv2.py",
+    "harness/distv2/",
+    ".github/scripts/dist_build_identity.py",
+    ".github/scripts/test_distributed_ci.py",
+    # The fork's semantic migration fixtures and their complete-run receipt.
+    "harness/forkfixes.py",
+    "harness/forkfixes/",
+    ".github/scripts/forkfixes_acceptance.py",
+    ".github/scripts/test_forkfixes_ci.py",
     # What fetches and checks the pinned LLVM for the build (.github/actions/blaze). No Nix:
     # neither job reads the flake.
     ".github/scripts/llvm.py",
@@ -62,8 +72,12 @@ CODE = (
     # The gate's jobs, and the actions they use.
     ".github/workflows/blaze.yaml",
     ".github/workflows/blaze-platform.yaml",
+    ".github/workflows/bench.yaml",
     ".github/actions/toolchain/",
     ".github/actions/blaze/",
+    ".github/actions/reflink/",
+    # The reflink target symlink must stay outside source provenance.
+    ".gitignore",
 )
 # What the warm tier (a push to main) reads besides: the std cases of the smoke corpus, run
 # against the blaze that build built.

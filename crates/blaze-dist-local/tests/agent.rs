@@ -491,6 +491,93 @@ fn a_verdict_is_taken_under_every_policy() {
 }
 
 #[test]
+fn a_final_compiler_or_output_refusal_cannot_fall_back() {
+    struct Refuses {
+        malformed_output: bool,
+        succeeds: bool,
+        calls: usize,
+    }
+    impl Granted for Refuses {
+        fn compile(&mut self, _: &[usize]) -> Result<Grant, String> {
+            panic!("this fixture has no distributable roots")
+        }
+
+        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, String> {
+            self.calls += 1;
+            if self.succeeds {
+                return Ok(Vec::new());
+            }
+            if !self.malformed_output {
+                return Err(
+                    "fixture::tail: output export refused conflicting immutable bytes".into(),
+                );
+            }
+            let first = value_of(&[92; 32]);
+            let mut second = first.clone();
+            second.bytes.push(1);
+            Ok(vec![first, second])
+        }
+    }
+
+    for malformed_output in [false, true] {
+        for policy in [LocalPolicy::Never, LocalPolicy::Fallback] {
+            let world = world(1, WorkConfig::default());
+            let unit = unit(93, 0);
+            let mut cfg = config(&world.socket, &world.blobs);
+            cfg.local = policy.clone();
+            cfg.deadline = Duration::from_secs(2);
+            let mut compiler = Refuses { malformed_output, succeeds: false, calls: 0 };
+            let mut observer = Client::connect(&world.socket, random_id().unwrap()).unwrap();
+            let request = blaze_wire::JobRequest {
+                unit: unit.spec,
+                platform: cfg.platform,
+                namespace: cfg.namespace.clone(),
+                source: cfg.source,
+                deadline_ms: observer.welcome.now_ms + 120_000,
+                local: policy.clone(),
+            };
+            let Answer::Binding(observing) =
+                observer.call(Command::Submit(submission(&request, NEED))).unwrap()
+            else {
+                panic!("the observer's subscription was refused")
+            };
+            let failure =
+                agent::run(&cfg, &unit, &mut compiler, &AtomicBool::new(false)).unwrap_err();
+            assert!(
+                matches!(&failure, Error::Refused(why)
+                    if why.contains(&blaze_dist_local::pack::hex(&unit.spec))
+                        && why.contains(if malformed_output {
+                            "full output cannot be packed"
+                        } else {
+                            "fixture::tail: output export refused conflicting immutable bytes"
+                        })),
+                "{failure}"
+            );
+            assert!(matches!(agent::decide(&policy, failure), Err(Error::Refused(_))));
+            assert_eq!(compiler.calls, 1);
+            assert!(world.blobs.published(&unit.spec).unwrap().is_none());
+            let Answer::Terminal(blaze_dist_local::protocol::Terminal {
+                value: Some(terminal), ..
+            }) = observer.call(Command::Terminal(observing.subscription)).unwrap()
+            else {
+                panic!("the lead's refusal must also end its other subscriber")
+            };
+            assert_eq!(terminal.termination.outcome, blaze_wire::Outcome::Failed);
+            assert!(agent::decide(&policy, Error::Ended(terminal.termination)).is_err());
+            // Remove only the compiler/output fault. The same one-builder
+            // coordinator must run this next execution: a refused tail's stop
+            // acknowledgment cannot leave its reservation held forever.
+            compiler.succeeds = true;
+            let completed =
+                agent::run(&cfg, &unit, &mut compiler, &AtomicBool::new(false)).unwrap();
+            assert_eq!(completed.source, Source::Executed);
+            assert_eq!(compiler.calls, 2);
+            observer.release().unwrap();
+        }
+    }
+}
+
+#[test]
 fn a_coordinator_that_is_gone_stops_the_build_unless_it_may_compile_here() {
     let world = world(1, WorkConfig::default());
     let unit = unit(7, 2);

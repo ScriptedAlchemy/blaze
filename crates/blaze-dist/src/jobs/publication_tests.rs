@@ -9,6 +9,7 @@ use super::*;
 enum Plant {
     None,
     EarlyDone,
+    LateVerdict,
 }
 
 fn execution() -> Execution {
@@ -61,12 +62,20 @@ fn packs(tag: u8) -> Vec<PackRef> {
     vec![PackRef { pack: [tag; 32], size: 1, keys: [tag; 32], packed: None, format: 1 }]
 }
 
-fn done(e: &mut Execution, now: u64, plant: Plant) -> Result<WorkersEventsAnswer, Refusal> {
+fn verdict(
+    e: &mut Execution,
+    now: u64,
+    outcome: Outcome,
+    plant: Plant,
+) -> Result<WorkersEventsAnswer, Refusal> {
     let completion = e.config.completion;
     if matches!(plant, Plant::EarlyDone) {
         // Plant the missing safeguard: work completion alone is treated as unit completion.
         e.config.completion = CompletionMode::WorkProtocol;
     }
+    // Plant the missing publication fence while retaining the accepted record for
+    // the oracle: a worker's later verdict must not supersede that full output.
+    let publication = if matches!(plant, Plant::LateVerdict) { e.publication.take() } else { None };
     let lead = e.lead().unwrap().to_owned();
     let result = e.worker_events(
         now,
@@ -74,14 +83,14 @@ fn done(e: &mut Execution, now: u64, plant: Plant) -> Result<WorkersEventsAnswer
         &WorkersEventsRequest {
             execution: e.id,
             attempt: e.attempt(),
-            events: vec![JobEvent::Done(DoneEvent {
-                outcome: Outcome::Passed,
-                counters: Vec::new(),
-            })],
+            events: vec![JobEvent::Done(DoneEvent { outcome, counters: Vec::new() })],
         },
         &mut Vec::new(),
     );
     e.config.completion = completion;
+    if let Some(publication) = publication {
+        e.publication = Some(publication);
+    }
     result
 }
 
@@ -94,9 +103,9 @@ fn scenario(ops: &[u8], plant: Plant) -> Result<(), String> {
     let mut next_subscriber = 2;
     for op in ops {
         now += 1;
-        match op % 10 {
+        match op % 12 {
             0 if e.lead().is_some() && e.state() == ExecState::Running => {
-                let _ = done(&mut e, now, plant);
+                let _ = verdict(&mut e, now, Outcome::Passed, plant);
             }
             1 => uploaded = true,
             2 if uploaded && e.lead().is_some() && e.state() == ExecState::Running => {
@@ -158,6 +167,14 @@ fn scenario(ops: &[u8], plant: Plant) -> Result<(), String> {
                         .is_err()
                 );
             }
+            10 | 11
+                if accepted.is_some()
+                    && e.lead().is_some()
+                    && e.state() == ExecState::Running =>
+            {
+                let outcome = if op % 12 == 10 { Outcome::Failed } else { Outcome::Refused };
+                let _ = verdict(&mut e, now, outcome, plant);
+            }
             _ => {}
         }
         if e.publication() != accepted.as_deref() {
@@ -170,16 +187,24 @@ fn scenario(ops: &[u8], plant: Plant) -> Result<(), String> {
                 "success preceded uploaded, accepted and delivered full output at {now}, op {op}"
             ));
         }
+        if accepted.is_some()
+            && matches!(e.state(), ExecState::Ended(Outcome::Failed | Outcome::Refused))
+        {
+            return Err(format!(
+                "accepted full output was superseded by a later worker verdict at {now}, op {op}"
+            ));
+        }
     }
     Ok(())
 }
 
 /// The invariant: a published-work execution reports success only after full output
 /// is uploaded, its immutable manifest is accepted unchanged, and delivery to
-/// subscribers completes; a later attempt cannot replace the accepted record.
+/// subscribers completes; a later attempt cannot replace the accepted record and
+/// a later worker verdict cannot supersede it.
 #[hegel::test(test_cases = 128)]
 fn every_success_has_one_immutable_full_manifest(tc: hegel::TestCase) {
-    let ops = tc.draw(gs::vecs(gs::integers::<u8>().max_value(9)).min_size(1).max_size(128));
+    let ops = tc.draw(gs::vecs(gs::integers::<u8>().max_value(11)).min_size(1).max_size(128));
     scenario(&ops, Plant::None).unwrap();
 }
 
@@ -189,11 +214,22 @@ fn the_oracle_catches_an_early_done_plant() {
 }
 
 #[test]
+fn the_oracle_catches_a_late_worker_verdict_plant() {
+    for verdict in [10, 11] {
+        assert!(
+            scenario(&[1, 2, verdict], Plant::LateVerdict)
+                .unwrap_err()
+                .contains("superseded by a later worker verdict")
+        );
+    }
+}
+
+#[test]
 fn phase_completion_and_manifest_commit_do_not_end_a_unit_before_delivery() {
     let mut e = execution();
-    assert!(done(&mut e, 1, Plant::None).is_err());
+    assert!(verdict(&mut e, 1, Outcome::Passed, Plant::None).is_err());
     e.commit_publication(2, "lead0", Attempt(1), &packs(7), &mut Vec::new()).unwrap();
-    assert!(done(&mut e, 3, Plant::None).is_err());
+    assert!(verdict(&mut e, 3, Outcome::Passed, Plant::None).is_err());
     assert_eq!(e.state(), ExecState::Running);
     e.subscribe(Subscriber {
         id: 2,
@@ -282,11 +318,21 @@ fn an_accepted_refusal_cannot_publish_success_after_reassignment(tc: hegel::Test
     assert_eq!(e.state(), ExecState::Ended(Outcome::Refused));
 }
 
-#[test]
-fn a_late_refusal_batch_cannot_rewrite_an_accepted_manifest() {
+#[hegel::test(test_cases = 16)]
+fn a_late_worker_verdict_cannot_rewrite_an_accepted_manifest(tc: hegel::TestCase) {
     let mut e = execution();
     e.commit_publication(1, "lead0", e.attempt(), &packs(7), &mut Vec::new()).unwrap();
     let before = e.events(0).len();
+    let event = match tc.draw(gs::integers::<u8>().max_value(2)) {
+        0 => JobEvent::Refused(blaze_wire::RefusedEvent {
+            function: "late".into(),
+            why: "late".into(),
+        }),
+        kind => JobEvent::Done(DoneEvent {
+            outcome: if kind == 1 { Outcome::Failed } else { Outcome::Refused },
+            counters: Vec::new(),
+        }),
+    };
     assert!(
         e.worker_events(
             2,
@@ -294,10 +340,13 @@ fn a_late_refusal_batch_cannot_rewrite_an_accepted_manifest() {
             &WorkersEventsRequest {
                 execution: e.id,
                 attempt: e.attempt(),
-                events: vec![JobEvent::Refused(blaze_wire::RefusedEvent {
-                    function: "late".into(),
-                    why: "late".into()
-                })],
+                events: vec![
+                    JobEvent::Output(blaze_wire::OutputEvent {
+                        stream: 1,
+                        bytes: b"unaccepted prefix".to_vec(),
+                    }),
+                    event,
+                ],
             },
             &mut Vec::new()
         )

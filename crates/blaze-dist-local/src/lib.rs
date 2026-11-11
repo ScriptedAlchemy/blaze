@@ -16,7 +16,7 @@ pub mod telemetry;
 
 use std::io;
 
-/// A framing, codec, protocol or IO failure. None triggers an implicit local compiler fallback.
+/// A distributed execution, compiler, protocol or IO failure. None permits implicit fallback.
 #[derive(Debug)]
 pub enum Error {
     /// Unix IO failure.
@@ -25,6 +25,8 @@ pub enum Error {
     Protocol(String),
     /// Committed distributed data is missing or corrupt; never fall back under its key.
     Committed(String),
+    /// The final compiler or output exporter refused the unit; never recompile its refusal.
+    Refused(String),
     /// The caller cancelled the build; never recompile it under local fallback.
     Cancelled(String),
     /// The unit's execution ended with nothing committed, as its terminal says.

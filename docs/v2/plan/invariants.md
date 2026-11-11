@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-10 invariants, 0 refinements, 1 reference models.
-By level: 2 tested, 8 simulated, 0 model-checked, 0 proved.
+11 invariants, 0 refinements, 1 reference models.
+By level: 3 tested, 8 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -31,8 +31,13 @@ By level: 2 tested, 8 simulated, 0 model-checked, 0 proved.
 
 ### blaze-dist
 
-- **`every_success_has_one_immutable_full_manifest`** *tested* (`crates/blaze-dist/src/jobs/publication_tests.rs`): a published-work execution reports success only after full output is uploaded, its immutable manifest is accepted unchanged, and delivery to subscribers completes; a later attempt cannot replace the accepted record.
-  Controls: `an_early_done_plant`.
+- **`every_success_has_one_immutable_full_manifest`** *tested* (`crates/blaze-dist/src/jobs/publication_tests.rs`): a published-work execution reports success only after full output is uploaded, its immutable manifest is accepted unchanged, and delivery to subscribers completes; a later attempt cannot replace the accepted record and a later worker verdict cannot supersede it.
+  Controls: `an_early_done_plant`, `a_late_worker_verdict_plant`.
+
+### blaze-dist-local
+
+- **`a_failed_heartbeat_cannot_publish_a_successful_tail`** *tested* (`crates/blaze-dist-local/src/agent.rs`): a final compiler refusal retains its diagnostic and remains terminal under every local policy despite a concurrent heartbeat failure; a successful tail cannot hide a failed or panicking heartbeat worker.
+  Controls: `a_dropped_heartbeat_failure`, `a_compiler_refusal_reclassified_as_transport_loss`.
 
 ### blaze-graph
 

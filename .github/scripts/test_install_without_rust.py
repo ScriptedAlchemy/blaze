@@ -11,8 +11,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("install_without_rust.py")
+# Python -I omits the script directory from sys.path; resolve our one sibling explicitly.
+CONTAINER_SPEC = importlib.util.spec_from_file_location("install_container", SCRIPT.with_name("install_container.py"))
+assert CONTAINER_SPEC and CONTAINER_SPEC.loader
+container = importlib.util.module_from_spec(CONTAINER_SPEC)
+sys.modules[CONTAINER_SPEC.name] = container
+CONTAINER_SPEC.loader.exec_module(container)
 SPEC = importlib.util.spec_from_file_location("install_without_rust", SCRIPT)
 assert SPEC and SPEC.loader
 smoke = importlib.util.module_from_spec(SPEC)
@@ -124,12 +131,56 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("BLAZE_SANDBOX", env)
         self.assertNotIn("--privileged", cmd)
         self.assertEqual(options(cmd, "--ulimit"), ["memlock=-1:-1"])
+        self.assertEqual(options(cmd, "--user"), ["1001:1001"])
+
+    def test_all_distributions_register_the_numeric_user_at_its_fresh_home(self):
+        for image, packages in (("debian:trixie-slim", "apt"), ("debian:bookworm-slim", "apt"),
+                                ("ubuntu:22.04", "apt"), ("registry.access.redhat.com/ubi9/ubi", "dnf")):
+            with self.subTest(image=image):
+                config = replace(fixture(), image=image, packages=packages, uid=2002, gid=2003)
+                commands = [json.loads(line[4:]) for line in smoke.dockerfile(config).splitlines()
+                            if line.startswith("RUN [")]
+                self.assertEqual(commands[0], ["groupadd", "--gid", "2003", "blaze"])
+                self.assertEqual(options(commands[1], "--uid"), ["2002"])
+                self.assertEqual(options(commands[1], "--gid"), ["2003"])
+                env = dict(value.split("=", 1) for value in options(smoke.command(config), "--env"))
+                self.assertEqual(options(commands[1], "--home-dir"), [env["HOME"]])
+                self.assertIn("--no-create-home", commands[1])
+                self.assertIn("shadow-utils" if packages == "dnf" else "passwd", smoke.PACKAGES[packages])
+        self.assertTrue(smoke.PREFLIGHT.startswith(container.PREFLIGHT))
+        self.assertIn('"$HOME/.cache"', smoke.PREFLIGHT[len(container.PREFLIGHT):])
+
+    def test_home_cache_is_prepared_before_the_container_starts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            temporary = root / "temp"
+            state = temporary / "blaze-fs/cache/blaze"
+            config = replace(fixture(), workspace=str(root / "source"), temporary=str(temporary),
+                             blaze_home=str(state), cache_home=str(state.parent),
+                             store=str(state / "v2/store"), target=str(state / "build/ci"),
+                             summary=str(temporary / "summary"))
+            for path in (Path(config.workspace), Path(config.store), Path(config.target), state / "std"):
+                path.mkdir(parents=True)
+            (Path(config.workspace) / "blaze-commit-x86_64-unknown-linux-gnu.tar.gz").write_text("archive fixture")
+            calls = []
+
+            def run(cmd, **kwargs):
+                calls.append((cmd, kwargs))
+                self.assertTrue((smoke.fresh_home(config) / ".cache").is_dir())
+                return subprocess.CompletedProcess(cmd, 0)
+
+            with patch.object(smoke.subprocess, "run", side_effect=run):
+                smoke.run(config)
+            self.assertEqual(calls[0][1]["input"], smoke.dockerfile(config))
+            self.assertEqual(options(calls[1][0], "--user"), ["1001:1001"])
+            self.assertEqual((smoke.fresh_home(config) / ".cache").stat().st_mode & 0o777, 0o700)
 
     def test_missing_state_bind_and_malformed_image_are_refused(self):
         for changes in ({"target": "/unmounted/target"},
                         {"target": "/job/temp/../unmounted/target"},
                         {"summary": "/job/temp/../outside-summary"},
-                        {"image": "ubuntu:22.04\nRUN echo wrong"}):
+                        {"image": "ubuntu:22.04\nRUN echo wrong"},
+                        {"blaze_home": "/job/temp/blaze:fs/cache/blaze"}, {"uid": 0}, {"gid": 0}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 smoke.command(replace(fixture(), **changes))
 

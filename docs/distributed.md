@@ -10,10 +10,10 @@ compiles which function, and puts the results in front of that build's store as 
 same keys. It adds no second code generator, no second store and no other tool: every executor
 is a daemon running blaze ([no-rustc.md](no-rustc.md)).
 
-Only a unit's dev (Cranelift) functions are shared this way, because a template stands alone. A
-release function's imports come from the whole build's summaries and a folded group from all its
-members, so those stay with the build that links them, and they reach other builds through the
-unit's published list.
+Work can be a standalone dev template, a release compile with its unit's import decisions, or a
+complete folded group. Each executor computes the same work set before taking a grant; release
+imports and every member of a folded group are part of that task's identity. The unit's published
+list lets later builds reuse the outputs without scheduling those tasks again.
 
 The fork's earlier design for V1, with its saved build specifications, signed records and
 distributed tests, is kept as a [record](reports/DISTRIBUTED-V1-DESIGN.md); none of it applies here.
@@ -74,10 +74,14 @@ reports any real error. When the path itself fails, `agent::decide` says what th
 |---|---|---|
 | a verdict was reported by the execution | taken | taken |
 | the execution ended without one (no lead, lost twice, cancelled, past its deadline) | the build stops, naming it | compiled here |
-| the coordinator or the cache server is gone, or a pack fails its check | the build stops, naming it | compiled here |
+| the coordinator or cache server is unavailable before commitment | the build stops, naming it | compiled here |
+| the final compiler or output exporter refuses the unit | the build stops with the original diagnostic | the build stops with the original diagnostic |
+| committed packs are missing or corrupt, or publication delivery fails after acceptance | the build stops, naming it | the build stops, naming it |
 
 Compiled here is the same build the daemon runs alone. A cancelled build leaves its execution, and
-an execution ends when its last subscriber leaves.
+an execution ends when its last subscriber leaves. A caller's own cancellation is terminal under
+both policies. A full manifest accepted by the coordinator is immutable: a later worker failure
+or refusal cannot replace it or turn it into permission to compile again.
 
 ## Pull requests and the shared cache
 
@@ -357,7 +361,6 @@ The cache server's calls are in `crates/blaze-serve/src/lib.rs`.
 - **No authentication and no collection** on the cache server: it listens on loopback unless told
   otherwise, and its directory grows until it is removed.
 - **Distributed tests** are not wired: `blaze test` runs here, whatever the build did.
-- **Release functions** are shared only through a unit's published list, as above.
 - **A unit between its execution and its list** is compiled again. An execution ends when its
   compile phase does, and its list is published once the build has made the rest of the unit
   and linked it. A build that submits the same unit in between starts an execution of its own.
@@ -372,3 +375,15 @@ third daemon reusing what they published, an edit, another pull request's checko
 worker killed mid-build, a worker stopped past its lease and resumed, a damaged pack, a lost
 coordinator with and without `fallback`, and the programs each daemon linked run and compared
 byte for byte.
+
+The Linux AArch64 lane of `.github/workflows/blaze-platform.yaml` requires this real harness after
+its current-tree build. It verifies the build artifact's commit, tree and binary SHA-256 identities,
+uses that Blaze to build the coordinator and cache server in an isolated home, runs the protocol
+and carrier crates' library and integration tests with their Hegel controls, and runs both dev
+and release with faults enabled. Release also requires two holders to emit actual LLVM and folded
+work. The workers have private stores and targets on the runner's verified reflink filesystem;
+each receives two cores and a 6 GiB daemon memory hint. These are resource hints, not whole-process
+memory limits. CI retains inputs, identities, logs, reports, lease/result captures and artifact
+hashes on failure as well as success. The aggregate check requires both complete runs; a missing
+receipt, skipped job or failed subprocess cannot count as acceptance. The separate
+`harness/distv2/selfcheck.py` step checks planted bugs in the evidence oracles only.

@@ -5,10 +5,11 @@ summary: One attempt-owned distributed unit through its full output record, foll
 # A unit ends after its full output is published
 
 An accepted refusal prevents full-manifest commitment and retains a typed refused terminal
-under every local policy. Once the full output is accepted, late refusal batches are rejected
-without changing that record. Delivery checks the subscriber's actual terminal before an agent
-returns success. Acceptance keeps its original attempt separately from a replacement lead's
-delivery attempt; equivalent cache pack partitions must contain identical key/kind/byte values.
+under every local policy. Once the full output is accepted, late refusal events and worker
+terminal verdicts are rejected without changing that record. Delivery checks the subscriber's
+actual terminal before an agent returns success. Acceptance keeps its original attempt separately
+from a replacement lead's delivery attempt; equivalent cache pack partitions must contain
+identical key/kind/byte values.
 
 A completed grant phase is not a completed unit. The unit's current lead keeps heartbeating
 while the ordinary `Build` finishes its tail, with the committed grant values ahead of its
@@ -44,15 +45,30 @@ Every wait remains bounded by the subscription deadline. Cancellation leaves its
 and is terminal under every local policy. Missing or corrupt committed packs, malformed published
 manifests, ambiguous publication acknowledgements and failed first-writer verification are also
 terminal, including under `LocalPolicy::Fallback`. An unavailable carrier before commitment may
-follow that explicit local policy. Real compiler refusals retain the lead's original diagnostics.
+follow that explicit local policy. Final compiler and output integrity refusals retain the lead's
+original diagnostics and cannot authorize another local build, even if their terminal report or a
+concurrent heartbeat fails.
+
+An agent acknowledges its exact stopped assignments after every compiler and heartbeat scope has
+returned, including a failed tail. The acknowledgment is accepted only for a pending stop of that
+execution and attempt; an old token cannot release a newer reservation. Its original failure is
+retained if cleanup loses its carrier.
+
 A first-writer conflict accepts different pack partitions only after verifying identical logical
 keys, kinds and bytes; the existing manifest stays immutable. The cache server's conditional
 repair API and durability simulation remain available for explicit repair of absent packs, but
 an agent never recompiles or repairs a published absence as a cache-miss recovery path.
 
 The Hegel simulation in `blaze-dist/src/jobs/publication_tests.rs` draws actor steps, virtual
-clock advances, early verdicts, failed mirrors, retries and lead replacement. Its oracle is
+clock advances, early and late verdicts, failed mirrors, retries and lead replacement. Its oracle is
 that every successful execution had one uploaded, accepted and delivered full record and
-that acceptance never changes. Its planted early-Done control must violate that oracle.
+that acceptance never changes and cannot be superseded by a later worker verdict. Its planted
+early-Done and missing publication-fence controls must violate that oracle.
 Carrier tests pause the lead between grant completion and publication, submit another
 requester, and verify one execution and one tail; a warm-tail value must reach an empty reader.
+
+Remaining lifecycle work: a helper that leaves while other subscribers remain has no explicit
+assignment-retirement transition. An unmatched stop acknowledgment must still be refused, so a
+helper that no longer observes the eventual stop can retain its reservation. This needs an
+attempt-fenced retirement request and a simulation of leaving, reassignment and stale
+acknowledgments; accepting an unmatched acknowledgment would weaken ownership.

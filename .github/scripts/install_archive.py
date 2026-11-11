@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import sys
 
+import install_container
+
 
 @dataclass(frozen=True)
 class Archive:
@@ -36,17 +38,17 @@ class Archive:
 IMAGE = "blaze-install-archive"
 DOCKERFILE = """FROM ubuntu:22.04
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \\
-    build-essential ca-certificates cmake curl git pkg-config xz-utils \\
+    build-essential ca-certificates cmake curl git passwd pkg-config xz-utils \\
     && rm -rf /var/lib/apt/lists/*
 """
-RECIPE = r'''
+RECIPE = install_container.PREFLIGHT + r'''
 . /etc/os-release
 [ "$VERSION_ID" = 22.04 ] || { echo "::error::release userspace is $VERSION_ID, expected 22.04"; exit 1; }
 uname -r
 getconf GNU_LIBC_VERSION
 [ "$(ulimit -l)" = unlimited ] || { echo "::error::release container lost the locked-memory limit"; exit 1; }
 store_dev=$(stat -Lc %d "$BLAZE_HOME/v2/store")
-for path in "$BLAZE_HOME/std" "$CARGO_TARGET_DIR" target; do
+for path in "$HOME/.cache" "$BLAZE_HOME/std" "$CARGO_TARGET_DIR" target; do
   [ "$(stat -Lc %d "$path")" = "$store_dev" ] || { echo "::error::$path and the store are on different devices inside the release container"; exit 1; }
 done
 uv run --frozen --no-dev python .github/scripts/build_release.py \
@@ -54,24 +56,29 @@ uv run --frozen --no-dev python .github/scripts/build_release.py \
 '''
 
 
+def dockerfile(config: Archive) -> str:
+    """A passwd home for the numeric runtime user, without importing the host's accounts."""
+    user = install_container.User(config.uid, config.gid, config.home)
+    return DOCKERFILE + user.dockerfile(create_home=True)
+
+
 def command(config: Archive) -> list[str]:
     """The container boundary: only named inputs, one uid and the host's verified volume."""
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]+", config.name):
         raise ValueError(f"invalid archive container name: {config.name!r}")
-    if config.uid < 0 or config.gid < 0:
-        raise ValueError("archive uid and gid must be nonnegative")
+    user = install_container.User(config.uid, config.gid, config.home)
     paths = [config.workspace, config.temporary, config.home, config.cargo_home, config.blaze_home,
              config.cache_home, config.store, config.target, config.llvm, config.bash_env, config.uv]
     for value in paths:
-        if not Path(value).is_absolute() or any(char in value for char in ",\n\r\0"):
-            raise ValueError(f"archive paths must be absolute and contain no mount delimiters: {value!r}")
+        if not Path(value).is_absolute() or ".." in Path(value).parts or any(char in value for char in ",\n\r\0"):
+            raise ValueError(f"archive paths must be absolute with no parent traversal or mount delimiters: {value!r}")
     temporary = Path(config.temporary)
     # Docker bind mounts include existing submounts: the job's Btrfs volume is below temporary.
     for value in (config.blaze_home, config.cache_home, config.store, config.target, config.bash_env):
         if not Path(value).is_relative_to(temporary):
             raise ValueError(f"archive state must be inside the job temporary bind: {value}")
     cmd = ["docker", "run", "--rm", "--init", "--name", config.name,
-           "--user", f"{config.uid}:{config.gid}",
+           "--user", user.ids,
            # Docker's outer default seccomp blocks io_uring; its AppArmor blocks the nested
            # namespaces in Blaze's own sandbox. This is also linux-6-8's container policy.
            "--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined",
@@ -82,6 +89,9 @@ def command(config: Archive) -> list[str]:
               (str(Path(config.cargo_home) / "bin"), True), (config.llvm, True)]
     for path, readonly in mounts:
         cmd += ["--mount", f"type=bind,src={path},dst={path}" + (",readonly" if readonly else "")]
+    # The launcher discovers this path through passwd, not the daemon's XDG_CACHE_HOME.
+    # Keep it writable on the same verified volume without binding the runner's whole home.
+    cmd += ["--mount", f"type=bind,src={config.cache_home},dst={Path(config.home) / '.cache'}"]
     cmd += ["--workdir", config.workspace]
     env = {
         "HOME": config.home, "CARGO_HOME": config.cargo_home, "BASH_ENV": config.bash_env,
@@ -103,7 +113,7 @@ def build(config: Archive) -> None:
     cmd = command(config)
     # Stage 0's own.rs::toolchains (e930296025) uses HOME/.blaze/toolchains even when
     # BLAZE_HOME relocates the daemon. install.sh fetches it before this helper is called.
-    for directory in (Path(config.workspace), Path(config.temporary),
+    for directory in (Path(config.workspace), Path(config.temporary), Path(config.cache_home),
                       Path(config.home) / ".blaze" / "toolchains",
                       Path(config.cargo_home) / "bin", Path(config.llvm) / "bin"):
         if not directory.is_dir():
@@ -112,7 +122,7 @@ def build(config: Archive) -> None:
         if not file.is_file():
             raise ValueError(f"archive setup is missing required input file: {file}")
     # A Dockerfile on stdin has no build context: do not send the mounted store to Docker.
-    subprocess.run(["docker", "build", "--tag", IMAGE, "-"], input=DOCKERFILE,
+    subprocess.run(["docker", "build", "--tag", IMAGE, "-"], input=dockerfile(config),
                    text=True, check=True, timeout=600)
     destination = Path(config.temporary) / "archive-tools"
     destination.mkdir()

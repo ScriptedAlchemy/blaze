@@ -202,9 +202,7 @@ impl Dist {
                 tracing::warn!(target: "blaze", what, "dist: the unit compiles here");
                 Ok(())
             }
-            Err(failure) => Err(format!(
-                "the distributed build failed: {what}: {failure} ({LOCAL_VAR}=fallback compiles the unit here instead)"
-            )),
+            Err(failure) => Err(format!("the distributed build failed: {what}: {failure}")),
         }
     }
 

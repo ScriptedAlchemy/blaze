@@ -172,8 +172,11 @@ class RunnerLabels(unittest.TestCase):
                 reference = check.MATRIX_REF.fullmatch(expression.group(1).strip())
                 if reference and check._matrix_values(job, reference.group(1)):
                     continue
-                if path.name == "blaze-platform.yaml":
+                if path.name in ("blaze-platform.yaml", "bench.yaml"):
                     self.assertEqual(runs, "${{ inputs.os }}", (path, job_id))
+                    os_input = workflow["on"]["workflow_call"]["inputs"]["os"]
+                    self.assertEqual(os_input["type"], "string")
+                    self.assertEqual(os_input["required"], "true")
                 else:
                     self.assertIn((path.name, job_id), (
                         ("bench-readme.yaml", "bench"), ("bench-bun.yaml", "bench"),
@@ -182,6 +185,28 @@ class RunnerLabels(unittest.TestCase):
                     self.assertEqual(job["strategy"]["matrix"],
                                      "${{ fromJSON(needs.platforms.outputs.matrix) }}")
                     self.assertIn("python3 harness/benchplatforms.py matrix", path.read_text())
+
+    def test_source_benchmark_runner_has_a_hosted_entry_point(self):
+        # The reusable benchmark inherits the platform's already checked os. A manual run
+        # has the one original hosted ARM64 choice, never a free-form private runner label.
+        from pathlib import Path
+        workflows = {path.name: check.read(path.read_text())
+                     for path in Path(WORKFLOWS).glob("*.yaml")}
+        bench = workflows["bench.yaml"]
+        self.assertEqual(set(bench["on"]), {"workflow_call", "workflow_dispatch"})
+        manual = bench["on"]["workflow_dispatch"]["inputs"]["os"]
+        self.assertEqual(manual["type"], "choice")
+        self.assertEqual(manual["options"], ["ubuntu-24.04-arm"])
+        self.assertEqual(manual["default"], "ubuntu-24.04-arm")
+        self.assertEqual(manual["required"], "true")
+        callers = []
+        for name, workflow in workflows.items():
+            for job_id, job in workflow["jobs"].items():
+                if job.get("uses") == "./.github/workflows/bench.yaml":
+                    callers.append((name, job_id))
+                    self.assertEqual(job["with"]["os"], "${{ inputs.os }}")
+                    self.assertEqual(job["needs"], "build")
+        self.assertEqual(callers, [("blaze-platform.yaml", "microbench")])
 
     def test_this_repository(self):
         paths = sorted(glob.glob(os.path.join(WORKFLOWS, "*.yaml")))

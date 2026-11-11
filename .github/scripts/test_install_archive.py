@@ -3,6 +3,7 @@
 
 from dataclasses import replace
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -11,6 +12,12 @@ import unittest
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("install_archive.py")
+# Python -I omits the script directory from sys.path; resolve our one sibling explicitly.
+CONTAINER_SPEC = importlib.util.spec_from_file_location("install_container", SCRIPT.with_name("install_container.py"))
+assert CONTAINER_SPEC and CONTAINER_SPEC.loader
+container = importlib.util.module_from_spec(CONTAINER_SPEC)
+sys.modules[CONTAINER_SPEC.name] = container
+CONTAINER_SPEC.loader.exec_module(container)
 SPEC = importlib.util.spec_from_file_location("install_archive", SCRIPT)
 assert SPEC and SPEC.loader
 archive = importlib.util.module_from_spec(SPEC)
@@ -56,7 +63,9 @@ class ArchiveTests(unittest.TestCase):
         self.assertIn(f"type=bind,src={config.cargo_home},dst={config.cargo_home}", mounts)
         self.assertIn(f"type=bind,src={config.cargo_home}/bin,dst={config.cargo_home}/bin,readonly", mounts)
         self.assertIn(f"type=bind,src={config.temporary},dst={config.temporary}", mounts)
-        self.assertEqual(len(mounts), 6)
+        self.assertIn(f"type=bind,src={config.cache_home},dst={config.home}/.cache", mounts)
+        self.assertEqual(len(mounts), 7)
+        self.assertFalse(any(f"src={config.home}," in mount or "dst=/etc/passwd" in mount for mount in mounts))
         self.assertFalse(any("src=/usr/lib," in mount or "src=/lib," in mount for mount in mounts))
         env = dict(value.split("=", 1) for value in options(cmd, "--env"))
         self.assertEqual(env["CARGO_HOME"], config.cargo_home)
@@ -67,9 +76,23 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(options(cmd, "--user"), ["1001:1001"])
         self.assertEqual(options(cmd, "--ulimit"), ["memlock=-1:-1"])
 
+    def test_image_registers_its_runtime_user_with_a_writable_home_cache(self):
+        config = fixture()
+        commands = [json.loads(line[4:]) for line in archive.dockerfile(config).splitlines()
+                    if line.startswith("RUN [")]
+        self.assertEqual(commands[0], ["groupadd", "--gid", str(config.gid), "blaze"])
+        self.assertEqual(options(commands[1], "--uid"), [str(config.uid)])
+        self.assertEqual(options(commands[1], "--gid"), [str(config.gid)])
+        self.assertEqual(options(commands[1], "--home-dir"), [config.home])
+        self.assertIn("--create-home", commands[1])
+        self.assertTrue(archive.RECIPE.startswith(container.PREFLIGHT))
+        self.assertIn('"$HOME/.cache"', archive.RECIPE[len(container.PREFLIGHT):])
+
     def test_unmounted_state_and_ambiguous_mount_paths_fail_before_docker(self):
         for changes in ({"target": "/elsewhere/target"}, {"llvm": "/llvm,readonly"},
-                        {"workspace": "relative"}, {"name": "not a container"}):
+                        {"target": "/work with spaces/temp/../outside"},
+                        {"workspace": "relative"}, {"name": "not a container"},
+                        {"home": "/home/with:field"}, {"uid": 0}, {"gid": 0}):
             with self.subTest(changes=changes), patch.object(archive.subprocess, "run") as run:
                 with self.assertRaises(ValueError):
                     archive.build(replace(fixture(), **changes))
@@ -78,7 +101,7 @@ class ArchiveTests(unittest.TestCase):
     def test_failed_build_removes_only_its_own_container(self):
         with tempfile.TemporaryDirectory() as root:
             config = replace(fixture(root), llvm=f"{root}/llvm")
-            for directory in (Path(config.workspace), Path(config.temporary),
+            for directory in (Path(config.workspace), Path(config.temporary), Path(config.cache_home),
                               Path(config.home) / ".blaze" / "toolchains",
                               Path(config.cargo_home) / "bin", Path(config.llvm) / "bin"):
                 directory.mkdir(parents=True)
@@ -96,7 +119,7 @@ class ArchiveTests(unittest.TestCase):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     archive.build(config)
             self.assertEqual(calls[0][0], ["docker", "build", "--tag", archive.IMAGE, "-"])
-            self.assertEqual(calls[0][1]["input"], archive.DOCKERFILE)
+            self.assertEqual(calls[0][1]["input"], archive.dockerfile(config))
             self.assertEqual(calls[-1][0], ["docker", "rm", "--force", config.name])
 
     def test_missing_pinned_toolchain_is_reported_before_docker(self):
@@ -104,6 +127,7 @@ class ArchiveTests(unittest.TestCase):
             config = fixture(root)
             Path(config.workspace).mkdir()
             Path(config.temporary).mkdir()
+            Path(config.cache_home).mkdir(parents=True)
             with patch.object(archive.subprocess, "run") as run:
                 with self.assertRaisesRegex(ValueError, r"\.blaze/toolchains"):
                     archive.build(config)
