@@ -599,6 +599,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     // [`AttrFlags::multiversion_levels`]'s to read.
                     (Some(Word::blaze), Some(Word::multiversion)) => {
                         attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION)
+                    }
                     // `#[blaze::drop(early)]`, `#[blaze::drop(early, trusted = "why")]` and
                     // `#[blaze::drop(scoped)]` on a type; anything else sets no flag, and
                     // both words set both, which `hir_ty_mir::mir::early_drop` refuses.
@@ -2408,6 +2409,15 @@ impl AttrFlags {
                         match attr.token_tree() {
                             Some(tt) => may_args(tt),
                             None => MayAttr { words: 0, trusted: None, malformed: None },
+                        }
+                    }
+                    _ => return ControlFlow::Continue(()),
+                };
+                ControlFlow::Break(read)
+            })
+        }
+    }
+
     /// What `#[blaze::differentiable]` on `owner` says ([`DifferentiableAttr`]); `None` without
     /// it, one bit test.
     #[inline]
