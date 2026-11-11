@@ -99,6 +99,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/toolchain
+      - name: kernel execution tracing for the observer controls
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends strace
       # The repository's Python workspace (pyproject.toml, uv.lock): its scripts lint and type-check.
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
@@ -128,6 +132,10 @@ jobs:
         run: uv run --frozen python .github/scripts/test_rival.py
       - name: release speed evidence regressions
         run: python3 -I .github/scripts/test_promote_speed.py
+      - name: release smoke provenance and compiler selection regressions
+        run: python3 -I .github/scripts/test_promote_smoke.py
+      - name: kernel process observation and loss controls
+        run: uv run --frozen python -m unittest discover --start-directory harness/v2 --pattern 'test_exec_observer.py'
       - name: distributed objective adapter regressions
         run: uv run --frozen python harness/v2/test_distributed.py
       - name: bounded seed readiness and shutdown regressions
@@ -324,6 +332,10 @@ jobs:
             parked_unposted_work_releases_the_lane_without_losing_its_continuation
             parked_work_unblocks_reclamation_with_one_worker_and_no_budget
             a_reclamation_hold_is_respected_without_a_configured_budget
+            overlapping_downloads_wait_for_shared_fetches_and_keep_their_outcomes
+            readable_bundle_values_keep_their_pending_durability_fence
+            verified_manifests_keep_immutable_bindings_and_refuse_conflicts_atomically
+            bundle_values_keep_their_manifest_bindings_across_local_and_shared_sources
             tls_bundle_publication_downloads_into_an_empty_local_store
             tls_bundle_refuses_an_untrusted_certificate_or_wrong_server_name
             tls_bundle_refuses_a_manifest_with_an_unpinned_or_damaged_signature
@@ -351,6 +363,16 @@ jobs:
             the_oracle_catches_a_stale_continuation_replaced_with_the_current_token
             the_oracle_catches_a_rejected_reclamation_prefix_entering_the_plane
             the_oracle_catches_a_reclamation_hold_bypassed_without_a_budget
+            the_oracle_catches_a_download_ignoring_an_existing_fetch
+            the_oracle_catches_a_shared_completion_consumed_by_one_download
+            the_oracle_catches_a_readable_value_without_its_durability_fence
+            the_oracle_catches_waiting_for_a_value_published_during_fetch_scheduling
+            the_oracle_catches_a_lost_manifest_binding
+            the_oracle_catches_a_partly_applied_conflicting_manifest
+            the_oracle_catches_a_readable_value_from_another_manifest_record
+            the_oracle_catches_a_racing_value_from_another_manifest_record
+            the_oracle_catches_a_shared_fetch_from_another_manifest_record
+            the_oracle_catches_an_old_fetch_outcome_delivered_after_a_new_manifest
           )
           for case_name in "${cases[@]}"; do
             grep -Eq "^test .*::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \

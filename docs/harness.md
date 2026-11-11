@@ -611,6 +611,59 @@ of a state), `engine.py` (the v2 adapter, the v1 one kept only for `proof.py`'s 
 cargo for fetching) and `report.py` (the
 result's shape).
 
+### Kernel execution observer
+
+`harness/v2/exec_observer.py` observes selected Blaze commands on Linux from the launch of
+their supervisor through `blaze --ignore-pin stop` and the termination of every traced
+descendant. It uses `strace` with fork/thread following and exit-kill support; the scripts
+and Linux AArch64 protocol jobs install it explicitly. Detached daemons and their late
+children stay in the trace. A missing tracer or unsupported tracing fails the run.
+
+The helper takes exactly one JSON object, inline, in a file or on `-` stdin, parsed into a
+frozen `Input`. Unknown fields, nonabsolute paths, malformed command names and arguments,
+repeated names, and invalid time bounds are refused. Its fields are:
+
+| Field | Meaning |
+|---|---|
+| `blaze` | Absolute selected client path, named `blaze`, with an executable `blaze-engine` beside it |
+| `cwd` | Existing absolute workspace directory |
+| `home`, `out` | Separate absolute directories that must not exist; their parents must exist |
+| `commands` | One to sixteen objects with a unique short lowercase `name` and a nonempty string list `args`; `stop`, `supervisor` and `tracer` are reserved names |
+| `command_seconds` | Positive per-command bound, default 4500 seconds |
+| `stop_seconds` | Positive shutdown bound, default 60 seconds |
+| `reap_seconds` | Positive bound for remaining descendants after shutdown, default 30 seconds |
+| `tracer` | Absolute tracer path, default `/usr/bin/strace` |
+
+Each time bound is an integer from 1 through 21,600. The client and tracer paths are resolved
+before launch; both and the engine beside that resolved client are SHA-256 bound before and
+after the run. Commands receive the selected client with `--ignore-pin`, a fresh `BLAZE_HOME`
+and its private cache, while the caller's `HOME` and sandbox policy stay unchanged. Commands
+stop at the first failure; shutdown still runs, and its failure does not replace an earlier
+command's exit status.
+
+The output directory retains the resolved `input.json`, one log per named command,
+`stop.log`, `supervisor.log`, `tracer.log`, `supervisor.json`, process trace files, and
+`result.json`. Accepted evidence must account for every successful process creation and
+complete termination or paired thread-exec transfer. Unknown, truncated or unpaired records,
+tracer diagnostics, a surviving descendant or changed binary fail the result. After the run,
+trace evidence above 128 MiB or 100,000 files is refused; these acceptance limits do not cap
+live trace-file growth. Executable paths naming `cargo`, `rustc` or `rustdoc`,
+including absolute and descriptor-based launches and the `.real`/`.exe` forms, fail even
+when the execution attempt itself fails. Raw traces contain command arguments, so inputs
+must not put secrets there.
+
+`harness/v2/test_exec_observer.py` supplies parser and native planted controls for short-lived
+and detached children, descriptor execs, incomplete traces, identity drift, path retargeting,
+command failure and failed cleanup. Its native forbidden-name fixtures are harmless copies
+of `true`; no Rust compiler is run. `.github/scripts/test_distributed_ci.py` drives the actual
+workflow shells through this observer with fake client and engine executables, checks the
+full command arguments and stop, and rejects missing or invalid C4 receipts. These controls
+are wired into the scripts job; hosted receipts record their results. Source review alone
+does not establish native acceptance.
+The scope is `linux-launched-descendants-through-blaze-stop`. Unwrapped commands, other
+operating systems, prior artifacts and compilers deliberately renamed or repackaged remain
+outside it; [C4 stays open](no-rustc.md#kernel-execution-evidence).
+
 ### Distributed builds
 
 `harness/distv2.py` runs [distributed builds](distributed.md) on real daemons, a real coordinator
@@ -623,6 +676,22 @@ lease and resumed, a pack damaged on the server, and no coordinator with and wit
 Every program is run, and what it prints covers a panic unwinding across units, a static of another
 crate and a build script's output. `{"args": ["--release"], "profile": "release", ...}` runs it
 under LLVM.
+
+The signed global-cache bundle client has four Hegel models and ten planted controls in
+`crates/blaze-global/src/tests/download.rs`. They cover overlapping downloads sharing a fetch,
+preservation of pending durability fences through readable-value races and crashes, atomic
+immutable manifest bindings, and full record equality for local values and shared fetches.
+The overlap model also retries after a prior outcome is queued: the driver must broadcast
+that batch to existing owners before delivering new manifests or scheduling a retry for the
+same key. A reversed-order control catches an old outcome settling the new download.
+Each of the three record-mismatch controls varies the content digest, kind and length
+separately. They run over the store and client's seeded simulation; the five separate TLS
+cases exercise the signed bundle protocol through real TLS channels. The B0 feedback job
+requires all 50 named cases: eleven Hegel models, two additional continuation/reservation
+cases, thirty-two planted controls and five TLS cases. The Stage 1 protocol receipt also
+requires exact success lines for all fourteen download models/controls from its full
+library/integration command. Hosted receipts record execution; daemon integration, trusted
+publisher policy and real cached-tree IO evidence still keep D11 open.
 
 `harness/forkfixes.py` holds the behaviour of the fixes the fork made to V1's front end
 (`harness/forkfixes/cases.py`): each case states its expected output, executed test or compiler
@@ -691,8 +760,8 @@ for each platform, each on a machine of its own kind.
 | `blaze.yaml` (`gate`) | pull request and merge group | on hosted Linux AArch64: blaze builds and tests itself through `harness/unittests.py`, the released blaze checks the workspace, the profile gate checks the build history, and the script and workflow jobs check the Python, rules, docs and runner policy. The store starts empty; the build hands its packs to the tests job. Lint baselines and the x86-64 cross build run outside `ci` until their existing blockers are settled | hosted runtime not measured in this integration |
 | `blaze.yaml` (`warm`) | push to main | the build and tests on hosted Linux AArch64 and macOS, with a fresh store per job; the AArch64 smoke job also runs. The existing canary and release workflows consume the resulting checks and artifacts | |
 | `blaze-platform.yaml` (`profile-gate`) | with each platform's build, but Windows | the profile's gate (`blaze debug gate`, [profiling.md](profiling.md#the-gate-what-a-profile-must-hold)) over the history the build's self-build wrote, with the blaze it made, held to `harness/profile-gate-known.toml`, and each fixture of `crates/blaze-profile/fixtures/gate/` failing its own check (`harness/profile_gate.py`); then `harness/v2/budgets.py` smoke with the same compiler, holding [the smoke's guards](#the-smokes-guards) and uploading `budgets-smoke-<platform>` for the `ci` job; uploads the build's per-build summary as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`. No secret | runtime not measured after integration |
-| `blaze.yaml` (`distributed-core`) | code tiers, alongside the source build | the pinned bootstrap executes the distributed, scheduler and global-cache library tests; all seven retirement/lifetime/reclamation models, two additional continuation/reservation cases, their twenty-two planted controls, and five TLS cases must report success. This partial feedback does not supply any Stage 1 integration or native acceptance receipt | runtime not yet measured |
-| `blaze-platform.yaml` (`distributed-tests`) | after the Linux AArch64 source build | the verified source-built compiler builds and executes the distributed and scheduler crates' library and integration tests, the signed global-cache bundle tests through real TLS channels, and `blaze-cargo`'s daemon tests. Every named release model and planted control must execute; both test groups and an unchanged-source receipt are required by `ci` | runtime not yet measured |
+| `blaze.yaml` (`distributed-core`) | code tiers, alongside the source build | the pinned bootstrap executes the distributed, scheduler and global-cache library tests; all eleven Hegel models, two additional continuation/reservation cases, thirty-two planted controls and five TLS cases must report success. This partial feedback does not supply any Stage 1 integration or native acceptance receipt | runtime not yet measured |
+| `blaze-platform.yaml` (`distributed-tests`) | after the Linux AArch64 source build | the verified source-built compiler executes the full distributed/scheduler library and integration targets and `blaze-cargo`'s daemon tests in one fresh home under the Linux execution observer. All twenty release controls and fourteen bundle models/controls need exact success lines. Both groups, unchanged source/binaries and a complete C4 execution receipt are required by `ci` | runtime not yet measured |
 | `blaze-platform.yaml` (`distributed`) | after the Linux AArch64 source build | the source-built compiler builds the services and runs `harness/distv2.py` in dev and release with every fault check; a complete receipt is required by `ci` | runtime not yet measured |
 | `blaze-platform.yaml` (`forkfixes`) | after the Linux AArch64 source build | all `harness/forkfixes.py` semantic migration cases with that same compiler; complete case, mapping and provenance evidence is required by `ci` | runtime not yet measured |
 | `profile-nightly.yaml` | nightly, by hand | `slower_between_commits` over main's last 10 summaries of one runner class, the newest against the rest (`harness/profile_trend.py`); fails naming each span 1.25 times and 50 ms slower or more | 5 min |

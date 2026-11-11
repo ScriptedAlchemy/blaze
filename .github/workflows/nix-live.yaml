@@ -145,10 +145,11 @@ jobs:
       - uses: ./.github/actions/blaze
         with:
           job: tests
+          reflink: "true"
       # blaze-live is a stub where live edits are not supported, and says so.
-      - run: nix develop --command blaze test --release -p blaze-live --locked
-      # With cargo: what this checks is that the demo builds with rustc, as a user's would.
-      - run: cargo build --locked
+      - run: nix develop --command blaze --ignore-pin test --release -p blaze-live --locked
+      # The demo is a real project built by the selected Blaze too.
+      - run: nix develop --command blaze --ignore-pin build --locked --target-dir "$CARGO_TARGET_DIR/life"
         working-directory: demo/life
       - name: window opens and stays up
         run: |
@@ -156,7 +157,7 @@ jobs:
           sudo apt-get install -y xvfb libgl1-mesa-dri libglx-mesa0 libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2 libwayland-client0
           export LIBGL_ALWAYS_SOFTWARE=1 RUST_BACKTRACE=1
           status=0
-          timeout 15 xvfb-run -a --server-args="-screen 0 1280x800x24" demo/life/target/debug/life > life.log 2>&1 || status=$?
+          timeout 15 xvfb-run -a --server-args="-screen 0 1280x800x24" "$CARGO_TARGET_DIR/life/debug/life" > life.log 2>&1 || status=$?
           cat life.log
           # timeout's own 124: the window was still up when it was stopped.
           test "$status" = 124 || { echo "::error::the window exited ($status) before it was stopped"; exit 1; }
@@ -184,11 +185,11 @@ jobs:
         with:
           job: tests
       # Where it is real code: the whole of macos.rs and the patch format.
-      - run: nix develop --command blaze test --release -p blaze-live --locked
+      - run: nix develop --command blaze --ignore-pin test --release -p blaze-live --locked
       # The blaze that edits the program: blaze's build of it (AGENTS.md rule
       # blaze-builds-blaze), the one users get; then the stage 0's daemon ends before it starts.
-      - run: nix develop --command blaze build --release -p blaze-engine --locked
-      - run: blaze stop
+      - run: nix develop --command blaze --ignore-pin build --release -p blaze-engine --locked
+      - run: blaze --ignore-pin stop
       - name: edit a running program
         run: |
           python3 harness/live_e2e.py "{\"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze-engine\"}"
@@ -198,9 +199,8 @@ jobs:
           for report in "$HOME"/Library/Logs/DiagnosticReports/*; do
             case "$report" in *blaze*|*liveprobe*) echo "::group::$report"; head -c 20000 "$report"; echo; echo "::endgroup::";; esac
           done
-      # With cargo, as in the demo job.
       - name: the demo builds on macOS
-        run: cargo build --locked
+        run: nix develop --command blaze --ignore-pin build --locked
         working-directory: demo/life
       # Why the daemon ended, when it did (the client does not say).
       - if: failure()

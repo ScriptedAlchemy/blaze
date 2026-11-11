@@ -86,12 +86,43 @@ Outside `crates/`, which the counter does not read, cargo or rustc still run in:
 | Place | What runs | What removes it |
 |---|---|---|
 | `harness/v2/engine.py`, `reference_env` and `cargo` | plain cargo with the pinned nightly, to fetch sources for the proof scripts (`cargo fetch`, `cargo vendor`, `cargo metadata`); nothing it builds is compared | blaze's own `fetch` and `vendor` as commands (`crates/blaze-metadata` has both; `metadata` is wired) |
-| `.github/workflows/nix-live.yaml`, the demo jobs | `cargo build --locked` of `demo/life`, on purpose: it checks the demo builds with rustc as a user's would | deleting the flake and that workflow (decided 2026-11-04) |
-| `tools/nix/unit_graph.py` and `tools/nix/unit_build.py` | cargo's unit graph, and one rustc per unit in the flake's per-unit builds | the same deletion |
+| `tools/nix/unit_graph.py` and `tools/nix/unit_build.py` | cargo's unit graph, and one rustc per unit in the flake's per-unit builds | replacing or deleting those legacy package paths and their callers |
+
+The Linux and macOS demo builds in `.github/workflows/nix-live.yaml` now invoke
+`blaze --ignore-pin build --locked` in `demo/life`. The flake's legacy unit-graph and
+per-unit package paths still invoke Cargo/rustc; changing the demo command does not remove
+them. Their replacement or deletion, including the remaining flake users, is still open.
 
 `harness/norustc.py` (the release train) measures the same thing from outside: how often rustc
 and rustdoc run when `harness/norustc/fixture` is built, edited, tested, doctested and checked
 with blaze, which has to be never.
+
+## Kernel execution evidence
+
+`harness/v2/exec_observer.py` launches a selected Blaze under Linux `strace`, following
+forks, threads, execs and detached descendants from launch through the selected compiler's
+unconditional `--ignore-pin stop`. A new private daemon home prevents reuse of an unobserved
+daemon. The helper resolves the client and tracer paths, binds them and the engine beside
+the resolved client by SHA-256, and checks their identities again after shutdown. Missing,
+unknown, incomplete or unpaired process traces, a surviving descendant, a failed command or
+stop, or an attempted execution
+whose path names Cargo, rustc or rustdoc fails the run. Absolute paths, descriptor-based
+`execveat`, and the `.real` and `.exe` forms are included.
+
+The Linux AArch64 source-built protocol job sends both its full library/integration command
+and the daemon release controls through one observed lifetime. Its receipt requires complete
+logs, an unchanged source-built compiler and a schema-1 result with scope
+`linux-launched-descendants-through-blaze-stop`, `passed: true` and return code zero.
+[The harness reference](harness.md#kernel-execution-observer) describes the input, retained
+evidence and planted controls. Hosted receipts record execution; source inspection alone
+does not establish native acceptance.
+
+This is evidence for commands actually run through the helper on Linux. It does not cover
+unwrapped jobs, other operating systems or pre-existing external services, establish that
+every consumed artifact was built without rustc, or identify a compiler deliberately renamed
+or repackaged under a different executable path. The remaining source sites and legacy Nix
+paths still need removal, and the native compiler and bootstrap gates still need their own
+receipts. Objective C4 remains open.
 
 The long form of this page (the measurements of October 2026, each step's design and the lanes
 that did them) is in git: `git show 9112d5e40e:docs/no-rustc.md`.

@@ -267,6 +267,41 @@ or an issue.
 (`smoke.json`). `harness/smoke.py` runs them against a blaze (its input's `blaze`, or `blaze` on
 PATH for an installed release).
 
+The harness takes one JSON object, inline, in a file or from `-` on stdin. Its frozen `Input`
+rejects unknown fields and wrong types. `command` is `run` (the default), `apt` or `brew`;
+the package commands print the system packages for the selected projects without running
+the compiler. `groups`, `only` and `profiles` choose the work; a selection outside its groups,
+an unknown name or a selection with nothing to execute is an error. For example:
+
+```sh
+python3 harness/smoke.py '{"command":"run","groups":["std"],"blaze":"/path/to/release/blaze","results":"/tmp/smoke-results.json"}'
+python3 harness/smoke.py '{"command":"apt","groups":["apps"],"only":["zed"],"corpus_rev":"<release-source-commit>"}'
+```
+
+Promotion supplies the release's source commit as `corpus_rev`. The manifest, project
+specifications, small-program sources, lockfiles and expected outputs are materialized from
+that exact commit's `harness/smoke/` tree; the running harness code stays at the gate's
+checkout. An invalid or unavailable commit, missing manifest or required case file, unsafe
+archive member, or oversized snapshot fails acquisition. Materialization admits only regular
+files and directories, with a 64 MiB archive/content bound and at most 10,000 entries. A small
+case added only in the gate's newer checkout may be reported as skipped; an all-skipped
+selection cannot pass. Without `corpus_rev`, the harness copies and hashes the current corpus.
+
+The release-corpus action makes the selected commit available without moving the checkout's
+HEAD. The application matrix and `apt`/`brew` queries use the same historical manifest as the
+run; a requested application absent from that release fails selection. `blaze_rev` separately
+selects the source built by the corpus's Blaze project, and promotion supplies the release
+commit there too.
+
+Every Blaze invocation, including project builds, download-lock preparation, timeout
+diagnostics and shutdown, uses the selected absolute executable with `--ignore-pin`.
+Failure reproductions name that executable. Results retain `blaze` and the per-check `results`
+and add the resolved compiler path and SHA-256, the optional sibling engine's identity, and
+the corpus commit, tree and snapshot SHA-256. Compiler identities are checked again after
+the bounded final stop; a changed compiler or failed shutdown is a failure alongside any
+original build or test failure. The corpus provenance and command-selection controls are in
+`.github/scripts/test_promote_smoke.py`; the scripts job's hosted receipts record their results.
+
 - **std** (no dependencies; the merge gate runs these on every pull request, under two minutes):
   `HashMap` insert and iterate, `thread::spawn` + `join`, `thread_local!`, `Mutex`/`OnceLock`/
   atomic statics, `std::env` and `std::fs` basics, `const_heap` (`Vec`, `String`, `Box` and

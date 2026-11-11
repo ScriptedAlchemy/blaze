@@ -3190,6 +3190,10 @@ fn f() -> u32 {
     /// persisted view and decoding, including nested and empty records.
     #[test]
     fn record_type_fields_and_defaults_round_trip() {
+        record_type_round_trip(false);
+    }
+
+    fn record_type_round_trip(lose_default: bool) {
         let (db, defs) = bodies(
             r#"
 #![blaze::records]
@@ -3200,12 +3204,27 @@ fn f(opts: { z: u8 = 7, a: { q: bool }, n: u16 }, empty: {}) {}
         let (signature, source_map) = FunctionSignature::with_source_map(&db, function);
         let store: &ExpressionStore = &signature.store;
         assert_store_round_trip(store, source_map);
-        let bytes = blaze_format::to_bytes(store);
+        let mut bytes = blaze_format::to_bytes(store);
+        if lose_default {
+            // Plant an encoder that loses a valid default, not malformed input: zero
+            // is the valid None slot, so reading and decoding must still succeed.
+            let id = store.type_refs()
+                .find_map(|(id, ty)| match ty {
+                    TypeRef::Record { defaults, .. } if defaults.get(0).is_some() => Some(id),
+                    _ => None,
+                })
+                .expect("a record whose first field has a default");
+            let buffer = Aligned::copy_from(&bytes);
+            let read = ExpressionStore::read(&buffer).expect("record types before the plant");
+            // A record's three header words precede its optional default slots.
+            let slot = read.ty_data[raw(id) as usize] as usize + 3;
+            assert_ne!(read.ty_extra[slot], 0, "the plant must remove a present default");
+            let at = offset_in(read.ty_extra, &buffer) + slot * size_of::<u32>();
+            bytes[at..at + size_of::<u32>()].copy_from_slice(&0_u32.to_le_bytes());
+        }
         let buffer = Aligned::copy_from(&bytes);
         let read = ExpressionStore::read(&buffer).expect("record types read in place");
         let decoded = read.decode().expect("record types decoded");
-        assert_eq!(decoded, *store);
-        assert_eq!(blaze_format::to_bytes(&decoded), bytes);
 
         let records: Vec<_> = (store.type_refs())
             .filter_map(|(id, ty)| match ty {
@@ -3225,7 +3244,7 @@ fn f(opts: { z: u8 = 7, a: { q: bool }, n: u16 }, empty: {}) {}
             };
             assert_eq!(decoded.names(saved_names), store.names(names));
             assert_eq!(saved_types, types);
-            assert_eq!(saved_defaults, defaults);
+            assert_eq!(saved_defaults, defaults, "persisted record field defaults changed");
 
             match types.len() {
                 3 => {
@@ -3263,6 +3282,15 @@ fn f(opts: { z: u8 = 7, a: { q: bool }, n: u16 }, empty: {}) {}
             bad[kind] = 16;
             assert!(ExpressionStore::read(&Aligned::copy_from(&bad)).is_err(), "unknown tag 16");
         }
+        assert_eq!(decoded, *store);
+        assert_eq!(blaze_format::to_bytes(&decoded), bytes);
+    }
+
+    #[test]
+    #[should_panic(expected = "persisted record field defaults changed")]
+    fn the_oracle_catches_a_lost_persisted_record_default() {
+        record_type_round_trip(false);
+        record_type_round_trip(true);
     }
 
     #[test]

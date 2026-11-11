@@ -2,14 +2,12 @@
 """smoke.py: small programs and real projects that must build and run correctly with `blaze run`
 and `blaze test`, in dev and --release (docs/release.md, "The smoke corpus").
 
-usage: smoke.py [INPUT]          run the corpus
-       smoke.py apt [INPUT]      the Debian packages the selected projects build with
-       smoke.py brew [INPUT]     the Homebrew packages they build with on macOS
+usage: smoke.py [INPUT]          one JSON object; command is run (default), apt or brew
 
 INPUT is one JSON object (inline, a file's path, or `-` for stdin; none is `{}`), every field
 optional:
 
-    {"groups": ["std", "crates", "projects", "apps"], "only": [NAME, ...], "profiles": ["dev", "release"],
+    {"command": "run", "groups": ["std", "crates", "projects", "apps"], "only": [NAME, ...], "profiles": ["dev", "release"],
      "blaze": "path of the `blaze` to run (default: the one on PATH)", "work": DIR,
      "results": "a JSON file of every result", "blaze_rev": "the commit of the project `blaze`",
      "corpus_rev": "the commit whose corpus the blaze is held to"}
@@ -17,7 +15,7 @@ optional:
 smoke/smoke.json names the cases and projects. A case is a directory smoke/<name>: a cargo
 project whose `blaze run` prints exactly smoke/<name>/expected.txt (given `args` and `env`) and
 whose `blaze test` passes `tests` tests. A project is a repository at a pinned commit (`rev`;
-`{blaze}` is --blaze-rev, by default this checkout's HEAD), whose `runs` print what they say
+`{blaze}` is `blaze_rev`, by default this checkout's HEAD), whose `runs` print what they say
 (`stdout` exactly, or `contains`, or a `file` that `starts` so, each character of it a byte)
 and whose `blaze test` (with the arguments of `test`) passes. A private repository is fetched with GH_TOKEN. A project may have
 `env` for its builds, `seconds` for each command (default 3600), and `prepare`, a module of the
@@ -38,10 +36,12 @@ crates.io), `projects` (a project's default), and `apps` (the large applications
 of its own in promote.yaml, with bench.py's times beside cargo's); all four are the gate a canary
 passes to become stable. Without `groups`, every group but `apps` runs.
 
-With `corpus_rev` (promote.yaml: the release's commit), a case this checkout has and that
-commit's harness/smoke/ does not is newer than the blaze under test and is skipped, said so in
-the results: a release is held to the corpus of its own commit, while the gate's own code is
-this checkout's. The commit has to be in this checkout (a clone with its history).
+With `corpus_rev` (promote.yaml: the release's commit), the manifest, project specifications,
+case sources and expected outputs all come from that commit's harness/smoke/ tree. A case
+introduced in this checkout after that manifest is reported as skipped; a selection with no
+cases or projects to run is an error. The commit has to be in this checkout (a clone with its
+history). Results name its exact commit, tree and snapshot digest. The gate's own code is this
+checkout's. Every Blaze command uses the selected absolute executable with `--ignore-pin`.
 
 A command that gives no answer in its time is followed by `blaze slow` in its directory, which
 names what the build it was in spent the time on (AGENTS.md rule 16), and `blaze stop`, so a
@@ -51,8 +51,9 @@ A case or project with `open` (an issue) is run and reported, and its failure do
 run. Each failure is printed with the command that repeats it. `results` is every result, for
 promote.yaml's issues. Stdlib only.
 """
-import base64, importlib, json, os, shlex, shutil, subprocess, sys, tempfile, time, typing
-from dataclasses import dataclass, fields
+import base64, hashlib, importlib, json, os, shlex, shutil, stat, subprocess, sys, tarfile, tempfile, time, typing
+from dataclasses import dataclass, fields, replace
+from pathlib import Path, PurePosixPath
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -65,12 +66,15 @@ Profile = typing.Literal["dev", "release"]
 GROUPS = ("std", "crates", "projects")
 CASE_SECS = 900
 PROJECT_SECS = 3600
+CORPUS_BYTES = 64 * 1024 * 1024
+CORPUS_FILES = 10_000
 # What blaze prints when something of the build was not its own (install.yaml looks for these too).
 NOT_BLAZES = ("blaze: bug:", "the daemon has no part")
 
 
 @dataclass(frozen=True)
 class Input:
+    command: typing.Literal["run", "apt", "brew"] = "run"
     groups: tuple[Group, ...] = GROUPS
     only: tuple[str, ...] = ()
     profiles: tuple[Profile, ...] = ("dev", "release")
@@ -101,6 +105,10 @@ def typed(text):
         hint = hints[name]
         if hint is str:
             ok = isinstance(given, str)
+        elif typing.get_origin(hint) is typing.Literal:
+            if not isinstance(given, str) or given not in typing.get_args(hint):
+                sys.exit(f"smoke.py: INPUT field {name} must be one of {typing.get_args(hint)}, not {given!r}")
+            ok = True
         else:
             (item, _) = typing.get_args(hint)
             allowed = typing.get_args(item) if typing.get_origin(item) is typing.Literal else None
@@ -111,14 +119,233 @@ def typed(text):
                 sys.exit(f"smoke.py: INPUT field {name} is a list of {', '.join(map(repr, allowed))}, not {given!r}")
         if not ok:
             sys.exit(f"smoke.py: INPUT field {name} is a {'string' if hint is str else 'list of strings'}, not {given!r}")
+        if name in ("groups", "profiles") and not given:
+            sys.exit(f"smoke.py: INPUT field {name} must not be empty")
     return Input(**value)
+
+
+def archive_limit(maximum):
+    """The child kernel refuses archive writes beyond the budget, before allocation.
+
+    This is only the source-reading git child, on the Linux/macOS smoke hosts. Its
+    inherited file-size bound may be stricter; never raise that bound for a read.
+    The controller and compiler retain their own resource limits unchanged.
+    """
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    limit = min([maximum, *(value for value in (soft, hard) if value != resource.RLIM_INFINITY)])
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, hard))
+
+
+def git(*words, output=None, max_bytes=None):
+    """A bounded source read; a missing revision is never a newer-case skip."""
+    if (output is None) != (max_bytes is None):
+        raise ValueError("smoke corpus: a file output needs an explicit acquisition byte bound")
+    if max_bytes is not None and (type(max_bytes) is not int or max_bytes <= 0):
+        raise ValueError("smoke corpus: the archive acquisition limit must be a positive integer")
+    if max_bytes is not None and os.name != "posix":
+        raise ValueError("smoke corpus: bounded archive acquisition needs a Linux or macOS smoke host")
+    done = subprocess.run(["git", "-C", ROOT, *words], stdout=output or subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=60,
+                          preexec_fn=(lambda: archive_limit(max_bytes)) if max_bytes is not None else None)
+    if max_bytes is not None and output.tell() > max_bytes:
+        raise ValueError(f"smoke corpus archive acquisition exceeded {max_bytes} bytes")
+    if done.returncode:
+        limit = f" (archive acquisition limited to {max_bytes} bytes)" if max_bytes is not None else ""
+        raise ValueError(f"smoke corpus: git {shlex.join(words)} exited {done.returncode}{limit}: "
+                         f"{done.stderr.decode(errors='replace').strip()}")
+    return done.stdout
+
+
+def resolve_commit(revision):
+    commit = git("rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}").decode().strip()
+    if len(commit) not in (40, 64) or any(c not in "0123456789abcdef" for c in commit):
+        raise ValueError(f"smoke corpus: {revision!r} did not resolve to a full commit: {commit!r}")
+    return commit
+
+
+def corpus_files(root):
+    """Only bounded regular files, with no link or special-file escape from the snapshot."""
+    found, total, count = [], 0, 0
+    for directory, directories, names in os.walk(root):
+        directories[:] = sorted(name for name in directories if name != "target")
+        names = sorted(name for name in names if name != "target")
+        count += len(directories) + len(names)
+        if count > CORPUS_FILES:
+            raise ValueError(f"smoke corpus exceeds {CORPUS_FILES} entries")
+        for name in directories:
+            path = Path(directory, name)
+            if path.is_symlink():
+                raise ValueError(f"smoke corpus: directory link {path} is not a snapshot file")
+        for name in names:
+            path = Path(directory, name)
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"smoke corpus: {path} is not a regular snapshot file")
+            total += info.st_size
+            found.append(path)
+            if total > CORPUS_BYTES or len(found) > CORPUS_FILES:
+                raise ValueError(f"smoke corpus exceeds {CORPUS_BYTES} bytes or {CORPUS_FILES} files")
+    return sorted(found)
+
+
+def file_digest(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def manifest_at(root):
+    path = Path(root, "smoke.json")
+    with path.open(encoding="utf-8") as source:
+        manifest = json.load(source)
+    if not isinstance(manifest, dict) or not all(isinstance(manifest.get(k), dict) for k in ("cases", "projects")):
+        raise ValueError(f"smoke corpus: {path} needs cases and projects objects")
+    if set(manifest["cases"]) & set(manifest["projects"]):
+        raise ValueError(f"smoke corpus: {path} names an item as both a case and a project")
+    for kind in ("cases", "projects"):
+        for name, spec in manifest[kind].items():
+            if not name or name in (".", "..") or "/" in name or "\\" in name or not isinstance(spec, dict):
+                raise ValueError(f"smoke corpus: invalid {kind} entry {name!r} in {path}")
+            if spec.get("group", "projects" if kind == "projects" else None) not in typing.get_args(Group):
+                raise ValueError(f"smoke corpus: {kind} entry {name!r} has no valid group in {path}")
+            if kind == "cases" and (type(spec.get("tests")) is not int or spec["tests"] < 0):
+                raise ValueError(f"smoke corpus: case {name!r} needs a nonnegative tests count in {path}")
+            if kind == "projects":
+                project_checks(name, spec, path)
+                if "macos" in spec:
+                    if not isinstance(spec["macos"], dict):
+                        raise ValueError(f"smoke corpus: project {name!r} needs an object for macos in {path}")
+                    project_checks(name, {**spec, **spec["macos"]}, path)
+    return manifest
+
+
+def project_checks(name, spec, path):
+    """Fetching or preparing a source tree alone cannot establish a compiler check."""
+    for field in ("builds", "runs"):
+        if field in spec and (not isinstance(spec[field], list)
+                              or not all(isinstance(step, dict) for step in spec[field])):
+            raise ValueError(f"smoke corpus: project {name!r} needs a list of {field} steps in {path}")
+    if "test" in spec and (not isinstance(spec["test"], list)
+                           or not all(isinstance(word, str) for word in spec["test"])):
+        raise ValueError(f"smoke corpus: project {name!r} needs a test argument list in {path}")
+    if not spec.get("builds") and not spec.get("runs") and "test" not in spec:
+        raise ValueError(f"smoke corpus: project {name!r} has no build, run or test check in {path}")
+
+
+class Corpus:
+    """One immutable input snapshot; selection and execution read the same manifest and files."""
+    def __init__(self, revision):
+        self.temporary = tempfile.TemporaryDirectory(prefix="blaze-smoke-corpus-")
+        self.root = Path(self.temporary.name, "smoke")
+        self.commit = self.tree = ""
+        try:
+            if revision:
+                self.commit = resolve_commit(revision)
+                self.tree = git("rev-parse", "--verify", f"{self.commit}:harness/smoke").decode().strip()
+                self.root.mkdir()
+                with tempfile.TemporaryFile() as archive:
+                    git("archive", "--format=tar", f"{self.commit}:harness/smoke", output=archive,
+                        max_bytes=CORPUS_BYTES)
+                    if archive.tell() > CORPUS_BYTES:
+                        raise ValueError(f"smoke corpus archive at {self.commit} exceeds {CORPUS_BYTES} bytes")
+                    archive.seek(0)
+                    self.extract(archive)
+            else:
+                corpus_files(CORPUS)
+                shutil.copytree(CORPUS, self.root, symlinks=True, ignore=shutil.ignore_patterns("target"))
+            files = corpus_files(self.root)
+            self.manifest = manifest_at(self.root)
+            for name in self.manifest["cases"]:
+                for required in ("Cargo.toml", "expected.txt"):
+                    if not Path(self.root, name, required).is_file():
+                        raise ValueError(f"smoke corpus at {self.commit or CORPUS}: case {name!r} lacks {required}")
+            rows = [(p.relative_to(self.root).as_posix(), p.stat().st_mode & 0o777, file_digest(p)) for p in files]
+            self.identity = dict(commit=self.commit or None, tree=self.tree or None,
+                                 sha256=hashlib.sha256(json.dumps(rows, separators=(",", ":")).encode()).hexdigest())
+        except BaseException:
+            self.temporary.cleanup()
+            raise
+
+    def extract(self, archive):
+        total = count = 0
+        with tarfile.open(fileobj=archive, mode="r:") as contents:
+            for member in contents:
+                relative = PurePosixPath(member.name)
+                if (relative.is_absolute() or ".." in relative.parts or "\\" in member.name
+                        or not relative.parts or ":" in relative.parts[0]):
+                    raise ValueError(f"smoke corpus: unsafe archive path {member.name!r}")
+                if not member.isdir() and not member.isfile():
+                    raise ValueError(f"smoke corpus: archive member {member.name!r} is not a regular file or directory")
+                if member.size < 0:
+                    raise ValueError(f"smoke corpus: archive member {member.name!r} has a negative size")
+                total += member.size
+                count += 1
+                if total > CORPUS_BYTES or count > CORPUS_FILES:
+                    raise ValueError(f"smoke corpus exceeds {CORPUS_BYTES} bytes or {CORPUS_FILES} entries")
+                path = self.root.joinpath(*relative.parts)
+                if member.isdir():
+                    path.mkdir(parents=True, exist_ok=True)
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    with contents.extractfile(member) as source, path.open("xb") as destination:
+                        shutil.copyfileobj(source, destination)
+                    path.chmod(0o755 if member.mode & 0o111 else 0o644)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.temporary.cleanup()
+
+
+def selection(args, corpus):
+    manifest = corpus.manifest
+    newer = {}
+    if corpus.commit:
+        newer = {name: spec for name, spec in manifest_at(CORPUS)["cases"].items()
+                 if name not in manifest["cases"] and name not in manifest["projects"]}
+    named = set(manifest["cases"]) | set(manifest["projects"]) | set(newer)
+    if unknown := sorted(set(args.only) - named):
+        raise ValueError(f"smoke.py: INPUT field only: no case or project {', '.join(unknown)}")
+
+    def selected(items, default):
+        return {n: s for n, s in items.items()
+                if s.get("group", default) in args.groups and (not args.only or n in args.only)}
+
+    cases = selected(manifest["cases"], None)
+    projects = selected(manifest["projects"], "projects")
+    skipped = selected(newer, None)
+    if left := sorted(set(args.only) - set(cases) - set(projects) - set(skipped)):
+        raise ValueError(f"smoke.py: INPUT field only names {', '.join(left)}, outside INPUT's groups {args.groups}")
+    if not cases and not projects:
+        raise ValueError(f"smoke corpus at {corpus.commit or CORPUS}: selection has no cases or projects to run")
+    return cases, projects, skipped
 
 
 def blaze_program(given):
     found = given or shutil.which("blaze")
     if not found or not os.path.isfile(found):
         sys.exit(f"smoke.py: no blaze {found or 'on PATH'}: INPUT's `blaze` names a build's, or an installed one is on PATH")
-    return os.path.abspath(found)
+    return str(Path(found).resolve(strict=True))
+
+
+def compiler_identity(blaze):
+    """Bind the selected program and the optional companion shipped in releases.
+
+    Both current V2 programs embed blaze_engine::main, so a standalone selected
+    program is valid. A companion present in a release is still part of that
+    executable set: its disappearance, appearance, replacement or drift is refused.
+    """
+    selected = Path(blaze)
+    companion = selected.with_name("blaze-engine" + EXE)
+    engine = None
+    if companion != selected and (companion.exists() or companion.is_symlink()):
+        resolved = companion.resolve(strict=True)
+        engine = dict(path=str(resolved), sha256=file_digest(resolved))
+    return dict(path=str(selected), sha256=file_digest(selected), engine=engine)
 
 
 def base_env():
@@ -186,13 +413,18 @@ def fetch(name, spec, rev, dest):
 
 
 class Smoke:
-    def __init__(self, args):
+    def __init__(self, args, corpus):
         self.blaze = blaze_program(args.blaze)
+        self.compiler = compiler_identity(self.blaze)
         self.work = os.path.abspath(args.work or tempfile.mkdtemp(prefix="blaze-smoke-"))
+        os.makedirs(self.work, exist_ok=True)
         self.profiles = args.profiles
         self.blaze_rev = args.blaze_rev
-        self.corpus_rev = args.corpus_rev
+        self.corpus = corpus
         self.results = []
+
+    def argv(self, *words):
+        return [self.blaze, "--ignore-pin", *words]
 
     def stalled(self, cwd, env):
         """What blaze says after a command gave no answer in its time: `blaze slow` (the span
@@ -200,21 +432,28 @@ class Smoke:
         output are kept with the result."""
         said = []
         for words, secs in ((["slow"], 300), (["stop"], 120)):
-            code, out, err, _ = run([self.blaze, *words], cwd, env, secs)
-            said.append(f"--- blaze {' '.join(words)}: exit {code}\n{out}{err}")
+            command = self.argv(*words)
+            try:
+                code, out, err, _ = run(command, cwd, env, secs)
+                said.append(f"--- {shown(command)}: exit {code}\n{out}{err}")
+            except (OSError, subprocess.SubprocessError) as error:
+                said.append(f"--- {shown(command)} could not finish: {error}")
         return "\n".join(said)
 
-    def newer_than_corpus(self, name):
-        """Whether the case `name` is not in `corpus_rev`'s corpus (always False without one)."""
-        if not self.corpus_rev:
-            return False
-        done = subprocess.run(["git", "-C", ROOT, "cat-file", "-e", f"{self.corpus_rev}:harness/smoke/{name}/Cargo.toml"],
-                              capture_output=True, text=True)
-        return done.returncode != 0
+    def stop(self):
+        command = self.argv("stop")
+        self.check("daemon stop", command, self.work, base_env(), 120,
+                   lambda code, _: None if code == 0 else f"stop exited {code}",
+                   shown(command), None, diagnose=False)
 
-    def check(self, what, argv, cwd, env, timeout, judge, repro, open_issue):
+    def error(self, what, error):
+        self.results.append(dict(what=what, ok=False, open=None, seconds=0, why=str(error),
+                                 repro="", stdout="", stderr=str(error)))
+        print(f"FAILED   {what}: {error}", flush=True)
+
+    def check(self, what, argv, cwd, env, timeout, judge, repro, open_issue, diagnose=True):
         code, out, err, secs = run(argv, cwd, env, timeout)
-        if code is None:
+        if code is None and diagnose:
             err += "\n" + self.stalled(cwd, env)
         lines = 25 if code is not None else 80
         not_ours = [line for line in err.splitlines() if any(it in line for it in NOT_BLAZES)]
@@ -237,17 +476,12 @@ class Smoke:
         return ["--release"] if profile == "release" else []
 
     def case(self, name, spec):
-        if self.newer_than_corpus(name):
-            why = f"not in the corpus at {self.corpus_rev[:10]}: newer than the blaze under test"
-            self.results.append(dict(what=name, ok=True, skipped=why, open=spec.get("open"), seconds=0, why=None,
-                                     repro="", stdout="", stderr=""))
-            print(f"skipped  {name}: {why}", flush=True)
-            return
-        source = os.path.join(CORPUS, name)
+        source = os.path.join(self.corpus.root, name)
         cwd = os.path.join(self.work, "cases", name)
         shutil.rmtree(cwd, ignore_errors=True)
         shutil.copytree(source, cwd, ignore=shutil.ignore_patterns("target"))
-        expected = open(os.path.join(source, "expected.txt")).read()
+        with open(os.path.join(source, "expected.txt"), encoding="utf-8") as answer:
+            expected = answer.read()
         extra = spec.get("env", {})
         env = dict(base_env(), **extra)
         tests = spec["tests"]
@@ -270,12 +504,12 @@ class Smoke:
 
         for profile in self.profiles:
             p = self.profile_args(profile)
-            argv = [self.blaze, "run", *p, "--", *spec.get("args", [])]
-            repro = shown(["blaze", "run", *p, "--", *spec.get("args", [])], extra, f"harness/smoke/{name}")
+            argv = self.argv("run", *p, "--", *spec.get("args", []))
+            repro = shown(argv, extra, cwd)
             self.check(f"{name} {profile} run", argv, cwd, env, CASE_SECS, ran, repro, spec.get("open"))
-            argv = [self.blaze, "test", *p]
+            argv = self.argv("test", *p)
             self.check(f"{name} {profile} test", argv, cwd, env, CASE_SECS, tested,
-                       shown(["blaze", "test", *p], extra, f"harness/smoke/{name}"), spec.get("open"))
+                       shown(argv, extra, cwd), spec.get("open"))
 
     def project(self, name, spec):
         if sys.platform == "darwin":
@@ -286,7 +520,7 @@ class Smoke:
         cwd = os.path.join(self.work, "projects", name)
         out_dir = os.path.join(self.work, "out", name)
         os.makedirs(out_dir, exist_ok=True)
-        clone = f"git clone https://github.com/{spec['repo']} {name} && cd {name} && git checkout {rev}"
+        clone = f"git clone {shlex.quote('https://github.com/' + spec['repo'])} {shlex.quote(name)} && cd {shlex.quote(name)} && git checkout {shlex.quote(rev)}"
         try:
             fetch(name, spec, rev, cwd)
         except (RuntimeError, subprocess.TimeoutExpired) as e:
@@ -336,14 +570,14 @@ class Smoke:
 
         for i, selection in enumerate(spec.get("fetches", [])):
             argv = ["lock", "--fetches", *selection]
-            self.check(f"{name} lock {i}", [self.blaze, *argv], cwd, env, seconds, judged({}),
-                       f"{clone} && {shown(['blaze', *argv], spec.get('env'))}", spec.get("open"))
+            self.check(f"{name} lock {i}", self.argv(*argv), cwd, env, seconds, judged({}),
+                       f"{clone} && {shown(self.argv(*argv), spec.get('env'))}", spec.get("open"))
         for profile in self.profiles:
             p = self.profile_args(profile)
             for i, step in enumerate(spec.get("builds", [])):
                 at = os.path.join(cwd, step.get("dir", "."))
-                built = shown(["blaze", "build", *p, *step.get("args", [])], spec.get("env"), step.get("dir"))
-                self.check(f"{name} {profile} build {i}", [self.blaze, "build", *p, *step.get("args", [])], at, env,
+                built = shown(self.argv("build", *p, *step.get("args", [])), spec.get("env"), step.get("dir"))
+                self.check(f"{name} {profile} build {i}", self.argv("build", *p, *step.get("args", [])), at, env,
                            seconds, judged({}), f"{clone} && {built}", spec.get("open"))
                 if "then" in step:
                     out_of = os.path.join("target", "release" if profile == "release" else "debug")
@@ -368,8 +602,8 @@ class Smoke:
                                 return f"{file} does not start with {step['starts']!r}"
                     return None
 
-                self.check(f"{name} {profile} run {i}", [self.blaze, "run", *args], cwd, env, seconds, ran,
-                           f"{clone} && {shown(['blaze', 'run', *args], spec.get('env'))}", spec.get("open"))
+                self.check(f"{name} {profile} run {i}", self.argv("run", *args), cwd, env, seconds, ran,
+                           f"{clone} && {shown(self.argv('run', *args), spec.get('env'))}", spec.get("open"))
             if "test" in spec:
                 args = [*p, *spec["test"]]
 
@@ -379,8 +613,8 @@ class Smoke:
                         return f"exit {code}, {passed} passed, {failed} failed"
                     return None if passed else "no test ran"
 
-                self.check(f"{name} {profile} test", [self.blaze, "test", *args], cwd, env, seconds, tested,
-                           f"{clone} && {shown(['blaze', 'test', *args], spec.get('env'))}", spec.get("open"))
+                self.check(f"{name} {profile} test", self.argv("test", *args), cwd, env, seconds, tested,
+                           f"{clone} && {shown(self.argv('test', *args), spec.get('env'))}", spec.get("open"))
 
 
 def zip_longest(a, b):
@@ -401,55 +635,69 @@ def summary(results, out):
     return failed
 
 
-def main():
-    words = sys.argv[1:]
-    packages = words[0] if words[:1] in (["apt"], ["brew"]) else None
-    if packages:
-        words = words[1:]
-    if len(words) > 1 or words[:1] in (["-h"], ["--help"]):
-        sys.exit(__doc__)
-    args = typed(words[0] if words else "")
-    corpus = json.load(open(os.path.join(CORPUS, "smoke.json")))
-    named = set(corpus["cases"]) | set(corpus["projects"])
-    if unknown := sorted(set(args.only) - named):
-        sys.exit(f"smoke.py: INPUT field only: no case or project {', '.join(unknown)}")
-    cases = {n: s for n, s in corpus["cases"].items() if s["group"] in args.groups and (not args.only or n in args.only)}
-    projects = {n: s for n, s in corpus["projects"].items()
-                if s.get("group", "projects") in args.groups and (not args.only or n in args.only)}
-    if left := sorted(set(args.only) - set(cases) - set(projects)):
-        sys.exit(f"smoke.py: INPUT field only names {', '.join(left)}, which INPUT's groups ({', '.join(args.groups)}) leave out")
-    if packages:
-        print(" ".join(sorted({p for s in projects.values() for p in s.get(packages, [])})))
-        return
+def execute(args, corpus):
+    cases, projects, skipped = selection(args, corpus)
+    if args.command in ("apt", "brew"):
+        print(" ".join(sorted({p for s in projects.values() for p in s.get(args.command, [])})))
+        return 0
     if not args.blaze_rev:
-        rev = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-        args = Input(**{**args.__dict__, "blaze_rev": rev})
-    if args.corpus_rev:
-        done = subprocess.run(["git", "-C", ROOT, "cat-file", "-e", f"{args.corpus_rev}^{{commit}}"], capture_output=True, text=True)
-        if done.returncode != 0:
-            sys.exit(f"smoke.py: INPUT field corpus_rev: {args.corpus_rev} is no commit of {ROOT} "
-                     f"(a shallow clone has no history: fetch it): {done.stderr.strip()}")
-    smoke = Smoke(args)
-    version = (subprocess.run([smoke.blaze, "--version"], capture_output=True, text=True).stdout.strip().splitlines() or [""])[0]
-    print(f"{version or smoke.blaze}: {len(cases)} cases, {len(projects)} projects, {', '.join(args.profiles)}; work {smoke.work}", flush=True)
+        args = replace(args, blaze_rev=resolve_commit("HEAD"))
+    smoke = Smoke(args, corpus)
+    version = ""
     began = time.monotonic()
     try:
+        command = smoke.argv("--version")
+        code, out, err, _ = run(command, smoke.work, base_env(), 60)
+        if code != 0 or not out.strip():
+            raise ValueError(f"{shown(command)} exited {code} without a valid version: {out}{err}")
+        version = out.strip().splitlines()[0]
+        print(f"{version}: {len(cases)} cases, {len(projects)} projects, {', '.join(args.profiles)}; work {smoke.work}", flush=True)
+        print(f"compiler {json.dumps(smoke.compiler, sort_keys=True)}; corpus {json.dumps(corpus.identity, sort_keys=True)}", flush=True)
+        for name, spec in skipped.items():
+            why = f"absent from the manifest at {corpus.commit}: newer than the blaze under test"
+            smoke.results.append(dict(what=name, ok=True, skipped=why, open=spec.get("open"), seconds=0,
+                                      why=None, repro="", stdout="", stderr=""))
+            print(f"skipped  {name}: {why}", flush=True)
         for name, spec in cases.items():
             smoke.case(name, spec)
         for name, spec in projects.items():
             smoke.project(name, spec)
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+        smoke.error("smoke harness", error)
     finally:
-        subprocess.run([smoke.blaze, "stop"], capture_output=True)
+        try:
+            smoke.stop()
+        except (OSError, subprocess.SubprocessError) as error:
+            smoke.error("daemon stop", error)
+    try:
+        if compiler_identity(smoke.blaze) != smoke.compiler:
+            smoke.error("compiler identity", f"selected compiler or companion of {smoke.blaze} changed during the smoke run")
+    except OSError as error:
+        smoke.error("compiler identity", error)
     print(f"{time.monotonic() - began:.0f} s", flush=True)
     if args.results:
         with open(args.results, "w") as f:
-            json.dump(dict(blaze=version, results=smoke.results), f, indent=1)
+            json.dump(dict(blaze=version, compiler=smoke.compiler, corpus=corpus.identity,
+                           results=smoke.results), f, indent=1)
     failed = summary(smoke.results, sys.stdout)
     if step_summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(step_summary, "a") as f:
             f.write(f"### smoke corpus: {version}\n\n")
             summary(smoke.results, f)
-    sys.exit(1 if failed else 0)
+    return 1 if failed else 0
+
+
+def main():
+    words = sys.argv[1:]
+    if len(words) > 1 or words[:1] in (["-h"], ["--help"]):
+        sys.exit(__doc__)
+    try:
+        args = typed(words[0] if words else "")
+        with Corpus(args.corpus_rev) as corpus:
+            code = execute(args, corpus)
+    except (OSError, ValueError, TypeError, KeyError, tarfile.TarError, subprocess.SubprocessError) as error:
+        sys.exit(f"smoke.py: {error}")
+    sys.exit(code)
 
 
 if __name__ == "__main__":

@@ -41,15 +41,6 @@
     "version": "1.1.5"
    },
    {
-    "dependencies": [
-     "indexmap",
-     "serde",
-     "sise"
-    ],
-    "name": "air",
-    "version": "0.1.0"
-   },
-   {
     "checksum": "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923",
     "name": "allocator-api2",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -426,6 +417,15 @@
     "version": "0.23.1"
    },
    {
+    "checksum": "09ec2f926cc3060f09db9ebc5b52823d85268d24bb917e472c0c4bea35780a7d",
+    "dependencies": [
+     "bit-vec"
+    ],
+    "name": "bit-set",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.10.0"
+   },
+   {
     "checksum": "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51",
     "dependencies": [
      "serde"
@@ -445,15 +445,6 @@
     "name": "bitflags",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "2.13.2"
-   },
-   {
-    "checksum": "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2",
-    "dependencies": [
-     "typenum"
-    ],
-    "name": "bitmaps",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "2.1.0"
    },
    {
     "checksum": "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae",
@@ -548,6 +539,7 @@
      "anyhow",
      "arrow-array",
      "base-db",
+     "base64",
      "blaze-alloc-count",
      "blaze-api",
      "blaze-build-script",
@@ -583,6 +575,8 @@
      "blaze-macro-eval",
      "blaze-manifest",
      "blaze-mem",
+     "blaze-metadata",
+     "blaze-new",
      "blaze-profile",
      "blaze-protocol",
      "blaze-query",
@@ -590,20 +584,22 @@
      "blaze-report",
      "blaze-serde",
      "blaze-sha256",
+     "blaze-shader",
      "blaze-source",
      "blaze-store-check",
      "blaze-testsel",
+     "blaze-tree",
      "blaze-ui",
      "blaze-units",
      "blaze-usercode",
      "blaze-vfs",
-     "blaze-wasm-pack",
      "blaze-wire",
      "cfg",
      "crossbeam-channel",
      "crossbeam-queue",
      "flate2",
      "futures-util",
+     "hegeltest",
      "hir",
      "hir-def",
      "hir-ty",
@@ -618,7 +614,9 @@
      "paths",
      "proc-macro-api",
      "ratatui",
+     "rcgen",
      "regex",
+     "rustls",
      "semver",
      "serde",
      "serde_json",
@@ -627,6 +625,7 @@
      "syntax",
      "tar",
      "tempfile",
+     "test-utils",
      "tokio",
      "toml",
      "tracing",
@@ -645,12 +644,16 @@
      "blaze-check",
      "blaze-core",
      "blaze-format",
+     "blaze-graph",
      "blaze-hash",
      "blaze-ids",
      "blaze-mem",
      "blaze-reclaim",
      "blaze-serde",
+     "blaze-spin",
      "blaze-v2-proof",
+     "crossbeam-channel",
+     "crossbeam-queue",
      "hegeltest",
      "lz4_flex",
      "serde",
@@ -700,6 +703,31 @@
    },
    {
     "dependencies": [
+     "blaze-api",
+     "blaze-core",
+     "blaze-protocol",
+     "blaze-report",
+     "blaze-rng",
+     "hegeltest",
+     "libc",
+     "serde",
+     "sonic-rs",
+     "tracing"
+    ],
+    "name": "blaze-client",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "blaze-api",
+     "blaze-client",
+     "blaze-protocol"
+    ],
+    "name": "blaze-client-c",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
      "blaze-alloc-count",
      "blaze-cas",
      "blaze-check",
@@ -717,6 +745,7 @@
      "blaze-store-check",
      "crossbeam-channel",
      "hashbrown 0.17.1",
+     "hegeltest",
      "serde",
      "serde_json",
      "tracing"
@@ -815,6 +844,33 @@
    },
    {
     "dependencies": [
+     "blaze-hash",
+     "hegeltest"
+    ],
+    "name": "blaze-diff",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "base-db",
+     "blaze-diff",
+     "blaze-hash",
+     "blaze-query",
+     "hegeltest",
+     "hir-def",
+     "hir-expand",
+     "hir-ty",
+     "hir-ty-mir",
+     "hir-ty-pure",
+     "intern",
+     "la-arena",
+     "rustc_type_ir"
+    ],
+    "name": "blaze-diff-mir",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
      "blaze-wire",
      "hegeltest"
     ],
@@ -827,7 +883,9 @@
      "blaze-dist",
      "blaze-serve",
      "blaze-wire",
+     "crossbeam-channel",
      "hegeltest",
+     "libc",
      "sha2 0.10.9",
      "tempfile",
      "tokio",
@@ -912,7 +970,6 @@
      "blaze-protocol",
      "blaze-rng",
      "blaze-serde",
-     "blaze-web",
      "crossbeam-channel",
      "ix-prof",
      "serde",
@@ -938,6 +995,43 @@
      "serde_json"
     ],
     "name": "blaze-explore-core",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "base-db",
+     "blaze-api",
+     "blaze-mem",
+     "hir-def",
+     "hir-ty-mir"
+    ],
+    "name": "blaze-ext",
+    "version": "0.1.0"
+   },
+   {
+    "dependencies": [
+     "base-db",
+     "blaze-diagnostics",
+     "blaze-ext",
+     "blaze-hash",
+     "blaze-ids",
+     "blaze-inproc",
+     "blaze-items",
+     "blaze-lints",
+     "blaze-mem",
+     "blaze-query",
+     "hegeltest",
+     "hir",
+     "hir-def",
+     "hir-expand",
+     "hir-ty",
+     "hir-ty-mir",
+     "panic-in-drop",
+     "rustc_lexer",
+     "syntax",
+     "toml"
+    ],
+    "name": "blaze-ext-host",
     "version": "0.0.0"
    },
    {
@@ -1076,9 +1170,11 @@
      "blaze-items",
      "blaze-mem",
      "blaze-usercode",
+     "hegeltest",
      "hir-ty",
      "hir-ty-borrowck",
      "memchr",
+     "rcgen",
      "ring",
      "rustls",
      "rustls-native-certs",
@@ -1203,7 +1299,8 @@
      "blaze-bytes",
      "blaze-core",
      "blaze-format",
-     "blaze-ids"
+     "blaze-ids",
+     "hegeltest"
     ],
     "name": "blaze-image",
     "version": "0.0.0"
@@ -1361,6 +1458,7 @@
      "blaze-mem",
      "blaze-sha256",
      "gimli",
+     "hegeltest",
      "object 0.40.0",
      "smallvec",
      "tracing",
@@ -1396,6 +1494,7 @@
      "blaze-profile",
      "blaze-query",
      "blaze-serde",
+     "blaze-vfs",
      "cfg",
      "either",
      "expect-test",
@@ -1424,6 +1523,16 @@
    },
    {
     "dependencies": [
+     "blaze-format",
+     "blaze-hash",
+     "blaze-ids",
+     "hegeltest"
+    ],
+    "name": "blaze-lir",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
      "blaze-alloc-count",
      "blaze-check",
      "blaze-ids",
@@ -1444,6 +1553,7 @@
      "blaze-units",
      "blaze-vfs",
      "cfg",
+     "hegeltest",
      "hir-def",
      "hir-expand",
      "hir-ty-mir",
@@ -1557,6 +1667,15 @@
      "serde_json"
     ],
     "name": "blaze-metadata",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "blaze-api",
+     "blaze-client",
+     "crossbeam-channel"
+    ],
+    "name": "blaze-napi",
     "version": "0.0.0"
    },
    {
@@ -1837,6 +1956,27 @@
    },
    {
     "dependencies": [
+     "base-db",
+     "blaze-hash",
+     "blaze-items",
+     "blaze-query",
+     "expect-test",
+     "hegeltest",
+     "hir-def",
+     "hir-expand",
+     "hir-ty",
+     "hir-ty-mir",
+     "hir-ty-pure",
+     "intern",
+     "naga",
+     "rustc_abi",
+     "rustc_type_ir"
+    ],
+    "name": "blaze-shader",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
      "anyhow",
      "blaze-alloc-count",
      "blaze-hash",
@@ -2069,42 +2209,6 @@
    },
    {
     "dependencies": [
-     "base-db",
-     "blaze-core",
-     "blaze-hash",
-     "blaze-query",
-     "blaze-serde",
-     "cfg",
-     "hir",
-     "hir-expand",
-     "intern",
-     "serde",
-     "span",
-     "syntax-bridge",
-     "triomphe",
-     "tt"
-    ],
-    "name": "blaze-wasm-pack",
-    "version": "0.0.0"
-   },
-   {
-    "dependencies": [
-     "base64",
-     "blaze-alloc-count",
-     "blaze-core",
-     "blaze-hash",
-     "blaze-ids",
-     "blaze-protocol",
-     "crossbeam-channel",
-     "flate2",
-     "flecs-c",
-     "sha1"
-    ],
-    "name": "blaze-web",
-    "version": "0.0.0"
-   },
-   {
-    "dependencies": [
      "serde_json",
      "sha2 0.10.9"
     ],
@@ -2257,10 +2361,10 @@
     "version": "1.0.4"
    },
    {
-    "checksum": "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724",
+    "checksum": "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527",
     "name": "cfg_aliases",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "0.2.1"
+    "version": "0.2.2"
    },
    {
     "checksum": "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06",
@@ -2292,7 +2396,7 @@
      "nom",
      "petgraph",
      "postcard",
-     "rustc-hash",
+     "rustc-hash 2.1.3",
      "serde",
      "serde_json",
      "serde_stacker",
@@ -2366,6 +2470,15 @@
     "name": "cobs",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.3.0"
+   },
+   {
+    "checksum": "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681",
+    "dependencies": [
+     "unicode-width 0.2.3"
+    ],
+    "name": "codespan-reporting",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.13.1"
    },
    {
     "checksum": "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570",
@@ -2562,7 +2675,7 @@
      "postcard",
      "pulley-interpreter",
      "regalloc2",
-     "rustc-hash",
+     "rustc-hash 2.1.3",
      "serde",
      "serde_derive",
      "sha2 0.10.9",
@@ -3269,19 +3382,6 @@
     "version": "1.1.10"
    },
    {
-    "dependencies": [
-     "cc",
-     "flecs-distr"
-    ],
-    "name": "flecs-c",
-    "version": "0.1.0"
-   },
-   {
-    "name": "flecs-distr",
-    "source": "git+https://github.com/indexable-inc/flecs?rev=ab8b8e051c6f8ac014557136c97847941bd3caa0#ab8b8e051c6f8ac014557136c97847941bd3caa0",
-    "version": "4.2.0"
-   },
-   {
     "checksum": "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1",
     "name": "fnv",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -3459,6 +3559,23 @@
     "version": "0.4.21"
    },
    {
+    "dependencies": [
+     "gpu-macros",
+     "hegeltest"
+    ],
+    "name": "gpu",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "proc-macro2",
+     "quote",
+     "syn 2.0.117"
+    ],
+    "name": "gpu-macros",
+    "version": "0.0.0"
+   },
+   {
     "checksum": "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b",
     "dependencies": [
      "cfg-if",
@@ -3544,7 +3661,7 @@
      "miniz_oxide",
      "once_cell",
      "rand",
-     "rustc-hash",
+     "rustc-hash 2.1.3",
      "rustix",
      "toml",
      "windows-sys 0.61.2"
@@ -3868,6 +3985,7 @@
      "hir-ty-identity",
      "hir-ty-mir",
      "hir-ty-print",
+     "hir-ty-pure",
      "hir-ty-share",
      "inkwell",
      "intern",
@@ -3930,8 +4048,8 @@
      "hir-def",
      "hir-expand",
      "hir-ty",
+     "hir-ty-lean",
      "hir-ty-mir",
-     "hir-ty-verus",
      "intern",
      "rustc_type_ir",
      "syntax",
@@ -3960,6 +4078,26 @@
      "stdx"
     ],
     "name": "hir-ty-identity",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "base-db",
+     "blaze-ids",
+     "blaze-query",
+     "cfg",
+     "expect-test",
+     "hegeltest",
+     "hir-def",
+     "hir-expand",
+     "hir-ty",
+     "hir-ty-borrowck",
+     "hir-ty-mir",
+     "intern",
+     "rustc_type_ir",
+     "syntax"
+    ],
+    "name": "hir-ty-lean",
     "version": "0.0.0"
    },
    {
@@ -4080,6 +4218,7 @@
      "blaze-mem",
      "blaze-query",
      "either",
+     "hegeltest",
      "hir-def",
      "hir-expand",
      "hir-ty",
@@ -4087,6 +4226,7 @@
      "hir-ty-print",
      "hir-ty-share",
      "intern",
+     "inventory",
      "rustc_type_ir",
      "smallvec",
      "span"
@@ -4200,28 +4340,6 @@
      "test-utils"
     ],
     "name": "hir-ty-unsafeck",
-    "version": "0.0.0"
-   },
-   {
-    "dependencies": [
-     "air",
-     "base-db",
-     "blaze-core",
-     "blaze-hash",
-     "blaze-ids",
-     "blaze-query",
-     "hir-def",
-     "hir-expand",
-     "hir-ty",
-     "hir-ty-mir",
-     "intern",
-     "num-bigint 0.5.1",
-     "rustc_type_ir",
-     "syntax",
-     "tracing",
-     "vir"
-    ],
-    "name": "hir-ty-verus",
     "version": "0.0.0"
    },
    {
@@ -4486,27 +4604,13 @@
     "version": "0.4.34"
    },
    {
-    "checksum": "d0acd33ff0285af998aaf9b57342af478078f53492322fafc47450e09397e0e9",
-    "dependencies": [
-     "bitmaps",
-     "rand_core 0.6.4",
-     "rand_xoshiro 0.6.0",
-     "sized-chunks",
-     "typenum",
-     "version_check"
-    ],
-    "name": "im",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "15.1.0"
-   },
-   {
     "checksum": "46bad832b9b463ed9398b8506488cc2e3b897a9d44f13af115f382aac71f4fec",
     "dependencies": [
      "archery",
      "equivalent",
      "imbl-sized-chunks",
      "rand_core 0.9.5",
-     "rand_xoshiro 0.7.0",
+     "rand_xoshiro",
      "version_check",
      "wide"
     ],
@@ -5002,6 +5106,43 @@
     "version": "0.4.7"
    },
    {
+    "checksum": "a616d2fb8c89516ac2723a581f69d6c18576046bed761bd6b305e5618e6ae130",
+    "dependencies": [
+     "arrayvec",
+     "bit-set",
+     "bitflags 2.13.2",
+     "cfg-if",
+     "cfg_aliases",
+     "codespan-reporting",
+     "half",
+     "hashbrown 0.17.1",
+     "indexmap",
+     "libm",
+     "log",
+     "naga-types",
+     "num-traits",
+     "once_cell",
+     "rustc-hash 1.1.0",
+     "spirv",
+     "thiserror"
+    ],
+    "name": "naga",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "30.0.1"
+   },
+   {
+    "checksum": "590afbf58a6f4f62873cd5cff4468061844bafa1cdf399cc954537c22d768d49",
+    "dependencies": [
+     "hashbrown 0.17.1",
+     "indexmap",
+     "rustc-hash 1.1.0",
+     "thiserror"
+    ],
+    "name": "naga-types",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "30.0.1"
+   },
+   {
     "checksum": "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d",
     "dependencies": [
      "bitflags 2.13.2",
@@ -5046,8 +5187,7 @@
     "checksum": "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0",
     "dependencies": [
      "num-integer",
-     "num-traits",
-     "serde"
+     "num-traits"
     ],
     "name": "num-bigint",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -5191,6 +5331,13 @@
     "name": "palette_math",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.7.7"
+   },
+   {
+    "dependencies": [
+     "blaze-ext"
+    ],
+    "name": "panic-in-drop",
+    "version": "0.1.0"
    },
    {
     "checksum": "da2442474a9404698c42509b8967f437249dbc7b50493e83020333d3943ec0ae",
@@ -5465,7 +5612,7 @@
      "rand",
      "rand_pcg",
      "ring",
-     "rustc-hash",
+     "rustc-hash 2.1.3",
      "rustls",
      "rustls-pki-types",
      "slab",
@@ -5533,7 +5680,7 @@
    {
     "dependencies": [
      "ra-ap-rustc_index",
-     "rustc-hash",
+     "rustc-hash 2.1.3",
      "rustc_apfloat",
      "smallvec"
     ],
@@ -5561,12 +5708,6 @@
     "version": "0.10.3"
    },
    {
-    "checksum": "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c",
-    "name": "rand_core",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "0.6.4"
-   },
-   {
     "checksum": "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c",
     "name": "rand_core",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -5586,15 +5727,6 @@
     "name": "rand_pcg",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.10.2"
-   },
-   {
-    "checksum": "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa",
-    "dependencies": [
-     "rand_core 0.6.4"
-    ],
-    "name": "rand_xoshiro",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "0.6.0"
    },
    {
     "checksum": "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41",
@@ -5720,7 +5852,7 @@
      "bumpalo",
      "hashbrown 0.17.1",
      "log",
-     "rustc-hash",
+     "rustc-hash 2.1.3",
      "serde",
      "smallvec"
     ],
@@ -5817,6 +5949,12 @@
     "version": "0.1.28"
    },
    {
+    "checksum": "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2",
+    "name": "rustc-hash",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.1.0"
+   },
+   {
     "checksum": "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d",
     "name": "rustc-hash",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -5899,7 +6037,7 @@
      "indexmap",
      "ra-ap-rustc_ast_ir",
      "ra-ap-rustc_index",
-     "rustc-hash",
+     "rustc-hash 2.1.3",
      "rustc_abi",
      "rustc_type_ir_macros",
      "smallvec",
@@ -6202,17 +6340,6 @@
     "version": "1.0.0"
    },
    {
-    "checksum": "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214",
-    "dependencies": [
-     "cfg-if",
-     "cpufeatures 0.3.1",
-     "digest 0.11.3"
-    ],
-    "name": "sha1",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "0.11.0"
-   },
-   {
     "checksum": "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283",
     "dependencies": [
      "cfg-if",
@@ -6306,22 +6433,6 @@
     "name": "similar",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "3.2.1"
-   },
-   {
-    "checksum": "b6be41bcb1c843a15a45bdb3b40532d873436ce5d826d4907053fa152eac0d9c",
-    "name": "sise",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "0.8.0"
-   },
-   {
-    "checksum": "16d69225bde7a69b235da73377861095455d298f2b970996eec25ddbb42b3d1e",
-    "dependencies": [
-     "bitmaps",
-     "typenum"
-    ],
-    "name": "sized-chunks",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "0.6.5"
    },
    {
     "checksum": "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5",
@@ -6440,6 +6551,15 @@
     "name": "spin",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.9.9"
+   },
+   {
+    "checksum": "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f",
+    "dependencies": [
+     "bitflags 2.13.2"
+    ],
+    "name": "spirv",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.4.0+sdk-1.4.341.0"
    },
    {
     "checksum": "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596",
@@ -6632,7 +6752,8 @@
    {
     "dependencies": [
      "blaze-ids",
-     "blaze-phf"
+     "blaze-phf",
+     "hegeltest"
     ],
     "name": "target-features",
     "version": "0.0.0"
@@ -7175,30 +7296,6 @@
     "name": "version_check",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.9.5"
-   },
-   {
-    "dependencies": [
-     "air",
-     "im",
-     "indexmap",
-     "num-bigint 0.5.1",
-     "num-traits",
-     "serde",
-     "sha2 0.11.1",
-     "sise",
-     "vir-macros"
-    ],
-    "name": "vir",
-    "version": "0.1.0"
-   },
-   {
-    "dependencies": [
-     "proc-macro2",
-     "syn 2.0.117",
-     "synstructure"
-    ],
-    "name": "vir-macros",
-    "version": "0.1.0"
    },
    {
     "checksum": "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b",
@@ -8209,6 +8306,12 @@
     "blaze-check": {
      "path": "crates/blaze-check"
     },
+    "blaze-client": {
+     "path": "crates/blaze-client"
+    },
+    "blaze-client-c": {
+     "path": "crates/blaze-client-c"
+    },
     "blaze-codegen": {
      "path": "crates/blaze-codegen"
     },
@@ -8225,6 +8328,14 @@
      "path": "crates/blaze-diagnostics",
      "version": "0.0.0"
     },
+    "blaze-diff": {
+     "path": "crates/blaze-diff",
+     "version": "0.0.0"
+    },
+    "blaze-diff-mir": {
+     "path": "crates/blaze-diff-mir",
+     "version": "0.0.0"
+    },
     "blaze-dist": {
      "path": "crates/blaze-dist"
     },
@@ -8239,6 +8350,12 @@
     },
     "blaze-explore-core": {
      "path": "crates/blaze-explore-core"
+    },
+    "blaze-ext": {
+     "path": "crates/blaze-ext"
+    },
+    "blaze-ext-host": {
+     "path": "crates/blaze-ext-host"
     },
     "blaze-fetch": {
      "path": "crates/blaze-fetch"
@@ -8314,6 +8431,9 @@
     "blaze-lints": {
      "path": "crates/blaze-lints"
     },
+    "blaze-lir": {
+     "path": "crates/blaze-lir"
+    },
     "blaze-live": {
      "path": "crates/blaze-live"
     },
@@ -8331,6 +8451,12 @@
     },
     "blaze-metadata": {
      "path": "crates/blaze-metadata"
+    },
+    "blaze-napi": {
+     "path": "crates/blaze-napi"
+    },
+    "blaze-new": {
+     "path": "crates/blaze-new"
     },
     "blaze-phf": {
      "path": "crates/blaze-phf",
@@ -8382,6 +8508,9 @@
     "blaze-sha256": {
      "path": "crates/blaze-sha256"
     },
+    "blaze-shader": {
+     "path": "crates/blaze-shader"
+    },
     "blaze-source": {
      "path": "crates/blaze-source"
     },
@@ -8397,6 +8526,9 @@
     },
     "blaze-testsel": {
      "path": "crates/blaze-testsel"
+    },
+    "blaze-tree": {
+     "path": "crates/blaze-tree"
     },
     "blaze-ui": {
      "path": "crates/blaze-ui"
@@ -8418,9 +8550,6 @@
     },
     "blaze-wasm-pack": {
      "path": "crates/blaze-wasm-pack"
-    },
-    "blaze-web": {
-     "path": "crates/blaze-web"
     },
     "blaze-wire": {
      "path": "crates/blaze-wire"
@@ -8469,9 +8598,6 @@
     "flate2": {
      "default-features": false,
      "version": "1.1.10"
-    },
-    "flecs-c": {
-     "path": "vendor/flecs-c"
     },
     "foldhash": "0.2.0",
     "fst": {
@@ -8551,6 +8677,10 @@
     "hir-ty-identity": {
      "path": "crates/hir-ty-identity"
     },
+    "hir-ty-lean": {
+     "path": "crates/hir-ty-lean",
+     "version": "0.0.0"
+    },
     "hir-ty-linear": {
      "path": "crates/hir-ty-linear",
      "version": "0.0.0"
@@ -8593,10 +8723,6 @@
     },
     "hir-ty-unsafeck": {
      "path": "crates/hir-ty-unsafeck",
-     "version": "0.0.0"
-    },
-    "hir-ty-verus": {
-     "path": "crates/hir-ty-verus",
      "version": "0.0.0"
     },
     "hir-ty-wfcheck": {
@@ -8817,7 +8943,6 @@
      "version": "1.0.229"
     },
     "serde_json": "1.0.154",
-    "sha1": "0.11.0",
     "sha2": "0.11",
     "shell-escape": "=0.1.5",
     "similar": "3.2.1",
@@ -8988,9 +9113,9 @@
     }
    },
    "exclude": [
-    "crates/blaze-wasm",
     "crates/harness",
     "demo",
+    "extensions",
     "harness",
     "library",
     "vendor/hegeltest",
@@ -9000,11 +9125,6 @@
     "vendor/arrow-buffer",
     "vendor/blake3-servil",
     "vendor/wasmtime",
-    "vendor/verus/air",
-    "vendor/verus/vir",
-    "vendor/verus/vir_macros",
-    "vendor/verus/builtin",
-    "vendor/verus/vstd",
     "vendor/charon/charon",
     "vendor/zstd-sys",
     "vendor/libzstd-rs-sys",
@@ -9170,6 +9290,9 @@
       "wide_index": "warn",
       "wildcard_arm": "warn"
      },
+     "lints-when-ready": {
+      "std_use": "warn"
+     },
      "lock": "required",
      "native": {
       "llvm": {
@@ -9273,23 +9396,6 @@
     "kind": "registry"
    },
    "version": "1.1.5"
-  },
-  "air@0.1.0": {
-   "authors": "",
-   "description": "Verus's Assertion Intermediate Language and its SMT driver, vendored into blaze (vendor/verus/SOURCE.md)",
-   "homepage": "",
-   "license": "MIT",
-   "license_file": "",
-   "links": null,
-   "name": "air",
-   "readme": "",
-   "repository": "",
-   "rust_version": "",
-   "source": {
-    "dir": "vendor/verus/air",
-    "kind": "path"
-   },
-   "version": "0.1.0"
   },
   "allocator-api2@0.2.21": {
    "authors": "Zakarum <zaq.dev@icloud.com>",
@@ -9886,6 +9992,23 @@
    },
    "version": "0.23.1"
   },
+  "bit-set@0.10.0": {
+   "authors": "Alexis Beingessner <a.beingessner@gmail.com>",
+   "description": "A set of bits",
+   "homepage": "https://github.com/contain-rs/bit-set",
+   "license": "Apache-2.0 OR MIT",
+   "license_file": "",
+   "links": null,
+   "name": "bit-set",
+   "readme": "README.md",
+   "repository": "https://github.com/contain-rs/bit-set",
+   "rust_version": "1.82",
+   "source": {
+    "checksum": "09ec2f926cc3060f09db9ebc5b52823d85268d24bb917e472c0c4bea35780a7d",
+    "kind": "registry"
+   },
+   "version": "0.10.0"
+  },
   "bit-vec@0.9.1": {
    "authors": "Alexis Beingessner <a.beingessner@gmail.com>",
    "description": "A vector of bits",
@@ -9936,23 +10059,6 @@
     "kind": "registry"
    },
    "version": "2.13.2"
-  },
-  "bitmaps@2.1.0": {
-   "authors": "Bodil Stokke <bodil@bodil.org>",
-   "description": "Fixed size boolean arrays",
-   "homepage": "",
-   "license": "MPL-2.0+",
-   "license_file": "",
-   "links": null,
-   "name": "bitmaps",
-   "readme": "./README.md",
-   "repository": "https://github.com/bodil/bitmaps",
-   "rust_version": "",
-   "source": {
-    "checksum": "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2",
-    "kind": "registry"
-   },
-   "version": "2.1.0"
   },
   "blake3-servil@0.8.0+b3c5efc7c975d903762dea809066f7c0a0603861": {
    "authors": "Jack O'Connor <oconnor663@gmail.com>:Samuel Neves:John Servil",
@@ -10141,6 +10247,40 @@
    },
    "version": "0.0.0"
   },
+  "blaze-client-c@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze-client's C ABI: connect to blaze's daemon, send requests of the agent API in JSON or CBOR, take each response in a callback (docs/client.md, include/blaze_client.h)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-client-c",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-client-c",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-client@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "A client of blaze's daemon with no process launch: a sans-IO core that multiplexes requests of the agent API on one connection, a blocking driver over the daemon's Unix socket, and `blaze-fast`, a small command line on it (docs/client.md)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-client",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-client",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "blaze-codegen-code@0.0.0": {
    "authors": "blaze contributors",
    "description": "The content identities of blaze's code generator and of its front end (the trait solver included), worked out by the program's build script over the checkout or a shipped tree: what stored templates and stored front-end answers are keyed by",
@@ -10222,6 +10362,40 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-diagnostics",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-diff-mir@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "Symbolic derivatives of pure functions (docs/future/autodiff.md, layer 2): lifting a function's monomorphized MIR to blaze-diff's expression graph, lowering a graph back to a MIR body, and `#[blaze::differentiable(symbolic)]`'s derivative body",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-diff-mir",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-diff-mir",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-diff@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "Symbolic differentiation of scalar float expressions (docs/future/autodiff.md, layers 2 and 3): a hash-consed expression graph, derivatives by a rule table, IEEE-exact and fast-math simplification on an e-graph, printing as Rust and as math, and evaluation",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-diff",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-diff",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -10327,6 +10501,40 @@
     "kind": "path"
    },
    "version": "0.0.0"
+  },
+  "blaze-ext-host@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "The host of blaze's extensions (docs/v2/plan/design/extensions.md): finds the extensions a workspace names, holds each to the compile-time checks, keys its build, loads it, runs its lints over a crate's bodies under fuel and a capped arena, and runs its facts to a fixpoint kept by code identity",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-ext-host",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-ext-host",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-ext@0.1.0": {
+   "authors": "blaze contributors",
+   "description": "The API of blaze's extensions (docs/v2/plan/design/extensions.md): the real MIR, a capability context and the declarations of lints and facts, behind one deliberately chosen facade that a user's analysis crate is compiled against",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-ext",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-ext",
+    "kind": "path"
+   },
+   "version": "0.1.0"
   },
   "blaze-fetch@0.0.0": {
    "authors": "blaze contributors",
@@ -10736,6 +10944,23 @@
    },
    "version": "0.0.0"
   },
+  "blaze-lir@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "LIR, blaze's low-level IR: one monomorphized function after layout, the ABI and drop elaboration, as flat columns with Rust's facts as flags and attribute rows; its builder, verifier, text form and blaze-format record (docs/v2/plan/design/lir.md)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-lir",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-lir",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "blaze-live@0.1.0": {
    "authors": "Indexable, Inc.",
    "description": "Applies blaze's edits to a program while it runs",
@@ -10834,6 +11059,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-metadata",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-napi@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze-client as a Node-API addon, for TypeScript on Bun and Node: connect, build, check, test, why, status and request as promises resolved off the JS thread (docs/client.md)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-napi",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-napi",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -11144,6 +11386,23 @@
    },
    "version": "0.0.0"
   },
+  "blaze-shader@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's device backend for shaders and GPU kernels (docs/future/gpu/shaders.md): a crate's GPU_ENTRIES read by const eval, the MIR they reach inlined, structured and lowered to naga IR, validated by naga and written as MSL",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-shader",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-shader",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "blaze-source@0.0.0": {
    "authors": "blaze contributors",
    "description": "where a package comes from, as cargo 1.99 names it: SourceId and the names of the directories cargo keeps a source in, with no I/O",
@@ -11361,40 +11620,6 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-wasi",
-    "kind": "path"
-   },
-   "version": "0.0.0"
-  },
-  "blaze-wasm-pack@0.0.0": {
-   "authors": "blaze contributors",
-   "description": "A cargo workspace as one file for blaze's in-browser compiler: made of a front end `blaze serve` lowered, loaded with no cargo",
-   "homepage": "",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "blaze-wasm-pack",
-   "readme": "",
-   "repository": "https://github.com/indexable-inc/blaze",
-   "rust_version": "1.101",
-   "source": {
-    "dir": "crates/blaze-wasm-pack",
-    "kind": "path"
-   },
-   "version": "0.0.0"
-  },
-  "blaze-web@0.0.0": {
-   "authors": "blaze contributors",
-   "description": "blaze's build page: the daemon serves the build, down to every function, on 127.0.0.1",
-   "homepage": "",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "blaze-web",
-   "readme": "",
-   "repository": "https://github.com/indexable-inc/blaze",
-   "rust_version": "1.101",
-   "source": {
-    "dir": "crates/blaze-web",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -11688,7 +11913,7 @@
    },
    "version": "0.0.0"
   },
-  "cfg_aliases@0.2.1": {
+  "cfg_aliases@0.2.2": {
    "authors": "Zicklag <zicklag@katharostech.com>",
    "description": "A tiny utility to help save you a lot of effort with long winded `#[cfg()]` checks.",
    "homepage": "https://github.com/katharostech/cfg_aliases",
@@ -11700,10 +11925,10 @@
    "repository": "https://github.com/katharostech/cfg_aliases",
    "rust_version": "",
    "source": {
-    "checksum": "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724",
+    "checksum": "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527",
     "kind": "registry"
    },
-   "version": "0.2.1"
+   "version": "0.2.2"
   },
   "chacha20@0.10.2": {
    "authors": "RustCrypto Developers",
@@ -11840,6 +12065,23 @@
     "kind": "registry"
    },
    "version": "0.3.0"
+  },
+  "codespan-reporting@0.13.1": {
+   "authors": "Brendan Zabarauskas <bjzaba@yahoo.com.au>",
+   "description": "Beautiful diagnostic reporting for text-based programming languages",
+   "homepage": "https://github.com/brendanzab/codespan",
+   "license": "Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "codespan-reporting",
+   "readme": "README.md",
+   "repository": "https://github.com/brendanzab/codespan",
+   "rust_version": "1.67",
+   "source": {
+    "checksum": "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681",
+    "kind": "registry"
+   },
+   "version": "0.13.1"
   },
   "colorchoice@1.0.5": {
    "authors": "",
@@ -13439,42 +13681,6 @@
    },
    "version": "1.1.10"
   },
-  "flecs-c@0.1.0": {
-   "authors": "",
-   "description": "Flecs's amalgamated C (the indexable-inc/flecs fork's, pinned below) built with cc, plus the declarations Rust calls it through",
-   "homepage": "",
-   "license": "MIT",
-   "license_file": "",
-   "links": "flecs",
-   "name": "flecs-c",
-   "readme": "",
-   "repository": "",
-   "rust_version": "",
-   "source": {
-    "dir": "vendor/flecs-c",
-    "kind": "path"
-   },
-   "version": "0.1.0"
-  },
-  "flecs-distr@4.2.0": {
-   "authors": "",
-   "description": "Where this fork's amalgamated flecs (distr/flecs.c, distr/flecs.h) is, for a build script that compiles it with its own defines. Builds nothing itself.",
-   "homepage": "",
-   "license": "MIT",
-   "license_file": "",
-   "links": null,
-   "name": "flecs-distr",
-   "readme": "",
-   "repository": "https://github.com/indexable-inc/flecs",
-   "rust_version": "",
-   "source": {
-    "dir": "distr",
-    "kind": "git",
-    "rev": "ab8b8e051c6f8ac014557136c97847941bd3caa0",
-    "url": "https://github.com/indexable-inc/flecs"
-   },
-   "version": "4.2.0"
-  },
   "fnv@1.0.7": {
    "authors": "Alex Crichton <alex@alexcrichton.com>",
    "description": "Fowler\u2013Noll\u2013Vo hash function",
@@ -13797,6 +14003,40 @@
     "kind": "registry"
    },
    "version": "0.4.21"
+  },
+  "gpu-macros@0.0.0": {
+   "authors": "",
+   "description": "#[gpu::vertex], #[gpu::fragment], #[gpu::kernel], #[derive(gpu::Varyings)] and #[derive(gpu::Pod)]: an entry point's binding table and a type's interface, written from its Rust signature (docs/future/gpu/shaders.md)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "gpu-macros",
+   "readme": "",
+   "repository": "",
+   "rust_version": "",
+   "source": {
+    "dir": "crates/gpu-macros",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "gpu@0.0.0": {
+   "authors": "",
+   "description": "Rust on the GPU, the shader side: vectors and Slang's math, built-ins, interpolation and resources as types, and the binding table every entry point's signature generates (docs/future/gpu/shaders.md)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "gpu",
+   "readme": "",
+   "repository": "",
+   "rust_version": "",
+   "source": {
+    "dir": "crates/gpu",
+    "kind": "path"
+   },
+   "version": "0.0.0"
   },
   "half@2.7.1": {
    "authors": "Kathryn Long <squeeself@gmail.com>",
@@ -14123,7 +14363,7 @@
   },
   "hir-ty-contracts@0.0.0": {
    "authors": "blaze contributors",
-   "description": "The optimizer's use of proved function contracts: a fact a native `ensures` states is used only once lane verus proves it, and each use is a fact the caller's code identity covers (docs/v2/plan/design/contracts.md, part 3).",
+   "description": "The optimizer's use of proved function contracts: a fact a native `ensures` states is used only once Lean proves it, and each use is a fact the caller's code identity covers (docs/v2/plan/design/contracts.md, part 3).",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
@@ -14151,6 +14391,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/hir-ty-identity",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "hir-ty-lean@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's borrow-checked MIR as structured MIR, and its functional translation to Lean 4: a model, the theorem statements of its clauses, and the pinned Lean's check of the proof (docs/v2/plan/design/formal-verification.md).",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "hir-ty-lean",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/hir-ty-lean",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -14338,23 +14595,6 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/hir-ty-unsafeck",
-    "kind": "path"
-   },
-   "version": "0.0.0"
-  },
-  "hir-ty-verus@0.0.0": {
-   "authors": "blaze contributors",
-   "description": "Formal verification of blaze_verify's native specification clauses: blaze's HIR lowered into Verus's VIR, proved through AIR by Z3 (docs/v2/plan/design/verus.md).",
-   "homepage": "",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "hir-ty-verus",
-   "readme": "",
-   "repository": "https://github.com/indexable-inc/blaze",
-   "rust_version": "1.101",
-   "source": {
-    "dir": "crates/hir-ty-verus",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -14783,23 +15023,6 @@
     "kind": "registry"
    },
    "version": "0.4.34"
-  },
-  "im@15.1.0": {
-   "authors": "Bodil Stokke <bodil@bodil.org>",
-   "description": "Immutable collection datatypes",
-   "homepage": "http://immutable.rs/",
-   "license": "MPL-2.0+",
-   "license_file": "",
-   "links": null,
-   "name": "im",
-   "readme": "./README.md",
-   "repository": "https://github.com/bodil/im-rs",
-   "rust_version": "1.46.0",
-   "source": {
-    "checksum": "d0acd33ff0285af998aaf9b57342af478078f53492322fafc47450e09397e0e9",
-    "kind": "registry"
-   },
-   "version": "15.1.0"
   },
   "imbl-sized-chunks@0.2.0": {
    "authors": "Bodil Stokke <bodil@bodil.org>:Joe Neeman <joeneeman@gmail.com>:Arthur Silva <arthurprs@gmail.com>",
@@ -15685,6 +15908,40 @@
    },
    "version": "0.4.7"
   },
+  "naga-types@30.0.1": {
+   "authors": "gfx-rs developers",
+   "description": "Common types for naga and wgpu",
+   "homepage": "https://wgpu.rs/",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "naga-types",
+   "readme": "README.md",
+   "repository": "https://github.com/gfx-rs/wgpu",
+   "rust_version": "",
+   "source": {
+    "checksum": "590afbf58a6f4f62873cd5cff4468061844bafa1cdf399cc954537c22d768d49",
+    "kind": "registry"
+   },
+   "version": "30.0.1"
+  },
+  "naga@30.0.1": {
+   "authors": "gfx-rs developers",
+   "description": "Shader translator and validator. Part of the wgpu project",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "naga",
+   "readme": "README.md",
+   "repository": "https://github.com/gfx-rs/wgpu",
+   "rust_version": "1.87",
+   "source": {
+    "checksum": "a616d2fb8c89516ac2723a581f69d6c18576046bed761bd6b305e5618e6ae130",
+    "kind": "registry"
+   },
+   "version": "30.0.1"
+  },
   "nix@0.31.3": {
    "authors": "",
    "description": "Rust friendly bindings to *nix APIs",
@@ -16041,6 +16298,23 @@
     "kind": "registry"
    },
    "version": "0.7.7"
+  },
+  "panic-in-drop@0.1.0": {
+   "authors": "",
+   "description": "blaze's `panic_in_drop` lint, ported to the extension API: the worked example",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "panic-in-drop",
+   "readme": "",
+   "repository": "",
+   "rust_version": "",
+   "source": {
+    "dir": "extensions/panic-in-drop",
+    "kind": "path"
+   },
+   "version": "0.1.0"
   },
   "papaya@0.2.5": {
    "authors": "Ibraheem Ahmed <ibraheem@ibraheem.ca>",
@@ -16671,23 +16945,6 @@
    },
    "version": "0.10.1"
   },
-  "rand_core@0.6.4": {
-   "authors": "The Rand Project Developers:The Rust Project Developers",
-   "description": "Core random number generator traits and tools for implementation.\n",
-   "homepage": "https://rust-random.github.io/book",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "rand_core",
-   "readme": "README.md",
-   "repository": "https://github.com/rust-random/rand",
-   "rust_version": "",
-   "source": {
-    "checksum": "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c",
-    "kind": "registry"
-   },
-   "version": "0.6.4"
-  },
   "rand_core@0.9.5": {
    "authors": "The Rand Project Developers:The Rust Project Developers",
    "description": "Core random number generator traits and tools for implementation.\n",
@@ -16721,23 +16978,6 @@
     "kind": "registry"
    },
    "version": "0.10.2"
-  },
-  "rand_xoshiro@0.6.0": {
-   "authors": "The Rand Project Developers",
-   "description": "Xoshiro, xoroshiro and splitmix64 random number generators",
-   "homepage": "https://rust-random.github.io/book",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "rand_xoshiro",
-   "readme": "README.md",
-   "repository": "https://github.com/rust-random/rngs",
-   "rust_version": "",
-   "source": {
-    "checksum": "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa",
-    "kind": "registry"
-   },
-   "version": "0.6.0"
   },
   "rand_xoshiro@0.7.0": {
    "authors": "The Rand Project Developers",
@@ -17044,6 +17284,23 @@
     "kind": "registry"
    },
    "version": "0.1.28"
+  },
+  "rustc-hash@1.1.0": {
+   "authors": "The Rust Project Developers",
+   "description": "speed, non-cryptographic hash used in rustc",
+   "homepage": "",
+   "license": "Apache-2.0/MIT",
+   "license_file": "",
+   "links": null,
+   "name": "rustc-hash",
+   "readme": "README.md",
+   "repository": "https://github.com/rust-lang-nursery/rustc-hash",
+   "rust_version": "",
+   "source": {
+    "checksum": "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2",
+    "kind": "registry"
+   },
+   "version": "1.1.0"
   },
   "rustc-hash@2.1.3": {
    "authors": "The Rust Project Developers",
@@ -17691,23 +17948,6 @@
    },
    "version": "1.0.0"
   },
-  "sha1@0.11.0": {
-   "authors": "RustCrypto Developers",
-   "description": "SHA-1 hash function",
-   "homepage": "",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "sha1",
-   "readme": "README.md",
-   "repository": "https://github.com/RustCrypto/hashes",
-   "rust_version": "1.85",
-   "source": {
-    "checksum": "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214",
-    "kind": "registry"
-   },
-   "version": "0.11.0"
-  },
   "sha2@0.10.9": {
    "authors": "RustCrypto Developers",
    "description": "Pure Rust implementation of the SHA-2 hash function family\nincluding SHA-224, SHA-256, SHA-384, and SHA-512.\n",
@@ -17895,40 +18135,6 @@
    },
    "version": "3.2.1"
   },
-  "sise@0.8.0": {
-   "authors": "Eduardo S\u00e1nchez Mu\u00f1oz <esm@eduardosm.net>",
-   "description": "SISE (Simple S-expression) parser, serializer and utilities library.",
-   "homepage": "",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "sise",
-   "readme": "README.md",
-   "repository": "https://github.com/eduardosm/rust-sise",
-   "rust_version": "1.56",
-   "source": {
-    "checksum": "b6be41bcb1c843a15a45bdb3b40532d873436ce5d826d4907053fa152eac0d9c",
-    "kind": "registry"
-   },
-   "version": "0.8.0"
-  },
-  "sized-chunks@0.6.5": {
-   "authors": "Bodil Stokke <bodil@bodil.org>",
-   "description": "Efficient sized chunk datatypes",
-   "homepage": "",
-   "license": "MPL-2.0+",
-   "license_file": "",
-   "links": null,
-   "name": "sized-chunks",
-   "readme": "./README.md",
-   "repository": "https://github.com/bodil/sized-chunks",
-   "rust_version": "",
-   "source": {
-    "checksum": "16d69225bde7a69b235da73377861095455d298f2b970996eec25ddbb42b3d1e",
-    "kind": "registry"
-   },
-   "version": "0.6.5"
-  },
   "slab@0.4.12": {
    "authors": "Carl Lerche <me@carllerche.com>",
    "description": "Pre-allocated storage for a uniform data type",
@@ -18115,6 +18321,23 @@
     "kind": "registry"
    },
    "version": "0.9.9"
+  },
+  "spirv@0.4.0+sdk-1.4.341.0": {
+   "authors": "Lei Zhang <antiagainst@gmail.com>",
+   "description": "Rust definition of SPIR-V structs and enums",
+   "homepage": "",
+   "license": "Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "spirv",
+   "readme": "README.md",
+   "repository": "https://github.com/gfx-rs/rspirv",
+   "rust_version": "",
+   "source": {
+    "checksum": "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f",
+    "kind": "registry"
+   },
+   "version": "0.4.0+sdk-1.4.341.0"
   },
   "stable_deref_trait@1.2.1": {
    "authors": "Robert Grosse <n210241048576@gmail.com>",
@@ -19407,40 +19630,6 @@
     "kind": "registry"
    },
    "version": "0.9.5"
-  },
-  "vir-macros@0.1.0": {
-   "authors": "",
-   "description": "Derive macros of Verus's VIR, vendored into blaze (vendor/verus/SOURCE.md)",
-   "homepage": "",
-   "license": "MIT",
-   "license_file": "",
-   "links": null,
-   "name": "vir-macros",
-   "readme": "",
-   "repository": "",
-   "rust_version": "",
-   "source": {
-    "dir": "vendor/verus/vir_macros",
-    "kind": "path"
-   },
-   "version": "0.1.0"
-  },
-  "vir@0.1.0": {
-   "authors": "",
-   "description": "Verus's Verification Intermediate Representation, vendored into blaze (vendor/verus/SOURCE.md)",
-   "homepage": "",
-   "license": "MIT",
-   "license_file": "",
-   "links": null,
-   "name": "vir",
-   "readme": "",
-   "repository": "",
-   "rust_version": "",
-   "source": {
-    "dir": "vendor/verus/vir",
-    "kind": "path"
-   },
-   "version": "0.1.0"
   },
   "walkdir@2.5.0": {
    "authors": "Andrew Gallant <jamslam@gmail.com>",
@@ -21717,6 +21906,51 @@
      "src": "src/lib.rs",
      "target": "base64"
     },
+    "bit-set@0.10.0 lib bit_set build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bit_vec",
+       "unit": "bit-vec@0.9.1 lib bit_vec build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bit-set@0.10.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bit_set"
+    },
+    "bit-vec@0.9.1 lib bit_vec build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bit-vec@0.9.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bit_vec"
+    },
     "bitflags@2.13.2 lib bitflags build": {
      "crate_type": "lib",
      "deps": [],
@@ -22452,6 +22686,14 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_metadata",
+       "unit": "blaze-metadata@0.0.0 lib blaze_metadata build"
+      },
+      {
+       "name": "blaze_new",
+       "unit": "blaze-new@0.0.0 lib blaze_new build"
+      },
+      {
        "name": "blaze_profile",
        "unit": "blaze-profile@0.0.0 lib blaze_profile build"
       },
@@ -22480,6 +22722,10 @@
        "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
       },
       {
+       "name": "blaze_shader",
+       "unit": "blaze-shader@0.0.0 lib blaze_shader build"
+      },
+      {
        "name": "blaze_source",
        "unit": "blaze-source@0.0.0 lib blaze_source build"
       },
@@ -22490,6 +22736,10 @@
       {
        "name": "blaze_testsel",
        "unit": "blaze-testsel@0.0.0 lib blaze_testsel build"
+      },
+      {
+       "name": "blaze_tree",
+       "unit": "blaze-tree@0.0.0 lib blaze_tree build"
       },
       {
        "name": "blaze_ui",
@@ -22506,10 +22756,6 @@
       {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
-      },
-      {
-       "name": "blaze_wasm_pack",
-       "unit": "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build"
       },
       {
        "name": "blaze_wire",
@@ -22679,6 +22925,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
@@ -22697,6 +22947,18 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
       },
       {
        "name": "lz4_flex",
@@ -23188,6 +23450,10 @@
       {
        "name": "blaze_wire",
        "unit": "blaze-wire@0.0.0 lib blaze_wire build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "sha2",
@@ -23903,10 +24169,6 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "blaze_web",
-       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "ix_prof",
@@ -25437,6 +25699,10 @@
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
       {
+       "name": "blaze_vfs",
+       "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
+      },
+      {
        "name": "cfg",
        "unit": "cfg@0.0.0 lib cfg build"
       },
@@ -25967,6 +26233,108 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_mem"
+    },
+    "blaze-metadata@0.0.0 lib blaze_metadata build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_registry",
+       "unit": "blaze-registry@0.0.0 lib blaze_registry build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.0.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_units",
+       "unit": "blaze-units@0.0.0 lib blaze_units build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.154 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-metadata@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_metadata"
+    },
+    "blaze-new@0.0.0 lib blaze_new build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "cargo_util_schemas",
+       "unit": "cargo-util-schemas@0.14.3 lib cargo_util_schemas build"
+      },
+      {
+       "name": "glob",
+       "unit": "glob@0.3.4 lib glob build"
+      },
+      {
+       "name": "pathdiff",
+       "unit": "pathdiff@0.2.3 lib pathdiff build"
+      },
+      {
+       "name": "toml_edit",
+       "unit": "toml_edit@0.25.12+spec-1.1.0 lib toml_edit build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-new@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_new"
     },
     "blaze-phf@0.0.0 lib blaze_phf build": {
      "crate_type": "lib",
@@ -26763,6 +27131,79 @@
      "src": "src/lib.rs",
      "target": "blaze_sha256"
     },
+    "blaze-shader@0.0.0 lib blaze_shader build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_items",
+       "unit": "blaze-items@0.0.0 lib blaze_items build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
+       "name": "hir_ty_pure",
+       "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "naga",
+       "unit": "naga@30.0.1 lib naga build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-shader@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_shader"
+    },
     "blaze-source@0.0.0 lib blaze_source build": {
      "crate_type": "lib",
      "deps": [
@@ -27030,6 +27471,71 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_testsel"
+    },
+    "blaze-tree@0.0.0 lib blaze_tree build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_format",
+       "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_metadata",
+       "unit": "blaze-metadata@0.0.0 lib blaze_metadata build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.0.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_units",
+       "unit": "blaze-units@0.0.0 lib blaze_units build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-tree@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_tree"
     },
     "blaze-ui@0.0.0 lib blaze_ui build": {
      "crate_type": "lib",
@@ -27460,193 +27966,6 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_wasi"
-    },
-    "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "base_db",
-       "unit": "base-db@0.0.0 lib base_db build"
-      },
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_query",
-       "unit": "blaze-query@0.0.0 lib blaze_query build"
-      },
-      {
-       "name": "blaze_serde",
-       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "cfg",
-       "unit": "cfg@0.0.0 lib cfg build"
-      },
-      {
-       "name": "hir_expand",
-       "unit": "hir-expand@0.0.0 lib hir_expand build"
-      },
-      {
-       "name": "hir",
-       "unit": "hir@0.0.0 lib hir build"
-      },
-      {
-       "name": "intern",
-       "unit": "intern@0.0.0 lib intern build"
-      },
-      {
-       "name": "serde",
-       "unit": "serde@1.0.229 lib serde build"
-      },
-      {
-       "name": "span",
-       "unit": "span@0.0.0 lib span build"
-      },
-      {
-       "name": "syntax_bridge",
-       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
-      },
-      {
-       "name": "triomphe",
-       "unit": "triomphe@0.1.17 lib triomphe build"
-      },
-      {
-       "name": "tt",
-       "unit": "tt@0.0.0 lib tt build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-wasm-pack@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_wasm_pack"
-    },
-    "blaze-web@0.0.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "blaze-web@0.0.0 lib blaze_web build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "base64",
-       "unit": "base64@0.23.1 lib base64 build"
-      },
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_ids",
-       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
-      },
-      {
-       "name": "blaze_protocol",
-       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
-      },
-      {
-       "name": "crossbeam_channel",
-       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "flate2",
-       "unit": "flate2@1.1.10 lib flate2 build"
-      },
-      {
-       "name": "flecs_c",
-       "unit": "flecs-c@0.1.0 lib flecs_c build"
-      },
-      {
-       "name": "sha1",
-       "unit": "sha1@0.11.0 lib sha1 build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_web"
     },
     "blaze-wire@0.0.0 lib blaze_wire build": {
      "crate_type": "lib",
@@ -28097,14 +28416,14 @@
      "src": "src/lib.rs",
      "target": "cfg"
     },
-    "cfg_aliases@0.2.1 lib cfg_aliases build host": {
+    "cfg_aliases@0.2.2 lib cfg_aliases build host": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2018",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "cfg_aliases@0.2.1",
+     "pkg": "cfg_aliases@0.2.2",
      "profile": {
       "codegen_units": 16,
       "debug_assertions": false,
@@ -28209,6 +28528,31 @@
      },
      "src": "src/lib.rs",
      "target": "cobs"
+    },
+    "codespan-reporting@0.13.1 lib codespan_reporting build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "codespan-reporting@0.13.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "codespan_reporting"
     },
     "compact_str@0.9.1 lib compact_str build": {
      "crate_type": "lib",
@@ -30849,111 +31193,6 @@
      "src": "src/lib.rs",
      "target": "flate2"
     },
-    "flecs-c@0.1.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "cc",
-       "unit": "cc@1.4.3 lib cc build host"
-      },
-      {
-       "name": "flecs_distr",
-       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "flecs-c@0.1.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "flecs-c@0.1.0 lib flecs_c build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "flecs_c"
-    },
-    "flecs-distr@4.2.0 lib flecs_distr build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "flecs-distr@4.2.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "lib.rs",
-     "target": "flecs_distr"
-    },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
      "deps": [],
@@ -32198,6 +32437,10 @@
        "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
+       "name": "hir_ty_pure",
+       "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
+      },
+      {
        "name": "hir_ty_share",
        "unit": "hir-ty-share@0.0.0 lib hir_ty_share build"
       },
@@ -32902,6 +33145,10 @@
       {
        "name": "intern",
        "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "inventory",
+       "unit": "inventory@0.3.25 lib inventory build"
       },
       {
        "name": "rustc_type_ir",
@@ -36248,12 +36495,203 @@
      "src": "src/lib.rs",
      "target": "mio"
     },
+    "naga-types@30.0.1 lib naga_types build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "indexmap",
+       "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@1.1.0 lib rustc_hash build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "naga-types@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "naga_types"
+    },
+    "naga@30.0.1 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "cfg_aliases",
+       "unit": "cfg_aliases@0.2.2 lib cfg_aliases build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": 16,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "naga@30.0.1 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "naga@30.0.1 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "naga@30.0.1 lib naga build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "arrayvec",
+       "unit": "arrayvec@0.7.8 lib arrayvec build"
+      },
+      {
+       "name": "bit_set",
+       "unit": "bit-set@0.10.0 lib bit_set build"
+      },
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.4 lib cfg_if build"
+      },
+      {
+       "name": "codespan_reporting",
+       "unit": "codespan-reporting@0.13.1 lib codespan_reporting build"
+      },
+      {
+       "name": "half",
+       "unit": "half@2.7.1 lib half build"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "indexmap",
+       "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "libm",
+       "unit": "libm@0.2.16 lib libm build"
+      },
+      {
+       "name": "log",
+       "unit": "log@0.4.31 lib log build"
+      },
+      {
+       "name": "naga_types",
+       "unit": "naga-types@30.0.1 lib naga_types build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "naga@30.0.1 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "num_traits",
+       "unit": "num-traits@0.2.19 lib num_traits build"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@1.1.0 lib rustc_hash build"
+      },
+      {
+       "name": "spirv",
+       "unit": "spirv@0.4.0+sdk-1.4.341.0 lib spirv build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "naga"
+    },
     "nix@0.31.3 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "cfg_aliases",
-       "unit": "cfg_aliases@0.2.1 lib cfg_aliases build host"
+       "unit": "cfg_aliases@0.2.2 lib cfg_aliases build host"
       }
      ],
      "edition": "2021",
@@ -38988,6 +39426,26 @@
      "src": "src/lib.rs",
      "target": "rustc_demangle"
     },
+    "rustc-hash@1.1.0 lib rustc_hash build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2015",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "rustc-hash@1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "rustc_hash"
+    },
     "rustc-hash@2.1.3 lib rustc_hash build": {
      "crate_type": "lib",
      "deps": [],
@@ -40789,43 +41247,6 @@
      "src": "src/lib.rs",
      "target": "serde_spanned"
     },
-    "sha1@0.11.0 lib sha1 build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "cfg_if",
-       "unit": "cfg-if@1.0.4 lib cfg_if build"
-      },
-      {
-       "name": "cpufeatures",
-       "unit": "cpufeatures@0.3.1 lib cpufeatures build"
-      },
-      {
-       "name": "digest",
-       "unit": "digest@0.11.3 lib digest build"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "alloc",
-      "default",
-      "oid"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "sha1@0.11.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "sha1"
-    },
     "sha2@0.10.9 lib sha2 build": {
      "crate_type": "lib",
      "deps": [
@@ -41472,6 +41893,31 @@
      },
      "src": "src/lib.rs",
      "target": "span"
+    },
+    "spirv@0.4.0+sdk-1.4.341.0 lib spirv build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      }
+     ],
+     "edition": "2018",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "spirv@0.4.0+sdk-1.4.341.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "spirv"
     },
     "stable_deref_trait@1.2.1 lib stable_deref_trait build": {
      "crate_type": "lib",
@@ -46641,6 +47087,51 @@
      "src": "src/lib.rs",
      "target": "base64"
     },
+    "bit-set@0.10.0 lib bit_set build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bit_vec",
+       "unit": "bit-vec@0.9.1 lib bit_vec build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bit-set@0.10.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bit_set"
+    },
+    "bit-vec@0.9.1 lib bit_vec build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bit-vec@0.9.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bit_vec"
+    },
     "bitflags@2.13.2 lib bitflags build": {
      "crate_type": "lib",
      "deps": [],
@@ -47376,6 +47867,14 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_metadata",
+       "unit": "blaze-metadata@0.0.0 lib blaze_metadata build"
+      },
+      {
+       "name": "blaze_new",
+       "unit": "blaze-new@0.0.0 lib blaze_new build"
+      },
+      {
        "name": "blaze_profile",
        "unit": "blaze-profile@0.0.0 lib blaze_profile build"
       },
@@ -47404,6 +47903,10 @@
        "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
       },
       {
+       "name": "blaze_shader",
+       "unit": "blaze-shader@0.0.0 lib blaze_shader build"
+      },
+      {
        "name": "blaze_source",
        "unit": "blaze-source@0.0.0 lib blaze_source build"
       },
@@ -47414,6 +47917,10 @@
       {
        "name": "blaze_testsel",
        "unit": "blaze-testsel@0.0.0 lib blaze_testsel build"
+      },
+      {
+       "name": "blaze_tree",
+       "unit": "blaze-tree@0.0.0 lib blaze_tree build"
       },
       {
        "name": "blaze_ui",
@@ -47430,10 +47937,6 @@
       {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
-      },
-      {
-       "name": "blaze_wasm_pack",
-       "unit": "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build"
       },
       {
        "name": "blaze_wire",
@@ -47603,6 +48106,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
@@ -47621,6 +48128,18 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
       },
       {
        "name": "lz4_flex",
@@ -48112,6 +48631,10 @@
       {
        "name": "blaze_wire",
        "unit": "blaze-wire@0.0.0 lib blaze_wire build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "sha2",
@@ -48827,10 +49350,6 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "blaze_web",
-       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "ix_prof",
@@ -50361,6 +50880,10 @@
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
       {
+       "name": "blaze_vfs",
+       "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
+      },
+      {
        "name": "cfg",
        "unit": "cfg@0.0.0 lib cfg build"
       },
@@ -50891,6 +51414,108 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_mem"
+    },
+    "blaze-metadata@0.0.0 lib blaze_metadata build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_registry",
+       "unit": "blaze-registry@0.0.0 lib blaze_registry build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.0.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_units",
+       "unit": "blaze-units@0.0.0 lib blaze_units build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.154 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-metadata@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_metadata"
+    },
+    "blaze-new@0.0.0 lib blaze_new build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "cargo_util_schemas",
+       "unit": "cargo-util-schemas@0.14.3 lib cargo_util_schemas build"
+      },
+      {
+       "name": "glob",
+       "unit": "glob@0.3.4 lib glob build"
+      },
+      {
+       "name": "pathdiff",
+       "unit": "pathdiff@0.2.3 lib pathdiff build"
+      },
+      {
+       "name": "toml_edit",
+       "unit": "toml_edit@0.25.12+spec-1.1.0 lib toml_edit build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-new@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_new"
     },
     "blaze-phf@0.0.0 lib blaze_phf build": {
      "crate_type": "lib",
@@ -51687,6 +52312,79 @@
      "src": "src/lib.rs",
      "target": "blaze_sha256"
     },
+    "blaze-shader@0.0.0 lib blaze_shader build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_items",
+       "unit": "blaze-items@0.0.0 lib blaze_items build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
+       "name": "hir_ty_pure",
+       "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "naga",
+       "unit": "naga@30.0.1 lib naga build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-shader@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_shader"
+    },
     "blaze-source@0.0.0 lib blaze_source build": {
      "crate_type": "lib",
      "deps": [
@@ -51954,6 +52652,71 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_testsel"
+    },
+    "blaze-tree@0.0.0 lib blaze_tree build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_format",
+       "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_metadata",
+       "unit": "blaze-metadata@0.0.0 lib blaze_metadata build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.0.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_units",
+       "unit": "blaze-units@0.0.0 lib blaze_units build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-tree@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_tree"
     },
     "blaze-ui@0.0.0 lib blaze_ui build": {
      "crate_type": "lib",
@@ -52384,193 +53147,6 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_wasi"
-    },
-    "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "base_db",
-       "unit": "base-db@0.0.0 lib base_db build"
-      },
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_query",
-       "unit": "blaze-query@0.0.0 lib blaze_query build"
-      },
-      {
-       "name": "blaze_serde",
-       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "cfg",
-       "unit": "cfg@0.0.0 lib cfg build"
-      },
-      {
-       "name": "hir_expand",
-       "unit": "hir-expand@0.0.0 lib hir_expand build"
-      },
-      {
-       "name": "hir",
-       "unit": "hir@0.0.0 lib hir build"
-      },
-      {
-       "name": "intern",
-       "unit": "intern@0.0.0 lib intern build"
-      },
-      {
-       "name": "serde",
-       "unit": "serde@1.0.229 lib serde build"
-      },
-      {
-       "name": "span",
-       "unit": "span@0.0.0 lib span build"
-      },
-      {
-       "name": "syntax_bridge",
-       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
-      },
-      {
-       "name": "triomphe",
-       "unit": "triomphe@0.1.17 lib triomphe build"
-      },
-      {
-       "name": "tt",
-       "unit": "tt@0.0.0 lib tt build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-wasm-pack@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_wasm_pack"
-    },
-    "blaze-web@0.0.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "blaze-web@0.0.0 lib blaze_web build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "base64",
-       "unit": "base64@0.23.1 lib base64 build"
-      },
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_ids",
-       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
-      },
-      {
-       "name": "blaze_protocol",
-       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
-      },
-      {
-       "name": "crossbeam_channel",
-       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "flate2",
-       "unit": "flate2@1.1.10 lib flate2 build"
-      },
-      {
-       "name": "flecs_c",
-       "unit": "flecs-c@0.1.0 lib flecs_c build"
-      },
-      {
-       "name": "sha1",
-       "unit": "sha1@0.11.0 lib sha1 build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_web"
     },
     "blaze-wire@0.0.0 lib blaze_wire build": {
      "crate_type": "lib",
@@ -53021,6 +53597,26 @@
      "src": "src/lib.rs",
      "target": "cfg"
     },
+    "cfg_aliases@0.2.2 lib cfg_aliases build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2018",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "cfg_aliases@0.2.2",
+     "profile": {
+      "codegen_units": 16,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "cfg_aliases"
+    },
     "chacha20@0.10.2 lib chacha20 build": {
      "crate_type": "lib",
      "deps": [
@@ -53113,6 +53709,31 @@
      },
      "src": "src/lib.rs",
      "target": "cobs"
+    },
+    "codespan-reporting@0.13.1 lib codespan_reporting build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "codespan-reporting@0.13.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "codespan_reporting"
     },
     "compact_str@0.9.1 lib compact_str build": {
      "crate_type": "lib",
@@ -55694,111 +56315,6 @@
      "src": "src/lib.rs",
      "target": "flate2"
     },
-    "flecs-c@0.1.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "cc",
-       "unit": "cc@1.4.3 lib cc build host"
-      },
-      {
-       "name": "flecs_distr",
-       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "flecs-c@0.1.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "flecs-c@0.1.0 lib flecs_c build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "flecs_c"
-    },
-    "flecs-distr@4.2.0 lib flecs_distr build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "flecs-distr@4.2.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "lib.rs",
-     "target": "flecs_distr"
-    },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
      "deps": [],
@@ -57043,6 +57559,10 @@
        "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
+       "name": "hir_ty_pure",
+       "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
+      },
+      {
        "name": "hir_ty_share",
        "unit": "hir-ty-share@0.0.0 lib hir_ty_share build"
       },
@@ -57747,6 +58267,10 @@
       {
        "name": "intern",
        "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "inventory",
+       "unit": "inventory@0.3.25 lib inventory build"
       },
       {
        "name": "rustc_type_ir",
@@ -61092,6 +61616,197 @@
      "src": "src/lib.rs",
      "target": "mio"
     },
+    "naga-types@30.0.1 lib naga_types build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "indexmap",
+       "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@1.1.0 lib rustc_hash build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "naga-types@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "naga_types"
+    },
+    "naga@30.0.1 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "cfg_aliases",
+       "unit": "cfg_aliases@0.2.2 lib cfg_aliases build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": 16,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "naga@30.0.1 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "naga@30.0.1 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "naga@30.0.1 lib naga build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "arrayvec",
+       "unit": "arrayvec@0.7.8 lib arrayvec build"
+      },
+      {
+       "name": "bit_set",
+       "unit": "bit-set@0.10.0 lib bit_set build"
+      },
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.4 lib cfg_if build"
+      },
+      {
+       "name": "codespan_reporting",
+       "unit": "codespan-reporting@0.13.1 lib codespan_reporting build"
+      },
+      {
+       "name": "half",
+       "unit": "half@2.7.1 lib half build"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "indexmap",
+       "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "libm",
+       "unit": "libm@0.2.16 lib libm build"
+      },
+      {
+       "name": "log",
+       "unit": "log@0.4.31 lib log build"
+      },
+      {
+       "name": "naga_types",
+       "unit": "naga-types@30.0.1 lib naga_types build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "naga@30.0.1 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "num_traits",
+       "unit": "num-traits@0.2.19 lib num_traits build"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@1.1.0 lib rustc_hash build"
+      },
+      {
+       "name": "spirv",
+       "unit": "spirv@0.4.0+sdk-1.4.341.0 lib spirv build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "naga"
+    },
     "nu-ansi-term@0.50.3 lib nu_ansi_term build": {
      "crate_type": "lib",
      "deps": [],
@@ -63754,6 +64469,26 @@
      "src": "src/lib.rs",
      "target": "rustc_demangle"
     },
+    "rustc-hash@1.1.0 lib rustc_hash build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2015",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "rustc-hash@1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "rustc_hash"
+    },
     "rustc-hash@2.1.3 lib rustc_hash build": {
      "crate_type": "lib",
      "deps": [],
@@ -65476,43 +66211,6 @@
      "src": "src/lib.rs",
      "target": "serde_spanned"
     },
-    "sha1@0.11.0 lib sha1 build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "cfg_if",
-       "unit": "cfg-if@1.0.4 lib cfg_if build"
-      },
-      {
-       "name": "cpufeatures",
-       "unit": "cpufeatures@0.3.1 lib cpufeatures build"
-      },
-      {
-       "name": "digest",
-       "unit": "digest@0.11.3 lib digest build"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "alloc",
-      "default",
-      "oid"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "sha1@0.11.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "sha1"
-    },
     "sha2@0.10.9 lib sha2 build": {
      "crate_type": "lib",
      "deps": [
@@ -66159,6 +66857,31 @@
      },
      "src": "src/lib.rs",
      "target": "span"
+    },
+    "spirv@0.4.0+sdk-1.4.341.0 lib spirv build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      }
+     ],
+     "edition": "2018",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "spirv@0.4.0+sdk-1.4.341.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "spirv"
     },
     "stable_deref_trait@1.2.1 lib stable_deref_trait build": {
      "crate_type": "lib",
@@ -71328,6 +72051,51 @@
      "src": "src/lib.rs",
      "target": "base64"
     },
+    "bit-set@0.10.0 lib bit_set build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bit_vec",
+       "unit": "bit-vec@0.9.1 lib bit_vec build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bit-set@0.10.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bit_set"
+    },
+    "bit-vec@0.9.1 lib bit_vec build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bit-vec@0.9.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bit_vec"
+    },
     "bitflags@2.13.2 lib bitflags build": {
      "crate_type": "lib",
      "deps": [],
@@ -71997,6 +72765,14 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_metadata",
+       "unit": "blaze-metadata@0.0.0 lib blaze_metadata build"
+      },
+      {
+       "name": "blaze_new",
+       "unit": "blaze-new@0.0.0 lib blaze_new build"
+      },
+      {
        "name": "blaze_profile",
        "unit": "blaze-profile@0.0.0 lib blaze_profile build"
       },
@@ -72025,6 +72801,10 @@
        "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
       },
       {
+       "name": "blaze_shader",
+       "unit": "blaze-shader@0.0.0 lib blaze_shader build"
+      },
+      {
        "name": "blaze_source",
        "unit": "blaze-source@0.0.0 lib blaze_source build"
       },
@@ -72035,6 +72815,10 @@
       {
        "name": "blaze_testsel",
        "unit": "blaze-testsel@0.0.0 lib blaze_testsel build"
+      },
+      {
+       "name": "blaze_tree",
+       "unit": "blaze-tree@0.0.0 lib blaze_tree build"
       },
       {
        "name": "blaze_ui",
@@ -72051,10 +72835,6 @@
       {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
-      },
-      {
-       "name": "blaze_wasm_pack",
-       "unit": "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build"
       },
       {
        "name": "blaze_wire",
@@ -72224,6 +73004,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
@@ -72242,6 +73026,18 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
       },
       {
        "name": "lz4_flex",
@@ -72733,6 +73529,10 @@
       {
        "name": "blaze_wire",
        "unit": "blaze-wire@0.0.0 lib blaze_wire build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "sha2",
@@ -73448,10 +74248,6 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "blaze_web",
-       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "ix_prof",
@@ -74978,6 +75774,10 @@
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
       {
+       "name": "blaze_vfs",
+       "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
+      },
+      {
        "name": "cfg",
        "unit": "cfg@0.0.0 lib cfg build"
       },
@@ -75508,6 +76308,108 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_mem"
+    },
+    "blaze-metadata@0.0.0 lib blaze_metadata build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_registry",
+       "unit": "blaze-registry@0.0.0 lib blaze_registry build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.0.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_units",
+       "unit": "blaze-units@0.0.0 lib blaze_units build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.154 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-metadata@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_metadata"
+    },
+    "blaze-new@0.0.0 lib blaze_new build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "cargo_util_schemas",
+       "unit": "cargo-util-schemas@0.14.3 lib cargo_util_schemas build"
+      },
+      {
+       "name": "glob",
+       "unit": "glob@0.3.4 lib glob build"
+      },
+      {
+       "name": "pathdiff",
+       "unit": "pathdiff@0.2.3 lib pathdiff build"
+      },
+      {
+       "name": "toml_edit",
+       "unit": "toml_edit@0.25.12+spec-1.1.0 lib toml_edit build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-new@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_new"
     },
     "blaze-phf@0.0.0 lib blaze_phf build": {
      "crate_type": "lib",
@@ -76304,6 +77206,79 @@
      "src": "src/lib.rs",
      "target": "blaze_sha256"
     },
+    "blaze-shader@0.0.0 lib blaze_shader build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_items",
+       "unit": "blaze-items@0.0.0 lib blaze_items build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
+       "name": "hir_ty_pure",
+       "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "naga",
+       "unit": "naga@30.0.1 lib naga build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-shader@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_shader"
+    },
     "blaze-source@0.0.0 lib blaze_source build": {
      "crate_type": "lib",
      "deps": [
@@ -76571,6 +77546,71 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_testsel"
+    },
+    "blaze-tree@0.0.0 lib blaze_tree build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_format",
+       "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_metadata",
+       "unit": "blaze-metadata@0.0.0 lib blaze_metadata build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.0.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_units",
+       "unit": "blaze-units@0.0.0 lib blaze_units build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-tree@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_tree"
     },
     "blaze-ui@0.0.0 lib blaze_ui build": {
      "crate_type": "lib",
@@ -77001,193 +78041,6 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_wasi"
-    },
-    "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "base_db",
-       "unit": "base-db@0.0.0 lib base_db build"
-      },
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_query",
-       "unit": "blaze-query@0.0.0 lib blaze_query build"
-      },
-      {
-       "name": "blaze_serde",
-       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "cfg",
-       "unit": "cfg@0.0.0 lib cfg build"
-      },
-      {
-       "name": "hir_expand",
-       "unit": "hir-expand@0.0.0 lib hir_expand build"
-      },
-      {
-       "name": "hir",
-       "unit": "hir@0.0.0 lib hir build"
-      },
-      {
-       "name": "intern",
-       "unit": "intern@0.0.0 lib intern build"
-      },
-      {
-       "name": "serde",
-       "unit": "serde@1.0.229 lib serde build"
-      },
-      {
-       "name": "span",
-       "unit": "span@0.0.0 lib span build"
-      },
-      {
-       "name": "syntax_bridge",
-       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
-      },
-      {
-       "name": "triomphe",
-       "unit": "triomphe@0.1.17 lib triomphe build"
-      },
-      {
-       "name": "tt",
-       "unit": "tt@0.0.0 lib tt build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-wasm-pack@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_wasm_pack"
-    },
-    "blaze-web@0.0.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "blaze-web@0.0.0 lib blaze_web build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "base64",
-       "unit": "base64@0.23.1 lib base64 build"
-      },
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_ids",
-       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
-      },
-      {
-       "name": "blaze_protocol",
-       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
-      },
-      {
-       "name": "crossbeam_channel",
-       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "flate2",
-       "unit": "flate2@1.1.10 lib flate2 build"
-      },
-      {
-       "name": "flecs_c",
-       "unit": "flecs-c@0.1.0 lib flecs_c build"
-      },
-      {
-       "name": "sha1",
-       "unit": "sha1@0.11.0 lib sha1 build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_web"
     },
     "blaze-wire@0.0.0 lib blaze_wire build": {
      "crate_type": "lib",
@@ -77638,14 +78491,14 @@
      "src": "src/lib.rs",
      "target": "cfg"
     },
-    "cfg_aliases@0.2.1 lib cfg_aliases build host": {
+    "cfg_aliases@0.2.2 lib cfg_aliases build host": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2018",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "cfg_aliases@0.2.1",
+     "pkg": "cfg_aliases@0.2.2",
      "profile": {
       "codegen_units": 16,
       "debug_assertions": false,
@@ -77754,6 +78607,31 @@
      },
      "src": "src/lib.rs",
      "target": "cobs"
+    },
+    "codespan-reporting@0.13.1 lib codespan_reporting build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "codespan-reporting@0.13.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "codespan_reporting"
     },
     "compact_str@0.9.1 lib compact_str build": {
      "crate_type": "lib",
@@ -80380,111 +81258,6 @@
      "src": "src/lib.rs",
      "target": "flate2"
     },
-    "flecs-c@0.1.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "cc",
-       "unit": "cc@1.4.3 lib cc build host"
-      },
-      {
-       "name": "flecs_distr",
-       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "flecs-c@0.1.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "flecs-c@0.1.0 lib flecs_c build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "flecs_c"
-    },
-    "flecs-distr@4.2.0 lib flecs_distr build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "flecs-distr@4.2.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "lib.rs",
-     "target": "flecs_distr"
-    },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
      "deps": [],
@@ -81729,6 +82502,10 @@
        "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
+       "name": "hir_ty_pure",
+       "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
+      },
+      {
        "name": "hir_ty_share",
        "unit": "hir-ty-share@0.0.0 lib hir_ty_share build"
       },
@@ -82433,6 +83210,10 @@
       {
        "name": "intern",
        "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "inventory",
+       "unit": "inventory@0.3.25 lib inventory build"
       },
       {
        "name": "rustc_type_ir",
@@ -85779,12 +86560,203 @@
      "src": "src/lib.rs",
      "target": "mio"
     },
+    "naga-types@30.0.1 lib naga_types build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "indexmap",
+       "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@1.1.0 lib rustc_hash build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "naga-types@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "naga_types"
+    },
+    "naga@30.0.1 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "cfg_aliases",
+       "unit": "cfg_aliases@0.2.2 lib cfg_aliases build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": 16,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "naga@30.0.1 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "naga@30.0.1 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "naga@30.0.1 lib naga build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "arrayvec",
+       "unit": "arrayvec@0.7.8 lib arrayvec build"
+      },
+      {
+       "name": "bit_set",
+       "unit": "bit-set@0.10.0 lib bit_set build"
+      },
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.4 lib cfg_if build"
+      },
+      {
+       "name": "codespan_reporting",
+       "unit": "codespan-reporting@0.13.1 lib codespan_reporting build"
+      },
+      {
+       "name": "half",
+       "unit": "half@2.7.1 lib half build"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "indexmap",
+       "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "libm",
+       "unit": "libm@0.2.16 lib libm build"
+      },
+      {
+       "name": "log",
+       "unit": "log@0.4.31 lib log build"
+      },
+      {
+       "name": "naga_types",
+       "unit": "naga-types@30.0.1 lib naga_types build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "naga@30.0.1 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "num_traits",
+       "unit": "num-traits@0.2.19 lib num_traits build"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@1.1.0 lib rustc_hash build"
+      },
+      {
+       "name": "spirv",
+       "unit": "spirv@0.4.0+sdk-1.4.341.0 lib spirv build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "naga"
+    },
     "nix@0.31.3 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "cfg_aliases",
-       "unit": "cfg_aliases@0.2.1 lib cfg_aliases build host"
+       "unit": "cfg_aliases@0.2.2 lib cfg_aliases build host"
       }
      ],
      "edition": "2021",
@@ -88515,6 +89487,26 @@
      "src": "src/lib.rs",
      "target": "rustc_demangle"
     },
+    "rustc-hash@1.1.0 lib rustc_hash build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2015",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "rustc-hash@1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "rustc_hash"
+    },
     "rustc-hash@2.1.3 lib rustc_hash build": {
      "crate_type": "lib",
      "deps": [],
@@ -90316,43 +91308,6 @@
      "src": "src/lib.rs",
      "target": "serde_spanned"
     },
-    "sha1@0.11.0 lib sha1 build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "cfg_if",
-       "unit": "cfg-if@1.0.4 lib cfg_if build"
-      },
-      {
-       "name": "cpufeatures",
-       "unit": "cpufeatures@0.3.1 lib cpufeatures build"
-      },
-      {
-       "name": "digest",
-       "unit": "digest@0.11.3 lib digest build"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "alloc",
-      "default",
-      "oid"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "sha1@0.11.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "sha1"
-    },
     "sha2@0.10.9 lib sha2 build": {
      "crate_type": "lib",
      "deps": [
@@ -90999,6 +91954,31 @@
      },
      "src": "src/lib.rs",
      "target": "span"
+    },
+    "spirv@0.4.0+sdk-1.4.341.0 lib spirv build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      }
+     ],
+     "edition": "2018",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "spirv@0.4.0+sdk-1.4.341.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "spirv"
     },
     "stable_deref_trait@1.2.1 lib stable_deref_trait build": {
      "crate_type": "lib",
@@ -96168,6 +97148,51 @@
      "src": "src/lib.rs",
      "target": "base64"
     },
+    "bit-set@0.10.0 lib bit_set build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bit_vec",
+       "unit": "bit-vec@0.9.1 lib bit_vec build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bit-set@0.10.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bit_set"
+    },
+    "bit-vec@0.9.1 lib bit_vec build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bit-vec@0.9.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bit_vec"
+    },
     "bitflags@2.13.2 lib bitflags build": {
      "crate_type": "lib",
      "deps": [],
@@ -96903,6 +97928,14 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_metadata",
+       "unit": "blaze-metadata@0.0.0 lib blaze_metadata build"
+      },
+      {
+       "name": "blaze_new",
+       "unit": "blaze-new@0.0.0 lib blaze_new build"
+      },
+      {
        "name": "blaze_profile",
        "unit": "blaze-profile@0.0.0 lib blaze_profile build"
       },
@@ -96931,6 +97964,10 @@
        "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
       },
       {
+       "name": "blaze_shader",
+       "unit": "blaze-shader@0.0.0 lib blaze_shader build"
+      },
+      {
        "name": "blaze_source",
        "unit": "blaze-source@0.0.0 lib blaze_source build"
       },
@@ -96941,6 +97978,10 @@
       {
        "name": "blaze_testsel",
        "unit": "blaze-testsel@0.0.0 lib blaze_testsel build"
+      },
+      {
+       "name": "blaze_tree",
+       "unit": "blaze-tree@0.0.0 lib blaze_tree build"
       },
       {
        "name": "blaze_ui",
@@ -96957,10 +97998,6 @@
       {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
-      },
-      {
-       "name": "blaze_wasm_pack",
-       "unit": "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build"
       },
       {
        "name": "blaze_wire",
@@ -97130,6 +98167,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
@@ -97148,6 +98189,18 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
       },
       {
        "name": "lz4_flex",
@@ -97639,6 +98692,10 @@
       {
        "name": "blaze_wire",
        "unit": "blaze-wire@0.0.0 lib blaze_wire build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "sha2",
@@ -98354,10 +99411,6 @@
       {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "blaze_web",
-       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "ix_prof",
@@ -99888,6 +100941,10 @@
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
       {
+       "name": "blaze_vfs",
+       "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
+      },
+      {
        "name": "cfg",
        "unit": "cfg@0.0.0 lib cfg build"
       },
@@ -100418,6 +101475,108 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_mem"
+    },
+    "blaze-metadata@0.0.0 lib blaze_metadata build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_registry",
+       "unit": "blaze-registry@0.0.0 lib blaze_registry build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.0.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_units",
+       "unit": "blaze-units@0.0.0 lib blaze_units build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.154 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-metadata@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_metadata"
+    },
+    "blaze-new@0.0.0 lib blaze_new build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "cargo_util_schemas",
+       "unit": "cargo-util-schemas@0.14.3 lib cargo_util_schemas build"
+      },
+      {
+       "name": "glob",
+       "unit": "glob@0.3.4 lib glob build"
+      },
+      {
+       "name": "pathdiff",
+       "unit": "pathdiff@0.2.3 lib pathdiff build"
+      },
+      {
+       "name": "toml_edit",
+       "unit": "toml_edit@0.25.12+spec-1.1.0 lib toml_edit build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-new@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_new"
     },
     "blaze-phf@0.0.0 lib blaze_phf build": {
      "crate_type": "lib",
@@ -101214,6 +102373,79 @@
      "src": "src/lib.rs",
      "target": "blaze_sha256"
     },
+    "blaze-shader@0.0.0 lib blaze_shader build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_items",
+       "unit": "blaze-items@0.0.0 lib blaze_items build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
+       "name": "hir_ty_pure",
+       "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "naga",
+       "unit": "naga@30.0.1 lib naga build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-shader@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_shader"
+    },
     "blaze-source@0.0.0 lib blaze_source build": {
      "crate_type": "lib",
      "deps": [
@@ -101481,6 +102713,71 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_testsel"
+    },
+    "blaze-tree@0.0.0 lib blaze_tree build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_format",
+       "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.0.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_metadata",
+       "unit": "blaze-metadata@0.0.0 lib blaze_metadata build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.0.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_units",
+       "unit": "blaze-units@0.0.0 lib blaze_units build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-tree@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_tree"
     },
     "blaze-ui@0.0.0 lib blaze_ui build": {
      "crate_type": "lib",
@@ -101911,193 +103208,6 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_wasi"
-    },
-    "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "base_db",
-       "unit": "base-db@0.0.0 lib base_db build"
-      },
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_query",
-       "unit": "blaze-query@0.0.0 lib blaze_query build"
-      },
-      {
-       "name": "blaze_serde",
-       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
-      },
-      {
-       "name": "cfg",
-       "unit": "cfg@0.0.0 lib cfg build"
-      },
-      {
-       "name": "hir_expand",
-       "unit": "hir-expand@0.0.0 lib hir_expand build"
-      },
-      {
-       "name": "hir",
-       "unit": "hir@0.0.0 lib hir build"
-      },
-      {
-       "name": "intern",
-       "unit": "intern@0.0.0 lib intern build"
-      },
-      {
-       "name": "serde",
-       "unit": "serde@1.0.229 lib serde build"
-      },
-      {
-       "name": "span",
-       "unit": "span@0.0.0 lib span build"
-      },
-      {
-       "name": "syntax_bridge",
-       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
-      },
-      {
-       "name": "triomphe",
-       "unit": "triomphe@0.1.17 lib triomphe build"
-      },
-      {
-       "name": "tt",
-       "unit": "tt@0.0.0 lib tt build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-wasm-pack@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_wasm_pack"
-    },
-    "blaze-web@0.0.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "blaze-web@0.0.0 lib blaze_web build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "base64",
-       "unit": "base64@0.23.1 lib base64 build"
-      },
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_ids",
-       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
-      },
-      {
-       "name": "blaze_protocol",
-       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
-      },
-      {
-       "name": "crossbeam_channel",
-       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "flate2",
-       "unit": "flate2@1.1.10 lib flate2 build"
-      },
-      {
-       "name": "flecs_c",
-       "unit": "flecs-c@0.1.0 lib flecs_c build"
-      },
-      {
-       "name": "sha1",
-       "unit": "sha1@0.11.0 lib sha1 build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-web@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_web"
     },
     "blaze-wire@0.0.0 lib blaze_wire build": {
      "crate_type": "lib",
@@ -102548,6 +103658,26 @@
      "src": "src/lib.rs",
      "target": "cfg"
     },
+    "cfg_aliases@0.2.2 lib cfg_aliases build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2018",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "cfg_aliases@0.2.2",
+     "profile": {
+      "codegen_units": 16,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "cfg_aliases"
+    },
     "chacha20@0.10.2 lib chacha20 build": {
      "crate_type": "lib",
      "deps": [
@@ -102644,6 +103774,31 @@
      },
      "src": "src/lib.rs",
      "target": "cobs"
+    },
+    "codespan-reporting@0.13.1 lib codespan_reporting build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "codespan-reporting@0.13.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "codespan_reporting"
     },
     "compact_str@0.9.1 lib compact_str build": {
      "crate_type": "lib",
@@ -105215,111 +106370,6 @@
      "src": "src/lib.rs",
      "target": "flate2"
     },
-    "flecs-c@0.1.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "cc",
-       "unit": "cc@1.4.3 lib cc build host"
-      },
-      {
-       "name": "flecs_distr",
-       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "flecs-c@0.1.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "flecs-c@0.1.0 lib flecs_c build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "rest"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "flecs-c@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "flecs_c"
-    },
-    "flecs-distr@4.2.0 lib flecs_distr build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "flecs-distr@4.2.0",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "lib.rs",
-     "target": "flecs_distr"
-    },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
      "deps": [],
@@ -106564,6 +107614,10 @@
        "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
+       "name": "hir_ty_pure",
+       "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
+      },
+      {
        "name": "hir_ty_share",
        "unit": "hir-ty-share@0.0.0 lib hir_ty_share build"
       },
@@ -107268,6 +108322,10 @@
       {
        "name": "intern",
        "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "inventory",
+       "unit": "inventory@0.3.25 lib inventory build"
       },
       {
        "name": "rustc_type_ir",
@@ -110613,6 +111671,197 @@
      "src": "src/lib.rs",
      "target": "mio"
     },
+    "naga-types@30.0.1 lib naga_types build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "indexmap",
+       "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@1.1.0 lib rustc_hash build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "naga-types@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "naga_types"
+    },
+    "naga@30.0.1 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "cfg_aliases",
+       "unit": "cfg_aliases@0.2.2 lib cfg_aliases build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": 16,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "naga@30.0.1 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "naga@30.0.1 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "naga@30.0.1 lib naga build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "arrayvec",
+       "unit": "arrayvec@0.7.8 lib arrayvec build"
+      },
+      {
+       "name": "bit_set",
+       "unit": "bit-set@0.10.0 lib bit_set build"
+      },
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.4 lib cfg_if build"
+      },
+      {
+       "name": "codespan_reporting",
+       "unit": "codespan-reporting@0.13.1 lib codespan_reporting build"
+      },
+      {
+       "name": "half",
+       "unit": "half@2.7.1 lib half build"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "indexmap",
+       "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "libm",
+       "unit": "libm@0.2.16 lib libm build"
+      },
+      {
+       "name": "log",
+       "unit": "log@0.4.31 lib log build"
+      },
+      {
+       "name": "naga_types",
+       "unit": "naga-types@30.0.1 lib naga_types build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "naga@30.0.1 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "num_traits",
+       "unit": "num-traits@0.2.19 lib num_traits build"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@1.1.0 lib rustc_hash build"
+      },
+      {
+       "name": "spirv",
+       "unit": "spirv@0.4.0+sdk-1.4.341.0 lib spirv build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "msl-out",
+      "spv-out",
+      "wgsl-out"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "naga@30.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "naga"
+    },
     "nu-ansi-term@0.50.3 lib nu_ansi_term build": {
      "crate_type": "lib",
      "deps": [],
@@ -113271,6 +114520,26 @@
      "src": "src/lib.rs",
      "target": "rustc_demangle"
     },
+    "rustc-hash@1.1.0 lib rustc_hash build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2015",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "rustc-hash@1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "rustc_hash"
+    },
     "rustc-hash@2.1.3 lib rustc_hash build": {
      "crate_type": "lib",
      "deps": [],
@@ -114993,43 +116262,6 @@
      "src": "src/lib.rs",
      "target": "serde_spanned"
     },
-    "sha1@0.11.0 lib sha1 build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "cfg_if",
-       "unit": "cfg-if@1.0.4 lib cfg_if build"
-      },
-      {
-       "name": "cpufeatures",
-       "unit": "cpufeatures@0.3.1 lib cpufeatures build"
-      },
-      {
-       "name": "digest",
-       "unit": "digest@0.11.3 lib digest build"
-      }
-     ],
-     "edition": "2024",
-     "features": [
-      "alloc",
-      "default",
-      "oid"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "sha1@0.11.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "sha1"
-    },
     "sha2@0.10.9 lib sha2 build": {
      "crate_type": "lib",
      "deps": [
@@ -115676,6 +116908,31 @@
      },
      "src": "src/lib.rs",
      "target": "span"
+    },
+    "spirv@0.4.0+sdk-1.4.341.0 lib spirv build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      }
+     ],
+     "edition": "2018",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "spirv@0.4.0+sdk-1.4.341.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "spirv"
     },
     "stable_deref_trait@1.2.1 lib stable_deref_trait build": {
      "crate_type": "lib",

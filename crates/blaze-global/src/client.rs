@@ -298,6 +298,16 @@ impl<C: Channels> Client<C> {
         self.listed.get(key)
     }
 
+    #[cfg(test)]
+    pub(crate) fn forget_manifest_binding(&mut self, key: &Key) {
+        self.listed.remove(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_manifest_prefix(&mut self, record: Record) {
+        self.listed.insert(record.key, record);
+    }
+
     /// Takes a completion of its own. Returns the store's: each the completion of a tag
     /// [`Store::fetch`] asked with, for [`Store::complete`].
     pub fn complete(
@@ -790,13 +800,28 @@ fn answer(
             }
         }
         Asked::Bundle(tag, id) => {
-            let result = bundle_answer(&mut Reader::new(body), id, trust);
-            if let Ok(Some(manifest)) = &result {
-                listed.reserve(manifest.entries.len());
-                for entry in &manifest.entries {
-                    listed.insert(entry.key, *entry);
+            let result = bundle_answer(&mut Reader::new(body), id, trust).and_then(|manifest| {
+                if let Some(manifest) = &manifest {
+                    // Validate the whole addition first. A key's record never changes, and
+                    // refusing a conflicting manifest must bind none of its other entries.
+                    for entry in &manifest.entries {
+                        if let Some(kept) = listed.get(&entry.key)
+                            && kept != entry
+                        {
+                            // alloc: an error's message, made only when it fails.
+                            return Err(format!(
+                                "bundle {:x} lists a different record for {:x} than an earlier verified manifest",
+                                id.0, entry.key.0
+                            ));
+                        }
+                    }
+                    listed.reserve(manifest.entries.len());
+                    for entry in &manifest.entries {
+                        listed.insert(entry.key, *entry);
+                    }
                 }
-            }
+                Ok(manifest)
+            });
             let failed = result.as_ref().err().cloned();
             outcomes.got.push(GotBundle { tag, id, result });
             failed.map_or(Ok(()), Err)
