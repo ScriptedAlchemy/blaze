@@ -1,5 +1,7 @@
 //! Executable definitions that the dynamic loader must see before a shared library's.
 
+use std::sync::Arc;
+
 use object::read::elf::Sym as _;
 
 use super::*;
@@ -36,7 +38,7 @@ fn elf_executable_interposes_shared_definitions() {
         },
     )
     .unwrap();
-    let so = contents(disk.file("out/libc.so"));
+    let so: Arc<[u8]> = contents(disk.file("out/libc.so")).into();
     let start = function(1, &returns(0), Vec::new());
     let private = function(2, &returns(2), Vec::new());
     let mut image = Image::new(name(TO), output(true)).unwrap();
@@ -96,7 +98,7 @@ fn elf_loader_resolves_the_executables_allocator() {
         .iter()
         .find(|it| it.path.file_name().is_some_and(|name| name == "libc.so.6"))
         .expect("the Linux x86-64 loader proof needs its native libc.so.6");
-    let libc = std::fs::read(&libc_file.path).unwrap();
+    let libc: Arc<[u8]> = std::fs::read(&libc_file.path).unwrap().into();
     // `_start` aligns the stack, calls dlsym(NULL, "malloc"), compares its result
     // with the address of our body and exits via SYS_exit (0 if equal, 1 otherwise).
     // The trailing literal is part of this function; no startup or external compiler
