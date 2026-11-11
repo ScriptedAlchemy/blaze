@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """blaze_cli.py: `blaze` and its daemon on real projects, unmodified.
 
-    blaze_cli.py [PROJECT...] [--small] [--only-projects] [--only-checks] [--only-upgraded] [--keep]
+    uv run --frozen python harness/blaze_cli.py '{"blaze": "/path/to/blaze", "small": true}'
+
+One strict JSON object, inline, a file path, or `-` for stdin. Input below names every field.
+`part` selects all, projects, checks or upgraded; `projects` names a subset, `sources` is the
+clone cache, `tmp` is the scratch parent, `output` holds the reports, and `keep` retains
+a successful run's scratch too.
 
 Four parts, all of which have to pass.
 
-Projects. Each one below is cloned at its tag, which has to be the commit it is pinned to, into `BLAZE_PROJECTS` (~/blaze-projects) when
+Projects. Each one below is cloned at its tag, which has to be the commit it is pinned to, into `sources` (~/blaze-projects) when
 it is not there, and copied; the clone is never written to. In the copy, with blaze's build
 of the same source from nothing (`Scratch`: a home, store and target directory of its own for
 every command) as the reference:
@@ -16,8 +21,8 @@ every command) as the reference:
   broken    a type error is added; both have to fail with the same status
 After every step the program's output and exit status and the result of every test have to be
 what the build from nothing gives for the same source, every build but `broken` has to
-succeed, and every test run has to pass by its own tests. A build cargo did in place of the
-daemon passes (that is the contract) and is in the table with the reason. Every build runs
+succeed, and every test run has to pass by its own tests. Every successful build must name
+the selected Blaze daemon as its producer; a fallback is a failure. Every build runs
 with `--message-format=json-render-diagnostics` (`machine_format`): who built it is its
 `build-finished` line on stdout (`how_built`), the program's and the tests' output is what
 comes after that line, and rustc's diagnostics stay rendered on stderr.
@@ -40,19 +45,22 @@ error in it fails, with nothing said of the project's toolchain but one line und
 no rustup and no Rust on the path, `blaze run` builds with blaze's own copy of its release and the edit is the daemon's.
 
 Upgraded. A project whose rust-toolchain file names another release: that is not said, and the
-build is not cargo's. `--only-upgraded` runs
+build is the selected Blaze's. `{"part": "upgraded"}` runs
 this part alone.
 
-Writes BLAZE-CLI.md and blaze_cli.json next to this file. A run of some projects replaces their rows
-and keeps the others. `--small` is the three projects of the CI job.
+Writes BLAZE-CLI.md and blaze_cli.json in `output` (this directory by default). A run of some projects replaces their rows
+and keeps the others. `{"small": true}` selects the three small projects.
 """
 import collections, contextlib, functools, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+from dataclasses import dataclass
+from typing import Literal
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import storelib
 from storelib import daemon_pid
-# The cargo this compares with is the pinned nightly's.
+# Retained for imported harness helpers; the command-line runner selects its compiler and
+# clone cache from Input, never from these compatibility environment variables.
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 # Set, not unset: cargo's `[env]` fills in only what is not already set, so an unset
 # RUST_BACKTRACE would take its value and panics would print differently.
@@ -63,12 +71,30 @@ EXE = ".exe" if WINDOWS else ""
 
 
 BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine" + EXE)
+COMPILER_ENV = "BLAZE_CLI_COMPILER"
+SCRATCH_PARENT = None
+
+
+def selected_blaze(env=None):
+    """The exact compiler selected for this side, including the deliberate replacement check."""
+    return os.path.abspath((env or {}).get(COMPILER_ENV) or BLAZE)
+
+
+def selected_toolchain(env=None):
+    """Read the selected Blaze's toolchain; no rustup, cargo or rustc probe runs."""
+    own = dict(os.environ, **{COMPILER_ENV: BLAZE}) if env is None else env
+    program = selected_blaze(own)
+    ran = subprocess.run([program, "--ignore-pin", "toolchain", "--json"], env=own,
+                         capture_output=True, text=True, timeout=900, stdin=subprocess.DEVNULL)
+    if ran.returncode != 0:
+        raise storelib.Failed(f"`{program} --ignore-pin toolchain --json` exited {ran.returncode}: {ran.stderr[-1500:]}")
+    return storelib.blaze_toolchain_of(ran.stdout)
 
 
 @functools.cache
 def host():
     """The host's tuple, as blaze's toolchain names it (`blaze toolchain --json`): no rustc runs."""
-    return storelib.blaze_toolchain(BLAZE, dict(os.environ)).host
+    return selected_toolchain().host
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 SOURCES = os.environ.get("BLAZE_PROJECTS") or os.path.expanduser("~/blaze-projects")
 
@@ -177,6 +203,38 @@ SMALL = ["ripgrep", "fd", "hyperfine"]
 # How a project is built: the name of the mode, and how the report names it.
 MODES = {"blaze": "`blaze`"}
 
+
+@dataclass(frozen=True)
+class Input:
+    blaze: str = os.path.join(ROOT, "target/release/blaze" + EXE)
+    projects: tuple[str, ...] = ()
+    small: bool = False
+    part: Literal["all", "projects", "checks", "upgraded"] = "all"
+    sources: str = os.path.expanduser("~/blaze-projects")
+    output: str = HERE
+    tmp: str = ""
+    keep: bool = False
+
+    def __post_init__(self):
+        for name in ("blaze", "sources", "output"):
+            if not getattr(self, name):
+                raise ValueError(f"{name} must name a path")
+        unknown = set(self.projects) - PROJECTS.keys()
+        if unknown:
+            raise ValueError(f"unknown projects: {', '.join(sorted(unknown))}")
+        if len(set(self.projects)) != len(self.projects):
+            raise ValueError("projects must not repeat a checkout")
+        if self.small and self.projects:
+            raise ValueError("small and projects are alternative project selections")
+        if self.part in ("checks", "upgraded") and (self.projects or self.small):
+            raise ValueError(f"part {self.part} runs no selected projects")
+
+
+def load(text):
+    """One strict frozen Input; imports of the harness helpers need no CLI parser setup."""
+    from typed_input import parse
+    return parse(Input, text, "blaze_cli.py")
+
 # What cargo and `blaze` print about the build, which is not the program's output.
 # cargo's status words, then blaze's own steps' (crates/blaze-ui), right-aligned to 12 columns.
 STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Waiting|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|blaze:|warning:|`blaze why` says more$)"
@@ -193,7 +251,11 @@ def write(at, path, text):
 
 def base_env(home):
     # BLAZE_LOCK: the workspaces are clones and generated ones, throwaway workspaces with no committed lock: their builds may write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
-    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TERM_COLOR="never", BLAZE_LOCK="write")
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home,
+               BLAZE_CACHE=os.path.join(home, "v2", "store"), CARGO_TERM_COLOR="never", BLAZE_LOCK="write")
+    env[COMPILER_ENV] = os.path.abspath(BLAZE)
+    if SCRATCH_PARENT is not None:
+        env["TMPDIR"] = SCRATCH_PARENT
     # Every side's cargo lays out a build as stable cargo does, as a user's does and as blaze
     # places a test: in nightly's second layout a test is in its unit's directory, from where
     # fd's, ripgrep's and just's tests find no program beside them.
@@ -249,7 +311,7 @@ def another_build(other):
     version. It has what a release ships beside blaze, as `BLAZE`'s directory does (the Pack
     step of blaze-platform.yaml)."""
     os.makedirs(other, exist_ok=True)
-    shipped = [it + EXE for it in ("blaze-engine", "blaze")]
+    shipped = sorted({*(it + EXE for it in ("blaze-engine", "blaze")), os.path.basename(BLAZE)})
     for name in shipped:
         if os.path.exists(os.path.join(os.path.dirname(BLAZE), name)):
             shutil.copy(os.path.join(os.path.dirname(BLAZE), name), os.path.join(other, name))
@@ -263,16 +325,23 @@ def timed(argv, cwd, env, timeout=7200):
 
 
 class Side:
-    """One of the builds of a checkout: `blaze` (`True`), or cargo alone into `target-ref`
-    (`False`), which is only ever a bench's speed baseline: what blaze's build does is held to
-    a `Scratch`, never to cargo's."""
+    """One selected Blaze building a checkout. Scratch is its fresh-build comparison.
 
-    def __init__(self, ws, env, blaze):
-        self.ws, self.blaze = ws, bool(blaze)
-        self.env = env if blaze else dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref"))
+    The legacy boolean stays in the import API; False refuses explicitly instead of
+    starting an ambient reference compiler or silently changing its meaning.
+    """
+
+    def __init__(self, ws, env, blaze=True):
+        if not blaze:
+            raise ValueError("Side(False) cannot launch Cargo; use Scratch for a fresh selected-Blaze comparison")
+        self.ws, self.blaze = ws, True
+        self.env = dict(env)
+        self.env.setdefault("CARGO_TARGET_DIR", os.path.join(ws, "target"))
+        self.program = selected_blaze(self.env)
+        self.env[COMPILER_ENV] = self.program
 
     def argv(self, command, *args):
-        return [*(["blaze"] if self.blaze else ["cargo"]), command, *(machine_format(command, args) if self.blaze else []), *args]
+        return [self.program, "--ignore-pin", command, *machine_format(command, args), *args]
 
     @contextlib.contextmanager
     def session(self):
@@ -314,15 +383,16 @@ class Scratch(Side):
         self.count += 1
         # macOS: under /tmp, as a daemon's socket is under its home and macOS allows 104 bytes.
         # Elsewhere $TMPDIR: /tmp may be a tmpfs, which can't share blocks with blaze's cache.
-        home = tempfile.mkdtemp(prefix="bz-scratch-", dir="/tmp" if sys.platform == "darwin" else None)
+        parent = SCRATCH_PARENT or ("/tmp" if sys.platform == "darwin" else None)
+        home = tempfile.mkdtemp(prefix="bz-scratch-", dir=parent)
         target = os.path.join(self.ws, "target-scratch")
         shutil.rmtree(target, ignore_errors=True)
         fresh = dict(base_env(home), **{k: v for k, v in self.env.items() if k != "BLAZE_HOME"})
-        fresh.update(BLAZE_HOME=home, CARGO_TARGET_DIR=target)
+        fresh.update(BLAZE_HOME=home, BLAZE_CACHE=os.path.join(home, "v2", "store"), CARGO_TARGET_DIR=target)
         try:
             yield fresh
         finally:
-            subprocess.run(["blaze", "stop"], cwd=self.ws, env=fresh, capture_output=True, timeout=120)
+            subprocess.run(self.argv("stop"), cwd=self.ws, env=fresh, capture_output=True, timeout=120)
             shutil.rmtree(home, ignore_errors=True)
 
 
@@ -374,6 +444,12 @@ def how_built(ran):
     if finished is not None:
         return "failed: its `build-finished` line says it failed, and no `error` line says why"
     return "failed: no `build-finished` line"
+
+
+def producer_verdict(ran):
+    """A successful command must identify its Blaze daemon; matching output alone is insufficient."""
+    who = how_built(ran)
+    return f"successful command was {who}" if ran.returncode == 0 and who != "daemon" else None
 
 
 def program_output(ran):
@@ -549,7 +625,8 @@ def project(name, spec, work, mode):
     ours, scratch = Side(ws, env, True), Scratch(ws, env)
     build, run, test = spec.get("build", []), spec.get("run", []), spec.get("test", [])
     row = dict(project=name, mode=mode, tag=spec["tag"], wrong=[], times={}, built={})
-    subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)
+    # There is no Cargo-style `blaze fetch`: the cold build resolves and fetches its own
+    # inputs. Do not pre-populate them with an unchecked ambient Cargo invocation.
     ours.cargo("stop")
 
     def step(label, command, args, compare):
@@ -558,6 +635,9 @@ def project(name, spec, work, mode):
         (took, mine), (fresh_s, fresh) = ours.cargo(command, *args), scratch.cargo(command, *args)
         row["times"][label] = (round(took, 2), round(fresh_s, 2))
         row["built"][label] = how_built(mine)
+        for side, built in (("daemon", mine), ("from nothing", fresh)):
+            if verdict := producer_verdict(built):
+                row["wrong"].append(f"{label}, {side}: {verdict}")
         wrong = difference(compare(mine), compare(fresh))
         if wrong:
             row["wrong"].append(f"{label}: {wrong}")
@@ -626,6 +706,68 @@ def project(name, spec, work, mode):
     return row
 
 
+# Both generated callers require the harness-selected absolute compiler. A missing value,
+# a failed launch or a failed build is a refusal, never a PATH or CARGO fallback.
+NESTED_BUILD = r'''
+fn build_app() -> std::process::ExitStatus {
+    let blaze = std::env::var_os("BLAZE_CLI_COMPILER")
+        .expect("the harness must supply its selected Blaze compiler");
+    assert!(std::path::Path::new(&blaze).is_absolute());
+    std::process::Command::new(blaze)
+        .args(["--ignore-pin", "build", "-q", "-p", "app", "--bin", "app"])
+        .status().expect("the selected Blaze build must start")
+}
+'''
+
+FLAG_INTEGRATION = NESTED_BUILD + r'''
+#[test]
+fn greets_it() {
+    assert_eq!(util::greeting("it").to_lowercase(), "hello it");
+}
+
+#[test]
+fn fails_when_asked() {
+    assert!(std::env::var("FLAGS_FAIL").is_err());
+}
+
+// Serialize the rebuild and readers of its executable, including on macOS.
+static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn a_blaze_inside_leaves_the_program() {
+    let _building = BUILDING.lock().unwrap_or_else(|it| it.into_inner());
+    let built = build_app();
+    assert!(built.success(), "the selected Blaze build failed: {built}");
+    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_app")).arg("it").output().unwrap();
+    assert!(ran.status.success());
+    assert!(String::from_utf8_lossy(&ran.stdout).starts_with("hello it"));
+}
+
+#[test]
+fn the_places_of_the_build_are_set() {
+    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());
+    let _building = BUILDING.lock().unwrap_or_else(|it| it.into_inner());
+    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();
+    assert!(ran.status.success());
+    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);
+}
+'''
+
+NESTED_MAIN = NESTED_BUILD + r'''
+fn main() {
+    let built = build_app();
+    if !built.success() {
+        std::process::exit(built.code().unwrap_or(1));
+    }
+    let app = std::env::var_os("BLAZE_CLI_APP").expect("the harness must name the rebuilt app");
+    let ran = std::process::Command::new(app).arg("nested").output().unwrap();
+    assert!(ran.status.success());
+    let said = String::from_utf8(ran.stdout).unwrap();
+    assert!(said.starts_with("nested: hello nested"), "nested build left a stale app: {said}");
+    print!("{said}");
+}
+'''
+
 FLAG_WORKSPACE = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "util", "shout"]\nresolver = "2"\n\n[profile.quick]\ninherits = "dev"\n\n[profile.release]\npanic = "abort"\n\n[profile.quick.package.util]\nopt-level = 3\noverflow-checks = false\n',
     "util/Cargo.toml": '[package]\nname = "util"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nloud = []\n',
@@ -638,7 +780,7 @@ FLAG_WORKSPACE = {
     "app/src/main.rs": '#![allow(unexpected_cfgs)]\n\nfn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    println!("{} {} {}", cfg!(debug_assertions), cfg!(extra), cfg!(target_feature = "avx2"));\n    let sum = std::panic::catch_unwind(|| name.len() as u8 + 251);\n    println!("{:?}", sum.ok());\n    if name == "fail" {\n        std::process::exit(3);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n}\n',
     "app/src/bin/other.rs": 'fn main() {\n    println!("other: {}", util::greeting("other"));\n}\n',
     "app/examples/demo.rs": 'fn main() {\n    println!("demo: {} {}", util::greeting("demo"), shout::shout("demo"));\n}\n',
-    "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A cargo inside writes the programs again, and on macOS it removes each and copies it back: a\n// test starting one meanwhile finds none.\nstatic BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());\n\n// A cargo run by a test builds, and leaves a program that runs: after a build by cargo it has\n// nothing to do, after a whole build, which leaves cargo no units, it builds the program again in\n// its place (as the check of the daemon of a program that runs cargo has it).\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    let _building = BUILDING.lock().unwrap_or_else(|it| it.into_inner());\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_app")).arg("it").output().unwrap();\n    assert!(String::from_utf8_lossy(&ran.stdout).starts_with("hello it"));\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let _building = BUILDING.lock().unwrap_or_else(|it| it.into_inner());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
+    "app/tests/it.rs": FLAG_INTEGRATION,
 }
 
 # What the edit round adds to the program: library code that rustc's build before the edit has
@@ -724,6 +866,9 @@ def flags(work):
     def round_of(label):
         for command, args, extra in flag_cases():
             (_, mine), (_, other) = ours.cargo(command, *args, env=extra), scratch.cargo(command, *args, env=extra)
+            for side, built in (("daemon", mine), ("from nothing", other)):
+                if verdict := producer_verdict(built):
+                    wrong.append(f"{label}, {side}: {verdict}")
             read = test_results if command == "test" else program_output
             differs = difference(read(mine), read(other))
             if "--doc" in args:
@@ -770,8 +915,7 @@ def daemon(work):
         open(os.path.join(ws, file), "w").write(text)
     # A file that is no text, beside the sources: the daemon loads the workspace all the same.
     open(os.path.join(ws, "util/src/not-text.bin"), "wb").write(b"\xff\xfe\x00\x80")
-    with open(os.path.join(ws, "app/src/bin/nested.rs"), "w") as nested:
-        nested.write('fn main() {\n    let cargo = std::process::Command::new("cargo").arg("build").status();\n    std::process::exit(cargo.ok().and_then(|it| it.code()).unwrap_or(1));\n}\n')
+    write(ws, "app/src/bin/nested.rs", NESTED_MAIN)
     git = lambda *args, cwd=ws: subprocess.run(["git", "-c", "user.name=blaze", "-c", "user.email=blaze@localhost", *args], cwd=cwd, check=True, capture_output=True)
     open(os.path.join(ws, ".gitignore"), "w").write("target\ntarget-scratch\n")
     git("init", "-q"), git("add", "."), git("commit", "-qm", "first")
@@ -799,15 +943,23 @@ def daemon(work):
     # No cargo builds first: the build is the daemon's from the start, with nothing to wait
     # for after cargo.
     check("and the first build's program is the daemon's", how_built(first) == "daemon", how_built(first))
-    # A program that runs plain `cargo build` on its own checkout, as a test suite may, after
-    # the daemon built it: cargo's own artifacts are behind the sources, so cargo builds
-    # them again and its executable takes the place of the daemon's. Both are right.
+    # Change only app's main after installing it. Building/running nested does not build
+    # app's main: nested must ask the selected Blaze to rebuild app, then run that result
+    # before the harness's next `run` could repair a stale or missing executable.
     edit(ws, "nested")
     _, installed = here.cargo("build")
-    _, nested = here.cargo("run", "--bin", "nested")
+    app_main = os.path.join(ws, "app/src/main.rs")
+    old_main = rewrite(app_main, 'println!("{}", util::greeting(&name));',
+                       'println!("nested: {}", util::greeting(&name));')
+    _, nested = here.cargo("run", "--bin", "nested", env={
+        "BLAZE_CLI_APP": os.path.join(here.env["CARGO_TARGET_DIR"], "debug", "app" + EXE)})
     _, after = here.cargo("run", "--bin", "app")
     _, reference = Scratch(ws, env).cargo("run", "--bin", "app")
-    check("a program that runs cargo on its checkout builds, and the next run is right", how_built(installed) == "daemon" and nested.returncode == 0 and after.returncode == reference.returncode and after.stdout == reference.stdout, f"{how_built(installed)}, nested {nested.returncode}, then {how_built(after)}")
+    check("a program builds its edited app with the selected Blaze, and the next run is right",
+          how_built(installed) == "daemon" and nested.returncode == 0 and "nested: hello nested" in nested.stdout
+          and after.returncode == reference.returncode == 0 and after.stdout == reference.stdout,
+          f"{how_built(installed)}, nested {nested.returncode}, then {how_built(after)}")
+    open(app_main, "w").write(old_main)
     edit(ws, "one")
     _, second = here.cargo("build")
     check("a later build is the daemon's, by the same daemon", how_built(second) == "daemon" and status() == pid, how_built(second))
@@ -820,7 +972,7 @@ def daemon(work):
     check("a build in the worktree is the daemon's", how_built(in_tree) == "daemon" and in_tree.returncode == 0, how_built(in_tree))
 
     edit(ws, "three")
-    client = subprocess.Popen(["blaze", "build"], cwd=ws, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **OWN_GROUP)
+    client = subprocess.Popen(here.argv("build"), cwd=ws, env=here.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **OWN_GROUP)
     time.sleep(0.01)
     kill_all(client)
     client.wait()
@@ -829,7 +981,7 @@ def daemon(work):
     check("the daemon outlives a client that is killed", status() == pid and after_kill.returncode == 0 and "hello world" in after_kill.stdout, how_built(after_kill))
 
     other = another_build(os.path.join(work, "other-build"))
-    newer = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
+    newer = Side(ws, dict(env, **{COMPILER_ENV: os.path.join(other, os.path.basename(BLAZE))}), True)
     edit(ws, "five")
     _, by_newer = newer.cargo("run")
     replaced = status()
@@ -946,16 +1098,16 @@ def daemon(work):
 
 def fake_toolchain(dir, version):
     """A toolchain a project's rust-toolchain file names by its path, whose rustc says it is
-    `version` and compiles nothing, so that a build with it fails. Its cargo is the real one,
-    copied: cargo names itself to what it runs by where it is."""
+    `version`. Every compiler tool is a refusing double: no installed Cargo is needed."""
     os.makedirs(os.path.join(dir, "bin"))
-    cargo = subprocess.run(["rustup", "which", "--toolchain", TOOLCHAIN, "cargo"], capture_output=True, text=True, check=True).stdout.strip()
-    shutil.copy(cargo, os.path.join(dir, "bin", "cargo"))
-    rustc = os.path.join(dir, "bin", "rustc")
-    with open(rustc, "w") as script:
-        script.write(f'#!/bin/sh\ncase "$1" in --version|-V) echo "rustc {version} (0000000 2026-01-01)"; exit 0;; esac\n'
-                     'echo "error: the toolchain the project pins was asked to compile: $*" >&2\nexit 1\n')
-    os.chmod(rustc, 0o755)
+    for tool in ("cargo", "rustc", "rustdoc"):
+        path = os.path.join(dir, "bin", tool)
+        with open(path, "w") as script:
+            script.write('#!/bin/sh\nprintf \'%s\\n\' "$0 $*" >> "$(dirname "$0")/../invocations"\n')
+            if tool == "rustc":
+                script.write(f'case "$1" in --version|-V) echo "rustc {version} (0000000 2026-01-01)"; exit 0;; esac\n')
+            script.write('echo "error: the toolchain the project pins was asked to compile: $*" >&2\nexit 1\n')
+        os.chmod(path, 0o755)
 
 
 def pinned(work, check):
@@ -963,7 +1115,7 @@ def pinned(work, check):
     an older stable and a nightly. `blaze` builds them with its own release, and their
     edits are the daemon's; a nightly's `#![feature]` builds, an error in it fails, the
     project's toolchain is said only under `-v`, and no build is cargo's."""
-    if WINDOWS or not shutil.which("rustup"):
+    if WINDOWS:
         return
     env = base_env(os.path.join(work, "home-pinned"))
     # rustup takes the variable over the project's file.
@@ -987,6 +1139,8 @@ def pinned(work, check):
         _, edited = side.cargo("run")
         how = how_built(edited)
         check("and its edit is the daemon's", edited.returncode == 0 and how == "daemon" and "pinned 48" in edited.stdout, f"{how[:90]}; {edited.stderr.strip()[-300:]!r}")
+        check("the project's pinned compiler tools were never invoked",
+              not os.path.exists(os.path.join(side.ws, "toolchain", "invocations")))
     # blaze's toolchain is a nightly (docs/toolchain.md): a nightly's `#![feature]` builds.
     # The project's rust-toolchain file is not read, and said only under `-v` (#837).
     side = project("featured", "1.101.0-nightly", "#![feature(never_type)]\nfn main() {\n    let _: Option<!> = None;\n}\n")
@@ -999,35 +1153,30 @@ def pinned(work, check):
     open(os.path.join(side.ws, "src/main.rs"), "a").write("\nfn broken() -> u32 { \"text\" }\n")
     _, failed = side.cargo("build")
     check("and an error in it fails with the error, nothing said of the project's toolchain", failed.returncode == 101 and "error[E0308]" in failed.stderr and not named(failed.stderr), f"exit {failed.returncode}, {failed.stderr.strip()[-400:]!r}")
+    check("the featured project's pinned compiler tools were never invoked",
+          not os.path.exists(os.path.join(side.ws, "toolchain", "invocations")))
     side.cargo("stop")
 
 
 class Bare(Side):
-    """`blaze` itself, where there is no cargo to run `blaze`: the same commands."""
-
-    def argv(self, command, *args):
-        return [os.path.join(os.path.dirname(BLAZE), "blaze" + EXE), command, *machine_format(command, args), *args]
+    """The selected Blaze with no Rust tools on PATH; kept for the imported helper API."""
 
 
 def own_toolchain(work, check):
     """A machine with no rustup and no Rust on the path (docs/v2/plan.md): blaze builds
-    with its own copy of its release, laid out in the machine's `~/.blaze/toolchains` (every
-    BLAZE_HOME reads that one) as rustup lays one out (here a copy of rustup's in a user's home
-    of the harness's, so nothing is downloaded), runs cargo and rustc from it, and the edit
-    after the first build is the daemon's."""
-    sysroot = subprocess.run(["rustup", "run", TOOLCHAIN, "rustc", "--print", "sysroot"], capture_output=True, text=True).stdout.strip() if shutil.which("rustup") else ""
-    if WINDOWS or not os.path.exists(os.path.join(sysroot, "lib/rustlib/multirust-channel-manifest.toml")):
+    with its own copy of its release, reported by the selected `blaze toolchain --json`.
+    Copy that complete release into an isolated user's home; both builds use Blaze."""
+    if WINDOWS:
         return
-    # Blaze's own copy has every component it pins (harness/toolchain_pins.py), wasm32-wasip1's
-    # standard library among them; a copy without one is downloaded again.
-    if not os.path.isdir(os.path.join(sysroot, "lib/rustlib/wasm32-wasip1")):
-        subprocess.run(["rustup", "target", "add", "--toolchain", TOOLCHAIN, "wasm32-wasip1"], capture_output=True)
+    chosen = selected_toolchain()
+    sysroot = chosen.sysroot
+    if not os.path.isfile(os.path.join(sysroot, "lib/rustlib/multirust-channel-manifest.toml")):
+        raise ValueError(f"the selected Blaze toolchain {sysroot} has no channel manifest to copy")
     home = os.path.join(work, "home-own")
     os.makedirs(home, mode=0o700)
     # The user's home of this machine: where blaze keeps its toolchains, whatever BLAZE_HOME says.
     user = os.path.join(work, "user-own")
-    host = subprocess.run([os.path.join(sysroot, "bin", "rustc"), "-vV"], capture_output=True, text=True).stdout.split("host: ")[1].split()[0]
-    own = os.path.join(user, ".blaze", "toolchains", f"{TOOLCHAIN}-{host}")
+    own = os.path.join(user, ".blaze", "toolchains", f"{chosen.nightly}-{chosen.host}")
 
     def link(source, target):
         try:
@@ -1053,13 +1202,16 @@ def own_toolchain(work, check):
     for d in env["PATH"].split(os.pathsep):
         if not d or not os.path.isdir(d):
             continue
-        if not any(os.path.exists(os.path.join(d, it + EXE)) for it in ("cargo", "rustc", "rustup")):
+        entries = os.listdir(d)
+        if not any(rusts.match(name) for name in entries):
             dirs.append(d)
             continue
-        for name in os.listdir(d):
+        for name in entries:
             if not rusts.match(name) and not os.path.lexists(os.path.join(rid, name)):
                 os.symlink(os.path.join(d, name), os.path.join(rid, name))
-    env["PATH"] = os.pathsep.join([os.path.dirname(BLAZE), *dirs, rid])
+    # Side uses the absolute selection. Re-adding its directory here would put Rust back
+    # on PATH when the supplied Blaze lives beside rustup's shims in ~/.cargo/bin.
+    env["PATH"] = os.pathsep.join([*dirs, rid])
 
     ws = os.path.join(work, "own-toolchain")
     os.makedirs(os.path.join(ws, "src"))
@@ -1161,27 +1313,31 @@ CLEANED = {
 
 
 def cleaned(work, check):
-    """A clean while the daemon runs (#721): `blaze clean`, `cargo clean` and `rm -rf
-    target` take away what it wrote under the target directory, the standard library's unit
-    among them, and tell it nothing. The next build is the same daemon's (v1's check was of the
-    same worker), which writes again what is gone, and so is an edit after it."""
+    """A clean while the daemon runs (#721): Blaze's implicit and explicit target clean,
+    and removing target directly, take away the program and build-script output under the
+    target directory. The next build is the same daemon's (v1's check was of the same worker),
+    which writes again what is gone, and so is an edit after it."""
     ws = os.path.realpath(os.path.join(work, "cleaned"))
     for file, text in CLEANED.items():
         os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
         open(os.path.join(ws, file), "w").write(text)
     env = base_env(os.path.join(work, "home-cleaned"))
     here = Side(ws, env, True)
+    target = here.env["CARGO_TARGET_DIR"]
     pid = lambda: daemon_pid(env["BLAZE_HOME"])
     _, first = here.cargo("run")
     before = pid()
     check("a program with a build script's output is the daemon's", first.returncode == 0 and how_built(first) == "daemon" and "hello from the script" in first.stdout, f"exit {first.returncode}, {first.stderr.strip()[-300:]!r}")
     cleans = [
         ("`blaze clean`", lambda: here.cargo("clean")),
-        ("`cargo clean`", lambda: timed(["cargo", "clean"], ws, env)),
-        ("`rm -rf target`", lambda: shutil.rmtree(os.path.join(ws, "target"))),
+        ("`blaze clean --target-dir`", lambda: here.cargo("clean", "--target-dir", target)),
+        ("removing target", lambda: shutil.rmtree(target)),
     ]
     for at, (name, clean) in enumerate(cleans):
-        clean()
+        cleaned = clean()
+        code = 0 if cleaned is None else cleaned[1].returncode
+        check(f"{name} succeeds and removes the actual target directory",
+              code == 0 and not os.path.exists(target), f"exit {code}; target {target}")
         _, again = here.cargo("run")
         held = again.returncode == 0 and how_built(again) == "daemon" and "hello from the script" in again.stdout and before is not None and pid() == before
         check(f"a build after {name} while the daemon runs is the same daemon's, and runs", held, f"exit {again.returncode}, daemon {before} then {pid()}, {again.stderr.strip()[-300:]!r}")
@@ -1203,12 +1359,14 @@ def manners(work, ws, env, here, check, edit):
     """What the commands say for themselves, a daemon that is going away, and an error only
     rustc's borrow checker finds."""
     for argv in (["blaze-engine", "--help"], ["blaze-engine", "-h"], ["blaze", "--help"], ["blaze", "-h"]):
-        ran = subprocess.run([BLAZE, *argv[1:]] if argv[0] == "blaze-engine" else argv, cwd=ws, env=env, capture_output=True, text=True)
+        program = os.path.join(os.path.dirname(BLAZE), argv[0] + EXE)
+        ran = subprocess.run([program, "--ignore-pin", *argv[1:]], cwd=ws, env=here.env, capture_output=True, text=True)
         listed = all(word in ran.stdout for word in ("status", "stop"))
         check(f"`{' '.join(argv)}` lists the commands and exits 0", ran.returncode == 0 and listed, f"exit {ran.returncode}")
 
     here.cargo("build")
-    for argv in ([BLAZE, "status"], [BLAZE, "tables", "--format=json"], [BLAZE, "--help"], ["blaze", "status"], ["blaze", "--help"]):
+    for argv in ([BLAZE, "--ignore-pin", "status"], [BLAZE, "--ignore-pin", "status", "--json"],
+                 [BLAZE, "--ignore-pin", "--help"], here.argv("status"), here.argv("--help")):
         shown = subprocess.Popen(argv, cwd=ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         shown.stdout.close()
         said = shown.stderr.read()
@@ -1276,7 +1434,11 @@ def abuse(work, ws, tree, env, check, status, alive):
         side.cargo("build")
     pid = status()
     # A client as a user starts one, with the format its build is read by (`machine_format`).
-    spawn = lambda root, *args: subprocess.Popen(["blaze", *args[:1], *machine_format(args[0], args[1:]), *args[1:]], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
+    def spawn(root, command, *args):
+        side = Side(root, env, True)
+        return subprocess.Popen(side.argv(command, *args), cwd=root, env=side.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
     # Round after round, as a client's program is started while the others put theirs in
     # place, which on macOS lost one program in a few hundred. `app` is its package's
     # `default-run`: the program is blaze's to start, not cargo's.
@@ -1327,7 +1489,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     check("the build after that is a new daemon's", after.returncode == 0 and greets(after.stdout, "tree0 after") and status() not in (None, pid) and how_built(after) == "daemon", how_built(after))
 
     other = os.path.join(work, "other-build")
-    older = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
+    older = Side(ws, dict(env, **{COMPILER_ENV: os.path.join(other, os.path.basename(BLAZE))}), True)
     pid = status()
     # v1 also read `blaze status`'s `daemon:` line, which said the daemon was another build;
     # v2's `blaze status --json` names only the daemon's build hash, so only that it is left is
@@ -1441,7 +1603,7 @@ def stranger(home, check):
         listener = subprocess.Popen(["sudo", "-n", "-u", name, sys.executable, "-c", LISTEN, trap], stdout=subprocess.PIPE, text=True, cwd="/")
         try:
             listener.stdout.readline()
-            asked = subprocess.run([BLAZE, "status"], capture_output=True, text=True, timeout=60,
+            asked = subprocess.run([BLAZE, "--ignore-pin", "status"], capture_output=True, text=True, timeout=60,
                                    env=dict(os.environ, BLAZE_HOME=os.path.dirname(trap)))
             heard = listener.communicate(timeout=30)[0].strip()
         finally:
@@ -1507,7 +1669,7 @@ def worktree(ours, row, build, run, edits, work):
     if added.returncode != 0:
         row["wrong"].append(f"worktree: {added.stderr[-200:]}")
         return
-    there = Side(tree, ours.env, True)
+    there = Side(tree, dict(ours.env, CARGO_TARGET_DIR=os.path.join(tree, "target")), True)
 
     def step(label, command, args):
         took, ran = there.cargo(command, *args)
@@ -1547,26 +1709,39 @@ def table(rows):
     return "\n".join(out)
 
 
-def main():
-    argv = sys.argv[1:]
-    names = [a for a in argv if not a.startswith("--")] or (SMALL if "--small" in argv else list(PROJECTS))
-    modes = [m for m in MODES if f"--{m}" in argv] or list(MODES)
+def main(given=None):
+    global BLAZE, SOURCES, SCRATCH_PARENT
+    if given is None:
+        if len(sys.argv) != 2:
+            sys.exit(__doc__)
+        given = load(sys.argv[1])
+    BLAZE = os.path.realpath(os.path.expanduser(given.blaze))
+    SOURCES = os.path.realpath(os.path.expanduser(given.sources))
+    if not os.path.isfile(BLAZE) or not os.access(BLAZE, os.X_OK):
+        raise ValueError(f"blaze must name an executable file: {BLAZE}")
+    output = os.path.realpath(os.path.expanduser(given.output))
+    os.makedirs(output, exist_ok=True)
+    host.cache_clear()
+    names = list(given.projects) or (SMALL if given.small else list(PROJECTS))
+    modes = list(MODES)
     # As the daemon names it: with no link and no short name in it.
     # The path of a socket is at most 104 bytes on macOS, and its temporary directory is long.
-    work = os.path.realpath(tempfile.mkdtemp(prefix="blaze-cargo-", dir="/tmp" if sys.platform == "darwin" else None))
+    parent = os.path.realpath(os.path.expanduser(given.tmp)) if given.tmp else ("/tmp" if sys.platform == "darwin" else None)
+    SCRATCH_PARENT = parent
+    work = os.path.realpath(tempfile.mkdtemp(prefix="blaze-cargo-", dir=parent))
     print(f"work {work}; blaze {BLAZE}", flush=True)
     result = dict(blaze=BLAZE, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
-    alone = "--only-upgraded" in argv
-    if "--only-checks" not in argv and not alone:
+    alone = given.part == "upgraded"
+    if given.part in ("all", "projects"):
         for name in names:
             for mode in modes:
                 print(f"{name}, {MODES[mode]}:", flush=True)
                 row = project(name, PROJECTS[name], work, mode)
                 result["projects"].append(row)
                 result["wrong"] += [f"{name}, {mode}: {w}" for w in row["wrong"]]
-                if "--keep" not in argv:
+                if not given.keep:
                     shutil.rmtree(os.path.join(work, name), ignore_errors=True)
-    if "--only-projects" not in argv and not alone:
+    if given.part in ("all", "checks"):
         print("flags:", flush=True)
         rows, wrong = flags(work)
         result["flags"] = rows
@@ -1574,20 +1749,20 @@ def main():
         print("daemon:", flush=True)
         result["daemon"] = daemon(work)
         result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
-    if "--only-projects" not in argv:
+    if given.part != "projects":
         print("upgraded:", flush=True)
         result["upgraded"] = upgraded(work)
         result["wrong"] += [f"upgraded: {name} {detail}" for name, held, detail in result["upgraded"] if not held]
     # A run of some of it leaves the rows of the rest as the run before wrote them.
-    stored = os.path.join(HERE, "blaze_cli.json")
+    stored = os.path.join(output, "blaze_cli.json")
     before = json.load(open(stored)) if os.path.exists(stored) else {}
     rows = {(row["project"], row.get("mode", "blaze")): row for row in before.get("projects", []) + result["projects"]}
     result["projects"] = [rows[name, mode] for name in PROJECTS for mode in MODES if (name, mode) in rows]
-    if "--only-projects" in argv or alone:
+    if given.part == "projects" or alone:
         kept = ("flags", "daemon") + (() if alone else ("upgraded",))
         result.update({part: before.get(part, []) for part in kept})
     json.dump(result, open(stored, "w"), indent=1)
-    with open(os.path.join(HERE, "BLAZE-CLI.md"), "w") as md:
+    with open(os.path.join(output, "BLAZE-CLI.md"), "w") as md:
         md.write("# blaze and its daemon\n\nGenerated by `harness/blaze_cli.py`. Seconds, blaze / blaze from nothing for the same step; the steps in the second checkout (`tree`) are blaze's only. "
                  "Bold is a build that finished; `(x)` one that failed, with its error below. "
                  "The profile picks the backend: dev is Cranelift's, release LLVM's. "
@@ -1607,11 +1782,14 @@ def main():
         if result.get("upgraded"):
             md.write("\n## After an upgrade, and a project pinned to another release\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["upgraded"]))
     # A failed run keeps its work directory, the daemons' logs in it, for CI's upload (blaze-platform.yaml's blaze-cli-logs).
-    if "--keep" not in argv and not result["wrong"]:
+    if not given.keep and not result["wrong"]:
         shutil.rmtree(work, ignore_errors=True)
     print("PASS" if not result["wrong"] else "FAIL:\n" + "\n".join(result["wrong"]))
     sys.exit(1 if result["wrong"] else 0)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError) as error:
+        sys.exit(f"blaze_cli.py: {error}")

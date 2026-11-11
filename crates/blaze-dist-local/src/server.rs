@@ -104,6 +104,8 @@ impl Server {
             || config.max_connections == 0
             || config.max_sessions == 0
             || config.session_ms == 0
+            || config.max_execution_ms == 0
+            || config.owner_cleanup_ms == 0
             || config.idle_ms == 0
             || config.max_subscribers == 0
             || config.max_executions == 0

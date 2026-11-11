@@ -30,7 +30,7 @@ ClientFrame = [0, LocalHello] | [1, Request]
 ServerFrame = [0, LocalWelcome] | [1, Response] | [2, WireError]
 ```
 
-The carrier and terminal contract are both version 2. The global codec version is
+The carrier is version 5 and the terminal contract is version 2. The global codec version is
 `blaze_wire::VERSION`. All three must match. A mismatch is refused without trying
 another decoder or invoking a compiler. Terminal version 2 is not global schema 2:
 typed digests use the codec's domain.
@@ -71,6 +71,9 @@ the supplied content before submission.
 
 The command discriminants are Submit 0, Subscribe 1, Resume 2, Events 3, Cancel 4,
 Join 5, Lease 6, Result 7, WorkerEvents 8, KillAck 9, Terminal 10, Release 11, Claim 12 and Packs 13.
+Full-manifest acceptance, lookup and delivery are CommitPublication 14, Publication 15 and
+DeliverPublication 16. RetireAssignment 17 requests the stop of an owned assignment.
+OwnedAssignment 18 reads the current token of an exact owned slot without claiming work.
 All payloads and their integer field numbers are in `src/protocol.rs`. All
 responses are in `Answer`.
 
@@ -89,6 +92,18 @@ responses are in `Answer`.
 - KillAck carries exact content/execution/attempt/executor and alive status.
   `accepted=true` means an actual pending assignment stop was acknowledged.
   Unknown/stale/duplicate acknowledgments cannot release a new reservation.
+- Claim binds its claimant label to the validated transport session. A resumed session retains
+  the owner; copying that label into a different session does not acquire the existing claim.
+  Promotion keeps the owner of a continuing reservation; fresh or reused slots start unowned.
+- OwnedAssignment carries exact content/execution/executor and the claimant label. It reads
+  only that owner's current token, including an old pending stop. It cannot claim an unowned
+  slot or follow a slot into another execution. Cleanup uses it only for slots the agent ran,
+  so cancellation before observing a promotion can retire the current owned token safely.
+- RetireAssignment carries exact content/execution/attempt/executor and the claimant label.
+  Only that assignment's owner can request its retirement. The coordinator fences its leases
+  and findings and emits its normal stop, preserving other subscribers. A retiring lead follows
+  the existing bounded reassignment rule. Repeating an owned pending retirement has no effect.
+  Capacity remains held until the separate KillAck, after the agent's work has stopped.
 
 Subscription is `{0: content, 1: execution, 2: subscriber}`. Binding is
 `{0: Subscription, 1: attempt}`. Response identity must echo epoch/session/sequence,
@@ -105,17 +120,23 @@ retained terminal attempt even if other subscribers continue on a new attempt.
 Session labels and daemon epochs are lifetime identities, **not** application
 capabilities. The socket is owner-only; deployment access remains the existing
 Unix/Tailscale access model. No PR/Main trust/sandbox layer is added.
+Within that socket, claims and retirement are bound to the same validated session. The session
+binding prevents one session from retiring another's assignment by copying its claimant label.
 
 Creation is idempotent for its nonce while the lifetime is live; after expiry the
 same nonce creates a new label and the old one stays dead. A resume names the
 issued label and the epoch together; an unknown, expired or released label is
-refused, and a different daemon is `daemon-moved`. Session lifetime is fixed, not
-renewed by reconnect, and expiry or `Release` returns capacity immediately. The
-live-session cap therefore bounds concurrent sessions, never a lifetime quota of
-identities, and no tombstone set grows with the number of clients served.
+refused, and a different daemon is `daemon-moved`. Reconnect alone does not renew a lifetime.
+Ordinary sessions have a fixed lifetime. An accepted job binding can retain its session through
+that execution's actual deadline and a cleanup allowance, so a compiler callback cannot outlive
+its claim owner or heartbeat clients merely by taking longer than the ordinary lifetime. Each
+session also has an immutable ceiling derived from its creation time and the configured limits.
+Welcome reports the expiry bound at that handshake; a resume reports extensions accepted since
+the preceding handshake. Expiry or `Release` returns session capacity; it does not acknowledge an
+executor's stop. The live-session cap bounds concurrent sessions, and no tombstone set grows with
+clients served.
 
-Requests have contiguous sequence numbers starting at 1. Before executing, the
-coordinator reserves replay space for a maximum-size response. It journals the
+Requests have contiguous sequence numbers starting at 1. The coordinator journals the
 **exact request and encoded answer**, including a refusal, before socket output.
 The same sequence/bytes returns that same status without repeating any effects.
 Different bytes under the same ID, a gap, exhausted journal or expired session
@@ -125,13 +146,19 @@ claimed durable across process crashes.
 
 This covers a multi-stage report retried after later stages were already
 accepted: it is answered from the journal, not re-fed as backwards progress.
-Clients must retain the pending request on IO failure and reconnect/retry it
-unchanged. A new session means **new** requests, not the old idempotency lifetime.
+On IO failure, a client resumes the same session once and retries the exact pending bytes.
+If that retry fails, it retains the pending request; it never creates another session to replay
+it. A new session means **new** requests, not the old idempotency lifetime.
 
 The default limits are:
 
 - Frames are at most 1 MiB. The server allows 32 connections and 32 live sessions.
-- A session lasts 300 seconds and has a journal of at most 1,024 requests and 8 MiB.
+- An ordinary session lasts 300 seconds. Its journal keeps only the latest exact request and
+  answer, each bounded by the negotiated frame size.
+- An execution lasts at most 24 hours from its first queued stage. Submit and Subscribe reject
+  deadlines beyond that ceiling before adding an interest. A verified execution binding can
+  retain its session through the actual deadline plus 300 seconds for cleanup, within that
+  session's immutable creation-time ceiling of 24 hours and 600 seconds.
 - The server retains at most 128 executions, each with at most 256 subscribers,
   4,096 events, 8 MiB of public event bytes and 8 MiB of accepted work-result bytes.
 - An event page contains 1 to 256 whole events and must fit the negotiated frame.

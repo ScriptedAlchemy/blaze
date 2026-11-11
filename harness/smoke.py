@@ -300,9 +300,11 @@ class Smoke:
             try:
                 cwd, prepared = importlib.import_module(spec["prepare"]).prepare(cwd)
             except (Exception, SystemExit) as e:
+                prepare_input = shlex.quote(json.dumps({"checkout": "."})) if spec["prepare"] == "bunprep" else "."
+                prepare_script = shlex.quote(os.path.join(HERE, f"{spec['prepare']}.py"))
                 self.results.append(dict(what=f"{name} prepare", ok=False, open=spec.get("open"),
                                          seconds=round(time.monotonic() - began, 1), why=str(e)[-3000:],
-                                         repro=f"{clone} && python3 harness/{spec['prepare']}.py .", stdout="", stderr=""))
+                                         repro=f"{clone} && python3 {prepare_script} {prepare_input}", stdout="", stderr=""))
                 print(f"FAILED   {name} prepare\n    {str(e)[-3000:]}", flush=True)
                 return
             env.update(prepared)

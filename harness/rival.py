@@ -1,66 +1,61 @@
 #!/usr/bin/env python3
-"""rival.py: our blaze against Astral's fork of it and plain cargo, turn by turn on one machine.
+"""rival.py: selected Blaze builds, ours and Astral's fork, on one machine.
 
-    rival.py ['<json>' | FILE | -]           measure, then write the report
-    rival.py report ['<json>' | FILE | -]    write the report again from the raw results
+    rival.py '{"arms": [...], "projects": [...], "work": "/fresh/reflink/work", "out": "/new/report"}'
+    rival.py '{"action": "report", "out": "/existing/report"}'
 
 Astral (astral-experiments/blaze) branched from our main at 6b3ed181 and tunes its fork for
 uv, ruff and ty. This is the score: every project, theirs and ours, built by each arm from the
 same pinned source, each arm in a checkout, home, store and target directory of its own.
 
 Per project and arm:
-  cold       the first build from nothing (no target, empty store, no daemon), plus for a blaze
-             arm the wait until its daemon has the workspace loaded (`ready_s`); under ours the
-             standard library's crates are units of that build like any other, under Astral's
-             they come from a remote made once by its own `std` command, as its release ships them
+  cold       the first build from nothing (no target, empty store/std, no daemon)
   no-op      the build again with nothing changed
   body       a statement added to one function's body (bench.py's `body` edit)
   signature  a method gets a parameter and every caller the argument (bench.py's `signature`)
-  tests      the project's tests (`test` of its spec), twice; the second is timed; under a
-             blaze arm every test has to pass by its own verdict but those `test_known` names
+  tests      the project's tests (`test` of its spec), twice; the second is timed;
+             every test has to pass by its own verdict but those `test_known` names
   output     after the cold build and the first of each edit the program runs (`run` of its
-             spec); under a blaze arm each edit's has to say what that arm's cold build said.
-             cargo is timed, never the answer
+             spec); each edit and reversal must say what that arm's cold build said
 Each phase but cold runs `runs` times. The arms take turns in a rotating order (round r starts
 with arm r mod n), never at once, so a slow minute of the machine falls on every arm alike; an
 edit is made in an arm's checkout, built, taken back and built again before the next arm's turn.
-A blaze build that cargo did (a fallback) is recorded as such and waits for the daemon to load
-again before the next timed build.
+Every accepted build identifies the selected daemon in its typed build-finished message.
+An unsupported interface or another producer is a retained failure, never a timing or a
+replacement compiler. A help-only probe refuses the old Astral CLI before its Cargo dispatcher
+can run. No Rustup/Cargo setup, standard-library substitute or warm-up fallback runs here.
 
 Input, one JSON object:
-  arms      [{"name", "kind": "blaze"|"astral"|"cargo", "bin", "commit", "path"}]: `bin` is
-            the directory with the arm's `blaze` (and `blaze-engine` or `ra-jit`), "" for cargo;
-            `path` are directories put first on PATH for this arm (its toolchain); `env` are
-            variables of this arm alone (RUSTUP_TOOLCHAIN: the nightly it is pinned to);
-            `commit` names what was built, for the report
+  arms      [{"name", "kind": "blaze"|"astral", "bin", "commit"}]: `bin` is an absolute
+            directory with that arm's `blaze` and its companion executables; `commit` names
+            the source built. Every executable is hashed before and after the whole run.
   projects  names from PROJECTS below (uv, ruff, ty) and bench.py's PROJECTS
-  work      a directory for the checkouts, homes and stores (emptied per project)
+  work      a new directory outside a Rust workspace, on a filesystem proven to share clones;
+            every arm has its own checkout, home, store, shared std and target under it
   out       where the results go: raw/<project>.json, host.json, commands.txt, README.md, and
             beside each project's JSON the output of each arm's first edit build and tests, with
             our blaze's profile of that edit (`BLAZE_PROFILE`; ui.perfetto.dev opens its trace.json)
   runs      timed builds per phase (default 5)
   tests     run each project's tests (default true)
-  interleave  the arms take turns within each phase (default true); false measures each blaze
-            arm on its own beside cargo, all its phases, and stops its daemon before the next,
+  interleave  the arms take turns within each phase (default true); false measures each
+            arm on its own, all its phases, and stops its daemon before the next,
             for a machine that cannot hold two daemons with the project loaded (16 GB and ruff)
   machine   what the machine is, for host.json and the README (for example "ix arm64 16 vCPU")
-The report subcommand takes {"out": DIR}.
+  action    "run" (default), or "report" with only out to read existing results
 
 Every command run is appended to commands.txt with its arm, directory and the variables it
 was given beyond the machine's own.
 """
-import json, os, platform, re, shutil, statistics, subprocess, sys, time, typing
-from dataclasses import MISSING, dataclass, field, fields
+import contextlib, json, os, platform, re, shutil, statistics, subprocess, sys, time, typing
+from dataclasses import MISSING, asdict, dataclass, fields, replace
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-import bench, blaze_cli, storelib
-from blaze_cli import Side, difference, program_output, test_results, test_verdict, wait_warm
+sys.path[:0] = [HERE, os.path.join(HERE, "v2")]
+import bench, benchschema, blaze_cli, clone_out, storelib
+from blaze_cli import Side, difference, program_output, test_results, test_verdict
 
 LET = bench.LET
-# The longest wait for a daemon to load: one that has not loaded by then is not waited for again.
-blaze_cli.WARMUP_SECS = 600
-
 # Astral's projects, at the revisions its downstream workflow pins (downstream-tests.yaml).
 PROJECTS = {
     "uv": dict(
@@ -99,7 +94,7 @@ PROJECTS = {
     ),
 }
 EDITS = ("body", "signature")
-KINDS = ("blaze", "astral", "cargo")
+KINDS = ("blaze", "astral")
 
 
 @dataclass(frozen=True)
@@ -108,8 +103,6 @@ class Arm:
     kind: str
     bin: str
     commit: str
-    path: list = field(default_factory=list)
-    env: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -118,6 +111,7 @@ class Input:
     projects: list
     work: str
     out: str
+    action: str = "run"
     runs: int = 5
     tests: bool = True
     interleave: bool = True
@@ -127,6 +121,7 @@ class Input:
 @dataclass(frozen=True)
 class Report:
     out: str
+    action: str = "report"
 
 
 def fail(message):
@@ -168,23 +163,29 @@ def typed(text):
     for at, arm in enumerate(arms):
         if arm.kind not in KINDS:
             fail(f"input.arms[{at}].kind is one of {', '.join(KINDS)}, not {arm.kind!r}")
-        if (arm.kind == "cargo") != (arm.bin == ""):
-            fail(f"input.arms[{at}].bin is \"\" for cargo and a directory for a blaze, not {arm.bin!r}")
-        if arm.bin and not os.path.isfile(os.path.join(arm.bin, "blaze")):
-            fail(f"input.arms[{at}].bin has no `blaze`: {arm.bin}")
-        if not all(type(p) is str for p in arm.path):
-            fail(f"input.arms[{at}].path is a list of directories, not {arm.path!r}")
-        if not all(type(v) is str for v in arm.env.values()):
-            fail(f"input.arms[{at}].env maps names to strings, not {arm.env!r}")
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", arm.name):
+            fail(f"input.arms[{at}].name must name one directory, not {arm.name!r}")
+        if not os.path.isabs(arm.bin) or not os.path.isdir(arm.bin):
+            fail(f"input.arms[{at}].bin must name an absolute executable directory: {arm.bin!r}")
+        if not re.fullmatch(r"[0-9a-f]{40}", arm.commit):
+            fail(f"input.arms[{at}].commit must identify the source with a full Git commit")
     if len({arm.name for arm in arms}) != len(arms):
         fail("input.arms has two arms of one name")
-    if sum(arm.kind == "cargo" for arm in arms) != 1:
-        fail("input.arms has exactly one cargo arm: every output is compared with its")
+    if {arm.kind for arm in arms} != set(KINDS) or sum(arm.kind == "blaze" for arm in arms) != 1:
+        fail("input.arms needs one selected ours (blaze) and at least one selected Astral arm")
+    if len({os.path.realpath(os.path.join(arm.bin, "blaze")) for arm in arms}) != len(arms):
+        fail("input.arms must select different Blaze executables")
     for at, name in enumerate(given.projects):
         if type(name) is not str or name not in spec_of_all():
             fail(f"input.projects[{at}] is one of {', '.join(sorted(spec_of_all()))}, not {name!r}")
+    if not given.projects or len(set(given.projects)) != len(given.projects):
+        fail("input.projects must be a nonempty list without duplicates")
     if given.runs < 1:
         fail(f"input.runs is at least 1, not {given.runs}")
+    if given.action != "run":
+        fail("input.action must be run or report")
+    if not given.work or not given.out:
+        fail("input.work and input.out must name new directories")
     return given, arms
 
 
@@ -211,62 +212,76 @@ class Runner:
         self.arm, self.ws, self.log = arm, ws, log
         self.home = os.path.join(work, f"home-{arm.name}")
         env = {k: v for k, v in os.environ.items() if not k.startswith(("BLAZE_", "RA_JIT_"))}
-        for name in ("RUSTFLAGS", "CARGO_TARGET_DIR", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "RUSTC_WRAPPER", "RUSTUP_TOOLCHAIN"):
-            env.pop(name, None)
         env.update(CARGO_TERM_COLOR="never", RUST_BACKTRACE="0", INSTA_UPDATE="no",
-                   CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT="false", **spec.get("env", {}), **arm.env)
-        env["PATH"] = os.pathsep.join([*([arm.bin] if arm.bin else []), *arm.path, env["PATH"]])
-        prefix = {"blaze": "BLAZE_", "astral": "RA_JIT_"}.get(arm.kind)
-        if prefix:
-            env[prefix + "HOME"] = self.home
-            env[prefix + "CACHE"] = os.path.join(work, f"store-{arm.name}")
-            env[prefix + "STATS"] = "1"
-        self.prefix, self.env, self.loads = prefix, env, bool(prefix)
-        self.side = Side(ws, env, arm.kind != "cargo")
+                   CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT="false", **spec.get("env", {}))
+        for name in ("RUSTFLAGS", "CARGO_TARGET_DIR", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET",
+                     "RUSTC_WRAPPER", "RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC", "CARGO",
+                     "CARGO_ENCODED_RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_INCREMENTAL", "XDG_RUNTIME_DIR"):
+            env.pop(name, None)
+        env.update(BLAZE_HOME=self.home, BLAZE_CACHE=os.path.join(work, f"store-{arm.name}"),
+                   XDG_CACHE_HOME=os.path.join(work, f"machine-{arm.name}"),
+                   CARGO_TARGET_DIR=os.path.join(ws, "target"), BLAZE_LOCK="write", BLAZE_CORES="all")
+        env[blaze_cli.COMPILER_ENV] = os.path.realpath(os.path.join(arm.bin, "blaze"))
+        self.side = Side(ws, env, True)
+        self.env = self.side.env
 
     def run(self, command, *args, env=None):
         self.log.ran(self.arm.name, self.ws, dict(self.side.env, **(env or {})), self.side.argv(command, *args))
         return self.side.cargo(command, *args, env=env)
 
     def stop(self):
-        if self.prefix:
-            self.side.cargo("stop")
+        _, ran = self.run("stop")
+        if ran.returncode:
+            raise RuntimeError(f"{self.arm.name}: stop failed: {ran.stderr[-1500:]}")
 
     def built(self, ran):
-        """Whether a blaze arm's daemon built it, or why cargo did; "cargo" for the cargo arm."""
-        if not self.prefix:
-            return "cargo"
-        said = ran.stdout + ran.stderr
-        reason = re.search(r"^(?:blaze|ra-jit): (?:bug: )?(.*?); (building with cargo|this build is cargo's|this is `cargo \w+`|is cargo's to build|rustc links)",
-                            said, re.M)
-        if reason:
-            return "cargo: " + reason[1][:160]
-        return "daemon" if re.search(r"\[(blaze|ra-jit)\]", said) else "unknown"
-
-    def ready(self):
-        if not self.loads:
-            return 0.0, ["cargo" if not self.prefix else "never loaded"]
-        took, states = wait_warm(self.side, self.ws)
-        if states == ["not loaded in time"]:
-            self.loads = False
-        return took, states
+        """Only the typed producer verdict counts; a log marker is not compiler evidence."""
+        return blaze_cli.how_built(ran)
 
 
-def shipped_std(arm, runner, work):
-    """A remote with Astral's arm's standard library unit, made by its own `std` command once, as
-    its release would ship it."""
-    remote = os.path.join(work, f"std-{arm.name}")
-    if os.path.isdir(remote):
-        return remote
-    engine = next(os.path.join(arm.bin, n) for n in ("blaze-engine", "ra-jit") if os.path.isfile(os.path.join(arm.bin, n)))
-    env = dict(runner.env, **{runner.prefix + "HOME": os.path.join(work, f"home-std-{arm.name}")})
-    # The arm's own blaze says where its Rust is (`blaze toolchain --json`), never rustc.
-    sysroot = storelib.blaze_toolchain(os.path.join(arm.bin, "blaze"), env).sysroot
-    runner.log.ran(arm.name, work, env, [engine, "std", remote, sysroot])
-    made = subprocess.run([engine, "std", remote, sysroot], capture_output=True, text=True, env=env)
-    if made.returncode != 0:
-        raise RuntimeError(f"{arm.name}: `std` failed:\n{made.stderr[-3000:]}")
-    return remote
+def compiler_identity(arm):
+    """Hash the selected launcher and every shipped executable, including the fork's ra-jit."""
+    directory = Path(arm.bin).resolve(strict=True)
+    program = directory / "blaze"
+    if not program.is_file() or not os.access(program, os.X_OK):
+        raise RuntimeError(f"{arm.name}: no executable selected Blaze at {program}")
+    paths = sorted(p for p in directory.iterdir() if p.is_file() and os.access(p, os.X_OK))
+    if any(path.resolve().parent != directory for path in paths):
+        raise RuntimeError(f"{arm.name}: executables must reside in the selected directory, including companions")
+    binaries = {str(path.resolve()): bench.sha256(path) for path in paths}
+    selected = str(program.resolve())
+    return dict(path=selected, sha256=binaries[selected], binaries=binaries)
+
+
+def protocol(arm, work, out, log):
+    """Refuse the old Cargo dispatcher with safe help before any toolchain/build/stop call."""
+    runner = Runner(arm, work, work, "protocol", {}, log)
+    identity = compiler_identity(arm)
+    transcript = []
+
+    def ask(argv, timeout=120):
+        log.ran(arm.name, work, runner.env, argv)
+        ran = subprocess.run(argv, cwd=work, env=runner.env, capture_output=True, text=True,
+                             timeout=timeout, stdin=subprocess.DEVNULL)
+        transcript.append(f"{argv!r}\nexit {ran.returncode}\n--- stdout\n{ran.stdout}\n--- stderr\n{ran.stderr}")
+        if ran.returncode:
+            raise RuntimeError(f"{arm.name}: unsupported compiler protocol: {argv[1:]} exited {ran.returncode}")
+        return ran.stdout
+
+    try:
+        # Work has no ancestor Cargo.toml, so even a launcher without --ignore-pin cannot
+        # select a workspace's other compiler. Astral's legacy --help never runs Cargo.
+        help_text = ask([identity["path"], "--help"])
+        for command in ("status", "toolchain"):
+            if not re.search(rf"^\s*{command}\b[^\n]*--json", help_text, re.M):
+                raise RuntimeError(f"{arm.name}: unsupported compiler protocol: --help does not advertise "
+                                   f"{command} --json; refusing before toolchain setup or builds")
+        chosen = storelib.blaze_toolchain_of(ask([identity["path"], "--ignore-pin", "toolchain", "--json"], timeout=900))
+        if compiler_identity(arm) != identity:
+            raise RuntimeError(f"{arm.name}: compiler identity changed during protocol validation")
+        return dict(compiler=identity, toolchain=asdict(chosen))
+    finally:
+        Path(out, "raw", f"protocol-{arm.name}.txt").write_text("\n".join(transcript))
 
 
 def fetch(name, spec, sources):
@@ -295,18 +310,40 @@ def median(values):
 
 
 def measure(name, spec, arms, given, log):
-    work = os.path.realpath(os.path.join(given.work, name))
-    shutil.rmtree(work, ignore_errors=True)
+    work = os.path.realpath(os.path.join(given.work, name, arms[0].name))
     os.makedirs(work)
     source = fetch(name, spec, os.path.join(given.work, "sources"))
     runners = {}
-    for arm in arms:
-        ws = os.path.join(work, arm.name)
-        shutil.copytree(source, ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", ".git"))
-        runners[arm.name] = Runner(arm, ws, work, name, spec, log)
+    required = ["cold", "no-op", *(kind for kind in EDITS if spec["edits"].get(kind))]
+    if given.tests and spec.get("test") is not None:
+        required += ["tests_first", "tests"]
+    result = dict(project=name, repo=spec["repo"], rev=spec["rev"], required=required,
+                  arms={a.name: dict(kind=a.kind, phases={}, wrong=[], failed=None) for a in arms})
+    try:
+        for arm in arms:
+            ws = os.path.join(work, arm.name)
+            shutil.copytree(source, ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", ".git"))
+            runners[arm.name] = Runner(arm, ws, work, name, spec, log)
+        measure_turns(name, spec, arms, given, runners, result)
+    except (RuntimeError, subprocess.SubprocessError, OSError, AssertionError, ValueError, storelib.Failed) as error:
+        for arm in arms:
+            row = result["arms"][arm.name]
+            row["failed"] = row["failed"] or str(error)[-2000:]
+    finally:
+        for arm in arms:
+            if arm.name not in runners:
+                continue
+            try:
+                runners[arm.name].stop()
+            except (RuntimeError, subprocess.SubprocessError, OSError, ValueError, storelib.Failed) as error:
+                row = result["arms"][arm.name]
+                row["failed"] = "; ".join(filter(None, (row["failed"], f"cleanup: {error}")))
+    return result
+
+
+def measure_turns(name, spec, arms, given, runners, result):
+    """One schedule of actual selected arms; a refused producer never supplies a sample."""
     build, run = spec.get("build", []), spec.get("run")
-    result = dict(project=name, repo=spec["repo"], rev=spec["rev"], arms={a.name: dict(kind=a.kind, phases={}, wrong=[], failed=None) for a in arms})
-    cargo_arm = next(a for a in arms if a.kind == "cargo")
     expected = {}
 
     def row(arm):
@@ -316,54 +353,44 @@ def measure(name, spec, arms, given, log):
         return row(arm)["failed"] is None
 
     def output_is_right(arm, label):
-        if run is None or not live(arm) or arm.kind == "cargo":
+        if run is None or not live(arm):
             return
         _, ran = runners[arm.name].run("run", *build, "--", *run)
+        if runners[arm.name].built(ran) != "daemon":
+            row(arm)["failed"] = f"{label} output was not built by the selected daemon: {runners[arm.name].built(ran)}"
+            return
         said = program_output(ran)
         if arm.name not in expected:
             expected[arm.name] = said
         elif wrong := difference(said, expected[arm.name]):
             row(arm)["wrong"].append(f"{label}: {wrong}"[:400])
 
-    def timed_build(arm):
-        r = runners[arm.name]
-        took, ran = r.run("build", *build)
+    def accepted(arm, label, ran):
         if ran.returncode != 0:
-            row(arm)["failed"] = f"build failed: {(ran.stderr or ran.stdout)[-1500:]}"
-            print(f"    {arm.name}: build FAILED\n" + "".join(f"      {l}\n" for l in (ran.stderr or ran.stdout).strip().splitlines()[-15:]), flush=True)
-            return None
-        built = r.built(ran)
-        if built.startswith("cargo:") or built == "unknown":
-            r.ready()
-        return round(took, 3), built
+            row(arm)["failed"] = f"{label} build exited {ran.returncode}: {(ran.stderr or ran.stdout)[-1500:]}"
+            return False
+        built = runners[arm.name].built(ran)
+        if built != "daemon":
+            row(arm)["failed"] = f"{label} build was not produced by the selected daemon: {built}"
+            return False
+        return True
 
-    for arm in arms:
-        runners[arm.name].stop()
-    for arm in arms:
-        r = runners[arm.name]
-        if r.prefix and arm.kind == "astral":
-            try:
-                r.env[r.prefix + "STD_FROM"] = shipped_std(arm, r, given.work)
-            except (RuntimeError, subprocess.CalledProcessError) as e:
-                row(arm)["failed"] = str(e)[-1500:]
-    if subprocess.run(["cargo", "fetch"], cwd=runners[cargo_arm.name].ws, env=runners[cargo_arm.name].env, capture_output=True).returncode != 0:
-        print("  cargo fetch failed; builds fetch what they need", flush=True)
+    def timed_build(arm, label):
+        if not live(arm):
+            return None
+        took, ran = runners[arm.name].run("build", *build)
+        return (round(took, 3), "daemon") if accepted(arm, label, ran) else None
 
     print(f"{name}: cold", flush=True)
     for arm in turns(arms, len(name)):
         if not live(arm):
             continue
-        r = runners[arm.name]
-        took, ran = r.run("build", *build)
-        if ran.returncode != 0:
-            row(arm)["failed"] = f"cold build failed: {(ran.stderr or ran.stdout)[-1500:]}"
-            print(f"  {arm.name:10} cold FAILED\n" + "".join(f"      {l}\n" for l in (ran.stderr or ran.stdout).strip().splitlines()[-15:]), flush=True)
-            continue
-        ready, states = r.ready()
-        row(arm)["phases"]["cold"] = dict(build_s=round(took, 3), ready_s=round(ready, 3), wall_s=round(took + ready, 3),
-                                          built=r.built(ran), states=states)
-        print(f"  {arm.name:10} cold {took:8.2f}s + ready {ready:6.2f}s  {r.built(ran)}  {states}", flush=True)
-    for arm in [cargo_arm] + [a for a in arms if a.kind != "cargo"]:
+        if got := timed_build(arm, "cold"):
+            took, built = got
+            row(arm)["phases"]["cold"] = dict(build_s=took, ready_s=0.0, wall_s=took,
+                                              samples_s=[took], built=built)
+            print(f"  {arm.name:10} cold {took:8.2f}s  {built}", flush=True)
+    for arm in arms:
         output_is_right(arm, "cold")
 
     def phase(label, samples):
@@ -378,7 +405,7 @@ def measure(name, spec, arms, given, log):
     samples = {a.name: [] for a in arms}
     for round_ in range(given.runs):
         for arm in turns(arms, round_):
-            if live(arm) and (got := timed_build(arm)):
+            if live(arm) and (got := timed_build(arm, "no-op")):
                 samples[arm.name].append(got)
     phase("no-op", samples)
 
@@ -395,78 +422,129 @@ def measure(name, spec, arms, given, log):
                 r = runners[arm.name]
                 bench.write_edit(r.ws, changes, False)
                 trace = os.path.realpath(os.path.join(given.out, "raw", f"{name}-{arm.name}-{kind}.profile"))
-                took, ran = r.run("build", *build, env={"BLAZE_PROFILE": trace} if round_ == 0 and r.prefix == "BLAZE_" else None)
+                took, ran = r.run("build", *build, env={"BLAZE_PROFILE": trace} if round_ == 0 and arm.kind == "blaze" else None)
                 if round_ == 0:
                     with open(os.path.join(given.out, "raw", f"{name}-{arm.name}-{kind}.txt"), "w") as f:
                         f.write(f"took {took:.3f}s, exit {ran.returncode}\n--- stdout\n{ran.stdout[-20000:]}\n--- stderr\n{ran.stderr[-40000:]}")
-                if ran.returncode != 0:
-                    rejected[arm.name] = (ran.stderr or ran.stdout)[-1500:]
+                if not accepted(arm, kind, ran):
+                    rejected[arm.name] = row(arm)["failed"]
                     print(f"    {arm.name}: {kind} edit rejected\n" + "".join(f"      {l}\n" for l in rejected[arm.name].strip().splitlines()[-8:]), flush=True)
                     made = None
                 else:
-                    made = round(took, 3), r.built(ran)
-                    if made[1].startswith("cargo:") or made[1] == "unknown":
-                        r.ready()
+                    made = round(took, 3), "daemon"
                 if made and round_ == 0:
-                    output_is_right(arm, kind) if arm.kind != "cargo" else None
+                    output_is_right(arm, kind)
                 bench.write_edit(r.ws, changes, True)
-                back = timed_build(arm)
+                back = timed_build(arm, f"{kind} reversed")
+                if back and round_ == 0:
+                    output_is_right(arm, f"{kind} reversed")
                 if made and back:
                     samples[arm.name].append((made[0], made[1], back[0]))
         phase(kind, samples)
         for arm in arms:
-            if arm.kind == "cargo" or not live(arm):
-                continue
             if arm.name in rejected:
-                row(arm)["wrong"].append(f"{kind}: rejects bench.py's edit, which is valid source"[:400])
+                row(arm)["wrong"].append(f"{kind}: rejects the edit or the required compiler producer"[:400])
                 row(arm)["phases"][kind] = dict(rejected=rejected[arm.name][-400:])
-        if cargo_arm.name in rejected:
-            row(cargo_arm)["phases"][kind] = dict(rejected=rejected[cargo_arm.name][-400:])
 
     if given.tests and spec.get("test") is not None:
         args = spec["test"]
         print(f"{name}: tests", flush=True)
         outcomes = {}
+        known = frozenset(spec.get("test_known", ()))
         for round_ in range(2):
             for arm in turns(arms, round_):
                 if not live(arm):
                     continue
                 took, ran = runners[arm.name].run("test", *args)
                 outcomes[arm.name] = (round(took, 3), ran)
-                if round_ == 0:
-                    row(arm)["phases"]["tests_first"] = dict(wall_s=round(took, 3))
-        known = frozenset(spec.get("test_known", ()))
+                producer = runners[arm.name].built(ran)
+                if producer != "daemon":
+                    row(arm)["failed"] = f"tests round {round_ + 1}: not the selected daemon: {producer}"
+                status, tests, totals = test_results(ran)
+                wrong = test_verdict((status, tests, totals), known)
+                if wrong:
+                    row(arm)["wrong"].append(f"tests round {round_ + 1}: {wrong}"[:400])
+                entry = dict(wall_s=round(took, 3), built=producer, status=status,
+                             passed=totals[1], failed=totals[2], ignored=totals[3],
+                             tests=len({test for test, _ in tests}), same=wrong is None, difference=wrong)
+                row(arm)["phases"]["tests_first" if round_ == 0 else "tests"] = entry
         for arm in arms:
             if arm.name not in outcomes:
                 continue
             took, ran = outcomes[arm.name]
             with open(os.path.join(given.out, "raw", f"{name}-{arm.name}-tests.txt"), "w") as f:
                 f.write(f"kept: {getattr(ran, 'kept', [])}\n--- stdout\n{ran.stdout}\n--- stderr\n{ran.stderr[-20000:]}")
-            status, tests, totals = test_results(ran)
-            entry = dict(wall_s=took, status=status, passed=totals[1], failed=totals[2], ignored=totals[3],
-                         built=runners[arm.name].built(ran))
-            if arm.kind != "cargo" and (wrong := test_verdict((status, tests, totals), known)):
-                entry["differs"] = wrong[:400]
-                row(arm)["wrong"].append(f"tests: {wrong}"[:400])
-            row(arm)["phases"]["tests"] = entry
-            print(f"  {arm.name:10} tests {took:8.2f}s  {totals[1]} passed {totals[2]} failed  {entry.get('differs', 'all pass') if arm.kind != 'cargo' else ''}", flush=True)
-
-    for arm in arms:
-        runners[arm.name].stop()
-    return result
+            entry = row(arm)["phases"].get("tests", row(arm)["phases"]["tests_first"])
+            print(f"  {arm.name:10} tests {took:8.2f}s  {entry['passed']} passed {entry['failed']} failed  {entry['difference'] or 'all pass'}", flush=True)
 
 
 def host(given, arms):
-    def out(argv):
-        ran = subprocess.run(argv, capture_output=True, text=True)
-        return ran.stdout.strip() if ran.returncode == 0 else None
     mem = open("/proc/meminfo").read().split("\n")[0] if os.path.exists("/proc/meminfo") else None
-    return dict(machine=given.machine, platform=platform.platform(), cpus=os.cpu_count(), affinity=len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
-                memory=mem, cargo=out(["cargo", "--version"]), date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                arms=[dict(name=a.name, kind=a.kind, commit=a.commit) for a in arms], runs=given.runs, interleave=given.interleave)
+    return dict(schema=2, machine=given.machine, platform=platform.platform(), cpus=os.cpu_count(),
+                affinity=len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
+                memory=mem, date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                arms=[dict(name=a.name, kind=a.kind, commit=a.commit) for a in arms],
+                projects=given.projects, runs=given.runs, tests=given.tests, interleave=given.interleave, errors=[])
 
 
 PHASES = ("cold", "no-op", "body", "signature", "tests")
+
+
+def evidence_errors(info, rows):
+    """Current comparisons require every requested arm/phase; historical labels stay intact."""
+    errors = list(info.get("errors", []))
+    if not rows:
+        errors.append("no projects were measured")
+    native = info.get("schema") == 2
+    if "schema" in info and not native:
+        errors.append(f"unsupported rival schema {info['schema']!r}")
+    if native:
+        if {row.get("project") for row in rows} != set(info["projects"]):
+            errors.append("the requested projects were not all measured")
+        for arm in info["arms"]:
+            if not arm.get("compiler") or arm.get("compiler_after") != arm["compiler"]:
+                errors.append(f"{arm['name']}: compiler identity was not verified unchanged after cleanup")
+            if not arm.get("toolchain"):
+                errors.append(f"{arm['name']}: required compiler protocol was not established")
+    for row in rows:
+        if row.get("error"):
+            errors.append(f"{row['project']}: {row['error']}")
+        for selected in info["arms"]:
+            name = selected["name"]
+            arm = row.get("arms", {}).get(name)
+            if not isinstance(arm, dict):
+                errors.append(f"{row['project']}/{name}: arm was not measured")
+                continue
+            prefix = f"{row['project']}/{name}"
+            if arm.get("failed"):
+                errors.append(f"{prefix}: {arm['failed']}")
+            errors += [f"{prefix}: {why}" for why in arm.get("wrong", [])]
+            if not native:
+                continue
+            spec = spec_of_all()[row["project"]]
+            required = ["cold", "no-op", *(kind for kind in EDITS if spec["edits"].get(kind))]
+            if info["tests"] and spec.get("test") is not None:
+                required += ["tests_first", "tests"]
+            for label in required:
+                phase = arm.get("phases", {}).get(label)
+                if not isinstance(phase, dict) or not benchschema.number(phase.get("wall_s")):
+                    errors.append(f"{prefix} {label}: no valid timing")
+                    continue
+                if phase.get("built") not in ("daemon", ["daemon"]):
+                    errors.append(f"{prefix} {label}: not built by the selected daemon")
+                if label not in ("tests_first", "tests"):
+                    samples = phase.get("samples_s")
+                    count = 1 if label == "cold" else info["runs"]
+                    if not isinstance(samples, list) or len(samples) != count or not all(map(benchschema.number, samples)):
+                        errors.append(f"{prefix} {label}: incomplete timing samples")
+                if label in EDITS and not benchschema.number(phase.get("back_s")):
+                    errors.append(f"{prefix} {label}: no valid reversal time")
+                if label in ("tests_first", "tests") and (
+                    phase.get("same") is not True or phase.get("difference") is not None
+                    or type(phase.get("tests")) is not int or phase["tests"] < 1
+                ):
+                    errors.append(f"{prefix} {label}: no complete passing test verdict")
+    return errors
 
 
 def report(out):
@@ -476,14 +554,21 @@ def report(out):
     rows = [json.load(open(os.path.join(out, "raw", f))) for f in sorted(os.listdir(os.path.join(out, "raw"))) if f.endswith(".json")]
     names = [a["name"] for a in info["arms"]]
     ours = next(a["name"] for a in info["arms"] if a["kind"] == "blaze")
-    lines = [f"# Rival score: our blaze, Astral's fork and cargo ({info['date'][:10]})", "",
+    errors = evidence_errors(info, rows)
+    historical = any(a["kind"] == "cargo" for a in info["arms"])
+    title = "our Blaze, Astral's fork and Cargo (historical)" if historical else "our Blaze and Astral's fork"
+    cold = "first build + the recorded daemon wait" if historical else "first build from empty state"
+    lines = [f"# Rival score: {title} ({info['date'][:10]})", "",
              f"Machine: {info['machine'] or info['platform']}, {info['affinity'] or info['cpus']} cores used. "
              f"{info['runs']} timed builds per phase, "
-             f"{'arms in turn' if info.get('interleave', True) else 'each blaze arm on its own beside cargo, one daemon at a time'} (harness/rival.py). Commits: "
+             f"{'arms in turn' if info.get('interleave', True) else 'one daemon at a time'} (harness/rival.py). Commits: "
              + ", ".join(f"{a['name']} ({a['kind']}) `{a['commit'][:10]}`" for a in info["arms"]) + ".", "",
-             "Seconds, median. cold = first build + the wait until the daemon is ready. tests = the second `test` run. "
+             f"Seconds, median. cold = {cold}. tests = the second `test` run. "
              f"gap = {ours} / fastest other arm: above 1.00x someone beats us. A cell with `!` was built by cargo "
-             "(the daemon declined); `x` failed; `rejected`: the edit did not build.", "",
+             "in the historical record; `x` failed; `rejected`: the edit did not build.", "",
+             ("Comparison refused; no ratios are reported." if errors else
+              "Historical measurements; the original producer labels are preserved." if historical else
+              "Every requested measurement passed its verdict."), "",
              "| project | phase | " + " | ".join(names) + " | gap |", "|---|---|" + "---:|" * (len(names) + 1)]
     for r in rows:
         for label in PHASES:
@@ -494,13 +579,20 @@ def report(out):
                 if p is None:
                     cells.append("x" if arm.get("failed") else "")
                     continue
+                if not isinstance(p, dict):
+                    cells.append("invalid")
+                    continue
                 if "rejected" in p:
                     cells.append("rejected")
                     continue
-                times[n] = p["wall_s"]
+                if not benchschema.number(p.get("wall_s")):
+                    cells.append("invalid")
+                    continue
+                if not errors:
+                    times[n] = p["wall_s"]
                 built = p.get("built")
-                flag = "!" if (isinstance(built, list) and any(b.startswith("cargo:") for b in built)) or (isinstance(built, str) and built.startswith("cargo:")) else ""
-                extra = f" ({p['passed']} ok, {p['failed']} failed)" if label == "tests" else ""
+                flag = "!" if (isinstance(built, list) and any(isinstance(b, str) and b.startswith("cargo:") for b in built)) or (isinstance(built, str) and built.startswith("cargo:")) else ""
+                extra = f" ({p.get('passed', '?')} ok, {p.get('failed', '?')} failed)" if label == "tests" else ""
                 cells.append(f"{p['wall_s']:.2f}{flag}{extra}")
             if not any(cells):
                 continue
@@ -509,45 +601,79 @@ def report(out):
             lines.append(f"| {r['project']} | {label} | " + " | ".join(cells) + f" | {gap} |")
     wrong = [(r["project"], n, w) for r in rows for n, a in r["arms"].items() for w in a.get("wrong", [])]
     failed = [(r["project"], n, a["failed"]) for r in rows for n, a in r["arms"].items() if a.get("failed")]
-    lines += ["", "## Wrong output or tests (against cargo)", ""]
+    lines += ["", "## Wrong output or tests", ""]
     lines += [f"- {p} / {n}: {w}" for p, n, w in wrong] or ["None."]
     lines += ["", "## Failed", ""]
     lines += [f"- {p} / {n}: {f.splitlines()[0][:200] if f else ''}" for p, n, f in failed] or ["None."]
+    lines += ["", "## Evidence refusals", ""]
+    lines += [f"- {error}" for error in errors] or ["None."]
     lines += ["", "Raw results: raw/<project>.json. Every command: commands.txt. Machine: host.json.", ""]
     open(os.path.join(out, "README.md"), "w").write("\n".join(lines))
     print("\n".join(lines))
+    return errors
 
 
 def main():
     argv = sys.argv[1:]
-    if argv[:1] == ["report"]:
-        if len(argv) > 2:
-            fail(f"usage: rival.py report ['<json>' | FILE | -]")
-        report(checked(Report, read(argv[1] if len(argv) == 2 else ""), "input").out)
-        return
     if len(argv) != 1:
         fail(f"usage: rival.py ['<json>' | FILE | -]\n\n{__doc__}")
-    given, arms = typed(argv[0])
-    os.makedirs(os.path.join(given.out, "raw"), exist_ok=True)
-    json.dump(host(given, arms), open(os.path.join(given.out, "host.json"), "w"), indent=1)
+    value = read(argv[0])
+    if isinstance(value, dict) and value.get("action") == "report":
+        sys.exit(1 if report(checked(Report, value, "input").out) else 0)
+    given, arms = typed(json.dumps(value))
+    given = replace(given, work=os.path.realpath(given.work), out=os.path.realpath(given.out))
+    if os.path.exists(given.out):
+        fail(f"out already exists; refusing to mix evidence: {given.out}")
+    os.makedirs(os.path.join(given.out, "raw"))
+    info = host(given, arms)
+    host_path = Path(given.out, "host.json")
+    host_path.write_text(json.dumps(info, indent=1))
     log = Log(os.path.join(given.out, "commands.txt"))
+    snapshots = {}
+    try:
+        if os.path.exists(given.work):
+            raise RuntimeError(f"work already exists; refusing to reuse compiler state: {given.work}")
+        if any((parent / "Cargo.toml").exists() for parent in Path(given.work).parents):
+            raise RuntimeError("work must be outside a Rust workspace so the help probe cannot follow a compiler pin")
+        os.makedirs(given.work)
+        with open(os.path.join(given.out, "reflink.txt"), "w") as evidence, contextlib.redirect_stdout(evidence):
+            clone_out.selftest(given.work)
+        for arm, record in zip(arms, info["arms"]):
+            try:
+                snapshots[arm.name] = compiler_identity(arm)
+                record["compiler"] = snapshots[arm.name]
+                record.update(protocol(arm, given.work, given.out, log))
+            except (RuntimeError, subprocess.SubprocessError, OSError, ValueError, storelib.Failed) as error:
+                info["errors"].append(f"{arm.name}: {error}")
+    except (RuntimeError, OSError, AssertionError, clone_out.engine.Failed) as error:
+        info["errors"].append(f"prerequisite: {error}")
+    host_path.write_text(json.dumps(info, indent=1))
     specs = spec_of_all()
-    cargo_arm = next(a for a in arms if a.kind == "cargo")
-    blocks = [arms] if given.interleave else [[cargo_arm, a] for a in arms if a.kind != "cargo"]
+    blocks = [arms] if given.interleave else [[arm] for arm in arms]
     for name in given.projects:
+        result = dict(project=name, repo=specs[name]["repo"], rev=specs[name]["rev"], arms={})
+        if info["errors"]:
+            result["arms"] = {a.name: dict(kind=a.kind, phases={}, wrong=[],
+                                           failed="not measured: compiler protocol or placement prerequisite failed") for a in arms}
         try:
-            result = None
-            for block in blocks:
+            for block in ([] if info["errors"] else blocks):
                 got = measure(name, specs[name], block, given, log)
-                if result is None:
-                    result = got
-                else:
-                    result["arms"].update((k, v) for k, v in got["arms"].items() if k != cargo_arm.name)
-        except (RuntimeError, subprocess.CalledProcessError, OSError, AssertionError) as e:
-            result = dict(project=name, repo=specs[name]["repo"], rev=specs[name]["rev"], arms={}, error=str(e)[-2000:])
+                result["arms"].update(got["arms"])
+        except (RuntimeError, subprocess.SubprocessError, OSError, AssertionError, ValueError, storelib.Failed) as e:
+            result["error"] = str(e)[-2000:]
             print(f"{name}: {e}", flush=True)
         json.dump(result, open(os.path.join(given.out, "raw", f"{name}.json"), "w"), indent=1)
-    report(given.out)
+    for arm, record in zip(arms, info["arms"]):
+        if arm.name not in snapshots:
+            continue
+        try:
+            record["compiler_after"] = compiler_identity(arm)
+            if record["compiler_after"] != snapshots[arm.name]:
+                info["errors"].append(f"{arm.name}: compiler identity changed before cleanup completed")
+        except (RuntimeError, OSError) as error:
+            info["errors"].append(f"{arm.name}: compiler identity after cleanup: {error}")
+    host_path.write_text(json.dumps(info, indent=1))
+    sys.exit(1 if report(given.out) else 0)
 
 
 if __name__ == "__main__":

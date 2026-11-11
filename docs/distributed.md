@@ -60,6 +60,12 @@ blaze-serve --dir DIR --listen 127.0.0.1:PORT
 5. What it took goes into its own store with what it made, so the link, the record and the next
    build have one store to read, and the unit's list is published for the builds to come.
 
+The coordinator retains a completed compile phase through final export and publication. A
+request for the same unit during that interval joins the execution and waits for its immutable
+manifest; it does not start another compile. Publication acceptance and delivery are separate,
+attempt-fenced transitions. The implementation and pending runtime evidence are described in
+[distributed publication](v2/plan/design/distributed-publication.md).
+
 ## When something fails
 
 A holder that stops heartbeating has its lease expire and its functions granted again. A lead that
@@ -82,6 +88,14 @@ Compiled here is the same build the daemon runs alone. A cancelled build leaves 
 an execution ends when its last subscriber leaves. A caller's own cancellation is terminal under
 both policies. A full manifest accepted by the coordinator is immutable: a later worker failure
 or refusal cannot replace it or turn it into permission to compile again.
+
+After its local compiler and heartbeat scopes stop, an agent retires its owned assignment and
+separately acknowledges the resulting stop. This releases a departing helper's reservation while
+other subscribers continue. A read of its exact owned slot finds a promotion that the agent did
+not observe before cancellation, without claiming new work. Both stop requests name the exact
+execution and attempt; retirement also binds the claimant to its transport session. An old
+request cannot stop or release a newer assignment. The protocol and pending runtime checks are in
+[assignment retirement](v2/plan/design/distributed-retirement.md).
 
 ## Pull requests and the shared cache
 
@@ -361,9 +375,6 @@ The cache server's calls are in `crates/blaze-serve/src/lib.rs`.
 - **No authentication and no collection** on the cache server: it listens on loopback unless told
   otherwise, and its directory grows until it is removed.
 - **Distributed tests** are not wired: `blaze test` runs here, whatever the build did.
-- **A unit between its execution and its list** is compiled again. An execution ends when its
-  compile phase does, and its list is published once the build has made the rest of the unit
-  and linked it. A build that submits the same unit in between starts an execution of its own.
 
 ## How it is tested
 
@@ -378,9 +389,12 @@ byte for byte.
 
 The Linux AArch64 lane of `.github/workflows/blaze-platform.yaml` requires this real harness after
 its current-tree build. It verifies the build artifact's commit, tree and binary SHA-256 identities,
-uses that Blaze to build the coordinator and cache server in an isolated home, runs the protocol
-and carrier crates' library and integration tests with their Hegel controls, and runs both dev
-and release with faults enabled. Release also requires two holders to emit actual LLVM and folded
+uses that Blaze to build the coordinator and cache server in an isolated home, and runs both dev
+and release with faults enabled. A separate job uses the same verified source-built compiler to
+run the protocol and carrier crates' library and integration tests with their Hegel controls;
+the merge gate requires that test receipt too. The pinned bootstrap predates the compiler repair
+needed by packages whose library and binary share a name, so it cannot supply this receipt.
+Release also requires two holders to emit actual LLVM and folded
 work. The workers have private stores and targets on the runner's verified reflink filesystem;
 each receives two cores and a 6 GiB daemon memory hint. These are resource hints, not whole-process
 memory limits. CI retains inputs, identities, logs, reports, lease/result captures and artifact

@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use blaze_dist::holder::{BatchCompiler, Compiled, Holder, HolderConfig, Plan, StopWhy};
-use blaze_dist::jobs::{LocalAction, local_action};
+use blaze_dist::jobs::{LocalAction, MAX_ATTEMPTS, local_action};
 use blaze_dist::{Ranges, Refusal};
 use blaze_wire::{
     Attempt, Digest, DoneEvent, EntryKey, EntryRef, ExecutionId, ItemKey, ItemOutcome, ItemResult,
@@ -59,7 +59,7 @@ pub struct Config {
     pub socket: PathBuf,
     /// The cache server.
     pub blobs: Blobs,
-    /// This daemon: who holds a claim, across its units.
+    /// This daemon's claim label, bound by the coordinator to each owned transport session.
     pub claimant: Digest,
     /// [`platform`] of the host triple.
     pub platform: Digest,
@@ -470,18 +470,19 @@ pub fn run(
     if result.is_err() {
         leave(&mut client, &binding);
     }
-    // execute has joined every compiler/heartbeat scope. Its claims now name
-    // actual stopped work, including a failed tail and superseded attempts.
-    // The coordinator accepts only the matching pending stop: a false ACK can
-    // never free a live or newer assignment. Preserve the original failure if
-    // cleanup loses its carrier; successful publication still requires its ACK.
-    let acknowledged = assignments.iter().try_for_each(|(executor, attempt)| {
-        acknowledge(
+    // execute has joined every compiler/heartbeat scope. Only its recorded slots
+    // can be cleaned up. An owned lookup observes a promotion that cancellation
+    // prevented the loop from seeing, without claiming any other assignment.
+    // Retirement and the separate ACK still name the exact returned token.
+    // Preserve the original failure if cleanup loses its carrier; successful
+    // publication still requires its stop acknowledgment.
+    let acknowledged = assignments.iter().try_for_each(|(executor, _)| {
+        retire_owned(
             &mut client,
             binding.subscription.content,
             binding.subscription.execution,
             executor,
-            *attempt,
+            config.claimant,
         )
     });
     let result =
@@ -1036,6 +1037,59 @@ fn deliver(client: &mut Client, binding: &Binding, packs: &[PackRef]) -> Result<
         },
         other => Err(Error::Protocol(format!("publication delivery answered {other:?}"))),
     }
+}
+
+fn retire_owned(
+    client: &mut Client,
+    content: blaze_wire::JobContent,
+    execution: ExecutionId,
+    executor: &str,
+    claimant: Digest,
+) -> Result<(), Error> {
+    for _ in 0..MAX_ATTEMPTS {
+        let lookup = Command::OwnedAssignment(carrier::OwnedAssignment {
+            content,
+            executor: executor.to_owned(),
+            execution,
+            claimant,
+        });
+        let attempt = match client.call(lookup)? {
+            Answer::OwnedAssignment(owned) => owned.attempt,
+            // Already acknowledged or reused: this owner must not follow the slot.
+            Answer::Error(error)
+                if matches!(Refusal::of(&error), Some(Refusal::NotHolder | Refusal::NoExecution)) =>
+            {
+                return Ok(());
+            }
+            other => return Err(Error::Protocol(format!("owned assignment answered {other:?}"))),
+        };
+        let request = Command::RetireAssignment(carrier::RetireAssignment {
+            content,
+            executor: executor.to_owned(),
+            execution,
+            attempt,
+            claimant,
+        });
+        match client.call(request)? {
+            Answer::Ack(_) => return acknowledge(client, content, execution, executor, attempt),
+            Answer::Error(error) if Refusal::of(&error) == Some(Refusal::AttemptMoved) => {
+                // A promotion raced the read. Query the same owned slot again; an old
+                // token never becomes authority over the replacement by itself.
+            }
+            Answer::Error(error)
+                if matches!(
+                    Refusal::of(&error),
+                    Some(Refusal::NotHolder | Refusal::NoExecution | Refusal::Ended)
+                ) =>
+            {
+                return Ok(());
+            }
+            other => {
+                return Err(Error::Protocol(format!("assignment retirement answered {other:?}")));
+            }
+        }
+    }
+    Err(Error::Protocol("owned assignment exceeded its reassignment bound during cleanup".to_owned()))
 }
 
 fn acknowledge(

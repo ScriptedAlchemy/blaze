@@ -51,20 +51,20 @@ jobs:
       contents: read
     timeout-minutes: 120
     env:
-      # Shared with bench-readme.yaml: blaze builds incrementally and the projects are cloned once.
-      BENCH_HOME: ${{ github.workspace }}/../bench-state
-      BENCH_WORK: ${{ matrix.work }}
+      BENCH_MACHINE: GitHub-hosted ${{ matrix.name }} (${{ matrix.label }})
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: user namespaces and counters
+      - uses: ./.github/actions/blaze
+        with:
+          job: bench-counts
+          llvm: 'true'
+          reflink: ${{ runner.os == 'Linux' && 'true' || 'false' }}
+      - name: counters
         if: runner.os == 'Linux'
         run: |
-          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
-            sudo -n sysctl kernel.apparmor_restrict_unprivileged_userns=0
-          fi
           # Counting the user mode of one's own processes needs perf_event_paranoid <= 2
           # (harness/counters.py); a machine that refuses says so in each count's gap.
           if [ "$(cat /proc/sys/kernel/perf_event_paranoid)" -gt 2 ]; then
@@ -74,22 +74,26 @@ jobs:
       - uses: ./.github/actions/nix
       - name: Build blaze
         run: |
+          bench_root=/tmp
+          if [ "$RUNNER_OS" = Linux ]; then bench_root="$RUNNER_TEMP/blaze-fs"; fi
+          export BENCH_HOME="$bench_root/bb-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$BENCH_HOME"
-          CARGO_HOME="$BENCH_HOME/stage0" sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
-          stage0="$BENCH_HOME/stage0/bin/blaze"
-          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c "$stage0" build -p blaze-engine --release --locked
+          echo "BENCH_HOME=$BENCH_HOME" >> "$GITHUB_ENV"
+          echo "TMPDIR=$bench_root" >> "$GITHUB_ENV"
+          stage0="$(command -v blaze)"
+          CARGO_TARGET_DIR="$BENCH_HOME/compiler" nix develop .#bench -c "$stage0" build -p blaze-engine --release --locked
           "$stage0" stop
       - name: Bench
         id: bench
         run: |
-          export BLAZE_BIN="$BENCH_HOME/target/release/blaze-engine"
-          export BLAZE_PROJECTS="$BENCH_HOME/projects"
-          work=${BENCH_WORK:-$BENCH_HOME/work}-counts
-          rm -rf "$work" "$BENCH_HOME/reference-counts"
           mkdir -p "$RUNNER_TEMP/results"
-          nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py \
-            fd hyperfine --stress --backend cranelift --runs 3 \
-            --work "$work" --reference "$BENCH_HOME/reference-counts" --out "$RUNNER_TEMP/results/bench.json" \
+          jq -n --arg blaze "$BENCH_HOME/compiler/release/blaze-engine" --arg work "$BENCH_HOME/work" \
+            --arg sources "$BENCH_HOME/projects" --arg out "$RUNNER_TEMP/results/bench.json" \
+            --arg commit "$GITHUB_SHA" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg machine "$BENCH_MACHINE" \
+            '{action:"run",blaze:$blaze,work:$work,sources:$sources,out:$out,commit:$commit,run_url:$run_url,
+              projects:["fd","hyperfine"],backends:["cranelift"],runs:3,stress:true,machine:$machine}' > "$RUNNER_TEMP/bench-input.json"
+          nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py "$RUNNER_TEMP/bench-input.json" \
             || { status=$?; [ "$status" = 3 ] || exit "$status"; echo "wrong=true" >> "$GITHUB_OUTPUT"; }
       - uses: actions/upload-artifact@v7
         if: always()
@@ -131,8 +135,10 @@ jobs:
             [ -f "$result" ] || continue
             slug=$(basename "$(dirname "$result")"); slug=${slug#counts-}
             history="docs/benchmarks/history/$slug-merge.jsonl"
-            python3 harness/benchhistory.py build "$result" --suite merge --history "$history"
-            python3 harness/benchhistory.py check "$history" --report "$RUNNER_TEMP/regressions-$slug.md" || regressed=true
+            jq -n --arg result "$result" --arg history "$history" \
+              '{action:"build",result:$result,suite:"merge",history:$history}' | python3 harness/benchhistory.py -
+            jq -n --arg history "$history" --arg report "$RUNNER_TEMP/regressions-$slug.md" \
+              '{action:"check",history:$history,report:$report}' | python3 harness/benchhistory.py - || regressed=true
             { echo "### $slug"; cat "$RUNNER_TEMP/regressions-$slug.md"; echo; } >> "$RUNNER_TEMP/regressions.md"
           done
           echo "regressed=$regressed" >> "$GITHUB_OUTPUT"

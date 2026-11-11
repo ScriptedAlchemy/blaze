@@ -8,7 +8,7 @@ are left out here; each names what replaced it. docs/upstream/ holds others' tex
 
 How blaze is now. Kept true: CI checks their links, paths and settings against the tree.
 
-- [benchmarks.md](benchmarks.md): How long an edit takes to build, the memory and disk it uses and how fast its programs run, against cargo, on three platforms.
+- [benchmarks.md](benchmarks.md): Blaze benchmark measurement and regression checks, with historical Cargo comparisons kept under their original labels.
 - [borrowck.md](borrowck.md): blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's verdicts, how it is scored, what is left.
 - [cargo.md](cargo.md): Every blaze command and setting: cargo's commands and flags, what a build does, sandboxing, manifests.
 - [const.md](const.md): Const evaluation: blaze's own interpreter for constants and const fns, and what it covers.
@@ -34,6 +34,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 
 Designs not (fully) built, newest first.
 
+- [v2/plan/design/distributed-retirement.md](v2/plan/design/distributed-retirement.md) (2026-11-11): An owned assignment retires through an attempt-fenced stop request and a separate acknowledgment; runtime verification is pending.
 - [v2/plan/objectives.md](v2/plan/objectives.md) (2026-11-09): The ledger. Every objective of the plan, the check that decides it and where it stands; generated from objectives.json by harness/v2/ledger.py.
 - [v2/plan/design/tasks.md](v2/plan/design/tasks.md) (2026-11-09): Tasks in the agent app. Every agent belongs to a task, the sidebar lists tasks with their agents under them, and a task says what it waits on, what it costs and how it ended.
 - [v2/plan/design/store-pool.md](v2/plan/design/store-pool.md) (2026-11-09): The store's hot tier as a vmcache-style buffer pool - one reserved range with a fixed slot per page of every store file, a state word per page (optimistic and pinned reads), misses as explicit reads through blaze-core that the task yields on, immutable records written once through the pool, eviction by the one evictor with MADV_DONTNEED / MADV_FREE_REUSABLE, prefetch we plan ourselves (change set, query graph, learned page sets, per-view warm sets), codegen outputs then memos then the image on it, a DST, and the lanes.

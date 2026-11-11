@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""bunprep.py: bun's Rust port (oven-sh/bun from v1.4) as a workspace whose executable rustc links.
+"""bunprep.py: bun's Rust port (oven-sh/bun from v1.4) as a workspace Blaze links.
 
-    bunprep.py CHECKOUT    prepares CHECKOUT-native (below) and prints the environment
+    bunprep.py '{"checkout": "/path/to/bun"}'
+        prepares CHECKOUT-native (below) and prints the environment
 
 Bun's own build (`bun scripts/build.ts`) compiles its C and C++ with ninja (JavaScriptCore from a
 prebuilt WebKit, BoringSSL, uSockets, ...), builds its Rust as one static library
-(`bun_runtime`) and links the two with clang. blaze builds and splices executables that rustc
-links, so the tree measured has one more workspace member, `bun-exe`: a `#![no_main]` binary of
-`bun_runtime`, whose `main` it is, with the native objects and libraries on rustc's link line.
+(`bun_runtime`) and links the two with clang. The measured tree has one more workspace member,
+`bun-exe`: a `#![no_main]` binary of `bun_runtime`, whose `main` it is, with the native objects
+and libraries supplied to Blaze's linker.
 
 `prepare(checkout)` copies the clone (which nothing writes to) to `CHECKOUT-native` once per
 revision and configures bun's release build there without LTO. Ninja then builds what bun's link
@@ -15,20 +16,20 @@ step (in build.ninja) takes besides bun's Rust, the code that Rust includes and 
 it has under `vendor/`, but not the Rust: that is what is measured. The native half of the link
 step goes to a file of link arguments that `bun-exe`'s build script reads (BUN_NATIVE_LINK_ARGS),
 and the member is added. It returns that tree, to be copied without its `build` directory, and
-the environment every build of it needs: bun's pinned toolchain, the code bun's build generated
+the environment every build of it needs: the code bun's build generated
 (BUN_CODEGEN_DIR) and the link arguments. `in_place(ws)` does the same in a checkout of its own
 (appruns.py's `prepare`). `sources(ws)` only fetches the crates bun's workspace has under
-`vendor/`, what `cargo metadata` needs.
+`vendor/`, so Blaze's own resolver can read the workspace. The selected Blaze build resolves
+the generated member and updates its throwaway lock file; preparation runs no Cargo command.
 
 What bun's build needs is on PATH: what docs/project/contributing.mdx lists (LLVM 23, cmake,
-ninja, go, a bun to run its scripts), as `nix develop .#bench-bun` has it, whose only Rust is
-bun's pinned nightly. With rustup, that nightly is installed when it is missing.
+ninja, go, a bun to run its scripts), as `nix develop .#bench-bun` has it. Rust compilation
+uses the selected Blaze executable and the toolchain it owns.
 fed1eb428d:docs/research/bun.md says what was measured with it.
 """
-import hashlib, os, re, shlex, shutil, subprocess, sys, tarfile, urllib.request
+import hashlib, json, os, re, shlex, shutil, subprocess, sys, tarfile, urllib.request
+from dataclasses import dataclass
 
-# The checkout's rust-toolchain.toml.
-TOOLCHAIN = "nightly-2026-09-15"
 PROFILE = "release"
 # Holds the revision the tree was built at and this file's hash: a tree prepared by an older
 # bunprep is built again, from its own build.
@@ -94,17 +95,11 @@ workspace = true
 
 
 def rust_env(env):
-    """`env` with bun's toolchain and none of the shell's flags for cargo."""
-    env = dict(env, RUSTUP_TOOLCHAIN=TOOLCHAIN)
-    for name in ("RUSTFLAGS", "CARGO_TARGET_DIR", "RUSTC_WORKSPACE_WRAPPER", "RUSTC_WRAPPER", "CARGO_BUILD_TARGET", "RUSTC"):
+    """Native preparation without an ambient Rust toolchain or compiler override."""
+    env = dict(env)
+    for name in ("RUSTUP_TOOLCHAIN", "RUSTFLAGS", "CARGO_TARGET_DIR", "RUSTC_WORKSPACE_WRAPPER", "RUSTC_WRAPPER", "CARGO_BUILD_TARGET", "RUSTC"):
         env.pop(name, None)
     return env
-
-
-def install_toolchain():
-    rustup = shutil.which("rustup")
-    if rustup and TOOLCHAIN not in subprocess.run([rustup, "toolchain", "list"], capture_output=True, text=True).stdout:
-        subprocess.run([rustup, "toolchain", "install", TOOLCHAIN, "--profile", "minimal"], check=True)
 
 
 def build_dir(tree):
@@ -258,8 +253,7 @@ def edit(path, old, new):
 
 def env_of(tree):
     out = build_dir(tree)
-    return {"RUSTUP_TOOLCHAIN": TOOLCHAIN,
-            "BUN_CODEGEN_DIR": os.path.join(out, "codegen"), "BUN_NATIVE_LINK_ARGS": os.path.join(out, "blaze-link.args")}
+    return {"BUN_CODEGEN_DIR": os.path.join(out, "codegen"), "BUN_NATIVE_LINK_ARGS": os.path.join(out, "blaze-link.args")}
 
 
 def head_of(tree):
@@ -301,16 +295,14 @@ def native(tree, head):
     log.close()
     link_args(tree)
     overlay(tree)
-    # The lock file gets the new member, so that `--locked` builds take it.
-    subprocess.run(["cargo", "metadata", "--format-version", "1"], cwd=tree, env=env, check=True,
-                   stdout=subprocess.DEVNULL)
+    # The caller's selected Blaze resolves this generated member. The fixture harnesses
+    # permit their throwaway lock files to be written; a typed --locked still refuses it.
     open(marker, "w").write(f"{head} {SELF}\n")
 
 
 def prepare(checkout):
     """A copy of the checkout with bun's own build in it, and the environment its builds need
     (see the module's text). The checkout itself is not changed."""
-    install_toolchain()
     tree = checkout.rstrip("/") + "-native"
     head = head_of(checkout)
     marker = os.path.join(tree, MARKER)
@@ -322,7 +314,7 @@ def prepare(checkout):
 
 
 def sources(ws):
-    """What `cargo metadata` needs of a checkout without bun's own build: the crates its
+    """What the resolver needs of a checkout without bun's own build: the crates its
     Cargo.toml has under `vendor/`, which that build fetches (scripts/build/deps/<name>.ts) at
     the commit the file pins, with the `.patch` files it lists applied as that build applies them
     (rust-argon2's lifts its memory floor). Enough for what reads the workspace without building
@@ -362,15 +354,42 @@ def sources(ws):
 
 def in_place(ws):
     """`prepare` in the checkout itself: what `apps.json`'s `"prepare": "bunprep"` runs."""
-    install_toolchain()
     native(ws, head_of(ws))
     return env_of(ws)
 
 
-if __name__ == "__main__":
+@dataclass(frozen=True)
+class Input:
+    checkout: str
+
+    def __post_init__(self):
+        if type(self.checkout) is not str or not self.checkout or "\0" in self.checkout:
+            raise ValueError("checkout must be a nonempty path")
+
+
+def load(value):
+    if value == "-":
+        value = sys.stdin.read()
+    elif not value.lstrip().startswith(("{", "[")):
+        value = open(value).read()
+    raw = json.loads(value)
+    if not isinstance(raw, dict):
+        raise ValueError("input must be one JSON object")
+    return Input(**raw)
+
+
+def main():
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
-    tree, env = prepare(os.path.abspath(sys.argv[1]))
+    try:
+        given = load(sys.argv[1])
+    except (OSError, TypeError, ValueError) as error:
+        raise SystemExit(f"bunprep.py: {error}") from error
+    tree, env = prepare(os.path.abspath(given.checkout))
     print(tree)
     for name, value in env.items():
         print(f"export {name}={shlex.quote(value)}")
+
+
+if __name__ == "__main__":
+    main()

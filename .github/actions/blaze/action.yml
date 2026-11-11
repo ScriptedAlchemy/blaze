@@ -139,48 +139,17 @@ runs:
         echo "trap '' RTMIN+6" > "$env_file"
         echo "BASH_ENV=$env_file" >> "$GITHUB_ENV"
     # The cause, shown: the release's daemon, started from a step whose bash read BASH_ENV, has
-    # SIGRTMIN+6 (signal 40, bit 39 of SigIgn) ignored and says its sampler is off.
+    # SIGRTMIN+6 (signal 40, bit 39 of SigIgn) ignored and says its sampler is off. That message
+    # precedes startup: require a status answer from this PID before its bounded stop and reap.
     - name: the release's daemon has its sampler off
       if: runner.os == 'Linux'
       shell: bash
       run: |
-        log="$RUNNER_TEMP/blaze-sigcheck.log"
-        blaze serve > "$log" 2>&1 & serve=$!
-        for _ in $(seq 120); do
-          grep -q "no CPU samples" "$log" && break
-          kill -0 "$serve" 2>/dev/null || break
-          sleep 0.5
-        done
-        rtmin6=$(( $(kill -l RTMIN) + 6 ))
-        sigign=$(awk '/^SigIgn:/ { print $2 }' "/proc/$serve/status" 2>/dev/null || true)
-        # An exited seed has no SigIgn: report its startup failure, not a failed trap.
-        if ! kill -0 "$serve" 2>/dev/null; then
-          status=0
-          wait "$serve" 2>/dev/null || status=$?
-          cat "$log"
-          echo "::error::the release's daemon $serve exited with status $status before its sampler could be checked; see its startup log above"
-          exit 1
-        fi
-        startup_error=
-        if ! grep -q "no CPU samples" "$log"; then
-          startup_error="did not say its sampler is off within 60 seconds"
-        elif [ -z "$sigign" ]; then
-          startup_error="has no readable SigIgn in /proc/$serve/status"
-        fi
-        if [ -n "$startup_error" ]; then
-          kill "$serve" 2>/dev/null || true
-          status=0
-          wait "$serve" 2>/dev/null || status=$?
-          cat "$log"
-          echo "::error::the release's daemon $serve $startup_error (exit status $status after termination); see its startup log above"
-          exit 1
-        fi
-        echo "daemon $serve: SigIgn $sigign; SIGRTMIN+6 is $rtmin6 (bit $(( rtmin6 - 1 )))"
-        cat "$log"
-        blaze stop >/dev/null 2>&1 || kill "$serve" 2>/dev/null || true
-        wait "$serve" 2>/dev/null || true
-        (( (16#$sigign >> (rtmin6 - 1)) & 1 )) || { echo "::error::the release's daemon does not ignore SIGRTMIN+6 (SigIgn $sigign): BASH_ENV's trap did not reach it"; exit 1; }
-        grep -q "no CPU samples" "$log" || { echo "::error::the release's daemon did not say its sampler is off"; exit 1; }
+        python3 - <<'PY' | python3 .github/scripts/seed_preflight.py -
+        import json, os, shutil
+        print(json.dumps({"blaze": shutil.which("blaze"),
+                          "log": os.path.join(os.environ["RUNNER_TEMP"], "blaze-sigcheck.log")}))
+        PY
     # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM"): llvm.py fetches the archive llvm.json names for this host, checks its
     # sha256 and unpacks it; vendor/llvm-sys/pin.rs refuses any other prefix. Below
     # /usr/local/lib because llvm-sys's build script names the prefix's `lib` to the linker, and a

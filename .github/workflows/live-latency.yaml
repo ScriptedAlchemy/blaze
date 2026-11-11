@@ -95,10 +95,12 @@ jobs:
         run: |
           mapfile -t files < <(find "$RUNNER_TEMP/latency" -name latency.json)
           [ "${#files[@]}" -gt 0 ] || { echo "::error::no program wrote its latency"; exit 1; }
-          python3 harness/benchhistory.py live "${files[@]}"
+          jq -n --args '{action:"live",files:$ARGS.positional}' "${files[@]}" | python3 harness/benchhistory.py -
           # One runner's medians differ by up to twice between two rounds of the same binary
           # (#77): a number is judged once three runs before it show the runners' spread.
-          if python3 harness/benchhistory.py check docs/benchmarks/history/macos-arm64-live.jsonl --least 3 --report "$RUNNER_TEMP/regressions.md"; then
+          if jq -n --arg report "$RUNNER_TEMP/regressions.md" \
+            '{action:"check",history:"docs/benchmarks/history/macos-arm64-live.jsonl",least:3,report:$report}' \
+            | python3 harness/benchhistory.py -; then
             echo "regressed=false" >> "$GITHUB_OUTPUT"
           else
             echo "regressed=true" >> "$GITHUB_OUTPUT"

@@ -67,8 +67,7 @@ early-Done and missing publication-fence controls must violate that oracle.
 Carrier tests pause the lead between grant completion and publication, submit another
 requester, and verify one execution and one tail; a warm-tail value must reach an empty reader.
 
-Remaining lifecycle work: a helper that leaves while other subscribers remain has no explicit
-assignment-retirement transition. An unmatched stop acknowledgment must still be refused, so a
-helper that no longer observes the eventual stop can retain its reservation. This needs an
-attempt-fenced retirement request and a simulation of leaving, reassignment and stale
-acknowledgments; accepting an unmatched acknowledgment would weaken ownership.
+An agent that leaves while other subscribers remain requests its owned assignment's retirement
+before acknowledging its stop. The session and attempt fences, the two-step capacity release,
+and the pending runtime checks are specified in
+[assignment retirement](distributed-retirement.md). An unmatched acknowledgment remains refused.

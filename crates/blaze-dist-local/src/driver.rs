@@ -29,7 +29,8 @@ use crate::protocol::*;
 pub struct DriverConfig {
     /// Sleep between ticks when the holder asked for nothing.
     pub poll: Duration,
-    /// Reconnects of one call before its IO error is the caller's.
+    /// Additional reconnects of one call after `Client::call`'s one automatic same-session
+    /// resume, before its IO error is the caller's.
     pub max_reconnects: u32,
     /// Explicit acceptance-only gate for one real result; no capture or IO when absent.
     pub result_gate: Option<crate::result_gate::ResultGate>,

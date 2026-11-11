@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -151,9 +152,11 @@ class AcceptanceGateTests(unittest.TestCase):
                 "workflows": {"result": "success"},
                 "linux-6-8": {"result": "success"},
                 "workspace-check": {"result": "success"},
+                "distributed-core": {"result": "success"},
                 "macos": {"result": "skipped"},
                 "linux-arm64": {"result": "success", "outputs": {
-                    "distributed_acceptance": "true", "forkfixes_acceptance": "true"}}}
+                    "distributed_acceptance": "true", "forkfixes_acceptance": "true",
+                    "protocol_tests": "true"}}}
         cases = [("gate passes", base, True)]
         warm = copy.deepcopy(base)
         warm["changes"]["outputs"]["tier"] = "warm"
@@ -167,17 +170,22 @@ class AcceptanceGateTests(unittest.TestCase):
         docs["linux-arm64"] = {"result": "skipped", "outputs": {}}
         docs["linux-6-8"]["result"] = "skipped"
         docs["workspace-check"]["result"] = "skipped"
+        docs["distributed-core"]["result"] = "skipped"
         cases.append(("docs need no build", docs, True))
-        for missing in ({}, {"distributed_acceptance": ""}, {"distributed_acceptance": "false"},
-                        {"distributed_acceptance": "true"}, {"forkfixes_acceptance": "true"},
-                        {"distributed_acceptance": "true", "forkfixes_acceptance": "false"}):
-            changed = copy.deepcopy(base)
-            changed["linux-arm64"]["outputs"] = missing
-            cases.append((f"missing acceptance {missing}", changed, False))
+        for receipt in ("distributed_acceptance", "forkfixes_acceptance", "protocol_tests"):
+            for value in (None, "", "false"):
+                changed = copy.deepcopy(base)
+                outputs = changed["linux-arm64"]["outputs"]
+                if value is None:
+                    del outputs[receipt]
+                else:
+                    outputs[receipt] = value
+                cases.append((f"missing acceptance {receipt}={value!r}", changed, False))
         for job, result in (("linux-arm64", "skipped"), ("linux-arm64", "cancelled"),
                             ("scripts", "failure"), ("scripts", "cancelled"), ("scripts", "skipped"),
                             ("workflows", "skipped"), ("linux-6-8", "skipped"),
-                            ("workspace-check", "skipped"), ("changes", "skipped")):
+                            ("workspace-check", "skipped"), ("distributed-core", "skipped"),
+                            ("distributed-core", "failure"), ("changes", "skipped")):
             changed = copy.deepcopy(base)
             changed[job]["result"] = result
             cases.append((f"{job} {result}", changed, False))
@@ -194,7 +202,8 @@ class AcceptanceGateTests(unittest.TestCase):
         python = commands / "python3"
         python.write_text(
             "#!/bin/sh\n"
-            'if [ "$1" = .github/scripts/dist_build_identity.py ]; then cat >/dev/null; fi\n'
+            'if [ "$1" = .github/scripts/dist_build_identity.py ]; then '
+            'cat > "$RUNNER_TEMP/identity-input.json"; fi\n'
             f"printf '%s\\n' 'distv2: every check passed'\nexit {code}\n")
         python.chmod(0o700)
         return evidence, {"RUNNER_TEMP": str(root), "GITHUB_OUTPUT": str(root / "output"),
@@ -215,6 +224,77 @@ class AcceptanceGateTests(unittest.TestCase):
                 output = root / "output"
                 self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if wanted else "")
 
+    def test_partial_b0_library_feedback_requires_every_model_and_control(self):
+        models = [
+            "retirement_preserves_survivors_and_exact_assignment_ownership",
+            "cancellation_cleans_a_promotion_the_worker_has_not_observed",
+            "stale_claimed_helpers_do_not_block_available_replacements",
+            "execution_bindings_retain_cleanup_without_sliding_replay_or_expiry",
+        ]
+        controls = [
+            "the_oracle_catches_leaving_without_retirement",
+            "the_oracle_catches_release_without_a_pending_stop",
+            "the_oracle_catches_a_stale_retirement_of_the_replacement_lead",
+            "the_oracle_catches_a_stale_acknowledgment_of_a_reused_slot",
+            "the_oracle_catches_an_unowned_retirement",
+            "the_oracle_catches_retired_work_kept_under_its_old_lease",
+            "the_oracle_catches_promotion_erasing_the_continuing_owner",
+            "the_oracle_catches_cleanup_using_only_the_last_observed_attempt",
+            "the_oracle_catches_a_stale_claimed_helper_misclassified_as_unclaimed",
+            "the_oracle_catches_a_missing_verified_execution_binding",
+            "the_oracle_catches_a_sliding_session_ceiling",
+            "the_oracle_catches_a_lost_reply_with_changed_replay_identity",
+            "the_oracle_catches_different_bytes_reusing_a_replay_identity",
+        ]
+        names = models + controls
+        # Read the actual job's literal setting, so removing verification from the workflow
+        # cannot be hidden by this shell fixture supplying its own unrelated default.
+        header = MAIN.read_text().split("  distributed-core:\n", 1)[1].split("    steps:\n", 1)[0]
+        mode = [line.split(":", 1)[1].strip().strip("\"'") for line in header.splitlines()
+                if line.startswith("      BLAZE_TESTS:")]
+        self.assertEqual(mode, ["verify"])
+        cases = [("complete", names, 0, 0), ("zero tests", [], 0, 1)]
+        # Each missing line is the only fault; all remaining cases still report success.
+        cases += [(f"missing model {name}", [item for item in names if item != name], 0, 1)
+                  for name in models]
+        cases += [(f"missing control {name}", [item for item in names if item != name], 0, 1)
+                  for name in controls]
+        cases.append(("compiler failed after success lines", names, 23, 23))
+        for label, reported, code, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                commands = root / "commands"
+                commands.mkdir()
+                blaze = commands / "blaze"
+                blaze.write_text(
+                    "#!/bin/sh\n"
+                    'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/core-evidence/invocation.txt"\n'
+                    'printf \'%s\\n\' "$BLAZE_TESTS" > "$RUNNER_TEMP/core-evidence/mode.txt"\n'
+                    'cat "$CORE_OUTPUT"\nexit "$CORE_EXIT"\n')
+                blaze.chmod(0o700)
+                output = f"running {len(reported)} tests\n"
+                output += "".join(f"test fixture::{name} ... ok\n" for name in reported)
+                output += f"test result: ok. {len(reported)} passed; 0 failed; 0 ignored\n"
+                transcript = root / "test-output.txt"
+                transcript.write_text(output)
+                env = {"RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(ROOT),
+                       "PATH": str(commands) + os.pathsep + os.environ["PATH"],
+                       "BLAZE_TESTS": mode[0], "CORE_OUTPUT": str(transcript), "CORE_EXIT": str(code)}
+                done = self.run_shell(MAIN, "distributed library models and planted controls with B0", env)
+                self.assertEqual(done.returncode, expected, done.stdout + done.stderr)
+                evidence = root / "core-evidence"
+                invocation = (evidence / "invocation.txt").read_text().splitlines()
+                self.assertEqual(invocation, [str(blaze), "--ignore-pin", "test", "--release", "--locked",
+                                              "--lib", "-p", "blaze-dist", "-p", "blaze-dist-local", "--no-fail-fast"])
+                self.assertEqual((evidence / "mode.txt").read_text(), "verify\n")
+                self.assertEqual((evidence / "tests.log").read_text(), output)
+                self.assertEqual((evidence / "bootstrap-pin.txt").read_bytes(),
+                                 (ROOT / ".github/blaze-version").read_bytes())
+                self.assertTrue((evidence / "bootstrap-sha256.txt").read_text().rstrip().endswith("  " + str(blaze)))
+                if expected == 1:
+                    missing = next(name for name in names if name not in reported)
+                    self.assertIn("missing executed library control: " + missing, done.stdout)
+
     def test_tee_preserves_a_harness_failure_even_with_a_success_line(self):
         for step in ("dev two-worker, cold-cache, cross-PR and fault acceptance",
                      "release and folded-group two-worker and fault acceptance"):
@@ -223,17 +303,82 @@ class AcceptanceGateTests(unittest.TestCase):
                 done = self.run_shell(PLATFORM, step, env)
                 self.assertEqual(done.returncode, 23, done.stdout + done.stderr)
 
-    def test_source_built_protocol_test_failure_reaches_ci(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _, env = self.shell_fixture(root)
-            binaries = root / "dist-binaries"
-            binaries.mkdir()
-            blaze = binaries / "blaze"
-            blaze.write_text("#!/bin/sh\nprintf '%s\\n' 'a protocol test failed'\nexit 23\n")
-            blaze.chmod(0o700)
-            done = self.run_shell(PLATFORM, "distributed protocol and carrier tests with Stage 1", env)
-            self.assertEqual(done.returncode, 23, done.stdout + done.stderr)
+    def test_protocol_handoff_verifies_stage1_before_retaining_its_provenance(self):
+        for code in (0, 23):
+            with self.subTest(identity_exit=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _, env = self.shell_fixture(root, code=code)
+                binaries = root / "protocol-binaries"
+                binaries.mkdir()
+                manifest = root / identity.MANIFEST
+                manifest.write_text('{"identity": "Stage 1 handoff fixture"}\n')
+                with tarfile.open(binaries / "blaze.tar", "w") as archive:
+                    archive.add(manifest, arcname=identity.MANIFEST)
+                done = self.run_shell(PLATFORM, "verify the protocol test Stage 1 handoff", env)
+                self.assertEqual(done.returncode, code, done.stdout + done.stderr)
+                self.assertEqual(json.loads((root / "identity-input.json").read_text()),
+                                 {"command": "verify", "binaries": str(binaries)})
+                retained = root / "protocol-evidence/stage1-build.json"
+                self.assertEqual(retained.exists(), code == 0)
+                if code == 0:
+                    self.assertEqual(retained.read_bytes(), manifest.read_bytes())
+
+    def test_protocol_tests_use_stage1_for_all_targets_and_preserve_failure(self):
+        for code in (0, 23):
+            with self.subTest(test_exit=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _, env = self.shell_fixture(root)
+                evidence = root / "protocol-evidence"
+                evidence.mkdir()
+                binaries = root / "protocol-binaries"
+                binaries.mkdir()
+                blaze = binaries / "blaze"
+                blaze.write_text(
+                    "#!/bin/sh\n"
+                    'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/protocol-evidence/invocation.txt"\n'
+                    f"printf '%s\\n' 'protocol test fixture exit {code}'\nexit {code}\n")
+                blaze.chmod(0o700)
+                # A return to the PATH's seed must fail even if the seed reports success:
+                # B0 cannot compile these same-name lib/bin integration test targets.
+                seed = root / "commands/blaze"
+                seed.write_text("#!/bin/sh\nprintf '%s\\n' 'seed used instead of Stage 1'\nexit 0\n")
+                seed.chmod(0o700)
+                done = self.run_shell(PLATFORM, "distributed protocol and carrier tests with Stage 1", env)
+                self.assertEqual(done.returncode, code, done.stdout + done.stderr)
+                invocation = (evidence / "invocation.txt").read_text().splitlines()
+                self.assertEqual(invocation[0], str(blaze))
+                args = invocation[1:]
+                self.assertEqual(args[:2], ["--ignore-pin", "test"])
+                packages = [args[i + 1] for i, arg in enumerate(args) if arg == "-p"]
+                self.assertCountEqual(packages, ["blaze-wire", "blaze-dist", "blaze-dist-local", "blaze-serve"])
+                for flag in ("--release", "--locked", "--lib", "--tests", "--no-fail-fast"):
+                    self.assertIn(flag, args)
+                for filter_or_no_run in ("--no-run", "--test", "--"):
+                    self.assertNotIn(filter_or_no_run, args)
+                self.assertIn(f"protocol test fixture exit {code}", (evidence / "tests.log").read_text())
+
+    def test_protocol_receipt_requires_completed_tests_log_and_unchanged_stage1(self):
+        cases = [("success", "test output\n", 0, True),
+                 ("success", "test output\n", 23, False),
+                 ("success", None, 0, False), ("success", "", 0, False)]
+        cases += [(outcome, "test output\n", 0, False)
+                  for outcome in ("", "failure", "cancelled", "skipped")]
+        for outcome, log, code, wanted in cases:
+            with self.subTest(outcome=outcome, log=log, identity_exit=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _, env = self.shell_fixture(root, code=code)
+                env["PROTOCOL_TEST_OUTCOME"] = outcome
+                evidence = root / "protocol-evidence"
+                evidence.mkdir()
+                if log is not None:
+                    (evidence / "tests.log").write_text(log)
+                done = self.run_shell(PLATFORM, "protocol tests completed with unchanged Stage 1 and source", env)
+                self.assertEqual(done.returncode == 0, wanted, done.stdout + done.stderr)
+                output = root / "output"
+                self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if wanted else "")
+                if outcome == "success" and log:
+                    self.assertEqual(json.loads((root / "identity-input.json").read_text()),
+                                     {"command": "verify", "binaries": str(root / "protocol-binaries")})
 
     def test_fork_migration_harness_failure_reaches_ci(self):
         with tempfile.TemporaryDirectory() as directory:

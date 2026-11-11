@@ -20,6 +20,7 @@ use blaze_dist_local::pack::{Pack, Value};
 use blaze_dist_local::protocol::{Answer, Command, submission};
 use blaze_dist_local::server::{MonotonicClock, Server, random_id};
 use blaze_wire::{Digest, LocalPolicy, Namespace, Reservation};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 const TRIPLE: &str = "test-triple";
 
@@ -459,6 +460,192 @@ fn an_already_cancelled_build_never_submits_an_execution() {
     assert!(matches!(agent::decide(&LocalPolicy::Fallback, error), Err(Error::Cancelled(_))));
     // Cancellation is checked before cache access or submission, so there is no intervening job.
     assert_eq!(execution_of(unit.spec), before + 1);
+}
+
+/// A compiler gate establishes which work is still running when cancellation occurs.
+struct Holding {
+    names: Vec<Digest>,
+    entered: Option<Sender<()>>,
+    release: Option<Receiver<()>>,
+}
+
+impl Granted for Holding {
+    fn compile(&mut self, names: &[usize]) -> Result<Grant, String> {
+        if let Some(entered) = self.entered.take() {
+            entered.send(()).unwrap();
+            self.release.take().unwrap().recv_timeout(Duration::from_secs(20)).unwrap();
+        }
+        Ok(Grant {
+            values: names.iter().map(|at| value_of(&self.names[*at])).collect(),
+            compiled: names.len() as u64,
+            stored: 0,
+            compiled_keys: names.iter().map(|at| self.names[*at]).collect(),
+        })
+    }
+}
+
+fn hold_first(unit: &Unit) -> (Holding, Receiver<()>, Sender<()>) {
+    let (entered, waiting) = bounded(1);
+    let (release, gate) = bounded(1);
+    (
+        Holding { names: unit.names.clone(), entered: Some(entered), release: Some(gate) },
+        waiting,
+        release,
+    )
+}
+
+fn observer_subscribes(observer: &mut Client, unit: &Unit) -> blaze_dist_local::protocol::Binding {
+    let request = blaze_wire::JobRequest {
+        unit: unit.spec,
+        platform: agent::platform(TRIPLE),
+        namespace: Namespace::Main,
+        source: [0; 32],
+        deadline_ms: observer.welcome.now_ms + 120_000,
+        local: LocalPolicy::Never,
+    };
+    let Answer::Binding(binding) =
+        observer.call(Command::Submit(submission(&request, NEED))).unwrap()
+    else {
+        panic!("the observer's subscription was refused")
+    };
+    binding
+}
+
+#[test]
+fn a_cancelled_helper_releases_its_slot_only_after_its_compiler_stops() {
+    let world = world(2, WorkConfig { grant_roots: 1, ..Default::default() });
+    let original = unit(94, 6);
+    let next = unit(95, 0);
+    let (mut lead, lead_waiting, release_lead) = hold_first(&original);
+    let (mut helper, helper_waiting, release_helper) = hold_first(&original);
+    let cancelled = AtomicBool::new(false);
+    let never = AtomicBool::new(false);
+    let mut observer = Client::connect(&world.socket, random_id().unwrap()).unwrap();
+    let surviving = observer_subscribes(&mut observer, &original);
+    std::thread::scope(|scope| {
+        let (world, original, never, cancelled) = (&world, &original, &never, &cancelled);
+        let leading = scope.spawn(move || {
+            agent::run(&config(&world.socket, &world.blobs), original, &mut lead, never).unwrap()
+        });
+        lead_waiting.recv_timeout(Duration::from_secs(20)).unwrap();
+        let helping = scope.spawn(move || {
+            agent::run(&config(&world.socket, &world.blobs), original, &mut helper, cancelled)
+        });
+        helper_waiting.recv_timeout(Duration::from_secs(20)).unwrap();
+        cancelled.store(true, Ordering::Release);
+        let queued = observer_subscribes(&mut observer, &next);
+        let Answer::Claimed(claim) = observer
+            .call(Command::Claim(blaze_dist_local::protocol::Claim {
+                content: queued.subscription.content,
+                execution: queued.subscription.execution,
+                claimant: [96; 32],
+            }))
+            .unwrap()
+        else {
+            panic!("the queued unit's claim was refused")
+        };
+        assert!(claim.executor.is_none(), "a compiler still running must retain its reservation");
+
+        release_helper.send(()).unwrap();
+        assert!(matches!(helping.join().unwrap(), Err(Error::Cancelled(_))));
+        let Answer::Terminal(terminal) =
+            observer.call(Command::Terminal(surviving.subscription.clone())).unwrap()
+        else {
+            panic!("the surviving subscriber's terminal lookup was refused")
+        };
+        assert!(terminal.value.is_none(), "the helper's cancellation must leave its lead running");
+        let mut next_config = config(&world.socket, &world.blobs);
+        next_config.deadline = Duration::from_secs(2);
+        let completed = agent::run(&next_config, &next, &mut Vanishes, never).unwrap();
+        assert_eq!(completed.execution, Some(queued.subscription.execution.0));
+        // The lead is still held. Only retirement plus its exact ACK could have
+        // made one of this coordinator's two builders available to the next unit.
+        release_lead.send(()).unwrap();
+        let completed = leading.join().unwrap();
+        assert_eq!(completed.execution, Some(surviving.subscription.execution.0));
+        assert_eq!(completed.values.len(), original.names.len());
+    });
+    observer.release().unwrap();
+}
+
+#[test]
+fn cancellation_before_observing_promotion_retires_the_owned_current_slot() {
+    let world = world(2, WorkConfig { grant_roots: 1, ..Default::default() });
+    let original = unit(97, 6);
+    let occupied = unit(98, 1);
+    let next = unit(99, 0);
+    let (mut lead, lead_waiting, release_lead) = hold_first(&original);
+    let (mut helper, helper_waiting, release_helper) = hold_first(&original);
+    let (mut occupying, occupied_waiting, release_occupied) = hold_first(&occupied);
+    let cancel_lead = AtomicBool::new(false);
+    let cancel_helper = AtomicBool::new(false);
+    let never = AtomicBool::new(false);
+    let mut observer = Client::connect(&world.socket, random_id().unwrap()).unwrap();
+    let surviving = observer_subscribes(&mut observer, &original);
+    std::thread::scope(|scope| {
+        let (world, original, occupied) = (&world, &original, &occupied);
+        let (cancel_lead, cancel_helper, never) = (&cancel_lead, &cancel_helper, &never);
+        let leading = scope.spawn(move || {
+            agent::run(&config(&world.socket, &world.blobs), original, &mut lead, cancel_lead)
+        });
+        lead_waiting.recv_timeout(Duration::from_secs(20)).unwrap();
+        let helping = scope.spawn(move || {
+            agent::run(&config(&world.socket, &world.blobs), original, &mut helper, cancel_helper)
+        });
+        helper_waiting.recv_timeout(Duration::from_secs(20)).unwrap();
+
+        cancel_lead.store(true, Ordering::Release);
+        release_lead.send(()).unwrap();
+        assert!(matches!(leading.join().unwrap(), Err(Error::Cancelled(_))));
+        let Answer::Binding(promoted) =
+            observer.call(Command::Resume(surviving.subscription.clone())).unwrap()
+        else {
+            panic!("the survivor could not observe the helper's promotion")
+        };
+        assert!(promoted.attempt > surviving.attempt);
+        // This helper is still inside its original compile callback. It cannot yet
+        // have returned to the agent loop and observed or claimed the new attempt.
+        cancel_helper.store(true, Ordering::Release);
+        let holding = scope.spawn(move || {
+            agent::run(&config(&world.socket, &world.blobs), occupied, &mut occupying, never)
+                .unwrap()
+        });
+        occupied_waiting.recv_timeout(Duration::from_secs(20)).unwrap();
+        let queued = observer_subscribes(&mut observer, &next);
+        let Answer::Claimed(claim) = observer
+            .call(Command::Claim(blaze_dist_local::protocol::Claim {
+                content: queued.subscription.content,
+                execution: queued.subscription.execution,
+                claimant: [100; 32],
+            }))
+            .unwrap()
+        else {
+            panic!("the next unit's claim was refused")
+        };
+        assert!(claim.executor.is_none(), "both local compilers still hold their slots");
+
+        release_helper.send(()).unwrap();
+        assert!(matches!(helping.join().unwrap(), Err(Error::Cancelled(_))));
+        let Answer::Terminal(terminal) =
+            observer.call(Command::Terminal(surviving.subscription.clone())).unwrap()
+        else {
+            panic!("the survivor's terminal lookup was refused")
+        };
+        assert_eq!(
+            terminal.value.unwrap().termination.outcome,
+            blaze_wire::Outcome::Lost,
+            "retiring the second lead preserves the existing reassignment bound"
+        );
+        let mut next_config = config(&world.socket, &world.blobs);
+        next_config.deadline = Duration::from_secs(2);
+        let completed = agent::run(&next_config, &next, &mut Vanishes, never).unwrap();
+        assert_eq!(completed.execution, Some(queued.subscription.execution.0));
+        // The first slot is occupied by another unit. The next unit can run only if
+        // cleanup discovered and acknowledged the helper's unobserved current token.
+        release_occupied.send(()).unwrap();
+        assert_eq!(holding.join().unwrap().values.len(), occupied.names.len());
+    });
+    observer.release().unwrap();
 }
 
 #[test]

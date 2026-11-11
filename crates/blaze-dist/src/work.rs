@@ -146,12 +146,14 @@ pub enum FenceWhy {
     RootsDisagree,
     /// The execution ended.
     Ended,
+    /// The assignment's owner requested its retirement.
+    Retired,
 }
 
 impl FenceWhy {
     /// Whether the end counts against the work it held: a revocation.
     fn counts(self) -> bool {
-        matches!(self, FenceWhy::Expired | FenceWhy::Hung | FenceWhy::Malformed)
+        matches!(self, FenceWhy::Expired | FenceWhy::Hung | FenceWhy::Malformed | FenceWhy::Retired)
     }
 }
 
@@ -1144,6 +1146,12 @@ impl WorkSet {
         }
         self.counters.holders_lost += 1;
         out.push(Effect::HolderLost { holder: holder.to_owned(), why });
+    }
+
+    /// The owned assignment is retiring. Revoke its work before its reservation can be released.
+    pub(crate) fn retire(&mut self, holder: &str, out: &mut Vec<Effect>) {
+        self.lose(holder, FenceWhy::Retired, out);
+        self.check_done(out);
     }
 
     /// Ends a live lease without its result: its roots go back to the pool and its names to

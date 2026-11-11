@@ -1,9 +1,9 @@
 //! Serialized routing, retry journal and retention for the local IO driver.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_dist::Refusal;
-use blaze_dist::jobs::{AssignmentToken, Effect, ExecState, Jobs};
+use blaze_dist::jobs::{AssignmentToken, Effect, ExecState, Execution, Jobs};
 use blaze_wire::{
     Ack, Digest, ErrorCode, ExecutionId, JobRequest, Limits, WireError, decode, encode,
 };
@@ -20,9 +20,15 @@ pub struct Config {
     /// Concurrent live sessions. An expired session is removed, so its capacity returns;
     /// this is not a lifetime quota of session identities.
     pub max_sessions: usize,
-    /// Fixed session lifetime in monotonic milliseconds. Hello does not extend it; a client
-    /// that outlives it creates a new session and resumes its subscriptions explicitly.
+    /// Initial session lifetime in monotonic milliseconds. Hello never extends it.
+    /// Verified job traffic may retain it within the immutable work lifetime ceiling.
     pub session_ms: u64,
+    /// Maximum execution lifetime from its first Queued stage. Later subscribers cannot
+    /// move this ceiling. The default 24 hours leaves headroom for coalesced one-hour jobs.
+    pub max_execution_ms: u64,
+    /// Time after an accepted execution deadline for stopped workers to retire and ACK.
+    /// This retains authority through terminal cleanup without making expiry a stop proof.
+    pub owner_cleanup_ms: u64,
     /// Executions retained, including those awaiting stop acknowledgments.
     pub max_executions: usize,
     /// Maximum public event count per execution before new worker reports get Busy.
@@ -52,6 +58,8 @@ impl Default for Config {
             max_connections: 32,
             max_sessions: 32,
             session_ms: 300_000,
+            max_execution_ms: 86_400_000,
+            owner_cleanup_ms: 300_000,
             max_executions: 128,
             max_events: 4_096,
             event_bytes: 8 << 20,
@@ -67,6 +75,10 @@ impl Default for Config {
 
 struct Session {
     expires: u64,
+    /// Immutable ceiling, including the initial admission wait and bounded work/cleanup.
+    maximum_expires: u64,
+    /// Only executions verified by a successful request, bounded by max_executions.
+    executions: BTreeSet<ExecutionId>,
     next: u64,
     /// The last request answered, its exact bytes and its answer's. A client has one request
     /// outstanding at a time, so this is the only one it can retry: a session that polls for
@@ -105,6 +117,36 @@ fn error(code: ErrorCode, text: &str) -> WireError {
     WireError::new(code, text)
 }
 
+/// A claimant label alone carries no authority. Its owned session is part of the core identity.
+fn owned_claimant(session: &Digest, label: &Digest) -> Digest {
+    let mut bytes = [0; 64];
+    bytes[..32].copy_from_slice(session);
+    bytes[32..].copy_from_slice(label);
+    blaze_wire::digest_of_encoded_name("blaze/local-claim-owner", &bytes)
+}
+
+/// The execution whose identity the route must validate before a successful binding.
+fn referenced_execution(command: &Command) -> Option<(ExecutionId, blaze_wire::JobContent)> {
+    Some(match command {
+        Command::Submit(_) | Command::Release(_) => return None,
+        Command::Subscribe(s) => (s.execution, s.content),
+        Command::Resume(s) | Command::Terminal(s) => (s.execution, s.content),
+        Command::Events(e) => (e.binding.subscription.execution, e.binding.subscription.content),
+        Command::Cancel(b) => (b.subscription.execution, b.subscription.content),
+        Command::Join(r) => (r.request.execution, r.content),
+        Command::Lease(r) => (r.request.execution, r.content),
+        Command::Result(r) => (r.request.lease.execution, r.content),
+        Command::WorkerEvents(r) => (r.request.execution, r.content),
+        Command::KillAck(r) => (r.execution, r.content),
+        Command::RetireAssignment(r) => (r.execution, r.content),
+        Command::OwnedAssignment(r) => (r.execution, r.content),
+        Command::Claim(r) => (r.execution, r.content),
+        Command::Packs(r) | Command::Publication(r) => (r.execution, r.content),
+        Command::CommitPublication(r) => (r.execution, r.content),
+        Command::DeliverPublication(r) => (r.execution, r.content),
+    })
+}
+
 impl Coordinator {
     /// Own the actual core registry. The caller sets admission/builders, not worker messages.
     /// The registry's ids are seeded from this daemon's epoch, so a restarted daemon
@@ -139,6 +181,39 @@ impl Coordinator {
         self.last_now
     }
 
+    fn execution_ceiling(&self, execution: &Execution) -> Result<u64, WireError> {
+        let queued = execution.stages().first().expect("execution starts Queued").1;
+        queued
+            .checked_add(self.config.max_execution_ms)
+            .ok_or_else(|| error(ErrorCode::Malformed, "execution-deadline-limit"))
+    }
+
+    fn session_work_limit(&self, session: Digest, ceiling: u64) -> Result<(), WireError> {
+        let bound = ceiling
+            .checked_add(self.config.owner_cleanup_ms)
+            .ok_or_else(|| error(ErrorCode::Conflict, "session-work-lifetime-limit"))?;
+        if bound > self.sessions[&session].maximum_expires {
+            return Err(error(ErrorCode::Conflict, "session-work-lifetime-limit"));
+        }
+        Ok(())
+    }
+
+    /// A later subscriber may lengthen a coalesced job. All verified participants keep
+    /// that job's cleanup allowance, but neither job nor session can slide its ceiling.
+    fn refresh_work_sessions(&mut self, now: u64) {
+        self.sessions.retain(|_, session| now <= session.expires);
+        for session in self.sessions.values_mut() {
+            session.executions.retain(|id| self.jobs.execution(*id).is_some());
+            for id in &session.executions {
+                let Some(deadline) = self.jobs.execution(*id).and_then(Execution::deadline) else {
+                    continue;
+                };
+                let bound = deadline.saturating_add(self.config.owner_cleanup_ms);
+                session.expires = session.expires.max(bound.min(session.maximum_expires));
+            }
+        }
+    }
+
     /// Actual timer transitions and terminal/session retention.
     pub fn tick(&mut self, now: u64) -> Vec<(ExecutionId, Effect)> {
         let now = self.now(now);
@@ -166,6 +241,7 @@ impl Coordinator {
                 self.units.remove(&id);
             }
         }
+        self.refresh_work_sessions(now);
         effects
     }
 
@@ -257,11 +333,20 @@ impl Coordinator {
             .issued
             .checked_add(1)
             .ok_or_else(|| error(ErrorCode::Busy, "session-label-exhausted"))?;
+        let expires = now
+            .checked_add(self.config.session_ms)
+            .ok_or_else(|| error(ErrorCode::Busy, "session-lifetime-overflow"))?;
+        let maximum_expires = expires
+            .checked_add(self.config.max_execution_ms)
+            .and_then(|bound| bound.checked_add(self.config.owner_cleanup_ms))
+            .ok_or_else(|| error(ErrorCode::Busy, "session-lifetime-overflow"))?;
         let session = self.label(counter);
         self.sessions.insert(
             session,
             Session {
-                expires: now.saturating_add(self.config.session_ms),
+                expires,
+                maximum_expires,
+                executions: BTreeSet::new(),
                 next: 1,
                 last: None,
                 nonce: hello.nonce,
@@ -318,10 +403,25 @@ impl Coordinator {
         // Apply deadlines before route-level retention checks. An expired execution is
         // retained terminal work, not a live coalescing target that may bypass capacity.
         let mut effects = self.tick(now);
-        let answer = match self.route(now, &request.command, &mut effects) {
+        let answer = match self.route(now, request.session, &request.command, &mut effects) {
             Ok(answer) => answer,
             Err(error) => Answer::Error(error),
         };
+        let execution = match &answer {
+            Answer::Error(_)
+            | Answer::Claimed(Claimed { executor: None, .. })
+            | Answer::KillAck(KillAnswer { accepted: false }) => None,
+            Answer::Binding(binding) => Some(binding.subscription.execution),
+            _ => referenced_execution(&request.command).map(|(id, _)| id),
+        };
+        if let Some(execution) = execution {
+            self.sessions
+                .get_mut(&request.session)
+                .expect("validated session")
+                .executions
+                .insert(execution);
+            self.refresh_work_sessions(now);
+        }
         let mut reply = encode(&ServerFrame::Response(Response {
             epoch: self.epoch,
             session: request.session,
@@ -393,9 +493,22 @@ impl Coordinator {
     fn route(
         &mut self,
         now: u64,
+        session: Digest,
         command: &Command,
         out: &mut Vec<(ExecutionId, Effect)>,
     ) -> Result<Answer, WireError> {
+        if let Some((id, content)) = referenced_execution(command) {
+            let execution = self
+                .jobs
+                .execution(id)
+                .filter(|e| e.content == content)
+                .ok_or_else(|| Refusal::NoExecution.to_wire(None))?;
+            let ceiling = self.execution_ceiling(execution)?;
+            if execution.deadline().is_some_and(|deadline| deadline > ceiling) {
+                return Err(error(ErrorCode::Malformed, "execution-deadline-limit"));
+            }
+            self.session_work_limit(session, ceiling)?;
+        }
         match command {
             Command::Submit(s) => {
                 let req: JobRequest = decode(&s.request.bytes, &Limits::DOCUMENTED)
@@ -407,6 +520,16 @@ impl Coordinator {
                     .jobs
                     .executions()
                     .find(|e| e.content == s.content && !matches!(e.state(), ExecState::Ended(_)));
+                let ceiling = match running {
+                    Some(execution) => self.execution_ceiling(execution)?,
+                    None => now
+                        .checked_add(self.config.max_execution_ms)
+                        .ok_or_else(|| error(ErrorCode::Malformed, "execution-deadline-limit"))?,
+                };
+                if req.deadline_ms > ceiling {
+                    return Err(error(ErrorCode::Malformed, "execution-deadline-limit"));
+                }
+                self.session_work_limit(session, ceiling)?;
                 // An equal live job adds an interest to the existing execution. A retained
                 // terminal instead creates a new execution with its own subscriber budget.
                 if running.is_none() && self.jobs.executions().count() >= self.config.max_executions
@@ -432,6 +555,10 @@ impl Coordinator {
                 }))
             }
             Command::Subscribe(s) => {
+                let execution = self.jobs.execution(s.execution).expect("preflight bound");
+                if s.deadline_ms > self.execution_ceiling(execution)? {
+                    return Err(error(ErrorCode::Malformed, "execution-deadline-limit"));
+                }
                 if self
                     .jobs
                     .execution(s.execution)
@@ -564,6 +691,35 @@ impl Coordinator {
                 );
                 Ok(Answer::KillAck(KillAnswer { accepted }))
             }
+            Command::RetireAssignment(r) => {
+                if self.jobs.execution(r.execution).is_none_or(|e| e.content != r.content) {
+                    return Err(Refusal::NoExecution.to_wire(None));
+                }
+                self.jobs
+                    .retire(
+                        now,
+                        &r.executor,
+                        AssignmentToken { execution: r.execution, attempt: r.attempt },
+                        owned_claimant(&session, &r.claimant),
+                        out,
+                    )
+                    .map_err(|r| r.to_wire(None))?;
+                Ok(Answer::Ack(Ack {}))
+            }
+            Command::OwnedAssignment(r) => {
+                if self.jobs.execution(r.execution).is_none_or(|e| e.content != r.content) {
+                    return Err(Refusal::NoExecution.to_wire(None));
+                }
+                let assignment = self
+                    .jobs
+                    .owned_assignment(
+                        &r.executor,
+                        r.execution,
+                        owned_claimant(&session, &r.claimant),
+                    )
+                    .map_err(|r| r.to_wire(None))?;
+                Ok(Answer::OwnedAssignment(OwnedAssignmentAnswer { attempt: assignment.attempt }))
+            }
             Command::Terminal(s) => {
                 self.subscription(s)?;
                 Ok(Answer::Terminal(Terminal {
@@ -577,7 +733,7 @@ impl Coordinator {
                 }
                 let claimed = self
                     .jobs
-                    .claim(now, c.execution, c.claimant, out)
+                    .claim(now, c.execution, owned_claimant(&session, &c.claimant), out)
                     .map_err(|r| r.to_wire(None))?;
                 let e = self.jobs.execution(c.execution).expect("claimed");
                 let lead = claimed.as_ref().is_some_and(|(who, _)| e.lead() == Some(who.as_str()));
@@ -645,6 +801,9 @@ impl Coordinator {
         }
     }
 }
+
+#[cfg(test)]
+mod lifetime_tests;
 
 #[cfg(test)]
 mod tests {

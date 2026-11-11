@@ -222,12 +222,16 @@ published archives, installed with `install.sh --version <v>` as a user installs
 - the whole smoke corpus (below), dev and `--release`, `blaze run` and `blaze test`;
 - each application of the corpus (below), in two jobs of its own per platform: **works** (its
   dev and release builds run, its tests pass under `blaze test`) and **speed** (`harness/bench.py`
-  with the release's `blaze-engine`, beside plain cargo on the same runner: the cold build, the
-  no-op build, every edit and the tests are faster with blaze than with cargo, the program and
-  its tests do the same as cargo's, and nothing is more than 25% worse than the stable release's
-  numbers, which it keeps as assets `bench-<runner>-<app>.json`; a stable release without them,
-  as the first, is not compared). Hosted runners are shared, so 25% is their noise and not a
-  benchmark: docs/benchmarks.md's numbers come from the bench machines;
+  with the selected released Blaze in the `cranelift` profile). Speed requires a completed
+  schema-2 result whose compiler hashes were verified unchanged after measurement, and a
+  stored stable baseline from `bench-<runner>-<app>.json`. Both must cover that exact
+  application and profile: the cold build, no-op, every declared edit and the project's tests
+  when configured. Missing, failed or malformed evidence fails the gate, including a missing
+  or partial stable baseline. The shared benchmark comparator applies the 25% regression
+  threshold, its small-change floors and its daemon/splice requirements to the stored Blaze
+  metrics. Historical baselines may supply their measured Blaze fields; their Cargo fields
+  keep their original meaning and do not enter this comparison. Hosted runners are shared,
+  so the threshold allows noise; docs/benchmarks.md's numbers come from the bench machines;
 - the train (`train.yaml`, every tier on every platform), dispatched on the tag: built from the
   commit the archives were built from. A train on a tag releases nothing and opens no issue;
 - main's tests (`promote.py tested`): the merge gate's run on the push of the tag's commit to
@@ -299,11 +303,10 @@ PATH for an installed release).
   `dir`; `codex --version`; the tests of codex-apply-patch, codex-protocol, codex-execpolicy
   and codex-features, which need no model, network or credentials). What a runner without a
   GPU cannot build or test is listed with why in the entry's `excluded`, which smoke.py prints.
-  Each is also measured against cargo (above); cargo builds dynamo and codex with their pinned
-  Rust (1.96.1 and 1.99.1), which their users build with.
+  Each also has the Blaze speed check above, compared with its stored stable Blaze measurements.
 
 The std cases are the merge gate's; all four groups are the promotion gate. blaze itself is in
-the corpus but not measured against cargo here: how fast blaze builds blaze is the self-build's
+the corpus but outside this application speed check: how fast blaze builds blaze is the self-build's
 measurement.
 
 ## Installing a channel
