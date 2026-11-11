@@ -795,33 +795,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-diff"
-version = "0.0.0"
-dependencies = [
- "blaze-hash",
- "hegeltest",
-]
-
-[[package]]
-name = "blaze-diff-mir"
-version = "0.0.0"
-dependencies = [
- "base-db",
- "blaze-diff",
- "blaze-hash",
- "blaze-query",
- "hegeltest",
- "hir-def",
- "hir-expand",
- "hir-ty",
- "hir-ty-mir",
- "hir-ty-pure",
- "intern",
- "la-arena",
- "rustc_type_ir",
-]
-
-[[package]]
 name = "blaze-diagnostics"
 version = "0.0.0"
 dependencies = [
@@ -867,6 +840,33 @@ dependencies = [
  "unicode-ident",
  "unicode-normalization",
  "unicode-security",
+]
+
+[[package]]
+name = "blaze-diff"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "hegeltest",
+]
+
+[[package]]
+name = "blaze-diff-mir"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-diff",
+ "blaze-hash",
+ "blaze-query",
+ "hegeltest",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "hir-ty-mir",
+ "hir-ty-pure",
+ "intern",
+ "la-arena",
+ "rustc_type_ir",
 ]
 
 [[package]]
@@ -3986,6 +3986,7 @@ dependencies = [
  "hir-ty-identity",
  "hir-ty-mir",
  "hir-ty-print",
+ "hir-ty-pure",
  "hir-ty-share",
  "inkwell",
  "intern",
@@ -4226,6 +4227,7 @@ dependencies = [
  "hir-ty-print",
  "hir-ty-share",
  "intern",
+ "inventory",
  "rustc_type_ir",
  "smallvec",
  "span",
