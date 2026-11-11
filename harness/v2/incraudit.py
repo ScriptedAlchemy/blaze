@@ -74,7 +74,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from array import array
 from collections import Counter
@@ -1057,8 +1056,6 @@ def main() -> None:
     if len(sys.argv) != 2:
         fail(SCRIPT, "takes one JSON value (inline, a file's path, or -), or `selftest`")
     args = parse(Input, sys.argv[1], SCRIPT)
-    if args.engine.kind != "v2":
-        fail(SCRIPT, "engine.kind: v2 only; v1 has no `blaze trace` and no history to read")
     check_target(args.target)
     rep = report.Report(SCRIPT, args.engine, args.out)
     try:
@@ -1066,7 +1063,7 @@ def main() -> None:
     except engine.Failed as e:
         rep.add(f"{PROPERTY}/setup", "error", str(e))
         rep.finish()
-    work = Path(args.work) if args.work else Path(tempfile.mkdtemp(prefix="incraudit-"))
+    work = engine.work_dir(args.work, "incraudit-")
     work.mkdir(parents=True, exist_ok=True)
     try:
         asyncio.run(audit(args, rep, eng, work))

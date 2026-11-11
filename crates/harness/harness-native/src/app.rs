@@ -32,7 +32,10 @@ mod chat;
 mod floats;
 mod fold;
 mod keys;
+mod maps;
 pub use floats::Float;
+#[cfg(target_os = "macos")]
+pub use maps::{MapCard, Places};
 mod panes;
 mod pointer;
 mod row_menu;
@@ -41,6 +44,7 @@ mod sidebar;
 mod stats;
 pub use stats::TICK as STATS_TICK;
 mod ghostty;
+mod world;
 mod script;
 pub use keys::{MenuLine, Outcome};
 pub use sidebar::Wheel;
@@ -274,6 +278,15 @@ pub struct App {
     pending_archive: bool,
     /// The ids the daemon no longer lists were dropped (once, on its first list).
     pruned: bool,
+    /// When cmd+N last asked for a new chat (the frame clock): an empty chat's lantern is struck again at it, so the
+    /// key always shows, even on the chat that already is the new one.
+    relit: f32,
+    /// The world api's calls waiting for the main thread (src/world_api.rs; None: not served), and how many scripts
+    /// its calls have run.
+    world_rx: Option<std::sync::mpsc::Receiver<crate::world_api::Pending>>,
+    world_scripts: u32,
+    /// The chat (its session) whose window the person asked to tuck away, until the window takes it ([`App::take_tuck`]).
+    tuck: Option<u64>,
     /// Remember the selected object in native.json (not for the offscreen shot).
     pub persist: bool,
     /// An offscreen shot's `HARNESS_NATIVE_SHOT_WORKING` (src/shot.rs): every session row and every run row shows at
@@ -320,6 +333,8 @@ pub struct App {
     screen: Option<[f32; 4]>,
     /// The windowed overlays the last frame drew, until the host takes them (src/app/floats.rs).
     floats: Vec<floats::Float>,
+    /// The map cards the last frame painted, until the host takes them (src/app/maps.rs).
+    maps: Vec<maps::MapCard>,
     /// The embedded browser: its link to the host, the pane, the views' input (app/browser.rs).
     browser: browser::Browser,
     /// A sidebar row's menu while it is open (a right press or a control-click on the row; src/app/row_menu.rs).
@@ -333,6 +348,28 @@ fn tone(w: WorldRef<'_>, name: &str) -> Fill {
 
 fn rgba(c: Rgba) -> [f32; 4] {
     [c.r, c.g, c.b, c.a]
+}
+
+/// Run `code` as the managed script `scene::<name>` in a [`scene_world`]. Err is flecs's error and line, under that name.
+pub fn load(world: &World, name: &str, code: &str) -> Result<(), String> {
+    let e = world.script_named(&format!("scene::{name}")).build_from_code(code);
+    script_error(*e).map_or(Ok(()), |err| Err(format!("scene script {name}: {err}")))
+}
+
+/// [`load`] from a file flecs reads (compiled in through `harness_native_ecs::embed_files`, or on disk), with what it
+/// `include`s: each include is a managed script of its own, so its error is on its own entity, not the includer's.
+pub fn load_file(world: &World, name: &str, path: &str) -> Result<(), String> {
+    let e = world.script_named(&format!("scene::{name}")).build_from_file(path);
+    if let Some(err) = script_error(*e) {
+        return Err(format!("scene script {path}: {err}"));
+    }
+    let mut bad = None;
+    world.new_query::<&flecs::Script>().each_entity(|e, _| {
+        if bad.is_none() {
+            bad = script_error(e).map(|err| format!("scene script {}: {err}", e.name()));
+        }
+    });
+    bad.map_or(Ok(()), Err)
 }
 
 fn script_error(e: EntityView<'_>) -> Option<String> {
@@ -369,8 +406,8 @@ fn tilde(p: &str) -> String {
 
 /// The app's world before anything runs in it: every component registered, the tokens, the primitives and the harness
 /// scene (with its included widget files) loaded. Err names the first script that failed and flecs's error. No window,
-/// Metal or daemon: the `scenes_load` test builds it headless.
-fn scene_world() -> Result<World, String> {
+/// Metal or daemon: the `scenes_load` test builds it headless, and harness-video loads a video's scene into it.
+pub fn scene_world() -> Result<World, String> {
     harness_native_ecs::init_os_api();
     harness_native_flecs::set_message_source(harness_native_ecs::last_error);
     // SAFETY: the OS API is set, and this binary links flecs (harness-native-ecs).
@@ -382,6 +419,7 @@ fn scene_world() -> Result<World, String> {
     crate::look::register(&world);
     archive::register(&world);
     browser::register(&world);
+    maps::register(&world);
     stats::register(&world);
     crate::keys::register(&world);
     view::register(&world);
@@ -390,35 +428,19 @@ fn scene_world() -> Result<World, String> {
     world.component::<crate::audio::Instrument>().writable();
     world.component::<crate::audio::Part>().writable();
     world.component::<crate::audio::RainOn>().writable();
+    world.component::<crate::audio::Song>().writable();
     world.component::<chat::GenOn>();
     script::install(&world);
     let _ = world.entity_named(APP);
     world.set(Clock::default());
     world.set(PointerState::default());
     world.set(Paint::default());
-    let mut scripts: Vec<(&str, &str)> = vec![("00-tokens", TOKENS)];
-    scripts.extend(harness_native_ui_prims::SCENES.iter().copied());
-    for (name, src) in scripts {
-        let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
-        if let Some(err) = script_error(*e) {
-            return Err(format!("scene script {name}: {err}"));
-        }
+    load(&world, "00-tokens", TOKENS)?;
+    for (name, src) in harness_native_ui_prims::SCENES {
+        load(&world, name, src)?;
     }
     harness_native_ecs::embed_files(SCENE);
-    let e = world.script_named("scene::10-harness").build_from_file(SCENE[0].0);
-    if let Some(err) = script_error(*e) {
-        return Err(format!("scene script {}: {err}", SCENE[0].0));
-    }
-    // Each `include` is a managed script of its own, so its error is on its own entity, not the includer's.
-    let mut bad = None;
-    world.new_query::<&flecs::Script>().each_entity(|e, _| {
-        if bad.is_none() {
-            bad = script_error(e).map(|err| format!("scene script {}: {err}", e.name()));
-        }
-    });
-    if let Some(err) = bad {
-        return Err(err);
-    }
+    load_file(&world, "10-harness", SCENE[0].0)?;
     // The inline components' labels and marks (`<PR repo=.. n={..}/>` shows `#n`), for the typesetter, which reads no
     // world.
     harness_native_render::inline::install(world.world_ref());
@@ -584,6 +606,10 @@ impl App {
             pinned: crate::prefs::keys("pinned").unwrap_or_default(),
             pending_archive: false,
             pruned: false,
+            relit: 0.0,
+            world_rx: None,
+            world_scripts: 0,
+            tuck: None,
             persist: true,
             shot_working: false,
             shot_plan: Vec::new(), // alloc: empty but in a shot
@@ -608,6 +634,7 @@ impl App {
             look,
             screen: None,
             floats: Vec::new(), // alloc: empty until an overlay's window shows
+            maps: Vec::new(), // alloc: empty until a cell draws a Map
             browser: browser::Browser::new(browser_wake, web_clip, web_pane),
             row_menu: None,
         };
@@ -1749,8 +1776,8 @@ impl App {
         if !on("sound") {
             return Ok(());
         }
-        let (level, music, ambient, rain, cues, moods) = scene_sound(self.world.world_ref())?;
-        crate::audio::start(level, if on("music") { music } else { 0.0 }, if on("ambient") { ambient } else { 0.0 }, &rain, cues, moods)
+        let (level, music, ambient, rain, cues, moods, songs) = scene_sound(self.world.world_ref())?;
+        crate::audio::start(level, if on("music") { music } else { 0.0 }, if on("ambient") { ambient } else { 0.0 }, &rain, cues, moods, songs)
     }
 
     /// How long a turn takes, by the turns already finished in every chat: their middle length (ms), once there are at
@@ -1773,8 +1800,8 @@ impl App {
     }
 
     /// The work bar (hn.WorkBar): while the chat in front works, a band along the window's top edge, placed by the
-    /// track's padding. With an estimate ([`Self::turn_estimate`]) it fills from the left as the turn nears it and
-    /// `eta` says about how long is left; with none, or past it, it sweeps. At rest it has no width. Drawn every frame
+    /// track's padding. With an estimate ([`Self::turn_estimate`]) it fills from the left as the turn nears it (the bar
+    /// alone: no words say a time); with none, or past it, it sweeps. At rest it has no width. Drawn every frame
     /// the display gives while it moves; under Reduce Motion a sweep is the whole hairline, still.
     fn step_work_bar(&mut self) {
         use harness_native_ui_layout_api::Padding;
@@ -1785,15 +1812,23 @@ impl App {
         let since = self.focused_chat().and_then(|(_, _, sid)| self.chats.borrow().get(&sid).filter(|t| t.busy).map(|t| t.turn_since));
         let busy = since.is_some() && whole >= 1.0;
         let still = harness_native_api::reduced(w);
-        // How far through the estimate the turn is, while it has not outrun it; and how long is left.
+        // How far along it is. A step that says so itself ("Checking blaze-core \u{b7} 132/388": a build, a test, a
+        // cell's `progress`) is the truth: that share, and how long is left at the rate it has gone. Else the estimate:
+        // how far through the middle length of finished turns this one is, while it has not outrun it.
+        let told = self.focused_chat().and_then(|(_, _, sid)| self.chats.borrow().get(&sid).and_then(step_share));
         let run = since.flatten().map(|from| model::now_ms().saturating_sub(from));
-        let toward = run.zip(self.turn_estimate()).filter(|(run, est)| run < est);
-        let mut left = String::new();
+        let toward = match told {
+            Some((done, total, started)) => {
+                let gone = started.map_or(0, |s| model::now_ms().saturating_sub(s));
+                // As if the whole took `whole` ms and `at` of it had gone.
+                let whole = if done > 0 { gone * total / done } else { 0 };
+                Some((gone.max(1), whole.max(gone + 1))).filter(|_| done > 0 && done < total)
+            }
+            None => run.zip(self.turn_estimate()).filter(|(run, est)| run < est),
+        };
         let pad = if !busy {
             Padding { l: whole, r: 0.0, t: 0.0, b: 0.0 }
         } else if let Some((run, est)) = toward {
-            let mins = (est - run).div_ceil(60_000);
-            left = if est - run < 45_000 { "under a minute".to_owned() } else { format!("about {mins} min") };
             Padding { l: 0.0, r: (whole * (1.0 - run as f32 / est as f32)).max(0.0), t: 0.0, b: 0.0 }
         } else if still {
             Padding::default()
@@ -1810,9 +1845,6 @@ impl App {
         };
         if track.entity().try_cloned::<&Padding>() != Some(pad) {
             track.set(pad);
-        }
-        if let Some(eta) = bar.part("foot").and_then(|f| f.part("eta")) {
-            eta.text(&left);
         }
         // It moves: every frame the display gives (a sweep at a calm rate steps visibly).
         if busy && !(still && toward.is_none()) {
@@ -1842,11 +1874,14 @@ impl App {
     }
 
     pub(in crate::app) fn new_chat(&mut self) {
+        self.relit = self.world.try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
         // Cmd-N on a chat nothing has been sent in yet does nothing: that chat already is the new one.
         if let Some(sid) = self.selected().and_then(|e| self.session_of(e))
             && self.chats.borrow().contains_key(&sid)
             && !self.sent(sid)
         {
+            // It says so: the lantern is struck again and the cue plays.
+            crate::audio::cue("fresh");
             self.poke();
             return;
         }
@@ -1898,6 +1933,23 @@ impl App {
         self.palette = None;
     }
 
+    /// The chat the person asked to tuck the window away for, once.
+    pub fn take_tuck(&mut self) -> Option<u64> {
+        self.tuck.take()
+    }
+
+    /// What a tucked-away window's item shows for chat `sid` (src/window/mini.rs): the item of the step it is on while
+    /// its turn runs, `done` once it ended, `fail` when it ended on an error; and whether it still runs.
+    pub fn tucked(&self, sid: u64) -> (&'static str, bool) {
+        let chats = self.chats.borrow();
+        let Some(t) = chats.get(&sid) else { return ("done", false) };
+        if t.busy {
+            return (harness_native_render::block::item(chat::live_face()), true);
+        }
+        let failed = t.items.iter().rev().find(|i| !matches!(i, model::chat::Item::TurnEnd { .. })).is_some_and(|i| matches!(i, model::chat::Item::Error { .. }));
+        (if failed { "fail" } else { "done" }, false)
+    }
+
     // ---- the frame ----
 
     /// One frame at `points` (the window's size in points) on a display of `backing` pixels a point.
@@ -1913,6 +1965,7 @@ impl App {
         self.stats_begin();
         self.reload_keys_if_changed();
         self.reload_ghostty_if_changed();
+        self.step_world();
         let z = self.zoom();
         let view = (points.0 / z, points.1 / z);
         let scale = backing * z;
@@ -2257,6 +2310,9 @@ impl App {
             } else if let Some(target) = a.strip_prefix("open:") {
                 // A link in a view (in the browser pane), or a file (a cell's FileRef) in the app its kind opens in, at its line.
                 self.open_target(target, alt);
+            } else if a == "chat:tuck" {
+                // Put the window away until the chat in front is done (src/window/mini.rs).
+                self.tuck = self.focused_chat().map(|(_, _, sid)| sid);
             } else if a == "chat:focus" {
                 self.tree_focus = false;
             } else if a == "pal:close" {
@@ -2292,6 +2348,8 @@ impl App {
         let dark = self.dark;
         // The windowed overlays' draws (src/app/floats.rs), by their node, in the order they first paint.
         let mut floats: Vec<(u64, Draw)> = Vec::new(); // alloc: none, or an overlay window's draw or two a frame
+        // The Map cards painted in the main window, for the host to lay its maps over (src/app/maps.rs).
+        self.maps.clear();
         for (id, mut p) in painted {
             let w = self.world.world_ref();
             let e = w.entity_from_id(id);
@@ -2306,6 +2364,14 @@ impl App {
             // Nothing is drawn that cannot be seen, a terminal's thousands of cells least of all.
             if !seen(&p) {
                 continue;
+            }
+            // A Map's card: the host covers it with its map. One in a windowed overlay keeps its empty plate (a map is a
+            // view of the main window's).
+            if p.window == 0
+                && e.has(maps::MapPlaces::id())
+                && let Some(card) = maps::card(e, &p, [laid.x, laid.y, laid.w * p.scale, laid.h * p.scale], dark)
+            {
+                self.maps.push(card);
             }
             // A terminal's cells and a Kip's picture are drawn on the main window's pixel grid and passes only.
             if p.window != 0 && (is_term || e.has(harness_native_ui_text_api::Kip::id())) {
@@ -2423,6 +2489,20 @@ impl App {
                 .try_cloned::<&harness_native_ui_layout_api::ScrollState>()
                 .map_or(0.0, |s| s.y)
         )
+    }
+
+    /// Draw the sidebar's ground opaque: for a host with nothing blurred behind it (an offscreen shot, iOS). The theme's
+    /// `tone_sidebar` is a tint over the window's vibrancy (src/window.rs: the effect view under the Metal view); with
+    /// no vibrancy under it the tint would show whatever the host lays there instead, so the fold's clip (hn.SideClip,
+    /// whose Fill is the sidebar's ground) takes the same colour at alpha 1. The macOS window never calls this.
+    pub fn opaque_sidebar(&mut self) {
+        let w = self.world.world_ref();
+        let mut fill = crate::look::tone(w, "sidebar");
+        fill.dark.a = 1.0;
+        fill.light.a = 1.0;
+        if let Some(clip) = w.entity_from_id(self.ids.device).parent().and_then(|side| side.parent()) {
+            clip.set(fill);
+        }
     }
 
     /// Start with the sidebar folded away (`HARNESS_NATIVE_SIDEBAR=0`, for captures).
@@ -2575,6 +2655,30 @@ fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
         _ if code.is_some() => "fail",
         _ => "",
     }
+}
+
+/// The share of its work the running step of transcript `t` says it has done ("\u{2026} \u{b7} 132/388" in its words: a
+/// build's, a test's, a cell's `progress`): done, total and when the step began. None when no running step says.
+fn step_share(t: &model::chat::Transcript) -> Option<(u64, u64, Option<u64>)> {
+    use model::chat::Item;
+    let block = t.items.iter().rev().find_map(|i| match i {
+        Item::Tool { block, result: None, .. } => Some(block),
+        _ => None,
+    })?;
+    let e = t.details.get(block)?.effects.iter().rev().find(|e| e.status == "running")?;
+    let (done, total) = share_in(&e.doing)?;
+    Some((done, total, e.started_ms))
+}
+
+/// The last `done/total` in `words` ("Checking blaze-core \u{b7} 132/388"): digits either side of a slash, the total
+/// over 0 and at least the done.
+fn share_in(words: &str) -> Option<(u64, u64)> {
+    words.match_indices('/').rev().find_map(|(i, _)| {
+        let done: String = words[..i].chars().rev().take_while(char::is_ascii_digit).collect::<Vec<_>>().into_iter().rev().collect();
+        let total: String = words[i + 1..].chars().take_while(char::is_ascii_digit).collect();
+        let (done, total) = (done.parse::<u64>().ok()?, total.parse::<u64>().ok()?);
+        (total > 0 && done <= total).then_some((done, total))
+    })
 }
 
 /// What a working agent is doing now, from its transcript's last item: the words its tooltip leads with, and the
@@ -2781,8 +2885,8 @@ fn set_if(v: View<'_>, fill: Fill) {
 /// # Errors
 /// A part of it is missing or malformed, named.
 /// The scene's sound as [`scene_sound`] reads it: the master, the music's and the rain's levels, the places the rain
-/// falls, the cues and the moods.
-type SceneSound = (f32, f32, f32, Vec<crate::music::RainSource>, Vec<crate::audio::Cue>, HashMap<String, crate::music::Mood>);
+/// falls, the cues, the moods and the songs (by name).
+type SceneSound = (f32, f32, f32, Vec<crate::music::RainSource>, Vec<crate::audio::Cue>, HashMap<String, crate::music::Mood>, Vec<crate::music::Song>);
 
 fn scene_sound(w: WorldRef<'_>) -> Result<SceneSound, String> {
     use harness_native_blaze::sound::{Note, Voice as V};
@@ -2814,25 +2918,42 @@ fn scene_sound(w: WorldRef<'_>) -> Result<SceneSound, String> {
         cues.push(crate::audio::Cue(c.name(), gain(c), notes));
     });
     let mut moods = HashMap::new(); // alloc: the scene's moods, read once
-    let mut bad = None;
-    at("hn::sound::mood")?.each_child(|m| {
-        let Some(mood) = m.try_cloned::<&crate::audio::Mood>() else { return };
-        // Its parts: each child that is a part (a `hn.sound.part` prefab's instance, its instrument inherited with it).
-        let mut parts = Vec::new();
+    let bad = std::cell::RefCell::new(None);
+    // The parts under a mood or a song: each child that is a part (a `hn.sound.part` prefab's instance, its instrument
+    // inherited with it), by name.
+    let parts_of = |m: EntityView<'_>| {
+        let mut parts = Vec::new(); // alloc: a mood's or song's parts, read once
         m.each_child(|c| {
             let (Some(part), Some(inst)) = (c.try_cloned::<&crate::audio::Part>(), c.try_cloned::<&crate::audio::Instrument>()) else { return };
             match inst.read(&c.path()).and_then(|i| part.read(c.name(), i, gain(c), &c.path())) {
                 Ok(p) => parts.push(p),
-                Err(e) => bad = Some(e),
+                Err(e) => *bad.borrow_mut() = Some(e),
             }
         });
         parts.sort_by(|a, b| a.name.cmp(&b.name));
-        match mood.read(parts, &m.path()) {
-            Ok(read) => _ = moods.insert(m.name(), read),
-            Err(e) => bad = Some(e),
+        parts
+    };
+    let mut songs = Vec::new(); // alloc: the scene's songs, read once
+    at("hn::sound::song")?.each_child(|s| {
+        let Some(song) = s.try_cloned::<&crate::audio::Song>() else { return };
+        match song.read(s.name(), parts_of(s), &s.path()) {
+            Ok(read) => songs.push(read),
+            Err(e) => *bad.borrow_mut() = Some(e),
         }
     });
-    if let Some(e) = bad {
+    songs.sort_by(|a, b| a.name.cmp(&b.name));
+    if songs.is_empty() {
+        return Err("hn.sound.song has no songs (scene/widgets/sound.flecs)".to_owned());
+    }
+    at("hn::sound::mood")?.each_child(|m| {
+        let Some(mood) = m.try_cloned::<&crate::audio::Mood>() else { return };
+        let parts = parts_of(m);
+        match mood.read(parts, &m.path()) {
+            Ok(read) => _ = moods.insert(m.name(), read),
+            Err(e) => *bad.borrow_mut() = Some(e),
+        }
+    });
+    if let Some(e) = bad.into_inner() {
         return Err(e);
     }
     cues.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2844,7 +2965,7 @@ fn scene_sound(w: WorldRef<'_>) -> Result<SceneSound, String> {
     });
     rain.sort_by(|a, b| a.0.cmp(&b.0));
     let rain = rain.into_iter().map(|(_, r)| r).collect();
-    Ok((gain(at("hn::sound")?), gain(at("hn::sound::mood")?), gain(at("hn::sound::ambient")?), rain, cues, moods))
+    Ok((gain(at("hn::sound")?), gain(at("hn::sound::mood")?), gain(at("hn::sound::ambient")?), rain, cues, moods, songs))
 }
 
 #[cfg(test)]
@@ -2966,18 +3087,34 @@ mod tests {
         assert!((drawn(pill).y - laid(rows[2]).y).abs() > 1.0, "a selection still slides");
     }
 
+    /// A step's own share is read from its words; a path or a date is not one.
+    #[test]
+    fn a_steps_share_is_read_from_its_words() {
+        assert_eq!(share_in("Checking blaze-core \u{b7} 132/388"), Some((132, 388)));
+        assert_eq!(share_in("Converting \u{b7} 0/12"), Some((0, 12)));
+        assert_eq!(share_in("Reading src/app.rs"), None);
+        assert_eq!(share_in("9/3 of them"), None);
+    }
+
     /// The scene's sound reads whole: every step item has a cue, `ready` and `done` ring, and every mood of the ladder is there.
     #[test]
     fn the_scenes_sound_reads() {
         let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
-        let (level, music, ambient, rain, cues, moods) = scene_sound(world.world_ref()).unwrap_or_else(|e| panic!("{e}"));
+        let (level, music, ambient, rain, cues, moods, songs) = scene_sound(world.world_ref()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(songs.len() >= 5 && songs.iter().all(|s| s.bars >= 16 && s.scale.len() >= 5 && s.chords.len() >= 4), "the songs: {:?}", songs.iter().map(|s| &s.name).collect::<Vec<_>>());
+        // A song's own part stands in for a mood's part of that name, so every one must be a part some mood has.
+        for s in &songs {
+            for p in &s.parts {
+                assert!(moods.values().any(|m| m.parts.iter().any(|mp| mp.name == p.name)), "song {}'s part {} is in no mood", s.name, p.name);
+            }
+        }
         assert!(level > 0.0 && music > 0.0 && ambient > 0.0 && rain.len() >= 3 && rain.iter().all(|r| r.gain > 0.0 && r.high > r.low));
         for item in ["exec", "read", "edit", "search", "net", "build", "spawn", "wait", "sql", "think"] {
             assert!(cues.iter().any(|c| c.0 == item && c.1 > 0.0 && !c.2.is_empty()), "no cue for {item}");
         }
         assert!(["ready", "done"].iter().all(|n| cues.iter().any(|c| c.0 == *n && !c.2.is_empty())));
         for mood in ["rest", "calm", "flow", "drive", "battle"] {
-            assert!(moods.get(mood).is_some_and(|m| m.tempo > 0.0 && !m.scale.is_empty() && !m.chords.is_empty() && m.parts.len() >= 2 && m.parts.iter().all(|p| p.level > 0.0 && !p.instrument.partials.is_empty() || p.instrument.noise > 0.0)), "mood {mood} is missing or has no parts");
+            assert!(moods.get(mood).is_some_and(|m| m.tempo > 0.0 && m.parts.len() >= 2 && m.parts.iter().all(|p| p.level > 0.0 && !p.instrument.partials.is_empty() || p.instrument.noise > 0.0)), "mood {mood} is missing or has no parts");
         }
     }
 
@@ -2994,10 +3131,7 @@ mod tests {
         let mut extra = vec![("20-keys", keys::KEYS), harness_native_ui_prims::GALLERY];
         extra.extend(harness_native_ui_prims::EXAMPLES.iter().copied());
         for (name, src) in extra {
-            let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
-            if let Some(err) = script_error(*e) {
-                panic!("scene script {name}: {err}");
-            }
+            load(&world, name, src).unwrap_or_else(|e| panic!("{e}"));
         }
         let mut bad = Vec::new();
         world.new_query::<&flecs::Script>().each_entity(|e, _| {
@@ -3042,7 +3176,7 @@ mod tests {
             "hn.GenCanvas", "hn.GenShape", "hn.GenShapeBack", "hn.GenChart", "hn.GenChartPlot", "hn.GenChartTick",
             "hn.GenChartBar", "hn.GenChartGroup", "hn.GenChartStack", "hn.GenChartHit", "hn.GenChartLabel",
             "hn.GenChartLegend", "hn.GenChartKey", "hn.GenChartPie", "hn.GenChartCenter", "hn.GenTone.faint",
-            "hn.GenTone.series1", "hn.GenTone.series8", "ui.Browser", "hn.GenBrowser", "hn.WebClip", "hn.WebPane",
+            "hn.GenTone.series1", "hn.GenTone.series8", "ui.Browser", "hn.GenBrowser", "hn.GenMap", "hn.WebClip", "hn.WebPane",
             "hn.WebMenu", "hn.WebPopup", "ui.MenuItem", "ui.MenuNote", "ui.MenuSep", "hn.ChatMention", "hn.ChatMentionItem", "hn.ChatMentionHead", "hn.ChatMentionCode", "hn.ChatMentionImage", "hn.PeekList", "hn.PeekEntry", "hn.PeekMeta",
         ]
         .into_iter()

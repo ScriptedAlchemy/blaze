@@ -336,7 +336,7 @@ fn two_closures_of_one_signature_keep_their_own_bodies() {
 /// of before it runs the C compiler: `fetch_update(AcqRel, Acquire, |t| t.checked_sub(1))` on
 /// an `AtomicU32` of `NUM_JOBS`, retried after a `YieldOnce` on a no-op waker, and given back
 /// when `retain_mut` drops a finished job's token. ring's and zstd-sys's build scripts, built by
-/// blaze, compiled `NUM_JOBS` objects and then slept in cc's `block_on` forever (queue 01523):
+/// blaze, compiled `NUM_JOBS` objects and then slept in cc's `block_on` forever:
 /// the MIR inliner inlined `drop_in_place`'s `drop_glue`, a placeholder, so `retain_mut`
 /// dropped nothing it removed. Each step is checked on its own, in the build script and in the
 /// program.
@@ -645,6 +645,23 @@ fn a_proc_macro_package_tests_build() {
     }
 }
 
+/// `#![no_std]` proc-macro crates of every edition, an attribute macro among them (as
+/// multiversion_no_op's), and one that declares its own `extern crate std`, each built as a
+/// wasm module and expanded: the glue blaze appends to a macro crate's root names std only
+/// through its own `extern crate std as __blaze_std`, so a crate whose extern prelude has no
+/// `std`, or that already declares one, builds.
+#[test]
+fn a_no_std_proc_macro_expands() {
+    let case = Case::new("a_no_std_proc_macro_expands");
+    let out = case.ok_in("", &["test"]);
+    let said = format!("{}{}", out.stdout, out.stderr);
+    assert!(
+        said.contains("test every_no_std_macro_expands ... ok"),
+        "`every_no_std_macro_expands` did not pass:\n{said}"
+    );
+}
+
+/// `#[blaze::contract_test]` (docs/v2/plan/design/contracts.md, part 2): a function whose
 /// `#![no_std]` proc-macro crates of every edition, an attribute macro among them (as
 /// multiversion_no_op's), and one that declares its own `extern crate std`, each built as a
 /// wasm module and expanded: the glue blaze appends to a macro crate's root names std only

@@ -6,7 +6,7 @@ date: 2026-11-04
 # HTTP/3 and WebTransport, sans-IO
 
 The owner has decided: blaze's QUIC and WebTransport stack follows rule 14 (sans-io-cores), as
-the HTTP/1.1 client already does (`crates/blaze-http`, `HANDOFF-http1-client.md`). Protocol
+the HTTP/1.1 client already does (`crates/blaze-http`). Protocol
 logic lives in synchronous state machines that take bytes, completions and the time, and hand
 back bytes, events and deadlines. One thin driver per IO backend does the IO.
 
@@ -218,7 +218,7 @@ One change, whole port (rule 23):
   not, because TLS and quinn-proto draw randomness (keys, connection IDs).
 - **The explorer's tests** (`crates/blaze-explore/src/server.rs`) keep every case and move onto
   the new client over real UDP on loopback: path and origin refusals, `unauthenticated` before
-  `hello`, `hello`, `views` as IPC, `unknown_op`, `no_world`, a live frame's layout, `bad_token`
+  `hello`, `hello`, `views` as IPC, `unknown_op`, a live frame's layout, `bad_token`
   closing only its own session, and the dev origin.
 - **The browser**, by hand: the probe page in Chrome and Firefox (bidirectional echo,
   unidirectional echo, datagrams), then `blaze explore` with the real page on ix.dev. This is

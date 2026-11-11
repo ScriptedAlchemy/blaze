@@ -1,8 +1,7 @@
 """worktree_keys.py: `a_second_checkout_at_another_path_reuses_every_key`. One commit of a real
 project in two checkouts at two different paths, built one after the other by one daemon with
 one store: the second build has to find in the store everything the first compiled, because no
-key may hold where a checkout lives (/tmp/blaze-lanes/v2-kernel.brief.md, "Identity";
-docs/cargo.md, "Where a build writes"). The idea is kache's benchmark
+key may hold where a checkout lives (docs/cargo.md, "Where a build writes"). The idea is kache's benchmark
 (github.com/kunobi-ninja/kache), which builds one commit in two worktrees and fails unless
 every key matches.
 
@@ -784,7 +783,7 @@ async def measured(args: Input, rep: report.Report, eng: engine.Engine, work: Pa
     # place known, so a name written with one checkout's places reads as the other's.
     try:
         bare = Places.of({f"checkout {which}": at for which, at in ws.items()})
-        dirs = {which: build_dir_of(parsed(which, ws[which], it, bare), home / "build") for which, it in ran.items()}
+        dirs = {which: build_dir_of(parsed(which, ws[which], it, bare), Path(engine.layout(home).builds)) for which, it in ran.items()}
         places = Places.of({**{f"checkout {w}": at for w, at in ws.items()},
                             **{f"build dir {w}": at for w, at in dirs.items()}})
         built = {which: parsed(which, ws[which], it, places) for which, it in ran.items()}
@@ -834,8 +833,6 @@ async def measured(args: Input, rep: report.Report, eng: engine.Engine, work: Pa
 
 
 def main(args: Input) -> None:
-    if args.engine.kind != "v2":
-        fail(SCRIPT, "engine.kind: v2; this reads the v2 daemon's JSON lines and history")
     if not os.path.isabs(args.duckdb) or not os.path.isfile(args.duckdb):
         fail(SCRIPT, f"duckdb: an absolute path to the DuckDB binary, not {args.duckdb!r}")
     if args.project not in budgets.PROJECTS:
@@ -844,7 +841,7 @@ def main(args: Input) -> None:
         eng = engine.Engine.of(args.engine)
     except engine.Failed as e:
         fail(SCRIPT, str(e))
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-worktree-keys-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-worktree-keys-")
     work.mkdir(parents=True, exist_ok=True)
     if any(work.iterdir()):
         fail(SCRIPT, f"work: {work} is not empty; the run fills it and removes it after")

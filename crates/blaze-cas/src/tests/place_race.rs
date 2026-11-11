@@ -56,7 +56,7 @@ fn race(case: Race, plant: bool) -> Result<(), String> {
     let mut sim = Sim::new(case.seed, Faults { max_latency: latency, ..Faults::default() });
     let (kind, bytes) = value_of(case.shape, case.seed ^ 0x5eed);
     let mut stores = [("a/store", 1u64 << 40), ("b/store", 2 << 40)].map(|(dir, tags)| {
-        let mut store = open_with(&mut sim, Config { dir: name(dir), layers: Vec::new(), tags });
+        let mut store = open_with(&mut sim, Config { dir: name(dir), layers: Vec::new(), tags, load_tags: tags + (1 << 32), loader: crate::Loader::Pumped });
         store.plant_clear_then_clone = plant;
         store.put(key(1), kind, &bytes).unwrap();
         flush(&mut sim, &mut store);
@@ -73,6 +73,10 @@ fn race(case: Race, plant: bool) -> Result<(), String> {
     tags[case.first] = stores[case.first].place(&key(1), to.clone(), &mut effects);
     let second = 1 - case.first;
     let (mut asked, mut seen, mut done) = (false, 0, Vec::new());
+    // The bound of the loop, on the simulation's clock: a completion is at most `latency` (some
+    // microseconds) away, so two places end in milliseconds, and a store that keeps asking for
+    // effects without ending is an `Err` naming the race, not a test that never returns.
+    let end = blaze_core::wait::Deadline::after(sim.now(), Duration::from_secs(60));
     loop {
         // The second store asks once the first's effects have had `lead` completions, or
         // once nothing is in flight, whichever comes first.
@@ -87,8 +91,17 @@ fn race(case: Race, plant: bool) -> Result<(), String> {
                 false => continue,
             }
         }
-        let until = blaze_core::wait::Deadline::after(sim.now(), Duration::from_secs(60));
-        sim.poll(&mut done, until);
+        sim.poll(&mut done, end);
+        // Effects are in flight (checked above), so a poll that delivers none either reached
+        // `end` or holds effects that will never complete: both end the race.
+        if done.is_empty() {
+            return Err(format!(
+                "the places did not end by {end:?} on the simulation's clock (now {:?}): {} \
+                 effects in flight and none completed",
+                sim.now(),
+                sim.in_flight()
+            ));
+        }
         for completion in done.drain(..) {
             seen += 1;
             if let Some(store) = stores.iter_mut().find(|store| store.owns(completion.tag)) {
@@ -133,7 +146,7 @@ fn race_draw(tc: &TestCase) -> Race {
     }
 }
 
-/// The DST: any schedule of two stores placing the same value at one shared path ends with
+/// The invariant: any schedule of two stores placing the same value at one shared path ends with
 /// both Ok and the path holding the value. `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
 fn two_stores_placing_one_value_at_one_path_both_succeed_in_any_order() {
@@ -148,7 +161,7 @@ fn two_stores_placing_one_value_at_one_path_both_succeed_in_any_order() {
 /// The planted-bug control: with the old remove-then-clone-onto-`to` order switched back on,
 /// the same oracle fails under some schedule of the same draws, with the error seen live.
 #[test]
-fn the_place_race_oracle_catches_a_remove_then_clone_onto_the_path() {
+fn the_oracle_catches_a_remove_then_clone_onto_the_path() {
     let mut caught = None;
     'search: for seed in 0..64 {
         for shape in [Shape::Output, Shape::External] {

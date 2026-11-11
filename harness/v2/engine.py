@@ -1,23 +1,20 @@
-"""engine.py: the blaze a v2 proof script measures, v1 or v2, behind one interface.
+"""engine.py: the blaze a v2 proof script measures, behind one interface.
 
 Every script under harness/v2 takes, in its typed input, an `engine`:
 
     {"kind": "v2", "blaze": "target/release/blaze"}
 
-(`backend` is v1's, given it as BLAZE_BACKEND; v2 takes only the default, as it picks each
-unit's backend from its profile and refuses every unit while BLAZE_BACKEND is set. v2 also takes
-`"dev_backend": "stencil"` or `"cranelift"`, forcing the dev tier's backend for every function,
-`"default"` leaving it to blaze), and does everything through `Engine`. `Engine.of` refuses
-`"kind": "v1"`: v1 is gone, and its adapter (`V1`) read what its workers logged and the
-`loading`/`ready` states `blaze status` printed, which a v2 blaze has none of, so against one it
-would measure nothing without a word. Builds, runs and tests go through the `blaze` command
-line (`blaze build`, `run`, `test`, `check`, `status`, `stop`), which v1 and v2 both have, so a
-script is the same for both. What only an engine's insides can say (what an edit recompiled,
-the codegen inputs of a build, the critical path of a cold build) is a method here:
+(`kind` is `"v2"`, the one engine there is. `backend` takes only the default, as blaze picks each
+unit's backend from its profile and refuses every unit while BLAZE_BACKEND is set;
+`"dev_backend": "stencil"` or `"cranelift"` forces the dev tier's backend for every function,
+`"default"` leaving it to blaze), and does everything through `Engine`. Builds, runs and tests
+go through the `blaze` command line (`blaze build`, `run`, `test`, `check`, `status`, `stop`).
+What only an engine's insides can say (what an edit recompiled, the codegen inputs of a build,
+the critical path of a cold build) is a method here:
 
-- a method v1 has no answer to raises `Unmeasurable`, and the result says "unmeasured": a run
-  against v1 still sets the bar;
-- v2 answers each from the agent API (`crates/blaze-api`) through the command line's forms of
+- a method with no answer raises `Unmeasurable`, and the result says "unmeasured", which is a
+  failure of the run;
+- blaze answers each from the agent API (`crates/blaze-api`) through the command line's forms of
   it (`crates/blaze-ui/src/api.rs`): what a request did from the `blaze-work` line a build, test
   or run prints under `--message-format=json`; `blaze codegen-inputs --format=json`,
   `blaze trace --out PATH` and `blaze tables --format=json` for the rest. An answer it cannot
@@ -25,6 +22,16 @@ the codegen inputs of a build, the critical path of a cold build) is a method he
 
 `Failed` is a step the harness could not do (a command that timed out, a daemon that did not
 come up): an error of the run, never a finding about the compiler.
+
+Where a daemon keeps what it keeps is `layout(home)` (harness/storelib.py's `Layout`, the one
+place it is decided): its socket, state, store, lock, log, profile history and build
+directories are all under its home, which `BLAZE_HOME` names, and no setting moves one out. So
+`Engine.env` takes a home and no store, `store_of(home)` is where a script reads the store, and
+`Engine.build_dir` is where a build's outputs are (the checkout has no `target`). `Engine.of`
+ends with `preflight`: what this harness assumes of the binary and cannot tell from the source
+it was written against (`blaze --version`, the commands it runs as `blaze --help` lists them,
+`blaze status --json`'s home, state and socket against `layout`) is checked against the binary
+before any build, and a miss is a `Failed` naming the assumption.
 
 `reference_env` is plain cargo with the pinned nightly (`harness/toolchain`), no incremental
 compilation and no wrapper: what a script fetches sources with (`cargo fetch`, `cargo vendor`,
@@ -37,22 +44,25 @@ import json
 import mmap
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import Any, Literal, cast
 
 import blake3
 
-if TYPE_CHECKING:
-    from storelib import BuildFinished
-
 HERE = Path(__file__).resolve().parent
 HARNESS = HERE.parent
+if str(HARNESS) not in sys.path:
+    sys.path.append(str(HARNESS))
+import storelib  # noqa: E402
+
 ROOT = HARNESS.parent
 TOOLCHAIN = (HARNESS / "toolchain").read_text().strip()
 EXE = ".exe" if os.name == "nt" else ""
@@ -73,22 +83,19 @@ SCRUBBED = (
     "BLAZE_BACKEND",
     "BLAZE_OPT",
     "BLAZE_EMIT",
+    # A memory limit nothing reads any more (the daemon's is BLAZE_DAEMON_MEMORY_GB, which a
+    # caller keeps): dropped so a stale export says nothing.
     "BLAZE_MEMORY_BUDGET",
+    # Where the socket goes without BLAZE_HOME (blaze_api::client::home); every command here has one.
+    "XDG_RUNTIME_DIR",
 )
-# What the v1 daemon's workers log about each build (crates/blaze-engine), read by `work_since`.
-V1_COMPILED = re.compile(r"^stats: (\d+) of (\d+) functions compiled", re.M)
-V1_STORE = re.compile(r"^store: (\d+) functions found, (\d+) compiled and added$", re.M)
-V1_LINK = re.compile(r"^link: \S+ \((.*)\)$", re.M)
-V1_DONE_BYTES = re.compile(rb"^(edit-to-binary:|cold: compiled|stats: )", re.M)
-SETTLE_SECS = 3.0
-QUIET_SECS = 0.25
 # The commands whose request ends in `Response::Work` (crates/blaze-api/src/build.rs), which the
 # command line prints under `--message-format=json` as a `blaze-work` line
 # (crates/blaze-ui/src/api.rs, `work_json`).
 WORKING = ("build", "test", "run")
 WORK_COUNTS = ("reran", "green", "compiled", "found", "critical_path_us")
 
-type Kind = Literal["v1", "v2"]
+type Kind = Literal["v2"]
 type Backend = Literal["cranelift", "llvm"]
 type DevBackend = Literal["default", "stencil", "cranelift"]
 DEV_BACKENDS: tuple[DevBackend, ...] = ("default", "stencil", "cranelift")
@@ -107,7 +114,7 @@ class EngineSpec:
     """The `engine` field of every script's input."""
 
     kind: Kind
-    # The `blaze` command line client (v1: the `blaze` beside `blaze-engine`).
+    # The `blaze` command line client.
     blaze: str
     backend: Backend = "cranelift"
     # The backend of every function the dev tier compiles (opt-level 0 and 1, and the first
@@ -120,7 +127,7 @@ class EngineSpec:
 
 
 class Unmeasurable(Exception):
-    """What was asked has no answer in this engine (v1 has no codegen inputs to compare)."""
+    """What was asked has no answer in this engine."""
 
 
 class Failed(Exception):
@@ -137,10 +144,6 @@ class Ran:
     returncode: int
     stdout: str
     stderr: str
-    # Its `build-finished` line read (harness/storelib.py), where the engine asked for one and
-    # cut `stdout` to what came after it (`V1.build`); None otherwise.
-    finished: "BuildFinished | None" = None
-
     def said(self, tail: int = 3000) -> str:
         return (self.stdout + self.stderr)[-tail:]
 
@@ -162,6 +165,11 @@ class Work:
     link: str | None = None
     said: str = ""
     green: int | None = None
+    # The reports of steps recomputed (`blaze-report` lines, one a root cause): none from a
+    # build that recomputed nothing (docs/v2/plan/design/why.md, "What is printed").
+    reports: int | None = None
+    # Each of those reports' text.
+    causes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -205,9 +213,87 @@ def run(step: str, argv: list[str], cwd: Path, env: dict[str, str], timeout: flo
     return ran
 
 
+def layout(home: Path) -> storelib.Layout:
+    """Where the daemon of `home` keeps everything (storelib.Layout, which states the daemon's
+    rule and where its code is): the one place a v2 script gets these paths from."""
+    return storelib.layout(str(home))
+
+
 def store_of(home: Path) -> Path:
-    """Where the daemon of `home` keeps its store (crates/blaze-cargo/src/serve/daemon.rs)."""
-    return home / "v2" / "store"
+    """Where the daemon of `home` keeps its store, and reads no other (`layout`)."""
+    return Path(layout(home).store)
+
+
+def seed_store(source: Path | None, home: Path) -> None:
+    """The store of `home` made a copy of the store directory `source` (another home's
+    `store_of`, or a copy kept of one), or with None emptied, before the daemon of `home`
+    starts: how a store is shared or seeded across homes, as the daemon reads only its own. A
+    `source` that is no directory is a `Failed` naming it."""
+    store = store_of(home)
+    shutil.rmtree(store, ignore_errors=True)
+    if source is None:
+        return
+    if not source.is_dir():
+        raise Failed(f"seeding the store of the home {home}: no store directory {source}")
+    store.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shutil.copytree(source, store, symlinks=True)
+
+
+def work_dir(given: str, prefix: str) -> Path:
+    """Where a v2 script keeps its checkouts and daemon homes (storelib.work_dir): `given`, or
+    a new directory on a file system blaze can place outputs on; probed either way, and a
+    `Failed` naming the directory and the requirement when blaze would refuse it."""
+    try:
+        return Path(storelib.work_dir(given, prefix))
+    except storelib.Failed as e:
+        raise Failed(str(e)) from None
+
+
+def empty_home(home: Path, keep_store: bool = False) -> None:
+    """Everything the daemon of `home` kept removed (its state, its build directories, the
+    packages it fetched), and with `keep_store` all but its store: what a build "from an empty
+    home into the same store" starts from, the store being in the home. The daemon is stopped
+    first by the caller."""
+    store = store_of(home)
+    if not keep_store or not store.is_dir():
+        shutil.rmtree(home, ignore_errors=True)
+        return
+    aside = home.with_name(f"{home.name}.store-kept")
+    shutil.rmtree(aside, ignore_errors=True)
+    os.rename(store, aside)
+    shutil.rmtree(home, ignore_errors=True)
+    store.parent.mkdir(parents=True, mode=0o700)
+    os.rename(aside, store)
+
+
+BUILD_DIR_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def build_dir_name(ws: Path) -> str:
+    """The front of the name of the default build directory of the workspace at `ws`, before
+    its id: the last part of its path, each character but ASCII letters, digits, `-`, `_` and
+    `.` as `_`, then `-` (blaze_manifest::home::build_dir); empty for a path with no last part."""
+    name = "".join(c if c.isascii() and (c.isalnum() or c in "-_.") else "_" for c in ws.name)
+    return f"{name}-" if name else ""
+
+
+def default_build_dir(home: Path, ws: Path) -> Path:
+    """The build directory the daemon of `home` gave the workspace at `ws` when no target
+    directory was named: the one `<home>/build/<name>-<id>` (docs/cargo.md, "Where a build
+    writes"), `<id>` 32 hex digits of a hash of the path as the daemon names it, which is not
+    computed again here: the directory is found by its name's front, and none or more than one
+    (two checkouts with one last part built in one home) is a `Failed` naming them."""
+    builds, front = Path(layout(home).builds), build_dir_name(ws)
+    try:
+        found = sorted(p for p in builds.iterdir()
+                       if p.is_dir() and p.name.startswith(front) and BUILD_DIR_ID.fullmatch(p.name[len(front):]))
+    except FileNotFoundError:
+        found = []
+    if len(found) != 1:
+        raise Failed(f"the build directory of {ws}: {len(found)} directories named `{front}<32 hex digits>` in "
+                     f"{builds} ({', '.join(p.name for p in found) or 'none'}), not one; a build with no "
+                     "`CARGO_TARGET_DIR` makes one there (crates/blaze-manifest/src/home.rs, `build_dir`)")
+    return found[0]
 
 
 def scrubbed() -> dict[str, str]:
@@ -417,15 +503,12 @@ class Engine(ABC):
         self.blaze = Path(spec.blaze).resolve()
         if not self.blaze.is_file():
             raise Failed(f"engine.blaze: no file {self.blaze}")
-        if spec.kind == "v2" and spec.backend != "cranelift":
+        if spec.backend != "cranelift":
             raise Failed(f"engine.backend {spec.backend!r}: v2 picks each unit's backend from its profile "
-                         "(opt-level), and BLAZE_BACKEND, BLAZE_OPT and BLAZE_EMIT are v1's: the v2 code "
+                         "(opt-level), and BLAZE_BACKEND, BLAZE_OPT and BLAZE_EMIT are gone: the code "
                          "generator refuses every unit while one is set (CHANGES_CODE in "
                          "crates/hir-ty-codegen/v2/backend.rs); build with `--release` for LLVM")
         if spec.dev_backend != "default":
-            if spec.kind == "v1":
-                raise Failed(f"engine.dev_backend {spec.dev_backend!r}: v1 has no stencil backend and no setting "
-                             "for the dev tier's; the backend axis is v2's")
             if spec.backend != "cranelift":
                 raise Failed(f"engine.dev_backend {spec.dev_backend!r} with engine.backend {spec.backend!r}: "
                              "BLAZE_BACKEND=llvm compiles every function with LLVM, so there is no dev tier to force")
@@ -433,34 +516,25 @@ class Engine(ABC):
 
     @staticmethod
     def of(spec: EngineSpec) -> "Engine":
-        if spec.kind == "v1":
-            raise Failed(f"engine.kind 'v1' ({spec.blaze}): v1 is gone, and its adapter reads its workers' logs "
-                         "(`<home>/*/*/log`) and `blaze status`'s `loading`/`ready` lines, which v2 has none of; "
-                         "give `\"kind\": \"v2\"`")
-        return V2(spec)
+        eng = V2(spec)
+        eng.preflight()
+        return eng
 
     @property
     def kind(self) -> Kind:
         return self.spec.kind
 
-    def env(self, home: Path, store: Path | None = None, target: Path | None = None,
-            extra: dict[str, str] | None = None) -> dict[str, str]:
-        """The environment of a `blaze` command with a home (daemon, socket, logs) and a store of
-        its own; the target directory is the workspace's `target` unless `target` is given.
-        The daemon's store is always `store_of(home)`: a `store` elsewhere is refused, and a store
-        shared or seeded across homes is copied there before the daemon starts."""
-        if store is not None and store != store_of(home):
-            raise Failed(f"a store at {store} for the home {home}: the daemon keeps its store at "
-                         f"{store_of(home)} and reads no other")
+    def env(self, home: Path, target: Path | None = None, extra: dict[str, str] | None = None) -> dict[str, str]:
+        """The environment of a `blaze` command whose daemon lives in `home` (`layout(home)`:
+        socket, state, store, logs, build directories). There is no store to name: the daemon
+        keeps it at `store_of(home)` and reads no other (`seed_store` copies one in). The build
+        directory is the daemon's default under the home unless `target` is given
+        (`CARGO_TARGET_DIR`); `build_dir` says where it is either way."""
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
         env = scrubbed()
         env.update(BLAZE_HOME=str(home), BLAZE_STATS="1", PATH=f"{self.blaze.parent}{os.pathsep}{env.get('PATH', '')}")
-        # v1 is told its backend by the environment. v2 refuses every unit while BLAZE_BACKEND,
-        # BLAZE_OPT or BLAZE_EMIT is set (`scrubbed` drops the caller's), so it gets none.
-        if self.kind == "v1":
-            env.update(BLAZE_BACKEND=self.spec.backend)
-            if self.spec.backend == "llvm":
-                env.update(BLAZE_OPT="2", BLAZE_EMIT="fast")
+        # blaze refuses every unit while BLAZE_BACKEND, BLAZE_OPT or BLAZE_EMIT is set (`scrubbed`
+        # drops the caller's), so it gets none.
         if target is not None:
             env["CARGO_TARGET_DIR"] = str(target)
         env.update(extra or {})
@@ -473,6 +547,17 @@ class Engine(ABC):
 
     def stop(self, ws: Path, env: dict[str, str]) -> None:
         self.command("stopping the daemon", "stop", [], ws, env, 300)
+
+    def build_dir(self, ws: Path, env: dict[str, str]) -> Path:
+        """Where the builds of `ws` under `env` put their outputs (`debug/<program>`,
+        `release/...`): the `CARGO_TARGET_DIR` `env` names, else the daemon's default for `ws`
+        under its home (`default_build_dir`), which is there once a build has run."""
+        if named := env.get("CARGO_TARGET_DIR"):
+            return Path(named)
+        return default_build_dir(Path(env["BLAZE_HOME"]), ws)
+
+    def preflight(self) -> None:
+        """Nothing here: an engine with assumptions to hold to its binary checks them."""
 
     @abstractmethod
     def not_blazes(self, ran: Ran) -> str | None:
@@ -516,124 +601,6 @@ class Engine(ABC):
         deterministic CBOR of `blaze_v2_proof::Trace`, which `blaze-v2-proof` compares."""
 
 
-class V1(Engine):
-    """v1's blaze (`blaze` beside `blaze-engine`): a daemon of workers, each logging what it
-    built under `BLAZE_HOME`; a build it cannot do is cargo's, and says so. `Engine.of` no
-    longer gives it (v1 is gone); only proof.py's check of its log reader still builds one."""
-
-    def not_blazes(self, ran: Ran) -> str | None:
-        import blaze_cli
-
-        # Reads `ran.finished`, which `build` filled from the `build-finished` line.
-        how_built: Callable[[Ran], str] = getattr(blaze_cli, "how_built")
-        how = how_built(ran)
-        if how == "daemon":
-            return None
-        # `how_built` says "daemon", "served <how>, not by the daemon" or "failed: <error>",
-        # never "cargo", and blaze_cli's `by_rustc` (the check of a refused build that went to
-        # cargo) is gone (queue 01087).
-        return how
-
-    def command(self, step: str, command: str, args: list[str], ws: Path, env: dict[str, str],
-                timeout: float = 7200) -> Ran:
-        """`blaze COMMAND ARGS` in `ws`; a command that builds runs with the format its build is
-        read by (`blaze_cli.machine_format`), its `build-finished` line goes to `Ran.finished` and
-        its `stdout` is what came after the line: the program's or the tests' own output."""
-        import blaze_cli
-        import storelib
-
-        machine_format: Callable[[str, Sequence[str]], list[str]] = getattr(blaze_cli, "machine_format")
-        added = machine_format(command, args)
-        ran = run(step, [str(self.blaze), command, *added, *args], ws, env, timeout)
-        if not added:
-            return ran
-        finished, rest = storelib.split_build_output(ran.stdout)
-        return replace(ran, stdout=rest, finished=finished) if finished is not None else ran
-
-    def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
-              timeout: float = 7200) -> Ran:
-        # The first build of a checkout can come before its worker has loaded it, and is then
-        # cargo's: the next ones are the daemon's once it is ready.
-        began = time.monotonic()
-        while True:
-            ran = self.command(step, command, list(args), ws, env, timeout)
-            if ran.returncode != 0 or self.not_blazes(ran) is None or time.monotonic() - began > timeout:
-                return ran
-            if "loading" not in self.command(f"{step}: status", "status", [], ws, env, 300).stdout:
-                return ran
-            time.sleep(0.5)
-
-    def wait_ready(self, ws: Path, env: dict[str, str], timeout: float = 3600) -> float:
-        root = os.path.realpath(ws)
-        began = time.monotonic()
-        while time.monotonic() - began < timeout:
-            status = self.command("the daemon's status", "status", [], ws, env, 300).stdout
-            states = re.findall(rf"^    {re.escape(root)}: (.*)$", status, re.M)
-            if states and not any(s.startswith("loading") for s in states):
-                if any(s != "ready" for s in states):
-                    raise Failed(f"the daemon did not load {root}: {states}")
-                return time.monotonic() - began
-            time.sleep(0.1)
-        raise Failed(f"the daemon did not have {root} ready in {timeout:.0f} s")
-
-    def logs(self, home: Path) -> list[Path]:
-        # A worker's log is `workers/<id>/log`; one that began as a spare keeps the spare's.
-        return sorted(set(home.glob("*/*/log")))
-
-    def mark(self, home: Path) -> Mark:
-        return Mark({str(p): p.stat().st_size for p in self.logs(home)})
-
-    def work_since(self, home: Path, mark: Mark) -> Work:
-        # Each log's bytes after the mark, read once: a poll reads only what was added since.
-        read: dict[str, bytearray] = {}
-
-        def grew() -> bool:
-            more = False
-            for path in self.logs(home):
-                got = read.setdefault(str(path), bytearray())
-                with open(path, "rb") as f:
-                    f.seek(mark.sizes.get(str(path), 0) + len(got))
-                    added = f.read()
-                if added:
-                    got += added
-                    more = True
-            return more
-
-        def done() -> bool:
-            return any(V1_DONE_BYTES.search(got) for got in read.values())
-
-        # A worker writes what it did after it answered the client: wait for it to be quiet.
-        began = time.monotonic()
-        grew()
-        quiet, finished = time.monotonic(), done()
-        while time.monotonic() - began < SETTLE_SECS:
-            time.sleep(0.05)
-            if grew():
-                quiet, finished = time.monotonic(), done()
-            elif finished and time.monotonic() - quiet >= QUIET_SECS:
-                break
-        said = "".join(read[path].decode(errors="replace") for path in sorted(read, key=Path))
-        compiled = sum(int(n) for n, _ in V1_COMPILED.findall(said))
-        stored = V1_STORE.findall(said)
-        links = V1_LINK.findall(said)
-        again = [link for link in links if not link.startswith("spliced")]
-        link = None if not links else "spliced" if not again else "full link: " + again[0][:160]
-        return Work(compiled=compiled, reran=None, found=sum(int(f) for f, _ in stored) if stored else None,
-                    link=link, said=said[-4000:])
-
-    def codegen_inputs(self, ws: Path, env: dict[str, str]) -> dict[str, str]:
-        raise Unmeasurable("v1 has no per-function codegen inputs to read; its programs are compared instead")
-
-    def critical_path_s(self, ws: Path, env: dict[str, str]) -> float:
-        raise Unmeasurable("v1 does not record the critical path of a build")
-
-    def tables(self, ws: Path, env: dict[str, str]) -> dict[str, Table]:
-        raise Unmeasurable("v1 keeps rowan trees and salsa memos, not columns it can count")
-
-    def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:
-        raise Unmeasurable("v1 has no query database of fingerprints and edges to trace")
-
-
 class V2(Engine):
     """blaze v2 (docs/v2/plan.md): one daemon per machine, whose only interface is the agent
     API; the command line is its client. Every build is its own (there is no path to cargo), so
@@ -644,30 +611,86 @@ class V2(Engine):
 
     def wait_ready(self, ws: Path, env: dict[str, str], timeout: float = 3600) -> float:
         # `Request::Status` answers once the daemon serves requests; a view is opened by the
-        # request that names it, so there is no loading of a workspace to wait out.
+        # request that names it, so there is no loading of a workspace to wait out. `blaze
+        # status` exits 0 with no daemon too (it starts none and says "no daemon is running",
+        # crates/blaze-cargo/src/cli/daemon.rs `status`), so its exit says nothing: the answer
+        # read is `blaze status --json`'s `daemon`, which is null until one answers.
         began = time.monotonic()
+        said = "it was not asked"
         while time.monotonic() - began < timeout:
-            if self.command("the daemon's status", "status", [], ws, env, 300).returncode == 0:
-                return time.monotonic() - began
+            try:
+                if storelib.blaze_status(str(self.blaze), env, str(ws), 300).daemon is not None:
+                    return time.monotonic() - began
+                said = "`blaze status --json` says no daemon is running"
+            except (storelib.Failed, subprocess.SubprocessError, OSError) as e:
+                said = f"{type(e).__name__}: {e}"
             time.sleep(0.1)
-        raise Failed(f"the daemon did not answer `blaze status` for {ws} in {timeout:.0f} s")
+        raise Failed(f"the daemon did not answer `blaze status --json` for {ws} in {timeout:.0f} s: {said}")
+
+    def preflight(self) -> None:
+        """What this harness assumes of the binary, held to the binary before any build; each
+        miss is a `Failed` naming the assumption and what the binary said instead:
+
+        - `blaze --version` exits 0 and names a version (kept as `self.version`);
+        - every command the v2 scripts run is listed by `blaze --help`, in the form they run it
+          (`HELP_LISTS`);
+        - `blaze status --json`, asked with a home of its own and no daemon, exits 0, reads as
+          storelib's format, says no daemon runs, and names the home, the state directory and
+          the socket `layout` names (the daemon's rule, storelib.Layout)."""
+        with tempfile.TemporaryDirectory(prefix="bz-pre-", dir="/tmp" if os.path.isdir("/tmp") else None) as tmp:
+            home = Path(os.path.realpath(tmp)) / "h"
+            env = self.env(home)
+            what = f"preflight of {self.blaze}"
+            said = run(f"{what}: `blaze --version`", [str(self.blaze), "--version"], home, env, 60, check=True).stdout
+            words = said.split()
+            if len(words) < 2 or words[0] != "blaze":
+                raise Failed(f"{what}: `blaze --version` said {said.strip()!r}, not `blaze <version> ...`")
+            self.version = said.strip()
+            listed = run(f"{what}: `blaze --help`", [str(self.blaze), "--help"], home, env, 60, check=True).stdout
+            missing = [name for name in HELP_LISTS if not help_lists(listed, name)]
+            if missing:
+                raise Failed(f"{what} ({self.version}): `blaze --help` lists no "
+                             f"{', '.join(f'`{name}`' for name in missing)}, which the harness runs (engine.py and "
+                             "the scripts over it); the harness is written against another blaze's commands")
+            try:
+                status = storelib.blaze_status(str(self.blaze), env, str(home))
+            except (storelib.Failed, subprocess.SubprocessError, OSError) as e:
+                raise Failed(f"{what} ({self.version}): `blaze status --json` with BLAZE_HOME={home}: {e}") from None
+            if status.daemon is not None:
+                raise Failed(f"{what}: a daemon (pid {status.daemon.pid}) answers in the new home {home}")
+            want = layout(home)
+            for name, got, wanted in (("home", status.home, want.home), ("state", status.state, want.state),
+                                      ("socket", status.socket, want.socket)):
+                if os.path.realpath(got) != os.path.realpath(wanted):
+                    raise Failed(f"{what} ({self.version}): with BLAZE_HOME={home}, `blaze status --json` says its "
+                                 f"{name} is {got}, and the harness lays out {wanted} (storelib.layout): the "
+                                 "daemon's rule for where it keeps things moved, and the layout has to follow it")
 
     def __init__(self, spec: EngineSpec):
         super().__init__(spec)
+        # `blaze --version`'s line, once `preflight` has asked.
+        self.version = ""
         # Each build, test and run through `build`, by its daemon's home: its step and its
         # `blaze-work` line, or None where it printed none.
         self.worked: dict[str, list[tuple[str, dict[str, object] | None]]] = {}
+        # Beside each of those, the `blaze-report` lines the command printed.
+        self.reported: dict[str, list[list[str]]] = {}
+        # Every command through `build`, in order: its step and its seconds, for a script to
+        # say where its time went.
+        self.took: list[tuple[str, float]] = []
 
     def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
               timeout: float = 7200) -> Ran:
         args = dev_backend_args(self.spec.dev_backend, command, args)
         ran = self.command(step, command, list(args), ws, env, timeout)
+        self.took.append((step, ran.seconds))
         if command in WORKING:
             label = f"{step} (`{' '.join(['blaze', command, *args])}`)"
             lines = worked_lines(ran.stdout) if "--message-format=json" in args else []
             if len(lines) > 1:
                 raise Failed(f"{label}: {len(lines)} `blaze-work` lines; a request reports what it did once")
             self.worked.setdefault(env["BLAZE_HOME"], []).append((label, lines[0] if lines else None))
+            self.reported.setdefault(env["BLAZE_HOME"], []).append(report_lines(ran.stdout))
         return ran
 
     def mark(self, home: Path) -> Mark:
@@ -697,8 +720,10 @@ class V2(Engine):
             link = f"first link: {label}: {it['path']}"
         else:
             link = "patched in place"
+        reports = [text for texts in self.reported.get(str(home), [])[mark.sizes["requests"]:] for text in texts]
         return Work(compiled=total("compiled"), reran=total("reran"), found=total("found"), link=link,
-                    said="\n".join(json.dumps(line, sort_keys=True) for _, line in lines), green=total("green"))
+                    said="\n".join([*(json.dumps(line, sort_keys=True) for _, line in lines), *reports]),
+                    green=total("green"), reports=len(reports), causes=tuple(reports))
 
     def codegen_inputs(self, ws: Path, env: dict[str, str]) -> dict[str, str]:
         # `blaze codegen-inputs --format=json` (`blaze_ui::api::codegen_inputs_json`): one object
@@ -737,6 +762,22 @@ class V2(Engine):
         self.command("the trace", "trace", ["--out", str(to)], ws, env, 600).checked("the trace")
         if not to.is_file():
             raise Failed(f"`blaze trace --out {to}` exited 0 and wrote no file")
+
+
+# The commands the v2 scripts run, each as `blaze --help` lists it (crates/blaze-cargo/src/cli.rs,
+# `HELP`): `preflight` refuses a binary that lists one of them otherwise.
+HELP_LISTS = ("build", "check", "run", "test", "stop", "status", "toolchain", "daemon",
+              "codegen-inputs --format=json", "trace --out PATH", "tables --format=json", "debug sql")
+
+
+def help_lists(listed: str, name: str) -> bool:
+    """Whether `blaze --help`'s text `listed` has a line for the command `name`: the line
+    starts with it, whole (`build, b`, `debug sql QUERY`; `tables` is not `tables-of`)."""
+    for line in listed.splitlines():
+        text = line.strip()
+        if text.startswith(name) and (len(text) == len(name) or text[len(name)] in " ,"):
+            return True
+    return False
 
 
 def profile_of(command: str, args: Sequence[str]) -> str:
@@ -786,6 +827,24 @@ def worked_lines(stdout: str) -> list[dict[str, object]]:
             continue
         if isinstance(line, dict) and cast(dict[str, object], line).get("reason") == "blaze-work":
             found.append(cast(dict[str, object], line))
+    return found
+
+
+def report_lines(stdout: str) -> list[str]:
+    """The `blaze-report` lines of a command's `--message-format=json` output that say why its
+    build recomputed steps (a report whose rule is one of `why:...`, docs/v2/plan/design/why.md):
+    one for each root cause, none when it recomputed nothing. Reports of other rules are not
+    of work done."""
+    found: list[str] = []
+    for text in stdout.splitlines():
+        if not text.startswith("{") or '"blaze-report"' not in text or '"why:' not in text:
+            continue
+        try:
+            line = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(line, dict) and cast(dict[str, object], line).get("reason") == "blaze-report":
+            found.append(text)
     return found
 
 

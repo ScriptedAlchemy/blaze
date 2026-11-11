@@ -220,10 +220,10 @@ A part runs all of its harnesses even when one fails, then names the ones that f
 long each took. Alongside the harnesses, CI runs `python3 harness/imports.py`, which imports
 every script of the harness, and
 `python3 harness/unittests.py`, which runs the Rust unit tests and holds them to
-`harness/known-failures.toml` (below). It is one `cargo test` from the root over blaze's crates and the front end's
-(`hir-ty`, `hir-ty-mir`, `hir-def`, `ide-diagnostics` and the rest), all
-members of the one workspace; the root `.cargo/config.toml` sets `CARGO_WORKSPACE_DIR`, where
-expect-test finds the parser's `.rast` files.
+`harness/known-failures.toml` (below). It is one `blaze test --release --workspace` from the root:
+every test of every member of the workspace, never a hand-kept subset; the root
+`.cargo/config.toml` sets `CARGO_WORKSPACE_DIR`, where expect-test finds the parser's `.rast`
+files.
 
 ### Under Cranelift
 
@@ -233,12 +233,12 @@ profile is.
 
 ### Under LLVM
 
-Build in the flake's dev shell, which has the LLVM 23 it pins
+blaze's default build links the LLVM 23 it pins, which blaze fetches by its sha256
 ([contributing.md](contributing.md#llvm)). Under v2 an `opt-level` of 2,
 `s` or `z` is then LLVM at `-O2` and 3 is LLVM at `-O3`, so the release profile is LLVM; a
 profile that asks for LLVM of a blaze built without it is refused.
 
-    nix develop -c cargo build -p blaze-engine --release
+    blaze build --release --locked -p blaze-engine
 
 `BLAZE_BACKEND` and `BLAZE_OPT` are v1's settings: under v2, either one set at all makes every
 unit fail, saying the variable changes code its key has no part of
@@ -473,14 +473,43 @@ value with an `engine`, `{"kind": "v2", "blaze": PATH}` (`Engine.of` refuses `"v
 worker logs and `ready` lines v2 doesn't have), and drives blaze only through
 the `blaze` command line and `engine.py`. It was written to run against v1 first and v2 later,
 unchanged; since 2026-10-30 there is only v2, so `"kind": "v2"` is the one that has a blaze to
-run. One thing stops it on v2 today: `Engine.env` sets `BLAZE_BACKEND` for every command (and
-`BLAZE_OPT` and `BLAZE_EMIT` for LLVM), and v2 refuses every unit while `BLAZE_BACKEND` or
-`BLAZE_OPT` is set ([Under LLVM](#under-llvm)).
+run. `Engine.env` sets no `BLAZE_BACKEND`, `BLAZE_OPT` or `BLAZE_EMIT` for it (and drops the
+caller's): v2 refuses every unit while one is set ([Under LLVM](#under-llvm)).
 
-A daemon keeps its store in `<home>/v2/store` and reads no other, so a harness gives a build a
-store of its own with a home of its own, and a store shared or warm across homes is copied to
-`<home>/v2/store` before that home's daemon starts (`engine.store_of`, `storelib.store_of`).
-`Engine.env` refuses a `store` anywhere else.
+Everything a daemon keeps is under its home, which `BLAZE_HOME` names, and no setting moves any
+of it out. `storelib.layout(home)` (`engine.layout` for a v2 script) is the one place the
+harnesses get these paths from, and states where blaze's code decides each; no script joins
+them itself:
+
+| What | Where |
+|---|---|
+| socket | `<home>/v2.sock` |
+| state | `<home>/v2` (`serve.lock`, `serve.log`, the profile history in `profile/`) |
+| store | `<home>/v2/store` |
+| build directories | `<home>/build/<name>-<32 hex>`, one per workspace root, unless `--target-dir` or `CARGO_TARGET_DIR` names one ([cargo.md](cargo.md#where-a-build-writes)) |
+| fetched packages | `<home>/sources` |
+
+So `Engine.env` takes a home and no store: a build with a store of its own is a build with a
+home of its own, a store shared or warm across homes is copied to the new home's store before
+its daemon starts (`engine.seed_store`), and a home emptied of all but its store is
+`engine.empty_home(home, keep_store=True)`. A checkout has no `target`: `Engine.build_dir`
+says where a build's outputs are (the `CARGO_TARGET_DIR` the script named, else the one
+directory the daemon made for the workspace under `<home>/build`).
+
+A script's work directory (`work`, or one it picks) is `engine.work_dir`'s (`storelib.work_dir`;
+`storelib.scratch` for the older harnesses): blaze places an output of 16 KiB or more as a clone
+of the store's file (`FICLONE`, `clonefile`) and fails a build where the file system cannot
+([cargo.md](cargo.md#where-a-build-writes)), so the directory is probed with one clone before
+anything is built. With none named it is a new directory under `/tmp`, or where `/tmp` cannot
+clone (tmpfs) under `blaze-harness` in the user's cache directory, removed at exit when left
+empty; a named one that cannot clone, or no base that can, stops the script naming the
+directory and the requirement.
+
+`Engine.of` ends with a preflight against the binary (`engine.V2.preflight`): `blaze --version`
+names a version, `blaze --help` lists every command the scripts run in the form they run it,
+and `blaze status --json`, asked with a new home, names the home, state directory and socket
+`storelib.layout` names. A miss stops the script before any build, naming the assumption, so a
+blaze that moved one of these is told from a blaze that built something wrong.
 
 - Where v1 has no answer (codegen inputs, a query trace, table sizes, the critical path), the
   outcome is `unmeasured`.
@@ -496,7 +525,12 @@ store of its own with a home of its own, and a store shared or warm across homes
 
 Each script writes `report.py`'s result (pass, fail, unmeasured or error per outcome) and has a
 `selftest` that needs neither blaze nor the network. Run them with `uv run --frozen python
-harness/v2/<script>.py '<json>'`. They are not in CI yet.
+harness/v2/<script>.py '<json>'`. Of them CI runs `budgets.py`'s selftest (blaze.yaml's
+`scripts` job, every change) and its smoke, `budgets.py '{"command": "smoke", "engine": ...}'`,
+with the blaze the change built (blaze-platform.yaml's `profile-gate` job, every tier): the
+preflight, then `fixture.py`'s workspace built cold in a new home and one no-op build and one
+body edit measured through the code the budgets run, which passes only when both gave a number
+and the daemon's lock and store are where `storelib.layout` says. The rest are not in CI yet.
 
 | Script | What it checks |
 |---|---|
@@ -506,8 +540,8 @@ harness/v2/<script>.py '<json>'`. They are not in CI yet.
 | `frontend/cases.py` | The front end's cases under `frontend/cases/<area>/`, each held to its own header: `//@ expect: reject KEYS` has blaze give exactly those errors, `accept` none, and an accepted program exits 0 (or panics, with `//@ run: panic`) and prints its `.stdout` when one is beside it. `rejects/` holds the cases of [#1522](https://github.com/indexable-inc/blaze/issues/1522) and [#1440](https://github.com/indexable-inc/blaze/issues/1440); `bodies-cache/` is built twice on one store, the second serving each dependency from it |
 | `determinism.py` | Two cold builds at the same path, pinned to different core counts (Linux), dev and release, of pinned projects and the oracle's fixture, must be byte for byte the same |
 | `worktree_keys.py` | `a_second_checkout_at_another_path_reuses_every_key` (after kache's benchmark): one commit of ripgrep copied to checkouts at three paths and built in order by one daemon with one store, A from an empty store. B and C must compile nothing A compiled: every unit `fresh`, every build-script run found and naming only its own checkout's places, no `macro expand` span and no `compiled` macro module in their builds' history, the same `codegen-inputs`. C tells the portable keys' first-use verification apart from a key that differs. Naming each function B compiled with its key's parts needs `blaze-keys` lines blaze does not print yet, an error until it does |
-| `tightmemory.py` | A cold build in a cgroup limited to 1.0 and 0.5 times cargo's peak, with swap off and `BLAZE_MEMORY_BUDGET` set (which no v2 crate reads yet), finishes with a program that prints what the unlimited cold build's prints, or refuses below 1.0 saying what it needs. It must never be OOM-killed or hang (Linux; `systemd-run --user` or a writable cgroup) |
-| `budgets.py` | The targets of [v2/plan/targets.md](v2/plan/objectives.md) as rows, each with the number measured, the budget and today's figure: edit to result, signature and formatting edits, no-op, warm start, memory against cargo, dev and release code speed, a big crate, the cold build's core use and critical path, CI for a small PR. [v2/plan/data.md](v2/plan/design/data.md)'s rows: bytes per token, node, expression, statement, memo, edge and relocation, memory per thousand lines, and cache misses per edit |
+| `tightmemory.py` | A cold build in a cgroup limited to 1.0 and 0.5 times cargo's peak, with swap off and `BLAZE_DAEMON_MEMORY_GB` saying the same size, finishes with a program that prints what the unlimited cold build's prints, or refuses below 1.0 saying what it needs. It must never be OOM-killed or hang (Linux; `systemd-run --user` or a writable cgroup) |
+| `budgets.py` | The targets of [v2/plan/targets.md](v2/plan/objectives.md) as rows, each with the number measured, the budget and today's figure: edit to result, signature and formatting edits, no-op, warm start, memory against cargo, dev and release code speed, a big crate, the cold build's core use and critical path, CI for a small PR. [v2/plan/data.md](v2/plan/design/data.md)'s rows: bytes per token, node, expression, statement, memo, edge and relocation, memory per thousand lines, and cache misses per edit. `projects` and `budgets` choose rows, each empty for all; a budget named with no row for any project named (or a project with no row for any budget named) stops the run naming it, never a quiet subset. `{"command": "smoke", ...}` is the smoke above |
 
 The fixtures and adapters beside them are `fixture.py` (the oracle's workspace, a pure function
 of a state), `engine.py` (the v2 adapter, the v1 one kept only for `proof.py`'s selftest of its log reader, and
@@ -593,7 +627,7 @@ for each platform, each on a machine of its own kind.
 |---|---|---|---|
 | `blaze.yaml` (`gate`) | pull request and merge group | on hosted Linux AArch64: blaze builds and tests itself through `harness/unittests.py`, the released blaze checks the workspace, the profile gate checks the build history, and the script and workflow jobs check the Python, rules, docs and runner policy. The store starts empty; the build hands its packs to the tests job. Lint baselines and the x86-64 cross build run outside `ci` until their existing blockers are settled | hosted runtime not measured in this integration |
 | `blaze.yaml` (`warm`) | push to main | the build and tests on hosted Linux AArch64 and macOS, with a fresh store per job; the AArch64 smoke job also runs. The existing canary and release workflows consume the resulting checks and artifacts | |
-| `blaze-platform.yaml` (`profile-gate`) | with each platform's build, but Windows | the profile's gate (`blaze debug gate`, [profiling.md](profiling.md#the-gate-what-a-profile-must-hold)) over the history the build's self-build wrote, with the blaze it made, held to `harness/profile-gate-known.toml`, and each fixture of `crates/blaze-profile/fixtures/gate/` failing its own check (`harness/profile_gate.py`); uploads the build's per-build summary as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`. No secret | a few min |
+| `blaze-platform.yaml` (`profile-gate`) | with each platform's build, but Windows | the profile's gate (`blaze debug gate`, [profiling.md](profiling.md#the-gate-what-a-profile-must-hold)) over the history the build's self-build wrote, with the blaze it made, held to `harness/profile-gate-known.toml`, and each fixture of `crates/blaze-profile/fixtures/gate/` failing its own check (`harness/profile_gate.py`); then `harness/v2/budgets.py` smoke with the same compiler; uploads the build's per-build summary as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`. No secret | runtime not measured after integration |
 | `blaze.yaml` (`distributed-core`) | code tiers, alongside the source build | the pinned bootstrap executes the distributed library tests; all four retirement/lifetime models and their thirteen planted controls must report success. This partial feedback does not supply any Stage 1 integration or native acceptance receipt | runtime not yet measured |
 | `blaze-platform.yaml` (`distributed-tests`) | after the Linux AArch64 source build | the verified source-built compiler builds and executes the distributed crates' library and integration tests, including their Hegel controls; an unchanged-source test receipt is required by `ci` | runtime not yet measured |
 | `blaze-platform.yaml` (`distributed`) | after the Linux AArch64 source build | the source-built compiler builds the services and runs `harness/distv2.py` in dev and release with every fault check; a complete receipt is required by `ci` | runtime not yet measured |
@@ -838,20 +872,29 @@ What is known to be wrong is written down, says why, and does not fail the run. 
 out right, it fails the run until it is taken off the list:
 
 - `harness/known-failures.toml`: Rust unit tests that fail, by crate and full name, each with
-  an owner (a lane or an issue) and a one-line cause, held by `harness/failures.py`;
+  a one-line cause, held by `harness/failures.py`: the only exemption the gate's tests have;
 - `OPEN` in `dwarf.py`: `realdebug.py`'s checks whose frames or variables are wrong;
 
-`failures.py` reads a run's log (`cargo test` or `blaze test`, libtest's text or JSON format)
-and fails on a failing test that is not listed, a listed test that passes, is ignored or no
-longer exists, and a test binary that did not finish (a crash leaves the rest of its tests
-unchecked); each failure names the crate, the test and the tail of its output. Entries owned by
-`unowned` are listed without failing the run, and listed tests the run could not check (their
-crate did not run, filtered out, unreached by `blaze test`, or `only` for another runner,
-profile or OS) are counted, so a partial run never reads as clean. CI's `unittests.py` calls it
-on its log; a lane runs it on the crates it touched before saying a failure was there before:
+`failures.py` reads a run's log (`blaze test`, libtest's text or JSON format) and fails on a
+failing test that is not listed, a listed test that passes, is ignored or no longer exists, a
+test binary that did not finish (a crash leaves the rest of its tests unchecked) unless it is
+listed as `<binary>::*`, and a package asked for none of whose test binaries ran (its test
+build failed) unless it is listed as `*`; each failure names the crate, the test and the tail
+of its output. Listed tests the run could not check (their crate did not run, filtered out,
+unreached by `blaze test --reached`, or `only` for another profile or OS) are counted, so a
+partial run never reads as clean. CI's `unittests.py` calls it on its log, with every package of
+the workspace asked for; a lane runs it on the crates it touched before saying a failure was
+there before:
 
-    uv run --frozen harness/failures.py '{"run": {"runner": "blaze", "packages": ["hir-def", "hir-ty-mir"]}}'
-    uv run --frozen harness/failures.py '{"results": ["test.log"], "runner": "cargo", "profile": "dev", "os": "macos"}'
+    uv run --frozen harness/failures.py '{"run": {"packages": ["hir-def", "hir-ty-mir"]}}'
+    uv run --frozen harness/failures.py '{"results": ["test.log"], "profile": "dev", "os": "macos"}'
+
+The list is written from a run, never by hand: `python3 harness/unittests.py '{"record": true}'`
+runs every test and writes the list again, sorted, each new entry with the first line of its
+failure as its cause and `only` the OS it ran on; the entries of other OSes are kept, and an
+entry that was there keeps its cause. Run it once on each OS the gate tests on (Linux and
+macOS), on the tree to land. `harness/failures.py selftest` (CI's `scripts` job) holds the
+checked-in list to the form the recorder writes.
 
 A failure joins the list only with an owner and a cause, in the change that explains it.
 

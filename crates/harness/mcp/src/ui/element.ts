@@ -6,6 +6,7 @@
  * types), and every check says the cell line it is about when it is known. Nothing here depends on Svelte. Copied from den's repl/src/ui/element.ts and cut to
  * the elements the harness app draws.
  */
+import { MAP_RULES } from './map.ts';
 import { fileProblem, mediaProblem } from './media.ts';
 import { ID_RULE, aspectOf, shaderWire, texturesProblem, uniformsOf } from './shader.ts';
 
@@ -35,6 +36,8 @@ export const ELEMENT_NAMES = [
   'Video', 'Shader',
   // A page of the harness browser (embedded Chromium), live: a view an agent opened (`view={page.view}`) or a URL the app opens.
   'Browser',
+  // Places on a real map that pans and zooms (map.ts): Apple's map, which the app lays over the element's card.
+  'Map',
 ] as const;
 export type ElementName = typeof ELEMENT_NAMES[number];
 
@@ -141,6 +144,8 @@ export const OWN_PROPS: Record<ElementName, readonly string[]> = {
   Shader: ['source', 'src', 'width', 'height', 'aspect', 'uniforms', 'textures', 'animate', 'id', 'sourceLine', 'children'],
   // One of the two: a view of the harness browser (cdp.ts Page.view), or an http(s) URL the app opens a view at.
   Browser: ['view', 'src'],
+  // Places as pins on Apple's map, fitted to them or looking at center with zoom; `here` is where the person is (map.ts).
+  Map: ['markers', 'center', 'zoom', 'here'],
 };
 /** Props the kernel sets itself, never listed as what an element takes. */
 const INTERNAL: ReadonlySet<string> = new Set(['sourceLine']);
@@ -168,7 +173,7 @@ export const INKS: readonly string[] = [...TONES, 'faint', ...Array.from({ lengt
 export const isInk = (v: unknown): v is string => typeof v === 'string' && INKS.includes(v);
 /** The inks as an error lists them. */
 const INKS_SAID = `${TONES.join(', ')}, faint, series1..series8, none (series1.. for categorical data)`;
-export const CHART_KINDS = ['bar', 'line', 'pie', 'donut', 'area', 'scatter', 'stacked'] as const;
+export const CHART_KINDS = ['bar', 'line', 'pie', 'donut', 'segments', 'area', 'scatter', 'stacked'] as const;
 /** The most series a Chart draws, and the most points in one. */
 export const MAX_SERIES = 8;
 export const MAX_POINTS = 2000;
@@ -674,6 +679,7 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
     width: positive, height: positive, aspect, uniforms, textures, animate: flag, id, sourceLine: whole(1, Number.MAX_SAFE_INTEGER, 'a line'),
   },
   Browser: { view, src: webUrl },
+  Map: MAP_RULES,
 };
 
 /** The elements that go to the app as exactly the props `elementWire` gives them: the controls, and every element of tier 3. */
@@ -1088,7 +1094,7 @@ export function chartError(name: string, value: unknown, props: Record<string, u
     if (!Array.isArray(value)) return fail(`data is ${said(value)}, not a list`);
     if (value.length > MAX_POINTS) return fail(`data has ${value.length} points; a Chart draws at most ${MAX_POINTS} per series (sum or sample them first)`);
     const slice = (p: unknown) => typeof p === 'object' && p !== null && !Array.isArray(p) && typeof (p as { label?: unknown }).label === 'string' && numeric((p as { value?: unknown }).value);
-    if (kind === 'pie' || kind === 'donut') {
+    if (kind === 'pie' || kind === 'donut' || kind === 'segments') {
       if (value.every(slice)) return undefined;
       if (value.every(numeric)) {
         const labels = props.labels;

@@ -104,11 +104,6 @@ jobs:
     # (the train, on main too, pushes nothing). A called workflow sees a secret only when its
     # caller passes it, environment secrets too: blaze.yaml calls this with `secrets: inherit`.
     environment: ${{ github.ref == 'refs/heads/main' && inputs.tier == 'warm' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
-    env:
-      # A pull request runs the tests its change reached and takes the rest as passed from
-      # main's store; main runs every test, which records each pass for the pull requests after
-      # it, and says of each that passed before whether it passed again.
-      BLAZE_TESTS: ${{ github.ref == 'refs/heads/main' && 'verify' || 'affected' }}
     steps:
       - name: no blaze for Windows
         if: env.BLAZE != 'true'
@@ -121,7 +116,7 @@ jobs:
       # With blaze, no rustup and no Nix: blaze brings its own Rust (.github/actions/blaze), and
       # the C compiler and linker are the runner's.
       # With the build job's project too, and LLVM: the tests are built with the features the
-      # build ships (harness/unittests.py, FEATURES).
+      # build ships (harness/unittests.py).
       - if: env.BLAZE == 'true'
         id: blaze
         uses: ./.github/actions/blaze
@@ -152,6 +147,8 @@ jobs:
       # A limit of its own, under the job's: a cold store's tests ran past the job's 90 minutes
       # on 2026-10-28, which cancelled the push after them, so no run after it found them
       # compiled. Run out here, the step fails and main's push still runs.
+      # Every test of every package of the workspace, held to harness/known-failures.toml, the
+      # one list of tests that may fail (harness/unittests.py).
       # unittests.py dumps the threads of a blaze that stops using the CPU (a stuck build).
       - if: env.BLAZE == 'true' && runner.os == 'Linux'
         run: |
@@ -208,14 +205,12 @@ jobs:
       # The packs the store has before the build, so that what it adds can be handed on.
       - if: env.BLAZE == 'true'
         run: find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-pulled.txt"
-      # Against the LLVM blaze pins. blaze's build is of every package the unit tests are of,
-      # with their features and profile (harness/unittests.py), so that its libraries are the
-      # ones the tests job's programs are built on. Every one of them is a dependency of
-      # blaze-engine, and each has the features it has in blaze-engine's build alone.
+      # Against the LLVM blaze pins. The build and unit tests select the whole workspace,
+      # with the same features and profile (harness/unittests.py), so the tests reuse its libraries.
       # Select only the profile history written by this build.
       - if: env.BLAZE == 'true' && inputs.harnesses == ''
         run: touch "$RUNNER_TEMP/profile-since"
-      - name: blaze build --release, of what the unit tests are built on
+      - name: blaze build --release --workspace, what the unit tests are built on
         if: env.BLAZE == 'true'
         run: |
           $PYTHON harness/unittests.py '{"build": true}'
@@ -286,7 +281,7 @@ jobs:
       # ci.py and focused.py run in the repository's Python workspace (pyproject.toml, uv.lock),
       # and the harnesses in the Python that runs them: they read their input with typed_input.
       - if: inputs.tier == 'fast' || inputs.tier == 'full'
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           enable-cache: false
@@ -583,7 +578,8 @@ jobs:
     needs: build
     if: inputs.harnesses == '' && !startsWith(inputs.os, 'windows')
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 30
+    # The profile gate is followed by the budgets smoke.
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -613,7 +609,7 @@ jobs:
           for bin in blaze-engine blaze; do
             [ -x "$bin" ] || { echo "::error::the build artifact has no executable $PWD/$bin"; exit 1; }
           done
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           enable-cache: false
@@ -627,6 +623,23 @@ jobs:
             '{blaze: $blaze, duckdb: $duckdb, history: $history, platform: $platform, runner: $runner, commit: $commit, out: $out}' \
             > "$RUNNER_TEMP/profile-gate.json"
           uv run --frozen --no-dev python harness/profile_gate.py "$RUNNER_TEMP/profile-gate.json"
+      # The budget harness still runs against the blaze this tree built (docs/harness.md, "The v2
+      # proof"): its preflight of the binary (version, commands, where a home's state, store and
+      # socket are), then fixture.py's three-crate workspace built in a new home, and one no-op
+      # build and one body edit measured through the code the budgets run. It holds no number to
+      # a budget; it fails when the harness and blaze no longer fit, at the change that parted them.
+      # The fixture has a build script, which runs in a sandbox of user namespaces.
+      # 64 s with a release on 32 cores; this runner has 16 and the tree's blaze, whose own code
+      # runs slower (#899). The step prints each command's seconds: tighten the bound from them.
+      - name: budgets.py smoke, with the blaze this tree built
+        timeout-minutes: 20
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          jq -n --arg blaze "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release/blaze" --arg out "$RUNNER_TEMP/budgets-smoke.json" \
+            '{command: "smoke", engine: {kind: "v2", blaze: $blaze}, out: $out}' > "$RUNNER_TEMP/budgets-smoke-input.json"
+          uv run --frozen --no-dev python harness/v2/budgets.py "$RUNNER_TEMP/budgets-smoke-input.json"
       - id: summary
         if: always()
         run: |
@@ -704,7 +717,7 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then bin="$(cygpath -w "$PWD")\\blaze-engine.exe"; else bin="$PWD/blaze-engine"; fi
           echo "BLAZE_BIN=$bin" >> "$GITHUB_ENV"
       # The harnesses run in the Python of the repository's workspace, as ci.py and focused.py do.
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           enable-cache: false

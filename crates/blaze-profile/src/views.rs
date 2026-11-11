@@ -106,6 +106,7 @@ pub const VIEWS: &[View] = &catalogue(
         view("cycle_reruns", &[BUILD, LIMIT]),
         view("key_part_diff", &[BEFORE, AFTER, LIMIT]),
         view("task_memory", &[BUILD]),
+        view("task_grants", &[BUILD, LIMIT]),
         view("memory_timeline", &[BUILD]),
         view("memory_peak_tasks", &[BUILD, LIMIT]),
         view("memory_at_peak", &[BUILD]),

@@ -1,6 +1,6 @@
 ---
 name: ui
-description: Cells as Svelte 5 UI: every element and prop the chat draws (text, tables, stats, charts, drawings, inputs, layout, dialogs, media, shaders, motion) and the rules; read before writing a UI cell.
+description: Cells as Svelte 5 UI: every element and prop the chat draws (text, tables, stats, charts, drawings, inputs, layout, dialogs, media, maps, shaders, motion) and the rules; read before writing a UI cell.
 ---
 To show a result as UI instead of prose (a dashboard, a comparison, a summary), write a ts cell that is Svelte 5
 markup (start it with <script> or an element); runes only ($state, $derived, $effect, $props), and the person sees it
@@ -45,12 +45,28 @@ character (he has moods).
 </Grid>
 ```
 
+Numbers are drawn. Parts of a whole (a disk's volumes, memory by process, a budget's lines) are one segmented bar
+with its legend and the total as a Stat over it: never a sentence, never a bar chart of the parts, and no table
+repeating what the legend already says. The cell is the whole answer; write nothing after it.
+
+```svelte
+<Column>
+  <Stat label="Container disk3" value="7.72 TB" note="469 GB free" />
+  <Chart kind="segments" unit="GB" data={[{label: 'Data', value: 2920}, {label: 'Projects', value: 2740},
+    {label: 'Nix Store', value: 1480}, {label: 'VM', value: 87}, {label: 'Free', value: 469}]} />
+</Column>
+```
+
+A part called Free, Other, Unused or Left is drawn quiet. One part against the rest (used and free alone) can be a
+donut. Amounts that are not parts of one whole are a bar chart (largest first), something over time a line chart,
+one figure alone a Stat.
+
 Content: Column, Row, Text (tone: ink muted strong error accent success warning), Markdown, Code, Table (rows of
 records; query, onselect; a cell that is an inline reference, `from: '<Path loc="/abs/file.md" line={12}>rule 48</Path>'`,
 draws as its chip: give a row its source that way), Badge, Stat (label, value, note), Card (title), Divider and Spacer.
 
-Charts: <Chart kind="bar|stacked|line|area|scatter|pie|donut" data={[...]} or series={[{name, data}]} labels={[...]}
-unit height /> (pie and donut take data as [{label, value}]); never draw a chart by hand.
+Charts: <Chart kind="bar|stacked|line|area|scatter|pie|donut|segments" data={[...]} or series={[{name, data}]} labels={[...]}
+unit height /> (pie, donut and segments take data as [{label, value}]); never draw a chart by hand.
 
 Drawings: SVG (svg, g, path, rect, circle, ellipse, line, polyline, polygon, text) or Canvas (view, Group, Path, Rect,
 Circle, Line, Polyline, Text); inks are tone names (ink, muted, accent, success, warning, error, faint,
@@ -77,8 +93,29 @@ in.u.<uniform>; texture(name, uv)); uniforms and textures take values or '@id' o
 live value, a Video's frames): <Shader aspect="16:9" textures={{ clip: '@clip' }} uniforms={{ gain: '@gain' }}>float4
 main(ShaderInput in) { return texture(clip, in.uv) * in.u.gain; }</Shader>.
 
+Places: Map shows them on Apple's map, live in the transcript: the person pans and zooms it in place, a pin and its
+label each; never draw a map by hand or list coordinates. markers is at most 200 of {lat, lon, label, detail, href, place} (place: a places() row's id; its pin then shows Apple's own card of the place when pressed, with its pictures, hours and rating: always pass it for places() rows) (lat
+-90 to 90, lon -180 to 180; detail shows when a pin is pressed, and href opens from there). It is fitted to the markers,
+or looks at center={[lat, lon]} with zoom (a web map's: 0 the world, 13 a town, 19 a building); here={[lat, lon]} is a
+blue dot for where the person is, and takes what `location()` returns as it is.
+
+```svelte
+<script>const me = await location();</script>
+<Map here={me} markers={[{lat: 34.103, lon: -118.101, label: 'Cha Redefine', detail: '0.1 mi, about eight outlets', href: 'https://example.com'}]} />
+```
+
 Every element also takes width, height (and min/max), grow, padX, padY, a sprung pose (x, y, scale, rotate, opacity),
 z, hover={{scale: 1.05}}, enter and exit (or Svelte's in:, out:, transition: fly fade scale slide, and animate:flip),
 and onpointerdown/move/up, ondrag, onwheel, onhover, onkeydown, onfocus, onblur.
 
-To ask the person and wait for the answer, await ask(text, {options, default}).
+To ask the person, await ask(text, {options, default, detail}): it waits for the answer and returns the label picked.
+The question is one short line ("Stop both daemons?"), at most 140 characters; the facts it rests on go in detail (one
+line) or in a Table or Stat shown above it in the same cell; an option is a few words. default is the option you
+recommend, shown picked: it is never taken for the person. block: false (with a default) goes ahead with it at once
+and leaves the question up; use it only for a choice that is cheap to change, never for one that stops, deletes,
+sends or spends. An answer always reaches you: as the cell's result while your call waits, else as a message from
+him ("Answer to ..."), so after a cell says it is backgrounded on an ask, end your turn and wait; do not poll it.
+A question that rests on numbers shows them above it in the same cell as a picture, not as sentences: a Chart of
+segments for shares of a whole, Stats for two or three figures, a Table for several things; then the question in a
+few words (render(svelte`<Chart .../>`, props); await ask("Stop both?", {options})). The cell is the whole reply: write no prose that says the question or its facts again, and once
+answered, do the thing and say only what happened.
