@@ -199,7 +199,8 @@ class NativeExecutionTests(unittest.TestCase):
             Path(env["BLAZE_CACHE"]).mkdir(parents=True, exist_ok=True)
             work_line = {"reason": "blaze-work", "reran": 1, "green": 0, "compiled": 2, "found": 0, "link": "patched",
                          "links": [{"path": str(target / "debug" / "fixture"), "how": "first" if first else "spliced", "why": []}]}
-            finished = {"reason": "build-finished", "success": True, "profile": "dev", "served": producer, "took_ms": 200}
+            finished = {"reason": "build-finished", "success": True, "profile": "dev", "served": producer,
+                        "took_ms": 200, "build_id": 1}
             output = "\n".join(json.dumps(line, separators=(",", ":")) for line in (work_line, finished)) + "\n"
             if action == "run":
                 output += "fixture\n"
