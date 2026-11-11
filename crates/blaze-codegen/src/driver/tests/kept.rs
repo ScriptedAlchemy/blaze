@@ -619,6 +619,26 @@ fn a_body_edit_keeps_each_call_when_other_instances_share_code() {
     assert_eq!(first_difference(program, WHOLE, &[(Edit::Body, (1, 1))], None), None);
 }
 
+/// Adding a shorter route to one of two describes of the same code changes no representative:
+/// the kept and fresh walks agree on its name, item, identity and every output digest.
+#[test]
+fn a_new_route_to_shared_code_keeps_its_describe() {
+    let mut program = Program::default();
+    program.function(1, 0x11, &[2, 3]).symbol = Some("main".to_owned());
+    program.function(2, 0x12, &[3, 4, 5]);
+    program.function(3, 0x13, &[4, 5]);
+    program.function(4, 0x14, &[5]).code_of = Some(4);
+    program.function(5, 0x14, &[5]).code_of = Some(4);
+    for id in [2, 3, 4] {
+        let function = program.functions.get_mut(&id).unwrap();
+        (function.foreign, function.over_editable) = (true, true);
+    }
+    for id in 1..=5 {
+        program.bodies.insert(id, (id % 3, false));
+    }
+    assert_eq!(first_difference(program, WHOLE, &[(Edit::AddRef, (0, 4))], None), None);
+}
+
 /// The control of the refinement for a changed function: an edit of 4's body gives it a new
 /// key, which its caller's places name. A driver that takes its kept describe without asking
 /// the front end builds 4 under its old key, and the oracle says so; the driver that asks

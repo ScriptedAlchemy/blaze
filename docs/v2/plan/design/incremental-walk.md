@@ -19,6 +19,10 @@ The store key domain changes; old templates remain under their old keys. The cos
 linear pass and a task-frame map, released on return. A repeated-target regression checks
 memo and store reuse against a fresh build; the kept-walk Hegel refinement checks edits.
 
+When several describes have one instance key, choose their representative by owner first,
+then stable item, identity, origin and name. Keep its whole node, including the name digest;
+an added route that changes discovery order must not change the representative or its outputs.
+
 | Kept | Key | Lives |
 |---|---|---|
 | a describe, a count | instance, requester, `Facing` | the database (memo) |

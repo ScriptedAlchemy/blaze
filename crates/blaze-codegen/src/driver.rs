@@ -2266,7 +2266,12 @@ impl<'a, B: Prepare> Build<'a, B> {
                             ));
                         } else {
                             let least = it.get().least_origin.min(node.least_origin);
-                            if new.owner < kept.owner {
+                            // An added route can reach another describe of this key first.
+                            // Keep one stable representative, including its name and digest,
+                            // rather than making the whole and kept walks depend on order.
+                            if (new.owner, new.item, new.identity, new.origin, &new.name)
+                                < (kept.owner, kept.item, kept.identity, kept.origin, &kept.name)
+                            {
                                 it.insert(node);
                             }
                             it.get_mut().least_origin = least;
