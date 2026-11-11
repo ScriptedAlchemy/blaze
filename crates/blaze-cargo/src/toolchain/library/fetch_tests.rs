@@ -33,6 +33,7 @@ fn clean_home_preserves_checkout_precedence_and_selected_release() {
         std::fs::File::create(release.join(super::archive_name(super::digest()))).unwrap();
     let xz = lzma_rust2::XzWriter::new(archive, Default::default()).unwrap();
     let mut archive = tar::Builder::new(xz);
+    archive.follow_symlinks(false);
     archive.append_dir_all("library", &checkout).unwrap();
     archive.into_inner().unwrap().finish().unwrap();
     let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
