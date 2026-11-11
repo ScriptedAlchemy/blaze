@@ -93,8 +93,9 @@ struct Engine {
     changed: HashMap<u32, u64>,
     /// The revision at which the dyn fact each function's body reads last changed.
     facts: HashMap<u32, u64>,
-    /// The revision each function was last described at.
-    seen: Lock<HashMap<(u32, Origin, bool), u64>>,
+    /// Each round's memo and its revision: verification must compare the supplied value,
+    /// which may be from another round, as the production front end does.
+    seen: Lock<HashMap<(u32, Origin, bool), (u64, Described<u32, u32>)>>,
     /// Whether the walk under way is against the program's dyn facts: its second round.
     against: AtomicBool,
     /// Describes made, and kept describes found to hold without one.
@@ -279,7 +280,6 @@ impl Frontend for Program {
         let direct = self.devirtualized(*id);
         let against = self.engine.against.load(Ordering::Relaxed);
         self.engine.describes.fetch_add(1, Ordering::Relaxed);
-        self.engine.seen.lock().insert((*id, *requester, against), self.engine.revision);
         let refs = function
             .calls
             .iter()
@@ -308,7 +308,7 @@ impl Frontend for Program {
             }
             None => code,
         };
-        Ok(Described {
+        let described = Described {
             owner: function.owner,
             identity: ContentId::of(
                 "blaze v2 test identity 1",
@@ -336,7 +336,11 @@ impl Frontend for Program {
             built_in: function.built_in.clone(),
             name: format!("f{id}"),
             cold: false,
-        })
+        };
+        // clone: the model's database owns its memo separately from the walk's value.
+        let memo = (self.engine.revision, described.clone());
+        self.engine.seen.lock().insert((*id, *requester, against), memo);
+        Ok(described)
     }
 
     fn describe_static(&self, id: &u32) -> Result<DescribedStatic<u32, u32>, CodegenError> {
@@ -404,7 +408,7 @@ impl Frontend for Program {
         &self,
         id: &u32,
         requester: &Origin,
-        _: &Described<u32, u32>,
+        was: &Described<u32, u32>,
     ) -> Result<Option<Described<u32, u32>>, CodegenError> {
         let engine = &self.engine;
         let against = engine.against.load(Ordering::Relaxed);
@@ -412,8 +416,12 @@ impl Frontend for Program {
         if against && !engine.misses_facts {
             changed = changed.max(engine.facts.get(id).copied().unwrap_or(0));
         }
-        let seen = engine.seen.lock().get(&(*id, *requester, against)).copied();
-        if seen.is_some_and(|seen| seen >= changed) {
+        let holds = engine
+            .seen
+            .lock()
+            .get(&(*id, *requester, against))
+            .is_some_and(|(seen, memo)| *seen >= changed && memo == was);
+        if holds {
             engine.verifies.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }

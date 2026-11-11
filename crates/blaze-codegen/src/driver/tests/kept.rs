@@ -639,6 +639,27 @@ fn a_new_route_to_shared_code_keeps_its_describe() {
     assert_eq!(first_difference(program, WHOLE, &[(Edit::AddRef, (0, 4))], None), None);
 }
 
+/// Removing the last dyn fact returns to the first round's memo. That memo cannot verify
+/// the second round's kept describe merely because its revision still holds.
+#[test]
+fn a_removed_last_dyn_fact_restores_the_first_round_describes() {
+    let mut program = Program::default();
+    for id in 1..=7 {
+        let calls: Vec<u32> = (id + 1..=7).collect();
+        let function = program.function(id, 0x10 + id as u8, &calls);
+        if id == 1 {
+            function.symbol = Some("main".to_owned());
+            function.statics.push(1);
+        } else {
+            (function.foreign, function.over_editable) = (true, true);
+        }
+        program.bodies.insert(id, (id % 3, false));
+    }
+    program.statics.insert(1, (1, None));
+    program.dyn_sites.insert(1, 4);
+    assert_eq!(first_difference(program, WHOLE, &[(Edit::RemoveFunction, (3, 0))], None), None);
+}
+
 /// The control of the refinement for a changed function: an edit of 4's body gives it a new
 /// key, which its caller's places name. A driver that takes its kept describe without asking
 /// the front end builds 4 under its old key, and the oracle says so; the driver that asks
