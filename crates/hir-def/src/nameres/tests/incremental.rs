@@ -212,8 +212,11 @@ fn no() {}
         // `use E::*` binds `E`'s variants, which no round-0 log holds: the maintainer reads
         // them again (`variants_syntax`, which reads the enum's `signature_syntax`) to see
         // whether the glob must run again.
+        // A root edit also checks its extension attributes before parsing; their unchanged
+        // value does not invalidate the definition map.
         &expect![[r#"
             [
+                "crate_extensions",
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
                 "HirFileId::ast_id_map",
@@ -574,6 +577,7 @@ pub type Ty = ();
         &[("file_item_tree_query", 1), ("parse", 1)],
         &expect![[r#"
             [
+                "crate_extensions",
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
                 "HirFileId::ast_id_map",
