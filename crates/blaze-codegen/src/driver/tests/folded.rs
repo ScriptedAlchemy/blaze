@@ -155,14 +155,15 @@ fn a_landed_group_holds_every_thunk_it_is_asked_for() {
             &mut errors,
         );
         assert!(errors.is_empty());
-        let thunks: Vec<_> = first
-            .functions
-            .iter()
-            .filter(|function| function.code.first() == Some(&0xe9))
-            .collect();
-        assert_eq!(thunks.len(), 2);
-        for thunk in thunks {
-            let key = keys::thunk(&body.key, &nodes[&thunk.key].stored());
+        // Built.functions is after dedupe: identical thunks may share code, but each
+        // requested member must have emitted and stored its own template before dedupe.
+        for id in [2, 3] {
+            let (member, node) = nodes.iter().find(|(_, node)| node.unit.item == item(id)).unwrap();
+            let kept = first.deduped.merged.get(member).unwrap_or(member);
+            assert!(first.functions.iter().any(|function| {
+                function.key == *kept && function.code.first() == Some(&0xe9)
+            }));
+            let key = keys::thunk(&body.key, &node.stored());
             assert_eq!(
                 first.stats.compiled_keys.iter().filter(|reported| **reported == key).count(),
                 1
