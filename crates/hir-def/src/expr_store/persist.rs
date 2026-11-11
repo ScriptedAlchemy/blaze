@@ -242,7 +242,7 @@ kinds! {
     /// Which [`type_ref::TypeRef`] variant a type of a buffer is, read in place.
     TypeRefKind {
         Never, Placeholder, Tuple, Path, RawPtr, Reference, Array, Slice, Fn, ImplTrait, DynTrait,
-        TypeParam, PatternType, Error, UnsafeBinder,
+        TypeParam, PatternType, Error, UnsafeBinder, Record,
     }
 
     /// Which [`LifetimeRef`] variant a node of a buffer is, read in place.
@@ -260,12 +260,17 @@ kinds! {
 same_numbers! {
     TypeRefKind = type_ref::TypeRefKind {
         Never, Placeholder, Tuple, Path, RawPtr, Reference, Array, Slice, Fn, ImplTrait, DynTrait,
-        TypeParam, PatternType, Error, UnsafeBinder,
+        TypeParam, PatternType, Error, UnsafeBinder, Record,
     }
     StatementKind = columns::StatementKind {
         Let, Expr, MacroDef, Item,
     }
 }
+
+const _: () = assert!(
+    TypeRefKind::ALL.len() == type_ref::TypeRefKind::ALL.len(),
+    "the persisted type-ref kinds cover the column's variants",
+);
 
 fn raw<T>(id: Idx<T>) -> u32 {
     id.into_raw().into_u32()
@@ -3179,6 +3184,85 @@ fn f() -> u32 {
         let long = with_word(&bytes, range_at + size_of::<u32>(), lists + 1);
         let long = ExpressionStore::read(&long).expect("only `extra` changed");
         assert!(long.decode().is_err(), "a list that ends past its array");
+    }
+
+    /// The invariant: record tags, field order, type ids and optional defaults survive the
+    /// persisted view and decoding, including nested and empty records.
+    #[test]
+    fn record_type_fields_and_defaults_round_trip() {
+        let (db, defs) = bodies(
+            r#"
+#![blaze::records]
+fn f(opts: { z: u8 = 7, a: { q: bool }, n: u16 }, empty: {}) {}
+"#,
+        );
+        let DefWithBodyId::FunctionId(function) = defs[0] else { panic!("`f` is a function") };
+        let (signature, source_map) = FunctionSignature::with_source_map(&db, function);
+        let store: &ExpressionStore = &signature.store;
+        assert_store_round_trip(store, source_map);
+        let bytes = blaze_format::to_bytes(store);
+        let buffer = Aligned::copy_from(&bytes);
+        let read = ExpressionStore::read(&buffer).expect("record types read in place");
+        let decoded = read.decode().expect("record types decoded");
+        assert_eq!(decoded, *store);
+        assert_eq!(blaze_format::to_bytes(&decoded), bytes);
+
+        let records: Vec<_> = (store.type_refs())
+            .filter_map(|(id, ty)| match ty {
+                TypeRef::Record { names, types, defaults } => Some((id, names, types, defaults)),
+                _ => None,
+            })
+            .collect(); // alloc: the test inspects the three fixture records together
+        assert_eq!(records.len(), 3, "outer, nested and empty record nodes");
+        for &(id, names, types, defaults) in &records {
+            assert_eq!(read.type_kind(id), Some(TypeRefKind::Record));
+            let kind = offset_in(read.ty_kind, &buffer) + raw(id) as usize;
+            assert_eq!(bytes[kind], 15, "the appended record tag");
+            let TypeRef::Record { names: saved_names, types: saved_types, defaults: saved_defaults } =
+                decoded.type_ref(id)
+            else {
+                panic!("record restored as another type")
+            };
+            assert_eq!(decoded.names(saved_names), store.names(names));
+            assert_eq!(saved_types, types);
+            assert_eq!(saved_defaults, defaults);
+
+            match types.len() {
+                3 => {
+                    let names = store.names(names);
+                    assert_eq!(
+                        [names[0].as_str(), names[1].as_str(), names[2].as_str()],
+                        ["z", "a", "n"]
+                    );
+                    assert!(matches!(store.type_ref(types[0]), TypeRef::Path(_)));
+                    assert!(matches!(store.type_ref(types[1]), TypeRef::Record { .. }));
+                    assert!(matches!(store.type_ref(types[2]), TypeRef::Path(_)));
+                    let default = defaults.get(0).expect("z's default");
+                    assert!(matches!(
+                        store.expr(default.expr),
+                        Expr::Literal(Literal::Int(7, _) | Literal::Uint(7, _))
+                    ));
+                    assert_eq!(defaults.len(), 3);
+                    assert_eq!(defaults.get(1), None);
+                    assert_eq!(defaults.get(2), None);
+                }
+                1 => {
+                    assert_eq!(store.names(names)[0].as_str(), "q");
+                    assert!(matches!(store.type_ref(types[0]), TypeRef::Path(_)));
+                    assert_eq!(defaults.len(), 1);
+                    assert_eq!(defaults.get(0), None);
+                }
+                0 => {
+                    assert!(store.names(names).is_empty());
+                    assert!(defaults.is_empty());
+                }
+                _ => panic!("unexpected record fields"),
+            }
+
+            let mut bad = bytes.clone();
+            bad[kind] = 16;
+            assert!(ExpressionStore::read(&Aligned::copy_from(&bad)).is_err(), "unknown tag 16");
+        }
     }
 
     #[test]
