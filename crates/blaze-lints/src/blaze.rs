@@ -901,6 +901,7 @@ impl Lint {
             }
             Lint::NegativeEffect => {
                 "write what the function may do, `#[blaze::may(..)]`, in place of what it may not (`blaze check --fix` rewrites it)"
+            }
             Lint::DurableWrite => {
                 "take `Effect::WriteUnsynced` or `Effect::RenameUnsynced` where a build can make the data again and its reader checks it, or say what must survive a crash with `// durable: <why>` on its line or the line above"
             }
