@@ -75,6 +75,9 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         ("blaze::build_script_ambient", ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
         // Never by default: a crate or a workspace's table asks for it.
         ("blaze::std_use", false),
+        ("blaze::program_lifetime", false),
+        ("blaze::could_be_program_lifetime", false),
+        ("blaze::could_be_ref32", false),
     ];
     for it in edition.lints.iter() {
         assert!(warns.iter().any(|(name, _)| *name == it.name), "`{}` says when it warns", it.name);
@@ -100,7 +103,6 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
                 + usize::from(in_internal)
                 + usize::from(in_pedantic)
                 + usize::from(in_edition),
-                + usize::from(in_(edition)),
             1,
             "`{}` is general, internal, pedantic_perf or edition, once",
             it.name
