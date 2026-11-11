@@ -14,7 +14,7 @@ on:
         type: boolean
         default: false
       full:
-        description: "Also time the other setups (cg_clif, mold, wild, -Zthreads, cargo check) and run the test suites, as the nightly run does"
+        description: "Also run each project's test suite, as the nightly run does"
         type: boolean
         default: false
 
@@ -68,50 +68,44 @@ jobs:
       contents: read
     timeout-minutes: 360
     env:
-      # Share benchmark state between steps within this hosted job.
-      BENCH_HOME: ${{ github.workspace }}/../bench-state
-      # macOS: the daemon's socket path has to fit in 104 bytes, so the work is under /tmp.
-      BENCH_WORK: ${{ matrix.work }}
+      BENCH_MACHINE: GitHub-hosted ${{ matrix.name }} (${{ matrix.label }})
       CARGO_TERM_COLOR: never
-      # The nightly run, and a run by hand that asks, compares with the other setups too.
-      FULL: ${{ github.event_name == 'schedule' || inputs.full }}
+      # The nightly run, and a run by hand that asks, runs the projects' test suites too.
+      FULL: ${{ github.event_name == 'schedule' || inputs.full || false }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      # bench.py runs the projects' tests with `blaze test`, which sandboxes them in
-      # namespaces a user makes; Ubuntu's AppArmor keeps users from that unless told otherwise.
-      - name: user namespaces
-        if: runner.os == 'Linux'
-        run: |
-          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
-            sudo -n sysctl kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-      # One blaze for both tiers: every native blaze links LLVM, and the profile picks the backend.
-      # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version
-      # names, installed into $BENCH_HOME for this job, run in the bench shell for the pinned LLVM and
-      # the C toolchain. Its daemon ends before the measured blaze starts.
+      - uses: ./.github/actions/blaze
+        with:
+          job: bench-readme
+          llvm: 'true'
+          reflink: ${{ runner.os == 'Linux' && 'true' || 'false' }}
+      # The native dependencies come from this shell; the selected Blaze builds the compiler.
       - uses: ./.github/actions/nix
       - name: Build blaze
         run: |
+          bench_root=/tmp
+          if [ "$RUNNER_OS" = Linux ]; then bench_root="$RUNNER_TEMP/blaze-fs"; fi
+          export BENCH_HOME="$bench_root/bb-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$BENCH_HOME"
-          CARGO_HOME="$BENCH_HOME/stage0" sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
-          stage0="$BENCH_HOME/stage0/bin/blaze"
-          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c "$stage0" build -p blaze-engine --release --locked
+          echo "BENCH_HOME=$BENCH_HOME" >> "$GITHUB_ENV"
+          echo "TMPDIR=$bench_root" >> "$GITHUB_ENV"
+          stage0="$(command -v blaze)"
+          CARGO_TARGET_DIR="$BENCH_HOME/compiler" nix develop .#bench -c "$stage0" build -p blaze-engine --release --locked
           "$stage0" stop
       - name: Bench
         id: bench
         run: |
-          export BLAZE_BIN="$BENCH_HOME/target/release/blaze-engine"
-          export BLAZE_PROJECTS="$BENCH_HOME/projects"
-          work=${BENCH_WORK:-$BENCH_HOME/work}
-          rm -rf "$work" "$BENCH_HOME/reference"
           mkdir -p "$RUNNER_TEMP/results"
-          full=()
-          [ "$FULL" = true ] && full=(--setups all --setups-on "ripgrep,nushell" --tests)
-          nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py \
-            ripgrep fd bat hyperfine just axum nushell helix bevy biome --runs 5 --cold-runs 5 "${full[@]}" \
-            --work "$work" --reference "$BENCH_HOME/reference" --out "$RUNNER_TEMP/results/bench.json" \
+          jq -n --arg blaze "$BENCH_HOME/compiler/release/blaze-engine" --arg work "$BENCH_HOME/work" \
+            --arg sources "$BENCH_HOME/projects" --arg out "$RUNNER_TEMP/results/bench.json" \
+            --arg commit "$GITHUB_SHA" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --argjson tests "$FULL" --arg machine "$BENCH_MACHINE" \
+            '{action:"run", blaze:$blaze, work:$work, sources:$sources, out:$out, commit:$commit, run_url:$run_url,
+              projects:["ripgrep","fd","bat","hyperfine","just","axum","nushell","helix","bevy","biome"],
+              backends:["cranelift","llvm"], runs:5, cold_runs:5, tests:$tests, machine:$machine}' > "$RUNNER_TEMP/bench-input.json"
+          nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py "$RUNNER_TEMP/bench-input.json" \
             || { status=$?; [ "$status" = 3 ] || exit "$status"; echo "wrong=true" >> "$GITHUB_OUTPUT"; }
       - uses: actions/upload-artifact@v7
         if: always()
@@ -122,7 +116,7 @@ jobs:
       - name: Fail on a wrong result
         if: steps.bench.outputs.wrong == 'true'
         run: |
-          echo "::error::under blaze a program or a test suite ended otherwise than under cargo: see the Bench step and the tests table"
+          echo "::error::a Blaze build, program output, or test suite failed its oracle: see the Bench step and the tests table"
           exit 1
 
   # Every platform's results into the README, docs/benchmarks.md and the history, in one commit:
@@ -153,12 +147,16 @@ jobs:
           pattern: bench-*
           path: ${{ runner.temp }}/results
       - name: README and docs/benchmarks.md
+        env:
+          FORCE: ${{ inputs.force || false }}
         run: |
           # A result refused (a program that said something else) leaves its platform's numbers as they were.
           for result in "$RUNNER_TEMP"/results/bench-*/bench.json; do
             [ -f "$result" ] || continue
             echo "::group::$result"
-            python3 harness/benchreport.py "$result" ${{ inputs.force && '--force' || '' }} || echo "::warning::$result was not published"
+            jq -n --arg result "$result" --argjson force "$FORCE" \
+              '{action:"publish",result:$result,force:$force}' | python3 harness/benchreport.py - \
+              || echo "::warning::$result was not published"
             echo "::endgroup::"
           done
       - name: History and regressions
@@ -169,8 +167,10 @@ jobs:
           for result in "$RUNNER_TEMP"/results/bench-*/bench.json; do
             [ -f "$result" ] || continue
             slug=$(basename "$(dirname "$result")"); slug=${slug#bench-}
-            python3 harness/benchhistory.py build "$result" --history "docs/benchmarks/history/$slug.jsonl"
-            python3 harness/benchhistory.py check "docs/benchmarks/history/$slug.jsonl" --report "$RUNNER_TEMP/regressions-$slug.md" || regressed=true
+            jq -n --arg result "$result" --arg history "docs/benchmarks/history/$slug.jsonl" \
+              '{action:"build",result:$result,history:$history}' | python3 harness/benchhistory.py -
+            jq -n --arg history "docs/benchmarks/history/$slug.jsonl" --arg report "$RUNNER_TEMP/regressions-$slug.md" \
+              '{action:"check",history:$history,report:$report}' | python3 harness/benchhistory.py - || regressed=true
             cat "$RUNNER_TEMP/regressions-$slug.md" >> "$RUNNER_TEMP/regressions.md"
           done
           echo "regressed=$regressed" >> "$GITHUB_OUTPUT"

@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-11 invariants, 0 refinements, 1 reference models.
-By level: 3 tested, 8 simulated, 0 model-checked, 0 proved.
+15 invariants, 0 refinements, 1 reference models.
+By level: 3 tested, 12 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -33,11 +33,19 @@ By level: 3 tested, 8 simulated, 0 model-checked, 0 proved.
 
 - **`every_success_has_one_immutable_full_manifest`** *tested* (`crates/blaze-dist/src/jobs/publication_tests.rs`): a published-work execution reports success only after full output is uploaded, its immutable manifest is accepted unchanged, and delivery to subscribers completes; a later attempt cannot replace the accepted record and a later worker verdict cannot supersede it.
   Controls: `an_early_done_plant`, `a_late_worker_verdict_plant`.
+- **`retirement_preserves_survivors_and_exact_assignment_ownership`** *simulated* (`crates/blaze-dist/src/jobs/retirement_tests.rs`): retiring an owned assignment fences its work without ending another subscriber or releasing capacity before its exact stop acknowledgment; stale retirement, unowned retirement and stale acknowledgments cannot affect a replacement assignment.
+  Controls: `leaving_without_retirement`, `release_without_a_pending_stop`, `a_stale_retirement_of_the_replacement_lead`, `a_stale_acknowledgment_of_a_reused_slot`, `an_unowned_retirement`, `retired_work_kept_under_its_old_lease`, `promotion_erasing_the_continuing_owner`, `cleanup_using_only_the_last_observed_attempt`, `a_stale_claimed_helper_misclassified_as_unclaimed`.
+- **`cancellation_cleans_a_promotion_the_worker_has_not_observed`** *simulated* (`crates/blaze-dist/src/jobs/retirement_tests.rs`): cancellation before a worker observes its promotion releases only that continuing owner's stopped slot, using a fresh exact token within the existing attempt bound; stale requests and other owners cannot take it or follow it into a new execution.
+  Controls: `leaving_without_retirement`, `release_without_a_pending_stop`, `a_stale_retirement_of_the_replacement_lead`, `a_stale_acknowledgment_of_a_reused_slot`, `an_unowned_retirement`, `retired_work_kept_under_its_old_lease`, `promotion_erasing_the_continuing_owner`, `cleanup_using_only_the_last_observed_attempt`, `a_stale_claimed_helper_misclassified_as_unclaimed`.
+- **`stale_claimed_helpers_do_not_block_available_replacements`** *simulated* (`crates/blaze-dist/src/jobs/retirement_tests.rs`): a stale claimed helper cannot block an available unclaimed or idle lead replacement, and the replacement cannot steal or release that old worker's reservation.
+  Controls: `leaving_without_retirement`, `release_without_a_pending_stop`, `a_stale_retirement_of_the_replacement_lead`, `a_stale_acknowledgment_of_a_reused_slot`, `an_unowned_retirement`, `retired_work_kept_under_its_old_lease`, `promotion_erasing_the_continuing_owner`, `cleanup_using_only_the_last_observed_attempt`, `a_stale_claimed_helper_misclassified_as_unclaimed`.
 
 ### blaze-dist-local
 
 - **`a_failed_heartbeat_cannot_publish_a_successful_tail`** *tested* (`crates/blaze-dist-local/src/agent.rs`): a final compiler refusal retains its diagnostic and remains terminal under every local policy despite a concurrent heartbeat failure; a successful tail cannot hide a failed or panicking heartbeat worker.
   Controls: `a_dropped_heartbeat_failure`, `a_compiler_refusal_reclassified_as_transport_loss`.
+- **`execution_bindings_retain_cleanup_without_sliding_replay_or_expiry`** *simulated* (`crates/blaze-dist-local/src/coordinator/lifetime_tests.rs`): verified work retains its bounded cleanup lifetime across coalesced deadline changes; replay keeps the exact request and response identity, refused limits publish no transition prefix, and neither reconnect nor a new lifetime revives expiry.
+  Controls: `a_missing_verified_execution_binding`, `a_sliding_session_ceiling`, `a_lost_reply_with_changed_replay_identity`, `different_bytes_reusing_a_replay_identity`.
 
 ### blaze-graph
 

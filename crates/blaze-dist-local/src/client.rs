@@ -3,19 +3,25 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use blaze_core::wait::{Clock, Deadline, Monotonic};
 use blaze_wire::{Digest, Limits, decode, encode};
 
 use crate::Error;
 use crate::protocol::*;
 use crate::server::frame;
 
+#[expect(unsafe_code, reason = "owned nonblocking Unix connect and checked sockaddr, no raw waits")]
+mod socket;
+
 /// Local client with immutable retry state. Session labels are lifetime identities, not capabilities.
 pub struct Client {
     stream: UnixStream,
-    /// Negotiated clock, versions, epoch and frame bounds.
+    socket: PathBuf,
+    /// Clock, versions, epoch and bounds from the most recent handshake. Verified job
+    /// traffic can extend expiry; reconnect refreshes expires_ms without changing identity.
     pub welcome: LocalWelcome,
     next: u64,
     pending: Option<Request>,
@@ -26,7 +32,9 @@ pub struct Client {
     reason = "a hello is sent once; its one caller gives it up"
 )]
 fn connect(path: &Path, hello: LocalHello) -> Result<(UnixStream, LocalWelcome), Error> {
-    let mut stream = UnixStream::connect(path)?;
+    let clock = Monotonic::new();
+    let deadline = Deadline::after(clock.now(), Duration::from_secs(5));
+    let mut stream = socket::connect_until(path, deadline, &clock)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(&frame(&encode(&ClientFrame::Hello(hello.clone()))))?;
@@ -68,7 +76,13 @@ impl Client {
     /// idempotent while that lifetime is live; it is not a capability or an authority.
     pub fn connect(path: &Path, nonce: Digest) -> Result<Self, Error> {
         let (stream, welcome) = connect(path, hello(nonce))?;
-        Ok(Self { next: welcome.next_request, welcome, stream, pending: None })
+        Ok(Self {
+            next: welcome.next_request,
+            welcome,
+            stream,
+            socket: path.to_owned(),
+            pending: None,
+        })
     }
 
     /// Resume this same lifetime and epoch. A pending request is never changed, skipped or
@@ -86,6 +100,7 @@ impl Client {
             return Err(Error::Protocol("resume-request-gap".to_owned()));
         }
         self.stream = stream;
+        self.socket = path.to_owned();
         self.welcome = welcome;
         Ok(())
     }
@@ -102,6 +117,8 @@ impl Client {
     }
 
     /// Submit a new command only after the previous response is bound and decoded.
+    /// One IO failure resumes this same session and retries its identical pending bytes.
+    /// Protocol refusal or genuine lifetime expiry never creates a replacement session.
     pub fn call(&mut self, command: Command) -> Result<Answer, Error> {
         if self.pending.is_some() {
             return Err(Error::Protocol("retry pending request first".to_owned()));
@@ -112,7 +129,14 @@ impl Client {
             sequence: self.next,
             command,
         });
-        self.retry()
+        match self.retry() {
+            Err(Error::Io(_)) => {
+                let socket = self.socket.clone();
+                self.reconnect(&socket)?;
+                self.retry()
+            }
+            answer => answer,
+        }
     }
 
     /// Resend the pending bytes unchanged. IO/disconnect errors retain them.
@@ -169,6 +193,8 @@ fn validate_answer(command: &Command, answer: &Answer) -> Result<(), Error> {
         (Command::Result(_), Answer::Result(_)) => true,
         (Command::WorkerEvents(_), Answer::WorkerEvents(_)) => true,
         (Command::KillAck(_), Answer::KillAck(_)) => true,
+        (Command::RetireAssignment(_), Answer::Ack(_)) => true,
+        (Command::OwnedAssignment(_), Answer::OwnedAssignment(_)) => true,
         (Command::Claim(_), Answer::Claimed(_)) => true,
         (Command::Packs(_), Answer::Packs(_)) => true,
         (Command::CommitPublication(_), Answer::Publication(_)) => true,

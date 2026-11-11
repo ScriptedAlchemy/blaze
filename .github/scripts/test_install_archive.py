@@ -35,7 +35,7 @@ def fixture(root="/work with spaces"):
         cache_home=f"{temporary}/blaze-fs/cache", store=f"{state}/v2/store",
         target=f"{state}/build/ci", llvm="/usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu",
         bash_env=f"{temporary}/blaze-sigrtmin6.sh", uv=f"{root}/uv",
-        name="blaze-install-123-1", uid=1001, gid=1001,
+        name="blaze-install-123-1", uid=1001, gid=1001, cores=2, daemon_memory_gb=6,
     )
 
 
@@ -75,6 +75,18 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(env["UV_PYTHON_INSTALL_DIR"], config.temporary + "/archive-python")
         self.assertEqual(options(cmd, "--user"), ["1001:1001"])
         self.assertEqual(options(cmd, "--ulimit"), ["memlock=-1:-1"])
+
+    def test_explicit_resource_settings_survive_the_container_boundary(self):
+        config = replace(fixture(), cores=3, daemon_memory_gb=7)
+        env = dict(value.split("=", 1) for value in options(archive.command(config), "--env"))
+        self.assertEqual(env["BLAZE_CORES"], "3")
+        self.assertEqual(env["BLAZE_DAEMON_MEMORY_GB"], "7")
+        for name in ("cores", "daemon_memory_gb"):
+            for value in (0, -1, True, "6", None):
+                with self.subTest(name=name, value=value), patch.object(archive.subprocess, "run") as run:
+                    with self.assertRaisesRegex(ValueError, "explicit positive integer"):
+                        archive.build(replace(fixture(), **{name: value}))
+                    run.assert_not_called()
 
     def test_image_registers_its_runtime_user_with_a_writable_home_cache(self):
         config = fixture()

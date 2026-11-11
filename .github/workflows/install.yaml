@@ -10,9 +10,9 @@ name: install
 on:
   push:
     branches: [main]
-    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_container.py", ".github/scripts/test_install_container.py", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/actions/blaze/**", ".github/actions/reflink/**", ".github/scripts/seed_preflight.py", ".github/scripts/test_seed_preflight.py", ".github/scripts/install_container.py", ".github/scripts/test_install_container.py", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
   pull_request:
-    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/scripts/install_container.py", ".github/scripts/test_install_container.py", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/actions/blaze/**", ".github/actions/reflink/**", ".github/scripts/seed_preflight.py", ".github/scripts/test_seed_preflight.py", ".github/scripts/install_container.py", ".github/scripts/test_install_container.py", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
   release:
     types: [published]
   schedule:
@@ -47,6 +47,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: shellcheck -s sh site/install.sh
+      - name: bounded seed readiness and shutdown regressions
+        run: python3 -I -B .github/scripts/test_seed_preflight.py
       - name: installer channel workflow regressions
         run: python3 -I .github/scripts/test_install_channels.py
       - name: environment-cleared container identity regressions
@@ -159,6 +161,9 @@ jobs:
     runs-on: ubuntu-24.04
     # A clean build of blaze by blaze, as a release's: about 97 minutes on this runner.
     timeout-minutes: 330
+    env:
+      BLAZE_CORES: "2"
+      BLAZE_DAEMON_MEMORY_GB: "6"
     steps:
       - uses: actions/checkout@v7
       - name: isolated bootstrap and registry directory
@@ -186,9 +191,11 @@ jobs:
             --arg uv "$(command -v uv)" \
             --arg name "blaze-install-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --argjson uid "$(id -u)" --argjson gid "$(id -g)" \
+            --argjson cores "$BLAZE_CORES" --argjson daemon_memory_gb "$BLAZE_DAEMON_MEMORY_GB" \
             '{workspace:$workspace, temporary:$temporary, home:$home, cargo_home:$cargo_home,
               blaze_home:$blaze_home, cache_home:$cache_home, store:$store, target:$target,
-              llvm:$llvm, bash_env:$bash_env, uv:$uv, name:$name, uid:$uid, gid:$gid}' \
+              llvm:$llvm, bash_env:$bash_env, uv:$uv, name:$name, uid:$uid, gid:$gid,
+              cores:$cores, daemon_memory_gb:$daemon_memory_gb}' \
             > "$RUNNER_TEMP/install-archive.json"
           uv run --frozen --no-dev python .github/scripts/install_archive.py "$RUNNER_TEMP/install-archive.json"
         timeout-minutes: 300

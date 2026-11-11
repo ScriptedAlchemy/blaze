@@ -255,9 +255,11 @@ class Daemon:
             if result["returncode"] != 0:
                 raise Failed(f"blaze stop exited {result['returncode']}")
             try:
-                self.process.wait(timeout=30)
+                status = self.process.wait(timeout=30)
             except subprocess.TimeoutExpired as error:
                 raise Failed("daemon did not exit within 30 s after blaze stop") from error
+            if status != 0:
+                raise Failed(f"the owned daemon exited {status} despite a successful stop command")
         finally:
             terminate(self.process)
             self.process = None

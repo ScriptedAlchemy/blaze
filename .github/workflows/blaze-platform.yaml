@@ -25,11 +25,11 @@ on:
         type: string
         required: true
       blaze-cli:
-        description: "`blaze` against cargo on small projects at pinned commits"
+        description: "selected Blaze and its fresh-build comparison on small projects at pinned commits"
         type: boolean
         default: false
       projects:
-        description: "`blaze` against cargo on the larger projects (an hour of machines)"
+        description: "selected Blaze and its fresh-build comparison on larger projects"
         type: boolean
         default: false
       bench:
@@ -55,6 +55,9 @@ on:
       forkfixes_acceptance:
         description: true only after every Linux fork migration fixture passes with this source-built Blaze
         value: ${{ jobs.forkfixes.outputs.accepted }}
+      protocol_tests:
+        description: true only after all distributed library and integration tests pass with this source-built Blaze
+        value: ${{ jobs.distributed-tests.outputs.accepted }}
 
 env:
   # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
@@ -174,6 +177,11 @@ jobs:
     # (https://github.com/indexable-inc/blaze/issues/899) is the work, not a reason for cargo.
     outputs:
       parts: ${{ steps.parts.outputs.parts || steps.focused.outputs.parts }}
+    # B0 reclaims its front end on the loop. Keep this full source build's reader wave
+    # smaller; any admission error or stall still fails it. Stage 1 jobs own their budgets.
+    env:
+      BLAZE_CORES: "2"
+      BLAZE_DAEMON_MEMORY_GB: "6"
     steps:
       - name: no blaze for Windows
         if: env.BLAZE != 'true'
@@ -293,6 +301,84 @@ jobs:
       - if: failure()
         uses: ./.github/actions/daemon-log
 
+  # These protocol, publication and transport crates are absent from unittests.py's crate
+  # list. Their integration targets need this branch's same-name lib/bin lowering fix:
+  # the pinned seed cannot compile them, so the full receipt requires the built Stage 1.
+  distributed-tests:
+    name: distributed protocol and carrier tests
+    needs: build
+    if: inputs.harnesses == '' && inputs.platform == 'linux-arm64'
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 90
+    outputs:
+      accepted: ${{ steps.accepted.outputs.accepted }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: blaze
+        uses: ./.github/actions/blaze
+        with:
+          job: distributed-tests
+          llvm: true
+          reflink: "true"
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: ${{ runner.temp }}/protocol-binaries
+      - name: verify the protocol test Stage 1 handoff
+        id: handoff
+        run: |
+          mkdir -p "$RUNNER_TEMP/protocol-evidence"
+          tar -xf "$RUNNER_TEMP/protocol-binaries/blaze.tar" -C "$RUNNER_TEMP/protocol-binaries"
+          jq -n --arg bin "$RUNNER_TEMP/protocol-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          cp "$RUNNER_TEMP/protocol-binaries/blaze-build.json" "$RUNNER_TEMP/protocol-evidence/stage1-build.json"
+      - name: distributed protocol and carrier tests with Stage 1
+        id: protocol
+        timeout-minutes: 75
+        env:
+          BLAZE_HOME: ${{ runner.temp }}/blaze-fs/protocol-tests
+          BLAZE_CACHE: ${{ runner.temp }}/blaze-fs/protocol-tests/v2/store
+          CARGO_TARGET_DIR: ${{ runner.temp }}/blaze-fs/protocol-target
+          BLAZE_DAEMON_MEMORY_GB: "12"
+          BLAZE_TESTS: verify
+        run: |
+          "$RUNNER_TEMP/protocol-binaries/blaze" --ignore-pin test --release --locked \
+            -p blaze-wire -p blaze-dist -p blaze-dist-local -p blaze-serve --lib --tests --no-fail-fast \
+            2>&1 | tee "$RUNNER_TEMP/protocol-evidence/tests.log"
+      - name: stop the protocol test daemon
+        if: always() && steps.handoff.outcome == 'success' && steps.protocol.outcome != 'skipped'
+        env:
+          BLAZE_HOME: ${{ runner.temp }}/blaze-fs/protocol-tests
+        run: timeout --kill-after=10s 60s "$RUNNER_TEMP/protocol-binaries/blaze" --ignore-pin stop
+      - name: protocol tests completed with unchanged Stage 1 and source
+        id: accepted
+        env:
+          PROTOCOL_TEST_OUTCOME: ${{ steps.protocol.outcome }}
+        run: |
+          test "$PROTOCOL_TEST_OUTCOME" = success \
+            || { echo "::error::the complete protocol test run did not succeed"; exit 1; }
+          test -s "$RUNNER_TEMP/protocol-evidence/tests.log" \
+            || { echo "::error::the complete protocol test run has no retained log"; exit 1; }
+          jq -n --arg bin "$RUNNER_TEMP/protocol-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          echo 'accepted=true' >> "$GITHUB_OUTPUT"
+      - if: failure()
+        uses: ./.github/actions/daemon-log
+        env:
+          BLAZE_HOME: ${{ runner.temp }}/blaze-fs/protocol-tests
+      - name: keep protocol test evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: protocol-tests-${{ inputs.platform }}
+          path: |
+            ${{ runner.temp }}/protocol-evidence
+            ${{ runner.temp }}/blaze-fs/protocol-tests/v2/serve.log
+          retention-days: 14
+          if-no-files-found: error
+
   # The self-build is shared with the existing tests, profile gate and benchmark jobs. Only
   # the coordinator and cache server are built here, by that Stage 1 in its own daemon home.
   # The fixture's two workers share this runner's resources and verified reflink filesystem;
@@ -302,7 +388,7 @@ jobs:
     needs: build
     if: inputs.harnesses == '' && inputs.platform == 'linux-arm64'
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 355
+    timeout-minutes: 330
     permissions:
       contents: read
     outputs:
@@ -341,23 +427,6 @@ jobs:
         run: |
           "$RUNNER_TEMP/dist-binaries/blaze" --ignore-pin build --release --locked -p blaze-dist-local -p blaze-serve --bins \
             2>&1 | tee "$RUNNER_TEMP/dist-evidence/services-build.log"
-      # These protocol, publication and transport crates are not in unittests.py's crate
-      # list. Run their real default library/integration targets, including Hegel controls,
-      # with the same Stage 1 that builds the acceptance services. Cached test passes alone
-      # do not satisfy this lane: verify reruns the tests and compares the result.
-      - name: distributed protocol and carrier tests with Stage 1
-        id: protocol-tests
-        timeout-minutes: 75
-        env:
-          BLAZE_HOME: ${{ runner.temp }}/blaze-fs/dist-builder
-          BLAZE_CACHE: ${{ runner.temp }}/blaze-fs/dist-builder/v2/store
-          BLAZE_DAEMON_MEMORY_GB: "12"
-          BLAZE_TESTS: verify
-          CARGO_TARGET_DIR: ${{ runner.temp }}/blaze-fs/dist-service-build
-        run: |
-          "$RUNNER_TEMP/dist-binaries/blaze" --ignore-pin test --release --locked \
-            -p blaze-wire -p blaze-dist -p blaze-dist-local -p blaze-serve --lib --tests --no-fail-fast \
-            2>&1 | tee "$RUNNER_TEMP/dist-evidence/protocol-tests.log"
       - name: stop the isolated Stage 1 builder
         if: always() && steps.handoff.outcome == 'success' && steps.services.outcome != 'skipped'
         env:
@@ -669,10 +738,8 @@ jobs:
           BLAZE_HOME="$RUNNER_TEMP/blaze-home" $PYTHON harness/smoke.py \
             "{\"groups\": [\"std\"], \"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"work\": \"$RUNNER_TEMP/smoke\"}"
 
-  # `blaze` in place of cargo on projects at pinned commits, and the flags and the daemon's
-  # life. Incremental compilation is left to the profile,
-  # as on a developer's machine: with it off the tests of every project are cargo's (the
-  # harness has that case among the flags).
+  # The selected source-built Blaze on pinned projects, flag combinations and daemon life.
+  # Each result is held to that same Blaze building the source from a fresh home and target.
   blaze-cli:
     name: blaze (${{ matrix.group }})
     if: inputs.blaze-cli
@@ -687,37 +754,67 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/toolchain
+      - uses: ./.github/actions/blaze
         with:
-          llvm: run
+          job: blaze-cli
+          llvm: true
+          reflink: ${{ runner.os == 'Linux' && 'true' || 'false' }}
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}
-          path: target/release
-      - run: tar -xf blaze.tar
-        working-directory: target/release
-      - name: blaze against cargo
+          path: ${{ runner.temp }}/cli-binaries
+      - name: verify the CLI harness Stage 1
+        id: handoff
+        run: |
+          mkdir -p "$RUNNER_TEMP/cli-evidence"
+          tar -xf "$RUNNER_TEMP/cli-binaries/blaze.tar" -C "$RUNNER_TEMP/cli-binaries"
+          jq -n --arg bin "$RUNNER_TEMP/cli-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          cp "$RUNNER_TEMP/cli-binaries/blaze-build.json" "$RUNNER_TEMP/cli-evidence/stage1-build.json"
+      - name: selected Blaze CLI checks and projects
         working-directory: harness
         # Under the job's limit, so that a run that hangs leaves time to keep what it logged.
         timeout-minutes: 40
+        env:
+          CLI_GROUP: ${{ matrix.group }}
+          TMPDIR: ${{ runner.os == 'Linux' && format('{0}/blaze-fs', runner.temp) || '/tmp' }}
         run: |
-          if [ "${{ matrix.group }}" = checks ]; then what=--only-checks; else what="--only-projects ${{ matrix.group }}"; fi
-          BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" env -u CARGO_INCREMENTAL $PYTHON blaze_cli.py $what
+          jq -n --arg blaze "$RUNNER_TEMP/cli-binaries/blaze" --arg group "$CLI_GROUP" \
+            --arg tmp "$TMPDIR" --arg output "$RUNNER_TEMP/cli-evidence" \
+            '{blaze: $blaze, part: (if $group == "checks" then "checks" else "projects" end),
+              projects: (if $group == "checks" then [] else ($group | split(" ")) end),
+              tmp: $tmp, output: $output}' > "$RUNNER_TEMP/cli-evidence/input.json"
+          env -u CARGO_INCREMENTAL uv run --frozen --no-dev python blaze_cli.py "$RUNNER_TEMP/cli-evidence/input.json" \
+            2>&1 | tee "$RUNNER_TEMP/cli-evidence/run.log"
+      - name: CLI checks used unchanged Stage 1 and source
+        if: always() && steps.handoff.outcome == 'success'
+        run: |
+          jq -n --arg bin "$RUNNER_TEMP/cli-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
       - name: what was running, and the daemons' logs
         if: failure()
-        run: ps -eo pid,ppid,etime,args > /tmp/blaze-cargo-processes.txt
-      - if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/cli-evidence"
+          ps -eo pid,ppid,etime,args > "$RUNNER_TEMP/cli-evidence/processes.txt"
+      - if: always()
         uses: actions/upload-artifact@v7
         with:
           name: blaze-cli-logs-${{ inputs.platform }}-${{ strategy.job-index }}
           path: |
-            /tmp/blaze-cargo-processes.txt
-            /tmp/blaze-cargo-*/home-*/*.log
-            /tmp/blaze-cargo-*/home-*/*/*/log
-          if-no-files-found: ignore
+            ${{ runner.temp }}/cli-evidence
+            ${{ runner.temp }}/blaze-fs/blaze-cargo-*/*.txt
+            ${{ runner.temp }}/blaze-fs/blaze-cargo-*/home-*/v2/serve.log
+            /tmp/blaze-cargo-*/*.txt
+            /tmp/blaze-cargo-*/home-*/v2/serve.log
+          retention-days: 14
+          if-no-files-found: error
 
   # The larger projects as they are published, natively on hosted AArch64: what the
-  # programs print and what every test says has to be what cargo gives. The ten after these took
+  # programs print and every test result must match a fresh build by the same Blaze. The ten after these took
   # more than a hosted runner's three hours, and it was shut down loading rust-analyzer.
   projects:
     name: projects (${{ matrix.projects }})
@@ -738,23 +835,61 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/toolchain
+      - uses: ./.github/actions/blaze
         with:
-          llvm: run
+          job: projects
+          llvm: true
+          reflink: ${{ runner.os == 'Linux' && 'true' || 'false' }}
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}
-          path: target/release
-      - run: tar -xf blaze.tar
-        working-directory: target/release
-      - name: blaze
-        working-directory: harness
+          path: ${{ runner.temp }}/projects-binaries
+      - name: verify the project harness Stage 1
+        id: handoff
         run: |
-          if [ "${{ matrix.projects }}" = checks ]; then what=--only-checks; else what="--only-projects ${{ matrix.projects }}"; fi
+          mkdir -p "$RUNNER_TEMP/projects-evidence"
+          tar -xf "$RUNNER_TEMP/projects-binaries/blaze.tar" -C "$RUNNER_TEMP/projects-binaries"
+          jq -n --arg bin "$RUNNER_TEMP/projects-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          cp "$RUNNER_TEMP/projects-binaries/blaze-build.json" "$RUNNER_TEMP/projects-evidence/stage1-build.json"
+      - name: selected Blaze larger projects
+        working-directory: harness
+        env:
+          CLI_GROUP: ${{ matrix.projects }}
+          TMPDIR: ${{ runner.os == 'Linux' && format('{0}/blaze-fs', runner.temp) || '/tmp' }}
+        run: |
+          jq -n --arg blaze "$RUNNER_TEMP/projects-binaries/blaze" --arg group "$CLI_GROUP" \
+            --arg tmp "$TMPDIR" --arg output "$RUNNER_TEMP/projects-evidence" \
+            '{blaze: $blaze, part: (if $group == "checks" then "checks" else "projects" end),
+              projects: (if $group == "checks" then [] else ($group | split(" ")) end),
+              tmp: $tmp, output: $output}' > "$RUNNER_TEMP/projects-evidence/input.json"
           status=0
-          BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" $PYTHON blaze_cli.py $what || status=$?
-          cat BLAZE-CLI*.md
+          uv run --frozen --no-dev python blaze_cli.py "$RUNNER_TEMP/projects-evidence/input.json" \
+            2>&1 | tee "$RUNNER_TEMP/projects-evidence/run.log" || status=$?
+          if [ -f "$RUNNER_TEMP/projects-evidence/BLAZE-CLI.md" ]; then cat "$RUNNER_TEMP/projects-evidence/BLAZE-CLI.md"; fi
           exit $status
+      - name: project checks used unchanged Stage 1 and source
+        if: always() && steps.handoff.outcome == 'success'
+        run: |
+          jq -n --arg bin "$RUNNER_TEMP/projects-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+      - name: keep project harness evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: project-logs-${{ inputs.platform }}-${{ strategy.job-index }}
+          path: |
+            ${{ runner.temp }}/projects-evidence
+            ${{ runner.temp }}/blaze-fs/blaze-cargo-*/*.txt
+            ${{ runner.temp }}/blaze-fs/blaze-cargo-*/home-*/v2/serve.log
+            /tmp/blaze-cargo-*/*.txt
+            /tmp/blaze-cargo-*/home-*/v2/serve.log
+          retention-days: 14
+          if-no-files-found: error
 
   # Not required to pass yet: the baseline was measured on another machine than the runner, so
   # the threshold on times is wide, and what it holds exactly is who built each step, whether
@@ -770,23 +905,52 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/toolchain
+      - uses: ./.github/actions/blaze
         with:
-          llvm: run
+          job: bench
+          llvm: true
+          reflink: ${{ runner.os == 'Linux' && 'true' || 'false' }}
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}
-          path: target/release
-      - run: tar -xf blaze.tar
-        working-directory: target/release
+          path: ${{ runner.temp }}/bench-binaries
+      - name: verify the benchmark Stage 1 handoff
+        id: handoff
+        run: |
+          tar -xf "$RUNNER_TEMP/bench-binaries/blaze.tar" -C "$RUNNER_TEMP/bench-binaries"
+          jq -n --arg bin "$RUNNER_TEMP/bench-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
       - name: Bench
         working-directory: harness
+        env:
+          BENCH_MACHINE: GitHub-hosted ${{ inputs.os }} (${{ inputs.platform }})
         run: |
-          export BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" BLAZE_LLVM_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine"
-          $PYTHON bench.py ripgrep --out "$RUNNER_TEMP/bench.json"
-          $PYTHON bench.py --compare bench-baseline.json "$RUNNER_TEMP/bench.json" --threshold 200
+          bench_root=/tmp
+          if [ "$RUNNER_OS" = Linux ]; then bench_root="$RUNNER_TEMP/blaze-fs"; fi
+          export TMPDIR="$bench_root"
+          jq -n --arg blaze "$RUNNER_TEMP/bench-binaries/blaze" \
+            --arg work "$bench_root/bench-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --arg sources "$bench_root/bench-projects" --arg out "$RUNNER_TEMP/bench.json" \
+            --arg commit "$GITHUB_SHA" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg machine "$BENCH_MACHINE" \
+            '{action: "run", blaze: $blaze, work: $work, sources: $sources, out: $out,
+              projects: ["ripgrep"], backends: ["cranelift", "llvm"], commit: $commit, run_url: $run, machine: $machine}' \
+            > "$RUNNER_TEMP/bench-input.json"
+          $PYTHON bench.py "$RUNNER_TEMP/bench-input.json"
+          jq -n --arg baseline "$GITHUB_WORKSPACE/harness/bench-baseline.json" --arg result "$RUNNER_TEMP/bench.json" \
+            '{action: "compare", baseline: $baseline, result: $result, threshold: 200}' \
+            > "$RUNNER_TEMP/bench-compare.json"
+          $PYTHON bench.py "$RUNNER_TEMP/bench-compare.json"
+      - name: benchmark source and compiler are unchanged
+        if: always() && steps.handoff.outcome == 'success'
+        run: |
+          jq -n --arg bin "$RUNNER_TEMP/bench-binaries" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: bench
-          path: ${{ runner.temp }}/bench.json
+          name: bench-${{ inputs.platform }}
+          path: |
+            ${{ runner.temp }}/bench.json
+            ${{ runner.temp }}/bench-input.json
+            ${{ runner.temp }}/bench-binaries/blaze-build.json

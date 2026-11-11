@@ -2,7 +2,7 @@
 
 The pinned stage 0 cannot start on linux-azure 6.8's broken buffer-ring check. Moving only the
 host kernel preserves the release's C compiler, old glibc and build_release.py's ABI checks.
-All paths are explicit in one typed JSON input. The caller prepares the pinned Blaze, LLVM
+All paths and bootstrap resource settings are explicit in one typed JSON input. The caller prepares the pinned Blaze, LLVM
 and a verified reflink volume through .github/actions/blaze; no host system libraries enter
 the container, and Blaze's own build-script sandbox remains enabled.
 """
@@ -33,6 +33,8 @@ class Archive:
     name: str
     uid: int
     gid: int
+    cores: int
+    daemon_memory_gb: int
 
 
 IMAGE = "blaze-install-archive"
@@ -66,6 +68,10 @@ def command(config: Archive) -> list[str]:
     """The container boundary: only named inputs, one uid and the host's verified volume."""
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]+", config.name):
         raise ValueError(f"invalid archive container name: {config.name!r}")
+    for name in ("cores", "daemon_memory_gb"):
+        value = getattr(config, name)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"archive {name} must be an explicit positive integer, got {value!r}")
     user = install_container.User(config.uid, config.gid, config.home)
     paths = [config.workspace, config.temporary, config.home, config.cargo_home, config.blaze_home,
              config.cache_home, config.store, config.target, config.llvm, config.bash_env, config.uv]
@@ -97,7 +103,8 @@ def command(config: Archive) -> list[str]:
         "HOME": config.home, "CARGO_HOME": config.cargo_home, "BASH_ENV": config.bash_env,
         "BLAZE_HOME": config.blaze_home, "XDG_CACHE_HOME": config.cache_home,
         "BLAZE_CACHE": config.store, "CARGO_TARGET_DIR": config.target,
-        "BLAZE_CACHE_MAX": "off", "BLAZE_CORES": "all", "BLAZE_LOCK": "write",
+        "BLAZE_CACHE_MAX": "off", "BLAZE_CORES": str(config.cores), "BLAZE_LOCK": "write",
+        "BLAZE_DAEMON_MEMORY_GB": str(config.daemon_memory_gb),
         "LLVM_SYS_231_PREFIX": config.llvm,
         "PATH": f"{config.cargo_home}/bin:{config.temporary}/archive-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         # Never reuse the host's workspace venv or its interpreter/symlinks.

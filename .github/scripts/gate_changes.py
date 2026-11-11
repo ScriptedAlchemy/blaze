@@ -57,6 +57,21 @@ CODE = (
     "harness/forkfixes/",
     ".github/scripts/forkfixes_acceptance.py",
     ".github/scripts/test_forkfixes_ci.py",
+    # The train's selected-Blaze CLI harness and its invocation/fixture controls.
+    "harness/blaze_cli.py",
+    ".github/scripts/test_blaze_cli.py",
+    # Current train benchmarks and their native preparation/evidence contracts.
+    "harness/bench.py",
+    "harness/benchschema.py",
+    "harness/test_bench.py",
+    ".github/scripts/test_benchmark_ci.py",
+    "harness/rival.py",
+    ".github/scripts/test_rival.py",
+    "harness/bunprep.py",
+    ".github/scripts/test_bunprep.py",
+    # The D11 ledger entry consumes sealed distributed acceptance evidence.
+    "harness/v2/distributed.py",
+    "harness/v2/test_distributed.py",
     # What fetches and checks the pinned LLVM for the build (.github/actions/blaze). No Nix:
     # neither job reads the flake.
     ".github/scripts/llvm.py",
@@ -69,6 +84,8 @@ CODE = (
     # The release of blaze that builds and tests blaze (.github/actions/blaze), and its installer.
     ".github/blaze-version",
     "site/install.sh",
+    ".github/scripts/seed_preflight.py",
+    ".github/scripts/test_seed_preflight.py",
     # The gate's jobs, and the actions they use.
     ".github/workflows/blaze.yaml",
     ".github/workflows/blaze-platform.yaml",

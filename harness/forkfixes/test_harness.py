@@ -129,6 +129,24 @@ class HarnessChecks(unittest.TestCase):
                 with self.assertRaisesRegex(runner.Failed, "600 s"):
                     daemon.start()
 
+    def test_successful_stop_command_cannot_hide_the_owned_daemons_crash(self):
+        for status in (0, 77, -9):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                process = Mock(pid=123)
+                process.wait.return_value = status
+                daemon = runner.Daemon(runner.Input("fake", directory), Path(directory))
+                daemon.process = process
+                with patch.object(runner, "command", return_value={"returncode": 0}), \
+                        patch.object(runner, "terminate") as terminate:
+                    if status == 0:
+                        daemon.stop()
+                    else:
+                        with self.assertRaisesRegex(runner.Failed, f"owned daemon exited {status}"):
+                            daemon.stop()
+                process.wait.assert_called_once_with(timeout=30)
+                terminate.assert_called_once_with(process)
+                self.assertIsNone(daemon.process)
+
     def test_warm_replay_must_report_store_hits(self):
         case = {"name": "replay", "files": {"src/main.rs": "fn main() {}"},
                 "steps": [{"replay": True, "prints": []}]}
@@ -186,7 +204,7 @@ class HarnessChecks(unittest.TestCase):
             root = Path(directory)
             (root / "logs").mkdir()
             daemon = runner.Daemon(runner.Input("fake", directory), root)
-            process = Mock(pid=42, poll=Mock(return_value=None))
+            process = Mock(pid=42, poll=Mock(return_value=None), wait=Mock(return_value=0))
             commands = []
 
             def fake_command(argv, cwd, env, log, timeout):

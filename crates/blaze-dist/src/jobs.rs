@@ -26,6 +26,9 @@ use crate::{Millis, Refusal};
 
 mod ingress;
 
+/// The registry permits one lead reassignment; loss of its second attempt ends the execution.
+pub const MAX_ATTEMPTS: u32 = 2;
+
 /// An execution's timings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionConfig {
@@ -110,6 +113,20 @@ pub struct AssignmentToken {
     pub attempt: Attempt,
 }
 
+/// The registry's one ownership record, retained through the assignment's pending stop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Assignment {
+    token: AssignmentToken,
+    stopping: bool,
+    claimant: Option<Digest>,
+}
+
+impl Assignment {
+    fn new(token: AssignmentToken) -> Assignment {
+        Assignment { token, stopping: false, claimant: None }
+    }
+}
+
 /// What an execution asks its driver to do, or tells it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -161,12 +178,10 @@ pub struct Execution {
     attempt: Attempt,
     lead: Option<String>,
     helpers: BTreeSet<String>,
-    /// Which agent process runs each assigned executor of this attempt ([`Jobs::claim`]).
-    claims: BTreeMap<String, Digest>,
-    claims_attempt: Attempt,
     lead_heard: Millis,
     heard: BTreeMap<String, Millis>,
     losses: u32,
+    /// Slots unavailable to this execution after loss or voluntary retirement.
     lost: BTreeSet<String>,
     work: Option<WorkSet>,
     subscribers: BTreeMap<u64, Subscriber>,
@@ -202,8 +217,6 @@ impl Execution {
             attempt: Attempt(1),
             lead: None,
             helpers: BTreeSet::new(),
-            claims: BTreeMap::new(),
-            claims_attempt: Attempt(0),
             lead_heard: now,
             heard: BTreeMap::new(),
             losses: 0,
@@ -387,7 +400,7 @@ impl Execution {
 
     /// Another helper for the current attempt: an idle executor of the right trust, platform
     /// and front end, as admission offers it (non-blocking: a lead never waits for one). Never
-    /// a lead this execution lost.
+    /// a slot this execution lost or retired.
     pub fn add_helper(&mut self, _now: Millis, executor: &str) -> Result<Attempt, Refusal> {
         if let ExecState::Ended(_) = self.state {
             return Err(Refusal::Ended);
@@ -409,6 +422,36 @@ impl Execution {
             return Err(Refusal::Ended);
         }
         if self.executors().any(|e| e == from) { Ok(()) } else { Err(Refusal::NotHolder) }
+    }
+
+    /// The registry verified the exact assignment owner. Revoke its work and request
+    /// its stop; the reservation remains held until the separate acknowledgment.
+    fn retire(
+        &mut self,
+        now: Millis,
+        from: &str,
+        attempt: Attempt,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), Refusal> {
+        if attempt != self.attempt {
+            return Err(Refusal::AttemptMoved);
+        }
+        self.member(from)?;
+        if let Some(work) = &mut self.work {
+            let mut log = Vec::new();
+            work.retire(from, &mut log);
+            out.extend(log.into_iter().map(Effect::Work));
+        }
+        self.heard.remove(from);
+        if self.lead.as_deref() == Some(from) {
+            self.lose_lead(now, out);
+        } else {
+            self.helpers.remove(from);
+            self.lost.insert(from.to_owned());
+            out.push(Effect::Kill { executor: from.to_owned(), assignment: self.assignment() });
+            self.after_work(now, out);
+        }
+        Ok(())
     }
 
     fn work_call<T>(
@@ -671,15 +714,7 @@ impl Execution {
         }
         let window = self.config.heartbeat_ms * self.config.missed_heartbeats;
         if self.lead.is_some() && now > self.lead_heard + window {
-            let lost = self.lead.take().expect("lead");
-            self.lost.insert(lost.clone());
-            out.push(Effect::Kill { executor: lost, assignment: self.assignment() });
-            self.losses += 1;
-            if self.losses >= 2 {
-                return self.end(now, Outcome::Lost, EndWhy::LeadLostTwice, out);
-            }
-            out.push(Effect::NeedLead);
-            return;
+            return self.lose_lead(now, out);
         }
         if let Some(work) = &mut self.work {
             let mut log = Vec::new();
@@ -687,6 +722,18 @@ impl Execution {
             out.extend(log.into_iter().map(Effect::Work));
         }
         self.after_work(now, out);
+    }
+
+    /// Both heartbeat expiry and owned retirement use the same bounded reassignment rule.
+    fn lose_lead(&mut self, now: Millis, out: &mut Vec<Effect>) {
+        let lost = self.lead.take().expect("lead");
+        self.lost.insert(lost.clone());
+        out.push(Effect::Kill { executor: lost, assignment: self.assignment() });
+        self.losses += 1;
+        if self.losses >= MAX_ATTEMPTS {
+            return self.end(now, Outcome::Lost, EndWhy::LeadLostTwice, out);
+        }
+        out.push(Effect::NeedLead);
     }
 
     /// When the compile phase is done, the stream says so: the lead reads it and assembles.
@@ -869,7 +916,7 @@ pub struct Jobs {
     running: BTreeMap<JobContent, ExecutionId>,
     platforms: BTreeMap<ExecutionId, (Digest, Reservation)>,
     pr_jobs: BTreeMap<u64, PrJobs>,
-    assignments: BTreeMap<String, (AssignmentToken, bool)>,
+    assignments: BTreeMap<String, Assignment>,
     next_execution: u64,
     next_subscriber: u64,
 }
@@ -1022,7 +1069,7 @@ impl Jobs {
     /// Forget a terminal execution only once all assignment-stop acknowledgments arrived.
     /// A transport supplies its own retention time and calls this after it elapsed.
     pub fn forget_terminal(&mut self, execution: ExecutionId) -> bool {
-        if self.assignments.values().any(|(token, _)| token.execution == execution)
+        if self.assignments.values().any(|assignment| assignment.token.execution == execution)
             || self
                 .executions
                 .get(&execution)
@@ -1037,9 +1084,10 @@ impl Jobs {
 
     /// An agent asks which assigned executor of `execution` it runs: the one it holds already,
     /// else the lead or a helper of the current attempt nobody claimed, else `None` until
-    /// admission assigns one. A claim names who acts for an executor and grants nothing: every
-    /// work call stays fenced by the lease and attempt, and an attempt that moves forgets them
-    /// (an agent that died cannot keep an executor whose heartbeats stopped).
+    /// admission assigns one. A claim names who acts for an executor, including who may retire
+    /// it; compile work still requires its own fenced lease. A continuing reservation retains
+    /// its owner across attempt changes; fresh assignments must be claimed. A prior assignment's
+    /// pending stop also retains its original owner until acknowledgment.
     pub fn claim(
         &mut self,
         now: Millis,
@@ -1048,24 +1096,78 @@ impl Jobs {
         out: &mut Vec<(ExecutionId, Effect)>,
     ) -> Result<Option<(String, Attempt)>, Refusal> {
         self.tick(now, out);
-        let e = self.executions.get_mut(&execution).ok_or(Refusal::NoExecution)?;
+        let e = self.executions.get(&execution).ok_or(Refusal::NoExecution)?;
         if let ExecState::Ended(_) = e.state() {
             return Err(Refusal::Ended);
         }
-        let attempt = e.attempt();
-        if e.claims_attempt != attempt {
-            e.claims.clear();
-            e.claims_attempt = attempt;
+        let token = e.assignment();
+        if let Some(executor) = e.executors().find(|executor| {
+            self.assignments.get(*executor).is_some_and(|assignment| {
+                assignment.token == token
+                    && !assignment.stopping
+                    && assignment.claimant == Some(claimant)
+            })
+        }) {
+            return Ok(Some((executor.to_owned(), token.attempt)));
         }
-        if let Some((executor, _)) = e.claims.iter().find(|(_, who)| **who == claimant) {
-            return Ok(Some((executor.clone(), attempt)));
-        }
-        let free =
-            e.executors().find(|executor| !e.claims.contains_key(*executor)).map(str::to_owned);
+        let free = e
+            .executors()
+            .find(|executor| {
+                self.assignments.get(*executor).is_some_and(|assignment| {
+                    assignment.token == token
+                        && !assignment.stopping
+                        && assignment.claimant.is_none()
+                })
+            })
+            .map(str::to_owned);
         Ok(free.map(|executor| {
-            e.claims.insert(executor.clone(), claimant);
-            (executor, attempt)
+            self.assignments.get_mut(&executor).expect("assigned").claimant = Some(claimant);
+            (executor, token.attempt)
         }))
+    }
+
+    /// Reads the current token of exactly this owner's slot, including a pending stop.
+    /// It never claims a slot or changes ownership. The execution fence prevents a lookup
+    /// for an old unit from following this executor into an unrelated reservation.
+    pub fn owned_assignment(
+        &self,
+        executor: &str,
+        execution: ExecutionId,
+        claimant: Digest,
+    ) -> Result<AssignmentToken, Refusal> {
+        let held = self.assignments.get(executor).ok_or(Refusal::NotHolder)?;
+        if held.token.execution != execution || held.claimant != Some(claimant) {
+            return Err(Refusal::NotHolder);
+        }
+        Ok(held.token)
+    }
+
+    /// Requests the stop of an exact owned assignment without cancelling other subscriptions.
+    /// A retiring lead follows the existing bounded reassignment rule.
+    /// Retirement is idempotent while that stop is pending; only `killed` releases capacity.
+    /// A carrier binds `claimant` to the same owned transport identity used for `claim`.
+    pub fn retire(
+        &mut self,
+        now: Millis,
+        executor: &str,
+        assignment: AssignmentToken,
+        claimant: Digest,
+        out: &mut Vec<(ExecutionId, Effect)>,
+    ) -> Result<(), Refusal> {
+        self.tick(now, out);
+        let held = self.assignments.get(executor).ok_or(Refusal::NotHolder)?;
+        if held.token != assignment {
+            return Err(Refusal::AttemptMoved);
+        }
+        if held.claimant != Some(claimant) {
+            return Err(Refusal::NotHolder);
+        }
+        if held.stopping {
+            return Ok(());
+        }
+        self.work_route(now, assignment.execution, out, |execution, log| {
+            execution.retire(now, executor, assignment.attempt, log)
+        })
     }
 
     /// The packs of the results `execution` committed, once its compile phase is done: what an
@@ -1263,7 +1365,11 @@ impl Jobs {
         alive: bool,
     ) -> bool {
         // An acknowledgment is meaningful only for a stop we requested on this assignment.
-        if self.assignments.get(executor) != Some(&(assignment, true)) {
+        if self
+            .assignments
+            .get(executor)
+            .is_none_or(|held| held.token != assignment || !held.stopping)
+        {
             return false;
         }
         self.assignments.remove(executor);
@@ -1299,7 +1405,8 @@ impl Jobs {
             let mut log = Vec::new();
             e.admitted(now, &mut log);
             if e.assign(now, &admitted.executor, &[], &mut log).is_ok() {
-                self.assignments.insert(admitted.executor.clone(), (e.assignment(), false));
+                self.assignments
+                    .insert(admitted.executor.clone(), Assignment::new(e.assignment()));
             }
             self.after(now, admitted.execution, log, out);
         }
@@ -1352,17 +1459,30 @@ impl Jobs {
             let Ok(attempt) = e.add_helper(now, &helper) else { continue };
             let assignment = e.assignment();
             self.admission.take(&helper, id, attempt);
-            self.assignments.insert(helper.clone(), (assignment, false));
+            self.assignments.insert(helper.clone(), Assignment::new(assignment));
             out.push((id, Effect::HelperAssigned { executor: helper, assignment }));
         }
     }
 
     fn track_stop(&mut self, effect: &Effect) {
         if let Effect::Kill { executor, assignment } = effect
-            && let Some((current, stopping)) = self.assignments.get_mut(executor)
-            && current == assignment
+            && let Some(held) = self.assignments.get_mut(executor)
+            && held.token == *assignment
         {
-            *stopping = true;
+            held.stopping = true;
+        }
+    }
+
+    /// A continuing reservation did not stop when its attempt changed. Keep its owner;
+    /// only a fresh or reused slot can acquire a new owner through `claim`.
+    fn track_reassignment(&mut self, executor: String, assignment: AssignmentToken) {
+        if let Some(held) = self.assignments.get_mut(&executor)
+            && held.token.execution == assignment.execution
+            && !held.stopping
+        {
+            held.token = assignment;
+        } else {
+            self.assignments.insert(executor, Assignment::new(assignment));
         }
     }
 
@@ -1381,17 +1501,19 @@ impl Jobs {
                 let namespace = e.namespace.clone();
                 // Helpers heard from inside the lead-loss window keep helping under the
                 // new attempt, and one of them leads first: it already holds this
-                // execution's front end. A helper assigned but not yet heard from is
-                // still a candidate next: it holds this execution's reservation in
-                // admission, so the idle pool cannot offer it, and leaving it out
-                // would end a job whose replacement is already assigned to it. Only
-                // with no helper at all does admission's idle pool supply the lead,
-                // as the simulator's reassignment does.
+                // execution's front end. An unclaimed helper is a candidate next: it
+                // holds a reservation that the idle pool cannot offer. A stale claimed
+                // helper cannot be taken over while its owner might still be running;
+                // prefer an idle replacement over that unavailable reservation.
                 let mut heard = e.heard_recently(now);
                 for helper in e.executors() {
                     if Some(helper) != e.lead()
                         && !except.iter().any(|lost| lost == helper)
                         && !heard.iter().any(|candidate| candidate == helper)
+                        && self
+                            .assignments
+                            .get(helper)
+                            .is_some_and(|assignment| assignment.claimant.is_none())
                     {
                         heard.push(helper.to_owned());
                     }
@@ -1409,10 +1531,10 @@ impl Jobs {
                         if e.assign(now, &lead, &helpers, &mut more).is_ok() {
                             let assignment = e.assignment();
                             self.admission.take(&lead, id, e.attempt());
-                            self.assignments.insert(lead, (assignment, false));
+                            self.track_reassignment(lead, assignment);
                             for helper in helpers {
-                                self.admission.take(&helper, id, e.attempt());
-                                self.assignments.insert(helper, (assignment, false));
+                                self.admission.take(&helper, id, assignment.attempt);
+                                self.track_reassignment(helper, assignment);
                             }
                         }
                     }
@@ -1500,3 +1622,6 @@ mod retention_tests {
 
 #[cfg(test)]
 mod publication_tests;
+
+#[cfg(test)]
+mod retirement_tests;

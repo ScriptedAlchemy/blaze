@@ -1,74 +1,35 @@
 #!/usr/bin/env python3
-"""bench.py: what a build costs through `blaze`, phase by phase, against plain cargo.
+"""Measure the selected source-built Blaze and compare its stored regression metrics.
 
-    bench.py [PROJECT...] [--backend cranelift|llvm]... [--runs N] [--out FILE] [--work DIR]
-             [--reference DIR] [--keep] [--stress]
-    bench.py --compare BASELINE RESULT [--threshold PERCENT]
+One strict JSON object, inline, a file path, or `-` for standard input:
+    {"action":"run", "blaze":"/path/to/blaze", "work":"/fresh/bench",
+     "out":"/results/bench.json", "projects":["ripgrep"], "runs":3}
+    {"action":"compare", "baseline":"OLD.json", "result":"NEW.json", "threshold":25}
+Run and Compare below define every field. No benchmark option is read from the environment.
 
-Each project is one pinned checkout (cloned into `BLAZE_PROJECTS` as blaze_cli.py does, and
-copied; the clone is never written to). A project with `prepare` (bun) is copied from the tree
-that module's `prepare` makes beside the clone, and is measured only when named, as is one with
-`named` (dynamo, whose build needs protoc and libclang; codex, which needs libcap). A project
-with `dir` is built in that directory of its checkout (codex: codex-rs), and its edits are
-paths in it. Under each
-backend, with a store, a daemon and a home of its own, and plain cargo building the same source
-into a target directory of its own outside the checkout (under `--reference`, which lets the two be on different disks, or `WORK/reference`):
-  cold       `blaze build` from nothing, which starts the daemon and is its first build; the
-             standard library's crates are units of that build like any other, built into the
-             empty store
-  no-op      `blaze build` with nothing changed
-  body       one function's body is edited
-  signature  a function gets another parameter, and every caller the argument
-  leaf       a body in a crate of the workspace that the others depend on
-  generic    the body of a generic function that is used at many types
-  runtime    (projects with a `runtime` workload) the program blaze linked, cargo's debug build
-             and cargo's release build run the same command in turn, `--runs` times (at least
-             10) each, as speed baselines; each has to exit 0
-Every edit is made and taken back `--runs` times, or once when the daemon turned it down and
-cargo built it; the time of each is the median, and every sample of both sides is kept. None of
-them changes what the program does: after the first of each kind the program is run and has
-to say what the program of blaze's cold build said; one that does not, or a test that fails
-under `blaze test` by its own verdict (but those the project's `test_known` names), is written
-down in `wrong`. cargo is only timed. A build that fails ends its project (what was measured is
-kept, with the error in `failed`) and the run goes on. Either way the run ends with exit code 3
-after writing the result.
-The result also names the commit of blaze, the date and the machine
-(`BLAZE_BENCH_MACHINE` names it, for example the instance type); `benchreport.py` turns it
-into docs/benchmarks.md's tables and the README's numbers.
+Each pinned checkout is copied into work. Each profile has its own daemon, home, store and
+target. The phases are cold, no-op, every configured edit and its reversal, and a second
+checkout with the first one's stored units. Optional tests use each project's own verdict;
+runtime workloads time the program built by Blaze. Every successful build must identify the
+selected daemon, and an edit must splice the existing image. Programs must keep the output
+and exit status of their first cold build. A failure is retained and exits 3.
 
-For every phase the result has the wall time of the command, cargo's time for the same
-step, the memory of both sides (`memory`: the most every process doing the work held at once,
-and the largest of them; harness/memory.py, docs/benchmarks.md "Memory and disk"), the most
-the daemon has held so far (`rss_mb`), whether the build finished, and from the `blaze-work`
-line blaze builds print under `--message-format=json`: whether the daemon added the change to
-the linked program or linked again (and why), how many functions it compiled, and what it
-timed itself by step (`steps_us`). The result also has what the daemon held once ready and after each phase
-(`resident`), and what each side has on disk at the end (`disk_mb`); the runtime phase has each
-program's peak and size.
-
-Every blaze step also has the instructions and cycles blaze's processes retired over it
-(`instructions`, `cycles`, the median, and `instructions_samples`; counters.py, docs/benchmarks.md
-"Instruction counts"): the command and the daemon the first command started, read from quiet to
-quiet, user mode on Linux. Where they can't be counted they are null and `counts_gap` says why.
-The test phases are not counted.
-
-`--stress` adds the stress corpus (harness/stress-corpus/manifest.json; with no project named,
-it alone): a cold `blaze check` and a cold `blaze build` of each crate, `--runs` times each, every
-one from nothing until the daemon is ready, with its wall time, blaze's peak memory and its
-counts, under `stress` in the result. Without the manifest the result says so in `stress_gap`.
-
-`--compare` reads two results and exits 1 when a phase of the second is slower or larger
-than in the first by more than the threshold, was built by cargo where the daemon built it,
-was linked again where it was added, or is missing. Differences under 50 ms are not counted.
-
-Both backends run one blaze, `BLAZE_BIN`, which has LLVM as every native blaze does. A backend
-is a profile, as v2 picks it: `cranelift` builds the dev profile, `llvm` the release profile
-(`--release`), on both sides.
+Schema 2 contains only Blaze measurements: wall time, samples, memory, work, splice,
+instructions, cycles, disk, tests and runtime. It contains no Cargo comparison or alternate
+rustc setup. Historical result files stay in their original schema and keep their Cargo
+labels. Compare uses their stored Blaze metrics, refuses missing phases or previously
+measured Blaze fields, and holds daemon and splice behavior exactly. Timing differences of
+50 ms or less do not count. Both profiles use the exact selected binary with --ignore-pin:
+cranelift is dev, llvm is --release. The binary's path and SHA-256 are recorded and rechecked.
 """
-import glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
+import glob, hashlib, importlib, json, math, os, platform, re, shutil, statistics, subprocess, sys, time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Literal
 
-import blaze_cli, counters, memory, storelib
-from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, fetch, how_built, program_output, test_results, test_verdict, timed
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import benchschema, blaze_cli, counters, memory, storelib
+from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, fetch, how_built, program_output, test_results, test_verdict
 
 LET = "\n    let _bench_edit = 1u32;"
 
@@ -410,32 +371,64 @@ for _spec in PROJECTS.values():
         (_file, _opening, _), = _spec["edits"]["body"]
         _spec["edits"]["newfn"] = new_function(_file, _opening)
 
-# The fastest ways to build Rust there already are, measured beside plain cargo with
-# `--setups` (issue #8). Each builds into a target directory of its own after every step that
-# plain cargo builds. Flags are added to the project's own (see Setup).
-SETUPS = {
-    # Another linker for the same build: the C compiler is told which (`-fuse-ld`).
-    "mold": dict(rustflags=["-C", "link-arg=-fuse-ld=mold"]),
-    "wild": dict(rustflags=["-C", "link-arg=-fuse-ld=wild"]),
-    # The parallel front end on the same compiler, which takes -Z flags with RUSTC_BOOTSTRAP.
-    # (-Zshare-generics is already on in a debug build, so it is not a setup of its own.)
-    "threads8": dict(rustflags=["-Zthreads=8"], env=dict(RUSTC_BOOTSTRAP="1")),
-    # rustc_codegen_cranelift comes only with a nightly (BLAZE_NIGHTLY): the nightly with
-    # LLVM tells its own difference from the backend's.
-    "nightly": dict(nightly=True),
-    "cranelift": dict(nightly=True, rustflags=["-Zcodegen-backend=cranelift"]),
-    "fastest": dict(nightly=True, rustflags=["-Zcodegen-backend=cranelift", "-Zthreads=8", "-C", "link-arg=-fuse-ld=wild"]),
-    # No code at all: what an editor's check costs.
-    "check": dict(command="check"),
-}
-
-# Each backend as v2 picks it, by the profile: cargo's arguments for it, given to both sides of
-# every build. v2 compiles dev with Cranelift and release with LLVM, and refuses every unit
+# Each backend as v2 picks it, by the profile. v2 compiles dev with Cranelift and release with LLVM, and refuses every unit
 # while BLAZE_BACKEND or BLAZE_OPT is set (crates/hir-ty-codegen/v2/backend.rs).
 BACKENDS = {"cranelift": (), "llvm": ("--release",)}
 DURATION = re.compile(r"([0-9.]+)(ns|µs|ms|s)\b")
 UNITS = {"ns": 1e-9, "µs": 1e-6, "ms": 1e-3, "s": 1.0}
 FLOOR_SECS = 0.05
+RESULT_SCHEMA = benchschema.VERSION
+
+
+@dataclass(frozen=True)
+class Run:
+    blaze: str
+    work: str
+    out: str
+    action: Literal["run"] = "run"
+    projects: tuple[str, ...] = ()
+    backends: tuple[Literal["cranelift", "llvm"], ...] = ("cranelift", "llvm")
+    sources: str = os.path.expanduser("~/blaze-projects")
+    runs: int = 3
+    cold_runs: int = 1
+    tests: bool = False
+    stress: bool = False
+    keep: bool = False
+    machine: str | None = None
+    commit: str | None = None
+    run_url: str | None = None
+
+    def __post_init__(self):
+        for name in ("blaze", "work", "out", "sources"):
+            if not getattr(self, name):
+                raise ValueError(f"{name} must name a path")
+        for name in ("runs", "cold_runs"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be positive")
+        if not self.backends or len(set(self.backends)) != len(self.backends):
+            raise ValueError("backends must be a nonempty list without repeats")
+        if len(set(self.projects)) != len(self.projects):
+            raise ValueError("projects must not repeat a checkout")
+        if unknown := set(self.projects) - PROJECTS.keys():
+            raise ValueError(f"unknown projects: {', '.join(sorted(unknown))}")
+
+
+@dataclass(frozen=True)
+class Compare:
+    baseline: str
+    result: str
+    action: Literal["compare"] = "compare"
+    threshold: int | float = 25
+
+    def __post_init__(self):
+        if not self.baseline or not self.result:
+            raise ValueError("baseline and result must name files")
+        if not math.isfinite(self.threshold) or self.threshold < 0:
+            raise ValueError("threshold must be a finite nonnegative percent")
+
+
+def load(text):
+    return benchschema.load_input(text, {"run": Run, "compare": Compare}, "run", "bench.py")
 
 
 def blaze_of(backend):
@@ -518,9 +511,8 @@ class Daemon:
 
 
 def metered(side, args, daemon=None, sampler=None, command="build", meter=None):
-    """`cargo [blaze] COMMAND ARGS` on `side`, timed, and the memory of what did the work
-    (memory.py): the command's tree (cargo, rustc, build scripts, the linker) and, given the
-    `daemon`, the daemon's (its workers and what they run). `peak_mb` is the most all of them
+    """The selected Blaze command, timed with the memory of its process tree and daemon.
+    `peak_mb` is the most all of them
     held at once, `largest_mb` the largest one process held. With `meter` (counters.Meter) the
     command, and what it starts, is counted by it; the caller reads the meter around it."""
     own = sampler is None
@@ -529,7 +521,8 @@ def metered(side, args, daemon=None, sampler=None, command="build", meter=None):
         sampler.add(daemon.pid())
     if own:
         sampler.start()
-    took, ran, used = memory.run(side.argv(command, *args), side.ws, side.env, 7200, sampler=sampler, meter=meter)
+    with side.session() as env:
+        took, ran, used = memory.run(side.argv(command, *args), side.ws, env, 7200, sampler=sampler, meter=meter)
     # As `Side.cargo` reads it: `side.argv` added the format its build is read by.
     blaze_cli.read_build(ran, cut=side.blaze and bool(blaze_cli.machine_format(command, args)))
     if own:
@@ -541,14 +534,13 @@ def metered(side, args, daemon=None, sampler=None, command="build", meter=None):
 
 
 def memory_phase(rows, resident=None):
-    """The memory of a phase from its runs, each a pair of what `metered` said of blaze and of
-    cargo: the median and the most of the peak of each side, and the median of its largest process.
+    """Blaze's median and maximum peaks, and the median of its largest process.
     `resident` is what the daemon held once the phase was over."""
     def side(used):
         peaks = [u["peak_mb"] for u in used]
         return dict(peak_mb=round(statistics.median(peaks)), peak_max_mb=max(peaks),
                     largest_mb=round(statistics.median(u["largest_mb"] for u in used)))
-    result = {"blaze": side([r[0] for r in rows]), "cargo": side([r[1] for r in rows])}
+    result = {"blaze": side(rows)}
     if resident is not None:
         result["blaze"]["resident_mb"] = resident
     return result
@@ -643,62 +635,11 @@ def compiled(out):
     return sum(work.compiled for work in storelib.worked(out))
 
 
-class Setup:
-    """Another way to build with cargo (`SETUPS`), measured beside plain cargo on the same
-    source after every step, into a target directory of its own. Once a build of it fails it
-    is left out of the rest of the project, and the failure is what it reports."""
-
-    def __init__(self, name, ws, env, target_root):
-        spec = SETUPS[name]
-        self.name, self.ws, self.command, self.failed = name, ws, spec.get("command", "build"), None
-        self.target = os.path.join(target_root, f"target-{name}")
-        self.env = dict(env, CARGO_TARGET_DIR=self.target, **spec.get("env", {}))
-        # Added to the project's own flags: cargo joins every `target.<cfg>.rustflags` that
-        # matches, where RUSTFLAGS would replace them (helix and zed set `--cfg tokio_unstable`).
-        self.config = ["--config", "target.'cfg(all())'.rustflags=" + json.dumps(spec["rustflags"])] if spec.get("rustflags") else []
-        self.cargo_bin = "cargo"
-        if spec.get("nightly"):
-            nightly = os.environ.get("BLAZE_NIGHTLY")
-            if not nightly:
-                raise SystemExit(f"the setup {name} needs BLAZE_NIGHTLY, a nightly toolchain with rustc-codegen-cranelift-preview (the bench shell sets it)")
-            self.cargo_bin = os.path.join(nightly, "bin/cargo")
-            self.env.update(RUSTC=os.path.join(nightly, "bin/rustc"), PATH=os.path.join(nightly, "bin") + os.pathsep + env["PATH"])
-
-    def build(self, args):
-        """The seconds of one build, or None once it has failed."""
-        if self.failed:
-            return None
-        took, ran = timed([self.cargo_bin, self.command, *self.config, *args], self.ws, self.env)
-        if ran.returncode != 0:
-            errors = [l for l in ran.stderr.splitlines() if l.startswith("error")] or ran.stderr.splitlines()[-3:]
-            self.failed = f"`cargo {self.command}` failed: {' / '.join(errors)[:300]}"
-            print(f"  setup {self.name}: {self.failed}", flush=True)
-            return None
-        return took
-
-    def clean(self):
-        shutil.rmtree(self.target, ignore_errors=True)
-
-
-def setup_times(setups, samples):
-    """The median and every sample of each setup, from one dict of seconds per build."""
-    result = {}
-    for setup in setups:
-        times = [s[setup.name] for s in samples if s.get(setup.name) is not None]
-        result[setup.name] = dict(median_s=round(statistics.median(times), 3), samples_s=[round(t, 3) for t in times]) if times else {}
-        if setup.failed:
-            result[setup.name]["failed"] = setup.failed
-    return result
-
-
-def disk(ws, ours, theirs):
-    """What each side has on disk, in megabytes as `du` counts them (memory.disk_mb): blaze's
-    target directory (cargo's own build, which `blaze build` starts with, and the
-    daemon's programs), its store and the rest of its home (workers' files, logs), and cargo's
-    target directory."""
+def disk(ours):
+    """Blaze's target, store and remaining home in MB, as memory.disk_mb counts them."""
     store = memory.disk_mb(storelib.store_of(ours.env["BLAZE_HOME"]))
-    return {"target": memory.disk_mb(os.path.join(ws, "target")), "store": store,
-            "home": memory.disk_mb(ours.env["BLAZE_HOME"]) - store, "cargo target": memory.disk_mb(theirs.env["CARGO_TARGET_DIR"])}
+    return {"target": memory.disk_mb(ours.env["CARGO_TARGET_DIR"]), "store": store,
+            "home": memory.disk_mb(ours.env["BLAZE_HOME"]) - store}
 
 
 def store_mb(path):
@@ -716,18 +657,32 @@ class Failed(Exception):
     """A build of a project failed: the project ends there, the run goes on."""
 
 
+def require_build(ran, label):
+    """A successful measurement has a successful native daemon build verdict."""
+    built = how_built(ran)
+    if ran.returncode != 0 or built != "daemon":
+        raise Failed(f"{label}: Blaze exited {ran.returncode}; {built}:\n{ran.stderr[-3000:]}")
+    return built
+
+
+def stop(side):
+    _, ran = side.cargo("stop", timeout=120)
+    if ran.returncode:
+        raise Failed(f"stop {side.env['BLAZE_HOME']}: exited {ran.returncode}: {ran.stderr[-1500:]}")
+
+
 # The phases measured so far and the daemon's side, by (project, backend): what is kept of a
 # project that failed.
 SO_FAR = {}
 
 
-def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_names=(), tests=False):
+def measure(name, spec, backend, runs, work, cold_runs=1, tests=False):
     """Runs every phase of one project under one backend. The result is the phases by name."""
     blaze = blaze_of(backend)
     ws = os.path.realpath(os.path.join(work, f"{name}-{backend}"))
     source, prepared = fetch(name, spec), {}
     if "prepare" in spec:
-        # A tree with what the project's own build makes before cargo, and what every build of
+        # A tree with the project's native prerequisites, and what every build of
         # it needs: its builds read that from the tree, so its `build` is not copied.
         source, prepared = importlib.import_module(spec["prepare"]).prepare(source)
     left_out = lambda at, names: [n for n in names if n in ("target", "target-ref", ".git")
@@ -739,34 +694,25 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     env = dict(blaze_cli.base_env(home(0)), **spec.get("env", {}), **prepared)
     env["PATH"] = os.path.dirname(blaze) + os.pathsep + env["PATH"]
     env.update(BLAZE_STATS="1")
-    # Neither side gets a compiler cache: a cold build is a cold build.
+    # A cold Blaze build has its own empty store and target.
     env.pop("RUSTC_WRAPPER", None)
-    ours, theirs = Side(ws, env, True), Side(ws, env, False)
-    if reference_dir:
-        theirs.env["CARGO_TARGET_DIR"] = os.path.join(reference_dir, f"target-ref-{name}-{backend}")
-    setups = [Setup(s, ws, theirs.env, reference_dir or ws) for s in setup_names]
+    env.update(BLAZE_HOME=home(0), CARGO_TARGET_DIR=os.path.join(ws, "target"), BLAZE_CACHE=storelib.store_of(home(0)))
+    env[blaze_cli.COMPILER_ENV] = os.path.abspath(blaze)
+    ours = Side(ws, env, True)
     phases, wrong = {}, []
     # Counts blaze's commands and the daemon the first of them starts (counters.py), for the
     # whole project: each step is read from quiet to quiet (`Meter.settle`).
     meter = counters.Meter()
     SO_FAR[name, backend] = (phases, wrong, ours, meter)
     build, run = [*spec.get("build", []), *BACKENDS[backend]], spec.get("run")
-    subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)
-
-    def others():
-        """Every setup builds what plain cargo just built: its seconds by name."""
-        return {setup.name: setup.build(build) for setup in setups}
-
-    def both():
+    # Dependency resolution and downloads belong to the selected Blaze cold build.
+    def build_once():
         before = meter.settle()
         took, mine, used = metered(ours, [*build, JSON], daemon, meter=meter)
         counted = meter.since(before, meter.settle())
-        reference, other, cargo_used = metered(theirs, build)
         builds[0] += 1
-        for side, ran in (("blaze", mine), ("cargo", other)):
-            if ran.returncode != 0:
-                raise Failed(f"{name} {backend}: the {side} build failed:\n{ran.stderr[-3000:]}")
-        return took, reference, how_built(mine), others(), used, cargo_used, mine.stdout, counted
+        built = require_build(mine, f"{name} {backend} build")
+        return took, built, used, mine.stdout, counted
 
     def edit_link(kind, step, out):
         """How the build of an edit linked, from the `blaze-work` lines in what it printed,
@@ -784,7 +730,9 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         """What blaze's build of the program says, run without `BLAZE_STATS`: its time table
         on stderr differs from run to run and is not the program's."""
         quiet = Side(ws, {k: v for k, v in ours.env.items() if k != "BLAZE_STATS"}, True)
-        return quiet.cargo("run", *build, "--", *run)[1]
+        ran = quiet.cargo("run", *build, "--", *run)[1]
+        require_build(ran, f"{name} {backend} run")
+        return ran
 
     def runs_right(label):
         if run is None:
@@ -796,14 +744,11 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     def report(label, phase):
         phases[label] = phase
         held = phase.get("memory") or {}
-        mem = (f"peak blaze {held['blaze']['peak_mb']:6} MB  cargo {held['cargo']['peak_mb']:6} MB  " +
+        mem = (f"peak blaze {held['blaze']['peak_mb']:6} MB  " +
                (f"daemon {held['blaze']['resident_mb']:6} MB  " if "resident_mb" in held["blaze"] else "")) if held else ""
         counted = f"{phase['instructions'] / 1e9:8.3f} G instructions  " if phase.get("instructions") is not None else ""
-        print(f"  {label:10} blaze {phase['wall_s']:8.3f}s  cargo {phase['cargo_s']:8.3f}s  {counted}{mem}"
+        print(f"  {label:10} blaze {phase['wall_s']:8.3f}s  {counted}{mem}"
               f"{phase['built'][:60]}  {phase.get('link') or ''}", flush=True)
-        if phase.get("setups"):
-            print("             " + "  ".join(f"{s} {t['median_s']:.3f}s" if t.get("median_s") is not None else f"{s} failed"
-                                       for s, t in phase["setups"].items()), flush=True)
 
     def cold_blaze(side, label, watched, counting):
         """`blaze build` from nothing on `side`, with the memory of both (the daemon is the
@@ -814,8 +759,7 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         before = counting.snapshot()
         with memory.Sampler() as sampler:
             took, mine, used = metered(side, [*build, JSON], sampler=sampler, meter=counting)
-            if mine.returncode != 0:
-                raise Failed(f"{name} {backend}: the first `blaze build` ({label}) failed:\n{mine.stderr[-3000:]}")
+            require_build(mine, f"{name} {backend} first build ({label})")
         warm = 0.0
         used = dict(peak_mb=max(sampler.peak_mb, used["largest_mb"]), largest_mb=max(used["largest_mb"], sampler.largest_mb),
                     resident_mb=watched.resident_mb())
@@ -826,110 +770,95 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         return took, warm, mine, used, counting.since(before, counting.settle())
 
     # Each cold run starts from nothing: no target directories, an empty store and a daemon of
-    # its own. The builds take turns, never at once: they would share the cores (a daemon that
-    # is ready is idle). The last one's daemon is the one the edits are measured with.
+    # its own. The last one's daemon is the one the edits are measured with.
     colds, builds = [], [0]
     for turn in range(cold_runs):
-        ours.cargo("stop")
-        for path in (os.path.join(ws, "target"), theirs.env["CARGO_TARGET_DIR"], home(turn)):
+        stop(ours)
+        for path in (ours.env["CARGO_TARGET_DIR"], home(turn)):
             shutil.rmtree(path, ignore_errors=True)
-        ours.env.update(BLAZE_HOME=home(turn))
+        ours.env.update(BLAZE_HOME=home(turn), BLAZE_CACHE=storelib.store_of(home(turn)))
         daemon = Daemon(ours)
         took, warm, mine, used, counted = cold_blaze(ours, "empty store", daemon, meter)
         said, built, peak = mine.stdout, how_built(mine), daemon.peak_mb()
         # The images this daemon has linked: each later link of one is an edit of it.
         linked = {link.path for link in links(said)}
-        reference, other, cargo_used = metered(theirs, build)
-        if other.returncode != 0:
-            raise Failed(f"{name} {backend}: the cargo build failed:\n{other.stderr[-3000:]}")
-        for setup in setups:
-            setup.clean()
-        setup_cold = others()
-        colds.append(dict(build_s=took, warm_s=warm, cargo_s=reference, setups=setup_cold, used=used, cargo_used=cargo_used,
-                          counts=counted))
-        print(f"  cold {turn + 1}/{cold_runs}  blaze {took:.2f}s + ready {warm:.2f}s  cargo {reference:.2f}s  "
-              + "  ".join(f"{s} {t:.2f}s" for s, t in setup_cold.items() if t), flush=True)
+        colds.append(dict(build_s=took, warm_s=warm, used=used, counts=counted))
+        print(f"  cold {turn + 1}/{cold_runs}  blaze {took:.2f}s + ready {warm:.2f}s", flush=True)
         if turn + 1 < cold_runs:
-            ours.cargo("stop")
+            stop(ours)
             shutil.rmtree(home(turn), ignore_errors=True)
     ready_mb = round(statistics.median(c["used"]["resident_mb"] for c in colds))
     resident = dict(ready_mb=ready_mb, after=[])
-    cold_disk = disk(ws, ours, theirs)
+    cold_disk = disk(ours)
     expected = program_output(program()) if run is not None else None
     med = lambda key: round(statistics.median(c[key] for c in colds), 3)
-    report("cold", dict(wall_s=round(statistics.median(c["build_s"] + c["warm_s"] for c in colds), 3), cargo_s=med("cargo_s"),
+    report("cold", dict(wall_s=round(statistics.median(c["build_s"] + c["warm_s"] for c in colds), 3),
                         rss_mb=max(peak, daemon.peak_mb()), built=built, build_s=med("build_s"), warm_s=med("warm_s"),
-                        samples_s=[round(c["build_s"] + c["warm_s"], 3) for c in colds], cargo_samples_s=[round(c["cargo_s"], 3) for c in colds],
+                        samples_s=[round(c["build_s"] + c["warm_s"], 3) for c in colds],
                         build_samples_s=[round(c["build_s"], 3) for c in colds],
-                        setups=setup_times(setups, [c["setups"] for c in colds]),
                         compiled=compiled(said), steps_s=cold_steps(said), threads_s=thread_steps(said),
-                        memory=memory_phase([(c["used"], c["cargo_used"]) for c in colds], ready_mb), disk_mb=cold_disk,
+                        memory=memory_phase([c["used"] for c in colds], ready_mb), disk_mb=cold_disk,
                         **counters.summary([c["counts"] for c in colds])))
 
-    samples = [both() for _ in range(max(runs, 3))]
-    said = "".join(s[6] for s in samples)
+    samples = [build_once() for _ in range(max(runs, 3))]
+    said = "".join(s[3] for s in samples)
     linked.update(link.path for link in links(said))
     held = daemon.resident_mb()
     resident["after"].append(dict(phase="no-op", builds=builds[0], mb=held))
-    report("no-op", dict(memory=memory_phase([(s[4], s[5]) for s in samples], held), wall_s=round(statistics.median(s[0] for s in samples), 3), cargo_s=round(statistics.median(s[1] for s in samples), 3),
-                         rss_mb=daemon.peak_mb(), built=samples[-1][2], compiled=compiled(said),
-                         samples_s=[round(s[0], 3) for s in samples], cargo_samples_s=[round(s[1], 3) for s in samples],
-                         setups=setup_times(setups, [s[3] for s in samples]), **counters.summary([s[7] for s in samples])))
+    report("no-op", dict(memory=memory_phase([s[2] for s in samples], held), wall_s=round(statistics.median(s[0] for s in samples), 3),
+                         rss_mb=daemon.peak_mb(), built=samples[-1][1], compiled=compiled(said),
+                         samples_s=[round(s[0], 3) for s in samples], **counters.summary([s[4] for s in samples])))
     runs_right("no-op")
 
     for kind, changes in spec["edits"].items():
         made, back = [], []
         for turn in range(runs):
             places = write_edit(ws, changes, False)
-            took, reference, built, theirs_too, used, cargo_used, said, counted = both()
+            took, built, used, said, counted = build_once()
             link = edit_link(kind, "edit", said)
-            made.append(dict(wall_s=took, cargo_s=reference, built=built, link=link, compiled=compiled(said), steps_ms=daemon_steps(said),
-                             threads_s=thread_steps(said), setups=theirs_too, used=used, cargo_used=cargo_used,
-                             counts=counted))
+            made.append(dict(wall_s=took, built=built, link=link, compiled=compiled(said), steps_ms=daemon_steps(said),
+                             threads_s=thread_steps(said), used=used, counts=counted))
             if turn == 0:
                 runs_right(kind)
             write_edit(ws, changes, True)
-            took, reference, built, *_, said, _ = both()
+            took, built, _, said, _ = build_once()
             link = edit_link(kind, "edit taken back", said)
-            back.append(dict(wall_s=took, cargo_s=reference, built=built, link=link, compiled=compiled(said)))
-            # An edit the daemon turned down is one finding, not a time to take a median of,
-            # and each has it load the workspace again.
-            if made[-1]["built"] != "daemon":
-                break
+            back.append(dict(wall_s=took, built=built, link=link, compiled=compiled(said)))
         # The slowest of them is the one to look at; the median is the one to compare.
         slowest = max(made, key=lambda s: s["wall_s"])
         median = lambda rows, key: round(statistics.median(r[key] for r in rows), 3)
         held = daemon.resident_mb()
         resident["after"].append(dict(phase=kind, builds=builds[0], mb=held))
-        report(kind, dict(memory=memory_phase([(s["used"], s["cargo_used"]) for s in made], held), wall_s=median(made, "wall_s"), cargo_s=median(made, "cargo_s"), rss_mb=daemon.peak_mb(),
+        report(kind, dict(memory=memory_phase([s["used"] for s in made], held), wall_s=median(made, "wall_s"), rss_mb=daemon.peak_mb(),
                           built=slowest["built"], link=slowest["link"], compiled=max(s["compiled"] for s in made), places=places,
                           steps_ms=slowest["steps_ms"], threads_s=slowest["threads_s"], slowest_s=round(slowest["wall_s"], 3),
-                          back_s=median(back, "wall_s"), back_cargo_s=median(back, "cargo_s"),
+                          back_s=median(back, "wall_s"),
                           back_link=max(back, key=lambda s: s["wall_s"])["link"],
-                          samples_s=[round(s["wall_s"], 3) for s in made], cargo_samples_s=[round(s["cargo_s"], 3) for s in made],
-                          setups=setup_times(setups, [s["setups"] for s in made]), **counters.summary([s["counts"] for s in made])))
+                          samples_s=[round(s["wall_s"], 3) for s in made], **counters.summary([s["counts"] for s in made])))
     resident.update(end_mb=resident["after"][-1]["mb"], builds=builds[0])
-    end_disk = disk(ws, ours, theirs)
+    end_disk = disk(ours)
     if tests and "test" in spec:
-        phases["test"] = test_suite(name, spec, ours, theirs, ws, wrong)
+        phases["test"] = test_suite(name, spec, ours, ws, wrong)
         phases["test"].update(instructions=None, cycles=None,
                               counts_gap="`blaze test` runs through blaze_cli.Side, outside memory.run: not counted")
-    ours.cargo("stop")
-    for setup in setups:
-        setup.clean()
+    stop(ours)
     # Other checkouts of the same commit, each with a daemon of its own and an empty target
     # directory but the store the measured one filled: a second checkout, or a teammate's store.
     warm_store = []
     for turn in range(cold_runs):
         other_top = top + "-b"
         shutil.copytree(top, other_top, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", "target-*"))
-        other_ws = os.path.join(other_top, os.path.relpath(ws, top))
+        other_ws = os.path.realpath(os.path.join(other_top, os.path.relpath(ws, top)))
         shutil.rmtree(home(f"{turn}b"), ignore_errors=True)
         shutil.copytree(storelib.store_of(ours.env["BLAZE_HOME"]), storelib.store_of(home(f"{turn}b")), symlinks=True)
-        second = Side(other_ws, dict(ours.env, BLAZE_HOME=home(f"{turn}b")), True)
-        with counters.Meter() as other_meter:
-            took_b, warm_b, _, used_b, counted_b = cold_blaze(second, "store filled by another checkout", Daemon(second), other_meter)
-        second.cargo("stop")
+        second = Side(other_ws, dict(ours.env, BLAZE_HOME=home(f"{turn}b"),
+                                    BLAZE_CACHE=storelib.store_of(home(f"{turn}b")),
+                                    CARGO_TARGET_DIR=os.path.join(other_ws, "target")), True)
+        try:
+            with counters.Meter() as other_meter:
+                took_b, warm_b, _, used_b, counted_b = cold_blaze(second, "store filled by another checkout", Daemon(second), other_meter)
+        finally:
+            stop(second)
         shutil.rmtree(other_top, ignore_errors=True)
         shutil.rmtree(home(f"{turn}b"), ignore_errors=True)
         warm_store.append((took_b, warm_b, used_b, counted_b))
@@ -947,30 +876,27 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     meter.close()
     result = dict(phases=phases, wrong=wrong, tag=spec["tag"], rev=spec["rev"], store_mb=stored,
                   cold_runs=cold_runs, resident=resident, disk_mb=end_disk)
-    # The project's own toolchain, which cargo builds with, not the one blaze is pinned to.
-    if own := prepared.get("RUSTUP_TOOLCHAIN") or spec.get("env", {}).get("RUSTUP_TOOLCHAIN"):
-        result["toolchain"] = own
     if "runtime" in spec:
-        result["runtime"] = runtime(name, spec, theirs, ws, build, max(runs, 10), wrong)
+        result["runtime"] = runtime(name, spec, ours, ws, build, max(runs, 10), wrong)
     return result
 
 
-def test_suite(name, spec, ours, theirs, ws, wrong):
-    """The project's tests run by `blaze test`, timed against `cargo test`: every test has to
-    pass under blaze but those `test_known` names. Three runs of each side come first and are not timed (the
-    first `blaze test` after a build is cargo's, and the daemon builds the test targets
-    at the next one; their times are kept as `first_s`). Then, three times: the edit of a widely
-    used function (`leaf`) and the tests of both, the edit taken back and the tests of both
-    (not timed), and the tests of both with nothing changed."""
+def test_suite(name, spec, ours, ws, wrong):
+    """The project's own tests under the selected Blaze, before/after edits and with no change.
+    Three initial runs are retained separately. Known failures stay explicit in test_known.
+    Every verdict, including the reversal, must pass that rule."""
     args, edit = spec["test"], spec["edits"].get("leaf") or spec["edits"]["body"]
 
     def tests(label):
-        (took, mine), (reference, other) = ours.cargo("test", *args), theirs.cargo("test", *args)
-        said, said_cargo = test_results(mine), test_results(other)
+        took, mine = ours.cargo("test", *args)
+        said = test_results(mine)
         differs = test_verdict(said, frozenset(spec.get("test_known", ())))
+        built = how_built(mine)
+        if built != "daemon":
+            differs = f"{built}; {differs}" if differs else built
         if differs:
             wrong.append(f"tests ({label}): {differs}")
-        return dict(wall_s=took, cargo_s=reference, built=how_built(mine), said=said_cargo, said_blaze=said, differs=differs)
+        return dict(wall_s=took, built=built, said=said, differs=differs)
 
     first = [tests("first runs") for _ in range(3)]
     edited, still = [], []
@@ -986,22 +912,21 @@ def test_suite(name, spec, ours, theirs, ws, wrong):
     failed = lambda said: sum(n for (_, outcome), n in said[1].items() if outcome == "FAILED")
     differs = next((r["differs"] for r in first + edited + still if r["differs"]), None)
     slowest = max(edited, key=lambda r: r["wall_s"])
-    phase = dict(wall_s=median(still, "wall_s"), cargo_s=median(still, "cargo_s"), rss_mb=0, built=slowest["built"],
+    phase = dict(wall_s=median(still, "wall_s"), rss_mb=0, built=slowest["built"],
                  built_still=max(still, key=lambda r: r["wall_s"])["built"],
-                 edit_s=median(edited, "wall_s"), edit_cargo_s=median(edited, "cargo_s"),
-                 first_s=[round(r["wall_s"], 3) for r in first], first_cargo_s=[round(r["cargo_s"], 3) for r in first],
-                 samples_s=[round(r["wall_s"], 3) for r in still], cargo_samples_s=[round(r["cargo_s"], 3) for r in still],
-                 edit_samples_s=[round(r["wall_s"], 3) for r in edited], edit_cargo_samples_s=[round(r["cargo_s"], 3) for r in edited],
+                 edit_s=median(edited, "wall_s"),
+                 first_s=[round(r["wall_s"], 3) for r in first], samples_s=[round(r["wall_s"], 3) for r in still],
+                 edit_samples_s=[round(r["wall_s"], 3) for r in edited],
                  command=["test", *args], edited=edit[0][0], tests=counted(last["said"]), failed=failed(last["said"]),
-                 failed_blaze=failed(last["said_blaze"]), same=differs is None, difference=differs)
-    print(f"  test       after an edit: blaze {phase['edit_s']:8.3f}s  cargo {phase['edit_cargo_s']:8.3f}s ({phase['built'][:40]})  "
-          f"nothing changed: blaze {phase['wall_s']:8.3f}s  cargo {phase['cargo_s']:8.3f}s  first runs {phase['first_s']}  "
+                 failed_blaze=failed(last["said"]), same=differs is None, difference=differs)
+    print(f"  test       after an edit: blaze {phase['edit_s']:8.3f}s ({phase['built'][:40]})  "
+          f"nothing changed: blaze {phase['wall_s']:8.3f}s  first runs {phase['first_s']}  "
           f"{phase['tests']} tests, {'all pass' if differs is None else 'WRONG: ' + differs[:200]}", flush=True)
     return phase
 
 
 # The stress corpus: small crates, each a pathological shape for a compiler, named with what
-# each is for by its manifest. Measured cold under `--stress`.
+# each is for by its manifest. Measured cold when stress is true.
 STRESS = os.path.join(HERE, "stress-corpus")
 STRESS_MANIFEST = os.path.join(STRESS, "manifest.json")
 
@@ -1050,7 +975,7 @@ def measure_stress(crate, backend, runs, work):
     home = os.path.join(work, f"home-stress-{name}-{backend}")
     env = blaze_cli.base_env(home)
     env["PATH"] = os.path.dirname(blaze_of(backend)) + os.pathsep + env["PATH"]
-    env.update(BLAZE_STATS="1")
+    env.update(BLAZE_STATS="1", BLAZE_CACHE=storelib.store_of(home), CARGO_TARGET_DIR=os.path.join(ws, "target"))
     env.pop("RUSTC_WRAPPER", None)
     side = Side(ws, env, True)
     args = list(BACKENDS[backend])
@@ -1058,22 +983,24 @@ def measure_stress(crate, backend, runs, work):
     for command in ("check", "build"):
         rows = []
         for _ in range(runs):
-            side.cargo("stop")
+            stop(side)
             for path in (os.path.join(ws, "target"), home):
                 shutil.rmtree(path, ignore_errors=True)
             with counters.Meter() as meter:
                 before = meter.snapshot()
                 with memory.Sampler() as sampler:
                     took, ran, used = metered(side, args, sampler=sampler, command=command, meter=meter)
-                    if ran.returncode != 0:
-                        side.cargo("stop")
-                        raise Failed(f"stress {name} {backend}: the cold `blaze {command}` failed:\n{ran.stderr[-3000:]}")
+                    try:
+                        require_build(ran, f"stress {name} {backend} cold {command}")
+                    except Failed:
+                        stop(side)
+                        raise
                 # v2's first build is the daemon's, with nothing left to load after it.
                 warm = 0.0
                 if pid := Daemon(side).pid():
                     meter.adopt(pid)
                 counted = meter.since(before, meter.settle())
-            side.cargo("stop")
+            stop(side)
             rows.append(dict(wall_s=took + warm, build_s=took, warm_s=warm, peak_mb=max(sampler.peak_mb, used["largest_mb"]),
                              built=how_built(ran), counts=counted))
         median = lambda key: round(statistics.median(r[key] for r in rows), 3)
@@ -1096,35 +1023,21 @@ def library():
     return os.path.join(ROOT, "library")
 
 
-def runtime(name, spec, theirs, ws, build, runs, wrong):
-    """How fast the program blaze linked runs, against cargo's debug and release builds of the
-    same source. The three are run in turn, `runs` times each after two runs to warm the page
-    cache, so that the machine's drift falls on all of them alike. Seconds per run; each has to
-    exit 0."""
+def runtime(name, spec, ours, ws, build, runs, wrong):
+    """The selected profile's Blaze program, after two warmups. Every invocation must exit 0."""
     spec = spec["runtime"]
-    built, build = "release" if "--release" in build else "debug", [a for a in build if a != "--release"]
-    _, released = theirs.cargo("build", "--release", *build)
-    if released.returncode != 0:
-        raise Failed(f"{name}: the cargo release build failed:\n{released.stderr[-3000:]}")
-    if built == "release":
-        _, debug = theirs.cargo("build", *build)
-        if debug.returncode != 0:
-            raise Failed(f"{name}: the cargo debug build failed:\n{debug.stderr[-3000:]}")
-    target = theirs.env["CARGO_TARGET_DIR"]
-    programs = {"blaze": os.path.join(ws, "target", built, spec["bin"]), "cargo debug": os.path.join(target, "debug", spec["bin"]),
-                "cargo release": os.path.join(target, "release", spec["bin"])}
+    built = "release" if "--release" in build else "debug"
+    programs = {"blaze": os.path.join(ours.env["CARGO_TARGET_DIR"], built, spec["bin"])}
     args = [a.replace("{library}", library()) for a in spec["args"]]
-    times, outputs, held = {label: [] for label in programs}, {}, {label: [] for label in programs}
+    times, held = {label: [] for label in programs}, {label: [] for label in programs}
     for turn in range(runs + 2):
         for label, program in programs.items():
             took, ran, used = memory.run([program, *args], cwd=ws, text=False)
-            outputs.setdefault(label, (ran.returncode, ran.stdout))
+            if ran.returncode:
+                wrong.append(f"runtime: {name} {label} run {turn + 1} exited with {ran.returncode}")
             if turn >= 2:
                 times[label].append(took)
                 held[label].append(used["largest_mb"])
-    for label, said in outputs.items():
-        if said[0] != 0:
-            wrong.append(f"runtime: {label} exited with {said[0]}")
     # The programs are one process each (ripgrep's threads are its own): its peak is the kernel's.
     result = {label: dict(median_s=round(statistics.median(t), 4), min_s=round(min(t), 4), max_s=round(max(t), 4), runs=len(t),
                           peak_mb=round(statistics.median(held[label])), peak_max_mb=max(held[label]),
@@ -1134,7 +1047,7 @@ def runtime(name, spec, theirs, ws, build, runs, wrong):
     return dict(command=[spec["bin"], *spec["args"]], **result)
 
 
-def machine():
+def machine(name=None, toolchain=None):
     """What the numbers were measured on."""
     def first_line(*argv):
         try:
@@ -1162,61 +1075,74 @@ def machine():
     if platform.system() == "Darwin":
         cpu = first_line("sysctl", "-n", "machdep.cpu.brand_string")
         memory = str(int(first_line("sysctl", "-n", "hw.memsize") or 0) // 1024) or None
-    # A run pinned to some of the cores (taskset) has those, and cargo's jobs follow them.
+    # A run pinned to some of the cores (taskset) has those.
     cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
     return dict(
         # Named by whoever runs it (the workflow names the instance type).
-        name=os.environ.get("BLAZE_BENCH_MACHINE"),
+        name=name,
         cpu=cpu, cores=cores, machine_cores=os.cpu_count(),
         # What else the machine was running: 1, 5 and 15 minute averages when the run started.
         load=", ".join(f"{v:.1f}" for v in os.getloadavg()),
         memory_gib=round(int(memory) / 1024 / 1024) if memory else None,
         os=platform.system(), arch=platform.machine(), kernel=platform.release(),
-        rustc=storelib.blaze_toolchain(blaze_cli.BLAZE, dict(os.environ)).rustc, cc=first_line("cc", "--version"), ld=first_line("ld", "--version"),
+        rustc=(toolchain or blaze_cli.selected_toolchain()).rustc, cc=first_line("cc", "--version"), ld=first_line("ld", "--version"),
         llvm=first_line("llvm-config", "--version"),
         incremental=os.environ.get("CARGO_INCREMENTAL", "profile default (on for dev)"),
         wrapper=None, linker="the toolchain's default (cc)",
-        # Nix's linker wrapper runs `realpath` for each of these on every link cargo makes (not
-        # on blaze's): runs are comparable only with the same count.
+        # Native linker inputs are part of the machine description.
         library_dirs=sum(arg.startswith("-L") for arg in os.environ.get("NIX_LDFLAGS", "").split()) or None,
     )
 
 
 def blaze_commit():
-    """The commit of blaze measured: `BLAZE_BENCH_COMMIT` when the caller knows better than the
-    checkout (a branch that changes only the harness, measured for main)."""
-    if os.environ.get("BLAZE_BENCH_COMMIT"):
-        return os.environ["BLAZE_BENCH_COMMIT"]
+    """The checkout's commit; a caller measuring another tree supplies commit in Run."""
     ran = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True)
     return ran.stdout.strip() or None
 
 
 def compare(baseline, result, threshold):
-    """What in `result` is worse than in `baseline` by more than `threshold` percent."""
-    worse = []
-    for key, was in baseline["results"].items():
-        now = result["results"].get(key)
+    """Stored Blaze regressions, including missing prior evidence. Cargo is never relabeled."""
+    worse = [f"baseline: {problem}" for problem in benchschema.errors(baseline)]
+    worse += benchschema.errors(result)
+    if worse:
+        return worse
+
+    def metric(label, field, before, after, floor, unit):
+        if before is None:
+            return
+        if not benchschema.number(before):
+            worse.append(f"baseline {label}: {field} is not finite and nonnegative")
+        elif not benchschema.number(after):
+            worse.append(f"{label}: {field} not measured or invalid")
+        elif after > before * (1 + threshold / 100) and after - before > floor:
+            worse.append(f"{label}: {field} {before}{unit} -> {after}{unit} "
+                         f"(+{100 * (after - before) / max(before, 1e-9):.0f}%)")
+
+    current = benchschema.measured(result)
+    for key, was in benchschema.measured(baseline).items():
+        now = current.get(key)
         if now is None:
             worse.append(f"{key}: not measured")
             continue
-        worse += [f"{key}: {w}" for w in now.get("wrong", [])]
         for label, old in was["phases"].items():
             new = now["phases"].get(label)
             if new is None:
                 worse.append(f"{key} {label}: not measured")
                 continue
-            for field, floor, unit in (("wall_s", FLOOR_SECS, "s"), ("rss_mb", 50, " MB"), ("compiled", 10, " functions")):
-                before, after = old.get(field), new.get(field)
-                if before is not None and after is not None and after > before * (1 + threshold / 100) and after - before > floor:
-                    worse.append(f"{key} {label}: {field} {before}{unit} -> {after}{unit} (+{100 * (after - before) / max(before, 1e-9):.0f}%)")
-            for side in ("blaze", "cargo"):
-                before, after = ((p.get("memory") or {}).get(side, {}).get("peak_mb") for p in (old, new))
-                if before is not None and after is not None and after > before * (1 + threshold / 100) and after - before > 100:
-                    worse.append(f"{key} {label}: {side} peak memory {before} MB -> {after} MB (+{100 * (after - before) / max(before, 1):.0f}%)")
-            if old["built"] == "daemon" and new["built"] != "daemon":
-                worse.append(f"{key} {label}: built by {new['built']}, was the daemon")
-            if old.get("link") == "spliced" and new.get("link") != "spliced":
-                worse.append(f"{key} {label}: {new.get('link')}, was spliced")
+            for field, floor, unit in (("wall_s", FLOOR_SECS, "s"), ("rss_mb", 50, " MB"), ("compiled", 10, " functions"),
+                                       ("edit_s", FLOOR_SECS, "s"), ("back_s", FLOOR_SECS, "s"),
+                                       ("instructions", 1_000_000, " instructions")):
+                metric(f"{key} {label}", field, old.get(field), new.get(field), floor, unit)
+            before, after = ((p.get("memory") or {}).get("blaze", {}).get("peak_mb") for p in (old, new))
+            metric(f"{key} {label}", "Blaze peak memory", before, after, 100, " MB")
+            for field in ("built", "built_still"):
+                if old.get(field) == "daemon" and new.get(field) != "daemon":
+                    worse.append(f"{key} {label}: {field} {new.get(field)}, was the daemon")
+            for field in ("link", "back_link"):
+                if old.get(field) == "spliced" and new.get(field) != "spliced":
+                    worse.append(f"{key} {label}: {field} {new.get(field)}, was spliced")
+        before, after = ((p.get("runtime") or {}).get("blaze", {}).get("median_s") for p in (was, now))
+        metric(key, "Blaze runtime", before, after, FLOOR_SECS, "s")
     return worse
 
 
@@ -1230,96 +1156,126 @@ def options(argv, name, default=None):
     return found or ([default] if default is not None else [])
 
 
-def main():
-    argv = sys.argv[1:]
-    threshold = float(options(argv, "--threshold", "25")[0])
-    if "--compare" in argv:
-        argv.remove("--compare")
-        baseline, result = (json.load(open(path)) for path in argv)
-        worse = compare(baseline, result, threshold)
-        print("\n".join(worse) or f"nothing over {threshold:.0f}% worse than the baseline")
-        sys.exit(1 if worse else 0)
-    backends, runs = options(argv, "--backend") or list(BACKENDS), int(options(argv, "--runs", "3")[0])
-    out = options(argv, "--out", os.path.join(HERE, "bench.json"))[0]
-    work = (options(argv, "--work") or [None])[0] or tempfile.mkdtemp(prefix="blaze-bench-")
-    # Never inside the checkout: cargo takes a target directory there that is not `target` for
-    # a source of the package, and a build script without `rerun-if-changed` (ripgrep's, fd's,
-    # hyperfine's) runs again, and the package builds again, at every build.
-    reference_dir = (options(argv, "--reference") or [None])[0] or os.path.join(work, "reference")
-    cold_runs = int(options(argv, "--cold-runs", "1")[0])
-    setup_names = [s for given in options(argv, "--setups") for s in given.split(",")]
-    setup_names = list(SETUPS) if setup_names == ["all"] else setup_names
-    setups_on = [p for given in options(argv, "--setups-on") for p in given.split(",")]
-    unknown = [s for s in setup_names if s not in SETUPS]
-    if unknown:
-        raise SystemExit(f"no setup {unknown}: the setups are {', '.join(SETUPS)}")
-    keep, tests, stress = "--keep" in argv, "--tests" in argv, "--stress" in argv
-    # `--stress` with no project measures the stress corpus alone.
-    names = [a for a in argv if not a.startswith("--")] or (
-        [] if stress else [n for n, spec in PROJECTS.items() if "prepare" not in spec and not spec.get("named")])
+def sha256(path):
+    with open(path, "rb") as stream:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def compiler_identity(program):
+    selected = Path(program).resolve(strict=True)
+    paths = [selected]
+    if selected.name in ("blaze", "blaze.exe"):
+        engine = selected.with_name("blaze-engine.exe" if selected.suffix == ".exe" else "blaze-engine")
+        if not engine.is_file():
+            raise Failed(f"{selected}: forwarding CLI has no adjacent {engine.name}")
+        paths.append(engine.resolve(strict=True))
+    binaries = {str(path): sha256(path) for path in paths}
+    return dict(path=str(selected), sha256=binaries[str(selected)], binaries=binaries)
+
+
+def source_tree():
+    """The harness checkout's source metadata, separate from a supplied compiler commit."""
+    def git(*args):
+        ran = subprocess.run(["git", "-C", ROOT, *args], capture_output=True, timeout=30)
+        if ran.returncode:
+            raise Failed(f"source metadata git {' '.join(args)}: {ran.stderr.decode(errors='replace')[-1500:]}")
+        return ran.stdout
+    return dict(head=git("rev-parse", "HEAD").decode().strip(), tree=git("rev-parse", "HEAD^{tree}").decode().strip(),
+                diff_sha256=hashlib.sha256(git("diff", "--binary", "HEAD")).hexdigest())
+
+
+def save(out, result):
+    with open(out, "w") as stream:
+        json.dump(result, stream, indent=1, allow_nan=False)
+        stream.write("\n")
+
+
+def run(given):
+    work, out = os.path.abspath(given.work), os.path.abspath(given.out)
+    if os.path.exists(work) and os.listdir(work):
+        raise Failed(f"work must be new or empty: {work}")
+    identity = compiler_identity(given.blaze)
+    blaze_cli.BLAZE, blaze_cli.SOURCES = identity["path"], os.path.abspath(given.sources)
+    blaze_cli.host.cache_clear()
+    toolchain = blaze_cli.selected_toolchain()
+    names = list(given.projects) or (
+        [] if given.stress else [n for n, spec in PROJECTS.items() if "prepare" not in spec and not spec.get("named")])
     os.makedirs(work, exist_ok=True)
-    os.makedirs(reference_dir, exist_ok=True)
-    result = dict(toolchain=TOOLCHAIN, machine=platform.machine(), cores=os.cpu_count(), runs=runs, cold_runs=cold_runs,
-                  commit=blaze_commit(), date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), host=machine(),
-                  backends={b: BACKENDS[b] for b in backends}, setups={s: SETUPS[s] for s in setup_names}, results={})
-    if any(SETUPS[s].get("nightly") for s in setup_names):
-        result["host"]["nightly"] = subprocess.run([os.path.join(os.environ.get("BLAZE_NIGHTLY", ""), "bin/rustc"), "-V"],
-                                                   capture_output=True, text=True).stdout.strip() or None
-    if os.environ.get("GITHUB_RUN_ID"):
-        result["run_url"] = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    result = dict(schema=RESULT_SCHEMA, compiler=identity, compiler_after=None, source_tree=source_tree(),
+                  toolchain=toolchain.name, toolchain_info=asdict(toolchain), repository_toolchain=TOOLCHAIN,
+                  machine=platform.machine(), cores=os.cpu_count(), runs=given.runs,
+                  cold_runs=given.cold_runs, commit=given.commit or blaze_commit(), run_url=given.run_url,
+                  date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), host=machine(given.machine, toolchain),
+                  backends={b: BACKENDS[b] for b in given.backends}, results={})
     for name in names:
-        for backend in backends:
+        for backend in given.backends:
             print(f"{name} {backend} ({blaze_of(backend)}; work {work})", flush=True)
-            # The other setups and the test suites are cargo's and the same for every backend: once.
-            first = backend == backends[0]
-            setups = setup_names if first and (not setups_on or name in setups_on) else []
             try:
-                measured = measure(name, PROJECTS[name], backend, runs, work, reference_dir, cold_runs, setups, tests and first)
-            except Failed as failed:
-                phases, wrong, ours, meter = SO_FAR[name, backend]
-                meter.close()
-                ours.cargo("stop")
+                measured = measure(name, PROJECTS[name], backend, given.runs, work, given.cold_runs, given.tests)
+            except (Failed, subprocess.TimeoutExpired) as failed:
+                phases, wrong, ours, meter = SO_FAR.get((name, backend), ({}, [], None, None))
+                for cleanup in (lambda: meter.close() if meter else None, lambda: stop(ours) if ours else None):
+                    try:
+                        cleanup()
+                    except Exception as error:
+                        wrong.append(f"cleanup: {error}")
                 print(f"  FAILED {failed}", flush=True)
-                measured = dict(phases=phases, wrong=wrong, failed=str(failed), tag=PROJECTS[name]["tag"], rev=PROJECTS[name]["rev"],
-                                cold_runs=cold_runs)
+                measured = dict(phases=phases, wrong=wrong, failed=str(failed), tag=PROJECTS[name]["tag"],
+                                rev=PROJECTS[name]["rev"], cold_runs=given.cold_runs)
             result["results"][f"{name}/{backend}"] = measured
             for line in measured["wrong"]:
                 print(f"  WRONG {line}", flush=True)
-            json.dump(result, open(out, "w"), indent=1)
-            if not keep:
-                for at in filter(None, (work, reference_dir)):
-                    for entry in os.listdir(at):
-                        if re.search(rf"(^|-){re.escape(name)}-{backend}(-|$)", entry):
-                            shutil.rmtree(os.path.join(at, entry), ignore_errors=True)
-    if stress:
+            save(out, result)
+            if not given.keep and not measured.get("failed") and not measured["wrong"]:
+                for entry in os.listdir(work):
+                    if re.search(rf"(^|-){re.escape(name)}-{backend}(-|$)", entry):
+                        shutil.rmtree(os.path.join(work, entry), ignore_errors=True)
+    if given.stress:
         crates, gap = stress_crates()
         result["stress"] = {}
         if gap:
             result["stress_gap"] = gap
             print(gap, flush=True)
-        for backend in backends:
+        for backend in given.backends:
             for crate in crates:
                 print(f"stress {crate['name']} {backend}: {crate['what']}", flush=True)
                 key = f"{crate['name']}/{backend}"
                 try:
-                    result["stress"][key] = measure_stress(crate, backend, runs, work)
-                except Failed as failed:
+                    result["stress"][key] = measure_stress(crate, backend, given.runs, work)
+                except (Failed, subprocess.TimeoutExpired) as failed:
                     print(f"  FAILED {failed}", flush=True)
                     result["stress"][key] = dict(phases={}, wrong=[], failed=str(failed), tag="stress", path=crate["path"],
                                                  what=crate["what"])
-                json.dump(result, open(out, "w"), indent=1)
-                if not keep:
+                save(out, result)
+                if not given.keep and not result["stress"][key].get("failed"):
                     for entry in os.listdir(work):
                         if entry.endswith(f"stress-{crate['name']}-{backend}"):
                             shutil.rmtree(os.path.join(work, entry), ignore_errors=True)
-        json.dump(result, open(out, "w"), indent=1)
-    measured_all = {**result["results"], **{f"stress:{k}": m for k, m in (result.get("stress") or {}).items()}}
-    wrong = [f"{key}: {line}" for key, measured in measured_all.items() for line in measured["wrong"]]
-    failed = [key for key, measured in measured_all.items() if measured.get("failed")]
-    print(f"wrote {out}; wrong: {len(wrong)}; failed: {', '.join(failed) or 'none'}")
-    # Not 1, which is also what an exception ends with: the run is whole and says what went wrong.
-    sys.exit(3 if wrong or failed else 0)
+    result["compiler_after"] = compiler_identity(given.blaze)
+    save(out, result)
+    wrong = benchschema.errors(result)
+    print(f"wrote {out}; findings: {len(wrong)}")
+    for finding in wrong:
+        print(f"  FAILED {finding}")
+    return 3 if wrong else 0
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise SystemExit(__doc__)
+    given = load(sys.argv[1])
+    if isinstance(given, Compare):
+        baseline, result = (json.load(open(path)) for path in (given.baseline, given.result))
+        worse = compare(baseline, result, given.threshold)
+        print("\n".join(worse) or f"nothing over {given.threshold:.0f}% worse than the stored Blaze baseline")
+        return 1 if worse else 0
+    return run(given)
 
 
 if __name__ == "__main__":
-    main()
+    sys.path.insert(0, os.path.join(ROOT, "tools", "typed-input", "src"))
+    raise SystemExit(main())

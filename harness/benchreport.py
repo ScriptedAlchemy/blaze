@@ -1,66 +1,36 @@
 #!/usr/bin/env python3
 """benchreport.py: docs/benchmarks.md's tables and the README's numbers, from results of bench.py.
 
-    benchreport.py RESULT [--name NAME] [--stored FILE] [--noise PERCENT] [--max-age HOURS] [--force] [--check]
-    benchreport.py --render
-    benchreport.py --charts
+    benchreport.py '{"action":"publish", "result":"RESULT.json", "force":false}'
+    benchreport.py '{"action":"render"}'
+    benchreport.py '{"action":"charts"}'
 
-Every table is a matrix over the platforms of benchplatforms.py (macOS arm64, Linux aarch64,
-Linux x86-64), each measured on a machine of its own. RESULT is what `bench.py --out` wrote on
-one of them; its platform is its host's. It is compared with that platform's stored result
-(docs/benchmarks/<platform>.json, e.g. linux-x86-64.json; `--stored` to say otherwise). When the
-two differ by more than noise, the stored one is replaced and every table it feeds is written
-again from the newest stored result of each platform: a platform that did not run keeps its last
-numbers, under its machine, date and commit. Otherwise nothing is written. More than noise is
-any of:
-  - a median time of either side, in any phase, moved by more than `--noise` percent (default
-    10) and by more than 50 ms
-  - a phase the daemon built is now built by cargo, or the other way round
-  - a project or backend is new or gone
-  - a peak of either side moved by more than noise and 100 MB
-  - the stored result is older than `--max-age` hours (default 24), so that the commit the
-    tables name is never more than a day behind main
-  - `--force`
-What a result of bench.py writes: in the README, its opening numbers (the edits chart's first
-row, in words) between `<!-- benchheadline:start -->` and `<!-- benchheadline:end -->`, and a
-small table of a few projects on one platform (PICK) between `<!-- benchpick:start -->` and
-`<!-- benchpick:end -->`; in docs/benchmarks.md, the build table between
-`<!-- benchsummary:start -->` and `<!-- benchsummary:end -->`, memory and disk (bench.py's
-`memory`, `resident` and `disk_mb`, docs/benchmarks.md "Memory and disk") between
-`<!-- benchmem:start -->` and `<!-- benchmem:end -->`, and every number between
-`<!-- bench:start -->` and `<!-- bench:end -->`.
-A runtime result (v1's harness/runbench.py's numbers; v2 has no runtime bench yet) writes docs/benchmarks.md's
-runtime table instead, between `<!-- runbench:start -->` and `<!-- runbench:end -->`: how fast each
-benchmark's program runs built by blaze's LLVM against `cargo build --release`, and the
-geometric mean. It is stored in docs/benchmarks/runtime-<platform>.json, and differs when a
-median of any build moved by more than noise, a benchmark is new or gone, or the stored run is
-older than `--max-age`. A build that failed, or whose program's run failed, has the whole result
-refused.
-`--name NAME` is a project measured on its own (bun, by the bench-bun workflow, which needs hours):
-its results are stored in docs/benchmarks/NAME-<platform>.json and runtime-NAME-<platform>.json,
-compared with those, and are a project like the others in every table and chart: each platform's
-results are its own result's with those of each project measured on its own folded in
-(`stored_all`), and a footnote under each table names the machine, commit and date of each such
-project. docs/benchmarks.md has every number of each, under its platform.
-A result in which a program said something else than blaze's cold build of it, or its run
-failed (`wrong`), is refused: exit 2,
-nothing written. A test suite that ended otherwise under `blaze test` is not refused: the
-tests table says how, and the workflow fails after writing. `--check` writes nothing and exits 1
-when it would have written. `--memory`, from before there were platforms, is the same as no flag:
-a platform's memory is its result's.
+One strict frozen JSON input, inline, a file path or `-`. Publish defines the remaining fields.
+Schema 2 reports Blaze's own times and memory; the history charts compare those with stored
+Blaze runs. Legacy result files retain their Cargo labels and are rendered in explicitly
+historical sections. They are never reinterpreted as fresh Blaze comparisons.
 
-Every summary table comes with its chart (benchcharts.py), written to
-docs/benchmarks/charts/ by the same call that writes the table: the edit speed-ups with the
-build table, memory and disk with the memory table, the runtime ratios with the runtime table,
-each blaze against cargo with a bar per platform and each platform's geometric mean. `--render` writes every table and chart again from the stored results, and
-`--charts` the charts alone.
+Results are stored by the host's platform in docs/benchmarks/<platform>.json; name chooses a
+separately measured project, and stored can choose another path. Each platform keeps its own
+machine, date and commit. A new schema, project, producer, missing measurement, movement past
+noise (default 10% and 50 ms or 100 MB), age past max_age (24 hours), or force requests a write.
+check writes nothing and exits 1 when a write would happen. Invalid or failed evidence,
+including test failures and an unfinished compiler identity check, exits 2 without publishing.
 
-The last line says `changed` or `unchanged`, and so does `changed=true|false` in
-$GITHUB_OUTPUT when that is set.
+The publisher replaces the README's benchheadline and benchpick sections and this page's
+benchsummary, benchmem and bench sections. Schema 2 uses only Blaze values; historical Cargo
+comparisons and whole-program runbench results retain their labels and comparison charts.
+The independent benchcharts history action draws the trends for new Blaze measurements.
+render regenerates all stored tables and charts; charts regenerates historical comparisons.
+The last line is changed or unchanged. When output names a file, changed=true|false is also
+appended there for a caller such as GitHub Actions; no environment option selects that file.
 """
 import datetime, json, math, os, re, shutil, sys
+from dataclasses import dataclass
+from typing import Literal
 
-import benchcharts
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import benchcharts, benchschema
 from benchplatforms import NAMES, platform, slug
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -115,6 +85,39 @@ SETUPS = {
 README_PHASES = ["body", "leaf", "signature", "no-op"]
 BACKEND_NAMES = {"cranelift": "Cranelift", "llvm": "LLVM"}
 NOT_MEASURED = "not measured yet"
+
+
+@dataclass(frozen=True)
+class Publish:
+    result: str
+    action: Literal["publish"] = "publish"
+    name: str | None = None
+    stored: str | None = None
+    noise: int | float = 10
+    max_age: int | float = 24
+    force: bool = False
+    check: bool = False
+    output: str | None = None
+
+    def __post_init__(self):
+        if not self.result:
+            raise ValueError("result must name a file")
+        if not benchschema.number(self.noise) or not benchschema.number(self.max_age):
+            raise ValueError("noise and max_age must be finite and nonnegative")
+
+
+@dataclass(frozen=True)
+class Render:
+    action: Literal["render"] = "render"
+
+
+@dataclass(frozen=True)
+class Charts:
+    action: Literal["charts"] = "charts"
+
+
+def load(text):
+    return benchschema.load_input(text, {"publish": Publish, "render": Render, "charts": Charts}, "publish", "benchreport.py")
 
 
 def seconds(value):
@@ -214,7 +217,11 @@ def stored_path(platform_name, kind="", name=None):
 def load_stored(path):
     for candidate in (path, os.path.join(os.path.dirname(path), LEGACY.get(os.path.basename(path), ""))):
         if os.path.isfile(candidate):
-            return json.load(open(candidate))
+            result = json.load(open(candidate))
+            if isinstance(result, dict) and "schema" in result and "runbench" not in result:
+                if wrong := benchschema.errors(result):
+                    raise ValueError(f"{candidate}: stored benchmark evidence is incomplete: {'; '.join(wrong)}")
+            return result
     return None
 
 
@@ -255,6 +262,81 @@ def fold(own, apart, kind):
     else:
         merged["results"] = {k: m for r in parts for k, m in r["results"].items()}
     return merged
+
+
+def schema_results(results, native):
+    """Keep each row's actual source schema when separately measured projects are folded."""
+    found = {}
+    for platform_name, result in results.items():
+        primary = own(result)
+        if primary is not None and benchschema.native(primary) != native:
+            primary = None
+        apart = {name: value for name, value in result.get("apart", {}).items()
+                 if benchschema.native(value) == native}
+        if primary is not None or apart:
+            found[platform_name] = fold(primary, apart, "")
+    return found
+
+
+def native_summary(results):
+    lines = ["Blaze build times from schema 2 measurements. Each selected binary is recorded by SHA-256 and "
+             "rechecked after the run. Compare a machine with its stored Blaze history; no Cargo reference is run.", "",
+             "| Project / profile | Platform | Cold | No change | Edit a function |", "|---|---|---:|---:|---:|"]
+    for platform_name, result in results.items():
+        for key, measured in sorted(result["results"].items(), key=lambda item: rank(item[0])):
+            phases = measured["phases"]
+            times = [seconds((phases.get(label) or {}).get("wall_s")) for label in ("cold", "no-op", "body")]
+            lines.append(f"| {project_name(key, measured)} / {key.rsplit('/', 1)[-1]} | {platform_name} | " + " | ".join(times) + " |")
+    lines += ["", *machines(results), "", f"Raw JSON: {raw_links(results)}.",
+              "The [history charts](docs/benchmarks.md#history-and-regressions) compare Blaze's own work, time and memory."]
+    return "\n".join(lines)
+
+
+def native_memory(results):
+    lines = ["Blaze's measured process and daemon memory, and its target, store and home on disk. "
+             "These schema 2 measurements have no Cargo side.", "",
+             "| Project / profile | Platform | Cold peak | Edit peak | Daemon at end | Disk |", "|---|---|---:|---:|---:|---:|"]
+    for platform_name, result in results.items():
+        for key, row in sorted(result["results"].items(), key=lambda item: rank(item[0])):
+            cold = ((row["phases"].get("cold") or {}).get("memory") or {}).get("blaze", {})
+            edit = (edit_memory(row) or {}).get("blaze", {})
+            disk = row.get("disk_mb") or {}
+            size = sum(disk.get(field) or 0 for field in ("target", "store", "home")) if disk else None
+            values = [cold.get("peak_mb"), edit.get("peak_mb"), (row.get("resident") or {}).get("end_mb"), size]
+            lines.append(f"| {project_name(key, row)} / {key.rsplit('/', 1)[-1]} | {platform_name} | "
+                         + " | ".join(map(megabytes, values)) + " |")
+    return "\n".join(lines)
+
+
+def native_platform_doc(name, result, stored):
+    compiler = result["compiler"]
+    raw = os.path.relpath(stored, os.path.join(ROOT, "docs"))
+    lines = [f"### {name}", "", f"Blaze {commit_link(result)}, {result['date']}; schema 2, measured {who(result)}. "
+             f"Raw: [{raw}]({raw}).", "", f"Compiler: `{compiler['path']}`, SHA-256 `{compiler['sha256']}`. "
+             "Its executable hashes were verified unchanged after the run.", "",
+             f"Machine: {machine_line(result)}.", "",
+             "| Project / profile | Phase | Blaze | Runs | Built | Link | Functions | Peak |", "|---|---|---:|---|---|---|---:|---:|"]
+    notes = []
+    for key, row in sorted(result["results"].items(), key=lambda item: rank(item[0])):
+        label = f"{project_name(key, row)} / {key.rsplit('/', 1)[-1]}"
+        for phase_name, phase in row["phases"].items():
+            peak = ((phase.get("memory") or {}).get("blaze") or {}).get("peak_mb")
+            lines.append(f"| {label} | {phase_name} | {seconds(phase['wall_s'])} | {spread(phase.get('samples_s'))} | "
+                         f"{phase.get('built', '-')} | {phase.get('link', '-')} | {phase.get('compiled', '-')} | {megabytes(peak)} |")
+            if phase_name == "test":
+                lines.append(f"| {label} | test after edit | {seconds(phase['edit_s'])} | {spread(phase.get('edit_samples_s'))} | "
+                             f"{phase.get('built', '-')} | - | {phase['tests']} tests | - |")
+        cold = row["phases"].get("cold") or {}
+        if cold.get("warm_store_s") is not None:
+            count = cold.get("warm_store_instructions")
+            notes += [f"{label}: another checkout with the filled store took {seconds(cold['warm_store_s'])}; "
+                      f"{count if count is not None else 'unavailable'} instructions.", ""]
+        if runtime := row.get("runtime"):
+            measured = runtime["blaze"]
+            notes += [f"{label} runtime (`{' '.join(runtime['command'])}`): Blaze median "
+                      f"{seconds(measured['median_s'])}, {measured['runs']} runs, peak {megabytes(measured['peak_mb'])}, "
+                      f"binary {megabytes(measured['size_mb'])}.", ""]
+    return lines + [""] + notes
 
 
 def own(result):
@@ -354,6 +436,16 @@ def edits_chart(results, backend="cranelift"):
 def headline(results, backend="cranelift"):
     """The README's opening numbers: the edits chart's first row (each platform's geometric mean over
     the projects of the median over the kinds of edit), in words."""
+    if current := schema_results(results, True):
+        medians = []
+        for platform_name, result in current.items():
+            times = [ph["wall_s"] for key, row in result["results"].items() if key.endswith("/" + backend)
+                     for phase, ph in row["phases"].items() if phase in EDITS and phase != "no-op"]
+            if times:
+                medians.append(f"**{seconds(benchcharts.median(times))}** on {platform_name}")
+        text = ("Measured Blaze edit-build medians: " + ", ".join(medians) + "." if medians
+                else "The current Blaze measurement has no Cranelift edit timings; see the profile tables.")
+        return HEADLINE_START + text + HEADLINE_END
     rows = edit_speedups(results, backend)
     said = []
     for p in NAMES:
@@ -364,7 +456,7 @@ def headline(results, backend="cranelift"):
             text = f"{factor:.0f}×" if factor >= 9.95 else f"{factor:.1f}×"
             said.append(f"**{text} {'faster' if m >= 1 else 'slower'}** on {p}")
     joined = ", ".join(said[:-1]) + f" and {said[-1]}" if len(said) > 1 else "".join(said)
-    return HEADLINE_START + joined + HEADLINE_END
+    return HEADLINE_START + "Historical Blaze v1 edits rebuilt " + joined + " than with `cargo build`, on average over real projects." + HEADLINE_END
 
 
 def edit_memory(measured):
@@ -408,7 +500,17 @@ def disk_chart(results, backend):
 
 def pick_section(results, backend="cranelift"):
     """The README's small table: an edit to one function of each project of PICK on PICK_ON."""
-    lines = [PICK_START, f"| Edit one function, then build ({PICK_ON}) | `cargo build` | `blaze build` |", "|---|---:|---:|"]
+    if current := schema_results(results, True):
+        lines = [PICK_START, f"| Edit one function, then build ({PICK_ON}) | Blaze |", "|---|---:|"]
+        measured = (current.get(PICK_ON) or {"results": {}})["results"]
+        for key in keys_of(current, backend):
+            name = key.split("/")[0]
+            phase = (measured.get(key) or {"phases": {}})["phases"].get("body")
+            if name in PICK and phase:
+                lines.append(f"| {PICK[name]} | {seconds(phase['wall_s'])} |")
+        lines += ["", "Schema 2 measures the selected Blaze; regression checks use stored Blaze results.", PICK_END]
+        return "\n".join(lines)
+    lines = [PICK_START, "Historical Blaze v1 comparison:", "", f"| Edit one function, then build ({PICK_ON}) | `cargo build` | `blaze build` |", "|---|---:|---:|"]
     measured = (results.get(PICK_ON) or {"results": {}})["results"]
     for key in keys_of(results, backend):
         name = key.split("/")[0]
@@ -431,6 +533,12 @@ def for_docs(section):
 def summary_section(results):
     """docs/benchmarks.md's build table: an edit to one function of each project on each platform,
     then every kind of edit by platform."""
+    if current := schema_results(results, True):
+        lines = [SUM_START, native_summary(current)]
+        if historical := schema_results(results, False):
+            old = summary_section(historical).removeprefix(SUM_START).removesuffix(SUM_END)
+            lines += ["", "<details><summary>Historical Cargo comparisons</summary>", "", old, "", "</details>"]
+        return "\n".join([*lines, SUM_END])
     backend = "cranelift"
     lines = [SUM_START]
     if summary := edits_chart(results, backend):
@@ -484,6 +592,12 @@ def summary_section(results):
 def memory_section(results):
     """docs/benchmarks.md's memory table: what an edit held at its peak on each platform, then by platform
     what the daemon holds between edits, what a cold build held and what each side keeps on disk."""
+    if current := schema_results(results, True):
+        lines = [MEM_START, native_memory(current)]
+        if historical := schema_results(results, False):
+            old = memory_section(historical).removeprefix(MEM_START).removesuffix(MEM_END)
+            lines += ["", "<details><summary>Historical Cargo memory comparisons</summary>", "", old, "", "</details>"]
+        return "\n".join([*lines, MEM_END])
     measured = {p: r for p, r in results.items() if has_memory(r)}
     backend = memory_backend(measured)
     lines = [MEM_START]
@@ -689,6 +803,8 @@ def differences(stored, result, noise, max_age_h):
     if stored is None:
         return ["nothing stored"]
     why = []
+    if benchschema.native(stored) != benchschema.native(result):
+        why.append("measurement schema changed; historical Cargo fields are not new Blaze measurements")
     if set(stored["results"]) != set(result["results"]):
         why.append(f"projects: {sorted(stored['results'])} -> {sorted(result['results'])}")
     when = lambda r: datetime.datetime.strptime(r["date"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
@@ -720,15 +836,6 @@ def differences(stored, result, noise, max_age_h):
 
 
 
-def options(argv, name, default=None):
-    if name in argv:
-        at = argv.index(name)
-        value = argv[at + 1]
-        del argv[at:at + 2]
-        return value
-    return default
-
-
 def doc_section(results):
     """docs/benchmarks.md's results: every number of the newest run of each platform."""
     lines = [START, "Every number of the newest run of each platform, then of each project measured on its own on it "
@@ -744,9 +851,11 @@ def doc_section(results):
 
 
 def platform_doc(name, result, stored):
+    if benchschema.native(result):
+        return native_platform_doc(name, result, stored)
     host = result.get("host") or {}
     raw = os.path.relpath(stored, os.path.join(ROOT, "docs"))
-    lines = [f"### {name}", "",
+    lines = [f"### {name} (historical Cargo comparison)", "",
              f"blaze {commit_link(result)}, {result['date']}, Rust {result['toolchain']}, {result['runs']} runs of each edit, "
              f"measured {who(result)}. Raw: [{raw}]({raw}).", "",
              "| Machine | |", "|---|---|"]
@@ -944,7 +1053,9 @@ def runtime_section(results):
 
 def charts():
     """Every chart again from the stored results."""
-    results = stored_all()
+    # Comparison charts need an actual historical Cargo side. New results feed the Blaze
+    # history charts through benchhistory; they cannot form a Cargo speed-up ratio.
+    results = schema_results(stored_all(), False)
     print("edits:", edits_chart(results))
     measured = {p: r for p, r in results.items() if has_memory(r)}
     if backend := memory_backend(measured):
@@ -986,53 +1097,45 @@ def render():
 
 
 def main():
-    argv = sys.argv[1:]
-    stored_arg = options(argv, "--stored")
-    name = options(argv, "--name")
-    noise = float(options(argv, "--noise", "10"))
-    max_age = float(options(argv, "--max-age", "24"))
-    force, check = "--force" in argv, "--check" in argv
-    if "--render" in argv:
-        render()
-        return
-    if "--charts" in argv:
-        charts()
-        return
-    paths = [a for a in argv if not a.startswith("--")]
-    if len(paths) != 1:
+    if len(sys.argv) != 2:
         raise SystemExit(__doc__)
-    result = json.load(open(paths[0]))
-    runtime = "runbench" in result
-    measured_on = platform(result)
-    if measured_on not in NAMES:
-        raise SystemExit(f"{paths[0]}: measured on {measured_on}, which is none of the platforms ({', '.join(NAMES)}; benchplatforms.py)")
-    kind = "runtime" if runtime else ""
-    stored_at = stored_arg or stored_path(measured_on, kind, name)
+    given = load(sys.argv[1])
+    if isinstance(given, Render):
+        render()
+        return 0
+    if isinstance(given, Charts):
+        charts()
+        return 0
+    result = json.load(open(given.result))
+    runtime = isinstance(result, dict) and "runbench" in result
     if runtime:
         wrong = runtime_wrong(result) if result["runbench"] else ["runbench.py wrote nothing"]
     else:
-        wrong = [f"{key}: {line}" for key, measured in result["results"].items() for line in measured.get("wrong", [])]
-    tests = [line for line in wrong if not runtime and line.split(": ", 1)[1].startswith("tests (")]
-    if programs := [line for line in wrong if line not in tests]:
-        print("refused: a program said something else than blaze's cold build, or its run failed\n"
-              + "\n".join(programs))
-        sys.exit(2)
-    if tests:
-        print("written with tests that ended otherwise than under cargo (shown in the table):\n" + "\n".join(tests))
+        wrong = benchschema.errors(result)
+    if wrong:
+        print("refused: benchmark evidence is incomplete or failed\n" + "\n".join(wrong))
+        return 2
+    measured_on = platform(result)
+    if measured_on not in NAMES:
+        raise SystemExit(f"{given.result}: measured on {measured_on}, which is none of the platforms ({', '.join(NAMES)}; benchplatforms.py)")
+    kind = "runtime" if runtime else ""
+    stored_at = os.path.abspath(given.stored or stored_path(measured_on, kind, given.name))
     stored = load_stored(stored_at)
-    why = (["--force"] if force else []) + (runtime_differences if runtime else differences)(stored, result, noise, max_age)
+    why = (["force"] if given.force else []) + (runtime_differences if runtime else differences)(stored, result, given.noise, given.max_age)
     changed = bool(why)
-    print(f"{measured_on}: " + ("\n".join(why[:40]) or f"every number within {noise:.0f}% (or 50 ms) of the stored run"))
-    if changed and not check:
+    print(f"{measured_on}: " + ("\n".join(why[:40]) or f"every number within {given.noise:.0f}% (or 50 ms) of the stored run"))
+    if changed and not given.check:
         os.makedirs(os.path.dirname(stored_at), exist_ok=True)
-        if os.path.abspath(paths[0]) != os.path.abspath(stored_at):
-            shutil.copyfile(paths[0], stored_at)
-        write_sections(kind, result, name)
-    if os.environ.get("GITHUB_OUTPUT"):
-        open(os.environ["GITHUB_OUTPUT"], "a").write(f"changed={'true' if changed else 'false'}\n")
+        if os.path.abspath(given.result) != os.path.abspath(stored_at):
+            shutil.copyfile(given.result, stored_at)
+        write_sections(kind, result, given.name)
+    if given.output:
+        with open(given.output, "a") as output:
+            output.write(f"changed={'true' if changed else 'false'}\n")
     print("changed" if changed else "unchanged")
-    sys.exit(1 if check and changed else 0)
+    return 1 if given.check and changed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.path.insert(0, os.path.join(ROOT, "tools", "typed-input", "src"))
+    raise SystemExit(main())

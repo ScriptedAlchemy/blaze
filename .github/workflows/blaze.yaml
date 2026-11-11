@@ -10,6 +10,7 @@
 #       the lint baselines (crates/blaze-lints/baselines) with the blaze the tree builds, on
 #       Linux AArch64,
 #       real two-worker distributed dev/release builds and fault acceptance with that same Blaze,
+#       protocol and carrier library/integration tests alongside the compiler build,
 #       `harness/imports.py` and `harness/rustcsites.py`, actionlint over the workflows. No `blaze fmt --check`: fmt.yaml
 #       formats main after each push instead.
 #   push to main: the build and the unit tests on Linux AArch64 and macOS, which
@@ -119,6 +120,22 @@ jobs:
         run: uv run --frozen python harness/distv2/selfcheck.py
       - name: distributed build identity and CI acceptance regressions
         run: uv run --frozen python -m unittest discover --start-directory .github/scripts --pattern 'test_distributed_ci.py'
+      - name: selected Blaze CLI and generated fixture regressions
+        run: uv run --frozen python -m unittest discover --start-directory .github/scripts --pattern 'test_blaze_cli.py'
+      - name: native Bun preparation regressions
+        run: python3 -I .github/scripts/test_bunprep.py
+      - name: Blaze benchmark evidence and history regressions
+        run: uv run --frozen --no-dev python -I -m unittest discover -s harness -p 'test_bench.py'
+      - name: benchmark workflow caller regressions
+        run: uv run --frozen --no-dev python -I .github/scripts/test_benchmark_ci.py
+      - name: rival compiler selection and evidence regressions
+        run: uv run --frozen python .github/scripts/test_rival.py
+      - name: release speed evidence regressions
+        run: python3 -I .github/scripts/test_promote_speed.py
+      - name: distributed objective adapter regressions
+        run: uv run --frozen python harness/v2/test_distributed.py
+      - name: bounded seed readiness and shutdown regressions
+        run: python3 -I -B .github/scripts/test_seed_preflight.py
       - name: fork migration oracle and CI acceptance regressions
         run: |
           uv run --frozen python -m unittest discover --start-directory harness/forkfixes --pattern 'test_*.py'
@@ -215,6 +232,9 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 150
     env:
+      # Keep the complete B0 bootstrap's reader wave below the previous swap-heavy run.
+      BLAZE_CORES: "2"
+      BLAZE_DAEMON_MEMORY_GB: "6"
       # Read by blaze's daemon when it starts (blaze-link's C driver, cc-rs in build scripts), so
       # set for the whole job. For the target alone: no plain CC or CXX (see above).
       CC_x86_64_unknown_linux_gnu: x86_64-linux-gnu-gcc
@@ -252,6 +272,71 @@ jobs:
       # Why the daemon ended, when it did (the client does not say).
       - if: failure()
         uses: ./.github/actions/daemon-log
+
+  # Partial feedback while the full compiler builds: B0 supports library targets, while
+  # the same-name lib/bin integration targets require Stage 1 (V2-REBASE.md).
+  distributed-core:
+    name: distributed library controls with B0 (partial)
+    needs: changes
+    if: needs.changes.outputs.tier != 'none'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      BLAZE_CORES: "2"
+      BLAZE_DAEMON_MEMORY_GB: "6"
+      BLAZE_TESTS: verify
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/blaze
+        with:
+          job: distributed-core
+          reflink: "true"
+      - name: distributed library models and planted controls with B0
+        timeout-minutes: 75
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-evidence"
+          selected="$(command -v blaze)"
+          sha256sum "$selected" > "$RUNNER_TEMP/core-evidence/bootstrap-sha256.txt"
+          cp "$GITHUB_WORKSPACE/.github/blaze-version" "$RUNNER_TEMP/core-evidence/bootstrap-pin.txt"
+          "$selected" --ignore-pin test --release --locked --lib -p blaze-dist -p blaze-dist-local --no-fail-fast \
+            2>&1 | tee "$RUNNER_TEMP/core-evidence/tests.log"
+          cases=(
+            retirement_preserves_survivors_and_exact_assignment_ownership
+            cancellation_cleans_a_promotion_the_worker_has_not_observed
+            stale_claimed_helpers_do_not_block_available_replacements
+            execution_bindings_retain_cleanup_without_sliding_replay_or_expiry
+            the_oracle_catches_leaving_without_retirement
+            the_oracle_catches_release_without_a_pending_stop
+            the_oracle_catches_a_stale_retirement_of_the_replacement_lead
+            the_oracle_catches_a_stale_acknowledgment_of_a_reused_slot
+            the_oracle_catches_an_unowned_retirement
+            the_oracle_catches_retired_work_kept_under_its_old_lease
+            the_oracle_catches_promotion_erasing_the_continuing_owner
+            the_oracle_catches_cleanup_using_only_the_last_observed_attempt
+            the_oracle_catches_a_stale_claimed_helper_misclassified_as_unclaimed
+            the_oracle_catches_a_missing_verified_execution_binding
+            the_oracle_catches_a_sliding_session_ceiling
+            the_oracle_catches_a_lost_reply_with_changed_replay_identity
+            the_oracle_catches_different_bytes_reusing_a_replay_identity
+          )
+          for case_name in "${cases[@]}"; do
+            grep -Eq "^test .*::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \
+              || { echo "::error::missing executed library control: $case_name"; exit 1; }
+          done
+      - name: stop the B0 library-test daemon
+        if: always()
+        run: timeout 60s blaze stop
+      - if: failure()
+        uses: ./.github/actions/daemon-log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: distributed-core-B0-partial
+          path: ${{ runner.temp }}/core-evidence/
+          if-no-files-found: warn
 
   # The gate's build and unit tests on hosted AArch64 (blaze-platform.yaml).
   linux-arm64:
@@ -324,6 +409,9 @@ jobs:
     if: needs.changes.outputs.tier != 'none'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
+    env:
+      BLAZE_CORES: "2"
+      BLAZE_DAEMON_MEMORY_GB: "6"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -362,6 +450,9 @@ jobs:
     if: needs.changes.outputs.tier != 'none'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 150
+    env:
+      BLAZE_CORES: "2"
+      BLAZE_DAEMON_MEMORY_GB: "6"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -378,7 +469,11 @@ jobs:
       # The release's daemon ends first; the tree's blaze runs its own, from a home of its own.
       - run: blaze stop
       - env:
-          BLAZE_HOME: ${{ runner.temp }}/tree-blaze-home
+          BLAZE_HOME: ${{ runner.temp }}/blaze-fs/tree-blaze-home
+          BLAZE_CACHE: ${{ runner.temp }}/blaze-fs/tree-blaze-home/v2/store
+          CARGO_TARGET_DIR: ${{ runner.temp }}/blaze-fs/tree-blaze-home/target
+          BLAZE_CORES: all
+          BLAZE_DAEMON_MEMORY_GB: "12"
         run: >-
           target/release/blaze check --workspace --target aarch64-unknown-linux-gnu
           --message-format short --baselines crates/blaze-lints/baselines
@@ -388,7 +483,7 @@ jobs:
 
   ci:
     name: ci
-    needs: [changes, scripts, workflows, linux-arm64, linux-6-8, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
+    needs: [changes, scripts, workflows, distributed-core, linux-arm64, linux-6-8, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
     if: always()
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
@@ -409,9 +504,11 @@ jobs:
             (.changes.outputs.tier == "none" or
               ((.changes.outputs.tier == "gate" or .changes.outputs.tier == "warm") and
                .["linux-arm64"].result == "success" and
+               .["distributed-core"].result == "success" and
                .["linux-6-8"].result == "success" and
                .["workspace-check"].result == "success" and
                (.changes.outputs.tier != "warm" or .macos.result == "success") and
+               .["linux-arm64"].outputs.protocol_tests == "true" and
                .["linux-arm64"].outputs.distributed_acceptance == "true" and
                .["linux-arm64"].outputs.forkfixes_acceptance == "true"))
-          ' > /dev/null || { echo "::error::this code change lacks distributed dev/release fault or fork migration acceptance"; exit 1; }
+          ' > /dev/null || { echo "::error::required checks or protocol, distributed, or fork migration acceptance are incomplete"; exit 1; }

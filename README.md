@@ -55,9 +55,10 @@ commands are not blaze's yet.
 
 ## How fast
 
-These numbers are blaze v1's; v2 has not been measured yet.
+Historical comparison rows are Blaze v1 measurements. Schema 2 reports Blaze's own time and
+compares it with stored Blaze runs; every result names its compiler and date.
 
-- Edits rebuild <!-- benchheadline:start -->**10× faster** on macOS arm64, **24× faster** on Linux aarch64 and **11× faster** on Linux x86-64<!-- benchheadline:end --> than with `cargo build`, on average over real projects.
+- <!-- benchheadline:start -->Historical Blaze v1 edits rebuilt **10× faster** on macOS arm64, **24× faster** on Linux aarch64 and **11× faster** on Linux x86-64 than with `cargo build`, on average over real projects.<!-- benchheadline:end -->
 - **About 20 ms** from saving a file to a running program using the new code, with
   [live edits](docs/usage.md#change-a-running-program).
 

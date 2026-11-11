@@ -22,10 +22,11 @@
         results files under `results`, with the command that repeats it
     promote.py speed '{"tag": ..., "project": "zed", "os": ..., "bench": "<bench.py result>",
                        "baseline": "<the stable's, or empty>", "threshold": 25, "out": "<file>"}'
-        the gate's speed check of an application: every phase of bench.py's result (cold,
-        no-op, each edit, tests) is faster with blaze than with cargo, nothing differs from
-        cargo's, and nothing is more than `threshold` percent worse than the stable release's
-        result (bench.py --compare); `out` is the verdict in smoke.py's results form
+        the gate's speed check of an application: a complete schema-2 Blaze benchmark,
+        including every edit and declared test suite, has no correctness failure or changed
+        compiler identity, and nothing is more than `threshold` percent worse than the stable
+        release's measured Blaze result. A missing stable baseline cannot establish speed;
+        `out` is the verdict in smoke.py's results form
     promote.py pointer '{"channel": "canary", "tag": "v0.YYYYMMDD.N"}'
         the channel's pointer names the release (by hand; the workflows move both with `metadata`)
     promote.py latest '{"out": "latest.json"}'
@@ -51,7 +52,7 @@ The JSON is inline, a file's path, or `-` for stdin. The same tag is flipped: no
 again and no archive changes, so a version names the same bytes before and after. Needs gh (GH_TOKEN).
 Python 3.11+, stdlib.
 """
-import datetime, glob, json, os, re, subprocess, sys, tempfile, time, typing
+import datetime, glob, importlib, json, os, re, shlex, subprocess, sys, tempfile, time, typing
 from dataclasses import dataclass, fields
 
 REPO = os.environ.get("BLAZE_RELEASE_REPO") or os.environ.get("GITHUB_REPOSITORY", "indexable-inc/blaze")
@@ -136,8 +137,6 @@ GATE = ".github/workflows/blaze.yaml"
 # TODO(x86-64): `linux x64 / tests` again once ix has x86-64 capacity (docs/harness.md "ix runners").
 GATE_TESTS = ("linux arm64 / tests", "macos arm64 / tests")
 POLL_SECS = 120
-# bench.py counts no difference under 50 ms.
-FLOOR_SECS = 0.05
 
 
 def typed(cls, text):
@@ -403,45 +402,79 @@ def issue(tag, run_url, results, needs):
         print(gh("issue", "create", "-R", REPO, "--title", title, "--label", "bug", "--body-file", "-", input=body).strip())
 
 
+def benchmark_tools():
+    """One benchmark schema, project specification and comparison policy, also under -I."""
+    directory = os.path.join(ROOT, "harness")
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    return importlib.import_module("benchschema"), importlib.import_module("bench")
+
+
 def speed(it):
     """The speed check of `it.project` from bench.py's result, written to `it.out` as smoke.py
     writes its results; exits 1 when it failed."""
-    data = json.load(open(it.bench))
-    repro = (f"BLAZE_BIN=\"$(dirname \"$(command -v blaze)\")/blaze-engine\" "
-             f"python3 harness/bench.py {it.project} --backend cranelift --runs 1 --cold-runs 1 --tests")
+    schema, benchmark = benchmark_tools()
+    recipe = json.dumps({"action": "run", "projects": [it.project], "backends": ["cranelift"],
+                         "runs": 1, "cold_runs": 1, "tests": True, "out": "/tmp/blaze-speed.json"})
+    repro = ('jq -n --arg blaze "$(command -v blaze)" --arg work "$(mktemp -d)" '
+             + shlex.quote(recipe + " + {blaze: $blaze, work: $work}")
+             + " | python3 harness/bench.py -")
     checks = []
 
     def check(what, why, seconds=0):
         checks.append(dict(what=f"{it.project} {what}", ok=why is None, open=None, seconds=seconds, why=why,
                            repro=repro, stdout="", stderr=""))
 
-    for key, measured in data["results"].items():
-        if measured.get("failed"):
-            check("bench", f"{key}: {measured['failed'][-3000:]}")
-        for line in measured.get("wrong", []):
-            check("bench", f"{key}: blaze's build does otherwise than cargo's: {line}")
+    try:
+        data = json.load(open(it.bench))
+        errors = schema.errors(data)
+        if not schema.native(data):
+            errors.append("speed needs a completed schema-2 Blaze benchmark")
+    except (OSError, ValueError, TypeError) as why:
+        data, errors = {}, [f"cannot read benchmark {it.bench}: {why}"]
+    if type(it.threshold) is not int or it.threshold < 0:
+        errors.append("threshold must be a nonnegative integer percentage")
+    spec = benchmark.PROJECTS.get(it.project)
+    if spec is None:
+        errors.append(f"no benchmark project {it.project!r}")
+    key = f"{it.project}/cranelift"
+
+    def coverage(result):
+        results = result.get("results") if isinstance(result, dict) else None
+        measured = results.get(key) if isinstance(results, dict) else None
+        if not isinstance(measured, dict):
+            return [f"{key}: the requested project and profile were not measured"]
+        if spec is not None:
+            required = {"cold", "no-op", *spec.get("edits", {})}
+            if "test" in spec:
+                required.add("test")
+            phases = measured.get("phases", {})
+            missing = sorted(required - set(phases)) if isinstance(phases, dict) else sorted(required)
+            if missing:
+                return [f"{key}: missing required phases {', '.join(missing)}"]
+        return []
+
+    errors += coverage(data)
+    check("complete Blaze measurement", "; ".join(errors) or None)
+    if not errors:
+        measured = data["results"][key]
         for label, phase in measured["phases"].items():
-            pairs = [("", phase.get("wall_s"), phase.get("cargo_s"))]
-            if "edit_s" in phase:
-                pairs.append((" after an edit", phase["edit_s"], phase.get("edit_cargo_s")))
-            for said, ours, theirs in pairs:
-                if ours is None or theirs is None:
-                    continue
-                slower = ours > theirs and ours - theirs > FLOOR_SECS
-                check(f"{label}{said}: blaze {ours:.2f} s, cargo {theirs:.2f} s",
-                      f"blaze is slower than cargo ({ours:.2f} s against {theirs:.2f} s)" if slower else None, ours)
-    if not data["results"]:
-        check("bench", "bench.py measured nothing")
-    if it.baseline and os.path.exists(it.baseline):
-        compared = subprocess.run([sys.executable, os.path.join(ROOT, "harness", "bench.py"), "--compare", it.baseline,
-                                   it.bench, "--threshold", str(it.threshold)], capture_output=True, text=True)
-        worse = [line for line in compared.stdout.splitlines() if line.strip()] if compared.returncode else []
-        if compared.returncode and not worse:
-            worse = [compared.stderr.strip()[-3000:] or f"bench.py --compare exited {compared.returncode}"]
-        stable = json.load(open(it.baseline)).get("commit") or "the stable release"
-        check(f"against stable ({it.threshold}%)", "; ".join(f"worse than stable ({stable}): {w}" for w in worse) or None)
-    else:
-        print(f"{it.project}: no result of the stable release to compare with (its first gate with this check)")
+            check(f"{label}: Blaze {phase['wall_s']:.2f} s", None, phase["wall_s"])
+        if not it.baseline or not os.path.isfile(it.baseline):
+            check("against stable", "a stored stable Blaze benchmark is required to establish speed")
+        else:
+            try:
+                baseline = json.load(open(it.baseline))
+                baseline_errors = schema.errors(baseline)
+                baseline_errors += coverage(baseline)
+                if baseline_errors:
+                    raise ValueError("; ".join(baseline_errors))
+                worse = benchmark.compare(baseline, data, it.threshold)
+                stable = baseline.get("commit") or "the stable release"
+                check(f"against stable ({it.threshold}%)",
+                      "; ".join(f"worse than stable ({stable}): {line}" for line in worse) or None)
+            except (OSError, ValueError, TypeError, KeyError) as why:
+                check("against stable", f"cannot compare stable Blaze evidence: {why}")
     with open(it.out, "w") as f:
         json.dump(dict(blaze=f"{it.tag} speed, {it.os}", results=checks), f, indent=1)
     failed = [c for c in checks if not c["ok"]]

@@ -123,7 +123,7 @@ def free_port() -> int:
 
 
 def host_triple(blaze: str, env: dict, timeout: int) -> str:
-    out = subprocess.run([blaze, "toolchain", "--json"], env=env, capture_output=True, text=True, check=True, timeout=timeout)
+    out = subprocess.run([blaze, "--ignore-pin", "toolchain", "--json"], env=env, capture_output=True, text=True, check=True, timeout=timeout)
     return json.loads(out.stdout)["host"]
 
 
@@ -302,7 +302,7 @@ class Run:
             gate_env["BLAZE_DIST_TEST_RESULT_GATE"] = str(result_gate.resolve())
         # Status is only for this run's private home, never a shared daemon.
         log = open(self.root / "logs" / f"{home}.daemon.log", "a")
-        args = [self.given.blaze, "serve"]
+        args = [self.given.blaze, "--ignore-pin", "serve"]
         if self.given.stall_bound is not None:
             args += ["--stall-bound", str(self.given.stall_bound)]
         with log:
@@ -316,7 +316,7 @@ class Run:
         self.sequence += 1
         log = open(self.root / "logs" / f"{home}.{self.sequence}.log", "w")
         process = subprocess.Popen(
-            [self.given.blaze, "build", *self.given.args],
+            [self.given.blaze, "--ignore-pin", "build", *self.given.args],
             cwd=project or self.project,
             env={**self.env(home, dist, **extra), "CARGO_TARGET_DIR": str(self.target(home, project))},
             stdout=log,
@@ -414,7 +414,7 @@ class Run:
 
 def daemon_pid(run: Run, home: str) -> int | None:
     out = subprocess.run(
-        [run.given.blaze, "status", "--json"], cwd=run.project, env=run.env(home, False), capture_output=True, text=True, timeout=run.given.command_timeout
+        [run.given.blaze, "--ignore-pin", "status", "--json"], cwd=run.project, env=run.env(home, False), capture_output=True, text=True, timeout=run.given.command_timeout
     )
     try:
         return (json.loads(out.stdout).get("daemon") or {}).get("pid")

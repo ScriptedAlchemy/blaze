@@ -4,7 +4,9 @@
 //! without the crate starting a thread. A failure prints the seed and the command that replays
 //! it, with every event, through the `replay` test:
 //!
-//!     BLAZE_DIST_SEED=<seed> cargo +1.99.0 test -p blaze-dist --test sim replay -- --nocapture
+//! Set BLAZE to the absolute path of the selected source-built Blaze:
+//!
+//!     BLAZE_DIST_SEED=<seed> "$BLAZE" --ignore-pin test -p blaze-dist --test sim replay -- --nocapture
 //!
 //! `BLAZE_DIST_SEEDS=<n>` changes the number of seeds per invariant set.
 
@@ -26,7 +28,7 @@ fn fail(set: &str, run: u64, failures: &[sim::Violation]) {
         panic!(
             "{} of {run} {set} seeds broke an invariant; the first: {first}\n\
              failing seeds: {seeds:?}\n\
-             replay: BLAZE_DIST_SEED={} cargo +1.99.0 test -p blaze-dist --test sim replay -- --nocapture",
+             replay: BLAZE_DIST_SEED={} \"$BLAZE\" --ignore-pin test -p blaze-dist --test sim replay -- --nocapture",
             failures.len(),
             first.seed,
         );

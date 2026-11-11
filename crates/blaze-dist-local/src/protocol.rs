@@ -1,4 +1,4 @@
-//! Local transport version 4. This carrier version is independent of the selected global
+//! Local transport version 5. This carrier version is independent of the selected global
 //! wire codec and terminal contract version 2. Every body is one canonical CBOR value.
 //!
 //! Version 2 changed who names a session. Version 1 echoed a client-chosen session ID in
@@ -8,6 +8,11 @@
 //! while that session is live. An older peer is refused by the version mismatch, not
 //! reinterpreted. Version 4 adds attempt-owned full-manifest acceptance, its immutable
 //! publication lookup and idempotent delivery; grant completion alone never ends a unit.
+//! Version 5 binds claims to their transport session and adds owned assignment retirement,
+//! followed by the existing separate stop acknowledgment before capacity can return. An
+//! exact-slot owned lookup observes promotions without claiming unrelated assignments.
+//! Verified execution bindings also retain their carrier lifetime through bounded work and
+//! cleanup; this does not revive an expired session or permit cross-session request replay.
 
 use blaze_wire::job_terminal_v2::SubscriberTerminalV2;
 use blaze_wire::{
@@ -18,7 +23,7 @@ use blaze_wire::{
 };
 
 /// Carrier protocol version; not blaze-wire's global codec version.
-pub const TRANSPORT_VERSION: u32 = 4;
+pub const TRANSPORT_VERSION: u32 = 5;
 
 wire_struct! {
     /// Creates a lifetime with `resume: None, epoch: None`, where `nonce` makes a retried
@@ -37,7 +42,8 @@ wire_struct! {
     /// Negotiated versions, clock origin, lifetime and bounds. Absolute job deadlines use
     /// this daemon's monotonic milliseconds, not wall-clock Unix timestamps. `created` says
     /// this Hello issued a new lifetime, so a client holding a request for another session
-    /// must not replay it here.
+    /// must not replay it here. `expires_ms` is the bound at this handshake; verified work
+    /// accepted later may extend it within the fixed ceiling, as the next resume reports.
     LocalWelcome {
         0 => transport: u32,
         1 => codec: u32,
@@ -135,6 +141,33 @@ wire_struct! {
         4 => alive: bool,
     }
 }
+wire_struct! {
+    /// Reads the current token of this owner's exact slot, including a pending stop.
+    /// This cannot claim a fresh slot or follow it into another execution.
+    OwnedAssignment {
+        0 => content: JobContent,
+        1 => executor: String,
+        2 => execution: ExecutionId,
+        3 => claimant: Digest,
+    }
+}
+wire_struct! {
+    /// The current token of the exact owned executor/execution named by its bound request.
+    OwnedAssignmentAnswer {
+        0 => attempt: Attempt,
+    }
+}
+wire_struct! {
+    /// Requests retirement of the exact assignment owned by this session and claimant label.
+    /// It emits a stop; only the separate KillAck releases the reservation.
+    RetireAssignment {
+        0 => content: JobContent,
+        1 => executor: String,
+        2 => execution: ExecutionId,
+        3 => attempt: Attempt,
+        4 => claimant: Digest,
+    }
+}
 wire_enum! {
     /// Requests after Hello. Reconnect uses Resume; Subscribe creates an additional interest.
     /// Release ends this lifetime deliberately, so a finished client returns its capacity
@@ -157,10 +190,13 @@ wire_enum! {
         CommitPublication => 14 (CommitPublication),
         Publication => 15 (Packs),
         DeliverPublication => 16 (DeliverPublication),
+        RetireAssignment => 17 (RetireAssignment),
+        OwnedAssignment => 18 (OwnedAssignment),
     }
 }
 wire_struct! {
     /// An agent asks which assigned executor of this execution it runs (`Jobs::claim`).
+    /// The coordinator binds the claimant label to this request's validated session.
     Claim {
         0 => content: JobContent,
         1 => execution: ExecutionId,
@@ -266,6 +302,7 @@ wire_enum! {
         Claimed => 10 (Claimed),
         Packs => 11 (CommittedPacks),
         Publication => 12 (Publication),
+        OwnedAssignment => 13 (OwnedAssignmentAnswer),
     }
 }
 wire_struct! {
