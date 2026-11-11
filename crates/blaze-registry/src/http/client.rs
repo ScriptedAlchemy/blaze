@@ -127,7 +127,7 @@ impl HyperHttp {
 
 impl HyperHttp {
     /// `url`'s body from byte `from`, collected, as a task on this client's runtime for a caller
-    /// in a runtime of its own: [`HyperHttp::stream_watched`]'s ranges, progress (said in
+    /// in a runtime of its own: [`HyperHttp::stream_watched`]'s bounds, ranges, progress (said in
     /// blaze-fetch's downloads as `what`) and stall bound. The answer's body is the bytes from
     /// `from` on, whether the server kept to the range (206) or sent the whole (200).
     pub fn get_from_async(
@@ -135,6 +135,7 @@ impl HyperHttp {
         url: &str,
         headers: &[(&str, &str)],
         from: u64,
+        bounds: Bounds,
         what: &str,
     ) -> Pending<anyhow::Result<Response>> {
         let (client, in_flight) = (self.client.clone(), self.in_flight.clone());
@@ -162,7 +163,7 @@ impl HyperHttp {
                 Ok(())
             };
             let mut answer = client
-                .ranged(&url, &headers, from, Bounds::NONE, &mut sink, &what, &mut |_| {})
+                .ranged(&url, &headers, from, bounds, &mut sink, &what, &mut |_| {})
                 .await?;
             if matches!(answer.status, 200 | 206) {
                 let skip = usize::try_from(from.saturating_sub(base)).unwrap_or(usize::MAX);

@@ -353,7 +353,9 @@ impl Source {
         match self {
             Source::Web { http, base } => {
                 let bytes =
-                    super::read_from(http, base, file, offset).await?.ok_or_else(missing)?;
+                    super::read_from(http, base, file, offset, blaze_registry::http::Bounds::NONE)
+                        .await?
+                        .ok_or_else(missing)?;
                 Ok(Body::Web { bytes, at: 0 })
             }
             Source::Dir(dir) => {

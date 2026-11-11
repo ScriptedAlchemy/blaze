@@ -84,6 +84,7 @@ impl HyperHttp {
         url: &str,
         _headers: &[(&str, &str)],
         _from: u64,
+        _bounds: Bounds,
         _what: &str,
     ) -> Pending<anyhow::Result<Response>> {
         let refused = NoNet { url: url.to_owned() }; // alloc: an error's address

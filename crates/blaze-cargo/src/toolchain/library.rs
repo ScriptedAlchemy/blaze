@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 
-use blaze_registry::http::HyperHttp;
+use blaze_registry::http::{Bounds, HyperHttp};
 
 /// The variable that names the library's directory to a process blaze starts.
 pub const VAR: &str = "BLAZE_LIBRARY";
@@ -175,8 +175,12 @@ pub fn fetch() -> Result<Library, String> {
             .to_owned()
     })?;
     let given = super::given_var(FROM_VAR).map_err(|it| it.to_string())?;
-    let releases = super::given_var("BLAZE_RELEASES").map_err(|it| it.to_string())?;
     let local = Library::ours_at(checkout());
+    let releases = if given.is_none() && local.is_none() {
+        super::given_var("BLAZE_RELEASES").map_err(|it| it.to_string())?
+    } else {
+        None
+    };
     let from = source(
         given.as_deref(),
         releases.as_deref(),
@@ -195,8 +199,8 @@ pub fn fetch() -> Result<Library, String> {
     Ok(FETCHED.get_or_init(|| fetched).clone())
 }
 
-/// An explicit library source wins, then the selected release source, then this build's
-/// matching checkout. A release mirror is authoritative even on the build machine.
+/// An explicit library source wins, then this build's matching checkout, then the selected
+/// release source. A development build with a checkout needs no release asset.
 fn source(
     given: Option<&str>,
     releases: Option<&str>,
@@ -206,13 +210,10 @@ fn source(
     if let Some(given) = given {
         return Ok(given.to_owned()); // alloc: one library fetch's source
     }
-    let base = match releases {
-        Some(base) => base,
-        None => match checkout {
-            Some(path) => return Ok(path.to_string_lossy().into_owned()),
-            None => crate::release::RELEASES,
-        },
-    };
+    if let Some(path) = checkout {
+        return Ok(path.to_string_lossy().into_owned()); // alloc: one library fetch's source
+    }
+    let base = releases.unwrap_or(crate::release::RELEASES);
     if !base.contains("://") {
         return Ok(Path::new(base).join(format!("v{version}")).to_string_lossy().into_owned());
     }
@@ -316,10 +317,11 @@ fn download(from: &str, file: &str) -> anyhow::Result<Vec<u8>> {
     }
     let address = super::base(from)?;
     let http = HyperHttp::shared()?;
+    let bounds = Bounds { most: u64::MAX, https_only: true };
     super::runtime()?.block_on(async {
         let mut tries = 0;
         loop {
-            let got = super::read_from(&http, &address, file, 0)
+            let got = super::read_from(&http, &address, file, 0, bounds)
                 .await
                 .and_then(|it| it.ok_or_else(|| anyhow::anyhow!("not there")));
             match got {
@@ -388,6 +390,10 @@ pub fn built_commit() -> &'static str {
 #[cfg(all(test, unix))]
 #[path = "library/download_tests.rs"]
 mod download_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "library/fetch_tests.rs"]
+mod fetch_tests;
 
 #[cfg(test)]
 mod tests {

@@ -18,7 +18,7 @@ pub mod own;
 
 use std::path::{Path, PathBuf};
 
-use blaze_registry::http::{Http as _, HttpNotSuccessful, HyperHttp};
+use blaze_registry::http::{Bounds, Http as _, HttpNotSuccessful, HyperHttp};
 
 /// blaze's toolchain as blaze names it in what it prints: `blaze-2026-10-25`, after the date of
 /// the Rust nightly it is (`harness/toolchain`), so it moves with every bump. rustup knows the
@@ -173,11 +173,12 @@ async fn read_from(
     base: &url::Url,
     file: &str,
     offset: u64,
+    bounds: Bounds,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let url = base.join(file)?;
     // In parallel ranges, said in blaze-fetch's downloads (the status line, `blaze status`, the
     // build's stall bound) and stopped after its stall bound without a byte.
-    let response = http.get_from_async(url.as_str(), &[], offset, file).await?;
+    let response = http.get_from_async(url.as_str(), &[], offset, bounds, file).await?;
     match response.status {
         404 | 410 => Ok(None),
         200 | 206 => Ok(Some(response.body)),
