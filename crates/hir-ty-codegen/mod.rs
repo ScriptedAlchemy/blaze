@@ -8774,10 +8774,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 unsupported!("fn pointer to {derived}");
             }
         };
-        // The function takes its caller's location as well, which the shim supplies.
-        if track_caller(db, callee) {
-            return self.reified(fn_ty, false);
-        }
         let sig = self.abi_sig(fn_ty)?;
         let inputs = Self::abi_inputs(sig.abi(), sig.inputs())?;
         let abi = self.fn_abi(sig.abi(), sig.output(), inputs.iter().copied())?;

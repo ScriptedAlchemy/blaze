@@ -1138,6 +1138,7 @@ impl Lint {
                 } else {
                     "nothing to change yet: what the finding names is of blaze's standard library (bstd, docs/v2/plan/design/std.md), which is not in this blaze; this lint is `allow` by default, a crate asks for it with `#![blaze::capabilities]`, and blaze's own workspace has it at `warn` once bstd is in the tree"
                 }
+            }
             Lint::ProgramLifetime => {
                 "a `#[blaze::program_lifetime]` type has no parameter and no `Drop`, holds only plain data, `&'static` references and other program-lifetime types, and is not `pub` unless its crate has `#![blaze::program_lifetime_api]`: change the field or take the attribute off"
             }
