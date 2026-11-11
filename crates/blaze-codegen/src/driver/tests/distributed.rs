@@ -180,7 +180,7 @@ fn changed_summary_import_choice_moves_the_plan_even_with_equal_walk_keys() {
     replacement.hint = Hint::Never;
     changed.0.insert(summary.key, replacement.encode());
     let plan = build.work_set(&[(1, member())], &[], &[], &changed).unwrap();
-    assert_eq!(original.nodes.keys, plan.nodes.keys, "the front-end walk is unchanged");
+    assert!(original.nodes.keys().eq(plan.nodes.keys()), "the front-end walk is unchanged");
     assert_ne!(original.digest(), plan.digest(), "summary decisions are identity inputs");
     let next = plan.release.iter().find(|task| task.name == importer.name).unwrap();
     assert!(!next.imports.imported.contains(&imported));

@@ -147,7 +147,7 @@ fn a_landed_group_holds_every_thunk_it_is_asked_for() {
         let body_key = keys::folded(&body.key);
         assert_eq!(first.stats.compiled_keys.iter().filter(|key| **key == body_key).count(), 1);
         let mut errors = Vec::new();
-        let (nodes, _, _) = Build::new(&machine, &program, &policy, &memo).walk(
+        let (nodes, ..) = Build::new(&machine, &program, &policy, &memo).walk(
             &[(1, member())],
             &[],
             &[],
