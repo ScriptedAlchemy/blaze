@@ -303,7 +303,7 @@ impl Steps for Real {
             .in_scope(|| {});
             return;
         }
-        if let Some(plan) = release.plan(blaze_graph::admission::Pressure::now()) {
+        if let Some(plan) = release.plan() {
             plan.run(&mut kept.lowered);
         }
     }

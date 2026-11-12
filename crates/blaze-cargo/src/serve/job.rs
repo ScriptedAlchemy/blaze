@@ -4650,6 +4650,7 @@ impl<S: Steps> Jobs<S> {
             if let Some(storing) = self.settling[at].storing.take() {
                 self.stored_kept(w, storing, Some(at), why);
             }
+            return;
         }
         if self.releasing.contains_key(&node) {
             self.released_front(w, node, ok, why);
@@ -8181,6 +8182,17 @@ fn at_its_end(open: bool, ok: bool, closed: bool) -> (bool, bool) {
         return (true, false);
     }
     (false, !closed)
+}
+
+/// A job over, not ok, with `error`: whether or not it was over already, its first error kept.
+fn fail_over(over: &mut Option<(bool, Option<ApiError>)>, error: ApiError) {
+    match over {
+        Some((ok, kept)) => {
+            *ok = false;
+            kept.get_or_insert(error);
+        }
+        None => *over = Some((false, Some(error))),
+    }
 }
 
 /// The build script runs a job held for their programs ([`Jobs::run_script`]) ended failed at
