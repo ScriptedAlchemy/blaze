@@ -75,13 +75,6 @@ pub(crate) const BLAZE_INTERNAL: On = blaze_kind(blaze::Kind::Internal);
 /// see whether the code is hot, allowed until a workspace or crate turns it on.
 pub(crate) const BLAZE_PEDANTIC_PERF: On = blaze_kind(blaze::Kind::PedanticPerf);
 
-/// The group `blaze::edition`: what the blaze edition removes, here the code blaze cannot
-/// analyse (`proc_macro_*`, `build_script_ambient`) and what blaze's standard library replaces
-/// (`std_use`), allowed until a workspace or crate turns
-/// it on, but for the lints whose advice this blaze already has
-/// ([`blaze::Lint::warns_by_default`]) (docs/v2/plan/design/edition.md).
-pub(crate) const BLAZE_EDITION: On = blaze_kind(blaze::Kind::Edition);
-
 /// The attribute a crate (or a module) opts in to capabilities with, after `blaze::`:
 /// `#![blaze::capabilities]` (docs/v2/plan/design/std.md, "The checks"). The effects it will
 /// turn into errors are not built; what it does today is ask for `blaze::std_use` at `warn`
