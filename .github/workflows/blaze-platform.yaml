@@ -159,7 +159,7 @@ jobs:
         run: |
           $PYTHON harness/unittests.py '{"args": ["--events", "json"]}'
       # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
+      - if: failure() || cancelled()
         uses: ./.github/actions/daemon-log
 
   build:
@@ -300,7 +300,7 @@ jobs:
           parts=$(uv run --frozen --no-dev python harness/focused.py parts "{\"harnesses\": $HARNESSES}")
           echo "parts=$parts" >> "$GITHUB_OUTPUT"
       # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
+      - if: failure() || cancelled()
         uses: ./.github/actions/daemon-log
 
   # These protocol, publication and transport crates are absent from unittests.py's crate
@@ -445,7 +445,7 @@ jobs:
           jq -n --arg bin "$RUNNER_TEMP/protocol-binaries" '{command: "verify", binaries: $bin}' \
             | python3 .github/scripts/dist_build_identity.py -
           echo 'accepted=true' >> "$GITHUB_OUTPUT"
-      - if: failure()
+      - if: failure() || cancelled()
         uses: ./.github/actions/daemon-log
         env:
           BLAZE_HOME: ${{ runner.temp }}/blaze-fs/protocol-tests
@@ -878,7 +878,7 @@ jobs:
           if [ "$RUNNER_OS" = Linux ]; then work="$BLAZE_HOME/smoke"; fi
           $PYTHON harness/smoke.py \
             "{\"groups\": [\"std\"], \"blaze\": \"${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release/blaze\", \"work\": \"$work\"}"
-      - if: failure()
+      - if: failure() || cancelled()
         uses: ./.github/actions/daemon-log
         env:
           BLAZE_HOME: ${{ env.BLAZE_HOME || format('{0}/blaze-home', runner.temp) }}
