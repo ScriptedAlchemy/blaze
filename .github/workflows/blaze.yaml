@@ -288,7 +288,7 @@ jobs:
             file "$f" | tee /dev/stderr | grep -q 'ELF 64-bit LSB .*x86-64' || { echo "::error::$f is not an x86-64 ELF"; exit 1; }
           done
       # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
+      - if: failure() || cancelled()
         uses: ./.github/actions/daemon-log
 
   # Partial feedback while the full compiler builds: B0 supports library targets, while
@@ -381,7 +381,7 @@ jobs:
       - name: stop the B0 library-test daemon
         if: always()
         run: timeout 60s blaze stop
-      - if: failure()
+      - if: failure() || cancelled()
         uses: ./.github/actions/daemon-log
       - uses: actions/upload-artifact@v7
         if: always()
@@ -567,7 +567,7 @@ jobs:
             --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}" \
             --message-format short --baselines crates/blaze-lints/baselines
       # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
+      - if: failure() || cancelled()
         uses: ./.github/actions/daemon-log
 
   ci:
