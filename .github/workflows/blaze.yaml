@@ -510,8 +510,8 @@ jobs:
             '{astlog: $astlog, rules: "tools/astlog/rules", paths: ["crates", "tools"], exclude: ["crates/harness"]}' \
             > "$RUNNER_TEMP/astlog.json"
           PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py "$RUNNER_TEMP/astlog.json"
-      # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
+      # A timed-out check is cancelled, so failure() alone loses its daemon evidence.
+      - if: failure() || cancelled()
         uses: ./.github/actions/daemon-log
 
   # AGENTS.md rule fix-through-blaze-lints: each clippy and blaze lint's findings, counted by
