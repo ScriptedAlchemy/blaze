@@ -271,8 +271,11 @@ fn digest(id: &BundleId, entries: &[Record]) -> ContentId {
 pub enum Downloaded {
     /// The cache has no bundle of the ID: the build is cold.
     NoBundle,
-    /// Every value it lists is in the store: `fetched` of the `listed` were fetched, the rest
-    /// were there already or fetched by another. Durable once each ticket is.
+    /// Every value it lists is in the store and matches its manifest record: `fetched` of
+    /// the `listed` were missing when its manifest arrived and have since been fetched,
+    /// possibly by another download. The rest were already readable. Durable once each
+    /// ticket is, including the store's pending puts when the manifest arrived, which cover
+    /// those already readable values too.
     Kept { listed: usize, fetched: usize, bytes: u64, tickets: Vec<Ticket> },
 }
 
@@ -282,14 +285,29 @@ pub struct Download {
     id: BundleId,
     asked: Tag,
     state: State,
+    #[cfg(test)]
+    pub(crate) plant: Plant,
+    #[cfg(test)]
+    pub(crate) publish_during_manifest: Option<fn(&mut Store)>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Plant {
+    None,
+    IgnoreShared,
+    IgnoreNewlyReadable,
+    ForgetPresentTickets,
+    IgnorePresentRecord,
+    IgnoreFetchedRecord,
 }
 
 enum State {
     Asking,
-    /// `waiting`: each key fetched and not yet answered, with its length.
+    /// `waiting`: each missing key not yet answered, with the record it must match.
     Fetching {
         listed: usize,
-        waiting: ByHash<Key, u64, Global>,
+        waiting: ByHash<Key, Record, Global>,
         fetched: usize,
         bytes: u64,
         tickets: Vec<Ticket>,
@@ -301,6 +319,34 @@ enum State {
 /// The most failures an error names; the rest are counted.
 const NAMED_MOST: usize = 8;
 
+/// `has` is for planning alone. A local value or another remote's valid fetch can have the
+/// same input key but a different record; neither establishes this manifest's binding.
+/// `get` has already checked the content hash, so compare its metadata without hashing again.
+fn stored(store: &Store, record: &Record) -> Result<bool, String> {
+    let Some(value) = store
+        .get(&record.key)
+        // alloc: an error's message, made only when it fails.
+        .map_err(|why| format!("{:x}: {why}", record.key.0))?
+    else {
+        return Ok(false);
+    };
+    let found = Record {
+        key: value.key,
+        kind: value.kind,
+        content: value.content,
+        len: value.bytes.len() as u64,
+    };
+    if found == *record {
+        Ok(true)
+    } else {
+        // alloc: an error's message, made only when it fails.
+        Err(format!(
+            "{:x}: its stored record is not the one its bundle's manifest lists",
+            record.key.0
+        ))
+    }
+}
+
 impl Download {
     pub fn start<C: Channels>(
         id: BundleId,
@@ -308,7 +354,15 @@ impl Download {
         effects: &mut Vec<Effect>,
     ) -> Download {
         let asked = client.bundle(id, effects);
-        Download { id, asked, state: State::Asking }
+        Download {
+            id,
+            asked,
+            state: State::Asking,
+            #[cfg(test)]
+            plant: Plant::None,
+            #[cfg(test)]
+            publish_during_manifest: None,
+        }
     }
 
     pub fn id(&self) -> BundleId {
@@ -316,6 +370,8 @@ impl Download {
     }
 
     /// Takes the client's manifests ([`Client::bundles`]), returning those not its own.
+    /// Broadcast pending store outcomes through [`Download::fetched`] first: a manifest
+    /// can start a new fetch of a key whose earlier attempt has already answered.
     pub fn bundles<C: Channels>(
         &mut self,
         got: Vec<GotBundle>,
@@ -340,24 +396,76 @@ impl Download {
                     let publics: Vec<Public> =
                         // alloc: setup: once a bundle or its lock file, not a value.
                         manifest.entries.iter().map(|entry| Public::listed(entry.key, entry.kind)).collect();
-                    // alloc: setup: once a bundle or its lock file, not a value.
-                    let lens: ByHash<Key, u64, Global> =
-                        manifest.entries.iter().map(|it| (it.key, it.len)).collect();
-                    let waiting = client
-                        .fetch_many(store, &publics, effects)
-                        .into_iter()
-                        .map(|(key, _)| (key, lens[&key]))
-                        // alloc: setup: once a bundle or its lock file, not a value.
-                        .collect();
+                    #[cfg(test)]
+                    let plant = self.plant;
+                    let present = |store: &Store, record: &Record| {
+                        #[cfg(test)]
+                        if plant == Plant::IgnorePresentRecord {
+                            return Ok(store.has(&record.key));
+                        }
+                        stored(store, record)
+                    };
+                    // A fetch already in flight returns no new tag. It is still missing:
+                    // every download that needs it must observe its eventual outcome.
+                    // alloc: setup: once a bundle, at most one record per listed key.
+                    let mut waiting: ByHash<Key, Record, Global> = ByHash::new_in(Global);
+                    let mut failed = Vec::new(); // alloc: only when a value is refused
+                    for record in &manifest.entries {
+                        match present(store, record) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                waiting.insert(record.key, *record);
+                            }
+                            Err(why) => failed.push(why),
+                        }
+                    }
+                    #[cfg(test)]
+                    if let Some(publish) = self.publish_during_manifest.take() {
+                        publish(store);
+                    }
+                    let _started = client.fetch_many(store, &publics, effects);
+                    // Another writer can publish between the snapshot and Store::fetch,
+                    // which then starts no fetch and owes no completion. Read presence
+                    // again, verifying its record before capturing the puts that cover it.
+                    #[cfg(test)]
+                    let recheck = self.plant != Plant::IgnoreNewlyReadable;
+                    #[cfg(not(test))]
+                    let recheck = true;
+                    if recheck {
+                        waiting.retain(|_, record| match present(store, record) {
+                            Ok(present) => !present,
+                            Err(why) => {
+                                failed.push(why);
+                                false
+                            }
+                        });
+                    }
+                    // Readable does not imply durable: another writer may just have put a
+                    // listed value. Capture the store's existing cross-writer fence once,
+                    // after every presence read above, so it covers all observed puts.
+                    let tickets = store.last_puts().iter().collect(); // alloc: one per writer
+                    #[cfg(test)]
+                    let waiting = if self.plant == Plant::IgnoreShared {
+                        waiting
+                            .into_iter()
+                            .filter(|(key, _)| _started.iter().any(|(started, _)| started == key))
+                            .collect()
+                    } else {
+                        waiting
+                    };
+                    #[cfg(test)]
+                    let tickets = if self.plant == Plant::ForgetPresentTickets {
+                        Vec::new()
+                    } else {
+                        tickets
+                    };
                     State::Fetching {
                         listed: manifest.entries.len(),
                         waiting,
                         fetched: 0,
                         bytes: 0,
-                        // alloc: setup: once a bundle or its lock file, not a value.
-                        tickets: Vec::new(),
-                        // alloc: an error's message, made only when it fails.
-                        failed: Vec::new(),
+                        tickets,
+                        failed,
                     }
                 }
             };
@@ -366,25 +474,44 @@ impl Download {
         others
     }
 
-    /// Takes how the store's fetches went ([`Store::fetched`]), returning those not its own.
-    pub fn fetched(&mut self, fetched: Vec<(Key, Fetched)>) -> Vec<(Key, Fetched)> {
+    /// Observes how the store's fetches went ([`Store::fetched`]). Broadcast the same slice
+    /// to every download and other owner before discarding it: one store fetch can satisfy
+    /// several manifests, and none owns its outcome exclusively. Repeated outcomes have no
+    /// effect once this download has accounted for their key. A kept outcome is verified
+    /// against this manifest through `store`: another owner may have used a different
+    /// remote or admission rule, whose success does not establish this manifest's record.
+    /// Broadcast each drained batch before delivering manifests or scheduling retries:
+    /// outcomes name keys, not fetch generations, so an old answer must never be delivered
+    /// after a new attempt for its key starts.
+    pub fn fetched(&mut self, fetched: &[(Key, Fetched)], store: &Store) {
         let State::Fetching { waiting, fetched: count, bytes, tickets, failed, .. } =
             &mut self.state
         else {
-            return fetched;
+            return;
         };
-        // alloc: setup: once a bundle or its lock file, not a value.
-        let mut others = Vec::new();
         for (key, how) in fetched {
-            let Some(len) = waiting.remove(&key) else {
-                others.push((key, how));
-                continue;
-            };
+            let Some(record) = waiting.remove(key) else { continue };
             match how {
                 Fetched::Kept(ticket) => {
-                    *count += 1;
-                    *bytes += len;
-                    tickets.push(ticket);
+                    let present = stored(store, &record);
+                    #[cfg(test)]
+                    let present = if self.plant == Plant::IgnoreFetchedRecord {
+                        Ok(true)
+                    } else {
+                        present
+                    };
+                    match present {
+                        Ok(true) => {
+                            *count += 1;
+                            *bytes += record.len;
+                            tickets.push(*ticket);
+                        }
+                        // alloc: an error's message, made only when it fails.
+                        Ok(false) => failed.push(format!(
+                            "{:x}: its fetch was kept but its value is not readable", key.0
+                        )),
+                        Err(why) => failed.push(why),
+                    }
                 }
                 // alloc: an error's message, made only when it fails.
                 Fetched::Missing => {
@@ -395,7 +522,6 @@ impl Download {
             }
         }
         self.settle();
-        others
     }
 
     /// How it ended, once it has.
@@ -422,6 +548,7 @@ impl Download {
                 tickets: std::mem::take(tickets),
             })
         } else {
+            failed.sort_unstable();
             // alloc: an error's message, made only when it fails.
             let named = failed.iter().take(NAMED_MOST).cloned().collect::<Vec<_>>().join("; ");
             let more = failed.len().saturating_sub(NAMED_MOST);

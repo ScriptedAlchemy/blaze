@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-73 invariants, 18 refinements, 5 reference models.
-By level: 57 tested, 34 simulated, 0 model-checked, 0 proved.
+78 invariants, 18 refinements, 5 reference models.
+By level: 58 tested, 38 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -136,6 +136,17 @@ By level: 57 tested, 34 simulated, 0 model-checked, 0 proved.
 - **`two_builds_give_the_same_diagnostics`** *tested* (`crates/blaze-ext-host/src/tests.rs`): two checks of the same source, on two databases, give the same diagnostics, byte for byte, in the same order; and so does a check that runs every job twice with its arena elsewhere.
   Controls: `an_extension_that_misses_a_finding`, `a_result_that_depends_on_an_address`.
 
+### blaze-global
+
+- **`overlapping_downloads_wait_for_shared_fetches_and_keep_their_outcomes`** *simulated* (`crates/blaze-global/src/tests/download.rs`): every overlapping bundle waits for all its missing values, including a fetch started by another owner, and receives the same original refusal or durability ticket exactly once. Dropping a waiter and repeating notifications do not change it; a queued outcome is broadcast before a new manifest can retry the same key.
+  Controls: `a_download_ignoring_an_existing_fetch`, `a_shared_completion_consumed_by_one_download`, `a_readable_value_without_its_durability_fence`, `waiting_for_a_value_published_during_fetch_scheduling`, `a_lost_manifest_binding`, `a_partly_applied_conflicting_manifest`, `a_readable_value_from_another_manifest_record`, `a_racing_value_from_another_manifest_record`, `a_shared_fetch_from_another_manifest_record`, `an_old_fetch_outcome_delivered_after_a_new_manifest`.
+- **`readable_bundle_values_keep_their_pending_durability_fence`** *simulated* (`crates/blaze-global/src/tests/download.rs`): a bundle's durability receipt covers already-readable pending puts as well as fetched values; no held sync counts as durable, and acknowledged values survive a crash and reopen unchanged.
+  Controls: `a_download_ignoring_an_existing_fetch`, `a_shared_completion_consumed_by_one_download`, `a_readable_value_without_its_durability_fence`, `waiting_for_a_value_published_during_fetch_scheduling`, `a_lost_manifest_binding`, `a_partly_applied_conflicting_manifest`, `a_readable_value_from_another_manifest_record`, `a_racing_value_from_another_manifest_record`, `a_shared_fetch_from_another_manifest_record`, `an_old_fetch_outcome_delivered_after_a_new_manifest`.
+- **`verified_manifests_keep_immutable_bindings_and_refuse_conflicts_atomically`** *simulated* (`crates/blaze-global/src/tests/download.rs`): verified manifests may repeat an equal key binding but never replace it; refusing one conflicting record changes none of that manifest's other bindings.
+  Controls: `a_download_ignoring_an_existing_fetch`, `a_shared_completion_consumed_by_one_download`, `a_readable_value_without_its_durability_fence`, `waiting_for_a_value_published_during_fetch_scheduling`, `a_lost_manifest_binding`, `a_partly_applied_conflicting_manifest`, `a_readable_value_from_another_manifest_record`, `a_racing_value_from_another_manifest_record`, `a_shared_fetch_from_another_manifest_record`, `an_old_fetch_outcome_delivered_after_a_new_manifest`.
+- **`bundle_values_keep_their_manifest_bindings_across_local_and_shared_sources`** *simulated* (`crates/blaze-global/src/tests/download.rs`): a bundle accepts only its signed content, kind and length, including a local value, a writer publishing during scheduling and a fetch another remote owns. A different self-consistent store value stays available to its owner but fails the bundle.
+  Controls: `a_download_ignoring_an_existing_fetch`, `a_shared_completion_consumed_by_one_download`, `a_readable_value_without_its_durability_fence`, `waiting_for_a_value_published_during_fetch_scheduling`, `a_lost_manifest_binding`, `a_partly_applied_conflicting_manifest`, `a_readable_value_from_another_manifest_record`, `a_racing_value_from_another_manifest_record`, `a_shared_fetch_from_another_manifest_record`, `an_old_fetch_outcome_delivered_after_a_new_manifest`.
+
 ### blaze-graph
 
 - **`footprint_stays_under_the_ceiling_unless_one_task_alone_exceeds_it`** *simulated* (`crates/blaze-graph/src/footprint/tests.rs`): whatever the peaks, the grants and what the allocator keeps, the footprint never passes the ceiling; growth within a grant never needs the gate; a task fails only when it alone passes the ceiling, with [`TooBig`]; every other task is built.
@@ -200,6 +211,8 @@ By level: 57 tested, 34 simulated, 0 model-checked, 0 proved.
 
 ### hir-def
 
+- **`record_type_fields_and_defaults_round_trip`** *tested* (`crates/hir-def/src/expr_store/persist.rs`): record tags, field order, type ids and optional defaults survive the persisted view and decoding, including nested and empty records.
+  Controls: `a_lost_persisted_record_default`.
 - **`a_write_of_a_file_has_a_job_for_its_crate_and_those_above_it_alone`** *tested* (`crates/hir-def/src/nameres/delta/tests.rs`): a crate with no job in a write (`delta::unreached`) is one whose job would change nothing, so after any write every crate's maintained map is the one a fresh resolution makes (`check_db`). And the cost: a write of a file has a job for its crate and the crates above it alone, not one for every crate of the graph.
   Controls: `a_crate_above_a_written_one_left_without_a_job`.
 - **`records_are_equal_exactly_when_their_field_sets_are`** *tested* (`crates/hir-def/src/record.rs`): two record types are equal exactly when their (name, type) sets are.

@@ -117,6 +117,38 @@ an untrusted standalone value signature, and a value that differs from its signe
 A trusted manifest authorizes its exact listed records. The network and disk completions come from
 `blaze-core`'s seeded simulation. The required source-built protocol job runs these tests.
 
+Overlapping bundle downloads track all of their missing values, including a fetch another
+owner already started. A shared completion is read by every waiting download without being
+consumed by the first one; each observes the original outcome and retains a refusal or absence.
+A download cannot report completion merely because it did not start a new request itself.
+The driver broadcasts each drained `Store::fetched` batch to existing owners before
+delivering new manifests or scheduling a retry for the same key. Outcomes identify a key,
+not a fetch generation; delivering an old batch after creating a new owner could settle
+the new download with the previous attempt's outcome.
+
+A readable value or successful shared fetch is checked against that download's complete
+signed record: key, kind, content digest and byte length. `Store::get` supplies the value
+under the store's existing content-checking contract; the bundle layer compares its metadata
+without rehashing the payload. A self-consistent local value accepted by another owner can
+still be the wrong record for this manifest and must fail the download. This check applies
+both before scheduling and to values published during scheduling or returned by another
+owner's fetch.
+
+Readability and durability are separate. A successful download returns the durability tickets
+for fetched values and for already-readable puts still awaiting sync when the manifest arrives.
+It also handles a value becoming readable while fetches are being scheduled. The caller must
+wait for those tickets before claiming durability; a readable value with a held sync is not a
+durable bundle. The simulation fixtures hold and release sync completions and reopen after a
+crash to check that boundary.
+
+Verified manifests may repeat an identical key-to-record binding. A later manifest cannot
+replace that binding with another record: the client checks the whole manifest for conflicts
+before adding any entries, so refusing one record leaves every previous binding intact and
+adds none of the refused manifest's other records. The bundle models and their planted
+controls are in `crates/blaze-global/src/tests/download.rs`: four Hegel models and ten
+planted controls. The Stage 1 receipt requires each to report success in the complete test
+run. Hosted receipts record their results; their source presence does not settle D11.
+
 The compiler daemon does not yet drive that bundle client, and `blaze-global::PINNED` has no
 publisher keys. A trusted service and publisher policy, daemon integration, a real cached-tree
 build, and causal evidence that remote IO stays off the critical path are still needed for D11.
@@ -406,7 +438,10 @@ its current-tree build. It verifies the build artifact's commit, tree and binary
 uses that Blaze to build the coordinator and cache server in an isolated home, and runs both dev
 and release with faults enabled. A separate job uses the same verified source-built compiler to
 run the protocol and carrier crates' library and integration tests with their Hegel controls;
-the merge gate requires that test receipt too. The pinned bootstrap predates the compiler repair
+the commands and their final stop run in one fresh home under the Linux
+[kernel execution observer](harness.md#kernel-execution-observer). The merge gate requires
+both named test groups, their exact-line control checks, unchanged source and binaries, and
+a complete kernel-execution receipt. The pinned bootstrap predates the compiler repair
 needed by packages whose library and binary share a name, so it cannot supply this receipt.
 Release also requires two holders to emit actual LLVM and folded
 work. The workers have private stores and targets on the runner's verified reflink filesystem;

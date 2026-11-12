@@ -337,22 +337,14 @@ jobs:
           jq -n --arg bin "$RUNNER_TEMP/protocol-binaries" '{command: "verify", binaries: $bin}' \
             | python3 .github/scripts/dist_build_identity.py -
           cp "$RUNNER_TEMP/protocol-binaries/blaze-build.json" "$RUNNER_TEMP/protocol-evidence/stage1-build.json"
+      - name: kernel execution tracing
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends strace
       - name: distributed protocol and carrier tests with Stage 1
         id: protocol
-        timeout-minutes: 75
-        env:
-          BLAZE_HOME: ${{ runner.temp }}/blaze-fs/protocol-tests
-          BLAZE_CACHE: ${{ runner.temp }}/blaze-fs/protocol-tests/v2/store
-          CARGO_TARGET_DIR: ${{ runner.temp }}/blaze-fs/protocol-target
-          BLAZE_DAEMON_MEMORY_GB: "12"
-          BLAZE_TESTS: verify
-        run: |
-          "$RUNNER_TEMP/protocol-binaries/blaze" --ignore-pin test --release --locked \
-            -p blaze-wire -p blaze-dist -p blaze-dist-local -p blaze-serve -p blaze-global -p blaze-graph --lib --tests --no-fail-fast \
-            2>&1 | tee "$RUNNER_TEMP/protocol-evidence/tests.log"
-      - name: daemon release and scheduler controls with Stage 1
-        id: release
-        timeout-minutes: 75
+        # Two 75-minute command bounds and bounded shutdown/reaping, all in one trace.
+        timeout-minutes: 153
         env:
           BLAZE_HOME: ${{ runner.temp }}/blaze-fs/protocol-tests
           BLAZE_CACHE: ${{ runner.temp }}/blaze-fs/protocol-tests/v2/store
@@ -361,9 +353,32 @@ jobs:
           BLAZE_TESTS: verify
           CARGO_TERM_COLOR: never
         run: |
-          "$RUNNER_TEMP/protocol-binaries/blaze" --ignore-pin test --release --locked \
-            --lib -p blaze-cargo --no-fail-fast -- serve:: \
-            2>&1 | tee "$RUNNER_TEMP/protocol-evidence/release.log"
+          jq -n --arg blaze "$RUNNER_TEMP/protocol-binaries/blaze" --arg cwd "$GITHUB_WORKSPACE" \
+            --arg home "$RUNNER_TEMP/blaze-fs/protocol-tests" --arg out "$RUNNER_TEMP/protocol-evidence/exec" \
+            '{blaze: $blaze, cwd: $cwd, home: $home, out: $out,
+              commands: [
+                {name: "tests", args: ["test", "--release", "--locked", "-p", "blaze-wire", "-p", "blaze-dist",
+                  "-p", "blaze-dist-local", "-p", "blaze-serve", "-p", "blaze-global", "-p", "blaze-graph",
+                  "--lib", "--tests", "--no-fail-fast"]},
+                {name: "release", args: ["test", "--release", "--locked", "--lib", "-p", "blaze-cargo",
+                  "--no-fail-fast", "--", "serve::"]}],
+              command_seconds: 4500, stop_seconds: 60, reap_seconds: 30}' \
+            > "$RUNNER_TEMP/protocol-evidence/observer-input.json"
+          status=0
+          python3 harness/v2/exec_observer.py "$RUNNER_TEMP/protocol-evidence/observer-input.json" || status=$?
+          for log in tests release stop tracer; do
+            path="$RUNNER_TEMP/protocol-evidence/exec/$log.log"
+            if [ -f "$path" ]; then
+              echo "::group::$log"
+              tail -n 80 "$path"
+              echo '::endgroup::'
+            fi
+          done
+          exit "$status"
+      - name: daemon release and scheduler controls with Stage 1
+        id: release
+        timeout-minutes: 1
+        run: |
           cases=(
             worker_release_keeps_the_loop_responsive_and_publication_fenced
             parked_successors_allow_release_with_one_work_slot
@@ -387,14 +402,29 @@ jobs:
             the_oracle_catches_history_before_handoff_failure
           )
           for case_name in "${cases[@]}"; do
-            grep -Eq "^test .*::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/protocol-evidence/release.log" \
+            grep -Eq "^test .*::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/protocol-evidence/exec/release.log" \
               || { echo "::error::missing executed daemon release control: $case_name"; exit 1; }
           done
-      - name: stop the protocol test daemon
-        if: always() && steps.handoff.outcome == 'success' && steps.protocol.outcome != 'skipped'
-        env:
-          BLAZE_HOME: ${{ runner.temp }}/blaze-fs/protocol-tests
-        run: timeout --kill-after=10s 60s "$RUNNER_TEMP/protocol-binaries/blaze" --ignore-pin stop
+          bundle_cases=(
+            overlapping_downloads_wait_for_shared_fetches_and_keep_their_outcomes
+            readable_bundle_values_keep_their_pending_durability_fence
+            verified_manifests_keep_immutable_bindings_and_refuse_conflicts_atomically
+            bundle_values_keep_their_manifest_bindings_across_local_and_shared_sources
+            the_oracle_catches_a_download_ignoring_an_existing_fetch
+            the_oracle_catches_a_shared_completion_consumed_by_one_download
+            the_oracle_catches_a_readable_value_without_its_durability_fence
+            the_oracle_catches_waiting_for_a_value_published_during_fetch_scheduling
+            the_oracle_catches_a_lost_manifest_binding
+            the_oracle_catches_a_partly_applied_conflicting_manifest
+            the_oracle_catches_a_readable_value_from_another_manifest_record
+            the_oracle_catches_a_racing_value_from_another_manifest_record
+            the_oracle_catches_a_shared_fetch_from_another_manifest_record
+            the_oracle_catches_an_old_fetch_outcome_delivered_after_a_new_manifest
+          )
+          for case_name in "${bundle_cases[@]}"; do
+            grep -Eq "^test .*::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/protocol-evidence/exec/tests.log" \
+              || { echo "::error::missing executed bundle control: $case_name"; exit 1; }
+          done
       - name: protocol tests completed with unchanged Stage 1 and source
         id: accepted
         env:
@@ -405,10 +435,13 @@ jobs:
             || { echo "::error::the complete protocol test run did not succeed"; exit 1; }
           test "$RELEASE_TEST_OUTCOME" = success \
             || { echo "::error::the daemon release control run did not succeed"; exit 1; }
-          test -s "$RUNNER_TEMP/protocol-evidence/tests.log" \
+          test -s "$RUNNER_TEMP/protocol-evidence/exec/tests.log" \
             || { echo "::error::the complete protocol test run has no retained log"; exit 1; }
-          test -s "$RUNNER_TEMP/protocol-evidence/release.log" \
+          test -s "$RUNNER_TEMP/protocol-evidence/exec/release.log" \
             || { echo "::error::the daemon release control run has no retained log"; exit 1; }
+          jq -e '.schema == 1 and .scope == "linux-launched-descendants-through-blaze-stop"
+            and .passed == true and .returncode == 0' "$RUNNER_TEMP/protocol-evidence/exec/result.json" > /dev/null \
+            || { echo "::error::the protocol run has no complete kernel execution evidence"; exit 1; }
           jq -n --arg bin "$RUNNER_TEMP/protocol-binaries" '{command: "verify", binaries: $bin}' \
             | python3 .github/scripts/dist_build_identity.py -
           echo 'accepted=true' >> "$GITHUB_OUTPUT"

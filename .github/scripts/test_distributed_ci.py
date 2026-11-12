@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """CI refuses wrong build identities and incomplete distributed acceptance.
 
-The small executables below are identity fixtures and shell command doubles. No Blaze
-build or daemon runs here; real distributed acceptance belongs to the dependent job.
+The small executables below are identity fixtures and shell command doubles. The protocol
+shell uses the real kernel observer and strace; real Blaze acceptance belongs to the dependent job.
 """
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -24,6 +26,51 @@ ROOT = Path(__file__).resolve().parents[2]
 MAIN = ROOT / ".github/workflows/blaze.yaml"
 PLATFORM = ROOT / ".github/workflows/blaze-platform.yaml"
 PASSED = "distv2: every check passed\n"
+PROTOCOL_STEP = "distributed protocol and carrier tests with Stage 1"
+RELEASE_STEP = "daemon release and scheduler controls with Stage 1"
+PROTOCOL_ACCEPTED_STEP = "protocol tests completed with unchanged Stage 1 and source"
+EXECUTION_SCOPE = "linux-launched-descendants-through-blaze-stop"
+RELEASE_CONTROLS = (
+    "worker_release_keeps_the_loop_responsive_and_publication_fenced",
+    "parked_successors_allow_release_with_one_work_slot",
+    "cancellation_at_each_handoff_boundary_retires_the_build",
+    "release_failure_and_panic_preserve_the_cause_and_keep_serving",
+    "refused_release_uses_one_accounted_discard",
+    "orphaned_worker_result_is_discarded_after_job_removal",
+    "late_write_requires_another_final_release",
+    "completion_preserves_later_pressure_finished_crates_and_end",
+    "final_release_policy_requires_completion_after_every_late_write",
+    "parking_an_unposted_task_after_cancel_or_failure_settles_without_a_token",
+    "pending_history_uses_the_completed_handoff_outcome",
+    "the_oracle_catches_inline_release",
+    "the_oracle_catches_a_held_successor_grant",
+    "the_oracle_catches_a_late_result_dropped_on_the_loop",
+    "the_oracle_catches_keep_after_an_older_final_release",
+    "the_oracle_catches_completion_erasing_later_pressure",
+    "the_oracle_catches_completion_erasing_later_finished_crates",
+    "the_oracle_catches_completion_erasing_a_later_end",
+    "the_oracle_catches_reusing_a_final_plan_before_a_late_write",
+    "the_oracle_catches_history_before_handoff_failure",
+)
+BUNDLE_MODELS = (
+    "overlapping_downloads_wait_for_shared_fetches_and_keep_their_outcomes",
+    "readable_bundle_values_keep_their_pending_durability_fence",
+    "verified_manifests_keep_immutable_bindings_and_refuse_conflicts_atomically",
+    "bundle_values_keep_their_manifest_bindings_across_local_and_shared_sources",
+)
+BUNDLE_CONTROLS = (
+    "the_oracle_catches_a_download_ignoring_an_existing_fetch",
+    "the_oracle_catches_a_shared_completion_consumed_by_one_download",
+    "the_oracle_catches_a_readable_value_without_its_durability_fence",
+    "the_oracle_catches_waiting_for_a_value_published_during_fetch_scheduling",
+    "the_oracle_catches_a_lost_manifest_binding",
+    "the_oracle_catches_a_partly_applied_conflicting_manifest",
+    "the_oracle_catches_a_readable_value_from_another_manifest_record",
+    "the_oracle_catches_a_racing_value_from_another_manifest_record",
+    "the_oracle_catches_a_shared_fetch_from_another_manifest_record",
+    "the_oracle_catches_an_old_fetch_outcome_delivered_after_a_new_manifest",
+)
+BUNDLE_CASES = BUNDLE_MODELS + BUNDLE_CONTROLS
 
 
 def shell_step(workflow: Path, name: str) -> str:
@@ -169,7 +216,7 @@ class AcceptanceGateTests(unittest.TestCase):
     def run_shell(self, workflow, step, env):
         return subprocess.run(
             [*shell_command(workflow, step), "-c", shell_step(workflow, step)],
-            env={**os.environ, **env}, text=True, capture_output=True, timeout=10)
+            cwd=ROOT, env={**os.environ, **env}, text=True, capture_output=True, timeout=30)
 
     def test_aggregate_requires_real_acceptance_for_every_code_tier(self):
         base = {"changes": {"result": "success", "outputs": {"tier": "gate"}},
@@ -219,20 +266,119 @@ class AcceptanceGateTests(unittest.TestCase):
                 done = self.run_shell(MAIN, "every required check passed", {"NEEDS": json.dumps(needs)})
                 self.assertEqual(done.returncode == 0, wanted, done.stdout + done.stderr)
 
-    def shell_fixture(self, root, *, code=0):
+    def shell_fixture(self, root, *, code=0, failure_harness=None):
         evidence = root / "dist-evidence"
         evidence.mkdir()
+        (root / "blaze-fs").mkdir()
         commands = root / "commands"
         commands.mkdir()
         python = commands / "python3"
+        harness_double = ""
+        if failure_harness is not None:
+            # The old tee/exit controls explicitly double their expensive harness. No
+            # other script, especially the execution observer, may silently be stubbed.
+            harness_double = (f"  {shlex.quote(failure_harness)})\n"
+                              f"    printf '%s\\n' 'distv2: every check passed'; exit {code} ;;\n")
         python.write_text(
             "#!/bin/sh\n"
-            'if [ "$1" = .github/scripts/dist_build_identity.py ]; then '
-            'cat > "$RUNNER_TEMP/identity-input.json"; fi\n'
-            f"printf '%s\\n' 'distv2: every check passed'\nexit {code}\n")
+            'case "$1" in\n'
+            "  harness/v2/exec_observer.py)\n"
+            "    shift\n"
+            f"    exec {shlex.quote(sys.executable)} {shlex.quote(str(ROOT / 'harness/v2/exec_observer.py'))} \"$@\" ;;\n"
+            "  .github/scripts/dist_build_identity.py)\n"
+            '    cat > "$RUNNER_TEMP/identity-input.json"\n'
+            f"    exit {code} ;;\n"
+            + harness_double
+            + '  *) printf \'unexpected Python command: %s\\n\' "$1" >&2; exit 97 ;;\n'
+            "esac\n")
         python.chmod(0o700)
         return evidence, {"RUNNER_TEMP": str(root), "GITHUB_OUTPUT": str(root / "output"),
+                          "GITHUB_WORKSPACE": str(ROOT),
                           "PATH": str(commands) + os.pathsep + os.environ["PATH"]}
+
+    def protocol_fixture(self, root, *, test_code=0, release_code=0, stop_code=0,
+                         reported=RELEASE_CONTROLS, bundle_reported=BUNDLE_CASES):
+        _, env = self.shell_fixture(root)
+        evidence = root / "protocol-evidence"
+        evidence.mkdir()
+        binaries = root / "protocol-binaries"
+        binaries.mkdir()
+        blaze = binaries / "blaze"
+        blaze.write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = --ignore-pin ] || exit 91\n'
+            'case "$2" in\n'
+            '  stop) name=stop ;;\n'
+            '  test) case " $* " in *" -p blaze-cargo "*) name=release ;; *) name=tests ;; esac ;;\n'
+            '  *) exit 92 ;;\n'
+            'esac\n'
+            'printf \'%s\\n\' "$name" >> "$RUNNER_TEMP/protocol-evidence/execution-order.txt"\n'
+            'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/protocol-evidence/$name-invocation.txt"\n'
+            'printf \'%s\\n\' "$BLAZE_TESTS" > "$RUNNER_TEMP/protocol-evidence/$name-mode.txt"\n'
+            'printf \'%s\\n\' "$BLAZE_HOME" "$BLAZE_CACHE" > "$RUNNER_TEMP/protocol-evidence/$name-home.txt"\n'
+            'if [ "$name" = stop ]; then printf \'%s\\n\' "shutdown fixture"; exit "$STOP_EXIT"; fi\n'
+            '"$RUNNER_TEMP/protocol-binaries/blaze-engine" "$name" || exit $?\n'
+            'if [ "$name" = tests ]; then cat "$PROTOCOL_OUTPUT"; exit "$PROTOCOL_EXIT"; fi\n'
+            'cat "$RELEASE_OUTPUT"\nexit "$RELEASE_EXIT"\n')
+        blaze.chmod(0o700)
+        engine = binaries / "blaze-engine"
+        engine.write_text(
+            "#!/bin/sh\n"
+            'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/protocol-evidence/engine-$1-invocation.txt"\n'
+            "exit 0\n")
+        engine.chmod(0o700)
+        # The seed succeeds deliberately. Selecting it must still fail the identity,
+        # invocation and trace assertions; B0 cannot compile these integration targets.
+        seed = root / "commands/blaze"
+        seed.write_text(
+            "#!/bin/sh\n"
+            'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/wrong-path-seed-used"\n'
+            "printf '%s\\n' 'seed used instead of Stage 1'\nexit 0\n")
+        seed.chmod(0o700)
+        protocol_output = root / "test-output.txt"
+        protocol_output.write_text(f"protocol test fixture exit {test_code}\n"
+                                   + "".join(f"test tests::download::{name} ... ok\n" for name in bundle_reported))
+        release_output = root / "release-output.txt"
+        release_output.write_text(f"running {len(reported)} tests\n"
+                                  + "".join(f"test serve::tests::release::{name} ... ok\n" for name in reported))
+        # Read the actual executing step, not the later release-log validation step.
+        header = PLATFORM.read_text().split(f"      - name: {PROTOCOL_STEP}\n", 1)[1].split("        run: |\n", 1)[0]
+        mode = [line.split(":", 1)[1].strip().strip("\"'") for line in header.splitlines()
+                if line.startswith("          BLAZE_TESTS:")]
+        self.assertEqual(mode, ["verify"])
+        env.update(BLAZE_TESTS=mode[0], PROTOCOL_OUTPUT=str(protocol_output), PROTOCOL_EXIT=str(test_code),
+                   RELEASE_OUTPUT=str(release_output), RELEASE_EXIT=str(release_code), STOP_EXIT=str(stop_code),
+                   BLAZE_HOME=str(root / "inherited-home"), BLAZE_CACHE=str(root / "inherited-cache"))
+        return evidence, binaries, env
+
+    def assert_protocol_evidence(self, root, *, test_code=0, release_code=0, stop_code=0):
+        evidence = root / "protocol-evidence"
+        binaries = root / "protocol-binaries"
+        commands = [("tests", test_code)] + ([("release", release_code)] if test_code == 0 else [])
+        expected_code = test_code or release_code or stop_code
+        receipt = json.loads((evidence / "exec/result.json").read_text())
+        self.assertEqual(receipt["schema"], 1)
+        self.assertEqual(receipt["scope"], EXECUTION_SCOPE)
+        self.assertIs(receipt["passed"], expected_code == 0)
+        self.assertEqual(receipt["returncode"], expected_code)
+        self.assertEqual(receipt["compiler"], {
+            name: hashlib.sha256((binaries / name).read_bytes()).hexdigest() for name in ("blaze", "blaze-engine")})
+        supervisor = json.loads((evidence / "exec/supervisor.json").read_text())
+        self.assertEqual(supervisor["commands"], [{"name": name, "returncode": code} for name, code in commands])
+        self.assertEqual(supervisor["stop"], stop_code)
+        self.assertIs(supervisor["complete"], True)
+        executions = [entry["path"] for entry in receipt["trace"]["executions"] if entry["succeeded"]]
+        self.assertEqual(executions.count(str(binaries / "blaze")), len(commands) + 1)
+        self.assertEqual(executions.count(str(binaries / "blaze-engine")), len(commands))
+        self.assertFalse((root / "wrong-path-seed-used").exists())
+        order = [name for name, _ in commands] + ["stop"]
+        self.assertEqual((evidence / "execution-order.txt").read_text().splitlines(), order)
+        for name in order:
+            self.assertEqual((evidence / f"{name}-home.txt").read_text().splitlines(),
+                             [str(root / "blaze-fs/protocol-tests"), str(root / "blaze-fs/protocol-tests/v2/store")])
+            self.assertEqual((evidence / f"{name}-mode.txt").read_text(), "verify\n")
+        self.assertEqual((evidence / "stop-invocation.txt").read_text().splitlines(),
+                         [str(binaries / "blaze"), "--ignore-pin", "stop"])
 
     def test_missing_or_non_fault_run_cannot_issue_an_acceptance_receipt(self):
         for dev, release, wanted in ((PASSED, PASSED, True), (None, PASSED, False),
@@ -260,7 +406,7 @@ class AcceptanceGateTests(unittest.TestCase):
             "parked_unposted_work_releases_the_lane_without_losing_its_continuation",
             "parked_work_unblocks_reclamation_with_one_worker_and_no_budget",
             "a_reclamation_hold_is_respected_without_a_configured_budget",
-        ]
+        ] + list(BUNDLE_MODELS)
         controls = [
             "the_oracle_catches_leaving_without_retirement",
             "the_oracle_catches_release_without_a_pending_stop",
@@ -284,7 +430,7 @@ class AcceptanceGateTests(unittest.TestCase):
             "the_oracle_catches_a_stale_continuation_replaced_with_the_current_token",
             "the_oracle_catches_a_rejected_reclamation_prefix_entering_the_plane",
             "the_oracle_catches_a_reclamation_hold_bypassed_without_a_budget",
-        ]
+        ] + list(BUNDLE_CONTROLS)
         tls_cases = [
             "tls_bundle_publication_downloads_into_an_empty_local_store",
             "tls_bundle_refuses_an_untrusted_certificate_or_wrong_server_name",
@@ -348,7 +494,7 @@ class AcceptanceGateTests(unittest.TestCase):
         for step in ("dev two-worker, cold-cache, cross-PR and fault acceptance",
                      "release and folded-group two-worker and fault acceptance"):
             with self.subTest(step=step), tempfile.TemporaryDirectory() as directory:
-                _, env = self.shell_fixture(Path(directory), code=23)
+                _, env = self.shell_fixture(Path(directory), code=23, failure_harness="harness/distv2.py")
                 done = self.run_shell(PLATFORM, step, env)
                 self.assertEqual(done.returncode, 23, done.stdout + done.stderr)
 
@@ -373,141 +519,144 @@ class AcceptanceGateTests(unittest.TestCase):
                     self.assertEqual(retained.read_bytes(), manifest.read_bytes())
 
     def test_protocol_tests_use_stage1_for_all_targets_and_preserve_failure(self):
-        for code in (0, 23):
-            with self.subTest(test_exit=code), tempfile.TemporaryDirectory() as directory:
+        for test_code, release_code, stop_code in ((0, 0, 0), (23, 0, 0), (0, 24, 0),
+                                                   (0, 0, 25), (23, 0, 25), (0, 24, 25)):
+            with self.subTest(test_exit=test_code, release_exit=release_code,
+                              stop_exit=stop_code), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                _, env = self.shell_fixture(root)
-                evidence = root / "protocol-evidence"
-                evidence.mkdir()
-                binaries = root / "protocol-binaries"
-                binaries.mkdir()
-                blaze = binaries / "blaze"
-                blaze.write_text(
-                    "#!/bin/sh\n"
-                    'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/protocol-evidence/invocation.txt"\n'
-                    f"printf '%s\\n' 'protocol test fixture exit {code}'\nexit {code}\n")
-                blaze.chmod(0o700)
-                # A return to the PATH's seed must fail even if the seed reports success:
-                # B0 cannot compile these same-name lib/bin integration test targets.
-                seed = root / "commands/blaze"
-                seed.write_text("#!/bin/sh\nprintf '%s\\n' 'seed used instead of Stage 1'\nexit 0\n")
-                seed.chmod(0o700)
-                done = self.run_shell(PLATFORM, "distributed protocol and carrier tests with Stage 1", env)
-                self.assertEqual(done.returncode, code, done.stdout + done.stderr)
-                invocation = (evidence / "invocation.txt").read_text().splitlines()
-                self.assertEqual(invocation[0], str(blaze))
-                args = invocation[1:]
-                self.assertEqual(args[:2], ["--ignore-pin", "test"])
-                packages = [args[i + 1] for i, arg in enumerate(args) if arg == "-p"]
-                self.assertCountEqual(packages, ["blaze-wire", "blaze-dist", "blaze-dist-local", "blaze-serve", "blaze-global", "blaze-graph"])
-                for flag in ("--release", "--locked", "--lib", "--tests", "--no-fail-fast"):
-                    self.assertIn(flag, args)
-                for filter_or_no_run in ("--no-run", "--test", "--"):
-                    self.assertNotIn(filter_or_no_run, args)
-                self.assertIn(f"protocol test fixture exit {code}", (evidence / "tests.log").read_text())
+                evidence, binaries, env = self.protocol_fixture(
+                    root, test_code=test_code, release_code=release_code, stop_code=stop_code)
+                done = self.run_shell(PLATFORM, PROTOCOL_STEP, env)
+                self.assertEqual(done.returncode, test_code or release_code or stop_code, done.stdout + done.stderr)
+                self.assert_protocol_evidence(root, test_code=test_code, release_code=release_code, stop_code=stop_code)
+                # Exact argv preserves every lib/integration target and permits no
+                # positional filter, --test selection, --no-run or skipped package.
+                self.assertEqual((evidence / "tests-invocation.txt").read_text().splitlines(),
+                                 [str(binaries / "blaze"), "--ignore-pin", "test", "--release", "--locked",
+                                  "-p", "blaze-wire", "-p", "blaze-dist", "-p", "blaze-dist-local",
+                                  "-p", "blaze-serve", "-p", "blaze-global", "-p", "blaze-graph",
+                                  "--lib", "--tests", "--no-fail-fast"])
+                self.assertIn(f"protocol test fixture exit {test_code}", (evidence / "exec/tests.log").read_text())
+                if test_code:
+                    self.assertFalse((evidence / "exec/release.log").exists())
+                    self.assertFalse((evidence / "release-invocation.txt").exists())
+                else:
+                    self.assertEqual((evidence / "release-invocation.txt").read_text().splitlines(),
+                                     [str(binaries / "blaze"), "--ignore-pin", "test", "--release", "--locked", "--lib",
+                                      "-p", "blaze-cargo", "--no-fail-fast", "--", "serve::"])
+                    self.assertEqual((evidence / "exec/release.log").read_bytes(), Path(env["RELEASE_OUTPUT"]).read_bytes())
 
-    def test_protocol_receipt_requires_completed_tests_log_and_unchanged_stage1(self):
-        cases = [("success", "test output\n", "success", "release output\n", 0, True),
-                 ("success", "test output\n", "success", "release output\n", 23, False),
-                 ("success", None, "success", "release output\n", 0, False),
-                 ("success", "", "success", "release output\n", 0, False),
-                 ("success", "test output\n", "success", None, 0, False),
-                 ("success", "test output\n", "success", "", 0, False)]
-        cases += [(outcome, "test output\n", "success", "release output\n", 0, False)
+    def test_protocol_receipt_requires_completed_logs_kernel_evidence_and_unchanged_stage1(self):
+        receipt = {"schema": 1, "scope": EXECUTION_SCOPE, "passed": True, "returncode": 0}
+        valid = json.dumps(receipt)
+        cases = [("success", "test output\n", "success", "release output\n", valid, 0, True),
+                 ("success", "test output\n", "success", "release output\n", valid, 23, False),
+                 ("success", None, "success", "release output\n", valid, 0, False),
+                 ("success", "", "success", "release output\n", valid, 0, False),
+                 ("success", "test output\n", "success", None, valid, 0, False),
+                 ("success", "test output\n", "success", "", valid, 0, False)]
+        cases += [(outcome, "test output\n", "success", "release output\n", valid, 0, False)
                   for outcome in ("", "failure", "cancelled", "skipped")]
-        cases += [("success", "test output\n", outcome, "release output\n", 0, False)
+        cases += [("success", "test output\n", outcome, "release output\n", valid, 0, False)
                   for outcome in ("", "failure", "cancelled", "skipped")]
-        for outcome, log, release_outcome, release_log, code, wanted in cases:
+        invalid_receipts = [None, "", "{", "null", "[]", "{}"]
+        for name, values in (("schema", (None, True, 2, "1")),
+                             ("scope", (None, "", "client-only")),
+                             ("passed", (None, False, 1, "true")),
+                             ("returncode", (None, True, 23, "0"))):
+            omitted = dict(receipt)
+            omitted.pop(name)
+            invalid_receipts.append(json.dumps(omitted))
+            for value in values:
+                invalid_receipts.append(json.dumps({**receipt, name: value}))
+        cases += [("success", "test output\n", "success", "release output\n", raw, 0, False)
+                  for raw in invalid_receipts]
+        for outcome, log, release_outcome, release_log, raw, code, wanted in cases:
             with self.subTest(outcome=outcome, log=log, release=release_outcome,
-                              release_log=release_log, identity_exit=code), tempfile.TemporaryDirectory() as directory:
+                              release_log=release_log, receipt=raw,
+                              identity_exit=code), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 _, env = self.shell_fixture(root, code=code)
                 env["PROTOCOL_TEST_OUTCOME"] = outcome
                 env["RELEASE_TEST_OUTCOME"] = release_outcome
-                evidence = root / "protocol-evidence"
-                evidence.mkdir()
+                evidence = root / "protocol-evidence/exec"
+                evidence.mkdir(parents=True)
                 if log is not None:
                     (evidence / "tests.log").write_text(log)
                 if release_log is not None:
                     (evidence / "release.log").write_text(release_log)
-                done = self.run_shell(PLATFORM, "protocol tests completed with unchanged Stage 1 and source", env)
+                if raw is not None:
+                    (evidence / "result.json").write_text(raw)
+                done = self.run_shell(PLATFORM, PROTOCOL_ACCEPTED_STEP, env)
                 self.assertEqual(done.returncode == 0, wanted, done.stdout + done.stderr)
                 output = root / "output"
                 self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if wanted else "")
-                if outcome == "success" and log and release_outcome == "success" and release_log:
+                if outcome == "success" and log and release_outcome == "success" and release_log and raw == valid:
                     self.assertEqual(json.loads((root / "identity-input.json").read_text()),
                                      {"command": "verify", "binaries": str(root / "protocol-binaries")})
+                else:
+                    self.assertFalse((root / "identity-input.json").exists())
 
     def test_daemon_release_receipt_requires_stage1_and_every_executed_control(self):
-        names = [
-            "worker_release_keeps_the_loop_responsive_and_publication_fenced",
-            "parked_successors_allow_release_with_one_work_slot",
-            "cancellation_at_each_handoff_boundary_retires_the_build",
-            "release_failure_and_panic_preserve_the_cause_and_keep_serving",
-            "refused_release_uses_one_accounted_discard",
-            "orphaned_worker_result_is_discarded_after_job_removal",
-            "late_write_requires_another_final_release",
-            "completion_preserves_later_pressure_finished_crates_and_end",
-            "final_release_policy_requires_completion_after_every_late_write",
-            "parking_an_unposted_task_after_cancel_or_failure_settles_without_a_token",
-            "pending_history_uses_the_completed_handoff_outcome",
-            "the_oracle_catches_inline_release",
-            "the_oracle_catches_a_held_successor_grant",
-            "the_oracle_catches_a_late_result_dropped_on_the_loop",
-            "the_oracle_catches_keep_after_an_older_final_release",
-            "the_oracle_catches_completion_erasing_later_pressure",
-            "the_oracle_catches_completion_erasing_later_finished_crates",
-            "the_oracle_catches_completion_erasing_a_later_end",
-            "the_oracle_catches_reusing_a_final_plan_before_a_late_write",
-            "the_oracle_catches_history_before_handoff_failure",
-        ]
-        step = "daemon release and scheduler controls with Stage 1"
-        header = PLATFORM.read_text().split(f"      - name: {step}\n", 1)[1].split("        run: |\n", 1)[0]
-        mode = [line.split(":", 1)[1].strip().strip("\"'") for line in header.splitlines()
-                if line.startswith("          BLAZE_TESTS:")]
-        self.assertEqual(mode, ["verify"])
-        cases = [("complete", names, 0, 0), ("zero tests", [], 0, 1)]
-        cases += [(f"missing {name}", [item for item in names if item != name], 0, 1) for name in names]
-        cases.append(("compiler failed after success lines", names, 23, 23))
+        cases = [("complete", RELEASE_CONTROLS, 0, 0), ("zero tests", (), 0, 1)]
+        cases += [(f"missing {name}", [item for item in RELEASE_CONTROLS if item != name], 0, 1)
+                  for name in RELEASE_CONTROLS]
+        cases.append(("compiler failed after success lines", RELEASE_CONTROLS, 23, 0))
         for label, reported, code, expected in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                _, env = self.shell_fixture(root)
-                env["BLAZE_TESTS"] = mode[0]
-                evidence = root / "protocol-evidence"
-                evidence.mkdir()
-                binaries = root / "protocol-binaries"
-                binaries.mkdir()
-                blaze = binaries / "blaze"
-                blaze.write_text(
-                    "#!/bin/sh\n"
-                    'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/protocol-evidence/release-invocation.txt"\n'
-                    'printf \'%s\\n\' "$BLAZE_TESTS" > "$RUNNER_TEMP/protocol-evidence/release-mode.txt"\n'
-                    'cat "$RELEASE_OUTPUT"\nexit "$RELEASE_EXIT"\n')
-                blaze.chmod(0o700)
-                seed = root / "commands/blaze"
-                seed.write_text("#!/bin/sh\nprintf '%s\\n' 'seed used instead of Stage 1'\nexit 0\n")
-                seed.chmod(0o700)
-                output = f"running {len(reported)} tests\n"
-                output += "".join(f"test serve::tests::release::{name} ... ok\n" for name in reported)
-                transcript = root / "release-output.txt"
-                transcript.write_text(output)
-                env.update(RELEASE_OUTPUT=str(transcript), RELEASE_EXIT=str(code))
-                done = self.run_shell(PLATFORM, step, env)
+                evidence, binaries, env = self.protocol_fixture(root, release_code=code, reported=reported)
+                protocol = self.run_shell(PLATFORM, PROTOCOL_STEP, env)
+                self.assertEqual(protocol.returncode, code, protocol.stdout + protocol.stderr)
+                done = self.run_shell(PLATFORM, RELEASE_STEP, env)
                 self.assertEqual(done.returncode, expected, done.stdout + done.stderr)
+                # The line check must not launch another compiler outside the trace.
+                self.assert_protocol_evidence(root, release_code=code)
                 self.assertEqual((evidence / "release-invocation.txt").read_text().splitlines(),
-                                 [str(blaze), "--ignore-pin", "test", "--release", "--locked", "--lib",
+                                 [str(binaries / "blaze"), "--ignore-pin", "test", "--release", "--locked", "--lib",
                                   "-p", "blaze-cargo", "--no-fail-fast", "--", "serve::"])
-                self.assertEqual((evidence / "release-mode.txt").read_text(), "verify\n")
-                self.assertEqual((evidence / "release.log").read_text(), output)
+                self.assertEqual((evidence / "exec/release.log").read_bytes(), Path(env["RELEASE_OUTPUT"]).read_bytes())
                 if expected == 1:
-                    missing = next(name for name in names if name not in reported)
+                    missing = next(name for name in RELEASE_CONTROLS if name not in reported)
                     self.assertIn("missing executed daemon release control: " + missing, done.stdout)
+                # Success lines cannot rescue a failed compiler or an incomplete set.
+                env.update(PROTOCOL_TEST_OUTCOME="success" if protocol.returncode == 0 else "failure",
+                           RELEASE_TEST_OUTCOME="success" if done.returncode == 0 else "failure")
+                accepted = self.run_shell(PLATFORM, PROTOCOL_ACCEPTED_STEP, env)
+                wanted = code == 0 and expected == 0
+                self.assertEqual(accepted.returncode == 0, wanted, accepted.stdout + accepted.stderr)
+                output = root / "output"
+                self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if wanted else "")
+
+    def test_protocol_receipt_requires_every_bundle_model_and_control_under_stage1(self):
+        cases = [("complete", BUNDLE_CASES, 0), ("zero bundle tests", (), 1)]
+        cases += [(f"missing {name}", [item for item in BUNDLE_CASES if item != name], 1)
+                  for name in BUNDLE_CASES]
+        for label, reported, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                evidence, _, env = self.protocol_fixture(root, bundle_reported=reported)
+                protocol = self.run_shell(PLATFORM, PROTOCOL_STEP, env)
+                self.assertEqual(protocol.returncode, 0, protocol.stdout + protocol.stderr)
+                checked = self.run_shell(PLATFORM, RELEASE_STEP, env)
+                self.assertEqual(checked.returncode, expected, checked.stdout + checked.stderr)
+                self.assert_protocol_evidence(root)
+                self.assertEqual((evidence / "exec/tests.log").read_bytes(), Path(env["PROTOCOL_OUTPUT"]).read_bytes())
+                if expected:
+                    missing = next(name for name in BUNDLE_CASES if name not in reported)
+                    self.assertIn("missing executed bundle control: " + missing, checked.stdout)
+                env.update(PROTOCOL_TEST_OUTCOME="success",
+                           RELEASE_TEST_OUTCOME="success" if checked.returncode == 0 else "failure")
+                accepted = self.run_shell(PLATFORM, PROTOCOL_ACCEPTED_STEP, env)
+                self.assertEqual(accepted.returncode == 0, expected == 0, accepted.stdout + accepted.stderr)
+                output = root / "output"
+                self.assertEqual(output.read_text() if output.exists() else "",
+                                 "accepted=true\n" if expected == 0 else "")
 
     def test_fork_migration_harness_failure_reaches_ci(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _, env = self.shell_fixture(root, code=23)
+            _, env = self.shell_fixture(root, code=23, failure_harness="harness/forkfixes.py")
             (root / "forkfixes-evidence").mkdir()
             done = self.run_shell(PLATFORM, "every fork migration fixture with Stage 1", env)
             self.assertEqual(done.returncode, 23, done.stdout + done.stderr)

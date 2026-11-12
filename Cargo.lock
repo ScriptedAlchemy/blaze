@@ -1172,6 +1172,7 @@ dependencies = [
  "blaze-items",
  "blaze-mem",
  "blaze-usercode",
+ "hegeltest",
  "hir-ty",
  "hir-ty-borrowck",
  "memchr",

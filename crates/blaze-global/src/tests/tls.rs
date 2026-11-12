@@ -115,12 +115,21 @@ fn tls_bundle_publication_downloads_into_an_empty_local_store() {
     for (key, _, bytes) in &values {
         assert_eq!(world.kept(key).as_ref(), Some(bytes));
     }
-    assert!(world.fetched.is_empty(), "the bundle owns its fetch completions");
+    assert_eq!(world.fetched.len(), values.len(), "the bundle shares fetch outcomes with other owners");
 
     // Removing the cold-store cause removes all value downloads, while the same real
-    // client still verifies the manifest over TLS.
+    // client still verifies the manifest over TLS. Readable values still carry the last
+    // pending put of their segment until it has actually been flushed.
     let again = download(&mut world, manifest.id).unwrap();
-    assert_eq!(again, Downloaded::Kept { listed: values.len(), fetched: 0, bytes: 0, tickets: Vec::new() });
+    assert_eq!(again, Downloaded::Kept {
+        listed: values.len(), fetched: 0, bytes: 0,
+        tickets: vec![*tickets.last().unwrap()],
+    });
+    world.mine.flush(&mut world.effects);
+    world.run();
+    assert!(tickets.iter().all(|ticket| world.mine.durable(*ticket)));
+    let durable = download(&mut world, manifest.id).unwrap();
+    assert_eq!(durable, Downloaded::Kept { listed: values.len(), fetched: 0, bytes: 0, tickets: Vec::new() });
 }
 
 #[test]

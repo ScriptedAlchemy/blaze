@@ -72,6 +72,10 @@ CODE = (
     # The D11 ledger entry consumes sealed distributed acceptance evidence.
     "harness/v2/distributed.py",
     "harness/v2/test_distributed.py",
+    # Linux execution evidence covers the source-built protocol and daemon tests through stop.
+    "harness/v2/exec_observer.py",
+    "harness/v2/exec_observer_child.py",
+    "harness/v2/test_exec_observer.py",
     # What fetches and checks the pinned LLVM for the build (.github/actions/blaze). No Nix:
     # neither job reads the flake.
     ".github/scripts/llvm.py",

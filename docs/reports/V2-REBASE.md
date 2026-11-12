@@ -343,3 +343,45 @@ No corrected stage1 native reproduction, two-worker release/fold compilation, cr
 cache reuse, worker-loss recovery, real fenced stale-result refusal, local-owned fallback,
 artifact equality, full forkfixes, or fixed-point bootstrap is claimed by this checkpoint.
 The map's ten owed rows are unchanged. PR 81 remains draft and B0 remains unpromoted.
+
+### Source integration pending hosted verification — 2026-11-11
+
+The next source changes add shared-download, durability and manifest-binding controls to
+the signed global-cache client. Overlapping bundle downloads retain every missing value,
+including one fetched by another owner, and each waiting download receives the same original
+completion. Drivers broadcast a drained batch to existing owners before delivering new
+manifests or scheduling retries, so a key-only result from an earlier fetch cannot settle a
+new download. The overlap model includes that schedule and a reversed-order planted control.
+Already-readable values keep their pending durability tickets; a value published
+while requests are being scheduled cannot leave a download waiting for an event that will
+never arrive. Local values, values published during scheduling and successful shared fetches
+must each match the download's complete signed record, including kind, content digest and
+length. Verified manifests keep immutable record bindings and reject a conflicting manifest
+before inserting any of its entries. The four seeded models and ten defect-restoring
+controls are in `crates/blaze-global/src/tests/download.rs`. Both the B0 partial gate's
+50-name list and the source-built protocol receipt require these fourteen cases to report
+success; their execution on this changed tree is still pending.
+
+The Linux protocol job now sends its full library/integration command and daemon release
+controls through `harness/v2/exec_observer.py` in one fresh daemon home. Kernel fork/exec
+evidence extends through the selected compiler's stop and the end of every descendant.
+Client, engine and tracer identities are checked before and after; missing or incomplete
+evidence, a forbidden named-tool execution, a command failure or failed cleanup prevents the
+acceptance receipt. The scripts job has real-observer controls using harmless fake client
+and engine programs. This covers only wrapped Linux launches and observed executable names;
+other operating systems, unwrapped work, prior artifacts and renamed compiler programs are
+outside its claim. C4 remains open.
+
+The promotion smoke harness also binds selection, project specifications, fixture files and
+expected outputs to the named release commit's corpus, records its commit/tree/content digest,
+and retains the selected compiler through `--ignore-pin` for every invocation and shutdown.
+Missing source, empty selections, compiler drift and failed cleanup fail the gate. Existing
+constant-evaluation failures remain ordinary failing cases; corpus provenance supplies no
+exemption for them.
+
+These are source changes and authored CI controls, not new execution receipts. D11 still
+requires trusted publisher policy, daemon bundle-client integration, a real cached-tree build
+and causal IO evidence. Corrected Stage 1 native reproduction, two-worker release/fold
+compilation, cross-PR cache reuse, loss/stale-result policy, artifact equality, full forkfixes
+and fixed-point bootstrap remain owed on the integrated tree. This checkpoint settles no
+rebase-map row and promotes no bootstrap compiler.

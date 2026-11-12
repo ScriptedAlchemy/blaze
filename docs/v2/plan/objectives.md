@@ -48,7 +48,7 @@ What must hold for any of the speed to count.
 | C1 | The corpus's real projects build with no flags and pass their own test suites | `realprojects.py run {"strict": true}`; `corpus.py` |  | ? |
 | C2 | Every incremental build equals a build from nothing: no stale result, no needless rerun | `oracle.py run`; `incraudit.py` |  | ? |
 | C3 | Two builds of one tree give the same bytes, on any core count | `determinism.py` |  | ? |
-| C4 | blaze builds, checks and tests blaze; no step of the gate, the train or a release runs cargo or rustc | *write: a gate step that fails when a cargo or rustc process is spawned* |  | ? |
+| C4 | blaze builds, checks and tests blaze; no step of the gate, the train or a release runs cargo or rustc | *write: native receipts for the source-built Linux execution observer, coverage of every gate/train/release invocation and supported platform, and removal of the legacy Nix cargo/rustc builders* |  | ? |
 | C5 | blaze runs rustc nowhere (docs/no-rustc.md lists what is left) | *write: one check per remaining step of docs/no-rustc.md* |  | ? |
 | C6 | blaze rejects what rustc rejects, with the same code and primary span, and accepts what it accepts | `corpus.py {"projects": ["rejections"]}`; *write: confirm corpus.py's rejections cover rustc's UI tests, or add them* |  | ? |
 | C7 | No `todo!`, `unimplemented!` or fallback path in crates/ | *write: a lint in `blaze check`* |  | ? |

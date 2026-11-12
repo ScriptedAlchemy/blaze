@@ -3,6 +3,7 @@
 //! no server should (damaged, truncated, reordered and oversized frames), and the outside
 //! peer [`Sim::dial`] makes, for requests no client sends.
 
+mod download;
 mod tls;
 
 use std::{ffi::OsString, time::Duration};
@@ -273,12 +274,22 @@ impl<C: Channels, S: Channels> World<C, S> {
     }
 
     fn gather(&mut self) {
-        let mut fetched = self.mine.fetched();
-        let mut bundles = self.client.bundles();
+        let fetched = self.mine.fetched();
+        let bundles = self.client.bundles();
+        self.gathered(fetched, bundles, false);
+    }
+
+    /// The real driver's delivery order, with one planted reversal for the retry oracle.
+    fn gathered(&mut self, fetched: Vec<(Key, Fetched)>, mut bundles: Vec<GotBundle>, after_manifest: bool) {
         if let Some(download) = &mut self.download {
+            if !after_manifest {
+                download.fetched(&fetched, &self.mine);
+            }
             bundles =
                 download.bundles(bundles, &mut self.mine, &mut self.client, &mut self.effects);
-            fetched = download.fetched(fetched);
+            if after_manifest {
+                download.fetched(&fetched, &self.mine);
+            }
         }
         self.fetched.extend(fetched);
         self.bundles.extend(bundles);
@@ -1063,14 +1074,14 @@ fn a_cold_build_is_one_download() {
     match world.download.take().unwrap().done() {
         Some(Ok(Downloaded::Kept { listed, fetched, bytes: got, tickets })) => {
             assert_eq!((*listed, *fetched, *got), (values().len(), values().len() - 1, bytes));
-            assert_eq!(tickets.len(), values().len() - 1);
+            assert_eq!(tickets.len(), values().len());
         }
         other => panic!("{other:?}"),
     }
     for (key, _, bytes) in values() {
         assert_eq!(world.kept(&key), Some(bytes));
     }
-    assert!(world.fetched.is_empty(), "the download's fetches are its own: {:?}", world.fetched);
+    assert_eq!(world.fetched.len(), values().len() - 1, "fetch outcomes remain available to every owner");
 
     let other = BundleId(ContentId([7; 32]));
     world.download = Some(Download::start(other, &mut world.client, &mut world.effects));

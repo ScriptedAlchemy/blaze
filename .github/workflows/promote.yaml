@@ -48,6 +48,8 @@ on:
     paths:
       - ".github/workflows/promote.yaml"
       - ".github/scripts/promote.py"
+      - ".github/scripts/test_promote_smoke.py"
+      - ".github/actions/release-corpus/**"
       - "harness/smoke.py"
       - "harness/smoke/**"
 
@@ -93,13 +95,21 @@ jobs:
           jq -n --arg tag "$WANTED" '{tag: $tag}' > "$RUNNER_TEMP/which.json"
           python3 -I .github/scripts/promote.py which "$RUNNER_TEMP/which.json"
           echo "stable=$(gh release view -R "$BLAZE_RELEASE_REPO" --json tagName -q .tagName)" >> "$GITHUB_OUTPUT"
+      - id: corpus
+        uses: ./.github/actions/release-corpus
+        with:
+          commit: ${{ steps.which.outputs.sha }}
+          repository: ${{ github.event_name == 'pull_request' && 'indexable-inc/blaze' || github.repository }}
       - id: apps
         env:
           WANTED: ${{ inputs.apps }}
+          CORPUS_MANIFEST: ${{ steps.corpus.outputs.manifest }}
         run: |
           apps=$(jq -c --arg wanted "$WANTED" '[.projects | to_entries[] | select(.value.group == "apps") | .key] as $all
             | ($wanted | split(",") | map(gsub(" "; "")) | map(select(. != ""))) as $named
-            | if ($named | length) == 0 then $all else $named end' harness/smoke/smoke.json)
+            | if ($named | length) == 0 then $all
+              elif (($named - $all) | length) != 0 then error("requested application is absent from the release corpus")
+              else ($named | unique) end' "$CORPUS_MANIFEST")
           echo "apps=$apps" | tee -a "$GITHUB_OUTPUT"
 
   smoke:
@@ -121,6 +131,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - uses: ./.github/actions/release-corpus
+        with:
+          commit: ${{ needs.release.outputs.sha }}
+          repository: ${{ github.event_name == 'pull_request' && 'indexable-inc/blaze' || github.repository }}
       - name: release smoke fixture regression
         run: python3 -I .github/scripts/test_promote_smoke.py
       - name: a CARGO_HOME of its own
@@ -190,8 +204,12 @@ jobs:
           blaze stop
       - name: what the projects build with
         if: runner.os == 'Linux'
+        env:
+          CORPUS_COMMIT: ${{ needs.release.outputs.sha }}
         run: |
-          read -ra packages <<< "$(python3 -I harness/smoke.py apt)"
+          jq -n --arg rev "$CORPUS_COMMIT" '{command: "apt", corpus_rev: $rev}' > "$RUNNER_TEMP/smoke-packages.json"
+          packages_text=$(python3 -I harness/smoke.py "$RUNNER_TEMP/smoke-packages.json")
+          read -ra packages <<< "$packages_text"
           if [ "${#packages[@]}" -gt 0 ]; then sudo apt-get update -qq && sudo apt-get install -y -qq "${packages[@]}"; fi
       - name: smoke corpus
         env:
@@ -257,8 +275,13 @@ jobs:
       OUT: /tmp/gate-out
       # Short: on macOS the daemon's socket path has to fit in 104 bytes.
       WORK: /tmp/gate
+      CORPUS_COMMIT: ${{ needs.release.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/release-corpus
+        with:
+          commit: ${{ needs.release.outputs.sha }}
+          repository: ${{ github.event_name == 'pull_request' && 'indexable-inc/blaze' || github.repository }}
       # An application's target directories are tens of GB: the runner's preinstalled SDKs go.
       - name: room on the disk
         if: runner.os == 'Linux'
@@ -284,12 +307,17 @@ jobs:
         run: sh site/install.sh --version "$TAG"
       - name: what ${{ matrix.app }} builds with
         run: |
-          jq -n --arg app "$APP" '{groups: ["apps"], only: [$app]}' > "$RUNNER_TEMP/app.json"
           if [ "$RUNNER_OS" = Linux ]; then
-            read -ra packages <<< "$(python3 -I harness/smoke.py apt "$RUNNER_TEMP/app.json")"
+            jq -n --arg app "$APP" --arg rev "$CORPUS_COMMIT" \
+              '{command: "apt", groups: ["apps"], only: [$app], corpus_rev: $rev}' > "$RUNNER_TEMP/app.json"
+            packages_text=$(python3 -I harness/smoke.py "$RUNNER_TEMP/app.json")
+            read -ra packages <<< "$packages_text"
             if [ "${#packages[@]}" -gt 0 ]; then sudo apt-get update -qq && sudo apt-get install -y -qq "${packages[@]}"; fi
           else
-            read -ra packages <<< "$(python3 -I harness/smoke.py brew "$RUNNER_TEMP/app.json")"
+            jq -n --arg app "$APP" --arg rev "$CORPUS_COMMIT" \
+              '{command: "brew", groups: ["apps"], only: [$app], corpus_rev: $rev}' > "$RUNNER_TEMP/app.json"
+            packages_text=$(python3 -I harness/smoke.py "$RUNNER_TEMP/app.json")
+            read -ra packages <<< "$packages_text"
             if [ "${#packages[@]}" -gt 0 ]; then brew install --quiet "${packages[@]}"; fi
           fi
       # bun's own build of its C and C++ (harness/bunprep.py) needs what this dev shell has;
@@ -309,7 +337,7 @@ jobs:
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
           jq -n --arg app "$APP" --arg rev "${{ needs.release.outputs.sha }}" --arg work "$WORK" --arg out "$OUT/$OS.json" \
-            '{groups: ["apps"], only: [$app], blaze_rev: $rev, work: $work, results: $out}' > "$RUNNER_TEMP/works.json"
+            '{groups: ["apps"], only: [$app], blaze_rev: $rev, corpus_rev: $rev, work: $work, results: $out}' > "$RUNNER_TEMP/works.json"
           $SHELL_OF_APP python3 -I harness/smoke.py "$RUNNER_TEMP/works.json"
       - name: ${{ matrix.app }} measured Blaze speed
         if: matrix.check == 'speed'
