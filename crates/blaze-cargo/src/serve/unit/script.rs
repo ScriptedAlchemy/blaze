@@ -2055,8 +2055,9 @@ impl ScriptRun {
                     disk,
                     |exit| script::cargo_rule(unit, env, exit),
                     |traced| {
-                        checked = pure::check(&job, run_unit, unit, traced);
-                        script::keyed(prepared, traced)
+                        checked =
+                            pure::check(&job, run_unit, unit, prepared.script_env(), traced);
+                        script::keyed(prepared, traced, checked.as_ref())
                     },
                 );
                 match completed {

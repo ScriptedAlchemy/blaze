@@ -63,6 +63,7 @@ let
       d = p.source.dir;
       library = lib.optionals (d == "crates/blaze-cargo")
         (map (f: repo + "/library/${f}") [ "DIGEST" "UPSTREAM" ])
+      ++ lib.optional (d == "crates/blaze-usercode") (repo + "/library/std/src/sys/provider/derive.rs")
       ++ lib.optional (d == "crates/blaze-inproc-rt") (repo + "/library/blaze_inproc_rt/src");
     in
     "${lib.fileset.toSource {

@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-81 invariants, 18 refinements, 5 reference models.
-By level: 61 tested, 38 simulated, 0 model-checked, 0 proved.
+88 invariants, 18 refinements, 6 reference models.
+By level: 66 tested, 40 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -20,6 +20,10 @@ By level: 61 tested, 38 simulated, 0 model-checked, 0 proved.
 
 - **`a_cgroups_footprint_is_its_charge_less_the_file_cache_the_kernel_can_drop`** *tested* (`crates/blaze-cargo/src/raw/memory.rs`): the cgroup's footprint is its charge less the file cache the kernel can drop, and nothing else is taken off. The directed case: a cgroup of 10 GiB of which 6 are file cache, 1 of that shared memory, is 5 GiB (the control: counting all of `file` as droppable says 4, counting none says 10). A line that only begins with a field's name (`file_mapped`, `shmem_thp`) is not the field.
   Controls: `shared_memory_dropped_and_file_cache_kept`.
+- **`a_provided_run_is_answered_the_same_randomness_every_time`** *tested* (`crates/blaze-cargo/src/sandbox/linux.rs`): in a run given a provider, what a process gets from `getrandom` and from `/dev/urandom` is the provider's: the same bytes on every run of the same seed, other bytes for each process and each open, other bytes under another seed, and nothing in the trace that can't be traced.
+  Controls: `randomness_read_without_a_provider`, `an_allocation_that_seeds_in_the_window`.
+- **`the_launchers_window_makes_no_call_the_supervisor_sees`** *tested* (`crates/blaze-cargo/src/sandbox/linux.rs`): between its filter's install and its exec the launcher's child makes no call the supervisor notes or answers (no allocation that seeds a heap, no clock): the supervisor takes every call of that process for the program's, and an answered one would move the program's stream.
+  Controls: `randomness_read_without_a_provider`, `an_allocation_that_seeds_in_the_window`.
 - **`a_kept_answer_is_said_again_only_while_a_walk_would_say_the_same`** *tested* (`crates/blaze-cargo/src/serve/job/noop/tests.rs`): the lane says a kept answer again only when a walk of every unit would say the same of the state the request is asked in, with every output in place and no other job under way: no input a build reads changed since the answer was kept. Over any run of edits of the checkout's files and its lock file, of a traced header, a listed directory, a path dependency and the layout profiles outside it, of the request's environment, features, profile and colors, of touches, deleted outputs, other jobs and requests, with the watches confirmed in time or late; and of a `//` comment at a line's end, in the source (its unit keyed by code text or, a lint reading comments, by bytes; its build warning of the commented line or not) and in a file the build script reads by its bytes. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_lane_that_ignores_an_edited_file`, `a_lane_that_ignores_the_lock_file`, `a_lane_that_does_not_compare_the_environment`, `a_lane_that_ignores_the_features_and_the_profile`, `a_lane_that_ignores_how_the_request_is_rendered`, `a_lane_that_ignores_a_traced_file_outside_the_view`, `a_lane_that_does_not_see_a_deleted_output`, `a_kept_walk_that_listed_a_directory`, `a_kept_build_that_made_something`, `a_lane_that_answers_beside_another_job`, `a_lane_that_trusts_an_unwatched_path_dependency`, `a_lane_that_does_not_see_layout_profiles_appear`, `a_replayed_script_that_writes_on_every_walk`, `a_foreign_write_taken_for_the_walks_echo`, `a_request_not_held_for_the_watches_round`, `a_lane_keyed_by_code_text_that_misses_a_token_change`, `a_lane_that_takes_bytes_something_reads_for_still`, `a_replayed_diagnostic_with_stale_quoted_text`.
 - **`pending_history_uses_the_completed_handoff_outcome`** *tested* (`crates/blaze-cargo/src/serve/job/tests.rs`): a delayed history row uses the exact completed handoff's failure or cancellation outcome, emits once, and never preserves an earlier successful compile verdict.
@@ -171,6 +175,11 @@ By level: 61 tested, 38 simulated, 0 model-checked, 0 proved.
 - **`the_images_file_is_always_one_image_whole`** *simulated* (`crates/blaze-image/src/place/tests.rs`): after any run of images placed, let go, failed and cut by a crash, the image's file holds one image whole, byte for byte what a fresh build wrote: the one placed once the placing said so (and after a crash then), the one before it when the placing was let go, and one of the two when it failed or the power went; and it opens and verifies. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_rename_without_its_sync`, `blocks_shared_from_bytes_the_file_no_longer_holds`.
 
+### blaze-item-hash
+
+- **`bodies_alike_but_for_their_names_list_one_shape`** *tested* (`crates/blaze-item-hash/src/tests/classify.rs`): two bodies of one identity that read the same of themselves list one shape for each step, so the store keeps one shape and one answer for both, and a rename keeps a body's records. A body's identity writes its own item as "self"; a fact about that item (its inference as its MIR reads it, its MIR and match check as its borrow check does) names it as [`values::OWN`], and its value is the body's own ([`values::value_in`]). Until 2026-11-10 such a fact named the item by its key: `FIRST` and `SECOND` filed two shapes of their MIR under one base key in one flush, which the daemon's store refused ("keeping the shape of the MIR of StaticId(..): two images were made under ..") after every build of ripgrep.
+  Controls: `a_shape_that_names_its_own_body_by_key`.
+
 ### blaze-link
 
 - **`a_torn_patch_is_never_taken_for_the_links_file`** *tested* (`crates/blaze-link/src/tests/patch.rs`): a file a patch did not wholly reach is never taken for the last link's. Whatever part of a patch's writes a crash kept, [`Image::verify`] refuses the file unless it is byte for byte the link's, naming it torn, and the link from scratch that follows writes the whole file, which verifies and behaves as the program.
@@ -217,6 +226,17 @@ By level: 61 tested, 38 simulated, 0 model-checked, 0 proved.
 
 - **`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`** *tested* (`crates/blaze-storemodel/src/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable. After any crash the restore serves no value whose bytes were lost, holds everything the store called durable and everything an answered build kept, and every answer's settling ended kept or said lost. Two builds on shared and separate keys with a reader, and a snapshot beside a build, each build answering before it flushes: every schedule, a crash after every IO step, so at every point between an answer sent and its results durable; with an IO failure anywhere, so a settling that ends with the store stopped. Then two kernel gets of one identity in two worlds racing for one shape slot, each answering at once and keeping what it left once it and every store before it is durable, with an IO failure anywhere and effects completing in any order.
   Controls: `a_kept_answer_relied_on_before_its_tickets_were_durable`, `a_settling_failure_dropped_silently`.
+
+### blaze-usercode
+
+- **`a_process_is_given_its_own_stream_whoever_else_asks`** *tested* (`crates/blaze-usercode/src/provider.rs`): what a process is given by `getrandom` is its own stream's bytes in order, a function of the seed and the process alone, however the asks of the run's processes interleave and however each cut its own.
+  Controls: `a_count_shared_by_all_processes`.
+- **`a_probe_is_a_search_directory_or_a_library_name_directly_in_one`** *simulated* (`crates/blaze-usercode/src/pure/tests.rs`): a read is the loader's walk of the run's library search path exactly when it is a search directory (there or not) or a library's name directly in one; a name found there is a load, which no pure key covers.
+  Controls: `a_search_path_prefix_treated_as_a_loader_probe`.
+- **`a_rejected_pure_run_cannot_be_reused_after_retry_or_restart`** *simulated* (`crates/blaze-usercode/src/script.rs`): a run rejected by its pure proof is retained under no sandboxed key; retries and a store restart must run and reject it again, never return a cache hit.
+  Controls: `a_refused_run_kept_under_its_sandboxed_key`.
+- **`what_the_sandbox_answered_is_not_what_cannot_be_traced`** *tested* (`crates/blaze-usercode/src/trace.rs`): what the sandbox answered from the run's provider is no input and nothing that can't be traced, and only what it answered: a run with only such lines is kept as any traced run, and a pure script's check (`pure::check`) passes it, while randomness it did not answer, beside an answer, is still what can't be traced.
+  Controls: `randomness_that_was_not_answered`, `an_answer_taken_for_what_cannot_be_traced`.
 
 ### hir-def
 
@@ -345,3 +365,7 @@ By level: 61 tested, 38 simulated, 0 model-checked, 0 proved.
 
 - **`DebugProgram`** (`crates/blaze-link/src/beside/tests.rs`): a program is its functions by number; what a debugger sees of it is what [`inside`] reads of its debug info made whole.
 - **`Program`** (`crates/blaze-link/src/tests/patch.rs`): a program is its functions by name and its statics' values; what it does is what [`normal`] reads of a fresh link of it.
+
+### blaze-usercode
+
+- **`model`** (`crates/blaze-usercode/src/provider.rs`): the byte at `offset` of what `process` is given by `getrandom`, whatever anyone asked before.

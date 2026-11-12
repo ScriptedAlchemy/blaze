@@ -37,6 +37,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 
 Designs not (fully) built, newest first.
 
+- [v2/plan/design/determinism.md](v2/plan/design/determinism.md) (2026-11-12): Give sandboxed build scripts reproducible randomness and an explicit wall clock without accepting untraced inputs.
 - [v2/plan/design/distributed-retirement.md](v2/plan/design/distributed-retirement.md) (2026-11-11): An owned assignment retires through an attempt-fenced stop request and a separate acknowledgment; runtime verification is pending.
 - [v2/plan/design/why.md](v2/plan/design/why.md) (2026-11-10): Why blaze recomputed each step of a build, said after every build and by `blaze why`, as a chain from the step through the key parts that differ down to a real input change (a file, a variable, a flag) or one of a closed set of other terminal reasons; an unexplained recompute is a blaze bug and is counted.
 - [v2/plan/design/simd.md](v2/plan/design/simd.md) (2026-11-10): Portable SIMD in blaze. The vector types are the pinned nightly's `core::simd`, with no feature gate under `#![blaze::simd]` (the edition turns it on); blaze adds one macro, `simd::native_lanes!`, and `#[blaze::multiversion]`, which compiles a function once per CPU level and picks one when the program starts; how the differentiator and the GPU kernels use the same types.

@@ -48,8 +48,10 @@ use crate::{
     trace::ALL_ENV_NAME,
 };
 
-/// Variables of one run alone: a script's jobserver, which another run is given another of.
-pub const RUN_ONLY: &[&str] = &["CARGO_MAKEFLAGS"];
+/// Variables of one run alone: a script's jobserver, which another run is given another of,
+/// and the run's provider ([`crate::provider::VAR`]), which is made of the run's key and so is
+/// no part of it: std reads it before `main`, and that read is of nothing the key lacks.
+pub const RUN_ONLY: &[&str] = &["CARGO_MAKEFLAGS", crate::provider::VAR];
 
 /// make's variables, passed through from a build started under make: its flags and variable
 /// overrides, which a script that runs make honours, and the jobserver of make's run, which is
@@ -171,12 +173,23 @@ pub fn prepare(
     // The script's environment, and last the launcher's [`GIVEN`]: the names its key has,
     // which the program's environment holds alone; every other variable is lent to it and
     // traced as it is read.
-    let mut command_env = Vec::with_capacity(vars.len() + 1); // alloc: setup, the command's environment
+    let mut command_env = Vec::with_capacity(vars.len() + 2); // alloc: setup, the command's environment
     command_env.extend(vars.iter().cloned()); // clone: setup, as above; the check keeps its own
     command_env.push((
         GIVEN.into(),
         crate::confine::given_value(names.iter().map(OsString::as_os_str)).map_err(Error)?,
     ));
+    // The run's provider, after the launcher's `GIVEN` as no variable of the script's
+    // ([`Prepared::script_env`]): its seed is made of the key, so it adds nothing to it, and
+    // its wall clock is the build's `SOURCE_DATE_EPOCH`, which the run is traced as reading
+    // when it asks the time.
+    let epoch = vars
+        .iter()
+        .find(|(name, _)| name.as_os_str() == OsStr::new(crate::provider::SOURCE_DATE_EPOCH))
+        .map(|(_, value)| value.as_os_str());
+    let provider =
+        crate::provider::Provider::of(RunKind::BuildScript, &key, epoch).map_err(Error)?;
+    command_env.push(provider.entry());
     let command = Command {
         program: unit.script.clone(), // clone: setup, the command owns its program
         args: Vec::new(),             // alloc: none, an empty list
@@ -299,7 +312,20 @@ fn shown(value: Option<&OsStr>) -> String {
 /// (or not set) and, when the whole environment was read, every one of it: a trace that holds
 /// another value, or misses one, would be kept under a key no check makes again, and is an
 /// error naming the variable rather than a run that is never found.
-pub fn keyed(prepared: &Prepared, traced: &mut Traced) -> Result<(), Error> {
+/// A pure proof's `checked` refusal is returned before changing the trace or retaining a
+/// value under any key. `None` is a script with no pure proof.
+pub fn keyed(
+    prepared: &Prepared,
+    traced: &mut Traced,
+    checked: Option<&Result<crate::pure::Read, String>>,
+) -> Result<(), Error> {
+    // A rejected proof must stop the keep under the sandboxed key too. Otherwise a retry
+    // reuses that value without ever checking the proof again. Keep the decision here,
+    // in the callback Run::complete invokes before writing anything to the store.
+    if let Some(Err(what)) = checked {
+        // clone: one diagnostic for a refused run
+        return Err(Error(what.clone()));
+    }
     traced.env.retain(|(name, _)| !run_only(name) && !prepared.given.contains(name));
     for (name, value) in &mut traced.env {
         if make_flag(name) {
@@ -473,6 +499,91 @@ mod tests {
         vec![("PATH".into(), path.into()), ("HOME".into(), "/home/u".into())]
     }
 
+    fn opened_script_store(sim: &mut blaze_core::sim::Sim) -> blaze_cas::Store {
+        use blaze_cas::{Config, Loader, Store};
+        use blaze_core::{FileName, run_until_idle};
+
+        let mut effects = Vec::new();
+        let config = Config {
+            dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48,
+            load_tags: (1 << 48) + (1 << 32), loader: Loader::Pumped,
+        };
+        let mut store = Store::open(config, &mut effects);
+        run_until_idle(sim, &mut effects, |completion, effects| {
+            store.complete(completion, effects);
+        }).expect("the store opens");
+        assert!(store.ready());
+        store
+    }
+
+    fn refusal_stays_unkept(seed: u64, restart: bool, plant: bool) -> Result<(), String> {
+        use blaze_core::{Done, Exit, Tag, run_until_idle, sim::{Faults, Ran, Sim}};
+        use crate::{inputs::Disk, run::{Begun, Run, RunError}};
+
+        let mut sim = Sim::new(seed, Faults::default());
+        let mut effects = Vec::new();
+        let mut store = opened_script_store(&mut sim);
+        let mut prepared = prepare(&unit(), &inherited("/a"), &place()).unwrap();
+        prepared.spec.out_dir = None;
+        sim.program("/t/build/p/script", |_, _| Ran {
+            exit: Exit {
+                code: Some(0), signal: None, stdout: Vec::new(), stderr: Vec::new(),
+                traced: Some(Traced::default()), peak_memory: 0,
+            },
+            takes: std::time::Duration::from_millis(1),
+        });
+        let rejected = Err("p v0.1.0: its pure proof refused Random".to_owned());
+        for attempt in 0..3 {
+            let mut disk = Disk::new(prepared.env.clone());
+            let begun = Run::begin(prepared.spec.clone(), &store, &mut disk, Tag(1), &mut effects)
+                .expect("the run begins");
+            let Begun::Running(run) = begun else {
+                return Err(format!("attempt {attempt} reused a refused run"));
+            };
+            let mut ended = None;
+            run_until_idle(&mut sim, &mut effects, |completion, _| {
+                assert!(matches!(completion.done, Done::Exited(_)));
+                ended = Some(completion);
+            }).expect("the simulated script ends");
+            let completed = run.complete(
+                ended.unwrap(), &mut store, &mut disk, |_| Ok(Default::default()),
+                |traced| keyed(&prepared, traced, if plant { None } else { Some(&rejected) }),
+            );
+            if !plant && !matches!(completed, Err(RunError::Traced { error: Error(ref why), .. })
+                if why == "p v0.1.0: its pure proof refused Random") {
+                return Err(format!("attempt {attempt} did not return its proof refusal"));
+            }
+            store.flush(&mut effects);
+            run_until_idle(&mut sim, &mut effects, |completion, effects| {
+                store.complete(completion, effects);
+            }).expect("the store settles");
+            if restart {
+                drop(store);
+                sim.crash();
+                store = opened_script_store(&mut sim);
+            }
+        }
+        Ok(())
+    }
+
+    /// The invariant: a run rejected by its pure proof is retained under no sandboxed key;
+    /// retries and a store restart must run and reject it again, never return a cache hit.
+    #[hegel::test]
+    fn a_rejected_pure_run_cannot_be_reused_after_retry_or_restart(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let seed: u64 = tc.draw(gs::integers());
+        let restart = tc.draw(gs::booleans());
+        assert_eq!(refusal_stays_unkept(seed, restart, false), Ok(()));
+    }
+
+    #[test]
+    fn the_oracle_catches_a_refused_run_kept_under_its_sandboxed_key() {
+        for restart in [false, true] {
+            assert!(refusal_stays_unkept(11, restart, true)
+                .is_err_and(|why| why.contains("reused a refused run")));
+        }
+    }
+
     /// A pinned native input's digest is part of the run's key: another archive is another
     /// run, even laid out at the same place; and a script given none keeps the key it had.
     #[test]
@@ -538,7 +649,7 @@ mod tests {
             ],
             ..Traced::default()
         };
-        keyed(&prepared, &mut traced).unwrap();
+        keyed(&prepared, &mut traced, None).unwrap();
         assert_eq!(traced.env, vec![("CC".into(), None)]);
     }
 
@@ -550,7 +661,7 @@ mod tests {
         let prepared = prepare(&unit(), &inherited("/a"), &place()).unwrap();
         let mut other =
             Traced { env: vec![("PATH".into(), Some("/elsewhere".into()))], ..Traced::default() };
-        let error = keyed(&prepared, &mut other).unwrap_err();
+        let error = keyed(&prepared, &mut other, None).unwrap_err();
         assert!(error.0.contains("`PATH`") && error.0.contains("a value of 10 bytes"), "{error:?}");
         // A value can be a secret: the error names its length, never its bytes.
         assert!(!error.0.contains("/elsewhere"), "{error:?}");
@@ -564,7 +675,7 @@ mod tests {
                 .map(|(name, value)| (name.clone(), Some(value.clone()))),
         );
         let mut short = Traced { env, ..Traced::default() };
-        let error = keyed(&prepared, &mut short).unwrap_err();
+        let error = keyed(&prepared, &mut short, None).unwrap_err();
         assert!(error.0.contains("no `HOME`"), "{error:?}");
     }
 
@@ -661,7 +772,7 @@ mod tests {
         let lines: Vec<Line> = names.iter().map(|name| Line::new(Seen::Env, "", name)).collect();
         let mut traced =
             trace::assemble(&lines, None, &mut Disk::new(prepared.script_env().to_vec())).unwrap();
-        keyed(prepared, &mut traced).unwrap();
+        keyed(prepared, &mut traced, None).unwrap();
         let roots = prepared.spec.roots.view();
         let (marked, stored) =
             roots.kept(&traced, &elided(b"cargo:rustc-cfg=x\n".to_vec())).unwrap();

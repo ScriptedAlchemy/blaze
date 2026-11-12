@@ -2153,6 +2153,7 @@ dependencies = [
  "blaze-query",
  "blaze-serde",
  "blaze-vfs",
+ "hegeltest",
  "libc",
  "memchr",
  "postcard",
