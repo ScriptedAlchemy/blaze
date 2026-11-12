@@ -3,7 +3,7 @@
 //! reservation, the pairs kept across relinks, tier-ups and rollbacks, [`Image::counter`]
 //! where the code counts, and the errors.
 
-use blaze_codegen::{Arch, CompiledFunction, Data, InstanceKey, RelocKind, Relocation, Target};
+use blaze_codegen::{Arch, CompiledFunction, Data, RelocKind, Relocation, Target};
 use blaze_inproc::{CodeMemory, CodeRange};
 
 use super::{
@@ -179,20 +179,14 @@ fn expected(arch: Arch, pair: u64) -> Vec<u64> {
     }
 }
 
-/// `key`'s code: its address, and its bytes in `file`.
-fn code_of<'f>(image: &Image, file: &'f [u8], key: &InstanceKey) -> (u64, &'f [u8]) {
-    let body = image.symbols.find_body(key).expect("linked");
+/// What function `n`'s code reaches, reading only its bytes from the image.
+fn reaches(image: &Image, read: impl FnOnce(u64, u64) -> Vec<u8>, n: u8) -> Vec<u64> {
+    let body = image.symbols.find_body(&key(n)).expect("linked");
     let (piece, _) = image.state.home(body).expect("placed");
     let piece = image.state.piece(piece).expect("live");
     let space = &image.state.spaces[piece.region as usize];
     let at = space.offset.expect("in the file") + (piece.addr - space.region.addr);
-    (piece.addr, &file[at as usize..][..piece.size as usize])
-}
-
-/// What function `n`'s code reaches, as linked in `file`.
-fn reaches(image: &Image, file: &[u8], n: u8) -> Vec<u64> {
-    let (addr, code) = code_of(image, file, &key(n));
-    reached(image.output.arch, addr, code)
+    reached(image.output.arch, piece.addr, &read(at, piece.size))
 }
 
 /// The address of the image's cells reservation.
@@ -207,9 +201,15 @@ fn pair_of(image: &Image, n: u8) -> Option<u32> {
     image.state.pairs.of(image.symbols.find_id(&id(n))?)
 }
 
-fn file(disk: &Disk) -> Vec<u8> {
+fn file(disk: &Disk) -> impl Fn(u64, u64) -> Vec<u8> + '_ {
     let it = disk.file(TO);
-    (0..it.len).map(|at| it.page(at / super::PAGE)[(at % super::PAGE) as usize]).collect()
+    // A tier-up puts code beyond the dev arena: its sparse gap is not read or allocated.
+    move |at, len| {
+        assert!(at <= it.len && len <= it.len - at, "code is inside the file");
+        (at..at + len)
+            .map(|at| it.page(at / super::PAGE)[(at % super::PAGE) as usize])
+            .collect()
+    }
 }
 
 #[test]
@@ -221,7 +221,6 @@ fn two_counting_functions_reach_distinct_pairs_in_the_cells_reservation() {
         let mut image = Image::new(name(TO), case.output(Some(dev(4)))).unwrap();
         let mut disk = Disk::default();
         disk.link(&mut image, case.change(&[&entry, &hook, &f, &g])).unwrap();
-        let bytes = file(&disk);
         let cells = cells_at(&image);
         assert_eq!(
             (pair_of(&image, F), pair_of(&image, G)),
@@ -234,9 +233,9 @@ fn two_counting_functions_reach_distinct_pairs_in_the_cells_reservation() {
             "{case:?}: a function that doesn't count has none"
         );
         assert_eq!(image.state.pairs.given(), 2);
-        assert_eq!(reaches(&image, &bytes, F), expected(arch, cells), "{case:?}: the first pair");
+        assert_eq!(reaches(&image, file(&disk), F), expected(arch, cells), "{case:?}: the first pair");
         assert_eq!(
-            reaches(&image, &bytes, G),
+            reaches(&image, file(&disk), G),
             expected(arch, cells + 16),
             "{case:?}: the second pair"
         );
@@ -274,20 +273,19 @@ fn a_relink_keeps_pairs_and_a_tier_up_gets_a_new_one_while_the_old_stays() {
         let tier_up =
             || Change { added: vec![&g2], slots: vec![(key(G), key(G2))], ..Change::default() };
         disk.link(&mut image, tier_up()).unwrap();
-        let bytes = file(&disk);
         assert_eq!(cells_at(&image), cells, "{case:?}: the reservation stays");
         assert_eq!(
-            reaches(&image, &bytes, F),
+            reaches(&image, file(&disk), F),
             expected(arch, cells),
             "{case:?}: a kept function keeps its pair"
         );
         assert_eq!(
-            reaches(&image, &bytes, G),
+            reaches(&image, file(&disk), G),
             expected(arch, cells + 16),
             "{case:?}: the tier-0 code keeps its pair"
         );
         assert_eq!(
-            reaches(&image, &bytes, G2),
+            reaches(&image, file(&disk), G2),
             expected(arch, cells + 32),
             "{case:?}: the tier-up's new key, a new pair"
         );
@@ -316,13 +314,12 @@ fn a_relink_keeps_pairs_and_a_tier_up_gets_a_new_one_while_the_old_stays() {
             "{case:?}: a new key never gets a rolled-back key's pair"
         );
         disk.link(&mut image, tier_up()).unwrap();
-        let bytes = file(&disk);
         assert_eq!(
-            reaches(&image, &bytes, G2),
+            reaches(&image, file(&disk), G2),
             expected(arch, cells + 32),
             "{case:?}: tiered up again, the same pair"
         );
-        assert_eq!(reaches(&image, &bytes, H), expected(arch, cells + 48));
+        assert_eq!(reaches(&image, file(&disk), H), expected(arch, cells + 48));
     }
 }
 
@@ -455,7 +452,8 @@ fn counter_is_the_offset_in_the_code_memory_where_the_code_counts() {
             memory.lay_out(case.format()).unwrap();
         }
         for n in [F, G] {
-            let calls = reaches(&image, &bytes, n)[0];
+            let calls =
+                reaches(&image, |at, len| bytes[at as usize..][..len as usize].to_vec(), n)[0];
             let at = image.counter(&key(n)).expect("a pair");
             assert_eq!(at, memory.cells().offset + (calls - cells), "{case:?}: function {n}");
             assert!(at.is_multiple_of(16) && at + 16 <= memory.cells().end(), "{case:?}: {at:#x}");
