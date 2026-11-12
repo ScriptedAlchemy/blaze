@@ -20,6 +20,8 @@
     library.py digest '{}'
         writes library/DIGEST, the digest blaze knows the library by (the store's key of the
         standard library; `toolchain/library.rs` computes the same): after any change to library/.
+    library.py check '{}'
+        checks library/DIGEST against the source files without changing either, before a build.
     library.py archive '{"out": "<dir>"}'
         writes <dir>/library-<digest>.tar.xz, the asset of a release a blaze without a checkout
         downloads the library from once, checking its files against the digest.
@@ -387,10 +389,20 @@ def do_digest(args):
     print(f"library/DIGEST: {write_digest()}")
 
 
-def do_archive(args):
-    digest = open(DIGEST).read().strip()
+def verified_digest():
+    with open(DIGEST) as source:
+        digest = source.read().strip()
     if digest_of(LIBRARY) != digest:
         sys.exit("library.py: library/DIGEST is not library/'s digest: `library.py digest '{}'` writes it")
+    return digest
+
+
+def do_check(args):
+    print(f"library/DIGEST verified: {verified_digest()}")
+
+
+def do_archive(args):
+    digest = verified_digest()
     os.makedirs(args.out, exist_ok=True)
     out = os.path.join(args.out, f"library-{digest}.tar.xz")
 
@@ -417,7 +429,7 @@ def do_archive(args):
 
 def main():
     commands = {"import": (Nightly, do_import), "merge": (Nightly, do_merge), "snapshot": (Empty, do_snapshot),
-                "digest": (Empty, do_digest),
+                "digest": (Empty, do_digest), "check": (Empty, do_check),
                 "archive": (Archive, do_archive)}
     if len(sys.argv) not in (2, 3) or sys.argv[1] not in commands:
         sys.exit(f"usage: library.py {{{'|'.join(commands)}}} '<json>'\n\n{__doc__}")

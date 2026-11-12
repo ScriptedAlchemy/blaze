@@ -109,6 +109,8 @@ jobs:
           version: '0.13.5'
           checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (hosted runner is arm64)
           enable-cache: false
+      - name: standard library source digest
+        run: uv run --frozen python harness/library.py check '{}'
       - run: uv run --frozen ruff check
       - run: uv run --frozen pyright
       # Some scripts ask rustc for the host when imported: after the toolchain is installed. In
