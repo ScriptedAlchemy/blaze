@@ -216,12 +216,12 @@ def forbidden(path: str) -> bool:
 @dataclass
 class Trace:
     pid: int
-    calls: list[str] = field(default_factory=list)
+    calls: list[str] = field(default_factory=list[str])
     # An exec by another thread changes its pid to its thread-group leader. strace
     # closes the old thread file, continues in the leader's file, and names both.
     moved_to: int | None = None
     moved_call: str | None = None
-    resumed: list[tuple[int, int, str]] = field(default_factory=list)
+    resumed: list[tuple[int, int, str]] = field(default_factory=list[tuple[int, int, str]])
     ended: bool = False
 
 
