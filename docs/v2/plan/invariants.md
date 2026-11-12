@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-78 invariants, 18 refinements, 5 reference models.
-By level: 58 tested, 38 simulated, 0 model-checked, 0 proved.
+81 invariants, 18 refinements, 5 reference models.
+By level: 61 tested, 38 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -75,6 +75,10 @@ By level: 58 tested, 38 simulated, 0 model-checked, 0 proved.
   Controls: `a_removed_entry_kept_in_the_id`.
 - **`rebound_functions_are_reached_through_their_slots`** *tested* (`crates/blaze-codegen/src/driver/tests.rs`): in a build that reaches edited code through slots, every function an edit fills again under its own key is reached through its slot by every caller, so no caller a splice keeps in place holds a direct branch to code the splice replaced.
   Controls: `a_refilled_function_called_directly`.
+- **`removing_a_dyn_target_updates_its_callers_group_and_durable_views`** *tested* (`crates/blaze-codegen/src/driver/tests/kept.rs`): the views of a function's inputs cover its dyn facts, so removing the last fact's target drops its code from both the kept and fresh builds, even when the function is skipped until its group or durable inputs are written.
+  Controls: `a_changed_function_whose_callers_keep_its_old_key`, `a_removed_ref_whose_target_stays_reached`, `a_dyn_fact_change_that_invalidates_nothing`, `a_patch_that_keeps_a_changed_functions_old_references`, `a_caller_that_names_a_changed_callees_old_key`, `a_pass_that_runs_whole`, `a_kept_template_used_after_its_callees_key_changed`, `a_delta_that_omits_a_removed_function`, `an_owner_kept_when_its_function_changed`, `a_dedupe_class_not_split_when_a_members_code_changed`, `a_recursion_claim_not_run_after_an_added_edge`.
+- **`a_removed_function_after_a_dyn_fact_edit_refuses_its_stale_handle`** *tested* (`crates/blaze-codegen/src/driver/tests/kept.rs`): removing a formerly reached function after a dyn-fact edit refuses its stale handle without panicking, and the kept and fresh builds still agree on every list and delta. A patch may ask again of the removed function before its reach graph settles.
+  Controls: `a_changed_function_whose_callers_keep_its_old_key`, `a_removed_ref_whose_target_stays_reached`, `a_dyn_fact_change_that_invalidates_nothing`, `a_patch_that_keeps_a_changed_functions_old_references`, `a_caller_that_names_a_changed_callees_old_key`, `a_pass_that_runs_whole`, `a_kept_template_used_after_its_callees_key_changed`, `a_delta_that_omits_a_removed_function`, `an_owner_kept_when_its_function_changed`, `a_dedupe_class_not_split_when_a_members_code_changed`, `a_recursion_claim_not_run_after_an_added_edge`.
 - **`the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand`** *tested* (`crates/blaze-codegen/src/driver/tests/kept.rs`): the work of every pass of a build after an edit is the edit's, not the program's. A leaf's body edit, a call added to a function already reached and a function removed each count the same work in a program of 100 functions and in one of 10,000, pass by pass, and each count is a constant and what the edit changed.
   Controls: `a_changed_function_whose_callers_keep_its_old_key`, `a_removed_ref_whose_target_stays_reached`, `a_dyn_fact_change_that_invalidates_nothing`, `a_patch_that_keeps_a_changed_functions_old_references`, `a_caller_that_names_a_changed_callees_old_key`, `a_pass_that_runs_whole`, `a_kept_template_used_after_its_callees_key_changed`, `a_delta_that_omits_a_removed_function`, `an_owner_kept_when_its_function_changed`, `a_dedupe_class_not_split_when_a_members_code_changed`, `a_recursion_claim_not_run_after_an_added_edge`.
 
@@ -204,6 +208,11 @@ By level: 58 tested, 38 simulated, 0 model-checked, 0 proved.
 - **`conditional_publication_preserves_comparison_and_whole_file_integrity`** *simulated* (`crates/blaze-serve/src/store/repair_tests.rs`): a conditional repair requires the current committed digest, an absent old pack, and verified replacement bytes; no stale writer may replace the winner, and each acknowledged repair survives a crash and reopen as a whole manifest.
   Controls: `the_comparison_bypass_plant`, `missing_file_sync_with_torn_appends`, `acknowledgement_before_directory_sync`.
 
+### blaze-shader
+
+- **`structured_control_flow_runs_as_the_graph_does`** *tested* (`crates/blaze-shader/src/structure/tests.rs`): for any reducible graph and any sequence of branch choices, the graph, its labelled structure, the simplified structure and naga's shape run the same blocks in the same order and leave from the same block, compared up to `FUEL` blocks. The oracle over Hegel's graphs and choices.
+  Controls: `planted_bugs`.
+
 ### blaze-storemodel
 
 - **`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`** *tested* (`crates/blaze-storemodel/src/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable. After any crash the restore serves no value whose bytes were lost, holds everything the store called durable and everything an answered build kept, and every answer's settling ended kept or said lost. Two builds on shared and separate keys with a reader, and a snapshot beside a build, each build answering before it flushes: every schedule, a crash after every IO step, so at every point between an answer sent and its results durable; with an IO failure anywhere, so a settling that ends with the store stopped. Then two kernel gets of one identity in two worlds racing for one shape slot, each answering at once and keeping what it left once it and every store before it is durable, with an IO failure anywhere and effects completing in any order.
@@ -299,6 +308,7 @@ By level: 58 tested, 38 simulated, 0 model-checked, 0 proved.
 - **`a_digest_kept_by_updates_is_the_files`** *tested* (`crates/blaze-link/src/digest.rs`): after any sequence of writes and changes of length, the digest kept by updating only the blocks written is the digest of the file hashed whole, root and nodes.
   Controls: `a_block_not_rehashed`.
 - **`an_image_and_its_side_file_resolve_as_debug_info_inside`** *tested* (`crates/blaze-link/src/tests/beside.rs`): an executable and its side file resolve every function's rows to the same (function, file, line) as the same program linked with its debug info inside, at its first link, after a body edit taken as a patch of both, and after a rollback.
+  Controls: `a_side_file_left_behind_an_edit`.
 - **`a_patched_file_behaves_as_a_fresh_link`** *tested* (`crates/blaze-link/src/tests/patch.rs`): after any sequence of edits (a body changed at the same size, smaller or larger than the room it had, a function added or removed, a callee set changed, a frame entry gained or lost, a static read, dropped or given another value), the file the patches make behaves as a fresh full link of the same program: the same entry, each function's code, each call resolved through its slot to the same function, each static read holding the same bytes, an unwind lookup of each function finding an entry that covers it, and the same function names in the symbol table. Each patch is of the file the last one left, never lays the image out whole, and the digest it gives is the patched file's hashed whole.
   Controls: `a_stale_unwind_entry`, `a_slot_left_on_the_old_body`, `a_removed_function_still_exported`, `a_write_the_digest_missed`, `a_check_of_the_length_alone`.
 
@@ -333,5 +343,5 @@ By level: 58 tested, 38 simulated, 0 model-checked, 0 proved.
 
 ### blaze-link
 
-- **`Program`** (`crates/blaze-link/src/beside/tests.rs`): a program is its functions by number; what a debugger sees of it is what [`inside`] reads of its debug info made whole.
+- **`DebugProgram`** (`crates/blaze-link/src/beside/tests.rs`): a program is its functions by number; what a debugger sees of it is what [`inside`] reads of its debug info made whole.
 - **`Program`** (`crates/blaze-link/src/tests/patch.rs`): a program is its functions by name and its statics' values; what it does is what [`normal`] reads of a fresh link of it.
