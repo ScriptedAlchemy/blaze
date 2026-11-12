@@ -184,7 +184,7 @@ class CorpusTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.repository = self.root / "repository"
         self.repository.mkdir()
         self.corpus = self.repository / "harness" / "smoke"
