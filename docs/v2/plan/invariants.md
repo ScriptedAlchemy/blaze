@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-88 invariants, 18 refinements, 6 reference models.
-By level: 66 tested, 40 simulated, 0 model-checked, 0 proved.
+90 invariants, 18 refinements, 6 reference models.
+By level: 68 tested, 40 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -211,6 +211,13 @@ By level: 66 tested, 40 simulated, 0 model-checked, 0 proved.
   Controls: `a_foreign_name_written_with_no_link`, `a_generation_begun_with_no_gen_row`, `a_reader_that_ignores_the_window`, `a_table_kept_across_a_park`.
 - **`every_row_is_in_the_history_once_after_any_crash`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): whatever the faults, wherever the power goes out, every row handed to the history is listed, handed back or left to read, exactly once, and the history opens.
   Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`.
+- **`workers_ending_loop_items_or_proving_memos_are_progress_and_parked_ones_stall`** *tested* (`crates/blaze-profile/src/watchdog.rs`): a daemon whose workers end a loop's items or prove memos current is never said to be stalled, however long no pool job ends and no query runs under a flight; one whose workers are all parked is said to be, at the bound.
+  Controls: `a_count_of_queries_under_a_flight_alone`.
+
+### blaze-query
+
+- **`a_large_value_is_kept_out_of_line_and_a_small_one_in_place`** *tested* (`crates/blaze-query/src/db/row.rs`): a row holds its value in place up to [`INLINE_MOST`] bytes and past it the address of the value's own block, which `drop_value` frees with the value; either way the row reads back what was put, its neighbours untouched, and a row is no longer than its header and its place.
+  Controls: `a_large_values_storage_retained_in_the_row`.
 
 ### blaze-serve
 

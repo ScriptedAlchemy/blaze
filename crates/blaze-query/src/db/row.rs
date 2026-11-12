@@ -399,7 +399,7 @@ mod tests {
         type Far<'a> = Row<'a, Counted<64>>;
         assert!(!Near::FAR && Far::FAR);
         assert_eq!(Near::SIZE, size_of::<Header>() + 16);
-        assert_eq!(Far::SIZE, size_of::<Header>() + size_of::<usize>());
+        check_large_row_size(Far::SIZE);
         assert_eq!((Far::FAR_BYTES, Near::FAR_BYTES), (512, 0));
         assert!(!Row::<[u8; INLINE_MOST]>::FAR, "a value of the bound stays in place");
         assert_eq!(Row::<u128>::SIZE, 48);
@@ -438,5 +438,20 @@ mod tests {
             }
         }
         assert_eq!(DROPS.load(Ordering::Relaxed), before + 6, "each value dropped once");
+    }
+
+    fn check_large_row_size(bytes: usize) {
+        assert_eq!(
+            bytes,
+            size_of::<Header>() + size_of::<usize>(),
+            "a large row retains only its pointer"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a large row retains only its pointer")]
+    fn the_oracle_catches_a_large_values_storage_retained_in_the_row() {
+        // The old inline layout kept these bytes even after dropping the value.
+        check_large_row_size(size_of::<Header>() + size_of::<Counted<64>>());
     }
 }
