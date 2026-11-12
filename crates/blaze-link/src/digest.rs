@@ -192,6 +192,10 @@ impl Digest {
                 self.dirty.sort_unstable();
             }
             self.raise(Digest::height_of(old));
+            let height = Digest::height_of(new) as u64;
+            if height < Digest::height_of(old) as u64 {
+                self.nodes.retain(|at, _| at >> 56 <= height);
+            }
         }
         self.len = len;
         // A taller tree's new levels are over the old top and zeros beside it.
@@ -370,6 +374,21 @@ mod tests {
         let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(12));
         if let Err(why) = kept_is_whole(&ops, false) {
             panic!("{why}");
+        }
+    }
+
+    #[test]
+    fn shrinking_keeps_only_nodes_below_the_new_root() {
+        for blocks in [2, 3, 5, 9] {
+            let ops = [
+                Op::Resize(blocks * BLOCK as u32 + 1),
+                Op::Write { at: 0, bytes: vec![1] },
+                Op::Resize(BLOCK as u32),
+                Op::Resize(1),
+                Op::Resize(0),
+                Op::Resize(blocks * BLOCK as u32 + 1),
+            ];
+            assert_eq!(kept_is_whole(&ops, false), Ok(()));
         }
     }
 
