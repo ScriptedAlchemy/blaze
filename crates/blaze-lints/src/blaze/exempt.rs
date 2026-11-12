@@ -132,7 +132,11 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::StdUse
         // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:
         // an allocation's comment says nothing about it.
-        | Lint::DefaultHasher => None,
+        | Lint::DefaultHasher
+        // A type's declaration and where it is held: kept with `#[expect(..)]` on the item.
+        | Lint::ProgramLifetime
+        | Lint::CouldBeProgramLifetime
+        | Lint::CouldBeRef32 => None,
     }
 }
 
