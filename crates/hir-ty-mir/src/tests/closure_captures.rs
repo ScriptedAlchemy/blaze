@@ -22,6 +22,27 @@ use crate::{
 
 use super::{setup_tracing, visit_module};
 
+/// An explicit object lifetime left out of a closure parameter is part of the closure's
+/// signature binder, including after earlier parameters have bound anonymous lifetimes.
+/// `hir-expand::mod_path::convert_path_view` has this shape; validating the lifetime against
+/// only the named variables panicked with `'^3 not found in []` before inference finished.
+#[test]
+fn a_closure_binds_the_explicit_elided_lifetime_of_its_dyn_parameter() {
+    super::check_no_mismatches(
+        r#"
+//- minicore: fn, sized
+fn main() {
+    let mut value = 2_u8;
+    let mut writer = |n| { value += n; value };
+    let mut call = |x: &u8, y: &u8, writer: &mut (dyn FnMut(u8) -> u8 + '_)| {
+        writer(*x) + *y
+    };
+    let result: u8 = call(&3, &7, &mut writer);
+}
+"#,
+    );
+}
+
 fn display_place(db: &TestDB, store: &ExpressionStore, place: &Place, local: BindingId) -> String {
     let mut result = store[local].name.display(db, Edition::LATEST).to_string();
     let mut last_was_deref = false;

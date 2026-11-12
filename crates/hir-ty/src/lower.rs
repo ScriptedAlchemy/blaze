@@ -1718,7 +1718,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             }
             &TypeBound::Lifetime(l) => {
                 let lifetime = self.lower_lifetime(l);
-                let binder = self.peek_bound_vars();
+                // `+ '_` in a closure parameter can bind an anonymous lifetime of its
+                // signature. Include it, just as for the path bounds above.
+                let binder = self.bound_vars_with_elided();
                 clause = Some(Clause(Predicate::new(
                     self.interner,
                     Binder::bind_with_vars(
