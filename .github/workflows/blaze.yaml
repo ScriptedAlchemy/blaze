@@ -452,7 +452,7 @@ jobs:
     secrets: inherit
     with:
       platform: macos-arm64
-      os: macos-15
+      os: macos-latest
       tier: warm
 
   # The released blaze checks the workspace on hosted AArch64. A macOS workspace

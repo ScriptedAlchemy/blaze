@@ -93,7 +93,7 @@ jobs:
           # TODO(x86-64): Linux x86-64's answers need rustc running on x86-64; until ix has x86-64
           # capacity answers.py --write keeps the ones it last wrote (docs/harness.md "ix runners").
           - { platform: linux-arm64, runner: ubuntu-24.04-arm }
-          - { platform: macos-arm64, runner: macos-15 }
+          - { platform: macos-arm64, runner: macos-latest }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:

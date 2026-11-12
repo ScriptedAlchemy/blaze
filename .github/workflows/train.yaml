@@ -58,7 +58,7 @@ jobs:
     uses: ./.github/workflows/blaze-platform.yaml
     with:
       platform: macos-arm64
-      os: macos-15
+      os: macos-latest
       tier: full
       blaze-cli: true
 

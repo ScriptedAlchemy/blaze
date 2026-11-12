@@ -34,7 +34,7 @@ env:
 jobs:
   latency:
     name: live edit latency, ${{ matrix.program }} (macOS arm64)
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -61,7 +61,7 @@ jobs:
           BLAZE_IDLE_SECS: "0"
         # The JSON has what it ran on (commit, run, host, battery) for benchhistory.py live.
         run: |
-          uv run --frozen --no-dev python harness/live_latency.py "{\"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"program\": \"$PROGRAM\", \"edits\": $EDITS, \"json\": \"$RUNNER_TEMP/latency.json\", \"machine\": \"GitHub macos-15 runner\"}"
+          uv run --frozen --no-dev python harness/live_latency.py "{\"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"program\": \"$PROGRAM\", \"edits\": $EDITS, \"json\": \"$RUNNER_TEMP/latency.json\", \"machine\": \"GitHub macos-latest runner\"}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

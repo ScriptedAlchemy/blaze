@@ -121,7 +121,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04-arm, macos-15]
+        os: [ubuntu-24.04-arm, macos-latest]
     env:
       BLAZE_REPO: ${{ github.repository }}
       TAG: ${{ needs.release.outputs.tag }}
@@ -263,7 +263,7 @@ jobs:
       fail-fast: false
       matrix:
         app: ${{ fromJSON(needs.release.outputs.apps) }}
-        os: [ubuntu-24.04-arm, macos-15]
+        os: [ubuntu-24.04-arm, macos-latest]
         check: [works, speed]
     env:
       BLAZE_REPO: ${{ github.repository }}
