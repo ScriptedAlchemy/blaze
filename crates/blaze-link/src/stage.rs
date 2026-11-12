@@ -2155,26 +2155,17 @@ impl<'a> Stage<'a> {
             if self.new.home(sym).is_some() || !matches!(self.new.def(sym), Def::None) {
                 continue;
             }
-            let keys = GotKind::ALL.map(|kind| SymKey::Got(kind, sym));
-            for key in keys.into_iter().chain([SymKey::Plt(sym)]) {
-                if let Some(Def::Piece { piece, .. }) =
-                    self.symbols.find(key).map(|it| self.new.def(it))
-                {
-                    cells.push(piece);
-                }
-            }
-            self.thunks_of(sym, &mut cells);
+            self.cells_of(sym, &mut cells);
         }
         // A slot emptied and not filled again ([`Stage::unslot`]) keeps its symbol, so the
-        // walk above never meets it: its thunks, made for callers out of reach of the cells
-        // piece, go as a removed function's do, and a caller still reaching one is
-        // [`Stage::dangling`]'s to name, as a removed piece's referrer.
+        // walk above never meets it. Its cells and thunks go as a removed function's do;
+        // a caller still reaching the slot is [`Stage::dangling`]'s to name.
         for slot in self.emptied.iter() {
             if self.new.cell(*slot).is_some() {
                 continue;
             }
             if let Some(slot_sym) = self.new.slot_syms.get(*slot as usize).copied() {
-                self.thunks_of(slot_sym, &mut cells);
+                self.cells_of(slot_sym, &mut cells);
             }
         }
         // A going PLT stub's thunks go too.
@@ -2187,6 +2178,19 @@ impl<'a> Stage<'a> {
         for id in cells {
             self.unmake(id);
         }
+    }
+
+    /// The linker's cells, stubs and thunks that reach `target`.
+    fn cells_of(&self, target: Sym, out: &mut FrameVec<'a, PieceId>) {
+        let keys = GotKind::ALL.map(|kind| SymKey::Got(kind, target));
+        for key in keys.into_iter().chain([SymKey::Plt(target)]) {
+            if let Some(Def::Piece { piece, .. }) =
+                self.symbols.find(key).map(|it| self.new.def(it))
+            {
+                out.push(piece);
+            }
+        }
+        self.thunks_of(target, out);
     }
 
     /// The thunks to `target` ([`crate::thunk`]): among its referrers, as each has fixups to it.

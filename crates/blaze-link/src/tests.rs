@@ -706,22 +706,36 @@ fn a_removed_function_still_called_through_its_slot_is_an_error() {
 /// what reads it, and the image.
 #[test]
 fn a_removed_functions_got_cell_goes_with_it() {
+    removed_functions_got_cell(false);
+}
+
+#[test]
+fn an_emptied_slots_got_cell_goes_with_it() {
+    removed_functions_got_cell(true);
+}
+
+fn removed_functions_got_cell(slotted: bool) {
+    let to = if slotted { Target::Function } else { Target::Direct };
     // `mov rax, [rip + target@GOTPCREL]; ret`
     let through_got = |n: u8, target: u8| {
         let reloc = blaze_codegen::Relocation {
             at: 3,
             kind: RelocKind::GotPcRel32,
-            target: Target::Direct(key(target)),
+            target: to(key(target)),
             addend: -4,
         };
         function(n, &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3], vec![reloc])
+    };
+    let reached = |linked: &Linked, caller: &str| {
+        let address = linked.u64_at(linked.rel32(linked.symbol(caller) + 3));
+        if slotted { linked.through_stub(address) } else { address }
     };
     let (start, g) = (through_got(1, 2), function(2, &returns(1), Vec::new()));
     let mut image = Image::new(name(TO), output(true)).unwrap();
     let mut disk = Disk::default();
     disk.link(&mut image, first(&start, &g)).unwrap();
     let a = Linked::of(disk.file(TO));
-    assert_eq!(a.u64_at(a.rel32(a.symbol("start") + 3)), a.symbol("g"), "the cell holds `g`");
+    assert_eq!(reached(&a, "start"), a.symbol("g"), "the cell reaches `g`");
 
     let error = image.stage(Change { removed: vec![key(2)], ..Change::default() }).unwrap_err();
     assert!(
@@ -748,7 +762,7 @@ fn a_removed_functions_got_cell_goes_with_it() {
     disk.link(&mut image, rebuilt).unwrap();
     let b = Linked::of(disk.file(TO));
     assert_eq!(
-        b.u64_at(b.rel32(b.symbol("start2") + 3)),
+        reached(&b, "start2"),
         b.symbol("g2"),
         "the new cell holds the new `g`"
     );
