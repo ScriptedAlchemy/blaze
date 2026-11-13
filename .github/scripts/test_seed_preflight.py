@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -356,6 +357,125 @@ class SeedInputTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(preflight.Failed):
                     preflight.status_pid(json.dumps(value))
+
+
+class ReadinessDeadlineTests(unittest.TestCase):
+    def given(self, **overrides):
+        values = {"blaze": "/bin/blaze", "log": "/tmp/seed.log",
+                  "ready_seconds": 2.0, "status_seconds": 0.5}
+        values.update(overrides)
+        return preflight.Input(**values)
+
+    def raise_ready(self, clock, command, expected=preflight.Failed, **overrides):
+        process = SimpleNamespace(pid=123)
+        log = io.StringIO()
+        with (
+            mock.patch.object(preflight, "alive"),
+            mock.patch.object(preflight.time, "monotonic", side_effect=list(clock)),
+            mock.patch.object(preflight, "command", side_effect=command) as status,
+            self.assertRaises(expected) as caught,
+        ):
+            preflight.ready(self.given(**overrides), process, log)
+        return caught.exception, status, log
+
+    def test_clamped_status_timeout_reports_readiness_and_keeps_the_command_timeout(self):
+        cases = (
+            {"ready_seconds": 2.0, "status_seconds": 0.5,
+             "clock": [10, 11.99370903, 12.01], "within": "2"},
+            {"ready_seconds": 120.0, "status_seconds": 120.0,
+             "clock": [0, 119.99370903, 120.01], "within": "120"},
+        )
+        detail = "blaze status --json did not finish within 0.00629097 seconds"
+        for case in cases:
+            with self.subTest(ready_seconds=case["ready_seconds"]):
+                failure = preflight.CommandTimeout(detail)
+
+                def command(_given, args, seconds, log, failure=failure, case=case):
+                    self.assertEqual(args, ["status", "--json"])
+                    self.assertLess(seconds, case["status_seconds"])
+                    self.assertEqual(format(seconds, "g"), "0.00629097")
+                    print("cleanup: signal 15 to owned process group 123", file=log, flush=True)
+                    raise failure
+
+                error, status, log = self.raise_ready(case["clock"], command,
+                                                       ready_seconds=case["ready_seconds"],
+                                                       status_seconds=case["status_seconds"])
+                self.assertEqual(
+                    str(error),
+                    "the owned seed daemon 123 did not answer status within "
+                    f"{case['within']} seconds; {detail}")
+                self.assertEqual(error.returncode, 124)
+                self.assertIs(error.__cause__, failure)
+                self.assertEqual(status.call_count, 1)
+                self.assertIn("cleanup: signal 15 to owned process group 123", log.getvalue())
+
+    def test_status_timeout_inside_the_readiness_budget_stays_the_command_failure(self):
+        # The third clock sample is past the readiness deadline, as cleanup can be.
+        failure = preflight.CommandTimeout("blaze status --json did not finish within 0.5 seconds")
+
+        def command(_given, args, seconds, log, failure=failure):
+            self.assertEqual(args, ["status", "--json"])
+            self.assertEqual(seconds, 0.5)
+            print("cleanup: signal 9 to owned process group 123", file=log, flush=True)
+            raise failure
+
+        error, status, log = self.raise_ready([10, 11, 100], command)
+        self.assertIs(error, failure)
+        self.assertEqual(status.call_count, 1)
+        self.assertIn("cleanup: signal 9 to owned process group 123", log.getvalue())
+
+    def test_clamped_budget_does_not_replace_other_status_failures(self):
+        failures = (
+            preflight.Failed("blaze status --json exited with status 37", 37),
+            preflight.Failed("blaze status --json needed forced process-group cleanup"),
+            preflight.Failed("owned process group 123 still has live members [123] "
+                             "after SIGKILL within 0.2 seconds", 124),
+            OSError("status spawn failed"),
+        )
+        for failure in failures:
+            with self.subTest(failure=str(failure)):
+                def command(*_args, failure=failure):
+                    raise failure
+
+                error, status, _log = self.raise_ready([10, 11.99370903, 12.01], command,
+                                                        type(failure))
+                self.assertIs(error, failure)
+                self.assertEqual(status.call_count, 1)
+
+    def test_malformed_status_json_is_not_a_readiness_timeout(self):
+        def command(_given, args, seconds, _log):
+            self.assertEqual(args, ["status", "--json"])
+            self.assertLess(seconds, 0.5)
+            return "not-json"
+
+        error, status, _log = self.raise_ready([10, 11.99370903, 12.01], command)
+        self.assertEqual(status.call_count, 1)
+        self.assertIn("did not return JSON", str(error))
+        self.assertNotIn("did not answer status", str(error))
+
+    def test_expired_readiness_budget_does_not_start_status(self):
+        def command(*_args):
+            raise AssertionError("status started after the readiness deadline")
+
+        error, status, _log = self.raise_ready([10, 12], command)
+        status.assert_not_called()
+        self.assertEqual(error.returncode, 124)
+        self.assertEqual(str(error),
+                         "the owned seed daemon 123 did not answer status within 2 seconds")
+
+    def test_owned_status_answer_is_ready(self):
+        def command(_given, args, seconds, _log):
+            self.assertEqual(args, ["status", "--json"])
+            self.assertEqual(seconds, 0.5)
+            return json.dumps({"daemon": {"pid": 123}})
+
+        process = SimpleNamespace(pid=123)
+        log = io.StringIO()
+        with mock.patch.object(preflight, "alive"), \
+                mock.patch.object(preflight.time, "monotonic", side_effect=[10, 11]), \
+                mock.patch.object(preflight, "command", side_effect=command):
+            preflight.ready(self.given(), process, log)
+        self.assertIn("ready: owned daemon 123 answered status", log.getvalue())
 
 
 if __name__ == "__main__":

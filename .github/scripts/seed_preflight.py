@@ -25,6 +25,11 @@ class Failed(Exception):
         self.returncode = max(1, returncode) if returncode >= 0 else 128 - returncode
 
 
+class CommandTimeout(Failed):
+    def __init__(self, message: str):
+        super().__init__(message, 124)
+
+
 @dataclass(frozen=True)
 class Input:
     blaze: str
@@ -164,7 +169,7 @@ def command(given: Input, args: list[str], seconds: float, log) -> str:
             if result != 0:
                 failure = Failed(f"blaze {' '.join(args)} exited with status {result}", result)
         except subprocess.TimeoutExpired:
-            failure = Failed(f"blaze {' '.join(args)} did not finish within {seconds:g} seconds", 124)
+            failure = CommandTimeout(f"blaze {' '.join(args)} did not finish within {seconds:g} seconds")
         except (Failed, OSError) as error:
             failure = error
         finally:
@@ -210,13 +215,22 @@ def status_pid(stdout: str) -> int | None:
 
 def ready(given: Input, process: subprocess.Popen, log) -> None:
     deadline = time.monotonic() + given.ready_seconds
+    readiness_timeout = (f"the owned seed daemon {process.pid} did not answer status within "
+                         f"{given.ready_seconds:g} seconds")
     while True:
         alive(process, "before readiness")
         left = deadline - time.monotonic()
         if left <= 0:
-            raise Failed(f"the owned seed daemon {process.pid} did not answer status within "
-                         f"{given.ready_seconds:g} seconds", 124)
-        pid = status_pid(command(given, ["status", "--json"], min(left, given.status_seconds), log))
+            raise Failed(readiness_timeout, 124)
+        # command() finishes cleanup before raising. That work can end after the
+        # readiness deadline, so this classifies from the grant.
+        allowance = min(left, given.status_seconds)
+        try:
+            pid = status_pid(command(given, ["status", "--json"], allowance, log))
+        except CommandTimeout as error:
+            if allowance < given.status_seconds:
+                raise Failed(f"{readiness_timeout}; {error}", 124) from error
+            raise
         alive(process, "before readiness")
         if pid is not None:
             if pid != process.pid:
