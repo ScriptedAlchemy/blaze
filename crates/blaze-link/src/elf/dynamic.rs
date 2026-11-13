@@ -1,9 +1,10 @@
 //! The regions only the ELF writer fills, from the placed image: `.interp`, the build ID,
 //! the dynamic symbol table with its strings, GNU hash table and versions, `.rela.dyn`,
-//! `.dynamic` and `.eh_frame_hdr`. A pure function of [`Placed`]: an incremental link asks
-//! again and gets the same bytes for the same image, on any number of cores. An incremental
+//! `.dynamic` and `.eh_frame_hdr`. Fresh tables are a pure function of [`Placed`]; retained
+//! tables also carry the encoded slot placement of the previous synthesis. An incremental
 //! output keeps its last `.rela.dyn` and `.eh_frame_hdr` and patches them where
-//! [`Placed::delta`] says what changed; a patched table is the one a build makes. A kept table
+//! [`Placed::delta`] says what changed. Moved relative entries keep their encoded slots when
+//! their destinations don't overlap; same-order edits make a build's bytes. A kept table
 //! is a [`CowBytes`] the writer and the core's states share: a patch copies only the pages it
 //! changes, and the table handed to the core is a clone, never a copy.
 
@@ -650,11 +651,13 @@ fn text_relocation(
 #[derive(Default)]
 pub(crate) struct KeptRela {
     synthesis: u64,
-    /// The table's bytes, its first `relative` entries the `RELATIVE` run in the order of
-    /// [`Placed::rebase`] (kept only when the slid addresses came sorted, so entry `i` is
-    /// `rebase[i]`'s): what the last link's state holds too.
+    /// The table's bytes, its first `relative` entries the `RELATIVE` run: what the last
+    /// link's state holds too.
     bytes: CowBytes,
     relative: usize,
+    /// By address-ordered input position, the encoded slot of each relative entry. Bound to
+    /// `synthesis` together with `bytes`.
+    slots: Vec<usize>,
     /// The binds' and GOT cells' entries a patch builds, reused.
     scratch: Vec<u8>,
     /// How many builds were patches.
@@ -664,8 +667,8 @@ pub(crate) struct KeptRela {
 
 /// `.rela.dyn`'s bytes, how many of its entries are `RELATIVE`, and whether another is a
 /// `TPOFF64`. With `kept` (an incremental output's) of the synthesis `placed.delta` is from,
-/// and every splice of the slid addresses of equal length, the `RELATIVE` run is patched and
-/// the binds and GOT cells built; otherwise all of it is built.
+/// with compatible input cardinality, the `RELATIVE` run is patched and the binds and GOT
+/// cells built; otherwise all of it is built.
 fn rela_dyn(
     writer: &Elf,
     placed: &Placed<'_>,
@@ -680,10 +683,36 @@ fn rela_dyn(
     };
     let last = std::mem::replace(&mut kept.synthesis, 0);
     let patches = placed.delta.filter(|delta| {
-        last != 0 && kept.relative == placed.rebase.len() && delta.patches(last, &[delta.rebase])
+        last != 0
+            && kept.relative == placed.rebase.len()
+            && delta.from == last
+            && delta.same_regions
     });
-    if let Some(delta) = patches
-        && patch_relative(writer, placed, delta, kept)
+    let assignment = patches.and_then(|delta| {
+        let mapping =
+            super::slots::recycle(&kept.slots, placed.rebase.len(), delta.rebase, |_| (), |_| ())?;
+        // The loader's writes may overlap, and their order is then observable. Such a
+        // table keeps canonical order, including duplicate relocation multiplicity.
+        let changes_order =
+            mapping.is_some() || kept.slots.iter().enumerate().any(|(at, slot)| at != *slot);
+        if changes_order
+            && placed
+                .rebase
+                .windows(2)
+                .any(|pair| pair[0].checked_add(8).is_none_or(|end| end > pair[1]))
+        {
+            return None;
+        }
+        Some((delta, mapping))
+    });
+    if let Some((delta, mapping)) = assignment
+        && patch_relative(
+            writer,
+            placed,
+            delta,
+            mapping.as_deref().unwrap_or(&kept.slots),
+            &mut kept.bytes,
+        )
     {
         // alloc: once per relink, the binds and GOT cells (a few hundred)
         let mut others = Vec::with_capacity(placed.binds.len() + 2 * placed.got.len());
@@ -696,6 +725,9 @@ fn rela_dyn(
         put_relas(&others, scratch);
         kept.bytes.resize(head + scratch.len());
         kept.bytes.update(head, scratch);
+        if let Some(mapping) = mapping {
+            kept.slots = mapping;
+        }
         kept.synthesis = placed.synthesis;
         #[cfg(test)]
         {
@@ -715,7 +747,10 @@ fn rela_dyn(
         // clone: two reference counts, the table shared with the state that holds it
         kept.bytes = bytes.clone();
         kept.relative = relative;
+        kept.slots = (0..relative).collect(); // alloc: one encoded slot per relative input
         kept.synthesis = placed.synthesis;
+    } else {
+        kept.slots.clear();
     }
     Ok((bytes, relative, tpoff))
 }
@@ -723,16 +758,17 @@ fn rela_dyn(
 /// Rewrites the kept `RELATIVE` run for `placed`: the entries of each splice of the slid
 /// addresses, and those whose 8 bytes the core wrote (a range of `delta.written`, a local GOT
 /// cell spliced), each read as [`relocations`] reads it. False, with the run left half
-/// patched, when that is not the table a build makes: a spliced address out of order, or one
+/// patched, when its inputs are invalid: a spliced address out of order, or one
 /// a build refuses (it gives the error).
 fn patch_relative(
     writer: &Elf,
     placed: &Placed<'_>,
     delta: &Delta<'_>,
-    kept: &mut KeptRela,
+    slots: &[usize],
+    bytes: &mut CowBytes,
 ) -> bool {
     let rebase = placed.rebase;
-    if kept.bytes.len() < RELA as usize * rebase.len() {
+    if bytes.len() < RELA as usize * rebase.len() {
         return false;
     }
     // The run was sorted and every entry outside the splices is as it was: it stays sorted
@@ -746,10 +782,9 @@ fn patch_relative(
         }
     }
     let relative = types(writer.output.arch).relative;
-    let bytes = &mut kept.bytes;
     let mut put = |at: usize| match slid(placed, rebase[at], relative) {
         Ok(rela) => {
-            bytes.update(RELA as usize * at, &rela.bytes());
+            bytes.update(RELA as usize * slots[at], &rela.bytes());
             true
         }
         Err(_) => false,

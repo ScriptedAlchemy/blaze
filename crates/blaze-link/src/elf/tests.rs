@@ -1850,6 +1850,230 @@ fn a_relink_patches_rela_dyn_as_a_build_makes_it() {
     assert_eq!(patched(&image), [1, 1, 1], "every table patched");
 }
 
+/// The encoded file of one synthesis, without asking the writer to synthesize it again.
+fn assembled(image: &Fixture, tables: &[(Class, Vec<u8>)], parts: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    let mut file = Vec::new();
+    let mut put = |at: u64, bytes: &[u8]| {
+        let at = at as usize;
+        file.resize(file.len().max(at + bytes.len()), 0);
+        file[at..at + bytes.len()].copy_from_slice(bytes);
+    };
+    image.with(|placed| {
+        for (region, contents) in image.regions.iter().zip(&image.contents) {
+            if let Some(offset) = image.writer.offset(placed, region) {
+                let bytes = tables
+                    .iter()
+                    .find(|it| it.0 == region.class)
+                    .map_or(contents.as_slice(), |it| it.1.as_slice());
+                put(offset, bytes);
+            }
+        }
+    });
+    for (at, bytes) in parts {
+        put(*at, bytes);
+    }
+    file
+}
+
+/// Decoded symbol records, independent of local record order and name offsets.
+fn symbols_of(bytes: &[u8]) -> Vec<(Vec<u8>, u8, u16, u64, u64)> {
+    let file = ElfFile64::<Endianness>::parse(bytes).unwrap();
+    let endian = file.endian();
+    let sections = file.elf_section_table();
+    let symtab = sections.symbols(endian, bytes, elf::SHT_SYMTAB).unwrap();
+    let (_, header) = sections.section_by_name(endian, b".symtab").unwrap();
+    let first_global = header.sh_info(endian) as usize;
+    let mut result: Vec<_> = symtab
+        .symbols()
+        .iter()
+        .enumerate()
+        .map(|(at, symbol)| {
+            assert_eq!(symbol.st_bind() == elf::STB_LOCAL, at < first_global);
+            (
+                symbol.name(endian, symtab.strings()).unwrap().to_vec(),
+                symbol.st_info().0,
+                symbol.st_shndx(endian).0,
+                symbol.st_value(endian),
+                symbol.st_size(endian),
+            )
+        })
+        .collect();
+    result.sort();
+    result
+}
+
+fn relative_records(
+    tables: &[(Class, Vec<u8>)],
+    count: usize,
+    arch: blaze_codegen::Arch,
+) -> Vec<Vec<u8>> {
+    let expected = match arch {
+        blaze_codegen::Arch::Aarch64 => elf::R_AARCH64_RELATIVE.0,
+        _ => elf::R_X86_64_RELATIVE.0,
+    };
+    let count_tag = table(tables, super::DYNAMIC)
+        .chunks_exact(16)
+        .find(|record| {
+            u64::from_le_bytes(record[..8].try_into().unwrap()) == elf::DT_RELACOUNT.0 as u64
+        })
+        .unwrap();
+    assert_eq!(u64::from_le_bytes(count_tag[8..].try_into().unwrap()), count as u64);
+    let records: Vec<_> = table(tables, super::RELA_DYN)
+        .chunks_exact(24)
+        .take(count)
+        .map(|record| {
+            // The leading group contains only architecture-correct RELATIVE records, symbol 0.
+            assert_eq!(u64::from_le_bytes(record[8..16].try_into().unwrap()), expected as u64);
+            record.to_vec()
+        })
+        .collect();
+    assert_eq!(records.len(), count);
+    records
+}
+
+/// Moving entries retains unrelated encoded slots, while decoded symbols and the exact
+/// relocation multiset remain a fresh build's. Subsequent in-place edits use the new map;
+/// a rollback's synthesis mismatch rebuilds canonical bytes and the mapping together.
+#[test]
+fn moved_entries_keep_slots_and_describe_the_fresh_image() {
+    const N: usize = 4098;
+    for arch in [blaze_codegen::Arch::X86_64, blaze_codegen::Arch::Aarch64] {
+        let mut image = relinked_of(N);
+        image.writer.output.arch = arch;
+        // Include duplicate names and the distinct zero-storage classes in the same table.
+        image.functions[9].name = None;
+        image.functions[10].name = Some("".into());
+        image.functions[11].name = image.functions[12].name.clone();
+        let (first, first_parts) = image.build(&image.writer, 1, None);
+        let (text, data) = (image.at(&Class::Text), image.at(&Class::Data));
+        let original_functions = image.functions.clone();
+        let original_rebase = image.rebase.clone();
+        let k = 100;
+        let to = 3000;
+        let mut function = image.functions.remove(k);
+        function.addr = text + 16 * to as u64 + 8;
+        function.size = 8;
+        image.functions.insert(to, function);
+        image.rebase.remove(k + 1);
+        image.rebase.insert(to + 1, data + 16 * to as u64 + 8);
+        image.put(&Class::Data, 16 * to + 8, &(text + 33).to_le_bytes());
+        let functions = [
+            splice(k as u32..k as u32 + 1, k as u32..k as u32),
+            splice(to as u32 + 1..to as u32 + 1, to as u32..to as u32 + 1),
+        ];
+        let rebase = [
+            splice(k as u32 + 1..k as u32 + 2, k as u32 + 1..k as u32 + 1),
+            splice(to as u32 + 2..to as u32 + 2, to as u32 + 1..to as u32 + 2),
+        ];
+        let written = [(data + 16 * to as u64 + 8, 8)];
+        let (moved, parts) =
+            image.build(&image.writer, 2, Some(&delta(1, &functions, &rebase, &[], &written)));
+        assert_eq!(patched(&image)[0], 1);
+        assert_eq!(patched(&image)[2], 1);
+        let records = relative_records(&moved, image.rebase.len(), arch);
+        let before = relative_records(&first, image.rebase.len(), arch);
+        for at in 0..records.len() {
+            if at != k + 1 {
+                assert_eq!(records[at], before[at], "unrelated relative slot {at}");
+            }
+        }
+        let fresh = Elf { output: image.writer.output.clone(), last: None };
+        let (built, built_parts) = image.build(&fresh, 2, None);
+        let mut actual = records;
+        let mut expected = relative_records(&built, image.rebase.len(), arch);
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected, "relative multiset, preserving duplicates");
+        assert_eq!(
+            symbols_of(&assembled(&image, &moved, &parts)),
+            symbols_of(&assembled(&image, &built, &built_parts))
+        );
+        // The only differing local record is the moved function's; names retain offsets.
+        let local_records = |bytes: &[u8]| {
+            let file = ElfFile64::<Endianness>::parse(bytes).unwrap();
+            let sections = file.elf_section_table();
+            let (_, header) = sections.section_by_name(file.endian(), b".symtab").unwrap();
+            let at = header.sh_offset(file.endian()) as usize;
+            bytes[at..at + 24 * N].to_vec()
+        };
+        let old_symbols = local_records(&assembled(&image, &first, &first_parts));
+        let new_symbols = local_records(&assembled(&image, &moved, &parts));
+        for (at, (was, now)) in
+            old_symbols.chunks_exact(24).zip(new_symbols.chunks_exact(24)).enumerate()
+        {
+            if at != k {
+                assert_eq!(was, now, "unrelated local slot {at}");
+            }
+        }
+        // A same-position edit after the move writes the recycled relative/symbol slots.
+        image.functions[to].size = 4;
+        image.put(&Class::Data, 16 * to + 8, &(text + 77).to_le_bytes());
+        let functions = [splice(to as u32..to as u32 + 1, to as u32..to as u32 + 1)];
+        let (edited, edited_parts) =
+            image.build(&image.writer, 3, Some(&delta(2, &functions, &[], &[], &written)));
+        let (built, built_parts) = image.build(&fresh, 3, None);
+        let mut actual = relative_records(&edited, image.rebase.len(), arch);
+        let mut expected = relative_records(&built, image.rebase.len(), arch);
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            symbols_of(&assembled(&image, &edited, &edited_parts)),
+            symbols_of(&assembled(&image, &built, &built_parts))
+        );
+        image.functions = original_functions;
+        image.rebase = original_rebase;
+        let rolled_back = image.build(&image.writer, 4, Some(&delta(1, &[], &[], &[], &[])));
+        assert_eq!(rolled_back, image.build(&fresh, 4, None));
+        assert_eq!(rolled_back, (first, first_parts));
+    }
+}
+
+/// The loader observes relocation order when eight-byte destinations overlap. Even after
+/// a prior move, construction uses canonical order, including duplicate multiplicity.
+#[test]
+fn overlapping_relative_writes_keep_canonical_loader_order() {
+    for prior_move in [false, true] {
+        for overlap in [0, 4] {
+            let mut image = relinked();
+            let data = image.at(&Class::Data);
+            if !prior_move {
+                image.rebase[3] = image.rebase[2] + overlap;
+            }
+            image.build(&image.writer, 1, None);
+            image.rebase.remove(6);
+            image.rebase.push(data + 16 * (RELINKED as u64 - 1) + 8);
+            let rebase = [
+                splice(6..7, 6..6),
+                splice(
+                    RELINKED as u32 + 1..RELINKED as u32 + 1,
+                    RELINKED as u32..RELINKED as u32 + 1,
+                ),
+            ];
+            let since = delta(1, &[], &rebase, &[], &[]);
+            if prior_move {
+                image.build(&image.writer, 2, Some(&since));
+                assert_eq!(patched(&image)[0], 1);
+                image.rebase[3] = image.rebase[2] + overlap;
+                relinks_as_built(&image, 3, &delta(2, &[], &[splice(3..4, 3..4)], &[], &[]));
+            } else {
+                relinks_as_built(&image, 2, &since);
+            }
+            assert_eq!(
+                patched(&image)[0],
+                u32::from(prior_move),
+                "overlapping writes use canonical construction"
+            );
+            let tables = image.build(&image.writer, 4, None).0;
+            let records =
+                relative_records(&tables, image.rebase.len(), blaze_codegen::Arch::X86_64);
+            let offsets: Vec<_> =
+                records.iter().map(|it| u64::from_le_bytes(it[..8].try_into().unwrap())).collect();
+            assert_eq!(offsets, image.rebase, "loader order and duplicate multiplicity");
+        }
+    }
+}
+
 /// A function renamed to a name of its length and one resized: their local symbols
 /// rewritten in the kept tail are the tail a build makes; a name of another length is built.
 #[test]

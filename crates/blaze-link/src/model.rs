@@ -1032,8 +1032,9 @@ pub(crate) struct Delta<'a> {
     /// `imports`, `exports` and `libraries` are the last link's (the same `Arc`s, and exports
     /// of the same names, addresses, sizes and kinds).
     pub same_names: bool,
-    /// No region moved or changed size, but for the writer's own synthetic regions, whose
-    /// size it makes.
+    /// No region moved or changed its room. A synthetic region's size is the writer's, and
+    /// a [`Class::Patch`] or [`Class::PatchData`] region's used size may change inside the
+    /// capacity reserved for it.
     pub same_regions: bool,
     /// Address ranges of the regions the core wrote since the last link, by address, none
     /// overlapping. In the [`Placed`] that [`Writer::file`] sees, they include the blocks of

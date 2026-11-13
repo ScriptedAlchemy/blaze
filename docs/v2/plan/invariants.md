@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-90 invariants, 18 refinements, 6 reference models.
-By level: 68 tested, 40 simulated, 0 model-checked, 0 proved.
+90 invariants, 20 refinements, 6 reference models.
+By level: 70 tested, 40 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -334,6 +334,10 @@ By level: 68 tested, 40 simulated, 0 model-checked, 0 proved.
   Controls: `a_changed_function_left_out_of_the_change`, `a_side_file_of_another_build_id`, `a_line_row_left_for_a_moved_function`, `a_debuglink_crc_not_updated`.
 - **`a_digest_kept_by_updates_is_the_files`** *tested* (`crates/blaze-link/src/digest.rs`): after any sequence of writes and changes of length, the digest kept by updating only the blocks written is the digest of the file hashed whole, root and nodes.
   Controls: `a_block_not_rehashed`.
+- **`slots_follow_entries_when_splices_move_them`** *tested* (`crates/blaze-link/src/elf/slots.rs`): after any sequence of moves, each retained or moved entry still owns its original encoded slot, and each slot is owned exactly once.
+  Controls: `slots_left_in_input_order`.
+- **`trimmed_blocks_reconstruct_the_new_part`** *tested* (`crates/blaze-link/src/file.rs`): trimmed paged and contiguous writes reconstruct every new byte, including zero extensions over unrelated old data, without writing beyond the part.
+  Controls: `skipped_zero_extensions`.
 - **`an_image_and_its_side_file_resolve_as_debug_info_inside`** *tested* (`crates/blaze-link/src/tests/beside.rs`): an executable and its side file resolve every function's rows to the same (function, file, line) as the same program linked with its debug info inside, at its first link, after a body edit taken as a patch of both, and after a rollback.
   Controls: `a_side_file_left_behind_an_edit`.
 - **`a_patched_file_behaves_as_a_fresh_link`** *tested* (`crates/blaze-link/src/tests/patch.rs`): after any sequence of edits (a body changed at the same size, smaller or larger than the room it had, a function added or removed, a callee set changed, a frame entry gained or lost, a static read, dropped or given another value), the file the patches make behaves as a fresh full link of the same program: the same entry, each function's code, each call resolved through its slot to the same function, each static read holding the same bytes, an unwind lookup of each function finding an entry that covers it, and the same function names in the symbol table. Each patch is of the file the last one left, never lays the image out whole, and the digest it gives is the patched file's hashed whole.

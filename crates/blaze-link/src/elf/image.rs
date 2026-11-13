@@ -4,8 +4,8 @@
 //! [`file`] reads the synthetic regions' bytes from [`Placed::contents`], where the core puts
 //! what [`crate::model::Writer::synthesize`] returned, so no table is built twice. An
 //! incremental output keeps the tail past the debug sections and, where [`Placed::delta`]
-//! spliced functions without changing any name's length, rewrites only their local symbols
-//! and names in it; the rest of the tail is small and written whole.
+//! spliced functions with compatible name storage, retains their symbol/name slots and
+//! rewrites only their records; the rest of the tail is small and written whole.
 
 use blaze_format::cursor::Put;
 use blaze_graph::par;
@@ -209,30 +209,20 @@ struct Local {
 }
 
 impl KeptSymtab {
-    /// Whether each function `splices` put in has a name where the one it replaced had, of
-    /// the length that one's had: then every local keeps its index and its name's place.
-    fn same_locals(&self, functions: &[Function], splices: &[Splice]) -> bool {
-        self.locals.len() == functions.len()
-            && splices.iter().all(|splice| {
-                let (start, end) = (splice.new.start as usize, splice.new.end as usize);
-                match (functions.get(start..end), self.locals.get(start..end)) {
-                    (Some(functions), Some(locals)) => {
-                        functions.iter().zip(locals).all(|(function, local)| {
-                            match function.name.as_deref() {
-                                None => local.sym == 0,
-                                Some(name) => {
-                                    local.sym != 0 && local.stored as usize == stored(name)
-                                }
-                            }
-                        })
-                    }
-                    _ => false,
-                }
-            })
+    /// Assigns the splices' new functions the removed functions' symbol/name slots when
+    /// their storage classes match. An empty name owns a symbol; an unnamed function does not.
+    fn remap_locals(&self, functions: &[Function], splices: &[Splice]) -> Option<Option<Vec<Local>>> {
+        super::slots::recycle(
+            &self.locals,
+            functions.len(),
+            splices,
+            |local| (local.sym != 0, local.stored as usize),
+            |at| (functions[at].name.is_some(), functions[at].name.as_deref().map_or(0, stored)),
+        )
     }
 
     /// Rewrites the local symbol and name of each function `splices` put in, once
-    /// [`KeptSymtab::same_locals`] held; `symtab` and `strtab` are where the tables are in the
+    /// [`KeptSymtab::remap_locals`] held; `symtab` and `strtab` are where the tables are in the
     /// kept bytes.
     fn patch_locals(
         &mut self,
@@ -699,14 +689,13 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     let mut last = writer.last();
     let mut kept = last.as_deref_mut().map(|it| &mut it.symtab);
     let from = kept.as_deref_mut().map_or(0, |it| std::mem::replace(&mut it.synthesis, 0));
-    let patch = match (kept.as_deref(), placed.delta) {
-        (Some(kept), Some(delta)) => {
-            from != 0
-                && delta.patches(from, &[delta.functions])
-                && kept.same_locals(placed.functions, delta.functions)
+    let assignment = match (kept.as_deref(), placed.delta) {
+        (Some(kept), Some(delta)) if from != 0 && delta.from == from && delta.same_regions => {
+            kept.remap_locals(placed.functions, delta.functions)
         }
-        _ => false,
+        _ => None,
     };
+    let patch = assignment.is_some();
     let (mut chunks, named, function_names) = match kept.as_deref() {
         // alloc: none, an empty Vec holds no buffer
         Some(kept) if patch => (Vec::new(), kept.layout.named, kept.layout.function_names),
@@ -807,6 +796,9 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     let (symtab, strtab) = (symtab_at - len, strtab_at - len);
     let bytes = match kept {
         Some(kept) if patch && kept.layout == layout && kept.bytes.len() == size => {
+            if let Some(Some(locals)) = assignment {
+                kept.locals = locals;
+            }
             let splices = placed.delta.map_or(&[][..], |it| it.functions);
             kept.patch_locals(regions, placed.functions, splices, symtab, strtab);
             let (syms, names_at) = globals_at(&layout);
