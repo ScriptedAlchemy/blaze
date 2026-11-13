@@ -1,0 +1,222 @@
+# The rival score (harness/rival.py): our selected Blaze and Astral's actual fork, on uv,
+# ruff and ty at the revisions Astral pins and on our corpus. Each project is one job on a
+# hosted runner; its arms run on that same runner, so the ratios
+# hold while the absolute seconds are a shared runner's (docs/harness.md: a dedicated machine's
+# numbers are the ones to publish; lane astral re-runs them on an ix VM). The report job merges
+# the projects into one README, which is the run's summary and the `rival` artifact.
+name: rival
+on:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+    inputs:
+      ours:
+        description: "The ref measured as our blaze (a PR's branch, for its before/after against main's run)"
+        default: ""
+  pull_request:
+    paths: ["harness/rival.py", ".github/scripts/test_rival.py", ".github/workflows/rival.yaml", ".github/actions/blaze/**", ".github/actions/reflink/**", ".github/scripts/seed_preflight.py", ".github/scripts/test_seed_preflight.py"]
+
+concurrency:
+  group: rival-${{ github.ref }}-${{ inputs.ours }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
+jobs:
+  build:
+    name: build both blazes
+    runs-on: ubuntu-24.04-arm
+    # A cold build of ours by blaze, then Astral's (on hosted AArch64).
+    timeout-minutes: 300
+    env:
+      BLAZE_CORES: "2"
+      BLAZE_DAEMON_MEMORY_GB: "6"
+    outputs:
+      ours: ${{ steps.commits.outputs.ours }}
+      astral: ${{ steps.commits.outputs.astral }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # On a PR, benchmark this PR's version, not the possibly pre-V2 base.
+          # A before/after comparison against main uses the separately recorded main run.
+          ref: ${{ inputs.ours || (github.event_name == 'pull_request' && github.event.pull_request.head.sha) || github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: astral-experiments/blaze
+          path: astral
+          persist-credentials: false
+      - id: commits
+        run: |
+          echo "ours=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "astral=$(git -C astral rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # Use the same stage-0, namespace, locked-memory, signal-sampler, swap and
+      # pinned LLVM setup as other V2 self-build jobs. Benchmark the PR head itself.
+      - uses: ./.github/actions/blaze
+        with:
+          job: rival
+          llvm: "true"
+          reflink: "true"
+      - name: our blaze
+        run: |
+          blaze build --locked --release -p blaze-engine --target-dir "$CARGO_TARGET_DIR"
+          blaze stop
+          mkdir -p bins/ours
+          find "$CARGO_TARGET_DIR/release" -maxdepth 1 -type f -perm -u+x -exec cp {} bins/ours/ \;
+          test -x bins/ours/blaze
+          test -x bins/ours/blaze-engine
+      - name: Astral's blaze
+        working-directory: astral
+        # Compile the real fork with the source-built compiler selected above. Its old
+        # Cargo.lock has no V2 blaze.lock; resolve that lock in this throwaway checkout.
+        # A distinct target on the same verified reflink volume cannot overwrite ours.
+        env:
+          CARGO_TARGET_DIR: ${{ env.BLAZE_HOME }}/build/astral
+          BLAZE_LOCK: write
+        run: |
+          "$GITHUB_WORKSPACE/bins/ours/blaze" --ignore-pin build --release --no-locked -p ra-jit --target-dir "$CARGO_TARGET_DIR" --message-format=json-render-diagnostics | tee "$RUNNER_TEMP/astral-build.ndjson"
+          "$GITHUB_WORKSPACE/bins/ours/blaze" --ignore-pin stop
+          python3 - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path(os.environ["GITHUB_WORKSPACE"]) / "harness"))
+          import storelib
+          finished = storelib.build_finished(Path(os.environ["RUNNER_TEMP"], "astral-build.ndjson").read_text())
+          if finished is None or not finished.daemon:
+              raise SystemExit("Astral's source build did not identify the selected Blaze daemon")
+          PY
+          mkdir -p ../bins/astral && find "$CARGO_TARGET_DIR/release" -maxdepth 1 -type f -perm -u+x -exec cp {} ../bins/astral/ \;
+          test -x ../bins/astral/blaze
+          test -x ../bins/astral/ra-jit
+      - if: failure()
+        uses: ./.github/actions/daemon-log
+      - run: tar -czf bins.tar.gz bins
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bins
+          path: bins.tar.gz
+          retention-days: 2
+          compression-level: 0
+
+  measure:
+    name: rival (${{ matrix.project }})
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [uv, ruff, ty, ripgrep]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ours || (github.event_name == 'pull_request' && github.event.pull_request.head.sha) || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: bins
+      - uses: ./.github/actions/blaze
+        with:
+          job: rival-measure
+          reflink: "true"
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - name: selected compilers
+        run: |
+          tar -xzf bins.tar.gz -C "$RUNNER_TEMP"
+      - name: measure
+        env:
+          OURS: ${{ needs.build.outputs.ours }}
+          ASTRAL: ${{ needs.build.outputs.astral }}
+          PROJECT: ${{ matrix.project }}
+        run: |
+          python3 - <<'PY' > "$RUNNER_TEMP/input.json"
+          import json, os
+          tmp = os.environ["RUNNER_TEMP"]
+          print(json.dumps(dict(
+              arms=[dict(name="ours", kind="blaze", bin=f"{tmp}/bins/ours", commit=os.environ["OURS"]),
+                    dict(name="astral", kind="astral", bin=f"{tmp}/bins/astral", commit=os.environ["ASTRAL"])],
+              projects=[os.environ["PROJECT"]], work=os.path.join(os.environ["BLAZE_HOME"], "rival-work"),
+              out="rival-out", runs=5, tests=True, interleave=False,
+              machine="GitHub-hosted ubuntu-24.04-arm")))
+          PY
+          uv run --frozen --no-dev python -u harness/rival.py "$RUNNER_TEMP/input.json"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rival-${{ matrix.project }}
+          path: rival-out
+          retention-days: 14
+
+  report:
+    name: rival report
+    needs: measure
+    if: always()
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ours || (github.event_name == 'pull_request' && github.event.pull_request.head.sha) || github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rival-*
+          path: parts
+      - run: |
+          uv run --frozen --no-dev python - <<'PY'
+          import json, shutil, sys
+          from pathlib import Path
+          sys.path.insert(0, "harness")
+          import rival
+          expected = ["uv", "ruff", "ty", "ripgrep"]
+          out = Path("rival")
+          (out / "raw").mkdir(parents=True)
+          records, errors, identities = [], [], []
+          for project in expected:
+              part = Path("parts", f"rival-{project}")
+              if not part.is_dir():
+                  errors.append(f"{project}: missing job artifact")
+                  continue
+              shutil.copytree(part, out / "parts" / project)
+              try:
+                  info = json.loads((part / "host.json").read_text())
+                  row = json.loads((part / "raw" / f"{project}.json").read_text())
+                  errors.extend(rival.evidence_errors(info, [row]))
+                  if info.get("projects") != [project]:
+                      errors.append(f"{project}: job did not request exactly its matrix project")
+                  identities.append([(a["name"], a["kind"], a["commit"],
+                                      sorted((Path(p).name, h) for p, h in a.get("compiler", {}).get("binaries", {}).items()))
+                                     for a in info["arms"]])
+                  records.append(info)
+                  shutil.copyfile(part / "raw" / f"{project}.json", out / "raw" / f"{project}.json")
+                  with (out / "commands.txt").open("a") as commands:
+                      commands.write(f"\n[{project}]\n" + (part / "commands.txt").read_text())
+              except (OSError, ValueError, TypeError, KeyError) as error:
+                  errors.append(f"{project}: unreadable evidence: {error}")
+          if not records:
+              raise SystemExit("No readable rival job evidence; see retained parts")
+          if any(identity != identities[0] for identity in identities[1:]):
+              errors.append("the jobs measured different compiler sources or executable bytes")
+          merged = dict(records[0], projects=expected, errors=errors)
+          (out / "host.json").write_text(json.dumps(merged, indent=1))
+          PY
+          uv run --frozen --no-dev python harness/rival.py '{"action": "report", "out": "rival"}'
+      - if: always()
+        run: |
+          test -f rival/README.md
+          cat rival/README.md >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rival
+          path: rival
+          retention-days: 90

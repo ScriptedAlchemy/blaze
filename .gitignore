@@ -1,5 +1,16 @@
-target*/
+# Build output at the top only: `target*/` below it is source (crates/target-features,
+# hir-ty's `target_feature/`, blaze-link's `target/`, fuzz/targets).
+/target*/
+# CI's verified reflink output is a symlink; the directory pattern above excludes no symlinks.
+/target
 __pycache__/
-# Built: `crates/ra-jit-wasm/web/build.sh` and `build-site.sh`.
-/crates/ra-jit-wasm/web/pkg/
-/site/playground/ra-jit/
+# uv's environment for the workspace's Python (pyproject.toml), and wrangler's state for the
+# Cloudflare Workers (site/, tools/remote-cache/) when run from the root.
+/.venv/
+.wrangler/
+# Hegel's failing-example database, where a run finds no hegel.toml (it turns it off).
+.hegel/
+# The standard library is upstream's file for file (harness/library.py import), `target/` source
+# directories included.
+!/library/**
+/library/target/

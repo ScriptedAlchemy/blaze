@@ -10,6 +10,7 @@ use cargo_util_schemas::manifest::{Hints, RustVersion};
 use serde::Serialize;
 
 use crate::dependency::SerializedDependency;
+use crate::files::Files;
 use crate::manifest::{Context, Manifest};
 use crate::paths::{ancestors, normalize_path};
 use crate::targets::SerializedTarget;
@@ -33,34 +34,43 @@ pub struct ExportInfo<'a, R = ()> {
 /// A package as `cargo metadata` prints it.
 #[derive(Serialize)]
 pub struct SerializedPackage<'a> {
-    name: &'a str,
-    version: &'a semver::Version,
-    id: PackageIdSpec,
-    license: Option<&'a str>,
-    license_file: Option<&'a str>,
-    description: Option<&'a str>,
-    source: Option<String>,
-    dependencies: Vec<SerializedDependency<'a>>,
-    targets: Vec<SerializedTarget<'a>>,
-    features: BTreeMap<&'a str, Vec<String>>,
-    manifest_path: &'a Path,
-    metadata: Option<&'a toml::Value>,
-    publish: Option<&'a [String]>,
-    authors: &'a [String],
-    categories: &'a [String],
-    keywords: &'a [String],
-    readme: Option<&'a str>,
-    repository: Option<&'a str>,
-    homepage: Option<&'a str>,
-    documentation: Option<&'a str>,
-    edition: String,
-    links: Option<&'a str>,
+    pub name: &'a str,
+    pub version: &'a semver::Version,
+    pub id: PackageIdSpec,
+    pub license: Option<&'a str>,
+    pub license_file: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub source: Option<String>,
+    pub dependencies: Vec<SerializedDependency<'a>>,
+    pub targets: Vec<SerializedTarget<'a>>,
+    pub features: BTreeMap<&'a str, Vec<String>>,
+    pub manifest_path: &'a Path,
+    pub metadata: Option<&'a toml::Value>,
+    pub publish: Option<&'a [String]>,
+    pub authors: &'a [String],
+    pub categories: &'a [String],
+    pub keywords: &'a [String],
+    pub readme: Option<&'a str>,
+    pub repository: Option<&'a str>,
+    pub homepage: Option<&'a str>,
+    pub documentation: Option<&'a str>,
+    pub edition: String,
+    pub links: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    metabuild: Option<&'a [String]>,
-    default_run: Option<&'a str>,
-    rust_version: Option<&'a RustVersion>,
+    pub metabuild: Option<&'a [String]>,
+    pub default_run: Option<&'a str>,
+    pub rust_version: Option<&'a RustVersion>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    hints: Option<&'a Hints>,
+    pub hints: Option<SerializedHints<'a>>,
+}
+
+/// `[hints]` as cargo 1.101.0 prints it: every hint it knows, null when not given.
+/// cargo-util-schemas 0.14.3 reads no `min-opt-level`.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SerializedHints<'a> {
+    pub min_opt_level: Option<&'a toml::Value>,
+    pub mostly_unused: Option<&'a toml::Value>,
 }
 
 impl SerializedPackage<'_> {
@@ -78,9 +88,13 @@ impl SerializedPackage<'_> {
 }
 
 /// The package of the manifest at `manifest_path` as `cargo metadata` prints it.
-pub fn export_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> SerializedPackage<'a> {
+pub fn export_package<'a, F: Files>(
+    manifest_path: &'a Path,
+    m: &'a Manifest,
+    files: &F,
+) -> anyhow::Result<SerializedPackage<'a>> {
     let meta = &m.metadata;
-    SerializedPackage {
+    Ok(SerializedPackage {
         name: &m.package_id.name,
         version: &m.package_id.version,
         id: m.package_id.to_spec(),
@@ -89,7 +103,11 @@ pub fn export_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> Serialize
         description: meta.description.as_deref(),
         source: (!m.package_id.source_id.is_path())
             .then(|| m.package_id.source_id.as_url().to_string()),
-        dependencies: m.dependencies.iter().map(|d| d.serialized()).collect(),
+        dependencies: m
+            .dependencies
+            .iter()
+            .map(|d| d.serialized(files))
+            .collect::<anyhow::Result<_>>()?,
         targets: m.targets.iter().filter_map(|t| t.serialized()).collect(),
         features: m
             .features
@@ -111,23 +129,32 @@ pub fn export_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> Serialize
         metabuild: m.metabuild.as_deref(),
         default_run: m.default_run.as_deref(),
         rust_version: meta.rust_version.as_ref(),
-        hints: m.hints.as_ref(),
-    }
+        hints: m.hints.as_ref().map(|it: &Hints| SerializedHints {
+            min_opt_level: None,
+            mostly_unused: it.mostly_unused.as_ref(),
+        }),
+    })
 }
 
 /// What `cargo metadata --no-deps` prints for the workspace.
-pub fn export_no_deps<'a>(ws: &'a Workspace<'_>) -> ExportInfo<'a> {
-    let packages = ws.members().map(|(path, m)| export_package(path, m)).collect();
+pub fn export_no_deps<'a, F: Files>(ws: &'a Workspace<'_, F>) -> anyhow::Result<ExportInfo<'a>> {
+    let packages = ws
+        .members()
+        .map(|(path, m)| export_package(path, m, ws.files()))
+        .collect::<anyhow::Result<_>>()?;
     export(ws, packages, None)
 }
 
-/// What `cargo metadata` prints for the workspace with `packages` and `resolve`.
-pub fn export<'a, R>(
-    ws: &'a Workspace<'_>,
+/// What `cargo metadata` prints for the workspace with `packages` and `resolve`. Its
+/// `target_directory` and `build_directory` are where blaze builds, under blaze's root unless
+/// the configuration names one ([`Workspace::target_dir`]), so editors and rust-analyzer look
+/// there and not in the checkout.
+pub fn export<'a, R, F: Files>(
+    ws: &'a Workspace<'_, F>,
     packages: Vec<SerializedPackage<'a>>,
     resolve: Option<R>,
-) -> ExportInfo<'a, R> {
-    ExportInfo {
+) -> anyhow::Result<ExportInfo<'a, R>> {
+    Ok(ExportInfo {
         packages,
         workspace_members: ws.members().map(|(_, m)| m.package_id.to_spec()).collect(),
         workspace_default_members: ws
@@ -135,27 +162,31 @@ pub fn export<'a, R>(
             .map(|(_, m)| m.package_id.to_spec())
             .collect(),
         resolve,
-        target_directory: ws.target_dir(),
-        build_directory: ws.build_dir(),
+        target_directory: ws.target_dir()?,
+        build_directory: ws.build_dir()?,
         version: VERSION,
         workspace_root: ws.root(),
         metadata: ws.custom_metadata(),
-    }
+    })
 }
 
 /// The manifest `--manifest-path` names, or the nearest `Cargo.toml` from the working
 /// directory up, with cargo's messages for neither.
-pub fn root_manifest(manifest_path: Option<&Path>, ctx: &Context) -> anyhow::Result<PathBuf> {
+pub fn root_manifest<F: Files>(
+    manifest_path: Option<&Path>,
+    ctx: &Context<F>,
+) -> anyhow::Result<PathBuf> {
     let cwd = ctx.config.cwd();
+    let files = ctx.files();
     let Some(manifest_path) = manifest_path else {
-        return find_root_manifest_for_wd(cwd);
+        return find_root_manifest_for_wd(files, cwd);
     };
     let path = normalize_path(&cwd.join(manifest_path));
-    if !path.exists() {
+    if !files.exists(&path) {
         bail!("manifest path `{}` does not exist", manifest_path.display())
-    } else if path.is_dir() {
+    } else if files.is_dir(&path) {
         let child_path = path.join("Cargo.toml");
-        let suggested_path = if child_path.exists() {
+        let suggested_path = if files.exists(&child_path) {
             format!("\nhelp: {} exists", child_path.display())
         } else {
             String::new()
@@ -178,14 +209,14 @@ fn is_embedded(path: &Path) -> bool {
     ext == Some(std::ffi::OsStr::new("rs")) || ext.is_none()
 }
 
-fn find_root_manifest_for_wd(cwd: &Path) -> anyhow::Result<PathBuf> {
+fn find_root_manifest_for_wd<F: Files>(files: &F, cwd: &Path) -> anyhow::Result<PathBuf> {
     let mut invalid_cargo_toml_path_exists = false;
     for current in ancestors(cwd, None) {
         let manifest = current.join("Cargo.toml");
-        if manifest.exists() {
+        if files.exists(&manifest) {
             return Ok(manifest);
         }
-        if current.join("cargo.toml").exists() {
+        if files.exists(&current.join("cargo.toml")) {
             invalid_cargo_toml_path_exists = true;
         }
     }

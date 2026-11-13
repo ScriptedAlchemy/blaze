@@ -2,9 +2,8 @@
 """warmstart.py PROJECT [--work DIR] [--env NAME=VALUE]...: what a start costs when the store
 already has every function, with nothing of rustc's to start from (#41).
 
-Every step has `RA_JIT_RUSTC_BASE=0`, so the first build of a daemon is its own, as it is
-without rustc (docs/no-rustc.md, step K):
-  first    a checkout and an empty store: `cargo ra-jit build` and the wait until ready
+The first build of a daemon is its own, with nothing of rustc's (docs/no-rustc.md, step K):
+  first    a checkout and an empty store: `blaze build` and the wait until ready
   warm     a second checkout of the same commit with a home of its own and the store the first
            filled
   restart  the second checkout's daemon stopped and started again with nothing changed: its
@@ -12,18 +11,18 @@ without rustc (docs/no-rustc.md, step K):
            told ahead of cargo's stored, keyed by the same toolchain
   again    the same once more, with the store holding all of that: what the issue is for
 After each, a body edit and its undoing, which the daemon is to patch, and the program's output,
-which has to be cargo's. For each step: the command's seconds, the wait until ready, the most
+which has to be what blaze from nothing (`blaze_cli.Scratch`) prints. For each step: the command's seconds, the wait until ready, the most
 memory held, what the worker compiled and timed, and what it took from the store: functions
 found and added, frozen crates served and written (all it said is in `WORK/said-STEP.txt`, and
 for the edit and its undoing in `WORK/said-STEP-edit.txt` and `-back.txt`). It fails when a
-step's output is not cargo's, or when the restart took nothing from the store the warm step
+step's output is not the one from nothing, or when the restart took nothing from the store the warm step
 filled.
 Writes the steps as JSON on stdout's last line. The projects are bench.py's, fetched as it fetches them.
 """
 import json, os, re, shutil, sys
 
-import bench, cargo_ra_jit, memory
-from cargo_ra_jit import Side, fetch, program_output, wait_warm
+import bench, blaze_cli, memory, storelib
+from blaze_cli import Scratch, Side, fetch, program_output, wait_warm
 
 
 def from_store(said):
@@ -44,24 +43,25 @@ def main():
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
     source = fetch(name, spec)
-    store = os.path.join(work, "store")
     build, run = spec.get("build", []), spec.get("run")
     edit = spec["edits"]["body"]
 
-    def checkout(label):
+    def checkout(label, seed=None):
+        """A copy of the project with a home of its own, whose store is a copy of `seed`'s."""
         ws = os.path.join(work, label)
         shutil.copytree(source, ws, symlinks=True, ignore=lambda at, names: [n for n in names if n in ("target", ".git")])
-        env = dict(cargo_ra_jit.base_env(os.path.join(work, f"home-{label}")), **spec.get("env", {}), **extra_env)
-        env.update(RA_JIT_CACHE=store, RA_JIT_RUSTC_BASE="0", RA_JIT_STATS="1")
+        home = os.path.join(work, f"home-{label}")
+        if seed is not None:
+            shutil.copytree(storelib.store_of(seed.env["BLAZE_HOME"]), storelib.store_of(home), symlinks=True)
+        env = dict(blaze_cli.base_env(home), **spec.get("env", {}), **extra_env)
+        env.update(BLAZE_STATS="1")
         env.pop("RUSTC_WRAPPER", None)
         return Side(ws, env, True)
 
-    reference = checkout("reference")
-    reference.env.pop("RA_JIT_CACHE")
-    plain = Side(reference.ws, reference.env, False)
-    _, ran = plain.cargo("build", *build)
-    assert ran.returncode == 0, ran.stderr[-3000:]
-    expected = program_output(plain.cargo("run", *build, "--", *run)[1]) if run is not None else None
+    expected = None
+    if run is not None:
+        scratch = checkout("scratch")
+        expected = program_output(Scratch(scratch.ws, scratch.env).cargo("run", *build, "--", *run)[1])
 
     steps = []
 
@@ -75,7 +75,7 @@ def main():
         with open(os.path.join(work, f"said-{label}.txt"), "w") as kept:
             kept.write(said)
         row = dict(step=label, build_s=round(took, 3), ready_s=round(ready, 3), states=states,
-                   built=bench.how_built(ran.stderr), peak_mb=max(sampler.peak_mb, used["largest_mb"]),
+                   built=bench.how_built(ran), peak_mb=max(sampler.peak_mb, used["largest_mb"]),
                    resident_mb=daemon.resident_mb(), compiled=bench.compiled(said), steps_s=bench.cold_steps(said),
                    store=from_store(said))
         edits = []
@@ -83,7 +83,7 @@ def main():
             bench.write_edit(side.ws, edit, back)
             took, ran, used = bench.metered(side, build, daemon)
             assert ran.returncode == 0, f"{label}: the edit: {ran.stderr[-3000:]}"
-            built = bench.how_built(ran.stderr)
+            built = bench.how_built(ran)
             said = daemon.said(1 if built == "daemon" else 0)
             with open(os.path.join(work, f"said-{label}-{'back' if back else 'edit'}.txt"), "w") as kept:
                 kept.write(said)
@@ -103,7 +103,7 @@ def main():
     first = checkout("first")
     step("first", first)
     first.cargo("stop")
-    second = checkout("second")
+    second = checkout("second", seed=first)
     step("warm", second)
     second.cargo("stop")
     step("restart", second)

@@ -5,15 +5,15 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::OnceLock,
 };
 
 use anyhow::{Context as _, bail};
 use semver::{Version, VersionReq};
 use serde_derive::Deserialize;
-use sha2::{Digest, Sha256};
 
-use crate::{Package, SourceId};
+use blaze_source::SourceId;
+
+use crate::Package;
 
 /// A vendored package.
 #[derive(Clone, Debug)]
@@ -24,6 +24,7 @@ pub struct Vendored {
     /// The sha256 of the `.crate` file it was unpacked from, which a registry's lock entry
     /// names; none for a package vendored from git.
     pub checksum: Option<String>,
+    // BTreeMap: `verify` reports the first changed file in path order, the same on every run.
     files: BTreeMap<String, String>,
 }
 
@@ -47,12 +48,16 @@ struct ManifestPackage {
 pub struct Directory {
     source: SourceId,
     root: PathBuf,
-    packages: OnceLock<Result<Vec<Vendored>, String>>,
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the vendored packages, read the first time one is asked for: per directory source, not global"
+    )]
+    packages: std::sync::OnceLock<Result<Vec<Vendored>, String>>,
 }
 
 impl Directory {
     pub fn new(source: SourceId, root: PathBuf) -> Directory {
-        Directory { source, root, packages: OnceLock::new() }
+        Directory { source, root, packages: Default::default() }
     }
 
     pub fn source(&self) -> &SourceId {
@@ -165,12 +170,10 @@ fn read(root: &Path) -> anyhow::Result<Vec<Vendored>> {
 fn verify(package: &Vendored) -> anyhow::Result<()> {
     for (file, expected) in &package.files {
         let path = package.root.join(file);
-        let mut hasher = Sha256::new();
-        let mut reader = std::fs::File::open(&path)
+        let bytes = std::fs::read(&path)
             .with_context(|| format!("failed to calculate checksum of: {}", path.display()))?;
-        std::io::copy(&mut reader, &mut hasher)
-            .with_context(|| format!("failed to calculate checksum of: {}", path.display()))?;
-        let actual: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+        let actual: String =
+            blaze_sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
         if &actual != expected {
             bail!(
                 "the listed checksum of `{}` has changed:\nexpected: {expected}\nactual:   {actual}\n\n\

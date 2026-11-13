@@ -1,28 +1,31 @@
 //! Asking a server for a file: the [`Http`] trait the index and the downloads go through, the
-//! retries of cargo's `net.retry` (`src/util/network/retry.rs`), and [`HyperHttp`], over the
-//! HTTP stack the rest of blaze uses (hyper 1 and rustls with ring).
+//! retries of cargo's `net.retry` (`src/util/network/retry.rs`), and [`HyperHttp`], over
+//! blaze-http (blaze's sans-IO HTTP/1.1 client, rustls with ring, driven on tokio); without the
+//! `net` feature (the seed profile) a [`HyperHttp`] whose every request is [`NoNet`].
 
 use std::{
     fmt,
-    io::Read,
-    sync::{Arc, OnceLock},
+    future::Future,
+    pin::Pin,
     time::{Duration, SystemTime},
 };
 
-use anyhow::Context;
-use http_body_util::{BodyExt, Empty};
-use hyper::{
-    Request, StatusCode,
-    body::{Bytes, Incoming},
-    header,
-};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
-};
+#[cfg(feature = "net")]
+mod client;
+#[cfg(not(feature = "net"))]
+mod offline;
 
-/// An answer to a GET, after its redirects, with its body decoded.
+/// Whether this blaze can ask a server for anything: built with the `net` feature. Without it
+/// every request is [`NoNet`], so what is not in the store or the sources already can't be had,
+/// and a build says so for every such package at once.
+pub const NET: bool = cfg!(feature = "net");
+
+#[cfg(feature = "net")]
+pub use client::HyperHttp;
+#[cfg(not(feature = "net"))]
+pub use offline::{HyperHttp, NoNet};
+
+/// An answer to a request, after its redirects, with its body decoded.
 #[derive(Clone, Debug, Default)]
 pub struct Response {
     pub status: u16,
@@ -37,10 +40,88 @@ impl Response {
     }
 }
 
+/// What a streamed download hands its watcher, every [`TICK`] and once at its end.
+// dyn: the caller's printer, once a tick
+pub type Watch<'w> = &'w mut (dyn FnMut(&blaze_fetch::progress::Line) + Send);
+
+/// A download that got no byte for [`blaze_fetch::progress::STALL`]: stopped, not tried again
+/// (what it got is the caller's to resume from).
+#[derive(Debug)]
+pub struct Stalled {
+    pub url: String,
+    pub idle: Duration,
+    pub line: blaze_fetch::progress::Line,
+}
+
+impl std::fmt::Display for Stalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no data from {} for {}, with {} come: the download is stopped as stalled \
+             (a download may go {} without a byte)",
+            self.url,
+            blaze_fetch::progress::Secs(self.idle),
+            blaze_fetch::progress::Bytes(self.line.done),
+            blaze_fetch::progress::Secs(blaze_fetch::progress::STALL),
+        )
+    }
+}
+
+impl std::error::Error for Stalled {}
+
+/// Work started at once and finished on whichever thread does it, awaited from any executor.
+// dyn: what `dyn Http` returns, one per network request, which costs far more than its box.
+pub type Pending<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// Where a streamed body goes, a piece at a time with its offset in the whole body
+/// ([`Http::stream`]); an error stops the transfer.
+pub type Sink<'s> = &'s mut (dyn FnMut(u64, &[u8]) -> std::io::Result<()> + Send);
+
 /// What asks servers for files. An error is one where no answer came, which is worth trying
 /// again, as cargo tries a connection or a transfer that failed again.
 pub trait Http: Send + Sync {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response>;
+
+    /// [`Http::get`], sent before this returns and answered when it is done, so that many
+    /// requests are in flight at once. By default it is asked and answered on this thread.
+    fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
+        Box::pin(std::future::ready(self.get(url, headers)))
+    }
+
+    /// [`Http::get`] of the body from byte `from`, which goes to `sink` as it comes, each piece
+    /// with its offset in the whole body, instead of into the answer, whose `body` is then
+    /// empty: a 206 from `from`, or a 200 of the whole body from 0 (a server that ignores
+    /// ranges). Any other answer is given for its error, with at most the first 64 KiB of its
+    /// body (HyperHttp's bound: no error page fills memory). HyperHttp asks a large body as
+    /// many ranges at once and shows it among blaze-fetch's downloads. By default (a test's
+    /// fake) the whole body is got and handed over from 0.
+    fn stream(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        _from: u64,
+        sink: Sink<'_>,
+    ) -> anyhow::Result<Response> {
+        let mut answer = self.get(url, headers)?;
+        if answer.status == 200 {
+            let mut at = 0u64;
+            for piece in answer.body.chunks(64 * 1024) {
+                let offset = at;
+                at += piece.len() as u64;
+                sink(offset, piece).map_err(|e| {
+                    anyhow::anyhow!("keeping the body of {}: {e}", blaze_fetch::redact(url))
+                })?;
+            }
+            answer.body = Vec::new(); // alloc: empty, allocates nothing
+        }
+        Ok(answer)
+    }
+
+    /// A wait that holds no thread; by default it holds this one ([`wait_out`]).
+    fn sleep(&self, duration: Duration) -> Pending<()> {
+        wait_out(duration);
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// An answer that is not what was asked for.
@@ -64,7 +145,8 @@ impl HttpNotSuccessful {
         }
     }
 
-    fn is_spurious(&self) -> bool {
+    /// Whether another try may get a better answer: a server error, or too many requests.
+    pub fn is_spurious(&self) -> bool {
         (500..600).contains(&self.code) || self.code == 429
     }
 }
@@ -108,25 +190,57 @@ impl Retry {
         let mut tried = 0;
         loop {
             match attempt() {
-                Err(e) if tried < self.retries && spurious(&e) => {
-                    let left = self.retries - tried;
-                    if !self.quiet {
-                        let tries = if left == 1 { "try" } else { "tries" };
-                        eprintln!(
-                            "warning: spurious network error ({left} {tries} remaining): {e:#}"
-                        );
-                    }
-                    tried += 1;
-                    let after = e.downcast_ref::<HttpNotSuccessful>().and_then(retry_after);
-                    let sleep = after.map_or_else(
-                        || self.fixed_sleep_ms.unwrap_or_else(|| sleep_ms(tried)),
-                        |it| it.min(MAX_RETRY_SLEEP_MS),
-                    );
-                    std::thread::sleep(Duration::from_millis(sleep));
-                }
+                Err(e) => match self.again(&mut tried, &e, SystemTime::now()) {
+                    Some(wait) => wait_out(wait),
+                    None => return Err(e),
+                },
                 it => return it,
             }
         }
+    }
+
+    /// [`Retry::run`] of an attempt that waits, sleeping with `http`, so that the thread runs
+    /// other requests in between.
+    pub async fn run_async<T, F: Future<Output = anyhow::Result<T>>>(
+        &self,
+        // dyn: the I/O driver, asked only to sleep between tries of a failed request.
+        http: &dyn Http,
+        mut attempt: impl FnMut() -> F,
+    ) -> anyhow::Result<T> {
+        let mut tried = 0;
+        loop {
+            match attempt().await {
+                Err(e) => match self.again(&mut tried, &e, SystemTime::now()) {
+                    Some(wait) => http.sleep(wait).await,
+                    None => return Err(e),
+                },
+                it => return it,
+            }
+        }
+    }
+
+    /// How long to wait before trying again after `e`, said as cargo says it, at `now` (the
+    /// first wait's jitter is read from it); none when `e` is not worth another try or the
+    /// tries are used up.
+    fn again(&self, tried: &mut u32, e: &anyhow::Error, now: SystemTime) -> Option<Duration> {
+        if *tried >= self.retries || !spurious(e) {
+            return None;
+        }
+        let left = self.retries - *tried;
+        if !self.quiet {
+            let tries = if left == 1 { "try" } else { "tries" };
+            eprintln!(
+                "warning: spurious network error ({left} {tries} remaining): {}",
+                blaze_fetch::scrub(&format!("{e:#}"))
+            );
+        }
+        *tried += 1;
+        let after = e.downcast_ref::<HttpNotSuccessful>().and_then(retry_after);
+        let sleep = after.map_or_else(
+            || self.fixed_sleep_ms.unwrap_or_else(|| sleep_ms(*tried, now)),
+            |it| it.min(MAX_RETRY_SLEEP_MS),
+        );
+        Some(Duration::from_millis(sleep))
     }
 }
 
@@ -138,15 +252,25 @@ fn spurious(e: &anyhow::Error) -> bool {
     }
 }
 
-/// The wait before try `tried + 1`: half a second and up to a second more at random first,
-/// then three seconds more each time, to ten.
-fn sleep_ms(tried: u32) -> u64 {
+/// The wait before try `tried + 1`: half a second and up to a second more at random first
+/// (from `now`'s milliseconds), then three seconds more each time, to ten.
+fn sleep_ms(tried: u32, now: SystemTime) -> u64 {
     if tried == 1 {
-        let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-        INITIAL_RETRY_SLEEP_BASE_MS + u64::from(nanos.subsec_nanos()) % INITIAL_RETRY_JITTER_MS
+        let since = now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        INITIAL_RETRY_SLEEP_BASE_MS + u64::from(since.subsec_millis()) % INITIAL_RETRY_JITTER_MS
     } else {
         (u64::from(tried - 1) * 3 * 1000 + INITIAL_RETRY_SLEEP_BASE_MS).min(MAX_RETRY_SLEEP_MS)
     }
+}
+
+/// Holds this thread for a wait [`Retry::again`] gave: the retries' one timer, where the asker
+/// has no runtime to wait on.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the retries' timer: `Retry::again` decides the wait, from the time it is given"
+)]
+fn wait_out(wait: Duration) {
+    std::thread::sleep(wait);
 }
 
 /// A `Retry-After` of seconds, on the answers it applies to, 429 and 503.
@@ -170,110 +294,58 @@ impl fmt::Display for Transport {
 
 impl std::error::Error for Transport {}
 
-/// How many redirects one request follows.
-const REDIRECTS: usize = 10;
-
-/// [`Http`] over hyper and rustls, with the machine's certificates, on a runtime of its own
-/// that any number of threads ask through at once.
-pub struct HyperHttp {
-    runtime: tokio::runtime::Runtime,
-    client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
-    user_agent: String,
-    /// How long a connection or a transfer may go without a byte, cargo's `http.timeout`.
-    timeout: Duration,
+/// What one request ([`HyperHttp::get_bounded`]) is held to, beyond what every request is.
+#[derive(Clone, Copy, Debug)]
+pub struct Bounds {
+    /// The most bytes its body may be, as sent and once decoded: a body that would be more
+    /// stops being read there ([`Refused::TooBig`]), so a server can't fill memory first.
+    pub most: u64,
+    /// Whether it is asked, and its redirects followed, over HTTPS only: a plain `http://`
+    /// address, given or redirected to, is [`Refused::NotHttps`] or [`Refused::Downgraded`].
+    pub https_only: bool,
 }
 
-impl HyperHttp {
-    pub fn new(timeout: Duration) -> anyhow::Result<HyperHttp> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("blaze-registry http")
-            .enable_all()
-            .build()?;
-        let roots = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .context("the machine's certificates cannot be read")?;
-        let connector = roots.https_or_http().enable_http1().build();
-        let client = Client::builder(TokioExecutor::new()).build(connector);
-        let user_agent = format!("blaze/{}", env!("CARGO_PKG_VERSION"));
-        Ok(HyperHttp { runtime, client, user_agent, timeout })
-    }
+impl Bounds {
+    /// What every request is held to: no limit of its own, and plain HTTP where it is asked.
+    pub const NONE: Bounds = Bounds { most: u64::MAX, https_only: false };
+}
 
-    /// One shared by the whole process, with cargo's default timeout of 30 seconds.
-    pub fn shared() -> anyhow::Result<Arc<HyperHttp>> {
-        static SHARED: OnceLock<Result<Arc<HyperHttp>, String>> = OnceLock::new();
-        let shared = SHARED.get_or_init(|| {
-            HyperHttp::new(Duration::from_secs(30)).map(Arc::new).map_err(|e| format!("{e:#}"))
-        });
-        shared.clone().map_err(anyhow::Error::msg)
-    }
+/// A request refused by its [`Bounds`]: an answer that is not worth asking again for.
+#[derive(Debug)]
+pub enum Refused {
+    /// `url`, asked over HTTPS only, is no `https://` address.
+    NotHttps { url: String },
+    /// `from`, asked over HTTPS only, redirects to `to`, which is not `https://`.
+    Downgraded { from: String, to: String },
+    /// `url`'s body is more than `most` bytes: as its `Content-Length` says (`said`), else as
+    /// read (`decoded`: once its gzip was decoded), where reading stopped.
+    TooBig { url: String, most: u64, said: Option<u64>, decoded: bool },
+}
 
-    async fn fetch(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
-        let mut address = url.to_owned();
-        for _ in 0..=REDIRECTS {
-            let mut request = Request::get(&address)
-                .header(header::USER_AGENT, &self.user_agent)
-                .header(header::ACCEPT_ENCODING, "gzip");
-            for (name, value) in headers {
-                request = request.header(*name, *value);
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refused::NotHttps { url } => {
+                write!(f, "{url} is not an https:// address, and this is fetched over HTTPS only")
             }
-            let request = request.body(Empty::new())?;
-            let answer = tokio::time::timeout(self.timeout, self.client.request(request))
-                .await
-                .map_err(|_| Transport(format!("no answer from {address} in {:?}", self.timeout)))?
-                .map_err(|e| Transport(format!("asking {address}: {e:#}")))?;
-            let status = answer.status();
-            if status.is_redirection() && status != StatusCode::NOT_MODIFIED {
-                let to = answer.headers().get(header::LOCATION).and_then(|it| it.to_str().ok());
-                let to = to.with_context(|| format!("{address} redirects nowhere"))?;
-                address = url::Url::parse(&address)?.join(to)?.to_string();
-                continue;
-            }
-            let headers: Vec<(String, String)> = answer
-                .headers()
-                .iter()
-                .filter_map(|(name, value)| {
-                    Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
-                })
-                .collect();
-            let mut body = answer.into_body();
-            let mut bytes = Vec::new();
-            while let Some(chunk) = self.next(&mut body, &address).await? {
-                bytes.extend_from_slice(&chunk);
-            }
-            let mut response = Response { status: status.as_u16(), headers, body: bytes };
-            if response.header("content-encoding").is_some_and(|it| it.eq_ignore_ascii_case("gzip"))
-            {
-                let mut decoded = Vec::new();
-                flate2::read::GzDecoder::new(&response.body[..])
-                    .read_to_end(&mut decoded)
-                    .map_err(|e| Transport(format!("{address} sent gzip that is not: {e}")))?;
-                response.body = decoded;
-            }
-            return Ok(response);
-        }
-        anyhow::bail!("{url}: more than {REDIRECTS} redirects")
-    }
-
-    async fn next(&self, body: &mut Incoming, address: &str) -> anyhow::Result<Option<Bytes>> {
-        loop {
-            let frame = tokio::time::timeout(self.timeout, body.frame()).await.map_err(|_| {
-                Transport(format!("transfer from {address} stalled for {:?}", self.timeout))
-            })?;
-            let Some(frame) = frame else { return Ok(None) };
-            let frame = frame.map_err(|e| Transport(format!("reading from {address}: {e}")))?;
-            if let Ok(data) = frame.into_data() {
-                return Ok(Some(data));
-            }
+            Refused::Downgraded { from, to } => write!(
+                f,
+                "{from} redirects to {to}, which is not https://, and this is fetched over HTTPS only"
+            ),
+            Refused::TooBig { url, most, said: Some(said), .. } => write!(
+                f,
+                "{url} is {said} bytes as its Content-Length says, more than the {most} it may be"
+            ),
+            Refused::TooBig { url, most, said: None, decoded } => write!(
+                f,
+                "{url} is more than the {most} bytes it may be{}, and reading it stopped there",
+                if *decoded { " once its gzip is decoded" } else { "" }
+            ),
         }
     }
 }
 
-impl Http for HyperHttp {
-    fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.fetch(url, headers))
-    }
-}
+impl std::error::Error for Refused {}
 
 #[cfg(test)]
 mod tests {
@@ -305,11 +377,14 @@ mod tests {
 
     #[test]
     fn sleeps_as_cargo() {
-        assert!((500..1500).contains(&sleep_ms(1)));
-        assert_eq!(sleep_ms(2), 3500);
-        assert_eq!(sleep_ms(3), 6500);
-        assert_eq!(sleep_ms(4), 9500);
-        assert_eq!(sleep_ms(5), 10000);
+        let at = |nanos| SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, nanos);
+        assert_eq!(sleep_ms(1, at(0)), 500);
+        assert_eq!(sleep_ms(1, at(250_000_000)), 750);
+        assert_eq!(sleep_ms(1, at(999_999_999)), 1499);
+        assert_eq!(sleep_ms(2, at(250_000_000)), 3500);
+        assert_eq!(sleep_ms(3, at(0)), 6500);
+        assert_eq!(sleep_ms(4, at(0)), 9500);
+        assert_eq!(sleep_ms(5, at(0)), 10000);
         let answer = |code, after: &str| HttpNotSuccessful {
             url: String::new(),
             code,
@@ -318,5 +393,51 @@ mod tests {
         };
         assert_eq!(retry_after(&answer(429, "2")), Some(2000));
         assert_eq!(retry_after(&answer(500, "2")), None);
+    }
+
+    /// The waits [`Retry::again`] gives, at a time the test picks: a `Retry-After` of seconds
+    /// on a 429 or a 503, to ten seconds; cargo's schedule where there is none, it is not
+    /// seconds, or the answer is another; none past the tries or for an answer not worth one.
+    #[test]
+    fn the_waits_between_tries_follow_retry_after_then_cargos_schedule() {
+        let now = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 250_000_000);
+        let retry = Retry { retries: 3, quiet: true, fixed_sleep_ms: None };
+        let failed = |status: u16, after: Option<&str>| -> anyhow::Error {
+            let headers =
+                after.map(|it| vec![("retry-after".to_owned(), it.to_owned())]).unwrap_or_default();
+            HttpNotSuccessful::new("u", &Response { status, headers, body: Vec::new() }).into()
+        };
+        let waits = |errors: &[anyhow::Error]| -> Vec<Option<u64>> {
+            let mut tried = 0;
+            errors
+                .iter()
+                .map(|e| {
+                    retry.again(&mut tried, e, now).map(|it| u64::try_from(it.as_millis()).unwrap())
+                })
+                .collect()
+        };
+        assert_eq!(
+            waits(&[failed(429, Some("2")), failed(503, Some("4")), failed(429, Some("60"))]),
+            [Some(2000), Some(4000), Some(10000)]
+        );
+        assert_eq!(
+            waits(&[failed(500, Some("2")), failed(503, None), failed(429, Some("soon"))]),
+            [Some(750), Some(3500), Some(6500)]
+        );
+        assert_eq!(
+            waits(&[failed(500, None), failed(500, None), failed(500, None), failed(500, None)]),
+            [Some(750), Some(3500), Some(6500), None]
+        );
+        assert_eq!(waits(&[failed(403, Some("2"))]), [None]);
+        let fixed = Retry { fixed_sleep_ms: Some(7), ..retry };
+        let mut tried = 0;
+        assert_eq!(
+            fixed.again(&mut tried, &failed(429, Some("2")), now),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            fixed.again(&mut tried, &failed(500, None), now),
+            Some(Duration::from_millis(7))
+        );
     }
 }

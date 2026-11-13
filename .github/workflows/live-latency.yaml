@@ -1,4 +1,4 @@
-# Save-to-running latency of live edits on macOS arm64, step by step (harness/live_latency.py).
+# Save-to-running latency of live edits on macOS arm64, edit by edit (harness/live_latency.py).
 # Runs on a push to a live-latency* branch, by hand, and every night on main. A run on main adds
 # a line to docs/benchmarks/history/macos-arm64-live.jsonl (the site's /bench page charts it)
 # and checks it against the runs before it (harness/benchhistory.py): a median past its noise
@@ -11,23 +11,15 @@ on:
     - cron: "41 8 * * *"
   workflow_dispatch:
     inputs:
-      modes:
-        description: "cargo, socket, burst, replay, restart, space separated"
-        default: "socket burst replay"
       edits:
-        description: edits timed per mode
+        description: edits timed
         default: "10"
-      rounds:
-        description: rounds of replay's typing
-        default: "1"
 
+# A newer push to the branch cancels the run before it; the nightly run and a run by hand are
+# never cancelled.
 concurrency:
-  group: live-latency-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_INCREMENTAL: 0
-  CARGO_NET_RETRY: 10
+  group: live-latency-${{ github.event_name }}-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 permissions:
   contents: write
@@ -35,10 +27,14 @@ permissions:
   # To start the site's deploy after the history commit: a push by GITHUB_TOKEN starts no workflow.
   actions: write
 
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
 jobs:
   latency:
     name: live edit latency, ${{ matrix.program }} (macOS arm64)
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -48,55 +44,49 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
-      - uses: Swatinem/rust-cache@v2
+      # This tree's blaze, built by stage 0 (AGENTS.md rule blaze-builds-blaze): the latency
+      # timed is of the blaze this commit makes.
+      - uses: ./.github/actions/blaze
         with:
-          shared-key: live-debug
-      - run: cargo build --release -p ra-jit
+          job: tests
+      - run: blaze build -p blaze-engine --release --locked
+      # The release's daemon ends first; live_latency.py runs the tree's blaze in a home of its own.
+      - run: blaze stop
+      # live_latency.py reads its input with the workspace's typed_input (pyproject.toml, uv.lock).
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: time edits of a running program
         env:
-          LATENCY_EDITS: ${{ inputs.edits || '10' }}
-          LATENCY_ROUNDS: ${{ inputs.rounds || '1' }}
-          # The file has what it ran on (commit, run, host, battery) for benchhistory.py live.
-          LATENCY_JSON: ${{ runner.temp }}/latency.json
-          RA_JIT_BENCH_MACHINE: GitHub macos-15 runner
-          RA_JIT_IDLE_SECS: "0"
-        run: RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 harness/live_latency.py --program ${{ matrix.program }} ${{ inputs.modes || 'socket burst replay' }}
-      - name: what the workers said
-        if: always()
+          EDITS: ${{ inputs.edits || '10' }}
+          PROGRAM: ${{ matrix.program }}
+          BLAZE_IDLE_SECS: "0"
+        # The JSON has what it ran on (commit, run, host, battery) for benchhistory.py live.
         run: |
-          for log in "$HOME"/.cache/ra-jit/workers/*/log "$HOME"/.cache/ra-jit/spares/*/log; do
-            [ -f "$log" ] || continue
-            echo "::group::$log (filtered)"
-            grep -E "request:|timeline-us|apply-us|splice|steps:|asked:|edit-to-binary|link:|live:|panicked|error" "$log" | cut -c1-400 | tail -300 || true
-            echo "::endgroup::"
-          done
+          uv run --frozen --no-dev python harness/live_latency.py "{\"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"program\": \"$PROGRAM\", \"edits\": $EDITS, \"json\": \"$RUNNER_TEMP/latency.json\", \"machine\": \"GitHub macos-latest runner\"}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: latency-${{ matrix.program }}
-          path: |
-            ${{ runner.temp }}/latency.json
-            ~/.cache/ra-jit/daemon.log
-            ~/.cache/ra-jit/workers/*/log
-            ~/.cache/ra-jit/spares/*/log
+          path: ${{ runner.temp }}/latency.json
           if-no-files-found: warn
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   history:
     name: history and regressions
     needs: latency
     # The programs that did run are recorded even when another failed.
     if: always() && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # The ruleset on main refuses a push from the workflow's own token: this one is allowed
           # past it (docs/harness.md, "CI").
-          token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
-      - uses: actions/download-artifact@v4
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
+      - uses: actions/download-artifact@v8
         with:
           pattern: latency-*
           path: ${{ runner.temp }}/latency
@@ -105,31 +95,25 @@ jobs:
         run: |
           mapfile -t files < <(find "$RUNNER_TEMP/latency" -name latency.json)
           [ "${#files[@]}" -gt 0 ] || { echo "::error::no program wrote its latency"; exit 1; }
-          python3 harness/benchhistory.py live "${files[@]}"
+          jq -n --args '{action:"live",files:$ARGS.positional}' "${files[@]}" | python3 harness/benchhistory.py -
           # One runner's medians differ by up to twice between two rounds of the same binary
           # (#77): a number is judged once three runs before it show the runners' spread.
-          if python3 harness/benchhistory.py check docs/benchmarks/history/macos-arm64-live.jsonl --least 3 --report "$RUNNER_TEMP/regressions.md"; then
+          if jq -n --arg report "$RUNNER_TEMP/regressions.md" \
+            '{action:"check",history:"docs/benchmarks/history/macos-arm64-live.jsonl",least:3,report:$report}' \
+            | python3 harness/benchhistory.py -; then
             echo "regressed=false" >> "$GITHUB_OUTPUT"
           else
             echo "regressed=true" >> "$GITHUB_OUTPUT"
           fi
           cat "$RUNNER_TEMP/regressions.md" >> "$GITHUB_STEP_SUMMARY"
+      # The README's and docs/benchmarks.md's trend charts, from the history just appended to.
+      - name: Trends
+        run: python3 harness/benchcharts.py '{}'
+      # Main may have moved during the run: bench_commit.py puts the commit on top, draws the
+      # trends again from the history as it is then, and tries again.
       - name: Commit to main
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/benchmarks/history/macos-arm64-live.jsonl
-          git commit -q -m "bench: live latency for ${GITHUB_SHA::10} [skip ci]"
-          for attempt in 1 2 3 4 5; do
-            git fetch -q origin main
-            git rebase -q origin/main || { git rebase --abort; echo "::error::the history commit does not apply to main"; exit 1; }
-            if git push -q origin HEAD:main; then
-              gh workflow run site.yaml --ref main
-              exit 0
-            fi
-            sleep $((attempt * 5))
-          done
-          exit 1
+          python3 .github/scripts/bench_commit.py "$(printf '{"message": "bench: live latency for %s [skip ci]", "paths": ["docs/benchmarks/history/macos-arm64-live.jsonl", "docs/benchmarks/charts/", "README.md", "docs/benchmarks.md"], "site": true}' "${GITHUB_SHA::10}")"
       - name: Open or update the regression issue
         if: steps.history.outputs.regressed == 'true'
         run: |

@@ -1,6 +1,6 @@
 [package]
 name = "site-render"
-description = "The ra-jit site's renderer: a Flecs world of pages, comments and a viewer in, one page's HTML out. Sans-IO: no files, clock or globals."
+description = "The blaze site's renderer: a Flecs world of pages, comments and a viewer in, one page's HTML out. Sans-IO: no files, clock or globals."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

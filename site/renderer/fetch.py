@@ -9,7 +9,8 @@ looks, so the site builds and `wrangler dev` runs on a machine without the Rust 
     uv run --script renderer/fetch.py --scp HOST:DIR [--port N]  # from a machine that ran renderer/build.py
 
 The CI artifact is `site-renderer` (.github/workflows/site.yaml), built from that run's commit: when you have changed
-renderer/ yourself, build on a dev host and use --scp. Needs `gh` (signed in) or `scp`.
+renderer/ yourself, build in an ix VM and copy renderer/target/site out with `ix shell` (site/renderer/README.md).
+Needs `gh` (signed in) or `scp`.
 """
 
 import argparse

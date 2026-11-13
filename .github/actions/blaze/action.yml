@@ -1,0 +1,178 @@
+# blaze to build and test blaze with (AGENTS.md rule blaze-builds-blaze): the release
+# .github/blaze-version names, installed by site/install.sh into ~/.cargo/bin with the Rust it builds
+# with (its own toolchain, ~/.blaze/toolchains, docs/v2/plan.md: no rustup), and an empty
+# store (V2 uses BLAZE_HOME and XDG_CACHE_HOME). With `llvm: true`, also the LLVM blaze pins
+# (crates/hir-ty-codegen/llvm.json), fetched by its sha256 and named by LLVM_SYS_231_PREFIX, for
+# a build of blaze, which links it (blaze-engine's default `native`). No Nix: the C compiler and linker are the runner's own (gcc and
+# glibc on Ubuntu, Xcode's clang on macOS), so what the build links runs on the runner as it is.
+# No shared remote: the v2 blaze pinned since 0.20261105.0 has no `blaze cache build|pull|push`
+# (its `blaze cache` is `gc` alone), so every run starts from an empty store until v2 has a remote.
+name: blaze
+description: the release of blaze .github/blaze-version names, its toolchain, and an empty store
+inputs:
+  job:
+    description: the job whose store this is (build, tests)
+    required: true
+  llvm:
+    description: also the pinned LLVM, as LLVM_SYS_231_PREFIX (true or false)
+    default: "false"
+  reflink:
+    description: put state, std, store and targets on a job-local reflink filesystem (hosted Linux only)
+    default: "false"
+runs:
+  using: composite
+  steps:
+    # `blaze test` runs every test in a sandbox made of namespaces a user makes, which
+    # Ubuntu's AppArmor keeps users from making unless told otherwise.
+    - name: user namespaces
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+          sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+    # The daemon pins its direct-IO buffers with io_uring (crates/blaze-core/src/uring.rs,
+    # `Registered`), which needs more locked memory than Ubuntu's 8 MiB RLIMIT_MEMLOCK; without
+    # it `blaze serve` exits at start ("io_uring registered buffers: Cannot allocate memory").
+    # Each later step's shell is a child of Runner.Worker, so its limit is the one raised.
+    - name: locked memory
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        worker=$(pgrep -o -f Runner.Worker) || { echo "::error::locked memory: no Runner.Worker process to raise RLIMIT_MEMLOCK of"; exit 1; }
+        sudo prlimit --pid "$worker" --memlock=unlimited:unlimited
+        prlimit --pid "$worker" --memlock
+    - name: locked memory is raised
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        [ "$(ulimit -l)" = unlimited ] || { echo "::error::locked memory: RLIMIT_MEMLOCK is $(ulimit -l) KiB in a step after it was raised"; exit 1; }
+    # A cold store (a release of other sources, or a project main has not pushed yet) builds blaze in more
+    # than a hosted runner's 16 GB (rcache, #664): swap lets that run finish, slowly, where it
+    # would be killed, and the warm runs after it never touch it. The pinned 0.20261030 release
+    # builds each program whole in one worker that keeps every crate's memos until the build ends
+    # (its salsa `lru` evicts only between builds): that worker's resident plus swapped memory
+    # was 34.2 GB on 2026-10-30 (green) and passed 36.4 GB, still rising, on 2026-11-04 (run
+    # 41755023516), when 20 GB of swap ran out and the runner was shut down. So 40 GB, as the disk
+    # allows with 20 GB left for the store and target/, until the release the gate builds with
+    # bounds its own memory (#1376; docs/memory-budget.md).
+    - name: swap
+      if: runner.os == 'Linux' && runner.environment == 'github-hosted'
+      shell: bash
+      env:
+        REFLINK: ${{ inputs.reflink }}
+      run: |
+        # On the disk with the most room: /mnt on x86-64, the root on AArch64, which has no /mnt.
+        disk=/
+        avail=$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')
+        if [ -d /mnt ]; then
+          other=$(df -B1 --output=avail /mnt | tail -n 1 | tr -d ' ')
+          if [ "$other" -gt "$avail" ]; then disk=/mnt; avail=$other; fi
+        fi
+        swap="${disk%/}/blaze.swap"
+        avail=$(( avail / 1024 / 1024 / 1024 ))
+        # Reflink jobs need at least 20 GiB of volume plus 20 GiB of host headroom.
+        reserve=20
+        if [ "$REFLINK" = true ]; then reserve=40; fi
+        gb=$(( avail - reserve < 40 ? avail - reserve : 40 ))
+        [ "$gb" -ge 20 ] || { echo "::error::swap: $disk has ${avail} GiB free, too little for 20 GiB of swap and ${reserve} GiB for the build and host"; exit 1; }
+        sudo fallocate -l "${gb}G" "$swap"
+        sudo chmod 600 "$swap"
+        sudo mkswap "$swap" > /dev/null
+        sudo swapon "$swap"
+        free -g
+    # Reflinks cannot cross devices or run on the hosted root's ext4. Set the actual V2
+    # roots and explicit target before install.sh or the sampler preflight starts blaze.
+    # The callers opt in together with their target-path consumers.
+    - if: inputs.reflink == 'true'
+      uses: ./.github/actions/reflink
+    # CI tools and artifacts also use ./target; its path must resolve to the same
+    # reflink device as the store, rather than the checkout's ext4 filesystem.
+    - name: checkout target uses the verified reflink filesystem
+      if: inputs.reflink == 'true'
+      shell: bash
+      run: |
+        [ ! -e target ] && [ ! -L target ] || { echo "::error::checkout target already exists before reflink setup"; exit 1; }
+        ln -s "$CARGO_TARGET_DIR" target
+        store_dev=$(stat -Lc %d "$BLAZE_HOME/v2/store")
+        target_dev=$(stat -Lc %d target)
+        [ "$store_dev" = "$target_dev" ] || { echo "::error::checkout target and store are on different devices"; exit 1; }
+    # The release .github/blaze-version names, not the newest canary: canaries come every 40
+    # minutes, sooner than a cold run (about an hour) ends and pushes, so with the newest every
+    # run whose canary changed blaze's sources would be cold. A pull request that moves the gate
+    # to a release built from other sources, and main's next run, are cold once; one that moves
+    # it to a release of the same sources keeps the store.
+    - name: blaze (the release .github/blaze-version names)
+      id: install
+      shell: bash
+      env:
+        JOB: ${{ inputs.job }}
+      run: |
+        # Without --no-toolchain: install.sh has blaze fetch its toolchain now (`blaze toolchain`),
+        # as a user's install does, rather than at the first build.
+        # Make the installed entrypoints available to this and later steps.
+        bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+        export PATH="$bin:$PATH"
+        echo "$bin" >> "$GITHUB_PATH"
+        sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
+        said=$(blaze-engine --version)
+        version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
+        [ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }
+        # A hosted machine and its store live for this job alone.
+        cache="${BLAZE_CACHE:-$RUNNER_TEMP/blaze-store}"
+        echo "BLAZE_CACHE=$cache" >> "$GITHUB_ENV"
+        echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
+        mkdir -p "$cache"
+    # TODO(stage 0 after 3732f60733): remove these two steps once .github/blaze-version names a
+    # release cut after 3732f60733 (the perf sampler, no signals). The pinned 0.20261105.4
+    # (built from e930296025) still has the signal sampler (68b022735f), which tgkills every span
+    # thread with SIGRTMIN+6 about every 20 ms; a relative-timeout wait restarts on each signal,
+    # so the serve loop never wakes and the watchdog reports LOOP_STALLED (run 42110597024). Its
+    # sampler::platform::check() leaves the sampler off when SIGRTMIN+6's action is not SIG_DFL,
+    # and SIG_IGN is inherited across fork and exec: every later step's bash sources BASH_ENV,
+    # so the daemon it starts inherits the ignored signal. Linux only: macOS has no RTMIN.
+    - name: SIGRTMIN+6 ignored (the pinned release's signal sampler off)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        env_file="$RUNNER_TEMP/blaze-sigrtmin6.sh"
+        echo "trap '' RTMIN+6" > "$env_file"
+        echo "BASH_ENV=$env_file" >> "$GITHUB_ENV"
+    # The cause, shown: the release's daemon, started from a step whose bash read BASH_ENV, has
+    # SIGRTMIN+6 (signal 40, bit 39 of SigIgn) ignored and says its sampler is off. That message
+    # precedes startup: require a status answer from this PID before its bounded stop and reap.
+    - name: the release's daemon has its sampler off
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        python3 - <<'PY' | python3 .github/scripts/seed_preflight.py -
+        import json, os, shutil
+        print(json.dumps({"blaze": shutil.which("blaze"),
+                          "log": os.path.join(os.environ["RUNNER_TEMP"], "blaze-sigcheck.log")}))
+        PY
+    # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM"): llvm.py fetches the archive llvm.json names for this host, checks its
+    # sha256 and unpacks it; vendor/llvm-sys/pin.rs refuses any other prefix. Below
+    # /usr/local/lib because llvm-sys's build script names the prefix's `lib` to the linker, and a
+    # build script in blaze's sandbox may name only system directories of libraries
+    # (crates/blaze-cargo/src/cargo/directives.rs, SYSTEM). The same directory every run, so the
+    # store's runs of the build scripts that read LLVM_SYS_231_PREFIX are found.
+    # llvm.py takes JSON through typed_input, which needs Python 3.12; the oldest hosted Ubuntu has
+    # 3.10, so select Python explicitly.
+    - if: inputs.llvm == 'true' && runner.environment == 'github-hosted'
+      uses: actions/setup-python@v7
+      with:
+        python-version: "3.13"
+    - name: LLVM (the pin)
+      if: inputs.llvm == 'true'
+      shell: bash
+      run: |
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) triple=x86_64-unknown-linux-gnu ;;
+          Linux-ARM64) triple=aarch64-unknown-linux-gnu ;;
+          macOS-ARM64) triple=aarch64-apple-darwin ;;
+          *) echo "::error::crates/hir-ty-codegen/llvm.json has no LLVM for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+        esac
+        sudo mkdir -p /usr/local/lib/blaze-llvm
+        sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
+        python3 .github/scripts/llvm.py "{\"command\": \"fetch\", \"target\": \"$triple\", \"dir\": \"/usr/local/lib/blaze-llvm/$triple\"}"
+        echo "LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/$triple" >> "$GITHUB_ENV"

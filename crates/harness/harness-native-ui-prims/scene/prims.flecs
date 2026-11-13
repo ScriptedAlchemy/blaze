@@ -1,0 +1,722 @@
+// The primitives (docs/ui-model.md section 2): every view is a tree of instances of these prefabs. Each is made of small
+// components and says only what it adds to its base; an instance says only what differs from its prefab.
+//
+// They live in the `ui` scope (`ui.Row`, `ui.Words`), declared inside a `ui { }` block (flecs 4.2 refuses dotted names
+// in declarations). `Text: {...}` inside `ui.Words` is still the component: a world alias wins over the script's own
+// declarations (the indexable-inc/flecs fork). `@tree ChildOf` keeps the prefabs' children in ChildOf tables, as in 4.1,
+// instead of 4.2's default Parent storage for prefab scopes. Instances write `title : ui.Words { Text: {s: "Hello"} }`
+// (two statements on one line need a `;` between them). Loaded after 00-tokens (it uses the tones, radii and sizes).
+//
+// Layout (harness-native-ui-layout) reads Flex, Size, Padding, Aspect and Intrinsic and writes Laid; draw reads the looks (Fill,
+// Edge, Shape, Lift, Frost, TextStyle) and the content (Text, Icon, Picture); input reads Pressable, Focusable,
+// Editable and Cursor. `OrderedChildren` makes a container's children keep the order they are declared in.
+//
+// `Cursor: {shape}` is the system pointer over a node and what is inside it, macOS's way: Text (the I-beam) on whatever
+// takes typing or selection (ui.Field, a text area), Arrow on controls (buttons, rows, chips), Hand only on a real link. A
+// Cursor makes its node a hit target; a hit node that says none (nor its ancestors) shows the arrow.
+//
+// A Size axis is {kind: Fit | Grow | Fixed | Percent, value, min, max}: Fit is its content; Grow shares the room left by
+// `value` as weight (0 counts as 1); Fixed is `value` points; Percent is `value` (0 to 1) of the parent's inner size;
+// `max` of 0 is no maximum.
+
+@tree ChildOf
+ui {
+  // The root of every primitive: a Node whose children keep their order.
+  prefab Node {
+    Node
+    OrderedChildren
+  }
+
+  // A flex container along a row.
+  prefab Row : ui.Node {
+    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+  }
+
+  // A flex container down a column.
+  prefab Column : ui.Node {
+    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+  }
+
+  // Children on top of one another, each aligned inside it.
+  prefab ZStack : ui.Node {
+    Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
+  }
+
+  // Takes the room that is left, on either axis it is a child along.
+  prefab Spacer : ui.Node {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  }
+
+  // A plate with room inside it: Fill, Edge and Shape from Plate; a place that wants a shadow or frost adds Lift or Frost.
+  prefab Box : ui.Column, Plate {
+    Padding: {l: 12, r: 12, t: 12, b: 12}
+  }
+
+  // Words, wrapping at the width layout gives them. The ink is the Fill, so `: ui.Words, Strong` sets it.
+  prefab Words : ui.Node, Ink {
+    Text: {s: ""}
+    Intrinsic: {w: 0, h: 0, at: 0}
+    TextStyle: {size: $size_body, line: 22, role: 0, bold: 0}
+  }
+
+  // Words on one line, never wrapped: cut with an ellipsis to the width layout gives them (a sidebar row's name, a count).
+  prefab Line : ui.Words {
+    OneLine
+  }
+
+  // A row's leading words (its name): a ui.Line that gives up its room first when the row is short of it, so its counts
+  // and badges keep theirs.
+  prefab Lead : ui.Line {
+    ShrinkFirst
+  }
+
+  // A glyph of den's icon set, 16 points, in the muted ink.
+  prefab Symbol : ui.Node, Muted {
+    Icon: {glyph: ""}
+    Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+  }
+
+  // A check mark (a menu item's tick; before ui.Icon, whose name `Icon` means from here on in this scope).
+  prefab Check : ui.Symbol {
+    Icon: {glyph: ""}
+  }
+
+  // A vector mark by name (a brand's: `Mark: {name: "claude"}`), 16 points, drawn from its outline so it is crisp at every
+  // zoom, sized by its ink rather than its bounds, in its Fill (the ink unless set).
+  prefab Icon : ui.Node, Ink {
+    Mark: {name: ""}
+    Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+  }
+
+  // A multi-colour vector drawing by name, in its own colours (`Drawing: {name: "rust"}`: a file kind's icon, IntelliJ's,
+  // harness-native-render drawing.rs; the dark appearance takes its `_dark` variant), 16 points, square in its box, crisp
+  // at every zoom. A file's icon is harness-native-ui-inline files.rs's drawing for its kind, never a name picked here.
+  prefab Art : ui.Node {
+    Drawing: {name: ""}
+    Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+  }
+
+  // A picture from the media cache, square until an instance sets another Aspect or a Size.
+  prefab Image : ui.Node {
+    Picture: {handle: ""}
+    Aspect: {ratio: 1}
+  }
+
+  // A button: a Row that can be hovered, pressed and focused (Pressable brings Hoverable and Focusable), with its label and
+  // icon as child Text and Icon. `Action` names what it does when activated.
+  prefab Button : ui.Row, Wash {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Center, wrap: false}
+    Padding: {l: 12, r: 12, t: 6, b: 6}
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+  }
+
+  // An icon button, the borderless way (a macOS toolbar or sidebar button): no plate, at rest or under the pointer. Its
+  // glyph is in muted ink, easing to strong ink on hover (Inks, on the hover spring); held, it gives (PressGive: scaled a
+  // little and dimmed) and springs back. Its square is the hit area, with an optional Tooltip. Children: `icon : ui.Symbol`.
+  prefab IconButton : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    AlignSelf: {align: Start}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: 28, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: 0}
+    Fill: $tone_clear
+    Inks: {rest: $tone_ink_muted, hover: $tone_ink_strong}
+    PressGive: {scale: $icon_press_scale, dim: $icon_press_dim, omega: $spring_press_omega, zeta: $spring_press_zeta}
+  }
+
+  // A switch or checkbox: a Button that shows OnLook while `(On, Set)` is on it. The knob or tick is a child.
+  prefab Toggle : ui.Button {
+    OnLook: {dark: $tone_accent.dark, light: $tone_accent.light}
+  }
+
+  // A text field: a Box laid along a row with an editable buffer and a placeholder (Editable brings Focusable).
+  prefab Field : ui.Box {
+    Editable: {buffer: "", caret: 0}
+    Cursor: {shape: Text}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 32, min: 0, max: 0}}
+    Padding: {l: 10, r: 10, t: 0, b: 0}
+    OnLook: {dark: $tone_accent.dark, light: $tone_accent.light}
+  }
+
+  // A scroller's parts (macOS's overlay NSScroller): a rounded knob and the faint track under it, laid over a scroll's
+  // trailing edge out of its flow by layout (`ScrollerPart`, harness_native_ui_layout_api::scroller_axis), faded by
+  // motion and driven by input; never set by hand. Over them the pointer is the arrow.
+  prefab ScrollKnob : ui.Node {
+    ScrollerPart: {axis: Y, track: false}
+    Fill: $tone_scroller_knob
+    Shape: {radius: $scroller_wide, n: 2, border: 0, feather: 0}
+    Cursor: {shape: Arrow}
+    Z: {z: 2}
+  }
+  prefab ScrollTrack : ui.Node {
+    ScrollerPart: {axis: Y, track: true}
+    Fill: $tone_scroller_track
+    Cursor: {shape: Arrow}
+    Z: {z: 1}
+  }
+
+  // The overlay scroller a scroll carries (ui.Scroll has it; `NoScroller` on an instance turns it off): its widths, hold
+  // and page from the tokens, a track and a knob per axis. It shows while the content scrolls (and `hold` seconds after),
+  // then fades; near its edge the knob widens over the track; a drag on the knob scrolls in proportion, a press on the
+  // track pages (`keep` points of the old page stay in view). It never takes layout room.
+  prefab Scroller {
+    Scroller: {thin: $scroller_thin, wide: $scroller_wide, inset: $scroller_inset, min: $scroller_min,
+      grab: $scroller_grab, hold: $scroller_hold, keep: $scroller_keep}
+    track_y : ui.ScrollTrack {}
+    knob_y : ui.ScrollKnob {}
+    track_x : ui.ScrollTrack { ScrollerPart: {axis: X, track: true} }
+    knob_x : ui.ScrollKnob { ScrollerPart: {axis: X, track: false} }
+  }
+
+  // Content larger than it is shown: it clips its children, shifts them by ScrollState, and shows the overlay scroller.
+  prefab Scroll : ui.Column, ui.Scroller {
+    Clip
+    ScrollState: {x: 0, y: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  }
+
+  // A column whose rows are instances of a row prefab kept by key from `source` (a feature fills it).
+  prefab List : ui.Column {
+    Repeat: {source: "", key: ""}
+  }
+
+  // A floating node placed against `(AnchoredTo, node)` on its Side, flipped and clamped to stay on screen: menus, tips,
+  // hover cards. It draws in the Overlay layer, above the base, in a window of its own (`Windowed`): it may reach past
+  // the main window's edge and is kept on the screen, as NSPopover is. What stays in the window (a toast, a sheet, a
+  // dialog over its pane) is not a ui.Overlay.
+  prefab Overlay : ui.Column, Plate {
+    Windowed
+    Layer: {level: Overlay}
+    Side: {edge: Bottom, dx: 0, dy: 4}
+    Padding: {l: 8, r: 8, t: 8, b: 8}
+  }
+
+  // A hairline across its container.
+  prefab Divider : ui.Node {
+    Fill: $tone_line
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+
+  // Words on a soft plate that hugs them (a chat message, a callout): as wide as its words up to the width it is offered,
+  // and never more than Size.w.max (`$bubble_max_w`); past that its words wrap inside it. It is padding, fill and shape
+  // around content and nothing else: the trailing or leading edge is its parent's `justify`. Children: `text : ui.Words`.
+  prefab Bubble : ui.Box {
+    Fill: $tone_wash
+    Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+    Shape: {radius: $radius_bubble, n: 4, border: 0, feather: 0}
+    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: $bubble_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 14, r: 14, t: 8, b: 8}
+  }
+
+  // A section label: small, muted, bold words.
+  prefab Label : ui.Words, Muted {
+    TextStyle: {size: $size_caption, line: 16, role: 0, bold: 1}
+  }
+
+  // The embedded browser's live view (harness-native-ui-browser-api; crates/harness/harness-browser): `BrowserView` names
+  // the host's view (or a page `src` to open), drawn on a quiet ground. Its parts, which the app fills
+  // (harness-native/src/app/browser.rs): `pic`, the view's frames (its Surface keyed by the view, so every node showing one
+  // view shares one ring; the pointer over it goes to the page while the node has BrowserFocus, its shape the page's), and
+  // `plate`, why there is no picture yet (not connected to the harness browser, the daemon's error, loading), empty once
+  // the first frame is in. It fills what it is given; a card or pane sizes it.
+  prefab Browser : ui.ZStack {
+    BrowserView: {view: 0, src: ""}
+    Fill: $tone_wash
+    Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
+    Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    pic : ui.Node {
+      Hoverable
+      Cursor: {shape: Arrow}
+      Surface: {key: 0, cover: 0}
+      Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    }
+    plate : ui.Column {
+      Overlay
+      Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
+      Padding: {l: 12, r: 12, t: 12, b: 12}
+      text : ui.Words {
+        Fill: $tone_ink_muted
+        Text: {s: "Not connected to the harness browser"}
+        TextStyle: {size: $size_caption, line: 16, role: 0, bold: 0}
+      }
+    }
+  }
+
+  // ---- SwiftUI's layout vocabulary (examples in scene/examples, drawn by HARNESS_NATIVE_GALLERY=1) ----
+
+  // A table: rows are ui.GridRow, cells their children; columns as wide as their widest cell. A ui.GridColumn child (not a
+  // node) per column says its alignment and width; a child that is not a GridRow (a ui.Divider) spans every column.
+  prefab Grid : ui.Node {
+    Grid: {hgap: 12, vgap: 6, align: Start, valign: Center}
+  }
+  prefab GridRow : ui.Node {
+    GridRow
+  }
+  prefab GridColumn {
+    GridColumn: {align: Start, w: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // Adaptive columns (LazyVGrid's .adaptive): as many columns of at least `min` as fit, each at most `max` (0: no max).
+  prefab AdaptiveGrid : ui.Column {
+    GridColumns: {min: 120, max: 0}
+    Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // A virtualized column (LazyVStack): `count` rows `row` tall, of which only those in view (and `overscan` more) exist,
+  // kept by harness_native_ui_view::lazy_for_each. Put it in a ui.Scroll.
+  prefab LazyColumn : ui.Column {
+    Lazy: {count: 0, row: 24, overscan: 4}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // A lazy adaptive grid: GridColumns and Lazy together (rows of `row` points, as many tiles across as fit).
+  prefab LazyGrid : ui.LazyColumn {
+    GridColumns: {min: 120, max: 0}
+    Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
+  }
+
+  // The first child variant that fits the width it is given (widest first); the rest are hidden.
+  prefab ViewThatFits : ui.Node {
+    ViewThatFits
+    Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
+  }
+
+  // A virtualized column of rows of any height (a chat transcript): only the rows in view and `overscan` points more
+  // exist, measured as they are laid out; spacers stand for the rest (`estimate` points a row never seen). Kept by
+  // harness_native_ui_view::lazy_stack. Put it in a ui.Scroll; rows carry their own padding (no gap).
+  prefab LazyList : ui.Column {
+    LazyStack: {estimate: 40, overscan: 400}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // A multi-line text input: its words (`text`, Text and TextEdit set by the host) wrap at its width and it grows with
+  // them up to Size.h.max, then scrolls. `hint` shows behind them while they are empty.
+  prefab TextArea : ui.Scroll {
+    Cursor: {shape: Text}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: $textarea_max_h}}
+    // The placeholder, behind the words: started $textarea_hint_inset after the caret (which stands at the words' start),
+    // in the faint ink (tone_ink_faint), well under the words' so it never reads as typed text.
+    hint_at : ui.Row {
+      Background
+      Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+      Padding: {l: $textarea_hint_inset, r: 0, t: 0, b: 0}
+      hint : ui.Words {
+        Fill: $tone_ink_faint
+        TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
+      }
+    }
+    text : ui.Words, Strong {
+      Cursor: {shape: Text}
+      TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
+      TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
+        caret_dark: $tone_ink_strong.dark, caret_light: $tone_ink_strong.light}
+    }
+  }
+
+  // A data table (harness_native_ui_view::table fills it from typed cells): a header over rows of one line each, every
+  // column as wide as it needs (measured: a short column hugs its content and its header is never cut, the long ones
+  // share what is left by need), long cells cut with an ellipsis and whole on hover. Words are in the UI face; code-ish
+  // values in the monospace face, numbers at the end in tabular figures, a bool a mark, a url its host in the link ink
+  // (opened on a press), nulls dim. A row under the pointer is washed; pressed (when the host gives rows an action) it
+  // opens below as a record (`open`, every field whole and wrapped). Past every column's floor `scroll` scrolls sideways.
+  // Only the rows in view exist: `body` (the rows down to the open one) and `rest` (those after it) are lazy columns laid
+  // against the nearest clipping ancestor. A view gives its own look by prefix (hn.ChatTable: hn.ChatTableHead,
+  // hn.ChatTableCell, ...), each made from the ui.Table* one, for its inks.
+  prefab TableHeadRow : ui.Row {
+    Flex: {axis: Row, gap: $table_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $table_row, min: 0, max: 0}}
+    Padding: {l: $table_pad, r: $table_pad, t: 0, b: 0}
+  }
+  prefab TableRow : ui.TableHeadRow {
+    Pressable
+    Action: {name: ""}
+    Fill: $tone_clear
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+  }
+  prefab TableCell : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    text : ui.Line {
+      TextStyle: {size: $size_table, line: 16, role: 0, bold: 0}
+    }
+  }
+  prefab TableCellMd : ui.TableCell {
+    text : ui.Line {
+      MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
+        link_dark: $tone_accent.dark, link_light: $tone_accent.light}
+    }
+  }
+  prefab TableCellCode : ui.TableCell {
+    text : ui.Line { TextStyle: {size: $size_code, line: 16, role: 9, bold: 0} }
+  }
+  prefab TableCellNum : ui.TableCell {
+    text : ui.Line { TextStyle: {size: $size_table, line: 16, role: 10, bold: 0} }
+  }
+  prefab TableCellDim : ui.TableCell {
+    text : ui.Line {
+      Fill: $tone_ink_muted
+      TextStyle: {size: $size_table, line: 16, role: 10, bold: 0}
+    }
+  }
+  prefab TableCellLink : ui.TableCell {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Hand}
+    text : ui.Line { Fill: $tone_accent }
+  }
+  prefab TableCellMark : ui.TableCell {
+    text : ui.Line { Fill: $tone_ink_muted }
+  }
+  prefab TableHead : ui.TableCell {
+    text : ui.Line {
+      Fill: $tone_ink_muted
+      TextStyle: {size: $size_table, line: 16, role: 0, bold: 0, weight: 500}
+    }
+  }
+  // An open row's record: a field per column, its name in a fixed gutter, its value whole and wrapped.
+  prefab TableRecord : ui.Column {
+    Fill: $tone_wash
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $table_pad, r: $table_pad, t: 6, b: 8}
+  }
+  prefab TableField : ui.Row {
+    Flex: {axis: Row, gap: $table_gap, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    key : ui.Line {
+      Fill: $tone_ink_muted
+      TextStyle: {size: $size_table, line: 18, role: 0, bold: 0, weight: 500}
+    }
+    value : ui.Words {
+      Cursor: {shape: Text}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_table, line: 18, role: 0, bold: 0}
+    }
+  }
+  prefab TableFieldMd : ui.TableField {
+    value : ui.Words {
+      MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
+        link_dark: $tone_accent.dark, link_light: $tone_accent.light}
+    }
+  }
+  // A stacked table's row (a small table too wide for its room, table.rs `stacks`): its first cell as the title, then
+  // every other field by name (the look's Field), whole and wrapped; a hairline between rows.
+  prefab TableStackRow : ui.Column {
+    Pressable
+    Action: {name: ""}
+    Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $table_pad, r: $table_pad, t: 9, b: 9}
+    title : ui.Words, Strong {
+      Cursor: {shape: Text}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_body, line: 20, role: 0, bold: 1}
+    }
+    fields : ui.Column {
+      Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+  prefab TableStackRowMd : ui.TableStackRow {
+    title : ui.Words, Strong {
+      MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
+        link_dark: $tone_accent.dark, link_light: $tone_accent.light}
+    }
+  }
+  prefab TableStackRule : ui.Divider {}
+  prefab Table : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    scroll : ui.Row {
+      Clip
+      ScrollState: {x: 0, y: 0}
+      Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      inner : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        head : ui.TableHeadRow {}
+        rule : ui.Divider {}
+        body : ui.LazyColumn {
+          Lazy: {count: 0, row: $table_row, overscan: 8}
+        }
+        open : ui.TableRecord {}
+        rest : ui.LazyColumn {
+          Lazy: {count: 0, row: $table_row, overscan: 8}
+        }
+      }
+    }
+    // The rows stacked, when they are (TableStackRow): empty while the grid shows.
+    stack : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+
+  // Search results (a value the kernel tags `kind: "search"`), not a table: each a title linking to its page (the whole
+  // url on hover, opened on a press), where it is, muted, then two lines of its snippet. harness_native_ui_view::results
+  // fills it with ui.Result rows (or a view's own, made from it).
+  prefab ResultList : ui.Column {
+    Flex: {axis: Column, gap: 10, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab Result : ui.Column {
+    Flex: {axis: Column, gap: 1, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    title : ui.Line {
+      Pressable
+      Action: {name: ""}
+      Cursor: {shape: Hand}
+      Fill: $tone_accent
+      TextStyle: {size: $size_body, line: 18, role: 0, bold: 0, weight: 500}
+    }
+    host : ui.Line {
+      Fill: $tone_ink_muted
+      TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0}
+    }
+    snippet : ui.Words {
+      Clip
+      Cursor: {shape: Text}
+      Fill: $tone_ink
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: $result_snippet_h}}
+      TextStyle: {size: $size_table, line: 18, role: 0, bold: 0}
+    }
+  }
+
+  // Words on one line cut in the middle (a path), or at the start (a tail that matters).
+  prefab LineMiddle : ui.Line {
+    Truncate: {mode: Middle}
+  }
+  prefab LineHead : ui.Line {
+    Truncate: {mode: Head}
+  }
+
+  // A menu, macOS NSMenu's (tokens menu_*): a plate hugging its widest item, its items, heads, separators and notes
+  // down it. ui.MenuPlate is the look alone (laid in the flow: a gallery's); ui.Menu floats it, out of the flow in the
+  // Overlay layer, hung menu_gap off the node it is `AnchoredTo` on its Side's edge (Top: above it; an instance sets
+  // another), growing out of that edge and fading in as it opens, back as it closes (a Grow Transition: its `from` is
+  // the edge it hangs from, so an instance that hangs it Bottom sets `from: Top`).
+  prefab MenuPlate : ui.Column {
+    Hoverable
+    Fill: $tone_raised
+    Edge: {dark: $tone_line_strong.dark, light: $tone_line_strong.light}
+    Shape: {radius: $menu_radius, n: 4, border: 1, feather: 0}
+    Lift: {blur: $menu_lift_blur, alpha: $menu_lift_alpha, dy: $menu_lift_dy}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: $menu_min_w, max: $menu_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $menu_pad, r: $menu_pad, t: $menu_pad, b: $menu_pad}
+  }
+  // In a window of its own (`Windowed`), as NSMenu is: past the main window's edge when it must be, kept on the screen,
+  // the system's shadow under it (its Lift is the in-window look, for a MenuPlate drawn in place). The plate is
+  // MenuPlate's: solid, one hairline. It is there at once and gone at once: no Transition, so an old menu never
+  // stands beside the one that replaced it.
+  prefab Menu : ui.MenuPlate {
+    Placed
+    Windowed
+    Layer: {level: Overlay}
+    Side: {edge: Top, dx: 0, dy: $menu_gap}
+  }
+  // An item: the check gutter (`mark`, clear unless ui.MenuItemOn), the `label` and its `meta` just after it, then trailing muted words pushed to
+  // the end (`about`, a line about it that truncates first; `keys`, its shortcut). Its highlight is a pill fading in on
+  // the hover spring; the pointer and the arrow keys move it together, so its owner keeps `Lit` on the highlighted item
+  // (HoverSteered; harness_native_ui_view::menu::Nav). `Action` names what a press does.
+  prefab MenuItem : ui.Row {
+    Pressable
+    HoverSteered
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    Shape: {radius: $menu_item_radius, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_selection_focus.dark, light: $tone_selection_focus.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $menu_item_h, min: 0, max: 0}}
+    Padding: {l: $menu_gutter_l, r: $menu_item_pad_r, t: 0, b: 0}
+    mark : ui.Check {
+      Fill: $tone_clear
+      Size: {w: {kind: Fixed, value: $menu_check, min: 0, max: 0}, h: {kind: Fixed, value: $menu_check, min: 0, max: 0}}
+      Padding: {l: 0, r: 0, t: 0, b: 0}
+    }
+    gutter : ui.Node {
+      Size: {w: {kind: Fixed, value: $menu_gutter_gap, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // Empty here; ui.MenuItemMarked (search_menu.flecs) puts a mark in it before the label.
+    lead : ui.Row {
+      Flex: {axis: Row, gap: $menu_gutter_gap, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    label : ui.Line, Strong {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
+    }
+    // Quiet words right after the label (a model's version, a count), never cut: what tells close items apart.
+    metagap : ui.Node {
+      Size: {w: {kind: Fixed, value: $menu_meta_gap, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    meta : ui.Line {
+      Fill: $tone_ink_muted
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_menu_meta, line: $line_menu, role: 0, bold: 0}
+    }
+    gap : ui.Spacer {
+      Size: {w: {kind: Grow, value: 1, min: $menu_trail_gap, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    about : ui.Lead, Muted {
+      TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
+    }
+    keys : ui.Line, Muted {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
+    }
+  }
+  // The item that is chosen now: its check shown.
+  prefab MenuItemOn : ui.MenuItem {
+    mark : ui.Check { Fill: $tone_ink_strong }
+  }
+  // An item that is not a choice but more of the list (a fold's "4 older"): its label quiet, at the meta's size, in
+  // line with the labels over it.
+  prefab MenuItemQuiet : ui.MenuItem {
+    label {
+      Fill: $tone_ink_muted
+      TextStyle: {size: $size_menu_meta, line: $line_menu, role: 0, bold: 0}
+    }
+  }
+  // A section's head: small, muted, in line with the items' labels.
+  prefab MenuHead : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $menu_head_h, min: 0, max: 0}}
+    Padding: {l: $menu_label_x, r: $menu_item_pad_r, t: 0, b: 0}
+    label : ui.Line, Muted {
+      TextStyle: {size: $size_menu_head, line: $line_menu, role: 0, bold: 1}
+    }
+  }
+  // A section's head led by its maker's mark (`Mark: {name}` set on `icon` by its owner) in the check gutter, so the
+  // mark says once whose items follow instead of on every row.
+  prefab MenuHeadMarked : ui.Row {
+    Flex: {axis: Row, gap: $menu_gutter_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $menu_head_h, min: 0, max: 0}}
+    Padding: {l: $menu_gutter_l, r: $menu_item_pad_r, t: 0, b: 0}
+    icon : ui.Icon {
+      Size: {w: {kind: Fixed, value: $menu_check, min: 0, max: 0}, h: {kind: Fixed, value: $menu_check, min: 0, max: 0}}
+    }
+    label : ui.Line, Muted {
+      TextStyle: {size: $size_menu_head, line: $line_menu, role: 0, bold: 1}
+    }
+  }
+  // A hairline between sections.
+  prefab MenuSep : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $menu_gutter_l, r: $menu_gutter_l, t: $menu_sep_pad, b: $menu_sep_pad}
+    line : ui.Node {
+      Fill: $tone_line
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+  }
+  // Why nothing can be chosen here: one short muted line in place of items, in line with their labels.
+  prefab MenuNote : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $menu_item_h, min: 0, max: 0}}
+    Padding: {l: $menu_label_x, r: $menu_item_pad_r, t: 0, b: 0}
+    label : ui.Line, Muted {
+      TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
+    }
+  }
+}
+
+@tree ChildOf
+ui {
+  // The selection's one look (harness-native-render select.rs): every surface that selects text draws its plate from
+  // here, and a Cmd+C pulses it with CopyLook (den's FlashLook grow and a light that sweeps it: a timeline, not a spring).
+  prefab selection {
+    Fill: $tone_text_selection
+    Shape: {radius: $plate_selection_radius, n: $plate_selection_n, border: 0, feather: 0}
+    CopyLook: {
+      secs: $copy_secs, rise: $copy_rise, grow: $copy_grow,
+      sweep: $copy_sweep, band: $copy_band, tilt: $copy_tilt, ink: $copy_ink,
+      dark: $tone_copy_sheen.dark, light: $tone_copy_sheen.light, add_dark: $copy_add_dark, add_light: $copy_add_light
+    }
+  }
+  // The text caret's one look (harness-native-render caret.rs, harness.slang's caret): every field, text area and the
+  // chat's composer draws its caret from here, den's: a rounded bar that sweeps when it jumps and blinks in the shader.
+  prefab caret {
+    CaretLook: {w: $caret_w, h: $caret_h, radius: $caret_radius, glide: $caret_glide, hold: $caret_hold, blink: $caret_blink, fade: $caret_fade}
+  }
+  // A lit paper lantern in the middle of a node (Lantern, harness-native-render lantern.rs; named Lamp because flecs
+  // refuses a prefab named like a component it sets): a Background, so it lies on
+  // its parent's frame out of the flow. Its owner turns it `on` while there is nothing else to show.
+  prefab Lamp : ui.Node {
+    Background
+    Lantern: {on: false, lit: 0}
+  }
+  // A small pixel-art item, a game's dropped item (PixelBlock, harness-native-render block.rs): its face names what it
+  // is and does (`exec` a terminal, `read` a book, `net` the world turning, `think` a crystal, ...); it floats and moves
+  // while shown; set another face and the old item sinks as the new one rises in over block_turn seconds. block_size across, its texels on whole device pixels.
+  prefab Block : ui.Node {
+    PixelBlock: {face: "cell", turn: $block_turn}
+    Size: {w: {kind: Fixed, value: $block_size, min: 0, max: 0}, h: {kind: Fixed, value: $block_size, min: 0, max: 0}}
+  }
+  // Words with light running through them, the sign that something is at work (a working row's title): a Sheen
+  // (harness-native-ui-look-api; drawn by harness-native-render paint.rs, glyph by glyph) sweeps a soft band left to right
+  // through the letters, lifting them toward tone_sheen, and rests between passes; under Reduce Motion they sit steadily a
+  // little brighter instead. Its defaults are the slow drift of sheen_think_*; a place that means another rhythm sets its
+  // own Sheen (scene/widgets/rows.flecs: one per activity). A Sheen of strength 0 lights nothing and costs nothing, the
+  // way a template turns one off. Only words in view with a moving sheen keep frames coming, at the calm rate.
+  prefab Shimmer : ui.Line {
+    Sheen: {period: $sheen_think_period, rest: $sheen_think_rest, band: $sheen_think_band, strength: $sheen_think_strength, still: $sheen_still, ease: $sheen_think_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+  }
+  // Struck-through words' one look (harness-native-render paint.rs, inline markdown's ~~struck~~): a hairline through
+  // the glyphs about the middle of their x-height, in the text's own ink at reduced alpha.
+  prefab strike {
+    StrikeLook: {w: $strike_w, rise: $strike_rise_em, alpha: $strike_alpha}
+  }
+  // LaTeX math's one look (harness-native-render math.rs and paint.rs, inline markdown's $…$ and a chat's displayed
+  // formula): its size against its words', the room kept clear above and below it in its line, and its strokes' width.
+  prefab formula {
+    MathLook: {inline_scale: $math_inline_scale, display_scale: $math_display_scale, inline_pad: $math_inline_pad, display_pad: $math_display_pad, stroke: $math_stroke_em}
+  }
+  spring {
+    // The springs the generic motion falls back on when a node has no Motion of its own.
+    prefab transition {
+      Motion: {omega: $spring_transition_omega, zeta: $spring_transition_zeta}
+    }
+    prefab matched {
+      Motion: {omega: $spring_matched_omega, zeta: $spring_matched_zeta}
+    }
+    prefab layout {
+      Motion: {omega: $spring_layout_omega, zeta: $spring_layout_zeta}
+    }
+    prefab pose {
+      Motion: {omega: $spring_pose_omega, zeta: $spring_pose_zeta}
+    }
+    // The overlay scroller's: showing, fading away, widening near its edge, and a page on its track.
+    prefab scroller_show {
+      Motion: {omega: $scroller_show_omega, zeta: $scroller_show_zeta}
+    }
+    prefab scroller_hide {
+      Motion: {omega: $scroller_hide_omega, zeta: $scroller_hide_zeta}
+    }
+    prefab scroller_wide {
+      Motion: {omega: $scroller_wide_omega, zeta: $scroller_wide_zeta}
+    }
+    prefab scroller_page {
+      Motion: {omega: $scroller_page_omega, zeta: $scroller_page_zeta}
+    }
+  }
+}

@@ -1,17 +1,23 @@
 //! Registries read and sources fetched as cargo 1.99 reads and fetches them, with no cargo:
-//! the sparse index with cargo's cache of it, `.crate` files checked by their sha256, kept in
-//! blaze's store by that hash and unpacked where cargo unpacks them, `[source]` replacement,
+//! the sparse index with cargo's cache of it, `.crate` files got through blaze-fetch (checked
+//! by their sha256 and kept in blaze's store) and unpacked where cargo unpacks them, `[source]` replacement,
 //! vendored directories and git checkouts, so that the paths a build sees (`file!()`, panics,
 //! `CARGO_MANIFEST_DIR`) are cargo's and cargo and blaze share `$CARGO_HOME`. What is ported
-//! from where is said at the top of each module; the plan is `docs/self-contained.md`.
+//! from where is said at the top of each module; the plan is `docs/v2/plan.md`.
 
+#![feature(allocator_api)]
+
+pub mod api;
+pub mod auth;
 pub mod directory;
 pub mod download;
 pub mod git;
+mod git_index;
 pub mod http;
 pub mod index;
+pub mod pinned;
+pub mod query;
 pub mod registry;
-mod source_id;
 pub mod sources;
 pub mod sparse;
 
@@ -22,13 +28,24 @@ use std::{
     sync::Arc,
 };
 
-pub use download::{Blobs, Package};
+use anyhow::Context as _;
+use blaze_source::SourceId;
+
+pub use download::Package;
+pub use query::IndexRegistry;
 pub use registry::Registry;
-pub use source_id::{
-    CRATES_IO_HTTP_INDEX, CRATES_IO_INDEX, CRATES_IO_REGISTRY, GitReference, SourceId, SourceKind,
-    short_hash,
-};
 pub use sources::{Locked, SourceConfig, SourceDef, SourceMap, Sources};
+
+/// A remote registry named by its index URL alone: sparse when it starts with `sparse+`, else
+/// a git index.
+pub fn registry_source(url: &str) -> anyhow::Result<SourceId> {
+    SourceId::for_registry(&url::Url::parse(url).with_context(|| format!("`{url}` is not a URL"))?)
+}
+
+/// The directory of a path, directory or local-registry source.
+pub(crate) fn path_of(id: SourceId) -> anyhow::Result<PathBuf> {
+    blaze_source::url_file(id.url()).map_err(|()| anyhow::anyhow!("{} is not a directory", id.url()))
+}
 
 /// What fetching reads of cargo's configuration (`[net]`, `[http]`, `--offline`), as a plain
 /// struct: `crates/blaze-manifest` fills it from `.cargo/config.toml`, `CARGO_*` variables and
@@ -55,17 +72,31 @@ pub struct Context {
     /// `$CARGO_HOME`, as cargo finds it: the `CARGO_HOME` variable, else `~/.cargo`.
     pub cargo_home: PathBuf,
     pub net: NetConfig,
+    // dyn: the I/O driver, chosen once per process; each call is a network round trip.
     pub http: Arc<dyn http::Http>,
-    /// blaze's store, which keeps `.crate` files by their sha256.
-    pub store: Option<Arc<dyn Blobs>>,
+    /// blaze's store, which keeps `.crate` files through blaze-fetch: by BLAKE3, with their
+    /// sha256 as the pin that finds them. With none, a download is still checked, and kept only
+    /// in cargo's cache.
+    pub store: Option<&'static blaze_cas::Handle>,
     /// Whether a `.crate` is also written to cargo's cache,
     /// `$CARGO_HOME/registry/cache/<registry>/`, so that cargo finds it there offline.
     pub keep_crate_files: bool,
+    /// Where a registry that requires authentication gets its token; with none, such a registry
+    /// is refused.
+    pub auth: Option<Arc<auth::Auth>>,
 }
 
 impl Context {
+    // dyn: the I/O driver, as on `Context::http`.
     pub fn new(cargo_home: PathBuf, http: Arc<dyn http::Http>) -> Context {
-        Context { cargo_home, net: NetConfig::default(), http, store: None, keep_crate_files: true }
+        Context {
+            cargo_home,
+            net: NetConfig::default(),
+            http,
+            store: None,
+            keep_crate_files: true,
+            auth: None,
+        }
     }
 }
 
@@ -86,7 +117,8 @@ pub fn cargo_home() -> Option<PathBuf> {
 /// `CacheLockMode::DownloadExclusive`), held while the index cache, `.crate` files and
 /// unpacked sources are written, so that cargo and blaze do not write them at once.
 pub struct PackageCacheLock {
-    _file: File,
+    // Let go of as this drops, even while a child spawned meanwhile still has the file open.
+    _file: stdx::file_lock::Locked,
 }
 
 impl PackageCacheLock {
@@ -102,10 +134,16 @@ impl PackageCacheLock {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open `{}`", path.display()))?;
-        if file.try_lock().is_err() {
-            eprintln!("    Blocking waiting for file lock on package cache");
-            file.lock().with_context(|| format!("failed to lock `{}`", path.display()))?;
-        }
+        let locked = stdx::file_lock::Locked::try_lock(file)
+            .with_context(|| format!("failed to lock `{}`", path.display()))?;
+        let file = match locked {
+            Ok(file) => file,
+            Err(file) => {
+                eprintln!("    Blocking waiting for file lock on package cache");
+                stdx::file_lock::Locked::lock(file)
+                    .with_context(|| format!("failed to lock `{}`", path.display()))?
+            }
+        };
         Ok(PackageCacheLock { _file: file })
     }
 }

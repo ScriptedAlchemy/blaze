@@ -1,10 +1,15 @@
 //! The `resolve` of `cargo metadata`, against cargo 1.99.0's for the same workspace
 //! (`metadata/metadata.sh` writes it).
 
+// The fixtures are cargo's output for a workspace at `/ws` on Linux: `path+file:///ws` ids,
+// which a Windows path is not, and `/ws` is no absolute path there.
+#![cfg(unix)]
+
 #[path = "resolver/helpers.rs"]
 mod helpers;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use blaze_resolve::metadata::{MetadataPackages, resolve_graph};
 use blaze_resolve::resolver::{CompileKind, ResolveOpts, VersionOrdering};
@@ -16,7 +21,7 @@ use helpers::resolve_summaries;
 
 fn source(name: &str) -> SourceId {
     let path = if name == "foo" { "/ws".to_owned() } else { format!("/ws/{name}") };
-    SourceId::from_url(&format!("path+file://{path}")).unwrap()
+    SourceId::for_path(Path::new(&path)).unwrap()
 }
 
 fn package(name: &str, version: &str, deps: Vec<Dependency>, features: &[&str]) -> Summary {

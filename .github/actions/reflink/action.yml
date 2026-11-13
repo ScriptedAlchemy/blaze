@@ -1,0 +1,133 @@
+# Artifact placement requires clones: the hosted runner's ext4 checkout cannot hold the store
+# or build outputs. Keep sources where checkout put them; put every placement path on one Btrfs.
+name: Blaze reflink filesystem
+description: A job-local Btrfs volume with proven shared blocks for Blaze state, std, store and builds
+runs:
+  using: composite
+  steps:
+    - name: hosted Linux only
+      shell: bash
+      run: |
+        [ "$RUNNER_OS/$RUNNER_ENVIRONMENT" = Linux/github-hosted ] || { echo "::error title=BlazeReflinkRunner::reflink setup requires hosted Linux, got $RUNNER_OS/$RUNNER_ENVIRONMENT"; exit 1; }
+    - uses: ./.github/actions/apt
+      with:
+        packages: btrfs-progs
+    - name: allocate the reflink filesystem
+      shell: bash
+      run: |
+        phase="selecting the backing disk"
+        trap 'echo "::error title=BlazeReflinkSetup::$phase failed at line $LINENO"' ERR
+        # Swap must already be allocated. /mnt is a separate disk on some hosted images;
+        # on ARM it may be absent. Measure bytes, without df's rounding up to a whole GiB.
+        disk=/
+        avail=$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')
+        if [ -d /mnt ]; then
+          other=$(df -B1 --output=avail /mnt | tail -n 1 | tr -d ' ')
+          if [ "$other" -gt "$avail" ]; then disk=/mnt; avail=$other; fi
+        fi
+        # Leave at least the old swap recipe's 20 GiB for the host's toolchains, LLVM,
+        # downloads and logs, or 20% on a larger disk. The remaining space is the volume,
+        # not a fixed small cap; preallocation keeps later host writes out of its budget.
+        gib=$(( 1024 * 1024 * 1024 ))
+        reserve=$(( avail / 5 > 20 * gib ? avail / 5 : 20 * gib ))
+        size=$(( (avail - reserve) / gib * gib ))
+        [ "$size" -ge "$(( 20 * gib ))" ] || { echo "::error title=BlazeReflinkCapacity::$disk has $avail bytes free after swap; need 20 GiB for Blaze plus $reserve bytes host headroom"; exit 1; }
+        volume="$RUNNER_TEMP/blaze-fs"
+        [ ! -e "$volume" ] || { echo "::error title=BlazeReflinkPath::$volume already exists; refusing to reuse or migrate it"; exit 1; }
+        phase="allocating $size bytes on $disk with $reserve bytes host headroom"
+        backing=$(sudo mktemp -d "${disk%/}/blaze-fs.XXXXXX")
+        image="$backing/volume.btrfs"
+        sudo fallocate -l "$size" "$image"
+        phase="formatting $image as Btrfs"
+        sudo mkfs.btrfs --nodiscard "$image"
+        phase="mounting $image at $volume"
+        mkdir "$volume"
+        # Discard would punch holes in the backing image and give away its reserved space.
+        sudo mount -t btrfs -o loop,noatime,nodiscard "$image" "$volume"
+        sudo chown "$(id -u):$(id -g)" "$volume"
+        echo "Blaze reflink filesystem: $image ($size bytes), $reserve bytes reserved on $disk"
+        findmnt -T "$volume"
+        df -B1 "$disk" "$volume"
+        # The hosted job owns this mount and backing image until the runner is destroyed;
+        # no cache is restored into it and no other job or machine shares it.
+    - name: prove store, std and build placement shares blocks
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import fcntl
+        import os
+        from pathlib import Path
+        import struct
+
+        class BlazeReflinkPreflight(RuntimeError):
+            pass
+
+        # Linux UAPI: linux/fs.h and linux/fiemap.h, identical on hosted ARM64 and X64.
+        FICLONE = 0x40049409
+        FS_IOC_FIEMAP = 0xC020660B
+        SHARED = 0x2000
+        header = struct.Struct("=QQIIII")
+        extent = struct.Struct("=QQQQQIIII")
+        size = 1024 * 1024  # Written, non-inline extents, never a sparse/zero-only probe.
+
+        def extents(file):
+            buf = bytearray(header.size + 64 * extent.size)
+            header.pack_into(buf, 0, 0, size, 1, 0, 64, 0)  # FIEMAP_FLAG_SYNC
+            try:
+                fcntl.ioctl(file.fileno(), FS_IOC_FIEMAP, buf)
+            except OSError as error:
+                raise BlazeReflinkPreflight(f"FIEMAP {file.name}: {error}") from error
+            count = header.unpack_from(buf)[3]
+            result, end = [], 0
+            for i in range(count):
+                logical, physical, length, _, _, flags, _, _, _ = extent.unpack_from(buf, header.size + i * extent.size)
+                if logical != end or not physical or not flags & SHARED or flags & (0x2 | 0x4 | 0x200):
+                    raise BlazeReflinkPreflight(f"{file.name}: extent is not contiguous, physical and shared: {(logical, physical, length, flags)}")
+                result.append((logical, physical, length))
+                end += length
+            if end < size:
+                raise BlazeReflinkPreflight(f"{file.name}: FIEMAP covers {end} of {size} bytes")
+            return result
+
+        try:
+            cache = Path(os.environ["RUNNER_TEMP"]) / "blaze-fs/cache"
+            home = cache / "blaze"
+            store = home / "v2/store"
+            target = home / "build/ci"
+            directories = [store / "placed", home / "std", home / "build", target]
+            for directory in directories:
+                directory.mkdir(parents=True, exist_ok=True)
+            device = home.stat().st_dev
+            payload = os.urandom(size)
+            source = directories[0] / ".reflink-preflight"
+            with source.open("xb+") as src:
+                src.write(payload)
+                src.flush()
+                os.fsync(src.fileno())
+                for directory in directories[1:]:
+                    if directory.stat().st_dev != device:
+                        raise BlazeReflinkPreflight(f"{directory}: device differs from store {store}")
+                    destination = directory / ".reflink-preflight"
+                    with destination.open("xb+") as dst:
+                        try:
+                            fcntl.ioctl(dst.fileno(), FICLONE, src.fileno())
+                        except OSError as error:
+                            raise BlazeReflinkPreflight(f"FICLONE {source} -> {destination} on device {device}: {error}") from error
+                        os.fsync(dst.fileno())
+                        shared = extents(src)
+                        if extents(dst) != shared or dst.read() != payload:
+                            raise BlazeReflinkPreflight(f"{source} -> {destination}: physical extents or bytes differ")
+                        print(f"FICLONE + FIEMAP shared blocks: {source} -> {destination}: {shared}")
+                    destination.unlink()
+            source.unlink()
+            # V2's machine store/std read XDG_CACHE_HOME; daemon state and default builds
+            # read BLAZE_HOME. BLAZE_CACHE alone does not relocate V2. Explicit targets must
+            # also be on this device; these workflows pass CARGO_TARGET_DIR to their builds.
+            with open(os.environ["GITHUB_ENV"], "a") as env:
+                for key, value in dict(XDG_CACHE_HOME=cache, BLAZE_HOME=home, BLAZE_CACHE=store, CARGO_TARGET_DIR=target).items():
+                    print(f"{key}={value}", file=env)
+                    print(f"{key}={value} (device {device})")
+        except (OSError, BlazeReflinkPreflight) as error:
+            print(f"::error title=BlazeReflinkPreflight::{error}")
+            raise SystemExit(1) from error
+        PY

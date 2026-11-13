@@ -1,37 +1,52 @@
 //! A registry served from memory: the index read and cached as cargo reads and caches it, and
 //! packages fetched, checked and unpacked where cargo unpacks them.
 
+#![feature(allocator_api)]
+
 use std::{
+    cell::Cell,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
+use blaze_hash::HashMap;
 use blaze_registry::{
-    Blobs, Context, Locked, Package, Registry, SourceConfig, SourceDef, SourceId, Sources,
-    download::{From, checksum, crate_url},
+    Context, Locked, Package, Registry, SourceConfig, SourceDef, Sources,
+    download::{From, checksum, crate_url, unpack_package_in},
     http::{Http, Response},
     index::Status,
+    pinned::crate_pin,
 };
-use rustc_hash::FxHashMap as HashMap;
+use blaze_source::SourceId;
+use blaze_core::lock::Lock;
 use semver::{Version, VersionReq};
+use std::alloc::Global;
 
 const BASE: &str = "https://index.example.com/";
 
 /// Files by URL, each with an ETag, and every request asked of it.
-#[derive(Default)]
 struct Server {
-    files: Mutex<HashMap<String, (Vec<u8>, String)>>,
-    asked: Mutex<Vec<(String, Vec<(String, String)>)>>,
+    files: Lock<HashMap<String, (Vec<u8>, String), Global>>,
+    asked: Lock<Vec<(String, Vec<(String, String)>)>>,
+}
+
+impl Default for Server {
+    fn default() -> Server {
+        Server {
+            files: Lock::new("registry.test.fetch.files", HashMap::new_in(Global)),
+            asked: Lock::new("registry.test.fetch.asked", Vec::new()),
+        }
+    }
 }
 
 impl Server {
     fn put(&self, url: &str, body: &[u8], etag: &str) {
-        self.files.lock().unwrap().insert(url.to_owned(), (body.to_vec(), etag.to_owned()));
+        self.files.lock().insert(url.to_owned(), (body.to_vec(), etag.to_owned()));
     }
 
     fn take_asked(&self) -> Vec<String> {
-        self.asked.lock().unwrap().drain(..).map(|(url, _)| url).collect()
+        self.asked.lock().drain(..).map(|(url, _)| url).collect()
     }
 }
 
@@ -39,8 +54,8 @@ impl Http for Server {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
         let headers: Vec<(String, String)> =
             headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        self.asked.lock().unwrap().push((url.to_owned(), headers.clone()));
-        let files = self.files.lock().unwrap();
+        self.asked.lock().push((url.to_owned(), headers.clone()));
+        let files = self.files.lock();
         let Some((body, etag)) = files.get(url) else {
             return Ok(Response { status: 404, ..Response::default() });
         };
@@ -56,19 +71,11 @@ impl Http for Server {
     }
 }
 
-#[derive(Default)]
-struct Memory(Mutex<HashMap<[u8; 32], Vec<u8>>>);
-
-impl Blobs for Memory {
-    fn get(&self, sha256: &[u8; 32]) -> Option<Vec<u8>> {
-        self.0.lock().unwrap().get(sha256).cloned()
-    }
-    fn has(&self, sha256: &[u8; 32]) -> bool {
-        self.0.lock().unwrap().contains_key(sha256)
-    }
-    fn put(&self, sha256: &[u8; 32], bytes: &[u8]) {
-        self.0.lock().unwrap().insert(*sha256, bytes.to_vec());
-    }
+/// A store of its own in `dir`, kept for the rest of the test process as the daemon's store
+/// is; what is put is read at once, before any commit.
+fn store(dir: &Path) -> &'static blaze_cas::Handle {
+    let driven = Box::leak(Box::new(blaze_cas::Driven::open(dir).unwrap()));
+    Box::leak(Box::new(driven.handle()))
 }
 
 fn temporary(name: &str) -> PathBuf {
@@ -103,7 +110,7 @@ fn line(name: &str, version: &str, cksum: &str, extra: &str) -> String {
 
 struct Fixture {
     server: Arc<Server>,
-    store: Arc<Memory>,
+    store: &'static blaze_cas::Handle,
     home: PathBuf,
     source: SourceId,
 }
@@ -116,16 +123,21 @@ impl Fixture {
             br#"{"dl":"https://dl.example.com/{crate}/{version}/{lowerprefix}/{sha256-checksum}"}"#,
             "c1",
         );
-        let source = SourceId::for_registry(&format!("sparse+{BASE}")).unwrap();
-        Fixture { server, store: Arc::default(), home: temporary(name), source }
+        let source = blaze_registry::registry_source(&format!("sparse+{BASE}")).unwrap();
+        let home = temporary(name);
+        Fixture { server, store: store(&home.join("store")), home, source }
     }
 
     fn registry(&self, offline: bool) -> Registry {
+        self.registry_with(offline, self.store)
+    }
+
+    fn registry_with(&self, offline: bool, store: &'static blaze_cas::Handle) -> Registry {
         let mut context = Context::new(self.home.clone(), self.server.clone());
-        context.store = Some(self.store.clone());
+        context.store = Some(store);
         context.net.offline = offline;
         context.net.retry.quiet = true;
-        Registry::remote(self.source.clone(), Arc::new(context)).unwrap()
+        Registry::remote(self.source, Arc::new(context)).unwrap()
     }
 
     fn publish(&self, name: &str, files: &[(&str, &[u8], u32)]) -> Package {
@@ -176,7 +188,7 @@ fn reads_and_caches_the_index_as_cargo() {
 
     registry.invalidate();
     assert_eq!(registry.query("serde", &any).unwrap().len(), 3);
-    let asked = fixture.server.asked.lock().unwrap().clone();
+    let asked = fixture.server.asked.lock().clone();
     let (url, headers) = asked.last().unwrap();
     assert_eq!(url, &format!("{BASE}se/rd/serde"));
     assert!(headers.contains(&("if-none-match".to_owned(), "\"v1\"".to_owned())));
@@ -193,7 +205,7 @@ fn reads_and_caches_the_index_as_cargo() {
     assert!(cache[5..].starts_with(b"etag: \"v2\"\0"));
 
     // Gone from the server: no versions, and no cache.
-    fixture.server.files.lock().unwrap().remove(&format!("{BASE}se/rd/serde"));
+    fixture.server.files.lock().remove(&format!("{BASE}se/rd/serde"));
     let registry = fixture.registry(false);
     registry.invalidate();
     assert!(registry.query("serde", &any).unwrap().is_empty());
@@ -240,7 +252,12 @@ fn fetches_into_cargos_directories_and_the_store() {
     let crate_file =
         fixture.home.join("registry/cache").join(registry.dir_name()).join("Demo-1.0.0.crate");
     assert_eq!(checksum(&std::fs::read(&crate_file).unwrap()), package.checksum);
-    assert_eq!(fixture.store.0.lock().unwrap().len(), 1);
+    let pin = crate_pin(&package.checksum).unwrap();
+    let kept = |store: &'static blaze_cas::Handle| {
+        let origin = blaze_fetch::Origin::Pinned { pin: &pin, form: blaze_fetch::Form::Blob };
+        blaze_fetch::Objects::new(store).lookup(origin).unwrap().is_some()
+    };
+    assert!(kept(fixture.store));
 
     // Unpacked already: nothing read.
     assert_eq!(registry.fetch_one(&package).unwrap().1, From::Unpacked);
@@ -251,10 +268,12 @@ fn fetches_into_cargos_directories_and_the_store() {
     assert_eq!(registry.fetch_one(&package).unwrap().1, From::Store);
     assert!(fixture.server.take_asked().is_empty());
     assert!(crate_file.is_file());
-    // From cargo's cache when the store does not have it.
+    // From cargo's cache when the store does not have it, which then keeps it.
     std::fs::remove_dir_all(&src).unwrap();
-    fixture.store.0.lock().unwrap().clear();
+    let empty = store(&fixture.home.join("empty-store"));
+    let registry = fixture.registry_with(false, empty);
     assert_eq!(registry.fetch_one(&package).unwrap().1, From::CargoCache);
+    assert!(kept(empty));
     // An unpacking cut short (no `.cargo-ok`) is done again.
     std::fs::remove_file(src.join(".cargo-ok")).unwrap();
     std::fs::write(src.join("stray"), b"").unwrap();
@@ -263,6 +282,14 @@ fn fetches_into_cargos_directories_and_the_store() {
     std::fs::write(src.join(".cargo-ok"), b"").unwrap();
     registry.fetch_one(&package).unwrap();
     assert!(src.join("src/lib.rs").is_file());
+    // A directory with files and no `.cargo-ok` at all (an unpacking killed midway) is removed
+    // and unpacked again, never failing on the files it left.
+    std::fs::remove_file(src.join(".cargo-ok")).unwrap();
+    std::fs::write(src.join("stray"), b"").unwrap();
+    registry.fetch_one(&package).unwrap();
+    assert!(src.join("src/lib.rs").is_file());
+    assert!(!src.join("stray").exists());
+    assert_eq!(std::fs::read_to_string(src.join(".cargo-ok")).unwrap(), r#"{"v":1}"#);
 }
 
 #[test]
@@ -279,8 +306,13 @@ fn refuses_what_cargo_refuses() {
         &bytes,
         "x",
     );
+    let specified = format!("specified: sha256:{}", wrong.checksum);
     let e = format!("{:#}", registry.fetch(&[wrong]).unwrap_err());
+    assert!(e.contains("failed to download `wrong v1.0.0`"), "{e}");
     assert!(e.contains("failed to verify the checksum of `wrong v1.0.0`"), "{e}");
+    assert!(e.contains("is not the bytes pinned by sha256, so nothing of it was kept"), "{e}");
+    assert!(e.contains(&specified), "{e}");
+    assert!(e.contains(&format!("got:       sha256:{}", checksum(&bytes))), "{e}");
 
     let outside = fixture.publish("outside", &[("other-1.0.0/a", b"a", 0o644)]);
     let e = format!("{:#}", registry.fetch(&[outside]).unwrap_err());
@@ -343,6 +375,30 @@ fn download_urls() {
     assert_eq!(crate_url("https://x/{crate}", "abc", "1.0.0", &sum), "https://x/abc");
 }
 
+#[test]
+fn unpacks_in_only_what_is_included() {
+    let dir = temporary("unpack-in");
+    let bytes = tarball(&[
+        ("only-1.0.0/Cargo.toml", b"[package]\n", 0o644),
+        ("only-1.0.0/src/lib.rs", b"pub fn f() {}\n", 0o644),
+        ("only-1.0.0/.gitignore", b"target\n", 0o644),
+    ]);
+    let dst = dir.join("only-1.0.0");
+    let asked = Cell::new(0);
+    let left_out = Path::new(".gitignore");
+    let written = unpack_package_in(&bytes, &dst, |path: &Path| {
+        asked.set(asked.get() + 1);
+        path != left_out
+    })
+    .unwrap();
+    assert_eq!(asked.get(), 3);
+    assert_eq!(written, (b"[package]\n".len() + b"pub fn f() {}\n".len()) as u64);
+    assert_eq!(std::fs::read(dst.join("src/lib.rs")).unwrap(), b"pub fn f() {}\n");
+    assert!(dst.join("Cargo.toml").is_file());
+    assert!(!dst.join(".gitignore").exists());
+    assert!(!dst.join(".cargo-ok").exists());
+}
+
 /// A vendored package as `cargo vendor` writes it: its files and a `.cargo-checksum.json`.
 fn vendor(dir: &Path, name: &str, version: &str, package: Option<&str>, files: &[(&str, &[u8])]) {
     let root = dir.join(name);
@@ -362,8 +418,7 @@ fn vendor(dir: &Path, name: &str, version: &str, package: Option<&str>, files: &
 
 fn locked(name: &str, version: &str, checksum: &str) -> Locked {
     Locked {
-        source: SourceId::crates_io_git(),
-        precise: None,
+        source: SourceId::crates_io(),
         package: Package {
             name: name.to_owned(),
             version: Version::parse(version).unwrap(),
@@ -395,7 +450,7 @@ fn reads_vendored_directories_as_cargo() {
     };
     let context = Arc::new(Context::new(fixture.home.clone(), fixture.server.clone()));
     let sources = Sources::new(&config, context).unwrap();
-    let directory = sources.directory(&SourceId::for_directory(&dir).unwrap()).unwrap();
+    let directory = sources.directory(SourceId::for_directory(&dir).unwrap()).unwrap();
     let mut names: Vec<_> =
         directory.packages().unwrap().iter().map(|it| it.name.clone()).collect();
     names.sort();
@@ -457,11 +512,7 @@ fn replaced_registries_unpack_under_the_replacement() {
     let context = Arc::new(Context::new(fixture.home.clone(), fixture.server.clone()));
     let sources = Sources::new(&config, context).unwrap();
     let roots = sources
-        .fetch(&[Locked {
-            source: SourceId::crates_io_git(),
-            precise: None,
-            package: package.clone(),
-        }])
+        .fetch(&[Locked { source: SourceId::crates_io(), package: package.clone() }])
         .unwrap();
     let dir = fixture.source.registry_dir_name();
     assert!(dir.starts_with("index.example.com-"), "{dir}");

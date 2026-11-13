@@ -3,8 +3,15 @@
 //! The `patched` workspace's fixtures are cargo 1.99.0's (`workspace_resolve/patched.sh`
 //! writes them).
 
-use std::collections::BTreeMap;
+// The fixtures are cargo's output for a workspace at `/ws` on Linux: `path+file:///ws` ids,
+// which a Windows path is not, and `/ws` is no absolute path there.
+#![cfg(unix)]
+#![feature(allocator_api)]
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use blaze_hash::HashMap;
 use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::metadata::{MetadataPackages, resolve_graph};
 use blaze_resolve::resolver::{CliFeatures, CompileKind, HasDevUnits, Members, VersionOrdering};
@@ -13,11 +20,11 @@ use blaze_resolve::{
     Dependency, InternedString, MemRegistry, PackageId, PackageIdSpec, Platform, Resolve,
     ResolveVersion, SourceId, Summary,
 };
-use rustc_hash::FxHashMap;
+use std::alloc::Global;
 use url::Url;
 
 fn path_source(dir: &str) -> SourceId {
-    SourceId::from_url(&format!("path+file://{dir}")).unwrap()
+    SourceId::for_path(Path::new(dir)).unwrap()
 }
 
 fn summary(name: &str, version: &str, source: SourceId, deps: Vec<Dependency>) -> Summary {
@@ -61,7 +68,7 @@ fn resolve(
     patch: &[(Url, Vec<Patch>)],
     lock: Option<&str>,
 ) -> Resolve {
-    let path_packages: FxHashMap<SourceId, Summary> = members
+    let path_packages: HashMap<SourceId, Summary, Global> = members
         .iter()
         .copied()
         .chain(packages)
@@ -87,6 +94,7 @@ fn resolve(
         version_ordering: VersionOrdering::MaximumVersionsFirst,
         rust_versions: None,
         resolve_version: ResolveVersion::default(),
+        offline_flag: None,
     };
     let registry: MemRegistry = members.iter().copied().chain(packages).cloned().collect();
     let specs: Vec<PackageIdSpec> = members.iter().map(|m| m.package_id().to_spec()).collect();

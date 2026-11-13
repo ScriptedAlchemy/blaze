@@ -1,0 +1,3 @@
+type: OutputEvent
+cbor: a20018c0018318730018ff
+digest: fca56f0898961b1729d3ed8be0474cffdbf614c20c4ec282197db610a5685fa0

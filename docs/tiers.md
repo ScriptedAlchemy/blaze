@@ -1,10 +1,17 @@
+---
+status: superseded
+summary: Tiers as blaze v1 did them (the engine's tier.rs): hot functions of a live program compiled again with LLVM and swapped in while it ran.
+date: 2026-10-30
+superseded_by: v2/plan/design/codegen.md
+---
 # Tiers
 
-A program that takes edits with `ra-jit-live` is also made faster while it runs. The daemon
+A program that takes edits with `blaze-live` is also made faster while it runs. The daemon
 samples where its threads are, compiles the functions it spends its time in again with LLVM,
 and swaps them in as patches, the way HotSpot or V8 tier up, without a restart
-([#6](https://github.com/indexable-inc/ra-jit/issues/6)). macOS on Apple silicon only, as
-live edits are; it needs a ra-jit built with `--features llvm`.
+([#6](https://github.com/indexable-inc/blaze/issues/6)). macOS on Apple silicon only, as
+live edits are. Released binaries have LLVM in them (23.1.4, linked statically); a blaze
+built from source needs `--features llvm` ([contributing.md](contributing.md#llvm)).
 
 ![The Tiers island of the Game of Life window](tiers.png)
 
@@ -16,13 +23,13 @@ live edits are; it needs a ra-jit built with `--features llvm`.
 | 2 | `Level::Llvm`, "LLVM -O3" (`O3`) | LLVM at `-O3`, with what the function calls built in where that is hot or small | a hot function, about a second after it gets hot; it counts its branches |
 | 3 | `Level::Pgo`, "LLVM -O3 + PGO" (`PGO`) | the same IR again, with what level 2 counted given to LLVM as `!prof` | a level-2 function that has counted for a second |
 
-The names are `ra_jit_live::format::LEVELS`, which the daemon's events and the window share.
+The names are `blaze_live::format::LEVELS`, which the daemon's events and the window share.
 
 ## How it goes
 
 1. **The program samples itself.** The worker that links a program's executable writes
-   `sample` in the program's directory (`~/.cache/ra-jit/live/<uuid>/`). The program's
-   `ra-jit-live-sample` thread then looks at one busy thread in turn every 2 ms
+   `sample` in the program's directory (`~/.cache/blaze/live/<uuid>/`). The program's
+   `blaze-live-sample` thread then looks at one busy thread in turn every 2 ms
    (`thread_get_state`, which stops the thread while it reads), counts the address it was
    at if that is the program's own code or a patch's, and writes `profile` four times a
    second: the counts since it started, the CPU it took itself, and the counters level-2
@@ -30,7 +37,7 @@ The names are `ra_jit_live::format::LEVELS`, which the daemon's events and the w
    names the worker that reads `profile`; once that process is gone (it exited, crashed or
    was killed, none of which removes the file) the program samples nothing until a worker
    asks again.
-2. **The worker puts each address in a function** (`crates/ra-jit/src/tier.rs`): the
+2. **The worker puts each address in a function** (`crates/blaze-engine/src/tier.rs`): the
    executable's own symbol table, or, for an address in the room for patches, the function
    a live patch put there in place of the executable's (`Baseline::live` says where each
    went). It keeps a second of samples per function.
@@ -40,7 +47,7 @@ The names are `ra_jit_live::format::LEVELS`, which the daemon's events and the w
    Every function that has had 0.3% of the samples is one that may be built into what is
    compiled. Code that is not the daemon's (rustc's copies of the dependencies) is shown at
    level 0 and is not asked for again.
-4. **The worker compiles them beside its builds** (`compile_tiered` in `main.rs`) on a
+4. **The worker compiles them beside its builds** (`compile_tiered` in `lib.rs`) on a
    thread of its own: it builds the IR of each with a copy of the database
    (`hir_ty_codegen::tier::prepare`), lets go of the database, and only then runs LLVM
    (`Prepared::finish`), so a change to the source never waits for LLVM. It keeps the code
@@ -49,7 +56,7 @@ The names are `ra_jit_live::format::LEVELS`, which the daemon's events and the w
    is spliced into the executable and published to the program, which writes a jump over
    the old entry. The program writes nothing it was not already writing.
 5. **It says what it did**: `tiers` in the program's directory (`format::Tiers`, read with
-   `ra_jit_live::tiers()`) has each hot function's level, share of the samples and what is
+   `blaze_live::tiers()`) has each hot function's level, share of the samples and what is
    under way, and the last events; the worker's log has the same events as `tier:` lines.
 
 ### What is built in
@@ -121,12 +128,39 @@ would have:
   On AArch64 an unaligned load is the same instruction; LLVM's code for the benchmark's
   `step` is the same with every access given its natural alignment.
 
+### LLVM's inliner
+
+LLVM's own inliner runs at threshold 500 (`llvm::INLINE_THRESHOLD`), over the 225 of `-O2` and
+250 of `-O3`; `BLAZE_LLVM_INLINE_THRESHOLD=N` sets another, and the store keeps code of each
+threshold apart. Measured on LLVM 23 with the runtime set of docs/benchmarks.md (dev-aws-5,
+x86-64, 16 cores, 5 rounds, each build with a cold store of its own; ratio to rustc's release
+build, lower is faster):
+
+| Build | Geomean | words | ripgrep | tokei | Code, bat | Code, ripgrep | Compile, all 8 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| blaze's building in, LLVM's default | 1.091 | 1.22 | 1.14 | 1.28 | 9.06 MB | 12.79 MB | 129.0 s |
+| nothing built in by blaze (`BLAZE_BUILT_IN=0`) | 1.092 | 1.22 | 1.14 | 1.31 | 9.06 MB | 12.79 MB | 129.7 s |
+| threshold 225 | 1.100 | 1.24 | 1.15 | 1.37 | 8.96 MB | 12.78 MB | 129.2 s |
+| **threshold 500** | **1.080** | 1.16 | 1.11 | 1.26 | 9.55 MB | 13.03 MB | 128.6 s |
+| threshold 1000 | 1.079 | 1.13 | 1.10 | 1.18 | 10.29 MB | 13.32 MB | 130.7 s |
+| nothing built in, threshold 500 | 1.077 | 1.16 | 1.09 | 1.24 | 9.54 MB | 13.03 MB | 129.3 s |
+| nothing built in, threshold 1000 | 1.079 | 1.13 | 1.09 | 1.17 | 10.29 MB | 13.33 MB | 130.4 s |
+
+Leaving every call to LLVM's inliner changes nothing measurable: the library's bodies blaze
+builds in are the small ones LLVM's inliner takes anyway. 500 is as fast as 1000 for half the
+growth in code (2 to 5% over the default against 4 to 14%), and neither costs compile time.
+The frames (`harness/frames.py` over the kept binaries): ripgrep's sum of frames is 992 KiB at
+the default, 977 KiB at 500 and 981 KiB at 1000 (rustc 581 KiB), its largest 36 KiB in every
+build; tokei's 1208, 1187 and 1177 KiB (rustc 570 KiB), its largest 124 KiB in every build,
+against 4.1 KiB under rustc. The inliner's threshold is not what makes blaze's frames
+larger than rustc's.
+
 ### Profile-guided optimization
 
 Level-2 code counts how often it is entered and, for each two-way branch of its IR in the
 order of the layout, how often it went each way: `select(condition, a, b)` picks the counter,
-so a branch costs one increment. The counters are `ra_jit_live_counters()`, a 64 K array in
-every program that links `ra-jit-live`, called by name; the worker hands out ranges of it.
+so a branch costs one increment. The counters are `blaze_live_counters()`, a 64 K array in
+every program that links `blaze-live`, called by name; the worker hands out ranges of it.
 Level 3 builds the same IR (the same functions built in), finds the same branches in the
 same order, and gives LLVM `!prof !{"branch_weights", taken, not}` on each and
 `!{"function_entry_count", n}` on the function; it counts nothing. When the branches do not
@@ -194,10 +228,10 @@ runs, and a new daemon starts every function at level 1.
 
 ## Turning it off
 
-`RA_JIT_TIER=off` in the daemon's environment starts none of it: no program is asked to
+`BLAZE_TIER=off` in the daemon's environment starts none of it: no program is asked to
 sample, no function leaves level 1, and the worker says `tier: off` in its log.
-`RA_JIT_TIER=off` in a program's own environment keeps it from sampling.
-`RA_JIT_TIER=2` stops at level 2, which then counts nothing. `RA_JIT_DUMP_TIER=1` has the
+`BLAZE_TIER=off` in a program's own environment keeps it from sampling.
+`BLAZE_TIER=2` stops at level 2, which then counts nothing. `BLAZE_DUMP_TIER=1` has the
 worker print the IR of each tiered function and why a body was not built in.
 
 ## Measured
@@ -213,8 +247,8 @@ work was run the same way.
 
 | Build | Generations per second | vs release | vs the checked build | Before this round |
 |---|---|---|---|---|
-| level 1, Cranelift (`RA_JIT_TIER=off`) | 18, 18 | 3% | 3% | 3% |
-| level 2, LLVM -O3 (`RA_JIT_TIER=2`) | 581, 568 | 86%, 86% | 94%, 93% | 69%, 73% |
+| level 1, Cranelift (`BLAZE_TIER=off`) | 18, 18 | 3% | 3% | 3% |
+| level 2, LLVM -O3 (`BLAZE_TIER=2`) | 581, 568 | 86%, 86% | 94%, 93% | 69%, 73% |
 | level 3, LLVM -O3 + PGO (default) | 595, 576 | 88%, 88% | 96%, 94% | 71%, 74% |
 | rustc `-O3` with `overflow-checks` and `debug-assertions`, the semantics of the dev profile | 619, 612 | 91%, 93% | 100% | 93%, 91% |
 | rustc release (`cargo build --release`) | 679, 657 | 100% | | 100% |
@@ -297,4 +331,4 @@ change.
 
 `harness/tiers.py` (macOS on AArch64; it says so and exits 0 elsewhere): promotion to levels
 2 and 3 with output identical to cargo's, an edit of a tiered function that demotes it and
-is applied at once, and `RA_JIT_TIER=off` changing nothing.
+is applied at once, and `BLAZE_TIER=off` changing nothing.

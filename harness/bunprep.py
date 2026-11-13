@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""bunprep.py: bun's Rust port (oven-sh/bun from v1.4) as a workspace whose executable rustc links.
+"""bunprep.py: bun's Rust port (oven-sh/bun from v1.4) as a workspace Blaze links.
 
-    bunprep.py CHECKOUT    prepares CHECKOUT-native (below) and prints the environment
+    bunprep.py '{"checkout": "/path/to/bun"}'
+        prepares CHECKOUT-native (below) and prints the environment
 
 Bun's own build (`bun scripts/build.ts`) compiles its C and C++ with ninja (JavaScriptCore from a
 prebuilt WebKit, BoringSSL, uSockets, ...), builds its Rust as one static library
-(`bun_runtime`) and links the two with clang. ra-jit builds and splices executables that rustc
-links, so the tree measured has one more workspace member, `bun-exe`: a `#![no_main]` binary of
-`bun_runtime`, whose `main` it is, with the native objects and libraries on rustc's link line.
+(`bun_runtime`) and links the two with clang. The measured tree has one more workspace member,
+`bun-exe`: a `#![no_main]` binary of `bun_runtime`, whose `main` it is, with the native objects
+and libraries supplied to Blaze's linker.
 
 `prepare(checkout)` copies the clone (which nothing writes to) to `CHECKOUT-native` once per
 revision and configures bun's release build there without LTO. Ninja then builds what bun's link
@@ -15,19 +16,20 @@ step (in build.ninja) takes besides bun's Rust, the code that Rust includes and 
 it has under `vendor/`, but not the Rust: that is what is measured. The native half of the link
 step goes to a file of link arguments that `bun-exe`'s build script reads (BUN_NATIVE_LINK_ARGS),
 and the member is added. It returns that tree, to be copied without its `build` directory, and
-the environment every build of it needs: bun's pinned toolchain, the code bun's build generated
+the environment every build of it needs: the code bun's build generated
 (BUN_CODEGEN_DIR) and the link arguments. `in_place(ws)` does the same in a checkout of its own
-(apps.py's `prepare`).
+(appruns.py's `prepare`). `sources(ws)` only fetches the crates bun's workspace has under
+`vendor/`, so Blaze's own resolver can read the workspace. The selected Blaze build resolves
+the generated member and updates its throwaway lock file; preparation runs no Cargo command.
 
 What bun's build needs is on PATH: what docs/project/contributing.mdx lists (LLVM 23, cmake,
-ninja, go, a bun to run its scripts), as `nix develop .#bench-bun` has it, whose only Rust is
-bun's pinned nightly. With rustup, that nightly is installed when it is missing.
-docs/research/bun.md says what was measured with it.
+ninja, go, a bun to run its scripts), as `nix develop .#bench-bun` has it. Rust compilation
+uses the selected Blaze executable and the toolchain it owns.
+fed1eb428d:docs/research/bun.md says what was measured with it.
 """
-import hashlib, os, re, shlex, shutil, subprocess, sys
+import hashlib, json, os, re, shlex, shutil, subprocess, sys, tarfile, urllib.request
+from dataclasses import dataclass
 
-# The checkout's rust-toolchain.toml.
-TOOLCHAIN = "nightly-2026-09-15"
 PROFILE = "release"
 # Holds the revision the tree was built at and this file's hash: a tree prepared by an older
 # bunprep is built again, from its own build.
@@ -38,7 +40,7 @@ FRAME_POINTERS = "[target.'cfg(all())']\nrustflags = [\"-C\", \"force-frame-poin
 # Flags of bun's link that are not kept, by why. Every other flag is: `--wrap`, the exported
 # symbols, the stack size and the libraries are what the program is.
 DROPPED = [
-    # An executable linked without `.eh_frame_hdr` has no index of its frames: ra-jit links
+    # An executable linked without `.eh_frame_hdr` has no index of its frames: blaze links
     # such a program again at every edit instead of adding the change to it. One linked
     # without compact unwind info is spliced (#33); bun's numbers are of the link without it.
     r"-Wl,-no_compact_unwind", r"-Wl,--no-eh-frame-hdr",
@@ -63,8 +65,8 @@ MAIN = """#![no_main]
 extern crate bun_runtime;
 """
 BUILD_RS = """fn main() {
-    let args = std::env::var("BUN_NATIVE_LINK_ARGS").expect("BUN_NATIVE_LINK_ARGS names the file of native link arguments");
     println!("cargo:rerun-if-env-changed=BUN_NATIVE_LINK_ARGS");
+    let args = std::env::var("BUN_NATIVE_LINK_ARGS").expect("BUN_NATIVE_LINK_ARGS names the file of native link arguments");
     println!("cargo:rerun-if-changed={args}");
     for line in std::fs::read_to_string(&args).unwrap().lines() {
         if !line.is_empty() {
@@ -73,6 +75,7 @@ BUILD_RS = """fn main() {
     }
 }
 """
+SANDBOX_ENV = '\n[workspace.metadata.blaze.sandbox]\nbuild-script-env = ["BUN_CODEGEN_DIR", "BUN_NATIVE_LINK_ARGS"]\n'
 MANIFEST = """[package]
 name = "bun-exe"
 version = "0.0.0"
@@ -92,17 +95,11 @@ workspace = true
 
 
 def rust_env(env):
-    """`env` with bun's toolchain and none of the shell's flags for cargo."""
-    env = dict(env, RUSTUP_TOOLCHAIN=TOOLCHAIN)
-    for name in ("RUSTFLAGS", "CARGO_TARGET_DIR", "RUSTC_WORKSPACE_WRAPPER", "RUSTC_WRAPPER", "CARGO_BUILD_TARGET", "RUSTC"):
+    """Native preparation without an ambient Rust toolchain or compiler override."""
+    env = dict(env)
+    for name in ("RUSTUP_TOOLCHAIN", "RUSTFLAGS", "CARGO_TARGET_DIR", "RUSTC_WORKSPACE_WRAPPER", "RUSTC_WRAPPER", "CARGO_BUILD_TARGET", "RUSTC"):
         env.pop(name, None)
     return env
-
-
-def install_toolchain():
-    rustup = shutil.which("rustup")
-    if rustup and TOOLCHAIN not in subprocess.run([rustup, "toolchain", "list"], capture_output=True, text=True).stdout:
-        subprocess.run([rustup, "toolchain", "install", TOOLCHAIN, "--profile", "minimal", "-c", "rust-src"], check=True)
 
 
 def build_dir(tree):
@@ -147,18 +144,18 @@ def native_targets(tree):
 
 
 def link_args(tree):
-    """The native half of bun's link, one argument per line in build/release/ra-jit-link.args:
+    """The native half of bun's link, one argument per line in build/release/blaze-link.args:
     every object and library but bun's own Rust (which `bun-exe` is), and the flags kept."""
     out = build_dir(tree)
     inputs, flags, lazy = link_statement(os.path.join(out, "build.ninja"))
     native = [os.path.join(out, path) for path in inputs if not path.startswith("rust-target/")]
     objects = [path for path in native if path.endswith(".o")]
-    filelist = os.path.join(out, "ra-jit-link.objects")
+    filelist = os.path.join(out, "blaze-link.objects")
     open(filelist, "w").write("\n".join(objects) + "\n")
     darwin = sys.platform == "darwin"
     args = [f"-Wl,-filelist,{filelist}"] if darwin else [f"@{filelist}"]
     if lazy:
-        lazylist = os.path.join(out, "ra-jit-link.lazy")
+        lazylist = os.path.join(out, "blaze-link.lazy")
         open(lazylist, "w").write("\n".join(it if it.startswith("-") else os.path.join(out, it) for it in lazy) + "\n")
         args.append(f"-Wl,@{lazylist}")
     args += [path for path in native if not path.endswith(".o")]
@@ -176,7 +173,7 @@ def link_args(tree):
     system = system_parts(tree, os.environ)
     if system:
         args.append(f"-L{system}/lib")
-    path = os.path.join(out, "ra-jit-link.args")
+    path = os.path.join(out, "blaze-link.args")
     open(path, "w").write("\n".join(args) + "\n")
     return path
 
@@ -196,7 +193,7 @@ def system_parts(tree, env):
     plain = {k: v for k, v in env.items() if k not in ("SDKROOT", "DEVELOPER_DIR")}
     apple = subprocess.run(["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], env=plain,
                            capture_output=True, text=True, check=True).stdout.strip()
-    system = os.path.join(build_dir(tree), "ra-jit-system")
+    system = os.path.join(build_dir(tree), "blaze-system")
     for path in SYSTEM:
         target = os.path.join(apple, "usr", path)
         if not os.path.exists(target):
@@ -216,6 +213,12 @@ def overlay(tree):
     for name, text in (("Cargo.toml", MANIFEST), ("main.rs", MAIN), ("build.rs", BUILD_RS)):
         open(os.path.join(tree, "bun-exe", name), "w").write(text)
     edit(os.path.join(tree, "Cargo.toml"), '  "src/bunfig",\n', '  "src/bunfig",\n  "bun-exe",\n')
+    # A sandboxed build script is given only what cargo documents, what it says it reads and
+    # what the root manifest names (docs/cargo.md): bun_core's reads BUN_CODEGEN_DIR without
+    # saying so, and bun-exe's needs BUN_NATIVE_LINK_ARGS on its first run.
+    manifest = os.path.join(tree, "Cargo.toml")
+    if SANDBOX_ENV not in open(manifest).read():
+        open(manifest, "a").write(SANDBOX_ENV)
     # Bun's C and C++ are its release build, without ASSERT_ENABLED; with debug assertions the
     # Rust calls the functions that only a build with them has.
     edit(os.path.join(tree, "Cargo.toml"), '[profile.dev]\npanic = "abort"\n',
@@ -250,8 +253,7 @@ def edit(path, old, new):
 
 def env_of(tree):
     out = build_dir(tree)
-    return {"RUSTUP_TOOLCHAIN": TOOLCHAIN, "RA_JIT_OTHER_TOOLCHAIN": "1",
-            "BUN_CODEGEN_DIR": os.path.join(out, "codegen"), "BUN_NATIVE_LINK_ARGS": os.path.join(out, "ra-jit-link.args")}
+    return {"BUN_CODEGEN_DIR": os.path.join(out, "codegen"), "BUN_NATIVE_LINK_ARGS": os.path.join(out, "blaze-link.args")}
 
 
 def head_of(tree):
@@ -293,16 +295,14 @@ def native(tree, head):
     log.close()
     link_args(tree)
     overlay(tree)
-    # The lock file gets the new member, so that `--locked` builds take it.
-    subprocess.run(["cargo", "metadata", "--format-version", "1"], cwd=tree, env=env, check=True,
-                   stdout=subprocess.DEVNULL)
+    # The caller's selected Blaze resolves this generated member. The fixture harnesses
+    # permit their throwaway lock files to be written; a typed --locked still refuses it.
     open(marker, "w").write(f"{head} {SELF}\n")
 
 
 def prepare(checkout):
     """A copy of the checkout with bun's own build in it, and the environment its builds need
     (see the module's text). The checkout itself is not changed."""
-    install_toolchain()
     tree = checkout.rstrip("/") + "-native"
     head = head_of(checkout)
     marker = os.path.join(tree, MARKER)
@@ -313,17 +313,83 @@ def prepare(checkout):
     return tree, env_of(tree)
 
 
+def sources(ws):
+    """What the resolver needs of a checkout without bun's own build: the crates its
+    Cargo.toml has under `vendor/`, which that build fetches (scripts/build/deps/<name>.ts) at
+    the commit the file pins, with the `.patch` files it lists applied as that build applies them
+    (rust-argon2's lifts its memory floor). Enough for what reads the workspace without building
+    it."""
+    for name in re.findall(r'path = "vendor/([^"/]+)"', open(os.path.join(ws, "Cargo.toml")).read()):
+        dep = open(os.path.join(ws, "scripts", "build", "deps", f"{name}.ts")).read()
+        if re.search(r'kind: "([^"]+)"', dep)[1] != "github-archive":
+            raise SystemExit(f"bunprep: vendor/{name} is not fetched from a GitHub archive")
+        repo = re.search(r'repo: "([^"]+)"', dep)[1]
+        commit = re.search(r'commit: (\w+)', dep)[1]
+        commit = re.search(rf'const {commit} = "([0-9a-f]{{40}})"', dep)[1]
+        listed = re.search(r"patches: \[([^\]]*)\]", dep)
+        patches = re.findall(r'"([^"]+)"', listed[1]) if listed else []
+        if "patches:" in dep and not listed or any(not it.endswith(".patch") for it in patches):
+            raise SystemExit(f"bunprep: vendor/{name} has patches other than a list of `.patch` files")
+        # The commit and the patches' contents, as bun's build identifies a fetched source.
+        identity = hashlib.sha256("\0".join([commit, *(open(os.path.join(ws, it)).read() for it in patches)])
+                                  .encode()).hexdigest()
+        into = os.path.join(ws, "vendor", name)
+        stamp = os.path.join(into, ".bunprep-commit")
+        if os.path.exists(stamp) and open(stamp).read().strip() == identity:
+            continue
+        shutil.rmtree(into, ignore_errors=True)
+        os.makedirs(into)
+        url = f"https://github.com/{repo}/archive/{commit}.tar.gz"
+        with urllib.request.urlopen(url) as archive, tarfile.open(fileobj=archive, mode="r|gz") as tar:
+            for member in tar:
+                member.name = member.name.partition("/")[2]
+                if member.name:
+                    tar.extract(member, into, filter="data")
+        # From the checkout's root: in a directory of a repository, `git apply` takes the
+        # patch's paths as the repository's.
+        for patch in patches:
+            subprocess.run(["git", "apply", f"--directory=vendor/{name}", patch], cwd=ws, check=True)
+        open(stamp, "w").write(f"{identity}\n")
+
+
 def in_place(ws):
     """`prepare` in the checkout itself: what `apps.json`'s `"prepare": "bunprep"` runs."""
-    install_toolchain()
     native(ws, head_of(ws))
     return env_of(ws)
 
 
-if __name__ == "__main__":
+@dataclass(frozen=True)
+class Input:
+    checkout: str
+
+    def __post_init__(self):
+        if type(self.checkout) is not str or not self.checkout or "\0" in self.checkout:
+            raise ValueError("checkout must be a nonempty path")
+
+
+def load(value):
+    if value == "-":
+        value = sys.stdin.read()
+    elif not value.lstrip().startswith(("{", "[")):
+        value = open(value).read()
+    raw = json.loads(value)
+    if not isinstance(raw, dict):
+        raise ValueError("input must be one JSON object")
+    return Input(**raw)
+
+
+def main():
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
-    tree, env = prepare(os.path.abspath(sys.argv[1]))
+    try:
+        given = load(sys.argv[1])
+    except (OSError, TypeError, ValueError) as error:
+        raise SystemExit(f"bunprep.py: {error}") from error
+    tree, env = prepare(os.path.abspath(given.checkout))
     print(tree)
     for name, value in env.items():
         print(f"export {name}={shlex.quote(value)}")
+
+
+if __name__ == "__main__":
+    main()

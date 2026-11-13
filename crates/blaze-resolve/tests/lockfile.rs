@@ -2,10 +2,10 @@
 //! and written back byte for byte, and cargo's `tests/testsuite/lockfile_compat.rs` (MIT or
 //! Apache-2.0) ported, with the resolve the resolver would hand over built by hand.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use blaze_resolve::lockfile::{self, Locked, PathDeps};
+use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::{GitReference, PackageId, Resolve, ResolveVersion, RustVersion, SourceId};
 use url::Url;
 
@@ -13,8 +13,11 @@ const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CKSUM: &str = "8e1b9346248cf3391ead604c4407258d327c28e37209f6d56127598165165dda";
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+/// A path package's source: an absolute directory, which `/ws` is not on Windows. What a lock
+/// file says of one is its name and version, not where it is.
 fn path_source(name: &str, version: &str) -> SourceId {
-    SourceId::from_url(&format!("path+file:///ws/{name}-{version}")).unwrap()
+    let root = if cfg!(windows) { "C:/ws" } else { "/ws" };
+    SourceId::for_path(&PathBuf::from(format!("{root}/{name}-{version}"))).unwrap()
 }
 
 /// Each entry without a source stands for a path package of its own directory.
@@ -78,21 +81,23 @@ fn foo_bar(checksum: Option<&str>, version: ResolveVersion) -> Resolve {
 }
 
 /// What cargo writes for a resolve whose lock file was `orig`, as `write_pkg_lockfile` does
-/// once the resolve took over the lock file's checksums and encoding.
-fn write(new: Resolve, orig: Option<&str>, locked: Option<Locked<'_>>) -> Result<Option<String>> {
-    write_msrv(new, orig, locked, None)
+/// once the resolve took over the lock file's checksums and encoding. `same_resolve` compares
+/// the resolves read back, as `--locked` does (blaze-units' lock policy decides what a change
+/// is then allowed to do).
+fn write(new: Resolve, orig: Option<&str>, same_resolve: Option<&PathDeps>) -> Result<Option<String>> {
+    write_msrv(new, orig, same_resolve, None)
 }
 
 fn write_msrv(
     mut new: Resolve,
     orig: Option<&str>,
-    locked: Option<Locked<'_>>,
+    same_resolve: Option<&PathDeps>,
     msrv: Option<&RustVersion>,
 ) -> Result<Option<String>> {
     if let Some(orig) = orig {
         new.merge_from(&read(orig)?)?;
     }
-    lockfile::lockfile_to_write(&mut new, orig, msrv, locked)
+    Ok(lockfile::lockfile_change(&mut new, orig, msrv, same_resolve))
 }
 
 const FOO_BAR_V4: &str = "\
@@ -196,27 +201,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 "#
     );
     let deps = path_deps(&lockfile::parse(&old).unwrap());
-    let locked =
-        Locked { flag: "--locked", path: Path::new("/ws/foo/Cargo.lock"), path_deps: &deps };
     let new = || foo_bar(Some(CKSUM), ResolveVersion::default());
-    assert_eq!(write(new(), Some(&old), Some(locked)).unwrap(), None);
+    assert_eq!(write(new(), Some(&old), Some(&deps)).unwrap(), None);
     // Without `--locked` the missing header makes it a change, and a change raises the encoding.
     assert_eq!(write(new(), Some(&old), None).unwrap().as_deref(), Some(FOO_BAR_V4));
 }
 
+/// Under `--locked` a missing lock file is a change, whatever the resolve: the lock policy
+/// (blaze-units' `lock::decide`) refuses it, naming it.
 #[test]
-fn locked_correct_error() {
+fn a_missing_lock_file_is_a_change_under_locked() {
     let deps = PathDeps::default();
-    let locked =
-        Locked { flag: "--locked", path: Path::new("/ws/foo/Cargo.lock"), path_deps: &deps };
-    let err =
-        write(foo_bar(Some(CKSUM), ResolveVersion::default()), None, Some(locked)).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "cannot create the lock file /ws/foo/Cargo.lock because --locked was passed to prevent this\n\
-         help: to generate the lock file without accessing the network, remove the --locked flag \
-         and use --offline instead."
-    );
+    let out = write(foo_bar(Some(CKSUM), ResolveVersion::default()), None, Some(&deps)).unwrap();
+    assert_eq!(out.as_deref(), Some(FOO_BAR_V4));
 }
 
 #[test]

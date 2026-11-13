@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
 """spaces.py: a workspace under a directory whose name has a space in it, built end to end by
-`cargo ra-jit build` (issue #14).
+`blaze build` (issue #14).
 
-usage: spaces.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc are
-                     found next to it)
+usage: spaces.py    (BLAZE_BIN names the blaze built; blaze is found next to
+                     it)
 
 The directory is also named with `$$`, `#` and a quote, which rustc's dep-info files write as
 they are, and the daemon's home is in it too. The workspace has a library and a program that
-calls it, and a module in a file whose name has a space. It is built until the daemon serves
-the build, then each crate is edited in turn. After every build the program has to print
-what the source says, and the daemon's objects have to name the functions of both crates by
-rustc's symbols: a crate the daemon does not find among what rustc built gets names of
-ra-jit's own (`ra-jit.<id>.<path>`), which nothing rustc built links to.
+calls it, and a module in a file whose name has a space. It is built, then each crate is
+edited in turn. After every build the program has to print what the source says, and the build
+has to be the daemon's: it prints a `blaze-work` line under `--message-format=json`.
+
+v1 also looked in its objects (`target/blaze/*/programs`) for functions named by blaze
+(`blaze.<id>.<path>`) rather than by rustc's symbols, as code rustc built links only to rustc's
+names. v2 builds every crate itself and writes no such objects, so that check is gone.
 
 Python 3, stdlib only.
 """
-import glob
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import worked  # noqa: E402
+
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 TIMEOUT = 900
 FILES = {
@@ -68,70 +70,51 @@ STEPS = [
     ("a method of the library", [("mid/src/lib.rs", ".sum()", ".sum::<u32>() * 2")], "2 10 12 one"),
     ("the file with a space in its name", [("app/src/with space.rs", '"one"', '"two"')], "2 10 12 two"),
 ]
-OWN_NAME = re.compile(r"^_?ra-jit\.[0-9a-f]+\.")
 
 
 def build(ws, env, step):
-    ran = subprocess.run(["cargo", "ra-jit", "build"], cwd=ws, env=env, capture_output=True, text=True,
-                         timeout=TIMEOUT)
+    """`blaze build --message-format=json`: whether the daemon served it (a `blaze-work` line)."""
+    ran = subprocess.run(["blaze", "build", "--message-format=json"], cwd=ws, env=env,
+                         capture_output=True, text=True, timeout=TIMEOUT)
     said = ran.stdout + ran.stderr
     if ran.returncode != 0:
         raise SystemExit(f"{step}: the build failed:\n{said[-3000:]}")
-    return said
-
-
-def own_names(ws):
-    """The functions the daemon's objects define under names of ra-jit's own."""
-    found = []
-    for obj in glob.glob(os.path.join(ws, "target", "ra-jit", "*", "programs", "*", "*.o")):
-        listed = subprocess.run(["nm", "--defined-only", obj], capture_output=True, text=True).stdout
-        names = [line.split()[-1] for line in listed.splitlines() if line.split()]
-        found += [name for name in names if OWN_NAME.match(name) and re.search(r"s(app|mid)", name)]
-    return sorted(set(found))
+    return bool(worked(ran.stdout))
 
 
 def main():
-    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
-    if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
-    root = tempfile.mkdtemp(prefix="ra-jit sp $$ #'q' ", dir="/tmp")
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
+    if not os.path.exists(os.path.join(bin_dir, "blaze")):
+        raise SystemExit(f"no blaze beside {os.environ['BLAZE_BIN']}")
+    root = tempfile.mkdtemp(prefix="blaze sp $$ #'q' ", dir="/tmp")
     ws, home = os.path.join(root, "work space"), os.path.join(root, "home")
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home)
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home)
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     program = os.path.join(ws, "target", "debug", "sapp")
     wrong = 0
     try:
+        # The first build starts the daemon and is served by it: no wait for it.
         build(ws, env, "first build")
-        for _ in range(240):
-            if "[ra-jit]" in build(ws, env, "wait for the daemon"):
-                break
-            time.sleep(0.5)
-        else:
-            raise SystemExit(f"no build said `[ra-jit]`; the daemon's log is in {home}")
         for what, edits, expected in STEPS:
             for path, old, new in edits:
                 text = open(os.path.join(ws, path)).read()
                 assert old in text, (what, old)
                 open(os.path.join(ws, path), "w").write(text.replace(old, new, 1))
-            said = build(ws, env, what)
+            served = build(ws, env, what)
             printed = subprocess.run([program], capture_output=True, text=True, timeout=60).stdout.strip()
-            own = own_names(ws)
-            served = "[ra-jit]" in said
             verdict = "ok"
             if printed != expected:
                 verdict = f"PRINTED {printed!r}, NOT {expected!r}"
             elif not served:
-                verdict = "NOT SERVED BY THE DAEMON"
-            elif own:
-                verdict = f"NAMED BY RA-JIT: {', '.join(own[:3])}"
+                verdict = "NOT SERVED BY THE DAEMON (no `blaze-work` line)"
             wrong += verdict != "ok"
             print(f"{what:40} {verdict}", flush=True)
     finally:
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     print(f"{len(STEPS) - wrong} of {len(STEPS)} right; under {root}")
     if wrong:
         sys.exit(1)

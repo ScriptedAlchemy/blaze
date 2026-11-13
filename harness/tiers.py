@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""Tiering end to end (macOS on AArch64, ra-jit built with `--features llvm`): a program that
+"""Tiering end to end (macOS on AArch64, a native blaze, which has LLVM): a program that
 takes edits runs under the daemon, which samples it and compiles its hot functions again with
 LLVM, swapping them in as patches while it runs (docs/tiers.md).
 
-usage: tiers.py          (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
-                          are found next to it)
+usage: tiers.py          (BLAZE_BIN names the blaze built; blaze is found next
+                          to it)
 
-A copy of demo/lifebench (the Game of Life on a large grid, run flat out) is built by cargo,
-then by a daemon. Three checks:
+A copy of demo/lifebench (the Game of Life on a large grid, run flat out) is built by blaze
+from nothing (a home, store and target directory of its own, BLAZE_TIER=off), then by a
+daemon. Three checks:
 
 1. promotion: the running program's hot functions reach level 2 (LLVM -O3) and level 3
-   (LLVM -O3 + PGO), and what it prints is what cargo's build prints, generation for
+   (LLVM -O3 + PGO), and what it prints is what the build from nothing prints, generation for
    generation;
 2. an edit demotes: an edit of a promoted function that keeps what it does (`next_age`) is
-   applied as a patch at once, the function is back at level 1, and the output stays cargo's;
-3. RA_JIT_TIER=off changes nothing: under a daemon started with it, nothing is sampled, no
-   function leaves level 1, and the output is cargo's.
+   applied as a patch at once, the function is back at level 1, and the output stays the
+   same;
+3. BLAZE_TIER=off changes nothing: under a daemon started with it, nothing is sampled, no
+   function leaves level 1, and the output is the build from nothing's.
+
+Every build is the daemon's (it prints a `blaze-work` line under `--message-format=json`);
+v1's wait until a build said `[blaze]` is gone, as v2 serves the first build. v1's worker logs
+(`tier: off`, the edit-to-binary time) are not read: v2 has no workers.
 
 Python 3.13, stdlib only. Every step has a timeout; a failure names the step.
 """
@@ -31,11 +37,15 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+sys.path.insert(0, str(HERE))
+from storelib import worked  # noqa: E402
+
 BUILD_TIMEOUT = 900
 # How long the program runs, and how long a level may take to be reached in it.
 RUN_SECONDS = int(os.environ.get("TIERS_SECONDS", "30"))
 LEVEL_TIMEOUT = 20
 SIZE = os.environ.get("TIERS_SIZE", "160")
+PIN = (HERE / "toolchain").read_text().strip()
 
 
 class StepError(Exception):
@@ -59,19 +69,19 @@ async def run(step: str, cmd: list[str], cwd: Path, env: dict[str, str]) -> str:
 
 
 async def build(step: str, cwd: Path, env: dict[str, str]) -> str:
-    return await run(step, ["cargo-ra-jit", "ra-jit", "build", "--locked"], cwd, env)
+    """`blaze build --message-format=json`; a build with no `blaze-work` line was not the
+    daemon's, and fails the step."""
+    said = await run(step, ["blaze", "build", "--locked", "--message-format=json"], cwd, env)
+    if not worked(said):
+        tail = "\n".join(said.strip().splitlines()[-30:])
+        raise StepError(f"{step}: the build printed no `blaze-work` line\n  output tail:\n{tail}")
+    return said
 
 
 async def serve(project: Path, env: dict[str, str]) -> None:
-    """Builds until the daemon serves the build, then once more after an edit: the first edit
-    after a daemon starts writes the whole object again."""
+    """Builds (the first build starts the daemon and is served by it), then once more after an
+    edit: the first edit after a daemon starts writes the whole object again."""
     await build("first build", project, env)
-    for _ in range(120):
-        if "[ra-jit]" in await build("wait for the daemon", project, env):
-            break
-        await asyncio.sleep(0.5)
-    else:
-        raise StepError("wait for the daemon: no build said `[ra-jit]` in 120 tries")
     source = project / "src" / "main.rs"
     source.write_text(source.read_text() + "\n// the daemon's first edit\n")
     await build("first edit", project, env)
@@ -129,51 +139,53 @@ async def finish(program: Program, tasks: list[asyncio.Task]) -> None:
     await asyncio.gather(*tasks)
 
 
-def same_as_cargo(step: str, ours: list[str], cargo: list[str]) -> None:
+def same_as_scratch(step: str, ours: list[str], scratch: list[str]) -> None:
     if not ours:
         raise StepError(f"{step}: the program printed no checksum")
-    if ours != cargo[: len(ours)]:
-        first = next(i for i, (a, b) in enumerate(zip(ours, cargo)) if a != b)
-        raise StepError(f"{step}: generation {100 * (first + 1)} differs from cargo's build:\n  ours  {ours[first]}\n  cargo {cargo[first]}")
+    if ours != scratch[: len(ours)]:
+        first = next(i for i, (a, b) in enumerate(zip(ours, scratch)) if a != b)
+        raise StepError(f"{step}: generation {100 * (first + 1)} differs from the build from nothing:\n"
+                        f"  ours          {ours[first]}\n  from nothing  {scratch[first]}")
 
 
 def live_dir(binary: Path) -> Path | None:
-    """The directory ra-jit-live keeps for the executable, named after its LC_UUID."""
+    """The directory blaze-live keeps for the executable, named after its LC_UUID."""
     data = binary.read_bytes()
     at = data.find(b"\x1b\x00\x00\x00\x18\x00\x00\x00")  # LC_UUID, 24 bytes
     if at < 0:
         return None
-    return Path.home() / ".cache" / "ra-jit" / "live" / data[at + 8 : at + 24].hex()
+    return Path.home() / ".cache" / "blaze" / "live" / data[at + 8 : at + 24].hex()
 
 
 async def main() -> None:
-    bin_dir = Path(os.environ["RA_JIT_BIN"]).resolve().parent
-    # Short: a worker's socket is in the daemon's home, and macOS takes 104 bytes of path.
+    bin_dir = Path(os.environ["BLAZE_BIN"]).resolve().parent
+    # Short: the daemon's socket is in its home, and macOS takes 104 bytes of path.
     work = Path(tempfile.mkdtemp(prefix="rjt-", dir="/tmp" if Path("/tmp").is_dir() else None))
     try:
-        shutil.copytree(ROOT / "crates" / "ra-jit-live", work / "crates" / "ra-jit-live")
+        shutil.copytree(ROOT / "crates" / "blaze-live", work / "crates" / "blaze-live")
         shutil.copytree(ROOT / "demo" / "lifebench", work / "demo" / "lifebench", ignore=shutil.ignore_patterns("target"))
         project = work / "demo" / "lifebench"
-        base = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RUSTUP_TOOLCHAIN="1.99.0")
-        for name in ("CARGO_INCREMENTAL", "RA_JIT_TIER", "RA_JIT_BACKEND", "RA_JIT_OPT"):
+        base = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RUSTUP_TOOLCHAIN=PIN)
+        for name in ("CARGO_INCREMENTAL", "BLAZE_TIER"):
             base.pop(name, None)
 
-        # What cargo's own build prints. The program never overflows, so its debug and
-        # release builds print the same; the release one gets as far as a tiered run does.
-        cargo_env = dict(base, CARGO_TARGET_DIR=str(work / "cargo"))
-        await run("cargo build", ["cargo", "build", "--locked", "--release"], project, cargo_env)
+        # What blaze's build from nothing prints, with nothing tiered: it runs a fixed number of
+        # generations, as many as a tiered run got to.
+        scratch_env = dict(base, CARGO_TARGET_DIR=str(work / "scratch"), BLAZE_HOME=str(work / "home-scratch"),
+                           BLAZE_TIER="off")
+        await build("build from nothing", project, scratch_env)
 
-        async def cargo(count: int) -> list[str]:
+        async def scratch(count: int) -> list[str]:
             proc = await asyncio.create_subprocess_exec(
-                str(work / "cargo" / "release" / "lifebench"), cwd=project,
-                env=dict(cargo_env, LIFE_GENERATIONS=str(100 * count), LIFE_SIZE=SIZE),
+                str(work / "scratch" / "debug" / "lifebench"), cwd=project,
+                env=dict(scratch_env, LIFE_GENERATIONS=str(100 * count), LIFE_SIZE=SIZE),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             )
             out, _ = await proc.communicate()
             return out.decode().splitlines()
 
         # 1 and 2: a daemon that tiers.
-        env = dict(base, CARGO_TARGET_DIR=str(work / "tiered"), RA_JIT_HOME=str(work / "home-tiered"))
+        env = dict(base, CARGO_TARGET_DIR=str(work / "tiered"), BLAZE_HOME=str(work / "home-tiered"))
         await serve(project, env)
         binary = work / "tiered" / "debug" / "lifebench"
         program, tasks = await start(binary, project, env, RUN_SECONDS)
@@ -192,42 +204,38 @@ async def main() -> None:
         source.write_text(text.replace(needle, "if n == 3 || n == 2 { age + 1 } else { 0 }"))
         await build("edit of next_age while it runs", project, env)
         deadline = time.monotonic() + 10
-        demoted = lambda: [it for it in program.events[events_before:] if it.startswith("next_age: back to Cranelift")]
+        # A function is shown by its path: `lifebench::next_age`.
+        demoted = lambda: [it for it in program.events[events_before:] if re.match(r"(?:\S*::)?next_age: back to Cranelift", it)]
         while not demoted() and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
         if not demoted():
             raise StepError("edit of next_age: the daemon did not send it back to level 1; events:\n  " + "\n  ".join(program.events[-10:]))
-        log = "".join(p.read_text(errors="replace") for p in (work / "home-tiered").rglob("log"))
-        took = re.findall(r"change: 1 files\n(?:.*\n)*?edit-to-binary: (\S+)", log)
-        print(f"edit demoted next_age: {demoted()[0]} (daemon edit-to-binary {took[-1] if took else '?'})")
+        print(f"edit demoted next_age: {demoted()[0]}")
         await program.wait_for("next_age hot again and promoted again", lambda levels: levels.get("next_age", 0) >= 2)
         print(f"promoted again once hot: {program.levels}")
         await finish(program, tasks)
-        same_as_cargo("output of the tiered program", program.checksums, await cargo(len(program.checksums)))
-        print(f"output: {len(program.checksums)} checksums, all cargo's")
+        same_as_scratch("output of the tiered program", program.checksums, await scratch(len(program.checksums)))
+        print(f"output: {len(program.checksums)} checksums, all the build from nothing's")
 
-        # 3: RA_JIT_TIER=off.
+        # 3: BLAZE_TIER=off.
         source.write_text(text)
-        env = dict(base, CARGO_TARGET_DIR=str(work / "off"), RA_JIT_HOME=str(work / "home-off"), RA_JIT_TIER="off")
+        env = dict(base, CARGO_TARGET_DIR=str(work / "off"), BLAZE_HOME=str(work / "home-off"), BLAZE_TIER="off")
         await serve(project, env)
         binary = work / "off" / "debug" / "lifebench"
         program, tasks = await start(binary, project, env, min(RUN_SECONDS, 12))
         await finish(program, tasks)
         if any(v > 1 for v in program.levels.values()):
-            raise StepError(f"RA_JIT_TIER=off: functions left level 1: {program.levels}")
+            raise StepError(f"BLAZE_TIER=off: functions left level 1: {program.levels}")
         live = live_dir(binary)
         if live is not None and (live / "sample").exists():
-            raise StepError(f"RA_JIT_TIER=off: the daemon asked the program to sample ({live / 'sample'})")
-        logs = "".join(p.read_text(errors="replace") for p in (work / "home-off").rglob("log"))
-        if "tier: off" not in logs:
-            raise StepError("RA_JIT_TIER=off: the worker did not say tiering is off")
-        same_as_cargo("output with RA_JIT_TIER=off", program.checksums, await cargo(len(program.checksums)))
-        print(f"RA_JIT_TIER=off: nothing sampled, nothing tiered, {len(program.checksums)} checksums, all cargo's")
+            raise StepError(f"BLAZE_TIER=off: the daemon asked the program to sample ({live / 'sample'})")
+        same_as_scratch("output with BLAZE_TIER=off", program.checksums, await scratch(len(program.checksums)))
+        print(f"BLAZE_TIER=off: nothing sampled, nothing tiered, {len(program.checksums)} checksums, all the build from nothing's")
     finally:
-        for home in ("home-tiered", "home-off"):
-            stop = dict(os.environ, RA_JIT_HOME=str(work / home), PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        for home in ("home-scratch", "home-tiered", "home-off"):
+            stop = dict(os.environ, BLAZE_HOME=str(work / home), PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
             try:
-                proc = await asyncio.create_subprocess_exec("cargo-ra-jit", "ra-jit", "stop", env=stop, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                proc = await asyncio.create_subprocess_exec("blaze", "stop", env=stop, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                 await asyncio.wait_for(proc.wait(), 30)
             except (OSError, TimeoutError):
                 pass

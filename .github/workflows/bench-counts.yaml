@@ -1,0 +1,159 @@
+# Optional hosted measurements; missing hardware counters remain an explicit gap.
+name: bench-counts
+on:
+  push:
+    branches: ["main"]
+    paths-ignore: ["README.md", "docs/**", "site/**"]
+  workflow_dispatch:
+
+# One run at a time on the machines; a push that comes during a run waits, and a newer push
+# replaces it while it waits. Its own group: a pending bench-readme run is never replaced by it.
+concurrency:
+  group: bench-counts
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BLAZE_CORES: all
+
+jobs:
+  platforms:
+    name: selected benchmark platforms
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      any: ${{ steps.matrix.outputs.any }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: matrix
+        env:
+          BENCH_RUNNERS: ${{ vars.BENCH_RUNNERS }}
+          BENCH_RUNNER: ${{ vars.BENCH_RUNNER }}
+        run: python3 harness/benchplatforms.py matrix
+
+  counts:
+    name: counts (${{ matrix.name }})
+    needs: platforms
+    if: >-
+      needs.platforms.outputs.any == 'true' &&
+      github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
+    runs-on: ${{ matrix.label }}
+    permissions:
+      contents: read
+    timeout-minutes: 120
+    env:
+      BENCH_MACHINE: GitHub-hosted ${{ matrix.name }} (${{ matrix.label }})
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/blaze
+        with:
+          job: bench-counts
+          llvm: 'true'
+          reflink: ${{ runner.os == 'Linux' && 'true' || 'false' }}
+      - name: counters
+        if: runner.os == 'Linux'
+        run: |
+          # Counting the user mode of one's own processes needs perf_event_paranoid <= 2
+          # (harness/counters.py); a machine that refuses says so in each count's gap.
+          if [ "$(cat /proc/sys/kernel/perf_event_paranoid)" -gt 2 ]; then
+            sudo -n sysctl kernel.perf_event_paranoid=2 || echo "::warning::perf_event_paranoid stays above 2: no instruction counts"
+          fi
+      # blaze builds blaze (AGENTS.md rule blaze-builds-blaze), as bench-readme.yaml builds it.
+      - uses: ./.github/actions/nix
+      - name: Build blaze
+        run: |
+          bench_root=/tmp
+          if [ "$RUNNER_OS" = Linux ]; then bench_root="$RUNNER_TEMP/blaze-fs"; fi
+          export BENCH_HOME="$bench_root/bb-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$BENCH_HOME"
+          echo "BENCH_HOME=$BENCH_HOME" >> "$GITHUB_ENV"
+          echo "TMPDIR=$bench_root" >> "$GITHUB_ENV"
+          stage0="$(command -v blaze)"
+          CARGO_TARGET_DIR="$BENCH_HOME/compiler" nix develop .#bench -c "$stage0" build -p blaze-engine --release --locked
+          "$stage0" stop
+      - name: Bench
+        id: bench
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          jq -n --arg blaze "$BENCH_HOME/compiler/release/blaze-engine" --arg work "$BENCH_HOME/work" \
+            --arg sources "$BENCH_HOME/projects" --arg out "$RUNNER_TEMP/results/bench.json" \
+            --arg commit "$GITHUB_SHA" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg machine "$BENCH_MACHINE" \
+            '{action:"run",blaze:$blaze,work:$work,sources:$sources,out:$out,commit:$commit,run_url:$run_url,
+              projects:["fd","hyperfine"],backends:["cranelift"],runs:3,stress:true,machine:$machine}' > "$RUNNER_TEMP/bench-input.json"
+          nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py "$RUNNER_TEMP/bench-input.json" \
+            || { status=$?; [ "$status" = 3 ] || exit "$status"; echo "wrong=true" >> "$GITHUB_OUTPUT"; }
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: counts-${{ matrix.slug }}
+          path: ${{ runner.temp }}/results/
+          if-no-files-found: ignore
+      - name: Fail on a wrong result
+        if: steps.bench.outputs.wrong == 'true'
+        run: |
+          echo "::error::a program, a build or a stress crate ended wrong under blaze: see the Bench step"
+          exit 1
+
+  history:
+    name: history and check
+    needs: [platforms, counts]
+    if: >-
+      always() && needs.platforms.outputs.any == 'true' &&
+      github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # The ruleset on main refuses a push from the workflow's own token (docs/harness.md, "CI").
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: counts-*
+          path: ${{ runner.temp }}/results
+      - name: History and check
+        id: history
+        run: |
+          regressed=false
+          : > "$RUNNER_TEMP/regressions.md"
+          for result in "$RUNNER_TEMP"/results/counts-*/bench.json; do
+            [ -f "$result" ] || continue
+            slug=$(basename "$(dirname "$result")"); slug=${slug#counts-}
+            history="docs/benchmarks/history/$slug-merge.jsonl"
+            jq -n --arg result "$result" --arg history "$history" \
+              '{action:"build",result:$result,suite:"merge",history:$history}' | python3 harness/benchhistory.py -
+            jq -n --arg history "$history" --arg report "$RUNNER_TEMP/regressions-$slug.md" \
+              '{action:"check",history:$history,report:$report}' | python3 harness/benchhistory.py - || regressed=true
+            { echo "### $slug"; cat "$RUNNER_TEMP/regressions-$slug.md"; echo; } >> "$RUNNER_TEMP/regressions.md"
+          done
+          echo "regressed=$regressed" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/regressions.md" >> "$GITHUB_STEP_SUMMARY"
+      # The README's and docs/benchmarks.md's trend charts, from the history just appended to.
+      - uses: ./.github/actions/nix
+      - name: Trends
+        run: python3 harness/benchcharts.py '{}'
+      # Main may have moved during the run: bench_commit.py puts the commit on top, draws the
+      # trends again from the history as it is then, and tries again.
+      - name: Commit to main
+        run: |
+          python3 .github/scripts/bench_commit.py "$(printf '{"message": "bench: instruction counts for %s [skip ci]", "paths": ["docs/benchmarks/history/", "docs/benchmarks/charts/", "README.md", "docs/benchmarks.md"]}' "${GITHUB_SHA::10}")"
+      - name: Fail on a regression
+        if: steps.history.outputs.regressed == 'true'
+        run: |
+          echo "::error::a benchmark regressed past its band (instructions 1%): see the run summary"
+          exit 1

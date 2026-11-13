@@ -67,7 +67,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use rustc_hash::FxBuildHasher;
+use std::alloc::Global;
 use tracing::{debug, trace};
 
 use crate::interning::InternedString;
@@ -76,7 +76,7 @@ use crate::poll::PollExt;
 use crate::{Dependency, PackageId, PackageIdSpec, Registry, Resolve, ResolveVersion, Summary};
 
 use self::context::ResolverContext;
-use self::dep_cache::RegistryQueryer;
+use self::dep_cache::{Query, RegistryQueryer, registry_queryer};
 use self::features::RequestedFeatures;
 use self::types::{ConflictMap, ConflictReason, DepsFrame};
 use self::types::{FeaturesSet, RcVecIter, RemainingDeps, ResolverProgress};
@@ -92,8 +92,7 @@ pub use self::version_prefs::VersionOrdering;
 pub use self::version_prefs::VersionPreferences;
 
 pub(crate) type CargoResult<T> = anyhow::Result<T>;
-pub(crate) type HashMap<K, V> = rustc_hash::FxHashMap<K, V>;
-pub(crate) type HashSet<K> = rustc_hash::FxHashSet<K>;
+pub(crate) use blaze_hash::{HashMap, HashSet};
 
 mod conflict_cache;
 mod context;
@@ -112,9 +111,11 @@ pub struct ResolveSettings<'a> {
     pub offline_flag: Option<&'a str>,
     /// Called once if resolving takes long, where cargo prints `Resolving dependency
     /// graph...` to a terminal.
+    // dyn: at most once per resolve, to the caller's terminal; a generic copies the resolver.
     pub on_slow: Option<&'a dyn Fn()>,
     /// The packages under a directory (name and manifest path), for the hint on a path
     /// dependency naming a package that is not there.
+    // dyn: only while wording a failed resolve's error; a generic copies the resolver.
     pub path_packages: Option<&'a dyn Fn(&Path) -> Vec<(InternedString, PathBuf)>>,
 }
 
@@ -152,7 +153,7 @@ pub fn resolve(
     settings: &ResolveSettings<'_>,
 ) -> CargoResult<Resolve> {
     let first_version = None;
-    let mut registry = RegistryQueryer::new(registry, replacements, version_prefs);
+    let mut registry = registry_queryer(registry, replacements, version_prefs);
 
     // Global cache of the reasons for each time we backtrack.
     let mut past_conflicting_activations = conflict_cache::ConflictCache::new();
@@ -170,7 +171,7 @@ pub fn resolve(
         }
     };
 
-    let mut cksums = HashMap::default();
+    let mut cksums = HashMap::new_in(Global);
     for (summary, _) in resolver_ctx.activations.values() {
         let cksum = summary.checksum().map(|s| s.to_owned());
         cksums.insert(summary.package_id(), cksum);
@@ -211,7 +212,7 @@ pub fn resolve(
 /// If all dependencies can be activated and resolved to a version in the
 /// dependency graph, `cx` is returned.
 fn activate_deps_loop(
-    registry: &mut RegistryQueryer<'_, impl Registry>,
+    registry: &mut RegistryQueryer<'_, impl Registry, impl Query>,
     summaries: &[(Summary, ResolveOpts)],
     first_version: Option<VersionOrdering>,
     settings: &ResolveSettings<'_>,
@@ -481,7 +482,7 @@ fn activate_deps_loop(
                         && let Some((other_parent, conflict)) = remaining_deps
                             .iter()
                             // for deps related to us
-                            .filter(|(_, other_dep)| known_related_bad_deps.contains(other_dep))
+                            .filter(|(_, other_dep)| known_related_bad_deps.contains(*other_dep))
                             .filter_map(|(other_parent, other_dep)| {
                                 past_conflicting_activations
                                     .find_conflicting(&resolver_ctx, other_dep, Some(pid))
@@ -621,7 +622,7 @@ fn activate_deps_loop(
 /// iterate through next.
 fn activate(
     cx: &mut ResolverContext,
-    registry: &mut RegistryQueryer<'_, impl Registry>,
+    registry: &mut RegistryQueryer<'_, impl Registry, impl Query>,
     parent: Option<(&Summary, &Dependency)>,
     candidate: Summary,
     first_version: Option<VersionOrdering>,
@@ -791,7 +792,7 @@ impl RemainingCandidates {
 /// It will add the new conflict to the cache if one is found.
 fn generalize_conflicting(
     cx: &ResolverContext,
-    registry: &mut RegistryQueryer<'_, impl Registry>,
+    registry: &mut RegistryQueryer<'_, impl Registry, impl Query>,
     past_conflicting_activations: &mut conflict_cache::ConflictCache,
     parent: &Summary,
     dep: &Dependency,
@@ -978,9 +979,9 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
     // We visit each node at most once and we keep
     // track of the path through the graph as we walk it. If we walk onto the
     // same node twice that's a cycle.
-    let mut checked = HashSet::with_capacity_and_hasher(resolve.len(), FxBuildHasher);
+    let mut checked = HashSet::with_capacity_in(resolve.len(), Global);
     let mut path = Vec::with_capacity(4);
-    let mut visited = HashSet::with_capacity_and_hasher(4, FxBuildHasher);
+    let mut visited = HashSet::with_capacity_in(4, Global);
     for pkg in resolve.iter() {
         if !checked.contains(&pkg) {
             visit(resolve, pkg, &mut visited, &mut path, &mut checked)?
@@ -991,9 +992,9 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
     fn visit(
         resolve: &Resolve,
         id: PackageId,
-        visited: &mut HashSet<PackageId>,
+        visited: &mut HashSet<PackageId, Global>,
         path: &mut Vec<PackageId>,
-        checked: &mut HashSet<PackageId>,
+        checked: &mut HashSet<PackageId, Global>,
     ) -> CargoResult<()> {
         if !visited.insert(id) {
             // We found a cycle and need to construct an error. Performance is no longer top priority.
@@ -1036,7 +1037,7 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
 /// particular, we don't store paths of path dependencies. That means that
 /// *different* packages may collide in the lock file, hence this check.
 fn check_duplicate_pkgs_in_lockfile(resolve: &Resolve) -> CargoResult<()> {
-    let mut unique_pkg_ids = HashMap::default();
+    let mut unique_pkg_ids = HashMap::new_in(Global);
     let state = lockfile::EncodeState::new(resolve);
     for pkg_id in resolve.iter() {
         let encodable_pkd_id = lockfile::encodable_package_id(pkg_id, &state, resolve.version());

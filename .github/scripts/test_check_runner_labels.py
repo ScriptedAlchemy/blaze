@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""test_check_runner_labels.py: the cases .github/scripts/check_runner_labels.py is held to.
+
+    python3 -m unittest discover --start-directory .github/scripts --pattern 'test_*.py'
+
+The workflows job of .github/workflows/blaze.yaml runs it, with the check itself, so that the check
+that no pull request's workflow can pick a self-hosted runner has cases of its own, and reads
+every workflow of this repository.
+"""
+import glob, os, sys, unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import check_runner_labels as check
+
+WORKFLOWS = os.path.join(os.path.dirname(HERE), "workflows")
+
+
+class RunnerLabels(unittest.TestCase):
+    def problems(self, text):
+        return check.check("workflow.yaml", text)
+
+    def test_hosted_runner(self):
+        self.assertEqual(self.problems(
+            "on:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n"), [])
+
+    def test_bare_self_hosted(self):
+        problems = self.problems("on: pull_request\njobs:\n  test:\n    runs-on: self-hosted\n")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("self-hosted", problems[0])
+
+    def test_self_hosted_in_a_list(self):
+        # All three: `linux` and `x64` are the default labels a self-hosted runner also gets.
+        problems = self.problems(
+            "on: [push, pull_request]\njobs:\n  test:\n    runs-on: [self-hosted, linux, x64]\n")
+        self.assertEqual(len(problems), 3)
+        self.assertIn("'self-hosted'", " ".join(problems))
+
+    def test_machine_labels(self):
+        for label in ("bench-macos", "macos-15-runner"):
+            problems = self.problems(f"on: pull_request\njobs:\n  test:\n    runs-on: {label}\n")
+            self.assertEqual(len(problems), 1, label)
+            self.assertIn(label, problems[0])
+
+    def test_machine_label_without_a_pull_request(self):
+        # A `push` or `schedule` workflow cannot be written by a fork, but a machine's label is
+        # still nothing a job of this repository may name.
+        problems = self.problems("on: schedule\njobs:\n  test:\n    runs-on: bench-macos\n")
+        self.assertEqual(len(problems), 1)
+
+    def test_generic_self_hosted_labels(self):
+        # `linux` and `x64` are the labels a self-hosted runner gets by default.
+        problems = self.problems(
+            "on: pull_request\njobs:\n  test:\n    runs-on: [linux, x64]\n")
+        self.assertEqual(len(problems), 2)
+
+    def test_matrix_of_hosted_runners(self):
+        self.assertEqual(self.problems(
+            "on: pull_request\n"
+            "jobs:\n"
+            "  test:\n"
+            "    strategy:\n"
+            "      matrix:\n"
+            "        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]\n"
+            "    runs-on: ${{ matrix.os }}\n"), [])
+
+    def test_matrix_include_of_hosted_runners(self):
+        self.assertEqual(self.problems(
+            "on: pull_request\n"
+            "jobs:\n"
+            "  test:\n"
+            "    strategy:\n"
+            "      matrix:\n"
+            "        include:\n"
+            "          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }\n"
+            "          - { os: macos-15, target: aarch64-apple-darwin }\n"
+            "    runs-on: ${{ matrix.os }}\n"), [])
+
+    def test_matrix_that_can_be_self_hosted(self):
+        problems = self.problems(
+            "on: pull_request\n"
+            "jobs:\n"
+            "  test:\n"
+            "    strategy:\n"
+            "      matrix:\n"
+            "        os: [ubuntu-24.04, self-hosted]\n"
+            "    runs-on: ${{ matrix.os }}\n")
+        self.assertEqual(len(problems), 1)
+
+    def test_matrix_this_cannot_resolve(self):
+        # A matrix computed by another job could hold anything.
+        problems = self.problems(
+            "on: pull_request\n"
+            "jobs:\n"
+            "  test:\n"
+            "    strategy:\n"
+            "      matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}\n"
+            "    runs-on: ${{ matrix.label }}\n")
+        self.assertEqual(len(problems), 1)
+
+    def test_runner_given_to_a_reusable_workflow(self):
+        problems = self.problems(
+            "on: pull_request\n"
+            "jobs:\n"
+            "  test:\n"
+            "    uses: ./.github/workflows/platform.yaml\n"
+            "    with:\n"
+            "      os: self-hosted\n")
+        self.assertEqual(len(problems), 1)
+
+    def test_hosted_runner_given_to_a_reusable_workflow(self):
+        self.assertEqual(self.problems(
+            "on: pull_request\n"
+            "jobs:\n"
+            "  test:\n"
+            "    uses: ./.github/workflows/platform.yaml\n"
+            "    with:\n"
+            "      os: macos-15\n"), [])
+
+    def test_runtime_matrix_without_a_pull_request(self):
+        # bench-readme's shape: the label comes from harness/benchplatforms.py at run time.
+        self.assertEqual(self.problems(
+            "on: schedule\n"
+            "jobs:\n"
+            "  bench:\n"
+            "    runs-on: ${{ matrix.label }}\n"), [])
+
+    def test_unreadable_workflow(self):
+        with self.assertRaises(check.Unreadable):
+            self.problems("on: push\njobs:\n\ttest:\n")
+
+    def test_private_ix_runner_on_schedule(self):
+        self.assertTrue(self.problems("on: schedule\njobs:\n  test:\n    runs-on: [ix, arm64]\n"))
+
+    def test_merge_queue_must_resolve_runner(self):
+        self.assertTrue(self.problems(
+            "on: merge_group\njobs:\n  test:\n    runs-on: ${{ needs.untrusted.outputs.runner }}\n"))
+
+    def test_scheduled_matrix_cannot_name_private_capacity(self):
+        self.assertTrue(self.problems(
+            "on: schedule\njobs:\n  test:\n    strategy:\n      matrix:\n        runner: [ubuntu-24.04, ix]\n"
+            "    runs-on: ${{ matrix.runner }}\n"))
+
+    def test_scheduled_caller_cannot_pass_private_capacity(self):
+        self.assertTrue(self.problems(
+            "on: schedule\njobs:\n  test:\n    uses: ./.github/workflows/platform.yaml\n"
+            "    with:\n      os: ix\n"))
+
+    def test_benchmark_platforms_are_hosted(self):
+        import runpy
+        from pathlib import Path
+        platforms = runpy.run_path(str(Path(HERE).parents[1] / "harness/benchplatforms.py"))
+        for platform in platforms["PLATFORMS"]:
+            self.assertRegex(platform["label"], check.HOSTED)
+            self.assertNotIn("labels", platform)
+        self.assertEqual(platforms["registered"]({}), [])
+        self.assertEqual(len(platforms["registered"]({"BENCH_RUNNER": "true"})), 1)
+        self.assertEqual(len(platforms["registered"]({
+            "BENCH_RUNNERS": "linux-x86-64,linux-aarch64,macos-arm64"})), 3)
+
+    def test_repository_runtime_runner_sources(self):
+        # The nonliteral runners the policy checker trusts: caller os inputs,
+        # or the one benchmark table checked above. A new source needs a test.
+        from pathlib import Path
+        for path in Path(WORKFLOWS).glob("*.yaml"):
+            workflow = check.read(path.read_text())
+            for job_id, job in workflow["jobs"].items():
+                runs = job.get("runs-on", "")
+                expression = check.EXPRESSION.fullmatch(runs) if isinstance(runs, str) else None
+                if not expression:
+                    continue
+                reference = check.MATRIX_REF.fullmatch(expression.group(1).strip())
+                if reference and check._matrix_values(job, reference.group(1)):
+                    continue
+                if path.name in ("blaze-platform.yaml", "bench.yaml"):
+                    self.assertEqual(runs, "${{ inputs.os }}", (path, job_id))
+                    os_input = workflow["on"]["workflow_call"]["inputs"]["os"]
+                    self.assertEqual(os_input["type"], "string")
+                    self.assertEqual(os_input["required"], "true")
+                else:
+                    self.assertIn((path.name, job_id), (
+                        ("bench-readme.yaml", "bench"), ("bench-bun.yaml", "bench"),
+                        ("bench-counts.yaml", "counts")))
+                    self.assertEqual(runs, "${{ matrix.label }}")
+                    self.assertEqual(job["strategy"]["matrix"],
+                                     "${{ fromJSON(needs.platforms.outputs.matrix) }}")
+                    self.assertIn("python3 harness/benchplatforms.py matrix", path.read_text())
+
+    def test_source_benchmark_runner_has_a_hosted_entry_point(self):
+        # The reusable benchmark inherits the platform's already checked os. A manual run
+        # has the one original hosted ARM64 choice, never a free-form private runner label.
+        from pathlib import Path
+        workflows = {path.name: check.read(path.read_text())
+                     for path in Path(WORKFLOWS).glob("*.yaml")}
+        bench = workflows["bench.yaml"]
+        self.assertEqual(set(bench["on"]), {"workflow_call", "workflow_dispatch"})
+        manual = bench["on"]["workflow_dispatch"]["inputs"]["os"]
+        self.assertEqual(manual["type"], "choice")
+        self.assertEqual(manual["options"], ["ubuntu-24.04-arm"])
+        self.assertEqual(manual["default"], "ubuntu-24.04-arm")
+        self.assertEqual(manual["required"], "true")
+        callers = []
+        for name, workflow in workflows.items():
+            for job_id, job in workflow["jobs"].items():
+                if job.get("uses") == "./.github/workflows/bench.yaml":
+                    callers.append((name, job_id))
+                    self.assertEqual(job["with"]["os"], "${{ inputs.os }}")
+                    self.assertEqual(job["needs"], "build")
+        self.assertEqual(callers, [("blaze-platform.yaml", "microbench")])
+
+    def test_this_repository(self):
+        paths = sorted(glob.glob(os.path.join(WORKFLOWS, "*.yaml")))
+        self.assertTrue(paths)
+        for path in paths:
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(check.check(path, f.read()), [], path)
+
+
+if __name__ == "__main__":
+    unittest.main()

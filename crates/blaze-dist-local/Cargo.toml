@@ -1,0 +1,31 @@
+[package]
+name = "blaze-dist-local"
+description = "Bounded deterministic-CBOR Unix transport for blaze's distributed protocol core"
+publish = false
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-core.workspace = true
+blaze-dist = { path = "../blaze-dist" }
+blaze-wire.workspace = true
+libc.workspace = true
+sha2 = "0.10"
+tracing.workspace = true
+
+[dev-dependencies]
+crossbeam-channel.workspace = true
+hegeltest.workspace = true
+blaze-serve.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

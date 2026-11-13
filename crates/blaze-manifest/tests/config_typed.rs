@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use blaze_manifest::Config;
 use blaze_manifest::config::{CompileKind, Flags, Replacement};
+use blaze_manifest::files::Disk;
 use cargo_platform::Cfg;
 
 struct Tree {
@@ -24,10 +25,12 @@ impl Tree {
             std::fs::write(path, contents).unwrap();
         }
         std::fs::create_dir_all(root.join("home")).unwrap();
-        Tree { root: root.canonicalize().unwrap() }
+        // Not the `\\?\` form `canonicalize` gives on Windows, which a path read back from a
+        // `file:` URL is not, as cargo's is not.
+        Tree { root: dunce::canonicalize(root).unwrap() }
     }
 
-    fn config(&self, env: &[(&str, &str)]) -> Config {
+    fn config(&self, env: &[(&str, &str)]) -> Config<Disk> {
         let mut vars =
             vec![("CARGO_HOME".to_owned(), self.root.join("home").display().to_string())];
         vars.extend(env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
@@ -63,7 +66,7 @@ rustflags = ["--cfg", "from_macos"]
 rustflags = ["--cfg", "from_windows"]
 "#;
 
-fn flags(config: &Config, requested: &[CompileKind], kind: &CompileKind) -> Vec<String> {
+fn flags(config: &Config<Disk>, requested: &[CompileKind], kind: &CompileKind) -> Vec<String> {
     config.extra_args(requested, HOST, Some(&macos()), kind, Flags::Rust).unwrap()
 }
 
@@ -165,7 +168,7 @@ fn two_matching_cfg_runners_are_an_error() {
         )],
     );
     let err = tree.config(&[]).target_runner(&CompileKind::Host, HOST, &macos()).unwrap_err();
-    let def = tree.root.join(".cargo/config.toml").display().to_string();
+    let def = tree.root.join(".cargo").join("config.toml").display().to_string();
     assert_eq!(
         err.to_string(),
         format!(
@@ -198,7 +201,7 @@ fn build_table_warns_of_keys_it_does_not_know() {
         config.build_config().unwrap().jobs,
         Some(blaze_manifest::config::JobsConfig::Integer(2))
     ));
-    let def = tree.root.join(".cargo/config.toml").display().to_string();
+    let def = tree.root.join(".cargo").join("config.toml").display().to_string();
     assert_eq!(
         config.take_warnings(),
         [format!("unused config key `build.target-dri` in `{def}`")]
@@ -253,10 +256,7 @@ fn source_replacement_follows_replace_with() {
     );
     let config = tree.config(&[]);
     let sources = config.source_configs().unwrap();
-    assert_eq!(
-        sources["vendored"].id.url,
-        url::Url::from_file_path(tree.root.join("vendor")).unwrap()
-    );
+    assert_eq!(sources["vendored"].id.url().to_file_path().unwrap(), tree.root.join("vendor"));
     assert_eq!(config.replacement("crates-io").unwrap(), Replacement::Source("vendored".into()));
     assert_eq!(config.replacement("vendored").unwrap(), Replacement::None);
     assert_eq!(config.replacement("alt").unwrap(), Replacement::Registry("my-registry".into()));
@@ -264,25 +264,27 @@ fn source_replacement_follows_replace_with() {
 
 #[test]
 fn source_tables_refuse_what_cargo_refuses() {
-    let def = |tree: &Tree| tree.root.join(".cargo/config.toml").display().to_string();
-    let cases: &[(&str, &str, &dyn Fn(&Tree) -> String)] = &[
+    fn def(tree: &Tree) -> String {
+        tree.root.join(".cargo").join("config.toml").display().to_string()
+    }
+    let cases: &[(&str, &str, fn(&Tree) -> String)] = &[
         (
             "source-branch",
             "[source.a]\nregistry = \"https://example.com\"\nbranch = \"main\"\n",
-            &|t| {
+            |t| {
                 format!(
                     "source definition `source.a` specifies `branch`, but that requires a `git` key to be specified (in {})",
                     def(t)
                 )
             },
         ),
-        ("source-none", "[source.a]\nreplace-with = \"b\"\n", &|_| {
+        ("source-none", "[source.a]\nreplace-with = \"b\"\n", |_| {
             "no source location specified for `source.a`, need `registry`, `local-registry`, `directory`, or `git` defined".into()
         }),
-        ("source-two", "[source.a]\ndirectory = \"v\"\ngit = \"https://example.com/r\"\n", &|_| {
+        ("source-two", "[source.a]\ndirectory = \"v\"\ngit = \"https://example.com/r\"\n", |_| {
             "more than one source location specified for `source.a`".into()
         }),
-        ("source-url", "[source.a]\nregistry = \"not a url\"\n", &|t| {
+        ("source-url", "[source.a]\nregistry = \"not a url\"\n", |t| {
             format!(
                 "configuration key `source.a.registry` specified an invalid URL (in {})",
                 def(t)
@@ -308,7 +310,7 @@ fn source_replacement_cycles_and_missing_names_are_errors() {
         )],
     );
     let config = tree.config(&[]);
-    let def = tree.root.join(".cargo/config.toml").display().to_string();
+    let def = tree.root.join(".cargo").join("config.toml").display().to_string();
     assert_eq!(
         config.replacement("a").unwrap_err().to_string(),
         format!(

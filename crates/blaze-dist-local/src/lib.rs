@@ -1,0 +1,48 @@
+//! Local Unix IO carrier for the sans-IO distributed protocol. This crate runs no compiler.
+//! A single nonblocking reactor owns the coordinator; clocks and effect delivery are injected.
+
+#![deny(missing_docs)]
+
+pub mod agent;
+pub mod blobs;
+pub mod client;
+pub mod coordinator;
+pub mod driver;
+pub mod pack;
+pub mod protocol;
+pub mod result_gate;
+pub mod server;
+pub mod telemetry;
+
+use std::io;
+
+/// A distributed execution, compiler, protocol or IO failure. None permits implicit fallback.
+#[derive(Debug)]
+pub enum Error {
+    /// Unix IO failure.
+    Io(io::Error),
+    /// The peer sent an invalid/version-mismatched response.
+    Protocol(String),
+    /// Committed distributed data is missing or corrupt; never fall back under its key.
+    Committed(String),
+    /// The final compiler or output exporter refused the unit; never recompile its refusal.
+    Refused(String),
+    /// The caller cancelled the build; never recompile it under local fallback.
+    Cancelled(String),
+    /// The unit's execution ended with nothing committed, as its terminal says.
+    Ended(blaze_wire::job_terminal_v2::TerminationV2),
+}
+
+impl From<io::Error> for Error {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for Error {}

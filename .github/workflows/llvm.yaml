@@ -1,0 +1,107 @@
+name: llvm
+
+# Builds the LLVM every native blaze links (crates/hir-ty-codegen/llvm.json: our fork
+# indexable-inc/llvm, ix/23.x, LLVM 23.1.4 with our fixes, the commit ix-aot pins) on each runner
+# a release of blaze is built on, and Windows, with .github/scripts/llvm.py, and puts the
+# archives into the R2 bucket blaze-releases (`native/<name>`, under llvm.json's `release`,
+# .github/scripts/r2.py), each under a name that carries its sha256. The
+# fork is public, so no token is needed. The run's summary has the `targets` to write into llvm.json
+# (`llvm.py` with `{"command": "pin", ...}`), which the flake, CI and the release then fetch by that hash.
+#
+# It runs when the recipe changes, and by hand after moving the pinned commit.
+on:
+  workflow_dispatch:
+  push:
+    paths: [.github/scripts/llvm.py, .github/workflows/llvm.yaml]
+
+concurrency:
+  group: llvm-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    # Hosted runners, Linux too, for the glibc a release asks for: the oldest hosted Ubuntu, not ix's
+    # 24.04 (docs/harness.md "ix runners"). TODO(sysroot): ix once blaze links against an older
+    # glibc sysroot (docs/v2/plan/design/toolchain-c.md); it has no --sysroot today.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          # The release's runners: the oldest hosted Ubuntu, so that what links LLVM asks for an old glibc.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+    steps:
+      - if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install ninja==1.13.0
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        # JSON, which escapes the backslashes of a Windows runner's temporary directory.
+        run: |
+          python .github/scripts/llvm.py "$(jq -nc --arg target "$TARGET" --arg work "$RUNNER_TEMP/llvm" --arg out "$RUNNER_TEMP/out" '{command: "build", target: $target, work: $work, out: $out}')"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: llvm-${{ matrix.target }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: llvm-*
+          path: ${{ runner.temp }}/llvm
+      # Into R2, where every fetch of the pin reads it (llvm.json's `release`, r2.py's `native`):
+      # each archive under its own name, which ends in its sha256, so a key never changes bytes
+      # and putting one already there puts the same file again. GitHub has no copy.
+      - name: the R2 token is set
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::LLVM is not published: blaze fetches it from R2, and the secret CLOUDFLARE_R2_API_TOKEN is not set in $GITHUB_REPOSITORY's Actions secrets"
+            exit 1
+          fi
+      - name: R2's objects
+        id: r2
+        run: |
+          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py "{\"kind\": \"native\", \"dir\": \"$RUNNER_TEMP/llvm\"}"; echo R2; } >> "$GITHUB_OUTPUT"
+      - name: Into R2
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            ${{ steps.r2.outputs.r2 }}
+      - name: Pins
+        run: |
+          python3 .github/scripts/llvm.py "$(jq -nc --arg root "$RUNNER_TEMP/llvm" '{command: "pin", root: $root}')"
+          { echo '`crates/hir-ty-codegen/llvm.json` for these builds:'; echo '```json'; cat crates/hir-ty-codegen/llvm.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cat crates/hir-ty-codegen/llvm.json

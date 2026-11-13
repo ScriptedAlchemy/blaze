@@ -1,0 +1,3 @@
+type: WorkersEventsAnswer
+cbor: a10018c0
+digest: 88d094c436869451fced90487120051202f75a1b63f2837eb33a96934a9842e9
