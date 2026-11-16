@@ -38,7 +38,7 @@ use std::cell::RefCell;
 
 use super::{
     super::function::probe, Cell, CycGraph, Cycle, CycleKind, Database, Dep, GNode, Indices,
-    Ingredient, Node, Op, Spec, TestDb, Vtable, fetch, interned_fields, least_fixpoint, node,
+    Ingredient, Node, Op, Spec, TestDb, Vtable, fetch, least_fixpoint, max_node, node,
     settled,
 };
 
@@ -136,18 +136,7 @@ impl Spec for Told {
     }
 
     fn compute(db: &TestDb, key: Node) -> u64 {
-        let at = *interned_fields::<Indices>(db.storage(), key.0) as usize;
-        let mut value = 0;
-        for &dep in &db.graph[at].deps {
-            value = value.max(match dep {
-                Dep::Input(input) => {
-                    let cell = Cell(db.cells.lock()[input]);
-                    cell.a(db)
-                }
-                Dep::Query(query) => *fetch::<Told>(db, node(db, query)),
-            });
-        }
-        value
+        max_node(db, key, |key| *fetch::<Told>(db, key))
     }
 
     fn initial(_: &TestDb, _: Node) -> u64 {

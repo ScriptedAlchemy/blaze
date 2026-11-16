@@ -1013,23 +1013,7 @@ fn run<F: Function>(
     let at = frame.unwrap_or_else(|| {
         local::with(|local| local.push(Frame::new(storage, FrameKind::Run, node, index, id)))
     });
-    // The planted bug (`tests/inner_heads.rs`): a kept head counts its rounds from 1 again.
-    #[cfg(test)]
-    if probe::KEPT_HEADS_START_AGAIN.with(Cell::get) {
-        keeper = 0;
-    }
-    if keeper != 0 {
-        // A head kept from the last round of a lower head's cycle runs again as part of that
-        // head's round: its frame is new, but the round is not its first. It starts at its
-        // keeper's, so its `cycle_recover` and its members' are told the cycle's round
-        // ([`participate`]), not 1 in every round. The keeper's run is on this stack
-        // ([`claimed`] runs a stale row nowhere else).
-        local::with(|local| {
-            if let Some(below) = local.find(storage, keeper) {
-                local.frames[at as usize].round = local.frames[below as usize].round;
-            }
-        });
-    }
+    inherit_round(storage, at, keeper);
     let mut running = Running { storage, header, word, at, index, id, armed: true };
     storage.event(|| EventKind::WillExecute { database_key: DatabaseKeyIndex::new(index, id) });
     counts::count(index, counts::EXECUTED);
@@ -1055,6 +1039,24 @@ fn run<F: Function>(
     }
     running.armed = false;
     local::with(|local| local.pop(at));
+}
+
+/// A kept head's new frame starts at its keeper's round, so every nested recovery sees the
+/// outer cycle's round. The keeper runs on this stack (`claimed` guards stale ownership).
+fn inherit_round(storage: &Storage, at: u32, keeper: u32) {
+    // The planted bug: a kept head counts its rounds from 1 again.
+    #[cfg(test)]
+    if probe::KEPT_HEADS_START_AGAIN.with(Cell::get) {
+        return;
+    }
+    if keeper == 0 {
+        return;
+    }
+    local::with(|local| {
+        if let Some(below) = local.find(storage, keeper) {
+            local.frames[at as usize].round = local.frames[below as usize].round;
+        }
+    });
 }
 
 /// The durability a run read: `HIGH` when it read nothing, `LOW` when untracked.

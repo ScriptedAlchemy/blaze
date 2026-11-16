@@ -1593,13 +1593,14 @@ fn until_it_holds<F: Function<Db = TestDb, Key = Cell, Value = u64>>(
     db: &TestDb,
     cell: Cell,
 ) -> u64 {
-    loop {
+    for _ in 0..1024 {
         match Cancelled::catch(AssertUnwindSafe(|| *get::<F>(db, cell))) {
             Ok(value) => return value,
             Err(Cancelled::WouldWaitOnItself { .. }) => {}
             Err(other) => panic!("cancelled: {other}"),
         }
     }
+    panic!("{} did not retain its flight after 1024 attempts", F::NAME);
 }
 
 #[test]
@@ -3125,23 +3126,25 @@ impl Spec for CycGraph {
     }
 
     fn compute(db: &TestDb, key: Node) -> u64 {
-        let at = *interned_fields::<Indices>(db.storage(), key.0) as usize;
-        let mut value = 0;
-        for &dep in &db.graph[at].deps {
-            value = value.max(match dep {
-                Dep::Input(input) => {
-                    let cell = Cell(db.cells.lock()[input]);
-                    cell.a(db)
-                }
-                Dep::Query(query) => *fetch::<CycGraph>(db, node(db, query)),
-            });
-        }
-        value
+        max_node(db, key, |key| *fetch::<CycGraph>(db, key))
     }
 
     fn initial(_: &TestDb, _: Node) -> u64 {
         0
     }
+}
+
+/// The max-query body, with recursion through the query whose recovery is being tested.
+fn max_node(db: &TestDb, key: Node, query: impl Fn(Node) -> u64) -> u64 {
+    let at = *interned_fields::<Indices>(db.storage(), key.0) as usize;
+    let mut value = 0;
+    for &dep in &db.graph[at].deps {
+        value = value.max(match dep {
+            Dep::Input(input) => Cell(db.cells.lock()[input]).a(db),
+            Dep::Query(index) => query(node(db, index)),
+        });
+    }
+    value
 }
 
 /// Every node's least fixpoint: each the max of what it reads, from all 0, until none moves.
