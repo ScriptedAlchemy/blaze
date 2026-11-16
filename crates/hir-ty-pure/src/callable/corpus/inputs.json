@@ -1,0 +1,5978 @@
+{
+  "files": {
+    "analyzer-inputs/arity_mismatch.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "arity_mismatch",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "main": {
+            "body": [
+              [
+                "fn",
+                "f",
+                "takes_one"
+              ],
+              [
+                "call",
+                "r",
+                "f",
+                []
+              ],
+              [
+                "return",
+                "r"
+              ]
+            ],
+            "params": []
+          },
+          "takes_one": {
+            "body": [
+              [
+                "return",
+                "x"
+              ]
+            ],
+            "params": [
+              "x"
+            ]
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/byte_full_token_alias.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "byte_full_token_alias",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "cb",
+                "dirty"
+              ],
+              [
+                "view",
+                "alias",
+                "cb",
+                "byte_token"
+              ],
+              [
+                "copy",
+                "copied",
+                "alias"
+              ],
+              [
+                "call",
+                "result",
+                "copied",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/dormant_function_body.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "dormant_function_body",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "dormant": {
+            "body": [
+              [
+                "fn",
+                "callback",
+                "dirty"
+              ],
+              [
+                "call",
+                null,
+                "callback",
+                []
+              ],
+              [
+                "return",
+                null
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "unused",
+                "dormant"
+              ],
+              [
+                "scalar",
+                "result",
+                5
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/exposed_scalar_reaches_live_slot.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "exposed_scalar_reaches_live_slot",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {
+          "callback": {
+            "address": 4096,
+            "initial": {
+              "kind": "uninitialized"
+            }
+          }
+        },
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "cb",
+                "dirty"
+              ],
+              [
+                "addr",
+                "pointer",
+                "callback"
+              ],
+              [
+                "store",
+                "pointer",
+                "cb"
+              ],
+              [
+                "expose",
+                "bits",
+                "pointer"
+              ],
+              [
+                "fn",
+                "read",
+                "read_address"
+              ],
+              [
+                "call",
+                "loaded",
+                "read",
+                [
+                  "bits"
+                ]
+              ],
+              [
+                "call",
+                "result",
+                "loaded",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "read_address": {
+            "body": [
+              [
+                "recover",
+                "recovered",
+                "bits"
+              ],
+              [
+                "load",
+                "loaded",
+                "recovered"
+              ],
+              [
+                "return",
+                "loaded"
+              ]
+            ],
+            "params": [
+              "bits"
+            ]
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/external_raw_memory_callback.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "external_raw_memory_callback",
+      "inputs": {
+        "raw_address": {
+          "kind": "opaque",
+          "reason": "unconstrained integer; concrete witness is not an analyzer constant"
+        }
+      },
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [
+          "input:raw_address",
+          "cell:raw"
+        ],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {
+          "raw": {
+            "address": 4096,
+            "initial": {
+              "kind": "opaque",
+              "reason": "external raw memory contents"
+            }
+          }
+        },
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "input",
+                "bits",
+                "raw_address"
+              ],
+              [
+                "recover",
+                "pointer",
+                "bits"
+              ],
+              [
+                "load",
+                "cb",
+                "pointer"
+              ],
+              [
+                "call",
+                "result",
+                "cb",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/fuel_exhausted.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "fuel_exhausted",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "loop": {
+            "body": [
+              [
+                "fn",
+                "f",
+                "loop"
+              ],
+              [
+                "call",
+                null,
+                "f",
+                []
+              ],
+              [
+                "return",
+                null
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "f",
+                "loop"
+              ],
+              [
+                "call",
+                null,
+                "f",
+                []
+              ],
+              [
+                "return",
+                null
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/heap_callback_through_helpers.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "heap_callback_through_helpers",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {
+          "callback": {
+            "address": 4096,
+            "initial": {
+              "kind": "uninitialized"
+            }
+          }
+        },
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "getter": {
+            "body": [
+              [
+                "load",
+                "v",
+                "p"
+              ],
+              [
+                "return",
+                "v"
+              ]
+            ],
+            "params": [
+              "p"
+            ]
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "cb",
+                "dirty"
+              ],
+              [
+                "addr",
+                "pointer",
+                "callback"
+              ],
+              [
+                "fn",
+                "put",
+                "setter"
+              ],
+              [
+                "call",
+                null,
+                "put",
+                [
+                  "pointer",
+                  "cb"
+                ]
+              ],
+              [
+                "fn",
+                "get",
+                "getter"
+              ],
+              [
+                "call",
+                "loaded",
+                "get",
+                [
+                  "pointer"
+                ]
+              ],
+              [
+                "call",
+                "result",
+                "loaded",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "setter": {
+            "body": [
+              [
+                "store",
+                "p",
+                "v"
+              ],
+              [
+                "return",
+                null
+              ]
+            ],
+            "params": [
+              "p",
+              "v"
+            ]
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/invalid_address.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "invalid_address",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "main": {
+            "body": [
+              [
+                "scalar",
+                "bits",
+                9999
+              ],
+              [
+                "recover",
+                "p",
+                "bits"
+              ],
+              [
+                "return",
+                null
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/live_slot_overwrite.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "live_slot_overwrite",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {
+          "callback": {
+            "address": 4096,
+            "initial": {
+              "kind": "uninitialized"
+            }
+          }
+        },
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "old",
+                "dirty"
+              ],
+              [
+                "fn",
+                "new",
+                "pure"
+              ],
+              [
+                "addr",
+                "pointer",
+                "callback"
+              ],
+              [
+                "store",
+                "pointer",
+                "old"
+              ],
+              [
+                "store",
+                "pointer",
+                "new"
+              ],
+              [
+                "load",
+                "cb",
+                "pointer"
+              ],
+              [
+                "call",
+                "result",
+                "cb",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "pure": {
+            "body": [
+              [
+                "scalar",
+                "result",
+                7
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/memory_address_is_not_code.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "memory_address_is_not_code",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {
+          "callback": {
+            "address": 4096,
+            "initial": {
+              "kind": "uninitialized"
+            }
+          }
+        },
+        "entry": "main",
+        "functions": {
+          "main": {
+            "body": [
+              [
+                "addr",
+                "p",
+                "callback"
+              ],
+              [
+                "call",
+                null,
+                "p",
+                []
+              ],
+              [
+                "return",
+                null
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/mixed_branch_effectful.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "mixed_branch_effectful",
+      "inputs": {
+        "choice": {
+          "kind": "known_token",
+          "token": {
+            "kind": "scalar",
+            "origin": "input:choice",
+            "payload": 1
+          }
+        }
+      },
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "clean",
+                "pure"
+              ],
+              [
+                "fn",
+                "effectful",
+                "dirty"
+              ],
+              [
+                "input",
+                "choose",
+                "choice"
+              ],
+              [
+                "branch",
+                "choose",
+                4,
+                7
+              ],
+              [
+                "copy",
+                "cb",
+                "effectful"
+              ],
+              [
+                "call",
+                "result",
+                "cb",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ],
+              [
+                "copy",
+                "cb",
+                "clean"
+              ],
+              [
+                "call",
+                "result",
+                "cb",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "pure": {
+            "body": [
+              [
+                "scalar",
+                "result",
+                7
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/mixed_branch_pure.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "mixed_branch_pure",
+      "inputs": {
+        "choice": {
+          "kind": "known_token",
+          "token": {
+            "kind": "scalar",
+            "origin": "input:choice",
+            "payload": 0
+          }
+        }
+      },
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "clean",
+                "pure"
+              ],
+              [
+                "fn",
+                "effectful",
+                "dirty"
+              ],
+              [
+                "input",
+                "choose",
+                "choice"
+              ],
+              [
+                "branch",
+                "choose",
+                4,
+                7
+              ],
+              [
+                "copy",
+                "cb",
+                "effectful"
+              ],
+              [
+                "call",
+                "result",
+                "cb",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ],
+              [
+                "copy",
+                "cb",
+                "clean"
+              ],
+              [
+                "call",
+                "result",
+                "cb",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "pure": {
+            "body": [
+              [
+                "scalar",
+                "result",
+                7
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/partial_bytes_refused.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "partial_bytes_refused",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "f",
+                "dirty"
+              ],
+              [
+                "view",
+                "partial",
+                "f",
+                "partial_bytes"
+              ],
+              [
+                "return",
+                null
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/pure_typed_trampoline.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "pure_typed_trampoline",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "main": {
+            "body": [
+              [
+                "fn",
+                "cb",
+                "pure"
+              ],
+              [
+                "fn",
+                "tr",
+                "trampoline"
+              ],
+              [
+                "call",
+                "result",
+                "tr",
+                [
+                  "cb"
+                ]
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "pure": {
+            "body": [
+              [
+                "scalar",
+                "result",
+                7
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "trampoline": {
+            "body": [
+              [
+                "call",
+                "result",
+                "callback",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": [
+              "callback"
+            ]
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/recursive_finite.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "recursive_finite",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "main": {
+            "body": [
+              [
+                "scalar",
+                "n",
+                2
+              ],
+              [
+                "fn",
+                "rec",
+                "recur"
+              ],
+              [
+                "call",
+                "result",
+                "rec",
+                [
+                  "n"
+                ]
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "recur": {
+            "body": [
+              [
+                "branch",
+                "n",
+                1,
+                6
+              ],
+              [
+                "sub1",
+                "next",
+                "n"
+              ],
+              [
+                "fn",
+                "self",
+                "recur"
+              ],
+              [
+                "call",
+                "result",
+                "self",
+                [
+                  "next"
+                ]
+              ],
+              [
+                "effect",
+                "unwind",
+                [
+                  "n"
+                ]
+              ],
+              [
+                "return",
+                "result"
+              ],
+              [
+                "scalar",
+                "base",
+                9
+              ],
+              [
+                "return",
+                "base"
+              ]
+            ],
+            "params": [
+              "n"
+            ]
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/returned_callback_factory.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "returned_callback_factory",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "factory": {
+            "body": [
+              [
+                "fn",
+                "result",
+                "dirty"
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "factory",
+                "factory"
+              ],
+              [
+                "call",
+                "cb",
+                "factory",
+                []
+              ],
+              [
+                "call",
+                "result",
+                "cb",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/unconstrained_integer_reaches_live_slot.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "unconstrained_integer_reaches_live_slot",
+      "inputs": {
+        "raw_address": {
+          "kind": "opaque",
+          "reason": "unconstrained integer; concrete witness is not an analyzer constant"
+        }
+      },
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [
+          "input:raw_address"
+        ],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {
+          "callback": {
+            "address": 4096,
+            "initial": {
+              "kind": "uninitialized"
+            }
+          }
+        },
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "cb",
+                "dirty"
+              ],
+              [
+                "addr",
+                "pointer",
+                "callback"
+              ],
+              [
+                "store",
+                "pointer",
+                "cb"
+              ],
+              [
+                "input",
+                "bits",
+                "raw_address"
+              ],
+              [
+                "fn",
+                "read",
+                "read_address"
+              ],
+              [
+                "call",
+                "loaded",
+                "read",
+                [
+                  "bits"
+                ]
+              ],
+              [
+                "call",
+                "result",
+                "loaded",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "read_address": {
+            "body": [
+              [
+                "recover",
+                "recovered",
+                "bits"
+              ],
+              [
+                "load",
+                "loaded",
+                "recovered"
+              ],
+              [
+                "return",
+                "loaded"
+              ]
+            ],
+            "params": [
+              "bits"
+            ]
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/uninitialized_cell.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "uninitialized_cell",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {
+          "callback": {
+            "address": 4096,
+            "initial": {
+              "kind": "uninitialized"
+            }
+          }
+        },
+        "entry": "main",
+        "functions": {
+          "main": {
+            "body": [
+              [
+                "addr",
+                "p",
+                "callback"
+              ],
+              [
+                "load",
+                "v",
+                "p"
+              ],
+              [
+                "return",
+                "v"
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/union_full_token_alias.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "union_full_token_alias",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "cb",
+                "dirty"
+              ],
+              [
+                "view",
+                "alias",
+                "cb",
+                "union_token"
+              ],
+              [
+                "copy",
+                "copied",
+                "alias"
+              ],
+              [
+                "call",
+                "result",
+                "copied",
+                []
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "analyzer-inputs/unused_effectful_fn_creation.json": {
+      "address_policy": "Cells are data locations. Fn targets are separate symbolic names. Unsupported recover/view semantics may remain incomplete.",
+      "args": [],
+      "branch_policy": "Known scalar input selects only that concrete path; no alternative path is merged here.",
+      "case_id": "unused_effectful_fn_creation",
+      "inputs": {},
+      "policy": {
+        "analyzer_verdict_not_implemented": true,
+        "concrete_trace_is_a_witness_only": true,
+        "incomplete_is_allowed": true,
+        "opaque_sources": [],
+        "opaque_values_must_not_imply_clean": true
+      },
+      "program": {
+        "cells": {},
+        "entry": "main",
+        "functions": {
+          "dirty": {
+            "body": [
+              [
+                "effect",
+                "io.write",
+                []
+              ],
+              [
+                "scalar",
+                "result",
+                11
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          },
+          "main": {
+            "body": [
+              [
+                "fn",
+                "unused",
+                "dirty"
+              ],
+              [
+                "scalar",
+                "result",
+                5
+              ],
+              [
+                "return",
+                "result"
+              ]
+            ],
+            "params": []
+          }
+        },
+        "schema": "concrete-callable-program/1"
+      },
+      "schema": "callable-analyzer-input/1",
+      "source_language": "concrete-callable-program/1; cell initial values replaced by abstract input descriptors"
+    },
+    "checkout-before.json": {
+      "frozen": {
+        "commit": "bef2422829b778559c292c4380d32d0953691529",
+        "path": "/home/zack/.t3/worktrees/blaze/t3-27ad9146",
+        "porcelain": "",
+        "tree": "dadd7013ae0f552e6058e384e29dfe0569f3c91d"
+      },
+      "observed": {
+        "commit": "c531b3b4cdae2c4e2543e6e274cb3f37dc240ff0",
+        "path": "/fast/projects/blaze",
+        "porcelain": "",
+        "tree": "9ac3e4e041f96c8a1c9ba1fed76cc6c7819f15c7"
+      }
+    },
+    "corpus.json": {
+      "cases": [
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "fn",
+                    "origin": "main#0:0",
+                    "payload": "pure"
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "trampoline"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "pure"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "trampoline",
+              "pure"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 2,
+                "function": "pure",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#2:0",
+                  "payload": 7
+                }
+              },
+              {
+                "activation": 1,
+                "function": "trampoline",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#2:0",
+                  "payload": 7
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#2:0",
+                  "payload": 7
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "pure_typed_trampoline",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "cb",
+                    "pure"
+                  ],
+                  [
+                    "fn",
+                    "tr",
+                    "trampoline"
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "tr",
+                    [
+                      "cb"
+                    ]
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "pure": {
+                "body": [
+                  [
+                    "scalar",
+                    "result",
+                    7
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "trampoline": {
+                "body": [
+                  [
+                    "call",
+                    "result",
+                    "callback",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": [
+                  "callback"
+                ]
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "Parameter callback executes through a typed trampoline."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "factory"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "factory#1:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "factory",
+              "dirty"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "factory",
+                "value": {
+                  "kind": "fn",
+                  "origin": "factory#1:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "activation": 2,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "returned_callback_factory",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "factory": {
+                "body": [
+                  [
+                    "fn",
+                    "result",
+                    "dirty"
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "factory",
+                    "factory"
+                  ],
+                  [
+                    "call",
+                    "cb",
+                    "factory",
+                    []
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "cb",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "Indirect factory invocation returns the subsequently invoked callback."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "addr",
+                    "origin": "main#0:1",
+                    "payload": "callback"
+                  },
+                  {
+                    "kind": "fn",
+                    "origin": "main#0:0",
+                    "payload": "dirty"
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:2",
+                  "payload": "setter"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "addr",
+                    "origin": "main#0:1",
+                    "payload": "callback"
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:4",
+                  "payload": "getter"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "setter",
+              "getter",
+              "dirty"
+            ],
+            "memory_trace": [
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:1",
+                  "payload": "callback"
+                },
+                "at": "setter#1:0",
+                "cell": "callback",
+                "op": "store",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:1",
+                  "payload": "callback"
+                },
+                "at": "getter#2:0",
+                "cell": "callback",
+                "op": "load",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "setter",
+                "value": null
+              },
+              {
+                "activation": 2,
+                "function": "getter",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "activation": 3,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#3:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#3:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "heap_callback_through_helpers",
+          "program": {
+            "cells": {
+              "callback": {
+                "address": 4096,
+                "initial": null
+              }
+            },
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "getter": {
+                "body": [
+                  [
+                    "load",
+                    "v",
+                    "p"
+                  ],
+                  [
+                    "return",
+                    "v"
+                  ]
+                ],
+                "params": [
+                  "p"
+                ]
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "cb",
+                    "dirty"
+                  ],
+                  [
+                    "addr",
+                    "pointer",
+                    "callback"
+                  ],
+                  [
+                    "fn",
+                    "put",
+                    "setter"
+                  ],
+                  [
+                    "call",
+                    null,
+                    "put",
+                    [
+                      "pointer",
+                      "cb"
+                    ]
+                  ],
+                  [
+                    "fn",
+                    "get",
+                    "getter"
+                  ],
+                  [
+                    "call",
+                    "loaded",
+                    "get",
+                    [
+                      "pointer"
+                    ]
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "loaded",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "setter": {
+                "body": [
+                  [
+                    "store",
+                    "p",
+                    "v"
+                  ],
+                  [
+                    "return",
+                    null
+                  ]
+                ],
+                "params": [
+                  "p",
+                  "v"
+                ]
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "Helpers perform an actual shared-heap store and load before invocation."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": null,
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "main#0:1",
+                  "payload": 5
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "unused_effectful_fn_creation",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "unused",
+                    "dirty"
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    5
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "Creating an effectful function token does not invoke it."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "dirty"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "union_full_token_alias",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "cb",
+                    "dirty"
+                  ],
+                  [
+                    "view",
+                    "alias",
+                    "cb",
+                    "union_token"
+                  ],
+                  [
+                    "copy",
+                    "copied",
+                    "alias"
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "copied",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "Full-token copy view preserves the original function token, without byte-level semantics."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "dirty"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "byte_full_token_alias",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "cb",
+                    "dirty"
+                  ],
+                  [
+                    "view",
+                    "alias",
+                    "cb",
+                    "byte_token"
+                  ],
+                  [
+                    "copy",
+                    "copied",
+                    "alias"
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "copied",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "Full-token copy view preserves the original function token, without byte-level semantics."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {
+            "inputs": {
+              "choice": {
+                "kind": "scalar",
+                "origin": "input:choice",
+                "payload": 1
+              }
+            }
+          },
+          "expected": {
+            "branches": [
+              {
+                "at": "main#0:3",
+                "condition": {
+                  "kind": "scalar",
+                  "origin": "input:choice",
+                  "payload": 1
+                },
+                "selected": "then"
+              }
+            ],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "dirty"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "mixed_branch_effectful",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "clean",
+                    "pure"
+                  ],
+                  [
+                    "fn",
+                    "effectful",
+                    "dirty"
+                  ],
+                  [
+                    "input",
+                    "choose",
+                    "choice"
+                  ],
+                  [
+                    "branch",
+                    "choose",
+                    4,
+                    7
+                  ],
+                  [
+                    "copy",
+                    "cb",
+                    "effectful"
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "cb",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ],
+                  [
+                    "copy",
+                    "cb",
+                    "clean"
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "cb",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "pure": {
+                "body": [
+                  [
+                    "scalar",
+                    "result",
+                    7
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "One explicitly selected concrete execution of the same mixed-branch source."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {
+            "inputs": {
+              "choice": {
+                "kind": "scalar",
+                "origin": "input:choice",
+                "payload": 0
+              }
+            }
+          },
+          "expected": {
+            "branches": [
+              {
+                "at": "main#0:3",
+                "condition": {
+                  "kind": "scalar",
+                  "origin": "input:choice",
+                  "payload": 0
+                },
+                "selected": "else"
+              }
+            ],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "pure"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "pure"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "pure",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#1:0",
+                  "payload": 7
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#1:0",
+                  "payload": 7
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "mixed_branch_pure",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "clean",
+                    "pure"
+                  ],
+                  [
+                    "fn",
+                    "effectful",
+                    "dirty"
+                  ],
+                  [
+                    "input",
+                    "choose",
+                    "choice"
+                  ],
+                  [
+                    "branch",
+                    "choose",
+                    4,
+                    7
+                  ],
+                  [
+                    "copy",
+                    "cb",
+                    "effectful"
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "cb",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ],
+                  [
+                    "copy",
+                    "cb",
+                    "clean"
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "cb",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "pure": {
+                "body": [
+                  [
+                    "scalar",
+                    "result",
+                    7
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "One explicitly selected concrete execution of the same mixed-branch source."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "exposed",
+                    "origin": "main#0:1",
+                    "payload": 4096
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:4",
+                  "payload": "read_address"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "read_address",
+              "dirty"
+            ],
+            "memory_trace": [
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:1",
+                  "payload": "callback"
+                },
+                "at": "main#0:2",
+                "cell": "callback",
+                "op": "store",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:1",
+                  "payload": "callback"
+                },
+                "at": "read_address#1:1",
+                "cell": "callback",
+                "op": "load",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "read_address",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "activation": 2,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "exposed_scalar_reaches_live_slot",
+          "program": {
+            "cells": {
+              "callback": {
+                "address": 4096,
+                "initial": null
+              }
+            },
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "cb",
+                    "dirty"
+                  ],
+                  [
+                    "addr",
+                    "pointer",
+                    "callback"
+                  ],
+                  [
+                    "store",
+                    "pointer",
+                    "cb"
+                  ],
+                  [
+                    "expose",
+                    "bits",
+                    "pointer"
+                  ],
+                  [
+                    "fn",
+                    "read",
+                    "read_address"
+                  ],
+                  [
+                    "call",
+                    "loaded",
+                    "read",
+                    [
+                      "bits"
+                    ]
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "loaded",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "read_address": {
+                "body": [
+                  [
+                    "recover",
+                    "recovered",
+                    "bits"
+                  ],
+                  [
+                    "load",
+                    "loaded",
+                    "recovered"
+                  ],
+                  [
+                    "return",
+                    "loaded"
+                  ]
+                ],
+                "params": [
+                  "bits"
+                ]
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "An address representation reaches storage containing Fn; the numeric address is not Fn."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": [
+              "raw_address"
+            ]
+          },
+          "execution": {
+            "inputs": {
+              "raw_address": {
+                "kind": "scalar",
+                "origin": "input:raw_address",
+                "payload": 4096
+              }
+            }
+          },
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "scalar",
+                    "origin": "input:raw_address",
+                    "payload": 4096
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:4",
+                  "payload": "read_address"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "read_address",
+              "dirty"
+            ],
+            "memory_trace": [
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:1",
+                  "payload": "callback"
+                },
+                "at": "main#0:2",
+                "cell": "callback",
+                "op": "store",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "input:raw_address",
+                  "payload": "callback"
+                },
+                "at": "read_address#1:1",
+                "cell": "callback",
+                "op": "load",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "read_address",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "activation": 2,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "unconstrained_integer_reaches_live_slot",
+          "program": {
+            "cells": {
+              "callback": {
+                "address": 4096,
+                "initial": null
+              }
+            },
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "cb",
+                    "dirty"
+                  ],
+                  [
+                    "addr",
+                    "pointer",
+                    "callback"
+                  ],
+                  [
+                    "store",
+                    "pointer",
+                    "cb"
+                  ],
+                  [
+                    "input",
+                    "bits",
+                    "raw_address"
+                  ],
+                  [
+                    "fn",
+                    "read",
+                    "read_address"
+                  ],
+                  [
+                    "call",
+                    "loaded",
+                    "read",
+                    [
+                      "bits"
+                    ]
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "loaded",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "read_address": {
+                "body": [
+                  [
+                    "recover",
+                    "recovered",
+                    "bits"
+                  ],
+                  [
+                    "load",
+                    "loaded",
+                    "recovered"
+                  ],
+                  [
+                    "return",
+                    "loaded"
+                  ]
+                ],
+                "params": [
+                  "bits"
+                ]
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "An address representation reaches storage containing Fn; the numeric address is not Fn."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [
+              "raw"
+            ],
+            "opaque_inputs": [
+              "raw_address"
+            ]
+          },
+          "execution": {
+            "inputs": {
+              "raw_address": {
+                "kind": "scalar",
+                "origin": "input:raw_address",
+                "payload": 4096
+              }
+            }
+          },
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "external:raw",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "dirty"
+            ],
+            "memory_trace": [
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "input:raw_address",
+                  "payload": "raw"
+                },
+                "at": "main#0:2",
+                "cell": "raw",
+                "op": "load",
+                "value": {
+                  "kind": "fn",
+                  "origin": "external:raw",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "external_raw_memory_callback",
+          "program": {
+            "cells": {
+              "raw": {
+                "address": 4096,
+                "initial": {
+                  "kind": "fn",
+                  "origin": "external:raw",
+                  "payload": "dirty"
+                }
+              }
+            },
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "input",
+                    "bits",
+                    "raw_address"
+                  ],
+                  [
+                    "recover",
+                    "pointer",
+                    "bits"
+                  ],
+                  [
+                    "load",
+                    "cb",
+                    "pointer"
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "cb",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "The concrete environment supplies a callback; its analyzer input remains opaque."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": null,
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "main#0:1",
+                  "payload": 5
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "dormant_function_body",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "dormant": {
+                "body": [
+                  [
+                    "fn",
+                    "callback",
+                    "dirty"
+                  ],
+                  [
+                    "call",
+                    null,
+                    "callback",
+                    []
+                  ],
+                  [
+                    "return",
+                    null
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "unused",
+                    "dormant"
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    5
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "Uninvoked bodies contain calls and effects, but execute neither."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [
+              {
+                "at": "recur#1:0",
+                "condition": {
+                  "kind": "scalar",
+                  "origin": "main#0:0",
+                  "payload": 2
+                },
+                "selected": "then"
+              },
+              {
+                "at": "recur#2:0",
+                "condition": {
+                  "kind": "scalar",
+                  "origin": "recur#1:1",
+                  "payload": 1
+                },
+                "selected": "then"
+              },
+              {
+                "at": "recur#3:0",
+                "condition": {
+                  "kind": "scalar",
+                  "origin": "recur#2:1",
+                  "payload": 0
+                },
+                "selected": "else"
+              }
+            ],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "scalar",
+                    "origin": "main#0:0",
+                    "payload": 2
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "recur"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "scalar",
+                    "origin": "recur#1:1",
+                    "payload": 1
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "recur#1:2",
+                  "payload": "recur"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "scalar",
+                    "origin": "recur#2:1",
+                    "payload": 0
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "recur#2:2",
+                  "payload": "recur"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "unwind",
+                "values": [
+                  {
+                    "kind": "scalar",
+                    "origin": "recur#1:1",
+                    "payload": 1
+                  }
+                ]
+              },
+              {
+                "label": "unwind",
+                "values": [
+                  {
+                    "kind": "scalar",
+                    "origin": "main#0:0",
+                    "payload": 2
+                  }
+                ]
+              }
+            ],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "recur",
+              "recur",
+              "recur"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 3,
+                "function": "recur",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "recur#3:6",
+                  "payload": 9
+                }
+              },
+              {
+                "activation": 2,
+                "function": "recur",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "recur#3:6",
+                  "payload": 9
+                }
+              },
+              {
+                "activation": 1,
+                "function": "recur",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "recur#3:6",
+                  "payload": 9
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "recur#3:6",
+                  "payload": 9
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "recursive_finite",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "main": {
+                "body": [
+                  [
+                    "scalar",
+                    "n",
+                    2
+                  ],
+                  [
+                    "fn",
+                    "rec",
+                    "recur"
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "rec",
+                    [
+                      "n"
+                    ]
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "recur": {
+                "body": [
+                  [
+                    "branch",
+                    "n",
+                    1,
+                    6
+                  ],
+                  [
+                    "sub1",
+                    "next",
+                    "n"
+                  ],
+                  [
+                    "fn",
+                    "self",
+                    "recur"
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "self",
+                    [
+                      "next"
+                    ]
+                  ],
+                  [
+                    "effect",
+                    "unwind",
+                    [
+                      "n"
+                    ]
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ],
+                  [
+                    "scalar",
+                    "base",
+                    9
+                  ],
+                  [
+                    "return",
+                    "base"
+                  ]
+                ],
+                "params": [
+                  "n"
+                ]
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "Three distinct recursive frames return one base token, then effects occur while unwinding."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "pure"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": null,
+            "invoked_targets": [
+              "main",
+              "pure"
+            ],
+            "memory_trace": [
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:2",
+                  "payload": "callback"
+                },
+                "at": "main#0:3",
+                "cell": "callback",
+                "op": "store",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:2",
+                  "payload": "callback"
+                },
+                "at": "main#0:4",
+                "cell": "callback",
+                "op": "store",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "pure"
+                }
+              },
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:2",
+                  "payload": "callback"
+                },
+                "at": "main#0:5",
+                "cell": "callback",
+                "op": "load",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "pure"
+                }
+              }
+            ],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "pure",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#1:0",
+                  "payload": 7
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#1:0",
+                  "payload": 7
+                }
+              }
+            ],
+            "status": "complete"
+          },
+          "fuel": 128,
+          "id": "live_slot_overwrite",
+          "program": {
+            "cells": {
+              "callback": {
+                "address": 4096,
+                "initial": null
+              }
+            },
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "old",
+                    "dirty"
+                  ],
+                  [
+                    "fn",
+                    "new",
+                    "pure"
+                  ],
+                  [
+                    "addr",
+                    "pointer",
+                    "callback"
+                  ],
+                  [
+                    "store",
+                    "pointer",
+                    "old"
+                  ],
+                  [
+                    "store",
+                    "pointer",
+                    "new"
+                  ],
+                  [
+                    "load",
+                    "cb",
+                    "pointer"
+                  ],
+                  [
+                    "call",
+                    "result",
+                    "cb",
+                    []
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "pure": {
+                "body": [
+                  [
+                    "scalar",
+                    "result",
+                    7
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "A concrete load sees the last store, with no union of old and new tokens."
+        }
+      ],
+      "error_cases": [
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "invalid_address",
+              "detail": "scalar address 9999 names no cell"
+            },
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "status": "failed"
+          },
+          "fuel": 128,
+          "id": "invalid_address",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "main": {
+                "body": [
+                  [
+                    "scalar",
+                    "bits",
+                    9999
+                  ],
+                  [
+                    "recover",
+                    "p",
+                    "bits"
+                  ],
+                  [
+                    "return",
+                    null
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "Unknown numeric storage addresses fail explicitly."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "arity_mismatch",
+              "detail": "function 'takes_one' needs 1 arguments, got 0"
+            },
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "status": "failed"
+          },
+          "fuel": 128,
+          "id": "arity_mismatch",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "f",
+                    "takes_one"
+                  ],
+                  [
+                    "call",
+                    "r",
+                    "f",
+                    []
+                  ],
+                  [
+                    "return",
+                    "r"
+                  ]
+                ],
+                "params": []
+              },
+              "takes_one": {
+                "body": [
+                  [
+                    "return",
+                    "x"
+                  ]
+                ],
+                "params": [
+                  "x"
+                ]
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "The wrong number of arguments fails before entering a callee."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "loop"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "loop#1:0",
+                  "payload": "loop"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "fuel_exhausted",
+              "detail": "execution stopped at the finite instruction budget"
+            },
+            "invoked_targets": [
+              "main",
+              "loop",
+              "loop"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "status": "incomplete"
+          },
+          "fuel": 4,
+          "id": "fuel_exhausted",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "loop": {
+                "body": [
+                  [
+                    "fn",
+                    "f",
+                    "loop"
+                  ],
+                  [
+                    "call",
+                    null,
+                    "f",
+                    []
+                  ],
+                  [
+                    "return",
+                    null
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "f",
+                    "loop"
+                  ],
+                  [
+                    "call",
+                    null,
+                    "f",
+                    []
+                  ],
+                  [
+                    "return",
+                    null
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "An unfinished recursive stack is incomplete rather than clean or complete."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "expected_function",
+              "detail": "call requires Fn, got addr"
+            },
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "status": "failed"
+          },
+          "fuel": 128,
+          "id": "memory_address_is_not_code",
+          "program": {
+            "cells": {
+              "callback": {
+                "address": 4096,
+                "initial": null
+              }
+            },
+            "entry": "main",
+            "functions": {
+              "main": {
+                "body": [
+                  [
+                    "addr",
+                    "p",
+                    "callback"
+                  ],
+                  [
+                    "call",
+                    null,
+                    "p",
+                    []
+                  ],
+                  [
+                    "return",
+                    null
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "Even a live Addr cannot be called as Fn."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "uninitialized_cell",
+              "detail": "cell 'callback' has no value"
+            },
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "status": "failed"
+          },
+          "fuel": 128,
+          "id": "uninitialized_cell",
+          "program": {
+            "cells": {
+              "callback": {
+                "address": 4096,
+                "initial": null
+              }
+            },
+            "entry": "main",
+            "functions": {
+              "main": {
+                "body": [
+                  [
+                    "addr",
+                    "p",
+                    "callback"
+                  ],
+                  [
+                    "load",
+                    "v",
+                    "p"
+                  ],
+                  [
+                    "return",
+                    "v"
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "An empty cell is an error, never an invented value."
+        },
+        {
+          "abstraction": {
+            "opaque_cells": [],
+            "opaque_inputs": []
+          },
+          "execution": {},
+          "expected": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "unsupported_view",
+              "detail": "only full-token union_token and byte_token copy views exist"
+            },
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "status": "failed"
+          },
+          "fuel": 128,
+          "id": "partial_bytes_refused",
+          "program": {
+            "cells": {},
+            "entry": "main",
+            "functions": {
+              "dirty": {
+                "body": [
+                  [
+                    "effect",
+                    "io.write",
+                    []
+                  ],
+                  [
+                    "scalar",
+                    "result",
+                    11
+                  ],
+                  [
+                    "return",
+                    "result"
+                  ]
+                ],
+                "params": []
+              },
+              "main": {
+                "body": [
+                  [
+                    "fn",
+                    "f",
+                    "dirty"
+                  ],
+                  [
+                    "view",
+                    "partial",
+                    "f",
+                    "partial_bytes"
+                  ],
+                  [
+                    "return",
+                    null
+                  ]
+                ],
+                "params": []
+              }
+            },
+            "schema": "concrete-callable-program/1"
+          },
+          "purpose": "Partial-byte reconstruction lies outside this full-token language."
+        }
+      ],
+      "expected_source": "Hand-derived literals in author_corpus.py; interpreter output is never used to write expectations.",
+      "schema": "concrete-callable-corpus/1",
+      "scope": "First-order concrete token language, not Rust pointers, MIR, native execution or an abstract analyzer."
+    },
+    "self-test-result.json": {
+      "controls": {
+        "invoked_dormant_body_rejected": true,
+        "removed_effect_rejected": true,
+        "unknown_request_field_rejected": true
+      },
+      "corpus_sha256": "a1732cb42544473df36b7b093b7a2d60aeac2ad9ff49fdd6189e5094c32b4fde",
+      "error_cases": 6,
+      "failures": [],
+      "fixture_cases": 14,
+      "interpreter_sha256": "d97367497a56777eb112bfa111e429e031ba9595867f1e371a629467ade05352",
+      "passed": true,
+      "records": [
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "fn",
+                    "origin": "main#0:0",
+                    "payload": "pure"
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "trampoline"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "pure"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": null,
+            "fuel_remaining": 120,
+            "invoked_targets": [
+              "main",
+              "trampoline",
+              "pure"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 2,
+                "function": "pure",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#2:0",
+                  "payload": 7
+                }
+              },
+              {
+                "activation": 1,
+                "function": "trampoline",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#2:0",
+                  "payload": 7
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#2:0",
+                  "payload": 7
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 8
+          },
+          "case": "pure_typed_trampoline",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "factory"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "factory#1:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "fuel_remaining": 119,
+            "invoked_targets": [
+              "main",
+              "factory",
+              "dirty"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "factory",
+                "value": {
+                  "kind": "fn",
+                  "origin": "factory#1:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "activation": 2,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 9
+          },
+          "case": "returned_callback_factory",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "addr",
+                    "origin": "main#0:1",
+                    "payload": "callback"
+                  },
+                  {
+                    "kind": "fn",
+                    "origin": "main#0:0",
+                    "payload": "dirty"
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:2",
+                  "payload": "setter"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "addr",
+                    "origin": "main#0:1",
+                    "payload": "callback"
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:4",
+                  "payload": "getter"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "fuel_remaining": 113,
+            "invoked_targets": [
+              "main",
+              "setter",
+              "getter",
+              "dirty"
+            ],
+            "memory_trace": [
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:1",
+                  "payload": "callback"
+                },
+                "at": "setter#1:0",
+                "cell": "callback",
+                "op": "store",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:1",
+                  "payload": "callback"
+                },
+                "at": "getter#2:0",
+                "cell": "callback",
+                "op": "load",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "setter",
+                "value": null
+              },
+              {
+                "activation": 2,
+                "function": "getter",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "activation": 3,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#3:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#3:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 15
+          },
+          "case": "heap_callback_through_helpers",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": null,
+            "fuel_remaining": 125,
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "main#0:1",
+                  "payload": 5
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 3
+          },
+          "case": "unused_effectful_fn_creation",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "fuel_remaining": 120,
+            "invoked_targets": [
+              "main",
+              "dirty"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 8
+          },
+          "case": "union_full_token_alias",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "fuel_remaining": 120,
+            "invoked_targets": [
+              "main",
+              "dirty"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 8
+          },
+          "case": "byte_full_token_alias",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [
+              {
+                "at": "main#0:3",
+                "condition": {
+                  "kind": "scalar",
+                  "origin": "input:choice",
+                  "payload": 1
+                },
+                "selected": "then"
+              }
+            ],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "fuel_remaining": 118,
+            "invoked_targets": [
+              "main",
+              "dirty"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 10
+          },
+          "case": "mixed_branch_effectful",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [
+              {
+                "at": "main#0:3",
+                "condition": {
+                  "kind": "scalar",
+                  "origin": "input:choice",
+                  "payload": 0
+                },
+                "selected": "else"
+              }
+            ],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "pure"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": null,
+            "fuel_remaining": 119,
+            "invoked_targets": [
+              "main",
+              "pure"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "pure",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#1:0",
+                  "payload": 7
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#1:0",
+                  "payload": 7
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 9
+          },
+          "case": "mixed_branch_pure",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "exposed",
+                    "origin": "main#0:1",
+                    "payload": 4096
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:4",
+                  "payload": "read_address"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "fuel_remaining": 114,
+            "invoked_targets": [
+              "main",
+              "read_address",
+              "dirty"
+            ],
+            "memory_trace": [
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:1",
+                  "payload": "callback"
+                },
+                "at": "main#0:2",
+                "cell": "callback",
+                "op": "store",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:1",
+                  "payload": "callback"
+                },
+                "at": "read_address#1:1",
+                "cell": "callback",
+                "op": "load",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "read_address",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "activation": 2,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 14
+          },
+          "case": "exposed_scalar_reaches_live_slot",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "scalar",
+                    "origin": "input:raw_address",
+                    "payload": 4096
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:4",
+                  "payload": "read_address"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "fuel_remaining": 114,
+            "invoked_targets": [
+              "main",
+              "read_address",
+              "dirty"
+            ],
+            "memory_trace": [
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:1",
+                  "payload": "callback"
+                },
+                "at": "main#0:2",
+                "cell": "callback",
+                "op": "store",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "input:raw_address",
+                  "payload": "callback"
+                },
+                "at": "read_address#1:1",
+                "cell": "callback",
+                "op": "load",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "read_address",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "activation": 2,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#2:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 14
+          },
+          "case": "unconstrained_integer_reaches_live_slot",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "external:raw",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "io.write",
+                "values": []
+              }
+            ],
+            "failure": null,
+            "fuel_remaining": 120,
+            "invoked_targets": [
+              "main",
+              "dirty"
+            ],
+            "memory_trace": [
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "input:raw_address",
+                  "payload": "raw"
+                },
+                "at": "main#0:2",
+                "cell": "raw",
+                "op": "load",
+                "value": {
+                  "kind": "fn",
+                  "origin": "external:raw",
+                  "payload": "dirty"
+                }
+              }
+            ],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "dirty",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "dirty#1:1",
+                  "payload": 11
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 8
+          },
+          "case": "external_raw_memory_callback",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": null,
+            "fuel_remaining": 125,
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "main#0:1",
+                  "payload": 5
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 3
+          },
+          "case": "dormant_function_body",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [
+              {
+                "at": "recur#1:0",
+                "condition": {
+                  "kind": "scalar",
+                  "origin": "main#0:0",
+                  "payload": 2
+                },
+                "selected": "then"
+              },
+              {
+                "at": "recur#2:0",
+                "condition": {
+                  "kind": "scalar",
+                  "origin": "recur#1:1",
+                  "payload": 1
+                },
+                "selected": "then"
+              },
+              {
+                "at": "recur#3:0",
+                "condition": {
+                  "kind": "scalar",
+                  "origin": "recur#2:1",
+                  "payload": 0
+                },
+                "selected": "else"
+              }
+            ],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "scalar",
+                    "origin": "main#0:0",
+                    "payload": 2
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "recur"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "scalar",
+                    "origin": "recur#1:1",
+                    "payload": 1
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "recur#1:2",
+                  "payload": "recur"
+                }
+              },
+              {
+                "args": [
+                  {
+                    "kind": "scalar",
+                    "origin": "recur#2:1",
+                    "payload": 0
+                  }
+                ],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "recur#2:2",
+                  "payload": "recur"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "label": "unwind",
+                "values": [
+                  {
+                    "kind": "scalar",
+                    "origin": "recur#1:1",
+                    "payload": 1
+                  }
+                ]
+              },
+              {
+                "label": "unwind",
+                "values": [
+                  {
+                    "kind": "scalar",
+                    "origin": "main#0:0",
+                    "payload": 2
+                  }
+                ]
+              }
+            ],
+            "failure": null,
+            "fuel_remaining": 109,
+            "invoked_targets": [
+              "main",
+              "recur",
+              "recur",
+              "recur"
+            ],
+            "memory_trace": [],
+            "returns": [
+              {
+                "activation": 3,
+                "function": "recur",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "recur#3:6",
+                  "payload": 9
+                }
+              },
+              {
+                "activation": 2,
+                "function": "recur",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "recur#3:6",
+                  "payload": 9
+                }
+              },
+              {
+                "activation": 1,
+                "function": "recur",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "recur#3:6",
+                  "payload": 9
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "recur#3:6",
+                  "payload": 9
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 19
+          },
+          "case": "recursive_finite",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "pure"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": null,
+            "fuel_remaining": 118,
+            "invoked_targets": [
+              "main",
+              "pure"
+            ],
+            "memory_trace": [
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:2",
+                  "payload": "callback"
+                },
+                "at": "main#0:3",
+                "cell": "callback",
+                "op": "store",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "dirty"
+                }
+              },
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:2",
+                  "payload": "callback"
+                },
+                "at": "main#0:4",
+                "cell": "callback",
+                "op": "store",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "pure"
+                }
+              },
+              {
+                "address": {
+                  "kind": "addr",
+                  "origin": "main#0:2",
+                  "payload": "callback"
+                },
+                "at": "main#0:5",
+                "cell": "callback",
+                "op": "load",
+                "value": {
+                  "kind": "fn",
+                  "origin": "main#0:1",
+                  "payload": "pure"
+                }
+              }
+            ],
+            "returns": [
+              {
+                "activation": 1,
+                "function": "pure",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#1:0",
+                  "payload": 7
+                }
+              },
+              {
+                "activation": 0,
+                "function": "main",
+                "value": {
+                  "kind": "scalar",
+                  "origin": "pure#1:0",
+                  "payload": 7
+                }
+              }
+            ],
+            "schema": "concrete-callable-result/1",
+            "status": "complete",
+            "steps": 10
+          },
+          "case": "live_slot_overwrite",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "invalid_address",
+              "detail": "scalar address 9999 names no cell"
+            },
+            "fuel_remaining": 126,
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "schema": "concrete-callable-result/1",
+            "status": "failed",
+            "steps": 2
+          },
+          "case": "invalid_address",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "arity_mismatch",
+              "detail": "function 'takes_one' needs 1 arguments, got 0"
+            },
+            "fuel_remaining": 126,
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "schema": "concrete-callable-result/1",
+            "status": "failed",
+            "steps": 2
+          },
+          "case": "arity_mismatch",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "main#0:0",
+                  "payload": "loop"
+                }
+              },
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "loop#1:0",
+                  "payload": "loop"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "fuel_exhausted",
+              "detail": "execution stopped at the finite instruction budget"
+            },
+            "fuel_remaining": 0,
+            "invoked_targets": [
+              "main",
+              "loop",
+              "loop"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "schema": "concrete-callable-result/1",
+            "status": "incomplete",
+            "steps": 4
+          },
+          "case": "fuel_exhausted",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "expected_function",
+              "detail": "call requires Fn, got addr"
+            },
+            "fuel_remaining": 126,
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "schema": "concrete-callable-result/1",
+            "status": "failed",
+            "steps": 2
+          },
+          "case": "memory_address_is_not_code",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "uninitialized_cell",
+              "detail": "cell 'callback' has no value"
+            },
+            "fuel_remaining": 126,
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "schema": "concrete-callable-result/1",
+            "status": "failed",
+            "steps": 2
+          },
+          "case": "uninitialized_cell",
+          "matched_manual_expected": true
+        },
+        {
+          "actual": {
+            "branches": [],
+            "call_trace": [
+              {
+                "args": [],
+                "callee": {
+                  "kind": "fn",
+                  "origin": "entry",
+                  "payload": "main"
+                }
+              }
+            ],
+            "effects": [],
+            "failure": {
+              "code": "unsupported_view",
+              "detail": "only full-token union_token and byte_token copy views exist"
+            },
+            "fuel_remaining": 126,
+            "invoked_targets": [
+              "main"
+            ],
+            "memory_trace": [],
+            "returns": [],
+            "schema": "concrete-callable-result/1",
+            "status": "failed",
+            "steps": 2
+          },
+          "case": "partial_bytes_refused",
+          "matched_manual_expected": true
+        }
+      ],
+      "schema": "concrete-callable-self-test-result/1",
+      "scope": "Python concrete-model checks only; no compiler, Rust, MIR or native acceptance claim"
+    }
+  },
+  "original": {
+    "adapter_sha256": "3c29fb9b8c5f172749433fc88dfef2556f87e2b3030aeaf321958a6e586a227c",
+    "api_snapshot_sha256": "43fd0192ef59faef5e6f7295e334db33f9b6a48e7f7743ce9caecfe5fa2e10db",
+    "fixture_sha256": "57893accd79385b35c8e10fd044eed56e2689023c9556676b66071ff34becbed",
+    "generator_sha256": "2a94930ac9b2a647480f6dcffd638082554a133e6b727f4cb67657f0c91ae73d",
+    "manifest": "89caa5f05404e64ef6463710245b136a7b713dacf162f2e49cb239309d9823cc  README.md\n287aecee44e512ed6a9f78e8fc8b013f877867bd868c88f3c47fed517aa96961  analyzer-inputs/arity_mismatch.json\n0a55d23041c21a177df4a40bcc71d92c333485cfa19551aea91e705043f9c411  analyzer-inputs/byte_full_token_alias.json\na76a96524cd4a24c39446c555988fee4aa561365ade9329cf7e47b056ae98eb1  analyzer-inputs/dormant_function_body.json\nf2b02d414f4d765147ae68ac3cede7a84c7d998f1a22a65bad9d9a863c4476be  analyzer-inputs/exposed_scalar_reaches_live_slot.json\n0c766037dc3f3e9aa9a96d9cc7ebb2e6ed3c05a091456288d5a66c7c4239ce21  analyzer-inputs/external_raw_memory_callback.json\n447aacc5976ee7b378798347b00c70927b0f7b2362358398ee87fc56d7353f11  analyzer-inputs/fuel_exhausted.json\n44ead808b8fdcba74a21e0005b07573ca6256ed2d1c819924e3a3459eaa0ba16  analyzer-inputs/heap_callback_through_helpers.json\n40b2510fbae2084e792ddac8486fab9f54364b70331c39d70ad6b7f618250fff  analyzer-inputs/invalid_address.json\nd5ea7de320673477acde164f5045f81be109d1c07e912bfd9293e21ada29108b  analyzer-inputs/live_slot_overwrite.json\n0e6a04bca3920d48694ebbe33bfb16f7f8cc3b76fe631b8032b7a2bb78c12d00  analyzer-inputs/memory_address_is_not_code.json\n127be2c38366d029d850331509043d9ee58c158d05a4bf9ae1ba1fa2b03ad896  analyzer-inputs/mixed_branch_effectful.json\n0c17e9f33846c1d7159a7ebdc2875d0990f9c90ce45579322f3e34388b7ee240  analyzer-inputs/mixed_branch_pure.json\naa3736eb56be843a797744923703ff0b6b074f0caac376f39f0f87fdb4582ebc  analyzer-inputs/partial_bytes_refused.json\nf80e9c601a3b760babbd6b5dcade43a582b7f3da7af0caa5482c3bb2de291b5d  analyzer-inputs/pure_typed_trampoline.json\n8ab6e7c32c50217993c76cbe7a444f8771afc07a91260d1b8ac92cf2390299cf  analyzer-inputs/recursive_finite.json\n8cb890e44b4f7487a74ec44ebfb914074d8b641e269601489b23bba8011f333d  analyzer-inputs/returned_callback_factory.json\n273470a9723b6bdcdc46583c04cf0af6d4d24cc2f318edde6389675309c0bcfd  analyzer-inputs/unconstrained_integer_reaches_live_slot.json\n6f65f403497887ec9cf5107dbb83c4f7a2c402dd302adc5eacce0a9a6dc1ecf0  analyzer-inputs/uninitialized_cell.json\ne8d0f19d9ce1055962a316ac82961a47f4d4876bc27a40f9528992e118e73533  analyzer-inputs/union_full_token_alias.json\n6e628cd708500ad187e5bacd8178eab0f5c089116ea0dcd9a076ecbadecb69a1  analyzer-inputs/unused_effectful_fn_creation.json\n5165b4feb1bc7719ecc484058af49d8ba03e1afd29e818df0e1772871d06c57f  author-request.json\naffff64453d6bfef9eb00f815cf45add92186be5f2cbb2c15ef8260bb031d1ed  author_corpus.py\n7b45af9c53d90f503d794978f9dfba33768550426174a58a5123c8f8ae6f4866  checkout-after.json\n7b45af9c53d90f503d794978f9dfba33768550426174a58a5123c8f8ae6f4866  checkout-before.json\n1b148af290e6cef1749c5aaea8a5aa8090a7e4893c7c84f2ee0e46e927819ecc  cleanup.json\nec157828ed2daa0d48fa48efcd73d3add38b7e7153206762b30d247a3d8967a6  command.json\na1732cb42544473df36b7b093b7a2d60aeac2ad9ff49fdd6189e5094c32b4fde  corpus.json\n77a29597be9fe0aee3494a811d4ae9bdc35dc74858dfd7d0628cc67f1052c287  input-hashes.json\nd97367497a56777eb112bfa111e429e031ba9595867f1e371a629467ade05352  interpreter.py\na8c98737f765570381f2977170b8b66a1e4b2fe49d06bc6001c9c98a8a07ab27  run-request.json\ne4367fb8d9193e4309a0e664e97c589e647c81d11f5ddeb227ba8c63e60a3c71  run-result.json\n84584b5d2c600699adff05cd62185b6f1e3c032b4cec05360a80410306449c85  run-started.json\n0b220593bb4351611d71aa845cc8994bc2d761ff2b710b4f478b8b4a1e7a285e  run_once.py\ncb14c1171f177743d85fba873f905a34d9d2c97514cb90617fe31aecd4e0af46  self-test-request.json\n381cad2cd66ad38780a0bee02f1325d197eaba233efbb065ba0ac162544c22ba  self-test-result.json\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  self-test.stderr\n9cb6550732e333a9558bd2b1e0e8c88a4d0b2ef9d47ca8a00b97b3c953ccc099  self-test.stdout\nf517dd1f6b496dd7306baae144976db698765d12fbb0e43f43a02dfc4fc18890  self_test.py\n"
+  },
+  "schema": "callable-fixture-inputs/1"
+}

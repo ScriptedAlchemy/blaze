@@ -10,13 +10,13 @@
 //! The inferred facts ([`instance_effects`], [`fn_memory`]) are the same summary's, for any
 //! instance, with or without an attribute.
 
-use std::alloc::Global;
+use std::{alloc::Global, fmt::Write as _};
 
 use base_db::{Crate, CrateOrigin, Db, FileId};
 use blaze_hash::HashSet;
 use blaze_query::db::FromId;
 use hir_def::{
-    AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, TraitId,
+    AdtId, DefWithBodyId, FieldId, FunctionId, HasModule, ItemContainerId, TraitId, VariantId,
     attrs::AttrFlags,
     signatures::{FunctionSignature, StructSignature},
 };
@@ -38,6 +38,7 @@ use rustc_type_ir::{
     TypeVisitableExt as _,
     inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind as _},
 };
+use smallvec::SmallVec;
 
 use crate::{
     effects::{self, EFFECTS, EffectDef, EffectSet, PURE, Rule, effect_index, trusted_trait},
@@ -522,10 +523,18 @@ fn params<'db>(
     // the solver takes. Erased, as the bodies the walk reads have them: the scan asks nothing
     // of a lifetime.
     let sig = cx.interner.instantiate_bound_regions_with_erased(sig);
-    let mut scan =
-        Params { cx, def, generic, seen: HashSet::new_in(Global), trouble: None, refuses, found };
-    for input in sig.inputs().iter().copied() {
-        scan.ty(input, false, false);
+    let mut scan = Params {
+        cx,
+        def,
+        generic,
+        seen: HashSet::new_in(Global),
+        trouble: None,
+        refuses,
+        found,
+        path: SmallVec::new(),
+    };
+    for (index, input) in sig.inputs().iter().copied().enumerate() {
+        scan.through(ParamEdge::Input(index), input, false, false);
         if scan.trouble.is_some() {
             break;
         }
@@ -552,13 +561,75 @@ struct Params<'a, 'db> {
     trouble: Option<(Rule, String)>,
     refuses: EffectSet,
     found: &'a mut Found,
+    /// The first traversal to the type being scanned, rendered only on refusal.
+    path: SmallVec<[(ParamEdge, Ty<'db>); 8]>,
+}
+
+#[derive(Clone, Copy)]
+enum ParamEdge {
+    Input(usize),
+    Pointee,
+    Field(FieldId),
+    TypeArgument,
+    Element,
+    Tuple(usize),
+    Captures,
+    Pattern,
 }
 
 impl<'db> Params<'_, 'db> {
     fn refuse(&mut self, rule: Rule, what: impl FnOnce() -> String) {
         if self.trouble.is_none() && self.refuses.has(rule) {
-            self.trouble = Some((rule, blaze_query::db::attach(self.cx.db, what)));
+            self.trouble = Some((
+                rule,
+                blaze_query::db::attach(self.cx.db, || {
+                    let mut what = what();
+                    what.push_str(" (parameter path: ");
+                    for (index, &(edge, ty)) in self.path.iter().enumerate() {
+                        if index != 0 {
+                            what.push_str(" → ");
+                        }
+                        match edge {
+                            ParamEdge::Input(index) => {
+                                let _ = write!(what, "parameter {index}");
+                            }
+                            ParamEdge::Pointee => what.push_str("pointee"),
+                            ParamEdge::Field(field) => {
+                                let names = field.parent.fields(self.cx.db).fields();
+                                if let VariantId::EnumVariantId(variant) = field.parent {
+                                    let _ = write!(
+                                        what,
+                                        "variant `{}` ",
+                                        variant.loc(self.cx.db).name.as_str()
+                                    );
+                                }
+                                let _ =
+                                    write!(what, "field `{}`", names[field.local_id].name.as_str());
+                            }
+                            ParamEdge::TypeArgument => what.push_str("type argument"),
+                            ParamEdge::Element => what.push_str("element"),
+                            ParamEdge::Tuple(index) => {
+                                let _ = write!(what, "tuple field {index}");
+                            }
+                            ParamEdge::Captures => what.push_str("captures"),
+                            ParamEdge::Pattern => what.push_str("pattern base"),
+                        }
+                        let ty = self.cx.normalize(ty);
+                        let name = hir_ty_print::rustc_type_name(self.cx.db, ty)
+                            .unwrap_or_else(|| self.cx.shown(ty).to_string());
+                        let _ = write!(what, ": `{name}`");
+                    }
+                    what.push(')');
+                    what
+                }),
+            ));
         }
+    }
+
+    fn through(&mut self, edge: ParamEdge, ty: Ty<'db>, shared: bool, toolchain: bool) {
+        self.path.push((edge, ty));
+        self.ty(ty, shared, toolchain);
+        self.path.pop();
     }
 
     /// Whether the effect refuses reading state that changes (`pure`), so memory the check
@@ -594,12 +665,12 @@ impl<'db> Params<'_, 'db> {
             });
         }
         match ty.kind() {
-            TyKind::Ref(_, pointee, rustc_type_ir::Mutability::Not) => self.ty(pointee, true, false),
-            TyKind::Ref(_, pointee, rustc_type_ir::Mutability::Mut) => self.ty(pointee, shared, false),
+            TyKind::Ref(_, pointee, rustc_type_ir::Mutability::Not) => self.through(ParamEdge::Pointee, pointee, true, false),
+            TyKind::Ref(_, pointee, rustc_type_ir::Mutability::Mut) => self.through(ParamEdge::Pointee, pointee, shared, false),
             // What memory holds hides no code: an effect that doesn't read state (`noalloc`,
             // `nopanic`, `nonblocking`) looks through a raw pointer as through a reference, for
             // a `dyn` or a function pointer behind it.
-            TyKind::RawPtr(pointee, _) if toolchain || !self.memory_matters() => self.ty(pointee, true, false),
+            TyKind::RawPtr(pointee, _) if toolchain || !self.memory_matters() => self.through(ParamEdge::Pointee, pointee, true, false),
             TyKind::RawPtr(..) => self.refuse(Rule::Unchecked, || {
                 format!("takes the raw pointer `{}`, whose memory the check can't see: take a reference", cx.shown(ty))
             }),
@@ -637,34 +708,34 @@ impl<'db> Params<'_, 'db> {
                         format!("takes the union `{}`, whose live field the check can't know", cx.shown(ty))
                     });
                 }
-                // `Unique<T>` and `PhantomData<T>` own a `T` (a `Box`'s, a `Vec`'s elements).
+                // Erased container storage still names its element type through these arguments.
                 if home && let AdtId::StructId(it) = id {
                     let name = StructSignature::of(cx.db, it).name.symbol().clone(); // clone: a handle of an interned name
                     if matches!(name.as_str(), "Unique" | "PhantomData") {
                         if let Some(owned) = adt_args.types().next() {
-                            self.ty(owned, shared, false);
+                            self.through(ParamEdge::TypeArgument, owned, shared, false);
                         }
                         return;
                     }
                 }
                 for variant in variants(cx.db, id) {
-                    for (_, field) in cx.db.field_types(variant).iter() {
+                    for (local_id, field) in cx.db.field_types(variant).iter() {
                         let field = field.ty().instantiate(cx.interner, adt_args).skip_norm_wip();
-                        self.ty(field, shared, home);
+                        self.through(ParamEdge::Field(FieldId { parent: variant, local_id }), field, shared, home);
                     }
                 }
             }
-            TyKind::Array(element, _) | TyKind::Slice(element) => self.ty(element, shared, false),
+            TyKind::Array(element, _) | TyKind::Slice(element) => self.through(ParamEdge::Element, element, shared, false),
             // A pattern type is its base type narrowed, in the same place: core's `NonNull<T>`
             // holds `pattern_type!(*const T is !null)`, a raw pointer in a toolchain type's field
             // (a `Vec`'s buffer), not one the function takes of its own.
-            TyKind::Pat(base, _) => self.ty(base, shared, toolchain),
+            TyKind::Pat(base, _) => self.through(ParamEdge::Pattern, base, shared, toolchain),
             TyKind::Tuple(fields) => {
-                for field in fields.iter() {
-                    self.ty(field, shared, false);
+                for (index, field) in fields.iter().enumerate() {
+                    self.through(ParamEdge::Tuple(index), field, shared, false);
                 }
             }
-            TyKind::Closure(_, closure_args) => self.ty(closure_args.as_closure().tupled_upvars_ty(), shared, false),
+            TyKind::Closure(_, closure_args) => self.through(ParamEdge::Captures, closure_args.as_closure().tupled_upvars_ty(), shared, false),
             _ => {}
         }
     }

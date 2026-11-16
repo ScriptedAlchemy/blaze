@@ -6,9 +6,88 @@ use super::{
     fns::fn_named,
 };
 use crate::{
-    PURE, check_generic,
+    PURE, Rule, check_generic,
     effect_attrs::{NOALLOC, NONBLOCKING},
 };
+
+#[test]
+fn a_parameter_refusal_names_the_first_instantiated_field_path() {
+    let db = hir_expand::fixture::db(
+        r#"
+//- minicore: sized, copy, phantom_data
+//- /alloc.rs crate:alloc
+pub struct RawVec<T> {
+    bytes: *const u8,
+    marker: core::marker::PhantomData<T>,
+}
+pub struct Vec<T> {
+    buf: RawVec<T>,
+}
+//- /lib.rs crate:kernel deps:alloc
+use core::marker::PhantomData;
+
+pub mod vfs { pub struct View { value: u8 } }
+pub mod other { pub struct View { value: u8 } }
+
+pub struct Idx<T> { raw: u32, of: PhantomData<fn() -> T> }
+pub struct Jobs { retired: alloc::Vec<Idx<vfs::View>> }
+pub struct Daemon { jobs: Jobs, later: Idx<other::View> }
+
+pub fn run(daemon: &mut Daemon, callback: fn()) {}
+pub fn input_number(scalar: u8, daemon: &Daemon) {}
+pub fn scalar(values: &alloc::Vec<u8>) {}
+
+pub enum Choice { Empty, Value { callback: fn() } }
+pub fn variant(choice: &Choice) {}
+
+pub struct Node { next: *const Node, callback: fn() }
+pub fn recursive(node: &Node) {}
+"#,
+    )
+    .into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let run = fn_named(&db, krate, "run");
+        let refusal = check_generic(&db, run, &NONBLOCKING).unwrap_err();
+        assert_eq!(refusal.rule, Rule::Unchecked, "{}", refusal.said());
+        let (_, path) = refusal.what.split_once("parameter path: ").unwrap();
+        let mut rest = path;
+        for part in [
+            "parameter 0:",
+            "kernel::Daemon",
+            "field `jobs`:",
+            "kernel::Jobs",
+            "field `retired`:",
+            "alloc::Vec<kernel::Idx<kernel::vfs::View>>",
+            "field `buf`:",
+            "alloc::RawVec<kernel::Idx<kernel::vfs::View>>",
+            "field `marker`:",
+            "type argument: `kernel::Idx<kernel::vfs::View>`",
+            "field `of`:",
+            "type argument: `fn() -> kernel::vfs::View`",
+        ] {
+            let Some((_, tail)) = rest.split_once(part) else {
+                panic!("missing {part:?} in {path}")
+            };
+            rest = tail;
+        }
+        assert!(!path.contains("other::View"), "{path}");
+        assert!(!path.contains("parameter 1:"), "{path}");
+
+        let input = fn_named(&db, krate, "input_number");
+        let refusal = check_generic(&db, input, &NONBLOCKING).unwrap_err();
+        assert!(refusal.what.contains("parameter path: parameter 1:"), "{}", refusal.said());
+
+        for (name, expected) in [
+            ("variant", "variant `Value` field `callback`: `fn()`"),
+            ("recursive", "field `callback`: `fn()`"),
+        ] {
+            let refusal = check_generic(&db, fn_named(&db, krate, name), &NONBLOCKING).unwrap_err();
+            assert!(refusal.what.contains(expected), "{name}: {}", refusal.said());
+        }
+        check_generic(&db, fn_named(&db, krate, "scalar"), &NONBLOCKING).unwrap();
+    });
+}
 
 /// The pinned core's `unsafe` precondition checks (`unchecked_add`'s, under every
 /// `Range<usize>` loop) build their message with `fmt::Arguments::from_str`, which transmutes a

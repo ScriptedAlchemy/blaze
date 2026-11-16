@@ -42,6 +42,9 @@ mod walk;
 mod tests;
 
 #[cfg(test)]
+mod callable;
+
+#[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
