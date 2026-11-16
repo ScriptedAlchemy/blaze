@@ -3269,4 +3269,6 @@ fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it(tc: Te
     }
 }
 
+/// A fixpoint over nested cycles: an inner head hands on that a row above it moved.
+mod inner_heads;
 mod stale_head;
