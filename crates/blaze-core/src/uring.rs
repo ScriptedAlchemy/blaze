@@ -637,17 +637,14 @@ impl Registered {
         };
         let nr = size_of::<RsrcRegister>() as libc::c_uint;
         register(ring, REGISTER_BUFFERS2, &raw const buffers, nr, "registered buffers", "5.13").map_err(|error| {
-            match error.raw_os_error() {
-                Some(libc::ENOMEM) => io::Error::new(
-                    error.kind(),
-                    // alloc: the error of a setup that failed.
-                    format!(
-                        "{error}: pinning {} MiB of buffers needs RLIMIT_MEMLOCK of that much (ulimit -l) or CAP_IPC_LOCK",
-                        DIRECT_BUFFERS as usize * DIRECT_PIECE >> 20
-                    ),
-                ),
-                _ => error,
-            }
+            let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: `limit` is a live, aligned `rlimit`; getrlimit only writes it.
+            let limit = if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0 {
+                Ok(limit)
+            } else {
+                Err(io::Error::last_os_error())
+            };
+            registered_refused(error, limit)
         })?;
         Ok(Registered { map })
     }
@@ -657,6 +654,33 @@ impl Registered {
         assert!(index < DIRECT_BUFFERS, "registered buffer {index} of {DIRECT_BUFFERS}");
         self.map.at.wrapping_add(index as usize * DIRECT_PIECE)
     }
+}
+
+/// Report observed limits without attributing every registration ENOMEM to memlock.
+fn registered_refused(error: io::Error, limit: io::Result<libc::rlimit>) -> io::Error {
+    // register() adds context with io::Error::new: the kind survives, raw_os_error does not.
+    if error.kind() != io::ErrorKind::OutOfMemory {
+        return error;
+    }
+    // alloc: the error of a setup that failed, once; the rest writes into it.
+    let mut out = format!(
+        "{error}: IORING_REGISTER_BUFFERS2 could not pin {} bytes; ",
+        DIRECT_BUFFERS as usize * DIRECT_PIECE
+    );
+    match limit {
+        Ok(limit) => {
+            _ = write!(
+                out,
+                "observed RLIMIT_MEMLOCK soft={} hard={} bytes ({} means unlimited)",
+                limit.rlim_cur, limit.rlim_max, libc::RLIM_INFINITY
+            );
+        }
+        Err(error) => {
+            _ = write!(out, "reading RLIMIT_MEMLOCK failed: {error}");
+        }
+    }
+    out.push_str("; ENOMEM can reflect locked-memory accounting or a kernel memory allocation failure");
+    io::Error::new(error.kind(), out)
 }
 
 /// The buffers a connection's multishot receive takes from (`IORING_REGISTER_PBUF_RING`): the
@@ -4953,6 +4977,35 @@ mod tests {
         assert!(sent[0].2 >= large.len(), "the asker's own buffer handed back");
         assert_eq!(ring.zero_copy_sends(), 1);
         assert_eq!(ring.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_buffer_registration_failure_reports_observed_limits_without_claiming_a_cause() {
+        let wrapped = || {
+            let cause = io::Error::from_raw_os_error(libc::ENOMEM);
+            io::Error::new(cause.kind(), format!("io_uring registered buffers: {cause}"))
+        };
+        assert_eq!(wrapped().raw_os_error(), None);
+        for soft in [64 << 10, 8 << 20, libc::RLIM_INFINITY] {
+            let error = registered_refused(wrapped(), Ok(libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: libc::RLIM_INFINITY,
+            }));
+            assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+            let text = error.to_string();
+            assert!(text.contains("IORING_REGISTER_BUFFERS2 could not pin 4194304 bytes"), "{text}");
+            assert!(text.contains(&format!("observed RLIMIT_MEMLOCK soft={soft}")), "{text}");
+            assert!(text.contains(&format!("hard={} bytes", libc::RLIM_INFINITY)), "{text}");
+            assert!(text.contains("or a kernel memory allocation failure"), "{text}");
+        }
+        let text = registered_refused(wrapped(), Err(io::Error::from_raw_os_error(libc::EIO))).to_string();
+        assert!(text.contains("reading RLIMIT_MEMLOCK failed: Input/output error"), "{text}");
+        assert!(!text.contains("observed RLIMIT_MEMLOCK"), "{text}");
+        let error = registered_refused(
+            io::Error::from_raw_os_error(libc::EPERM),
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+        );
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
     }
 
     #[test]
