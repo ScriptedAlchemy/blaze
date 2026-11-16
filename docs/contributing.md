@@ -212,13 +212,10 @@ under `docs/reports/` do this and it is the reason they can be used.
 Several lanes, people or agents, change ra-jit at once. A lane shares the Mac, `git`'s
 metadata and main with all the others, so:
 
-- **Heavy work runs on a dev host.** A release build of a branch, a harness sweep
+- **Heavy work runs in ubuntu-main.** A release build of a branch, a harness sweep
   (`cargo_ra_jit.py`, `buildmodel.py`, `keys.py`, the soak), a benchmark or anything longer
-  than a few minutes runs on an AWS dev host. Claim the host with a CLAIMED row in the host
-  ledger (`/Volumes/Projects/nix/scratch/memory/host-ledger.md`; hosts, ssh and the ledger's
-  rules are in the `fleet-ops` skill), work in a directory named for the lane, and add a
-  RELEASED row when done. Ask for a lease as long as the run (`dev-aws renew N <hours>`): an
-  expired lease stops the host mid-run.
+  than a few minutes runs in the `ubuntu-main` environment. Work in a directory named for the
+  lane and coordinate concurrent jobs so lanes do not contend for the same resources.
 - **The Mac does quick checks only:** one harness, one unit test, `cargo check`, hot reload.
   It is shared by every lane at once, and a lane that builds a full release there slows all
   of them.
@@ -234,7 +231,7 @@ metadata and main with all the others, so:
   fast tier does not cover, run the full tier on the branch first
   (`gh workflow run ra-jit.yaml --ref <branch> -f tier=full`).
 - **Clean up when done:** remove the worktree (`git worktree remove`), its target directory,
-  and the lane's directories on the dev host; delete the merged branch.
+  and the lane's directories in `ubuntu-main`; delete the merged branch.
 
 ## Landing a change
 

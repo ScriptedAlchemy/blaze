@@ -33,9 +33,9 @@ How to build, test and change ra-jit, including the vendored rust-analyzer, is
   HTTP (remote) with one documented, versioned schema in deterministic CBOR (JSON only as a
   rendering for people), and the CLI is a client of the same API:
   [docs/roadmap.md](docs/roadmap.md#8-the-agent-api).
-- **Heavy work runs on a dev host, the Mac does quick checks.** Release builds, harness sweeps
-  and benchmarks run on an AWS dev host claimed in the host ledger (`fleet-ops` skill), with a
-  lease as long as the run, released after: [docs/contributing.md](docs/contributing.md#working-in-parallel).
+- **Heavy work runs in ubuntu-main, the Mac does quick checks.** Release builds, harness sweeps
+  and benchmarks run in the `ubuntu-main` environment, in a directory named for the lane.
+  Coordinate concurrent jobs there: [docs/contributing.md](docs/contributing.md#working-in-parallel).
 - **One worktree per lane, never `git stash`.** A uniquely named worktree with its own
   `CARGO_TARGET_DIR` or a shared sccache; the stash is shared by every worktree; harnesses run
   with `RUST_BACKTRACE=0`.
