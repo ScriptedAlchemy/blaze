@@ -317,7 +317,7 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
 /// nothing again (`Worked::misses` of 0): its summary is of those misses, so it is empty, and
 /// a no-op build makes no second round trip and waits for no history thread. The daemon's
 /// error otherwise.
-pub(super) fn recomputed() -> Result<Vec<blaze_api::Report>, String> {
+pub(super) fn recomputed(start: Start) -> Result<Vec<blaze_api::Report>, String> {
     let build = super::client_rows::build();
     if build == 0 || super::client_rows::misses() == 0 || !cfg!(feature = "native") {
         return Ok(Vec::new());
@@ -328,7 +328,7 @@ pub(super) fn recomputed() -> Result<Vec<blaze_api::Report>, String> {
     let mut summary = Vec::new();
     let request =
         Request::Rebuilt { all: false, cwd: None, item: None, build: Some(build), unexplained: false };
-    ask_if_running(request, Start::Never, |response| {
+    ask_if_running(request, start, |response| {
         if let ResponseRef::Rebuilt(it) = response
             && it.build == Some(build)
         {
@@ -862,18 +862,18 @@ fn run(sql: &str) -> Result<Vec<RecordBatch>, Refusal> {
 /// that writes the history and can't be asked, or whose flush the manifest does not show, is
 /// an error naming it: never a read that quietly misses rows.
 fn history_source() -> Result<(PathBuf, PathBuf), Refusal> {
-    Ok(history_paths()?)
+    Ok(history_paths(Start::Never)?)
 }
 
 /// The DuckDB that reads the history, and the history's directory: an error names what is
 /// missing.
-pub(super) fn history_paths() -> Result<(PathBuf, PathBuf), String> {
+pub(super) fn history_paths(start: Start) -> Result<(PathBuf, PathBuf), String> {
     let duckdb = super::duckdb::path()?;
     let state: PathBuf = crate::serve::state().map_err(|error| format!("{error:#}"))?;
     let dir = history::dir_in(&state);
     if let Some(pid) = history::writer(&dir) {
         let mut flushed = None;
-        ask(Request::Flush, Start::Never, |response| {
+        ask(Request::Flush, start, |response| {
             if let ResponseRef::Flushed { seq } = response {
                 flushed = Some(seq);
             }

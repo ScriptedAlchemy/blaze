@@ -279,6 +279,7 @@ fn pinned_elsewhere(words: &[OsString], given: bool) -> Result<Ran, String> {
             pin::pinned_text(&named)
         );
     }
+    blaze_cargo::cli::allow_release_handoff(words, &wanted)?;
     let pinned = versions::fetch(&wanted).map_err(|why| {
         format!(
             "{shown} pins blaze {wanted}, which could not be fetched ({why:#}); no other blaze builds in its place ({ignoring})"
@@ -334,6 +335,7 @@ fn run_default(words: &[OsString], manifest: Option<std::path::PathBuf>) -> Resu
             this.parent().unwrap_or(Path::new("")).display()
         ));
     }
+    blaze_cargo::cli::allow_release_handoff(words, &runs)?;
     let default = versions::fetch_for(&runs, "the default `blaze update` installed").map_err(|why| {
         format!(
             "blaze {runs}, the default `blaze update` installed, could not be fetched ({why:#}); no other blaze \

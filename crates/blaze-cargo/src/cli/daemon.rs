@@ -63,8 +63,8 @@ pub trait Api {
     }
 }
 
-/// One request per connection: anything held once its Done has come (a response to another
-/// request, or more of this one) is the daemon's mistake, said as one.
+/// One request at a time: anything held once its Done has come (an unsolicited response,
+/// or more of this one) is the daemon's mistake, said as one.
 impl Api for Client {
     fn call<F: FnMut(ResponseRef<'_>, bool)>(
         &mut self,
@@ -73,7 +73,7 @@ impl Api for Client {
     ) -> Result<bool, ClientError> {
         let ok = self.call_ref(request, on)?;
         if self.buffered() {
-            let said = "the daemon sent more on a connection whose one request had its Done";
+            let said = "the daemon sent more after the current request had its Done";
             // alloc: error path, the daemon's mistake.
             return Err(ClientError::Refused(blaze_api::ApiError::new(said, None)));
         }
@@ -89,7 +89,7 @@ impl Api for Client {
 /// Tells the daemon on `client` to stop: Stop's Done, then, on the same request, each step of
 /// its stop ([`blaze_api::Response::Stopping`]) until it hangs up. One read may hold the Done
 /// and the first steps, so this is [`Client::call_ref`], never [`Api::call`] (which refuses
-/// what follows a Done on a connection of one request), and the caller's
+/// what follows a Done), and the caller's
 /// [`Client::until_hung_up`] takes the steps held. `on` is given each response up to the Done;
 /// the Done's `ok`.
 pub(crate) fn told_to_stop(
@@ -99,11 +99,76 @@ pub(crate) fn told_to_stop(
     client.call_ref(Request::Stop, on)
 }
 
-/// Whether a daemon is started when none answers.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Whether a daemon may be started or replaced; `Never` is the legacy passive client,
+/// which can still activate a socket unit and does not validate the daemon's build.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Start {
+    #[default]
     IfMissing,
     Never,
+    /// Only an existing daemon of this build and these settings, without socket activation.
+    ConnectOnly,
+}
+
+impl Start {
+    /// Follow-up/status/stop requests preserve connect-only; default behavior stays passive.
+    pub fn passive(self) -> Self {
+        match self {
+            Start::ConnectOnly => Start::ConnectOnly,
+            Start::IfMissing | Start::Never => Start::Never,
+        }
+    }
+}
+
+/// The connection decision, before the driver is allowed to spawn a daemon.
+enum Found<C> {
+    Ready(Option<C>),
+    Start(Option<ClientError>),
+}
+
+/// The client policy core: injectable observations and effects, no IO of its own. A failed
+/// activation check is an error before dialing; no absent or stale socket starts a daemon
+/// under connect-only. `check` must refuse a mismatched build before stopping it.
+fn find<C>(
+    start: Start,
+    socket: &Path,
+    activation: impl FnOnce() -> anyhow::Result<bool>,
+    dial: impl FnOnce() -> Result<C, ClientError>,
+    check: impl FnOnce(C) -> anyhow::Result<Option<C>>,
+) -> anyhow::Result<Found<C>> {
+    if start == Start::ConnectOnly {
+        allow_connect(start, socket, activation()?)?;
+    }
+    match dial() {
+        Ok(client) if start == Start::Never => Ok(Found::Ready(Some(client))),
+        Ok(client) => match check(client)? {
+            Some(client) => Ok(Found::Ready(Some(client))),
+            None if start == Start::IfMissing => Ok(Found::Start(None)),
+            None => anyhow::bail!(
+                "--daemon-policy=connect-only-v1: validation at {} requested a replacement, \
+                 which the policy forbids",
+                socket.display()
+            ),
+        },
+        Err(error) if !nothing_listens(&error) => {
+            Err(DaemonError::Connect { socket: socket.to_owned(), error }.into())
+        }
+        Err(error) if start == Start::IfMissing => Ok(Found::Start(Some(error))),
+        Err(_) => Ok(Found::Ready(None)),
+    }
+}
+
+/// A connect can start a socket-activated daemon. Refuse installed activation even when a
+/// daemon currently runs; there is no portable atomic check-and-connect to a live process.
+fn allow_connect(start: Start, socket: &Path, activated: bool) -> anyhow::Result<()> {
+    if start == Start::ConnectOnly && activated {
+        anyhow::bail!(
+            "--daemon-policy=connect-only-v1 refuses socket {}: installed socket activation \
+             could start a daemon",
+            socket.display()
+        );
+    }
+    Ok(())
 }
 
 /// Why the CLI has no daemon to speak to.
@@ -211,20 +276,20 @@ pub fn nothing_listens(error: &ClientError) -> bool {
 /// other values of settings this command sets ([`crate::serve::settings`]) is refused before
 /// any request, naming each setting, both values and the fix ([`DaemonError::Drifted`]), so no
 /// build runs under values it did not ask for. It is never restarted over them.
+/// `ConnectOnly` makes the same checks but refuses replacement and installed activation
+/// before dialing. Missing and stale sockets return `None` without touching their files.
 #[cfg(all(unix, feature = "native"))]
 pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     let socket = crate::serve::socket()?;
-    let refused = match Client::unix(&socket) {
-        Ok(client) if start == Start::Never => return Ok(Some(client)),
-        Ok(client) => match this_build(client, &socket)? {
-            Some(client) => return Ok(Some(client)),
-            None => None,
-        },
-        Err(error) if !nothing_listens(&error) => {
-            return Err(DaemonError::Connect { socket, error }.into());
-        }
-        Err(_) if start == Start::Never => return Ok(None),
-        Err(error) => Some(error),
+    let refused = match find(
+        start,
+        &socket,
+        || activated(&socket),
+        || Client::unix(&socket),
+        |client| this_build(client, &socket, start),
+    )? {
+        Found::Ready(client) => return Ok(client),
+        Found::Start(refused) => refused,
     };
     if let Some(refused) = refused {
         say_start(&socket, &refused)?;
@@ -368,14 +433,14 @@ fn named(build: &blaze_api::Build) -> String {
     format!("{} {}", build.exe.path, &id[..id.len().min(12)])
 }
 
-/// The connection `client` was, made again for the command's own request, when its daemon is
-/// this blaze keeping the settings this command sets ([`DaemonError::Drifted`] when not);
+/// The checked connection under connect-only, otherwise a new command connection, when
+/// its daemon is this blaze keeping the settings this command sets ([`DaemonError::Drifted`] when not);
 /// `None` once one of another build was stopped, for this one to start.
 #[cfg(all(any(unix, windows), feature = "native"))]
-fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client>> {
+fn this_build(mut client: Client, socket: &Path, start: Start) -> anyhow::Result<Option<Client>> {
     use anyhow::Context as _;
-    // One Status round trip and a second connect a command: what a mismatch of builds or of
-    // settings is found by, before any request of this blaze runs on another's daemon.
+    // Connect-only keeps Status and the command on the same connection: a new listener
+    // at this pathname must never receive a request on the strength of the old one's Status.
     let _span = tracing::info_span!(
         target: "blaze",
         "client: ask the daemon which blaze it is and what it keeps"
@@ -390,6 +455,9 @@ fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client
         crate::serve::build_of(&exe)
     })? {
         Builds::Same => {
+            if start == Start::ConnectOnly {
+                return Ok(Some(client));
+            }
             return match Client::unix(socket) {
                 Ok(client) => Ok(Some(client)),
                 Err(error) => Err(DaemonError::Connect { socket: socket.to_owned(), error }.into()),
@@ -406,6 +474,7 @@ fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client
         }
         Builds::Other { pid, theirs, ours } => (pid, theirs, ours),
     };
+    allow_replace(start, socket, pid, &theirs, &ours)?;
     if activated(socket)? {
         anyhow::bail!(
             "the daemon socket-activated at {} (pid {pid}) is another build of blaze ({}) than this one ({}): \
@@ -460,6 +529,28 @@ fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client
         );
     }
     Ok(None)
+}
+
+/// The replacement gate, before a Stop, a wait or a spawn can occur.
+fn allow_replace(
+    start: Start,
+    socket: &Path,
+    pid: u32,
+    theirs: &blaze_api::Build,
+    ours: &blaze_api::Build,
+) -> anyhow::Result<()> {
+    if start == Start::ConnectOnly {
+        anyhow::bail!(
+            "--daemon-policy=connect-only-v1 refuses daemon at {} (pid {pid}, build {:x}, \
+             executable {}) for client build {:x} ({}): replacing it is forbidden; no Stop was sent",
+            socket.display(),
+            theirs.id,
+            theirs.exe.path,
+            ours.id,
+            ours.exe.path
+        );
+    }
+    Ok(())
 }
 
 /// The line a command that starts the daemon says first, or why it starts none: a socket
@@ -664,17 +755,15 @@ const ASK_AGAIN: Duration = Duration::from_millis(20);
 pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     use anyhow::Context as _;
     let socket = crate::serve::socket()?;
-    let refused = match Client::unix(&socket) {
-        Ok(client) if start == Start::Never => return Ok(Some(client)),
-        Ok(client) => match this_build(client, &socket)? {
-            Some(client) => return Ok(Some(client)),
-            None => None,
-        },
-        Err(error) if !nothing_listens(&error) => {
-            return Err(DaemonError::Connect { socket, error }.into());
-        }
-        Err(_) if start == Start::Never => return Ok(None),
-        Err(error) => Some(error),
+    let refused = match find(
+        start,
+        &socket,
+        || activated(&socket),
+        || Client::unix(&socket),
+        |client| this_build(client, &socket, start),
+    )? {
+        Found::Ready(client) => return Ok(client),
+        Found::Start(refused) => refused,
     };
     match &refused {
         Some(refused) => eprintln!("blaze: starting the daemon ({refused})"),
@@ -726,10 +815,13 @@ pub fn connect(_: Start) -> anyhow::Result<Option<Client>> {
 }
 
 /// The seed's connection: the engine `blaze serve` runs, started in this process for this
-/// command alone and stopped as the client closes ([`crate::serve::once`]), whatever `start`
-/// says, as there is no daemon running to find.
+/// command alone and stopped as the client closes ([`crate::serve::once`]). Connect-only
+/// refuses before starting this engine: there is no daemon running to find.
 #[cfg(not(feature = "native"))]
-pub fn connect(_: Start) -> anyhow::Result<Option<Client>> {
+pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
+    if start == Start::ConnectOnly {
+        anyhow::bail!("--daemon-policy=connect-only-v1: {NO_DAEMON}");
+    }
     crate::serve::once::connect().map(Some)
 }
 
@@ -1262,11 +1354,12 @@ fn started() -> anyhow::Result<(std::path::PathBuf, std::process::Child)> {
     Ok((log, child?))
 }
 
-/// `blaze stop`: the daemon made durable and ended, waited for until its socket is gone.
+/// `blaze stop`: the daemon made durable and stopped. Connect-only waits for hang-up alone;
+/// the legacy policy also probes whether its socket still answers.
 // dyn: the CLI's output writer, written a few times per command.
 #[cfg(feature = "native")]
-pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
-    let Some(mut client) = connect(Start::Never)? else {
+pub fn stop(err: &mut dyn std::io::Write, color: bool, start: Start) -> anyhow::Result<i32> {
+    let Some(mut client) = connect(start)? else {
         writeln!(err, "no daemon is running")?;
         return Ok(0);
     };
@@ -1287,21 +1380,42 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     // The daemon stops listening, says each step of its stop, then hangs up its connection
     // last, once its image is written. With a unit installed the socket answers on (the
     // manager listens, and a connect would start the daemon again).
-    if let Err(error) = client.until_hung_up(PATIENCE) {
-        let what = format!("the daemon at {} was told to stop: {error}", socket.display());
-        err.write_all(super::say::error(&what, color).as_bytes())?;
-        return Ok(super::Exit::Failed.code());
-    }
-    #[cfg(any(unix, windows))]
-    if !activated(&socket)? && answers(&socket)? {
-        let what = format!(
-            "the daemon at {} was told to stop, hung up, and still answers",
-            socket.display()
-        );
+    if let Err(error) = finish_stop(
+        start,
+        &socket,
+        || client.until_hung_up(PATIENCE),
+        || {
+            #[cfg(any(unix, windows))]
+            return Ok(!activated(&socket)? && answers(&socket)?);
+            #[cfg(not(any(unix, windows)))]
+            Ok(false)
+        },
+    ) {
+        let what = format!("{error:#}"); // alloc: stop's error, once
         err.write_all(super::say::error(&what, color).as_bytes())?;
         return Ok(super::Exit::Failed.code());
     }
     Ok(0)
+}
+
+/// Stop's completion policy after its explicit Stop was accepted: wait on that connection,
+/// and under connect-only never probe a socket which a manager could now have taken over.
+fn finish_stop(
+    start: Start,
+    socket: &Path,
+    wait: impl FnOnce() -> Result<(), ClientError>,
+    probe: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    if let Err(error) = wait() {
+        anyhow::bail!("the daemon at {} was told to stop: {error}", socket.display());
+    }
+    if start != Start::ConnectOnly && probe()? {
+        anyhow::bail!(
+            "the daemon at {} was told to stop, hung up, and still answers",
+            socket.display()
+        );
+    }
+    Ok(())
 }
 
 /// Whether the daemon still answers at `socket`; a connect that fails for another reason than
@@ -1324,6 +1438,7 @@ pub fn status(
     err: &mut dyn std::io::Write,
     color: bool,
     json: bool,
+    start: Start,
 ) -> anyhow::Result<i32> {
     // What this blaze knows without a daemon, read before connecting: a home blaze can't name
     // is the error, as it is for every command.
@@ -1335,7 +1450,7 @@ pub fn status(
         }),
         false => None,
     };
-    let Some(mut client) = connect(Start::Never)? else {
+    let Some(mut client) = connect(start)? else {
         match &place {
             Some(place) => out.write_all(status_json(place, None)?.as_bytes())?,
             None => writeln!(out, "no daemon is running")?,
@@ -1480,7 +1595,7 @@ pub fn units(verb: DaemonVerb, err: &mut dyn std::io::Write, color: bool) -> any
     };
     // A daemon the CLI started holds the socket's path: stopped first, so the manager's socket
     // is the only one there, and its exit does not remove the manager's file.
-    let stopped = stop(err, color)?;
+    let stopped = stop(err, color, Start::Never)?;
     if stopped != 0 {
         return Ok(stopped);
     }
@@ -1515,7 +1630,7 @@ pub fn units(_: DaemonVerb, _: &mut dyn std::io::Write, _: bool) -> anyhow::Resu
 /// the feature, as there is none to stop, ask or install.
 #[cfg(not(feature = "native"))]
 // dyn: the CLI's output writer, unused: the refusal is the error.
-pub fn stop(_: &mut dyn std::io::Write, _: bool) -> anyhow::Result<i32> {
+pub fn stop(_: &mut dyn std::io::Write, _: bool, _: Start) -> anyhow::Result<i32> {
     anyhow::bail!("blaze stop: {NO_DAEMON}")
 }
 
@@ -1526,6 +1641,7 @@ pub fn status(
     _: &mut dyn std::io::Write,
     _: bool,
     _: bool,
+    _: Start,
 ) -> anyhow::Result<i32> {
     anyhow::bail!("blaze status: {NO_DAEMON}")
 }

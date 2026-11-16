@@ -272,6 +272,222 @@ fn build(id: u8, path: &str, inode: u64) -> blaze_api::Build {
 
 const SOCKET: &str = "/run/blaze/v2.sock";
 
+#[test]
+fn missing_and_stale_sockets_start_only_under_the_default_policy() {
+    for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+        for start in [Start::IfMissing, Start::Never, Start::ConnectOnly] {
+            let result = find::<()>(
+                start,
+                Path::new(SOCKET),
+                || Ok(false),
+                || Err(ClientError::Io(io::Error::from(kind))),
+                |_| panic!("checked a daemon that did not answer"),
+            )
+            .unwrap();
+            assert_eq!(matches!(&result, Found::Start(Some(_))), start == Start::IfMissing);
+            assert_eq!(matches!(&result, Found::Ready(None)), start != Start::IfMissing);
+        }
+    }
+    for start in [Start::IfMissing, Start::Never, Start::ConnectOnly] {
+        assert!(
+            find::<()>(
+                start,
+                Path::new(SOCKET),
+                || Ok(false),
+                || Err(ClientError::Io(io::Error::from(io::ErrorKind::PermissionDenied))),
+                |_| unreachable!()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn connect_only_refuses_activation_before_dialing_and_activation_check_errors() {
+    let why = match find::<()>(
+        Start::ConnectOnly,
+        Path::new(SOCKET),
+        || Ok(true),
+        || panic!("dialed a socket that could activate a daemon"),
+        |_| unreachable!(),
+    ) {
+        Err(why) => why.to_string(),
+        Ok(_) => panic!("accepted activation"),
+    };
+    assert!(why.contains(SOCKET) && why.contains("connect-only-v1"));
+    assert!(
+        find::<()>(
+            Start::ConnectOnly,
+            Path::new(SOCKET),
+            || anyhow::bail!("unit state is unread"),
+            || panic!("dialed with unread activation state"),
+            |_| unreachable!()
+        )
+        .is_err()
+    );
+    // Legacy policies neither inspect nor change activation behavior.
+    for start in [Start::IfMissing, Start::Never] {
+        assert!(matches!(
+            find(
+                start,
+                Path::new(SOCKET),
+                || panic!("changed default policy"),
+                || Ok(()),
+                |client| Ok(Some(client))
+            )
+            .unwrap(),
+            Found::Ready(Some(()))
+        ));
+    }
+}
+
+#[test]
+fn connect_only_never_starts_after_a_failed_or_incomplete_identity_check() {
+    assert!(
+        find(
+            Start::ConnectOnly,
+            Path::new(SOCKET),
+            || Ok(false),
+            || Ok(()),
+            |_| anyhow::bail!("schema or settings mismatch")
+        )
+        .is_err()
+    );
+    assert!(
+        find(Start::ConnectOnly, Path::new(SOCKET), || Ok(false), || Ok(()), |_| Ok(None)).is_err()
+    );
+}
+
+/// A deterministic transcript through the real policy core and build classifier. Hegel
+/// draws absent/stale/live peers, build skew and activation between successive client calls.
+/// It performs no socket, process, clock, filesystem or environment operations.
+fn policy_transcript(steps: &[(u8, bool)], start: Start, plant_replace: bool) -> bool {
+    use std::cell::Cell;
+    let a = build(1, "/old/blaze", 10);
+    let b = build(2, "/new/blaze", 20);
+    for &(peer, activated) in steps {
+        let stopped = Cell::new(false);
+        let dialed = Cell::new(false);
+        let found = find(
+            start,
+            Path::new(SOCKET),
+            || Ok(activated),
+            || {
+                dialed.set(true);
+                match peer {
+                    0 => Err(ClientError::Io(io::Error::from(io::ErrorKind::NotFound))),
+                    1 => Err(ClientError::Io(io::Error::from(io::ErrorKind::ConnectionRefused))),
+                    _ => Ok(OfBuild {
+                        build: if peer == 2 { b.clone() } else { a.clone() },
+                        asked: Vec::new(),
+                        settings: Vec::new(),
+                    }),
+                }
+            },
+            |mut api| {
+                match builds(&mut api, Path::new(SOCKET), &b.exe, &[], || Ok(b.clone()))? {
+                    Builds::Same => Ok(Some(api)),
+                    Builds::Other { pid, theirs, ours } => {
+                        if !plant_replace {
+                            allow_replace(start, Path::new(SOCKET), pid, &theirs, &ours)?;
+                        }
+                        // The driver's replacement effects occur only after this gate permits them.
+                        stopped.set(true);
+                        Ok(None)
+                    }
+                    Builds::Settings { .. } => unreachable!(),
+                }
+            },
+        );
+        let spawning = matches!(&found, Ok(Found::Start(_)));
+        let safe = match start {
+            Start::ConnectOnly => {
+                !spawning
+                    && !stopped.get()
+                    && (!activated || !dialed.get())
+                    && (activated || peer != 2 || matches!(&found, Ok(Found::Ready(Some(_)))))
+            }
+            Start::IfMissing => spawning == (peer != 2) && stopped.get() == (peer == 3),
+            Start::Never => !spawning && !stopped.get() && dialed.get(),
+        };
+        if !safe {
+            return false;
+        }
+    }
+    true
+}
+
+/// The invariant: connect-only emits no spawn or implicit Stop for missing, stale, live or
+/// mismatched peers, and never dials known activation; default replacement remains enabled.
+#[hegel::test]
+fn client_policy_transcripts(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let steps: Vec<(u8, bool)> = tc.draw(
+        gs::vecs(hegel::tuples!(gs::integers::<u8>().max_value(3), gs::booleans()))
+            .min_size(1)
+            .max_size(40),
+    );
+    for start in [Start::IfMissing, Start::Never, Start::ConnectOnly] {
+        assert!(policy_transcript(&steps, start, false));
+    }
+}
+
+#[test]
+fn the_oracle_catches_implicit_stop_of_a_mismatched_daemon() {
+    assert!(!policy_transcript(&[(3, false)], Start::ConnectOnly, true));
+    assert!(policy_transcript(&[(3, false)], Start::ConnectOnly, false));
+}
+
+#[test]
+fn a_refused_replacement_names_both_executables_and_the_daemon() {
+    let error = allow_replace(
+        Start::ConnectOnly,
+        Path::new(SOCKET),
+        77,
+        &build(1, "/old/blaze", 10),
+        &build(2, "/new/blaze", 20),
+    )
+    .unwrap_err()
+    .to_string();
+    for text in [SOCKET, "77", "/old/blaze", "/new/blaze", "no Stop was sent"] {
+        assert!(error.contains(text), "{error}");
+    }
+}
+
+#[test]
+fn explicit_connect_only_stop_waits_but_never_reconnects_after_hangup() {
+    use std::cell::Cell;
+    let waited = Cell::new(false);
+    finish_stop(
+        Start::ConnectOnly,
+        Path::new(SOCKET),
+        || {
+            waited.set(true);
+            Ok(())
+        },
+        || panic!("reconnected after the requested Stop"),
+    )
+    .unwrap();
+    assert!(waited.get());
+    let failed = finish_stop(
+        Start::ConnectOnly,
+        Path::new(SOCKET),
+        || Err(ClientError::Io(io::Error::from(io::ErrorKind::TimedOut))),
+        || panic!("probed after a failed wait"),
+    )
+    .unwrap_err();
+    assert!(failed.to_string().contains(SOCKET));
+    assert!(finish_stop(Start::Never, Path::new(SOCKET), || Ok(()), || Ok(false)).is_ok());
+    assert!(finish_stop(Start::Never, Path::new(SOCKET), || Ok(()), || Ok(true)).is_err());
+}
+
+#[cfg(not(feature = "native"))]
+#[test]
+fn connect_only_never_starts_the_seed_engine() {
+    let Err(error) = connect(Start::ConnectOnly) else { panic!("seed engine started") };
+    assert!(error.to_string().contains("connect-only-v1"));
+}
+
 /// A client of build B finds a daemon of build A: only Status is sent to it, and the answer
 /// names both builds and the daemon's pid; no request of B's runs on A.
 #[test]
@@ -307,6 +523,70 @@ fn a_daemon_of_another_file_with_the_same_bytes_is_this_build() {
     let mut daemon = OfBuild { build: a, asked: Vec::new(), settings: Vec::new() };
     let got = builds(&mut daemon, Path::new(SOCKET), &copy.exe, &[], || Ok(copy.clone())).unwrap();
     assert_eq!(got, Builds::Same);
+}
+
+/// Replacing the socket pathname after Status cannot redirect a connect-only command.
+#[cfg(all(unix, feature = "native"))]
+#[test]
+fn connect_only_keeps_the_checked_connection_after_the_listener_is_replaced() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("s");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let file = std::fs::File::open(&exe).unwrap();
+    let mut known = OfBuild {
+        build: blaze_api::Build {
+            exe: crate::serve::executable(&exe, &file).unwrap(),
+            ..blaze_api::Build::default()
+        },
+        settings: crate::serve::settings::of_client(|name| std::env::var_os(name)),
+        asked: Vec::new(),
+    };
+    let mut answers = Vec::new();
+    known.call(Request::Status, |it, _| answers.push(it.into_owned())).unwrap();
+    let path = socket.clone();
+    let (sent, received) = std::sync::mpsc::sync_channel(1);
+    let daemon = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let item = blaze_protocol::read_frame(&mut stream).unwrap().unwrap();
+        let status = blaze_api::frames::decode::<Request>(&item).unwrap();
+        assert_eq!(status.body, Request::Status);
+        std::fs::remove_file(&path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+        sent.send(replacement).unwrap();
+        for answer in answers {
+            stream
+                .write_all(
+                    &blaze_api::frames::encode(&blaze_api::Envelope::new(status.id, answer))
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let item = blaze_protocol::read_frame(&mut stream).unwrap().unwrap();
+        let command = blaze_api::frames::decode::<Request>(&item).unwrap();
+        assert_eq!(command.body, Request::Stop);
+        assert_ne!(command.id, status.id);
+        stream
+            .write_all(
+                &blaze_api::frames::encode(&blaze_api::Envelope::new(
+                    command.id,
+                    Response::Done { ok: true },
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+    });
+    let client = Client::unix(&socket).unwrap();
+    let mut client = this_build(client, &socket, Start::ConnectOnly).unwrap().unwrap();
+    let replacement = received.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(replacement.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert!(told_to_stop(&mut client, |_, _| {}).unwrap());
+    client.until_hung_up(Duration::from_secs(3)).unwrap();
+    daemon.join().unwrap();
 }
 
 /// A daemon of this build told another memory limit than this command sets (the 80 GB daemon

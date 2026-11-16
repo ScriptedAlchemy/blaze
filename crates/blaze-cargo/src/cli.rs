@@ -46,6 +46,7 @@ pub mod observe;
 pub mod own;
 pub mod perf;
 pub mod place;
+mod policy;
 #[cfg(feature = "native")]
 pub mod pprof;
 pub mod print;
@@ -124,6 +125,7 @@ Commands:
     perf record|runs|diff          The performance history of programs blaze built: what changed between runs, and why
 
 Options:
+    --daemon-policy=connect-only-v1  Before build/test/status/stop: never start or replace a daemon
     -V, --version  Print version info and exit
     -h, --help     Print help
 
@@ -137,11 +139,12 @@ Every command takes cargo's flags; `blaze help <COMMAND>` lists them.
 fn said_recomputed<O: Write, E: Write>(
     printer: &mut Printer<'_, O, E>,
     shown: Shown,
+    start: Start,
 ) -> io::Result<()> {
     if shown.quiet {
         return Ok(());
     }
-    match observe::recomputed() {
+    match observe::recomputed(start) {
         Ok(summary) => printer.recomputed(summary),
         Err(why) => printer.err().write_all(say::warning(&why, shown.color).as_bytes()),
     }
@@ -150,8 +153,8 @@ fn said_recomputed<O: Write, E: Write>(
 /// What this client recorded of its build, sent to the daemon's history, and with
 /// `BLAZE_PROFILE` the build's trace written (its path said on `err`): a failure is said on
 /// `err` as a warning naming the step and the build, and the command's own outcome stands.
-fn sent_client_rows(err: &mut impl Write, color: bool) {
-    let said = match client_rows::send() {
+fn sent_client_rows(err: &mut impl Write, color: bool, start: Start) {
+    let said = match client_rows::send(start) {
         Ok(None) => return,
         Ok(Some(path)) => format!(
             "{}: the build's trace (ui.perfetto.dev): {}\n",
@@ -199,7 +202,7 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     // row each: 86% of a self-build's spans (`flight::FOLD_BELOW`). Until 2026-11-04 nothing
     // set this, and one 52-minute build wrote 192 M spans in 6,175 files.
     blaze_profile::flight::fold_below(blaze_profile::flight::FOLD_BELOW);
-    if words.first().is_some_and(|it| it == "serve") {
+    if words.first().is_some_and(|it| it == "serve") && !policy::mentioned(&words) {
         #[cfg(feature = "native")]
         return crate::serve::main(words.into_iter().skip(1));
         #[cfg(not(feature = "native"))]
@@ -249,6 +252,20 @@ pub fn words(args: impl Iterator<Item = OsString>) -> Vec<OsString> {
         words.remove(0);
     }
     words
+}
+
+/// A launcher must not pass a versioned client policy to a different release: historical
+/// parsers can ignore unknown globals on `stop` and `status`. No capability is inferred from
+/// that release's version. This guard runs before fetching or executing the other release.
+pub fn allow_release_handoff(words: &[OsString], release: &str) -> Result<(), String> {
+    if policy::mentioned(words) {
+        return Err(format!(
+            "client daemon policy forbids handing this command to blaze {release}: its policy \
+             support is unverified; use a compiled client with this policy in a workspace \
+             that runs that client"
+        ));
+    }
+    Ok(())
 }
 
 /// The words after `blaze status` or `blaze toolchain`: `--json` or nothing, whether JSON was
@@ -371,18 +388,29 @@ fn no_such_command(name: &str) -> String {
 }
 
 /// One command line, run: its exit code.
-pub fn command(words: Vec<OsString>) -> i32 {
+pub fn command(mut words: Vec<OsString>) -> i32 {
+    let start = match policy::take(&mut words) {
+        Ok(start) => start,
+        Err(what) => {
+            eprint!("{}", say::error(&what, auto_color()));
+            return Exit::Usage.code();
+        }
+    };
     let parsing =
         tracing::info_span!(target: "blaze", "client: parse the command line").entered();
     let parsed = args::parse(words);
     drop(parsing);
-    let asked = match parsed {
+    let mut asked = match parsed {
         Ok(asked) => asked,
         Err(usage) => {
             eprint!("{}", args::refusal(&usage, auto_color()));
             return Exit::Usage.code();
         }
     };
+    if let Err(what) = policy::apply(&mut asked, start) {
+        eprint!("{}", say::error(&what, auto_color()));
+        return Exit::Usage.code();
+    }
     let said = |result: anyhow::Result<i32>| match result {
         Ok(code) => code,
         Err(error) => {
@@ -407,13 +435,14 @@ pub fn command(words: Vec<OsString>) -> i32 {
             eprint!("{}", say::error(&no_such_command(&name), auto_color()));
             Exit::Failed.code()
         }
-        Asked::Stop => said(daemon::stop(&mut io::stderr().lock(), auto_color())),
+        Asked::Stop => said(daemon::stop(&mut io::stderr().lock(), auto_color(), start.passive())),
         Asked::Status(words) => match json_flag("status", words) {
             Ok(json) => said(daemon::status(
                 &mut io::stdout().lock(),
                 &mut io::stderr().lock(),
                 auto_color(),
                 json,
+                start.passive(),
             )),
             Err(what) => {
                 eprint!("{}", say::error(&what, auto_color()));
@@ -645,11 +674,16 @@ fn cargo(asked: &Invocation) -> i32 {
     };
     let connecting =
         tracing::info_span!(target: "blaze", "client: connect to the daemon").entered();
-    let connected = daemon::connect(Start::IfMissing);
+    let connected = daemon::connect(asked.daemon_start);
     drop(connecting);
     let mut client = match connected {
         Ok(Some(client)) => client,
-        Ok(None) => return refused("no daemon answers, and none could be started", color),
+        Ok(None) => {
+            return refused(
+                "no daemon answers; the selected client policy permits no daemon start",
+                color,
+            );
+        }
         Err(error) => return refused(&format!("{error:#}"), color),
     };
     let stats = std::env::var_os("BLAZE_STATS").is_some();
@@ -670,7 +704,7 @@ fn cargo(asked: &Invocation) -> i32 {
         let then = live::drive(&mut client, asked, &place, request, shown, started);
         // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
         let closed = client.close();
-        sent_client_rows(&mut io::stderr().lock(), color);
+        sent_client_rows(&mut io::stderr().lock(), color, asked.daemon_start.passive());
         if let Err(error) = closed {
             return refused(&format!("closing the connection to the build engine: {error}"), color);
         }
@@ -696,7 +730,7 @@ fn cargo(asked: &Invocation) -> i32 {
     );
     // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
     let closed = client.close();
-    sent_client_rows(&mut err, color);
+    sent_client_rows(&mut err, color, asked.daemon_start.passive());
     if let Err(error) = closed {
         let _ = err.write_all(
             say::error(&format!("closing the connection to the build engine: {error}"), color)
@@ -913,7 +947,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         _ => None,
     };
     printer.finish(ok, started.elapsed())?;
-    said_recomputed(&mut printer, shown)?;
+    said_recomputed(&mut printer, shown, asked.daemon_start.passive())?;
     // A check that failed on its findings still has its suggestions made: a deny lint's
     // finding is an error, and its fix takes it away.
     if let Some(found) = found

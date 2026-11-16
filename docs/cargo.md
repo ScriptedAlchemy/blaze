@@ -1024,6 +1024,36 @@ the socket it bound, so an ending daemon never removes the next one's. A command
 daemon of another build tells it to stop and waits for its process to end before starting
 its own.
 
+For a client that must use an already running daemon, put the versioned option before the
+command: `blaze --daemon-policy=connect-only-v1 build`, `test`, `status --json`, or `stop`.
+The option is consumed by the client, never passed to cargo's argument reader. v1 supports
+only these four commands (including `b` and `t`), plus help and version; other commands and
+unknown policy versions are refused before dispatch. The option must occur once and first;
+words after `--` remain test/program arguments. Without the option, behavior is unchanged.
+
+Connect-only never spawns a daemon or stops one to replace it. It refuses installed socket
+activation before connecting, even if a daemon currently runs: a connect to that listener
+could start one. A missing or stale socket is left alone; build/test fail, while status
+reports no daemon and stop succeeds without sending anything. An existing daemon must pass
+the client's build, API schema and settings checks. Connect-only sends the command on that
+same connection, so a replacement listener cannot inherit another daemon's Status check.
+A mismatch fails before the command's
+request, including before an explicit stop. Build/test's summary, client-profile upload and
+optional trace export preserve the policy on every subsequent daemon connection. A successful
+connect-only stop waits for the daemon's hang-up and makes no reconnect probe afterwards.
+It does not wait for proof of process exit beyond the existing hang-up contract.
+
+This option requires a newly compiled client containing this implementation. The launcher
+refuses to hand its policy to another pinned or default release before fetching or executing
+that release; an older parser can ignore an unknown global on status/stop. No historical
+binary's support is inferred, and no environment variable enables this mode. It does not
+disable normal build/test preparation, toolchain provisioning or test execution. It is a
+client start/replacement policy, not a sandbox for commands or for external service managers.
+The activation check recognizes blaze's installed systemd/launchd units; an externally
+managed listener or a concurrent activation change is outside this check. Validation must
+use a separately established socket without activation and keep its service configuration
+fixed; the client cannot make a filesystem-unit check and a kernel connect atomic.
+
 It is one process, with no workers: one loop holds the API server, the watched files, the
 database, the store and the scheduler, for every workspace and checkout it is asked about.
 What it may hold is the machine's memory less a margin of 1 GiB: the least of what the

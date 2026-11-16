@@ -11,13 +11,15 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-90 invariants, 20 refinements, 6 reference models.
-By level: 70 tested, 40 simulated, 0 model-checked, 0 proved.
+91 invariants, 21 refinements, 6 reference models.
+By level: 72 tested, 40 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
 ### blaze-cargo
 
+- **`client_policy_transcripts`** *tested* (`crates/blaze-cargo/src/cli/daemon/tests.rs`): connect-only emits no spawn or implicit Stop for missing, stale, live or mismatched peers, and never dials known activation; default replacement remains enabled.
+  Controls: `implicit_stop_of_a_mismatched_daemon`.
 - **`a_cgroups_footprint_is_its_charge_less_the_file_cache_the_kernel_can_drop`** *tested* (`crates/blaze-cargo/src/raw/memory.rs`): the cgroup's footprint is its charge less the file cache the kernel can drop, and nothing else is taken off. The directed case: a cgroup of 10 GiB of which 6 are file cache, 1 of that shared memory, is 5 GiB (the control: counting all of `file` as droppable says 4, counting none says 10). A line that only begins with a field's name (`file_mapped`, `shmem_thp`) is not the field.
   Controls: `shared_memory_dropped_and_file_cache_kept`.
 - **`a_provided_run_is_answered_the_same_randomness_every_time`** *tested* (`crates/blaze-cargo/src/sandbox/linux.rs`): in a run given a provider, what a process gets from `getrandom` and from `/dev/urandom` is the provider's: the same bytes on every run of the same seed, other bytes for each process and each open, other bytes under another seed, and nothing in the trace that can't be traced.
@@ -350,6 +352,8 @@ By level: 70 tested, 40 simulated, 0 model-checked, 0 proved.
 
 ### hir-ty-pure
 
+- **`closed_graphs_cover_the_recorded_callable_witnesses`** *tested* (`crates/hir-ty-pure/src/callable/fixtures.rs`): a closed whole-token graph covers every recorded concrete invoked target and effect; known positive cases close, selected unsupported cases do not. Failed/incomplete concrete records witness prefixes only, never successful execution.
+  Controls: `missing_callable_targets_and_effects`.
 - **`a_program_optimized_on_facts_behaves_as_written`** *tested* (`crates/hir-ty-pure/src/facts/model.rs`): a program optimized on the facts proved of its functions is seen to do what the program as written does: the same output, the same panic, the same hang. For random small programs (calls by name and through objects, cleanups, guards, panics and hangs that depend on the argument) and every argument, with every [`Spend`] made wherever [`Facts::license`] allows it.
   Controls: `an_unwind_edge_removed_for_a_callee_that_panics_through_a_dyn_call`, `a_pure_call_hoisted_above_the_branch_guarding_its_panic`, `a_fact_relied_on_but_missing_from_the_key`.
 
@@ -379,4 +383,4 @@ By level: 70 tested, 40 simulated, 0 model-checked, 0 proved.
 
 ### blaze-usercode
 
-- **`model`** (`crates/blaze-usercode/src/provider.rs`): the byte at `offset` of what `process` is given by `getrandom`, whatever anyone asked before.
+- **`model`** (`crates/blaze-usercode/src/provider/answers.rs`): the byte at `offset` of what `process` is given by `getrandom`, whatever anyone asked before.

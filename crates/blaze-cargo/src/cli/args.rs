@@ -463,6 +463,8 @@ pub enum DaemonVerb {
 #[derive(Debug, PartialEq, Default)]
 pub struct Invocation {
     pub command: Option<Command>,
+    /// Client-only daemon policy, set before dispatch; never part of cargo's arguments.
+    pub daemon_start: super::daemon::Start,
     /// The words before `--`, as typed, flags typed before the command first: cargo's to read.
     /// None of `run`'s program arguments, nor blaze's own `--reached`, `--ub*` and `--refused`,
     /// nor `-C`.

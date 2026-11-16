@@ -90,7 +90,7 @@ fn began_ns() -> i64 {
 /// Sends what this process recorded to the daemon as build `BUILD`'s client rows, and then,
 /// with `BLAZE_PROFILE` naming a directory, writes the build's trace there as `trace.json`.
 /// Nothing when no build was heard, or in the seed. An error names the step and the build.
-pub fn send() -> Result<Option<PathBuf>, String> {
+pub fn send(start: Start) -> Result<Option<PathBuf>, String> {
     let build = BUILD.load(Ordering::Relaxed);
     // The seed runs its engine in this process (`serve::once`): its history already records
     // this process, and a second connection would start a second engine.
@@ -98,10 +98,10 @@ pub fn send() -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     let request = rows(build)?;
-    observe::ask(request, Start::Never, |_| Ok(()))
+    observe::ask(request, start, |_| Ok(()))
         .map_err(|why| format!("sending build {build}'s client rows to the daemon: {why}"))?;
     let Some(dir) = std::env::var_os(PROFILE).filter(|it| !it.is_empty()) else { return Ok(None) };
-    export(build, Path::new(&dir)).map(Some)
+    export(build, Path::new(&dir), start).map(Some)
 }
 
 /// This process's rows since it began, every one given `build`, as the request that sends
@@ -146,8 +146,9 @@ fn encoded<E: std::fmt::Display>(
 
 /// `BLAZE_PROFILE`: build `build`'s Chrome trace from the history, as `blaze debug time
 /// --trace` makes it, written to `<dir>/trace.json`; its path.
-fn export(build: u64, dir: &Path) -> Result<PathBuf, String> {
-    let (duckdb, history) = observe::history_paths().map_err(|why| format!("{PROFILE}: {why}"))?;
+fn export(build: u64, dir: &Path, start: Start) -> Result<PathBuf, String> {
+    let (duckdb, history) =
+        observe::history_paths(start).map_err(|why| format!("{PROFILE}: {why}"))?;
     let source = load::Source { duckdb: &duckdb, history: &history };
     let trace = load::trace_of(&source, build)
         .map_err(|error| format!("{PROFILE}: build {build}'s trace: {error}"))?;
