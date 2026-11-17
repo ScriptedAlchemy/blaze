@@ -84,21 +84,32 @@ class Input:
 
 
 def load(text: str) -> Input:
-    raw = json.loads(sys.stdin.read() if text == "-" else (Path(text).read_text() if not text.lstrip().startswith("{") else text))
+    raw = json.loads(sys.stdin.read() if text == "-" else (Path(text).read_text() if not text.lstrip().startswith(("{", "[")) else text))
+    if not isinstance(raw, dict):
+        raise Failed("input must be a JSON object")
     for name in ("args", "run"):
         if name in raw:
+            if not isinstance(raw[name], list) or not all(isinstance(value, str) and "\0" not in value for value in raw[name]):
+                raise Failed(f"{name} must be a JSON array of strings without NUL bytes")
             raw[name] = tuple(raw[name])
     given = Input(**raw)
-    if any(type(v) is not int or v <= 0 for v in (given.timeout, given.command_timeout)):
-        raise Failed("timeout and command_timeout must be positive")
-    if any(v is not None and (type(v) is not int or v <= 0) for v in (given.cores, given.daemon_memory_gb)):
-        raise Failed("cores and daemon_memory_gb must be positive integers when supplied")
+    for name in ("blaze", "dist_local", "serve", "scratch", "project"):
+        value = getattr(given, name)
+        if not isinstance(value, str) or not value or "\0" in value:
+            raise Failed(f"{name} must name a nonempty path without NUL bytes")
+    for name in ("timeout", "command_timeout", "cores", "daemon_memory_gb", "stall_bound"):
+        value = getattr(given, name)
+        if value is None and name in ("cores", "daemon_memory_gb", "stall_bound"):
+            continue
+        if type(value) is not int or value <= 0:
+            raise Failed(f"{name} must be a positive integer when supplied")
     if not isinstance(given.env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in given.env.items()):
         raise Failed("env must map strings to strings")
     if any(name.startswith("BLAZE_DIST_") for name in given.env):
         raise Failed("env must not override BLAZE_DIST_*: distribution and policies are controlled case inputs")
-    if type(given.release_fold) is not bool:
-        raise Failed("release_fold must be boolean")
+    for name in ("faults", "release_fold"):
+        if type(getattr(given, name)) is not bool:
+            raise Failed(f"{name} must be boolean")
     if given.release_fold and ("--release" not in given.args or given.profile != "release"):
         raise Failed('release_fold requires args ["--release"] and profile "release"')
     for name in ("profile", "program"):

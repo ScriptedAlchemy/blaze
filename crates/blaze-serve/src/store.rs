@@ -228,7 +228,7 @@ impl Store {
         // atomic name, so concurrent PUTs cannot change the verified packs.
         let packs = blaze_wire::pack_list::decode(bytes)
             .map_err(|why| Error::malformed(format!("the new {name}: {why}")))?;
-        self.verify_manifest_packs(name, &packs, true)?;
+        self.verify_manifest_packs(name, &packs, packs.len())?;
         publish(&object, bytes)?;
         Ok(true)
     }
@@ -274,18 +274,25 @@ impl Store {
             .map_err(|why| Error::malformed(format!("the current {name}: {why}")))?;
         // Inspect every present old pack, even when another is missing: a
         // conflicting immutable key is not a repairable cache miss.
-        let missing = self.verify_manifest_packs(name, &old, false)?;
+        let missing = self.verify_manifest_packs(name, &old, 0)?;
         if !missing {
             return Ok(false);
         }
-        let replacement = blaze_wire::pack_list::decode(bytes)
+        let mut replacement = blaze_wire::pack_list::decode(bytes)
             .map_err(|why| Error::malformed(format!("the replacement {name}: {why}")))?;
-        self.verify_manifest_packs(name, &replacement, true)?;
+        let required = replacement.len();
+        // A missing pack does not release the immutable keys in surviving old packs.
+        // Compare both manifests together: validating each in isolation would permit a
+        // repair to replace an old verified value with conflicting new bytes.
+        replacement.extend(old);
+        self.verify_manifest_packs(name, &replacement, required)?;
         publish(&object, bytes)?;
         Ok(true)
     }
 
     /// Validate each native pack, then merge its ordered records to compare equal keys.
+    /// The first `required` packs must exist; later packs may be absent. Conditional
+    /// repair compares the replacement and surviving old packs in this one frontier.
     /// The request limit bounds the frontier to one record per manifest line, independent
     /// of the number of keys in a unit. Only two files and fixed byte buffers are live.
     /// Work is linear in pack bytes plus O(records * log(packs)) frontier operations.
@@ -295,13 +302,13 @@ impl Store {
         &self,
         name: &str,
         packs: &[blaze_wire::PackRef],
-        require_all: bool,
+        required: usize,
     ) -> Result<bool, Error> {
         let mut frontier = BinaryHeap::new(); // alloc: one pending record per bounded manifest line
         let mut missing = false;
         for (at, pack) in packs.iter().enumerate() {
             if !self.verify_pack(pack)? {
-                if require_all {
+                if at < required {
                     return Err(Error::new(
                         blaze_wire::ErrorCode::Refused,
                         format!("{name} names absent pack {}", hex(&pack.pack)),

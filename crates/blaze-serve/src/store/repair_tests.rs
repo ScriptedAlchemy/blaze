@@ -264,7 +264,7 @@ fn only_an_exact_stale_list_can_be_repaired_and_the_replacement_survives_reopen(
     let store = Store::open(dir.path()).unwrap();
     assert_eq!(current(&store), new);
     // Reopen through the same full-manifest verifier used by production publication.
-    assert!(!store.verify_manifest_packs(&name(), &[b.0.clone()], true).unwrap());
+    assert!(!store.verify_manifest_packs(&name(), &[b.0.clone()], 1).unwrap());
     assert!(!store.repair_list(&name(), &digest(&old), &old).unwrap());
 }
 
@@ -676,10 +676,17 @@ fn partitions_agree(packs: &[native_pack::Pack]) -> bool {
     true
 }
 
+#[derive(Clone, Copy)]
+enum PublicationKind {
+    First,
+    RepairMissing,
+    RepairSurviving,
+}
+
 fn native_partition_scenario(
     count: usize,
     conflict: u8,
-    repair: bool,
+    kind: PublicationKind,
     plan: u8,
     seed: u64,
     plant: Plant,
@@ -688,12 +695,27 @@ fn native_partition_scenario(
     let store = Store::open(dir.path()).unwrap();
     let packs = native_partitions(count, conflict);
     let valid = partitions_agree(&packs);
-    let references: Vec<_> = packs.iter().map(|pack| pack.reference.clone()).collect(); // alloc: test manifest
+    let mut references: Vec<_> = packs.iter().map(|pack| pack.reference.clone()).collect(); // alloc: test manifest
     for pack in &packs {
         store.put_blob(&path(&pack.reference), &pack.bytes).unwrap();
     }
+    let repair = !matches!(kind, PublicationKind::First);
+    let mut previous = vec![pack(250).0]; // alloc: absent old pack authorizes only a valid repair
+    if matches!(kind, PublicationKind::RepairSurviving) {
+        // Retain the complete original in the old manifest, with its missing peer.
+        // The new manifest holds only disjoint even/odd partitions, so a conflict
+        // can be found only by comparing old and new, never either in isolation.
+        let whole = packs
+            .iter()
+            .position(|pack| {
+                native_pack::read(&pack.bytes, &pack.reference).unwrap().len() == count
+            })
+            .expect("the original complete pack");
+        previous.push(references.remove(whole));
+    }
+    previous.sort();
     let new = pack_list::encode(&references);
-    let old = pack_list::encode(&[pack(250).0]); // absent old pack authorizes only a valid repair
+    let old = pack_list::encode(&previous);
     let mut sim = Sim::new(seed, Faults::default());
     let published = slot("objects/published");
     if repair {
@@ -755,9 +777,9 @@ fn native_partition_scenario(
     }
     let pending = store.verification_peak.load(Ordering::Relaxed);
     assert!(
-        pending <= references.len(),
+        pending <= references.len() + if repair { previous.len() } else { 0 },
         "retained {pending} records for {} packs",
-        references.len(),
+        references.len() + if repair { previous.len() } else { 0 },
     );
     if valid {
         assert_eq!(pending, packs.iter().filter(|pack| pack.bytes.len() > 8).count());
@@ -765,14 +787,21 @@ fn native_partition_scenario(
     Ok(())
 }
 
+/// The invariant: first publication and conditional repair never admit conflicting
+/// kinds, lengths or bytes for one immutable key, including a key surviving in an old
+/// manifest; an acknowledged publication survives a crash and reopen byte for byte.
 #[hegel::test(test_cases = 32)]
 fn native_partitions_preserve_values_through_publication_faults_and_reopen(tc: hegel::TestCase) {
     let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(24));
     let conflict = tc.draw(gs::integers::<u8>().max_value(3));
-    let repair = tc.draw(gs::integers::<u8>().max_value(1)) == 1;
+    let kind = match tc.draw(gs::integers::<u8>().max_value(2)) {
+        0 => PublicationKind::First,
+        2 if count >= 3 => PublicationKind::RepairSurviving,
+        _ => PublicationKind::RepairMissing,
+    };
     let plan = tc.draw(gs::integers::<u8>().max_value(71));
     let seed = tc.draw(gs::integers::<u64>());
-    native_partition_scenario(count, conflict, repair, plan, seed, Plant::None).unwrap();
+    native_partition_scenario(count, conflict, kind, plan, seed, Plant::None).unwrap();
 }
 
 #[test]
@@ -783,7 +812,7 @@ fn native_output_spans_wire_batches_and_frontier_memory_depends_only_on_pack_cou
     native_partition_scenario(
         blaze_wire::Limits::DOCUMENTED.batch_items as usize + 1,
         0,
-        false,
+        PublicationKind::First,
         0,
         0,
         Plant::None,
@@ -791,17 +820,21 @@ fn native_output_spans_wire_batches_and_frontier_memory_depends_only_on_pack_cou
     .unwrap();
     // Check CBOR array-head transitions against Pack::of/read's commitments.
     for count in [0, 1, 23, 24, 255, 256] {
-        native_partition_scenario(count, 0, true, 0, 0, Plant::None).unwrap();
+        native_partition_scenario(count, 0, PublicationKind::RepairMissing, 0, 0, Plant::None).unwrap();
     }
 }
 
 #[test]
-fn the_partition_oracle_catches_removing_cross_pack_comparison() {
-    for repair in [false, true] {
+fn the_oracle_catches_removing_cross_pack_comparison() {
+    for kind in [
+        PublicationKind::First,
+        PublicationKind::RepairMissing,
+        PublicationKind::RepairSurviving,
+    ] {
         for conflict in 1..=3 {
-            native_partition_scenario(3, conflict, repair, 0, 0, Plant::None).unwrap();
+            native_partition_scenario(3, conflict, kind, 0, 0, Plant::None).unwrap();
             assert!(
-                native_partition_scenario(3, conflict, repair, 0, 0, Plant::MirrorsBypass)
+                native_partition_scenario(3, conflict, kind, 0, 0, Plant::MirrorsBypass)
                     .is_err_and(|why| why.contains("admitted conflicting immutable values"))
             );
         }

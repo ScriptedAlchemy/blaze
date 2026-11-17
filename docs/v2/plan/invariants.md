@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-90 invariants, 20 refinements, 6 reference models.
-By level: 70 tested, 40 simulated, 0 model-checked, 0 proved.
+96 invariants, 20 refinements, 6 reference models.
+By level: 74 tested, 42 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -79,6 +79,7 @@ By level: 70 tested, 40 simulated, 0 model-checked, 0 proved.
   Controls: `a_removed_entry_kept_in_the_id`.
 - **`rebound_functions_are_reached_through_their_slots`** *tested* (`crates/blaze-codegen/src/driver/tests.rs`): in a build that reaches edited code through slots, every function an edit fills again under its own key is reached through its slot by every caller, so no caller a splice keeps in place holds a direct branch to code the splice replaced.
   Controls: `a_refilled_function_called_directly`.
+- **`warm_dev_and_release_grants_refuse_missing_debug_without_recompiling`** *tested* (`crates/blaze-codegen/src/driver/tests/distributed.rs`): a warm grant exports every debug table its templates name, or refuses the missing key without recompiling. This holds for both store and memo templates.
 - **`removing_a_dyn_target_updates_its_callers_group_and_durable_views`** *tested* (`crates/blaze-codegen/src/driver/tests/kept.rs`): the views of a function's inputs cover its dyn facts, so removing the last fact's target drops its code from both the kept and fresh builds, even when the function is skipped until its group or durable inputs are written.
   Controls: `a_changed_function_whose_callers_keep_its_old_key`, `a_removed_ref_whose_target_stays_reached`, `a_dyn_fact_change_that_invalidates_nothing`, `a_patch_that_keeps_a_changed_functions_old_references`, `a_caller_that_names_a_changed_callees_old_key`, `a_pass_that_runs_whole`, `a_kept_template_used_after_its_callees_key_changed`, `a_delta_that_omits_a_removed_function`, `an_owner_kept_when_its_function_changed`, `a_dedupe_class_not_split_when_a_members_code_changed`, `a_recursion_claim_not_run_after_an_added_edge`.
 - **`a_removed_function_after_a_dyn_fact_edit_refuses_its_stale_handle`** *tested* (`crates/blaze-codegen/src/driver/tests/kept.rs`): removing a formerly reached function after a dyn-fact edit refuses its stale handle without panicking, and the kept and fresh builds still agree on every list and delta. A patch may ask again of the removed function before its reach graph settles.
@@ -92,6 +93,8 @@ By level: 70 tested, 40 simulated, 0 model-checked, 0 proved.
   Controls: `a_hot_lock_on_the_turn_loop`.
 - **`pages_read_back_what_was_put_after_any_crash`** *simulated* (`crates/blaze-core/src/sim/pages.rs`): whatever the faults, wherever the power goes out, a read hands back the bytes put or a refusal the disk's rot explains, the open finds what completed, and every load ends.
   Controls: `a_page_loaded_as_its_read_is_asked`, `a_failed_load_kept`, `a_load_with_no_check`, `an_eviction_of_a_page_the_commit_pinned`, `a_head_written_before_the_data_s_sync`.
+- **`a_write_at_an_offset_goes_through_the_page_cache`** *simulated* (`crates/blaze-core/src/uring.rs`): a write at an offset goes through the page cache whatever its size and alignment. Writes of 8 MiB at multiples of 8 MiB and one unaligned: the open of each asks for no `O_DIRECT`, each is one buffered write on its slot, and each reads back as written. Its control is `the_oracle_catches_a_write_at_an_offset_opened_around_the_cache`.
+  Controls: `a_write_at_an_offset_opened_around_the_cache`.
 - **`every_public_wait_ends_in_a_sandboxed_process`** *tested* (`crates/blaze-core/src/wait/filtered.rs`): in a process the sandbox launcher marked, under a filter that refuses io_uring as the sandbox's does, every wait `blaze_core::wait` gives ends, on the direct driver, and no ring is asked for.
   Controls: `a_sandboxed_process_waiting_on_the_ring`.
 - **`every_wait_ends_by_its_deadline_under_interruption`** *simulated* (`crates/blaze-core/src/wait/tests.rs`): whatever interrupts it, every wait ends by its deadline, never says it passed before it did, and is ready whenever its event came first.
@@ -218,11 +221,19 @@ By level: 70 tested, 40 simulated, 0 model-checked, 0 proved.
 
 - **`a_large_value_is_kept_out_of_line_and_a_small_one_in_place`** *tested* (`crates/blaze-query/src/db/row.rs`): a row holds its value in place up to [`INLINE_MOST`] bytes and past it the address of the value's own block, which `drop_value` frees with the value; either way the row reads back what was put, its neighbours untouched, and a row is no longer than its header and its place.
   Controls: `a_large_values_storage_retained_in_the_row`.
+- **`a_cycle_ends_only_after_a_round_in_which_no_row_read_on_the_stack_moved`** *tested* (`crates/blaze-query/src/db/tests/inner_heads.rs`): a cycle's rows are made final only by a round in which every value a run read from a row of the cycle on the stack is the value that row ended the round with. Every row of the cycle that ends a round with another value than was read from it says so, and the word reaches the outermost head through every head between them, so the answers are the fixpoint a run from scratch reaches, whichever row is asked first and whether the rows were made in this view or verified into it after a write.
+  Controls: `an_inner_head_that_keeps_a_moved_row_to_itself`, `a_kept_head_that_counts_its_rounds_from_one_again`.
+- **`a_kept_head_is_told_the_round_of_its_cycles_outermost_head`** *tested* (`crates/blaze-query/src/db/tests/inner_heads.rs`): the round a row's `cycle_recover` is told is its cycle's outermost head's. A head the cycle keeps from one round to the next is told each round's number in turn, at whatever depth it is nested: its new frame starts at the round of the head that kept it. Rows 0, 3 and 1 are each read on the stack in each of the three rounds; rows 2 and 4 never are, so they recover nothing.
+  Controls: `an_inner_head_that_keeps_a_moved_row_to_itself`, `a_kept_head_that_counts_its_rounds_from_one_again`.
+- **`a_stale_head_of_another_tasks_cycle_is_waited_for_never_run`** *tested* (`crates/blaze-query/src/db/tests/stale_head.rs`): a provisional row is run and written only by the task whose stack holds its cycle's head. A task that comes to hold the flight of a stale inner head of another task's cycle waits for the head instead, so every task gets the fixpoint a single task computes, and no run finds its own row emptied under it.
+  Controls: `a_stale_head_run_by_a_task_that_does_not_head_its_cycle`.
 
 ### blaze-serve
 
+- **`native_partitions_preserve_values_through_publication_faults_and_reopen`** *simulated* (`crates/blaze-serve/src/store/repair_tests.rs`): first publication and conditional repair never admit conflicting kinds, lengths or bytes for one immutable key, including a key surviving in an old manifest; an acknowledged publication survives a crash and reopen byte for byte.
+  Controls: `removing_cross_pack_comparison`, `the_comparison_bypass_plant`, `missing_file_sync_with_torn_appends`, `acknowledgement_before_directory_sync`.
 - **`conditional_publication_preserves_comparison_and_whole_file_integrity`** *simulated* (`crates/blaze-serve/src/store/repair_tests.rs`): a conditional repair requires the current committed digest, an absent old pack, and verified replacement bytes; no stale writer may replace the winner, and each acknowledged repair survives a crash and reopen as a whole manifest.
-  Controls: `the_comparison_bypass_plant`, `missing_file_sync_with_torn_appends`, `acknowledgement_before_directory_sync`.
+  Controls: `removing_cross_pack_comparison`, `the_comparison_bypass_plant`, `missing_file_sync_with_torn_appends`, `acknowledgement_before_directory_sync`.
 
 ### blaze-shader
 

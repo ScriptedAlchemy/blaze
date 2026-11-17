@@ -215,3 +215,56 @@ fn successive_dev_grants_reexport_debug_of_a_shared_memo_shape() {
     assert_eq!(restored.stats.compiled, 0);
     assert!(restored.functions.iter().all(|function| function.side.is_some()));
 }
+
+/// The invariant: a warm grant exports every debug table its templates name, or refuses
+/// the missing key without recompiling. This holds for both store and memo templates.
+#[test]
+fn warm_dev_and_release_grants_refuse_missing_debug_without_recompiling() {
+    for level in [OptLevel::O0, OptLevel::O3] {
+        for memo_only in [false, true] {
+            let (program, policy, machine, memo) = (
+                program(),
+                policy(level, Mode::Output),
+                Machine { emit_debug: true, ..Machine::default() },
+                Memo::new(),
+            );
+            let build = Build::new(&machine, &program, &policy, &memo);
+            let work = build.work_set(&[(1, member())], &[], &[], &Store::default()).unwrap();
+            let first = build.compile_granted(&work, &work.names(), &Store::default()).unwrap();
+            let debug: Vec<_> = first
+                .compiled
+                .iter()
+                .chain(&first.stored)
+                .filter(|put| put.kind == Kind::Debug)
+                .map(|put| put.key)
+                .collect();
+            assert!(!debug.is_empty(), "the fixture must emit actual debug tables");
+            let mut complete = Store::default();
+            outputs(first, &mut complete);
+            let mut input = Store::default();
+            for (key, bytes) in &complete.0 {
+                if !memo_only || debug.contains(key) {
+                    input.0.insert(*key, bytes.clone());
+                }
+            }
+            let missing = debug[0];
+            let bytes = input.0.remove(&missing).unwrap();
+            let emitted = machine.emitted.load(Ordering::Relaxed);
+            let errors = build.compile_granted(&work, &work.names(), &input).unwrap_err();
+            assert!(errors.iter().any(|error| {
+                error.what.contains("missing debug table")
+                    && error.what.contains(&format!("{missing:?}"))
+            }));
+            assert_eq!(machine.emitted.load(Ordering::Relaxed), emitted);
+
+            // Restoring only the omitted table makes exactly the original grant transferable.
+            input.0.insert(missing, bytes);
+            let restored = build.compile_granted(&work, &work.names(), &input).unwrap();
+            assert_eq!(restored.stats.compiled, 0);
+            let mut receiver = Store::default();
+            outputs(restored, &mut receiver);
+            assert_eq!(receiver.0, complete.0);
+            assert_eq!(machine.emitted.load(Ordering::Relaxed), emitted);
+        }
+    }
+}

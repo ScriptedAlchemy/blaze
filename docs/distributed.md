@@ -43,22 +43,24 @@ blaze-serve --dir DIR --listen 127.0.0.1:PORT
 `crates/blaze-cargo/src/serve/unit/dist.rs` wires it into a unit's codegen, and
 `crates/blaze-dist-local/src/agent.rs` is one daemon's side of it.
 
-1. The unit's walk names its work. Equal instance keys are equal inputs, whatever machine computed
-   them, so the digest of a walk's keys (`blaze_codegen::driver::WorkSet::digest`) is the job:
-   executors that differ in anything a function's code depends on are not in one execution.
+1. The unit's walk and canonical plans name its work. `blaze_codegen::driver::WorkSet::digest`
+   covers functions, statics, roots, resolved references, summaries and release/fold decisions:
+   executors that differ in any of those inputs are not in one execution.
 2. A list published under that digest names everything an earlier build made. Its packs are read,
-   each checked against what the list says, and nothing is scheduled. A list naming a pack the
-   server lost is an unpublished unit.
+   each checked against what the list says, and nothing is scheduled. A list naming a missing or
+   corrupt pack is a terminal refusal, including when local fallback was requested.
 3. Otherwise the agent submits the job. An equal job joins the running execution. It claims the
    executor assigned to it and runs a holder: join, lease, compile a batch of functions by the code
    a store miss runs (`Build::compile_granted`), seal them into a pack, upload it, then report it,
    so a committed result's bytes exist. Heartbeats go on from another thread, since the batch
    compiler owns its thread.
-4. When the work is done every agent reads every committed pack. The build then runs as always,
-   with those values in front of its store. `BLAZE_VERIFY_STORE` samples them as it samples the
-   store's own; what nothing committed it compiles itself and reports.
-5. What it took goes into its own store with what it made, so the link, the record and the next
-   build have one store to read, and the unit's list is published for the builds to come.
+4. When the grants are done, the current lead finishes the ordinary build with their committed
+   values in front of its store. `BLAZE_VERIFY_STORE` samples those values as it samples local
+   ones. The lead uploads every produced and consumed value, then asks the coordinator to accept
+   the full immutable manifest against its attempt. Helpers wait for this complete record.
+5. A subscriber mirrors that accepted manifest to the cache and acknowledges delivery. Every
+   subscriber imports its complete values into its own store, so the link, record and next build
+   read the same outputs. Accepted publication never authorizes another compile.
 
 The coordinator retains a completed compile phase through final export and publication. A
 request for the same unit during that interval joins the execution and waits for its immutable

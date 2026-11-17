@@ -431,6 +431,27 @@ class Oracles(unittest.TestCase):
                                   ("profile", "debug/../../outside"), ("profile", "")):
                 with self.subTest(field=field, unsafe=unsafe), self.assertRaises(e.Failed):
                     h.load(json.dumps({**base, field: unsafe}))
+            for field, invalid in (("faults", 0), ("faults", 1), ("faults", "false"), ("faults", None),
+                                   ("release_fold", 0), ("release_fold", "true"),
+                                   ("args", "--release"), ("args", [1]), ("args", ["bad\0argument"]),
+                                   ("run", "11"), ("run", [False]), ("run", None),
+                                   ("timeout", True), ("command_timeout", 1.5), ("cores", True),
+                                   ("daemon_memory_gb", "6"), ("stall_bound", False), ("stall_bound", 0),
+                                   ("blaze", ""), ("dist_local", ["/unused"]), ("serve", "bad\0path"),
+                                   ("scratch", False), ("project", None)):
+                with self.subTest(field=field, invalid=invalid), self.assertRaisesRegex(e.Failed, field):
+                    h.load(json.dumps({**base, field: invalid}))
+            with self.assertRaisesRegex(e.Failed, "JSON object"):
+                h.load("[]")
+            self.assertTrue(h.load(json.dumps(base)).faults)
+            self.assertFalse(h.load(json.dumps({**base, "faults": False})).faults)
+            release = h.load(json.dumps({**base, "faults": True, "release_fold": True,
+                                         "args": ["--release"], "profile": "release", "run": ["11"],
+                                         "stall_bound": 90}))
+            self.assertTrue(release.faults and release.release_fold)
+            self.assertEqual(release.args, ("--release",))
+            self.assertEqual(release.run, ("11",))
+            self.assertEqual(release.stall_bound, 90)
 
     def test_provenance_rejects_untracked_source_while_preserving_tracked_patch(self):
         with tempfile.TemporaryDirectory() as directory:
