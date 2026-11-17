@@ -250,16 +250,11 @@ impl Lookup for Planted<'_> {
     }
 }
 
-fn ensure(held: bool, what: impl FnOnce() -> String) -> Result<(), String> {
-    if held { Ok(()) } else { Err(what()) }
-}
-
 /// The oracle of [`warm_dev_and_release_grants_refuse_missing_debug_without_recompiling`]: for a
 /// dev and a release build, with the templates in the store and in the memo only, a warm grant
 /// whose input lacks one debug table is refused naming exactly that key with nothing recompiled,
-/// and restoring only that table makes exactly the original grant transferable. `Err` names
-/// the first thing that did not hold.
-fn warm_grants_refuse_missing_debug(bug: Option<Bug>) -> Result<(), String> {
+/// and restoring only that table makes exactly the original grant transferable.
+fn warm_grants_refuse_missing_debug(bug: Option<Bug>) {
     for (level, built) in [(OptLevel::O0, "dev"), (OptLevel::O3, "release")] {
         for memo_only in [false, true] {
             let templates = if memo_only { "memo" } else { "store" };
@@ -294,57 +289,47 @@ fn warm_grants_refuse_missing_debug(bug: Option<Bug>) -> Result<(), String> {
             let changed = [&bytes[..], &[0xff]].concat();
             let emitted = machine.emitted.load(Ordering::Relaxed);
             let planted = Planted { store: &input, bug, at: missing, changed: &changed };
-            let errors = match build.compile_granted(&work, &work.names(), &planted) {
-                Err(errors) => errors,
-                Ok(_) => {
-                    return Err(format!("{case}: granted a bundle that lacks {missing:?}"));
-                }
-            };
-            ensure(
+            let errors = build
+                .compile_granted(&work, &work.names(), &planted)
+                .expect_err("granted a bundle that lacks a debug table");
+            assert!(
                 errors.iter().any(|error| {
                     error.what.contains("missing debug table")
                         && error.what.contains(&format!("{missing:?}"))
                 }),
-                || format!("{case}: the refusal does not name the missing {missing:?}"),
-            )?;
-            ensure(machine.emitted.load(Ordering::Relaxed) == emitted, || {
-                format!("{case}: the refusal recompiled")
-            })?;
+                "{case}: the refusal does not name the missing {missing:?}"
+            );
+            assert_eq!(
+                machine.emitted.load(Ordering::Relaxed),
+                emitted,
+                "{case}: the refusal recompiled"
+            );
 
             // Restoring only the omitted table makes exactly the original grant transferable.
             input.0.insert(missing, bytes);
             let planted = Planted { store: &input, bug, at: missing, changed: &changed };
-            let restored = match build.compile_granted(&work, &work.names(), &planted) {
-                Ok(restored) => restored,
-                Err(errors) => {
-                    let why: Vec<_> = errors.iter().map(|error| error.what.as_str()).collect();
-                    let why = why.join("; ");
-                    return Err(format!("{case}: the restored grant was refused: {why}"));
-                }
-            };
-            ensure(restored.stats.compiled == 0, || {
-                format!("{case}: the restored grant compiled")
-            })?;
+            let restored = build.compile_granted(&work, &work.names(), &planted).unwrap();
+            assert_eq!(restored.stats.compiled, 0, "{case}: the restored grant compiled");
             let mut receiver = Store::default();
             outputs(restored, &mut receiver);
-            ensure(receiver.0 == complete.0, || {
-                format!("{case}: the restored grant is not the original, byte for byte")
-            })?;
-            ensure(machine.emitted.load(Ordering::Relaxed) == emitted, || {
-                format!("{case}: the restored grant recompiled")
-            })?;
+            assert_eq!(
+                receiver.0, complete.0,
+                "{case}: the restored grant is not the original, byte for byte"
+            );
+            assert_eq!(
+                machine.emitted.load(Ordering::Relaxed),
+                emitted,
+                "{case}: the restored grant recompiled"
+            );
         }
     }
-    Ok(())
 }
 
 /// The invariant: a warm grant exports every debug table its templates name, or refuses
 /// the missing key without recompiling. This holds for both store and memo templates.
 #[test]
 fn warm_dev_and_release_grants_refuse_missing_debug_without_recompiling() {
-    if let Err(why) = warm_grants_refuse_missing_debug(None) {
-        panic!("{why}");
-    }
+    warm_grants_refuse_missing_debug(None);
 }
 
 /// The control of [`warm_dev_and_release_grants_refuse_missing_debug_without_recompiling`]: its
@@ -352,18 +337,16 @@ fn warm_dev_and_release_grants_refuse_missing_debug_without_recompiling() {
 /// table it lacks, which a grant that never refused would export as the real one: the grant is
 /// granted, and the oracle says so before it looks at anything else.
 #[test]
+#[should_panic(expected = "granted a bundle that lacks")]
 fn the_oracle_catches_a_missing_debug_table_answered_as_present() {
-    let why = warm_grants_refuse_missing_debug(Some(Bug::AnswersAMissingTable))
-        .expect_err("the planted bug was not found");
-    assert!(why.contains("granted a bundle that lacks"), "found for another reason: {why}");
+    warm_grants_refuse_missing_debug(Some(Bug::AnswersAMissingTable));
 }
 
 /// The control of [`warm_dev_and_release_grants_refuse_missing_debug_without_recompiling`] for
 /// its restoration half: the refusal is right and only the restored table differs by a byte, which
 /// the oracle finds in the exported bytes and nowhere else.
 #[test]
+#[should_panic(expected = "not the original, byte for byte")]
 fn the_oracle_catches_a_restored_debug_table_that_is_not_the_original() {
-    let why = warm_grants_refuse_missing_debug(Some(Bug::ChangesARestoredTable))
-        .expect_err("the planted bug was not found");
-    assert!(why.contains("not the original, byte for byte"), "found for another reason: {why}");
+    warm_grants_refuse_missing_debug(Some(Bug::ChangesARestoredTable));
 }

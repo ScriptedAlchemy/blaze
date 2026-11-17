@@ -344,9 +344,12 @@ class CorpusTests(unittest.TestCase):
             self.interrupted_record(corpus)
 
     def test_oracle_catches_only_saving_results_after_the_run(self):
-        with smoke.Corpus(self.old) as corpus, mock.patch.object(smoke.Results, "append", list.append):
-            with self.assertRaisesRegex(AssertionError, "must retain completed smoke results"):
-                self.interrupted_record(corpus)
+        with (
+            smoke.Corpus(self.old) as corpus,
+            mock.patch.object(smoke.Results, "append", list.append),
+            self.assertRaisesRegex(AssertionError, "must retain completed smoke results"),
+        ):
+            self.interrupted_record(corpus)
 
     def test_oracle_catches_losing_the_selected_compilers_ignore_pin(self):
         with smoke.Corpus(self.old) as corpus, \
