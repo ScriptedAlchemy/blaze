@@ -270,6 +270,24 @@ pub struct TestCase {
     draw_state: Arc<Mutex<DrawState>>,
 }
 
+/// Keeps the exact handle that opened a draw alive until it closes, even if a generator
+/// switches child handles or unwinds after rejecting its input.
+struct GenerationScope(Arc<CTestCase>);
+
+impl GenerationScope {
+    fn new(tc: &TestCase) -> Self {
+        let handle = Arc::clone(&tc.handle.borrow());
+        handle.generation_scope(true).unwrap_or_else(|rc| raise_for_rc(rc));
+        Self(handle)
+    }
+}
+
+impl Drop for GenerationScope {
+    fn drop(&mut self) {
+        self.0.generation_scope(false).expect("a draw closes its own generation scope");
+    }
+}
+
 impl Clone for TestCase {
     fn clone(&self) -> Self {
         TestCase {
@@ -533,6 +551,7 @@ impl TestCase {
         name: &str,
         repeatable: bool,
     ) -> T {
+        let _generation = GenerationScope::new(self);
         let mid_draw = {
             let local = self.local.borrow();
             local.span_depth > 0 || local.printing_depth > 0
@@ -569,6 +588,7 @@ impl TestCase {
     /// their `do_draw` directly: that is what groups each component's
     /// choices for the shrinker.
     pub fn draw_silent<T>(&self, generator: impl Generator<T>) -> T {
+        let _generation = GenerationScope::new(self);
         self.start_span(generator.label());
         let value = generator.do_draw(self);
         self.stop_span(false);
@@ -596,6 +616,7 @@ impl TestCase {
         generator: impl PrintableGenerator<T>,
         printer: &mut PrettyPrinter,
     ) -> T {
+        let _generation = GenerationScope::new(self);
         self.start_span(generator.label());
         let value = generator.do_draw_and_print(self, printer);
         self.stop_span(false);

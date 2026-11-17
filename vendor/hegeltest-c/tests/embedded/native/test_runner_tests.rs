@@ -80,6 +80,59 @@ fn concurrent_machine(ds: &dyn DataSource) -> Result<(), TestCaseResult> {
     }
 }
 
+/// An expensive oracle does not make cheap generation unhealthy. Inject durations into
+/// the real accounting path instead of waiting for the production30-second threshold.
+#[test]
+fn body_time_and_measurement_replays_do_not_spend_the_generation_budget() {
+    with_engine(
+        Settings::new().database(None).verbosity(Verbosity::Quiet),
+        None,
+        |_ds| TestCaseResult::Valid,
+        async |ctx| {
+            let run = valid_at(vec![bool_node(true)]);
+            ctx.record_run(&run, Duration::from_secs(3600), Duration::from_secs(1), false).unwrap();
+            assert_eq!(ctx.total_test_time, Duration::from_secs(3600));
+            assert_eq!(ctx.total_generation_time, Duration::from_secs(1));
+            assert!(
+                too_slow_check(
+                    ctx.valid_test_cases,
+                    ctx.total_generation_time,
+                    Duration::from_secs(30),
+                    false
+                )
+                .is_none()
+            );
+            assert!(
+                too_slow_check(
+                    ctx.valid_test_cases,
+                    ctx.total_test_time,
+                    Duration::from_secs(30),
+                    false
+                )
+                .is_some(),
+                "the old accounting must fail this control"
+            );
+            ctx.record_run(&run, Duration::from_secs(3600), Duration::from_secs(31), true).unwrap();
+            assert_eq!(
+                ctx.total_generation_time,
+                Duration::from_secs(1),
+                "measurement replays do not spend the generation budget"
+            );
+            ctx.record_run(&run, Duration::from_secs(31), Duration::from_secs(31), false).unwrap();
+            assert!(
+                too_slow_check(
+                    ctx.valid_test_cases,
+                    ctx.total_generation_time,
+                    Duration::from_secs(30),
+                    false
+                )
+                .is_some(),
+                "a genuinely slow generator still fails"
+            );
+        },
+    );
+}
+
 #[test]
 fn too_slow_check_reports_when_under_threshold_and_unsuppressed() {
     let msg = too_slow_check(1, Duration::from_secs(60), Duration::from_secs(30), false);
@@ -736,7 +789,7 @@ fn overrun_during_draw_overrides_a_swallowed_valid_outcome() {
             TestCaseResult::Valid
         },
         async |ctx, _| {
-            let run = ctx.execute(NativeTestCase::for_choices(&[], None, None)).await.unwrap();
+            let (run, _) = ctx.execute(NativeTestCase::for_choices(&[], None, None)).await.unwrap();
             assert_eq!(run.status, Status::EarlyStop);
         },
     );
@@ -3082,6 +3135,30 @@ where
     });
 }
 
+#[test]
+fn execution_charges_generation_intervals_and_excludes_body_gaps() {
+    let ntc = NativeTestCase::for_choices(&[], None, None);
+    let family = ntc.family().clone();
+    family.generation_time.set_time(Duration::ZERO);
+    with_engine(
+        quiet_settings(),
+        None,
+        move |ds| {
+            ds.generation_scope(true).unwrap();
+            family.generation_time.set_time(Duration::from_secs(1));
+            ds.generation_scope(false).unwrap();
+            family.generation_time.set_time(Duration::from_secs(3601));
+            TestCaseResult::Valid
+        },
+        async |ctx| {
+            let (run, mismatch) = ctx.test_function(ntc).await.unwrap();
+            assert_eq!(run.status, Status::Valid);
+            assert!(mismatch.is_none());
+            assert_eq!(ctx.total_generation_time, Duration::from_secs(1));
+        },
+    );
+}
+
 /// An interesting [`RunResult`] at `origin` realizing `nodes` as top-level
 /// draws, standing in for a raw execution's outcome.
 fn interesting_at(origin: &str, nodes: Vec<ChoiceNode>) -> RunResult {
@@ -3125,17 +3202,24 @@ fn history_records_raw_displacements_and_shrink_accepts() {
             ctx.record_run(
                 &interesting_at(origin, vec![bool_node(true), bool_node(true)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
             ctx.record_run(
                 &interesting_at(origin, vec![bool_node(true), bool_node(true), bool_node(false)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
-            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(false)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             let history = ctx.origins.get(origin).unwrap().history();
             assert_eq!(history.entries().len(), 3);
             assert!(history.entries()[0].accept, "founding sighting");
@@ -3157,6 +3241,7 @@ fn history_dedupes_repeated_timelines() {
                 ctx.record_run(
                     &interesting_at(origin, vec![bool_node(true)]),
                     Duration::ZERO,
+                    Duration::ZERO,
                     false,
                 )
                 .unwrap();
@@ -3174,13 +3259,24 @@ fn history_is_kept_only_while_deterministic() {
         |_ds| TestCaseResult::Valid,
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(true)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             ctx.nd_flip();
-            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(false)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             ctx.record_run(
                 &interesting_at("Panic: other", vec![bool_node(false)]),
+                Duration::ZERO,
                 Duration::ZERO,
                 false,
             )
@@ -3203,10 +3299,20 @@ fn a_measurement_run_neither_displaces_nor_persists() {
         |_ds| TestCaseResult::Valid,
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
-                .unwrap();
-            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, true)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(true)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(false)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                true,
+            )
+            .unwrap();
             assert_eq!(
                 ctx.origins.incumbent(origin).unwrap(),
                 &[bool_node(true)],
@@ -3215,8 +3321,13 @@ fn a_measurement_run_neither_displaces_nor_persists() {
             assert_eq!(ctx.origins.get(origin).unwrap().history().entries().len(), 1);
 
             ctx.reuse_replays = true;
-            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, true)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(false)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                true,
+            )
+            .unwrap();
             ctx.reuse_replays = false;
             assert_eq!(
                 ctx.origins.incumbent(origin).unwrap(),
@@ -3242,8 +3353,13 @@ fn history_is_dropped_when_the_origin_confirms() {
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
-            ctx.record_run(&interesting_at(&origin, vec![bool_node(true)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(&origin, vec![bool_node(true)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             assert!(ctx.origins.get(&origin).is_some_and(|c| !c.history().is_empty()));
             ctx.nd_flip();
             let output = Settings::new().output;
@@ -3270,8 +3386,13 @@ fn a_first_check_outcome_miss_flips_the_run_before_displacement() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(true)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             ctx.first_check_sweep().await.unwrap();
             assert!(ctx.nd_active, "an outcome miss must flip the run");
             assert_eq!(
@@ -3298,8 +3419,13 @@ fn a_first_check_realized_timeline_miss_flips_the_run() {
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
-            ctx.record_run(&interesting_at(&origin, vec![int_node(5)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(&origin, vec![int_node(5)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             ctx.first_check_sweep().await.unwrap();
             assert!(
                 ctx.nd_active,
@@ -3323,8 +3449,13 @@ fn first_check_evidence_seeds_the_origins_ledger() {
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
-            ctx.record_run(&interesting_at(&origin, vec![int_node(5)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(&origin, vec![int_node(5)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             ctx.first_check_sweep().await.unwrap();
             let seed = ctx.origins.entry(&origin).take_seed().unwrap();
             assert_eq!(seed.fails(), 1, "the failing divergent replay is a fail");
@@ -3394,11 +3525,13 @@ fn each_origin_gets_its_own_first_check() {
             ctx.record_run(
                 &interesting_at("Panic: a", vec![bool_node(true)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
             ctx.record_run(
                 &interesting_at("Panic: b", vec![bool_node(false)]),
+                Duration::ZERO,
                 Duration::ZERO,
                 false,
             )
@@ -3429,8 +3562,13 @@ fn an_all_reproduce_first_check_keeps_the_run_deterministic() {
         },
         async |ctx| {
             let origin = format!("Panic: {bug}");
-            ctx.record_run(&interesting_at(&origin, vec![bool_node(true)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(&origin, vec![bool_node(true)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             ctx.first_check_sweep().await.unwrap();
             assert!(!ctx.nd_active);
             assert!(ctx.origins.get(origin.as_str()).is_some_and(|c| c.first_checked()));
@@ -3448,8 +3586,13 @@ fn an_all_reproduce_first_check_keeps_the_run_deterministic() {
 /// shortlex-smaller, mirroring a real generation phase.
 fn seed_history(ctx: &mut Engine<'_>, origin: &str, values: &[i128]) {
     for &value in values {
-        ctx.record_run(&interesting_at(origin, vec![int_node(value)]), Duration::ZERO, false)
-            .unwrap();
+        ctx.record_run(
+            &interesting_at(origin, vec![int_node(value)]),
+            Duration::ZERO,
+            Duration::ZERO,
+            false,
+        )
+        .unwrap();
     }
 }
 
@@ -3666,8 +3809,13 @@ fn the_sweep_rejects_an_origin_out_of_bar_attempts() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(true)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             for _ in 0..nd::BAR_ATTEMPTS_PER_RUN {
                 assert!(ctx.origins.entry(origin).spend_bar_attempt());
             }
@@ -3699,8 +3847,13 @@ fn shrink_admission_rejects_an_origin_out_of_bar_attempts() {
         },
         async |ctx| {
             let origin = "Panic: bug".to_string();
-            ctx.record_run(&interesting_at(&origin, vec![bool_node(true)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(&origin, vec![bool_node(true)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             ctx.origins.entry(&origin).clear_history();
             for _ in 0..nd::BAR_ATTEMPTS_PER_RUN {
                 assert!(ctx.origins.entry(&origin).spend_bar_attempt());
@@ -3739,8 +3892,13 @@ fn the_final_replay_review_confirms_through_the_bar() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(true)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             assert!(ctx.origins.needs_confirmation(origin));
             ctx.origins.entry(origin).record_miss();
             let output = ctx.settings.output.clone();
@@ -3776,8 +3934,13 @@ fn a_bar_rejected_review_falls_through_to_eviction() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(true)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             ctx.origins.entry(origin).clear_history();
             let output = ctx.settings.output.clone();
             ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
@@ -3832,8 +3995,13 @@ fn an_out_of_attempts_review_evicts_without_a_batch() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(true)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             ctx.origins.entry(origin).clear_history();
             for _ in 0..nd::BAR_ATTEMPTS_PER_RUN {
                 assert!(ctx.origins.entry(origin).spend_bar_attempt());
@@ -4165,6 +4333,7 @@ fn a_flip_during_final_replay_reviews_already_replayed_origins() {
             ctx.record_run(
                 &interesting_at("Panic: alpha", vec![int_node(3)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
@@ -4317,8 +4486,13 @@ fn a_post_flip_origin_faces_the_bar_at_shrink_time() {
         async |ctx| {
             let origin = format!("Panic: {bug}");
             ctx.nd_flip();
-            ctx.record_run(&interesting_at(&origin, vec![int_node(90)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(&origin, vec![int_node(90)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             assert!(ctx.origins.get(&origin).is_none_or(|c| c.history().is_empty()));
             let output = ctx.settings.output.clone();
             let mut shrunk = crate::native::HashSet::default();
@@ -4354,8 +4528,13 @@ fn a_post_flip_fluke_is_rejected_at_the_bar_at_shrink_time() {
         async |ctx| {
             let origin = format!("Panic: {bug}");
             ctx.nd_flip();
-            ctx.record_run(&interesting_at(&origin, vec![int_node(90)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(&origin, vec![int_node(90)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             let output = ctx.settings.output.clone();
             let mut shrunk = crate::native::HashSet::default();
             let timed_out = ctx
@@ -4394,10 +4573,16 @@ fn a_mid_shrink_flip_requeues_from_the_pre_shrink_nodes() {
             // probes that repeat these keys execute (nothing to serve) and
             // the contradicting verdicts are the observed mid-shrink flip.
             ctx.collect_statistics = true;
-            ctx.record_run(&interesting_at(origin, vec![int_node(70)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![int_node(70)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             for v in 50..70 {
-                ctx.record_run(&valid_at(vec![int_node(v)]), Duration::ZERO, false).unwrap();
+                ctx.record_run(&valid_at(vec![int_node(v)]), Duration::ZERO, Duration::ZERO, false)
+                    .unwrap();
             }
             ctx.collect_statistics = false;
             let output = ctx.settings.output.clone();
@@ -4453,6 +4638,7 @@ fn an_exact_final_replay_vanish_aborts_under_error_strictness() {
         async |ctx| {
             ctx.record_run(
                 &interesting_at("Panic: bug", vec![int_node(90)]),
+                Duration::ZERO,
                 Duration::ZERO,
                 false,
             )
@@ -4585,8 +4771,13 @@ fn an_exact_shrink_verify_vanish_aborts_under_error_strictness() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(&interesting_at(origin, vec![int_node(90)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![int_node(90)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             let output = ctx.settings.output.clone();
             let mut shrunk = crate::native::HashSet::default();
             let err = ctx
@@ -4621,8 +4812,13 @@ fn a_divergent_shrink_verify_vanish_aborts_under_error_strictness() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(&interesting_at(origin, vec![int_node(90)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![int_node(90)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             let output = ctx.settings.output.clone();
             let mut shrunk = crate::native::HashSet::default();
             let err = ctx
@@ -4664,6 +4860,7 @@ fn a_first_check_structural_miss_aborts_under_error_strictness() {
             ctx.record_run(
                 &interesting_at(&origin, vec![int_node(5), int_node(6)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
@@ -4690,8 +4887,13 @@ fn a_first_check_outcome_miss_aborts_under_error_strictness() {
         },
         async |ctx| {
             let origin = "Panic: bug";
-            ctx.record_run(&interesting_at(origin, vec![bool_node(true)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(true)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             match ctx.first_check_sweep().await {
                 Err(crate::backend::RunError::Flaky(msg)) => {
                     assert!(msg.contains("Flaky test detected"), "got: {msg}");
@@ -4739,11 +4941,17 @@ fn nd_raw_interesting_never_displaces_an_occupied_origin() {
         async |ctx| {
             let origin = "Panic: bug";
             let big = vec![bool_node(true), bool_node(true)];
-            ctx.record_run(&interesting_at(origin, big), Duration::ZERO, false).unwrap();
+            ctx.record_run(&interesting_at(origin, big), Duration::ZERO, Duration::ZERO, false)
+                .unwrap();
             assert_eq!(ctx.origins.incumbent(origin).unwrap().len(), 2);
 
-            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(false)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             assert_eq!(
                 ctx.origins.incumbent(origin).unwrap().len(),
                 2,
@@ -4751,8 +4959,13 @@ fn nd_raw_interesting_never_displaces_an_occupied_origin() {
             );
 
             ctx.origins.entry(origin).confirm(0.9, None, Graph::new(), 0, (4, 4)).unwrap();
-            ctx.record_run(&interesting_at(origin, vec![bool_node(false)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![bool_node(false)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             assert_eq!(ctx.origins.incumbent(origin).unwrap().len(), 2);
         },
     );
@@ -4767,6 +4980,7 @@ fn nd_admission_leaves_the_origin_unconfirmed() {
         async |ctx| {
             ctx.record_run(
                 &interesting_at("Panic: bug", vec![bool_node(true)]),
+                Duration::ZERO,
                 Duration::ZERO,
                 false,
             )
@@ -4796,6 +5010,7 @@ fn nd_discovery_sweep_evicts_an_unconfirmable_origin() {
             ctx.record_run(
                 &interesting_at("Panic: fluke", vec![bool_node(true)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
@@ -4822,6 +5037,7 @@ fn nd_discovery_sweep_confirms_a_real_failure() {
         async |ctx| {
             ctx.record_run(
                 &interesting_at("Panic: bug", vec![bool_node(true)]),
+                Duration::ZERO,
                 Duration::ZERO,
                 false,
             )
@@ -4860,6 +5076,7 @@ fn nd_persists_only_validated_incumbents() {
         async |ctx| {
             ctx.record_run(
                 &interesting_at("Panic: bug", vec![bool_node(true)]),
+                Duration::ZERO,
                 Duration::ZERO,
                 false,
             )
@@ -5634,9 +5851,10 @@ fn measurement_runs_move_no_counters_but_still_admit_origins() {
                 settled: Vec::new(),
                 ended: false,
             };
-            ctx.record_run(&valid, Duration::from_secs(1), true).unwrap();
+            ctx.record_run(&valid, Duration::from_secs(1), Duration::ZERO, true).unwrap();
             ctx.record_run(
                 &interesting_at("Panic: measured", vec![bool_node(true)]),
+                Duration::ZERO,
                 Duration::ZERO,
                 true,
             )
@@ -5652,7 +5870,7 @@ fn measurement_runs_move_no_counters_but_still_admit_origins() {
             );
             assert!(ctx.origins.needs_confirmation("Panic: measured"));
 
-            ctx.record_run(&valid, Duration::from_secs(1), false).unwrap();
+            ctx.record_run(&valid, Duration::from_secs(1), Duration::ZERO, false).unwrap();
             assert_eq!(ctx.calls, 1);
             assert_eq!(ctx.valid_test_cases, 1);
             assert_eq!(ctx.total_test_time, Duration::from_secs(1));
@@ -6075,6 +6293,7 @@ fn measurement_replays_are_counted_in_the_run_statistics() {
             ctx.record_run(
                 &interesting_at("Panic: bug", vec![bool_node(true)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
@@ -6481,6 +6700,7 @@ fn final_replay_evicts_a_dry_unconfirmed_origin() {
             ctx.record_run(
                 &interesting_at("Panic: bug", vec![bool_node(true)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
@@ -6507,6 +6727,7 @@ fn a_reproducing_final_replay_confirms_an_unconfirmed_origin() {
         async |ctx| {
             ctx.record_run(
                 &interesting_at("Panic: bug", vec![bool_node(true)]),
+                Duration::ZERO,
                 Duration::ZERO,
                 false,
             )
@@ -6536,6 +6757,7 @@ fn report_blobs_only_confirmed_origins() {
             ctx.record_run(
                 &interesting_at("Panic: a", vec![bool_node(true)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
@@ -6545,6 +6767,7 @@ fn report_blobs_only_confirmed_origins() {
                 .unwrap();
             ctx.record_run(
                 &interesting_at("Panic: b", vec![bool_node(false)]),
+                Duration::ZERO,
                 Duration::ZERO,
                 false,
             )
@@ -6601,6 +6824,7 @@ fn unconfirmed_origins_report_caveat_only_when_nothing_confirmed() {
             ctx.record_run(
                 &interesting_at("Panic: a", vec![bool_node(true)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
@@ -6608,6 +6832,7 @@ fn unconfirmed_origins_report_caveat_only_when_nothing_confirmed() {
             assert!(ctx.origins.needs_confirmation("Panic: a"));
             ctx.record_run(
                 &interesting_at("Panic: b", vec![bool_node(false)]),
+                Duration::ZERO,
                 Duration::ZERO,
                 false,
             )
@@ -6654,6 +6879,7 @@ fn report_multiple_false_truncates_after_the_confirmed_filter() {
             ctx.record_run(
                 &interesting_at("Panic: b", vec![bool_node(false)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
@@ -6684,14 +6910,14 @@ fn nd_runs_record_targeting_observations_as_race_seeds() {
         None,
         |_ds| TestCaseResult::Valid,
         async |ctx| {
-            ctx.record_run(&observing_run(), Duration::ZERO, false).unwrap();
+            ctx.record_run(&observing_run(), Duration::ZERO, Duration::ZERO, false).unwrap();
             assert!(!ctx.targeting.is_empty());
         },
     );
     with_counting_ctx(
         |_ds| TestCaseResult::Valid,
         async |ctx, _execs| {
-            ctx.record_run(&observing_run(), Duration::ZERO, false).unwrap();
+            ctx.record_run(&observing_run(), Duration::ZERO, Duration::ZERO, false).unwrap();
             assert!(!ctx.targeting.is_empty());
         },
     );
@@ -7565,8 +7791,13 @@ fn a_flip_during_a_successful_final_replay_keeps_the_failure() {
             let (run, mismatch) = ctx.test_function(ntc).await.unwrap();
             assert_eq!(run.status, Status::Valid);
             assert!(mismatch.is_none());
-            ctx.record_run(&interesting_at(&origin, vec![int_node(3)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(&origin, vec![int_node(3)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             assert!(!ctx.nd_handling());
             let output = ctx.settings.output.clone();
             ctx.final_replay(Verbosity::Quiet, &output, None, false).await.unwrap();
@@ -7609,11 +7840,17 @@ fn a_dry_pooled_review_backtracks_over_history_at_the_final_replay() {
             ctx.record_run(
                 &interesting_at(&origin, vec![int_node(77), int_node(77)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
-            ctx.record_run(&interesting_at(&origin, vec![int_node(3)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(&origin, vec![int_node(3)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             ctx.nd_flip();
             let output = ctx.settings.output.clone();
             ctx.final_replay(Verbosity::Quiet, &output, None, true).await.unwrap();
@@ -7667,11 +7904,17 @@ fn an_exhausted_backtrack_after_a_dry_pooled_review_rejects_the_origin() {
             ctx.record_run(
                 &interesting_at(origin, vec![wide_node(999_999)]),
                 Duration::ZERO,
+                Duration::ZERO,
                 false,
             )
             .unwrap();
-            ctx.record_run(&interesting_at(origin, vec![wide_node(3)]), Duration::ZERO, false)
-                .unwrap();
+            ctx.record_run(
+                &interesting_at(origin, vec![wide_node(3)]),
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+            )
+            .unwrap();
             ctx.nd_flip();
             let output = ctx.settings.output.clone();
             ctx.final_replay(Verbosity::Quiet, &output, None, true).await.unwrap();

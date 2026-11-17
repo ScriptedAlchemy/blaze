@@ -1782,6 +1782,7 @@ const STATUS_UNSET: u8 = u8::MAX;
 /// caller-owned handles rather than here; any stream of the family can
 /// drive one, drawing from its own choice sequence.
 pub struct FamilyCore {
+    pub(crate) generation_time: crate::native::generation_time::GenerationTime,
     /// The family's write-once conclusion, with the interesting origin for
     /// an `Interesting` verdict.
     conclusion: Mutex<Option<(Status, Option<InterestingOrigin>)>>,
@@ -1814,6 +1815,7 @@ pub struct FamilyCore {
 impl FamilyCore {
     fn new(budget: usize) -> Self {
         FamilyCore {
+            generation_time: Default::default(),
             conclusion: Mutex::new(None),
             concluded_status: AtomicU8::new(STATUS_UNSET),
             total_draws: AtomicUsize::new(0),
@@ -1891,6 +1893,8 @@ impl FamilyCore {
 /// draw budget, live set, and stateful bookkeeping are shared through
 /// [`FamilyCore`] and the replay.
 pub struct NativeTestCase {
+    /// Client draw scopes opened on this stream, distinct from sibling scopes.
+    pub(crate) generation_scopes: usize,
     replay: Replay,
     rng: Option<EngineRng>,
     max_size: usize,
@@ -2179,6 +2183,7 @@ impl NativeTestCase {
             child_nodes: Vec::with_capacity(bookkept),
             top_child_nodes: 0,
             has_discards: false,
+            generation_scopes: 0,
             observer,
             trailing_template,
             narrow_ranges: NarrowRanges::default(),

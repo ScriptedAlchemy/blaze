@@ -637,10 +637,14 @@ impl<'db> Params<'_, 'db> {
                         format!("takes the union `{}`, whose live field the check can't know", cx.shown(ty))
                     });
                 }
-                // `Unique<T>` and `PhantomData<T>` own a `T` (a `Box`'s, a `Vec`'s elements).
+                // `PhantomData<T>` stores no `T` and can call none of its code.
+                // `Unique<T>` owns a `T` (a `Box`'s, a `Vec`'s elements).
                 if home && let AdtId::StructId(it) = id {
                     let name = StructSignature::of(cx.db, it).name.symbol().clone(); // clone: a handle of an interned name
-                    if matches!(name.as_str(), "Unique" | "PhantomData") {
+                    if name.as_str() == "PhantomData" {
+                        return;
+                    }
+                    if name.as_str() == "Unique" {
                         if let Some(owned) = adt_args.types().next() {
                             self.ty(owned, shared, false);
                         }

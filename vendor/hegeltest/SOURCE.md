@@ -14,8 +14,10 @@ tests use (the `testing` skill, .agents/skills/testing/SKILL.md): Hypothesis's e
 - Licence: MIT, copyright Antithesis, LLC (LICENSE in each directory, the repository's LICENSE).
 - Used only as a dev-dependency, with `default-features = false, features = ["static-engine"]`:
   the engine is linked as a Rust crate, with no Python server and no shared library.
-- The three directories are excluded from blaze's workspace (root `Cargo.toml`), so their own
-  tests are not blaze's to run; they are built only as dependencies of blaze's tests.
+- The three directories are excluded from blaze's workspace (root `Cargo.toml`). They build as
+  dependencies of blaze's tests. Changes to the vendored engine or client also run their
+  retained embedded tests directly with `blaze test --manifest-path` (the client requires
+  `--features static-engine`); their test dependencies stay in their own lockfiles.
 
 Kept from `tests/`: every file under `tests/embedded/` (subdirectories too) that a
 `#[cfg(test)] #[path = ...]` module names, and the data files those include with `include!`
@@ -26,7 +28,7 @@ Kept from `tests/`: every file under `tests/embedded/` (subdirectories too) that
 `native/` were missing. Left out: the rest of every `tests/` directory (the integration tests and
 libhegel's other embedded tests), `examples/`, `benches/`,
 `scripts/`, `include/` (the C header), the justfiles, AGENTS.md, CHANGELOG.md, RELEASE.md, the
-`[[bin]]` fixtures and the dev-dependencies they need, and the hegel workspace's own
+`[[bin]]` fixtures and the dev-dependencies those fixtures need, and the hegel workspace's own
 `Cargo.toml` and `Cargo.lock`.
 
 Changes, each marked `blaze:`:
@@ -49,3 +51,8 @@ Changes, each marked `blaze:`:
    rejects their `boxed` methods' `Self: 'b` bound when that lifetime is anonymous (#1678),
    blocking the test dependencies. This keeps the same lifetime-generic impls and gives the
    bootstrap compiler names it can check; the general compiler bug remains open.
+7. Generator scopes measure the union of nested and concurrent generation intervals for
+   the TooSlow health check, including custom client generators. Property-body time stays
+   in execution statistics. The vendored static client uses an internal Rust function to
+   open and close scopes; the public C ABI and replay data are unchanged. The retained
+   embedded tests have their `tempfile` and engine `serde_json` dev-dependencies restored.

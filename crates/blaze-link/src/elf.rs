@@ -33,6 +33,7 @@ mod dynamic;
 mod image;
 mod native;
 mod read;
+mod slots;
 #[cfg(test)]
 mod tests;
 

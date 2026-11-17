@@ -41,3 +41,7 @@ serde_json = ["dep:serde_json"]
 serde_json_raw_value = ["serde_json", "serde_json/raw_value"]
 # The only engine mode blaze builds: the engine linked as a Rust dependency.
 static-engine = ["dep:hegeltest-c", "hegeltest-c/std"]
+
+# blaze: retained embedded tests validate the static client's engine boundary.
+[dev-dependencies]
+tempfile = "3.27.0"

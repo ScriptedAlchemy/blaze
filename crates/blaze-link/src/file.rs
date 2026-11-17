@@ -562,7 +562,7 @@ impl<'a> Stage<'a> {
                     }
                     if matches!(space.region.class, Class::Synthetic(_)) {
                         let ranges = &mut ranges;
-                        space.bytes.changed_blocks(&old.bytes, BLOCK, scratch, |at, len| {
+                        changed_pages(&old.bytes, &space.bytes, scratch, |at, len| {
                             ranges.push((offset + at as u64, len as u64))
                         });
                     }
@@ -582,7 +582,7 @@ impl<'a> Stage<'a> {
             ) {
                 (Ok(Part::Writer(old)), Part::Writer(new)) => {
                     let ranges = &mut ranges;
-                    new.changed_blocks(old, BLOCK, scratch, |at, len| {
+                    changed_pages(old, new, scratch, |at, len| {
                         ranges.push((offset + at as u64, len as u64))
                     });
                 }
@@ -597,8 +597,10 @@ impl<'a> Stage<'a> {
     }
 }
 
-/// Whether no region moved or changed its room, nor its size but for a synthetic one, whose
-/// size the writer makes: `old` the last link's, `new` this one's, by index.
+/// Whether no region moved or changed its room: `old` the last link's, `new` this one's, by
+/// index. Used size may still change for a synthetic region, which the writer fills, and for
+/// [`Class::Patch`] and [`Class::PatchData`], which keep a reserved address and capacity while
+/// an incremental link appends into them.
 fn same_regions(old: &[Space], new: &[Region]) -> bool {
     old.len() == new.len()
         && old.iter().zip(new).all(|(old, new)| {
@@ -606,7 +608,8 @@ fn same_regions(old: &[Space], new: &[Region]) -> bool {
             old.class == new.class
                 && old.addr == new.addr
                 && old.capacity == new.capacity
-                && (old.size == new.size || matches!(new.class, Class::Synthetic(_)))
+                && (old.size == new.size
+                    || matches!(new.class, Class::Synthetic(_) | Class::Patch | Class::PatchData))
         })
 }
 
@@ -631,13 +634,41 @@ fn delta<'d>(
     })
 }
 
-/// Pushes each `BLOCK` of `new`, at file offset `offset`, that differs from `old`, the bytes the
-/// last link wrote there.
+/// The smallest span covering the differences in `new`. Bytes beyond the old part must
+/// be written even if zero: another old part or region may occupy those file offsets.
+fn changed_span(old: &[u8], new: &[u8]) -> Option<std::ops::Range<usize>> {
+    let differs = |at: usize| old.get(at) != Some(&new[at]);
+    let start = (0..new.len()).find(|&at| differs(at))?;
+    let end = (start..new.len()).rfind(|&at| differs(at)).unwrap() + 1;
+    Some(start..end)
+}
+
+/// Compared pages remain shared when possible; only the differing span of each block is
+/// emitted. Stack buffers avoid flattening a region or allocating for every comparison.
+fn changed_pages(
+    old: &CowBytes,
+    new: &CowBytes,
+    scratch: &mut Vec<std::ops::Range<usize>>,
+    mut out: impl FnMut(usize, usize),
+) {
+    let (mut was, mut now) = ([0; BLOCK], [0; BLOCK]);
+    new.changed_blocks(old, BLOCK, scratch, |at, len| {
+        let have = old.len().saturating_sub(at).min(len);
+        old.copy_to(at.min(old.len()), &mut was[..have]);
+        new.copy_to(at, &mut now[..len]);
+        if let Some(range) = changed_span(&was[..have], &now[..len]) {
+            out(at + range.start, range.len());
+        }
+    });
+}
+
+/// Pushes the differing span of each compared `BLOCK` of `new`, at file offset `offset`.
 fn changed_blocks(offset: u64, old: &[u8], new: &[u8], ranges: &mut Vec<(u64, u64)>) {
     for start in (0..new.len()).step_by(BLOCK) {
         let end = (start + BLOCK).min(new.len());
-        if old.get(start..end) != Some(&new[start..end]) {
-            ranges.push((offset + start as u64, (end - start) as u64));
+        let was = &old[start.min(old.len())..end.min(old.len())];
+        if let Some(range) = changed_span(was, &new[start..end]) {
+            ranges.push((offset + (start + range.start) as u64, range.len() as u64));
         }
     }
 }
@@ -663,14 +694,67 @@ mod tests {
         new.extend_from_slice(&[1, 2, 3]);
         let mut ranges = Vec::new();
         changed_blocks(100, &old, &new, &mut ranges);
-        assert_eq!(ranges, [(100 + BLOCK as u64, BLOCK as u64), (100 + 3 * BLOCK as u64, 3)]);
+        assert_eq!(ranges, [(105 + BLOCK as u64, 1), (100 + 3 * BLOCK as u64, 3)]);
         ranges.clear();
         changed_blocks(0, &new, &old, &mut ranges);
         assert_eq!(
             ranges,
-            [(BLOCK as u64, BLOCK as u64)],
+            [(BLOCK as u64 + 5, 1)],
             "a shorter part rewrites none past its end"
         );
+    }
+
+    fn trimmed_writes(old: &[u8], new: &[u8], plant: bool) -> Result<(), String> {
+        // The old part ends here, but the old file continues with unrelated nonzero data.
+        let mut file = vec![0x55; old.len().max(new.len()) + 8];
+        file[..old.len()].copy_from_slice(old);
+        let suffix = file[new.len()..].to_vec();
+        let mut ranges = Vec::new();
+        changed_blocks(0, old, new, &mut ranges);
+        let mut paged = Vec::new();
+        changed_pages(
+            &CowBytes::from_vec(old.to_vec()),
+            &CowBytes::from_vec(new.to_vec()),
+            &mut Vec::new(),
+            |at, len| paged.push((at as u64, len as u64)),
+        );
+        if ranges != paged {
+            return Err("paged and contiguous writes differ".into());
+        }
+        for (at, len) in ranges {
+            let (at, len) = (at as usize, len as usize);
+            for i in at..at + len {
+                if !plant || i < old.len() || new[i] != 0 {
+                    file[i] = new[i];
+                }
+            }
+        }
+        if file[..new.len()] != *new || file[new.len()..] != suffix {
+            return Err("trimmed writes do not restore the new part exactly".into());
+        }
+        Ok(())
+    }
+
+    /// The refinement: trimmed paged and contiguous writes reconstruct every new byte,
+    /// including zero extensions over unrelated old data, without writing beyond the part.
+    #[hegel::test]
+    fn trimmed_blocks_reconstruct_the_new_part(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let old = tc.draw(gs::vecs(gs::integers::<u8>()).max_size(2 * BLOCK + 7));
+        let mut new = old.clone();
+        let end = tc.draw(gs::integers::<u16>().max_value((3 * BLOCK) as u16)) as usize;
+        new.resize(end, 0);
+        if !new.is_empty() {
+            let at = tc.draw(gs::integers::<u16>()) as usize % new.len();
+            new[at] = tc.draw(gs::integers::<u8>());
+        }
+        trimmed_writes(&old, &new, false).unwrap();
+    }
+
+    #[test]
+    fn the_oracle_catches_skipped_zero_extensions() {
+        assert_eq!(trimmed_writes(&[7, 8], &[7, 8, 0, 0], false), Ok(()));
+        assert!(trimmed_writes(&[7, 8], &[7, 8, 0, 0], true).is_err());
     }
 
     #[test]

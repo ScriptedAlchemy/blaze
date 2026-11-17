@@ -194,7 +194,7 @@ impl Dist {
     /// What a failure of the distributed path means for the unit named `what`.
     pub(super) fn or_compile_here(
         &self,
-        what: String,
+        what: &str,
         failure: blaze_dist_local::Error,
     ) -> Result<(), String> {
         match agent::decide(&self.config.local, failure) {

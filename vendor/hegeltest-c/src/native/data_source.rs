@@ -52,6 +52,10 @@ impl NativeDataSource {
         ntc.nodes.clone()
     }
 
+    pub(crate) fn generation_time(handle: &NativeTestCaseHandle) -> core::time::Duration {
+        handle.lock().family().generation_time.elapsed()
+    }
+
     /// Convenience: extract spans from a handle after a test case.
     pub fn take_spans(handle: &NativeTestCaseHandle) -> Vec<Span> {
         handle.lock().spans.clone().into_vec()
@@ -139,6 +143,11 @@ impl NativeDataSource {
             return Err(self.aborted_error());
         }
         let mut ntc = self.inner.lock();
+        let family = Arc::clone(ntc.family());
+        let _scope = family
+            .generation_time
+            .scope()
+            .map_err(|why| DataSourceError::InvalidArgument(why.into()))?;
         f(&mut ntc).map_err(|e| match e {
             EngineError::Overrun => {
                 self.aborted.store(true, Ordering::Relaxed);
@@ -164,6 +173,33 @@ impl NativeDataSource {
 }
 
 impl DataSource for NativeDataSource {
+    fn generation_scope(&self, enter: bool) -> Result<(), DataSourceError> {
+        // An exiting client guard must work even after an assumption/overrun aborted draws.
+        let mut ntc = self.inner.lock();
+        if enter {
+            let scopes = ntc.generation_scopes.checked_add(1).ok_or_else(|| {
+                DataSourceError::InvalidArgument("too many generation scopes on a stream".into())
+            })?;
+            ntc.family()
+                .generation_time
+                .enter()
+                .map_err(|why| DataSourceError::InvalidArgument(why.into()))?;
+            ntc.generation_scopes = scopes;
+        } else {
+            let scopes = ntc.generation_scopes.checked_sub(1).ok_or_else(|| {
+                DataSourceError::InvalidArgument(
+                    "a generation scope closed on a stream that opened none".into(),
+                )
+            })?;
+            ntc.family()
+                .generation_time
+                .exit()
+                .map_err(|why| DataSourceError::InvalidArgument(why.into()))?;
+            ntc.generation_scopes = scopes;
+        }
+        Ok(())
+    }
+
     fn generate_integer(
         &self,
         min_value: &BigInt,

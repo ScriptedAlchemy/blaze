@@ -128,3 +128,39 @@ pub fn raw(raw: &mut Raw, input: &u8) -> u8 {
         assert!(said.contains("takes the raw pointer `*const u8`"), "{said}");
     });
 }
+
+/// A phantom function signature describes variance/ownership and stores no callable value.
+/// An actual function-pointer field remains unchecked even beside the same marker.
+#[test]
+fn phantom_function_signatures_are_not_callable_state() {
+    let db = hir_expand::fixture::db(
+        r#"
+//- minicore: sized, copy, phantom_data, fn
+//- /lib.rs crate:kernel
+pub struct View;
+pub struct Marked {
+    marker: core::marker::PhantomData<fn() -> View>,
+    value: usize,
+}
+pub struct Callable {
+    marker: core::marker::PhantomData<fn() -> View>,
+    callback: fn() -> View,
+}
+#[blaze::nonblocking]
+pub fn read(value: &Marked) -> usize { value.value }
+#[blaze::nonblocking]
+pub fn call(value: &Callable) -> View { (value.callback)() }
+"#,
+    )
+    .into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let read = fn_named(&db, krate, "read");
+        if let Err(refusal) = check_generic(&db, read, &NONBLOCKING) {
+            panic!("a phantom function pointer stores no code: {}", refusal.said());
+        }
+        let call = fn_named(&db, krate, "call");
+        let refusal = check_generic(&db, call, &NONBLOCKING).unwrap_err();
+        assert!(refusal.said().contains("function pointer"), "{}", refusal.said());
+    });
+}

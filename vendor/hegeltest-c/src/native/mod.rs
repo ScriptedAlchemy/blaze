@@ -1,3 +1,4 @@
+pub(crate) mod generation_time;
 pub(crate) type HashMap<K, V> = hashbrown::HashMap<K, V, rustc_hash::FxBuildHasher>;
 pub(crate) type HashSet<T> = hashbrown::HashSet<T, rustc_hash::FxBuildHasher>;
 

@@ -22,6 +22,59 @@ fn emitting_test_case() -> (RunHandle, TestCase) {
     (run, tc)
 }
 
+struct RejectedGeneration;
+
+impl gs::Generator<()> for RejectedGeneration {
+    fn do_draw(&self, tc: &TestCase) {
+        tc.assume(false);
+    }
+}
+
+impl gs::PrintableGenerator<()> for RejectedGeneration {
+    fn do_draw_and_print(&self, tc: &TestCase, _printer: &mut PrettyPrinter) {
+        self.do_draw(tc);
+    }
+}
+
+#[test]
+fn rejected_generators_close_timing_scopes_through_every_draw_entry() {
+    for kind in 0..3 {
+        let (_run, tc) = emitting_test_case();
+        let result = catch_unwind(AssertUnwindSafe(|| match kind {
+            0 => tc.draw(RejectedGeneration),
+            1 => tc.draw_silent(RejectedGeneration),
+            _ => tc.draw_and_print(RejectedGeneration, &mut PrettyPrinter::noop()),
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            tc.handle.borrow().generation_scope(false),
+            Err(hegel_c::hegel_result_t::HEGEL_E_INVALID_ARG),
+            "the client guard already closed after rejection"
+        );
+    }
+}
+
+#[test]
+fn a_generation_scope_unwinds_after_another_clone_completes_the_family() {
+    let (_run, tc) = emitting_test_case();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _scope = GenerationScope::new(&tc);
+        let child = tc.clone();
+        child
+            .handle
+            .borrow()
+            .mark_complete(hegel_c::hegel_status_t::HEGEL_STATUS_VALID, None)
+            .unwrap();
+        panic!("the generator unwinds after completion");
+    }));
+    assert!(result.is_err());
+    assert_eq!(
+        tc.handle.borrow().generation_scope(false),
+        Err(hegel_c::hegel_result_t::HEGEL_E_INVALID_ARG),
+        "the guard closed its entering handle even after family completion"
+    );
+}
+
 #[test]
 fn debug_is_non_exhaustive() {
     let (_run, tc) = emitting_test_case();
