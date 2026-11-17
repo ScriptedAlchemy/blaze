@@ -57,6 +57,13 @@ const DIRENTS: usize = 32 << 10;
 /// Holes a [`Strings`] keeps before it is squeezed, at the least.
 const HOLES: usize = 4 << 10;
 
+#[cfg(test)]
+thread_local! {
+    /// A test's count of this thread's fanotify starts, so reusing an inotify spare is tested
+    /// without depending on the process's privilege or where the kernel refuses fanotify.
+    static FANOTIFY_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A tree watched, with fanotify or inotify.
 pub(crate) struct Tree(Kind);
 
@@ -80,22 +87,31 @@ impl Tree {
         Tree::reusing(None, root, dir, nonblocking)
     }
 
-    /// As [`Tree::new`], into the tables `spare` kept.
+    /// As [`Tree::new`], into the tables `spare` kept. An inotify `spare` is of a start
+    /// fanotify refused, and a process gains no privilege after, so its start is inotify's
+    /// without asking fanotify again: an unprivileged `fanotify_init` succeeds (Linux 5.13 on)
+    /// and only the mark after it is refused, so each such ask would make and drop fanotify's
+    /// tables.
     pub(crate) fn reusing(
         spare: Option<Spare>,
         root: &Path,
         dir: &FileName,
         nonblocking: bool,
     ) -> io::Result<Tree> {
-        let (fanotify, inotify) = match spare {
-            Some(Spare::Fanotify(room)) => (Some(room), None),
-            Some(Spare::Inotify(room)) => (None, Some(room)),
-            None => (None, None),
+        let fanotify = match spare {
+            Some(Spare::Fanotify(room)) => Some(room),
+            Some(Spare::Inotify(room)) => {
+                return Inotify::new(root, dir, nonblocking, Some(room))
+                    .map(|it| Tree(Kind::Inotify(it)));
+            }
+            None => None,
         };
+        #[cfg(test)]
+        FANOTIFY_STARTS.with(|starts| starts.set(starts.get() + 1));
         match crate::fanotify::Fanotify::new(root, dir, nonblocking, fanotify) {
             Ok(it) => Ok(Tree(Kind::Fanotify(it))),
             Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-                Ok(Tree(Kind::Inotify(Inotify::new(root, dir, nonblocking, inotify)?)))
+                Ok(Tree(Kind::Inotify(Inotify::new(root, dir, nonblocking, None)?)))
             }
             Err(error) => Err(error),
         }
@@ -699,6 +715,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A watch given an inotify spare, which only a start fanotify refused leaves, reuses its
+    /// tables without asking fanotify again and allocates nothing once warm. Before the fix the
+    /// reuse asked fanotify first: unprivileged Linux made and dropped its tables, and a
+    /// privileged start selected fanotify. The count makes that control independent of both the
+    /// process's privilege and whether `fanotify_init` or its later mark is refused.
+    #[test]
+    fn a_watch_with_an_inotify_spare_reuses_it_without_asking_fanotify() {
+        let root = std::env::temp_dir().join(format!("blaze-watch-spare-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = FileName::new("src").unwrap();
+        // Make the legitimate end state directly so this control also runs where fanotify is
+        // allowed; the first watch warms every table this architecture fills synchronously.
+        let first = Inotify::new(&root, &src, true, None).unwrap();
+        let spare = Tree(Kind::Inotify(first)).end();
+        let starts = FANOTIFY_STARTS.with(|starts| starts.get());
+        let tree = blaze_alloc_count::assert_at_most(0, "a watch with an inotify spare", || {
+            Tree::reusing(Some(spare), &root, &src, true)
+        });
+        assert_eq!(FANOTIFY_STARTS.with(|starts| starts.get()), starts);
+        let tree = tree.unwrap();
+        assert!(matches!(&tree.0, Kind::Inotify(_)));
+        drop(tree);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A batch tells each valid name once, sorted, and allocates the names and their vector
