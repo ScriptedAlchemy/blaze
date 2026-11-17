@@ -213,11 +213,12 @@ jobs:
           packages_text=$(python3 -I harness/smoke.py "$RUNNER_TEMP/smoke-packages.json")
           read -ra packages <<< "$packages_text"
           if [ "${#packages[@]}" -gt 0 ]; then sudo apt-get update -qq && sudo apt-get install -y -qq "${packages[@]}"; fi
-      # Under the job's 300 minutes, so that a smoke that hangs (the macOS one reached the job's
+      # Leave 20 minutes after both 30-minute install steps and this corpus within the job's
+      # 300 minutes, so that a smoke that hangs (the macOS one reached the job's
       # limit with nothing kept) ends as a failed step: the results, `what blaze recorded` and
       # the uploads below still run, where a cancelled job runs none of them.
       - name: smoke corpus
-        timeout-minutes: 250
+        timeout-minutes: 220
         env:
           # Fork PRs have a read-only Actions token and no bot secret. The PR corpus is public.
           # Real release promotion retains the bot token for its unchanged full corpus.
