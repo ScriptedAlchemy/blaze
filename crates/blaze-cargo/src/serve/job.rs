@@ -4653,7 +4653,7 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         if self.releasing.contains_key(&node) {
-            self.released_front(w, node, ok, why);
+            self.released_front(w, node, ok, why.as_deref());
             return;
         }
         let Some(id) = self.batches.job_of(node) else { return };
@@ -5399,7 +5399,7 @@ impl<S: Steps> Jobs<S> {
         w.plane.close(w.now, request);
         if let Err(error) = added {
             let why = format!("the plane refused admission: {error}"); // alloc: a refused handoff
-            self.released_front(w, node, false, Some(why));
+            self.released_front(w, node, false, Some(&why));
         }
     }
 
@@ -5450,7 +5450,7 @@ impl<S: Steps> Jobs<S> {
         w: &mut World<'_, S>,
         node: NodeId,
         ok: bool,
-        why: Option<String>,
+        why: Option<&str>,
     ) {
         let Some(releasing) = self.releasing.remove(&node) else { return };
         let Releasing { owner, work, discard, value, .. } = releasing;
@@ -5478,7 +5478,7 @@ impl<S: Steps> Jobs<S> {
         if error.is_none()
             && (!ok || !answered || (!discard && returned.is_none() && !cancelled))
         {
-            let why = why.as_deref().unwrap_or("no exclusive database was returned");
+            let why = why.unwrap_or("no exclusive database was returned");
             let what = format!("the front end release of {} did not complete: {why}", owner.checkout); // alloc: a failed handoff
             error = Some(ApiError::new(what, Some(owner.checkout.clone())));
         }

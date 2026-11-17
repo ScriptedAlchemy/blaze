@@ -128,7 +128,7 @@ fn a_harness_false_bench_keeps_its_main_through_writing_and_root_selection() {
     };
     use blaze_units::query::{BuildConfig, Command, Invocation, Mount, Origin};
     use blaze_vfs::{Op, Vfs};
-    use hir_ty_codegen::v2::{HARNESS_MODULE, Kind, RootKind};
+    use hir_ty_codegen::v2::{HARNESS_MODULE, RootKind};
 
     let dir = tempfile::tempdir().unwrap();
     let (mut vfs, _) = Vfs::recover(FileName::new("plain-bench.vfs").unwrap(), 0, &[]);
@@ -254,7 +254,10 @@ fn a_harness_false_bench_keeps_its_main_through_writing_and_root_selection() {
     let roots = codegen::test_roots(&job, &reader, 0).unwrap();
     assert!(roots.tests.is_empty());
     let [start, ..] = roots.roots.as_slice() else { panic!("the bench has a main") };
-    assert!(matches!(start.0, Kind::Start(_)), "the bench starts its own main");
+    assert!(
+        matches!(start.0, hir_ty_codegen::v2::Kind::Start(_)),
+        "the bench starts its own main"
+    );
     let normal = codegen::test_roots(&job, &reader, 1).unwrap();
     assert_eq!(normal.tests.iter().map(|it| it.name.as_str()).collect::<Vec<_>>(), ["ordinary"]);
     // The old executable selection asks for libtest although cfg(test) is legitimate.
@@ -2635,6 +2638,7 @@ fn native_link_key(
                     noprelude: None,
                     nounused: None,
                     dev: false,
+                    gpu: false,
                 })
                 .collect();
         }

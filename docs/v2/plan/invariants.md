@@ -375,4 +375,4 @@ By level: 68 tested, 40 simulated, 0 model-checked, 0 proved.
 
 ### blaze-usercode
 
-- **`model`** (`crates/blaze-usercode/src/provider.rs`): the byte at `offset` of what `process` is given by `getrandom`, whatever anyone asked before.
+- **`model`** (`crates/blaze-usercode/src/provider/answers.rs`): the byte at `offset` of what `process` is given by `getrandom`, whatever anyone asked before.

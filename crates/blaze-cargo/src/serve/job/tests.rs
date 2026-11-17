@@ -46,9 +46,6 @@ fn opened(root: u8) -> Opened {
 /// A job of nothing but its views, as [`Jobs::begin`] puts one in.
 fn job(views: Vec<Opened>) -> Job<Real> {
     Job {
-        paused: blaze_graph::pressure::Paused::default(),
-        began: std::time::Duration::ZERO,
-        doing_said: None,
         work: Work::Snapshot,
         views,
         ready: Vec::new(),
@@ -568,7 +565,7 @@ fn an_immutable_store_conflict_refuses_programs_and_conflicting_outputs() {
     let bad_key = blaze_cas::Key(ContentId([7; 32]));
     let other_key = blaze_cas::Key(ContentId([8; 32]));
 
-    job.over = Some((false, Some(ApiError::new("an independent unit failed".into(), None))));
+    job.over = Some((false, Some(ApiError::new("an independent unit failed", None))));
     assert!(job.refused_store_keys.is_empty());
     assert_eq!(
         output_readiness(&paths, &busy, &refused, !job.refused_store_keys.is_empty()),

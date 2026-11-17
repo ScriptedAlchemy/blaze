@@ -1164,7 +1164,7 @@ pub(crate) fn generate<'db>(
                         tracing::debug!(target: "blaze", ?why, "dist: cancelled");
                     }
                     Err(dist::RunError::Path(why)) => dist.or_compile_here(
-                        format!("unit {unit} (`{}` of {})", u.target.name, u.pkg_id),
+                        &format!("unit {unit} (`{}` of {})", u.target.name, u.pkg_id),
                         why,
                     )?,
                 }
