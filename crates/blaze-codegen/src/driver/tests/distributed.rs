@@ -216,12 +216,54 @@ fn successive_dev_grants_reexport_debug_of_a_shared_memo_shape() {
     assert!(restored.functions.iter().all(|function| function.side.is_some()));
 }
 
-/// The invariant: a warm grant exports every debug table its templates name, or refuses
-/// the missing key without recompiling. This holds for both store and memo templates.
-#[test]
-fn warm_dev_and_release_grants_refuse_missing_debug_without_recompiling() {
-    for level in [OptLevel::O0, OptLevel::O3] {
+/// A planted bug in the store a warm grant reads its debug tables from: the grant's own code is
+/// untouched, so the oracle of the invariant below sees only what a grant path that mishandled a
+/// debug table would let through.
+#[derive(Clone, Copy, PartialEq)]
+enum Bug {
+    /// A store that answers an empty table for the debug table it does not hold, as a grant
+    /// that took a miss for a table would.
+    AnswersAMissingTable,
+    /// A store that hands back the table it holds with a byte added, as a grant that rebuilt or
+    /// rewrote a restored table instead of exporting it as it was would.
+    ChangesARestoredTable,
+}
+
+/// The warm grant's input store, with `bug` planted on the debug table `at` when there is one.
+struct Planted<'a> {
+    store: &'a Store,
+    bug: Option<Bug>,
+    at: Key,
+    /// The bytes of `at` with one more byte, for [`Bug::ChangesARestoredTable`].
+    changed: &'a [u8],
+}
+
+impl Lookup for Planted<'_> {
+    fn read(&self, key: &Key) -> Result<Option<&[u8]>, String> {
+        const EMPTY: &[u8] = &[];
+        let held = Lookup::read(self.store, key)?;
+        Ok(match (self.bug, held) {
+            (Some(Bug::AnswersAMissingTable), None) if *key == self.at => Some(EMPTY),
+            (Some(Bug::ChangesARestoredTable), Some(_)) if *key == self.at => Some(self.changed),
+            (_, held) => held,
+        })
+    }
+}
+
+fn ensure(held: bool, what: impl FnOnce() -> String) -> Result<(), String> {
+    if held { Ok(()) } else { Err(what()) }
+}
+
+/// The oracle of [`warm_dev_and_release_grants_refuse_missing_debug_without_recompiling`]: for a
+/// dev and a release build, with the templates in the store and in the memo only, a warm grant
+/// whose input lacks one debug table is refused naming exactly that key with nothing recompiled,
+/// and restoring only that table makes exactly the original grant transferable. `Err` names
+/// the first thing that did not hold.
+fn warm_grants_refuse_missing_debug(bug: Option<Bug>) -> Result<(), String> {
+    for (level, built) in [(OptLevel::O0, "dev"), (OptLevel::O3, "release")] {
         for memo_only in [false, true] {
+            let templates = if memo_only { "memo" } else { "store" };
+            let case = format!("{built} grant with {templates} templates");
             let (program, policy, machine, memo) = (
                 program(),
                 policy(level, Mode::Output),
@@ -249,22 +291,79 @@ fn warm_dev_and_release_grants_refuse_missing_debug_without_recompiling() {
             }
             let missing = debug[0];
             let bytes = input.0.remove(&missing).unwrap();
+            let changed = [&bytes[..], &[0xff]].concat();
             let emitted = machine.emitted.load(Ordering::Relaxed);
-            let errors = build.compile_granted(&work, &work.names(), &input).unwrap_err();
-            assert!(errors.iter().any(|error| {
-                error.what.contains("missing debug table")
-                    && error.what.contains(&format!("{missing:?}"))
-            }));
-            assert_eq!(machine.emitted.load(Ordering::Relaxed), emitted);
+            let planted = Planted { store: &input, bug, at: missing, changed: &changed };
+            let errors = match build.compile_granted(&work, &work.names(), &planted) {
+                Err(errors) => errors,
+                Ok(_) => {
+                    return Err(format!("{case}: granted a bundle that lacks {missing:?}"));
+                }
+            };
+            ensure(
+                errors.iter().any(|error| {
+                    error.what.contains("missing debug table")
+                        && error.what.contains(&format!("{missing:?}"))
+                }),
+                || format!("{case}: the refusal does not name the missing {missing:?}"),
+            )?;
+            ensure(machine.emitted.load(Ordering::Relaxed) == emitted, || {
+                format!("{case}: the refusal recompiled")
+            })?;
 
             // Restoring only the omitted table makes exactly the original grant transferable.
             input.0.insert(missing, bytes);
-            let restored = build.compile_granted(&work, &work.names(), &input).unwrap();
-            assert_eq!(restored.stats.compiled, 0);
+            let planted = Planted { store: &input, bug, at: missing, changed: &changed };
+            let restored = match build.compile_granted(&work, &work.names(), &planted) {
+                Ok(restored) => restored,
+                Err(errors) => {
+                    let why: Vec<_> = errors.iter().map(|error| error.what.as_str()).collect();
+                    let why = why.join("; ");
+                    return Err(format!("{case}: the restored grant was refused: {why}"));
+                }
+            };
+            ensure(restored.stats.compiled == 0, || {
+                format!("{case}: the restored grant compiled")
+            })?;
             let mut receiver = Store::default();
             outputs(restored, &mut receiver);
-            assert_eq!(receiver.0, complete.0);
-            assert_eq!(machine.emitted.load(Ordering::Relaxed), emitted);
+            ensure(receiver.0 == complete.0, || {
+                format!("{case}: the restored grant is not the original, byte for byte")
+            })?;
+            ensure(machine.emitted.load(Ordering::Relaxed) == emitted, || {
+                format!("{case}: the restored grant recompiled")
+            })?;
         }
     }
+    Ok(())
+}
+
+/// The invariant: a warm grant exports every debug table its templates name, or refuses
+/// the missing key without recompiling. This holds for both store and memo templates.
+#[test]
+fn warm_dev_and_release_grants_refuse_missing_debug_without_recompiling() {
+    if let Err(why) = warm_grants_refuse_missing_debug(None) {
+        panic!("{why}");
+    }
+}
+
+/// The control of [`warm_dev_and_release_grants_refuse_missing_debug_without_recompiling`]: its
+/// own oracle, over the same fixtures, finds a store that answers an empty table for the debug
+/// table it lacks, which a grant that never refused would export as the real one: the grant is
+/// granted, and the oracle says so before it looks at anything else.
+#[test]
+fn the_oracle_catches_a_missing_debug_table_answered_as_present() {
+    let why = warm_grants_refuse_missing_debug(Some(Bug::AnswersAMissingTable))
+        .expect_err("the planted bug was not found");
+    assert!(why.contains("granted a bundle that lacks"), "found for another reason: {why}");
+}
+
+/// The control of [`warm_dev_and_release_grants_refuse_missing_debug_without_recompiling`] for
+/// its restoration half: the refusal is right and only the restored table differs by a byte, which
+/// the oracle finds in the exported bytes and nowhere else.
+#[test]
+fn the_oracle_catches_a_restored_debug_table_that_is_not_the_original() {
+    let why = warm_grants_refuse_missing_debug(Some(Bug::ChangesARestoredTable))
+        .expect_err("the planted bug was not found");
+    assert!(why.contains("not the original, byte for byte"), "found for another reason: {why}");
 }
