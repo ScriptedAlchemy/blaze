@@ -1,0 +1,347 @@
+{
+  "schema_version": 1,
+  "pull_request": "https://github.com/ScriptedAlchemy/blaze/pull/68",
+  "status": "in_progress",
+  "tested_head": "f8bed03399660f6929517ecdccdcbdc2cedbc4cc",
+  "host": {
+    "os": "macOS-26.6.2-arm64-arm-64bit",
+    "architecture": "arm64",
+    "rust": "1.99.0",
+    "nix": "2.35.4",
+    "llvm": "20.1.8 (flake pinned)"
+  },
+  "scope_note": "Each check names its tested commit. Earlier macOS results do not certify later compiler changes. The producer fix has separate native verification and exact source hashes below; complete Linux bootstrap CI is still required.",
+  "checks": [
+    {
+      "name": "remote keeper recovery",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "RUST_BACKTRACE=0 cargo +1.99.0 test --locked -p ra-jit --bin ra-jit remote::keeper::recovery_tests -- --nocapture",
+      "result": "passed",
+      "details": "11 passed, 0 failed",
+      "log_sha256": "098af01eef4ae3ee20309899485f51126dfc3fcdbd1528b3d30928bdf63a9991"
+    },
+    {
+      "name": "remote keeper shutdown",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "RUST_BACKTRACE=0 cargo +1.99.0 test --locked -p ra-jit --bin ra-jit remote::keeper::shutdown_tests -- --nocapture",
+      "result": "passed",
+      "details": "6 passed, 0 failed",
+      "log_sha256": "1ad2306621a99722b39a3708a1288c2fc002036b6032fb882263a94d8476ff1a"
+    },
+    {
+      "name": "source identity",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "BLAZE_BUILD_SCRIPT=<compiled crates/ra-jit/build.rs> python3 harness/source_identity_test.py -v",
+      "result": "passed",
+      "details": "26 passed, 1 skipped: the filesystem refuses non-UTF-8 filenames; rerun on the tested head also passed",
+      "log_sha256": "9f99dc32ed3f856f525f052acc758b54895d5ed4e015b43fc104ca00446a55c9"
+    },
+    {
+      "name": "LLVM-enabled release build",
+      "tested_commit": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+      "command": "RUST_BACKTRACE=0 CARGO_INCREMENTAL=0 nix develop --command cargo build -p ra-jit --release --features llvm --locked",
+      "result": "passed",
+      "details": "Build passed with the pinned LLVM environment",
+      "log_sha256": "5212594a406c00f41ac8bcd45ac4d025c46f9db5d556c636b61e12d4dcf00b65"
+    },
+    {
+      "name": "Cranelift Mach-O unwind",
+      "tested_commit": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+      "command": "RUST_BACKTRACE=0 RA_JIT_BACKEND=cranelift RA_JIT_OPT=2 RA_JIT_EMIT=fast RA_JIT_BIN=<built ra-jit> python3 harness/nocompact.py",
+      "result": "passed",
+      "details": "6/6: original link, four edits, and 1000 added functions",
+      "log_sha256": "51e503a8ba62300bf857f7f82462b85e33424a05b1fe871d49aa95e659fccd76"
+    },
+    {
+      "name": "LLVM Mach-O unwind",
+      "tested_commit": "99a4e5fa219398fe9cd00f91e7cab824e86b26e3",
+      "command": "RUST_BACKTRACE=0 RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast RA_JIT_BIN=<built ra-jit> python3 harness/nocompact.py",
+      "result": "passed",
+      "details": "6/6: original link, four edits, and 1000 added functions",
+      "log_sha256": "336f5e04298d96f7507ab7fa957e96a718a189ec3727d4fc6fbb3f63d0f9cc29"
+    },
+    {
+      "name": "live edits",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "RA_JIT_BIN=<built ra-jit> RA_JIT_HOME=<short temporary path> python3.13 harness/live_e2e.py",
+      "result": "passed",
+      "details": "Five live patches, independent second program, restart, and panic unwind passed. Earlier local attempts hit a long socket path and a host swap guard; the isolated rerun passed.",
+      "log_sha256": "0e86d7dedfc75219ff23aad8738b9e0a94ff713adc01d3dd4b36198eab59a3a0"
+    },
+    {
+      "name": "live runtime unit tests",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "RUST_BACKTRACE=0 cargo +1.99.0 test --locked --release -p ra-jit-live",
+      "result": "passed",
+      "details": "2 passed, 0 failed; doctests: 0",
+      "log_sha256": "cd1099d9880c6c495a3582818380fcfa8dda4bdc874f8f5f3a82cc31802988ae"
+    },
+    {
+      "name": "macOS demo build",
+      "tested_commit": "804e2a47a19b61c6f3067c5b130acbdb8756e368",
+      "command": "cargo +1.99.0 build --locked --manifest-path demo/life/Cargo.toml",
+      "result": "passed",
+      "details": "Build passed",
+      "log_sha256": "5f4b8a9adeceb8f97ce86dc2087a87f769facbfd97e06ab6fa97f10abbaaddea"
+    }
+  ],
+  "nix_evaluation": {
+    "tested_commit": "04c9c6ea1ffdd44fda164e57bbf417340b431bb2",
+    "result": "passed",
+    "attributes": [
+      "daemon",
+      "run",
+      "life",
+      "daemon-units",
+      "life-bin"
+    ],
+    "command": "nix eval --raw .#packages.aarch64-darwin.<attribute>.drvPath",
+    "log_sha256": {
+      "daemon": "987a51c81de36270664a9a1b9ae3ff0e7a86cdf6ecd7c1589ebc472a5d149d47",
+      "run": "60b5d8ac2bfdc684b69b4b865436bb5f517a4d122de1aca62ad5932f86756f5d",
+      "life": "10807356228eda0a3682af9ba6cd0c30e0e9eba93997256b2ad05566efc8f921",
+      "daemon-units": "e11706a73cfc2a9cd67c65c107d1ed83e3992934f9d114a0cf63c55995f82656",
+      "life-bin": "ab5c076f14e32238a91a9dc708452c6234ddb822895f56d06385ea3c63c57900"
+    }
+  },
+  "nix_package_build": {
+    "tested_commit": "04c9c6ea1ffdd44fda164e57bbf417340b431bb2",
+    "result": "passed",
+    "exit": 0,
+    "command": "nix build --print-build-logs --no-link --option max-jobs 4 --option cores 2 .#daemon-units .#run",
+    "log_sha256": "4cc36c5c483596e97acac08bbd1bc5dcf8cc2f566e74dc17cacf4e0b0009b3a0",
+    "runtime_smoke": {
+      "command": "nix run .#blaze -- --help",
+      "result": "passed",
+      "log_sha256": "c359839a62146d2651a04c896dc673775c2cc666c077376a04d6de8dec684996"
+    },
+    "profile_note": "The pinned PGO profile has a different crate identity from this Nix build and matches few workspace functions. The build uses the existing non-strict profile policy; this is an optimization warning, not a test failure.",
+    "recovery": "After the T3 restart, the surviving older-head build was interrupted after toolchain realization and before its release compilation. This current-head build reused completed store outputs.",
+    "previous_attempt": {
+      "tested_commit": "12738507c4b842bd26c2fe54e246df9aea0c452c",
+      "result": "interrupted",
+      "log_sha256": "7dab4f846ca3b9ecf17e58d3bc2880e7c8e4aa73373801652a5a6627d9003039"
+    }
+  },
+  "local_cache_configuration": {
+    "setting": "NIX_CACHE_HOME=$HOME/code/.cache/nix",
+    "persistent_shell_files": [
+      "~/.zshenv",
+      "~/.bash_profile",
+      "~/.profile"
+    ],
+    "verified": "A fetcher-cache-v4.sqlite database was created in the requested directory; fresh bash and zsh shells export the setting.",
+    "package_store": "/nix/store",
+    "symlinks_added": false,
+    "defender_exclusions_changed": false,
+    "note": "The user chose to retain the standard package store and finish the checks."
+  },
+  "merge_readiness": {
+    "ready": false,
+    "pending": [
+      "Hosted CI on the repaired compiler",
+      "Complete C2 runtime acceptance",
+      "A permitted landing path: dist/main has no configured merge queue"
+    ],
+    "unit_gate_note": "All 17 formerly excepted failures pass in the clean LLVM-selected gate. No new ignores were added.",
+    "landing_note": "dist/main requires ci and C2 runtime checks. Its merge queue is not configured. No merge or bypass has been performed."
+  },
+  "ci_blockers": [
+    {
+      "job": "ubuntu-24.04-arm",
+      "url": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41921616928/job/126896068453",
+      "failure": "The fork nightly SHA256SUMS release asset returns HTTP 404.",
+      "remediation": "Pull-request installer jobs now build a native candidate archive for their target and pass it only to install and upgrade steps. Scheduled, manual, push, and release events still verify published assets. Native CI execution is pending."
+    },
+    {
+      "job": "this commit's build",
+      "url": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41921616928/job/126896068187",
+      "failure": "The owned proc-macro server build exits nonzero. Its captured diagnostic was previously discarded; the release script now prints it and re-raises the original failure.",
+      "diagnosis": "The historical completed workflow archive exposes a libc build-script probe with a named rather than absolute source toolchain.",
+      "remediation": "Producer launchers now bind their resolved absolute source installation; native regression checks pass. Complete Linux bootstrap CI is pending."
+    }
+  ],
+  "release_diagnostics_change": {
+    "behavior": "Print captured bootstrap stdout/stderr on subprocess failure, delete the partial executable, and preserve the original CalledProcessError and exit status. Successful bootstrap completeness checks are unchanged.",
+    "validation": [
+      "New regression cases failed before the change and passed afterward.",
+      "python3.13 -B .github/scripts/test_build_release.py: all cases passed.",
+      "python3.13 harness/imports.py: 147/147 scripts import.",
+      "git diff --check: passed."
+    ]
+  },
+  "installer_candidate_change": {
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "aarch64-apple-darwin"
+    ],
+    "linux_proc_macro_server": "Built with --server by blaze; no compiler fallback is added.",
+    "archive_contract": "blaze-commit-<target>.tar.gz containing blaze-commit-<target>/, consumed through install.sh BLAZE_ARCHIVE.",
+    "existing_checks": "Install, in-place upgrade, toolchain, hello-world execution, and missing-version checks remain.",
+    "validation": [
+      "actionlint .github/workflows/install.yaml: passed.",
+      "shellcheck -s sh install.sh: passed.",
+      "python3.13 harness/check_runner_labels.py: passed.",
+      "python3.13 -B .github/scripts/test_build_release.py: all cases passed.",
+      "git diff --check: passed."
+    ],
+    "native_execution": "Pending CI; lint success is not an installation verdict."
+  },
+  "producer_probe_fix": {
+    "historical_failure_commit": "14910d3b3",
+    "historical_job": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41928450245/job/126918949193",
+    "root_error": "libc build.rs: the producer probe needs its absolute source toolchain",
+    "cause": "The owned launcher inherited a named RUSTUP_TOOLCHAIN instead of binding the resolved source installation.",
+    "change": "All three producer-launcher creation paths now supply their resolved sysroot. The launcher binds that absolute installation, and owned Cargo queries recognize the same binding. Shell quoting remains native-byte preserving and altered launchers are rejected.",
+    "source_sha256": {
+      "crates/ra-jit/src/answers.rs": "aaee732fb4993322d1f840abc7046e0c8208a672b6bb08dc96471573fcf16529",
+      "crates/ra-jit/src/cargo/producer_plan.rs": "d9651feeda1c38b90580de611ef3b2ea53794ac1cc4fef29fbbe6bf6586f1743",
+      "crates/ra-jit/src/main.rs": "0ae698da5ca62f50642d6f32d359d2a546e4b7509d2bc335ad3eb2b01de15051",
+      "crates/ra-jit/src/scripts/captured.rs": "d9b18488985ffe442d00abf2496dfa9f34cfd83549145abafb877feb86d68578"
+    },
+    "verification": [
+      "Pinned-LLVM release build of the combined implementation: passed.",
+      "answers:: native tests: 30 passed, 0 failed.",
+      "Fresh build.rs queried RUSTC --version with RUSTUP_TOOLCHAIN=1.99.0; its cfg-gated executable printed producer-probe-ok.",
+      "cargo +1.99.0 fmt --all -- --check: passed.",
+      "harness/rustcsites.py: 14 existing launch sites, none new.",
+      "harness/norustc_test.py: 9 total, 4 passed and 5 Linux-specific cases skipped on macOS.",
+      "git diff --check: passed."
+    ],
+    "linux_bootstrap": "Awaiting CI; local verification does not certify the complete Linux server bootstrap.",
+    "tested_commit": "6c5f7b30ffca49601e911ee9341b4f21c7d2ea82",
+    "shared_implementation_commit": "fa9e35370977982cdb0986b3599a670659d15c5b",
+    "completion": "Preserve the parallel launcher-binding implementation, update the remaining workspace and captured-script call sites, fix the recognizer slice type, and exercise named toolchains and exact argument preservation.",
+    "verification_log_sha256": {
+      "producer-combined-answers-tests.log": "5d52d6c3c3abec46226545a68d2c134adcc7cd027fd9ee45a9003903ddf6e000",
+      "producer-combined-release-build.log": "22e1bffe2d7b46f0c9a5a22c5623137365a68d25500e45fde2fdc8369de889b1",
+      "producer-combined-probe-integration.log": "a964a499e94320183c82807bc0d2ca59513210811b584dff204217b58a50d07c",
+      "producer-combined-norustc.log": "100991710ea204bb38c0ac941f6397b0083ea3fb67924a2c7d770afac3c51b12"
+    }
+  },
+  "latest_local_source_check": "f8bed03399660f6929517ecdccdcbdc2cedbc4cc",
+  "installer_toolchain_report_change": {
+    "historical_job": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41932716034/job/126933396117",
+    "failure": "Installation succeeded, but the workflow only recognized an older blaze toolchain report label.",
+    "change": "Preserve the shared checker and portable candidate-build jobs. Extend the checker to the explicit and owned source-installation reports in addition to rustup and older published formats; require the absolute installation and Rust library source directory to exist.",
+    "validation": [
+      "Executed the exact workflow step with native binaries in an isolated CARGO_HOME: previous check failed (exit 1), updated check passed (exit 0).",
+      "Five shell-backed identity, path-refusal, source-presence, and portable-host regressions passed.",
+      "actionlint install.yaml, shellcheck install.sh and the shared checker, runner-label checks, and git diff --check passed."
+    ],
+    "tested_step_sha256": "6baee5661df5e35a57908b4c58cbbcd0a22851d212fd94aba67538e8857b6855",
+    "log_sha256": "a4ab517a2c23ad607820499ecc38ec912adfba61f5ff4ae6325a2f220f08a835",
+    "native_ci": "Pending; local step verification does not certify the entire installer workflow.",
+    "shared_implementation_commit": "2ed824e6a9cc401a513f4723977e3c6ff15ec0ae",
+    "checker_sha256": "8ae19f8dfbe05c40fce9b2e6a191f12455c85bf083733af6be1fa16e331d42b3"
+  },
+  "latest_branch_observation": {
+    "head": "f8bed03399660f6929517ecdccdcbdc2cedbc4cc",
+    "unit_gate": "OPEN is absent; clean LLVM-selected strict gate passed with zero failures.",
+    "remaining_validation": "Hosted CI, complete C2 acceptance and remaining platform coverage."
+  },
+  "ci_observation_before_semantic_update": {
+    "head": "04c9c6ea1ffdd44fda164e57bbf417340b431bb2",
+    "observed_at": "2026-11-05T03:09:44.942Z",
+    "passed": 47,
+    "failed": 0,
+    "pending": [
+      "dist linux-x64 / C2 runtime (ubuntu-24.04, saved-llvm)",
+      "serve / server"
+    ],
+    "skipped": 10
+  },
+  "host_memory_maintenance": {
+    "idle_bazel_servers_stopped": 1,
+    "stopped_server_footprint_mib": 1678,
+    "busy_servers_preserved": 6,
+    "fseventsd_restart": "Refused by macOS System Integrity Protection; no service change applied.",
+    "memory_pressure_after": "normal"
+  },
+  "llvm_unwind_repair": {
+    "tested_commit": "f8bed03399660f6929517ecdccdcbdc2cedbc4cc",
+    "tested_tree": "5193cc1ba6f5a6495e6acad49f9dc4702888d350",
+    "clean_before_and_after": true,
+    "compiler": {
+      "build_verified": true,
+      "head": "f8bed03399660f6929517ecdccdcbdc2cedbc4cc",
+      "sha256": "0ec7bfa477bd72ba1db49b442a7bbcb2b8c9c9e725d1f229321329277af6e647",
+      "size": 92085856
+    },
+    "strict_gate": {
+      "backend": "llvm",
+      "features": [
+        "llvm"
+      ],
+      "passed": 3105,
+      "failed": 0,
+      "ignored": 10,
+      "total": 3115,
+      "seconds": 376.72
+    },
+    "reduced_array_clone": {
+      "opt_levels": [
+        0,
+        2
+      ],
+      "rustc_and_llvm_match": true,
+      "compiled_roots": 2,
+      "total_roots": 2
+    },
+    "corpus": {
+      "backends": [
+        "llvm",
+        "cranelift"
+      ],
+      "output_matches_rustc": true,
+      "compiled_roots": 953,
+      "total_roots": 955,
+      "compared_layouts": 1261,
+      "wrong_layouts": 0,
+      "refusals": [
+        "undecided_alias_drop::ReadOnlyQuery::release_state: HasErrorType layout",
+        "stabilized::arm::naked_const: nonliteral asm constant"
+      ]
+    },
+    "llvm_runtime_smokes": {
+      "nocompact": "6/6",
+      "headerpad": "6/6"
+    },
+    "aarch64_cfi_scan": {
+      "llvm_corpus_calls_with_fde": 47039,
+      "llvm_unsaved_lr_calls": 0,
+      "rustc_reference_calls_with_fde": 30597,
+      "rustc_unsaved_lr_calls": 0,
+      "scope": "Checks saved x30 at FDE-covered call sites; not a complete unwind verifier."
+    },
+    "regression": {
+      "base_commit": "227b78f87d5e321a3cc8f41bac0574c4638853a8",
+      "base_result": "With only the standalone test added, the live resume call fails at offset 0x48. The fixture makes no calls in dead code.",
+      "fixed_result": "Distinct bodies, 400 members, CFI and bounded cleanup LSDA checks pass.",
+      "phase_read_ms": 18.883792,
+      "timing_scope": "Isolated native 400-member unit fixture on this Mac; not end-to-end performance."
+    },
+    "logs_sha256": {
+      "build-llvm.log": "68a8a905e024c7ad7631c3683d062bce1d8a46575ec32f8967820d6c3db0ac47",
+      "strict-unit-gate-llvm.log": "caa2c2d7f8d96a0c6c5cd74e7ebbba12c4116345b1bc910fe7ca93d06aeba780",
+      "unwind-llvm-o0.log": "d65a2b82f3a034c3e6e6b7903ab8c4c1189a2aaefedafc59751986b4504ebfb1",
+      "unwind-llvm-o2.log": "e7db61ed0a78a77387055030e8575acd58e508031ddf83113c9909cc0487d720",
+      "corpus-llvm-o2.log": "6d50c858e224707b7cdd74881803b955df77549241cf262df1c90f1b407b16ae",
+      "corpus-cranelift-o2.log": "49b377d5c815ca038a04a477fa124b5501f7b592f506db931dfdcdd9147497d7",
+      "nocompact-llvm-o2.log": "69742fc1db6d2510b12649238cf4c15c41fceda5425aefd72357e81a3affe098",
+      "headerpad-llvm-o2.log": "07da0fca0eb550c4c729e8a15f835b770b2f740d9bb4874228165081fdb0ea2f",
+      "corpus-cfi-scan.log": "0f3f7f0c7be0b086d49d19bfc1e7a17b65d30841158d5a19cbbbdedf80cf8d68",
+      "unit-400-clean.log": "cbbd6fea957dd3dc436eb4fa29e2d773450d0c073e94f47df9c750e343a4ba08"
+    },
+    "linux_precursor": {
+      "tested_commit": "ff37d9d45c3bdab2382059d1cc35cca63ce4e86d",
+      "cli_passed": 687,
+      "cli_failed": 0,
+      "cli_ignored": 5,
+      "linker": "LLD, two linker threads, 3 GiB container; GNU ld was killed before tests under the same memory limit.",
+      "other_suites": "dist, wire, spec, serve, metadata, registry, resolve, bundle transport and all 27 source-identity checks passed in preceding clean Linux runs.",
+      "scope": "Precursor receipts do not certify the later LLVM-only production changes."
+    }
+  }
+}

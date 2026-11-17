@@ -1,0 +1,3 @@
+type: AssignedEvent
+cbor: a200612e011abb1b019d
+digest: 71ffffb398994b929b82db2088a4bf01ef620ff542994953faecb52b27348031

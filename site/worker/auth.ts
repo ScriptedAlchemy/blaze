@@ -6,9 +6,12 @@
  * POST /auth/logout              ends the session (form field `next`), 303 to next
  *
  * The GitHub access token is used once to read /user and then revoked: never stored or logged. The
- * session cookie holds a random token; D1 keeps only its SHA-256. Both cookies are `__Host-` (Secure, Path=/,
- * no Domain), so a sibling subdomain cannot set or shadow them.
+ * session cookie holds a random token; D1 keeps only its SHA-256. Both cookies are `__Secure-`, host-only and scoped to
+ * the site's base path (worker/http.ts setCookie), so they are not sent to the rest of ix.dev.
+ *
+ * Paths here are site paths (worker/base.ts): `next` has no base, and every redirect goes to `outer(next)`.
  */
+import { outer } from './base';
 import type { Env } from './env';
 import {
 	boundedBody,
@@ -25,11 +28,11 @@ import {
 	timingSafeEqual,
 } from './http';
 
-const OAUTH_COOKIE = '__Host-gh_oauth';
-const SESSION_COOKIE = '__Host-session';
+const OAUTH_COOKIE = '__Secure-blaze_gh_oauth';
+const SESSION_COOKIE = '__Secure-blaze_session';
 const OAUTH_MAX_AGE = 600;
 const SESSION_MAX_AGE = 30 * 86400;
-const USER_AGENT = 'ra-jit-site';
+const USER_AGENT = 'blaze-site';
 /** The logout form is one `next` field. */
 const LOGOUT_MAX = 4096;
 
@@ -78,7 +81,7 @@ function start(env: Env, url: URL): Response {
 	const state = randomToken();
 	const gh = new URL('https://github.com/login/oauth/authorize');
 	gh.searchParams.set('client_id', env.GITHUB_CLIENT_ID);
-	gh.searchParams.set('redirect_uri', `${url.origin}/auth/github/callback`);
+	gh.searchParams.set('redirect_uri', `${url.origin}${outer('/auth/github/callback')}`);
 	gh.searchParams.set('state', state);
 	gh.searchParams.set('allow_signup', 'true');
 	// The state is base64url, so the first "." splits it from next.
@@ -102,7 +105,7 @@ async function callback(request: Request, env: Env, ctx: ExecutionContext, url: 
 	}
 
 	// The visitor said no on GitHub's page.
-	if (url.searchParams.get('error')) return redirect(next, [clearOauth]);
+	if (url.searchParams.get('error')) return redirect(outer(next), [clearOauth]);
 
 	const code = url.searchParams.get('code');
 	if (!code) return fail('GitHub did not send a code.');
@@ -115,7 +118,7 @@ async function callback(request: Request, env: Env, ctx: ExecutionContext, url: 
 			client_id: env.GITHUB_CLIENT_ID,
 			client_secret: env.GITHUB_CLIENT_SECRET,
 			code,
-			redirect_uri: `${url.origin}/auth/github/callback`,
+			redirect_uri: `${url.origin}${outer('/auth/github/callback')}`,
 		}),
 	});
 	const tokenOut: { access_token?: unknown; error?: unknown } = tokenRes.ok ? await tokenRes.json<{ access_token?: unknown; error?: unknown }>().catch(() => ({})) : {};
@@ -169,7 +172,7 @@ async function callback(request: Request, env: Env, ctx: ExecutionContext, url: 
 			now + SESSION_MAX_AGE,
 		),
 	]);
-	return redirect(next, [clearOauth, setCookie(SESSION_COOKIE, token, SESSION_MAX_AGE)]);
+	return redirect(outer(next), [clearOauth, setCookie(SESSION_COOKIE, token, SESSION_MAX_AGE)]);
 }
 
 async function logout(request: Request, env: Env): Promise<Response> {
@@ -185,7 +188,7 @@ async function logout(request: Request, env: Env): Promise<Response> {
 	}
 	const token = cookie(request, SESSION_COOKIE);
 	if (token) await env.DB.prepare('DELETE FROM sessions WHERE token_hash = ?').bind(await sha256hex(token)).run();
-	return redirect(next, [clearCookie(SESSION_COOKIE)]);
+	return redirect(outer(next), [clearCookie(SESSION_COOKIE)]);
 }
 
 /** DELETE /applications/{client_id}/token: ends this one token (the user's grant to the app stays). Logs only the status. */

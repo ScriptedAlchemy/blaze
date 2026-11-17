@@ -1,5 +1,5 @@
 //! The window: a readout at the top, the running Game of Life on the left with its tiers under
-//! it, and the editor on the right, in the Islands Dark theme. ra-jit-live applies each patch
+//! it, and the editor on the right, in the Islands Dark theme. blaze-live applies each patch
 //! on a thread of its own the moment it arrives; the next step of the simulation runs the new
 //! rules from main.rs.
 
@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use ra_jit_live::{Live, Outcome};
+use blaze_live::{Live, Outcome};
 
 use crate::editor::{self, Editor};
 use crate::theme::{self, Theme};
@@ -46,8 +46,6 @@ struct App {
     /// part of it the edit waited in the editor for the one before.
     outcome: Option<(String, bool)>,
     edit_to_running: Option<(Duration, Duration)>,
-    /// What applying the last patch took, and how long it waited to be applied.
-    apply: Option<(Duration, Duration)>,
     patches: u64,
     editor: Editor,
     build: BuildStatus,
@@ -99,17 +97,17 @@ impl App {
                             .color(t.function),
                     );
                     // Where the time of this one edit went, adding up to it: waiting in the
-                    // editor for the edit before to be answered, the daemon's build and the
-                    // patch's way here, and the program's wait for its apply thread and the
-                    // apply (what ra-jit-live's line says too).
-                    let mut parts = vec![format!("in the editor {:.1} ms", ms(queued))];
-                    if let Some((took, waited)) = self.apply {
-                        let daemon = total.saturating_sub(queued + waited + took);
-                        parts.push(format!("daemon {:.1} ms", ms(daemon)));
-                        parts.push(format!("in the program {:.2} ms", ms(waited)));
-                        parts.push(format!("apply {:.2} ms", ms(took)));
-                    }
-                    ui.colored_label(t.comment, format!("({})", parts.join(", ")));
+                    // editor for the edit before to be answered, then the daemon's build, the
+                    // patch's way here and its switch.
+                    let daemon = total.saturating_sub(queued);
+                    ui.colored_label(
+                        t.comment,
+                        format!(
+                            "(in the editor {:.1} ms, build and switch {:.1} ms)",
+                            ms(queued),
+                            ms(daemon)
+                        ),
+                    );
                 }
                 (Some((_, true)), None) => {
                     ui.heading(egui::RichText::new("edit applied").color(t.function));
@@ -155,7 +153,7 @@ impl App {
         } else if self.editor.file.is_none() {
             ui.colored_label(
                 t.comment,
-                "no source to edit: start the window from demo/life, or set RA_JIT_LIFE_FILE",
+                "no source to edit: start the window from demo/life, or set BLAZE_LIFE_FILE",
             );
         } else if self.build.ok || self.build.text.is_empty() {
             let file =
@@ -204,11 +202,8 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok((outcome, took)) = self.applied.try_recv() {
             let applied = matches!(outcome, Outcome::Applied { .. });
-            if let Outcome::Applied { took, waited, .. } = outcome {
-                self.patches += 1;
-                self.apply = Some((took, waited));
-            }
             if applied {
+                self.patches += 1;
                 self.edit_to_running = took;
             }
             self.outcome = Some((outcome.to_string(), applied));
@@ -284,10 +279,10 @@ impl eframe::App for App {
     }
 }
 
-/// The file to edit: `RA_JIT_LIFE_FILE`, else src/main.rs here (the launcher starts the window
+/// The file to edit: `BLAZE_LIFE_FILE`, else src/main.rs here (the launcher starts the window
 /// in the crate's copy), else the crate this was built from, if it is still there.
 fn source_file() -> Option<PathBuf> {
-    if let Some(file) = std::env::var_os("RA_JIT_LIFE_FILE") {
+    if let Some(file) = std::env::var_os("BLAZE_LIFE_FILE") {
         return Some(file.into());
     }
     [
@@ -299,7 +294,7 @@ fn source_file() -> Option<PathBuf> {
     .map(|p| std::path::absolute(&p).unwrap_or(p))
 }
 
-/// `RA_JIT_LIFE_HEADLESS=1`: the same program without a window, for harness/live_latency.py to
+/// `BLAZE_LIFE_HEADLESS=1`: the same program without a window, for harness/live_latency.py to
 /// time edits of the demo by (its executable is the window's, eframe and all). Each patch is
 /// applied as it lands, as in the window; what `step_ms()` returns is printed whenever it
 /// changes, with the time it was seen.
@@ -339,7 +334,7 @@ fn headless(mut life: Life) -> eframe::Result {
 }
 
 pub fn run(life: Life) -> eframe::Result {
-    if std::env::var_os("RA_JIT_LIFE_HEADLESS").is_some() {
+    if std::env::var_os("BLAZE_LIFE_HEADLESS").is_some() {
         return headless(life);
     }
     let (live, live_note) = match Live::start() {
@@ -348,8 +343,8 @@ pub fn run(life: Life) -> eframe::Result {
     };
     let tiering_off = if live.is_none() {
         Some("tiering: off, as live edits are".to_owned())
-    } else if std::env::var_os("RA_JIT_TIER").is_some_and(|it| it == "off") {
-        Some("tiering: off (RA_JIT_TIER=off)".to_owned())
+    } else if std::env::var_os("BLAZE_TIER").is_some_and(|it| it == "off") {
+        Some("tiering: off (BLAZE_TIER=off)".to_owned())
     } else {
         None
     };
@@ -367,7 +362,6 @@ pub fn run(life: Life) -> eframe::Result {
         live_note,
         outcome: None,
         edit_to_running: None,
-        apply: None,
         patches: 0,
         editor,
         build: BuildStatus::default(),
@@ -383,11 +377,11 @@ pub fn run(life: Life) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(theme::ISLANDS_DARK.metrics.window_size)
-            .with_title("ra-jit: Game of Life, live"),
+            .with_title("blaze: Game of Life, live"),
         ..Default::default()
     };
     eframe::run_native(
-        "ra-jit life",
+        "blaze life",
         options,
         Box::new(move |creation| {
             let ctx = creation.egui_ctx.clone();

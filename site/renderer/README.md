@@ -7,13 +7,13 @@ module. TS is the host: the build's bake step, routing, auth, D1, the cache and 
 
 ```
 content/*.flecs ──▶ site-snapshot.wasm (Flecs inside) ──▶ snapshot (.gen/site.cbor) ──▶ site.wasm ──▶ HTML
-   gen/build.ts bake: highlight.js, bench widget ──┘                                       ▲
+   gen/build.ts bake: highlight.js; bench charts ──┘                                       ▲
                                               comments (CBOR) + viewer (CBOR) ─────────────┘
 ```
 
 | crate | what it is |
 |---|---|
-| `core` (`site-render`) | The renderer. `world.rs` is the entity store it reads, and `snapshot.rs` loads it from a flecs-snapshot DAG-CBOR document. `render.rs`, `inline.rs` and `comments.rs` are the page, inline text and thread rendering (ported from the former `render/*.ts`, byte for byte). `js.rs` holds the JS semantics the output depends on: whitespace, `String(n)`, `encodeURIComponent`, `String.replace`, UTF-16 slicing and `Date`. The core does no I/O, reads no clock and has no globals. Feature `scripts` runs the content in Flecs (`scripts.rs`). |
+| `core` (`site-render`) | The renderer. `world.rs` is the entity store it reads, and `snapshot.rs` loads it from a flecs-snapshot DAG-CBOR document. `render.rs`, `inline.rs` and `comments.rs` are the page, inline text and thread rendering; `course.rs` lays out the course path as a graph (bands, rows, columns, gutter tracks) (ported from the former `render/*.ts`, byte for byte). `js.rs` holds the JS semantics the output depends on: whitespace, `String(n)`, `encodeURIComponent`, `String.replace`, UTF-16 slicing and `Date`. The core does no I/O, reads no clock and has no globals. Feature `scripts` runs the content in Flecs (`scripts.rs`). |
 | `wasm` (`site-wasm`) | The core behind a C ABI: `site.wasm`, the worker's module and the build's renderer. No Flecs. |
 | `snapshot` (`site-snapshot`) | The content scripts and the baked HTML to a snapshot, behind a C ABI: `site-snapshot.wasm`, Flecs's C compiled in (flecs-c for wasm32-unknown-unknown). Build time only. |
 | `serve` (`site-serve`) | The whole site as a wasi:http component (wstd): pages, comments from a `CommentStore`, and the build's assets. A demo. |
@@ -31,12 +31,13 @@ uv run --script renderer/fetch.py     # or fetch them: CI's `site-renderer` arti
 cargo run (in one, the features would unify and `site.wasm` would get Flecs), then runs `wasm-opt -Oz` when it is on
 PATH. Flecs's C needs a clang with the wasm32 backend: set `CC_wasm32_unknown_unknown` and `AR_wasm32_unknown_unknown`
 when the default `clang` is a wrapper that adds host flags (nix: `llvmPackages.clang-unwrapped` and
-`llvmPackages.bintools-unwrapped`). Cargo builds run on a dev host or in CI, not on the Mac.
+`llvmPackages.bintools-unwrapped`). Cargo builds run in an ix VM or in CI, not on the Mac.
 
 The modules are platform-independent build outputs, not checked in. CI (`.github/workflows/site.yaml`) builds them on
 every run and uploads them as `site-renderer`; `fetch.py` downloads the latest green run's (this branch, else main), so
 `bun run build` and `wrangler dev` work without a Rust toolchain. An artifact is built from its run's commit: after
-changing `renderer/`, build on a dev host and fetch with `--scp`.
+changing `renderer/`, build in the lane's ix VM and copy `renderer/target/site` out with
+`ix shell <lane> -- tar -C <dir>/renderer/target/site -c . | tar -x -C renderer/target/site`.
 
 Measured 2026-10-25 (Rust 1.99.0, binaryen 133 on dev-aws-14, flecs-opinionated 959ccd4; `bun gen/build.ts` on the
 Mac; the worker bundle row is from the earlier 736e38c build):
@@ -67,7 +68,6 @@ p = site_alloc(n); write the snapshot at p; site_load(h, p, n); site_free(p, n) 
 site_pages(h)                                                                     output: JSON [{url, file, doc, discussable}]
 site_discussable(h)                                                               output: JSON {doc: {title, blocks: {id: text}}}
 site_render(h, url, url_len, comments, comments_len, discussion, discussion_len)  0 with the HTML, or 1 with the error
-site_spoken(h, url, url_len)                                                      0 with JSON [{id, block, text, authored}], or 1
 output: site_output_len(h) bytes at site_output_ptr(h);  site_drop(h)
 ```
 
@@ -83,14 +83,18 @@ instance and makes a new one on the next request.
 
 `site-snapshot.wasm`: `snap_new`, `snap_alloc`, `snap_free`, `snap_build(h, input, len)` (0 with the snapshot, or 1 with
 the error), `snap_output_ptr`, `snap_output_len`, `snap_drop`. The input is JSON
-`{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, baked?, audio?}}}`, the scripts in run order (`schema.flecs`,
-`refs.flecs`, then the rest by path).
+`{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, baked?}}}`, the scripts in run order (`schema.flecs`,
+`refs.flecs`, then the rest by path, then the ones the build generated, such as the benchmark charts).
 
-## Highlighting and the bench stay in TS, embedded as-is
+## Highlighting and glyphs stay in TS, embedded as-is; charts are content
 
-`gen/build.ts` pre-renders highlighted code (highlight.js) and the BenchHistory widget, by entity path, and the
-snapshot step sets that HTML on the entities as `Highlighted {html}` (Code, Command) and `Baked {html}` (BenchHistory).
-The core embeds it unchanged, so the core has no highlighter and the CSS is unchanged.
+`gen/build.ts` pre-renders highlighted code (highlight.js) and each lesson's and update's glyph (gen/glyphs.ts), by entity path,
+and the snapshot step sets that HTML on the entities as `Highlighted {html}` (Code, Command) and `Baked {html}` (a
+lesson or update page). The core embeds it unchanged, so the core has no highlighter.
+
+Charts are elements like any other (`RowChart`, `LineChart`, `Charts`, `Picker` in `content/schema.flecs`), drawn by
+`core/src/chart.rs` as HTML rows and inline SVG with a table of their numbers. The benchmark page's are written by the build from the
+history files (`gen/bench/`) as a Flecs script that runs after the content.
 
 ## wasi:http host
 
@@ -105,7 +109,7 @@ wasmtime serve -S cli target/wasm32-wasip2/release/site-serve.wasm
 - It is a demo: the viewer comes from an `x-demo-user` header (`octo`, `mallory`, `admin`). `wasmtime serve` creates
   a fresh instance per request, so the store has no writes.
 - A page request takes about 5.6 ms, including instantiation and the snapshot load.
-- The component is 3.9 MB, of which 2.7 MB is `demo.avif`.
+- The component was 3.9 MB, of which 2.7 MB was `demo.avif` (since removed with the home page's demo).
 
 ## Parity with the former TS renderer
 
@@ -119,7 +123,7 @@ The fixtures stay: `serve` seeds its store from `fixtures/comments.json`.
 ## Flecs, and what is left
 
 The core never touches Flecs; only `core/src/scripts.rs` does, behind the `scripts` feature, through flecs-snapshot's
-`World`: `run` for the content scripts and for `bake.flecs` (which only defines `Highlighted`, `Baked` and `Audio`),
+`World`: `run` for the content scripts and for `bake.flecs` (which only defines `Highlighted` and `Baked`),
 `set` for the baked HTML (checked against each component's layout), and `roots` for the root list (sorted bytewise).
 The `world_*` C exports are behind flecs-snapshot's `ffi` feature, which the renderer leaves off, so they are not in
 `site-snapshot.wasm`. `snapshot.rs` reads documents strictly, as flecs-snapshot's own reader does: an unknown key in

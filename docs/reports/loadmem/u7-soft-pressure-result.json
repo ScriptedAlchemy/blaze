@@ -1,0 +1,20 @@
+{
+  "n": 1,
+  "one_core_affinity": 0,
+  "functions": 946,
+  "allocator_mib": 3072,
+  "footprint_at_pause_bytes": 17170432,
+  "footprint_sampled_peak_bytes": 1601421312,
+  "startup_paused_before_workspace": true,
+  "soft_budget_bytes": 67108864,
+  "source_sha": "f1dedc0b783a19aa0f7f87491a03a8ccb71db3e3",
+  "reserve_bytes": 4639838208,
+  "available_before": 7324192768,
+  "available_allocated": 4157947904,
+  "available_released": 7314513920,
+  "source": "real /proc/meminfo and memory PSI",
+  "pause_recovery": true,
+  "matches_reference": true,
+  "seconds": 13.0,
+  "limiter": "one CPU, release compiler and shared Docker VM; no baseline or speedup claim"
+}

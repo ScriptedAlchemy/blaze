@@ -74,14 +74,21 @@ fn respond(
 
 #[wstd::http_server]
 async fn main(req: Request<Body>) -> Result<Response<Body>, Error> {
-    let path = req.uri().path().to_string();
+    let mut site = Site::from_snapshot(embedded::SNAPSHOT).map_err(Error::msg)?;
+    let html = "text/html; charset=utf-8";
+    // Pages and assets sit under the site's base (`Served` on `site`, /blaze); dist/ and the page URLs have none.
+    let path = match req.uri().path().strip_prefix(site.served().base.as_str()) {
+        Some(p) if p.starts_with('/') => p.to_string(),
+        _ => {
+            let r = site.render("/404", &[], &Discussion::default()).map_err(Error::msg)?;
+            return respond(StatusCode::NOT_FOUND, html, r.html, "404");
+        }
+    };
     if let Some((_, bytes)) = embedded::ASSETS.iter().find(|(p, _)| *p == path) {
         return respond(StatusCode::OK, content_type(&path), *bytes, "asset");
     }
-    let mut site = Site::from_snapshot(embedded::SNAPSHOT).map_err(Error::msg)?;
     let url = path.strip_suffix(".html").unwrap_or(&path);
     let url = if url.len() > 1 { url.trim_end_matches('/') } else { url };
-    let html = "text/html; charset=utf-8";
     let Some(page) = site.page(url).cloned() else {
         let r = site.render("/404", &[], &Discussion::default()).map_err(Error::msg)?;
         return respond(StatusCode::NOT_FOUND, html, r.html, "404");

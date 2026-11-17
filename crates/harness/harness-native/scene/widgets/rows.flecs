@@ -1,0 +1,216 @@
+// The sidebar's rows as templates (flecs script reactivity): the host sets an instance's props (src/app.rs sync_view,
+// harness_native_ui_view::View::props) and flecs re-runs only the parts that read a prop that changed. Every tree row
+// implements hn.Row (scene/widgets/row.flecs); each kind adds its own props. Parts the host animates (a chevron's Fold, a row's HoverAmt) keep
+// their runtime state across a re-run: a re-run sets components, it does not remake entities, nor remove a component an
+// arm set before (so where a part's look depends on a prop, every arm sets it).
+//
+// Calm one-line rows, no status dots, nothing that moves. How a row stands is in its title's ink (`look`: "on" while
+// selected, "rest" while live, "done" once it ended), its mark's ink (strong while it works, faint else: the host sets
+// it), and a few faint words trailing it (`meta`: what it is doing now, how it ended). A failure is its mark in the error
+// ink, never red words (a run's trailing words still are: `alarm`). The parts are hn.tree's (scene/widgets/tree.flecs).
+using flecs.script
+
+@tree ChildOf
+hn {
+  // A session: its chevron gutter at its depth (hn.Hang; folded, as every row starts, nothing under it shows but the
+  // selection), what it is (`kind_icon`), its title on one line (its
+  // rename, a sub-agent's spawn name, a chat's first message: never its kind and number, which end its tooltip), how
+  // many things are at work under it while it is folded (`under`: a faint dot and count, "" when none or open, so work
+  // starting under a row never opens it), and trailing how long ago it started or ended, or how it went wrong (`why` its
+  // tooltip). On hover its shortcut
+  // (`hint`) takes the trailing words' place. `focus`: the selection while the tree has the keyboard. `edit`: its name is
+  // being renamed (cmd+R): the name is the field's words (the host sets their caret and selection), its pill the field.
+  // `menu`: its menu is open (a right press on it, src/app/row_menu.rs): ringed in the accent.
+  @tree ChildOf
+  template ObjRow : Row {
+    prop look: string = "rest"
+    prop under: string = ""
+    prop mark: string = ""
+    prop meta: string = ""
+    prop why: string = ""
+    prop hint: string = ""
+    prop focus: bool = false
+    prop edit: bool = false
+    prop menu: bool = false
+    (IsA, hn.TreeRowLook)
+    Action: {name: "select:{obj}"}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
+    Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
+    hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
+    // A mark only when there is something to say, tree_kind across before its title (src/app.rs sync_view sets it,
+    // outside the template's reactive inputs): a dot in the strong ink while its agent works, the same dot in the error
+    // ink when it failed, nothing else; a shell its terminal glyph. Which agent it is ends the row's tooltip.
+    kind_icon : hn.tree.Kind {}
+    name : hn.tree.Head {
+      Text: {s: $name}
+      // What it is doing while it works ("Running a command: cargo test"), where it works and when it started or ended
+      // (the trailing words carry only what is new: what it works on, how it failed).
+      Tooltip: {text: $why}
+      if $look == "on" {
+        Fill: $tone_ink_strong
+        TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree_on}
+      } else {
+        if $look == "done" {
+          Fill: $tone_ink_muted
+        } else {
+          Fill: $tone_ink
+        }
+        TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
+      }
+    }
+    spacer : ui.Spacer {}
+    // Folded with work under it: a faint dot and how many; a press on the chevron
+    // (or Right) opens it. Gone when nothing works under it, or once it is open and they show.
+    if $under != "" {
+      under : ui.Row {
+        Flex: {axis: Row, gap: $tree_under_gap, align: Center, justify: End, wrap: false}
+        FixedSize: {h: true, v: false}
+        Tooltip: {text: "$under at work under it"}
+        dot : ui.Symbol {
+          Size: {w: {kind: Fixed, value: $tree_under_dot, min: 0, max: 0}, h: {kind: Fixed, value: $tree_under_dot, min: 0, max: 0}}
+          Icon: {glyph: ""}
+          Fill: $tone_ink_faint
+        }
+        count : hn.tree.Trail {
+          Text: {s: $under}
+        }
+      }
+    }
+    meta : hn.tree.Trail {
+      Text: {s: $meta}
+      Tooltip: {text: $why}
+      // Gone while hovered when the shortcut shows in its place.
+      if $hint == "" {
+        HoverShow: {row: 0, keep: true, away: false}
+      } else {
+        HoverShow: {row: 0, keep: false, away: true}
+      }
+    }
+    // The shortcut (cmd+1 to 9), on hover only, where the trailing words were: a layer over the row (out of its flow),
+    // its words at the row's right inset.
+    keys : ui.Row {
+      Overlay
+      Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+      Padding: {l: 0, r: $tree_pad_r, t: 0, b: 0}
+      hint : hn.tree.Trail {
+        Text: {s: $hint}
+        HoverShow: {row: 0, keep: false, away: false}
+      }
+    }
+    // While its menu is open (src/app/row_menu.rs): a ring round it, the selection left where it is.
+    ring : hn.RowMenuMark {
+      plate {
+        if $menu {
+          Edge: {dark: $tone_accent.dark, light: $tone_accent.light}
+        } else {
+          Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+        }
+      }
+    }
+    if $selected {
+      pill : hn.Selection {
+        plate {
+          if $edit {
+            Fill: $tone_well
+          } else {
+            if $focus {
+              Fill: $tone_selection_focus
+            } else {
+              Fill: $tone_selection
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // A shell run (or one of its pipeline stages) under its session, on the session rows' grid: its command, shortened
+  // (src/app.rs short_cmd) in the quieter run ink, a step brighter while it runs (`busy`), and
+  // trailing how long it took
+  // (`meta`; on hover, or always when `keep`: a failure, lost, pending, skipped; red when `alarm`). A folded session
+  // shows only its running runs, so a finished one folds away on its own.
+  @tree ChildOf
+  template RunRow : Row {
+    prop look: string = "rest"
+    prop mark: string = ""
+    prop busy: bool = false
+    prop alarm: bool = false
+    prop meta: string = ""
+    prop keep: bool = false
+    prop focus: bool = false
+    prop menu: bool = false
+    (IsA, hn.TreeRowLook)
+    Action: {name: "select:{obj}"}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_run_h, min: 0, max: 0}}
+    Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
+    hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
+    // A command, at a glance: the terminal glyph, faint, tree_kind across before its line.
+    kind_icon : hn.tree.CmdKind {}
+    name : hn.tree.Cmd {
+      Text: {s: $name}
+      if $look == "on" {
+        Fill: $tone_ink_strong
+      } else {
+        if $busy {
+          Fill: $tone_ink
+        } else {
+          Fill: $tone_ink_muted
+        }
+      }
+    }
+    spacer : ui.Spacer {}
+    meta : hn.tree.Trail {
+      Text: {s: $meta}
+      if $alarm {
+        Fill: $tone_error
+      } else {
+        Fill: $tone_ink_faint
+      }
+      HoverShow: {row: 0, keep: $keep, away: false}
+    }
+    // While its menu is open (src/app/row_menu.rs): a ring round it, the selection left where it is.
+    ring : hn.RowMenuMark {
+      plate {
+        if $menu {
+          Edge: {dark: $tone_accent.dark, light: $tone_accent.light}
+        } else {
+          Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+        }
+      }
+    }
+    if $selected {
+      pill : hn.Selection {
+        plate {
+          if $focus {
+            Fill: $tone_selection_focus
+          } else {
+            Fill: $tone_selection
+          }
+        }
+      }
+    }
+  }
+
+  // The archive row at the sidebar's bottom (`selected`: its glyph in the strong ink while the Archive, or an object opened
+  // from it, is selected): an archive box, still. Clicked, the Archive pane (hn.ArchivePane) takes the main card.
+  @tree ChildOf
+  template ArchiveRow : Row {
+    (IsA, ui.IconButton)
+    Tooltip: {text: "Archive"}
+    if $selected {
+      Inks: {rest: $tone_ink_strong, hover: $tone_ink_strong}
+    } else {
+      Inks: {rest: $tone_ink_muted, hover: $tone_ink_strong}
+    }
+    icon : ui.Symbol {
+      Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: $tree_icon, min: 0, max: 0}}
+      Icon: {glyph: ""}
+    }
+    async {
+      while true {
+        const e = await on.click(this)
+        await hn.act("archive:open", e.alt)
+      }
+    }
+  }
+}

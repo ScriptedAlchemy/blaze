@@ -9,13 +9,14 @@ use std::rc::Rc;
 use anyhow::bail;
 
 use super::features::CliFeatures;
-use super::{CargoResult, HashMap};
+use super::{CargoResult, HashMap, HashSet};
 use crate::dependency::Dependency;
 use crate::edit_distance::{closest_msg, edit_distance};
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
 use crate::package_id_spec::PackageIdSpec;
 use crate::summary::{FeatureValue, Summary};
+use std::alloc::Global;
 
 /// The workspace, as far as choosing its members' features goes.
 #[derive(Clone, Copy)]
@@ -70,17 +71,18 @@ fn collect_matching_features(
     let summary_features = member.features();
 
     // Dependency name -> dependency
-    let dependencies: BTreeMap<InternedString, &Dependency> =
+    let dependencies: HashMap<InternedString, &Dependency, Global> =
         member.dependencies().iter().map(|dep| (dep.name_in_toml(), dep)).collect();
 
     // Features that enable optional dependencies
-    let optional_dependency_names: BTreeSet<_> = dependencies
+    let optional_dependency_names: HashSet<_, Global> = dependencies
         .iter()
         .filter(|(_, dep)| dep.is_optional())
         .map(|(name, _)| name)
         .copied()
         .collect();
 
+    // BTreeSet: becomes `CliFeatures::features`, which is hashed and compared.
     let mut features = BTreeSet::new();
 
     // Checks if a member contains the given feature.
@@ -385,8 +387,8 @@ fn members_with_features_old<'a>(
 ) -> Vec<(&'a Summary, CliFeatures)> {
     // Split off any features with the syntax `member-name/feature-name` into a map
     // so that those features can be applied directly to those workspace-members.
-    let mut member_specific_features: HashMap<InternedString, BTreeSet<FeatureValue>> =
-        HashMap::default();
+    let mut member_specific_features: HashMap<InternedString, BTreeSet<FeatureValue>, Global> =
+        HashMap::new_in(Global);
     // Features for the member in the current directory.
     let mut cwd_features = BTreeSet::new();
     for feature in cli_features.features.iter() {

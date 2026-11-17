@@ -1,6 +1,6 @@
 """memory.py: how much memory a process tree holds, the same way on Linux and macOS.
 
-The one helper the benchmarks measure memory with (bench.py, runbench.py, apps.py); a
+The one helper the benchmarks measure memory with (bench.py and the rest); a
 harness that measures memory imports this rather than reading /proc or `ps` itself. What it
 measures, and how far off it can be, is docs/benchmarks.md, "Memory and disk". In short:
 
@@ -28,18 +28,14 @@ library only.
 """
 import ctypes, os, platform, resource, stat, subprocess, sys, tempfile, threading, time
 
+import counters
+
 DARWIN = platform.system() == "Darwin"
-INTERVAL = float(os.environ.get("RA_JIT_MEMORY_INTERVAL", "0.01"))
+INTERVAL = float(os.environ.get("BLAZE_MEMORY_INTERVAL", "0.01"))
 PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024 if hasattr(os, "sysconf") else 4
 
 if DARWIN:
     _proc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    _RUSAGE_INFO_V4 = 4
-    # struct rusage_info_v4 (<sys/resource.h>): a UUID, then 35 counters of 64 bits.
-    _FOOTPRINT, _LIFETIME_MAX_FOOTPRINT = 7, 28
-
-    class _RusageInfo(ctypes.Structure):
-        _fields_ = [("uuid", ctypes.c_uint8 * 16), ("counters", ctypes.c_uint64 * 35)]
 
 
 def maxrss_mb(usage):
@@ -52,10 +48,11 @@ def held_kb(pid):
     zombie, which holds nothing). On Linux the most is what it holds now: the sampler keeps
     the peak."""
     if DARWIN:
-        info = _RusageInfo()
-        if _proc.proc_pid_rusage(pid, _RUSAGE_INFO_V4, ctypes.byref(info)) != 0 or not info.counters[_FOOTPRINT]:
+        # rusage_info_v4, read where it is read for instructions too (counters.py).
+        info = counters.rusage(pid)
+        if info is None or not info["footprint"]:
             return None
-        return info.counters[_FOOTPRINT] // 1024, info.counters[_LIFETIME_MAX_FOOTPRINT] // 1024
+        return info["footprint"] // 1024, info["lifetime_max_footprint"] // 1024
     try:
         with open(f"/proc/{pid}/statm") as f:
             pages = int(f.read().split()[1])
@@ -101,6 +98,49 @@ def tree(root):
         found.append(pid)
         todo += children(pid)
     return found
+
+
+def system_mb():
+    """What the whole machine has and uses now, in megabytes: `total`, `used` (all but what
+    the kernel could hand out without swapping, `MemAvailable`), `swap_total` and `swap_used`.
+    None off Linux."""
+    try:
+        with open("/proc/meminfo") as f:
+            info = {line.split(":")[0]: int(line.split()[1]) for line in f if line.split()[1:]}
+    except (OSError, ValueError):
+        return None
+    mb = lambda kb: round(kb / 1024)
+    return dict(
+        total=mb(info["MemTotal"]), used=mb(info["MemTotal"] - info["MemAvailable"]),
+        swap_total=mb(info["SwapTotal"]), swap_used=mb(info["SwapTotal"] - info["SwapFree"]),
+    )
+
+
+def largest_processes(count):
+    """The `count` processes of the whole machine that hold the most, as (megabytes resident,
+    megabytes swapped out, pid, name), most first. Linux only: empty elsewhere."""
+    found = []
+    for pid in (int(p) for p in os.listdir("/proc") if p.isdigit()) if os.path.isdir("/proc") else ():
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                status = dict(line.rstrip("\n").split(":\t", 1) for line in f if ":\t" in line)
+        except OSError:
+            continue
+        kb = lambda field: int(status.get(field, "0 kB").split()[0])
+        if kb("VmRSS") or kb("VmSwap"):
+            found.append((round(kb("VmRSS") / 1024), round(kb("VmSwap") / 1024), pid, status.get("Name", "?").strip()))
+    return sorted(found, key=lambda it: it[0] + it[1], reverse=True)[:count]
+
+
+def cpu_seconds(pid):
+    """The CPU time `pid` has used, user and system, in seconds; None when it is gone or off
+    Linux."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
 
 def resident_mb(roots):
@@ -196,18 +236,24 @@ class Sampler:
         return round(max(self.most.values(), default=0) / 1024)
 
 
-def run(argv, cwd=None, env=None, timeout=None, sampler=None, text=True, stdin=subprocess.DEVNULL):
+def run(argv, cwd=None, env=None, timeout=None, sampler=None, text=True, stdin=subprocess.DEVNULL, meter=None):
     """Runs `argv` to its end as `subprocess.run(capture_output=True)` does. The result is
     (seconds, the CompletedProcess, the memory): `largest_mb` is the peak of the largest process
     of its tree (`wait4`'s, exact, or the sampler's when more), `peak_mb` the most the tree held
     at once (sampled, and never below `largest_mb`). With `sampler`, the command is watched by
     it (beside what it already watches), `largest_mb` is `wait4`'s alone and `peak_mb` None:
-    the caller has the sampler's; without, by one of its own."""
+    the caller has the sampler's; without, by one of its own. With `meter` (a
+    counters.Meter), the command and what it starts are counted by it: on Linux it starts
+    stopped until its counter is open, and the time is taken from when it was let go."""
     own = sampler is None
     sampler = sampler or Sampler()
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         began = time.time()
-        child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin, stdout=out, stderr=err)
+        if meter is not None:
+            child = meter.popen(argv, cwd=cwd, env=env, stdin=stdin, stdout=out, stderr=err)
+            began = time.time()
+        else:
+            child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin, stdout=out, stderr=err)
         sampler.add(child.pid)
         if own:
             sampler.start()
@@ -216,6 +262,10 @@ def run(argv, cwd=None, env=None, timeout=None, sampler=None, text=True, stdin=s
         if timer:
             timer.start()
         try:
+            if meter is not None:
+                # Exited and not reaped: macOS's totals of it are read now, the last time they can be.
+                os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+                meter.exited(child.pid)
             largest = waited(child)
         finally:
             if timer:

@@ -1,0 +1,77 @@
+# The blaze daemon's log, retained after a failed job: the client says only that the daemon did not
+# start or listen, and the daemon says in its log why (`blaze serve`'s serve.log, under blaze's
+# cache directory). Use as the last step of a job that ran .github/actions/blaze, with
+# `if: failure() || cancelled()` to retain evidence from timed-out jobs too.
+name: blaze daemon log
+description: Print daemon log tails and retain full logs with source and kernel provenance.
+runs:
+  using: composite
+  steps:
+    - id: collect
+      if: always()
+      shell: bash
+      run: |
+        root="${BLAZE_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/blaze}"
+        root="${root%/}"
+        evidence=$(mktemp -d "$RUNNER_TEMP/blaze-daemon-logs.XXXXXX")
+        artifact_id=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+        echo "path=$evidence" >> "$GITHUB_OUTPUT"
+        echo "name=daemon-logs-$GITHUB_JOB-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$artifact_id" >> "$GITHUB_OUTPUT"
+        found=
+        for log in "$root"/*/serve.log "$root"/serve.log; do
+          [ -f "$log" ] || continue
+          found=1
+          relative="${log#"$root"/}"
+          destination="$evidence/logs/$relative"
+          mkdir -p "$(dirname "$destination")"
+          cp "$log" "$destination"
+          echo "::group::$log (last 200 lines)"
+          tail -n 200 "$destination"
+          echo "::endgroup::"
+        done
+        [ -n "$found" ] || echo "no blaze daemon log under $root"
+        # Only explicit provenance fields: no credential files, environment dump or compiler
+        # invocation. Collecting a failed daemon's evidence must not start another daemon.
+        python3 - "$evidence" <<'PY'
+        import json
+        import os
+        from pathlib import Path
+        import platform
+        import subprocess
+        import sys
+
+        evidence = Path(sys.argv[1])
+
+        def probe(command, cwd=None):
+            try:
+                result = subprocess.run(command, cwd=cwd, text=True, capture_output=True,
+                                        check=True, timeout=15)
+                return result.stdout.strip()
+            except (OSError, subprocess.SubprocessError) as error:
+                return {"error": str(error)}
+
+        metadata = {
+            "repository": os.environ.get("GITHUB_REPOSITORY"),
+            "job": os.environ.get("GITHUB_JOB"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "event_sha": os.environ.get("GITHUB_SHA"),
+            "checkout_commit": probe(["git", "rev-parse", "HEAD"]),
+            "checkout_tree": probe(["git", "rev-parse", "HEAD^{tree}"]),
+            "tracked_changes": probe(["git", "diff", "--name-only", "HEAD"]),
+            "kernel": platform.release(),
+            "system": platform.system(),
+            "machine": platform.machine(),
+        }
+        pin = Path(".github/blaze-version")
+        metadata["stage0_pin"] = pin.read_text().strip() if pin.is_file() else None
+        (evidence / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        PY
+    - name: retain complete daemon logs
+      if: always() && steps.collect.outputs.path != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ steps.collect.outputs.name }}
+        path: ${{ steps.collect.outputs.path }}
+        if-no-files-found: warn
+        retention-days: 14

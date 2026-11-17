@@ -1,47 +1,61 @@
 #!/usr/bin/env python3
-"""realbench.py: build times of real projects, `cargo ra-jit` against plain cargo (issue #7).
+"""realbench.py: build times of real projects, `blaze` against plain cargo (issue #7).
 
     realbench.py [PROJECT...] [--runs N] [--work DIR] [--parts cold,noop,edits] [--pause S]
 
-Projects are cloned at the tags `cargo_ra_jit.py` pins, into `RA_JIT_PROJECTS`
-(~/ra-jit-projects), and copied into WORK/<project>/a; the clone is never written to.
-Cargo builds into WORK/<project>/t-cargo and ra-jit into WORK/<project>/t-ra-jit, both from
+Projects are cloned at the tags `blaze_cli.py` pins, into `BLAZE_PROJECTS`
+(~/blaze-projects), and copied into WORK/<project>/a; the clone is never written to.
+Cargo builds into WORK/<project>/t-cargo and blaze into WORK/<project>/t-blaze, both from
 the same checkout, so an edit is seen by both. Every step runs N times (default 5) and the
 report gives the median, min and max.
 
   cold        per run, in this order: `cargo build` with an empty target directory;
-              `cargo ra-jit build` with an empty target directory, no daemon and an empty
-              store; the same with the store filled beforehand by a ra-jit build of the same
-              commit in another checkout (WORK/<project>/b). For ra-jit two times: until
-              the command returns (cargo's build through the wrapper) and until the daemon
-              says the checkout is ready (loaded, and every program built once by it).
-  noop        `cargo build` and `cargo ra-jit build` with nothing changed.
+              `blaze build` with an empty target directory, no daemon and an empty
+              store; the same with the store filled beforehand by a blaze build of the same
+              commit in another checkout (WORK/<project>/b). The command returns once the
+              daemon built it (v1 also timed until its worker said the checkout was ready;
+              v2 has no workers, and nothing goes on after the command returns).
+  noop        `cargo build` and `blaze build` with nothing changed.
   edits       main: a statement added to the body of the program's own `main`;
               lib: the same in a function of a library of the workspace the program uses;
               newfn: a new function in the program's crate, called from `main`.
               Each run writes a different statement, so every run is a real change. Per
-              run, `cargo ra-jit build` then `cargo build`; then both programs are run with
+              run, `blaze build` then `cargo build`; then both programs are run with
               `--version` and with a small real command line, and their stdout, stderr and
               exit status must be the same.
 
-`--pause S` waits S seconds once the daemon is ready, before the no-op and the edits, as a
-person would before the first edit: what the daemon does by itself once ready is then over.
+`--pause S` waits S seconds after the setup build, before the no-op and the edits, as a
+person would before the first edit.
 
-Every warm `cargo ra-jit build` (no-op and edits) runs with RA_JIT_TRACE, and the row keeps
-where the time of its median run went: the client's breakdown of its wall time into steps of
-the client, the daemon and the worker, plus the time outside the client (cargo, process
-start). `--table FILE` prints the results table and that breakdown table.
+Every `blaze build` runs with `--message-format=json-render-diagnostics` (`BLAZE_BUILD`),
+and who built it (the row's `built`) is its `build-finished` line, read by
+`blaze_cli.how_built`, with, for the daemon's, how the request linked from its `blaze-work`
+line (`daemon, patched` or `daemon, placed`). The host's `rustc` is the release
+`blaze toolchain --json` names.
+
+Every warm `blaze build` (no-op and edits) runs with BLAZE_PROFILE, and the row keeps
+where the time of its median run went: the build's critical path from the trace BLAZE_PROFILE
+exports from the daemon's history (`blaze debug time --trace`'s), summed by the kind of each
+link, plus the time of the command outside that path (cargo, process start, the client).
+`--table FILE` prints the results table and that breakdown table.
 
 Results go to WORK/realbench.json (rows replaced per project) and a table on stdout.
 """
-import asyncio, json, os, re, shutil, statistics, subprocess, sys, time
+import asyncio, json, os, shutil, statistics, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import storelib  # noqa: E402
+from blaze_cli import how_built, machine_format  # noqa: E402
+from storelib import worked  # noqa: E402
+
 ROOT = os.path.dirname(HERE)
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit")
+BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine")
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-SOURCES = os.environ.get("RA_JIT_PROJECTS") or os.path.expanduser("~/ra-jit-projects")
+SOURCES = os.environ.get("BLAZE_PROJECTS") or os.path.expanduser("~/blaze-projects")
 STEP_SECS = 3600
+# `blaze build` with the format `how_built` reads who built it by.
+BLAZE_BUILD = ["blaze", "build", *machine_format("build", ())]
 
 
 def stmt(r, indent):
@@ -49,14 +63,14 @@ def stmt(r, indent):
 
 
 def added(r, indent):
-    return f"\n{indent}let _ = std::hint::black_box(ra_jit_added_{r}({r}));"
+    return f"\n{indent}let _ = std::hint::black_box(blaze_added_{r}({r}));"
 
 
 def added_fn(r):
-    return f"\n#[inline(never)]\nfn ra_jit_added_{r}(x: u64) -> u64 {{\n    x.wrapping_mul(31) ^ {r}\n}}\n"
+    return f"\n#[inline(never)]\nfn blaze_added_{r}(x: u64) -> u64 {{\n    x.wrapping_mul(31) ^ {r}\n}}\n"
 
 
-# Tags and revisions are the ones of `cargo_ra_jit.py`.
+# Tags and revisions are the ones of `blaze_cli.py`.
 PROJECTS = {
     "ripgrep": dict(
         repo="BurntSushi/ripgrep", tag="15.1.0", rev="af60c2de9d85e7f3d81c78601669468cf02dabab", bin="rg",
@@ -88,15 +102,18 @@ def edit_text(kind, spec, text, r):
     return text.replace(anchor, anchor + stmt(r, indent))
 
 
-def base_env(home, store, target):
-    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RA_JIT_HOME=home, CARGO_TERM_COLOR="never",
-               CARGO_NET_OFFLINE="true", CARGO_TARGET_DIR=target, RA_JIT_IDLE_SECS="0")
-    env["PATH"] = os.path.dirname(RA_JIT) + os.pathsep + env["PATH"]
-    for name in ("RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_INCREMENTAL", "RA_JIT_CACHE"):
+def base_env(home, target):
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TERM_COLOR="never",
+               CARGO_NET_OFFLINE="true", CARGO_TARGET_DIR=target, BLAZE_IDLE_SECS="0")
+    env["PATH"] = os.path.dirname(BLAZE) + os.pathsep + env["PATH"]
+    for name in ("RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_INCREMENTAL"):
         env.pop(name, None)
-    if store:
-        env["RA_JIT_CACHE"] = store
     return env
+
+
+def store_of(home):
+    """Where the daemon of `home` keeps its store."""
+    return storelib.layout(home).store
 
 
 async def run(argv, cwd, env, step, timeout=STEP_SECS, check=True):
@@ -119,61 +136,36 @@ async def run(argv, cwd, env, step, timeout=STEP_SECS, check=True):
     return took, proc.returncode, out, err
 
 
-def how_built(stderr):
-    """Whether the daemon built it, or why cargo did (as `cargo_ra_jit.py` reads it)."""
-    reason = re.search(r"^ra-jit: (?:bug: )?(.*?); (building with cargo|this is `cargo \w+`)(?:, which .*)?$", stderr, re.M)
-    if reason:
-        return "cargo: " + reason[1]
-    kept = re.search(r"^ra-jit: (.*); nothing has changed since cargo built$", stderr, re.M)
-    if kept:
-        return "unchanged"
-    return "daemon" if "[ra-jit]" in stderr else "cargo"
-
-
-def checking(root):
-    """Whether the `cargo check` that `cargo ra-jit` starts after cargo built runs below root."""
-    for pid in filter(str.isdigit, os.listdir("/proc")):
-        try:
-            words = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
-            if b"check" in words[1:2] and os.readlink(f"/proc/{pid}/cwd").startswith(root):
-                return True
-        except OSError:
-            pass
-    return False
-
-
-async def wait_ready(ws, env, began, step):
-    """Seconds from `began` until the daemon says `ws` is ready; then waits for the
-    background `cargo check` too, so that it does not run under the next timing."""
-    async with asyncio.timeout(STEP_SECS):
-        while True:
-            _, _, out, _ = await run(["cargo", "ra-jit", "status"], ws, env, step, check=False)
-            states = re.findall(rf"^    {re.escape(ws)}: (.*)$", out, re.M)
-            if states and not any(s.startswith("loading") for s in states):
-                ready = time.monotonic() - began
-                if not all(s == "ready" for s in states):
-                    raise RuntimeError(f"{step}: daemon did not load {ws}: {states}")
-                break
-            if re.search(r"^daemon: not running$", out, re.M) and time.monotonic() - began > 30:
-                raise RuntimeError(f"{step}: no daemon: {out[-800:]}")
-            await asyncio.sleep(0.1)
-        while checking(ws):
-            await asyncio.sleep(0.25)
-    return ready
+def built_by(rc, out, err):
+    """Who built a `BLAZE_BUILD` that exited `rc` and printed `out` and `err`: its
+    `build-finished` line (`blaze_cli.how_built`), and for the daemon's, how the request linked
+    (`patched` or `placed`) from its `blaze-work` line."""
+    how = how_built(subprocess.CompletedProcess(BLAZE_BUILD, rc, out, err))
+    works = worked(out)
+    return f"{how}, {works[-1].link}" if how == "daemon" and works else how
 
 
 async def traced(argv, cwd, env, step, trace):
-    """Runs a `cargo ra-jit build` with RA_JIT_TRACE at `trace`; the result is run()'s and
-    where its time went, from the trace: the client's breakdown (ms, adding up to its wall
-    time) and the time outside the client (cargo before and after it, process start)."""
-    took, rc, out, err = await run(argv, cwd, dict(env, RA_JIT_TRACE=trace), step)
+    """Runs a `blaze build` with BLAZE_PROFILE in the directory `trace`; the result is
+    run()'s and where its time went, from the exported trace's critical path: each kind of
+    link's time (ms), and the command's time outside the path (cargo before and after it,
+    process start, the client)."""
+    took, rc, out, err = await run(argv, cwd, dict(env, BLAZE_PROFILE=trace), step)
     try:
-        ours = json.load(open(trace))["raJit"]
-        os.remove(trace)
+        events = json.load(open(os.path.join(trace, "trace.json")))["traceEvents"]
+        shutil.rmtree(trace)
     except (OSError, ValueError, KeyError):
         return took, rc, out, err, None
-    rows = [[name, round(us / 1000, 1)] for name, us in ours["breakdown"]]
-    rows.append(["outside the client", round(took * 1000 - ours["total_us"] / 1000, 1)])
+    tracks = {(e["pid"], e["tid"]) for e in events
+              if e.get("ph") == "M" and e.get("name") == "thread_name" and e.get("args", {}).get("name") == "critical path"}
+    by_kind = {}
+    for e in events:
+        if e.get("ph") == "X" and (e.get("pid"), e.get("tid")) in tracks:
+            by_kind[e["cat"]] = by_kind.get(e["cat"], 0) + e["dur"]
+    if not tracks:
+        return took, rc, out, err, None
+    rows = [[kind, round(us / 1000, 1)] for kind, us in by_kind.items()]
+    rows.append(["outside the critical path", round(took * 1000 - sum(by_kind.values()) / 1000, 1)])
     return took, rc, out, err, rows
 
 
@@ -214,80 +206,78 @@ async def project(name, spec, work, runs, parts, pause=0.0):
     source = fetch(name, spec)
     top = os.path.realpath(os.path.join(work, name))
     ws, other = os.path.join(top, "a"), os.path.join(top, "b")
-    tc, tr = os.path.join(top, "t-cargo"), os.path.join(top, "t-ra-jit")
+    tc, tr = os.path.join(top, "t-cargo"), os.path.join(top, "t-blaze")
     for path in (ws, other):
         if not os.path.isdir(path):
             shutil.copytree(source, path, symlinks=True)
-    warm_store = os.path.join(top, "store-warm")
+    warm_store = store_of(os.path.join(top, "home-store-fill-0"))
     row = dict(project=name, tag=spec["tag"], rev=spec["rev"], runs=runs)
-    cargo_env = base_env(os.path.join(top, "home-cargo"), None, tc)
+    cargo_env = base_env(os.path.join(top, "home-cargo"), tc)
     await run(["cargo", "fetch"], ws, dict(cargo_env, CARGO_NET_OFFLINE="false"), f"{name} fetch")
 
     async def stop(env, cwd):
-        await run(["cargo", "ra-jit", "stop"], cwd, env, f"{name} stop", check=False)
+        await run(["blaze", "stop"], cwd, env, f"{name} stop", check=False)
 
-    async def ra_jit_cold(label, store, i, cwd=ws, target=tr):
+    async def blaze_cold(label, seed, i, cwd=ws, target=tr):
+        """A build in a new home with no daemon: its store empty, or a copy of `seed`'s. Its
+        seconds, how it was built and its environment."""
         home = os.path.join(top, f"home-{label}-{i}")
         shutil.rmtree(home, ignore_errors=True)
         os.makedirs(home, mode=0o700)
+        if seed:
+            shutil.copytree(seed, store_of(home), symlinks=True)
         shutil.rmtree(target, ignore_errors=True)
-        env = base_env(home, store, target)
-        began = time.monotonic()
-        took, _, _, err = await run(["cargo", "ra-jit", "build"], cwd, env, f"{name} {label} {i} build")
-        ready = await wait_ready(cwd, env, began, f"{name} {label} {i} ready")
-        print(f"  {label:16} run {i}: build {took:7.2f}s  ready {ready:7.2f}s  ({how_built(err)})", flush=True)
-        return took, ready, env
+        env = base_env(home, target)
+        took, rc, out, err = await run(BLAZE_BUILD, cwd, env, f"{name} {label} {i} build")
+        how = built_by(rc, out, err)
+        print(f"  {label:16} run {i}: build {took:7.2f}s  ({how})", flush=True)
+        return took, how, env
 
     if "cold" in parts:
-        # The warm store: one ra-jit build of the same commit in the other checkout.
-        shutil.rmtree(warm_store, ignore_errors=True)
-        _, ready_b, env_b = await ra_jit_cold("store-fill", warm_store, 0, cwd=other, target=os.path.join(top, "t-b"))
+        # The warm store: one blaze build of the same commit in the other checkout.
+        fill_b, _, env_b = await blaze_cold("store-fill", None, 0, cwd=other, target=os.path.join(top, "t-b"))
         await stop(env_b, other)
-        cargo_t, cold_b, cold_r, warm_b, warm_r = [], [], [], [], []
+        cargo_t, cold_b, cold_h, warm_b, warm_h = [], [], [], [], []
         for i in range(1, runs + 1):
             shutil.rmtree(tc, ignore_errors=True)
             took, _, _, _ = await run(["cargo", "build"], ws, cargo_env, f"{name} cargo cold {i}")
             cargo_t.append(took)
             print(f"  {'cargo cold':16} run {i}: {took:7.2f}s", flush=True)
-            store = os.path.join(top, f"store-empty-{i}")
-            shutil.rmtree(store, ignore_errors=True)
-            b, r, env = await ra_jit_cold("empty-store", store, i)
-            cold_b.append(b); cold_r.append(r)
+            b, h, env = await blaze_cold("empty-store", None, i)
+            cold_b.append(b); cold_h.append(h)
             await stop(env, ws)
-            shutil.rmtree(store, ignore_errors=True)
-            b, r, env = await ra_jit_cold("warm-store", warm_store, i)
-            warm_b.append(b); warm_r.append(r)
+            shutil.rmtree(env["BLAZE_HOME"], ignore_errors=True)
+            b, h, env = await blaze_cold("warm-store", warm_store, i)
+            warm_b.append(b); warm_h.append(h)
             if i < runs:
                 await stop(env, ws)
-        row["cold"] = dict(cargo=summary(cargo_t), ra_jit_build=summary(cold_b), ra_jit_ready=summary(cold_r),
-                           warm_store_build=summary(warm_b), warm_store_ready=summary(warm_r), store_fill_ready=round(ready_b, 3))
+        row["cold"] = dict(cargo=summary(cargo_t), blaze_build=summary(cold_b), blaze_built=cold_h,
+                           warm_store_build=summary(warm_b), warm_store_built=warm_h, store_fill_build=round(fill_b, 3))
         shutil.rmtree(os.path.join(top, "t-b"), ignore_errors=True)
     # The daemon of the last warm-store run serves what follows; start one if there is none.
-    env = base_env(os.path.join(top, "home-main"), warm_store, tr)
+    env = base_env(os.path.join(top, "home-main"), tr)
     if "cold" in parts:
-        env = base_env(os.path.join(top, f"home-warm-store-{runs}"), warm_store, tr)
+        env = base_env(os.path.join(top, f"home-warm-store-{runs}"), tr)
     else:
-        os.makedirs(env["RA_JIT_HOME"], mode=0o700, exist_ok=True)
+        os.makedirs(env["BLAZE_HOME"], mode=0o700, exist_ok=True)
         await run(["cargo", "build"], ws, cargo_env, f"{name} cargo setup")
-        began = time.monotonic()
-        await run(["cargo", "ra-jit", "build"], ws, env, f"{name} ra-jit setup")
-        await wait_ready(ws, env, began, f"{name} ready")
+        await run(BLAZE_BUILD, ws, env, f"{name} blaze setup")
     await run(["cargo", "build"], ws, cargo_env, f"{name} cargo settle")
     await asyncio.sleep(pause)
     # The linker each side's program was linked with.
     row["linker"] = {side: subprocess.run(["readelf", "-p", ".comment", os.path.join(t, "debug", spec["bin"])], capture_output=True, text=True).stdout
-                     for side, t in (("cargo", tc), ("ra-jit", tr))}
+                     for side, t in (("cargo", tc), ("blaze", tr))}
 
-    trace = os.path.join(top, "trace.json")
+    trace = os.path.join(top, "profile")
     if "noop" in parts:
         c, r, built, spent = [], [], [], []
         for i in range(1, runs + 1):
-            took, _, _, err, steps = await traced(["cargo", "ra-jit", "build"], ws, env, f"{name} noop ra-jit {i}", trace)
-            r.append(took); built.append(how_built(err)); spent.append(steps)
+            took, rc, out, err, steps = await traced(BLAZE_BUILD, ws, env, f"{name} noop blaze {i}", trace)
+            r.append(took); built.append(built_by(rc, out, err)); spent.append(steps)
             took, _, _, _ = await run(["cargo", "build"], ws, cargo_env, f"{name} noop cargo {i}")
             c.append(took)
-            print(f"  {'no-op':16} run {i}: ra-jit {r[-1]:6.2f}s ({built[-1]})  cargo {took:6.2f}s", flush=True)
-        row["noop"] = dict(cargo=summary(c), ra_jit=summary(r), built=built, breakdown=median_breakdown(r, spent))
+            print(f"  {'no-op':16} run {i}: blaze {r[-1]:6.2f}s ({built[-1]})  cargo {took:6.2f}s", flush=True)
+        row["noop"] = dict(cargo=summary(c), blaze=summary(r), built=built, breakdown=median_breakdown(r, spent))
 
     if "edits" in parts:
         row["edits"] = {}
@@ -298,20 +288,20 @@ async def project(name, spec, work, runs, parts, pause=0.0):
             try:
                 for i in range(1, runs + 1):
                     open(file, "w").write(edit_text(kind, spec, pristine, i))
-                    took, _, _, err, steps = await traced(["cargo", "ra-jit", "build"], ws, env, f"{name} {kind} ra-jit {i}", trace)
-                    r.append(took); built.append(how_built(err)); spent.append(steps)
+                    took, rc, out, err, steps = await traced(BLAZE_BUILD, ws, env, f"{name} {kind} blaze {i}", trace)
+                    r.append(took); built.append(built_by(rc, out, err)); spent.append(steps)
                     took, _, _, _ = await run(["cargo", "build"], ws, cargo_env, f"{name} {kind} cargo {i}")
                     c.append(took)
                     a, b = await outputs(ws, tr, spec, f"{name} {kind} run"), await outputs(ws, tc, spec, f"{name} {kind} run")
                     same.append(a == b)
-                    print(f"  {'edit ' + kind:16} run {i}: ra-jit {r[-1]:6.2f}s ({built[-1]})  cargo {took:6.2f}s  same={a == b}", flush=True)
+                    print(f"  {'edit ' + kind:16} run {i}: blaze {r[-1]:6.2f}s ({built[-1]})  cargo {took:6.2f}s  same={a == b}", flush=True)
                     if a != b:
-                        print(f"    ra-jit: {a}\n    cargo:  {b}", flush=True)
+                        print(f"    blaze: {a}\n    cargo:  {b}", flush=True)
             finally:
                 open(file, "w").write(pristine)
-            await run(["cargo", "ra-jit", "build"], ws, env, f"{name} {kind} restore")
+            await run(BLAZE_BUILD, ws, env, f"{name} {kind} restore")
             await run(["cargo", "build"], ws, cargo_env, f"{name} {kind} restore")
-            row["edits"][kind] = dict(cargo=summary(c), ra_jit=summary(r), built=built, same=same,
+            row["edits"][kind] = dict(cargo=summary(c), blaze=summary(r), built=built, same=same,
                                       breakdown=median_breakdown(r, spent))
         row["sample_output"] = (await outputs(ws, tr, spec, f"{name} sample"))[0][1].strip()
     await stop(env, ws)
@@ -324,7 +314,7 @@ def table(rows):
         return f"{x['median']:.2f} ({x['min']:.2f}-{x['max']:.2f})"
     def ratio(c, r):
         return f"{c['median'] / r['median']:.1f}x"
-    lines = ["| Project | Step | cargo | ra-jit | cargo / ra-jit | ra-jit built by |", "|---|---|---:|---:|---:|---|"]
+    lines = ["| Project | Step | cargo | blaze | cargo / blaze | blaze built by |", "|---|---|---:|---:|---:|---|"]
     for name, row in rows.items():
         label = f"{name} {row.get('tag', '')}".strip()
         if "failed" in row:
@@ -332,25 +322,23 @@ def table(rows):
             continue
         cold = row.get("cold")
         if cold:
-            lines.append(f"| {label} | cold, empty store: command returns | {cell(cold['cargo'])} | {cell(cold['ra_jit_build'])} | {ratio(cold['cargo'], cold['ra_jit_build'])} | cargo (wrapper) |")
-            lines.append(f"| | cold, empty store: daemon ready | | {cell(cold['ra_jit_ready'])} | {ratio(cold['cargo'], cold['ra_jit_ready'])} | |")
-            lines.append(f"| | cold, warm store: command returns | | {cell(cold['warm_store_build'])} | {ratio(cold['cargo'], cold['warm_store_build'])} | cargo (wrapper) |")
-            lines.append(f"| | cold, warm store: daemon ready | | {cell(cold['warm_store_ready'])} | {ratio(cold['cargo'], cold['warm_store_ready'])} | |")
+            lines.append(f"| {label} | cold, empty store | {cell(cold['cargo'])} | {cell(cold['blaze_build'])} | {ratio(cold['cargo'], cold['blaze_build'])} | {', '.join(sorted(set(cold.get('blaze_built', []))))} |")
+            lines.append(f"| | cold, warm store | | {cell(cold['warm_store_build'])} | {ratio(cold['cargo'], cold['warm_store_build'])} | {', '.join(sorted(set(cold.get('warm_store_built', []))))} |")
         if "noop" in row:
             n = row["noop"]
-            lines.append(f"| | no-op | {cell(n['cargo'])} | {cell(n['ra_jit'])} | {ratio(n['cargo'], n['ra_jit'])} | {', '.join(sorted(set(n['built'])))} |")
+            lines.append(f"| | no-op | {cell(n['cargo'])} | {cell(n['blaze'])} | {ratio(n['cargo'], n['blaze'])} | {', '.join(sorted(set(n['built'])))} |")
         for kind, what in (("main", "edit: body of `main`"), ("lib", "edit: body in a library"), ("newfn", "edit: new function")):
             e = row.get("edits", {}).get(kind)
             if e:
                 same = f"; output same {sum(e['same'])}/{len(e['same'])}"
-                lines.append(f"| | {what} | {cell(e['cargo'])} | {cell(e['ra_jit'])} | {ratio(e['cargo'], e['ra_jit'])} | {', '.join(sorted(set(e['built'])))}{same} |")
+                lines.append(f"| | {what} | {cell(e['cargo'])} | {cell(e['blaze'])} | {ratio(e['cargo'], e['blaze'])} | {', '.join(sorted(set(e['built'])))}{same} |")
     return "\n".join(lines)
 
 
 def breakdown_table(rows, top=7):
-    """Where the time of each warm row's median run went: its biggest steps, then what no step
-    covers and what is outside the client, in ms. The steps add up to the run's time."""
-    lines = ["| Project | Step | ra-jit (median run) | Where the time went (ms) |", "|---|---|---:|---|"]
+    """Where the time of each warm row's median run went: its critical path's biggest kinds of
+    link, then the time outside the path, in ms. The steps add up to the run's time."""
+    lines = ["| Project | Step | blaze (median run) | Where the time went (ms) |", "|---|---|---:|---|"]
     for name, row in rows.items():
         label = f"{name} {row.get('tag', '')}".strip()
         parts = [("no-op", row.get("noop"))] + [(f"edit: {kind}", row.get("edits", {}).get(kind)) for kind in ("main", "lib", "newfn")]
@@ -358,7 +346,7 @@ def breakdown_table(rows, top=7):
             b = (part or {}).get("breakdown")
             if not b:
                 continue
-            fixed = ("unaccounted", "outside the client")
+            fixed = ("outside the critical path",)
             steps = sorted((s for s in b["steps"] if s[0] not in fixed), key=lambda s: -s[1])
             shown = [f"{n} {ms:.1f}" for n, ms in steps[:top]]
             rest = sum(ms for _, ms in steps[top:])
@@ -393,15 +381,15 @@ async def main():
     rows = json.load(open(out)) if os.path.exists(out) else {}
     host = dict(cpus=os.cpu_count(), cpu=next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), "?"),
                 load=open("/proc/loadavg").read().split()[:3], kernel=os.uname().release,
-                rustc=subprocess.run(["rustc", f"+{TOOLCHAIN}", "-V"], capture_output=True, text=True).stdout.strip(),
-                ra_jit=subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip())
+                rustc=storelib.blaze_toolchain("blaze", dict(os.environ, PATH=os.path.dirname(BLAZE) + os.pathsep + os.environ["PATH"])).rustc,
+                blaze=subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip())
     print(json.dumps(host), flush=True)
     for name in names:
         print(f"== {name}", flush=True)
         load = open("/proc/loadavg").read().split()[:3]
         try:
             row = await project(name, PROJECTS[name], work, runs, parts, pause)
-        except Exception as e:  # A project ra-jit cannot build is a result.
+        except Exception as e:  # A project blaze cannot build is a result.
             row = dict(project=name, failed=f"{type(e).__name__}: {e}")
             print(f"  FAILED: {row['failed']}", flush=True)
         row["host"] = host

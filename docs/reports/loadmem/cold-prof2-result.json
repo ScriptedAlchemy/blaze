@@ -1,0 +1,35 @@
+{
+ "command": [
+  "blaze",
+  "build",
+  "--locked",
+  "-p",
+  "tracedecay-cli"
+ ],
+ "td": "/Users/bytedance/dev/td-u5",
+ "blaze_bin": "/Users/bytedance/dev/blaze-targets/u5/release",
+ "started": "2026-10-26T00:24:06",
+ "watchdog_mb": 24576,
+ "marks": {},
+ "tripped": {
+  "reason": "footprint of the client's cargo and rustc 33.0 GB passed 32.0 GB",
+  "footprint_mb": 0,
+  "client_mb": 33841,
+  "at_s": 696.1,
+  "swap_used_mb": 5266,
+  "pids": 0
+ },
+ "peak_mb": 0,
+ "peak_client_mb": 33841,
+ "swap_start_mb": 3808,
+ "guard": {
+  "RA_JIT_MEMORY_MAX": "16G",
+  "RA_JIT_OWN_BASE_MEMORY": "12G",
+  "RA_JIT_SPARE": "0"
+ },
+ "peak_swap_growth_mb": 1459,
+ "exit": -15,
+ "outcome": "watchdog-killed",
+ "wall_s": 698.3,
+ "last_mb": 0
+}

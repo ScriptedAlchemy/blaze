@@ -1,36 +1,32 @@
 #!/usr/bin/env python3
 """latelisted.py: what a file an `include!` names declares is listed in its crate, though the
-daemon listed the crate beside cargo's build before the file was loaded.
+file is loaded only once the names are resolved.
 
-usage: latelisted.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+usage: latelisted.py    (BLAZE_BIN names the blaze built; blaze is found next to it)
 
 bun's crates `include!` the code its generators write, from a directory a build script names in
-a variable (`BUN_CODEGEN_DIR`). The VFS has none of those files when the daemon, told of the
-build ahead of cargo, lists a crate cargo has built while cargo still compiles the rest: the
-files are read once the names are resolved. The listing was kept, so the functions they declare
-were missing from the program's entries until an edit had the crate listed again, and that
-edit's patch then compiled every one of them as a function added. Here a library includes
-`exports.in` (not a `.rs` file, so nothing loads it but the macro) with EXPORTS functions of the
-C ABI, and the binary's build script keeps cargo busy after it. Once the daemon serves the build,
-a function is added to the library: its patch has to be of a few functions, not of the
-EXPORTS, and the program has to print what cargo's does. The daemon's first build is its own
-(`RA_JIT_RUSTC_BASE=0`), which the edit patches: a base it builds in the background, once
-idle, may be given up on a small machine, and an added function does not patch what rustc
-linked.
+a variable (`BUN_CODEGEN_DIR`). The VFS has none of those files when the daemon first lists a
+crate: the files are read once the names are resolved. A listing kept from before was missing
+the functions they declare from the program's entries until an edit had the crate listed again,
+and that edit's patch then compiled every one of them as a function added. Here a library
+includes `exports.in` (not a `.rs` file, so nothing loads it but the macro) with EXPORTS
+functions of the C ABI. Once the daemon has built the program, a function is added to the
+library: the build has to compile a few functions, not the EXPORTS (`compiled` of its
+`blaze-work` line under `--message-format=json`), and the program has to print what its source
+says (`PRINTS`). v1 read the count from its workers' `patch: N functions` lines; v2 has no
+workers.
 
 Python 3, stdlib only.
 """
-import glob, os, re, shutil, subprocess, sys, tempfile, time
+import glob, os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import cargo_ra_jit
-from cargo_ra_jit import Side, wait_warm
-from spare import FIRST_MAIN, FIRST_TOML, settled
+import blaze_cli
+from blaze_cli import Side
+from storelib import links, state_of, worked
 
 EXPORTS = 64
-# How long the binary's build script keeps cargo busy once the library is built.
-WAIT_SECS = 10
 FILES = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "gen"]\nresolver = "2"\n',
     "gen/Cargo.toml": '[package]\nname = "gen"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n',
@@ -43,103 +39,67 @@ FILES = {
                                         for i in range(EXPORTS)),
     "gen/src/lib.rs": 'include!(concat!(env!("GEN_DIR"), "/exports.in"));\n\n'
                       'pub fn value() -> u32 {\n    1\n}\n',
-    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n\n'
+    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
                       '[dependencies]\ngen = { path = "../gen" }\n',
-    "app/build.rs": f'fn main() {{\n    println!("cargo:rerun-if-changed=build.rs");\n'
-                    f'    std::thread::sleep(std::time::Duration::from_secs({WAIT_SECS}));\n}}\n',
     "app/src/main.rs": 'fn main() {\n    println!("{} {}", gen::value(), gen::late_export_3());\n}\n',
 }
-
-
-def patches(home):
-    """The `patch: N functions` lines of the workers' logs, in order."""
-    found = []
-    for log in sorted(glob.glob(os.path.join(home, "*", "*", "log"))):
-        found += [int(n) for n in re.findall(r"^patch: (\d+) functions$", open(log, errors="replace").read(), re.M)]
-    return found
-
-
-def worker_log(home):
-    """The log of the worker that loaded the workspace beside cargo's build, if one did."""
-    for log in glob.glob(os.path.join(home, "*", "*", "log")):
-        if re.search(r"^compiled ahead: ", open(log, errors="replace").read(), re.M):
-            return log
-    return None
+# What the program prints once `value` adds what `added` gives.
+PRINTS = "41 3\n"
 
 
 def tails(home, lines=40):
-    """The last lines of each of the daemon's logs, for a failure on a machine whose files are
-    gone once it ends."""
-    logs = sorted(glob.glob(os.path.join(home, "*.log")) + glob.glob(os.path.join(home, "*", "*", "log")))
+    """The last lines of each of the daemon's logs (`<home>/v2/serve.log` when a build started
+    it), for a failure on a machine whose files are gone once it ends."""
+    logs = sorted(glob.glob(os.path.join(home, "*.log")) + glob.glob(os.path.join(state_of(home), "*.log")))
     return "".join(f"\n--- {log}\n" + "".join(open(log, errors="replace").readlines()[-lines:]) for log in logs)
 
 
 def build(side, step, home):
-    _, ran = side.cargo("build")
+    """`blaze build --message-format=json`: what it printed on stdout."""
+    _, ran = side.cargo("build", "--message-format=json")
     if ran.returncode != 0:
         raise SystemExit(f"{step}: the build failed:\n{(ran.stdout + ran.stderr)[-3000:]}{tails(home)}")
-    return ran.stdout + ran.stderr
+    return ran.stdout
 
 
 def main():
-    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
-    if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
+    if not os.path.exists(os.path.join(bin_dir, "blaze")):
+        raise SystemExit(f"no blaze beside {os.environ['BLAZE_BIN']}")
     # Short, for the daemon's sockets under its home.
-    root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-ll-", dir="/tmp"))
-    ws, first_ws, home = (os.path.join(root, n) for n in ("ws", "first", "home"))
+    root = os.path.realpath(tempfile.mkdtemp(prefix="blaze-ll-", dir="/tmp"))
+    ws, home = (os.path.join(root, n) for n in ("ws", "home"))
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    os.makedirs(os.path.join(first_ws, "src"))
-    open(os.path.join(first_ws, "Cargo.toml"), "w").write(FIRST_TOML)
-    open(os.path.join(first_ws, "src/main.rs"), "w").write(FIRST_MAIN)
-    env = cargo_ra_jit.base_env(home)
+    env = blaze_cli.base_env(home)
     env["PATH"] = bin_dir + os.pathsep + env["PATH"]
-    for name in ("RUSTC_WRAPPER", "CARGO_INCREMENTAL", "RA_JIT_SPARE"):
+    for name in ("RUSTC_WRAPPER", "CARGO_INCREMENTAL"):
         env.pop(name, None)
-    env["RA_JIT_RUSTC_BASE"] = "0"
-    first, side = Side(first_ws, env, True), Side(ws, env, True)
-    reference = Side(ws, env, False)
+    side = Side(ws, env, True)
     program = os.path.join(ws, "target", "debug", "app")
     wrong = []
     try:
-        # A daemon with a spare already up is told of the next build ahead of cargo.
-        build(first, "first", home)
-        wait_warm(first, first_ws)
-        settled(home)
         build(side, "cold", home)
-        _, states = wait_warm(side, ws)
-        if states != ["ready"]:
-            raise SystemExit(f"the daemon did not get ready: {states}{tails(home)}")
-        for _ in range(240):
-            if "[ra-jit]" in build(side, "wait for the daemon", home):
-                break
-            time.sleep(0.5)
-        else:
-            raise SystemExit(f"no build said `[ra-jit]`{tails(home)}")
-        if worker_log(home) is None:
-            raise SystemExit(f"the daemon listed nothing beside cargo's build, which is what this tests{tails(home)}")
-        seen = len(patches(home))
         lib = os.path.join(ws, "gen/src/lib.rs")
         text = open(lib).read()
         open(lib, "w").write(text.replace("pub fn value() -> u32 {\n    1\n}",
                                           "pub fn value() -> u32 {\n    1 + added()\n}\n\nfn added() -> u32 {\n    40\n}"))
         said = build(side, "a function added", home)
-        made = patches(home)[seen:]
+        work = worked(said)
+        compiled = work[-1].compiled if work else None
+        made = links(said, "app")
         ran = subprocess.run([program], capture_output=True, text=True, timeout=60)
-        _, theirs = reference.cargo("run", "-q", "-p", "app")
-        if "[ra-jit]" not in said:
-            wrong.append("the edit was not served by the daemon")
-        elif not made:
-            wrong.append("the edit was not patched")
-        elif made[-1] >= EXPORTS:
-            wrong.append(f"the patch is of {made[-1]} functions: the {EXPORTS} the included file declares were not listed")
-        if ran.stdout != theirs.stdout:
-            wrong.append(f"the program printed {ran.stdout.strip()!r}, cargo's {theirs.stdout.strip()!r}")
-        print(f"{'a function added':30} {'ok' if not wrong else 'WRONG':8} patch of {made[-1] if made else '-'} functions")
+        if compiled is None:
+            wrong.append("the edit was not built by the daemon: no `blaze-work` line")
+        elif compiled >= EXPORTS:
+            wrong.append(f"the edit compiled {compiled} functions: the {EXPORTS} the included file declares were not listed")
+        if ran.stdout != PRINTS:
+            wrong.append(f"the program printed {ran.stdout.strip()!r}, not {PRINTS.strip()!r}")
+        how = made[-1] if made else "no link"
+        print(f"{'a function added':30} {'ok' if not wrong else 'WRONG':8} {compiled if compiled is not None else '-'} functions compiled; {how}")
     finally:
-        first.cargo("stop")
+        side.cargo("stop")
     for why in wrong:
         print(f"  {why}")
     if wrong:

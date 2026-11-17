@@ -95,7 +95,11 @@ fn number(name: &str) -> Option<u64> {
 /// the sampler's share of a core in thousandths. What the daemon did since `seen` is printed
 /// as it comes, a line each, with how long after `started` (milliseconds since the epoch).
 fn levels(seen: &mut u64, started: u64) -> String {
-    let Some(tiers) = ra_jit_live::tiers() else { return String::new() };
+    let tiers = match blaze_live::tiers() {
+        Ok(Some(tiers)) => tiers,
+        Ok(None) => return String::new(),
+        Err(why) => return format!("tiers_error={why:?}"),
+    };
     let since = *seen;
     for event in tiers.events.iter().filter(|it| it.at > since) {
         let at = event.at.saturating_sub(started) as f64 / 1e3;
@@ -125,7 +129,7 @@ fn main() {
     let side = number("LIFE_SIZE").unwrap_or(512) as usize;
     let generations = number("LIFE_GENERATIONS");
     let seconds = Duration::from_secs(number("LIFE_SECONDS").unwrap_or(20));
-    match ra_jit_live::Live::start() {
+    match blaze_live::Live::start() {
         Ok(live) => live.apply_as_they_come(|outcome| eprintln!("live: {outcome}")),
         Err(why) => eprintln!("live: off: {why}"),
     }

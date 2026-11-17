@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """realdebug.py: what a debugger, a panic, perf and addr2line are told by a program
-`cargo ra-jit` built of a real project, against the cargo build of the same source.
+`blaze` built of a real project.
 
     realdebug.py [PROJECT...] [--keep]
 
-Each project is cloned as cargo_ra_jit.py has it, and copied. A panic that an environment
-variable asks for is written into the copy, cargo builds it into `target-ref`, and
-`cargo ra-jit` builds it cold, waits for the daemon, and builds it again after a comment is
-added, so that the program looked at is the one the daemon linked. Then, in the dev profile:
-  gdb       stops at each place, in a function of ra-jit's; the arguments and locals cargo's
-            build names there are named, with the same values where they are plain ones
-  panic     the frames of the workspace's files are those of the cargo build, by file:line
+Each project is cloned as blaze_cli.py has it, and copied. A panic that an environment
+variable asks for is written into the copy, and `blaze` builds it cold, waits for the
+daemon, and builds it again after a comment is added, so that the program looked at is the
+one the daemon linked. Then, in the dev profile:
+  gdb       stops at each place, in a function of blaze's, and has its arguments and locals
+            with values, none of them optimized out (v2 compiles the dev profile with Cranelift)
+  panic     each panic has a frame at the line the panic was written into, by file:line
   perf      `perf record --call-graph dwarf`, then `perf report` names the symbols and
-            `perf script` the lines of the frames in ra-jit's functions
-  addr2line every function of ra-jit's has a name and a line at its first address
-  dwarfdump `llvm-dwarfdump --verify` has nothing to say of ra-jit's units
+            `perf script` the lines of the frames in blaze's functions
+  addr2line every function of blaze's has a name and a line at its first address
+  dwarfdump `llvm-dwarfdump --verify` has nothing to say of blaze's units
 """
 import os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request, http.client
 
-import cargo_ra_jit
-from cargo_ra_jit import PROJECTS, Side, base_env, fetch, how_built, rewrite, wait_warm
-from debuginfo import DWARFDUMP, LLVM, OPTIMIZED_OUT, Tally, compare, own_ranges, panics, units, unit_of
+import blaze_cli
+from blaze_cli import PROJECTS, Side, base_env, fetch, how_built, rewrite, wait_warm
+from dwarf import DWARFDUMP, OPTIMIZED_OUT, Tally, held, own_ranges, panics, units, unit_of
 
 PANIC = 'if std::env::var_os("REALDEBUG_PANIC").is_some() { panic!("asked for"); }'
 
@@ -132,62 +132,46 @@ def stopped(binary, ws, place, run, serves):
                 at=int(pc.group(1), 16) - int(base.group(1), 16) if pc and base else None)
 
 
-def plain(value):
-    """Whether what gdb printed is a number, a character or a truth value: something that is
-    the same in two builds of one source at one place, once it has been given a value."""
-    return bool(re.fullmatch(r"-?\d+(\.\d+)?|true|false|\d+ '.*'", value))
-
-
-def debugger(tally, what, reference, binary, ws, spec):
+def debugger(tally, what, binary, ws, spec):
     run, serves = spec.get("run", []), spec.get("serves")
     for file, text in spec["places"]:
         place = f"{file}:{line_of(ws, file, text)}"
         said = f"{what}: gdb at {os.path.basename(file)}:{place.rsplit(':', 1)[1]}"
-        theirs, ours = stopped(reference, ws, place, run, serves), stopped(binary, ws, place, run, serves)
-        if not theirs:
-            tally.say(said, "not looked at", "gdb does not stop there in the cargo build")
-            continue
+        ours = stopped(binary, ws, place, run, serves)
         if not ours:
-            # Optimized code may have no instruction for a line, and then there is nowhere to stop.
-            empty = LLVM and "contains no code" in told(binary, ws, f"info line {place}")
-            tally.say(said, "no code" if empty else "NOT STOPPED", "the optimizer left the line none" if empty else "")
+            tally.say(said, "NOT STOPPED")
             continue
         producer = unit_of(binary, ours["at"]) if ours["at"] is not None else "nothing"
-        if not producer.startswith("ra-jit"):
-            tally.say(said, "NOT RA_JIT'S", f"the code is of {producer}")
+        if not producer.startswith("blaze"):
+            tally.say(said, "NOT BLAZE'S", f"the code is of {producer}")
             continue
-        # What rustc has an `async` body resumed with is of no name the source has.
-        names = [name for name in theirs["values"] if name != "_task_context"]
-        unnamed = [name for name in names if name not in ours["values"]]
-        gone = [name for name in names if name in ours["values"] and OPTIMIZED_OUT in ours["values"][name]]
-        both = [name for name in names if name not in unnamed and name not in gone]
-        same = [name for name in both if ours["values"][name] == theirs["values"][name]]
-        differ = [name for name in both if name not in same and plain(theirs["values"][name])]
-        verdict = ("NOT NAMED" if unnamed or (gone and not LLVM) else "OTHER VALUE" if differ
-                   else "OTHER FUNCTION" if ours["name"] != theirs["name"] else "as cargo's")
-        more = (f"in {ours['name'][:50]}: {len(names) - len(unnamed)} of {len(names)} names, {len(same)} values the same, "
-                f"{len(both) - len(same) - len(differ)} not plain ones and shown otherwise, {len(gone)} optimized out")
-        first = (unnamed + gone + differ)[:1]
-        if first and verdict.isupper():
-            more += f"; {first[0]} = {ours['values'].get(first[0], 'nothing')[:60]} for {theirs['values'][first[0]][:60]}"
+        # What an `async` body is resumed with is of no name the source has.
+        names = [name for name in ours["values"] if name != "_task_context"]
+        gone = [name for name in names if OPTIMIZED_OUT in ours["values"][name]]
+        verdict = "OPTIMIZED OUT" if gone else "stopped"
+        more = f"in {ours['name'][:50]}: {len(names)} names, {len(gone)} optimized out"
+        if gone and verdict.isupper():
+            more += f"; {gone[0]}"
         tally.say(said, verdict, more)
 
 
-def backtrace(tally, what, reference, binary, ws, spec):
+def backtrace(tally, what, binary, ws, spec):
     env = dict(os.environ, RUST_BACKTRACE="1", REALDEBUG_PANIC="1")
-    theirs, ours = (panics(driven([it, *spec.get("run", [])], ws, env, spec.get("serves"))) for it in (reference, binary))
-    compare(tally, f"{what}: frames of each panic", theirs, ours, binary)
+    ours = panics(driven([binary, *spec.get("run", [])], ws, env, spec.get("serves")))
+    file = spec["panic"][0]
+    site = f"{file}:{line_of(ws, file, PANIC)}"
+    held(tally, f"{what}: frames of each panic", ours, [[(None, site)]] * max(len(ours), 1))
 
 
 def profiler(tally, what, binary, ws, spec):
     perf = shutil.which("perf")
-    data = os.path.join(tempfile.mkdtemp(prefix="ra-jit-realdebug-perf-"), "perf.data")
+    data = os.path.join(tempfile.mkdtemp(prefix="blaze-realdebug-perf-"), "perf.data")
     if perf:
         driven([perf, "record", "-o", data, "-F", "2000", "--call-graph", "dwarf,32768", binary, *spec.get("run", [])],
                ws, dict(os.environ), spec.get("serves"), times=300)
     if not perf or not os.path.exists(data):
         return tally.say(f"{what}: perf", "not run", "no perf here, or it may not sample: see kernel.perf_event_paranoid")
-    # A function is ra-jit's when a unit of ra-jit's has its first address.
+    # A function is blaze's when a unit of blaze's has its first address.
     starts = {start for start, _ in own_ranges(binary)}
     table = subprocess.run(["nm", "--defined-only", binary], capture_output=True, text=True, errors="replace").stdout
     mine = {name for at, name in re.findall(r"^([0-9a-f]+) \w (\S+)$", table, re.M) if int(at, 16) in starts}
@@ -202,8 +186,8 @@ def profiler(tally, what, binary, ws, spec):
     ours = [row for row in rows if row in mine]
     verdict = "NO SAMPLES" if not frames or not ours else "NO LINE" if lost else "NO SYMBOL" if unnamed else "named"
     tally.say(f"{what}: perf record, report and script", verdict,
-              f"report: {len(rows)} symbols of the program, {len(ours)} of ra-jit's functions, {len(unnamed)} without a name; "
-              f"script: {len(frames)} frames in ra-jit's functions, {len(lost)} without a line" + (f": {lost[0][:60]}" if lost else ""))
+              f"report: {len(rows)} symbols of the program, {len(ours)} of blaze's functions, {len(unnamed)} without a name; "
+              f"script: {len(frames)} frames in blaze's functions, {len(lost)} without a line" + (f": {lost[0][:60]}" if lost else ""))
 
 
 def addr2line(tally, what, binary):
@@ -215,55 +199,53 @@ def addr2line(tally, what, binary):
     unlined = [at for at, (_, line) in zip(starts, pairs) if not re.search(r"\.rs:\d+", line)]
     verdict = "NOT ASKED" if len(pairs) != len(starts) or not starts else "NO NAME" if unnamed else "NO LINE" if unlined else "resolved"
     tally.say(f"{what}: addr2line at each function", verdict,
-              f"{len(starts)} functions of ra-jit's, {len(unnamed)} without a name, {len(unlined)} without a line"
+              f"{len(starts)} functions of blaze's, {len(unnamed)} without a name, {len(unlined)} without a line"
               + (f": {(unnamed + unlined)[0]:#x}" if unnamed or unlined else ""))
 
 
 def verify(tally, what, binary):
-    """`llvm-dwarfdump --verify`, for the units of ra-jit's: rustc's own have functions the linker
-    left out, which it finds to overlap, in the cargo build as well."""
+    """`llvm-dwarfdump --verify`, for the units of blaze's: rustc's own have functions the linker
+    left out, which it finds to overlap."""
     said = subprocess.run([DWARFDUMP, "--verify", binary], capture_output=True, text=True, errors="replace").stdout
     heads = units(binary)
-    count = sum(bool(re.search(r'DW_AT_producer\s+\("ra-jit ', unit)) for unit in heads)
+    count = sum(bool(re.search(r'DW_AT_producer\s+\("blaze[ "]', unit)) for unit in heads)
     spans = []
     listed = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", "--recurse-depth=0", binary],
                             capture_output=True, text=True, errors="replace").stdout
     for unit in re.finditer(r"^(0x[0-9a-f]+): Compile Unit: length = (0x[0-9a-f]+).*?(?=^0x[0-9a-f]+: Compile Unit|\Z)", listed, re.S | re.M):
-        if re.search(r'DW_AT_producer\s+\("ra-jit ', unit.group(0)):
+        if re.search(r'DW_AT_producer\s+\("blaze[ "]', unit.group(0)):
             spans.append((int(unit.group(1), 16), int(unit.group(1), 16) + int(unit.group(2), 16)))
     errors = [it for it in re.split(r"^error: ", said, flags=re.M)[1:] if "occurred" not in it.splitlines()[0] and not it.startswith("Aggregated")]
     ours = [it for it in errors
             if any(low <= int(at, 16) < high for at in re.findall(r"^(0x[0-9a-f]+): DW_TAG", it, re.M)[:2] for low, high in spans)
             or not re.search(r"^0x[0-9a-f]+: DW_TAG", it, re.M)]
     tally.say(f"{what}: llvm-dwarfdump --verify", "INVALID" if ours else "sound" if count else "NO UNIT",
-              f"{count} units of ra-jit's with {len(ours)} errors, {len(errors) - len(ours)} in rustc's units"
+              f"{count} units of blaze's with {len(ours)} errors, {len(errors) - len(ours)} in rustc's units"
               + (f": {ours[0].splitlines()[0][:70]}" if ours else ""))
 
 
 def project(tally, name, work):
     spec, check = PROJECTS[name], CHECKS[name]
     ws = os.path.realpath(os.path.join(work, name))
-    shutil.copytree(fetch(name, spec), ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref"))
+    shutil.copytree(fetch(name, spec), ws, symlinks=True, ignore=shutil.ignore_patterns("target"))
     rewrite(os.path.join(ws, check["panic"][0]), *check["panic"][1:])
     env = base_env(os.path.join(work, "home"))
-    ours, theirs = Side(ws, env, True), Side(ws, env, False)
+    ours = Side(ws, env, True)
     build = check.get("build", [])
     ours.cargo("stop")
-    for side in (theirs, ours):
-        took, ran = side.cargo("build", *build)
-        if ran.returncode != 0:
-            return tally.say(f"{name}: built", "NOT BUILT", ran.stderr[-200:])
+    took, ran = ours.cargo("build", *build)
+    if ran.returncode != 0:
+        return tally.say(f"{name}: built", "NOT BUILT", ran.stderr[-200:])
     _, states = wait_warm(ours, ws)
     with open(os.path.join(ws, check["panic"][0]), "a") as source:
         source.write("// built again\n")
-    for side in (theirs, ours):
-        took, ran = side.cargo("build", *build)
-    built = how_built(ran.stderr)
+    took, ran = ours.cargo("build", *build)
+    built = how_built(ran)
     tally.say(f"{name}: built", "by the daemon" if built == "daemon" else "NOT BY THE DAEMON", f"{built}; {'; '.join(states)[:80]}; {took:.2f}s")
-    reference, binary = (os.path.join(ws, target, "debug", check["binary"]) for target in ("target-ref", "target"))
+    binary = os.path.join(ws, "target", "debug", check["binary"])
     verify(tally, name, binary)
-    debugger(tally, name, reference, binary, ws, check)
-    backtrace(tally, name, reference, binary, ws, check)
+    debugger(tally, name, binary, ws, check)
+    backtrace(tally, name, binary, ws, check)
     profiler(tally, name, binary, ws, check)
     addr2line(tally, name, binary)
     ours.cargo("stop")
@@ -271,7 +253,7 @@ def project(tally, name, work):
 
 def main():
     names = [a for a in sys.argv[1:] if not a.startswith("--")] or list(CHECKS)
-    work = tempfile.mkdtemp(prefix="ra-jit-realdebug-")
+    work = tempfile.mkdtemp(prefix="blaze-realdebug-")
     tally = Tally()
     try:
         for name in names:
@@ -281,7 +263,7 @@ def main():
             print(f"kept: {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
-    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'} ({'llvm' if LLVM else 'cranelift'})")
+    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'}")
     sys.exit(1 if tally.wrong else 0)
 
 

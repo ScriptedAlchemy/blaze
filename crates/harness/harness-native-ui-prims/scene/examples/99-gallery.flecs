@@ -1,0 +1,49 @@
+// The SwiftUI-vocabulary gallery (HARNESS_NATIVE_GALLERY=1 with HARNESS_NATIVE_SHOT): every example card in an adaptive
+// grid filling the window. The host writes the window's SafeAreaInset on it (the title-bar strip); its header pads
+// itself out of it. The cards run taller than the window, so it scrolls (ScrollState, Clip): a column that does not
+// shrinks its Fit children to fit, and squeezed the header under its own title.
+
+swiftui_gallery : ui.Column {
+  Clip
+  ScrollState: {x: 0, y: 0}
+  Fill: $tone_card
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
+  SafeAreaInset: {l: 0, r: 0, t: 0, b: 0}
+  head : ui.Row {
+    SafeAreaPadding: {l: false, r: false, t: true, b: false}
+    Flex: {axis: Row, gap: 10, align: FirstBaseline, justify: Start, wrap: false}
+    Padding: {l: 20, r: 20, t: 8, b: 0}
+    title : ui.Words, Strong { Text: {s: "Layout vocabulary"}; TextStyle: {size: 22, line: 28, role: 0, bold: 1} }
+    sub : ui.Words, Muted { Text: {s: "SwiftUI's, as flecs components and prims"} }
+  }
+  cards : ui.AdaptiveGrid {
+    GridColumns: {min: 290, max: 0}
+    Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 20, r: 20, t: 0, b: 20}
+    grid : ex.GridDemo {}
+    adaptive : ex.AdaptiveDemo {}
+    lazy : ex.LazyDemo {}
+    scroller : ex.ScrollerDemo {}
+    table : ex.TableDemo {}
+    stack : ex.StackDemo {}
+    baseline : ex.BaselineDemo {}
+    alignself : ex.AlignSelfDemo {}
+    truncate : ex.TruncateDemo {}
+    bubble : ex.BubbleDemo {}
+    compose : ex.ComposeDemo {}
+    safearea : ex.SafeAreaDemo {}
+    fits : ex.FitsDemo {}
+    matched : ex.MatchedDemo {}
+    transition : ex.TransitionDemo {}
+    removal : ex.RemovalDemo {}
+    animate : ex.AnimateDemo {}
+    menu : ex.MenuDemo {}
+    search_menu : ex.SearchMenuDemo {}
+    level : ex.LevelDemo {}
+    browser : ex.BrowserDemo {}
+    art : ex.ArtDemo {}
+    sheen : ex.SheenDemo {}
+    block : ex.BlockDemo {}
+  }
+}

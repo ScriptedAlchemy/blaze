@@ -1,0 +1,41 @@
+[package]
+name = "blaze-serve"
+description = "blaze's cache server: the packs and unit lists of a distributed build over HTTP/1.1, each pack checked against its name on write"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-core.workspace = true
+blaze-wire.workspace = true
+anyhow.workspace = true
+sha2 = "0.10"
+# The HTTP/1.1 server: hyper is the stack the rest of blaze already uses, and its `server`
+# feature is the only thing this crate turns on that the tree did not have on.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server", "http1", "tokio"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http-body-util = "0.1"
+tokio = { version = "1.47", features = ["rt-multi-thread", "net", "fs", "io-util", "signal", "sync", "time", "macros"] }
+bytes = "1"
+# Already in the lockfile; configures transport liveness rather than job policy.
+socket2 = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+hegeltest.workspace = true
+tempfile = "3"
+crc32fast = "1"
+
+[lints]
+workspace = true

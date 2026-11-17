@@ -1,0 +1,3 @@
+type: Outcome
+cbor: 8201f6
+digest: fd7c3862be041f3701ed01349ac14059e2f196ba3517f7295fe59278dc15a002

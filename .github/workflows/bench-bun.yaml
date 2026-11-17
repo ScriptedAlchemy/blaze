@@ -24,6 +24,10 @@ defaults:
   run:
     shell: bash
 
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
 jobs:
   platforms:
     name: selected benchmark platforms
@@ -53,37 +57,41 @@ jobs:
       contents: read
     timeout-minutes: 360
     env:
-      # Kept between runs, outside the checkout, as bench-readme's: ra-jit builds
-      # incrementally, bun is cloned once and its C and C++ built once per revision.
-      BENCH_HOME: ${{ github.workspace }}/../bench-state
-      BENCH_WORK: ${{ matrix.work }}
+      BENCH_MACHINE: GitHub-hosted ${{ matrix.name }} (${{ matrix.label }})
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v7
-      - name: Build ra-jit (as released, and with the llvm feature)
+      - uses: ./.github/actions/blaze
+        with:
+          job: bench-bun
+          llvm: 'true'
+          reflink: ${{ runner.os == 'Linux' && 'true' || 'false' }}
+      - uses: ./.github/actions/nix
+      - name: Build blaze
         run: |
+          bench_root=/tmp
+          if [ "$RUNNER_OS" = Linux ]; then bench_root="$RUNNER_TEMP/blaze-fs"; fi
+          export BENCH_HOME="$bench_root/bb-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$BENCH_HOME"
-          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c cargo build -p ra-jit --release
-          CARGO_TARGET_DIR="$BENCH_HOME/target-llvm" nix develop .#bench -c cargo build -p ra-jit --release --features llvm
-      # Edits: bun's own build of its C and C++ goes to RA_JIT_PROJECTS/bun-native once per
+          echo "BENCH_HOME=$BENCH_HOME" >> "$GITHUB_ENV"
+          echo "TMPDIR=$bench_root" >> "$GITHUB_ENV"
+          stage0="$(command -v blaze)"
+          CARGO_TARGET_DIR="$BENCH_HOME/compiler" nix develop .#bench -c "$stage0" build -p blaze-engine --release --locked
+          "$stage0" stop
+      # Edits: bun's own build of its C and C++ goes to BLAZE_PROJECTS/bun-native once per
       # revision (bunprep.py); the measured trees are copies of it.
       - name: Bench
         id: bench
         run: |
-          export RA_JIT_BIN="$BENCH_HOME/target/release/ra-jit" RA_JIT_LLVM_BIN="$BENCH_HOME/target-llvm/release/ra-jit" RA_JIT_PROJECTS="$BENCH_HOME/projects"
-          work=${BENCH_WORK:+$BENCH_WORK-bun}
-          work=${work:-$BENCH_HOME/work-bun}
-          rm -rf "$work" "$BENCH_HOME/reference-bun"
           mkdir -p "$RUNNER_TEMP/results"
-          nix develop .#bench-bun -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py bun \
-            --runs 3 --work "$work" --reference "$BENCH_HOME/reference-bun" --out "$RUNNER_TEMP/results/bench-bun.json" \
+          jq -n --arg blaze "$BENCH_HOME/compiler/release/blaze-engine" --arg work "$BENCH_HOME/work" \
+            --arg sources "$BENCH_HOME/projects" --arg out "$RUNNER_TEMP/results/bench-bun.json" \
+            --arg commit "$GITHUB_SHA" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg machine "$BENCH_MACHINE" \
+            '{action:"run",blaze:$blaze,work:$work,sources:$sources,out:$out,commit:$commit,run_url:$run_url,
+              projects:["bun"],backends:["cranelift","llvm"],runs:3,machine:$machine}' > "$RUNNER_TEMP/bench-input.json"
+          nix develop .#bench-bun -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py "$RUNNER_TEMP/bench-input.json" \
             || { status=$?; [ "$status" = 3 ] || exit "$status"; echo "wrong=true" >> "$GITHUB_OUTPUT"; }
-      - name: Runtime bench
-        continue-on-error: true
-        run: |
-          export RA_JIT_BIN="$BENCH_HOME/target-llvm/release/ra-jit" APPS_DIR="$BENCH_HOME/apps"
-          nix develop .#bench-bun -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py --runtime bun \
-            --runs 5 --out "$RUNNER_TEMP/results/runtime-bun.json"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -93,7 +101,7 @@ jobs:
       - name: Fail on a wrong result
         if: steps.bench.outputs.wrong == 'true'
         run: |
-          echo "::error::under ra-jit bun said something else than under cargo: see the Bench step"
+          echo "::error::Bun failed a Blaze build or its program-output oracle: see the Bench step"
           exit 1
 
   publish:
@@ -111,16 +119,19 @@ jobs:
           fetch-depth: 0
           # The ruleset on main refuses a push from the workflow's own token: this one is allowed
           # past it (docs/harness.md, "CI").
-          token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
       - uses: actions/download-artifact@v8
         with:
           pattern: bench-bun-*
           path: ${{ runner.temp }}/results
       - name: README
+        env:
+          FORCE: ${{ inputs.force || false }}
         run: |
-          for result in "$RUNNER_TEMP"/results/bench-bun-*/bench-bun.json "$RUNNER_TEMP"/results/bench-bun-*/runtime-bun.json; do
+          for result in "$RUNNER_TEMP"/results/bench-bun-*/bench-bun.json; do
             [ -f "$result" ] || continue
-            python3 harness/benchreport.py "$result" --name bun ${{ inputs.force && '--force' || '' }} \
+            jq -n --arg result "$result" --argjson force "$FORCE" \
+              '{action:"publish",result:$result,name:"bun",force:$force}' | python3 harness/benchreport.py - \
               || echo "::warning::$result was not published"
           done
       - name: Commit to main

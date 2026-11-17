@@ -1,0 +1,5 @@
+host memory pressure: Critical; pausing new compile work
+host memory pressure: compile admission paused; 0 compile steps completed
+host memory pressure: Warning; compile admission resumed
+symbols: 10832 in 128.7ms
+load workspace: 927.1ms

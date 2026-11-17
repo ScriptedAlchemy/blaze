@@ -1,10 +1,9 @@
 //! Each tree of `tests/config-fixtures` read as `cargo -Zunstable-options config get` with the
-//! arguments of each run, against what cargo 1.99 printed (`expected.json`, written by
-//! `harness/resolve.py --fixtures` with the runs of the case's `case.json` after its
-//! `CONFIG_RUNS`).
+//! arguments of each run, against what cargo 1.99 printed (`expected.json`, recorded
+//! once with the runs of the case's `case.json` after its `CONFIG_RUNS`, and kept as blaze's own
+//! expected output).
 
 #[path = "support/paths.rs"]
-#[allow(dead_code)]
 mod fixture_paths;
 
 use std::path::{Path, PathBuf};
@@ -31,7 +30,7 @@ fn copy_dir(from: &Path, to: &Path) {
 fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
     let root = scratch.join(fixture.file_name().unwrap());
     copy_dir(fixture, &root);
-    let root = root.canonicalize().unwrap();
+    let root = dunce::canonicalize(root).unwrap();
     let case: serde_json::Value = match std::fs::read_to_string(fixture.join("case.json")) {
         Ok(text) => serde_json::from_str(&text).unwrap(),
         Err(_) => serde_json::json!({}),
@@ -45,7 +44,13 @@ fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
         }
     };
     let root_text = root.display().to_string();
-    let mut env = vec![("CARGO_HOME".to_owned(), home.display().to_string())];
+    // Stop the walk up for `.cargo/config.toml` at the scratch dir, as cargo's own tests do, so
+    // config files above it (an ix VM's `/.cargo/config.toml`) don't reach what cargo recorded.
+    let test_root = scratch.canonicalize().unwrap();
+    let mut env = vec![
+        ("CARGO_HOME".to_owned(), home.display().to_string()),
+        ("__CARGO_TEST_ROOT".to_owned(), test_root.display().to_string()),
+    ];
     for (k, v) in case["env"].as_object().into_iter().flatten() {
         env.push((k.clone(), v.as_str().unwrap().replace("$ROOT", &root_text)));
     }

@@ -19,17 +19,20 @@
 //! and optimize it: helix and nushell build in about twice the time of cargo's release build,
 //! and would with nothing imported. Codegen units that share their imports are #176.
 
+#![forbid(unsafe_code)]
+
 use std::{
     collections::VecDeque,
-    hash::BuildHasher,
-    sync::{Arc, LazyLock, Mutex, OnceLock, atomic::Ordering},
+    sync::{Arc, atomic::Ordering},
 };
 
+use base_db::Db;
+use blaze_hash::{HashSet, SharedMap};
 use cranelift_codegen::ir;
 use hir_def::{attrs::AttrFlags, signatures::FunctionSignature};
 use hir_ty::{db::HirDatabase, next_solver::StoredGenericArgs, traits::StoredParamEnvAndCrate};
 use rustc_abi::ExternAbi;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use std::alloc::Global;
 
 use super::{
     Instance, InstanceDef,
@@ -65,8 +68,9 @@ const CLIF_PER_IMPORTED: usize = 16;
 /// A function as the compiles that call it import it.
 pub(super) struct Export {
     /// The module of the function alone, under `llvm::OWN`, with what it refers to declared
-    /// under the names of `requests`, as LLVM's pre-link pipeline left it.
-    pub(super) bitcode: Vec<u8>,
+    /// under the names of `requests`, as LLVM's pre-link pipeline left it. Shared with the
+    /// function's own compile where the two are the same bytes (`v2::release`).
+    pub(super) bitcode: Arc<[u8]>,
     pub(super) requests: Requests,
     pub(super) signature: ir::Signature,
     /// Its instructions, as LLVM counts them.
@@ -85,18 +89,15 @@ pub(super) struct Import {
 }
 
 /// Whether the compiles of the build under way import what they call: LLVM at `-O2` or above
-/// in a build of a whole program ([`super::tier`]'s `across`), unless `RA_JIT_IMPORT=0`,
-/// which has them build their callees in as compiles at a level above 1 do.
+/// in a build of a whole program ([`super::tier`]'s `across`).
 pub(super) fn enabled() -> bool {
-    static ASKED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("RA_JIT_IMPORT").is_none_or(|it| it != "0"));
-    *ASKED && super::tier::across() && backend::whole_program()
+    super::tier::across() && backend::whole_program()
 }
 
 /// The exports of what `recorder` calls that its compile imports, and of what those call in
 /// turn, the first first: what a call asks for is in the compile's names from then on.
 pub(super) fn chosen(recorder: &mut Recorder<'_>) -> Vec<Import> {
-    tallied(chosen_for(recorder, &|_| false, BUDGET))
+    tallied(chosen_for(recorder, &HashSet::new_in(Global), BUDGET))
 }
 
 /// `chosen`, counted as imported.
@@ -112,16 +113,18 @@ pub(super) fn tallied(chosen: Vec<Import>) -> Vec<Import> {
 /// room of all of them and imports none of them: `defined` says which instances it has.
 pub(super) fn chosen_for(
     recorder: &mut Recorder<'_>,
-    defined: &dyn Fn(&Instance) -> bool,
+    defined: &HashSet<Instance, Global>,
     budget: usize,
 ) -> Vec<Import> {
     let db = recorder.db;
+    // alloc: the result, owned by the caller; empty until an import is chosen
     let mut chosen = Vec::new();
-    let mut taken: FxHashSet<u32> = FxHashSet::default();
+    let mut taken: HashSet<u32, Global> = HashSet::new_in(Global);
     let mut spent = 0;
     // The calls to look at, by the number of the callee among the compile's requests, with
     // the share of a body's room left to it.
     let mut next: VecDeque<(u32, f32, u32)> =
+        // alloc: one exact block per compile, the queue of its calls
         (0..recorder.requests.funcs.len() as u32).map(|id| (id, 1.0, 0)).collect();
     while let Some((id, share, depth)) = next.pop_front() {
         if taken.contains(&id) {
@@ -129,7 +132,7 @@ pub(super) fn chosen_for(
         }
         let request = &recorder.requests.funcs[id as usize];
         let FuncTarget::Instance(instance, env) = &request.target else { continue };
-        if !super::tier::shared(db, instance) || defined(instance) {
+        if !super::tier::shared(db, instance) || defined.contains(instance) {
             continue;
         }
         let Some(export) = export(db, instance, env) else { continue };
@@ -151,7 +154,9 @@ pub(super) fn chosen_for(
         if depth + 1 < DEPTH {
             next.extend(funcs.iter().map(|it| (it.as_u32(), share * EVOLUTION, depth + 1)));
         }
+        // alloc: the import's own lists, one exact block each, kept with the result
         let funcs = funcs.iter().map(|it| it.as_u32()).collect();
+        // alloc: the import's own lists, one exact block each, kept with the result
         let datas = datas.iter().map(|it| it.as_u32()).collect();
         chosen.push(Import { export, id, funcs, datas });
     }
@@ -165,24 +170,20 @@ type Key = (InstanceDef, StoredGenericArgs, bool);
 
 /// The exports of the process, each built once: a compile that asks for one another is
 /// building waits for it, and no export asks for another while it is built.
-struct Exports {
-    shards: Vec<Mutex<FxHashMap<Key, Arc<OnceLock<Option<Arc<Export>>>>>>>,
-}
-
-static EXPORTS: LazyLock<Exports> =
-    LazyLock::new(|| Exports { shards: (0..64).map(|_| Mutex::default()).collect() });
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one table of exports, each built once by the first compile that asks"
+)]
+static EXPORTS: std::sync::LazyLock<SharedMap<Key, Arc<std::sync::OnceLock<Option<Arc<Export>>>>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// The export of `instance`, built if no compile asked for it before. `None` for one that is
 /// not imported: too large, a coroutine, or a body LLVM has no lowering for.
-fn export(
-    db: &dyn HirDatabase,
-    instance: &Instance,
-    env: &StoredParamEnvAndCrate,
-) -> Option<Arc<Export>> {
+fn export(db: &Db, instance: &Instance, env: &StoredParamEnvAndCrate) -> Option<Arc<Export>> {
+    // clone: a refcount of the interned arguments, which the shared table keeps as its key
     let key = (instance.def, instance.args.clone(), instance.checked);
-    let shards = &EXPORTS.shards;
-    let shard = &shards[FxBuildHasher.hash_one(&key) as usize % shards.len()];
-    let slot = shard.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_default().clone();
+    // clone: the slot's `Arc`, so the table's guard is let go before the export is built
+    let slot = EXPORTS.pin().get_or_insert_with(key, Arc::default).clone();
     slot.get_or_init(|| {
         let start = stdx::time::Instant::now();
         let built = build(db, instance, env).map(Arc::new);
@@ -191,16 +192,13 @@ fn export(
         tally.exports.add(start.elapsed(), bytes);
         built
     })
+    // clone: a refcount; the import holds the export past the slot's borrow
     .clone()
 }
 
 /// The export of `instance`: its body built alone, with nothing of what it calls built in but
 /// the small functions of the standard library every compile builds in.
-fn build(
-    db: &dyn HirDatabase,
-    instance: &Instance,
-    env: &StoredParamEnvAndCrate,
-) -> Option<Export> {
+fn build(db: &Db, instance: &Instance, env: &StoredParamEnvAndCrate) -> Option<Export> {
     let (tracked, flags) = match instance.def {
         InstanceDef::Fn(func) => {
             let signature = FunctionSignature::of(db, func);
@@ -233,56 +231,57 @@ fn build(
     let backend::Backend::Llvm(optimization) = backend::Backend::from_env().ok()? else {
         return None;
     };
-    super::tier::plain(|| {
-        if let InstanceDef::Fn(func) = instance.def
-            && db.mir_body(func.into()).ok()?.coroutine.is_some()
-        {
-            return None;
-        }
-        // Drop glue is built from the type it drops, and has no MIR.
-        let body = match instance.def {
-            InstanceDef::DropGlue => None,
-            _ => Some(super::instance_body(db, instance, env.clone()).ok()?),
-        };
-        let mut cg = Recorder::new(
-            db,
-            &**super::target().ok()?,
-            super::selected_target().ok()?,
-            instance.checked,
-        );
-        cg.unlocated = true;
-        let args = instance.args.clone();
-        let mut ctx =
-            super::build(&mut cg, env.as_ref(db), body.as_deref(), tracked, |fx| match fx.body {
-                Some(_) => {
-                    fx.args = Some(args);
-                    fx.codegen()
-                }
-                None => {
-                    use rustc_type_ir::inherent::GenericArgs as _;
-                    fx.drop_glue(args.as_ref().type_at(0))
-                }
-            })
-            .ok()?;
-        if cg.naked.is_some() || cg.opaque {
-            return None;
-        }
-        super::inline(&mut ctx, &cg.inlined).ok()?;
-        super::promote::promote(&mut ctx.func, cg.named_slots());
-        super::tier::fold_known_branches(&mut ctx, cg.isa);
-        if ctx.func.dfg.num_insts() > room * CLIF_PER_IMPORTED {
-            return None;
-        }
-        let pointees = std::mem::take(&mut cg.pointees);
-        let lowered = Tally::global().time(Phase::Export, || {
-            super::llvm::export(&cg.wants, &ctx.func, &pointees, hint, optimization)
-        });
-        let (bitcode, size) = lowered.ok()?;
-        let requests = cg.finish().0;
-        if size > room || !requests.ordered() {
-            return None;
-        }
-        let signature = ctx.func.signature.clone();
-        Some(Export { bitcode, requests, signature, size, hint })
-    })
+    // Its `Recorder` is its own, which builds in no compile's hot functions (`tier::Inlining`).
+    if let InstanceDef::Fn(func) = instance.def
+        && db.mir_body(func.into()).ok()?.coroutine.is_some()
+    {
+        return None;
+    }
+    // Drop glue is built from the type it drops, and has no MIR.
+    let body = match instance.def {
+        InstanceDef::DropGlue => None,
+        // clone: once per export in the process; the query takes its key
+        _ => Some(super::instance_body(db, instance, env.clone(), None).ok()?),
+    };
+    // No export, never one for a guessed target: the compile that imports it is of a crate
+    // of this target graph and loaded the target with `?`, so a target that fails reaches
+    // it as that error.
+    let target = super::target_of_crate(db, env.as_ref(db).krate).ok()?;
+    let mut cg = Recorder::new(db, &**super::isa_for(target).ok()?, target, instance.checked, None);
+    cg.unlocated = true;
+    // clone: once per export in the process, moved into the closure that builds it
+    let args = instance.args.clone();
+    let mut ctx =
+        super::build(&mut cg, env.as_ref(db), body.as_deref(), tracked, |fx| match fx.body {
+            Some(_) => {
+                fx.args = Some(args);
+                fx.codegen()
+            }
+            None => {
+                use rustc_type_ir::inherent::GenericArgs as _;
+                fx.drop_glue(args.as_ref().type_at(0))
+            }
+        })
+        .ok()?;
+    if cg.naked.is_some() || cg.opaque {
+        return None;
+    }
+    super::inline(&mut ctx, &cg.inlined).ok()?;
+    super::promote::promote(&mut ctx.func, cg.named_slots());
+    super::tier::fold_known_branches(&mut ctx, cg.isa);
+    if ctx.func.dfg.num_insts() > room * CLIF_PER_IMPORTED {
+        return None;
+    }
+    let pointees = std::mem::take(&mut cg.pointees);
+    let lowered = Tally::global().time(Phase::Export, || {
+        super::llvm::export(&cg.wants, &ctx.func, &pointees, hint, optimization)
+    });
+    let (bitcode, size) = lowered.ok()?;
+    let requests = cg.finish().0;
+    if size > room || !requests.ordered() {
+        return None;
+    }
+    // clone: once per export in the process, kept with it
+    let signature = ctx.func.signature.clone();
+    Some(Export { bitcode, requests, signature, size, hint })
 }

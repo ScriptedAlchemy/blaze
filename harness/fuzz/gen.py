@@ -22,6 +22,7 @@ import contextlib, os, random, sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from constfn import ConstFns
 from scenes import Scenes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -2074,7 +2075,7 @@ class Gen(Scenes):
             self.cov["panic.assert"] += 1
             compared = self.ty(lambda x: x.kind != "param" and x.leaves <= 6)
             # The message of `assert!` is the condition as rustc prints it back, which breaks
-            # lines where ra-jit does not (found/assert-message.rs): the condition is kept short.
+            # lines where blaze does not (found/assert-message.rs): the condition is kept short.
             held = self.fresh()
             self.emit(f"let {held}: bool = {self.cond()};")
             self.emit(self.r.choice([f"assert!({held});", f"assert!(!{held}, \"held {{}}\", {self.expr(self.t.u32, 1)});",
@@ -2521,6 +2522,10 @@ class Gen(Scenes):
             self.make_fn()
         self.phase("run")
         self.make_run()
+        const_fns = ConstFns(self.key)
+        self.lines += const_fns.case()
+        self.lines.insert(self.lines.index("    pub fn run() {") + 1, "        const_fns();")
+        self.cov["const.fn"] += len(const_fns.fns)
         return self.lines
 
     def phase(self, name):

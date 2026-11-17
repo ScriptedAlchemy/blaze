@@ -1,9 +1,8 @@
 //! Each workspace of `tests/fixtures` read as `cargo metadata --no-deps --format-version 1`
 //! from the directory its `fixture.json` names, against what cargo 1.99 printed for it
-//! (`expected.json`, written by `harness/resolve.py --fixtures`).
+//! (`expected.json`, recorded once and kept as blaze's own expected output).
 
 #[path = "support/paths.rs"]
-#[allow(dead_code)]
 mod fixture_paths;
 
 use std::path::{Path, PathBuf};
@@ -29,7 +28,7 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// The error as cargo prints it, blank lines dropped as `harness/resolve.py` drops them.
+/// The error as cargo prints it, blank lines dropped as they were when `expected.json` was recorded.
 fn error_text(err: &anyhow::Error, cwd: &Path) -> String {
     if let Some(diagnostic) = err.downcast_ref::<ManifestDiagnostic>() {
         return diagnostic
@@ -59,7 +58,7 @@ fn error_text(err: &anyhow::Error, cwd: &Path) -> String {
 fn read(fixture: &Path, scratch: &Path) -> String {
     let root = scratch.join(fixture.file_name().unwrap());
     copy_dir(fixture, &root);
-    let root = root.canonicalize().unwrap();
+    let root = dunce::canonicalize(root).unwrap();
     let home = scratch.join("cargo-home");
     std::fs::create_dir_all(&home).unwrap();
     let cwd = match std::fs::read_to_string(fixture.join("fixture.json")) {
@@ -69,14 +68,20 @@ fn read(fixture: &Path, scratch: &Path) -> String {
         }
         Err(_) => root.clone(),
     };
-    let env = [("CARGO_HOME".to_owned(), home.display().to_string())];
+    // blaze's root, where the workspace's build directory is: `$BLAZE_HOME/build/<name>-<id>`
+    // in what is printed.
+    let blaze_home = scratch.join("blaze-home");
+    let env = [
+        ("CARGO_HOME".to_owned(), home.display().to_string()),
+        ("BLAZE_HOME".to_owned(), blaze_home.display().to_string()),
+    ];
     let result = (|| {
         let ctx = Context::new(Config::load(&cwd, env, &[])?);
         let manifest = root_manifest(None, &ctx)?;
         let ws = Workspace::new(&manifest, &ctx)?;
         let mut out = Vec::new();
         let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
-        export_no_deps(&ws)
+        export_no_deps(&ws)?
             .serialize(&mut serde_json::Serializer::with_formatter(&mut out, formatter))?;
         anyhow::Ok(String::from_utf8(out)?)
     })();
@@ -93,7 +98,35 @@ fn read(fixture: &Path, scratch: &Path) -> String {
             String::from_utf8(out).unwrap()
         }
     };
+    let builds = blaze_manifest::home::builds(&blaze_home);
+    let text = fixture_paths::normalize_path(&text, &builds, "$BLAZE_HOME/build");
+    // The build directory's id is a digest of where the scratch copy is: `<name>-ID` in what
+    // is kept.
+    let text = workspace_ids(&text);
     fixture_paths::normalize(&text, &root, &home) + "\n"
+}
+
+/// `text` with each `$BLAZE_HOME/build/<name>-<32 hex digits>` as `$BLAZE_HOME/build/<name>-ID`.
+fn workspace_ids(text: &str) -> String {
+    const AT: &str = "$BLAZE_HOME/build/";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(AT) {
+        let (before, after) = rest.split_at(at + AT.len());
+        out.push_str(before);
+        let end = after.find(|it: char| it == '"' || it == '/').unwrap_or(after.len());
+        let name = &after[..end];
+        match name.rsplit_once('-') {
+            Some((prefix, id)) if id.len() == 32 && id.bytes().all(|it| it.is_ascii_hexdigit()) => {
+                out.push_str(prefix);
+                out.push_str("-ID");
+            }
+            _ => out.push_str(name),
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[test]

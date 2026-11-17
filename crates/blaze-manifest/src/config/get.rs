@@ -11,6 +11,7 @@ use serde_json::json;
 
 use super::{Config, ConfigKey, ConfigValue as CV, Definition};
 use crate::diagnostic::report;
+use crate::files::Disk;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigFormat {
@@ -182,7 +183,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<Args> {
 
 /// `cargo config get`. The command is unstable, so the cargo that runs it reads its `unstable`
 /// table on start, which loads the files: an error in them is an error here even unmerged.
-pub fn get(config: &Config, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
+pub fn get(config: &Config<Disk>, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
     config.ensure_loaded()?;
     if opts.show_origin && !matches!(opts.format, ConfigFormat::Toml) {
         bail!(
@@ -214,7 +215,7 @@ pub fn get(config: &Config, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
                         let _ = writeln!(
                             out.stdout,
                             "# {k}={}",
-                            shell_escape::escape(Cow::Borrowed(v))
+                            shell_escape::unix::escape(Cow::Borrowed(v))
                         );
                     }
                 }
@@ -223,8 +224,11 @@ pub fn get(config: &Config, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
                         "note: The following environment variables may affect the loaded values.\n",
                     );
                     for (k, v) in env {
-                        let _ =
-                            writeln!(out.stderr, "{k}={}", shell_escape::escape(Cow::Borrowed(v)));
+                        let _ = writeln!(
+                            out.stderr,
+                            "{k}={}",
+                            shell_escape::unix::escape(Cow::Borrowed(v))
+                        );
                     }
                 }
             }
@@ -240,7 +244,11 @@ pub fn get(config: &Config, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
     Ok(out)
 }
 
-fn maybe_env<'a>(config: &'a Config, key: &ConfigKey, cv: &CV) -> Option<Vec<(&'a str, &'a str)>> {
+fn maybe_env<'a>(
+    config: &'a Config<Disk>,
+    key: &ConfigKey,
+    cv: &CV,
+) -> Option<Vec<(&'a str, &'a str)>> {
     if !matches!(cv, CV::Table(..)) {
         return None;
     }
@@ -338,7 +346,7 @@ fn print_json(out: &mut String, key: &ConfigKey, cv: &CV, include_key: bool) {
 }
 
 fn print_toml_unmerged(
-    config: &Config,
+    config: &Config<Disk>,
     out: &mut String,
     opts: &GetOptions<'_>,
     key: &ConfigKey,
@@ -387,7 +395,7 @@ fn print_toml_unmerged(
     if !env.is_empty() {
         out.push_str("# Environment variables\n");
         for (k, v) in env {
-            let _ = writeln!(out, "# {k}={}", shell_escape::escape(Cow::Borrowed(v)));
+            let _ = writeln!(out, "# {k}={}", shell_escape::unix::escape(Cow::Borrowed(v)));
         }
         out.push('\n');
     }
@@ -398,4 +406,49 @@ fn print_toml_unmerged(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod env_quoting_tests {
+    use super::main;
+
+    #[test]
+    fn cargo_config_annotation_output_is_host_independent() {
+        let scratch = stdx::tempfile::NamedTempDir::new("blaze-config-annotations-").unwrap();
+        let root = scratch.path();
+        let home = root.join("cargo-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(root.join(".cargo/config.toml"), "[build]\njobs = 2\n").unwrap();
+        let env = [
+            ("CARGO_HOME".to_owned(), home.display().to_string()),
+            ("__CARGO_TEST_ROOT".to_owned(), root.display().to_string()),
+            ("CARGO_BUILD_RUSTFLAGS".to_owned(), "x y".to_owned()),
+        ];
+        for (flags, stdout_annotation, stderr) in [
+            (&[][..], Some("# CARGO_BUILD_RUSTFLAGS='x y'"), ""),
+            (
+                &["--format", "json"][..],
+                None,
+                "note: The following environment variables may affect the loaded values.\n\
+                 CARGO_BUILD_RUSTFLAGS='x y'\n",
+            ),
+            (&["--merged", "no"][..], Some("# CARGO_BUILD_RUSTFLAGS='x y'"), ""),
+        ] {
+            let args: Vec<String> = ["-Zunstable-options", "config", "get", "build"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .map(str::to_owned)
+                .collect();
+            let (code, output) = main(root, env.clone(), &args);
+            assert_eq!(code, 0, "{args:?}: {}", output.stderr);
+            let annotations: Vec<_> = output
+                .stdout
+                .lines()
+                .filter(|line| line.starts_with("# CARGO_BUILD_RUSTFLAGS="))
+                .collect();
+            assert_eq!(annotations, stdout_annotation.into_iter().collect::<Vec<_>>(), "{args:?}");
+            assert_eq!(output.stderr, stderr, "{args:?}");
+        }
+    }
 }

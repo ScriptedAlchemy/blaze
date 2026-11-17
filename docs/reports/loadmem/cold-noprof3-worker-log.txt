@@ -1,0 +1,8 @@
+symbols: 1019117 in 6.5s
+load workspace: 64.4s
+memory after load: 4003 MB resident, 2405 MB live
+resolve: 586 crates in 17.8s
+frozen, of 534 crates: def maps of 0, impls of 0, lang items of 0 from the store, 1472 written, not frozen: 67 def maps with a procedural macro, 34 impls with a procedural macro, 29 def maps with a crate of procedural macros
+proc macros: 19987 expanded in 18.46s, 0 from the store in 0.00s, 0.61s to key them (16480 derives in 14.12s, 2692 attributes in 3.37s, 815 function-like in 0.97s); 19172 kept
+memory after resolve: 11816 MB resident, 7001 MB live
+first build: rustc_binary None (a file: false), splice true, patch true, link_cmd true, socket true, isolate false, splicing true, RA_JIT_RUSTC_BASE=0 false, files written since rustc built 0, harnessed false

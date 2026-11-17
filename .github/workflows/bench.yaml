@@ -1,23 +1,48 @@
-# Microbenchmarks of the store's hot paths (crates/ra-jit-bench), run by tango in pairs: on a
+# Microbenchmarks of the store's hot paths (crates/blaze-bench), run in pairs by its own runner
+# (crates/blaze-bench/src/lib.rs; the job keeps the name `tango`, the harness it replaced): on a
 # pull request the binary of the change against the binary of its base, interleaved on one
 # runner, so that the runner's own drift cancels out. A benchmark fails the run only when it
-# is slower beyond doubt (tango's z-score) and by more than NOISE percent, twice in a row.
-# On main they are run alone, for the times.
+# is slower beyond doubt (a paired z-score) and by more than NOISE percent, twice in a row.
+# On main they are run alone, for the times. The platform build hands over its source-built
+# compiler: a seed released before a harness fix cannot test that fix by rebuilding the bench.
 name: bench
 on:
-  push:
-    branches: ["main"]
-    paths-ignore: ["site/**", "**.md", "harness/**"]
-  pull_request:
-    paths-ignore: ["site/**", "**.md", "harness/**"]
+  workflow_call:
+    inputs:
+      artifact:
+        description: this run's source-built compiler artifact, sealed with its source and binary identities
+        type: string
+        required: true
+      platform:
+        description: the platform in artifact and job names
+        type: string
+        required: true
+      os:
+        description: the GitHub-hosted runner that built the compiler
+        type: string
+        required: true
   workflow_dispatch:
+    # By hand, build Stage 1 explicitly; PRs and main reuse blaze-platform.yaml's build.
+    inputs:
+      os:
+        description: the hosted Linux ARM64 runner for a standalone benchmark
+        type: choice
+        options: [ubuntu-24.04-arm]
+        default: ubuntu-24.04-arm
+        required: true
+
+permissions:
+  contents: read
 
 concurrency:
-  # As ra-jit.yaml: a pull request's newer push cancels its run, every push to main finishes.
-  group: bench-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # A newer push to main or to the pull request cancels the run before it; a run by hand is
+  # never cancelled.
+  group: bench-${{ inputs.platform || 'linux-arm64' }}-${{ github.event_name }}-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   # Seconds each benchmark runs for, and the slowdown in percent below which it is noise.
@@ -32,47 +57,122 @@ defaults:
 jobs:
   tango:
     name: tango
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    runs-on: ${{ inputs.os }}
+    # Includes a source bootstrap only for workflow_dispatch; normal CI shares the build.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      # Prepare the pinned toolchain, LLVM, memlock and verified reflink filesystem. The seed
+      # starts only for this setup or an explicit manual bootstrap; Stage 1 builds both benches.
+      - uses: ./.github/actions/blaze
         with:
-          key: bench
+          job: build
+          llvm: true
+          reflink: "true"
+      - name: download this run's source-built compiler
+        if: inputs.artifact != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact }}
+          path: ${{ runner.temp }}/bench-compiler
+      - name: unpack the source-built compiler
+        if: inputs.artifact != ''
+        run: tar -xf "$RUNNER_TEMP/bench-compiler/blaze.tar" -C "$RUNNER_TEMP/bench-compiler"
+      - name: build Stage 1 for a manual run
+        if: github.event_name == 'workflow_dispatch' && inputs.artifact == ''
+        timeout-minutes: 150
+        run: |
+          blaze build --release --locked -p blaze-engine --bins --target-dir "$CARGO_TARGET_DIR"
+          blaze stop
+          mkdir -p "$RUNNER_TEMP/bench-compiler"
+          cp "$CARGO_TARGET_DIR/release/blaze" "$CARGO_TARGET_DIR/release/blaze-engine" "$RUNNER_TEMP/bench-compiler/"
+          jq -n --arg bin "$RUNNER_TEMP/bench-compiler" '{command: "seal", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+      - name: verify Stage 1 and give it a separate daemon home
+        id: compiler
+        run: |
+          jq -n --arg bin "$RUNNER_TEMP/bench-compiler" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          mkdir -p "$RUNNER_TEMP/bench-evidence"
+          cp "$RUNNER_TEMP/bench-compiler/blaze-build.json" "$RUNNER_TEMP/bench-evidence/"
+          # The machine store and std remain on the verified Btrfs volume; only the daemon
+          # state and output directories change. An installed seed cannot serve this client.
+          echo "BLAZE_HOME=$RUNNER_TEMP/blaze-fs/bench-daemon" >> "$GITHUB_ENV"
+          echo "BENCH_TARGET=$RUNNER_TEMP/blaze-fs/bench-target" >> "$GITHUB_ENV"
+          echo "BENCH_COMPILER=$RUNNER_TEMP/bench-compiler/blaze" >> "$GITHUB_ENV"
       # The base first, in the same checkout, so that the change's build reuses whatever of
       # it the change did not touch. A base without the benchmarks has nothing to pair with.
       - name: Build the base
         if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
-          git checkout -q --detach ${{ github.event.pull_request.base.sha }}
-          if [ -d crates/ra-jit-bench ]; then
-            cargo bench -p ra-jit-bench --bench store --no-run --message-format=json \
-              | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
-              | xargs -I{} cp {} "$RUNNER_TEMP/bench-base"
+          build_store() {
+            "$BENCH_COMPILER" --ignore-pin build --release --locked -p blaze-bench --bench store --target-dir "$BENCH_TARGET/base" \
+              2>&1 | tee "$RUNNER_TEMP/bench-evidence/base-build.log"
+            mapfile -t executables < <(find "$BENCH_TARGET/base/release/deps" -maxdepth 1 -type f -perm -u+x -name 'store-*')
+            [ "${#executables[@]}" = 1 ] || { echo "::error::the base build must make exactly one store benchmark, found ${#executables[@]}"; exit 1; }
+            cp "${executables[0]}" "$RUNNER_TEMP/bench-base"
+          }
+          # Always return to the change, including when the base fails, so cleanup and the
+          # evidence uploader still use this workflow's actions and provenance checks.
+          trap 'git checkout -q --detach "$HEAD_SHA"' EXIT
+          git checkout -q --detach "$BASE_SHA"
+          if [ -d crates/blaze-bench ]; then
+            build_store
           fi
-          git checkout -q --detach ${{ github.sha }}
+          # A base built before blaze-bench had its own runner speaks no protocol to pair with.
+          if [ -x "$RUNNER_TEMP/bench-base" ] && [ "$("$RUNNER_TEMP/bench-base" protocol 2>/dev/null)" != "blaze-bench-protocol 1" ]; then
+            echo "The base's benchmarks predate blaze-bench's runner: nothing to pair with."
+            rm "$RUNNER_TEMP/bench-base"
+          fi
       - name: Build the change
         run: |
-          cargo bench -p ra-jit-bench --bench store --no-run --message-format=json \
-            | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
-            | xargs -I{} cp {} "$RUNNER_TEMP/bench-head"
+          jq -n --arg bin "$RUNNER_TEMP/bench-compiler" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+          "$BENCH_COMPILER" --ignore-pin build --release --locked -p blaze-bench --bench store --target-dir "$BENCH_TARGET/head" \
+            2>&1 | tee "$RUNNER_TEMP/bench-evidence/head-build.log"
+          mapfile -t executables < <(find "$BENCH_TARGET/head/release/deps" -maxdepth 1 -type f -perm -u+x -name 'store-*')
+          [ "${#executables[@]}" = 1 ] || { echo "::error::the change's build must make exactly one store benchmark, found ${#executables[@]}"; exit 1; }
+          cp "${executables[0]}" "$RUNNER_TEMP/bench-head"
       - name: Compare with the base
         if: github.event_name == 'pull_request'
         run: |
           [ -x "$RUNNER_TEMP/bench-base" ] || { echo "The base has no benchmarks: nothing to compare."; exit 0; }
-          compare() { "$RUNNER_TEMP/bench-head" --color never compare "$RUNNER_TEMP/bench-base" -t "$TIME" --noise-threshold "$NOISE" -o | tee -a "$RUNNER_TEMP/bench.txt"; }
-          { echo '### tango: change against base'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          compare() { "$RUNNER_TEMP/bench-head" --color never compare "$RUNNER_TEMP/bench-base" -t "$TIME" --noise-threshold "$NOISE" -o | tee -a "$RUNNER_TEMP/bench-evidence/bench.txt"; }
+          { echo '### blaze-bench: change against base'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           status=0
-          compare || { echo "A slowdown over ${NOISE}%: measuring again" | tee -a "$RUNNER_TEMP/bench.txt"; compare || status=$?; }
-          { cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          compare || { echo "A slowdown over ${NOISE}%: measuring again" | tee -a "$RUNNER_TEMP/bench-evidence/bench.txt"; compare || status=$?; }
+          { cat "$RUNNER_TEMP/bench-evidence/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           [ "$status" = 0 ] || echo "::error::a benchmark is over ${NOISE}% slower than on the base, twice"
           exit "$status"
-      # On main, and on a pull request whose base has no benchmarks.
+      # On main, and on a pull request whose base has no benchmarks to pair with.
       - name: Times
         run: |
           [ ! -x "$RUNNER_TEMP/bench-base" ] || exit 0
-          "$RUNNER_TEMP/bench-head" --color never solo -t "$TIME" | tee "$RUNNER_TEMP/bench.txt"
-          { echo '### tango'; echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          "$RUNNER_TEMP/bench-head" --color never solo -t "$TIME" | tee "$RUNNER_TEMP/bench-evidence/bench.txt"
+          { echo '### blaze-bench'; echo '```'; cat "$RUNNER_TEMP/bench-evidence/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: the same compiler finished both builds
+        run: |
+          jq -n --arg bin "$RUNNER_TEMP/bench-compiler" '{command: "verify", binaries: $bin}' \
+            | python3 .github/scripts/dist_build_identity.py -
+      - name: stop the benchmark compiler
+        if: always() && steps.compiler.outcome == 'success'
+        run: '"$BENCH_COMPILER" --ignore-pin stop'
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
+      - name: keep compiler identity, build logs and timings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: microbench-${{ inputs.platform || 'linux-arm64' }}
+          path: |
+            ${{ runner.temp }}/bench-evidence
+            ${{ runner.temp }}/blaze-fs/bench-daemon/v2/serve.log
+          retention-days: 14
+          if-no-files-found: error

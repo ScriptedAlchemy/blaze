@@ -20,7 +20,9 @@
  */
 import discussableJson from '../.gen/discussable.json';
 import { currentUser, isAdmin, type User } from './auth';
+import { outer } from './base';
 import type { Env } from './env';
+import { announce } from './presence';
 import { boundedBody, json, mediaType, methodNotAllowed, plain, redirect, safeNext, sameOrigin } from './http';
 import { docUrl, forgetVersion, type FormError } from './pages';
 import type { Discussable } from './site-wasm';
@@ -89,9 +91,9 @@ export async function handleComments(request: Request, env: Env, url: URL): Prom
 /** Back to the page after a form post: to `hash`, or to the block's form with the error shown. */
 function back(doc: string, block: string, outcome: { hash: string } | { error: FormError }): Response {
 	const path = docUrl(doc) ?? '/';
-	if ('hash' in outcome) return redirect(safeNext(`${path}${outcome.hash}`));
+	if ('hash' in outcome) return redirect(outer(safeNext(`${path}${outcome.hash}`)));
 	const q = new URLSearchParams({ 'c-error': outcome.error, 'c-block': block });
-	return redirect(safeNext(`${path}?${q}#block-${encodeURIComponent(block)}`));
+	return redirect(outer(safeNext(`${path}?${q}#block-${encodeURIComponent(block)}`)));
 }
 
 async function list(request: Request, env: Env, url: URL): Promise<Response> {
@@ -191,6 +193,7 @@ async function insert(env: Env, me: User, docName: unknown, block: unknown, rawB
 		.first<{ id: number; created_at: string }>();
 	if (!row) return { status: 429, error: 'Too many comments. Try again later.', code: 'rate' };
 	forgetVersion(name);
+	await announce(env, name);
 	const comment: CommentOut = {
 		id: row.id,
 		block,
@@ -242,5 +245,6 @@ async function erase(env: Env, me: User, id: number): Promise<'ok' | 'gone' | 'f
 		.bind(id)
 		.run();
 	forgetVersion(row.doc);
+	await announce(env, row.doc);
 	return 'ok';
 }

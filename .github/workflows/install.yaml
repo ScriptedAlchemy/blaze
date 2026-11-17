@@ -1,17 +1,18 @@
 name: install
 
-# install.sh, run as a user runs it, on each platform it installs on: from the newest release
+# site/install.sh, run as a user runs it, on each platform it installs on: from the newest release
 # (the nightly build before the first), into a CARGO_HOME of its own, toolchain included; then
-# `blaze` and `cargo blaze` in a new project. And this commit's build, installed in a Debian
+# `blaze` in a new project; then each channel and pin form (`--channel`, BLAZE_CHANNEL,
+# `--version stable|canary|V`) against the published release-service channel pointers. And this commit's build, installed in a Debian
 # container with no Rust at all, which runs `blaze run` in a project written by hand. On a
 # change to the script, on each release once it is published, weekly (a release's assets or
 # GitHub's redirects can change under it) and by hand. Not a check the merge queue requires.
 on:
   push:
     branches: [main]
-    paths: ["install.sh", ".github/workflows/install.yaml"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/actions/blaze/**", ".github/actions/reflink/**", ".github/scripts/seed_preflight.py", ".github/scripts/test_seed_preflight.py", ".github/scripts/install_container.py", ".github/scripts/test_install_container.py", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
   pull_request:
-    paths: ["install.sh", ".github/workflows/install.yaml"]
+    paths: ["site/install.sh", ".github/workflows/install.yaml", ".github/actions/blaze/**", ".github/actions/reflink/**", ".github/scripts/seed_preflight.py", ".github/scripts/test_seed_preflight.py", ".github/scripts/install_container.py", ".github/scripts/test_install_container.py", ".github/scripts/install_archive.py", ".github/scripts/test_install_archive.py", ".github/scripts/install_without_rust.py", ".github/scripts/test_install_without_rust.py", ".github/scripts/test_install_channels.py"]
   release:
     types: [published]
   schedule:
@@ -25,92 +26,183 @@ on:
 permissions:
   contents: read
 
+# A newer push to the branch or the pull request cancels the run before it; a release, the
+# weekly run and a run by hand each have a group of their own, so nothing cancels or replaces them.
 concurrency:
-  group: install-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: install-${{ github.event_name }}-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+  # The projects built here are new and throwaway, with no committed lock: their builds may
+  # write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
+  BLAZE_LOCK: write
 
 jobs:
   shellcheck:
     name: shellcheck
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - run: shellcheck -s sh install.sh
+      - run: shellcheck -s sh site/install.sh
+      - name: bounded seed readiness and shutdown regressions
+        run: python3 -I -B .github/scripts/test_seed_preflight.py
+      - name: installer channel workflow regressions
+        run: python3 -I .github/scripts/test_install_channels.py
+      - name: environment-cleared container identity regressions
+        run: python3 -I .github/scripts/test_install_container.py
+      - name: release userspace regressions
+        run: python3 -I .github/scripts/test_install_archive.py
+      - name: no-Rust installer oracle regressions
+        run: python3 -I .github/scripts/test_install_without_rust.py
 
   install:
     name: ${{ matrix.os }}
+    # A fresh GitHub-hosted machine for each platform.
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        os: [ubuntu-24.04-arm, macos-latest]
     env:
-      BLAZE_REPO: ${{ github.repository }}
+      # The installer and channel assertions read this same published release service.
+      BLAZE_RELEASES: https://blaze-releases.ix.dev
       # A release the workflow was started for, or the one just published.
       BLAZE_VERSION: ${{ inputs.version || (github.event_name == 'release' && github.event.release.tag_name) || '' }}
     steps:
       - uses: actions/checkout@v7
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/reflink
       # Here and not in the job's env, which has no runner context.
       - name: a CARGO_HOME of its own
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
       # Piped, as the README has it: no terminal, nothing asked. dash is Ubuntu's /bin/sh.
       - name: install
-        run: sh < install.sh
+        run: sh < site/install.sh
       - name: what it installed runs
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
-          for bin in cargo-blaze ra-jit cargo-ra-jit ra-jit-rustc; do test -x "$CARGO_HOME/bin/$bin"; done
-          cargo blaze --help | head -n 3
-          # A release from before blaze had its own Rust has rustup install 1.99.0 instead.
-          if [ -x "$CARGO_HOME/bin/blaze" ]; then
-            blaze toolchain | tee /dev/stderr | grep -F "blaze builds with Rust 1.99.0"
-          else
-            rustup run 1.99.0 rustc --version
-            rustup component list --toolchain 1.99.0 --installed | grep -q '^rust-src'
-          fi
+          # Until a release after the rename (#270), the newest has the programs' old names.
+          test -x "$CARGO_HOME/bin/blaze"
+          test -x "$CARGO_HOME/bin/blaze-engine" || test -x "$CARGO_HOME/bin/ra-jit" # rename: old name
+          for bin in cargo-blaze cargo-ra-jit; do if test -e "$CARGO_HOME/bin/$bin"; then exit 1; fi; done # rename: old name
+          blaze --help | head -n 3
+          blaze toolchain | tee /dev/stderr | grep -F "blaze's toolchain (Rust $(cat harness/toolchain))"
       - name: again, which upgrades in place
-        run: sh install.sh --verbose
+        run: sh site/install.sh --verbose
       - name: blaze in a new project
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
           cd "$RUNNER_TEMP"
-          cargo new --quiet hello
+          blaze new --quiet hello
           cd hello
-          if [ -x "$CARGO_HOME/bin/blaze" ]; then
-            blaze build
-            blaze run | grep -F "Hello, world!"
-            cargo blaze run | grep -F "Hello, world!"
-            blaze stop
-          else
-            rustup override set 1.99.0
-            cargo blaze build
-            cargo blaze run | grep -F "Hello, world!"
-            cargo blaze stop
-          fi
+          blaze build
+          blaze run | grep -F "Hello, world!"
+          blaze stop
       - name: a release that is not there says so
         run: |
-          if sh install.sh --version 0.0.0-none > out.txt 2>&1; then cat out.txt; exit 1; fi
+          if sh site/install.sh --version 0.0.0-none > out.txt 2>&1; then cat out.txt; exit 1; fi
           cat out.txt
           grep -F "there is no blaze release 0.0.0-none" out.txt
+      # Query the same published channel pointers as site/install.sh, not GitHub's
+      # unrelated release listing (a fork may have no GitHub releases at all).
+      # Keep every channel/pin check; only omit the repeated toolchain download.
+      - name: channels
+        run: |
+          export PATH="$CARGO_HOME/bin:$PATH"
+          releases="${BLAZE_RELEASES:-https://blaze-releases.ix.dev}"
+          releases="${releases%/}"
+          case "$releases" in
+            https://*) ;;
+            *) echo "::error::release origin must use HTTPS: $releases"; exit 1 ;;
+          esac
+          channel_version() {
+            value=$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "$releases/channels/$1") || return
+            value=$(printf '%s' "$value" | tr -d ' \r\n')
+            if ! printf '%s\n' "$value" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::$releases/channels/$1 does not contain a release version" >&2
+              return 1
+            fi
+            printf '%s\n' "$value"
+          }
+          stable=$(channel_version stable)
+          canary=$(channel_version canary)
+          echo "stable $stable, canary v$canary"
+          # installs VERSION SAID COMMAND...: the command installs VERSION and says SAID.
+          installs() {
+            version="$1"; said="$2"; shift 2
+            env -u BLAZE_VERSION "$@" > out.txt 2>&1 || { cat out.txt; exit 1; }
+            cat out.txt
+            grep -Fx "$said is installed." out.txt
+            blaze --version | tee /dev/stderr | grep -F "blaze $version " > /dev/null
+          }
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain --channel stable
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain --version stable
+          installs "$canary" "blaze $canary (canary)" sh site/install.sh --no-toolchain --channel canary
+          installs "$canary" "blaze $canary (canary)" env BLAZE_CHANNEL=canary sh site/install.sh --no-toolchain
+          installs "$canary" "blaze $canary (canary)" sh site/install.sh --no-toolchain --version canary
+          # A version is that release, whatever the channel.
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain --channel canary --version "$stable"
+          if sh site/install.sh --channel nightly > out.txt 2>&1; then cat out.txt; exit 1; fi
+          grep -F "blaze has no channel nightly." out.txt
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
-  # This commit's build, as the release builds it: on the release's Ubuntu, so that it asks for
-  # the glibc a release asks for, with blaze's proc-macro server beside ra-jit. The profile may
-  # be of older crates (no --strict); build_release.py refuses a binary that asks for a glibc
-  # newer than RHEL 9's.
+  # This commit's build, as the release builds it: in the release's Ubuntu userspace, so that
+  # it asks for the glibc a release asks for, and with no PGO,
+  # as release.yaml builds it: with a profile older than the crates the build sat silent past
+  # every crate for 50 minutes and more, at random (04:27Z and 07:02Z on 2026-10-28).
+  # build_release.py refuses a binary that asks for a glibc newer than RHEL 9's.
+  # Keep Ubuntu 22.04's compiler and libraries while using the 24.04 host's kernel: the pinned
+  # stage 0 predates blaze-core's ReservedCheck repair for linux-azure 6.8's inverted check of
+  # io_uring buffer-ring reserved words. A container changes userspace, not the host kernel.
   archive:
     name: this commit's build
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    runs-on: ubuntu-24.04
+    # A clean build of blaze by blaze, as a release's: about 97 minutes on this runner.
+    timeout-minutes: 330
+    env:
+      BLAZE_CORES: "2"
+      BLAZE_DAEMON_MEMORY_GB: "6"
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.99.0 --profile minimal --component rust-src && rustup default 1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - name: isolated bootstrap and registry directory
+        run: echo "CARGO_HOME=$RUNNER_TEMP/archive-cargo" >> "$GITHUB_ENV"
+      # The release's own recipe, and the recipe is what it checks: the stage 0
+      # .github/blaze-version names (blaze builds blaze, never cargo or rustc), the pinned LLVM,
+      # and a store of this job's own that nothing pushes, so a clean build (release.yaml).
+      - uses: ./.github/actions/blaze
         with:
-          shared-key: install-dist
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: python3 .github/scripts/build_release.py --target x86_64-unknown-linux-gnu --out shipped --server
+          job: install-archive
+          llvm: true
+          reflink: "true"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - name: build the release in Ubuntu 22.04 userspace
+        run: |
+          jq -n \
+            --arg workspace "$PWD" --arg temporary "$RUNNER_TEMP" --arg home "$HOME" \
+            --arg cargo_home "${CARGO_HOME:-$HOME/.cargo}" \
+            --arg blaze_home "$BLAZE_HOME" --arg cache_home "$XDG_CACHE_HOME" \
+            --arg store "$BLAZE_CACHE" --arg target "$CARGO_TARGET_DIR" \
+            --arg llvm "$LLVM_SYS_231_PREFIX" --arg bash_env "$BASH_ENV" \
+            --arg uv "$(command -v uv)" \
+            --arg name "blaze-install-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --argjson uid "$(id -u)" --argjson gid "$(id -g)" \
+            --argjson cores "$BLAZE_CORES" --argjson daemon_memory_gb "$BLAZE_DAEMON_MEMORY_GB" \
+            '{workspace:$workspace, temporary:$temporary, home:$home, cargo_home:$cargo_home,
+              blaze_home:$blaze_home, cache_home:$cache_home, store:$store, target:$target,
+              llvm:$llvm, bash_env:$bash_env, uv:$uv, name:$name, uid:$uid, gid:$gid,
+              cores:$cores, daemon_memory_gb:$daemon_memory_gb}' \
+            > "$RUNNER_TEMP/install-archive.json"
+          uv run --frozen --no-dev python .github/scripts/install_archive.py "$RUNNER_TEMP/install-archive.json"
+        timeout-minutes: 300
       - name: archive
         run: |
           name=blaze-commit-x86_64-unknown-linux-gnu
@@ -122,6 +214,9 @@ jobs:
         with:
           name: archive
           path: blaze-commit-x86_64-unknown-linux-gnu.tar.gz
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   # A machine with no Rust: blaze brings its own, and the first `blaze run` prints the program's
   # output. The time is from the start of install.sh to that output. On the oldest systems a
@@ -129,6 +224,8 @@ jobs:
   no-rust:
     name: no Rust installed, ${{ matrix.system }}
     needs: archive
+    # Prepare the verified filesystem on the host before entering a fresh matrix userspace.
+    # No host compiler or toolchain is mounted in that userspace.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -139,69 +236,39 @@ jobs:
           - { system: Debian 12, image: "debian:bookworm-slim", packages: apt }
           - { system: Ubuntu 22.04, image: "ubuntu:22.04", packages: apt }
           - { system: RHEL 9, image: "registry.access.redhat.com/ubi9/ubi", packages: dnf }
-    container: ${{ matrix.image }}
-    # As in `docker run`: the runner's /github/home belongs to its own user, and the daemon
-    # keeps nothing in a directory another user can replace things in.
-    env:
-      HOME: /root
     steps:
-      - if: matrix.packages == 'apt'
-        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates gcc libc6-dev
-      - if: matrix.packages == 'dnf'
-        run: dnf install -y -q gcc tar gzip && dnf clean all
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: archive
-      - name: no rustup, cargo or rustc
+      - name: user namespaces for Blaze's sandbox
         run: |
-          for tool in rustup cargo rustc; do
-            if command -v "$tool"; then echo "::error::$tool is on PATH"; exit 1; fi
-          done
-      - name: install, then blaze run in a project written by hand
-        shell: sh
-        run: |
-          set -eu
-          began=$(date +%s.%N)
-          BLAZE_ARCHIVE="$PWD/blaze-commit-x86_64-unknown-linux-gnu.tar.gz" sh < install.sh
-          export PATH="$HOME/.cargo/bin:$PATH"
-          mkdir -p "$RUNNER_TEMP/hello/src"
-          cd "$RUNNER_TEMP/hello"
-          printf '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n' > Cargo.toml
-          printf 'fn main() {\n    println!("Hello, world!");\n}\n' > src/main.rs
-          blaze run > out.txt 2> err.txt || { cat err.txt; exit 1; }
-          ended=$(date +%s.%N)
-          cat err.txt out.txt
-          grep -Fx "Hello, world!" out.txt
-          if grep -e "ra-jit: bug:" -e "the daemon has no part" err.txt; then
-            echo "::error::the build was not blaze's"; exit 1
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          echo "${{ matrix.system }}, from install.sh to Hello, world!: $(echo "$ended - $began" | awk '{ printf "%.1f s", $1 - $3 }')" | tee -a "$GITHUB_STEP_SUMMARY"
-          du -sh "$HOME/.blaze/toolchains" "$HOME/.cargo/bin" | tee -a "$GITHUB_STEP_SUMMARY"
-          for tool in rustup cargo rustc; do
-            if command -v "$tool"; then echo "::error::$tool is on PATH after installing"; exit 1; fi
-          done
-          blaze stop
-      # A derive from crates.io: the daemon's load links it with ra-jit and expands it with the
-      # server beside ra-jit, on this system's glibc; an edit after is the daemon's.
-      - name: proc macros, by blaze's server
-        shell: sh
+      - uses: ./.github/actions/reflink
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - name: install this commit, run its program and edit its proc macro project
+        env:
+          IMAGE: ${{ matrix.image }}
+          PACKAGES: ${{ matrix.packages }}
+          SYSTEM: ${{ matrix.system }}
+          MATRIX_INDEX: ${{ strategy.job-index }}
         run: |
-          set -eu
-          export PATH="$HOME/.cargo/bin:$PATH"
-          RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 blaze-proc-macro-srv --version
-          mkdir -p "$RUNNER_TEMP/derive/src"
-          cd "$RUNNER_TEMP/derive"
-          printf '[package]\nname = "derive"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\n' > Cargo.toml
-          printf '#[derive(serde::Serialize)]\nstruct Point {\n    x: i32,\n}\n\nfn serializable<T: serde::Serialize>(_: &T) -> &str {\n    "derived"\n}\n\nfn main() {\n    println!("{} {}", serializable(&Point { x: 1 }), 1);\n}\n' > src/main.rs
-          RA_JIT_PROC_MACRO_SERVER=1 blaze run > out.txt 2> err.txt || { cat err.txt; exit 1; }
-          cat err.txt out.txt
-          grep -Fx "derived 1" out.txt
-          sed -i 's/serializable(&Point { x: 1 }), 1)/serializable(\&Point { x: 2 }), 2)/' src/main.rs
-          RA_JIT_PROC_MACRO_SERVER=1 blaze run > out.txt 2>> err.txt || { cat err.txt; exit 1; }
-          cat err.txt out.txt
-          grep -Fx "derived 2" out.txt
-          if grep -e "ra-jit: bug:" -e "the daemon has no part" -e "did not make the proc macro" -e "no proc-macro server" err.txt; then
-            echo "::error::the proc macros were not blaze's"; exit 1
-          fi
-          blaze stop
+          jq -n --arg workspace "$PWD" --arg temporary "$RUNNER_TEMP" \
+            --arg image "$IMAGE" --arg packages "$PACKAGES" --arg system "$SYSTEM" \
+            --arg blaze_home "$BLAZE_HOME" --arg cache_home "$XDG_CACHE_HOME" \
+            --arg store "$BLAZE_CACHE" --arg target "$CARGO_TARGET_DIR" \
+            --arg summary "$GITHUB_STEP_SUMMARY" \
+            --arg name "blaze-install-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$MATRIX_INDEX" \
+            --argjson uid "$(id -u)" --argjson gid "$(id -g)" \
+            '{workspace:$workspace, temporary:$temporary, image:$image, packages:$packages,
+              system:$system, blaze_home:$blaze_home, cache_home:$cache_home, store:$store,
+              target:$target, summary:$summary, name:$name, uid:$uid, gid:$gid}' \
+            > "$RUNNER_TEMP/install-without-rust.json"
+          uv run --frozen --no-dev python .github/scripts/install_without_rust.py "$RUNNER_TEMP/install-without-rust.json"
+      - if: failure()
+        uses: ./.github/actions/daemon-log

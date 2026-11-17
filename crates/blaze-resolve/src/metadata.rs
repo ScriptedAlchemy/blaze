@@ -2,10 +2,10 @@
 //! 1.99.0 (5f94df4789) writes them (`src/ops/cargo_metadata.rs`). cargo's unstable artifact
 //! dependencies (`-Zbindeps`) and the fields they add are not ported.
 
-use std::collections::BTreeMap;
-
+use blaze_hash::HashMap;
 use cargo_platform::Platform;
 use serde::Serialize;
+use std::alloc::Global;
 
 use crate::dependency::DepKind;
 use crate::interning::InternedString;
@@ -63,24 +63,26 @@ pub fn resolve_graph(
     resolve: &Resolve,
     members: &[PackageId],
     root: Option<PackageId>,
-    packages: &dyn MetadataPackages,
+    packages: &impl MetadataPackages,
     requested_kinds: &[CompileKind],
 ) -> CargoResult<MetadataResolve> {
-    let mut node_map = BTreeMap::new();
+    let mut node_map = HashMap::with_capacity_in(resolve.len(), Global);
     for &member in members {
         build_resolve_graph_r(&mut node_map, member, resolve, packages, requested_kinds)?;
     }
+    let mut nodes: Vec<_> = node_map.into_iter().collect();
+    nodes.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     Ok(MetadataResolve {
-        nodes: node_map.into_values().collect(),
+        nodes: nodes.into_iter().map(|(_, node)| node).collect(),
         root: root.map(|id| id.to_spec()),
     })
 }
 
-fn build_resolve_graph_r(
-    node_map: &mut BTreeMap<PackageId, MetadataResolveNode>,
+fn build_resolve_graph_r<P: MetadataPackages>(
+    node_map: &mut HashMap<PackageId, MetadataResolveNode, Global>,
     pkg_id: PackageId,
     resolve: &Resolve,
-    packages: &dyn MetadataPackages,
+    packages: &P,
     requested_kinds: &[CompileKind],
 ) -> CargoResult<()> {
     if node_map.contains_key(&pkg_id) {

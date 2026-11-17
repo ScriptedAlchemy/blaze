@@ -1,4 +1,7 @@
 /** Small helpers shared by the routes: cookies, origin checks, redirects, tokens. */
+import buildJson from '../.gen/build.json';
+import { COOKIE_PATH } from './base';
+import { csp } from './csp';
 
 export function json(body: unknown, status = 200, headers: HeadersInit = {}): Response {
 	const h = new Headers(headers);
@@ -22,7 +25,7 @@ const NEXT_MAX = 1024;
 const NEXT_BASE = 'https://x.invalid';
 
 /**
- * A same-site path to send the browser back to, or "/". The value is resolved against a placeholder origin the way
+ * A site path (no base, worker/base.ts) to send the browser back to, or "/"; redirect to `outer()` of it. The value is resolved against a placeholder origin the way
  * a browser would resolve it, so "//host", "/\host", "/.//host" and the like (another host) fail, and what comes
  * back is the parsed path, query and fragment: percent-encoded ASCII, safe in a Location header. Input or output
  * longer than 1024 chars: "/".
@@ -72,11 +75,13 @@ export function cookie(request: Request, name: string): string | null {
 }
 
 /**
- * An HttpOnly, Secure, SameSite=Lax cookie on Path=/ with no Domain, as the `__Host-` prefix requires (browsers drop a
- * `__Host-` cookie set any other way). Browsers count http://localhost as secure, so `wrangler dev` still works.
+ * An HttpOnly, Secure, SameSite=Lax, host-only (no Domain) cookie on the site's base path (`/blaze`), so it never goes
+ * to the rest of ix.dev. Its name is `__Secure-` prefixed (browsers drop it unless it is set Secure from https); a
+ * `__Host-` cookie would have to be Path=/ and so be sent to every ix.dev service. Browsers count http://localhost as
+ * secure, so `wrangler dev` still works.
  */
 export function setCookie(name: string, value: string, maxAge: number): string {
-	return `${name}=${value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
+	return `${name}=${value}; HttpOnly; Secure; SameSite=Lax; Path=${COOKIE_PATH}; Max-Age=${maxAge}`;
 }
 
 export const clearCookie = (name: string) => setCookie(name, '', 0);
@@ -139,25 +144,25 @@ export async function boundedBody(request: Request, max: number): Promise<Respon
 	return new Response(bytes, { headers });
 }
 
-const TURNSTILE = 'https://challenges.cloudflare.com';
+/** The chat translator's worker script, under the base. */
+const TRANSLATOR = '/js/translate-worker.js';
+/** The code graph page (site/graph/), under the base: it compiles its layout simulation's wasm. */
+const GRAPH = '/graph';
 
 /**
- * The Content-Security-Policy of the HTML the worker serves: scripts, styles and fetches from this origin only, avatars
- * from GitHub, narration audio (media-src) from this origin, forms posting back here. `turnstile` (only /updates) also lets in the Turnstile script and its frame.
- * static/_headers gives the static pages the same policy, less the avatars and Turnstile; change both together.
+ * The build of the client scripts and styles the site's pages run with (gen/build.ts). Sent with every page as
+ * `x-blaze-assets`: the client router (client/nav.ts) swaps a page in only when it matches its own, so after a deploy
+ * an open tab's next click is a load.
  */
-export function csp({ turnstile = false } = {}): string {
-	return [
-		"default-src 'self'",
-		turnstile ? `script-src 'self' ${TURNSTILE}` : "script-src 'self'",
-		"style-src 'self'",
-		"img-src 'self' https://avatars.githubusercontent.com https://github.com",
-		"connect-src 'self'",
-		"media-src 'self'",
-		turnstile ? `frame-src ${TURNSTILE}` : "frame-src 'none'",
-		"form-action 'self'",
-		"frame-ancestors 'none'",
-		"base-uri 'none'",
-		"object-src 'none'",
-	].join('; ');
+export const ASSETS_HEADER = 'x-blaze-assets';
+export const ASSETS = buildJson.assets;
+
+/** A static file (the ASSETS binding) with the headers every page gets: the CSP above, nosniff, the referrer policy. */
+export function assetHeaders(res: Response, path = ''): Response {
+	const out = new Response(res.body, res);
+	out.headers.set(ASSETS_HEADER, ASSETS);
+	out.headers.set('content-security-policy', csp({ translator: path === TRANSLATOR, wasm: path === GRAPH }));
+	out.headers.set('x-content-type-options', 'nosniff');
+	out.headers.set('referrer-policy', 'strict-origin-when-cross-origin');
+	return out;
 }

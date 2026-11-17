@@ -7,9 +7,10 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::Path;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use serde::Deserialize;
 use serde_untagged::UntaggedEnumVisitor;
+use std::alloc::Global;
 
 use super::{ConfigRelativePath, OptValue, PathAndArgs, StringList, Value};
 
@@ -58,6 +59,18 @@ pub struct CargoNetConfig {
     pub offline: Option<bool>,
     pub git_fetch_with_cli: Option<bool>,
     pub ssh: Option<CargoSshConfig>,
+}
+
+/// `[unstable]`: the `-Z` flags blaze reads, in the form cargo's `CliUnstable` takes them from
+/// configuration. Other keys are left unread, as cargo leaves keys it has no field for.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CargoUnstableConfig {
+    pub unstable_options: Option<bool>,
+    pub bindeps: Option<bool>,
+    pub build_std: Option<Vec<String>>,
+    pub build_std_features: Option<Vec<String>>,
+    pub codegen_backend: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,7 +272,7 @@ impl EnvConfigValue {
     }
 }
 
-pub type EnvConfig = FxHashMap<String, EnvConfigValue>;
+pub type EnvConfig = HashMap<String, EnvConfigValue, Global>;
 
 /// A token or key, which `Debug` does not show.
 #[derive(Clone, Deserialize)]
@@ -285,8 +298,6 @@ pub struct RegistryConfig {
     pub index: Option<String>,
     pub token: OptValue<Secret<String>>,
     pub credential_provider: Option<PathAndArgs>,
-    pub secret_key: OptValue<Secret<String>>,
-    pub secret_key_subject: Option<String>,
     pub min_publish_age: Option<String>,
     #[serde(rename = "protocol")]
     _protocol: Option<String>,
@@ -299,8 +310,6 @@ pub struct GlobalRegistryConfig {
     pub index: Option<String>,
     pub token: OptValue<Secret<String>>,
     pub credential_provider: Option<PathAndArgs>,
-    pub secret_key: OptValue<Secret<String>>,
-    pub secret_key_subject: Option<String>,
     pub min_publish_age: Option<String>,
     pub global_min_publish_age: Option<String>,
     #[serde(rename = "default")]
@@ -315,8 +324,6 @@ impl GlobalRegistryConfig {
             index: self.index,
             token: self.token,
             credential_provider: self.credential_provider,
-            secret_key: self.secret_key,
-            secret_key_subject: self.secret_key_subject,
             min_publish_age: self.min_publish_age,
             _protocol: None,
         }

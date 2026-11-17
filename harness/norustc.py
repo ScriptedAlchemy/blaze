@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """norustc.py: how many times rustc and rustdoc run in each scenario of a small workspace built
-with `cargo ra-jit`, against the counts recorded in norustc/baseline.json. A count above its
-baseline fails: ra-jit is to run no rustc, and a change may only lower the counts
+with `blaze`, against the counts recorded in norustc/baseline.json. A count above its
+baseline fails: blaze is to run no rustc, and a change may only lower the counts
 (docs/no-rustc.md).
 
     norustc.py [--record] [--keep]
@@ -9,27 +9,33 @@ baseline fails: ra-jit is to run no rustc, and a change may only lower the count
 The workspace, norustc/fixture, has a program with an `asm!` block, a library with unit tests,
 doctests and features, which the root package uses through another library, a proc macro, and a path dependency outside the workspace with a build script that
 `include!`s a file, `include_str!`s another, reads a variable with `option_env!` and expands the proc macro. It
-is built with a copy of the pinned toolchain whose rustc, rustdoc and cargo write a line for
-each run and then become the real tool, linked with rustup under a name of its own for the run.
-A scenario ends once no counted tool runs and the log has been still for a while, so what the
-daemon does after a command is counted with it.
+is built with a copy of blaze's own toolchain (the sysroot `blaze toolchain --json` names) whose
+rustc, rustdoc and cargo write a line for each run and then become the real tool, put where
+blaze looks for its toolchain in a user's home of the run's own (`HOME`'s
+`.blaze/toolchains/<its name>`, which every BLAZE_HOME reads) and first on PATH, so a run of any of the three by blaze or by anything it starts is counted. No rustc is
+asked where the toolchain is, and rustup is not used. A scenario ends once no counted tool
+runs and the log has been still for a while, so what the daemon does after a command is
+counted with it. (v1 also waited for `blaze status` to say the workspace was `ready`;
+v2 has no load state, and a build that returns is done.)
 
---record writes this platform's and backend's counts into the baseline, after a change that
+--record writes this platform's counts into the baseline (the fixture is built in the dev
+profile, which v2 compiles with Cranelift), after a change that
 lowered them. Where a count differs from run to run (cargo's own cache of what rustc answered
-is raced by the cargos ra-jit runs beside it), the baseline is the highest seen. --keep leaves the work directory. Linux and macOS: the stand-ins are shell
+is raced by the cargos blaze runs beside it), the baseline is the highest seen. --keep leaves the work directory. Linux and macOS: the stand-ins are shell
 scripts.
 """
 import json, os, platform, shutil, subprocess, sys, tempfile, time
 
+import storelib
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit")
-TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
+BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine")
 FIXTURE = os.path.join(HERE, "norustc", "fixture")
 BASELINE = os.path.join(HERE, "norustc", "baseline.json")
 SYSTEM = {"linux": "linux", "darwin": "macos"}[sys.platform]
 ARCH = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
-PLACE = f"{SYSTEM}-{ARCH} {os.environ.get('RA_JIT_BACKEND') or 'cranelift'}"
+PLACE = f"{SYSTEM}-{ARCH}"
 COUNTED = ("rustc", "rustdoc", "cargo")
 # How long the log has to be still, with no counted tool running, for a step to be over.
 STILL = 4
@@ -43,35 +49,36 @@ exec {real} "$@"
 """
 
 MAIN, LIB = "src/main.rs", "word/src/lib.rs"
-# The scenarios, each a list of (step, cargo ra-jit arguments, edits, whether to wait for the
-# daemon to be ready). An edit is (file, old, new), or (file, None, text to add).
+# The scenarios, each a list of (step, blaze arguments, edits). An edit is (file, old, new),
+# or (file, None, text to add). A step's command returns when its build is done; what the
+# daemon does after it is waited for by `settle`.
 SCENARIOS = [
-    ("cold build", [("cold", ["build"], [], True)]),
+    ("cold build", [("cold", ["build"], [])]),
     ("edits", [
-        ("nothing edited", ["build"], [], False),
-        ("a body", ["build"], [(MAIN, '"{} words', '"{} words!')], False),
-        ("a library's body", ["build"], [(LIB, ".count()", ".filter(|it| !it.is_empty()).count()")], False),
-        ("a new function", ["build"], [(MAIN, "fn main() {", "fn more() -> u32 {\n    3\n}\n\nfn main() {\n    more();")], False),
-        ("an error", ["build"], [(MAIN, "    more();", '    let _wrong: u32 = "no";\n    more();')], False),
-        ("the error mended", ["build"], [(MAIN, '    let _wrong: u32 = "no";\n', "")], False),
+        ("nothing edited", ["build"], []),
+        ("a body", ["build"], [(MAIN, '"{} words', '"{} words!')]),
+        ("a library's body", ["build"], [(LIB, ".count()", ".filter(|it| !it.is_empty()).count()")]),
+        ("a new function", ["build"], [(MAIN, "fn main() {", "fn more() -> u32 {\n    3\n}\n\nfn main() {\n    more();")]),
+        ("an error", ["build"], [(MAIN, "    more();", '    let _wrong: u32 = "no";\n    more();')]),
+        ("the error mended", ["build"], [(MAIN, '    let _wrong: u32 = "no";\n', "")]),
     ]),
     ("tests", [
-        ("first test --no-run", ["test", "--no-run", "--workspace"], [], True),
-        ("a body", ["test", "--no-run", "--workspace"], [(MAIN, '"{} words!', '"{} words!!')], False),
-        ("a test added", ["test", "--no-run", "--workspace"], [(LIB, None, "\n#[test]\nfn added() {}\n")], False),
+        ("first test --no-run", ["test", "--no-run", "--workspace"], []),
+        ("a body", ["test", "--no-run", "--workspace"], [(MAIN, '"{} words!', '"{} words!!')]),
+        ("a test added", ["test", "--no-run", "--workspace"], [(LIB, None, "\n#[test]\nfn added() {}\n")]),
     ]),
     ("doctests", [
-        ("first", ["test", "--doc", "-p", "word"], [], False),
-        ("again", ["test", "--doc", "-p", "word"], [], False),
+        ("first", ["test", "--doc", "-p", "word"], []),
+        ("again", ["test", "--doc", "-p", "word"], []),
     ]),
-    ("check", [("check", ["check"], [], False)]),
+    ("check", [("check", ["check"], [])]),
     # With no build of its flags loaded the daemon loads the workspace to check it.
     ("check unloaded", [
-        ("the daemon stopped", ["stop"], [], False),
-        ("check", ["check"], [], False),
-        ("an error", ["check"], [(MAIN, "fn main() {", 'fn wrong() -> u32 {\n    "no"\n}\n\nfn main() {')], False),
-        ("the error mended", ["check"], [(MAIN, 'fn wrong() -> u32 {\n    "no"\n}\n\n', "")], False),
-        ("another package", ["check", "-p", "word"], [], False),
+        ("the daemon stopped", ["stop"], []),
+        ("check", ["check"], []),
+        ("an error", ["check"], [(MAIN, "fn main() {", 'fn wrong() -> u32 {\n    "no"\n}\n\nfn main() {')]),
+        ("the error mended", ["check"], [(MAIN, 'fn wrong() -> u32 {\n    "no"\n}\n\n', "")]),
+        ("another package", ["check", "-p", "word"], []),
     ]),
 ]
 
@@ -80,11 +87,10 @@ def run(argv, **kwargs):
     return subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, **kwargs)
 
 
-def counted_toolchain(work, log):
-    """A copy of the pinned toolchain whose rustc, rustdoc and cargo are stand-ins. rustc finds
-    its sysroot by where its library is, so the libraries are copied and the rest linked."""
-    sysroot = run(["rustc", f"+{TOOLCHAIN}", "--print", "sysroot"], check=True).stdout.strip()
-    toolchain = os.path.join(work, "toolchain")
+def counted_toolchain(sysroot, toolchain, log):
+    """A copy at `toolchain` of blaze's toolchain at `sysroot` whose rustc, rustdoc and cargo
+    are stand-ins. rustc finds its sysroot by where its library is, so the libraries are copied
+    and the rest linked."""
     os.makedirs(os.path.join(toolchain, "bin"))
     os.makedirs(os.path.join(toolchain, "lib"))
     for entry in os.listdir(sysroot):
@@ -158,19 +164,25 @@ def apply(ws, edits):
 
 def main():
     record, keep = "--record" in sys.argv, "--keep" in sys.argv
-    # Under /tmp on macOS: the daemon's socket is in RA_JIT_HOME below, and under $TMPDIR
+    # Under /tmp on macOS: the daemon's socket is in BLAZE_HOME below, and under $TMPDIR
     # (/var/folders/...) its path passes the 104 bytes macOS has for one.
-    work = tempfile.mkdtemp(prefix="ra-jit-norustc-", dir="/tmp" if sys.platform == "darwin" else None)
+    work = tempfile.mkdtemp(prefix="blaze-norustc-", dir="/tmp" if sys.platform == "darwin" else None)
     log = os.path.join(work, "runs.log")
     open(log, "w").close()
-    name = f"ra-jit-norustc-{os.getpid()}"
-    toolchain = counted_toolchain(work, log)
-    run(["rustup", "toolchain", "link", name, toolchain], check=True)
     ws = os.path.join(work, "ws")
     shutil.copytree(FIXTURE, ws)
     home = os.path.join(work, "home")
     os.makedirs(home, mode=0o700)
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("RA_JIT", "RUSTC", "RUSTDOC"))}
+    # Where blaze keeps its toolchain, as blaze says (downloaded once into the user's
+    # `~/.blaze/toolchains` when it is not there). Every BLAZE_HOME reads the user's home's
+    # toolchains (crates/blaze-cargo's `toolchain::own::toolchains`), so the counted copy goes in
+    # a user's home of the run's own, which the run's HOME names.
+    blaze = os.path.join(os.path.dirname(os.path.abspath(BLAZE)), "blaze")
+    sysroot = storelib.blaze_toolchain(blaze, {k: v for k, v in os.environ.items() if k != "BLAZE_BIN"}).sysroot
+    user = os.path.join(work, "user")
+    toolchain = counted_toolchain(sysroot, os.path.join(user, ".blaze", "toolchains", os.path.basename(sysroot)), log)
+    real_home = os.path.expanduser("~")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("BLAZE_", "RUSTC", "RUSTDOC"))}
     for unset in ("RUSTFLAGS", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "CARGO"):
         env.pop(unset, None)
     # Flags the shell gives a target (nix's x86-64 Linux shell sets
@@ -178,24 +190,20 @@ def main():
     # under them: six more runs that only ask in the cold build.
     for key in [k for k in env if k.endswith("RUSTFLAGS")]:
         del env[key]
-    env.update(RUSTUP_TOOLCHAIN=name, RA_JIT_HOME=home, RA_JIT_CACHE=os.path.join(work, "store"),
-               PATH=os.path.dirname(os.path.abspath(RA_JIT)) + os.pathsep + env["PATH"],
+    # HOME holds the counted toolchain; cargo's home and the standard library's shared
+    # directory (`~/.cache/blaze`) stay the user's, so nothing is fetched or built again.
+    env.update(BLAZE_HOME=home, HOME=user,
+               CARGO_HOME=os.environ.get("CARGO_HOME") or os.path.join(real_home, ".cargo"),
+               XDG_CACHE_HOME=os.environ.get("XDG_CACHE_HOME") or os.path.join(real_home, ".cache"),
+               PATH=os.pathsep.join((os.path.dirname(os.path.abspath(BLAZE)), os.path.join(toolchain, "bin"), env["PATH"])),
                CARGO_TERM_COLOR="never", RUST_BACKTRACE="0", CARGO_NET_OFFLINE="true")
-    if os.environ.get("RA_JIT_BACKEND"):
-        env["RA_JIT_BACKEND"] = os.environ["RA_JIT_BACKEND"]
     found, failed = {}, []
     try:
         for scenario, steps in SCENARIOS:
             began = len(open(log).read().splitlines())
-            for step, args, edits, wait in steps:
+            for step, args, edits in steps:
                 apply(ws, edits)
-                ran = run(["cargo", "ra-jit", *args], cwd=ws, env=env, timeout=1200)
-                if wait and ran.returncode == 0:
-                    for _ in range(600):
-                        status = run(["cargo", "ra-jit", "status"], cwd=ws, env=env).stdout
-                        if ": ready" in status:
-                            break
-                        time.sleep(1)
+                ran = run(["blaze", *args], cwd=ws, env=env, timeout=1200)
                 settle(log)
                 said = (ran.stderr.strip().splitlines() or [""])[-1][:100]
                 print(f"  {scenario}: {step}: exit {ran.returncode}  {said}", flush=True)
@@ -209,8 +217,7 @@ def main():
             print(f"{scenario}: rustc {runs['rustc']} ({questions} only asking), rustdoc {runs['rustdoc']}, "
                   f"cargo {runs['cargo']}", flush=True)
     finally:
-        run(["cargo", "ra-jit", "stop"], cwd=ws, env=env)
-        run(["rustup", "toolchain", "uninstall", name])
+        run(["blaze", "stop"], cwd=ws, env=env)
     baseline = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
     recorded = baseline.get(PLACE)
     if record:
@@ -240,7 +247,7 @@ def main():
     for line in failed:
         print(f"FAILED: {line}")
     if risen and not record:
-        print("ra-jit runs rustc more than it did: docs/no-rustc.md says why that is refused")
+        print("blaze runs rustc more than it did: docs/no-rustc.md says why that is refused")
         sys.exit(1)
     if failed:
         print("the fixture's doctests failed: they pass under rustdoc")

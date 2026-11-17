@@ -12,7 +12,7 @@ import json, os, sys
 
 # Short macOS work paths keep daemon sockets within the 104-byte limit.
 PLATFORMS = [
-    dict(slug="macos-arm64", name="macOS arm64", label="macos-15", work="/tmp/ra-jit-bench"),
+    dict(slug="macos-arm64", name="macOS arm64", label="macos-15", work="/tmp/blaze-bench"),
     dict(slug="linux-aarch64", name="Linux aarch64", label="ubuntu-24.04-arm", work=""),
     dict(slug="linux-x86-64", name="Linux x86-64", label="ubuntu-24.04", work=""),
 ]

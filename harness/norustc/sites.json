@@ -1,10 +1,4 @@
 {
- "crates/ra-jit/src/answers.rs": 1,
- "crates/ra-jit/src/bin/ra-jit-rustc.rs": 1,
- "crates/ra-jit/src/cargo/mod.rs": 1,
- "crates/ra-jit/src/cargo/run.rs": 1,
- "crates/ra-jit/src/cargo/state.rs": 6,
- "crates/ra-jit/src/cargo/wrapper.rs": 3,
- "crates/ra-jit/src/plan.rs": 1,
- "crates/ra-jit/src/stub.rs": 1
+ "crates/blaze-build-script/src/elide/tests.rs": 1,
+ "crates/blaze-cargo/src/answers/own.rs": 2
 }

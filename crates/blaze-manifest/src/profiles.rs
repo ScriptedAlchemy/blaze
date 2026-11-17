@@ -1,5 +1,5 @@
-//! Profiles as cargo 1.99 computes them (`src/workspace/profiles.rs` and `validate_profile` in
-//! its manifest parser), on the stable channel: the root manifest's `[profile]` tables with the
+//! Profiles as the pinned nightly's cargo computes them (`src/workspace/profiles.rs` and
+//! `validate_profile` in its manifest parser): the root manifest's `[profile]` tables with the
 //! configuration's merged over them, the built-in ones, `inherits` chains, and the `Profile` of
 //! a unit from its package, whether it is built for the host and its target, serialized as
 //! `cargo build --unit-graph` prints it.
@@ -7,44 +7,38 @@
 //! What a unit is built for (`UnitFor`) is the unit graph's to compute; this module takes it.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use anyhow::{Context as _, bail};
+use blaze_hash::{HashMap, HashSet};
 use cargo_util_schemas::core::PackageIdSpec;
 use cargo_util_schemas::manifest::{
     ProfileName, ProfilePackageSpec, StringOrBool, TomlDebugInfo, TomlProfile, TomlProfiles,
-    TomlTrimPaths, TomlTrimPathsValue,
+    TomlTrimPaths,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
+use std::alloc::Global;
 
-use crate::config::{CompileKind, Config};
+use crate::config::{CliUnstable, CompileKind, Config};
 use crate::features::{Feature, Features};
-use crate::source::SourceId;
+use crate::files::Files;
+use crate::manifest::PackageId;
 
-/// A package as a `[profile.*.package.<spec>]` override is matched against it.
-pub trait ProfilePackage: fmt::Display {
-    fn name(&self) -> &str;
-    fn version(&self) -> &semver::Version;
-    fn source_id(&self) -> &SourceId;
-}
-
-fn spec_matches(spec: &PackageIdSpec, pkg: &dyn ProfilePackage) -> bool {
-    if spec.name() != pkg.name() {
+fn spec_matches(spec: &PackageIdSpec, pkg: &PackageId) -> bool {
+    if spec.name() != pkg.name {
         return false;
     }
     if let Some(v) = spec.partial_version()
-        && !v.matches(pkg.version())
+        && !v.matches(&pkg.version)
     {
         return false;
     }
     if let Some(u) = spec.url()
-        && *u != pkg.source_id().url
+        && u != pkg.source_id.url()
     {
         return false;
     }
     if let Some(k) = spec.kind()
-        && *k != pkg.source_id().kind
+        && !crate::source::spec_kind_is(k, pkg.source_id.kind())
     {
         return false;
     }
@@ -55,21 +49,24 @@ fn spec_matches(spec: &PackageIdSpec, pkg: &dyn ProfilePackage) -> bool {
 #[derive(Clone, Debug)]
 pub struct Profiles {
     incremental: Option<bool>,
-    dir_names: FxHashMap<String, String>,
-    by_name: FxHashMap<String, ProfileMaker>,
+    dir_names: HashMap<String, String, Global>,
+    by_name: HashMap<String, ProfileMaker, Global>,
     original_profiles: BTreeMap<String, TomlProfile>,
     requested_profile: String,
     rustc_host: String,
+    /// blaze: the requested profile's `contract-checks`, when its `inherits` chain sets one
+    /// ([`Profiles::set_contract_checks`]); else its root's default.
+    contract_checks: Option<bool>,
 }
 
 impl Profiles {
     /// The profiles of a workspace whose root manifest has `manifest_profiles` and the cargo
     /// features `features`, building with `requested_profile` on a rustc whose host is
     /// `rustc_host`. The warnings of config profiles go to `config`.
-    pub fn new(
+    pub fn new<F: Files>(
         manifest_profiles: Option<&TomlProfiles>,
         features: &Features,
-        config: &Config,
+        config: &Config<F>,
         requested_profile: &str,
         rustc_host: &str,
     ) -> anyhow::Result<Profiles> {
@@ -82,13 +79,12 @@ impl Profiles {
         let mut makers = Profiles {
             incremental,
             dir_names: predefined_dir_names(),
-            by_name: FxHashMap::default(),
+            by_name: HashMap::new_in(Global),
             original_profiles: profiles.clone(),
             requested_profile: requested_profile.to_owned(),
             rustc_host: rustc_host.to_owned(),
+            contract_checks: None,
         };
-        // `trim-paths` is unstable: no manifest blaze reads enables it.
-        let trim_paths_enabled = false;
         makers.by_name.insert(
             "dev".to_owned(),
             ProfileMaker { default: Profile::default_dev(), toml: profiles.get("dev").cloned() },
@@ -96,7 +92,7 @@ impl Profiles {
         makers.by_name.insert(
             "release".to_owned(),
             ProfileMaker {
-                default: Profile::default_release(trim_paths_enabled),
+                default: Profile::default_release(),
                 toml: profiles.get("release").cloned(),
             },
         );
@@ -133,7 +129,7 @@ impl Profiles {
             }
             return Ok(());
         }
-        let mut set = FxHashSet::default();
+        let mut set = HashSet::new_in(Global);
         set.insert(name.to_owned());
         let maker = self.process_chain(name, profile, &mut set, profiles)?;
         self.by_name.insert(name.to_owned(), maker);
@@ -144,7 +140,7 @@ impl Profiles {
         &mut self,
         name: &str,
         profile: &TomlProfile,
-        set: &mut FxHashSet<String>,
+        set: &mut HashSet<String, Global>,
         profiles: &BTreeMap<String, TomlProfile>,
     ) -> anyhow::Result<ProfileMaker> {
         let mut maker = match &profile.inherits {
@@ -179,7 +175,7 @@ impl Profiles {
     /// The profile of a unit of `pkg`, as cargo's `Profiles::get_profile`.
     pub fn get_profile(
         &self,
-        pkg: &dyn ProfilePackage,
+        pkg: &PackageId,
         is_member: bool,
         is_local: bool,
         unit_for: UnitFor,
@@ -201,6 +197,9 @@ impl Profiles {
         }
         if let Some(v) = self.incremental {
             profile.incremental = v;
+        }
+        if let Some(on) = self.contract_checks {
+            profile.contract_checks = on;
         }
         if !is_local {
             profile.incremental = false;
@@ -238,7 +237,7 @@ impl Profiles {
     pub fn validate_packages(
         &self,
         manifest_profiles: Option<&TomlProfiles>,
-        packages: &[&dyn ProfilePackage],
+        packages: &[&PackageId],
         warnings: &mut Vec<String>,
     ) -> anyhow::Result<()> {
         let mut names: Vec<&String> = self.by_name.keys().collect();
@@ -263,6 +262,94 @@ impl Profiles {
     pub fn profile_names(&self) -> impl Iterator<Item = &str> {
         self.by_name.keys().map(String::as_str)
     }
+
+    /// blaze: takes the requested profile's `contract-checks` from `keys` (the root manifest's,
+    /// [`read_contract_checks`]): the first profile of its `inherits` chain that sets one, else
+    /// the default of the chain's root (`dev` on, `release` off), which the makers carry.
+    pub fn set_contract_checks(&mut self, keys: &ContractChecks) -> anyhow::Result<()> {
+        let mut name = self.requested_profile.as_str();
+        // `Profiles::new` refused every cycle; the bound is for a chain it did not walk.
+        for _ in 0..=self.original_profiles.len() + PREDEFINED_INHERITS.len() {
+            if let Some(&on) = keys.by_profile.get(name) {
+                self.contract_checks = Some(on);
+                return Ok(());
+            }
+            if name == "dev" || name == "release" {
+                return Ok(());
+            }
+            name = match self.original_profiles.get(name).and_then(|it| it.inherits.as_deref()) {
+                Some(parent) => parent,
+                None => match PREDEFINED_INHERITS.iter().find(|(child, _)| *child == name) {
+                    Some((_, parent)) => parent,
+                    None => return Ok(()),
+                },
+            };
+        }
+        bail!(
+            "profile `{}`'s `inherits` chain does not end at `dev` or `release`, reading its `contract-checks`",
+            self.requested_profile
+        )
+    }
+}
+
+/// The built-in profiles' `inherits`, as [`predefined_profiles`] sets them.
+const PREDEFINED_INHERITS: [(&str, &str); 4] =
+    [("debug", "dev"), ("bench", "release"), ("test", "dev"), ("doc", "dev")];
+
+/// blaze: each `[profile.<name>]`'s `contract-checks` in a root manifest
+/// (docs/v2/plan/design/contracts.md, part 1). cargo's `TomlProfile` has no such key (real cargo
+/// warns of an unused manifest key and builds), so it is read from the manifest's TOML itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContractChecks {
+    by_profile: BTreeMap<String, bool>,
+}
+
+/// The `contract-checks` keys of the root manifest at `path`. A value that is not a boolean,
+/// or the key under a profile's `package` or `build-override` table (it is a profile-wide
+/// setting: the crate cfg of every unit of the build), is an error naming the key.
+pub fn read_contract_checks<F: Files>(
+    files: &F,
+    path: &std::path::Path,
+) -> anyhow::Result<ContractChecks> {
+    // alloc: an error's context, made only when the read fails.
+    let bytes = files.read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow::anyhow!("path at `{}` was not valid utf-8", path.display()))?;
+    contract_checks_of(text)
+        .with_context(|| format!("failed to parse manifest at `{}`", path.display()))
+}
+
+/// [`read_contract_checks`] of a manifest's text.
+pub fn contract_checks_of(manifest: &str) -> anyhow::Result<ContractChecks> {
+    const KEY: &str = "contract-checks";
+    let table: toml::Table = manifest.parse()?;
+    let mut by_profile = BTreeMap::new();
+    let Some(profiles) = table.get("profile").and_then(toml::Value::as_table) else {
+        return Ok(ContractChecks { by_profile });
+    };
+    for (name, profile) in profiles {
+        let Some(profile) = profile.as_table() else { continue };
+        if let Some(value) = profile.get(KEY) {
+            let Some(on) = value.as_bool() else {
+                bail!("`profile.{name}.{KEY}` is a boolean (`true` or `false`), not `{value}`");
+            };
+            by_profile.insert(name.clone(), on);
+        }
+        let nested =
+            profile.get("build-override").into_iter().map(|it| ("build-override".to_owned(), it));
+        let packages = profile.get("package").and_then(toml::Value::as_table).into_iter().flatten();
+        for (place, table) in
+            nested.chain(packages.map(|(spec, it)| (format!("package.{spec}"), it)))
+        {
+            if table.get(KEY).is_some() {
+                bail!(
+                    "`profile.{name}.{place}.{KEY}`: `{KEY}` is a setting of the whole profile, \
+                     set under `[profile.{name}]`, not for one package or the build's host units"
+                );
+            }
+        }
+    }
+    Ok(ContractChecks { by_profile })
 }
 
 /// The profile a command builds with, as cargo's `get_profile_name`: `default` (`dev`, or
@@ -285,11 +372,11 @@ pub fn requested_profile(
     }
 }
 
-fn is_ci(config: &Config) -> bool {
+fn is_ci<F: Files>(config: &Config<F>) -> bool {
     config.env("CI").is_some() || config.env("TF_BUILD").is_some()
 }
 
-fn predefined_dir_names() -> FxHashMap<String, String> {
+fn predefined_dir_names() -> HashMap<String, String, Global> {
     [("dev", "debug"), ("test", "debug"), ("bench", "release")]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -297,14 +384,9 @@ fn predefined_dir_names() -> FxHashMap<String, String> {
 }
 
 fn predefined_profiles() -> [(&'static str, TomlProfile); 4] {
-    let inherits =
-        |name: &str| TomlProfile { inherits: Some(name.to_owned()), ..TomlProfile::default() };
-    [
-        ("debug", inherits("dev")),
-        ("bench", inherits("release")),
-        ("test", inherits("dev")),
-        ("doc", inherits("dev")),
-    ]
+    PREDEFINED_INHERITS.map(|(name, parent)| {
+        (name, TomlProfile { inherits: Some(parent.to_owned()), ..TomlProfile::default() })
+    })
 }
 
 /// The hard-coded defaults of a profile and its TOML, `inherits` merged in. The precedence,
@@ -318,12 +400,7 @@ struct ProfileMaker {
 }
 
 impl ProfileMaker {
-    fn get_profile(
-        &self,
-        pkg: Option<&dyn ProfilePackage>,
-        is_member: bool,
-        is_for_host: bool,
-    ) -> Profile {
+    fn get_profile(&self, pkg: Option<&PackageId>, is_member: bool, is_for_host: bool) -> Profile {
         let mut profile = self.default.clone();
         if let Some(toml) = &self.toml {
             merge_profile(&mut profile, toml);
@@ -341,7 +418,7 @@ impl ProfileMaker {
 }
 
 fn merge_toml_overrides(
-    pkg: Option<&dyn ProfilePackage>,
+    pkg: Option<&PackageId>,
     is_member: bool,
     is_for_host: bool,
     profile: &mut Profile,
@@ -459,6 +536,11 @@ pub struct Profile {
     pub incremental: bool,
     pub panic: PanicStrategy,
     pub strip: Strip,
+    /// blaze: whether the unit checks its native contract clauses at run time (manifest key
+    /// `contract-checks`; dev and test on, release and bench off). Not in cargo's unit graph,
+    /// which this type serializes as cargo prints it.
+    #[serde(skip)]
+    pub contract_checks: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rustflags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -484,6 +566,7 @@ impl Default for Profile {
             incremental: false,
             panic: PanicStrategy::Unwind,
             strip: Strip::Deferred(StripInner::None),
+            contract_checks: false,
             rustflags: Vec::new(),
             trim_paths: None,
             hint_mostly_unused: None,
@@ -509,7 +592,7 @@ impl Profile {
             self.debug_assertions,
             self.overflow_checks,
             self.rpath,
-            (self.incremental, self.panic, &self.strip),
+            (self.incremental, self.panic, &self.strip, self.contract_checks),
             &self.rustflags,
             &self.trim_paths,
         )
@@ -523,16 +606,16 @@ impl Profile {
             debug_assertions: true,
             overflow_checks: true,
             incremental: true,
+            contract_checks: true,
             ..Profile::default()
         }
     }
 
-    fn default_release(trim_paths_enabled: bool) -> Profile {
+    fn default_release() -> Profile {
         Profile {
             name: "release".to_owned(),
             root: ProfileRoot::Release,
             opt_level: "3".to_owned(),
-            trim_paths: trim_paths_enabled.then(|| TomlTrimPathsValue::Object.into()),
             ..Profile::default()
         }
     }
@@ -643,14 +726,14 @@ impl PartialEq for Strip {
 }
 
 /// What a unit is built for, as far as its profile goes: cargo's `UnitFor` less its features.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct UnitFor {
     host: bool,
     host_features: bool,
     panic_setting: PanicSetting,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 enum PanicSetting {
     AlwaysUnwind,
     ReadProfile,
@@ -721,10 +804,10 @@ impl UnitFor {
 
 /// The manifest's profiles with the configuration's merged over them, and the profiles only the
 /// configuration defines that the requested one or the built-in ones reach.
-fn merge_config_profiles(
+fn merge_config_profiles<F: Files>(
     manifest_profiles: Option<&TomlProfiles>,
     features: &Features,
-    config: &Config,
+    config: &Config<F>,
     requested_profile: &str,
 ) -> anyhow::Result<BTreeMap<String, TomlProfile>> {
     let mut profiles: BTreeMap<String, TomlProfile> = match manifest_profiles {
@@ -733,7 +816,7 @@ fn merge_config_profiles(
         }
         None => BTreeMap::new(),
     };
-    let mut check_to_add = FxHashSet::default();
+    let mut check_to_add = HashSet::new_in(Global);
     check_to_add.insert(requested_profile.to_owned());
     for (name, profile) in &mut profiles {
         if let Some(config_profile) = get_config_profile(features, config, name)? {
@@ -746,7 +829,7 @@ fn merge_config_profiles(
     for name in ["dev", "release", "debug", "test", "bench"] {
         check_to_add.insert(name.to_owned());
     }
-    let mut current = FxHashSet::default();
+    let mut current = HashSet::new_in(Global);
     while !check_to_add.is_empty() {
         std::mem::swap(&mut current, &mut check_to_add);
         for name in current.drain() {
@@ -763,16 +846,16 @@ fn merge_config_profiles(
     Ok(profiles)
 }
 
-fn get_config_profile(
+fn get_config_profile<F: Files>(
     features: &Features,
-    config: &Config,
+    config: &Config<F>,
     name: &str,
 ) -> anyhow::Result<Option<TomlProfile>> {
     let Some(profile) = config.config_profile(name)? else { return Ok(None) };
     let mut warnings = Vec::new();
-    validate_profile(&profile.val, name, features, &mut warnings).with_context(|| {
-        format!("config profile `{name}` is not valid (defined in `{}`)", profile.definition)
-    })?;
+    validate_profile(&profile.val, name, features, config.unstable(), &mut warnings).with_context(
+        || format!("config profile `{name}` is not valid (defined in `{}`)", profile.definition),
+    )?;
     for warning in warnings {
         config.warn(warning);
     }
@@ -780,7 +863,7 @@ fn get_config_profile(
 }
 
 fn validate_packages_unique(
-    packages: &[&dyn ProfilePackage],
+    packages: &[&PackageId],
     name: &str,
     toml: Option<&TomlProfile>,
 ) -> anyhow::Result<Vec<PackageIdSpec>> {
@@ -814,7 +897,7 @@ fn validate_packages_unique(
 }
 
 fn validate_packages_unmatched(
-    packages: &[&dyn ProfilePackage],
+    packages: &[&PackageId],
     name: &str,
     toml: &TomlProfile,
     found: &[PackageIdSpec],
@@ -827,12 +910,12 @@ fn validate_packages_unmatched(
             continue;
         }
         let name_matches: Vec<String> =
-            packages.iter().filter(|p| p.name() == spec.name()).map(|p| p.to_string()).collect();
+            packages.iter().filter(|p| p.name == spec.name()).map(|p| p.to_string()).collect();
         if name_matches.is_empty() {
             let suggestion = crate::edit_distance::closest_msg(
                 spec.name(),
                 packages.iter(),
-                |p| p.name(),
+                |p| p.name.as_str(),
                 "package",
             );
             warnings.push(format!(
@@ -852,31 +935,36 @@ fn validate_packages_unmatched(
 pub fn validate_profiles(
     profiles: &TomlProfiles,
     features: &Features,
+    unstable: &CliUnstable,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     for (name, profile) in profiles.get_all() {
-        validate_profile(profile, name, features, warnings)?;
+        validate_profile(profile, name, features, unstable, warnings)?;
     }
     Ok(())
 }
 
-/// A profile checked as cargo's `validate_profile` does, the unstable keys refused unless the
-/// manifest's `cargo-features` allow them.
+/// A profile checked as nightly cargo's `validate_profile` does, the unstable keys
+/// (`codegen-backend`, `rustflags`, `panic = "immediate-abort"`) refused unless the manifest's
+/// `cargo-features` list them. For `codegen-backend` cargo also takes `-Zcodegen-backend` (or
+/// `codegen-backend = true` under `[unstable]`) in place of the manifest's, and so does blaze; the
+/// other two `-Z` flags (`-Zprofile-rustflags`, `-Zpanic-immediate-abort`) it does not read yet.
 pub fn validate_profile(
     root: &TomlProfile,
     name: &str,
     features: &Features,
+    unstable: &CliUnstable,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<()> {
-    validate_profile_layer(root, features)?;
+    validate_profile_layer(root, features, unstable)?;
     if let Some(profile) = &root.build_override {
         validate_profile_override(profile, "build-override")?;
-        validate_profile_layer(profile, features)?;
+        validate_profile_layer(profile, features, unstable)?;
     }
     if let Some(packages) = &root.package {
         for profile in packages.values() {
             validate_profile_override(profile, "package")?;
-            validate_profile_layer(profile, features)?;
+            validate_profile_layer(profile, features, unstable)?;
         }
     }
     if let Some(dir_name) = &root.dir_name {
@@ -914,15 +1002,16 @@ pub fn validate_profile(
     Ok(())
 }
 
-fn validate_profile_layer(profile: &TomlProfile, features: &Features) -> anyhow::Result<()> {
-    if profile.codegen_backend.is_some() {
+fn validate_profile_layer(
+    profile: &TomlProfile,
+    features: &Features,
+    unstable: &CliUnstable,
+) -> anyhow::Result<()> {
+    if profile.codegen_backend.is_some() && !unstable.codegen_backend {
         features.require(Feature::codegen_backend)?;
     }
     if profile.rustflags.is_some() {
         features.require(Feature::profile_rustflags)?;
-    }
-    if profile.trim_paths.is_some() {
-        features.require(Feature::trim_paths)?;
     }
     if profile.panic.as_deref() == Some("immediate-abort") {
         features.require(Feature::panic_immediate_abort)?;

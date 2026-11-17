@@ -1,0 +1,34 @@
+{
+ "command": [
+  "blaze",
+  "build",
+  "--locked",
+  "-p",
+  "tracedecay-cli"
+ ],
+ "td": "/Users/bytedance/dev/td-u7",
+ "blaze_bin": "/Users/bytedance/dev/blaze-targets/u7/release",
+ "started": "2026-10-26T04:37:35",
+ "watchdog_mb": 24576,
+ "marks": {
+  "2": 482.8,
+  "4": 549.0,
+  "8": 556.3,
+  "12": 566.7,
+  "16": 594.3
+ },
+ "tripped": null,
+ "peak_mb": 16424,
+ "peak_client_mb": 19638,
+ "swap_start_mb": 5996,
+ "guard": {
+  "RA_JIT_MEMORY_MAX": "16G",
+  "RA_JIT_OWN_BASE_MEMORY": "12G",
+  "RA_JIT_SPARE": "0"
+ },
+ "peak_swap_growth_mb": 0,
+ "exit": 0,
+ "outcome": "ok",
+ "wall_s": 607.1,
+ "last_mb": 5
+}

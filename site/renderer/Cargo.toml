@@ -1,4 +1,4 @@
-# The site's renderer in Rust (README.md). Its own workspace, not a member of ra-jit's: it builds for wasm32 and
+# The site's renderer in Rust (README.md). Its own workspace, not a member of blaze's: it builds for wasm32 and
 # depends on flecs-opinionated by path, neither of which the compiler's workspace should see.
 [workspace]
 resolver = "3"

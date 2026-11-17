@@ -1,0 +1,1044 @@
+// harness-native's tokens: the names den's primitives (harness-native-ui-prims, prims.flecs) read, and the app's own.
+// After den-native's 00-tokens.flecs (github.com/andrewgazelka/den), cut to what harness draws. Colours are sRGB 0..1,
+// `{r, g, b, a}`, straight (not premultiplied); every Fill and Edge has a dark and a light.
+
+// ---- The rules this look keeps (a terminal's: all function, nothing going on) ----
+// 1. Ink only. Four inks on one ground say everything; a kind's mark, a slider, a highlight and a selection are ink
+//    or a step of grey, never a hue. The accent is for a link and a focus ring; red is for a real failure.
+// 2. Nothing moves on its own, and nothing eases. A hover, a highlight, a menu and a sheet are there at once and gone at
+//    once, so no two states ever show together. Work is said in words and a ticking time; the one motion left is the
+//    small status glyph's breath in a chat while something runs (it also keeps that time ticking).
+// The one exception to 1 and 2, asked for by name: the block on a running step's line (ui.Block): pixel art in its
+//    own colours, a game's item icon, that turns to a new face when the step changes and is still between turns.
+// 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass, corners of 8. The one
+//    translucent surface, asked for by name: the sidebar (tone_sidebar), a tint over the system's blur of what is behind
+//    the window. Everything else is opaque.
+// 4. Type is the hierarchy: size, weight and ink before any box, rule or icon.
+//
+// ---- The theme: the one place a colour is chosen ----
+// Every surface names one of these roles, never a colour: a widget's `Fill: $tone_card`, Rust's `look::tone(w, "card")`
+// (hn.Theme, scene/widgets/theme.flecs, holds one child per role). Dark is near-black with a cool undertone: a ground of
+// #0A0B0D, plates a step or two above it, hairlines barely over the ground, one blue (#4D8EFF) for a link and a focus
+// ring, colour only where it means something; code keeps JetBrains' Islands Dark scheme (code_ink below); light is the blaze site's paper
+// (site/styles/tokens.css) with the same blue. Another look is another set of these values; nothing else changes. The
+// scene test `no_raw_colours` (src/app.rs) fails on a colour literal anywhere but here and the palettes below.
+//
+// Grounds, darkest to most lifted:
+// - ground: the window and the main card under every pane (#0A0B0D / #f2f1ee).
+// - sidebar: the sidebar. The main card's ground as a tint (its alpha is the one place the sidebar's translucency is
+//   chosen) over the window's vibrancy, the system's blur of what is behind the window (src/window.rs: the
+//   NSVisualEffectView under the Metal view), as Finder's and Maps' sidebars are; one `line` hairline (hn.Seam) divides
+//   it from the main card. Keep its colour the ground's: with nothing behind the window (an offscreen shot, iOS) the
+//   host draws it at alpha 1 (src/app.rs opaque_sidebar), which is then the ground itself.
+// - card: a plate that sits on the ground: the composer, the palette's and the picker's cards, a generated Card (#111216).
+// - raised: what floats over everything, solid (never glass): menus, popovers, hover cards, a user's bubble (dark #16181C; light --bg-3, so a
+//   popover lifts toward the light on the paper ground).
+// - well: what is sunk into a surface: a field, a code block, a rename field (#070809).
+// - term_ground: the terminal's own ground, under a terminal pane's grid only; the one role the user's Ghostty theme sets
+//   (src/app/ghostty.rs), since a terminal's colours are chosen against it. The built-in theme's is the dark ground in both.
+export mut tone_ground: Fill = {dark: {0.039, 0.043, 0.051, 1}, light: {0.949, 0.945, 0.933, 1}}
+export mut tone_sidebar: Fill = {dark: {0.039, 0.043, 0.051, 0.72}, light: {0.949, 0.945, 0.933, 0.66}}
+export mut tone_card: Fill = {dark: {0.067, 0.071, 0.086, 1}, light: {0.965, 0.961, 0.949, 1}}
+export mut tone_raised: Fill = {dark: {0.086, 0.094, 0.11, 1}, light: {0.965, 0.961, 0.949, 1}}
+export mut tone_well: Fill = {dark: {0.027, 0.031, 0.035, 1}, light: {0.922, 0.918, 0.898, 1}}
+export mut tone_term_ground: Fill = {dark: {0.039, 0.043, 0.051, 1}, light: {0.039, 0.043, 0.051, 1}}
+// Lines: a hairline (a card's edge, a rule, the sidebar's seam; --line) and the stronger one (a floating plate's edge, a
+// control's track or outline; --line-2).
+export mut tone_line: Fill = {dark: {0.102, 0.11, 0.129, 1}, light: {0.863, 0.859, 0.835, 1}}
+export mut tone_line_strong: Fill = {dark: {0.149, 0.161, 0.188, 1}, light: {0.804, 0.800, 0.776, 1}}
+// Inks: strong (titles, headings, a selected row, bold), the body, muted (secondary words, icons at rest), faint (meta,
+// markers, a placeholder, what has ended); --ink-1..4.
+export mut tone_ink_strong: Fill = {dark: {0.929, 0.937, 0.949, 1}, light: {0.086, 0.086, 0.090, 1}}
+export mut tone_ink: Fill = {dark: {0.761, 0.773, 0.8, 1}, light: {0.275, 0.275, 0.290, 1}}
+export mut tone_ink_muted: Fill = {dark: {0.545, 0.565, 0.6, 1}, light: {0.420, 0.416, 0.431, 1}}
+export mut tone_ink_faint: Fill = {dark: {0.353, 0.373, 0.412, 1}, light: {0.635, 0.631, 0.616, 1}}
+// Washes: the strong ink at an alpha, so they read on any ground. Hover (a row's, a button's), wash (a resting plate,
+// inline code's: --s-tint), selection (the selected row's pill), selection_focus (a step brighter, never a colour, while its list has
+// the keyboard; a menu's highlighted item), press (held). A scrim dims what is under a sheet.
+export mut tone_hover: Fill = {dark: {1, 1, 1, 0.04}, light: {0.086, 0.086, 0.090, 0.04}}
+export mut tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {0.086, 0.086, 0.090, 0.06}}
+export mut tone_selection: Fill = {dark: {0.102, 0.114, 0.137, 1}, light: {0.086, 0.086, 0.090, 0.06}}
+export mut tone_selection_focus: Fill = {dark: {0.137, 0.149, 0.176, 1}, light: {0.086, 0.086, 0.090, 0.085}}
+export mut tone_press: Fill = {dark: {1, 1, 1, 0.1}, light: {0.086, 0.086, 0.090, 0.11}}
+export mut tone_scrim: Fill = {dark: {0, 0, 0, 0.36}, light: {0, 0, 0, 0.14}}
+export mut tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+// Selected text's plate (ui.selection; every surface's, the terminal's too): IntelliJ's text selection blue (the strong
+// ink at 18% on the paper).
+export mut tone_text_selection: Fill = {dark: {0.122, 0.227, 0.42, 0.9}, light: {0.086, 0.086, 0.090, 0.18}}
+// The light a copy sweeps over what it took (ui.selection's CopyLook): the accent lifted toward white on the dark page,
+// where it adds to the plate, and the accent itself on the paper, where it tints; its alpha is the light at its brightest.
+export mut tone_copy_sheen: Fill = {dark: {0.72, 0.82, 1.0, 0.24}, light: {0.22, 0.443, 0.882, 0.16}}
+// The ink a Sheen's band lifts words toward (a working row's title, ui.Shimmer): on the dark page past the strong ink, to a
+// near-white with a breath of the accent's cool in it, so the band still reads as light over a selected row's strong title;
+// on the paper a deep accent ink, since brightening dark words toward the paper would only fade them.
+export mut tone_sheen: Fill = {dark: {0.9, 0.95, 1.0, 1}, light: {0.11, 0.30, 0.74, 1}}
+// The accent: only what is on or pressable-and-chosen (a switch, a focused control, a load bar); its faint wash (a search
+// match, a highlighted cell); the ink on a solid accent or a coloured badge. A link's ink; inline code's (--doc-code-ink).
+export mut tone_accent: Fill = {dark: {0.302, 0.557, 1, 1}, light: {0.22, 0.443, 0.882, 1}}
+// The level slider's fill and its ends' words (level_*, below), from the theme's inks.
+export mut tone_level_fill: Fill = $tone_ink
+export mut tone_level_scale: Fill = $tone_ink_faint
+export mut tone_accent_wash: Fill = {dark: {0.302, 0.557, 1, 0.16}, light: {0.22, 0.443, 0.882, 0.16}}
+export mut tone_on_accent: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
+// An aside (a chat draft that starts with a space: a question asked of a fork of the conversation, outside it): the
+// composer's card while the draft is one, and the answer's card over it, a plate of the card's ground with a little of
+// the accent in it, edged in the accent at a low alpha, so the mode reads at a glance and stays quiet. Opaque, so the
+// composer's lift does not show through it.
+export mut tone_aside: Fill = {dark: {0.063, 0.094, 0.161, 1}, light: {0.904, 0.921, 0.948, 1}}
+export mut tone_aside_line: Fill = {dark: {0.302, 0.557, 1, 0.4}, light: {0.22, 0.443, 0.882, 0.35}}
+export mut tone_link: Fill = {dark: {0.478, 0.655, 1, 1}, light: {0.149, 0.459, 0.749, 1}}
+export mut tone_code_ink: Fill = {dark: {0.808, 0.816, 0.839, 1}, light: {0.031, 0.031, 0.031, 1}}
+// States, colour that carries meaning only: success (running, passed; --ok), warning (lost, pending), error (failed,
+// killed; --danger), each with a faint wash for a plate behind words in it.
+export mut tone_success: Fill = {dark: {0.427, 0.69, 0.514, 1}, light: {0.125, 0.541, 0.235, 1}}
+export mut tone_warning: Fill = {dark: {0.835, 0.588, 0.216, 1}, light: {0.761, 0.49, 0.016, 1}}
+export mut tone_error: Fill = {dark: {0.961, 0.494, 0.518, 1}, light: {0.788, 0.31, 0.31, 1}}
+export mut tone_success_wash: Fill = {dark: {0.427, 0.69, 0.514, 0.12}, light: {0.125, 0.541, 0.235, 0.1}}
+export mut tone_warning_wash: Fill = {dark: {0.835, 0.588, 0.216, 0.12}, light: {0.761, 0.49, 0.016, 0.11}}
+export mut tone_error_wash: Fill = {dark: {0.961, 0.494, 0.518, 0.12}, light: {0.788, 0.31, 0.31, 0.1}}
+// Controls' parts: a switch's or slider's knob (a light disc in both appearances), an overlay scroller's knob and the
+// faint track it widens over (ui.Scroller; AppKit's).
+export mut tone_knob: Fill = {dark: {0.95, 0.95, 0.96, 1}, light: {1, 1, 1, 1}}
+export mut tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.18}, light: {0.086, 0.086, 0.090, 0.20}}
+export mut tone_scroller_track: Fill = {dark: {1, 1, 1, 0.03}, light: {0.086, 0.086, 0.090, 0.03}}
+
+// ---- Palettes: colours that name a thing, not a surface ----
+// A kind's icon, a brand mark, a file type, a chart series, a GitHub state, code by capture, the colour well's hues and
+// F3's overlay. Each is data (which thing this is), so it is not a role; it still lives only in this file.
+
+// Type: macOS sidebar sizes in Inter. Rows 13, runs 12, section labels 11, a run's command in the code face 11.5.
+export const size_caption = 11
+export const size_body = 13
+// Chrome: the words on controls that sit around content rather than being it (the composer's model picker, a bar's
+// readouts), clearly a step under the body (size_chat, size_body) so what was typed or said leads; line_chrome is
+// their line, which the bar centres them on.
+export const size_chrome = 11.5
+export const line_chrome = 14
+export const size_row = 13
+export const size_run = 12
+export const size_label = 11
+export const size_code = 11.5
+// Weights (CSS numbers): a row's name medium (the Archive's, the palette's, the picker's), a section label semibold; a
+// sidebar tree row's title a touch over regular (Notion's sidebar reads that weight on its dark ground), medium while
+// selected.
+export const weight_row = 500
+export const weight_tree = 450
+export const weight_tree_on = 540
+export const weight_label = 600
+
+// The Archive's rows (hn.Arch*): 24 tall, children indented indent_step a level (the tree's step too), icons 14 in a 16
+// box, its disclosure slot disclose_w wide with a chevron_box chevron. The sidebar's tree has its own (tree_* below).
+export const row_h = 24
+export const indent_step = 12
+export const icon_box = 16
+export const chevron_box = 12
+export const disclose_w = 18
+// The sidebar's tree, Notion's sidebar: calm one-line rows, a title and a few muted words trailing it, no dots and no
+// marks. A session row tree_row_h tall, a run tree_run_h, packed (the air between rows is the pill's inset). Each row
+// starts its chevron gutter (tree_gutter wide) tree_pad in from its left edge plus indent_step a level, so a child's
+// chevron sits under its parent's mark or title (gutter and step are equal) and the title column never moves; then its title,
+// tree_gap, its trailing words; tree_pad_r on the right. The chevron is a thin vector mark tree_chevron across (its ink
+// about 7.5 tall), shown in tone_ink_faint where the row has rows under it (folded, it holds what finished). tree_icon is
+// the Archive button's glyph box. Folded with work under it, a session's row shows a faint dot (tree_under_dot)
+// tree_under_gap before how many.
+export const tree_row_h = 28
+export const tree_run_h = 22
+export const tree_gutter = 12
+export const tree_icon = 16
+export const tree_under_dot = 8
+export const tree_under_gap = 3
+export const tree_chevron = 9
+// A row's kind at a glance (an agent's mark, a terminal glyph): tree_kind across, tree_kind_gap before its title. A
+// row's trailing words are at most tree_trail_max wide, so the title keeps the row.
+export const tree_kind = 12
+export const tree_kind_gap = 6
+export const tree_trail_max = 84
+// The tree's indent guides (hn.Hang's slots): a hairline down the middle of each ancestor's chevron gutter, in
+// tone_guide (Islands' tree-indent-guide-border), for as many levels as tree_guides; a done mark in a childless row's
+// gutter (tree_mark across: a check in tone_success, a cross in tone_error).
+export const tree_guide_w = 1
+export const tree_guides = 6
+export const tree_mark = 11
+export mut tone_guide: Fill = {dark: {0.122, 0.133, 0.153, 1}, light: {0.086, 0.086, 0.090, 0.10}}
+export const tree_pad = 2
+export const tree_pad_r = 8
+export const tree_gap = 6
+export const line_row = 16
+// The selection pill and the hover wash hug the row pill_inset in from its frame (4 points of air between neighbours),
+// corners radius_row.
+export const pill_inset = 2
+export const radius_row = 6
+// The work bar (frame.flecs hn.WorkBar): work_bar_h tall, its band work_bar_share of the window long, crossing in
+// work_bar_period seconds.
+export const work_bar_h = 2
+export const work_bar_share = 0.28
+export const work_bar_period = 1.6
+// ui.Block (prims.flecs): a pixel-art block block_size across (16 texels: 1.5 points each), turning to a new face over
+// block_turn seconds.
+export const block_size = 24
+export const block_turn = 0.32
+// ui.Shimmer's default Sheen (prims.flecs; harness-video's captions use the primitive, the app's own views do not: rule
+// 2): a pass of sheen_think_period seconds, then sheen_think_rest at rest; the band sheen_think_band points either side
+// of its middle, lifting the letters sheen_think_strength of the way to tone_sheen; sheen_think_ease of an ease-in-out;
+// steady at sheen_still of it under Reduce Motion.
+export const sheen_think_period = 2.6
+export const sheen_think_rest = 1.1
+export const sheen_think_band = 36
+export const sheen_think_strength = 0.7
+export const sheen_think_ease = 0.6
+export const sheen_still = 0.35
+// The group header (the device's name) over the tree, group_h tall, its words label_inset in from the sidebar's edge:
+// in line with the depth-0 chevrons.
+export const group_h = 28
+
+// The sidebar's side margin: the tree pads itself by it, and the Archive row sits in from it. label_inset is the group
+// header's left edge: side_inset + tree_pad + the chevron's inset in its gutter, in line with the depth-0 chevrons.
+export const side_inset = 8
+export const label_inset = 16
+export const row_gap = 8
+export const row_pad = 8
+
+// A status dot, and a failure's badge (its exit code).
+export const dot_size = 6
+export const dot_radius = 3
+export const badge_h = 15
+export const badge_radius = 4
+export const badge_pad = 5
+export const size_badge = 10
+export const line_badge = 12
+
+// Springs (omega rad/s, zeta): a breath (slow, critically damped; a chat status dims to breath_floor), the sidebar
+// folding (cmd+S).
+export const breath_omega = 3.2
+export const breath_zeta = 1
+export const breath_floor = 0.3
+export const sidebar_omega = 60
+export const sidebar_zeta = 1
+// The sidebar tree's one spring family: what moves in it together lands together, critically damped (no overshoot,
+// no ring) on tree_omega, fast enough to read as near instant (settled in under a tenth of a second) while still
+// showing where a row went. A row folding in or away (a new chat's row growing in, a finished run folding off), the
+// selection pill sliding between rows (its position; its size is always its row's), the scroll gliding to the
+// selection and a disclosure chevron's quarter turn all ride it; Reduce Motion lands each at once.
+export const tree_omega = 64
+export const tree_zeta = 1
+export const turn_omega = $tree_omega
+export const turn_zeta = $tree_zeta
+export const pill_omega = $tree_omega
+export const pill_zeta = $tree_zeta
+export const tree_fold_omega = $tree_omega
+export const tree_fold_zeta = $tree_zeta
+export const tree_glide_omega = $tree_omega
+export const tree_glide_zeta = $tree_zeta
+// A folding row's words: they show only once the row has tree_fold_lead of its height, easing in over the rest as
+// they settle tree_fold_rise points down into place (and go the same way back, before the row closes).
+export const tree_fold_lead = 0.45
+export const tree_fold_rise = 4
+// From rest, a selection move of more than this many rows lands at once (mid-slide it always slides on): far enough
+// that a new chat's row at the foot of a screenful glides, a cmd+9 across a long tree lands.
+export const pill_jump_rows = 8
+// The tree's scroll: the margin the glide to the selected row leaves inside an edge, the edge fade.
+export const tree_reveal_margin = 8
+export const tree_fade_len = 22
+// Dragging the sidebar's edge (den's feel, src/resize.rs): its width stays between side_min and side_max; dragged left
+// past half of side_min by side_latch more it latches closed (folding away on the sidebar spring), and dragged back
+// out past half of side_min by side_latch it latches open again, so it never flickers at the boundary. Past side_max
+// it stretches at most side_give, half of it side_soft points past, and the whole window rubber-bands right by that
+// much, springing back on the window_back spring when let go. Touching side_max pulses once, again only after a
+// side_rearm retreat. A press within side_grab of the edge grabs it; folded, a press within side_reach of the window's
+// left edge does (wider, clear of AppKit's own window-resize band). side_keep is the least the main card keeps beside
+// it, lowering side_max in a narrow window.
+export const side_min = 180
+export const side_max = 300
+export const side_latch = 8
+export const side_give = 24
+export const side_soft = 48
+export const side_rearm = 8
+export const side_grab = 5
+export const side_reach = 10
+export const side_keep = 320
+export const window_back_omega = 44
+export const window_back_zeta = 1
+// Overlay scrollers (prims.flecs ui.Scroller, on every ui.Scroll; macOS's overlay NSScroller): the knob scroller_thin
+// across at rest and scroller_wide over its track while the pointer is within scroller_grab of the edge, scroller_inset
+// off the edge, never shorter than scroller_min (but shortened under a rubber band). It shows as the content scrolls,
+// stays scroller_hold seconds after it stops, then fades; it comes in on the show spring, goes on the hide spring, widens
+// on the wide spring. A press on the track pages toward it on the page spring, keeping scroller_keep points in view.
+export const scroller_thin = 6
+export const scroller_wide = 10
+export const scroller_inset = 2
+export const scroller_min = 24
+export const scroller_grab = 16
+export const scroller_hold = 0.7
+export const scroller_keep = 24
+export const scroller_show_omega = 40
+export const scroller_show_zeta = 1
+export const scroller_hide_omega = 13
+export const scroller_hide_zeta = 1
+export const scroller_wide_omega = 32
+export const scroller_wide_zeta = 1
+export const scroller_page_omega = 44
+export const scroller_page_zeta = 1
+// The traffic lights fading in while the pointer rests in their corner (sidebar folded, Dia's).
+export const lights_omega = 48
+export const lights_zeta = 1
+// The generic motion springs (prims.flecs's ui.spring tokens): a node's insert and removal Transition, a MatchedGeometry
+// slide (the selection pill between rows), and an Animate node's Size, Padding and Fill easing.
+export const spring_transition_omega = 56
+export const spring_transition_zeta = 1
+export const spring_matched_omega = 64
+export const spring_matched_zeta = 1
+export const spring_layout_omega = 56
+export const spring_layout_zeta = 1
+// A Posed node's glide to its pose (prims.flecs ui.spring.pose, motion's Posing): den's `smooth` GenSpring.
+export const spring_pose_omega = 56
+export const spring_pose_zeta = 1
+
+// The Archive pane: its title, search line, filter chips, day headings and the right-hand columns (duration, time).
+export const size_title = 15
+export const field_h = 30
+export const chip_h = 24
+export const chip_radius = 12
+export const section_h = 30
+export const arch_took_w = 56
+export const arch_time_w = 84
+// A finished child (a run, a stage, a sub-agent) stays among a folded node's rows this long after it ended, its done
+// mark in its gutter, then folds away (seconds).
+export const tree_linger_s = 5
+// A finished run with no session leaves the live tree this long after it ended (seconds).
+export const archive_after_s = 600
+// How long after it ended a top-level session (a chat that exited, was stopped or lost its daemon) stays in the tree
+// before the Archive files it on its own (seconds; an hour). A message to it in the Archive brings it back.
+export const archive_done_after_s = 3600
+
+// Overlays over the window: the command palette (cmd+K) and the new-object picker (cmd+N), each a card on a scrim
+// (hn.Scrim, hn.OverlayCard in scene/widgets/palette.flecs), there at once and gone at once.
+export const overlay_radius = 8
+export const overlay_pad = 6
+
+// Menus (prims.flecs ui.Menu and its parts), macOS NSMenu's: a plate menu_radius round that hugs its widest item (at
+// least menu_min_w, at most menu_max_w), menu_pad in from its edge, hung menu_gap off what opened it, its shadow
+// menu_lift_* (an in-window plate's; a windowed one has the system's); it is there at once. An item is
+// menu_item_h tall at size_menu, its highlight a pill menu_item_radius round in tone_selection_focus, on one item only;
+// a ticked item's check sits in the leading gutter (menu_gutter_l in, menu_check across, menu_gutter_gap before the
+// label), so every label starts at menu_label_x whether ticked or not. Its trailing words (a model's line, a key) are
+// muted, at least menu_trail_gap after the label. A section's head is size_menu_head, muted; a separator is a hairline
+// menu_sep_pad above and below.
+export const menu_radius = 8
+export const menu_pad = 5
+export const menu_gap = 6
+export const menu_min_w = 120
+export const menu_max_w = 380
+export const menu_lift_blur = 18
+export const menu_lift_alpha = 0.28
+export const menu_lift_dy = 6
+export const menu_item_h = 22
+export const menu_item_radius = 5
+export const menu_item_pad_r = 10
+export const menu_gutter_l = 6
+export const menu_check = 11
+export const menu_gutter_gap = 5
+export const menu_label_x = $menu_gutter_l + $menu_check + $menu_gutter_gap
+export const menu_trail_gap = 20
+export const menu_head_h = 20
+export const menu_sep_pad = 5
+// A menu item's meta (prims.flecs ui.MenuItem `meta`: a version, a count) sits menu_meta_gap after its label, muted, at
+// size_menu_meta. A section head with its maker's mark (ui.MenuHeadMarked) carries the mark in the check gutter.
+export const menu_meta_gap = 5
+export const size_menu_meta = 12
+// A level slider (level.flecs ui.LevelSlider, harness_native_ui_view::level): a few named stops on a groove level_groove_h
+// tall, level_groove_radius round, filled in tone_level_fill up to a knob level_knob across (tone_level_knob, its
+// hairline tone_level_knob_edge, a small lift), each stop a dot level_tick across (tone_level_tick) where the knob rests
+// on it. The knob glides between stops on the level spring. Its head (the name of what it sets, then the stop's name) is
+// level_head_h tall at size_level_head; its scale (what the ends mean) at size_level_scale in tone_level_scale, level_gap
+// apart from the track.
+export const level_groove_h = 4
+export const level_groove_radius = 2
+export const level_knob = 14
+export const level_tick = 3
+export const level_gap = 5
+export const level_head_h = 18
+export const size_level_head = 12
+export const size_level_scale = 10.5
+export const line_level_scale = 13
+export const level_omega = 52
+export const level_zeta = 0.9
+export mut tone_level_groove: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.09}}
+export mut tone_level_tick: Fill = {dark: {1, 1, 1, 0.30}, light: {0, 0, 0, 0.24}}
+export mut tone_level_knob: Fill = {dark: {0.95, 0.95, 0.96, 1}, light: {1, 1, 1, 1}}
+export mut tone_level_knob_edge: Fill = {dark: {0, 0, 0, 0.30}, light: {0, 0, 0, 0.18}}
+// A searchable menu (search_menu.flecs ui.SearchMenu): a marked item's mark menu_mark across before its label, the
+// filter's caret menu_caret_w wide.
+export const menu_mark = 13
+export const menu_caret_w = 1.5
+export const size_menu = 13
+export const line_menu = 16
+export const size_menu_head = 11
+// The palette: a wide card near the window's top, its query line, its entries.
+export const palette_w = 560
+export const palette_top = 96
+export const palette_query_h = 38
+export const palette_row_h = 32
+// The picker: a narrow card a little above the window's middle (picker_rise lifts it), a quiet label over one row a
+// kind (its mark in a picker_mark box, its name, its shortcut, the key that picks it in a keycap).
+export const picker_w = 300
+export const picker_rise = 80
+export const picker_head_h = 24
+export const picker_row_h = 34
+export const picker_mark = 18
+export const keycap_min = 18
+export const keycap_h = 18
+export const keycap_pad = 5
+export const keycap_radius = 4
+export const size_keycap = 11
+export const line_keycap = 13
+
+export const radius_control = 6
+export const radius_card = 8
+// ui.Bubble: its corners and the most it widens to before its words wrap (about 65 characters of body text).
+export const radius_bubble = 8
+export const bubble_max_w = 480
+
+// An icon button (ui.IconButton) has no plate: its glyph rests in tone_ink_muted and eases to tone_ink_strong under the
+// pointer (tone_accent while what it opens is open); held, it scales to icon_press_scale and dims to icon_press_dim, and
+// springs back on the press spring (a little under-damped, so the release has a touch of give).
+export const icon_press_scale = 0.92
+export const icon_press_dim = 0.7
+export const spring_press_omega = 38
+export const spring_press_zeta = 0.62
+
+// A kind's icon and the brand marks (hn.Kind): ink only, so they turn with the appearance; no brand's colour.
+export mut tone_kind_claude: Fill = $tone_ink_muted
+export mut tone_kind_codex: Fill = $tone_ink_muted
+export mut tone_kind_cursor: Fill = $tone_ink_muted
+
+prefab Strong {
+  Fill: $tone_ink_strong
+}
+prefab Ink {
+  Fill: $tone_ink
+}
+prefab Muted {
+  Fill: $tone_ink_muted
+}
+prefab Faint {
+  Fill: $tone_ink_faint
+}
+prefab Accent {
+  Fill: $tone_accent
+}
+prefab Wash {
+  Fill: $tone_wash
+}
+prefab Plate {
+  Fill: $tone_card
+  Edge: {dark: $tone_line.dark, light: $tone_line.light}
+  Shape: {radius: $radius_card, n: 4, border: 1, feather: 0}
+}
+
+// F3's debug overlay (hn.Stats, src/app/stats.rs), over the terminal's ground in both appearances: a translucent plate, its
+// monospace caption, and its frame-time bars (a frame over the 60 Hz budget in the hot tone).
+export const size_stats = 11
+export const line_stats = 14
+export const radius_stats = 6
+export mut tone_stats_plate: Fill = {dark: {0, 0, 0, 0.62}, light: {0, 0, 0, 0.62}}
+export mut tone_stats_ink: Fill = {dark: {1, 1, 1, 0.90}, light: {1, 1, 1, 0.90}}
+export mut tone_stats_bar: Fill = {dark: {0.427, 0.69, 0.514, 0.85}, light: {0.427, 0.69, 0.514, 0.85}}
+export mut tone_stats_hot: Fill = {dark: {0.961, 0.494, 0.518, 1}, light: {0.961, 0.494, 0.518, 1}}
+
+// The selection's shape (harness-native-render's select.rs; its colour is the theme's tone_text_selection): one plate
+// under the glyphs wherever text is selected (a chat's transcript and input, a table's copied row, the terminal), corners
+// of radius 4 on a superellipse of n 2; its rows join into one shape (a corner a touching row covers stays square).
+// Ghostty's selection-background, where the theme sets one, retints it.
+export const plate_selection_radius = 4
+export const plate_selection_n = 2
+// Cmd+C pulses it, a timeline rather than a spring. The grow is den's FlashLook (after the site's selshape.ts and the os
+// text field): the shape and its glyphs grow by copy_grow about the selection's middle over copy_secs, on a fast ease-out
+// peaking copy_rise of the way in, and fall back as a cubic. With it a light (tone_copy_sheen) sweeps the whole shape left
+// to right over copy_sweep on an ease-in-out, coming up and dying away as it goes: a soft band copy_band points either
+// side of its middle, leaning back copy_tilt points for every point down so each row below lights a beat after the one
+// above. It adds to the plate on the dark page (copy_add_dark 1) and lies over it as a tint on the paper (copy_add_light
+// 0), and the glyphs it crosses take copy_ink of its colour where it is brightest. Under Reduce Motion nothing grows or
+// moves: the shape and its glyphs brighten by the light and fade back over copy_secs. At its end the pulse is exactly at
+// rest and the frame goes idle.
+export const copy_secs = 0.16
+export const copy_rise = 0.18
+export const copy_grow = 0.025
+export const copy_sweep = 0.28
+export const copy_band = 30
+export const copy_tilt = 0.6
+export const copy_ink = 0.6
+export const copy_add_dark = 1
+export const copy_add_light = 0
+// The text caret (prims.flecs ui.caret, den's CaretLook): a bar caret_w wide (whole device pixels), caret_h of the
+// font's size tall about its line's middle, caret_radius round. A jump farther than its height sweeps from where it was
+// over caret_glide seconds on an ease-out cubic, its tail at half the bar's ink; after it last moved it stays solid
+// caret_hold seconds, then blinks once every caret_blink seconds (on for the first half), each turn eased over caret_fade
+// of the cycle. Its ink is tone_ink_strong. The sweep is off by default (caret_glide 0: the caret snaps); 0.2 turns it on.
+export const caret_w = 1.5
+export const caret_h = 1.25
+export const caret_radius = 0.75
+export const caret_glide = 0
+export const caret_hold = 0.5
+export const caret_blink = 1.06
+export const caret_fade = 0.09
+// Struck-through words (prims.flecs ui.strike, inline markdown's ~~struck~~): a strike_w point hairline (at least a
+// device pixel) whose middle sits strike_rise_em of the words' size over their baseline (half Inter's x-height, 0.546
+// em), in the text's own ink at strike_alpha of it.
+export const strike_w = 1
+export const strike_rise_em = 0.27
+export const strike_alpha = 0.7
+// LaTeX math (prims.flecs ui.formula; inline markdown's $…$, a chat's displayed formula): set at math_inline_scale of
+// its words' size in a line, math_display_scale displayed (Computer Modern's x-height is smaller than Inter's, hence above
+// 1), keeping math_inline_pad or math_display_pad points clear above and below in its line; strokes math_stroke_em thick
+// (KaTeX's 1.5 px at its 40 px em). den's MathLook.
+export const math_inline_scale = 1.1
+export const math_display_scale = 1.25
+export const math_inline_pad = 2
+export const math_display_pad = 10
+export const math_stroke_em = 0.0375
+// Inline code's chip (MarkdownText).
+export const textarea_max_h = 132
+// A growing text area (ui.field.GrowingTextArea): it grows with its words to textarea_grow_share of its pane's height
+// (less what the pane shows around it), then scrolls; a caret out of view glides back textarea_caret_margin points inside
+// the edges on the textarea_glide spring.
+export const textarea_grow_share = 0.85
+export const textarea_caret_margin = 6
+export const textarea_glide_omega = 48
+export const textarea_glide_zeta = 1
+// How far a text area's placeholder starts after its caret (which stands at the words' start), as a macOS field's does.
+export const textarea_hint_inset = 4
+// ui.Table: a row's height, the room between columns, a row's inset and its words' size; ui.Result: a snippet's two lines.
+export const table_row = 24
+export const table_gap = 14
+export const table_pad = 6
+export const size_table = 12.5
+export const result_snippet_h = 36
+
+// The chat pane (hn.ChatPane, scene/widgets/chat.flecs, src/app/chat.rs): a column of the transcript as wide as reads
+// well, the user's words on a soft plate, code on a card, tool calls as quiet one-line rows, the input at the foot.
+// chat_w is the reading column (the words, the bubble's trailing edge, the input): centred, chat_pad clear of the pane's
+// edges either side when the pane is narrower. It is the measure: chat_measure ems of the body text, about 70
+// characters of Inter at 35 (iA Writer's), widened for a chat that is half code, so a line still never runs the width of
+// a wide window.
+export const chat_pad = 24
+// How far the transcript thins out where it scrolls under the composer (and under the pane's top): soft, never a cut line.
+export const chat_fade_len = 12
+// A reply streaming in (theme role chat_stream): the transcript follows its end on a spring (landing at once from rest
+// when the end is more than chat_follow_far away); each glyph rises chat_glyph_rise points and fades in over
+// chat_glyph_dur seconds from the frame it came; and words show at an even pace about chat_pace_lag seconds behind what
+// came, chat_pace_min to chat_pace_max bytes of text (about characters) a second, never more than chat_pace_most
+// seconds behind.
+export const chat_follow_omega = 40
+export const chat_follow_zeta = 1
+export const chat_follow_far = 2000
+export const chat_glyph_dur = 0.18
+export const chat_glyph_rise = 2
+export const chat_pace_lag = 0.25
+export const chat_pace_min = 30
+export const chat_pace_max = 1400
+export const chat_pace_most = 2
+// Vertical rhythm, top to bottom: chat_gap_block between two blocks of a reply (half above a block, half below; under
+// half a line, so a short reply reads as a few small paragraphs of one thought, not a document's), the person's message
+// chat_gap_turn below the reply before it and chat_gap_reply above the reply to it (a message sits with its answer).
+export const chat_gap_block = 10
+export const chat_gap_turn = 28
+export const chat_gap_reply = 14
+export const chat_block_half = $chat_gap_block / 2
+// The person's bubble: its words' inset (even to the eye: the line's own leading adds to the vertical), its line, and the
+// least room it leaves at the leading edge.
+export const chat_bubble_pad_x = 12
+export const chat_bubble_pad_y = 7
+export const line_chat_bubble = 20
+export const chat_bubble_lead = 48
+// Body text: 14 on a 21 line (1.5).
+export const size_chat = 14
+export const line_chat = 21
+// The measure (chat_w, above): wide enough for code and tables beside the words (a line of prose runs about 100
+// characters of Inter at its widest).
+export const chat_measure = 52
+export const chat_w = $size_chat * $chat_measure
+// Headings: a scale of about 1.15 over the body, each semibold in the strong ink (tone_ink_strong), set by size and
+// weight, never by colour. Each sits closer to what it heads than to what came before: chat_h<n>_above over it,
+// chat_h<n>_below under it (less a block's half gap, which the block under it brings).
+export const size_chat_h1 = 21
+export const line_chat_h1 = 27
+export const chat_h1_above = 20
+export const chat_h1_below = 4
+export const size_chat_h2 = 18
+export const line_chat_h2 = 24
+export const chat_h2_above = 16
+export const chat_h2_below = 2
+export const size_chat_h3 = 15.5
+export const line_chat_h3 = 22
+export const chat_h3_above = 12
+export const chat_h3_below = 0
+// Lists (hn.ChatItem*): a hanging indent, the marker in a chat_list_mark_w gutter so wrapped lines align with the words,
+// not the marker; chat_list_inset in from the column's edge; a nested list chat_list_nest further in (the parent's words'
+// edge); chat_item_gap between items, much less than between paragraphs. A bullet is small (size_chat_bullet) and faint
+// (tone_ink_faint), a number the body's size in the muted ink with tabular figures.
+export const chat_list_mark_w = 18
+export const chat_list_inset = 2
+export const chat_list_nest_w = $chat_list_mark_w
+export const chat_item_gap = 3
+export const chat_item_half = $chat_item_gap / 2
+export const size_chat_bullet = 10
+export const line_chat_code = 17
+export const chat_bubble_radius = 8
+// The widest a user's bubble gets before its words wrap: about three quarters of the column, as iMessage and ChatGPT do.
+export const chat_bubble_max_w = $chat_w * 0.8
+// The composer (hn.ChatPane's foot.card): one card holding the words, centred in the reading column (chat_w wide at
+// most, as the transcript), chat_foot_pad_t over it; the status bar (foot.status) under it, chat_foot_pad_b over the
+// pane's foot. The card is a step lighter than the chat's ground with one hairline round it and no shadow,
+// chat_composer_radius round, chat_composer_pad in from its sides; the words sit a further
+// chat_composer_text_inset in (so they start where the status bar's model control's words do), chat_composer_pad_t under
+// its top and chat_composer_pad_b over its bottom.
+export const chat_foot_pad_t = 6
+export const chat_foot_pad_b = 8
+export const chat_composer_radius = 8
+// What runs for a chat, over its composer (hn.ChatActivityItem): items chat_activity_h tall, chat_activity_gap apart,
+// chat_activity_radius round, chat_activity_pad in, a glyph chat_activity_icon across chat_activity_icon_gap before
+// its words, at most chat_activity_max_w wide (the words cut first); chat_activity_below of air under the strip.
+export const chat_activity_h = 22
+export const chat_activity_gap = 6
+export const chat_activity_radius = 7
+export const chat_activity_pad = 8
+export const chat_activity_icon = 11
+export const chat_activity_icon_gap = 5
+export const chat_activity_max_w = 260
+export const chat_activity_below = 8
+// A chip's hover card (hn.ChatActivityPop, src/app/chat.rs fill_activity_pop): chat_activity_pop_w wide over the chip,
+// chat_activity_pop_pad in, its lines chat_activity_pop_gap apart, a step's glyph chat_activity_icon across.
+export const chat_activity_pop_w = 300
+export const chat_activity_pop_pad = 12
+export const chat_activity_pop_gap = 4
+// The running step's item at the top of the turn's card (16 texels at 4 points each).
+export const chat_activity_pop_item = 64
+// Messages sent while a turn runs and not yet taken (hn.ChatQueued, src/app/chat.rs fill_chat_queued): bubbles at the
+// trailing edge over the composer, chat_queued_gap apart, in a dashed-quiet look: the bubble's ground at
+// chat_queued_fade, a clock glyph chat_activity_icon across and the word "Queued" before it.
+export const chat_queued_gap = 6
+export const chat_queued_fade = 0.35
+// A finished turn's steps button (hn.ChatTurnSteps): beside the person's bubble on hover, chat_turn_steps square, its
+// glyph chat_turn_steps_icon across, chat_turn_steps_gap before the bubble.
+export const chat_turn_steps = 22
+export const chat_turn_steps_icon = 13
+export const chat_turn_steps_gap = 4
+// Pictures pasted into the message being written (hn.ChatAttach, src/app/chat.rs fill_attach): a strip of thumbnails over
+// the words, each chat_attach_h tall at its own aspect (no wider than chat_attach_max_w), chat_attach_gap apart,
+// chat_attach_radius round, a remove button chat_attach_remove across (its glyph chat_attach_icon) chat_attach_inset in
+// from the top trailing corner. A sent message's pictures show as the same thumbnails over its bubble, chat_sent_h tall.
+export const chat_attach_h = 64
+export const chat_attach_max_w = 160
+export const chat_attach_gap = 8
+export const chat_attach_radius = 8
+export const chat_attach_remove = 18
+export const chat_attach_icon = 10
+export const chat_attach_inset = 4
+export const chat_sent_h = 120
+export const chat_composer_pad = 8
+export const chat_composer_pad_t = 12
+export const chat_composer_pad_b = 10
+export const chat_composer_text_inset = 6
+export const chat_composer_gap = 6
+// The space under the pasted pictures' strip, over the words: the card's own gap between its parts.
+export const chat_attach_below = $chat_composer_gap
+// An aside's answer (hn.ChatAside, src/app/chat.rs fill_chat_aside): a card over the composer, chat_aside_gap above it,
+// chat_aside_radius round, chat_aside_pad_x in from its sides, chat_aside_pad_t under its top and chat_aside_pad_b over
+// its bottom; its head chat_bar_h tall (the quiet "Aside" at the bar's chrome size, the working ring while it asks, a
+// close button chat_aside_close across with its glyph chat_aside_icon), chat_aside_head_gap over the answer's words.
+export const chat_aside_gap = 8
+export const chat_aside_radius = 14
+export const chat_aside_pad_x = 14
+export const chat_aside_pad_t = 6
+export const chat_aside_pad_b = 10
+export const chat_aside_head_gap = 2
+export const chat_aside_close = 20
+export const chat_aside_icon = 10
+// The focused chat's status bar, at the sidebar's foot (frame.flecs hn.SideChat; nothing sits under the composer), no
+// plate; its controls chat_bar_h tall, chat_bar_gap apart: on the left den's model and effort picker
+// as one quiet control (hn.ChatPick, src/app/chat/pick.rs: the model's name, its effort as a level meter and a small
+// chevron, chat_pick_h tall, chat_pick_pad_x in, its chevron chat_pick_chevron across chat_pick_gap after the rest, a
+// wash under the pointer); the meter (hn.ChatEffort) chat_effort_lead after the name, chat_effort_h tall, a bar per
+// effort chat_effort_bar_w wide, chat_effort_gap apart, chat_effort_bar_radius round, rising from chat_effort_floor of
+// its height to all of it. On the right the context meter (hn.ChatContext: a ring chat_ring across, its stroke
+// chat_ring_stroke, in a square chat_bar_h across that takes the pointer). While the agent works that one ring breathes
+// down to chat_working_breath: the composer's sign of work, not a button (Return sends, Escape stops). After it, how much
+// of the person's plan is used (hn.ChatPlan, src/app/chat/plan.rs): chat_plan_lead after the ring, a bar
+// chat_plan_meter_w by chat_plan_meter_h, chat_plan_meter_radius round, chat_plan_gap before its words, chat_plan_trail
+// of air after them. An aside's card shows its own working ring (hn.ChatWorking: chat_working across, stroke
+// chat_working_stroke).
+// Everything in the bar is chrome, secondary to the words typed over it: the picker's name at size_chrome in the muted
+// ink, and its marks (chevron, level meter, rings) and their hit plates scaled to that size, not to the body's.
+// The picker's menu is a ui.SearchMenu (menu_*).
+export const size_chat_status = 12
+export const line_chat_status = 15
+export const chat_status_t = 4
+export const chat_bar_h = 24
+export const chat_bar_gap = 2
+export const chat_plan_lead = 4
+export const chat_plan_trail = 2
+export const chat_plan_gap = 5
+export const chat_plan_meter_w = 18
+export const chat_plan_meter_h = 3
+export const chat_plan_meter_radius = 1.5
+export const chat_pick_h = 22
+export const chat_pick_pad_x = 6
+export const chat_pick_radius = 7
+export const chat_pick_gap = 3
+export const chat_pick_chevron = 7
+export const chat_ring = 12
+export const chat_ring_stroke = 1.4
+export const chat_working = 13
+export const chat_working_stroke = 1.1
+export const chat_working_breath = 0.45
+export const chat_effort_lead = 5
+export const chat_effort_h = 8
+export const chat_effort_bar_w = 2
+export const chat_effort_gap = 1.5
+export const chat_effort_bar_radius = 1
+export const chat_effort_floor = 0.3
+// The picker's menu (hn.ChatPickMenu): chat_pick_menu_w wide whatever it holds, so a model's line about it wraps under
+// the list (chat_pick_detail_*: size, line, insets; always chat_pick_detail_h tall, two lines, so the menu never
+// changes height as the highlight moves) instead of being cut; the effort's slider chat_pick_level_t under
+// the hairline and chat_pick_level_b over the plate's foot. A sideways two-finger swipe over the control (or the
+// slider) steps the effort a stop each chat_pick_swipe_step points the fingers travel (detents: momentum never steps
+// it), a pulse on the trackpad at each; the effort is sent chat_pick_commit_secs after the last step (one switch for a
+// swipe through several), and the control says the effort in words while it moves and chat_pick_word_secs after.
+export const chat_pick_menu_w = 252
+// The `@` mention menu (hn.ChatMention, chat/mention.rs): chat_mention_w wide over the composer, its leading edge on the
+// card's; a row each place, its kind's icon chat_mention_icon square, its name, then its folder quiet at the end.
+export const chat_mention_w = 340
+export const chat_mention_icon = 16
+// Its preview of the highlighted place (chat/mention.rs), beside the list past a hairline: a chat_mention_preview_w by
+// chat_mention_preview_h box (as tall as the most rows, so the menu keeps its size), chat_mention_preview_pad in from
+// its edges: the path, then a picture drawn whole, as many of a file's first lines as fit in the code face (each read
+// to chat_mention_cols_n characters; the box cuts what is wider), or as many of a folder's first entries as fit.
+export const chat_mention_preview_w = 380
+export const chat_mention_preview_h = 8 * $menu_item_h
+export const chat_mention_preview_pad = 10
+export const chat_mention_cols_n = 64
+export const size_chat_pick_detail = 11.5
+export const line_chat_pick_detail = 15
+export const chat_pick_detail_t = 3
+export const chat_pick_detail_b = 4
+export const chat_pick_detail_h = $chat_pick_detail_t + 2 * $line_chat_pick_detail + $chat_pick_detail_b
+export const chat_pick_level_t = 2
+export const chat_pick_level_b = 4
+export const chat_pick_swipe_step = 22
+export const chat_pick_commit_secs = 0.35
+export const chat_pick_word_secs = 1.2
+// What the chat pane shows around the composer's words besides the transcript (the foot's insets, the card's insets,
+// nothing else): the words grow to textarea_grow_share of the pane less it.
+export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad_b
+// The meter's popover while the pointer is on it (scene/widgets/context.flecs hn.ChatContextPop, src/app/chat/context.rs):
+// a menu plate (ui.Menu's place over what opened it, its lift and motion) chat_ctx_w wide, chat_ctx_pad in, its lines
+// chat_ctx_gap apart: a head, the window as a donut chat_ctx_pie across with how full it is in its middle (size_ctx_pct;
+// chat_ctx_bar_pad above
+// and below) holding a segment a part, then a row a part chat_ctx_row_h tall: a dot chat_ctx_dot across in its ink,
+// chat_ctx_dot_gap before its name, its tokens, its share of the window flush right in chat_ctx_share_w. A part's splits
+// sit under it with no dot, quieter. The foot (the last call's cache split, whose counts these are) at size_caption.
+export const chat_ctx_w = 296
+export const chat_ctx_pad = 10
+export const chat_ctx_gap = 0
+export const chat_ctx_pie = 112
+// How far the other slices fade while the pointer is on one.
+export const chat_ctx_dim = 0.6
+export const size_ctx_pct = 20
+export const line_ctx_pct = 24
+export const chat_ctx_bar_pad = 7
+export const chat_ctx_row_h = 20
+export const chat_ctx_dot = 7
+export const chat_ctx_dot_gap = 7
+export const chat_ctx_share_w = 36
+export const chat_ctx_foot_pad = 7
+export const chat_ctx_foot_gap = 2
+export const chat_row_estimate = 44
+// A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): plain words, and a status icon only where
+// one says more than a word (scene/widgets/chat_status.flecs: a thought's ring leads, a call's running dot trails),
+// chat_line_status across. Its height, its lead-in, and the chevron that shows on hover only (chat_line_chevron across). What sits under a line (its output, its
+// table, its steps, a run's calls) starts chat_line_inset in, with a faint guide (tone_line, chat_guide_w wide)
+// at chat_guide_x; a run's calls sit in from its line by chat_nest, so their words start where the content does.
+export const chat_tool_h = 24
+export const chat_line_pad = 4
+export const chat_line_chevron = 10
+export const chat_line_status = 12
+// A thought's ring (hn.chat_status.thinking and thought): its line as heavy as the codicons' at chat_line_status.
+export const chat_think_stroke = 1.2
+export const chat_guide_x = 8
+export const chat_guide_w = 1
+export const chat_line_inset = 22
+export const chat_nest = $chat_line_inset - $chat_line_pad
+// Between a line's words, its argument and its detail.
+export const chat_line_word_gap = 5
+// A folded line's marks (hn.StepTally): chat_tally_gap between a kind's glyph and its count, chat_tally_between kinds.
+export const chat_tally_gap = 3
+export const chat_tally_between = 10
+// A drawn view's code button's glyph.
+export const chat_line_icon = 14
+// A drawn view's code button: hung in the column's gutter, left of the view, shown while the view is hovered.
+export const chat_view_code = 20
+export const chat_view_code_hang = $chat_view_code + 2
+// The chat is the theme's page: tone_ground under it, cards and the composer in tone_card, code in tone_well, a user's
+// bubble tone_raised, words in the four inks, tone_line on cards; the one accent only on what is pressable. Drawn in the
+// window's appearance (chat.rs `chat_dark`).
+// The send button: quiet (tone_wash, its arrow faint) with nothing to send, then solid in the strong ink with its arrow
+// (and the stop's square) in tone_ground.
+// Inline code amid the words, as the site sets it: the code face (the one monospace in prose) at chat_code_em of the
+// words, in tone_code_ink on tone_wash, chat_code_radius round.
+export const chat_code_radius = 5
+// Inline components (harness-native-ui-prims/scene/inline.flecs): the chip under the pointer brightens a step
+// (tone_wash: a chip at rest has no plate) and underlines its label (tone_ink_faint), held down a step more
+// (tone_press). A GitHub pull request's or issue's state picks its icon's ink, as GitHub's Primer draws them (open green, draft and not planned grey,
+// merged and completed purple, closed red), and its head commit's checks the mark after it (success green, failure red,
+// pending amber).
+export mut tone_gh_open: Fill = {dark: {0.247, 0.725, 0.314, 1}, light: {0.102, 0.498, 0.216, 1}}
+export mut tone_gh_draft: Fill = {dark: {0.569, 0.596, 0.631, 1}, light: {0.349, 0.388, 0.431, 1}}
+export mut tone_gh_merged: Fill = {dark: {0.671, 0.490, 0.973, 1}, light: {0.510, 0.314, 0.875, 1}}
+export mut tone_gh_closed: Fill = {dark: {0.973, 0.318, 0.286, 1}, light: {0.812, 0.133, 0.180, 1}}
+export mut tone_gh_ci_success: Fill = $tone_gh_open
+export mut tone_gh_ci_failure: Fill = $tone_gh_closed
+export mut tone_gh_ci_pending: Fill = {dark: {0.824, 0.600, 0.133, 1}, light: {0.604, 0.404, 0.0, 1}}
+// A chip's hover card (scene/widgets/peek.flecs hn.ChatPeek, src/app/chat/peek.rs): after the pointer rests on a chip
+// inline_peek_dwell seconds, a menu plate (ui.Menu: an overlay over its chip, its lift and motion) inline_peek_w wide,
+// inline_peek_pad in, its lines inline_peek_gap apart: a header row (an icon or favicon inline_peek_icon_w square, then
+// `owner/repo #n` or the site), the title flush left, then a GitHub item's state and checks, author and lines changed,
+// its description's first lines; a page's description and picture (inline_peek_image_h tall, only when it has one) and
+// its live view once a browser host has one (inline_peek_page_h); a file's first lines in the code face. It closes
+// when the pointer leaves the chip and the card both. The checks' marks are inline_peek_mark_w square; under the
+// pointer the checks line opens a list of the checks not passed, a row each inline_peek_check_h tall, its parts
+// inline_peek_check_gap apart and inline_peek_check_pad in from its wash's ends (inline_peek_check_radius round).
+export const inline_peek_dwell_s = 0.35
+export const inline_peek_w = 360
+// A pull request or issue said on its own: its card in the words (hn.ChatRefCard), at most this wide.
+export const chat_ref_w = 520
+export const inline_peek_pad = 12
+export const inline_peek_gap = 6
+export const inline_peek_image_h = 160
+export const inline_peek_radius = 8
+export const inline_peek_icon_w = 16
+export const inline_peek_icon_radius = 3
+export const inline_peek_page_h = 240
+export const inline_peek_badge_pad = 6
+export const inline_peek_lines_n = 8
+export const inline_peek_mark_w = 12
+export const inline_peek_check_h = 22
+export const inline_peek_check_gap = 6
+export const inline_peek_check_pad = 4
+export const inline_peek_check_radius = 5
+// A folder's card lists its entries the Finder's way (hn.PeekEntry): folders first, inline_peek_entries_n of them, each
+// a compact row of its kind's icon (inline_peek_entry_icon_w square, the name's size) and its name in the body face,
+// inline_peek_entry_gap between rows; a quiet line says how many more.
+export const inline_peek_entries_n = 12
+export const inline_peek_entry_icon_w = 14
+export const inline_peek_entry_gap = 2
+export const line_peek_entry = 18
+export const size_peek_title = 14
+export const line_peek_title = 19
+export const size_peek_body = 12.5
+export const line_peek_body = 17.5
+export const size_peek_meta = 11.5
+export const line_peek_meta = 15
+// The words on a state pill (the pill is the state's own ink): white in both appearances, as GitHub sets them.
+// A text caret: plain white on the dark page (near-black on the light one), no accent: colour that says nothing.
+// A cell's own UI in the chat (scene/widgets/genui.flecs, src/app/chat/genui.rs): the space between its elements, and
+// a Stat's value, set large.
+export const gen_gap = 8
+export const size_gen_stat = 22
+// A chart's series inks (genui chart.rs, `hn.GenTone.series1` on), the dataviz skill's validated categorical palette in its
+// fixed order (blue orange aqua yellow magenta green violet red; never cycled, a ninth folds into "other"), each
+// appearance its own steps. A transcript is drawn in its ground's scheme (dark unless a Ghostty theme makes it light).
+// Checked with validate_palette.js: dark on #121214, worst adjacent CVD dE 8.4, normal-vision 19.3, all >= 3:1; light on
+// white, CVD 9.1, normal-vision 19.6, three slots under 3:1 (aqua, yellow, magenta), so a chart always labels its values
+// (legend, tips).
+export mut tone_series1: Fill = {dark: {0.224, 0.529, 0.898, 1}, light: {0.165, 0.471, 0.839, 1}}
+export mut tone_series2: Fill = {dark: {0.851, 0.349, 0.149, 1}, light: {0.922, 0.408, 0.204, 1}}
+export mut tone_series3: Fill = {dark: {0.098, 0.620, 0.439, 1}, light: {0.106, 0.686, 0.478, 1}}
+export mut tone_series4: Fill = {dark: {0.788, 0.522, 0.000, 1}, light: {0.929, 0.631, 0.000, 1}}
+export mut tone_series5: Fill = {dark: {0.835, 0.318, 0.506, 1}, light: {0.910, 0.482, 0.643, 1}}
+export mut tone_series6: Fill = {dark: {0.000, 0.514, 0.000, 1}, light: {0.000, 0.514, 0.000, 1}}
+export mut tone_series7: Fill = {dark: {0.565, 0.522, 0.914, 1}, light: {0.384, 0.314, 0.839, 1}}
+export mut tone_series8: Fill = {dark: {0.902, 0.404, 0.404, 1}, light: {0.890, 0.286, 0.282, 1}}
+export const line_gen_stat = 28
+// A cell's controls (genui/control.rs, hn.Gen<control> in widgets/genui.flecs): one height for a button, a field and a
+// select; a switch's track and knob, a check box's square, a radio's dot, a slider's rail and knob; a field's widest.
+// Their colours are the theme's: a control's plate tone_card, a field tone_well edged in tone_line, the off track
+// tone_line_strong, the knob tone_knob, the on state tone_accent under tone_on_accent, a segment's plate tone_raised.
+export const gen_control_h = 28
+export const gen_switch_w = 30
+export const gen_switch_h = 18
+export const gen_switch_knob = 14
+export const gen_box = 16
+export const gen_dot = 6
+export const gen_rail = 4
+export const gen_slider_knob = 16
+export const gen_field_w = 320
+export const gen_option_h = 26
+export const size_gen_control = 13
+// How faint a control is drawn while it takes no input (disabled, or no handler): a Pose fade.
+export const gen_inert_fade = 0.55
+
+// Generative UI, tier 3 (scene/widgets/genui.flecs, src/app/chat/genui/{layout,float,media}.rs): what floats over the
+// transcript (a popover, a menu, a dialog's plate over its scrim, a toast) and what folds, splits, tabs and shows status,
+// after den's 30-genui.flecs and 33-genui-prims.flecs.
+export const size_gen_small = 12
+export const gen_float_w = 280
+export const gen_menu_w = 160
+export const gen_dialog_w = 380
+export const gen_toast_w = 420
+export const gen_float_gap = 6
+export const gen_split_h = 240
+export const gen_split_hit = 13
+export const gen_tab_h = 30
+export const gen_chip_h = 28
+export const gen_file_h = 24
+export const gen_icon = 18
+export const gen_image_h = 360
+export const size_gen_title = 15
+export const gen_bone_h = 10
+// A badge's ground is opaque and edged (tone_raised, tone_line_strong), so its ink reads over a picture as on the plain
+// ground (a Layer over an Image). A toned Badge's plate (den's GenBadge<Tone>) is its state's wash (tone_<state>_wash).
+// A Shader's and a Video's box (genui/surface.rs, hn.GenShader and hn.GenVideo): a Shader with no height and no aspect is
+// gen_shader_h tall; both are rounded by radius_gen_media on a quiet ground (what shows before the first frame). A video's
+// controls ride a dark plate along its foot, gen_video_bar_pad in from its edges, in light inks over the picture whatever
+// the appearance (a picture is not the ground: a palette, not a role); its scrub rail is the slider's, thinner.
+export const gen_shader_h = 200
+export const radius_gen_media = 8
+export const gen_video_bar_h = 32
+export const gen_video_bar_pad = 8
+export const gen_video_rail = 3
+export const gen_video_knob = 12
+export const radius_gen_video_bar = 8
+export mut tone_gen_video_bar: Fill = {dark: {0.08, 0.08, 0.09, 0.72}, light: {0.08, 0.08, 0.09, 0.72}}
+export mut tone_gen_video_ink: Fill = {dark: {1, 1, 1, 0.82}, light: {1, 1, 1, 0.82}}
+export mut tone_gen_video_ink_hover: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
+export mut tone_gen_video_track: Fill = {dark: {1, 1, 1, 0.28}, light: {1, 1, 1, 0.28}}
+export mut tone_gen_video_fill: Fill = {dark: {1, 1, 1, 0.92}, light: {1, 1, 1, 0.92}}
+
+// Code's colours by tree-sitter capture (harness-native-render/src/highlight.rs, a fenced block's `Highlight`):
+// `code_ink.<capture>` colours that capture and the ones under it (`function` colours `function.method` and
+// `function.macro`); a capture none names keeps the words' own ink. Dark is JetBrains' Islands Dark editor scheme
+// (IslandSchemeDark.xml), light IntelliJ Light's; a Ghostty theme does not change them (only the terminal follows it).
+@tree ChildOf
+code_ink {
+  keyword { Fill: {dark: {0.812, 0.557, 0.427, 1}, light: {0, 0.2, 0.702, 1}} }
+  function { Fill: {dark: {0.337, 0.659, 0.961, 1}, light: {0, 0.384, 0.478, 1}} }
+  type { Fill: {dark: {0.737, 0.745, 0.769, 1}, light: {0, 0, 0, 1}} }
+  constructor { Fill: {dark: {0.337, 0.659, 0.961, 1}, light: {0, 0.384, 0.478, 1}} }
+  attribute { Fill: {dark: {0.702, 0.682, 0.376, 1}, light: {0.62, 0.533, 0.051, 1}} }
+  string { Fill: {dark: {0.416, 0.671, 0.451, 1}, light: {0.024, 0.49, 0.09, 1}} }
+  escape { Fill: {dark: {0.812, 0.557, 0.427, 1}, light: {0, 0.216, 0.651, 1}} }
+  number { Fill: {dark: {0.165, 0.675, 0.722, 1}, light: {0.09, 0.314, 0.922, 1}} }
+  constant { Fill: {dark: {0.78, 0.49, 0.733, 1}, light: {0.529, 0.063, 0.58, 1}} }
+  property { Fill: {dark: {0.78, 0.49, 0.733, 1}, light: {0.529, 0.063, 0.58, 1}} }
+  label { Fill: {dark: {0.737, 0.745, 0.769, 1}, light: {0, 0, 0, 1}} }
+  operator { Fill: {dark: {0.737, 0.745, 0.769, 1}, light: {0, 0, 0, 1}} }
+  comment { Fill: {dark: {0.478, 0.494, 0.522, 1}, light: {0.549, 0.549, 0.549, 1}} }
+  variable { builtin { Fill: {dark: {0.812, 0.557, 0.427, 1}, light: {0, 0.2, 0.702, 1}} } }
+}
+
+// Kip in the app's chrome (the ui.Mascot primitive's `Kip`, kip.flecs): how tall he stands where he shows. Never in a
+// chat (no avatar there). No chats: kip_empty tall over the empty pane's note. The Archive with nothing in it:
+// kip_archive tall over its note.
+export const kip_empty = 72
+export const kip_archive = 44
+
+// genui new elements (lane E: File, CellRef, ColorPicker and DropZone; widgets/genui.flecs's "New elements" section,
+// src/app/chat/genui/{files,cellref,color,dropzone}.rs), after den's 30-genui.flecs and 33-genui-prims.flecs.
+// A File row: its height, inset and gap, its kind's icon, the hover wash it takes when pressable (6% ink, its corners).
+export const gen_file_row_h = 32
+export const gen_file_pad = 8
+export const gen_file_gap = 8
+export const gen_file_icon = 16
+export const gen_file_radius = 8
+export const line_gen_file = 22
+export const line_gen_meta = 16
+// A CellRef's card: the space between its head (the cell's name and its badge) and the cell's view or output.
+export const gen_cell_gap = 6
+export const gen_cell_head_gap = 8
+// A ColorPicker, after macOS's accent picker: round swatches gen_swatch across (a hairline round each), gen_swatch_gap
+// apart in boxes the ring's size; the picked one ringed (gen_swatch_ring across, gen_swatch_ring_border thick, in the
+// ink), the ring sliding to a new pick on the matched spring; a hover wash gen_swatch_hover across. The last well is a
+// wheel of hues that opens the system colour panel; a colour picked there shows as a dot gen_swatch_custom across in it.
+export const gen_swatch = 22
+export const gen_swatch_radius = 11
+export const gen_swatch_ring = 30
+export const gen_swatch_ring_radius = 15
+export const gen_swatch_ring_border = 2
+export const gen_swatch_gap = 2
+export const gen_swatch_hover_pad = -1
+export const gen_swatch_hover_radius = 14
+export const gen_swatch_custom = 10
+export const gen_swatch_custom_radius = 5
+// The well's hues, a turn of the colour wheel from red (HSV saturation 0.78, value 0.95), the same in both appearances.
+export mut tone_gen_wheel_0: Fill = {dark: {0.950, 0.209, 0.209, 1}, light: {0.950, 0.209, 0.209, 1}}
+export mut tone_gen_wheel_1: Fill = {dark: {0.950, 0.580, 0.209, 1}, light: {0.950, 0.580, 0.209, 1}}
+export mut tone_gen_wheel_2: Fill = {dark: {0.950, 0.950, 0.209, 1}, light: {0.950, 0.950, 0.209, 1}}
+export mut tone_gen_wheel_3: Fill = {dark: {0.580, 0.950, 0.209, 1}, light: {0.580, 0.950, 0.209, 1}}
+export mut tone_gen_wheel_4: Fill = {dark: {0.209, 0.950, 0.209, 1}, light: {0.209, 0.950, 0.209, 1}}
+export mut tone_gen_wheel_5: Fill = {dark: {0.209, 0.950, 0.580, 1}, light: {0.209, 0.950, 0.580, 1}}
+export mut tone_gen_wheel_6: Fill = {dark: {0.209, 0.950, 0.950, 1}, light: {0.209, 0.950, 0.950, 1}}
+export mut tone_gen_wheel_7: Fill = {dark: {0.209, 0.580, 0.950, 1}, light: {0.209, 0.580, 0.950, 1}}
+export mut tone_gen_wheel_8: Fill = {dark: {0.209, 0.209, 0.950, 1}, light: {0.209, 0.209, 0.950, 1}}
+export mut tone_gen_wheel_9: Fill = {dark: {0.580, 0.209, 0.950, 1}, light: {0.580, 0.209, 0.950, 1}}
+export mut tone_gen_wheel_10: Fill = {dark: {0.950, 0.209, 0.950, 1}, light: {0.950, 0.209, 0.950, 1}}
+export mut tone_gen_wheel_11: Fill = {dark: {0.950, 0.209, 0.580, 1}, light: {0.950, 0.209, 0.580, 1}}
+// A DropZone: a sunk plate (a field's ground, a hairline at 16% ink) with its words in the middle, gen_drop_min_h tall
+// at least; lit while Finder files are carried over it (8% ink over it, the hairline at 60% ink, thicker), the light
+// fading in and out on the transition spring.
+export const gen_drop_radius = 10
+export const gen_drop_pad = 16
+export const gen_drop_gap = 8
+export const gen_drop_min_h = 96
+export const gen_drop_hot_border = 1.5
+
+// genui element props and motion (scene/widgets/genui.flecs, "Element props and motion"). A Progress glides to a new
+// value on the gen_glide spring; below its max a sheen sweeps along its fill (den ui/progress.rs's shimmer): across in
+// gen_sweep_period seconds, gen_sweep_share of the fill long, fading to gen_sweep_low as an end cuts it, in
+// tone_press. A Loading or a Skeleton stays unseen for gen_pending_delay seconds, then fades in on the gen_pending
+// spring (den's PendingLook), so a wait that ends at once never flickers. A Table's query marks what it found in each
+// cell with a tone_accent_wash plate, gen_match_radius round.
+export const gen_glide_omega = 18
+export const gen_glide_zeta = 1
+export const gen_sweep_period = 1.4
+export const gen_sweep_share = 0.34
+export const gen_sweep_low = 0.25
+export const gen_pending_delay = 0.15
+export const gen_pending_omega = 14
+export const gen_pending_zeta = 1
+export const gen_match_radius = 3
+
+// ---- genui universal props ----------------------------------------------------------------------------------------
+// The props every element of a cell's UI takes (src/app/chat/genui/common.rs, canvas.rs; hn.GenUniversal in widgets/genui.flecs),
+// after den's genui_prims.rs. An element's pose glides on the pose spring (spring_pose_*), except while an `enter` or
+// `exit` plays: a spring that settles in its `ms`, omega gen_settle_rate * 1000 / ms, critically damped (gen_settle_zeta).
+// A press on an element with onDrag is a drag once it moves gen_drag_slop points. A Canvas shape's or Group's pose and
+// turn spring on gen_shape_omega / gen_shape_zeta (den's `smooth` too).
+export const gen_settle_rate = 6.6
+export const gen_settle_zeta = 1
+export const gen_drag_slop = 3
+export const gen_shape_omega = 22
+export const gen_shape_zeta = 1
+
+// ---- the embedded browser ---------------------------------------------------------------------------------------------
+// The harness browser's views (src/app/browser.rs; crates/harness/harness-browser). A chat card (hn.GenBrowser) shows the
+// page at gen_browser_aspect (width over height, 16:10) above its title and address, a gen_browser_load hairline in
+// tone_accent along the picture's foot while the page loads. The pane (hn.WebPane, cmd+shift+B) sits on the right
+// web_pane_w wide, opening and folding on the sidebar's spring; its toolbar is web_toolbar_h tall with the address in a
+// web_url_h field, the extensions menu web_menu_w wide, and an extension's popup web_popup_w by web_popup_h. Its left
+// edge drags (src/app/web_drag.rs): a press within web_grab of it grabs it, and the width stays between web_pane_min and
+// web_pane_max, less in a narrow window so the main card keeps web_keep beside it.
+export const gen_browser_aspect = 1.6
+export const gen_browser_load = 2
+// A Map's card (hn.GenMap; src/app/maps.rs): gen_map_aspect wide over tall (5:3), rounded by radius_gen_media, the
+// host's live map (Apple's, src/window/maps.rs) laid over it.
+export const gen_map_aspect = 1.6667
+export const web_pane_w = 520
+export const web_pane_min = 320
+export const web_pane_max = 1200
+export const web_grab = 5
+export const web_keep = 360
+export const web_toolbar_h = 40
+export const web_url_h = 26
+export const web_menu_w = 240
+export const web_popup_w = 360
+export const web_popup_h = 480

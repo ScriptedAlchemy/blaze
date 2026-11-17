@@ -4,7 +4,7 @@ name: bench-readme
 on:
   push:
     branches: ["main"]
-    paths-ignore: ["README.md", "CHANGELOG.md", "docs/**", "site/**"]
+    paths-ignore: ["README.md", "docs/**", "site/**"]
   schedule:
     - cron: "17 9 * * *"
   workflow_dispatch:
@@ -14,7 +14,7 @@ on:
         type: boolean
         default: false
       full:
-        description: "Also time the other setups (cg_clif, mold, wild, -Zthreads, cargo check) and run the test suites, as the nightly run does"
+        description: "Also run each project's test suite, as the nightly run does"
         type: boolean
         default: false
 
@@ -34,6 +34,10 @@ permissions:
 defaults:
   run:
     shell: bash
+
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
 
 jobs:
   platforms:
@@ -64,47 +68,45 @@ jobs:
       contents: read
     timeout-minutes: 360
     env:
-      # Share benchmark state between steps within this hosted job.
-      BENCH_HOME: ${{ github.workspace }}/../bench-state
-      # macOS: the daemon's socket path has to fit in 104 bytes, so the work is under /tmp.
-      BENCH_WORK: ${{ matrix.work }}
+      BENCH_MACHINE: GitHub-hosted ${{ matrix.name }} (${{ matrix.label }})
       CARGO_TERM_COLOR: never
-      # The nightly run, and a run by hand that asks, compares with the other setups too.
-      FULL: ${{ github.event_name == 'schedule' || inputs.full }}
+      # The nightly run, and a run by hand that asks, runs the projects' test suites too.
+      FULL: ${{ github.event_name == 'schedule' || inputs.full || false }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      # The Cranelift tier is measured with ra-jit as it is installed and released, without
-      # the `llvm` feature: on Linux a binary that links libLLVM spends about 6 ms loading it
-      # each time it starts, which every `cargo ra-jit` does.
-      - name: Build ra-jit (as released, and with the llvm feature)
+      - uses: ./.github/actions/blaze
+        with:
+          job: bench-readme
+          llvm: 'true'
+          reflink: ${{ runner.os == 'Linux' && 'true' || 'false' }}
+      # The native dependencies come from this shell; the selected Blaze builds the compiler.
+      - uses: ./.github/actions/nix
+      - name: Build blaze
         run: |
+          bench_root=/tmp
+          if [ "$RUNNER_OS" = Linux ]; then bench_root="$RUNNER_TEMP/blaze-fs"; fi
+          export BENCH_HOME="$bench_root/bb-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$BENCH_HOME"
-          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c cargo build -p ra-jit --release
-          CARGO_TARGET_DIR="$BENCH_HOME/target-llvm" nix develop .#bench -c cargo build -p ra-jit --release --features llvm
+          echo "BENCH_HOME=$BENCH_HOME" >> "$GITHUB_ENV"
+          echo "TMPDIR=$bench_root" >> "$GITHUB_ENV"
+          stage0="$(command -v blaze)"
+          CARGO_TARGET_DIR="$BENCH_HOME/compiler" nix develop .#bench -c "$stage0" build -p blaze-engine --release --locked
+          "$stage0" stop
       - name: Bench
         id: bench
         run: |
-          export RA_JIT_BIN="$BENCH_HOME/target/release/ra-jit" RA_JIT_LLVM_BIN="$BENCH_HOME/target-llvm/release/ra-jit"
-          export RA_JIT_PROJECTS="$BENCH_HOME/projects"
-          work=${BENCH_WORK:-$BENCH_HOME/work}
-          rm -rf "$work" "$BENCH_HOME/reference"
           mkdir -p "$RUNNER_TEMP/results"
-          full=()
-          [ "$FULL" = true ] && full=(--setups all --setups-on "ripgrep,nushell" --tests)
-          nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py \
-            ripgrep fd bat hyperfine just axum nushell helix bevy biome --runs 5 --cold-runs 5 "${full[@]}" \
-            --work "$work" --reference "$BENCH_HOME/reference" --out "$RUNNER_TEMP/results/bench.json" \
+          jq -n --arg blaze "$BENCH_HOME/compiler/release/blaze-engine" --arg work "$BENCH_HOME/work" \
+            --arg sources "$BENCH_HOME/projects" --arg out "$RUNNER_TEMP/results/bench.json" \
+            --arg commit "$GITHUB_SHA" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --argjson tests "$FULL" --arg machine "$BENCH_MACHINE" \
+            '{action:"run", blaze:$blaze, work:$work, sources:$sources, out:$out, commit:$commit, run_url:$run_url,
+              projects:["ripgrep","fd","bat","hyperfine","just","axum","nushell","helix","bevy","biome"],
+              backends:["cranelift","llvm"], runs:5, cold_runs:5, tests:$tests, machine:$machine}' > "$RUNNER_TEMP/bench-input.json"
+          nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py "$RUNNER_TEMP/bench-input.json" \
             || { status=$?; [ "$status" = 3 ] || exit "$status"; echo "wrong=true" >> "$GITHUB_OUTPUT"; }
-      # How fast the built programs run: harness/runbench.py, ra-jit's LLVM against
-      # `cargo build --release`, into the runtime table.
-      - name: Runtime bench
-        continue-on-error: true
-        run: |
-          export RA_JIT_BIN="$BENCH_HOME/target-llvm/release/ra-jit" APPS_DIR="$BENCH_HOME/apps"
-          nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py --runtime \
-            --runs 5 --out "$RUNNER_TEMP/results/runtime.json"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -114,7 +116,7 @@ jobs:
       - name: Fail on a wrong result
         if: steps.bench.outputs.wrong == 'true'
         run: |
-          echo "::error::under ra-jit a program or a test suite ended otherwise than under cargo: see the Bench step and the tests table"
+          echo "::error::a Blaze build, program output, or test suite failed its oracle: see the Bench step and the tests table"
           exit 1
 
   # Every platform's results into the README, docs/benchmarks.md and the history, in one commit:
@@ -139,18 +141,22 @@ jobs:
           fetch-depth: 0
           # The ruleset on main refuses a push from the workflow's own token: this one is allowed
           # past it (docs/harness.md, "CI").
-          token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
       - uses: actions/download-artifact@v8
         with:
           pattern: bench-*
           path: ${{ runner.temp }}/results
       - name: README and docs/benchmarks.md
+        env:
+          FORCE: ${{ inputs.force || false }}
         run: |
           # A result refused (a program that said something else) leaves its platform's numbers as they were.
-          for result in "$RUNNER_TEMP"/results/bench-*/bench.json "$RUNNER_TEMP"/results/bench-*/runtime.json; do
+          for result in "$RUNNER_TEMP"/results/bench-*/bench.json; do
             [ -f "$result" ] || continue
             echo "::group::$result"
-            python3 harness/benchreport.py "$result" ${{ inputs.force && '--force' || '' }} || echo "::warning::$result was not published"
+            jq -n --arg result "$result" --argjson force "$FORCE" \
+              '{action:"publish",result:$result,force:$force}' | python3 harness/benchreport.py - \
+              || echo "::warning::$result was not published"
             echo "::endgroup::"
           done
       - name: History and regressions
@@ -161,30 +167,23 @@ jobs:
           for result in "$RUNNER_TEMP"/results/bench-*/bench.json; do
             [ -f "$result" ] || continue
             slug=$(basename "$(dirname "$result")"); slug=${slug#bench-}
-            python3 harness/benchhistory.py build "$result" --history "docs/benchmarks/history/$slug.jsonl"
-            python3 harness/benchhistory.py check "docs/benchmarks/history/$slug.jsonl" --report "$RUNNER_TEMP/regressions-$slug.md" || regressed=true
+            jq -n --arg result "$result" --arg history "docs/benchmarks/history/$slug.jsonl" \
+              '{action:"build",result:$result,history:$history}' | python3 harness/benchhistory.py -
+            jq -n --arg history "docs/benchmarks/history/$slug.jsonl" --arg report "$RUNNER_TEMP/regressions-$slug.md" \
+              '{action:"check",history:$history,report:$report}' | python3 harness/benchhistory.py - || regressed=true
             cat "$RUNNER_TEMP/regressions-$slug.md" >> "$RUNNER_TEMP/regressions.md"
           done
           echo "regressed=$regressed" >> "$GITHUB_OUTPUT"
           cat "$RUNNER_TEMP/regressions.md" >> "$GITHUB_STEP_SUMMARY"
+      # The README's and docs/benchmarks.md's trend charts, from the history just appended to.
+      - uses: ./.github/actions/nix
+      - name: Trends
+        run: python3 harness/benchcharts.py '{}'
+      # Main may have moved during the run: bench_commit.py puts the commit on top, draws the
+      # trends again from the history as it is then, and tries again.
       - name: Commit to main
         run: |
-          git add README.md docs/benchmarks.md docs/benchmarks/
-          git diff --cached --quiet && exit 0
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -q -m "bench: numbers for ${GITHUB_SHA::10} [skip ci]"
-          # Main may have moved during the run: put the commit on top and try again.
-          for attempt in 1 2 3 4 5; do
-            git fetch -q origin main
-            git rebase -q origin/main || { git rebase --abort; echo "::error::the bench commit does not apply to main"; exit 1; }
-            if git push -q origin HEAD:main; then
-              gh workflow run site.yaml --ref main
-              exit 0
-            fi
-            sleep $((attempt * 5))
-          done
-          exit 1
+          python3 .github/scripts/bench_commit.py "$(printf '{"message": "bench: numbers for %s [skip ci]", "paths": ["README.md", "docs/benchmarks.md", "docs/benchmarks/"], "site": true}' "${GITHUB_SHA::10}")"
       - name: Open or update the regression issue
         if: steps.history.outputs.regressed == 'true'
         run: |

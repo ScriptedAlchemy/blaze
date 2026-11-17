@@ -1,0 +1,3 @@
+type: RefusedEvent
+cbor: a200612e01612e
+digest: 92e749f70b5fd5a920ed6c9dcc19512b5bcc009a75046aed53b2261fbc4c865b

@@ -10,6 +10,7 @@ on:
     paths:
       - "site/**"
       - "README.md"
+      - "site/install.sh"
       - "docs/demo*"
       - "docs/benchmarks/**"
       - ".github/workflows/site.yaml"
@@ -17,6 +18,7 @@ on:
     paths:
       - "site/**"
       - "README.md"
+      - "site/install.sh"
       - "docs/demo*"
       - "docs/benchmarks/**"
       - ".github/workflows/site.yaml"
@@ -25,16 +27,19 @@ on:
 permissions:
   contents: read
 
+# A newer push to main (a newer deploy) or to the pull request cancels the run before it; a run
+# by hand is never cancelled.
 concurrency:
-  group: site-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
-  cancel-in-progress: true
+  group: site-${{ github.event_name }}-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
 
 jobs:
   site:
-    runs-on: ubuntu-24.04
-    # Narration: manifests are checked in, the audio files live in R2 (site/audio/README.md), so pages keep their player.
-    env:
-      SITE_AUDIO_REMOTE: '1'
+    runs-on: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: site
@@ -45,16 +50,26 @@ jobs:
         with:
           targets: wasm32-unknown-unknown wasm32-wasip2
           components: clippy rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: site/renderer
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-      - name: wasm-opt (binaryen)
+      # The renderer builds with cargo, and no cache, until blaze builds the renderer: what ships
+      # is its own Rust release's wasm32 with LTO at opt-level z, and blaze's wasm32 modules are
+      # still many times rustc's size (docs/platforms.md, "wasm32").
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      # The release build for the runner's architecture (the ix runners are AArch64; an x86-64
+      # wasm-opt there fails with "Exec format error"), checked by its sha256 (the release's own
+      # .sha256 files).
+      - name: wasm-opt (binaryen version_133)
         env:
           BINARYEN: version_133
         run: |
-          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/$BINARYEN/binaryen-$BINARYEN-x86_64-linux.tar.gz" | tar xz -C "$RUNNER_TEMP"
+          case "$RUNNER_ARCH" in
+            X64) arch=x86_64 sum=2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489 ;;
+            ARM64) arch=aarch64 sum=89c07ea56faf38d0fbecf36ca8ec0721756716185f265b568e133d427f299bf8 ;;
+            *) echo "::error::no pinned binaryen $BINARYEN for $RUNNER_ARCH"; exit 1 ;;
+          esac
+          tgz="$RUNNER_TEMP/binaryen.tar.gz"
+          curl -fsSL --retry 3 -o "$tgz" "https://github.com/WebAssembly/binaryen/releases/download/$BINARYEN/binaryen-$BINARYEN-$arch-linux.tar.gz"
+          echo "$sum  $tgz" | sha256sum -c -
+          tar -xzf "$tgz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/binaryen-$BINARYEN/bin" >> "$GITHUB_PATH"
       - name: Renderer
         run: |
@@ -76,7 +91,7 @@ jobs:
           if-no-files-found: error
       - uses: oven-sh/setup-bun@v2
       # The .flecs content mapper runs under node (type stripping, node:wasi).
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: bun install --frozen-lockfile
@@ -101,7 +116,7 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: site
-          command: d1 migrations apply ra-jit-updates --remote
+          command: d1 migrations apply blaze-updates --remote
       - name: Deploy
         if: steps.credentials.outputs.present == 'true'
         uses: cloudflare/wrangler-action@v4

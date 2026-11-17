@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 use crate::inline::esc;
 use crate::js;
+use crate::render::Served;
 use crate::world::{Entity, Id, Scalar, Value, World};
 
 pub const PAGE_BLOCK: &str = "_page";
@@ -247,7 +248,7 @@ fn github(login: &str) -> String {
     format!("https://github.com/{}", js::encode_uri_component(login))
 }
 
-fn item(c: &Comment, block_id: &str, d: &Discussion) -> String {
+fn item(c: &Comment, block_id: &str, d: &Discussion, served: &Served) -> String {
     let avatar = if avatar_ok(&c.avatar_url) {
         c.avatar_url.clone()
     } else {
@@ -255,8 +256,8 @@ fn item(c: &Comment, block_id: &str, d: &Discussion) -> String {
     };
     let del = match &d.viewer {
         Some(v) if v.admin || v.id == c.user_id => format!(
-            "<form class=\"c-delform\" method=\"post\" action=\"/api/comments/{}/delete\"><button type=\"submit\" class=\"c-del\" aria-label=\"Delete comment by {}\">Delete</button></form>",
-            c.id,
+            "<form class=\"c-delform\" method=\"post\" action=\"{}\"><button type=\"submit\" class=\"c-del\" aria-label=\"Delete comment by {}\">Delete</button></form>",
+            esc(&served.href(&format!("/api/comments/{}/delete", c.id))),
             esc(&c.login)
         ),
         _ => String::new(),
@@ -313,7 +314,8 @@ pub fn button(block_id: &str, world: &World, n: Id) -> String {
     )
 }
 
-/// A block's thread: its comments, then the form (or the sign-in link).
+/// A block's thread: its comments, then the form (or the sign-in link). `url` is the page's site path; links and
+/// form actions go under `served`'s base, but `next` stays a site path (the worker adds the base when it redirects).
 pub fn thread(
     block_id: &str,
     world: &World,
@@ -321,9 +323,11 @@ pub fn thread(
     doc: &str,
     url: &str,
     d: &Discussion,
+    served: &Served,
 ) -> String {
     let page = block_id == PAGE_BLOCK;
-    let mut list: String = comments_of(world, n).iter().map(|c| item(c, block_id, d)).collect();
+    let mut list: String =
+        comments_of(world, n).iter().map(|c| item(c, block_id, d, served)).collect();
     if list.is_empty() && !page {
         list = "<p class=\"c-empty\">No comments yet.</p>".into();
     }
@@ -335,11 +339,11 @@ pub fn thread(
     format!(
         "<div{attrs} id=\"block-{}\"><div class=\"c-list\">{list}</div><div class=\"c-form\">{}</div></div>",
         esc(block_id),
-        form(block_id, doc, url, d)
+        form(block_id, doc, url, d, served)
     )
 }
 
-fn form(block_id: &str, doc: &str, url: &str, d: &Discussion) -> String {
+fn form(block_id: &str, doc: &str, url: &str, d: &Discussion, served: &Served) -> String {
     let err = match &d.error {
         Some(e) if e.block == block_id => e.message.as_str(),
         _ => "",
@@ -355,13 +359,15 @@ fn form(block_id: &str, doc: &str, url: &str, d: &Discussion) -> String {
         }
         let next = format!("{url}#block-{block_id}");
         return format!(
-            "{}<p class=\"c-empty\"><a href=\"/auth/github?next={}\">Sign in with GitHub</a> to comment.</p>",
+            "{}<p class=\"c-empty\"><a href=\"{}?next={}\">Sign in with GitHub</a> to comment.</p>",
             if err.is_empty() { "" } else { &error },
+            esc(&served.href("/auth/github")),
             esc(&js::encode_uri_component(&next))
         );
     };
     format!(
-        "<form class=\"c-compose\" method=\"post\" action=\"/api/comments\"><input type=\"hidden\" name=\"doc\" value=\"{doc}\" /><input type=\"hidden\" name=\"block\" value=\"{block}\" /><textarea name=\"body\" rows=\"3\" maxlength=\"{BODY_MAX}\" required placeholder=\"{ph}\" aria-label=\"Comment\"></textarea>{error}<div class=\"row\"><span>Signed in as {login}{admin} · <button type=\"submit\" form=\"c-signout\" class=\"c-signout\">sign out</button></span><button type=\"submit\">Post</button></div></form>",
+        "<form class=\"c-compose\" method=\"post\" action=\"{action}\"><input type=\"hidden\" name=\"doc\" value=\"{doc}\" /><input type=\"hidden\" name=\"block\" value=\"{block}\" /><textarea name=\"body\" rows=\"3\" maxlength=\"{BODY_MAX}\" required placeholder=\"{ph}\" aria-label=\"Comment\"></textarea>{error}<div class=\"row\"><span>Signed in as {login}{admin} · <button type=\"submit\" form=\"c-signout\" class=\"c-signout\">sign out</button></span><button type=\"submit\">Post</button></div></form>",
+        action = esc(&served.href("/api/comments")),
         doc = esc(doc),
         block = esc(block_id),
         ph = if block_id == PAGE_BLOCK { "Comment on the page" } else { "Comment on this" },
@@ -371,10 +377,11 @@ fn form(block_id: &str, doc: &str, url: &str, d: &Discussion) -> String {
 }
 
 /// The sign-out form the threads' "sign out" buttons submit (forms cannot nest).
-pub fn sign_out_form(url: &str, d: &Discussion) -> String {
+pub fn sign_out_form(url: &str, d: &Discussion, served: &Served) -> String {
     match d.viewer {
         Some(_) => format!(
-            "<form id=\"c-signout\" method=\"post\" action=\"/auth/logout\" hidden><input type=\"hidden\" name=\"next\" value=\"{}\" /></form>",
+            "<form id=\"c-signout\" method=\"post\" action=\"{}\" hidden><input type=\"hidden\" name=\"next\" value=\"{}\" /></form>",
+            esc(&served.href("/auth/logout")),
             esc(url)
         ),
         None => String::new(),

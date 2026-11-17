@@ -9,13 +9,13 @@ shared. The steps: once ready, once the daemon has built its own base (the build
 nobody asked for, `build_own_base`), with the most the tree held while it did, and after each
 edit of `--edits` (default `body,newfn`, from bench.py's `PROJECTS`) and its undoing.
 `--env` is given to the daemon (it takes its environment from the first build), to try an
-allocator setting or `RA_JIT_SPARE=0`. Writes the steps as JSON on stdout's last line.
+allocator setting or `BLAZE_SPARE=0`. Writes the steps as JSON on stdout's last line.
 Linux only; the projects are bench.py's, fetched as it fetches them.
 """
 import json, os, re, shutil, subprocess, sys, time
 
-import bench, cargo_ra_jit, memory
-from cargo_ra_jit import Side, fetch, wait_warm
+import bench, blaze_cli, memory
+from blaze_cli import Side, fetch, wait_warm
 
 FIELDS = ("VmRSS", "RssAnon", "RssFile", "RssShmem", "VmHWM", "VmSwap")
 
@@ -28,7 +28,7 @@ def role(pid):
     name = os.path.basename(args[0].decode(errors="replace"))
     if b"--spare" in args:
         return "spare"
-    if name == "ra-jit":
+    if name == "blaze-engine":
         return "daemon" if args[1:2] == [b"daemon"] else "worker"
     return name
 
@@ -93,9 +93,9 @@ def main():
     shutil.copytree(source, ws, symlinks=True, ignore=lambda at, names: [n for n in names if n in ("target", "target-ref", ".git")
                                                                          or ("prepare" in spec and n == "build" and os.path.samefile(at, source))])
     home = os.path.join(work, "home")
-    env = dict(cargo_ra_jit.base_env(home), **spec.get("env", {}), **prepared, **extra_env)
-    env["PATH"] = os.path.dirname(bench.ra_jit_of("cranelift")) + os.pathsep + env["PATH"]
-    env.update(bench.BACKENDS["cranelift"], RA_JIT_STATS="1", RA_JIT_CACHE=os.path.join(work, "store"))
+    env = dict(blaze_cli.base_env(home), **spec.get("env", {}), **prepared, **extra_env)
+    env["PATH"] = os.path.dirname(bench.blaze_of("cranelift")) + os.pathsep + env["PATH"]
+    env.update(BLAZE_STATS="1")
     env.pop("RUSTC_WRAPPER", None)
     ours = Side(ws, env, True)
     build = spec.get("build", [])
@@ -117,7 +117,7 @@ def main():
                     sampler.add(daemon.pid())
                     took, ran = ours.cargo("build", *build)
                 split(daemon, kind + (" back" if back else ""), steps, wall_s=round(took, 3), peak_mb=sampler.peak_mb,
-                      built=bench.how_built(ran.stderr)[:40])
+                      built=bench.how_built(ran)[:40])
     finally:
         ours.cargo("stop")
     print(json.dumps(dict(project=name, env=extra_env, steps=steps)))
