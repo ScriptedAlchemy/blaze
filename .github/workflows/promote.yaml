@@ -189,8 +189,10 @@ jobs:
         uses: ./.github/actions/reflink
       # As a user installs it: the toolchain blaze downloads included.
       - name: install ${{ env.TAG }}
+        timeout-minutes: 30
         run: sh site/install.sh --version "$TAG"
       - name: what it installed runs
+        timeout-minutes: 30
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
           blaze --version | tee /dev/stderr | grep -F "blaze ${TAG#v} "
@@ -211,7 +213,11 @@ jobs:
           packages_text=$(python3 -I harness/smoke.py "$RUNNER_TEMP/smoke-packages.json")
           read -ra packages <<< "$packages_text"
           if [ "${#packages[@]}" -gt 0 ]; then sudo apt-get update -qq && sudo apt-get install -y -qq "${packages[@]}"; fi
+      # Under the job's 300 minutes, so that a smoke that hangs (the macOS one reached the job's
+      # limit with nothing kept) ends as a failed step: the results, `what blaze recorded` and
+      # the uploads below still run, where a cancelled job runs none of them.
       - name: smoke corpus
+        timeout-minutes: 250
         env:
           # Fork PRs have a read-only Actions token and no bot secret. The PR corpus is public.
           # Real release promotion retains the bot token for its unchanged full corpus.
@@ -458,6 +464,7 @@ jobs:
       - name: promote ${{ env.TAG }}
         id: promote
         if: needs.smoke.result == 'success' && needs.apps.result == 'success' && needs.train.result == 'success' && needs.main-tests.result == 'success' && inputs.promote
+        shell: bash # -eo pipefail: a failing promote.py fails the step through the tee; the default shell's status is tee's, and `outcome` then reads `success` for a promotion that failed (the `promoted` output)
         run: |
           jq -n --arg tag "$TAG" --arg run "$RUN" '{tag: $tag, run: $run, bench: "results"}' > "$RUNNER_TEMP/promote.json"
           python3 -I .github/scripts/promote.py promote "$RUNNER_TEMP/promote.json" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -179,6 +179,18 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertFalse([name for name, spec in corpus["projects"].items() if spec.get("private")])
 
 
+class ResultsTests(unittest.TestCase):
+    def test_each_result_is_saved_as_it_is_added(self):
+        # A job's time limit kills the run with no chance to write: what was reached is kept.
+        saved = []
+        results = smoke.Results()
+        results.save = lambda: saved.append([row["what"] for row in results])
+        results.append({"what": "first"})
+        results.append({"what": "second"})
+        self.assertEqual(saved, [["first"], ["first", "second"]])
+        self.assertEqual(len(smoke.Results()), 0)
+
+
 class CorpusTests(unittest.TestCase):
     """The oracle holds the real harness to a historical tree and one selected executable."""
     def setUp(self):
@@ -301,6 +313,8 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(fetched, [("app", "a" * 40)])
             self.assertEqual({call[0][2] for call in calls}, {"--version", "lock", "build", "run", "test", "stop"})
             self.assertEqual(record["corpus"], corpus.identity)
+            self.assertIs(record["complete"], True)
+            self.assertFalse(Path(self.args.results + ".part").exists(), "the rename left no partial file")
             self.assertEqual(record["compiler"]["path"], str(self.selected))
             self.assertIsNone(record["compiler"]["engine"], "a standalone selected Blaze remains supported")
             self.assertTrue(all(row["ok"] for row in record["results"]))

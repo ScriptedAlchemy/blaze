@@ -99,6 +99,15 @@ jobs:
           test -x ../bins/astral/ra-jit
       - if: failure()
         uses: ./.github/actions/daemon-log
+      # What the build of Astral's fork said, when it failed: the report job has no measurement
+      # to show then, and this is the evidence of why.
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-evidence-astral
+          path: ${{ runner.temp }}/astral-build.ndjson
+          if-no-files-found: ignore
+          retention-days: 14
       - run: tar -czf bins.tar.gz bins
       - uses: actions/upload-artifact@v7
         with:
@@ -158,10 +167,27 @@ jobs:
 
   report:
     name: rival report
-    needs: measure
+    needs: [build, measure]
     if: always()
     runs-on: ubuntu-24.04-arm
     steps:
+      # No measurement ran when a build did not finish (`measure` is skipped), and the merge
+      # below would then say only that no job left evidence. Say which build failed, and fail.
+      - name: a build did not finish
+        if: needs.build.result != 'success'
+        env:
+          BUILD: ${{ needs.build.result }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir rival
+          {
+            echo "# rival: no measurement"
+            echo
+            echo "The job \`build both blazes\` ended as \`$BUILD\`, so no project was measured."
+            echo "Its log and the \`build-evidence-astral\` artifact (Astral's fork's build messages) are in $RUN"
+          } > rival/README.md
+          echo "::error::build both blazes ended as $BUILD: nothing was measured"
+          exit 1
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ours || (github.event_name == 'pull_request' && github.event.pull_request.head.sha) || github.sha }}

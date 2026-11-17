@@ -412,6 +412,18 @@ def fetch(name, spec, rev, dest):
             raise RuntimeError(f"{name}: `{' '.join(argv[-3:])}` failed: {done.stderr.strip()}")
 
 
+class Results(list):
+    """The results so far. `save`, when set, is called after each one is added, so that a run
+    that is killed (a job's time limit ends the whole process tree with no chance to write) has
+    still kept every result it reached in `results`."""
+    save = None
+
+    def append(self, item):
+        super().append(item)
+        if self.save is not None:
+            self.save()
+
+
 class Smoke:
     def __init__(self, args, corpus):
         self.blaze = blaze_program(args.blaze)
@@ -421,7 +433,7 @@ class Smoke:
         self.profiles = args.profiles
         self.blaze_rev = args.blaze_rev
         self.corpus = corpus
-        self.results = []
+        self.results = Results()
 
     def argv(self, *words):
         return [self.blaze, "--ignore-pin", *words]
@@ -645,6 +657,19 @@ def execute(args, corpus):
     smoke = Smoke(args, corpus)
     version = ""
     began = time.monotonic()
+
+    def write_results(complete):
+        """`results` as it stands, replaced whole by a rename. `complete` is false until the
+        run has finished, so a file left by a killed run says it is a part."""
+        if not args.results:
+            return
+        part = args.results + ".part"
+        with open(part, "w") as f:
+            json.dump(dict(blaze=version, compiler=smoke.compiler, corpus=corpus.identity,
+                           complete=complete, results=smoke.results), f, indent=1)
+        os.replace(part, args.results)
+
+    smoke.results.save = lambda: write_results(False)
     try:
         command = smoke.argv("--version")
         code, out, err, _ = run(command, smoke.work, base_env(), 60)
@@ -675,10 +700,7 @@ def execute(args, corpus):
     except OSError as error:
         smoke.error("compiler identity", error)
     print(f"{time.monotonic() - began:.0f} s", flush=True)
-    if args.results:
-        with open(args.results, "w") as f:
-            json.dump(dict(blaze=version, compiler=smoke.compiler, corpus=corpus.identity,
-                           results=smoke.results), f, indent=1)
+    write_results(True)
     failed = summary(smoke.results, sys.stdout)
     if step_summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(step_summary, "a") as f:
