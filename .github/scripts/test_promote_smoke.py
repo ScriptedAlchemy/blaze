@@ -179,18 +179,6 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertFalse([name for name, spec in corpus["projects"].items() if spec.get("private")])
 
 
-class ResultsTests(unittest.TestCase):
-    def test_each_result_is_saved_as_it_is_added(self):
-        # A job's time limit kills the run with no chance to write: what was reached is kept.
-        saved = []
-        results = smoke.Results()
-        results.save = lambda: saved.append([row["what"] for row in results])
-        results.append({"what": "first"})
-        results.append({"what": "second"})
-        self.assertEqual(saved, [["first"], ["first", "second"]])
-        self.assertEqual(len(smoke.Results()), 0)
-
-
 class CorpusTests(unittest.TestCase):
     """The oracle holds the real harness to a historical tree and one selected executable."""
     def setUp(self):
@@ -333,6 +321,32 @@ class CorpusTests(unittest.TestCase):
         with smoke.Corpus(self.old) as corpus, mock.patch.object(corpus, "root", self.corpus):
             with self.assertRaisesRegex(AssertionError, "historical snapshot"):
                 self.exercise(corpus)
+
+    def interrupted_record(self, corpus):
+        with mock.patch.object(smoke.Smoke, "project", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.exercise(corpus)
+        path = Path(self.args.results)
+        self.assertTrue(path.is_file(), "an interrupted run must retain completed smoke results")
+        record = json.loads(path.read_text())
+        self.assertIs(record["complete"], False)
+        self.assertEqual(record["corpus"], corpus.identity)
+        self.assertEqual(record["compiler"]["path"], str(self.selected))
+        completed = [row for row in record["results"] if not row.get("skipped")]
+        self.assertTrue(completed, "the interruption must follow actual case results")
+        self.assertEqual([row["what"] for row in completed],
+                         ["fixture dev run", "fixture dev test", "daemon stop"])
+        self.assertTrue(all(row["ok"] for row in completed))
+        self.assertFalse(Path(self.args.results + ".part").exists())
+
+    def test_interrupted_run_retains_results_without_claiming_completion(self):
+        with smoke.Corpus(self.old) as corpus:
+            self.interrupted_record(corpus)
+
+    def test_oracle_catches_only_saving_results_after_the_run(self):
+        with smoke.Corpus(self.old) as corpus, mock.patch.object(smoke.Results, "append", list.append):
+            with self.assertRaisesRegex(AssertionError, "must retain completed smoke results"):
+                self.interrupted_record(corpus)
 
     def test_oracle_catches_losing_the_selected_compilers_ignore_pin(self):
         with smoke.Corpus(self.old) as corpus, \

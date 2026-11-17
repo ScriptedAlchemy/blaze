@@ -165,7 +165,7 @@ class ResultGateOracles(unittest.TestCase):
             gate = run.root / "gate"
             with patch.object(h.subprocess, "Popen", return_value=child) as start:
                 run.daemon("a", result_gate=gate)
-            self.assertEqual(start.call_args.kwargs["env"]["BLAZE_DIST_TEST_RESULT_GATE"], str(gate))
+            self.assertEqual(start.call_args.kwargs["env"]["BLAZE_DIST_TEST_RESULT_GATE"], str(gate.resolve()))
             self.assertNotIn("BLAZE_DIST_TEST_RESULT_GATE", run.env("a", True))
             with self.assertRaises(e.Failed):
                 run.daemon("a", result_gate=run.root / "another")
