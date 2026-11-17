@@ -17,6 +17,32 @@ fn exhausted_source() -> (NativeDataSource, NativeTestCaseHandle) {
 }
 
 #[test]
+fn generation_scopes_are_paired_per_stream_and_close_after_conclusion() {
+    let (ds, handle) = random_source();
+    ds.generation_scope(true).unwrap();
+    let clone = ds.clone_stream().unwrap();
+    assert!(clone.generation_scope(false).is_err(), "one stream cannot close another's scope");
+    assert_eq!(handle.lock().family().generation_time.active(), 1);
+    clone.generation_scope(true).unwrap();
+    assert_eq!(handle.lock().family().generation_time.active(), 2);
+    ds.mark_complete(&TestCaseResult::Invalid);
+    ds.generation_scope(false).unwrap();
+    assert_eq!(handle.lock().family().generation_time.active(), 1);
+    clone.generation_scope(false).unwrap();
+    assert_eq!(handle.lock().family().generation_time.active(), 0);
+    assert!(ds.generation_scope(false).is_err());
+}
+
+#[test]
+fn a_generation_scope_closes_after_a_native_draw_aborts() {
+    let (ds, handle) = exhausted_source();
+    ds.generation_scope(true).unwrap();
+    assert!(ds.generate_integer(&BigInt::from(0), &BigInt::from(10)).is_err());
+    ds.generation_scope(false).unwrap();
+    assert_eq!(handle.lock().family().generation_time.active(), 0);
+}
+
+#[test]
 fn take_nodes_and_take_spans_return_recorded_data() {
     let (ds, handle) = random_source();
     ds.generate_integer(&BigInt::from(0), &BigInt::from(10)).unwrap();

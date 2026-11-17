@@ -668,7 +668,7 @@ impl<'a> Engine<'a> {
 
                     if let Some(msg) = too_slow_check(
                         self.valid_test_cases,
-                        self.total_test_time,
+                        self.total_generation_time,
                         too_slow_threshold,
                         settings.health_check_suppressed(HealthCheck::TooSlow),
                     ) {
@@ -1072,18 +1072,18 @@ const POST_BUG_EXTRA_CALLS: u64 = 1000;
 /// real time.
 pub(crate) fn too_slow_check(
     valid_test_cases: u64,
-    total_test_time: core::time::Duration,
+    generation_time: core::time::Duration,
     threshold: core::time::Duration,
     suppressed: bool,
 ) -> Option<String> {
-    if valid_test_cases < HEALTH_CHECK_MAX_VALID && total_test_time > threshold && !suppressed {
+    if valid_test_cases < HEALTH_CHECK_MAX_VALID && generation_time > threshold && !suppressed {
         Some(format!(
             "FailedHealthCheck: TooSlow — input generation is slow: \
              only {valid_test_cases} valid inputs after {:?} (threshold \
              {:?}). Slow generation makes property testing much less \
              effective. If this is expected, suppress the TooSlow health check \
              with the suppress_health_check setting.",
-            total_test_time, threshold
+            generation_time, threshold
         ))
     } else {
         None
@@ -1505,6 +1505,8 @@ pub(crate) struct Engine<'a> {
     /// `test_cases` budget when a failure does not end generation.
     pub(crate) interesting_test_cases: u64,
     pub(crate) total_test_time: core::time::Duration,
+    /// Only time inside generation scopes; the TooSlow guard excludes property-body work.
+    pub(crate) total_generation_time: core::time::Duration,
     pub(crate) test_is_trivial: bool,
     pub(crate) first_bug_at: Option<u64>,
     pub(crate) last_bug_at: Option<u64>,
@@ -1581,6 +1583,7 @@ impl<'a> Engine<'a> {
             overrun_test_cases: 0,
             interesting_test_cases: 0,
             total_test_time: core::time::Duration::ZERO,
+            total_generation_time: core::time::Duration::ZERO,
             test_is_trivial: false,
             first_bug_at: None,
             last_bug_at: None,
@@ -2942,9 +2945,9 @@ impl<'a> Engine<'a> {
             ntc.set_should_capture();
         }
         let tc_start = crate::sys::Instant::now();
-        let run = self.execute(ntc).await?;
+        let (run, generation_time) = self.execute(ntc).await?;
         let elapsed = tc_start.map_or(core::time::Duration::ZERO, |start| start.elapsed());
-        let mut mismatch = self.record_run(&run, elapsed, measurement)?;
+        let mut mismatch = self.record_run(&run, elapsed, generation_time, measurement)?;
         if mismatch.is_some()
             && self.settings.nondeterminism_strictness != NondeterminismStrictness::Error
         {
@@ -2968,6 +2971,7 @@ impl<'a> Engine<'a> {
         &mut self,
         run: &RunResult,
         elapsed: core::time::Duration,
+        generation_time: core::time::Duration,
         measurement: bool,
     ) -> Result<Option<RunError>, InternalError> {
         let (mismatch, mismatched_origin) =
@@ -2979,6 +2983,7 @@ impl<'a> Engine<'a> {
         } else {
             self.calls += 1;
             self.total_test_time += elapsed;
+            self.total_generation_time += generation_time;
             if run.nodes.is_empty() && run.status >= Status::Invalid {
                 self.test_is_trivial = true;
             }
@@ -3082,7 +3087,10 @@ impl<'a> Engine<'a> {
     /// execution. `Err` means the driver violated the run contract by
     /// resuming the engine without concluding the offered case (see
     /// [`NativeDataSource::take_outcome`]).
-    async fn execute(&mut self, ntc: NativeTestCase) -> Result<RunResult, RunError> {
+    async fn execute(
+        &mut self,
+        ntc: NativeTestCase,
+    ) -> Result<(RunResult, core::time::Duration), RunError> {
         if self.settings.verbosity == Verbosity::Verbose {
             self.settings.output.line("Running test case");
         }
@@ -3104,17 +3112,21 @@ impl<'a> Engine<'a> {
             TestCaseResult::Interesting(f) => (Status::Interesting, Some(f.origin)),
         };
 
-        Ok(RunResult {
-            status,
-            nodes,
-            spans,
-            origin,
-            target_observations,
-            events,
-            divergence,
-            settled,
-            ended,
-        })
+        let generation_time = NativeDataSource::generation_time(&handle);
+        Ok((
+            RunResult {
+                status,
+                nodes,
+                spans,
+                origin,
+                target_observations,
+                events,
+                divergence,
+                settled,
+                ended,
+            },
+            generation_time,
+        ))
     }
 
     /// The single replay chokepoint — Hypothesis's `cached_test_function` —

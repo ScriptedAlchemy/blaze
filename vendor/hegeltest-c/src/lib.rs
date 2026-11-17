@@ -3296,6 +3296,30 @@ pub unsafe extern "C" fn hegel_stop_span(
     }
 }
 
+/// Internal to blaze's vendored static client: bracket a client generator, including
+/// custom generator code. Closing remains legal after rejection or family conclusion.
+/// Unlike a choice span, this scope carries no replay data.
+pub unsafe fn hegel_generation_scope(
+    ctx: *mut HegelContext,
+    tc: *mut HegelTestCase,
+    enter: bool,
+) -> hegel_result_t {
+    clear_last_error(ctx);
+    let result = if enter {
+        unsafe { tc_guard(ctx, "hegel_generation_scope", tc) }
+    } else {
+        unsafe { tc_lock(ctx, "hegel_generation_scope", tc) }
+    };
+    let (tc, _guard) = match result {
+        Ok(pair) => pair,
+        Err(rc) => return rc,
+    };
+    match tc.stream.generation_scope(enter) {
+        Ok(()) => HEGEL_OK,
+        Err(error) => translate_ds_error(ctx, error),
+    }
+}
+
 /// The span label for a generator identified by a name: the 64-bit FNV-1a
 /// hash of the name's bytes. Use it for the label of a generator with no
 /// component generators (`hegel_label_from_name("mylib.integers")`), and

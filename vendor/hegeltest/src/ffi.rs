@@ -927,6 +927,13 @@ impl CTestCase {
         rc_to_value(rc, std::net::Ipv6Addr::from(out))
     }
 
+    pub(crate) fn generation_scope(&self, enter: bool) -> Result<(), hegel_result_t> {
+        // SAFETY: this live handle remains owned by the client's scope until it closes.
+        rc_to_unit(with_context(|ctx| unsafe {
+            hegel_c::hegel_generation_scope(ctx, self.raw, enter)
+        }))
+    }
+
     pub(crate) fn start_span(&self, label: u64) -> Result<(), hegel_result_t> {
         rc_to_unit(with_context(|ctx| unsafe { hegel_c::hegel_start_span(ctx, self.raw, label) }))
     }

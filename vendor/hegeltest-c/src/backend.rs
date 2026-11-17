@@ -66,6 +66,9 @@ impl core::error::Error for DataSourceError {}
 /// Implementations must be `Send + Sync` so a `TestCase` clone can be moved to
 /// another thread.
 pub trait DataSource: Send + Sync {
+    /// Open or close a client generator scope; a close remains valid after conclusion.
+    fn generation_scope(&self, enter: bool) -> Result<(), DataSourceError>;
+
     /// Draw an integer uniformly-ish from `[min_value, max_value]`, biased
     /// toward boundary values as the engine sees fit. Errors with
     /// `InvalidArgument` when `min_value > max_value`.
