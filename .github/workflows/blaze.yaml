@@ -85,9 +85,40 @@ jobs:
             /harness/toolchain
             /Cargo.toml
             /Cargo.lock
-      - uses: ./.github/actions/script
+      - id: bootstrap
+        uses: ./.github/actions/script
         with:
           job: changes
+      # A locked bootstrap failure stays a failure. Ask the exact installed release for its
+      # proposed lockfiles in a complete, disposable snapshot, never in the build's checkout.
+      - name: diagnose bootstrap lockfiles in an isolated snapshot
+        if: failure() && steps.bootstrap.outcome == 'failure'
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          blaze_bin=$(command -v blaze)
+          snapshot=$(mktemp -d "$RUNNER_TEMP/blaze-lock.XXXXXX")
+          trap 'rm -rf "$snapshot"' EXIT
+          evidence="$RUNNER_TEMP/blaze-lock-evidence"
+          mkdir -p "$evidence"
+          git rev-parse HEAD > "$evidence/commit.txt"
+          blaze-engine --version > "$evidence/version.txt"
+          timeout 30s git archive HEAD | timeout 30s tar -x -C "$snapshot"
+          (cd "$snapshot" && timeout --kill-after=10s 120s "$blaze_bin" lock -p scripts --bins) \
+            2>&1 | tee "$evidence/resolve.log"
+          cp "$snapshot/Cargo.lock" "$evidence/Cargo.lock"
+          if [ -f "$snapshot/blaze.lock" ]; then cp "$snapshot/blaze.lock" "$evidence/blaze.lock"; fi
+          diff_status=0
+          diff -u Cargo.lock "$evidence/Cargo.lock" > "$evidence/Cargo.lock.diff" || diff_status=$?
+          cat "$evidence/Cargo.lock.diff"
+          [ "$diff_status" -le 1 ]
+      - name: keep bootstrap lockfile diagnosis
+        if: failure() && steps.bootstrap.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bootstrap-lock-diagnosis
+          path: ${{ runner.temp }}/blaze-lock-evidence/
+          if-no-files-found: warn
       - id: files
         env:
           GH_TOKEN: ${{ github.token }}
