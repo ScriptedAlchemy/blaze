@@ -204,54 +204,75 @@ jobs:
       # release .github/blaze-version names, never by the blaze this tree builds: a tree whose
       # compiler does not build must still be checked (the stage-0 rule). From the Actions cache
       # when their inputs are unchanged (./.github/actions/script). No LLVM: the scripts link none.
-      - uses: ./.github/actions/script
+      - id: bootstrap
+        uses: ./.github/actions/script
         with:
           job: scripts
+      # Independent checks still run after another check fails, once their tools exist.
+      # Each failure keeps the job failed; a failed bootstrap or cancellation runs none.
       # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
       # their index (scripts/src/bin/docs.rs). And no Python file is added: tools/python-allowed.txt
       # lists the ones left and only shrinks (docs/v2/plan/design/scripts.md).
-      - run: |
+      - name: documentation contracts and index
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        run: |
           "$BLAZE_SCRIPTS/docs" selftest
           "$BLAZE_SCRIPTS/docs" check
       # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md,
       # scripts/src/bin/rustcsites.rs).
-      - run: '"$BLAZE_SCRIPTS/rustcsites"'
+      - name: compiler invocation sites
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        run: '"$BLAZE_SCRIPTS/rustcsites"'
       # The objectives ledger's rows are well formed and its table is current (scripts/src/bin/ledger.rs).
-      - run: |
+      - name: objective ledger controls and index
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        run: |
           "$BLAZE_SCRIPTS/ledger" selftest
           "$BLAZE_SCRIPTS/ledger" '{"command": "check"}'
       # The budget harness's own parts hold: which rows an input selects, the daemon home's layout
       # against the daemon's rule, the smoke's edit on the fixture (harness/v2/budgets.py). Its
       # smoke, against the blaze a change builds, is blaze-platform.yaml's profile-gate job.
-      - run: uv run --frozen python harness/v2/budgets.py selftest
+      - name: budget harness controls
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        run: uv run --frozen python harness/v2/budgets.py selftest
       # The smoke's guards (harness/v2/guards.py): each finding a bound is for, in miniature, is
       # refused by its bound and the fixed state passes; the known list reads; a result with a
       # guard missing is refused. And which packages a change touches (scripts/src/bin/changed.rs).
-      - run: |
+      - name: guard and changed-package controls
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        run: |
           uv run --frozen python harness/v2/guards.py selftest
           "$BLAZE_SCRIPTS/changed" selftest
       # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them
       # (scripts/src/bin/invariants.rs).
-      - run: |
+      - name: invariant controls and index
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        run: |
           "$BLAZE_SCRIPTS/invariants" selftest
           "$BLAZE_SCRIPTS/invariants" '{"command": "check"}'
       # The Lean proofs, as far as no Lean is needed (harness/v2/lean_gate.py): the list of
       # theorems (lean/theorems.json) names statements that are there, no source says `sorry`,
       # `native_decide`, `axiom` or `partial def`, lean/analysis's manifest is checked in at the
       # pinned Mathlib, and docs/v2/plan/proofs.md is current. The `lean` job builds them.
-      - run: |
+      - name: Lean source controls
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        run: |
           uv run --frozen python harness/v2/lean_gate.py selftest
           uv run --frozen python harness/v2/lean_gate.py '{"command": "sources"}'
       # blaze's registry of rustc's lints (crates/blaze-lint-defs/src/rustc.rs) is the one written
       # from rustc's source at the commit library/UPSTREAM pins, unedited: a toolchain bump that
       # does not write it again fails here (scripts/src/bin/lint_table.rs).
-      - run: |
+      - name: rustc lint table
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        run: |
           "$BLAZE_SCRIPTS/lint_table" selftest
           "$BLAZE_SCRIPTS/lint_table" '{"command": "check"}'
       # Each hash domain in crates/ is written once outside tests, and is under a cache of
       # docs/v2/plan/design/caches.md with the grain of its key; each hasher that is not BLAKE3
       # has its class there (scripts/src/bin/domains.rs).
-      - run: |
+      - name: hash domains
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        run: |
           "$BLAZE_SCRIPTS/domains" '{"root": "."}'
       # What is left of the global heap only goes down (AGENTS.md bump-allocate): per crate,
       # outside tests, the `// alloc:` lines left to convert, the `expect`s of
@@ -262,6 +283,7 @@ jobs:
       # over its row has its new sites named from the base's diff (scripts/src/bin/allocs.rs). It needs no compiler, where the lints need a blaze that
       # checks the workspace. Against the base itself: the checkout is shallow.
       - name: global-heap allocations only go down
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
@@ -282,6 +304,7 @@ jobs:
       # compiler, where the lint needs a blaze that checks the workspace. Against the base
       # itself: the checkout is shallow.
       - name: untyped errors only go down
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
@@ -298,6 +321,7 @@ jobs:
       # crate's test of the previous layout (rule persisted-state-round-trips;
       # scripts/src/bin/layouts.rs).
       - name: a changed persisted layout has a previous-layout test
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
@@ -312,6 +336,7 @@ jobs:
       # A change of blaze-profile's schema version lands only once ix.dev/explore reads it
       # (.github/scripts/explore_page.py; release.yaml checks every release too).
       - name: ix.dev/explore reads a new profile schema
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
         run: |
           git fetch -q --depth=1 origin main
           version() { grep -E '^pub const VERSION: u32' "$@"; }
