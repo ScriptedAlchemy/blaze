@@ -204,6 +204,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast, get_args
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -2162,13 +2163,35 @@ def selftest_layout() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         top = Path(tmp).resolve()
         home, ws = top / "home", top / "my repo"
-        env = eng.env(home, None, {"X": "1"})
+        # A cold script bootstrap exports the old cache controls; a cache hit does not.
+        # Always plant them so this isolation check has the same force in either job.
+        with patch.dict(os.environ, {
+            "BLAZE_HOME": str(top / "inherited-home"),
+            "BLAZE_CACHE": str(top / "inherited-store"),
+            "BLAZE_CACHE_MAX": "off",
+            "CARGO_TARGET_DIR": str(top / "inherited-target"),
+            "XDG_RUNTIME_DIR": str(top / "inherited-runtime"),
+            "BLAZE_BACKEND": "llvm",
+            "BLAZE_DAEMON_MEMORY_GB": "7",
+            "BLAZE_CACHE_ENDPOINT": "https://cache.invalid",
+        }):
+            env = eng.env(home, None, {"X": "1"})
+            named = eng.env(home, top / "t", {"X": "2"})
+            reference = engine.reference_env(top / "reference", {"X": "3"})
         expect(env["BLAZE_HOME"] == str(home) and home.is_dir() and env["X"] == "1", "the environment names the home")
-        for name in ("BLAZE_CACHE", "CARGO_TARGET_DIR", "XDG_RUNTIME_DIR", "BLAZE_BACKEND"):
+        for name in ("BLAZE_CACHE", "BLAZE_CACHE_MAX", "CARGO_TARGET_DIR", "XDG_RUNTIME_DIR", "BLAZE_BACKEND"):
             expect(name not in env, f"the environment sets no {name}: the daemon's home says where everything is")
-        named = eng.env(home, top / "t")
-        expect(named["CARGO_TARGET_DIR"] == str(top / "t") and eng.build_dir(ws, named) == top / "t",
-               "a target directory named is the build directory")
+        expect(named["BLAZE_HOME"] == str(home) and named["X"] == "2"
+               and named["CARGO_TARGET_DIR"] == str(top / "t") and eng.build_dir(ws, named) == top / "t",
+               "an explicit home, target directory and extras survive inherited settings")
+        expect(reference["CARGO_TARGET_DIR"] == str(top / "reference") and reference["X"] == "3"
+               and "BLAZE_HOME" not in reference, "the reference environment uses its explicit target and extras")
+        for isolated in (env, named, reference):
+            expect("BLAZE_CACHE" not in isolated and "BLAZE_CACHE_MAX" not in isolated,
+                   "legacy cache controls are absent from every explicit environment")
+            expect(isolated["BLAZE_DAEMON_MEMORY_GB"] == "7"
+                   and isolated["BLAZE_CACHE_ENDPOINT"] == "https://cache.invalid",
+                   "supported daemon and remote-cache settings remain inherited")
         refused("a build directory before any build", lambda: eng.build_dir(ws, env), engine.Failed)
         builds = Path(engine.layout(home).builds)
         mine = builds / ("my_repo-" + "0123456789abcdef" * 2)

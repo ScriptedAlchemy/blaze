@@ -79,6 +79,10 @@ SCRUBBED = (
     "CARGO_BUILD_JOBS",
     "CARGO_INCREMENTAL",
     "BLAZE_HOME",
+    # The pinned bootstrap still exports these legacy store controls. V2's storage comes
+    # from its explicit home, so neither the old location nor its limit is inherited.
+    "BLAZE_CACHE",
+    "BLAZE_CACHE_MAX",
     "BLAZE_BIN",
     "BLAZE_BACKEND",
     "BLAZE_OPT",

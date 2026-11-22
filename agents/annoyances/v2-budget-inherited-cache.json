@@ -1,0 +1,18 @@
+{
+  "id": "v2-budget-inherited-cache",
+  "date": "2026-11-21",
+  "who": "GPT-6 Astra Pro, frontend_merge lane",
+  "where": "harness/v2/engine.py SCRUBBED; harness/v2/budgets.py selftest_layout; CI job 137067146771",
+  "what": "The budget selftest failed its no-BLAZE_CACHE assertion after a cold script bootstrap, while the same layout test passed with no inherited legacy cache setting.",
+  "cost": "The budget control failed after all 21 native tools were rebuilt and docs and ledger passed; the other independent native checks still ran.",
+  "cause": "The bootstrap action exports BLAZE_CACHE and BLAZE_CACHE_MAX for its pinned release. The V2 harness copied them from the parent environment, and the layout test relied on whatever environment its caller happened to provide.",
+  "whys": [
+    "the shared scrub list omitted both legacy cache controls",
+    "the assertion had no hostile inherited values of its own, so a cache-hit job could not expose the omission"
+  ],
+  "class": "environment isolation depended on the bootstrap cache state",
+  "prevention": "Drop the two exact legacy names in the harness's shared scrubber. Always inject hostile inherited settings in the layout test, while checking that explicit home, target and extras and supported daemon/remote settings survive.",
+  "workaround": "none; the bootstrap's environment remains available to its workspace build",
+  "fix": "The clean and poisoned budget selftests pass. Removing either scrubbed cache name independently makes the strengthened layout test fail. Focused strict Pyright and configured Ruff pass; explicit-file Ruff findings match the pre-change baseline.",
+  "state": "fixed; clean, poisoned and planted-regression controls verified locally"
+}
