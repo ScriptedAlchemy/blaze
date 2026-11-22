@@ -165,7 +165,7 @@ fn checked_as(
 
 /// Each fixture a test checked through [`checked_as`] with neither derives expanded nor a
 /// module appended, with its prefix and options, in the order checked: what
-/// `pieces::tests::the_pieces_check_equals_the_whole_check` checks again by piece, beside its
+/// `pieces::tests::the_oracle_catches_skipped_bodies_and_incomplete_probe_settings` checks again by piece, beside its
 /// own fixtures, after every edit kind.
 pub(crate) static CHECKED: blaze_core::lock::Lock<Vec<(String, String, Options)>> =
     blaze_core::lock::Lock::new("test.diagnostics.checked", Vec::new());

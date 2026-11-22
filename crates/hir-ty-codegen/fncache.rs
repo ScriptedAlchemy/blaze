@@ -63,16 +63,13 @@ use super::{
     is_thread_local, link_name_for,
 };
 
+mod key;
+
 /// The function whose instance names how the arguments and the result are written: reached
 /// for the hash, though what it does is not the cached function's.
 const CODEC: &str = "__blaze_codec";
 /// Changes when what is hashed does, so no hash of before means anything now.
-const FORMAT: u32 = 2;
-/// The domain of a cached function's code: its closure's CodeId (`hir_ty_identity::code_id`),
-/// the target and the nightly, of which the `Code` the call is answered with is the first
-/// 16 bytes. The purity of what it reaches is the walk's to say until lane pure's
-/// `#[blaze::pure]` check takes it (docs/v2/plan/design/code-identity.md).
-const CACHED_CODE_DOMAIN: &str = "blaze v2 cached code 1";
+const FORMAT: u32 = key::FORMAT;
 /// Whether `BLAZE_FN_CACHE_TRACE` asks for what the walk goes through, read once a process.
 static TRACE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some());
 
@@ -212,14 +209,13 @@ pub(super) fn cache_code(
     })?;
     // The nightly: what is outside the checkout is linked as its pre-built std, whose code a
     // nightly can change.
-    let mut hasher = blaze_ids::Hasher::new(CACHED_CODE_DOMAIN);
-    hasher.update(&FORMAT.to_le_bytes()).part(target.triple().as_bytes());
-    hasher
-        .part(crate::v2::toolchain::NIGHTLY.as_bytes())
-        .update(&[closure.checked as u8])
-        .id(&code.0);
-    let id = hasher.finish().0;
-    Ok(u128::from_le_bytes(id[..16].try_into().expect("a content ID's first 16 bytes")))
+    Ok(key::code(
+        FORMAT,
+        target.triple().as_bytes(),
+        crate::v2::toolchain::NIGHTLY.as_bytes(),
+        closure.checked,
+        &code.0,
+    ))
 }
 
 /// What `instance` of the cached function `func` writes as the code of its body

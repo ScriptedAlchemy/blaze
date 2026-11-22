@@ -22,6 +22,26 @@ pub(super) enum Step {
     Failed,
 }
 
+/// A completion cannot advance this publication's current durability barrier.
+#[derive(Debug)]
+pub(super) struct RefusedCompletion {
+    pub(super) step: Step,
+    pub(super) tag: Tag,
+    pub(super) done: Done,
+}
+
+impl std::fmt::Display for RefusedCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "objects/published: {:?} refused completion {:?} with tag {:?}",
+            self.step, self.done, self.tag,
+        )
+    }
+}
+
+impl std::error::Error for RefusedCompletion {}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Plant {
@@ -84,15 +104,14 @@ impl Publication {
         })
     }
 
-    pub(super) fn complete(&mut self, completion: Completion) -> Result<(), String> {
+    pub(super) fn complete(&mut self, completion: Completion) -> Result<(), RefusedCompletion> {
         let next = match (self.step, completion.tag, completion.done) {
             (Step::FileSync, Tag(0), Done::Synced) => Step::Rename,
             (Step::Rename, Tag(1), Done::Renamed) => Step::DirectorySync,
             (Step::DirectorySync, Tag(2), Done::Synced) => Step::Acknowledged,
-            (step, _, done) => {
+            (step, tag, done) => {
                 self.step = Step::Failed;
-                // alloc: an error names the logical publication slot and refused transition.
-                return Err(format!("objects/published: {step:?} refused completion {done:?}"));
+                return Err(RefusedCompletion { step, tag, done });
             }
         };
         self.step = next;

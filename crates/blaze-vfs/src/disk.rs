@@ -638,7 +638,7 @@ mod tests {
     /// Against a map kept beside it. Control: the overlay alone (the image's column left out)
     /// misses names the model holds, and the oracle says so.
     #[test]
-    fn a_column_hands_every_name_once_in_order_with_its_stamp() {
+    fn the_oracle_catches_a_column_omitting_its_persisted_names() {
         let mut disks = Disks::default();
         let mut model = BTreeMap::new();
         let disk = disks.of("main", &name("w"));

@@ -167,7 +167,8 @@ impl World {
             self.jobs.tick(self.now, &mut out);
             self.effects(out)?;
             self.check_assignments()?;
-            self.jobs.admission_view().check().map_err(|e| self.violation("capacity", e))?;
+            self.jobs.admission_view().check()
+                .map_err(|error| self.violation("capacity", error.to_string()))?;
             self.assignments()?;
             if self.now >= horizon
                 && self.kills.is_empty()
@@ -185,7 +186,7 @@ impl World {
                     format!("execution {:?} never ended: {:?}", e.id, e.state()),
                 ));
             }
-            stages(e).map_err(|d| self.violation("stages", d))?;
+            stages(e, self.seed, self.now)?;
         }
         Ok(self.summary)
     }
@@ -734,7 +735,7 @@ impl World {
 }
 
 /// Stage timestamps go forward, each stage after the one before it.
-fn stages(e: &jobs::Execution) -> Result<(), String> {
+fn stages(e: &jobs::Execution, seed: u64, now: Millis) -> Result<(), Violation> {
     let public: Vec<_> = e
         .events(0)
         .iter()
@@ -744,7 +745,12 @@ fn stages(e: &jobs::Execution) -> Result<(), String> {
         })
         .collect();
     if public != e.stages() {
-        return Err(format!("{:?}: public stages bypass coordinator bookkeeping", e.id));
+        return Err(Violation {
+            seed,
+            invariant: "stages",
+            at: now,
+            detail: format!("{:?}: public stages bypass coordinator bookkeeping", e.id),
+        });
     }
     let mut last: Option<(u64, Millis)> = None;
     for (stage, at) in e.stages() {
@@ -752,7 +758,12 @@ fn stages(e: &jobs::Execution) -> Result<(), String> {
         if let Some((r, t)) = last
             && (*at < t || (rank < r && *stage != Stage::Assigned))
         {
-            return Err(format!("{:?}: stage {stage:?} at {at} after {r} at {t}", e.id));
+            return Err(Violation {
+                seed,
+                invariant: "stages",
+                at: now,
+                detail: format!("{:?}: stage {stage:?} at {at} after {r} at {t}", e.id),
+            });
         }
         last = Some((rank, *at));
     }

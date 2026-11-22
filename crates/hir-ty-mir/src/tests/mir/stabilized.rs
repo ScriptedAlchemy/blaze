@@ -37,8 +37,8 @@ fn runs(meta: &str, source: &str) {
     check_pass_and_stdio(&fixture(meta, source), "", "");
 }
 
-/// The control of every test here: a `check` that does not hold stops the run, and one
-/// that holds does not.
+/// The invariant: a fixture's `check` that does not hold stops the MIR run with a panic,
+/// and one that holds returns. This control exercises the assertion used by every test here.
 #[test]
 fn the_oracle_catches_a_check_that_does_not_hold() {
     let source = "fn main() { check(1 + 1 == 3); }";

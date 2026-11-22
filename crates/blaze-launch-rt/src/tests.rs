@@ -927,7 +927,7 @@ fn joined(waiters: usize, joined: Joined, twice: bool) -> (usize, Vec<Bound>) {
 /// naming it. The control: `Plant::JoinsTwice`, a join not remembered, runs it again for a
 /// second round of calls, which the count catches.
 #[test]
-fn a_first_need_with_no_daemon_joins_once_and_every_waiter_is_bound_or_refused_by_name() {
+fn the_oracle_catches_a_first_need_join_not_remembered() {
     for waiters in [1, 6] {
         for how in [Joined::Fails, Joined::Unheld, Joined::Welcomed] {
             let (ran, answers) = joined(waiters, how, matches!(how, Joined::Fails));

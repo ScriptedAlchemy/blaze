@@ -320,7 +320,7 @@ mod tests {
         }
     }
 
-    /// The round trip: every entry given is found with its bytes, and a key not given is not.
+    /// The invariant: every entry written is found with its bytes, and a key not given is not.
     #[test]
     fn every_entry_written_is_found_with_its_bytes_and_no_other_key_is() {
         for count in [0, 1, 2, 7, 500, 20_000] {

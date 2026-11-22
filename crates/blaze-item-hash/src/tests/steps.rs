@@ -724,7 +724,7 @@ fn resolves_dep_value(db: &Db, f: DefWithBodyId) -> FactRef {
 /// boundary again): the steps list a row of the block's def map and no `Resolves` of `value`
 /// in `dep`, the import's lookup hidden behind it.
 #[test]
-fn a_blocks_use_is_read_as_the_names_it_looked_up() {
+fn the_oracle_catches_a_block_boundary_hiding_its_name_reads() {
     let db = db_of(BLOCK_USE[0]);
     let f = super::perturb::body(&db, "f");
     let seen = steps_seen(&db, &[f]);

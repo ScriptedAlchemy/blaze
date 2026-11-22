@@ -730,10 +730,32 @@ fn inherent_assoc_types_fact_changes_with_the_list_and_only_then() {
     ]);
 }
 
+trait StepValue {
+    fn of(db: &Db, fact: FactRef) -> Option<ContentId>;
+}
+
+struct StepAnswer;
+
+impl StepValue for StepAnswer {
+    fn of(db: &Db, fact: FactRef) -> Option<ContentId> {
+        values::value(db, local_crate(db), fact)
+    }
+}
+
+struct BodyKeyAsStepValue;
+
+impl StepValue for BodyKeyAsStepValue {
+    fn of(_db: &Db, fact: FactRef) -> Option<ContentId> {
+        // The planted shortcut uses the body's stable item key as its answer. The key
+        // identifies the body across edits; it does not describe what the body computes.
+        Some(fact.subject)
+    }
+}
+
 /// The value of `fact`, the local crate seeing it, in a database of `source` with an item
 /// store of [`crate::Bodies`] installed (a body's step value is its answer in the store's
 /// encoding, which names items through the store's facts).
-fn step_fact_value(source: &str, fact: fn(&Db) -> FactRef) -> Option<ContentId> {
+fn step_fact_value<V: StepValue>(source: &str, fact: fn(&Db) -> FactRef) -> Option<ContentId> {
     let db = db_of(&format!("{PRELUDE}{source}"));
     let installed = body_store::install(
         &db,
@@ -743,7 +765,7 @@ fn step_fact_value(source: &str, fact: fn(&Db) -> FactRef) -> Option<ContentId> 
         Mode::Serve,
     )
     .expect("an item store for the test database");
-    let value = values::value(&db, local_crate(&db), fact(&db));
+    let value = V::of(&db, fact(&db));
     drop(installed);
     value
 }
@@ -756,14 +778,15 @@ fn k_mir(db: &Db) -> FactRef {
     values::step_fact_of(db, body_named(db, "k"), Step::Mir).expect("a MIR step fact")
 }
 
-/// The invariant of another body's step fact (a `const fn` evaluated, a coroutine's
-/// witnesses): its value is the hash of that body's answer, so it changes exactly when the
-/// answer does. A literal changed is the same inference and another MIR; a return type changed
-/// is another inference; another body's edit changes neither. The control is the literal pair
-/// under the inference: a value made of the body's text (a planted fact keyed by its source,
-/// not its answer) would change there, and the assertion fails on it.
-#[test]
-fn another_bodys_step_fact_changes_with_its_answer_and_only_then() {
+#[derive(Debug, PartialEq, Eq)]
+enum StepMismatch {
+    MissingBefore(&'static str),
+    MissingAfter(&'static str),
+    Changed(&'static str),
+    Unchanged(&'static str),
+}
+
+fn step_values_match<V: StepValue>() -> Result<(), StepMismatch> {
     let cases: [(&str, &str, &str, fn(&Db) -> FactRef, bool); 4] = [
         ("a literal, the MIR", "pub const fn k() -> u32 { 1 }", "pub const fn k() -> u32 { 2 }", k_mir, true),
         ("a literal, the inference", "pub const fn k() -> u32 { 1 }", "pub const fn k() -> u32 { 2 }", k_infer, false),
@@ -777,10 +800,35 @@ fn another_bodys_step_fact_changes_with_its_answer_and_only_then() {
         ),
     ];
     for (what, before, after, fact, changes) in cases {
-        let (was, is) = (step_fact_value(before, fact), step_fact_value(after, fact));
-        assert!(was.is_some() && is.is_some(), "{what}: a step fact with no value: {was:?} {is:?}");
-        assert_eq!(was != is, changes, "{what}");
+        let was = step_fact_value::<V>(before, fact).ok_or(StepMismatch::MissingBefore(what))?;
+        let is = step_fact_value::<V>(after, fact).ok_or(StepMismatch::MissingAfter(what))?;
+        if was != is && !changes {
+            return Err(StepMismatch::Changed(what));
+        }
+        if was == is && changes {
+            return Err(StepMismatch::Unchanged(what));
+        }
     }
+    Ok(())
+}
+
+/// The invariant of another body's step fact (a `const fn` evaluated, a coroutine's
+/// witnesses): its value is the hash of that body's answer, so it changes exactly when the
+/// answer does. A literal changed is the same inference and another MIR; a return type changed
+/// is another inference; another body's edit changes neither. The control substitutes the
+/// body's stable item key for its step value: the literal changes the MIR, but not that key.
+#[test]
+fn another_bodys_step_fact_changes_with_its_answer_and_only_then() {
+    assert_eq!(step_values_match::<StepAnswer>(), Ok(()));
+}
+
+#[test]
+fn the_oracle_catches_a_body_key_used_as_its_step_value() {
+    assert_eq!(step_values_match::<StepAnswer>(), Ok(()));
+    assert_eq!(
+        step_values_match::<BodyKeyAsStepValue>(),
+        Err(StepMismatch::Unchanged("a literal, the MIR"))
+    );
 }
 
 /// The invariant of `CrateSettings`: a dependency's settings fact (what a row of its `Crate`

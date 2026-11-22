@@ -120,6 +120,8 @@ fn refines<M: Memo>(ops: &[Op], mut mine: M) -> Result<(), String> {
     Ok(())
 }
 
+/// The refinement: after every keep, arena drop and request end, the resident memo answers
+/// the reference's bytes, accounts for the same resident bytes, and aligns every record.
 #[test]
 fn resident_refines_the_reference() {
     blaze_sim::check(blaze_sim::Config::cases(300), |tape| {

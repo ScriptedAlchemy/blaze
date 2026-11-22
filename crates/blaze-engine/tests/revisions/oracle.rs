@@ -81,6 +81,9 @@ fn case(parts: Parts, turns: &[Turn]) {
     }
 }
 
+/// The invariant: after every drawn edit, save and event, the incremental program's result,
+/// output and diagnostics equal a clean build of that revision, and its work stays within
+/// the turn's bound. This real-process oracle remains an explicitly ignored long-running test.
 #[test]
 #[ignore = "minutes of real builds a case: docs/harness.md, \"The oracle\""]
 fn any_turn_sequence_builds_as_clean() {

@@ -1064,7 +1064,7 @@ pub fn k() -> u32 { dep::d() }
     /// would be refused. The control: under the plant, the rows classified as before are each
     /// the whole `Crate` fact, which the oracle tells apart.
     #[test]
-    fn a_read_of_another_crates_key_or_lang_items_is_a_fact_of_its_surface() {
+    fn the_oracle_catches_surface_reads_classified_as_a_whole_crate() {
         let db = fixture::db_with_boundaries(TWO_CRATES, mark_boundaries, blaze_memo::Reads::Kept).into_db();
         let dep = crate_named(&db, "dep");
         let expected = |name: &str| -> Option<FactRef> {

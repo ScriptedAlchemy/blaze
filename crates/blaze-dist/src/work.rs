@@ -847,7 +847,7 @@ impl WorkSet {
                     self.counters.malformed += 1;
                     self.fence(generation, FenceWhy::Malformed, out);
                     self.check_done(out);
-                    return Err(Refusal::Malformed(what));
+                    return Err(Refusal::Malformed(what.to_string()));
                 }
             };
         let roots_done = processed_roots.len() as usize;
@@ -1323,31 +1323,54 @@ impl WorkSet {
 /// The shape of a result against its grant: the processed and returned roots and names, or
 /// what is wrong. Items are the processed roots' in ascending index order, then the processed
 /// names' in the grant's set order, one each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShapeError {
+    RootRanges,
+    UngrantedRoots,
+    UngrantedNames,
+    ItemCount { actual: usize, processed: usize },
+    NameOrder,
+}
+
+impl std::fmt::Display for ShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RootRanges => f.write_str("returned roots overlap or are empty"),
+            Self::UngrantedRoots => f.write_str("returned roots that were not granted"),
+            Self::UngrantedNames => f.write_str("returned names that were not granted"),
+            Self::ItemCount { actual, processed } => write!(f, "{actual} items for {processed} processed"),
+            Self::NameOrder => f.write_str("name items out of the grant's order"),
+        }
+    }
+}
+
+impl std::error::Error for ShapeError {}
+
 #[allow(clippy::type_complexity)]
 fn shape(
     issued: &Issued,
     req: &BatchResult,
-) -> Result<(Ranges, Vec<WorkName>, Ranges, BTreeSet<WorkName>), String> {
+) -> Result<(Ranges, Vec<WorkName>, Ranges, BTreeSet<WorkName>), ShapeError> {
     let returned_roots = Ranges::from_wire(&req.returned_roots)
-        .ok_or_else(|| "returned roots overlap or are empty".to_owned())?;
+        .ok_or(ShapeError::RootRanges)?;
     if !issued.roots.contains_all(&returned_roots) {
-        return Err("returned roots that were not granted".to_owned());
+        return Err(ShapeError::UngrantedRoots);
     }
     let returned_names: BTreeSet<WorkName> = req.returned_names.iter().copied().collect();
     if !returned_names.iter().all(|n| issued.names.contains(n)) {
-        return Err("returned names that were not granted".to_owned());
+        return Err(ShapeError::UngrantedNames);
     }
     let processed_roots = issued.roots.minus(&returned_roots);
     let processed_names: Vec<WorkName> =
         issued.names.iter().filter(|n| !returned_names.contains(n)).copied().collect();
     let want = processed_roots.len() as usize + processed_names.len();
     if req.items.len() != want {
-        return Err(format!("{} items for {want} processed", req.items.len()));
+        return Err(ShapeError::ItemCount { actual: req.items.len(), processed: want });
     }
     let roots_done = processed_roots.len() as usize;
     for (item, name) in req.items[roots_done..].iter().zip(&processed_names) {
         if item.name != *name {
-            return Err("name items out of the grant's order".to_owned());
+            return Err(ShapeError::NameOrder);
         }
     }
     Ok((processed_roots, processed_names, returned_roots, returned_names))

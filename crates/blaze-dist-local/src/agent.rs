@@ -89,10 +89,13 @@ pub struct Unit {
 
 /// What compiles a grant: on the thread that called [`run`], which may own the front end.
 pub trait Granted {
+    /// The compiler/exporter's matchable refusal, retained until the carrier reports it.
+    type Error: std::error::Error;
+
     /// The values of `names`, each index into [`Unit::names`]: from the store or compiled.
     /// `Err` gives the batch back: another executor or the final build gets to it, and a real
     /// compile error is reported there, by the build that links the unit.
-    fn compile(&mut self, names: &[usize]) -> Result<Grant, String>;
+    fn compile(&mut self, names: &[usize]) -> Result<Grant, Self::Error>;
 
     /// Complete the unit through its ordinary build with the committed phase values in
     /// front of its store. Only the current lead runs this tail; other subscribers take
@@ -101,7 +104,7 @@ pub trait Granted {
     fn complete(
         &mut self,
         _values: &BTreeMap<Digest, (u8, Vec<u8>)>,
-    ) -> Result<Vec<Value>, String> {
+    ) -> Result<Vec<Value>, Self::Error> {
         Ok(Vec::new())
     }
 }
@@ -241,25 +244,65 @@ fn after_publication<T>(unit: &Unit, result: Result<T, Error>) -> Result<T, Erro
     })
 }
 
-struct Batches<'a> {
+struct Batches<'a, G: Granted + ?Sized> {
     unit: &'a Unit,
     blobs: &'a Blobs,
-    granted: &'a mut dyn Granted,
+    granted: &'a mut G,
     compiled: u64,
     stored: u64,
     grants: u64,
     compiled_keys: Vec<Digest>,
 }
 
-impl BatchCompiler for Batches<'_> {
-    fn compile(&mut self, plan: &Plan) -> Result<Compiled, String> {
+#[derive(Debug)]
+enum BatchError {
+    NoncanonicalRoots { unit: Digest },
+    RootIndex { unit: Digest, index: u64 },
+    Pack { unit: Digest, source: crate::pack::PackError },
+    Upload { unit: Digest, source: Error },
+}
+
+impl std::fmt::Display for BatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoncanonicalRoots { unit } => {
+                write!(f, "unit {}: granted root ranges are not canonical", hex(unit))
+            }
+            Self::RootIndex { unit, index } => {
+                write!(f, "unit {}: granted root {index} is outside the root set", hex(unit))
+            }
+            Self::Pack { unit, source } => {
+                write!(f, "unit {}: cannot pack the granted values: {source}", hex(unit))
+            }
+            Self::Upload { unit, source } => {
+                write!(f, "unit {}: cannot upload the granted pack: {source}", hex(unit))
+            }
+        }
+    }
+}
+
+impl std::error::Error for BatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pack { source, .. } => Some(source),
+            Self::Upload { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl<G: Granted + ?Sized> BatchCompiler for Batches<'_, G> {
+    type Error = BatchError;
+
+    fn compile(&mut self, plan: &Plan) -> Result<Compiled, Self::Error> {
         let ranges =
-            Ranges::from_wire(&plan.grant.roots).ok_or("granted root ranges are not canonical")?;
+            Ranges::from_wire(&plan.grant.roots)
+                .ok_or(BatchError::NoncanonicalRoots { unit: self.unit.spec })?;
         let indexes: Vec<u64> = ranges.indexes().collect();
         let mut names = Vec::with_capacity(indexes.len());
         for index in &indexes {
             let at = usize::try_from(*index).ok().filter(|at| *at < self.unit.names.len());
-            names.push(at.ok_or_else(|| format!("granted root {index} is outside the root set"))?);
+            names.push(at.ok_or(BatchError::RootIndex { unit: self.unit.spec, index: *index })?);
         }
         if std::env::var_os("BLAZE_DIST_EVENTS").is_some() {
             let work: Vec<String> = names
@@ -290,8 +333,11 @@ impl BatchCompiler for Batches<'_> {
                     self.compiled_keys.extend(grant.compiled_keys);
                     let mut references = Vec::new(); // alloc: one reference per bounded pack
                     // Every pack is uploaded before this grant's result is posted.
-                    for pack in Pack::batches(grant.values)? {
-                        self.blobs.put_pack(&pack).map_err(|e| e.to_string())?;
+                    for pack in Pack::batches(grant.values)
+                        .map_err(|source| BatchError::Pack { unit: self.unit.spec, source })?
+                    {
+                        self.blobs.put_pack(&pack)
+                            .map_err(|source| BatchError::Upload { unit: self.unit.spec, source })?;
                         references.push(pack.reference);
                     }
                     (
@@ -300,7 +346,7 @@ impl BatchCompiler for Batches<'_> {
                     )
                 }
                 Err(why) => {
-                    tracing::warn!(target: "blaze", why, "a distributed grant goes back");
+                    tracing::warn!(target: "blaze", why = %why, "a distributed grant goes back");
                     (
                         |_| ItemOutcome::Local(Why { why: "the batch was given back".to_owned() }),
                         Vec::new(),
@@ -372,7 +418,7 @@ fn import_using(
                 Error::Committed(format!("pack {name}: committed retrieval failed: {error}"))
             })?
             .ok_or_else(|| Error::Committed(format!("pack {name} was committed and is gone")))?;
-        for value in read(&bytes, reference).map_err(Error::Committed)? {
+        for value in read(&bytes, reference).map_err(|error| Error::Committed(error.to_string()))? {
             match values.entry(value.key) {
                 std::collections::btree_map::Entry::Vacant(at) => {
                     at.insert((value.kind, value.bytes));
@@ -418,7 +464,7 @@ fn answer(client: &mut Client, command: Command, what: &str) -> Result<Answer, E
 pub fn run(
     config: &Config,
     unit: &Unit,
-    granted: &mut dyn Granted,
+    granted: &mut (impl Granted + ?Sized),
     cancelled: &AtomicBool,
 ) -> Result<Arrived, Error> {
     ensure_not_cancelled(unit, cancelled)?;
@@ -495,7 +541,7 @@ pub fn run(
 fn execute(
     config: &Config,
     unit: &Unit,
-    granted: &mut dyn Granted,
+    granted: &mut (impl Granted + ?Sized),
     cancelled: &AtomicBool,
     started: Instant,
     now_ms: &(impl Fn() -> u64 + Sync),
@@ -629,7 +675,8 @@ fn execute(
                         }
                         Error::Refused(format!("unit {}: {why}", hex(&unit.spec)))
                     };
-                    let extra = granted.complete(&arrived.values).map_err(&mut refuse)?;
+                    let extra = granted.complete(&arrived.values)
+                        .map_err(|error| refuse(error.to_string()))?;
                     ensure_not_cancelled(unit, cancelled)?;
                     if lost.load(Ordering::Acquire) {
                         return Ok(None);
@@ -904,7 +951,7 @@ fn hold(
     execution: ExecutionId,
     attempt: Attempt,
     now_ms: &(impl Fn() -> u64 + Sync),
-    granted: &mut dyn Granted,
+    granted: &mut (impl Granted + ?Sized),
     cancelled: &AtomicBool,
     arrived: &mut Arrived,
 ) -> Result<StopWhy, Error> {

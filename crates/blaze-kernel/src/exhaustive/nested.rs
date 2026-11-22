@@ -594,7 +594,7 @@ fn every_nested_sequence_in_scope_gives_what_a_fresh_run_gives() {
 /// reached by the change of a fact it read, and the carried session gives it stale. From the
 /// warm start: the entries are another session's.
 #[test]
-fn a_hit_admitted_without_postings_is_caught() {
+fn the_oracle_catches_a_hit_admitted_without_postings() {
     let after = stale_after_a_carry(Bug::HitUnposted, Start::Warm, Says::Column);
     assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
 }
@@ -602,7 +602,7 @@ fn a_hit_admitted_without_postings_is_caught() {
 /// The control of I1, the time: postings written at the next carry, after its seed, miss the
 /// change that carry is of.
 #[test]
-fn a_posting_written_at_the_next_carry_is_caught() {
+fn the_oracle_catches_a_posting_written_at_the_next_carry() {
     let after = stale_after_a_carry(Bug::PostLate, Start::Cold, Says::Column);
     assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
 }
@@ -610,7 +610,7 @@ fn a_posting_written_at_the_next_carry_is_caught() {
 /// The control of I2: a change set that leaves out a fact that appeared where nothing was
 /// leaves the entries that saw nothing there verified.
 #[test]
-fn an_absence_left_out_of_the_change_set_is_caught() {
+fn the_oracle_catches_an_absence_left_out_of_the_change_set() {
     let after = stale_after_a_carry(Bug::AbsenceUnsaid, Start::Cold, Says::Column);
     assert!(after.iter().any(|it| matches!(it, Did::Set(_, Some(_)))), "{after:?}");
 }
@@ -621,7 +621,7 @@ fn an_absence_left_out_of_the_change_set_is_caught() {
 /// a reached root is repaired, not dropped, holds under the bug (the row is live), so it is
 /// the oracle that catches it.
 #[test]
-fn a_root_kept_without_its_repair_is_caught() {
+fn the_oracle_catches_a_root_kept_without_its_repair() {
     let after = stale_after_a_carry(Bug::RootKept, Start::Cold, Says::Column);
     assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
     assert!(after.iter().any(|it| matches!(it, Did::Get(1..))), "{after:?}");
@@ -630,7 +630,7 @@ fn a_root_kept_without_its_repair_is_caught() {
 /// The control of rule 26 for the session's records: a session opened from the store that
 /// reads no posting back (it "starts empty" of readers) is carried past an entry it holds.
 #[test]
-fn a_session_opened_without_its_postings_is_caught() {
+fn the_oracle_catches_a_session_opened_without_its_postings() {
     let after = stale_after_a_carry(Bug::OpenUnposted, Start::Cold, Says::Column);
     assert!(after.iter().any(|it| matches!(it, Did::Reopen)), "{after:?}");
     assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
@@ -639,7 +639,7 @@ fn a_session_opened_without_its_postings_is_caught() {
 /// The control of I3: a carry that repairs the highest entry first, and none twice, looks a
 /// parent up against a child that is still as it was.
 #[test]
-fn a_parent_repaired_before_its_child_is_caught() {
+fn the_oracle_catches_a_parent_repaired_before_its_child() {
     let after = stale_after_a_carry(Bug::ParentFirst, Start::Cold, Says::Column);
     let sets = after.iter().filter(|it| matches!(it, Did::Set(..))).count();
     assert!(sets >= 2, "one change queues no parent beside a child: {after:?}");
@@ -648,7 +648,7 @@ fn a_parent_repaired_before_its_child_is_caught() {
 /// The control of "a session is of one pin": a session that answers whatever its world's pin
 /// is now gives, after a fact changed, the value it verified before.
 #[test]
-fn a_session_that_outlives_its_pin_is_caught() {
+fn the_oracle_catches_a_session_that_outlives_its_pin() {
     let after = match explore(Bug::StalePin, Start::Cold, Says::Column).1 {
         Some(Failure::Stale { after, .. }) => after,
         other => panic!("a stale pin was planted and the oracle found {other:?}"),
@@ -659,14 +659,14 @@ fn a_session_that_outlives_its_pin_is_caught() {
 /// The control of "one read of the child's value": a parent that records its child's reads in
 /// place of it, and leaves one out, gives a stale hit within the scope.
 #[test]
-fn a_parent_that_records_its_childs_reads_but_one_is_caught() {
+fn the_oracle_catches_a_parent_recording_its_childs_reads_but_one() {
     stale_hit(Bug::ChildReads);
 }
 
 /// The control of "the read sees the value's hash": a read of a step's value that sees only
 /// which step it is gives a stale hit once the child's value changes.
 #[test]
-fn a_cutoff_by_the_childs_identity_alone_is_caught() {
+fn the_oracle_catches_a_cutoff_by_the_childs_identity_alone() {
     stale_hit(Bug::IdentityOnly);
 }
 
@@ -674,7 +674,7 @@ fn a_cutoff_by_the_childs_identity_alone_is_caught() {
 /// reaches no one, and the entry that saw the fact is given as it was (a fact set, a get, the
 /// fact gone, a get).
 #[test]
-fn a_valued_read_that_went_taken_as_what_it_saw_is_caught() {
+fn the_oracle_catches_a_valued_read_that_went_taken_as_what_it_saw() {
     let after = stale_after_a_carry(Bug::ValuedGoneSame, Start::Cold, Says::Valued);
     assert!(after.iter().any(|it| matches!(it, Did::Set(_, None))), "{after:?}");
 }
@@ -683,7 +683,7 @@ fn a_valued_read_that_went_taken_as_what_it_saw_is_caught() {
 /// memory values nothing of a session opened from the store, and an entry it holds whose fact
 /// changed stays verified. From the warm start, where a get finds and posts before the reopen.
 #[test]
-fn a_valued_kind_that_reads_no_posting_back_is_caught() {
+fn the_oracle_catches_a_valued_kind_that_reads_no_posting_back() {
     let after = stale_after_a_carry(Bug::ValuedUnloaded, Start::Warm, Says::Valued);
     assert!(after.iter().any(|it| matches!(it, Did::Reopen)), "{after:?}");
     assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
@@ -692,7 +692,7 @@ fn a_valued_kind_that_reads_no_posting_back_is_caught() {
 /// The control of I2 when nothing says: a holder with no difference of a kind that says it
 /// exact with no name (in place of `Changed::everything`) leaves every reader verified.
 #[test]
-fn a_kind_with_no_difference_said_clean_is_caught() {
+fn the_oracle_catches_a_kind_with_no_difference_said_clean() {
     let after = stale_after_a_carry(Bug::KindSaidClean, Start::Cold, Says::Unknown);
     assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
 }
@@ -729,7 +729,7 @@ fn first_posting_then_valued(bug: Bug) -> Result<(), Failure> {
 /// of saying, which the exhaustive scope does not hold, so the sequence is directed; with no
 /// bug it gives the fresh value.
 #[test]
-fn a_value_kept_from_the_first_posting_is_caught() {
+fn the_oracle_catches_a_value_kept_from_the_first_posting() {
     assert_eq!(first_posting_then_valued(Bug::None), Ok(()));
     match first_posting_then_valued(Bug::SeenAtFirstPost) {
         Err(Failure::Stale { .. }) => {}

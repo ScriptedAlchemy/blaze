@@ -294,7 +294,7 @@ fn a_hit_is_what_the_work_would_answer_now() {
 
 /// The control of the refinement: a read left out of the list is a stale hit.
 #[test]
-fn a_read_left_out_of_the_list_is_caught() {
+fn the_oracle_catches_a_read_left_out_of_the_list() {
     let caught = first_failure(ROOMY, Bug::ReadLeftOut, false);
     assert!(
         matches!(caught, Some((_, (_, Failure::Stale | Failure::TwoValues, _)))),
@@ -304,7 +304,7 @@ fn a_read_left_out_of_the_list_is_caught() {
 
 /// The control of the refinement: an absent read not listed is a stale hit once it is there.
 #[test]
-fn a_negative_read_dropped_is_caught() {
+fn the_oracle_catches_a_negative_read_dropped() {
     let caught = first_failure(ROOMY, Bug::NegativeDropped, false);
     assert!(
         matches!(caught, Some((_, (_, Failure::Stale | Failure::TwoValues, _)))),
@@ -345,7 +345,7 @@ fn no_put_offers_other_bytes_under_a_held_key() {
 /// The control of write-once: an answer keyed without one of its reads is two answers under
 /// one key.
 #[test]
-fn an_answer_keyed_without_a_read_is_caught() {
+fn the_oracle_catches_an_answer_keyed_without_a_read() {
     let caught = first_failure(ROOMY, Bug::AnswerKeyedWithoutARead, true);
     assert!(matches!(caught, Some((_, (_, Failure::TwoValues, _)))), "{caught:?}");
 }

@@ -545,7 +545,7 @@ fn a_body_with_a_macro_call_is_made_and_moves_with_the_call_alone() {
 /// call, is made under the same plant, so the refused row is the call's and not the body
 /// syntax's.
 #[test]
-fn a_refused_row_is_told_with_its_reader() {
+fn the_oracle_catches_a_macro_argument_read_outside_its_boundary() {
     let (out, told) = hir_expand::planted_file_call_args(|| made(MACROS, "by_own"));
     let failed = out.expect_err("the body task, its call's argument read off the file by the plant");
     assert_eq!(failed, TaskFailed::Refused { what: "base_db::handles::VfsText" }, "told: {told:#?}");
@@ -607,7 +607,7 @@ fn made_two(text: &str, name: &str) -> (Key<Body>, Vec<u8>) {
 /// stored by its id in the writer's database, are each refused by name in the serving
 /// snapshot, never served as another body.
 #[test]
-fn a_broken_transport_is_refused_by_name() {
+fn the_oracle_catches_broken_mir_type_and_item_transport() {
     for plant in [Plant::DropType, Plant::DatabaseId] {
         let written = planted(plant, || write(FIXTURE));
         let record = read_back(&written);

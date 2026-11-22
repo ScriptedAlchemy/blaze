@@ -398,7 +398,7 @@ fn every_sequence_in_scope_gives_what_a_fresh_run_gives() {
 /// The control of "every read is recorded": a step that reads one fact behind its context
 /// gives a stale hit within the scope.
 #[test]
-fn a_read_left_out_is_caught() {
+fn the_oracle_catches_a_read_left_out() {
     let (after, hit) = stale(Plant::ReadLeftOut);
     assert!(hit, "the stale value after {after:?} was computed, not a hit");
 }
@@ -406,7 +406,7 @@ fn a_read_left_out_is_caught() {
 /// The control of "a read of nothing is a read": a step that does not record a fact it found
 /// absent gives a stale hit once the fact is there.
 #[test]
-fn a_negative_read_dropped_is_caught() {
+fn the_oracle_catches_a_negative_read_dropped() {
     let (after, hit) = stale(Plant::NegativeDropped);
     assert!(hit, "the stale value after {after:?} was computed, not a hit");
 }

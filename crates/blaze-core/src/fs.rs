@@ -1451,11 +1451,11 @@ pub(crate) fn assert_syncs_a_sealed_file(driver: &mut impl crate::Driver, root: 
 mod tests {
     use super::*;
 
-    /// The invariant ([`assert_syncs_a_sealed_file`]'s, on the file calls every driver but the
-    /// ring's makes): [`sync`] and [`barrier`] of a file sealed read-only succeed, and of a
+    /// The invariant: on the file calls every driver but the ring's makes,
+    /// [`sync`] and [`barrier`] of a file sealed read-only succeed, and of a
     /// missing one make it. The control: the write-open they made before is refused.
     #[test]
-    fn a_sync_of_a_file_sealed_read_only_succeeds() {
+    fn the_oracle_catches_a_sync_opening_a_sealed_file_for_write() {
         let root = dir("sync-sealed");
         let sealed = root.join("sealed");
         std::fs::write(&sealed, b"placed").unwrap();

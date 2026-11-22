@@ -322,11 +322,30 @@ const NAMED_MOST: usize = 8;
 /// `has` is for planning alone. A local value or another remote's valid fetch can have the
 /// same input key but a different record; neither establishes this manifest's binding.
 /// `get` has already checked the content hash, so compare its metadata without hashing again.
-fn stored(store: &Store, record: &Record) -> Result<bool, String> {
+#[derive(Debug)]
+enum StoredError {
+    Corrupt(blaze_cas::Corrupt),
+    Record { expected: Record, actual: Record },
+}
+
+impl std::fmt::Display for StoredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Corrupt(source) => write!(f, "{:x}: {source}", source.key.0),
+            Self::Record { expected, actual } => write!(f,
+                "{:x}: its stored record is not the one its bundle's manifest lists: expected {expected:?}, found {actual:?}",
+                expected.key.0,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StoredError {}
+
+fn stored(store: &Store, record: &Record) -> Result<bool, StoredError> {
     let Some(value) = store
         .get(&record.key)
-        // alloc: an error's message, made only when it fails.
-        .map_err(|why| format!("{:x}: {why}", record.key.0))?
+        .map_err(StoredError::Corrupt)?
     else {
         return Ok(false);
     };
@@ -339,11 +358,7 @@ fn stored(store: &Store, record: &Record) -> Result<bool, String> {
     if found == *record {
         Ok(true)
     } else {
-        // alloc: an error's message, made only when it fails.
-        Err(format!(
-            "{:x}: its stored record is not the one its bundle's manifest lists",
-            record.key.0
-        ))
+        Err(StoredError::Record { expected: *record, actual: found })
     }
 }
 
@@ -416,7 +431,7 @@ impl Download {
                             Ok(false) => {
                                 waiting.insert(record.key, *record);
                             }
-                            Err(why) => failed.push(why),
+                            Err(why) => failed.push(why.to_string()),
                         }
                     }
                     #[cfg(test)]
@@ -435,7 +450,7 @@ impl Download {
                         waiting.retain(|_, record| match present(store, record) {
                             Ok(present) => !present,
                             Err(why) => {
-                                failed.push(why);
+                                failed.push(why.to_string());
                                 false
                             }
                         });
@@ -510,7 +525,7 @@ impl Download {
                         Ok(false) => failed.push(format!(
                             "{:x}: its fetch was kept but its value is not readable", key.0
                         )),
-                        Err(why) => failed.push(why),
+                        Err(why) => failed.push(why.to_string()),
                     }
                 }
                 // alloc: an error's message, made only when it fails.

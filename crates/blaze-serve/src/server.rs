@@ -28,7 +28,7 @@ use tokio::{
 };
 
 use crate::blob::{ObjectName, hex};
-use crate::error::{Error, failed};
+use crate::error::{ConnectionError, Error, ServeError, failed};
 use crate::store::{Store, temporary};
 
 mod progress;
@@ -344,13 +344,16 @@ impl Server {
 }
 
 /// Serves `config` until the process ends: one task a connection.
-pub async fn serve(config: Config) -> anyhow::Result<()> {
+pub async fn serve(config: Config) -> Result<(), ServeError> {
     let setup = config.clone();
-    let server = Arc::new(tokio::task::spawn_blocking(move || Server::open(&setup)).await??);
+    let opened = tokio::task::spawn_blocking(move || Server::open(&setup)).await
+        .map_err(|source| ServeError::StoreTask { directory: config.dir.clone(), source })?
+        .map_err(|source| ServeError::Store { directory: config.dir.clone(), source })?;
+    let server = Arc::new(opened);
     let listener = TcpListener::bind(config.listen)
         .await
-        .map_err(|e| anyhow::anyhow!("listening on {}: {e}", config.listen))?;
-    let local = listener.local_addr()?;
+        .map_err(|source| ServeError::Listen { address: config.listen, source })?;
+    let local = listener.local_addr().map_err(ServeError::ListenerAddress)?;
     println!(
         "blaze-serve: serving {} on http://{local}, routes /v1, codec {}, no authentication",
         server.store().dir().display(),
@@ -358,13 +361,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     );
     tokio::select! {
         done = serve_on(listener, server) => done,
-        _ = tokio::signal::ctrl_c() => Ok(()),
+        signal = tokio::signal::ctrl_c() => signal.map_err(ServeError::Signal),
     }
 }
 
 /// Serves the connections of `listener` with `server`, until the listener fails. A test uses
 /// this with a listener of its own, so the port is one the machine gives.
-pub async fn serve_on(listener: TcpListener, server: Arc<Server>) -> anyhow::Result<()> {
+pub async fn serve_on(listener: TcpListener, server: Arc<Server>) -> Result<(), ServeError> {
+    let address = listener.local_addr().map_err(ServeError::ListenerAddress)?;
     let permits = Arc::new(Semaphore::new(server.resources.connections));
     let mut connections = tokio::task::JoinSet::new();
     let mut sweep = tokio::time::interval(server.resources.sweep_every);
@@ -385,9 +389,9 @@ pub async fn serve_on(listener: TcpListener, server: Arc<Server>) -> anyhow::Res
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(source) => return Err(ServeError::Accept { address, source }),
                 };
-                let permit = permits.clone().acquire_owned().await?;
+                let permit = permits.clone().acquire_owned().await.map_err(ServeError::Capacity)?;
                 let server = server.clone();
                 connections.spawn(async move {
                     let _permit = permit;
@@ -409,14 +413,15 @@ async fn accept(
     listener.accept().await
 }
 
-async fn connection(stream: TcpStream, server: Arc<Server>) -> anyhow::Result<()> {
+async fn connection(stream: TcpStream, server: Arc<Server>) -> Result<(), ConnectionError> {
     let idle = server.resources.idle;
+    let peer = stream.peer_addr().map_err(ConnectionError::PeerAddress)?;
     let socket = socket2::SockRef::from(&stream);
     socket.set_tcp_keepalive(
         &socket2::TcpKeepalive::new()
             .with_time(Duration::from_secs(30))
             .with_interval(Duration::from_secs(10)),
-    )?;
+    ).map_err(|source| ConnectionError::Keepalive { peer, source })?;
     let io = TokioIo::new(progress::ProgressIo::new(stream, idle));
     let service = service_fn(move |request| {
         let server = server.clone();
@@ -426,7 +431,7 @@ async fn connection(stream: TcpStream, server: Arc<Server>) -> anyhow::Result<()
         .timer(TokioTimer::new())
         .header_read_timeout(idle)
         .serve_connection(io, service)
-        .await?;
+        .await.map_err(|source| ConnectionError::Http { peer, source })?;
     Ok(())
 }
 
@@ -567,7 +572,7 @@ mod tests {
         _dir: tempfile::TempDir,
         server: Arc<Server>,
         port: u16,
-        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        task: tokio::task::JoinHandle<Result<(), ServeError>>,
     }
 
     impl Running {
@@ -630,6 +635,26 @@ mod tests {
             })
             .await
             .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bind_failure_retains_the_address_and_os_error() {
+        use std::error::Error as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::at(directory.path(), address.port());
+        config.listen = address;
+        let error = serve(config).await.unwrap_err();
+        assert!(error.source().is_some());
+        match error {
+            ServeError::Listen { address: refused, source } => {
+                assert_eq!(refused, address);
+                assert_eq!(source.kind(), std::io::ErrorKind::AddrInUse);
+            }
+            other => panic!("the occupied address was not the refusal: {other}"),
         }
     }
 

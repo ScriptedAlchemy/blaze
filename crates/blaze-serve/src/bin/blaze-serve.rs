@@ -24,5 +24,6 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)?;
     let mut config = Config::at(dir, listen.port());
     config.listen = listen;
-    blaze_serve::serve(config).await
+    blaze_serve::serve(config).await?;
+    Ok(())
 }

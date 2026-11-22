@@ -551,7 +551,7 @@ static CONTROLS: Once = Once::new();
 /// file asked is answered as a fresh state answers it.
 #[test]
 fn a_command_answers_as_a_fresh_state_does() {
-    CONTROLS.call_once(each_planted_bug_is_caught);
+    CONTROLS.call_once(the_oracle_catches_each_planted_commit_bug);
     blaze_sim::check(SimConfig::cases(200), |tape| {
         let seed = tape.next_u64("sim seed");
         let coarse = tape.bool("coarse");
@@ -657,7 +657,7 @@ fn caught(plant: Plant, scenario: fn(&mut Harness) -> Result<(), String>, cases:
 /// twice), `SlotBeforeFlush` (the slot written before the run's puts are durable: a crash
 /// between leaves a slot naming records the store lost).
 #[test]
-fn each_planted_bug_is_caught() {
+fn the_oracle_catches_each_planted_commit_bug() {
     caught(Plant::TrustsRacy, racy_rewrite, 4, true);
     caught(Plant::KeepsRemoved, removed, 4, true);
     caught(Plant::SkipsSequence, raced, 4, true);

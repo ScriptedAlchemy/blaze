@@ -16,6 +16,25 @@ use blaze_wire::{Attempt, Digest, ExecutionId, Namespace, Reservation};
 
 use crate::{Millis, Refusal};
 
+/// A machine's held reservations exceed the capacity that it advertised.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapacityExceeded<'a> {
+    /// The machine whose capacity was exceeded.
+    pub machine: &'a str,
+    /// The reservations held by the machine's executors.
+    pub used: Reservation,
+    /// The capacity originally advertised by this machine.
+    pub capacity: &'a Reservation,
+}
+
+impl std::fmt::Display for CapacityExceeded<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "machine {} holds {:?}, past its capacity {:?}", self.machine, self.used, self.capacity)
+    }
+}
+
+impl std::error::Error for CapacityExceeded<'_> {}
+
 /// Admission's bounds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmissionConfig {
@@ -483,15 +502,12 @@ impl Admission {
     }
 
     /// Whether every machine's reservations are within its capacity.
-    pub fn check(&self) -> Result<(), String> {
+    pub fn check(&self) -> Result<(), CapacityExceeded<'_>> {
         let zero = Reservation { memory: 0, cpus: 0, disk: 0 };
         for (name, machine) in &self.machines {
             let used = self.used(name);
             if !fits(&zero, &used, &machine.capacity) {
-                return Err(format!(
-                    "machine {name} holds {used:?}, past its capacity {:?}",
-                    machine.capacity
-                ));
+                return Err(CapacityExceeded { machine: name, used, capacity: &machine.capacity });
             }
         }
         Ok(())

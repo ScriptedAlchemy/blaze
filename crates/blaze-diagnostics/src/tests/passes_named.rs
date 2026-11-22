@@ -154,7 +154,7 @@ pub fn one() -> u32 { 1 }
 /// spends its time under no span of its own.
 /// Control: `Plant::Unnamed` (the `names` pass run under no span) fails, naming `names`.
 #[test]
-fn every_crate_pass_runs_under_its_span() {
+fn the_oracle_catches_a_crate_pass_without_its_span() {
     let opened_now = opened(ONE_FUNCTION, Plant::None);
     if let Err(why) = named(&opened_now) {
         panic!("{why}");

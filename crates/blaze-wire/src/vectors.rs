@@ -266,41 +266,93 @@ fn unhex32(text: &str) -> Option<[u8; 32]> {
     <[u8; 32]>::try_from(bytes.as_slice()).ok()
 }
 
-/// One type of the schema: its name, a vector of one value of it, and a round trip of one value.
+/// The codec property violated by a seeded schema round trip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoundTripErrorKind {
+    /// The type's encoder produced bytes the strict decoder refused.
+    Decode(crate::Error),
+    /// Reencoding the decoded value changed its canonical bytes.
+    Bytes {
+        /// The original encoding's byte length.
+        original: usize,
+        /// The decoded value's reencoding length.
+        reencoded: usize,
+    },
+    /// Decoding changed the value even though the bytes may be equal.
+    Value,
+}
+
+/// A seeded schema round trip failed, with the type and cause retained separately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoundTripError {
+    /// The schema type whose codec was exercised.
+    pub type_name: &'static str,
+    /// The generator seed that reproduces the failure.
+    pub seed: u64,
+    /// The codec property that failed.
+    pub kind: RoundTripErrorKind,
+}
+
+impl std::fmt::Display for RoundTripError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at seed {}: ", self.type_name, self.seed)?;
+        match &self.kind {
+            RoundTripErrorKind::Decode(source) => write!(f, "decoding the encoded value: {source}"),
+            RoundTripErrorKind::Bytes { original, reencoded } => {
+                write!(f, "encode(decode(x)) is {reencoded} bytes and x is {original}")
+            }
+            RoundTripErrorKind::Value => f.write_str("decode(x) is another value"),
+        }
+    }
+}
+
+impl std::error::Error for RoundTripError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            RoundTripErrorKind::Decode(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// One schema type and the real codec controls run for it.
 pub struct Entry {
     /// The type's name, as the domain separation spells it.
     pub name: &'static str,
     /// One value's vector, from a seed.
     pub vector: fn(u64) -> Vector,
     /// Decodes one value and encodes it again, refusing a byte that differs.
-    pub round_trip: fn(u64) -> Result<(), String>,
+    pub round_trip: fn(u64) -> Result<(), RoundTripError>,
     /// Reads these bytes as the type and writes that value again, refusing a byte that differs.
-    pub reencode: fn(&[u8]) -> Result<Vec<u8>, String>,
+    pub reencode: fn(&[u8]) -> Result<Vec<u8>, crate::Error>,
 }
 
 /// Reads `cbor` as `T` and writes the value again; `Err` says how the two differ.
 ///
 /// This is the strictest check a message gets: the validator's bytes pass first, then the schema,
 /// and the bytes that come back must be the ones that went in.
-pub fn reencode<T: Wire + Named>(cbor: &[u8]) -> Result<Vec<u8>, String> {
-    let value: T =
-        crate::validate_as(cbor, &crate::Limits::DOCUMENTED).map_err(|e| e.to_string())?;
+pub fn reencode<T: Wire + Named>(cbor: &[u8]) -> Result<Vec<u8>, crate::Error> {
+    let value: T = crate::validate_as(cbor, &crate::Limits::DOCUMENTED)?;
     Ok(encode(&value))
 }
 
 /// Decodes one value of `T` from a seed and encodes it again; `Err` says how it differed.
-pub fn round_trip<T: Wire + Named + Sample + PartialEq>(seed: u64) -> Result<(), String> {
+pub fn round_trip<T: Wire + Named + Sample + PartialEq>(seed: u64) -> Result<(), RoundTripError> {
     let mut g = Gen::new(seed);
     let value: T = T::sample(&mut g);
     let bytes = encode(&value);
     let limits = crate::Limits::DOCUMENTED;
-    let decoded: T = crate::validate_as(&bytes, &limits).map_err(|e| e.to_string())?;
+    let refused = |kind| RoundTripError { type_name: T::NAME, seed, kind };
+    let decoded: T = crate::validate_as(&bytes, &limits)
+        .map_err(|source| refused(RoundTripErrorKind::Decode(source)))?;
     let again = encode(&decoded);
     if again != bytes {
-        return Err(format!("encode(decode(x)) is {} bytes and x is {}", again.len(), bytes.len()));
+        return Err(refused(RoundTripErrorKind::Bytes {
+            original: bytes.len(), reencoded: again.len(),
+        }));
     }
     if decoded != value {
-        return Err("decode(x) is another value".to_owned());
+        return Err(refused(RoundTripErrorKind::Value));
     }
     Ok(())
 }
@@ -321,9 +373,9 @@ macro_rules! wire_types {
                     vector: (|seed| $crate::vectors::Vector::of::<$ty>(seed))
                         as fn(u64) -> $crate::vectors::Vector,
                     round_trip: (|seed| $crate::vectors::round_trip::<$ty>(seed))
-                        as fn(u64) -> Result<(), String>,
+                        as fn(u64) -> Result<(), $crate::vectors::RoundTripError>,
                     reencode: (|cbor| $crate::vectors::reencode::<$ty>(cbor))
-                        as fn(&[u8]) -> Result<Vec<u8>, String>,
+                        as fn(&[u8]) -> Result<Vec<u8>, $crate::Error>,
                 }),*
             ]
         }

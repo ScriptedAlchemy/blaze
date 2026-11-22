@@ -1204,19 +1204,48 @@ const DEMO: &str = r#"{"id": "rust-borrowing", "title": "Borrowing in Rust", "go
  {"id": "lifetimes", "title": "Lifetimes", "about": "A borrow cannot outlive its value"}
 ]}"#;
 
+/// A requested Learn screenshot cannot be prepared from the demo course.
+#[derive(Debug)]
+pub enum ShotError<'a> {
+    Demo(harness_learn::CourseError),
+    NoSteps,
+    UnknownScreen(&'a str),
+}
+
+impl std::fmt::Display for ShotError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Demo(source) => write!(f, "the Learn screenshot's demo course: {source}"),
+            Self::NoSteps => f.write_str("the demo's first lesson has no steps"),
+            Self::UnknownScreen(screen) => write!(f,
+                "HARNESS_NATIVE_SHOT_LEARN {screen:?}: not a screen (new, home, making, read, choice, picked, right, wrong, fill, order, done)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShotError<'_> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Demo(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
 impl App {
     /// A shot's Learn (`HARNESS_NATIVE_SHOT_LEARN=<screen>`, src/shot.rs): the demo course at one of its screens,
     /// nothing read from or written to disk. Screens: `home` (a course in progress), `new` (nothing yet), `read`,
     /// `choice`, `picked`, `right`, `wrong`, `fill`, `order`, `done`, `making`.
-    pub fn shot_learn(&mut self, screen: &str) -> Result<(), String> {
-        let course = Course::parse(DEMO).map_err(|e| e.to_string())?;
+    pub fn shot_learn<'a>(&mut self, screen: &'a str) -> Result<(), ShotError<'a>> {
+        let course = Course::parse(DEMO).map_err(ShotError::Demo)?;
         let mut l = self.learn.borrow_mut();
         let l = &mut *l;
         l.shot = true;
         let day = today();
         let mut p = Progress::default();
         let walk = |run: &mut Run, p: &mut Progress, inputs: &[Input]| inputs.iter().for_each(|i| run.step(i.clone(), p, day));
-        let mut run = Run::lesson(&course, &course.lessons[0], 7).ok_or("the demo's first lesson has no steps")?;
+        let mut run = Run::lesson(&course, &course.lessons[0], 7).ok_or(ShotError::NoSteps)?;
         let to_choice = [Input::Next];
         let to_fill = [Input::Next, Input::Choose(2), Input::Submit, Input::Next];
         match screen {
@@ -1251,7 +1280,7 @@ impl App {
                 }
                 walk(&mut run, &mut p, &[Input::Submit, Input::Next, Input::Type("dropped".into()), Input::Submit, Input::Next]);
             }
-            other => return Err(format!("HARNESS_NATIVE_SHOT_LEARN {other:?}: not a screen (new, home, making, read, choice, picked, right, wrong, fill, order, done)")),
+            other => return Err(ShotError::UnknownScreen(other)),
         }
         if screen == "course" {
             l.draft = Draft::default();

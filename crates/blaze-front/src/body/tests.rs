@@ -384,7 +384,7 @@ fn a_change_to_an_asked_fact_moves_the_address_and_to_another_does_not() {
 /// with nothing changed the planted rerun is byte-equal (the audit raises nothing false); with
 /// nothing planted, the change moves the address and no stale record is found.
 #[test]
-fn a_planted_missing_ask_is_caught_by_a_rerun() {
+fn the_oracle_catches_a_body_read_missing_from_its_shape() {
     let world = base();
     for kind in READ_KINDS {
         let old = run(&world, item(0), Some(kind), false).expect("a planted run");
@@ -410,7 +410,7 @@ fn a_planted_missing_ask_is_caught_by_a_rerun() {
 /// The invariant: the record is a function of the universe alone: two runs write equal bytes,
 /// and so does a run that asks in another order; a fact asked twice is one row. 100 seeds.
 #[test]
-fn the_record_is_deterministic() {
+fn the_body_record_is_deterministic() {
     for seed in 0..100 {
         let mut rng = SplitMix64::new(seed);
         let mut world = base();

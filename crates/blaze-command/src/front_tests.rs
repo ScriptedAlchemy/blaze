@@ -811,7 +811,7 @@ fn a_dependency_s_bodies_are_not_asked() {
 /// The invariant: no dependency is lowered in the process that checks the binary; the planted
 /// snapshot that does not give its dependency is caught by name.
 #[test]
-fn dependency_never_lowered() {
+fn the_oracle_catches_dependency_text_lowered_in_its_dependent() {
     let dir = fixture("lowered", LIB, Global);
     let graph = graph(&dir, Global);
     let (surface, body) = resolutions(&graph, Global);

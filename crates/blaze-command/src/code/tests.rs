@@ -1,7 +1,7 @@
 //! The code path's rules, each with a planted control its oracle catches:
 //!
 //! - a plan of an instance with no body (drop glue) has a read list, and it moves when a
-//!   field's type gains a `Drop` impl ([`drop_glue_reads_move_when_a_field_type_gains_drop`]);
+//!   field's type gains a `Drop` impl ([`the_oracle_catches_drop_glue_reads_cut_to_syntax`]);
 //! - an edit of a callee renames the caller's relocation and keeps the caller's code key, so
 //!   the caller compiles nothing ([`a_callee_edit_renames_a_place_and_keeps_the_callers_key`]);
 //! - a program's rows with one left out are refused naming it, before any template is read
@@ -243,7 +243,7 @@ fn moved(facts: &[(FactRef, Option<ContentId>)], db: &Db, home: Crate) -> Vec<Fa
 /// reaches `main::roots`, `drop_glue::<main::Outer>`, `drop_glue::<main::Noisy>` and
 /// `<main::Noisy as Drop>::drop`; the second also `drop_glue::<main::Inner>`).
 #[test]
-fn drop_glue_reads_move_when_a_field_type_gains_drop() {
+fn the_oracle_catches_drop_glue_reads_cut_to_syntax() {
     let policy = policy();
     let glue = ["drop_glue", "main::Outer"];
     let (one, two) = (database(DROPS), database(DROPS_INNER));

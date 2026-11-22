@@ -85,8 +85,16 @@ mod theorems {
         }
     }
 
-    /// The theorem's function holds on drawn schedules, picks and flags, reached with both
-    /// orders of the two swaps.
+    /// The invariant (proved: crates/blaze-core/lean/BlazeCore/Handoff.lean): no hand-back is
+    /// missed in the weak memory. For every schedule of a sender and the driver, every value
+    /// each read may see under its ordering, and the flag set or clear as they begin: where
+    /// both returned, the driver read the sender's slot after its drain, or the sender was
+    /// told to wake the driver ([`hands`]). The flag's swaps are ordered, and the later
+    /// acquires what the earlier released. The proof covers all eleven reachable combinations
+    /// of the threads' points, the flag's messages and whose view names the slot's store.
+    /// This test draws schedules, picks and flags, reaching both orders of the swaps.
+    /// `the_oracle_catches_a_flag_swapped_relaxed` removes the ordering; Lean checks the same
+    /// counterexample by evaluation (`BlazeCore.HandoffModel`).
     #[test]
     fn no_hand_back_is_missed_where_it_is_run() {
         let config = Config {

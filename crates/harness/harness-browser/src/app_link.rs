@@ -151,7 +151,7 @@ fn handle(up: AppUp) -> Result<(), String> {
             })?;
         }
         AppUp::Post { view, msg } => {
-            let (f, script) = host::ui_post(view, &msg)?;
+            let (f, script) = host::ui_post(view, &msg).map_err(|error| error.to_string())?;
             f.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
         }
         AppUp::Close { view } => {

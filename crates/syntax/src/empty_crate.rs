@@ -5,7 +5,40 @@
 //! for. In particular, cfg attributes, macro calls and parser recovery cannot
 //! make a crate appear empty without their own semantic checks.
 
-use crate::{AstNode, Edition, NodeOrToken, SourceFile, SyntaxKind, ast};
+use crate::{AstNode, Edition, NodeOrToken, SourceFile, SyntaxError, SyntaxKind, TextRange, ast};
+
+/// Why the complete-source check cannot prove an empty library.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The parser rejected the source, with its original location and reason.
+    Syntax(SyntaxError),
+    /// A token has meaning beyond the accepted empty-library grammar.
+    Token { kind: SyntaxKind, range: TextRange },
+    /// An attribute is not one of the explicitly understood inner attributes.
+    Attribute(TextRange),
+    /// A source node is an item or parser recovery, not an accepted inner attribute.
+    Item(TextRange),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Syntax(source) => write!(f, "source syntax error at {:?}: {source}", source.range()),
+            Self::Token { kind, range } => write!(f, "unchecked source token {kind:?} at {range:?}"),
+            Self::Attribute(range) => write!(f, "unchecked crate attribute at {range:?}"),
+            Self::Item(range) => write!(f, "crate item or recovered syntax at {range:?}"),
+        }
+    }
+}
+
+impl std::error::Error for Refusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Syntax(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// An empty library has no bodies, signatures, definitions or exports to check
 /// or lower. Its implicit language library is still chosen by `no_std`.
@@ -22,19 +55,19 @@ impl EmptyCrate {
 
 /// Return a proof only for syntax whose entire meaning is known here. A refusal
 /// says nothing about whether a fuller compiler would accept the source.
-pub fn check(text: &str, edition: Edition) -> Result<EmptyCrate, &'static str> {
+pub fn check(text: &str, edition: Edition) -> Result<EmptyCrate, Refusal> {
     let parsed = SourceFile::parse(text, edition);
-    if !parsed.errors().is_empty() {
-        return Err("the source has syntax errors");
+    if let Some(error) = parsed.errors().into_iter().next() {
+        return Err(Refusal::Syntax(error));
     }
     let mut result = EmptyCrate { no_std: false };
     for child in parsed.syntax_node().children_with_tokens() {
         match child {
             NodeOrToken::Token(token) => match token.kind() {
                 SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::SHEBANG => {}
-                _ => return Err("the source contains an unchecked token"),
+                kind => return Err(Refusal::Token { kind, range: token.text_range() }),
             },
-            NodeOrToken::Node(node) => match ast::AnyAttr::cast(node) {
+            NodeOrToken::Node(node) => match ast::AnyAttr::cast(node.clone()) {
                 Some(ast::AnyAttr::Attr(attr))
                     if attr.kind().is_inner()
                         && attr.as_simple_atom().as_deref() == Some("no_std") =>
@@ -42,8 +75,8 @@ pub fn check(text: &str, edition: Edition) -> Result<EmptyCrate, &'static str> {
                     result.no_std = true;
                 }
                 Some(ast::AnyAttr::DocComment(doc)) if doc.kind().is_inner() => {}
-                Some(_) => return Err("the crate has an unchecked attribute"),
-                None => return Err("the crate contains items or recovered syntax"),
+                Some(_) => return Err(Refusal::Attribute(node.text_range())),
+                None => return Err(Refusal::Item(node.text_range())),
             },
         }
     }

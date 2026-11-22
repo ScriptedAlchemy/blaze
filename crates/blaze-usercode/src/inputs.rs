@@ -1196,7 +1196,7 @@ mod tests {
     /// `MacOSX27.2.sdk/usr/lib/libm.tbd` is two links.
     #[cfg(unix)]
     #[test]
-    fn a_path_through_symlinks_rests_on_each_link_and_the_file_they_end_at() {
+    fn the_oracle_catches_a_missing_parent_vouched_for_by_nothing() {
         let made = TempDir::for_test("blaze-files-links-");
         let dir = std::fs::canonicalize(&made).unwrap();
         for sub in ["sdks/real/lib", "other"] {

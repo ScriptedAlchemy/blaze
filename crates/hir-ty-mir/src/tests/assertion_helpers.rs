@@ -133,6 +133,8 @@ mod tests {
         assert!(!held("//- minicore: sized\nfn assert_eq(a: u8, b: u8) {}\nfn main() {}"));
     }
 
+    /// The invariant: assertion helpers that can stop the program are accepted, while a
+    /// helper that silently returns is refused by the same check used for every fixture.
     #[test]
     fn a_helper_that_stops_the_program_is_held() {
         // A typed hole does not lower, so a call of it fails: the helper of most fixtures.

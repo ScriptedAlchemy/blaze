@@ -581,7 +581,7 @@ fn fresh_controls() {
 /// `Plant::SkipsPremises`, `Plant::SkipsDirectories` (a file added is missed), and a read left
 /// out of the slot (`Writer::LeavesANameOut`).
 #[test]
-fn a_solo_hit_is_what_a_fresh_build_says() {
+fn the_oracle_catches_solo_hits_with_omitted_or_racy_inputs() {
     FRESH_CONTROLS.call_once(fresh_controls);
     blaze_sim::check(Config::DEFAULT, |tape| {
         let ops: Vec<Op> = tape.vec(0..=40, "ops", op);
@@ -611,7 +611,7 @@ fn daemon_controls() {
 /// world's own digests answers `Hit(a)`; and after `rehearse` gave `Ok`, with nothing moved,
 /// `Solo` hits. Control: one record's bytes swapped for another answer's.
 #[test]
-fn the_client_and_the_daemon_decide_the_same() {
+fn the_oracle_catches_a_slot_holding_another_requests_answer() {
     DAEMON_CONTROLS.call_once(daemon_controls);
     blaze_sim::check(Config::DEFAULT, |tape| {
         let ops: Vec<Op> = tape.vec(0..=40, "ops", op);

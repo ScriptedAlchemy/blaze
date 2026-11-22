@@ -341,14 +341,14 @@ fn shown(value: Option<&OsStr>) -> String {
 pub fn keyed(
     prepared: &Prepared,
     traced: &mut Traced,
-    checked: Option<&Result<crate::pure::Read, String>>,
+    checked: Option<&Result<crate::pure::Read, Error>>,
 ) -> Result<(), Error> {
     // A rejected proof must stop the keep under the sandboxed key too. Otherwise a retry
     // reuses that value without ever checking the proof again. Keep the decision here,
     // in the callback Run::complete invokes before writing anything to the store.
     if let Some(Err(what)) = checked {
         // clone: one diagnostic for a refused run
-        return Err(Error(what.clone()));
+        return Err(what.clone());
     }
     traced.env.retain(|(name, _)| !run_only(name) && !prepared.given.contains(name));
     for (name, value) in &mut traced.env {
@@ -562,7 +562,7 @@ mod tests {
             },
             takes: std::time::Duration::from_millis(1),
         });
-        let rejected = Err("p v0.1.0: its pure proof refused Random".to_owned());
+        let rejected = Err(Error("p v0.1.0: its pure proof refused Random".to_owned()));
         for attempt in 0..3 {
             let mut disk = Disk::new(prepared.env.clone(), &Looks::none());
             let begun = Run::begin(prepared.spec.clone(), &store, &mut disk, Tag(1), &mut effects)

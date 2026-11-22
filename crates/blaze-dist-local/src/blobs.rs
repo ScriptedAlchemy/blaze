@@ -139,8 +139,10 @@ impl Blobs {
             list,
             || self.published(spec),
             |existing, proposed| {
-                let existing = blaze_wire::pack_list::decode(existing).map_err(Error::Committed)?;
-                let proposed = blaze_wire::pack_list::decode(proposed).map_err(Error::Committed)?;
+                let existing = blaze_wire::pack_list::decode(existing)
+                    .map_err(|error| Error::Committed(error.to_string()))?;
+                let proposed = blaze_wire::pack_list::decode(proposed)
+                    .map_err(|error| Error::Committed(error.to_string()))?;
                 Ok(crate::agent::import(self, &existing)? == crate::agent::import(self, &proposed)?)
             },
         )

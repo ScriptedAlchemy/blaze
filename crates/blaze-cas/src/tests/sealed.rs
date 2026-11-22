@@ -358,7 +358,7 @@ fn a_crash_at_any_point_of_a_compaction_leaves_the_records_or_the_sealed_set() {
 /// The planted-bug control: a seal whose root leaves out the sealed set it made
 /// (`SEALED_NOT_NAMED`). The oracle says so as soon as the pin names that root.
 #[test]
-fn a_root_that_leaves_out_its_sealed_set_is_caught() {
+fn the_oracle_catches_a_root_leaving_out_its_sealed_set() {
     let why = compacted(1, None, true).unwrap_err();
     assert!(why.contains("is kept by nothing the pin's root names"), "{why}");
     // Cut before the pin moved, the root before still keeps the records: no loss yet.

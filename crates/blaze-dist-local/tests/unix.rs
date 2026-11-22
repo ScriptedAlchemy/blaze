@@ -2085,7 +2085,9 @@ fn the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls(
 
     struct Compiler;
     impl BatchCompiler for Compiler {
-        fn compile(&mut self, plan: &Plan) -> Result<Compiled, String> {
+        type Error = std::convert::Infallible;
+
+        fn compile(&mut self, plan: &Plan) -> Result<Compiled, Self::Error> {
             let ranges = blaze_dist::Ranges::from_wire(&plan.grant.roots).unwrap();
             Ok(Compiled {
                 generation: plan.grant.lease.generation,

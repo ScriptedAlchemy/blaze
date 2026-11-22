@@ -9,7 +9,7 @@ use cargo_util_schemas::core::PackageIdSpec;
 use cargo_util_schemas::manifest::{Hints, RustVersion};
 use serde::Serialize;
 
-use crate::dependency::SerializedDependency;
+use crate::dependency::{MetadataPathError, SerializedDependency};
 use crate::files::Files;
 use crate::manifest::{Context, Manifest};
 use crate::paths::{ancestors, normalize_path};
@@ -92,7 +92,7 @@ pub fn export_package<'a, F: Files>(
     manifest_path: &'a Path,
     m: &'a Manifest,
     files: &F,
-) -> anyhow::Result<SerializedPackage<'a>> {
+) -> Result<SerializedPackage<'a>, MetadataPathError> {
     let meta = &m.metadata;
     Ok(SerializedPackage {
         name: &m.package_id.name,
@@ -107,7 +107,7 @@ pub fn export_package<'a, F: Files>(
             .dependencies
             .iter()
             .map(|d| d.serialized(files))
-            .collect::<anyhow::Result<_>>()?,
+            .collect::<Result<_, MetadataPathError>>()?,
         targets: m.targets.iter().filter_map(|t| t.serialized()).collect(),
         features: m
             .features
@@ -141,7 +141,7 @@ pub fn export_no_deps<'a, F: Files>(ws: &'a Workspace<'_, F>) -> anyhow::Result<
     let packages = ws
         .members()
         .map(|(path, m)| export_package(path, m, ws.files()))
-        .collect::<anyhow::Result<_>>()?;
+        .collect::<Result<_, MetadataPathError>>()?;
     export(ws, packages, None)
 }
 

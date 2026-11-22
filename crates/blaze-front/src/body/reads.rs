@@ -5,7 +5,7 @@
 //!   handed (its dependencies' surfaces and made tables, its own unit's), and the answer is what
 //!   the shape holds. The check reads no fact any other way; a fact it reads past [`Asks`] is a
 //!   hole in the shape, which blaze-keyed's `Audit` policy finds by redoing the record (the
-//!   test `a_planted_missing_ask_is_caught_by_a_rerun`).
+//!   test `the_oracle_catches_a_body_read_missing_from_its_shape`).
 //! - A negative read (a name looked up and not found, an impl sought and absent) is an ask like
 //!   any other: its answer is `record::absent(&id)`, so a name that appears moves the answer and
 //!   with it the record's address, and a name still absent keeps it.

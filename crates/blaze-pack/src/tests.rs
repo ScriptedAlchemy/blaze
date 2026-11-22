@@ -230,7 +230,7 @@ fn flipped(seed: u64, plant: bool) -> (u64, Result<import::Summary, Refused>, Id
 /// stops naming the record the flipped byte is in. The control puts unchecked: the oracle
 /// (the model checks every put against the manifest) must see it.
 #[test]
-fn a_flipped_byte_anywhere_in_a_pack_is_refused_naming_the_record() {
+fn the_oracle_catches_unchecked_flipped_pack_bytes() {
     let mut caught = 0;
     for seed in 0..SEEDS {
         let (violations, done, hit) = flipped(seed, false);
@@ -319,7 +319,7 @@ fn crashed_at_every_step(seed: u64, plant: bool) -> u64 {
 /// is durable without its pin, and the import run again completes with the origin's bytes.
 /// The control puts unchecked over a flipped body.
 #[test]
-fn a_crash_mid_import_shows_no_unverified_record_and_a_re_import_completes() {
+fn the_oracle_catches_unverified_records_published_across_a_crash() {
     let mut caught = 0;
     for seed in 0..40 {
         assert_eq!(crashed_at_every_step(seed, false), 0, "seed {seed}");
@@ -351,7 +351,7 @@ fn collected_after_import(seed: u64, pin: bool) -> usize {
 /// of everything unrooted between the import and the first build takes none of it and the
 /// build makes 0 units. The control imports without the pin: the collection takes them all.
 #[test]
-fn an_import_pins_what_it_imports_so_a_collection_before_the_first_build_takes_nothing() {
+fn the_oracle_catches_an_import_without_its_pin() {
     for seed in 0..SEEDS {
         assert_eq!(collected_after_import(seed, true), 0, "seed {seed}");
         assert_eq!(collected_after_import(seed, false), 25, "seed {seed}: the control kept records with no pin");
@@ -471,7 +471,7 @@ fn fetched(seed: u64, count: usize, sources: &[Does], plant: bool) -> Fetched {
 /// the fetch naming it and the key, with nothing of the lie kept. The control keeps
 /// unchecked: the oracle (each kept record against the origin) must see it.
 #[test]
-fn of_two_sources_one_lying_the_lie_is_named_and_nothing_of_it_is_kept() {
+fn the_oracle_catches_a_lying_sources_bytes_kept_unchecked() {
     let mut caught = 0;
     for seed in 0..SEEDS {
         let got = fetched(seed, 16, &[Does::Honest, Does::Lies], false);

@@ -228,7 +228,7 @@ fn every_kind_has_a_row() {
 
 /// The control: one kind left out of the walk, and the check names exactly it.
 #[test]
-fn a_kind_left_out_is_caught() {
+fn the_oracle_catches_a_surface_fact_kind_left_out() {
     let db = db_of(EVERY_KIND);
     let lib = crate_named(&db, "lib");
     let rows = rows_of(&db, lib, Some(items::LAYOUT));
@@ -258,7 +258,7 @@ fn record_of(db: &Db, krate: Crate) -> (Aligned, Key<Surface>) {
 /// database and once in another of the same text, the bytes are equal; its rows are the walk's
 /// and its seen row.
 #[test]
-fn the_record_is_deterministic() {
+fn the_surface_record_is_deterministic() {
     let db = db_of(EVERY_KIND);
     let lib = crate_named(&db, "lib");
     let (first, at) = record_of(&db, lib);

@@ -658,7 +658,7 @@ fn image_of_files(n: usize, size: usize) -> Vec<u8> {
 /// 100 bytes a file. The control: an image that writes the texts back in (the layout before,
 /// planted) grows with B, and the same check fails.
 #[test]
-fn an_image_is_o_of_its_files_not_of_their_bytes() {
+fn the_oracle_catches_an_image_copying_its_files_bytes() {
     let (small, large) = (image_of_files(1000, 16), image_of_files(1000, 4 << 10));
     assert_eq!(small.len(), large.len(), "an image's length is independent of its texts'");
     assert!(large.len() < 1000 * 160, "about 100 bytes a file, not {}", large.len() / 1000);
@@ -677,7 +677,7 @@ fn an_image_is_o_of_its_files_not_of_their_bytes() {
 }
 
 thread_local! {
-    /// A planted bug, for [`an_image_is_o_of_its_files_not_of_their_bytes`]'s control: the
+    /// A planted bug, for [`the_oracle_catches_an_image_copying_its_files_bytes`]'s control: the
     /// image's writer writes every file's bytes into a section of their own again.
     pub(crate) static PLANT_TEXTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

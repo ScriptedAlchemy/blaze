@@ -202,7 +202,7 @@ pub fn fetch() -> Result<Library, String> {
         releases.as_deref(),
         local.as_ref().map(|it| it.dir.as_path()),
         crate::release::get().version,
-    )?;
+    ).map_err(|error| error.to_string())?;
     let fetched = fetch_into(&dir, &from, digest()).map_err(|e| {
         format!(
             "blaze compiles the standard library from its own source (digest {}), which it \
@@ -217,12 +217,25 @@ pub fn fetch() -> Result<Library, String> {
 
 /// An explicit library source wins, then this build's matching checkout, then the selected
 /// release source. A development build with a checkout needs no release asset.
-fn source(
+#[derive(Debug, PartialEq, Eq)]
+struct InsecureReleaseSource<'a> {
+    address: &'a str,
+}
+
+impl std::fmt::Display for InsecureReleaseSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "`BLAZE_RELEASES` is {}, which is not an https:// address or a directory", self.address)
+    }
+}
+
+impl std::error::Error for InsecureReleaseSource<'_> {}
+
+fn source<'a>(
     given: Option<&str>,
-    releases: Option<&str>,
+    releases: Option<&'a str>,
     checkout: Option<&Path>,
     version: &str,
-) -> Result<String, String> {
+) -> Result<String, InsecureReleaseSource<'a>> {
     if let Some(given) = given {
         return Ok(given.to_owned()); // alloc: one library fetch's source
     }
@@ -234,9 +247,7 @@ fn source(
         return Ok(Path::new(base).join(format!("v{version}")).to_string_lossy().into_owned());
     }
     if !base.starts_with("https://") {
-        return Err(format!(
-            "`BLAZE_RELEASES` is {base}, which is not an https:// address or a directory"
-        ));
+        return Err(InsecureReleaseSource { address: base });
     }
     Ok(format!("{}/v{version}", base.trim_end_matches('/')))
 }

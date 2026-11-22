@@ -575,7 +575,11 @@ fn run_with(tape: &Tape, plant: Plant, panic_at: Option<PanicAt>) -> Result<(), 
     Ok(())
 }
 
-/// The invariant at the top of this file, over many cases.
+/// The invariant: under the drawn interleavings, each acyclic key runs once per snapshot,
+/// cyclic keys settle on their head's task, and every answer equals the recursive evaluator's
+/// answer for that snapshot. Changed arenas and their dependents are not carried; recorded
+/// reads equal the evaluator's facts on both runs and hits; hits perform no checks; and a key
+/// held by another task is awaited rather than mistaken for the asking task's own cycle.
 #[test]
 fn every_interleaving_answers_as_the_evaluator() {
     blaze_sim::check(blaze_sim::Config::cases(64), |tape| run(tape, Plant::None));
@@ -801,6 +805,8 @@ fn carried_reader(tape: &Tape, reader: Reader) -> Result<(), String> {
     Ok(())
 }
 
+/// The invariant: a carried-table reader looks up only generations its snapshot holds,
+/// answers that snapshot's values, removes superseded ids and never refuses a live id.
 #[test]
 fn a_reader_of_a_carried_table_looks_up_only_live_ids() {
     blaze_sim::check(blaze_sim::Config::cases(64), |tape| carried_reader(tape, Reader::Live));

@@ -352,7 +352,7 @@ fn simulate(ops: &[Op], plant: bool) -> Result<(), String> {
 /// (`Evidence::keep_racy`) vouches for a file's old content after a second write in the same
 /// second, and across a crash and start, and the oracle catches both.
 #[test]
-fn marks_through_crashes_vouch_only_for_what_the_files_hold() {
+fn the_oracle_catches_racy_marks_vouching_after_rewrites_and_crashes() {
     blaze_sim::check(Config::DEFAULT, |tape| {
         let count = tape.int_in(0..=40usize, "ops");
         let ops: Vec<Op> = (0..count).map(|_| draw_op(tape)).collect();

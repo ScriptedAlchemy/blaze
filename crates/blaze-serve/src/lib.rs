@@ -35,6 +35,6 @@ mod server;
 mod store;
 
 pub use blob::{Kind, ObjectName};
-pub use error::{Error, ErrorCode};
+pub use error::{Error, ErrorCode, ServeError};
 pub use server::{Body, Config, Resources, Server, serve, serve_on};
 pub use store::Store;

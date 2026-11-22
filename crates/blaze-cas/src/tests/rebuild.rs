@@ -282,7 +282,7 @@ fn late_back() -> Vec<Op> {
 /// does). The records committed while the build was out are then in no table and under the
 /// end an open scans from: gone after a reopen. The run passes with nothing planted.
 #[test]
-fn a_head_naming_the_ends_at_the_write_loses_what_was_committed_meanwhile() {
+fn the_oracle_catches_a_head_skipping_records_committed_during_rebuild() {
     for seed in 0..8 {
         let world = runs(&late_back(), seed, quiet(), false, true)
             .unwrap_or_else(|why| panic!("seed {seed}: the store as it is must pass: {why}"));

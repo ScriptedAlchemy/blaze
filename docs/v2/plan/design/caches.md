@@ -1,235 +1,212 @@
 ---
-status: plan
-summary: The inventory of every place blaze keeps a result to avoid work, with the grain of each key, how it is invalidated and bounded, its defect and owner; and every hash function by use. The `domains` script holds each hash domain and each non-BLAKE3 hasher in the tree to a row here.
-date: 2026-11-12
+status: current
+summary: The hash-domain, cache-key grain, non-BLAKE3 hasher and environment-variable inventory of surviving source, including explicitly parked compiler consumers. The domains script checks entries against the tree.
 ---
 # Caches: the inventory
 
-Lane cache-audit-1112, read on `int-1112`, 2026-11-12. The rule: AGENTS.md `granular-caching`
-(65), with 21, 52, 3, 25, 26 and 51. A row is one cache. **Grain** is the grain of an entry's
-*key*: `item` (a function, type, impl, goal, macro call, test), `file`, `unit` (a cargo unit, a
-run of user code), `crate`, `program` (a linked image), `checkout`, `process`, or `none` (it
-keeps no result). A grain of `crate` or coarser has to name its owner or its argument in the
-last cell: `scripts/src/bin/domains.rs` fails otherwise, and fails on a hash domain in `crates/`
-that no row under "Domains" lists. Cells come from each cache's module doc and key function; a
-row marked † had its doc read and not its producer, and its cells are that doc's claims.
+This inventory follows the source after the V2 item-layer rewrite. It includes active libraries
+and retained compiler source; [parked.md](../parked.md) names what is excluded from the build.
+A listed key or record does not establish that its compiler consumer runs. Deleted daemon/query
+producers and obsolete domains are absent; their history remains in Git.
 
-"Store" in *bound* is the store's budget and collector (docs/gc.md); "footprint" is the
-daemon's memory ceiling (rule 50). "By key" in *invalidation* means nothing is ever removed
-or overwritten: a changed input makes another key.
+A grain is the granularity of an entry’s key: `item`, `file`, `unit`, `crate`, `program`,
+`checkout`, `process`, or `none` for inputs, fixtures and names that keep no result. Coarse
+containers state why they exist and how their entries are keyed. Retained coarse semantic
+caches are identified as integration work. The [domains script](../../../../scripts/src/bin/domains.rs)
+requires every observed domain stem, non-BLAKE3 hasher and named environment variable to be
+classified, and refuses stale classifications and duplicate domain definitions.
 
 ## The caches
 
-| cache | grain | value, and what its key holds | invalidation | after a restart | bound | defect, owner |
-|---|---|---|---|---|---|---|
-| `query-memos` | item | every tracked query's result (`blaze-query`): the query and its interned arguments | verified by the edges each run recorded; `lru`, `mem_tag` eviction of values | from `daemon-image` | footprint, `Database::collect` | per-instance MIR memos with `lru = 0`, dropped by hand in `hir/src/evict.rs`: monowalk-1112, records-bodies |
-| `daemon-image` | process | the database's memos and edges, the VFS tree, kept parses, the cost history: one file a home | whole, by the code identity of the blaze that wrote it and its checks; `BLAZE_RESTORE_WITHOUT` leaves parts unused | it is the restart | one file | a container, not an entry's key; what replaces a whole-image restore with records: records-restart2 |
-| `vfs-tree` | file | files and directories by content ID, the Merkle hash of each directory (`subtree`) | the watcher's journal; a directory's hash by its entries | image, then the journal's tail | †not read | none found |
-| `disk-stamps` | file | the content hash of a file outside every view (a toolchain, `/usr/include`), by its path and what `stat` says (length, mtime, ctime, inode, device) | by the stamp, and only a stamp older than `RACY_NS` (2 s) is kept, so no write can share the tick of a kept one (`Stamp::racy`, 2026-11-12) | no (hashed again) | none: `Sharded::intern`, one entry a path and stamp ever seen in the process, never removed | off unix the stamp has no ctime and no inode (`created` stands in), so a rewrite that restores length and mtime is missed there; unbounded; no owner |
-| `plan-queries` | file | manifests, config, lock, the plan, the units, std's units, `blaze tree`: queries over each file read (`blaze-units/src/load`) | as `query-memos` | image | as `query-memos` | †none found |
-| `kept-plans` | checkout | `Roots::plans`: the last plan of each request shape of a checkout (`serve/job.rs:1889`) | replaced when a job of the shape plans | no | `PLANS_KEPT` a checkout; checkouts never leave `Roots` | keyed by the checkout's absolute path and the request's shape: noopkeep |
-| `noop-answers` | checkout | `Roots::answers`: the answer of a build that made nothing, one a request shape | let go when a job of its shape walks | no | `noop::MOST_SHAPES` a checkout | request identity over the whole environment: noopkeep |
-| `request-certificates` | checkout | one store record (`Kind::Query`) a request shape and content (`serve/job/certificate.rs`): every input the answer is a function of, by content (the view's root, package directories' Merkle ids with their reading units, variables read, outside files and probes, outputs' stamps), keyed by (relocated shape, view root, blaze); and one slot a (shape, checkout directory) naming the last certificate's key | by key; checked whole (`Certificate::holds`), failing only for six named reasons | yes | store | a quick first check that nothing moved, no entry's key (rule 65): on a miss it names the group that moved and the walk asks each unit's own records; replaces `noop-answers` when wired: certificate2 (docs/v2/plan/design/certificate.md) |
-| `kept-front-end` | checkout | `Roots::fronts`: the database of a checkout's last build | by the variables it read (`EnvReads`) and its subject | no; from records | footprint (`job/giving.rs`) | one a checkout; a second checkout of the same sources lowers again: records-restart2 |
-| `found-record` | crate | a crate's filed image key and its package's file manifest, under its plan key (plan fields, directory Merkle IDs, dependencies' plan keys, front end code) | by key; the filed key is used only when the serve's own image key equals it | yes | store | a crate's key is its entry's key: records-restart2 |
-| `dep-image` | crate | a dependency's lang items, signatures and diagnostic items (its def map is its pages, a record beside it), under its image key (crate inputs, every file of its source root, dependencies' surfaces, front end code) and the values of what it read (`reads` slots) | by key | yes | store | crate-keyed; refused whole for a path under the daemon's home (records-1112e) and for every local crate (`eligible`, records-restart2); a crate whose `include!` reads outside its source root is refused whole (`serve::include_refusal`) where `unit-records` files the same read by value: Unowned 3 |
-| `def-map-pages` | crate | a dependency's def map as pages read a name at a time, under the image's key | by key | yes | store | crate-keyed, the one form of a served def map (the image holds no def map part); a module's names written once (layout 3): F2 |
-| `item-pages` | crate | a dependency's items, impl and trait items, attribute flags as pages | by key | yes | store | crate-keyed: records-items |
-| `macro-defs` | item | a declarative macro's tokens, under the position-free hash of its definition, and a file's index of its items (`hir-expand/src/declarative/stored.rs`, `stored/index.rs`) | by key | yes | store | †new this round, doc read only; its lane is not in `/tmp/round2/ready` |
-| `impl-tables` | crate | a dependency's impl tables, frozen and paged (`hir-ty/src/method_resolution/frozen*`) | by key | yes | store | crate-keyed: records-impls |
-| `dep-bodies` | crate | every body of a dependency: inference and the borrow check's verdict, one part a crate, under `bodies_key` (the image key, every dependency's check key, the borrow checker's mode) | by key | yes | store | crate-keyed, and deep: a body edit in a crate moves the check key of every crate above it (`blaze-diagnostics/src/cache.rs:154`): records-bodies; Unowned 1 |
-| `dep-check-outcome` | crate | a dependency's diagnostics before rendering, under its check key and the lint flags | by key | yes | store | crate-keyed and deep as `dep-bodies`; **unowned**: Unowned 1 |
-| `dep-consts` | crate | a dependency constant's value, under its crate's check key and its item key (`hir-ty/src/consteval/deps.rs:51`) | by key | yes | store | a crate's key in every entry's key. Its per-item form is written (`body_store/konst.rs`, the item store's fourth step) and off: an evaluation reads the constant's own runtime MIR, which no fact stands for, so every offer would be refused. The one condition that turns it on, and deletes this row's store: runtime MIR being a step of the item store (restore.md, "One form, a function: the end state"): records-bodies |
-| `item-store` | item | a body's inference, MIR and borrow verdict, and, written and not switched on, a constant's value (`body_store/konst.rs`; see `dep-consts`), under its identity and the facts the step read (shapes) | by key | yes | store, `blaze_record::Bounds::STANDARD` shapes a key | the identity is made from the lowered body, so a hit pays the lowering: records-bodies |
-| `goal-store` | item | a global trait goal's answer, under its stable form and the facts its evaluation read | by key | yes | store, `blaze_record::Bounds::STANDARD` | none found; the crate key in it is the asking crate's identity (name, cfg, dependencies), not its content |
-| `records` | item | no cache of its own: the one form (`blaze-record`) a result is kept in with what it read, base key → read-lists → answer; the key of a list is the base and its slot in the base's chain, of an answer the list's bytes and the digest of each read it names | by key; a list older than the open generation and the one before it is no longer searched | yes | store; `Bounds`: 4 lists a generation, 1024 generations a base, `Placed::Full` past it | no user yet: `goal-store` and `item-store` are ported next (primitive-1112), then `runs`, the request certificate and `hir_def::deps` slots |
-| `item-facts` | item | the fact values (`blaze-items`: signature, layout, implements, ...) that `item-store`, `goal-store` and `kernel-entries` are keyed by | as `query-memos` | image | as `query-memos` | †none found |
-| `expansions` | item | a proc-macro expansion, under the macro's library, the call's tokens with relative spans, the crate's variables and what the run read (shapes) | by key; `BLAZE_PROC_MACRO_CACHE=check` expands as well | yes | store | the library re-given when a store verdict moves, scope equality by order: reth-1112 |
-| `macro-machine-code` | crate | a wasm proc-macro module's machine code, under the module's ID and the engine's code ID (`Kind::Machine`) | by key; loaded only from this daemon's own store | yes | store | a module is the unit Wasmtime compiles: argued, no owner needed |
-| `runs` | unit | a build script's or test's result, under its code, what it was given and every input it read (`blaze-usercode/src/index.rs`); a pure script a second time under its instance graph's identity, found before it is compiled | by key; `BLAZE_SCRIPT_CACHE=check`, `BLAZE_PURE=verify`, `BLAZE_ELIDE=verify` run as well | yes | store, a bounded chain of shapes | two keys for one result is by design (the pure key needs no compile); the lookup hashes a whole tree (reth-1112-12): reth-1112 |
-| `warm-processes` | process | a proc-macro server or test fork server kept running, by its program's code, sandbox and set variables | ends with its process | no | †not read | †none found |
-| `test-passes` | item | a test's pass, under its name, the functions it executed and what it read | by key; a history of at most `LOOKBACK` runs | yes | store; the history only grows | †none found |
-| `unit-records` | unit | a unit's outputs and diagnostics, under its record inputs and the values of what its closure read | by key; `BLAZE_UNIT_KEY_DEEP=1` plants the old deep key | yes | store | three keys for one record (narrow, quoted, whole: `serve/unit/compile.rs:505`); dependents keyed by a whole-interface digest; per-item read parts not wired: cutoff-1112 |
-| `outputs` | file | a whole output as content-defined chunks, a linked image as a recipe over its base (`Kind::Output`, `Kind::Derived`) | by content | yes | store | none found |
-| `doctest-images` | item | a doctest example's and the runner's linked image, under the unit's record inputs less its crate identity, and the example's code | by key | yes | store | †none found |
-| `why-ledger` | unit | why each step ran: the last key parts of each subject | appended a build | yes | †not read | †none found |
-| `cost-predictor` | unit | what a unit's, a checkout's lowering's and a front end's store last cost | learned each run | image | one row a key | not a result; the lowering's is keyed by the checkout |
-| `code` | item | a function's dev and release templates, summaries, folded bodies, thunks, statics' templates, side tables, debug info: each under its instance key (code hash, type-argument facts, settings) and what it builds in (`blaze-codegen/src/query.rs`) | by key | yes | store | †the table in `query.rs` read, not each producer |
-| `describes` | crate | what describing an instance gives, under the image key of the instance's home crate and the instance ported | by key | yes | store | a crate's key in every entry's key; not written by real builds; workspace crates have none: monowalk-1112 |
-| `kernel-entries` | item | a kernel step's value, under the step's identity and the hashes of its reads (`blaze-kernel`) | by key | yes | store, `MOST_SHAPES` | †none found |
-| `devirt-world` | program | what a whole program does with trait objects, each object's digest | †not read | †not read | †not read | whole-program by what it is; not audited: Unowned 5 |
-| `fn-cache` | item | `#[blaze::cache]`: a function's results in the built program, under its code ID and arguments | by key | the program's own | the program's | none found |
-| `link-state` | program | a link's rows (a function, a static, a span table each) and one digest, patched by each build's delta | by the delta's entries | no; the linked output is a `Derived` recipe | one a program | a container of per-function rows; †`blaze-link` not read |
-| `layout-profiles` | program | address maps and profile weights by function identity, in `<target-dir>/layout`; PGO and lint profiles by content | by build id | files | †not read | †none found |
-| `fetched` | file | downloaded objects by their BLAKE3, an index from an origin (a pin, a pure step) to its object | by key | yes | store | none found |
-| `ext-facts` | crate | an extension's build and each fact it computes, under the extension's key (blaze's code, its sources, its grants) | by key | yes | store | an extension's whole source in every fact's key ("coarser than one identity per fact function", `blaze-ext-host/src/key.rs`); **unowned**: Unowned 6 |
-| `lean-proofs` | item | what Lean printed of one module of a proof check (a function's model, a proof file, a theorem's check) that it accepted, beside the module under the build directory's `lean/`, with the compiled module Lean kept (`serve/unit/prove.rs`, `blaze prove`) | by the step's key: the Lean release, the module's text and the keys of the modules it imports (`hir_ty_lean::plan`); a verdict carries a hash of itself and is written only after its compiled module is ordered before it | yes | none: one verdict a module of a build directory, gone with the directory | files in the build directory, not records of the store; a proof file is one module however many theorems it proves, so an edit to one proof runs the file again |
-| `profile-history` | process | the profile's parquet history: a log, not a result | appended | files | `BLAZE_PROFILE_CAP_MB` | none found |
-| `store` | none | the store's own keys, values, chunks, dictionaries, pins (`blaze-cas`, `blaze-format`) | the collector | yes | budget | pins not covering every record family: storegc; seal groups naming every row of a broken group: sealgroups |
-| `remote` | none | transport of records between machines (`blaze-global`, `blaze-pack`, `blaze-hub`) | n/a | n/a | n/a | †not audited |
-| `flights` | none | single-flight keys: concurrent askers of one download, layout or compile share it | ends with the flight | no | n/a | not a cache |
-| `identity` | none | content IDs of inputs (a file's text, a crate's settings, the code of blaze itself): parts of other rows' keys | n/a | n/a | n/a | n/a |
-| `not-keys` | none | literals of the domain form that key nothing: messages, test tools, models, proofs | n/a | n/a | n/a | n/a |
-| `unaudited` | none | domains this audit did not place (`blaze-launch-host`, `blaze-engine`, `blaze-thin`, `serve/unit/run/launch.rs`) | | | | to be placed; the list only shrinks |
-
-48 rows. By grain: 12 item, 5 file, 4 unit, 11 crate, 3 program, 4 checkout, 3 process, 6 none.
-
-## Unowned defects
-
-1. **Check keys are deep and a crate each.** `bodies_key` hashes every dependency's check key
-   (`blaze-diagnostics/src/cache.rs:154`), and `dep-check-outcome` and `dep-consts` are filed
-   under it: one body edit moves every entry of every crate above. Harmless while only
-   registry crates are eligible; all-miss the day local crates are (records-restart2's
-   `eligible`). The form to move to: a constant under its item key and the fact values its
-   evaluation read (as `item-store`), diagnostics a body.
-2. (done 2026-11-12) `blaze-premap`, an image of every dependency under one key of the whole
-   graph, had no dependent crate and was deleted.
-3. **An `include!` outside the source root refuses the crate's image whole**, where
-   `unit-records` files the same read by its value. File it in the image's `reads`.
-4. **`disk-stamps`** is never trimmed, and off unix its stamp can be restored by a writer (no ctime).
-5. **`devirt-world`**, `remote`, `layout-profiles` and the rows marked † were
-   not read to their producers.
-6. **`ext-facts`**: every fact under its extension's whole source.
+| cache | grain | identity and retained value | owner and integration state |
+|---|---|---|---|
+| `mapped-images` | file | Mapped image spines, VFS text pages and shipped source-tree listings. These contain separately named files, not the deleted query database image. | blaze-image, blaze-vfs and blaze-cargo/toolchain; the compiler mounting path is parked. |
+| `vfs-tree` | file | File contents, directory entries and journal records; names and bytes use distinct domains. | blaze-vfs; the driver checks filesystem observations. |
+| `disk-stamps` | file | A file’s remembered content identity under its path and stat stamp, with the racy-stamp exclusion. | blaze-usercode/inputs; local observation reuse for traced runs, not a portable content identity. Compiler integration is parked. |
+| `plan-queries` | file | Manifest, configuration and invocation reads, plus resolver/source identities; a plan combines these input records. | blaze-units, blaze-tree, blaze-source and blaze-resolve; compiler planning consumers are parked. |
+| `request-certificates` | checkout | A request shape/tool base, its recorded reads and answer; a local slot projects its certificate and stamps. | blaze-certify; a certificate summarizes one completed request while its units/items keep their own keys. The old daemon writer is deleted. |
+| `item-pages` | item | The remaining item-syntax identity; the deleted frozen dependency item-page store is not a live producer. | hir-def/item_tree/items; retained parked source. |
+| `macro-defs` | item | Definition/call token hashes, hygiene, cfg, editions and syntax extensions; a file index locates per-item rows. | hir-expand/declarative/stored; retained compiler integration is parked. |
+| `impl-tables` | crate | Retained frozen impl-table and candidate-set records. | hir-ty/method_resolution/frozen; the legacy container remains crate-grained and parked. Item-grain impl facts are replacement integration work. |
+| `dep-bodies` | crate | Retained dependency-body records and portable IDs. | hir-ty/check_cache; the legacy dependency container is crate-grained and parked, distinct from the per-body item store. |
+| `dep-check-outcome` | crate | A dependency check outcome under its check key and diagnostic settings. | blaze-diagnostics/cache; legacy crate-grained outcome, parked pending the item findings path. |
+| `dep-consts` | crate | A legacy dependency constant-value key contains the crate check key and item identity. | hir-ty/consteval/deps; retained parked code, to be replaced by the item-store result when that integration is complete. |
+| `item-store` | item | Body lowering, inference, MIR, borrow verdict and constant-value records; base identity plus the facts each step read. | hir-ty/body_store and blaze-item-hash; retained compiler code is parked. |
+| `goal-store` | item | One canonical trait-solver goal and its solver/reading context. | hir-ty/next_solver/goal_store; retained compiler code is parked. |
+| `records` | item | A value under its base, read-list and observed read values; the list is independently named. | blaze-record; this is not a whole-checkout answer cache. |
+| `item-facts` | item | An item, type, scope, impl set or source-location fact; the query records the fact it actually read. | blaze-items, blaze-item-hash and hir-ty-mir; compiler-facing producers are parked. |
+| `expansions` | item | One proc-macro expansion with its macro library, input tokens and observed environment/files. | proc-macro-api and blaze-macro-eval; retained integration is parked. |
+| `macro-machine-code` | file | A proc-macro Wasm module and its engine-specific compiled bytes. | blaze-macro-eval/wasm; module content and engine bytes determine the key. Integration is parked. |
+| `runs` | unit | One build-script or sandboxed-test invocation, provider, inputs and traced outside reads. | blaze-usercode; each invocation is a unit. Compiler integration is parked. |
+| `warm-processes` | unit | A reusable user-code process under the inputs determining that process. | blaze-usercode/warm; retained parked source, separate from a persisted run answer. |
+| `test-passes` | item | One test entry and its observed code/outside reads; suite and program-state tables index these entries. | blaze-program/reach and blaze-testsel; a suite is a container, not the key of each test result. Compiler integration is parked. |
+| `unit-records` | unit | A unit signature and manifest identity, late reads and front-end settings; bodies stay separately keyed. | blaze-unitkey and blaze-command/front; the unit is the Cargo compilation context. Full command integration is parked. |
+| `code` | item | A function instance, static, template or code-shaping fact, including reference-alias patterns. | blaze-codegen and hir-ty-codegen; retained parked source. The lexical inventory also includes retained test fixture domains. |
+| `describes` | item | An instance/static plan or describe record under its target, toolchain, stage and read-addressed content. | hir-ty-codegen/v2/frontend/described; retained compiler integration is parked. |
+| `kernel-entries` | item | A registered computation by its code, arguments and flags, checked against the facts it read. | blaze-kernel; the registry identifies definitions rather than replacing an entry’s key. |
+| `devirt-world` | program | The retained devirtualization world, sites, object/type arguments and fixtures. | hir-ty-codegen; the current world is program-wide and parked. Its grain is inventoried debt, not the final design. |
+| `fn-cache` | item | A pure closure code key under behavior identity, key format, target, nightly and overflow policy. | hir-ty-codegen/fncache; its exact pure key constructor is included by an active library test, while compiler execution stays parked. |
+| `link-state` | program | Image state, section/head digests, native inputs and linker records; functions/statics retain individual identities. | blaze-link; whole-image state is the container needed to resume incremental placement. Its compiler consumer is parked. |
+| `layout-profiles` | program | Profile images, weights, component/run identities and merged profile records. | blaze-profile and hir-ty-codegen; a profile describes a program/recording, not a semantic answer for every body. |
+| `fetched` | file | Fetched objects, content chunks, their indexes and package placement. | blaze-fetch and blaze-pack; object/chunk content fixes its key. |
+| `lean-proofs` | item | The retained Lean verdict identity. | hir-ty-lean; front-end integration is parked; standalone Lean proofs run separately. |
+| `store` | item | Content-addressed values, schemas, pins, sealed item sets and their directory roots. | blaze-cas, blaze-format and blaze-gc; sets locate individually keyed items, not a coarser identity replacing them. |
+| `remote` | file | Signed roots/key lists/bundles, shard indexes, segment values and global/pack manifests. | blaze-remote, blaze-global and blaze-pack; distribution containers are verified before their records are trusted. |
+| `identity` | none | Code, configuration, source-root and other input identities consumed by the rows above; this row keeps no result. | Source-defined identities are inventoried without claiming all compiler consumers are active. |
+| `not-keys` | none | Model/negative-control fixtures, oracle samples and domain-shaped non-cache text. | blaze-storemodel, kernel exhaustive controls, front-items cutoff tests and retained fixtures; no production answer is cached by this row. |
+| `unaudited` | none | Remaining launch/rustc-stand-in identities whose producer audit is still outstanding. | Inventoried for uniqueness; this row claims no cache-validity proof. |
+| `agent-sessions` | process | Agent hook session/token names, not compiler result keys. | blaze-cargo/cli/agents; a session is deliberately process-scoped. The compiler hook path is parked. |
+| `plain-store` | file | Physical segment/log/root identities, namespace names, boot and nonce checks. | blaze-cas/plain; segments pack individually keyed records. Boot/nonce names do not stand for compiler answers. |
+| `typed-records` | item | Declared kind/code identities and read-addressed values under a key, read shape and observed answers. | blaze-keyed; kinds determine key fields and record roots, and a checked record carries its full key. |
+| `program-items` | item | Function type arguments/settings and static-value records for the program walk. | blaze-program; stable symbols are distinct from content-dependent plan/code/value keys. |
+| `program-manifests` | program | An ordered program manifest, its content chunks and kept image rows. | blaze-program and blaze-command/program; the manifest describes the whole program, while rows name individual plan/code/static keys. Full compiler wiring is parked. |
+| `solo-sessions` | checkout | The no-daemon prototype command’s checkout namespace, pin and answer. | blaze-solo; a checkout pin names the observed world/session, while computations keep their kernel identities. |
+| `surface-names` | item | A module export set, independent of exported bodies. | blaze-surface/module_scope; the module is the item whose public names are described. |
+| `file-items` | item | An outlined item, signature, head and sibling context derived from parser events. | blaze-file-items; this layer retains neither a syntax tree nor a database. |
+| `front-syntax` | item | Per-item IDs, headers, bodies, names and impl gates, plus their file/reading context. | blaze-front-items; file/crate tables contain independently digested parts. |
+| `front-settings` | process | The front-end settings singleton and individual setting fields used by its session. | base-db/settings; settings apply to a database/session rather than one item. This retained integration is parked. |
+| `own-effects` | item | A body’s own effects and their shape before transitive callee effects are folded in. | hir-ty-pure/own; this per-body fact feeds the transitive summary. Compiler integration is parked. |
+| `kernel-sessions` | process | Verified rows and read postings, rooted by a pin and stored in immutable keyed trie nodes. | blaze-kernel/session and trie; a session contains independently validated computation rows, not their semantic key. |
+| `kernel-tables` | item | A computation value partitioned into keyed parts, key-set digests and a deterministic Merkle index. | blaze-kernel/table; a part reader depends on its part, not every part of the owner. |
+| `launch-records` | item | A function/static launch/bind record, named places and text/string data. | blaze-launch-host; each callee/static has its own bind key. Compiler integration is parked. |
+| `launch-images` | program | A kept launched-program start state and the next launcher’s answer. | blaze-launch-host/start; this restart container references individually keyed records. Its old daemon consumer is deleted. |
+| `command-graphs` | checkout | A request’s unit graph, checkout/program namespace, target/features and resolved source/tool settings. | blaze-command; request-wide setup does not replace unit/body keys. Compiler dependencies keep this crate parked. |
+| `outside-reads` | none | Current file, directory, environment and existence observations. | blaze-host/outside and blaze-solo/world; inputs to record validation, not another cache of completed work. |
 
 ## Switches that select a caching path
 
-| variable | what it selects | who removes it, when |
+The scanner counts a literal name even for a build-time input, a scrubbed legacy setting,
+a route-validation name or a test-module constant. The inventory does not imply that each
+variable is a live runtime control. Names removed with the old daemon are not retained.
+
+| variable | what it selects | owner and lifetime |
 |---|---|---|
-| `BLAZE_ITEM_STORE=off` | no item store | records-bodies, once bodies are records; `verify` stays as the differential |
-| `BLAZE_UNIT_KEY_DEEP=1` | the old deep unit key, as a planted bug in shipped code | cutoff-1112, when revision cases have their in-process driver (`tests/revisions/main.rs` names `sim`; there is no `sim.rs`): a plant is then a value the test gives the job, and no binary reads it |
-| `BLAZE_FRONT_END_PER_PLAN=1` | the plan as the kept front end's identity, a planted bug as above | onefront, as above |
-| `BLAZE_DEPS=full` | every dependency checked whole, not only what programs reach | stays: the differential run's (`harness/v2/reachable.py`) |
-| `BLAZE_DEP_IMAGES` (`check`, `verify`), `BLAZE_PROC_MACRO_CACHE=check`, `BLAZE_SCRIPT_CACHE=check`, `BLAZE_PURE=verify`, `BLAZE_ELIDE=verify`, `BLAZE_ITEM_STORE=verify` | a hit does the work as well and compares | stay: they select no second path |
-| `BLAZE_RESTORE_WITHOUT` | parts of a good image left unused | stays: for finding which part a fault follows |
+| `BLAZE_PROC_MACRO_CACHE=check` | Re-expands a kept expansion and compares its stored result; normal mode is Keep, and every other value is refused. | The retained proc-macro-api checker; verification mode stays when the parked compiler integration returns. |
+| `BLAZE_CACHE_TRANSPORT` | Explicit HTTP/1.1 or HTTP/3 for anonymous public-cache reads. Signed requests use HTTP/1.1. Record keys/representations are unchanged. | blaze-remote; both protocols are intentional. Failure of the chosen protocol is an error, not implicit fallback. |
 
-Every other `BLAZE_` variable a file of `crates/` names outside tests selects no caching path
-(the `domains` script fails on one that is neither here nor in the table; the code-changing
-knobs, `BLAZE_OPT` and the rest, are refused by a build whose keys do not hold them:
-`hir-ty-codegen/v2/backend.rs` `CHANGES_CODE`). Other variables: `BLAZE_AHEAD`, `BLAZE_ALLOC_TRACE`, `BLAZE_API_TOKEN`, `BLAZE_ASSEMBLER`, `BLAZE_BACKEND`, `BLAZE_BENCH_MACHINE`, `BLAZE_BIN`, `BLAZE_BORROWCK`, `BLAZE_BORROWCK_DEBUG`, `BLAZE_BUILT_IN`, `BLAZE_CACHE`, `BLAZE_CHECK_PLACES`, `BLAZE_CODEGEN_CODE`, `BLAZE_CORES`, `BLAZE_DAEMON_MEMORY_GB`, `BLAZE_DEV_TOOLCHAIN_AS`, `BLAZE_DUCKDB`, `BLAZE_DUMP_CLIF`, `BLAZE_DUMP_LLVM`, `BLAZE_DUMP_MIR`, `BLAZE_DUMP_TIER`, `BLAZE_DURABILITY_CENSUS`, `BLAZE_EMIT`, `BLAZE_FN_CACHE_TRACE`, `BLAZE_FRONT_END_CODE`, `BLAZE_FUZZ_RUNS`, `BLAZE_GC_TEST_HOLD_LEASE`, `BLAZE_GIT_DATE`, `BLAZE_GIT_SHA`, `BLAZE_GPU_MSL_HARNESS_NATIVE_SHADERS`, `BLAZE_HASH_ORDER_CHILD`, `BLAZE_HISTORY_LEVEL`, `BLAZE_HOME`, `BLAZE_HUGE_PAGES`, `BLAZE_IGNORE_PIN_FOR`, `BLAZE_INLINE`, `BLAZE_INLINE_ASM`, `BLAZE_INPROC`, `BLAZE_LAUNCH`, `BLAZE_LAUNCHED`, `BLAZE_LAYOUTS`, `BLAZE_LEAN`, `BLAZE_LEAN_PROVER`, `BLAZE_LIBRARY`, `BLAZE_LIBRARY_FROM`, `BLAZE_LLVM_INLINE_THRESHOLD`, `BLAZE_LOCK`, `BLAZE_MACHINE_MEMORY_GB`, `BLAZE_MEMORY_BUDGET`, `BLAZE_MIR_OPT`, `BLAZE_NO_HOME`, `BLAZE_OPT`, `BLAZE_ORACLE_MINUTES`, `BLAZE_ORACLE_OUT`, `BLAZE_PINNED_BY`, `BLAZE_PROFILE`, `BLAZE_PROFILE_CAP_MB`, `BLAZE_PROFILE_DETAIL`, `BLAZE_PROMOTE`, `BLAZE_RECORD_CODE`, `BLAZE_REGALLOC`, `BLAZE_RELEASE`, `BLAZE_RELEASES`, `BLAZE_REVISIONS_SEED`, `BLAZE_REVISIONS_STORE_CHECK`, `BLAZE_RUN_AS_DEFAULT`, `BLAZE_RUST_DIST`, `BLAZE_SANDBOX`, `BLAZE_SANDBOX_TEST_ALONE`, `BLAZE_SCRIPT_RUSTC`, `BLAZE_STATS`, `BLAZE_TEST_UNSET`, `BLAZE_TOOLCHAINS`, `BLAZE_TRACE_HOLDERS`, `BLAZE_UI`, `BLAZE_UI_TRANSCRIPT`, `BLAZE_VERIFY_STORE`, `BLAZE_VERSION`, `BLAZE_VERSION_LINE`, `BLAZE_WARM_SOCKET`.
+### Remote settings
 
-### Distributed observation and acceptance controls
+`BLAZE_CACHE_ENDPOINT`, `BLAZE_CACHE_BUCKET` and `BLAZE_CACHE_PUBLIC_URL` identify the service.
+`BLAZE_CACHE_PUBLIC_ANCHORS` fixes public trust. `BLAZE_CACHE_ACCESS_KEY_ID`,
+`BLAZE_CACHE_SECRET_ACCESS_KEY`, `BLAZE_CACHE_SIGNING_SEED` and `BLAZE_CACHE_KEY_LIST` supply
+writer credentials and signing authority. `BLAZE_CACHE_ANCHOR_SEED` is an explicit key-list
+creation input. The settings reader refuses values simultaneously supplied in a file and
+the environment. These configure access to the same signed formats, not parallel validity rules.
 
-These retained fork controls select no caching path and add nothing to a cache or work key.
-Their [runtime contract](../../../distributed.md#environment-variables-and-acceptance-probes)
-distinguishes observation from a deliberate scheduling fault:
+### Observation, replay and process controls
 
-| variable | effect on execution and identity | owner and why it stays |
-|---|---|---|
-| `BLAZE_DIST_EVENTS` | Observation: appends actual grants, results and terminal transitions as locked JSON lines. It adds evidence IO, not a cache representation, lookup policy or key input. With it unset, no evidence file is opened. | The distributed carrier's `crates/blaze-dist-local/src/telemetry.rs`, called by its agent and server; retained because the acceptance harness checks these real transitions and refuses missing evidence. |
-| `BLAZE_DIST_TEST_RESULT_GATE` | Acceptance fault: captures one current lead's real result in a fresh directory and pauses its sender's heartbeats until release or a finite deadline. It can cause lease expiry and stale-result rejection; the released command, work identity and cache keys are unchanged. No capture or gate IO occurs when it is unset. | The carrier's `crates/blaze-dist-local/src/result_gate.rs`, enabled by the agent and driven through the ordinary client in `crates/blaze-dist-local/src/driver.rs`; retained to prove that a delayed real result cannot regain fenced authority. It is not a production cache selector. |
+`BLAZE_DIST_EVENTS` appends actual distributed transitions as locked JSON lines. This is
+observation IO, not a cache representation or key selector. `BLAZE_DIST_TEST_RESULT_GATE`
+captures a real lead’s result and suspends its sender’s heartbeats until release or its finite
+deadline, allowing acceptance to demonstrate fenced stale-result rejection. Both belong to the
+retained carrier and do no file IO when unset.
 
-### Library test process controls
+`BLAZE_TEST_LIBRARY_DOWNLOAD` and `BLAZE_TEST_LIBRARY_FETCH` isolate download/fetch child tests.
+`BLAZE_SIM_SEED`, `BLAZE_SIM_SEEDS` and `BLAZE_SIM_TAPE` select simulation replay or coverage.
+`BLAZE_DAEMON_EXIT_UNHELD` remains named by the parked thin-client route-consistency check;
+the daemon implementation it referred to was deleted.
 
-These variables belong only to test modules included by `crates/blaze-cargo/src/toolchain/library.rs` under
-`cfg(all(test, unix))` or `cfg(all(test, target_os = "linux"))`. They select the child side of
-isolated library-download/fetch tests; they are absent from production builds and select no
-production cache policy or key.
+`BLAZE_AUDIT_DB` selects the advisory database whose tree the retained audit command hashes.
+`BLAZE_BSTD_DIGEST` is the build-time identity of the shipped bstd archive, not a runtime cache
+mode. Other source-named settings cover diagnostics, toolchain/code identities, resource limits,
+test probes, front-end/backend policy and explicit environment scrubbing:
 
-| variable | effect in the test process | owner and why it stays |
-|---|---|---|
-| `BLAZE_TEST_LIBRARY_DOWNLOAD` | Supplies the private TLS mirror URL to a child running the redirect test, isolating its certificate roots and shared HTTP client. The child checks HTTPS redirects and refuses a downgrade to HTTP. | `crates/blaze-cargo/src/toolchain/library/download_tests.rs`; retained to exercise the real download entry point with private process state. |
-| `BLAZE_TEST_LIBRARY_FETCH` | Marks the child that calls the real fetch entry point in a clean home. The parent runs it with the matching checkout visible or hidden to check checkout precedence and the selected release, then verifies the fetched library digest. | `crates/blaze-cargo/src/toolchain/library/fetch_tests.rs`; retained for the explicitly invoked Linux clean-home acceptance test. |
+`BLAZE_ALLOC_TRACE`, `BLAZE_ASSEMBLER`, `BLAZE_BACKEND`, `BLAZE_BENCH_MACHINE`, `BLAZE_BIN`, `BLAZE_BORROWCK`,
+`BLAZE_BORROWCK_DEBUG`, `BLAZE_BUILT_IN`, `BLAZE_CHECK_PLACES`, `BLAZE_CODEGEN_CODE`, `BLAZE_CORES`, `BLAZE_DUMP_CLIF`,
+`BLAZE_DUMP_LLVM`, `BLAZE_DUMP_MIR`, `BLAZE_DUMP_TIER`, `BLAZE_EMIT`, `BLAZE_FN_CACHE_TRACE`, `BLAZE_FRONT_END_CODE`,
+`BLAZE_FUZZ_RUNS`, `BLAZE_GC_TEST_HOLD_LEASE`, `BLAZE_GIT_DATE`, `BLAZE_GIT_SHA`, `BLAZE_HASH_ORDER_CHILD`, `BLAZE_HISTORY_LEVEL`,
+`BLAZE_HOME`, `BLAZE_HUGE_PAGES`, `BLAZE_IGNORE_PIN_FOR`, `BLAZE_INLINE`, `BLAZE_INLINE_ASM`, `BLAZE_INPROC`,
+`BLAZE_LAYOUTS`, `BLAZE_LEAN`, `BLAZE_LEAN_PROVER`, `BLAZE_LIBRARY`, `BLAZE_LIBRARY_FROM`, `BLAZE_LLVM_INLINE_THRESHOLD`,
+`BLAZE_LOCK`, `BLAZE_MEMORY_BUDGET`, `BLAZE_MIR_OPT`, `BLAZE_NO_HOME`, `BLAZE_OPT`, `BLAZE_ORACLE_MINUTES`,
+`BLAZE_ORACLE_OUT`, `BLAZE_PINNED_BY`, `BLAZE_PROFILE_CAP_MB`, `BLAZE_PROFILE_DETAIL`, `BLAZE_PROMOTE`, `BLAZE_RECORD_CODE`,
+`BLAZE_REGALLOC`, `BLAZE_RELEASE`, `BLAZE_RELEASES`, `BLAZE_REVISIONS_SEED`, `BLAZE_REVISIONS_STORE_CHECK`, `BLAZE_RUN_AS_DEFAULT`,
+`BLAZE_RUST_DIST`, `BLAZE_SANDBOX`, `BLAZE_SANDBOX_TEST_ALONE`, `BLAZE_SCRIPT_RUSTC`, `BLAZE_STATS`, `BLAZE_TOOLCHAINS`,
+`BLAZE_TRACE_HOLDERS`, `BLAZE_UI`, `BLAZE_UI_TRANSCRIPT`, `BLAZE_VERIFY_STORE`, `BLAZE_VERSION`, `BLAZE_VERSION_LINE`,
+`BLAZE_WARM_SOCKET`.
 
 ## Hash functions
 
-The rule: a hash that stands for content (in a key, a record, a persisted file, or wherever
-equal hashes are taken as equal things with no compare after) is BLAKE3 under a domain
-(`blaze_ids::Hasher`), at least 128 bits kept. Classes: `identity`; `probe` (a slot or shard
-hash, the full key compared after); `required` (another tool's format); `integrity` (a
-checksum of bytes already named); `random` (a seed wanted random, nothing kept by it);
-`names` (code that names a hasher and hashes nothing with it). The `domains` script fails on
-a file under `crates/` that names SipHash, `DefaultHasher`, `RandomState`, `FxHasher`,
-`AHasher` or FNV's basis outside tests and is under no path of this table.
+Content identities use BLAKE3 under a domain, retaining at least 128 bits. Other classes are
+`probe` (the key is compared after selecting a slot), `required` (another format’s algorithm),
+`integrity`, `random`, `names` (recognizing a hasher rather than using it), and `unaudited`.
 
-| where | function | class | why, and what a collision costs |
+| where | function | class | what equality means |
 |---|---|---|---|
-| `crates/blaze-ids/` | BLAKE3, 256 bits (`ContentId`) or its first 128 (`Fingerprint`) | identity | the rule; also `syntax-tree`'s `subtree_hash` and, since 2026-11-12, `hir-ty-codegen`'s `print_of` |
-| `crates/blaze-hash/` | foldhash under one fixed seed; SipHash-1-3 under a drawn key for keys an attacker picks; the key's own first word for keys that are hashes | probe | in memory only; the map compares the key |
-| `crates/blaze-std/src/lib.rs` | the above, re-exported | names | |
-| `crates/hir-def/src/nameres/frozen/pages.rs` | FNV-1a, 64 bits | probe | persisted slot hash of def-map and item pages; the name or key bytes are compared after (`pages.rs:630`, `items.rs:313`); the layout word is `fnv(ENCODING)`, which does not name the function: a change of it has to bump `ENCODING` by hand |
-| `crates/hir-ty/src/method_resolution/frozen/pages.rs` | FNV-1a, 64 bits | probe | as above; the entry is decoded and compared (line 451) |
-| `crates/hir-ty-codegen/type_id.rs` | `StableSipHasher128` | required | a `TypeId` as rustc computes it: rustc's code compares it with ours |
-| `crates/blaze-units/src/load/plan/hash.rs` | `StableSipHasher128` | required | cargo's `compute_metadata`, input for input |
-| `crates/blaze-source/src/source_id.rs` | `StableSipHasher128` | required | †cargo's hash of a source, in registry directory names |
-| `crates/blaze-graph/src/ledger.rs` | FNV-1a, 64 bits | integrity | the machine ledger's checksum; also a home's label (`serve/machine.rs:167`), where two homes of one hash and one path tail read as one: †not traced to a decision |
-| `crates/blaze-profile/src/flight/postmortem.rs` | FNV-1a, 64 bits | identity | †a layout word of the flight recorder: a collision reads another layout's bytes; no build depends on it |
-| `crates/blaze-profile/src/panics.rs` | FNV-1a, 64 bits | probe | a panic site's counter, no compare after: a collision adds two sites' counts |
-| `crates/blaze-std/src/rt.rs` | std's `RandomState` | random | a seed from the OS |
-| `crates/ix-prof/src/lib.rs` | std's `RandomState` | random | a session's nonce |
-| `crates/blaze-query/src/db/value.rs` | | names | `RandomState` in a list of types |
-| `crates/blaze-lints/` | | names | the lints that ban these hashers |
-| `crates/hir-ty-codegen/fncache.rs` | | names | what `#[blaze::cache]` knows of std's `RandomState` |
-| `crates/hir-ty-pure/` | | names | the purity model of `RandomState` |
-| `crates/harness/` | `DefaultHasher`, FNV-1a | unaudited | the harness app, not the compiler |
+| `crates/blaze-ids/` | BLAKE3, 256 bits or the first 128 | identity | Content identity under a domain. |
+| `crates/blaze-hash/` | foldhash, SipHash and prehashed key words | probe | The map compares complete keys after probing. |
+| `crates/blaze-memo/src/lib.rs` | FNV-1a, 64 bits | probe | Kind names choose table hashes; kinds compare by their static Kind addresses, so a collision is not identity equality. |
+| `crates/blaze-std/src/lib.rs` | Re-exported hashers | names | Public names, not another implementation. |
+| `crates/hir-ty/src/method_resolution/frozen/pages.rs` | FNV-1a, 64 bits | probe | The persisted slot is followed by decoding and comparing the entry key. |
+| `crates/hir-ty-codegen/type_id.rs` | StableSipHasher128 | required | Rust TypeId compatibility. |
+| `crates/blaze-units/src/load/plan/hash.rs` | StableSipHasher128 | required | Cargo metadata identity. |
+| `crates/blaze-source/src/source_id.rs` | StableSipHasher128 | required | Cargo-compatible source and registry directory identity. |
+| `crates/blaze-profile/src/flight/postmortem.rs` | FNV-1a, 64 bits | identity | The recorder’s existing layout word; a collision can confuse layouts. Inventoried debt, not a BLAKE3 content-identity claim. |
+| `crates/blaze-profile/src/panics.rs` | FNV-1a, 64 bits | probe | Panic-site counters; colliding sites can combine counts. |
+| `crates/blaze-std/src/rt.rs` | RandomState | random | A runtime seed, not persisted content identity. |
+| `crates/ix-prof/src/lib.rs` | RandomState | random | A recording-session nonce. |
+| `crates/hir-ty-codegen/fncache.rs` | Recognized RandomState names | names | The function-cache purity model. |
+| `crates/hir-ty-pure/` | Recognized RandomState names | names | The purity/effect model. |
+| `crates/harness/` | DefaultHasher and FNV-1a | unaudited | The separately built harness application; producer audit remains open. |
 
-Not held by the script, required by others: SHA-256 for crates.io checksums, lock files and
-toolchain pins (`blaze-fetch/src/digest.rs`); SHA-1 for git objects (`blaze-hub/src/git.rs`);
-MD5 and SHA-1 where a debug-info format asks; CRC32 for `.gnu_debuglink`
-(`blaze-link/src/beside/crc.rs`). Integrity: CRC32C of the image's and the store's page groups
-(`blaze-ids/src/crc32c.rs`). 64-bit values used as names, each a probe or a first check:
-`item_scope.rs` `name_hash` (in memory, of a pointer), `hir/persist.rs` `text_hash` (keyed at
-random; the bytes written are the same under any key), `delta/state.rs` `cost_key` (the first
-eight bytes of a content ID, a cost estimate's key).
+Other format-required hashes are not scanned by this rule: SHA-256 for registry/lock/pin
+checksums, MD5 or SHA-1 where debug formats require them, and CRC32 for GNU debug links.
+The scanner’s coverage does not establish that these are every algorithm in the repository.
 
 ## Domains
 
-Each hash domain written in `crates/` outside tests, less its version number, under the cache
-it keys. `blaze v2 ` is left off; a name that starts otherwise is written with `=`. A literal
-with a backtick in it is no domain and is not listed.
+Each name is the source domain less its trailing version number. Without `=`, it has the prefix
+`blaze v2 `; a leading `=` spells the whole stem. Versioned variants share one entry. An absent
+producer is removed, and a new producer needs a row explaining its key grain.
 
-The retained reference-alias domains belong to the `code` cache at item grain. Their inputs
-describe one function's references; no crate or checkout identity is added:
-
-| domain (without `blaze v2 ` or its version) | source and inputs |
-|---|---|
-| `reference aliases` | `crates/blaze-codegen/src/template.rs` hashes the reference count and each resolved target's first equal position. It records the equality pattern independently of target identities, distinguishing repeated references from distinct ones. |
-| `aliased shape` | `crates/blaze-codegen/src/backend.rs` hashes the prepared shape ID together with that reference-alias digest. The resulting template memo key separates otherwise equal shapes whose reference equality patterns differ; the store key in `crates/blaze-codegen/src/driver.rs` also includes the alias digest. |
-
-- `query-memos`: `db input absent`, `db input config`, `db input file`, `db input names`, `db input path`, `db input root path`, `db shared value`, `db value`, `query key`
-- `daemon-image`: `db blob 2: values at 16-byte boundaries, keys' bytes, paths`, `db edges 2: edge(kind u16, pad 6, input 32, saw 16) 56; a memo's in the order read`, `db table 2: u64 1 + a key's first memo or 0; a power of two, probed linearly`, `image spine`, `vfs blobs 1: file bytes`, `vfs disks 2: disk.rs's encoding`, `vfs image`
-- `vfs-tree`: `db memory directory`, `db memory root`, `db package subtree`, `db subtree`, `db subtree key`, `db subtree query`, `vfs directory`, `vfs file`, `vfs journal record`, `vfs name index key`
+- `mapped-images`: `image spine`, `tree texts`, `vfs disks 2: disk.rs's encoding`, `vfs file text 1: a file's bytes under its FILE_DOMAIN content id`, `vfs image`
+- `vfs-tree`: `vfs directory`, `vfs file`, `vfs journal record`, `vfs name index key`
 - `disk-stamps`: `disk stamp`, `disk view id stamp`
 - `plan-queries`: `cargo asked`, `cargo asked key`, `cargo asked or not`, `cargo config`, `cargo config key`, `cargo config read`, `cargo configured`, `cargo dir`, `cargo dir key`, `cargo file`, `cargo file key`, `cargo fixed dir`, `cargo fixed dir key`, `cargo fixed file`, `cargo fixed file key`, `cargo foreign`, `cargo foreign key`, `cargo found dir`, `cargo found file`, `cargo invocation`, `cargo invocation key`, `cargo manifest`, `cargo manifest key`, `cargo manifest parsed`, `cargo mount index`, `cargo mount table`, `cargo mounts`, `cargo mounts key`, `cargo plan`, `cargo plan key`, `cargo planned`, `cargo std key`, `cargo std placement`, `cargo std planned`, `cargo std units`, `cargo tree`, `cargo tree key`, `cargo tree printed`, `cargo units`, `cargo workspace`, `cargo workspace key`, `cargo workspace read`, `=blaze workspace build dir`, `=blaze-resolve package id`, `=blaze-source interned string`, `=blaze-source registry name`, `=blaze-source source id`
-- `kept-plans`: `serve last plan`
-- `noop-answers`: `serve no-op config`, `serve no-op drawn`, `serve no-op inputs`, `serve no-op request`, `serve no-op subject`, `serve request shape`
-- `request-certificates`: `serve request certificate`, `serve request certificate slot`
-- `kept-front-end`: `front end subject`, `front end variable`
-- `found-record`: `found key`, `found key directory`, `found record`
-- `dep-image`: `=blaze frozen def map`, `dependency image`, `dependency image key`, `dependency image reads`, `dependency signature key`, `dependency signature record`, `dependency signatures`, `frozen print`
-- `def-map-pages`: `def map pages`
-- `item-pages`: `item pages`, `item syntax`
-- `macro-defs`: `file entry set`, `macro def tokens`, `file index`, `item attrs`, `item body`, `item header`
-- `impl-tables`: `=blaze frozen impls`, `candidate set`, `impl set`, `impl tables`
+- `request-certificates`: `request slot`, `request slot body`, `request slot names`, `serve request certificate`, `serve request certificate variable`
+- `item-pages`: `item syntax`
+- `macro-defs`: `expansion key`, `file entry set`, `file index`, `item attrs`, `item body`, `item header`, `item tokens`, `macro def squeeze`, `macro def tokens`, `whole item hash`
+- `impl-tables`: `=blaze frozen impls`, `impl tables`
 - `dep-bodies`: `dependency bodies`, `dependency body`, `dependency runtime MIR`, `hir-def body tree`, `ported ids and types`
 - `dep-check-outcome`: `dependency check outcome`
 - `dep-consts`: `dependency constant value`
-- `item-store`: `head identity`, `impl identity`, `item identity`, `item identity crate inputs`, `item identity lang items`, `item presentation`, `item store`, `item store 1 answer record`, `item store 1 body`, `item store MIR`, `item store borrow check passed`, `item store inference`, `item store step value 1 MIR`, `item store step value 1 inference`, `item-hash absent`, `item-hash attrs`, `item-hash crate root`, `item-hash fields`, `item-hash match check`, `item-hash traits in scope`, `item-hash whole scope`, `item early identity`, `item store constant value`, `item-hash crate names`
-- `goal-store`: `goal`, `goal 3 solver`, `goal crate`
+- `item-store`: `body entry`, `item early identity`, `item identity crate inputs`, `item identity front end input`, `item presentation`, `item store`, `item store 1 answer record`, `item store 1 body`, `item store MIR`, `item store borrow check verdict`, `item store constant value`, `item store inference`, `item store lowering`, `item store served answer`, `item store step value 1 MIR`, `item store step value 1 inference`, `item-hash absent`, `item-hash attrs`, `item-hash crate names`, `item-hash crate root`, `item-hash fields`, `item-hash match check`, `item-hash traits in scope`, `item-hash whole scope`
+- `goal-store`: `goal`, `goal crate`
 - `records`: `record answer`, `record list`
-- `item-facts`: `=blaze fact relied`, `bound derive method`, `bound hash`, `builtin derive signature`, `closure code hash`, `code hash`, `contract clause`, `contract fact`, `contract facts`, `coroutine code hash`, `crate key`, `deep hash`, `fact`, `fact auto traits`, `fact captures`, `fact code`, `fact coherence`, `fact const value`, `fact const value type`, `fact crate`, `fact derive`, `fact drop check`, `fact field`, `fact hidden types`, `fact implements`, `fact layout`, `fact method`, `fact name`, `fact resolves`, `fact rpitit types`, `fact signature`, `fact specializes`, `fact target`, `fact vtable`, `field order`, `field order plan`, `form`, `form spans`, `index impls`, `index scope`, `interface hash`, `item key`, `layout`, `layout hash`, `name`, `seen impls`, `signature hash`, `simplified type`
+- `item-facts`: `=blaze fact relied`, `bound derive method`, `bound hash`, `builtin derive signature`, `closure code hash`, `code hash`, `coroutine code hash`, `deep hash`, `fact`, `fact auto traits`, `fact block impls`, `fact captures`, `fact code`, `fact coherence`, `fact const value`, `fact const value type`, `fact crate`, `fact derive`, `fact drop check`, `fact field`, `fact hidden types`, `fact implements`, `fact inherent impls`, `fact layout`, `fact method`, `fact name`, `fact resolves`, `fact rpitit types`, `fact scope traits named`, `fact signature`, `fact specializes`, `fact target`, `fact trait impls`, `fact traits named`, `fact vtable`, `field order`, `field order plan`, `form`, `form spans`, `index impls`, `index scope`, `interface hash`, `item key`, `item-hash crate settings`, `item-hash escaped`, `item-hash escaped item`, `item-hash field order`, `item-hash inherent assoc types`, `item-hash modules`, `item-hash setting`, `keyed ref`, `layout`, `layout hash`, `mir source names`, `name`, `seen impls`, `signature hash`, `simplified type`
 - `expansions`: `expansion reads gone`, `macro-eval code`, `passed environment`, `proc-macro checked expansion`, `proc-macro library`, `verified expansion values`
 - `macro-machine-code`: `wasm engine bytes`, `wasm proc macro machine code`, `wasm proc macro module`
-- `runs`: `copy origin`, `provider seed`, `pure script identity`, `pure script instance`, `root path`, `run depends on its roots`, `run file shown`, `run given`, `run given part`, `run shape slot`, `run traced`, `shape id`, `test attributes`, `test history slot`, `test identity`, `test members`, `test reached set`, `traced listing`, `unverified copies`
+- `runs`: `copy origin`, `disk entry look`, `provider scope`, `provider seed`, `pure script identity`, `pure script instance`, `root path`, `run depends on its roots`, `run file shown`, `run given`, `run given part`, `run shape slot`, `run traced`, `shape id`, `test attributes`, `traced listing`, `unverified copies`
 - `warm-processes`: `warm key`
-- `test-passes`: `testsel history slot`, `testsel identity`, `testsel set`, `testsel sim beside`, `testsel sim bound`, `testsel sim given`, `testsel unlogged`
-- `unit-records`: `cargo test natives`, `cargo test spans`, `cargo unit check`, `cargo unit identity`, `cargo unit identity part`, `cargo unit narrow built`, `cargo unit narrow checked`, `cargo unit narrow code`, `cargo unit narrow interface`, `cargo unit narrow surface`, `cargo unit record`, `cargo unit record here`, `cargo unit record parts`, `cargo unit record quoted`, `cargo unit record quotes`, `cargo unit record reads`, `crate code identity`, `crate own code`, `crate own narrow`, `crate surface slot`, `diagnostics emitted`, `file code text`, `file interface text`, `file still text`, `file surface text`, `library crate narrow`, `test context`
-- `outputs`: `cargo linked output`, `cargo output`
-- `doctest-images`: `doctest image`, `doctest image without the unit's identity`
-- `why-ledger`: `serve job diagnostic said`, `serve settling subject`, `serve unfinished subject`, `why ledger version 4, records zstd`, `why record part`, `why run key`, `why run key with reads`, `why run read`, `why unit subject`
-- `cost-predictor`: `kept front end store cost`, `lowering cost`, `program build`, `unit cost`
-- `code`: `=blaze asm`, `=blaze global asm`, `aliased shape`, `allocator`, `allocator item`, `asm`, `asm item`, `behaviour identity`, `behaviour identity leaf`, `body code`, `built function entry`, `built id`, `built in`, `built static entry`, `built static key`, `cached function`, `code`, `code id`, `code identity inlined`, `code identity name`, `code identity value edges (test)`, `code with names read`, `codegen binding names`, `codegen discriminant`, `codegen names read`, `codegen owned code`, `codegen package name`, `codegen policy`, `codegen settings`, `codegen span table`, `codegen template code`, `codegen told types`, `compile identity`, `compile identity callee`, `compile identity value`, `compile identity walk`, `compiled code print`, `counter`, `data`, `debug name`, `edits fixture code`, `exec bound`, `exec fn id`, `exec placed`, `exec span table`, `exec static`, `exec static value`, `fold data`, `fold ir`, `fold references`, `fold shape`, `folded`, `folded identity`, `function digest`, `global_asm object`, `group flight`, `hir-firewall code`, `identity adt`, `identity args`, `identity bound`, `identity const`, `identity type`, `imports`, `instance`, `instance abi`, `instance bound`, `instance identity`, `link span table`, `live assumed unhashable`, `masked`, `multiversion plan`, `own place shape`, `owned data`, `placed`, `placed args`, `recursion shim body`, `reference aliases`, `reference placed`, `reference placement`, `relative flight`, `relative shape`, `release imported bodies`, `release laid out`, `renamed owned data`, `shape`, `share fact`, `shared args`, `shim`, `side`, `start`, `static definition`, `static digest`, `static value`, `store folded`, `store masked`, `store release template`, `store side`, `store static`, `store summary`, `store thunk`, `subject`, `summarized`, `target`, `template`, `template own span table`, `test listing`, `told args`, `toolchain id`, `why dev template step`
-- `describes`: `describe record`, `describe record stage`
-- `kernel-entries`: `kernel entry`, `kernel identity`, `kernel shape slot`
+- `test-passes`: `=blaze program test`, `testsel program state`, `testsel unlogged`, `=blaze-testsel ask`, `=blaze-testsel env value`, `=blaze-testsel test attrs`, `=blaze-testsel test env`, `=blaze-testsel test item`, `=blaze-testsel test suite`
+- `unit-records`: `diagnostics emitted`, `=blaze-command deferred late read`, `=blaze-command unit settings`, `=blaze-unitkey manifest identity and printed names`
+- `code`: `=blaze asm`, `=blaze global asm`, `aliased shape`, `allocator`, `allocator item`, `asm`, `asm item`, `behaviour identity`, `behaviour identity leaf`, `body code`, `built function entry`, `built id`, `built in`, `built static entry`, `built static key`, `cached function`, `code`, `code id`, `code identity inlined`, `code identity name`, `code identity value edges (test)`, `code with names read`, `codegen binding names`, `codegen discriminant`, `codegen names read`, `codegen owned code`, `codegen package name`, `codegen policy`, `codegen settings`, `codegen span table`, `codegen template code`, `codegen told types`, `compile identity`, `compile identity callee`, `compile identity value`, `compile identity walk`, `compiled code print`, `counter`, `data`, `debug name`, `edits fixture code`, `exec bound`, `exec fn id`, `exec placed`, `exec span table`, `exec static`, `exec static value`, `fold data`, `fold ir`, `fold references`, `fold shape`, `folded`, `folded identity`, `function digest`, `global_asm object`, `group flight`, `identity adt`, `identity args`, `identity bound`, `identity const`, `identity type`, `imports`, `instance`, `instance abi`, `instance bound`, `instance identity`, `link span table`, `live assumed unhashable`, `masked`, `multiversion plan`, `own place shape`, `owned data`, `placed`, `placed args`, `recursion shim body`, `reference aliases`, `reference placed`, `reference placement`, `relative flight`, `relative shape`, `release imported bodies`, `release laid out`, `renamed owned data`, `shape`, `share fact`, `shared args`, `shim`, `side`, `start`, `static digest`, `static value`, `store folded`, `store masked`, `store release template`, `store side`, `store static`, `store summary`, `store thunk`, `subject`, `summarized`, `target`, `template`, `template own span table`, `test listing`, `told args`, `toolchain id`, `why dev template step`
+- `describes`: `codegen static`, `describe record`, `describe record stage`, `instance plan name`, `launch naming`, `static plan name`
+- `kernel-entries`: `kernel identity`, `kernel registry`
 - `devirt-world`: `devirt code`, `devirt fixture`, `devirt object`, `devirt object args`, `devirt site`, `devirt world`
 - `fn-cache`: `cached code`
-- `link-state`: `link asan global name`, `link asan globals`, `link asan module name`, `link asan odr indicator`, `link cie`, `link debug record`, `link file`, `link file block`, `link file name`, `link file node`, `link function`, `link given`, `link given entry`, `link image`, `link keyed leaf`, `link keyed node`, `link keyed set`, `link lineage`, `link msan option`, `link sancov bound`, `link sanitizer constructor`, `link sanitizer constructor pointer`, `link shipped native input`, `link static`, `link target autolinked libraries aarch64`, `link target autolinked libraries x86_64`, `link target default libraries`, `link target re-exported libraries aarch64`, `link target re-exported libraries x86_64`, `link target script`, `serve debug side file`, `serve debug side plist`, `serve launch sidecar`, `span table`
-- `layout-profiles`: `args`, `layout image`, `layout key`, `layout weights`, `link heat`, `link layout`, `lint profile`, `perf code`, `perf component`, `perf deep`, `perf image`, `perf merged`, `perf rep`, `perf run`, `pgo name`, `pgo profile`
-- `fetched`: `=blaze pack chunk`, `=blaze pack object`, `fetched package on disk`, `=blaze-fetch`, `=blaze-fetch chunk: a piece of an object by its BLAKE3`, `=blaze-fetch index record: form, BLAKE3, length`, `=blaze-fetch object as an input`, `=blaze-fetch object: bytes, or chunks of 4194304 bytes, by their BLAKE3`, `=blaze-fetch origin`
-- `ext-facts`: `extension body`, `extension build`, `extension fact`, `extension fact last`, `extension fact value`
-- `lean-proofs`: `lean step`, `lean verdict`
-- `store`: `=blaze gc lease nonce`, `buffer`, `hashcons pack`, `schema`, `store chunk`, `store cold unit`, `store dictionary`, `store key`, `store pin`, `store staging`, `store value`, `zstd dictionary`, `store set leaf`, `store set root`
-- `remote`: `=blaze hub tree edge`, `=blaze hub tree node`, `=blaze pack manifest`, `=blaze pack signed message`, `global bundle`, `global manifest`, `global manifest key`, `global piece`, `global record key`
-- `flights`: `serve fetch`, `serve library`, `serve library fingerprint`, `serve native`
-- `identity`: `=blaze error union member`, `=blaze shipped code identity`, `build id`, `cfg options`, `codegen code`, `codegen code input`, `crate`, `crate graph`, `crate ported`, `crate ported files`, `crate setting part`, `crate workspace data`, `env`, `file text`, `file without text`, `front end code`, `included file`, `named paths bucket`, `record makers`, `shared store writer`, `source root`, `source root content without other crates' OUT_DIRs`, `source root leaf`, `source root node`, `source root path`, `target data`, `unit record code`
-- `not-keys`: `=blaze fetch-url's request is not UTF`, `=blaze storemodel code`, `=blaze storemodel crash check`, `=blaze storemodel disk`, `=blaze storemodel expectation`, `=blaze storemodel fact`, `=blaze storemodel input`, `=blaze storemodel key`, `ci oracle sample`, `proof kernel read`, `proof kernel value`, `verify store sample`, `=blaze-bench-protocol`
-- `unaudited`: `=blaze launch file name`, `=blaze launch location`, `=blaze launch program`, `=blaze pin lookup`, `launch slot`, `rustc stand-in library directory`, `rustc stand-in library root`, `rustc stand-in probe view`
+- `link-state`: `link asan global name`, `link asan globals`, `link asan module name`, `link asan odr indicator`, `link cie`, `link debug record`, `link file`, `link file block`, `link file name`, `link file node`, `link image`, `link keyed leaf`, `link keyed node`, `link keyed set`, `link lineage`, `link msan option`, `link sancov bound`, `link sanitizer constructor`, `link sanitizer constructor pointer`, `link target autolinked libraries aarch64`, `link target autolinked libraries x86_64`, `link target default libraries`, `link target re-exported libraries aarch64`, `link target re-exported libraries x86_64`, `link target script`, `span table`, `=blaze-link kept state`, `=blaze-link kept state head`, `=blaze-link kept state output`, `=blaze-link kept state section`
+- `layout-profiles`: `args`, `link heat`, `link layout`, `perf component`, `perf deep`, `perf image`, `perf merged`, `perf rep`, `perf run`, `pgo name`, `pgo profile`
+- `fetched`: `=blaze pack chunk`, `=blaze pack object`, `=blaze-fetch`, `=blaze-fetch chunk: a piece of an object by its BLAKE3`, `=blaze-fetch index record: form, BLAKE3, length`, `=blaze-fetch object as an input`, `=blaze-fetch object: bytes, or chunks of 4194304 bytes, by their BLAKE3`, `=blaze-fetch origin`
+- `lean-proofs`: `lean step`
+- `store`: `=blaze gc lease nonce`, `buffer`, `hashcons pack`, `schema`, `store chunk`, `store cold unit`, `store dictionary`, `store key`, `store pin`, `store sealed set`, `store set leaf`, `store set root`, `store staging`, `store value`, `zstd dictionary`
+- `remote`: `global bundle`, `global manifest`, `global manifest key`, `global piece`, `global record key`, `=blaze-remote bundle`, `=blaze-remote key list`, `=blaze-remote root`, `=blaze-remote shard block`, `=blaze-remote shard head`, `=blaze-remote toolchain`, `=blaze-remote value`
+- `identity`: `=blaze error union member`, `=blaze shipped code identity`, `codegen code`, `codegen code input`, `crate graph`, `crate ported files`, `crate workspace data`, `front end code`, `source root content without other crates' OUT_DIRs`, `target data`, `unit record code`
+- `not-keys`: `=blaze fetch-url's request is not UTF`, `=blaze storemodel code`, `=blaze storemodel crash check`, `=blaze storemodel disk`, `=blaze storemodel expectation`, `=blaze storemodel fact`, `=blaze storemodel input`, `=blaze storemodel key`, `=blaze storemodel open crash check`, `=blaze storemodel pin`, `front cutoffs test`, `kernel exhaustive fact`, `kernel exhaustive input`, `kernel exhaustive pin`, `kernel planted identity only`, `verify store sample`, `=blaze-bench-protocol`
+- `unaudited`: `=blaze launch file name`, `=blaze launch location`, `=blaze pin lookup`, `launch slot`, `rustc stand-in library directory`, `rustc stand-in library root`, `rustc stand-in probe view`
+- `agent-sessions`: `=blaze agents session`, `=blaze agents token`
+- `plain-store`: `=blaze plain store boot`, `=blaze plain store log`, `=blaze plain store namespace`, `=blaze plain store nonce`, `=blaze plain store root`, `=blaze plain store segment`
+- `typed-records`: `=blaze-keyed address`, `=blaze-keyed code key`, `=blaze-keyed shape slot`
+- `program-items`: `=blaze program args`, `=blaze program settings`, `=blaze program static`
+- `program-manifests`: `=blaze program chunk`, `=blaze program manifest`, `=blaze-command program image rows`
+- `solo-sessions`: `=blaze solo answer`, `=blaze solo checkout`, `=blaze solo pin`
+- `surface-names`: `=blaze surface exports`
+- `file-items`: `file item`, `file item head`, `file item siblings`, `file item signature`
+- `front-syntax`: `front carry step code`, `front crate`, `front file`, `front item base`, `front item body record`, `front item header`, `front item id`, `front item impl gates`, `front item impl scope`, `front item names`, `front reading`
+- `front-settings`: `front setting field`, `front settings`
+- `own-effects`: `hir-ty-pure own effects`, `hir-ty-pure own effects shape`
+- `kernel-sessions`: `kernel session name`, `kernel session node`, `kernel session root`
+- `kernel-tables`: `kernel table branch`, `kernel table branch keys`, `kernel table key`, `kernel table leaf`, `kernel table leaf keys`, `kernel table part`
+- `launch-records`: `=blaze launch str`, `=blaze launch text`, `launch bind`, `launch symbols`
+- `launch-images`: `launch start`, `launch start body`
+- `command-graphs`: `=blaze-command checkout`, `=blaze-command code settings`, `=blaze-command dir`, `=blaze-command graph`, `=blaze-command library`, `=blaze-command program`, `=blaze-command settings`, `=blaze-command source`, `=blaze-command target`, `=blaze-command tool`, `=blaze-command view`, `=blaze-command walk features`, `=blaze-command walk target`
+- `outside-reads`: `front carry exists`, `=blaze-host outside directory`, `=blaze-host outside gone`, `=blaze-host outside unset`, `=blaze-host outside variable`

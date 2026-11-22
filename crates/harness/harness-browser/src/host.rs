@@ -422,7 +422,7 @@ pub fn open(spec: OpenSpec) -> Result<u64, String> {
     if spec.size[0] == 0 || spec.size[1] == 0 {
         return Err(format!("a view {}x{} points at {} is empty", spec.size[0], spec.size[1], spec.url));
     }
-    let ui = if spec.ui { Some(UiPage { url: spec.url.clone(), origin: Origin::of(&spec.url)?, loaded: false }) } else { None };
+    let ui = if spec.ui { Some(UiPage { url: spec.url.clone(), origin: Origin::of(&spec.url).map_err(|error| error.to_string())?, loaded: false }) } else { None };
     let url = spec.url.clone();
     let view = with("opening a view", |h| {
         if let Some(why) = &h.quitting {
@@ -851,7 +851,31 @@ pub fn devtools(view: u64, message: &[u8]) {
 ///
 /// # Errors
 /// A `Runtime.bindingCalled` for the binding with no string payload.
-fn binding_call(message: &[u8]) -> Result<Option<String>, String> {
+#[derive(Debug)]
+enum BindingError {
+    Json(serde_json::Error),
+    MissingPayload(Value),
+}
+
+impl std::fmt::Display for BindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json(source) => write!(f, "a DevTools event that is not JSON: {source}"),
+            Self::MissingPayload(params) => write!(f, "its {BINDING} call carried no string payload: {params}"),
+        }
+    }
+}
+
+impl std::error::Error for BindingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Json(source) => Some(source),
+            Self::MissingPayload(_) => None,
+        }
+    }
+}
+
+fn binding_call(message: &[u8]) -> Result<Option<String>, BindingError> {
     #[derive(serde::Deserialize)]
     struct Event {
         #[serde(default)]
@@ -859,13 +883,13 @@ fn binding_call(message: &[u8]) -> Result<Option<String>, String> {
         #[serde(default)]
         params: Value,
     }
-    let e: Event = serde_json::from_slice(message).map_err(|e| format!("a DevTools event that is not JSON: {e}"))?;
+    let e: Event = serde_json::from_slice(message).map_err(BindingError::Json)?;
     if e.method != "Runtime.bindingCalled" || e.params.get("name").and_then(Value::as_str) != Some(BINDING) {
         return Ok(None);
     }
     match e.params.get("payload").and_then(Value::as_str) {
         Some(p) => Ok(Some(p.to_owned())),
-        None => Err(format!("its {BINDING} call carried no string payload: {}", e.params)),
+        None => Err(BindingError::MissingPayload(e.params)),
     }
 }
 
@@ -1253,19 +1277,51 @@ pub fn navigation_refused(view: u64, url: &str) -> bool {
 ///
 /// # Errors
 /// No such view, a view that is not a UI view, text that is not JSON, or no main frame, naming the view (and its url).
-pub fn ui_post(view: u64, msg: &str) -> Result<(Frame, String), String> {
-    let b = with("a post to a UI view", |h| {
-        let p = h.pages.get(&view).ok_or_else(|| format!("the app posted to view {view}, which does not exist"))?;
-        let ui = p.ui.as_ref().ok_or_else(|| format!("the app posted to view {view} ({}), which is not a UI view", p.info.url))?;
-        if let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(msg) {
-            return Err(format!("the app posted text that is not JSON to UI view {view} ({}): {e}", ui.url));
+#[derive(Debug)]
+pub enum UiPostError {
+    MissingView { view: u64 },
+    NotUi { view: u64, url: String },
+    Json { view: u64, url: String, source: serde_json::Error },
+    MissingBrowser { view: u64, url: String },
+    HostStopped { view: u64 },
+    MissingFrame { view: u64, url: String },
+}
+
+impl std::fmt::Display for UiPostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingView { view } => write!(f, "the app posted to view {view}, which does not exist"),
+            Self::NotUi { view, url } => write!(f, "the app posted to view {view} ({url}), which is not a UI view"),
+            Self::Json { view, url, source } => write!(f, "the app posted text that is not JSON to UI view {view} ({url}): {source}"),
+            Self::MissingBrowser { view, url } => write!(f, "UI view {view} ({url}) has no browser yet"),
+            Self::HostStopped { view } => write!(f, "posting to view {view}: the host is not running"),
+            Self::MissingFrame { view, url } => write!(f, "UI view {view} ({url}) has no main frame to post to"),
         }
-        let b = p.browser.clone().ok_or_else(|| format!("UI view {view} ({}) has no browser yet", ui.url))?;
+    }
+}
+
+impl std::error::Error for UiPostError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Json { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+pub fn ui_post(view: u64, msg: &str) -> Result<(Frame, String), UiPostError> {
+    let b = with("a post to a UI view", |h| {
+        let p = h.pages.get(&view).ok_or(UiPostError::MissingView { view })?;
+        let ui = p.ui.as_ref().ok_or_else(|| UiPostError::NotUi { view, url: p.info.url.clone() })?;
+        if let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(msg) {
+            return Err(UiPostError::Json { view, url: ui.url.clone(), source: e });
+        }
+        let b = p.browser.clone().ok_or_else(|| UiPostError::MissingBrowser { view, url: ui.url.clone() })?;
         Ok((b, ui.url.clone()))
     })
-    .unwrap_or_else(|| Err(format!("posting to view {view}: the host is not running")))?;
+    .unwrap_or(Err(UiPostError::HostStopped { view }))?;
     let (b, url) = b;
-    let f = b.main_frame().ok_or_else(|| format!("UI view {view} ({url}) has no main frame to post to"))?;
+    let f = b.main_frame().ok_or_else(|| UiPostError::MissingFrame { view, url })?;
     // JSON text is a JavaScript expression; a page with no harnessRecv yet (still loading) gets nothing, and says
     // `ready` once it has one.
     Ok((f, format!("window.harnessRecv && window.harnessRecv({msg});")))

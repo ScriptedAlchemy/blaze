@@ -54,7 +54,7 @@ pub fn run_holder(
     executor: &str,
     config: &DriverConfig,
     now_ms: impl Fn() -> u64 + Send,
-    compiler: &mut dyn BatchCompiler,
+    compiler: &mut (impl BatchCompiler + ?Sized),
 ) -> Result<StopWhy, Error> {
     let never = AtomicBool::new(false);
     run_holder_until(client, socket, holder, content, executor, config, now_ms, compiler, &never)
@@ -73,7 +73,7 @@ pub fn run_holder_until(
     executor: &str,
     config: &DriverConfig,
     now_ms: impl Fn() -> u64 + Send,
-    compiler: &mut dyn BatchCompiler,
+    compiler: &mut (impl BatchCompiler + ?Sized),
     leave: &AtomicBool,
 ) -> Result<StopWhy, Error> {
     let mut pending: Option<u64> = None;
@@ -93,7 +93,7 @@ fn drive(
     holder: &mut Holder,
     config: &DriverConfig,
     now_ms: impl Fn() -> u64 + Send,
-    compiler: &mut dyn BatchCompiler,
+    compiler: &mut (impl BatchCompiler + ?Sized),
     leave: &AtomicBool,
     mut transmit: impl FnMut(&Call, u64) -> Result<Reply, Error> + Send,
 ) -> Result<StopWhy, Error> {
@@ -221,7 +221,7 @@ fn drive(
         while let Ok(task) = receiver.recv() {
             match task {
                 CompilerTask::Compile(plan) => {
-                    if finished.send(compiler.compile(&plan)).is_err() {
+                    if finished.send(compiler.compile(&plan).map_err(|error| error.to_string())).is_err() {
                         break;
                     }
                 }
@@ -374,7 +374,9 @@ mod tests {
     }
 
     impl BatchCompiler for SlowCompiler {
-        fn compile(&mut self, plan: &Plan) -> Result<Compiled, String> {
+        type Error = std::convert::Infallible;
+
+        fn compile(&mut self, plan: &Plan) -> Result<Compiled, Self::Error> {
             assert_eq!(std::thread::current().id(), self.caller);
             self.calls.set(self.calls.get() + 1);
             self.active.store(true, Ordering::SeqCst);
@@ -447,7 +449,7 @@ mod tests {
                 ..Default::default()
             },
             || start.elapsed().as_millis() as u64,
-            &mut compiler,
+            &mut compiler as &mut dyn BatchCompiler<Error = std::convert::Infallible>,
             &AtomicBool::new(false),
             |call, _| {
                 Ok(match call {

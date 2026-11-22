@@ -180,7 +180,7 @@ fn broken(seed: u64, keeps_removed: bool) -> Option<String> {
 /// order of the driver's completions. Control (the planted bug): a removal that leaves the
 /// file is caught as a record taken twice.
 #[test]
-fn every_whole_file_is_taken_once_and_a_part_never() {
+fn the_oracle_catches_a_removal_that_keeps_the_consumed_file() {
     for seed in 0..64 {
         assert_eq!(broken(seed, false), None, "seed {seed}");
     }

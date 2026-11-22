@@ -12,6 +12,48 @@ pub enum Origin {
     Http { https: bool, host: String, port: u16 },
 }
 
+/// A UI page cannot establish an origin from the supplied address.
+#[derive(Debug)]
+pub struct OriginError<'a> {
+    pub url: &'a str,
+    pub kind: OriginErrorKind<'a>,
+}
+
+#[derive(Debug)]
+pub enum OriginErrorKind<'a> {
+    MissingScheme,
+    FileHost(&'a str),
+    MissingPath,
+    Ipv6Bracket,
+    MissingHost,
+    Port { text: &'a str, source: std::num::ParseIntError },
+    Scheme(&'a str),
+}
+
+impl std::fmt::Display for OriginError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a UI view cannot open at {}: ", self.url)?;
+        match &self.kind {
+            OriginErrorKind::MissingScheme => f.write_str("it has no scheme (a UI view is file://, http:// or https://)"),
+            OriginErrorKind::FileHost(host) => write!(f, "a file url names the host {host}"),
+            OriginErrorKind::MissingPath => f.write_str("a file url with no path"),
+            OriginErrorKind::Ipv6Bracket => f.write_str("an IPv6 host with no closing bracket"),
+            OriginErrorKind::MissingHost => f.write_str("it names no host"),
+            OriginErrorKind::Port { text, source } => write!(f, "its port {text:?}: {source}"),
+            OriginErrorKind::Scheme(scheme) => write!(f, "its scheme is {scheme} (a UI view is file://, http:// or https://)"),
+        }
+    }
+}
+
+impl std::error::Error for OriginError<'_> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            OriginErrorKind::Port { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
 /// `s` with its `%XX` escapes decoded (a `%` not followed by two hex digits is kept as it is).
 fn unescape(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
@@ -32,10 +74,9 @@ fn unescape(s: &str) -> Vec<u8> {
     out
 }
 
-/// `url`'s scheme, lowercased, and the rest after `://`.
-fn split(url: &str) -> Option<(String, &str)> {
-    let (scheme, rest) = url.split_once("://")?;
-    Some((scheme.to_ascii_lowercase(), rest))
+/// `url`'s scheme and the rest after `://`; a scheme is compared without regard to case.
+fn split(url: &str) -> Option<(&str, &str)> {
+    url.split_once("://")
 }
 
 impl Origin {
@@ -43,30 +84,30 @@ impl Origin {
     ///
     /// # Errors
     /// A url that is not `file://`, `http://` or `https://`, or one whose host or port cannot be read, naming it.
-    pub fn of(url: &str) -> Result<Self, String> {
-        let bad = |why: &str| format!("a UI view cannot open at {url}: {why}");
-        let (scheme, rest) = split(url).ok_or_else(|| bad("it has no scheme (a UI view is file://, http:// or https://)"))?;
+    pub fn of(url: &str) -> Result<Self, OriginError<'_>> {
+        let bad = |kind| OriginError { url, kind };
+        let (scheme, rest) = split(url).ok_or_else(|| bad(OriginErrorKind::MissingScheme))?;
         let rest = rest.split(['?', '#']).next().unwrap_or("");
-        match scheme.as_str() {
-            "file" => {
+        match scheme {
+            scheme if scheme.eq_ignore_ascii_case("file") => {
                 // file:///p, or file://localhost/p: no other host names a file here.
                 let (host, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
                 if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
-                    return Err(bad(&format!("a file url names the host {host}")));
+                    return Err(bad(OriginErrorKind::FileHost(host)));
                 }
                 if path.is_empty() {
-                    return Err(bad("a file url with no path"));
+                    return Err(bad(OriginErrorKind::MissingPath));
                 }
                 Ok(Self::File(unescape(path)))
             }
-            "http" | "https" => {
-                let https = scheme == "https";
+            scheme if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") => {
+                let https = scheme.eq_ignore_ascii_case("https");
                 let authority = rest.split('/').next().unwrap_or("");
                 let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
                 // A bracketed IPv6 host keeps its colons; the port is after the bracket.
                 let (host, port) = match hostport.strip_prefix('[') {
                     Some(v6) => {
-                        let (h, after) = v6.split_once(']').ok_or_else(|| bad("an IPv6 host with no closing bracket"))?;
+                        let (h, after) = v6.split_once(']').ok_or_else(|| bad(OriginErrorKind::Ipv6Bracket))?;
                         (h, after.strip_prefix(':'))
                     }
                     None => match hostport.rsplit_once(':') {
@@ -75,16 +116,16 @@ impl Origin {
                     },
                 };
                 if host.is_empty() {
-                    return Err(bad("it names no host"));
+                    return Err(bad(OriginErrorKind::MissingHost));
                 }
                 let port = match port.filter(|p| !p.is_empty()) {
-                    Some(p) => p.parse::<u16>().map_err(|e| bad(&format!("its port {p:?}: {e}")))?,
+                    Some(p) => p.parse::<u16>().map_err(|source| bad(OriginErrorKind::Port { text: p, source }))?,
                     None if https => 443,
                     None => 80,
                 };
                 Ok(Self::Http { https, host: host.to_ascii_lowercase(), port })
             }
-            other => Err(bad(&format!("its scheme is {other} (a UI view is file://, http:// or https://)"))),
+            other => Err(bad(OriginErrorKind::Scheme(other))),
         }
     }
 
@@ -132,7 +173,8 @@ mod tests {
     fn other_schemes_and_broken_urls_are_refused() {
         for url in ["about:blank", "chrome://extensions", "data:text/html,x", "file://host/p", "file://", "http://", "http://h:99999/", "http://[::1/"] {
             let e = Origin::of(url).unwrap_err();
-            assert!(e.contains(url), "{e}");
+            assert_eq!(e.url, url);
+            assert!(e.to_string().contains(url), "{e}");
         }
     }
 }

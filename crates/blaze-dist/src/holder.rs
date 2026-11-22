@@ -106,8 +106,11 @@ pub struct Compiled {
 /// depending on a transport (the local carrier is Unix-only; the compiler
 /// is not). A compile failure is the driver's to surface, named.
 pub trait BatchCompiler {
+    /// The compiler's own failure type; the carrier renders it only at its message boundary.
+    type Error: std::error::Error;
+
     /// Compile one granted batch whole, its entries sealed and uploaded.
-    fn compile(&mut self, plan: &Plan) -> Result<Compiled, String>;
+    fn compile(&mut self, plan: &Plan) -> Result<Compiled, Self::Error>;
     /// Drop retained findings of these names.
     fn release(&mut self, names: &[WorkName]);
 }

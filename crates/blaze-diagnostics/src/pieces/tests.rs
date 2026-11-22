@@ -280,7 +280,7 @@ pub fn r() { loop { break; } }
 /// does not know a tool refuses its attribute, so its piece is only unclean, never wrongly
 /// clean; a setting a probe lacks that makes it find less is what the refusal stops).
 #[test]
-fn the_pieces_check_equals_the_whole_check() {
+fn the_oracle_catches_skipped_bodies_and_incomplete_probe_settings() {
     // clone: the fixtures checked so far, taken out of the lock before checking any
     let recorded = CHECKED.lock().clone();
     let mut seen: blaze_hash::HashSet<&str, Global> = blaze_hash::HashSet::new_in(Global); // alloc: a test's set of fixtures seen

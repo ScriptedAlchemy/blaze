@@ -15,6 +15,32 @@ use crate::source::SourceId;
 
 pub use blaze_resolve::DepKind;
 
+/// A dependency's metadata path could not be given its native filesystem identity.
+#[derive(Debug)]
+pub struct MetadataPathError {
+    /// The dependency whose path was being serialized.
+    pub dependency: String,
+    /// The path passed to the workspace's filesystem reader.
+    pub path: PathBuf,
+    /// The reader's original canonicalization error.
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for MetadataPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,
+            "the path dependency `{}` at `{}` could not be canonicalized: {}",
+            self.dependency, self.path.display(), self.source,
+        )
+    }
+}
+
+impl std::error::Error for MetadataPathError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Dependency {
     /// The name of the package depended on, which is what `name_in_toml` renames.
@@ -147,17 +173,15 @@ impl Dependency {
         self.kind != DepKind::Development
     }
 
-    pub fn serialized<F: Files>(&self, _files: &F) -> anyhow::Result<SerializedDependency<'_>> {
+    pub fn serialized<F: Files>(&self, _files: &F) -> Result<SerializedDependency<'_>, MetadataPathError> {
         let path = self.source_id.local_path();
         #[cfg(windows)]
         let path = path
             .map(|path| {
-                _files.canonicalize(&path).with_context(|| {
-                    format!(
-                        "the path dependency `{}` at `{}` could not be canonicalized",
-                        self.name,
-                        path.display()
-                    )
+                _files.canonicalize(&path).map_err(|source| MetadataPathError {
+                    dependency: self.name.clone(),
+                    path,
+                    source,
                 })
             })
             .transpose()?;

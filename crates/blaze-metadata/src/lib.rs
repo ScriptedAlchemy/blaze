@@ -661,7 +661,7 @@ fn resolving_with<R>(
     let mut serialized: Vec<SerializedPackage<'_>> = ws
         .members()
         .map(|(path, m)| export_package(path, m, ctx.files()))
-        .collect::<Result<_>>()?;
+        .collect::<std::result::Result<_, _>>()?;
     let member_count = serialized.len();
     for package in path_packages.iter().chain(&fetched) {
         let mut it = export_package(&package.manifest_path, &package.manifest, ctx.files())?;

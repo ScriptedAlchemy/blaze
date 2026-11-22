@@ -479,7 +479,7 @@ const REPEATS: &str = "struct S;\n\
 /// the third of three the first's path), keying refuses the unit by `KeyError::TwoItems` naming
 /// two rows of the file.
 #[test]
-fn equal_siblings_have_their_own_ids() {
+fn the_oracle_catches_repeated_siblings_without_distinct_ids() {
     use crate::image::{REPEAT_PLANT, RepeatPlant};
     let all = ids(REPEATS.as_bytes());
     let mut sorted = all.clone();
@@ -549,7 +549,7 @@ fn call_candidates() -> Vec<String, Global> {
 /// by name: with the tokens not read (the image of layout 3), core's `repr_iovec.rs` is
 /// missing; with the `#[path]` in the tokens not read, it is missing too.
 #[test]
-fn modules_a_macro_call_writes_are_candidates() {
+fn the_oracle_catches_unread_macro_call_tokens_and_paths() {
     use crate::image::{CALL_PLANT, CallPlant};
     let want = [
         "io/io_slice/after.rs (call)",
@@ -777,7 +777,7 @@ fn macro_candidates() -> (usize, Vec<String, Global>) {
 /// definition that is off and an unknown macro name nothing. The control, failing by name:
 /// with definitions' bodies not read (the image of layout 4), libc's `types.rs` is missing.
 #[test]
-fn modules_a_macro_definition_writes_are_candidates() {
+fn the_oracle_catches_unread_macro_definition_bodies() {
     use crate::image::{CALL_PLANT, CallPlant};
     let (sites, found) = macro_candidates();
     assert_eq!(sites, 2, "the calls of `prelude` ({found:?})");

@@ -197,7 +197,7 @@ fn kept_by_root(pinned: bool, followed: bool) -> (u64, u64, u64, u64) {
 /// collector that follows no listing (`SET_NOT_FOLLOWED`, the planted bug) keeps the pin's
 /// root and none of the items, which a collection would then forget.
 #[test]
-fn a_kept_root_keeps_exactly_what_its_listing_names() {
+fn the_oracle_catches_a_collector_ignoring_a_kept_roots_listing() {
     let (live, rooted, in_set, outside) = kept_by_root(true, true);
     assert!(rooted >= in_set, "every item of the set is kept: {rooted} of {in_set}");
     assert!(live - rooted >= outside, "no item outside the set is: {rooted} of {live}");

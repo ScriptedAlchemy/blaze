@@ -392,7 +392,7 @@ fn the_runner_reruns_exactly_what_can_have_changed() {
 /// The control: with the program's changed functions dropped, an edited function's executor is
 /// reported cached, and the oracle says so.
 #[test]
-fn the_runner_oracle_catches_a_shortcut_that_skips_the_changes() {
+fn the_oracle_catches_a_runner_shortcut_that_skips_the_changes() {
     blaze_sim::control(Config::cases(64), Plant::None, Plant::ShortcutSkipsChanged, "reported cached with no kept pass", sequence);
 }
 
@@ -400,6 +400,6 @@ fn the_runner_oracle_catches_a_shortcut_that_skips_the_changes() {
 /// 2026-11-14), every run that read it races its settle and is not kept, so a no-op runs every
 /// test again, and the oracle says so.
 #[test]
-fn the_runner_oracle_catches_the_whole_environment_answered_by_name() {
+fn the_oracle_catches_the_whole_environment_answered_by_name() {
     blaze_sim::control(Config::cases(32), Plant::None, Plant::WholeEnvAskedByName, "can have changed", sequence);
 }

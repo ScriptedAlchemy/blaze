@@ -11,6 +11,93 @@ use blaze_wire::{
 };
 use sha2::{Digest as _, Sha256};
 
+/// The native pack requirement that a producer or reader refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackErrorKind {
+    /// One immutable key has distinct values.
+    ConflictingKey(Digest),
+    /// The complete encoded pack cannot be represented in the host's address space.
+    SizeOverflow,
+    /// A complete pack exceeds the documented blob limit.
+    BlobLimit,
+    /// A producer's partition target cannot hold a header and one item.
+    PartitionLimits,
+    /// A value's encoded size overflows the host's address space.
+    ValueSizeOverflow(Digest),
+    /// One value cannot fit in a documented native pack.
+    ValueLimit(Digest),
+    /// The reference names an unsupported native format.
+    Format(u32),
+    /// The actual and committed byte lengths differ.
+    Length {
+        /// The bytes received.
+        actual: u64,
+        /// The length committed by the manifest.
+        committed: u64,
+    },
+    /// The pack's bytes do not hash to the committed digest.
+    Digest(Digest),
+    /// The native header is absent.
+    Header,
+    /// A record header or payload is truncated.
+    TruncatedValue,
+    /// Records are not in strictly increasing key order.
+    KeyOrder,
+    /// The set of keys differs from the commitment.
+    Keys,
+}
+
+/// A native pack refusal names the committed pack when one exists and a matchable cause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackError {
+    /// The committed pack being read; producers have no commitment yet.
+    pub pack: Option<Digest>,
+    /// The condition that refused the pack.
+    pub kind: PackErrorKind,
+}
+
+impl PackError {
+    fn producing(kind: PackErrorKind) -> Self {
+        Self { pack: None, kind }
+    }
+}
+
+impl std::fmt::Display for PackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use PackErrorKind as Kind;
+        if let Some(pack) = &self.pack {
+            write!(f, "pack {} ", hex(pack))?;
+        }
+        match &self.kind {
+            Kind::ConflictingKey(key) => write!(f, "two values under the key {}", hex(key)),
+            Kind::SizeOverflow => f.write_str("the pack's total byte length overflows usize"),
+            Kind::BlobLimit => write!(f, "exceeds the {}-byte blob limit", Limits::DOCUMENTED.blob),
+            Kind::PartitionLimits => {
+                f.write_str("native pack partition limits must hold at least a header and one key")
+            }
+            Kind::ValueSizeOverflow(key) => {
+                write!(f, "native value {} has an overflowing size", hex(key))
+            }
+            Kind::ValueLimit(key) => write!(
+                f,
+                "native value {} exceeds the {}-byte pack limit",
+                hex(key), Limits::DOCUMENTED.blob,
+            ),
+            Kind::Format(format) => write!(f, "is of format {format}"),
+            Kind::Length { actual, committed } => {
+                write!(f, "is {actual} bytes, committed as {committed}")
+            }
+            Kind::Digest(got) => write!(f, "hashes to {}", hex(got)),
+            Kind::Header => f.write_str("has no header"),
+            Kind::TruncatedValue => f.write_str("ends inside a value"),
+            Kind::KeyOrder => f.write_str("is not in key order"),
+            Kind::Keys => f.write_str("holds other keys than were committed"),
+        }
+    }
+}
+
+impl std::error::Error for PackError {}
+
 /// One value: a store key, its kind's code, its bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Value {
@@ -33,12 +120,12 @@ pub struct Pack {
 
 /// Canonicalize the entire set BEFORE partitioning, so identical duplicates
 /// coalesce and conflicting keys cannot be concealed at a pack boundary.
-fn canonical(mut values: Vec<Value>) -> Result<Vec<Value>, String> {
+fn canonical(mut values: Vec<Value>) -> Result<Vec<Value>, PackError> {
     values.sort_unstable_by(|a, b| a.key.cmp(&b.key));
     values.dedup();
     for pair in values.windows(2) {
         if pair[0].key == pair[1].key {
-            return Err(format!("two values under the key {}", hex(&pair[0].key)));
+            return Err(PackError::producing(PackErrorKind::ConflictingKey(pair[0].key)));
         }
     }
     Ok(values)
@@ -50,13 +137,13 @@ impl Pack {
     /// are an error: a key covers all its value depends on. Native records are not a
     /// CBOR array: the blob byte limit, not the wire batch item limit, bounds this format.
     /// Use [`Self::batches`] to partition new uploads without refusing older whole packs.
-    pub fn of(values: Vec<Value>) -> Result<Pack, String> {
+    pub fn of(values: Vec<Value>) -> Result<Pack, PackError> {
         let values = canonical(values)?;
         let size = values.iter().try_fold(DIST_PACK_MAGIC.len(), |size: usize, value| {
             size.checked_add(41)?.checked_add(value.bytes.len())
-        }).ok_or_else(|| "the pack's total byte length overflows usize".to_owned())?;
+        }).ok_or_else(|| PackError::producing(PackErrorKind::SizeOverflow))?;
         if u64::try_from(size).map_or(true, |size| size > Limits::DOCUMENTED.blob) {
-            return Err(format!("a native pack exceeds the {}-byte blob limit", Limits::DOCUMENTED.blob));
+            return Err(PackError::producing(PackErrorKind::BlobLimit));
         }
         let mut bytes = Vec::with_capacity(size);
         bytes.extend_from_slice(&DIST_PACK_MAGIC);
@@ -80,7 +167,7 @@ impl Pack {
     /// These partitioning targets do not change the persisted native format's limits.
     /// This partitions the same work; it never drops or recompiles a
     /// value. The manifest already supports multiple sorted pack references.
-    pub fn batches(values: Vec<Value>) -> Result<Vec<Pack>, String> {
+    pub fn batches(values: Vec<Value>) -> Result<Vec<Pack>, PackError> {
         Self::batches_with_limits(values, Limits::DOCUMENTED.batch_items as usize, 64 << 20)
     }
 
@@ -91,9 +178,9 @@ impl Pack {
         values: Vec<Value>,
         max_items: usize,
         target_bytes: usize,
-    ) -> Result<Vec<Pack>, String> {
+    ) -> Result<Vec<Pack>, PackError> {
         if max_items == 0 || target_bytes < DIST_PACK_MAGIC.len() {
-            return Err("native pack partition limits must hold at least a header and one key".to_owned());
+            return Err(PackError::producing(PackErrorKind::PartitionLimits));
         }
         let values = canonical(values)?;
         if values.is_empty() {
@@ -105,9 +192,9 @@ impl Pack {
         let mut size = DIST_PACK_MAGIC.len();
         for value in values {
             let entry = value.bytes.len().checked_add(41)
-                .ok_or_else(|| format!("native value {} has an overflowing size", hex(&value.key)))?;
+                .ok_or_else(|| PackError::producing(PackErrorKind::ValueSizeOverflow(value.key)))?;
             if entry > blob_limit.saturating_sub(DIST_PACK_MAGIC.len()) {
-                return Err(format!("native value {} exceeds the {}-byte pack limit", hex(&value.key), Limits::DOCUMENTED.blob));
+                return Err(PackError::producing(PackErrorKind::ValueLimit(value.key)));
             }
             if !group.is_empty()
                 && (group.len() >= max_items
@@ -118,7 +205,7 @@ impl Pack {
                 size = DIST_PACK_MAGIC.len();
             }
             size = size.checked_add(entry)
-                .ok_or_else(|| "native partition byte length overflows usize".to_owned())?;
+                .ok_or_else(|| PackError::producing(PackErrorKind::SizeOverflow))?;
             group.push(value);
         }
         packs.push(Pack::of(group)?);
@@ -135,30 +222,29 @@ fn keys_digest(keys: impl Iterator<Item = Digest>) -> Digest {
 /// and keys are all checked before a value is returned, and the values must be in key order.
 /// A native pack is an opaque byte-bounded blob, not a CBOR batch: older producers may
 /// have committed more records than the current upload partitioning target permits.
-pub fn read(bytes: &[u8], reference: &PackRef) -> Result<Vec<Value>, String> {
-    let name = hex(&reference.pack);
+pub fn read(bytes: &[u8], reference: &PackRef) -> Result<Vec<Value>, PackError> {
+    let refused = |kind| PackError { pack: Some(reference.pack), kind };
     if reference.format != DIST_PACK_FORMAT {
-        return Err(format!("pack {name} is of format {}", reference.format));
+        return Err(refused(PackErrorKind::Format(reference.format)));
     }
     if reference.size > Limits::DOCUMENTED.blob {
-        return Err(format!("pack {name} exceeds the {}-byte blob limit", Limits::DOCUMENTED.blob));
+        return Err(refused(PackErrorKind::BlobLimit));
     }
     if bytes.len() as u64 != reference.size {
-        return Err(format!(
-            "pack {name} is {} bytes, committed as {}",
-            bytes.len(),
-            reference.size
-        ));
+        return Err(refused(PackErrorKind::Length {
+            actual: bytes.len() as u64,
+            committed: reference.size,
+        }));
     }
     let got: Digest = Sha256::digest(bytes).into();
     if got != reference.pack {
-        return Err(format!("pack {name} hashes to {}", hex(&got)));
+        return Err(refused(PackErrorKind::Digest(got)));
     }
     let mut rest =
-        bytes.strip_prefix(&DIST_PACK_MAGIC).ok_or_else(|| format!("pack {name} has no header"))?;
+        bytes.strip_prefix(&DIST_PACK_MAGIC).ok_or_else(|| refused(PackErrorKind::Header))?;
     let mut values = Vec::new();
     while !rest.is_empty() {
-        let short = || format!("pack {name} ends inside a value");
+        let short = || refused(PackErrorKind::TruncatedValue);
         let (key, after) = rest.split_first_chunk::<32>().ok_or_else(short)?;
         let (kind, after) = after.split_first().ok_or_else(short)?;
         let (len, after) = after.split_first_chunk::<8>().ok_or_else(short)?;
@@ -168,13 +254,13 @@ pub fn read(bytes: &[u8], reference: &PackRef) -> Result<Vec<Value>, String> {
         }
         let (value, after) = after.split_at(len);
         if values.last().is_some_and(|last: &Value| last.key >= *key) {
-            return Err(format!("pack {name} is not in key order"));
+            return Err(refused(PackErrorKind::KeyOrder));
         }
         values.push(Value { key: *key, kind: *kind, bytes: value.to_vec() });
         rest = after;
     }
     if keys_digest(values.iter().map(|it| it.key)) != reference.keys {
-        return Err(format!("pack {name} holds other keys than were committed"));
+        return Err(refused(PackErrorKind::Keys));
     }
     Ok(values)
 }
@@ -225,8 +311,9 @@ mod tests {
         let reordered = Pack::batches_with_limits(source.into_iter().rev().collect(), 2, usize::MAX).unwrap();
         assert_eq!(reordered, by_items, "partition names may not depend on producer order");
         assert_eq!(Pack::batches(Vec::new()).unwrap(), vec![Pack::of(Vec::new()).unwrap()]);
-        assert!(Pack::batches_with_limits(vec![value(1, b"a"), value(1, b"b")], 1, usize::MAX)
-            .unwrap_err().contains("two values"), "conflicting keys on different partitions refuse");
+        assert!(matches!(Pack::batches_with_limits(vec![value(1, b"a"), value(1, b"b")], 1, usize::MAX)
+            .unwrap_err().kind, PackErrorKind::ConflictingKey(_)),
+            "conflicting keys on different partitions refuse");
         assert!(Pack::batches_with_limits(vec![value(1, b"a")], 0, usize::MAX).is_err());
     }
 
@@ -274,13 +361,13 @@ mod tests {
         // Removing the unrelated item cap must not remove the native byte cap.
         let mut oversized = legacy.reference.clone();
         oversized.size = Limits::DOCUMENTED.blob + 1;
-        assert!(read(&legacy.bytes, &oversized).unwrap_err().contains("blob limit"));
+        assert_eq!(read(&legacy.bytes, &oversized).unwrap_err().kind, PackErrorKind::BlobLimit);
     }
 
     #[test]
     fn two_values_under_one_key_are_refused() {
         let error = Pack::of(vec![value(1, b"a"), value(1, b"b")]).unwrap_err();
-        assert!(error.contains("two values"), "{error}");
+        assert_eq!(error.kind, PackErrorKind::ConflictingKey([1; 32]), "{error}");
         assert!(Pack::of(vec![value(1, b"a"), value(1, b"a")]).is_ok(), "one value, twice");
     }
 
@@ -289,13 +376,15 @@ mod tests {
         let pack = Pack::of(vec![value(1, b"one")]).unwrap();
         let mut flipped = pack.bytes.clone();
         *flipped.last_mut().unwrap() ^= 1;
-        assert!(read(&flipped, &pack.reference).unwrap_err().contains("hashes"));
+        let refused = read(&flipped, &pack.reference).unwrap_err();
+        assert_eq!(refused.pack, Some(pack.reference.pack));
+        assert!(matches!(refused.kind, PackErrorKind::Digest(_)));
         let mut short = pack.reference.clone();
         short.size -= 1;
-        assert!(read(&pack.bytes, &short).unwrap_err().contains("committed"));
+        assert!(matches!(read(&pack.bytes, &short).unwrap_err().kind, PackErrorKind::Length { .. }));
         let mut keys = pack.reference.clone();
         keys.keys = [9; 32];
-        assert!(read(&pack.bytes, &keys).unwrap_err().contains("other keys"));
+        assert_eq!(read(&pack.bytes, &keys).unwrap_err().kind, PackErrorKind::Keys);
         // The right digest over bytes that are not a pack: refused by their shape.
         let junk = b"not a pack".to_vec();
         let reference = PackRef {
@@ -303,6 +392,6 @@ mod tests {
             size: junk.len() as u64,
             ..pack.reference.clone()
         };
-        assert!(read(&junk, &reference).unwrap_err().contains("no header"));
+        assert_eq!(read(&junk, &reference).unwrap_err().kind, PackErrorKind::Header);
     }
 }

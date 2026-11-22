@@ -120,7 +120,9 @@ struct Compiler {
 }
 
 impl Granted for Compiler {
-    fn compile(&mut self, names: &[usize]) -> Result<Grant, String> {
+    type Error = std::convert::Infallible;
+
+    fn compile(&mut self, names: &[usize]) -> Result<Grant, Self::Error> {
         self.entered.fetch_add(1, Ordering::SeqCst);
         // Each executor's first grant waits for the other's, so the split is not a race.
         for _ in 0..2_000 {
@@ -186,8 +188,10 @@ fn two_agents_split_a_unit_and_both_get_all_of_it() {
 struct Vanishes;
 
 impl Granted for Vanishes {
-    fn compile(&mut self, _: &[usize]) -> Result<Grant, String> {
-        Err("this executor's compile failed".to_owned())
+    type Error = std::io::Error;
+
+    fn compile(&mut self, _: &[usize]) -> Result<Grant, Self::Error> {
+        Err(std::io::Error::other("this executor's compile failed"))
     }
 }
 
@@ -197,7 +201,10 @@ fn a_batch_given_back_leaves_its_names_to_the_build() {
     let unit = unit(2, 4);
     let never = AtomicBool::new(false);
     let arrived =
-        agent::run(&config(&world.socket, &world.blobs), &unit, &mut Vanishes, &never).unwrap();
+        agent::run(
+            &config(&world.socket, &world.blobs), &unit,
+            &mut Vanishes as &mut dyn Granted<Error = std::io::Error>, &never,
+        ).unwrap();
     assert!(arrived.values.is_empty(), "nothing was committed: the final build compiles them");
 }
 
@@ -375,7 +382,9 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
     // partitions below contain exactly the same logical values for the same unit.
     struct WithNeighbors(Vec<Digest>);
     impl Granted for WithNeighbors {
-        fn compile(&mut self, names: &[usize]) -> Result<Grant, String> {
+        type Error = std::convert::Infallible;
+
+        fn compile(&mut self, names: &[usize]) -> Result<Grant, Self::Error> {
             Ok(Grant {
                 values: self.0.iter().map(value_of).collect(),
                 compiled: names.len() as u64,
@@ -470,7 +479,9 @@ struct Holding {
 }
 
 impl Granted for Holding {
-    fn compile(&mut self, names: &[usize]) -> Result<Grant, String> {
+    type Error = std::convert::Infallible;
+
+    fn compile(&mut self, names: &[usize]) -> Result<Grant, Self::Error> {
         if let Some(entered) = self.entered.take() {
             entered.send(()).unwrap();
             self.release.take().unwrap().recv_timeout(Duration::from_secs(20)).unwrap();
@@ -685,19 +696,21 @@ fn a_final_compiler_or_output_refusal_cannot_fall_back() {
         calls: usize,
     }
     impl Granted for Refuses {
-        fn compile(&mut self, _: &[usize]) -> Result<Grant, String> {
+        type Error = std::io::Error;
+
+        fn compile(&mut self, _: &[usize]) -> Result<Grant, Self::Error> {
             panic!("this fixture has no distributable roots")
         }
 
-        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, String> {
+        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, Self::Error> {
             self.calls += 1;
             if self.succeeds {
                 return Ok(Vec::new());
             }
             if !self.malformed_output {
-                return Err(
-                    "fixture::tail: output export refused conflicting immutable bytes".into(),
-                );
+                return Err(std::io::Error::other(
+                    "fixture::tail: output export refused conflicting immutable bytes",
+                ));
             }
             let first = value_of(&[92; 32]);
             let mut second = first.clone();
@@ -865,11 +878,13 @@ struct WithTail<'a> {
 }
 
 impl Granted for WithTail<'_> {
-    fn compile(&mut self, names: &[usize]) -> Result<Grant, String> {
+    type Error = std::convert::Infallible;
+
+    fn compile(&mut self, names: &[usize]) -> Result<Grant, Self::Error> {
         self.compiler.compile(names)
     }
 
-    fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, String> {
+    fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, Self::Error> {
         Ok(vec![self.extra.clone()])
     }
 }
@@ -885,10 +900,12 @@ fn a_late_subscriber_waits_for_the_one_leads_full_tail() {
         extra: Value,
     }
     impl Granted for Paused {
-        fn compile(&mut self, _: &[usize]) -> Result<Grant, String> {
+        type Error = std::convert::Infallible;
+
+        fn compile(&mut self, _: &[usize]) -> Result<Grant, Self::Error> {
             panic!("empty work set")
         }
-        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, String> {
+        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, Self::Error> {
             assert_eq!(self.tails.fetch_add(1, Ordering::SeqCst), 0);
             self.entered.send(()).unwrap();
             self.release.recv_timeout(Duration::from_secs(20)).unwrap();
@@ -897,10 +914,12 @@ fn a_late_subscriber_waits_for_the_one_leads_full_tail() {
     }
     struct Reader;
     impl Granted for Reader {
-        fn compile(&mut self, _: &[usize]) -> Result<Grant, String> {
+        type Error = std::convert::Infallible;
+
+        fn compile(&mut self, _: &[usize]) -> Result<Grant, Self::Error> {
             panic!("late subscriber compiled")
         }
-        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, String> {
+        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, Self::Error> {
             panic!("late subscriber ran a second tail")
         }
     }

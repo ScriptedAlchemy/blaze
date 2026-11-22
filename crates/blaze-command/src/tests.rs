@@ -323,7 +323,7 @@ fn cold_then_no_op(bench: &Bench) -> Result<(), String> {
 /// a certificate; with no look of the command's own ([`Plant::NoLook`]) a no-op gathers every
 /// unit's text.
 #[test]
-fn an_unchanged_checkout_is_certified_and_runs_no_task() {
+fn the_oracle_catches_a_no_op_with_a_run_base_or_missing_look() {
     let bench = Bench::new("blaze-command-noop");
     assert_eq!(cold_then_no_op(&bench), Ok(()));
 
@@ -379,7 +379,7 @@ fn edit(tape: &Tape) -> (usize, usize) {
 /// that leaves out its last read ([`Plant::SkipsARead`], `src/u1.rs`) never sees an edit of
 /// unit 1, and the oracle names it.
 #[test]
-fn an_edit_reruns_only_the_body_it_edits() {
+fn the_oracle_catches_an_edit_hidden_by_a_skipped_read() {
     blaze_sim::check(Config::cases(12), |tape: &Tape| {
         let drawn = tape.vec(1..=4, "edits", edit);
         edits(&Bench::new("blaze-command-edits"), &drawn)
@@ -408,7 +408,7 @@ fn stopped(bench: &Bench) -> Result<(), String> {
 /// naming the unit and why. The control: a command that ignores blocked units
 /// ([`Plant::IgnoresBlocked`]) runs tasks, and the oracle says so.
 #[test]
-fn a_blocked_unit_stops_the_command_by_name_before_any_task() {
+fn the_oracle_catches_a_blocked_unit_run_anyway() {
     assert_eq!(stopped(&Bench::new("blaze-command-blocked")), Ok(()));
 
     let control = Bench::new("blaze-command-blocked-control");

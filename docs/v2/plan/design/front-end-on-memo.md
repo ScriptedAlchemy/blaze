@@ -538,7 +538,7 @@ the macro, so the count is of the source, spelling-independent.
 expression store, a source map). `keep_owned<'db, T: Send + Sync + 'db>(&'db Memo, T) -> &'db T`
 places the value in the run's arena and lists it on the same drop list (`Slot::drop_owned`):
 dropped once, with the arena. Counted in `owns.txt` with the `owns` attributes. Test:
-`tests/additions.rs` `keep_owned_drops_with_its_arena`, its control `keep_owned_unlisted_leaks`
+`tests/additions.rs` `keep_owned_drops_with_its_arena`, its control `the_oracle_catches_keep_owned_missing_its_drop_list`
 (planted `KeepOwnedUnlisted`), and `arenas_drop_downstream_first`.
 
 **No-drop at `cargo check`** (decision 7). Without `owns`, every tracked fn and interned struct

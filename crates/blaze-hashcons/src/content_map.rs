@@ -244,7 +244,7 @@ mod tests {
     /// when the twin goes in.
     #[test]
     #[should_panic(expected = "two unequal values")]
-    fn two_unequal_values_with_one_id_stop() {
+    fn the_oracle_catches_a_content_hash_omitting_part_of_the_value() {
         let mut map: ContentMap<Half, Global> = ContentMap::new_in(Global); // alloc: a test's map
         map.insert(Half(1, 1));
         map.insert(Half(1, 2));

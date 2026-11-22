@@ -79,7 +79,7 @@ fn check(
 /// pack's header and last block's padding. No value is read for it. The control: a census that
 /// leaves out the records still in a segment is caught.
 #[test]
-fn the_census_counts_every_kind_and_sums_to_the_files() {
+fn the_oracle_catches_a_census_omitting_unflushed_records() {
     let mut sim = Sim::new(21, quiet());
     let mut store = open(&mut sim, "store");
     let put = every_kind();
