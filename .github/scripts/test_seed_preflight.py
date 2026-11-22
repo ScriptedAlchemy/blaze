@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real seed preflight with bounded fake processes, never a Blaze daemon."""
 
+from contextlib import nullcontext
 import importlib.util
 import io
 import json
@@ -25,21 +26,22 @@ sys.modules[SPEC.name] = preflight
 SPEC.loader.exec_module(preflight)
 
 
-def action_step(name):
-    lines = ACTION.read_text().splitlines()
-    heading = f"    - name: {name}"
-    if lines.count(heading) != 1:
-        raise AssertionError(f"blaze action needs one {name} step")
-    start = lines.index(heading) + 1
-    while start < len(lines) and lines[start] != "      run: |":
-        if lines[start].startswith("    - "):
+def action_step(name, path=ACTION):
+    lines = path.read_text().splitlines()
+    matches = [i for i, line in enumerate(lines) if line.strip() == f"- name: {name}"]
+    if len(matches) != 1:
+        raise AssertionError(f"{path} needs one {name} step")
+    start = matches[0] + 1
+    while start < len(lines) and lines[start].strip() != "run: |":
+        if lines[start].lstrip().startswith("- "):
             raise AssertionError(f"{name} has no shell body")
         start += 1
+    indent = len(lines[start]) - len(lines[start].lstrip()) + 2
     body = []
     for line in lines[start + 1:]:
-        if line and not line.startswith("        "):
+        if line and not line.startswith(" " * indent):
             break
-        body.append(line[8:] if line else "")
+        body.append(line[indent:] if line else "")
     return "\n".join(body) + "\n"
 
 
@@ -164,7 +166,7 @@ def reset_sampler_signal():
 
 @unittest.skipUnless(sys.platform == "linux", "the pinned seed's signal workaround is Linux-only")
 class SeedPreflightTests(unittest.TestCase):
-    def exercise(self, mode="ok", *, ignored=True, action=False, **control):
+    def exercise(self, mode="ok", *, ignored=True, action=False, work_code=None, **control):
         with tempfile.TemporaryDirectory(prefix="blaze seed ") as directory:
             root = Path(directory)
             (root / "bin").mkdir()
@@ -197,6 +199,29 @@ class SeedPreflightTests(unittest.TestCase):
             if action:
                 body = action_step("the release's daemon has its sampler off")
                 argv = ["bash", "-e", "-o", "pipefail", "-c", body]
+            elif work_code is not None:
+                wrapper = root / "work.py"
+                wrapper.write_text('''
+import importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location("seed_preflight", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+given = module.load(sys.argv[2])
+def work(daemon, log):
+    with (pathlib.Path(given.log).parent / "trace.jsonl").open("a") as trace:
+        trace.write(json.dumps({"command": "work", "pid": daemon.pid}) + "\\n")
+    if int(sys.argv[3]):
+        raise module.Failed("deliberate workspace failure", int(sys.argv[3]))
+try:
+    module.run(given, work=work)
+except module.Failed as error:
+    print(error, file=sys.stderr)
+    sys.exit(error.returncode)
+''')
+                argv = ["bash", "-e", "-o", "pipefail", "-c", 'exec "$1" -I "$2" "$3" "$4" "$5"',
+                        "seed-work-test", sys.executable, str(wrapper), str(SCRIPT), json.dumps(config),
+                        str(work_code)]
             else:
                 argv = ["bash", "-e", "-o", "pipefail", "-c", 'exec "$1" -I "$2" "$3"',
                         "seed-test", sys.executable, str(SCRIPT), json.dumps(config)]
@@ -296,6 +321,19 @@ class SeedPreflightTests(unittest.TestCase):
                 self.assertNotIn("seed preflight: owned daemon ready, sampler off, clean shutdown", done.stdout)
         self.assertIn("seed complete shutdown log", done.stdout)
 
+    def test_workspace_failure_still_stops_the_owned_daemon_and_keeps_the_original_exit(self):
+        for mode, work_code, expected in (("ok", 0, 0), ("ok", 23, 23),
+                                           ("stop_failure", 23, 23), ("stop_failure", 0, 37)):
+            with self.subTest(mode=mode, work_code=work_code):
+                done, trace, _ = self.exercise(mode, work_code=work_code)
+                self.assertEqual(done.returncode, expected, done.stdout + done.stderr)
+                commands = [row["command"] for row in trace]
+                self.assertLess(commands.index("work"), commands.index("stop"))
+                self.assertEqual(next(row["pid"] for row in trace if row["command"] == "work"),
+                                 next(row["pid"] for row in trace if row["command"] == "serve"))
+                if work_code:
+                    self.assertIn("deliberate workspace failure", done.stderr)
+
     def test_descendants_are_stopped_after_their_leader_exits_without_signaling_other_groups(self):
         # Success and failure exits both leave a real TERM-ignoring child. A
         # separate live session must survive every owned-group cleanup below.
@@ -338,6 +376,59 @@ class SeedPreflightTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=2)
+
+    def test_cancellation_during_spawn_reaps_its_owned_child(self):
+        real_popen = subprocess.Popen
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / "sleeping-command"
+            child.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable)
+                             + " -I -c 'import time; time.sleep(60)'\n")
+            child.chmod(0o700)
+            given = preflight.Input(str(child), str(root / "seed.log"), cleanup_seconds=0.2)
+
+            def exercise(deferred):
+                spawned = []
+
+                def launch(*args, **kwargs):
+                    process = real_popen(*args, **kwargs)
+                    spawned.append(process)
+                    # The child exists, but command() has not received its handle.
+                    # Only the actual deferred mask can postpone this cancellation.
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return process
+
+                handler = signal.signal(signal.SIGTERM, preflight.interrupted)
+                previous = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+                control = nullcontext() if deferred else mock.patch.object(
+                    preflight, "deferred_interrupts",
+                    side_effect=lambda: nullcontext(signal.pthread_sigmask(signal.SIG_BLOCK, set())))
+                try:
+                    with control, mock.patch.object(preflight.subprocess, "Popen", side_effect=launch):
+                        with self.assertRaises(preflight.Failed) as caught:
+                            preflight.command(given, ["status", "--json"], 1.0, io.StringIO())
+                    self.assertEqual(caught.exception.returncode, 128 + signal.SIGTERM)
+                    self.assertEqual(len(spawned), 1)
+                    process = spawned[0]
+                    reaped = process.returncode is not None
+                    if reaped:
+                        with self.assertRaises(ChildProcessError):
+                            os.waitpid(process.pid, os.WNOHANG)
+                    else:
+                        self.assertIsNone(preflight.exited(process), "the control must leave a live child")
+                    return reaped
+                finally:
+                    # A regressed owner and the deliberately unmasked control must
+                    # fail the oracle without leaking their real child from the test.
+                    for process in spawned:
+                        if process.poll() is None:
+                            process.kill()
+                        process.wait(timeout=2)
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+                    signal.signal(signal.SIGTERM, handler)
+
+            self.assertTrue(exercise(True), "command returned before reaping its cancelled child")
+            self.assertFalse(exercise(False), "the oracle missed cancellation before handle ownership")
 
 
 class SeedInputTests(unittest.TestCase):
@@ -476,6 +567,271 @@ class ReadinessDeadlineTests(unittest.TestCase):
                 mock.patch.object(preflight, "command", side_effect=command):
             preflight.ready(self.given(), process, log)
         self.assertIn("ready: owned daemon 123 answered status", log.getvalue())
+
+
+class WorkspaceScopeTests(unittest.TestCase):
+    unit = "blaze-workspace-test.scope"
+    group = Path("/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice") / unit
+    origin = (preflight.MemoryLimit("/sys/fs/cgroup/system.slice/runner.service", "max", "max", "max"),
+              preflight.MemoryLimit("/sys/fs/cgroup/system.slice", "max", "max", "max"))
+
+    def scope(self, **changes):
+        fields = dict(unit=self.unit, memory_gb="6", command=(sys.executable, "-c", "pass"),
+                      entered=True, origin=self.origin, memlock=(-1, -1))
+        fields.update(changes)
+        return preflight.WorkspaceScope(**fields)
+
+    def properties(self, **changes):
+        fields = dict(Id=self.unit, ActiveState="active", LoadState="loaded", InvocationID="a" * 32,
+                      ControlGroup="/" + str(self.group.relative_to(preflight.CGROUPS)))
+        fields.update(changes)
+        return fields
+
+    def limits(self):
+        return (preflight.MemoryLimit(str(self.group), str(6 << 30), "max", "max"),
+                preflight.MemoryLimit(str(self.group.parent), str(3 << 30), str(2 << 30), "0"))
+
+    def test_effective_target_limits_remain_stricter_than_the_configured_cap(self):
+        proof = preflight.scope_proof(self.scope(), self.properties(), self.group, self.limits(), (-1, -1))
+        self.assertEqual(proof["effective_limits"],
+                         {"memory.max": 3 << 30, "memory.high": 2 << 30, "memory.swap.max": 0})
+        self.assertEqual(proof["configured_memory_bytes"], 6 << 30)
+
+    def test_a_scope_cannot_leave_any_finite_source_ancestor_constraint(self):
+        for field in ("maximum", "high", "swap"):
+            with self.subTest(field=field):
+                fields = dict(path=self.origin[0].path, maximum="max", high="max", swap="max")
+                fields[field] = str(1 << 30)
+                rows = (preflight.MemoryLimit(**fields),)
+                with self.assertRaisesRegex(preflight.Failed, "would leave"):
+                    preflight.preserve_ancestors(rows, self.group)
+                # Remaining below that ancestor keeps its aggregate constraint.
+                preflight.preserve_ancestors(rows, Path(rows[0].path) / "owned.scope")
+
+    def test_missing_nonroot_controls_cannot_truncate_ancestor_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            group = root / "parent" / "owned.scope"
+            group.mkdir(parents=True)
+            for path in (group, group.parent):
+                for name in ("memory.max", "memory.high", "memory.swap.max"):
+                    (path / name).write_text("max\n")
+            self.assertEqual(len(preflight.memory_limits(group, root)), 2)
+            (group.parent / "memory.high").unlink()
+            with self.assertRaises(FileNotFoundError):
+                preflight.memory_limits(group, root)
+
+    def test_bad_membership_cap_invocation_or_memlock_stops_before_daemon_start(self):
+        cases = (
+            (self.group.parent / "foreign.scope", self.properties(), self.limits(), (-1, -1)),
+            (self.group, self.properties(InvocationID=""), self.limits(), (-1, -1)),
+            (self.group, self.properties(),
+             (preflight.MemoryLimit(str(self.group), str(7 << 30), "max", "max"),), (-1, -1)),
+            (self.group, self.properties(), self.limits(), (8192, 8192)),
+        )
+        for group, properties, limits, memlock in cases:
+            with self.subTest(group=group, properties=properties, limits=limits, memlock=memlock), \
+                    tempfile.TemporaryDirectory() as directory:
+                given = preflight.Input("/bin/blaze", str(Path(directory) / "serve.log"), scope=self.scope())
+                with (mock.patch.dict(os.environ, {"BLAZE_DAEMON_MEMORY_GB": "6"}),
+                      mock.patch.object(preflight, "process_cgroup", return_value=group),
+                      mock.patch.object(preflight, "unit_properties", return_value=properties),
+                      mock.patch.object(preflight, "memory_limits", return_value=limits),
+                      mock.patch.object(preflight.resource, "getrlimit", return_value=memlock),
+                      mock.patch.object(preflight, "run") as daemon,
+                      self.assertRaises(preflight.Failed)):
+                    preflight.entered_scope(given)
+                daemon.assert_not_called()
+
+    def test_an_outside_daemon_prevents_scope_creation_without_being_stopped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scope = self.scope(entered=False, origin=(), memlock=None)
+            given = preflight.Input("/bin/blaze", str(Path(directory) / "serve.log"), scope=scope)
+            with (mock.patch.dict(os.environ, {"BLAZE_DAEMON_MEMORY_GB": "6"}),
+                  mock.patch.object(preflight, "process_cgroup", return_value=Path(self.origin[0].path)),
+                  mock.patch.object(preflight, "memory_limits", return_value=self.origin),
+                  mock.patch.object(preflight, "systemd", return_value={"ControlGroup": "/user.slice/app.slice"}),
+                  mock.patch.object(preflight, "command", return_value='{"daemon":{"pid":123}}') as command,
+                  mock.patch.object(preflight.subprocess, "Popen") as launch,
+                  self.assertRaisesRegex(preflight.Failed, "outside workspace daemon")):
+                preflight.launch_scope(given)
+            launch.assert_not_called()
+            self.assertEqual(command.call_args.args[1], ["status", "--json"])
+
+    def test_cancellation_during_scope_cleanup_preserves_the_first_failure(self):
+        for status in (23, 0):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                scope = self.scope(entered=False, origin=(), memlock=None)
+                given = preflight.Input("/bin/blaze", str(root / "serve.log"), scope=scope)
+                process = SimpleNamespace(pid=321)
+                finished = []
+
+                def completed(owned, _seconds):
+                    self.assertIs(owned, process)
+                    if status == 0:
+                        # Scope identity/cap validation has its own tests. This
+                        # fixture isolates cancellation after the workload's exit.
+                        (root / "workspace-scope.json").write_text("{}")
+                    return status
+
+                def clean_scope(_given, owned, _log):
+                    self.assertIs(owned, process)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    finished.append("scope")
+                    return False
+
+                def cleanup(owned, _seconds, _log):
+                    self.assertIs(owned, process)
+                    finished.append("process")
+                    return False
+
+                handler = signal.signal(signal.SIGTERM, preflight.interrupted)
+                previous = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+                try:
+                    with (mock.patch.dict(os.environ, {"BLAZE_DAEMON_MEMORY_GB": "6"}),
+                          mock.patch.object(preflight, "process_cgroup", return_value=Path(self.origin[0].path)),
+                          mock.patch.object(preflight, "memory_limits", return_value=self.origin),
+                          mock.patch.object(preflight.resource, "getrlimit", return_value=(-1, -1)),
+                          mock.patch.object(preflight, "systemd", return_value={"ControlGroup": "/user.slice/app.slice"}),
+                          mock.patch.object(preflight, "command", return_value='{"daemon":null}'),
+                          mock.patch.object(preflight.subprocess, "Popen", return_value=process),
+                          mock.patch.object(preflight, "wait_exit", side_effect=completed),
+                          mock.patch.object(preflight, "clean_scope", side_effect=clean_scope),
+                          mock.patch.object(preflight, "cleanup", side_effect=cleanup),
+                          self.assertRaises(preflight.Failed) as caught):
+                        preflight.launch_scope(given)
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+                    signal.signal(signal.SIGTERM, handler)
+                self.assertEqual(finished, ["scope", "process"])
+                self.assertEqual(caught.exception.returncode, status or 128 + signal.SIGTERM)
+
+    def test_cleanup_needs_the_matching_proved_invocation_and_never_touches_a_foreign_unit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            given = preflight.Input("/bin/blaze", str(Path(directory) / "serve.log"), scope=self.scope())
+            process = SimpleNamespace(pid=321)
+            with mock.patch.object(preflight, "unit_properties") as query:
+                self.assertFalse(preflight.clean_scope(given, process, io.StringIO()))
+            query.assert_not_called()  # Failed creation has no unit-cleanup authority.
+            preflight.evidence(given, "workspace-scope.json",
+                               {"unit": self.unit, "supervisor_pid": 321,
+                                "invocation_id": "a" * 32, "cgroup": str(self.group)})
+            with (mock.patch.object(preflight, "unit_properties",
+                                    return_value=self.properties(InvocationID="b" * 32)),
+                  mock.patch.object(preflight, "systemd") as signal_unit,
+                  self.assertRaisesRegex(preflight.Failed, "different invocation")):
+                preflight.clean_scope(given, process, io.StringIO())
+            signal_unit.assert_not_called()
+            with mock.patch.object(preflight, "unit_properties",
+                                   return_value=self.properties(ActiveState="inactive", ControlGroup="")):
+                self.assertFalse(preflight.clean_scope(given, process, io.StringIO()))
+
+    def test_scope_input_keeps_argv_literal_and_refuses_unknown_or_unbounded_configuration(self):
+        raw = {"blaze": "/bin/blaze", "log": "/tmp/serve.log",
+               "scope": {"unit": self.unit, "memory_gb": "6", "command": ["/bin/echo", "$literal"]}}
+        given = preflight.load(json.dumps(raw))
+        self.assertEqual(given.scope.command, ("/bin/echo", "$literal"))
+        self.assertEqual(given.scope.memory_bytes, 6 << 30)
+        for changes in ({"unknown": 1}, {"seconds": 0}, {"entered": True}, {"memory_gb": "NaN"},
+                        {"command": ["relative"]}, {"unit": "foreign.scope"}):
+            with self.subTest(changes=changes), self.assertRaises((TypeError, ValueError)):
+                preflight.load(json.dumps({**raw, "scope": {**raw["scope"], **changes}}))
+
+
+class WorkspaceScopeWiringTests(unittest.TestCase):
+    def fixture(self, root, *, fail="", code=0):
+        (root / "bin").mkdir()
+        (root / ".github/scripts").mkdir(parents=True)
+        (root / "tmp").mkdir()
+        target = root / "target with spaces"
+        (target / "debug").mkdir(parents=True)
+        astlog = target / "debug/astlog"
+        astlog.write_text("#!/bin/sh\nexit 0\n")
+        astlog.chmod(0o700)
+        # The real shell hands a typed argv to its supervisor. The fixture executes
+        # that argv directly; cap/identity refusal is exercised by the entry tests.
+        (root / ".github/scripts/seed_preflight.py").write_text('''
+import json, os, pathlib, subprocess, sys
+given = json.load(sys.stdin)
+pathlib.Path(os.environ["SCOPE_INPUT"]).write_text(json.dumps(given))
+sys.exit(subprocess.run(given["scope"]["command"], check=False, timeout=10).returncode)
+''')
+        program = root / "command.py"
+        program.write_text('''
+import json, os, pathlib, sys
+name, *args = sys.argv[1:]
+with pathlib.Path(os.environ["TRACE"]).open("a") as out:
+    out.write(json.dumps([name, *args]) + "\\n")
+if name == "changed":
+    print("--workspace")
+if name == "jq":
+    print(json.dumps({"astlog": args[args.index("--arg")+2]}))
+which = ("all-targets" if "--all-targets" in args else "check") if name == "blaze" and args[0] == "check" else name
+sys.exit(int(os.environ["FAIL_CODE"]) if which == os.environ["FAIL_STAGE"] else 0)
+''')
+        for name in ("blaze", "git", "changed", "jq", "build.sh"):
+            exe = root / "bin" / name
+            exe.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " -I "
+                           + shlex.quote(str(program)) + " " + shlex.quote(name) + ' "$@"\n')
+            exe.chmod(0o700)
+        python = root / "bin/python3"
+        python.write_text("#!/bin/sh\nif [ \"${1:-}\" = tools/astlog/scan.py ]; then exec "
+                          + shlex.quote(sys.executable) + " -I " + shlex.quote(str(program))
+                          + ' scan "$@"; fi\nexec ' + shlex.quote(sys.executable) + ' -I "$@"\n')
+        python.chmod(0o700)
+        env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ.get("PATH", ""),
+                   BASE="", RUNNER_TEMP=str(root / "tmp"), GITHUB_WORKSPACE=str(root),
+                   GITHUB_ENV=str(root / "github-env"), CARGO_TARGET_DIR=str(target),
+                   BLAZE_SCRIPTS=str(root / "bin"), BLAZE_DAEMON_MEMORY_GB="6",
+                   SCOPE_INPUT=str(root / "scope-input.json"), TRACE=str(root / "trace.jsonl"),
+                   FAIL_STAGE=fail, FAIL_CODE=str(code), GITHUB_ACTION_PATH=str(root / "bin"),
+                   SCRIPT_DIR=str(root / "scripts with spaces"), SCRIPT_KEY="literal-$key")
+        return env, target
+
+    def trace(self, root):
+        return [json.loads(line) for line in (root / "trace.jsonl").read_text().splitlines()]
+
+    def test_no_narrow_check_still_runs_whole_workspace_all_targets_and_astlog(self):
+        workflow = SCRIPT.parents[1] / "workflows/blaze.yaml"
+        body = action_step("workspace compiler checks in an owned bounded user scope", workflow)
+        for fail, code in (("", 0), ("check", 23), ("all-targets", 29), ("scan", 31)):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                env, target = self.fixture(root, fail=fail, code=code)
+                done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=root,
+                                      env=env, text=True, capture_output=True, timeout=15)
+                self.assertEqual(done.returncode, code, done.stdout + done.stderr)
+                trace = self.trace(root)
+                wanted = [["blaze", "check", "--workspace", "--message-format", "short", "--target-dir", str(target)]]
+                if fail != "check":
+                    wanted.append(["blaze", "check", "--workspace", "--all-targets", "--message-format", "short",
+                                   "--target-dir", str(target)])
+                if fail not in ("check", "all-targets"):
+                    wanted.append(["blaze", "build", "-p", "astlog", "--target-dir", str(target)])
+                self.assertEqual([row for row in trace if row[0] == "blaze"], wanted)
+                self.assertEqual(any(row[0] == "scan" for row in trace), fail not in ("check", "all-targets"))
+                given = json.loads((root / "scope-input.json").read_text())
+                self.assertEqual(given["scope"]["memory_gb"], "6")
+
+    def test_script_cache_miss_preserves_build_argv_and_failure_in_either_explicit_mode(self):
+        action = SCRIPT.parents[1] / "actions/script/action.yml"
+        body = action_step("build missing scripts", action)
+        for budget in ("", "6"):
+            for code in (0, 37):
+                with self.subTest(budget=budget, code=code), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    env, _ = self.fixture(root, fail="build.sh", code=code)
+                    env["SCOPE_MEMORY_GB"] = budget
+                    done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=root,
+                                          env=env, text=True, capture_output=True, timeout=15)
+                    self.assertEqual(done.returncode, code, done.stdout + done.stderr)
+                    self.assertEqual(self.trace(root), [["build.sh", env["SCRIPT_DIR"], env["SCRIPT_KEY"]]])
+                    self.assertEqual((root / "scope-input.json").exists(), bool(budget))
+                    if budget:
+                        given = json.loads((root / "scope-input.json").read_text())
+                        self.assertEqual(given["scope"]["command"],
+                                         [str(root / "bin/build.sh"), env["SCRIPT_DIR"], env["SCRIPT_KEY"]])
 
 
 if __name__ == "__main__":

@@ -19,7 +19,12 @@ use std::{
 };
 
 use blaze_serve::{Config, Server, serve_on};
-use blaze_wire::{Digest, Limits, PackRef, WireError, decode};
+use blaze_wire::{Digest, Limits, WireError, decode};
+
+// HTTP fixtures use the real producer, so their records and manifest commitments cannot
+// drift into an older format behind a current magic header.
+#[path = "../../blaze-dist-local/src/pack.rs"]
+mod native_pack;
 
 /// A server on a directory of its own, on a port the machine gives, ended when the test ends.
 struct Served {
@@ -192,43 +197,15 @@ fn answer_reader_respects_bodyless_responses() {
     }
 }
 
-/// A sealed pack of `values` in the store's format, laid out as `harness/packs.py` lays one
-/// out: the magic, the counts, a block header and an entry per value, then the values as they
-/// are (a value is a block of its own here, uncompressed).
-fn pack(values: &[(Digest, &[u8])]) -> Vec<u8> {
-    let mut out = blaze_wire::DIST_PACK_MAGIC.to_vec();
-    out.extend_from_slice(&(values.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(values.len() as u32).to_le_bytes());
-    for (_, value) in values {
-        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-    }
-    let start = out.len() + 48 * values.len();
-    let mut at = start;
-    for (block, (key, value)) in values.iter().enumerate() {
-        out.extend_from_slice(key);
-        out.extend_from_slice(&(block as u32).to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        let crc = crc32(key, value);
-        out.extend_from_slice(&crc.to_le_bytes());
-        at += value.len();
-    }
-    assert_eq!(at, start + values.iter().map(|(_, value)| value.len()).sum::<usize>());
-    for (_, value) in values {
-        out.extend_from_slice(value);
-    }
-    out
-}
-
-/// The CRC-32 of a record, as the store writes it: the key, the value's length, the value.
-fn crc32(key: &Digest, value: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(key);
-    hasher.update(&(value.len() as u32).to_le_bytes());
-    hasher.update(value);
-    hasher.finalize()
+/// The native producer's canonical bytes and commitment for these store values.
+fn pack(values: &[(Digest, &[u8])]) -> native_pack::Pack<Global> {
+    let mut input = Vec::with_capacity_in(values.len(), Global);
+    input.extend(values.iter().map(|(key, bytes)| native_pack::Value {
+        key: *key,
+        kind: 0,
+        bytes: bytes.to_vec_in(Global),
+    }));
+    native_pack::Pack::of(input, Global).expect("canonical native values")
 }
 
 fn digest(bytes: &[u8]) -> Digest {
@@ -248,7 +225,7 @@ fn pack_name(bytes: &[u8]) -> String {
 #[test]
 fn a_blob_is_sent_whole() {
     let served = Served::start();
-    let bytes = pack(&[(digest(b"one"), b"value one"), (digest(b"two"), b"value two")]);
+    let bytes = pack(&[(digest(b"one"), b"value one"), (digest(b"two"), b"value two")]).bytes;
     let name = pack_name(&bytes);
     let put = served.ask("PUT", &format!("/v1/blob/{name}"), &[], &bytes);
     assert_eq!(put.status, 204, "{}", put.error().message);
@@ -267,10 +244,10 @@ fn a_blob_is_sent_whole() {
 #[test]
 fn a_write_of_a_wrong_hash_is_refused_and_names_nothing() {
     let served = Served::start();
-    let bytes = pack(&[(digest(b"one"), b"value one")]);
+    let bytes = pack(&[(digest(b"one"), b"value one")]).bytes;
     let name = pack_name(&bytes);
     // The right bytes under another name: refused, and the name holds nothing after.
-    let other = pack(&[(digest(b"other"), b"another value")]);
+    let other = pack(&[(digest(b"other"), b"another value")]).bytes;
     let wrong = served.ask("PUT", &format!("/v1/blob/{name}"), &[], &other);
     assert_eq!(wrong.status, 422);
     assert_eq!(wrong.error().code, 9);
@@ -297,7 +274,7 @@ fn a_write_of_a_wrong_hash_is_refused_and_names_nothing() {
 fn a_concurrent_write_of_one_blob_leaves_one_whole_blob() {
     let served = Served::start();
     let bytes =
-        pack(&[(digest(b"one"), b"a value that is not small"), (digest(b"two"), &[7; 4096])]);
+        pack(&[(digest(b"one"), b"a value that is not small"), (digest(b"two"), &[7; 4096])]).bytes;
     let name = pack_name(&bytes);
     let port = served.port;
     let writers: Vec<_> = (0..8)
@@ -345,27 +322,14 @@ fn a_list_is_written_once() {
     let key = digest(b"an item");
     let first_pack = pack(&[(key, b"first")]);
     let second_pack = pack(&[(key, b"second")]);
-    for bytes in [&first_pack, &second_pack] {
-        let put = served.ask("PUT", &format!("/v1/blob/{}", pack_name(bytes)), &[], bytes);
+    for pack in [&first_pack, &second_pack] {
+        let put = served.ask(
+            "PUT", &format!("/v1/blob/{}", pack_name(&pack.bytes)), &[], &pack.bytes,
+        );
         assert_eq!(put.status, 204, "{}", put.error().message);
     }
-    let keys = blaze_wire::digest_of_encoded_name(
-        "blaze/dist-pack-keys",
-        &blaze_wire::encode(&vec![key], Global),
-    );
-    let list = |bytes: &[u8]| {
-        blaze_wire::pack_list::encode(
-            &[PackRef {
-                pack: digest(bytes),
-                size: bytes.len() as u64,
-                keys,
-                packed: None,
-                format: blaze_wire::DIST_PACK_FORMAT,
-            }],
-            Global,
-        )
-    };
-    let (first, second) = (list(&first_pack), list(&second_pack));
+    let first = blaze_wire::pack_list::encode(&[first_pack.reference], Global);
+    let second = blaze_wire::pack_list::encode(&[second_pack.reference], Global);
     assert_ne!(first, second, "the two writers propose different pack lists");
     let wrote = served.ask("PUT", &path, &[], &first);
     assert_eq!(wrote.status, 204, "{}", wrote.error().message);
@@ -398,7 +362,7 @@ fn a_name_that_is_not_the_layouts_reaches_no_file() {
 #[test]
 fn uppercase_digest_routes_are_rejected_without_creating_aliases() {
     let served = Served::start();
-    let bytes = pack(&[(digest(b"canonical"), b"lowercase")]);
+    let bytes = pack(&[(digest(b"canonical"), b"lowercase")]).bytes;
     let d = hex(&digest(&bytes));
     assert_ne!(d, d.to_uppercase());
     for name in [

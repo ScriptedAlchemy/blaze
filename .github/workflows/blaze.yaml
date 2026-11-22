@@ -1093,45 +1093,72 @@ jobs:
       - uses: ./.github/actions/script
         with:
           job: check
-      # The fast tier: the packages the change touches and those that depend on them, each
-      # after what it needs (scripts/src/bin/changed.rs), checked before the workspace, so a change's
-      # first compile error comes in minutes and names the earliest cause. What it checks the
-      # workspace check below finds checked. Against the base itself: the checkout is shallow.
-      - name: blaze check of the packages this change touches
+          memory-gb: ${{ env.BLAZE_DAEMON_MEMORY_GB }}
+      # The configured six-GiB budget needs its own accounting scope: the pinned release
+      # otherwise subtracts the hosted agent's cached files from that daemon budget.
+      # The setup preflight has stopped its owned daemon. This supervisor refuses any
+      # other daemon, proves the user scope/cap, and owns serve through all checks below.
+      - name: workspace compiler checks in an owned bounded user scope
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
-          if [ -z "$BASE" ] || ! git fetch -q --depth=1 origin "$BASE"; then
-            echo "no base to compare with: the workspace check below is the check"; exit 0
-          fi
-          args=$("$BLAZE_SCRIPTS/changed" "{\"base\": \"$BASE\", \"direct\": true, \"print\": \"args\"}")
-          if [ -z "$args" ] || [ "$args" = --workspace ]; then
-            echo "nothing narrower than the workspace to check first: ${args:-no package changed}"; exit 0
-          fi
-          echo "blaze check $args --lib --tests"
-          # TODO(stage 0 with --deny): add `--deny blaze::todo` once .github/blaze-version's release takes it.
-          # shellcheck disable=SC2086
-          blaze check $args --lib --tests --message-format short --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
-      - run: blaze check --workspace --message-format short --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
-      # Every target, the test targets among them: a test that no longer type-checks against
-      # the code it tests fails here, in every crate, where the unit tests job compiles the test
-      # targets of harness/unittests.py's CRATES alone (2026-11-09: blaze-cas's place_race.rs and
-      # hir-ty-mir's tests/consteval/comptime.rs did not compile on main). A step of its own,
-      # after the libraries', so the log says which of the two failed; what the first checked
-      # is not checked again.
-      # TODO(stage 0 with --deny): add `--deny blaze::todo` once .github/blaze-version's release takes it.
-      - name: blaze check --workspace --all-targets (the test targets compile)
-        run: blaze check --workspace --all-targets --message-format short --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
-      # astlog's rules (tools/astlog/rules) over the crates and tools, each file on its own: a
-      # finding of an error rule fails the job (tools/astlog/README.md#rules-in-blaze).
-      - run: blaze build -p astlog --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
-      - run: |
+          set -euo pipefail
+          evidence=$(mktemp -d "$RUNNER_TEMP/workspace-scope.XXXXXX")
+          echo "BLAZE_WORKSPACE_SCOPE_EVIDENCE=$evidence" >> "$GITHUB_ENV"
+          cat > "$evidence/check.sh" <<'SH'
+          set -euo pipefail
+          # A shallow checkout needs the base before the optional narrow check.
+          # Returning here leaves the complete workspace checks below mandatory.
+          changed_packages() {
+            if [ -z "$BASE" ] || ! git fetch -q --depth=1 origin "$BASE"; then
+              echo "no base to compare with: the workspace check below is the check"; return
+            fi
+            args=$("$BLAZE_SCRIPTS/changed" "{\"base\": \"$BASE\", \"direct\": true, \"print\": \"args\"}")
+            if [ -z "$args" ] || [ "$args" = --workspace ]; then
+              echo "nothing narrower than the workspace to check first: ${args:-no package changed}"; return
+            fi
+            echo "blaze check $args --lib --tests"
+            # shellcheck disable=SC2086
+            blaze check $args --lib --tests --message-format short --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
+          }
+          # TODO(stage 0 with --deny): add `--deny blaze::todo` once the pin takes it.
+          echo '::group::blaze check of the packages this change touches'
+          changed_packages
+          echo '::endgroup::'
+          echo '::group::blaze check --workspace'
+          blaze check --workspace --message-format short --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
+          echo '::endgroup::'
+          echo '::group::blaze check --workspace --all-targets (the test targets compile)'
+          blaze check --workspace --all-targets --message-format short --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
+          echo '::endgroup::'
+          echo '::group::astlog build and rules'
+          blaze build -p astlog --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
           astlog="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/debug/astlog"
           [ -x "$astlog" ] || { echo "::error::the build made no executable $astlog"; exit 1; }
           jq -n --arg astlog "$astlog" \
             '{astlog: $astlog, rules: "tools/astlog/rules", paths: ["crates", "tools"], exclude: ["crates/harness"]}' \
             > "$RUNNER_TEMP/astlog.json"
           PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py "$RUNNER_TEMP/astlog.json"
+          echo '::endgroup::'
+          SH
+          python3 - "$evidence" <<'PY' | python3 .github/scripts/seed_preflight.py -
+          import json, os, pathlib, shutil, sys, uuid
+          evidence = pathlib.Path(sys.argv[1])
+          print(json.dumps({"blaze": shutil.which("blaze"), "log": str(evidence / "serve.log"),
+                            "scope": {"unit": f"blaze-workspace-{uuid.uuid4().hex}.scope",
+                                      "memory_gb": os.environ["BLAZE_DAEMON_MEMORY_GB"],
+                                      "command": [shutil.which("bash"), "-e", "-o", "pipefail",
+                                                  str(evidence / "check.sh")],
+                                      "seconds": 4500}}))
+          PY
+      - name: retain workspace scope and daemon proof
+        if: always() && env.BLAZE_WORKSPACE_SCOPE_EVIDENCE != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: workspace-scope-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.BLAZE_WORKSPACE_SCOPE_EVIDENCE }}
+          if-no-files-found: error
+          retention-days: 14
       # A timed-out check is cancelled, so failure() alone loses its daemon evidence.
       - if: failure() || cancelled()
         uses: ./.github/actions/daemon-log
