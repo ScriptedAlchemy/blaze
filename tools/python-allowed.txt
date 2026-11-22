@@ -138,6 +138,7 @@ harness/unwindsplice.py
 harness/v2/agents.py
 harness/v2/bounds.py
 harness/v2/budgets.py
+harness/v2/clone_out.py
 harness/v2/constspec.py
 harness/v2/corpus.py
 harness/v2/dbsp/edits.py

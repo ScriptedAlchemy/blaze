@@ -515,6 +515,21 @@ fn argv_of<'c>(c: &'c Check, given: &'c str) -> Vec<&'c str> {
     argv
 }
 
+/// A check's declared input with only the engine fields and report path it takes injected.
+fn input_of(c: &Check, engine: &EngineSpec, out: &Path) -> Value {
+    let mut given: Map<String, Value> = c.input.as_object().cloned().unwrap_or_default();
+    if c.takes.iter().any(|it| it == "engine") {
+        given.insert("engine".to_owned(), engine.to_value());
+    }
+    if c.takes.iter().any(|it| it == "blaze") {
+        given.insert("blaze".to_owned(), Value::String(engine.blaze.clone()));
+    }
+    if c.takes.iter().any(|it| it == "out") {
+        given.insert("out".to_owned(), Value::String(out.to_string_lossy().into_owned()));
+    }
+    Value::Object(given)
+}
+
 /// The line `run` prints as a check starts: its script and its first argument, as the Python
 /// printed `argv[4:6]`.
 fn starting(id: &str, c: &Check, given: &str) -> String {
@@ -583,7 +598,6 @@ fn run_checks(it: &Args, root: &Path, ledger: &Ledger) -> (Ledger, Vec<usize>) {
         Ok(ran) if ran.status == 0 => ran.out().trim().to_owned(),
         _ => fail(SCRIPT, "`date +%Y-%m-%d` did not run"),
     };
-    let engine_value = engine.to_value();
     let mut rows: Vec<Row> = Vec::new();
     let mut touched: Vec<usize> = Vec::new();
     let mut pinned = false;
@@ -598,17 +612,7 @@ fn run_checks(it: &Args, root: &Path, ledger: &Ledger) -> (Ledger, Vec<usize>) {
         let mut codes: Vec<(&Check, i32, String)> = Vec::new();
         for (n, c) in r.checks.iter().enumerate() {
             let out = work.join(format!("{}-{n}.json", r.id));
-            let mut given: Map<String, Value> = c.input.as_object().cloned().unwrap_or_default();
-            if c.takes.iter().any(|it| it == "engine") {
-                given.insert("engine".to_owned(), engine_value.clone());
-            }
-            if c.takes.iter().any(|it| it == "blaze") {
-                given.insert("blaze".to_owned(), Value::String(engine.blaze.clone()));
-            }
-            if c.takes.iter().any(|it| it == "out") {
-                given.insert("out".to_owned(), Value::String(out.to_string_lossy().into_owned()));
-            }
-            let given = dumps(&Value::Object(given));
+            let given = dumps(&input_of(c, engine, &out));
             if rust_bin(&c.script).is_some() && !pinned {
                 if let Err(why) = pinned_blaze(root) {
                     fail(SCRIPT, &why);
@@ -689,6 +693,59 @@ fn main_with(it: &Args) {
 
 fn expect(holds: bool, what: &str) {
     blaze_script::expect(SCRIPT, holds, what);
+}
+
+/// The registered D11 check crosses from this Rust ledger into the retained Python adapter.
+/// Keep its input/dispatch/status regression here, beside the actual ledger implementation;
+/// harness/v2/test_distributed.py checks that the adapter runs both full acceptance profiles.
+fn distributed_selftest() {
+    // Read the checkout being checked, not a build-time copy baked into a cached script.
+    let ledger: Ledger = input::parse(DATA, SCRIPT);
+    let Some(row) = ledger.rows.iter().find(|row| row.id == "D11") else {
+        fail(SCRIPT, "selftest: the registered D11 row is missing");
+    };
+    expect(row.checks.len() == 1, "D11 runs one adapter covering both profiles");
+    let check = &row.checks[0];
+    expect(
+        check.script == "harness/v2/distributed.py"
+            && check.command.is_empty()
+            && check.takes == owned(&["blaze", "out"]),
+        "D11 hands the selected blaze and report path to the distributed adapter",
+    );
+    let engine: EngineSpec = input::parse(r#"{"kind": "v2", "blaze": "selected/blaze"}"#, SCRIPT);
+    let out = Path::new("ledger-work/D11-0.json");
+    let given = input_of(check, &engine, out);
+    expect(
+        given
+            == serde_json::json!({
+                "cores": 2, "daemon_memory_gb": 6,
+                "blaze": "selected/blaze", "out": "ledger-work/D11-0.json"
+            }),
+        "D11 keeps its explicit resources and does not inject an unrequested engine field",
+    );
+    let encoded = dumps(&given);
+    expect(
+        argv_of(check, &encoded)
+            == ["uv", "run", "--frozen", "python", "harness/v2/distributed.py", encoded.as_str()],
+        "D11 dispatches the registered Python adapter with the ledger's actual input",
+    );
+    let passed = judged(row, &[(check, 0, String::new())], "abc", "d");
+    let expected = if row.missing.is_empty() {
+        Status::new("met", "abc", "d", "")
+    } else {
+        Status::new("open", "abc", "d", &first_300(&format!("its checks pass; still to write: {}", row.missing)))
+    };
+    expect(passed == expected, "D11's missing acceptance evidence remains open after its adapter passes");
+    let complete = Row { missing: String::new(), ..row.clone() };
+    let failed = judged(&complete, &[(check, 1, "distv2-dev fail (controlled build failure)".to_owned())], "abc", "d");
+    expect(
+        failed.state == "open" && failed.detail.contains("controlled build failure"),
+        "even a complete D11 row cannot be met when its adapter fails",
+    );
+    expect(
+        judged(&complete, &[(check, 0, String::new())], "abc", "d") == Status::new("met", "abc", "d", ""),
+        "D11 becomes met only when every check passes and no evidence is missing",
+    );
 }
 
 fn selftest() {
@@ -807,6 +864,7 @@ fn selftest() {
             && starting("A", &check, "{}") == "A: harness/v2/budgets.py {} ...",
         "the line a check starts with is its script and its first argument",
     );
+    distributed_selftest();
     println!("{SCRIPT} selftest: ok");
 }
 

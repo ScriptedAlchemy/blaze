@@ -1024,6 +1024,9 @@ def count_failures(counts: Mapping[str, int], most: int) -> list[str]:
             for name in EDIT_QUERIES if counts.get(name, 0) > most]
 
 
+type SlowJson = str | int | float | bool | None | list[SlowJson] | dict[str, SlowJson]
+
+
 def gap_failures(printed: str, most_ms: float, what: str) -> list[str]:
     """Why a build whose `blaze slow --json` report is `printed` fails its edit by the time no
     span names; empty when it does not. The report's blind spots of kind `unrecorded` are the
@@ -1031,7 +1034,7 @@ def gap_failures(printed: str, most_ms: float, what: str) -> list[str]:
     fails, saying how much and where the report says it was. A report that is no report is a
     ValueError naming `what`."""
     try:
-        report_ = json.loads(printed)
+        report_: SlowJson = json.loads(printed)
     except json.JSONDecodeError as error:
         raise ValueError(f"{what}: `blaze slow --json` printed no JSON: {error}") from error
     spots = report_.get("blind_spots") if isinstance(report_, dict) else None
@@ -1047,25 +1050,27 @@ def gap_failures(printed: str, most_ms: float, what: str) -> list[str]:
     # Where each stretch is, as the report's `gaps` say it (report version 9): its thread and the
     # spans of its lane before and after it. A stretch its lane ran inside no span (`no_span`) is
     # no `unrecorded` blind spot, and is held to the same bound, each on its own.
-    gaps = [gap for gap in report_.get("gaps", []) if isinstance(gap, dict)]
-    out = []
+    report_object = cast(dict[str, SlowJson], report_)
+    gaps = [gap for gap in cast(list[SlowJson], report_object.get("gaps", [])) if isinstance(gap, dict)]
+    out: list[str] = []
     for gap in gaps:
-        ms = gap.get("dur_ns", 0) / 1e6
+        ms = cast(int | float, gap.get("dur_ns", 0)) / 1e6
         if gap.get("kind") == "no_span" and ms > most_ms:
             out.append(f"{ms:.4g} ms of the critical path ran inside no span, over the bound of {most_ms:.4g} ms "
                        f"(slow-is-p0-traced: name it with a span first): {gap_where(gap)}")
     if hidden <= most_ms:
         return out
     where = "; ".join([gap_where(gap) for gap in gaps if gap.get("kind") != "no_span"]
-                      or [str(line) for spot in lost for line in spot.get("evidence", [])])
+                      or [str(line) for spot in lost for line in cast(list[SlowJson], spot.get("evidence", []))])
     return out + [f"{hidden:.4g} ms of the critical path is under no span, over the bound of {most_ms:.4g} ms "
                   f"(slow-is-p0-traced: name it with a span first): {where or 'the report names no lane'}"]
 
 
-def gap_where(gap: dict[str, Any]) -> str:
+def gap_where(gap: dict[str, SlowJson]) -> str:
     """One gap of `blaze slow --json`'s `gaps` in words: how long, where in the build, on which
     thread, and between which spans of its lane."""
-    return (f"{gap.get('dur_ns', 0) / 1e6:.4g} ms at {gap.get('from_ns', 0) / 1e6:.4g} ms on "
+    return (f"{cast(int | float, gap.get('dur_ns', 0)) / 1e6:.4g} ms at "
+            f"{cast(int | float, gap.get('from_ns', 0)) / 1e6:.4g} ms on "
             f"{gap.get('thread_name') or gap.get('lane')} ({gap.get('kind')}), after "
             f"{gap.get('before') or 'no span of its lane'}, before {gap.get('after') or 'no span of its lane'}")
 

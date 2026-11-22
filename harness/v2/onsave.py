@@ -17,6 +17,7 @@ one JSON line."""
 import json, os, re, shutil, statistics, subprocess, sys, time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 
 @dataclass(frozen=True)
@@ -29,12 +30,53 @@ class Input:
     n: int = 15
     warm: int = 30
     pauses: tuple[int, ...] = (0, 50, 200, 1000)
-    env: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict[str, str])
 
 
-RAW = json.loads(sys.argv[1])
-assert set(RAW) <= set(Input.__dataclass_fields__), RAW
-IN = Input(**{**RAW, "pauses": tuple(RAW.get("pauses", (0, 50, 200, 1000)))})
+def read_input() -> Input:
+    value: object = json.loads(sys.argv[1])
+    if not isinstance(value, dict):
+        sys.exit("onsave.py: the input is one JSON object")
+    raw = cast(dict[str, object], value)
+    assert set(raw) <= set(Input.__dataclass_fields__), raw
+    strings: dict[str, str] = {}
+    for name in ("bin", "work", "label", "project"):
+        string = raw.get(name, "hello" if name == "project" else None)
+        if not isinstance(string, str):
+            sys.exit(f"onsave.py: {name} is a string")
+        strings[name] = string
+    ahead = raw.get("ahead")
+    if not isinstance(ahead, bool):
+        sys.exit("onsave.py: ahead is a required boolean")
+    integers: dict[str, int] = {}
+    for name, default in (("n", 15), ("warm", 30)):
+        integer = raw.get(name, default)
+        if not isinstance(integer, int) or isinstance(integer, bool):
+            sys.exit(f"onsave.py: {name} is an integer")
+        integers[name] = integer
+    pauses_value = raw.get("pauses", [0, 50, 200, 1000])
+    if not isinstance(pauses_value, list):
+        sys.exit("onsave.py: pauses is a list of integers")
+    pauses: list[int] = []
+    for pause in cast(list[object], pauses_value):
+        if not isinstance(pause, int) or isinstance(pause, bool):
+            sys.exit("onsave.py: pauses is a list of integers")
+        pauses.append(pause)
+    env_value = raw.get("env", {})
+    if not isinstance(env_value, dict):
+        sys.exit("onsave.py: env is an object of names to strings")
+    env: dict[str, str] = {}
+    for name, setting in cast(dict[str, object], env_value).items():
+        if not isinstance(setting, str):
+            sys.exit(f"onsave.py: env.{name} is a string")
+        env[name] = setting
+    return Input(
+        strings["bin"], strings["work"], strings["label"], ahead, strings["project"],
+        integers["n"], integers["warm"], tuple(pauses), env,
+    )
+
+
+IN = read_input()
 assert IN.project in ("hello", "six"), IN.project
 WORK = Path(IN.work).resolve()
 HOME = WORK / "home"
@@ -185,11 +227,12 @@ def main() -> None:
     row("daemon pid", daemon)
 
     row("no-op run", stats([run(VALUE[0], "no-op") for _ in range(IN.n)]))
-    times = []
+    times: list[float] = []
     for i in range(IN.n):
         write(VALUE[0], f"// comment {i}\n")
         times.append(run(VALUE[0], "comment"))
     row("comment edit + run, no pause", stats(times))
+    cpus: list[float] = []
     for pause in IN.pauses:
         times, cpus = [], []
         before_log = said(log())

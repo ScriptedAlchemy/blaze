@@ -23,8 +23,9 @@
 # to main, also the smoke corpus (harness/smoke.py, harness/smoke/).
 # scripts/src/bin/gate_changes.rs has the list and why each path is on it. It names what is
 # code, so a new directory is not: any other change (documentation, the site, benches, the
-# other harnesses and workflows) runs the script checks alone, and a list of files that cannot
-# be had counts as code. `ci` is the one check that says whether everything that ran passed: it
+# other harnesses and workflows) runs the script, workflow and Lean checks plus partial
+# distributed library feedback, and a list of files that cannot be had counts as code.
+# `ci` is the one check that says whether everything that ran passed: it
 # is the check branch rules and the merge queue require. The queue tests each pull request
 # merged onto main and whatever is ahead of it, and main moves only to what it tested.
 #
@@ -444,10 +445,10 @@ jobs:
 
   # Partial library feedback on the pinned Rust toolchain. Upstream parks blaze-global
   # and removes the old memory-admission API; full compiler acceptance remains in Stage 1.
+  # Run after workflow validation on every trigger, even if changes or scripts cannot bootstrap.
   distributed-core:
     name: distributed library controls with pinned Cargo (partial)
-    needs: [changes, scripts, workflows]
-    if: needs.changes.outputs.tier != 'none'
+    needs: [workflows]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     env:

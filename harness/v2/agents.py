@@ -22,6 +22,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 ROOT = Path(__file__).resolve().parents[2] / "agents"
 KINDS = {"howto": ("id", "date", "who", "task", "do", "why", "state"), "annoyances": ("id", "date", "who", "where", "what", "state")}
@@ -34,7 +35,7 @@ class Ask:
     full: bool = False
     show: str | None = None
     classes: bool = False
-    add: dict | None = None
+    add: dict[str, object] | None = None
     check: bool = False
     imported: str | None = None
     lane: str | None = None
@@ -43,28 +44,53 @@ class Ask:
 def ask() -> Ask:
     if len(sys.argv) != 2:
         sys.exit(__doc__)
-    raw = json.loads(sys.argv[1])
-    if not isinstance(raw, dict):
+    value: object = json.loads(sys.argv[1])
+    if not isinstance(value, dict):
         sys.exit("agents.py: the input is one JSON object")
-    raw = dict(raw)
+    raw = dict(cast(dict[str, object], value))
     if "import" in raw:
         raw["imported"] = raw.pop("import")
     unknown = set(raw) - set(Ask.__dataclass_fields__)
     if unknown:
         sys.exit(f"agents.py: unknown field {sorted(unknown)}")
-    return Ask(**raw)
+    flags: dict[str, bool] = {}
+    for name in ("howto", "full", "classes", "check"):
+        flag = raw.get(name, False)
+        if not isinstance(flag, bool):
+            sys.exit(f"agents.py: {name} is a boolean")
+        flags[name] = flag
+    strings: dict[str, str | None] = {}
+    for name in ("find", "show", "imported", "lane"):
+        string = raw.get(name)
+        if string is not None and not isinstance(string, str):
+            sys.exit(f"agents.py: {name} is a string or null")
+        strings[name] = string
+    add = raw.get("add")
+    if add is not None and not isinstance(add, dict):
+        sys.exit("agents.py: add is a JSON object or null")
+    return Ask(
+        howto=flags["howto"], find=strings["find"], full=flags["full"], show=strings["show"],
+        classes=flags["classes"], add=cast(dict[str, object] | None, add), check=flags["check"],
+        imported=strings["imported"], lane=strings["lane"],
+    )
 
 
-def rows(kind: str) -> list[dict]:
-    out = []
+def object_row(value: object, where: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise TypeError(f"agents.py: {where} is a JSON object")
+    return cast(dict[str, object], value)
+
+
+def rows(kind: str) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
     for path in sorted((ROOT / kind).glob("*.json")):
-        row = json.loads(path.read_text())
+        row = object_row(json.loads(path.read_text()), str(path))
         row["id"] = path.stem
         out.append(row)
     return out
 
 
-def write(kind: str, name: str, row: dict) -> str:
+def write(kind: str, name: str, row: dict[str, object]) -> str:
     safe = "".join(c if c.isalnum() or c in "-_." else "-" for c in name).strip("-.")
     if not safe:
         sys.exit(f"agents.py: `{name}` names no file")
@@ -80,13 +106,20 @@ def write(kind: str, name: str, row: dict) -> str:
     return safe
 
 
-def text(row: dict) -> str:
+def text(row: dict[str, object]) -> str:
     return json.dumps(row, ensure_ascii=False).lower()
 
 
-def one_line(row: dict) -> str:
+def row_string(row: dict[str, object], name: str) -> str:
+    value = row.get(name, "")
+    if not isinstance(value, str):
+        raise TypeError(f"agents.py: row {row.get('id')}: {name} is a string")
+    return value
+
+
+def one_line(row: dict[str, object]) -> str:
     what = " ".join(str(row.get("what") or row.get("task") or "").split())
-    return f"{row['id']:22s} {row.get('date', ''):10s} {row.get('state', ''):8.8s} {row.get('where', '')[:28]:28s} {what[:110]}"
+    return f"{row_string(row, 'id'):22s} {row_string(row, 'date'):10s} {row_string(row, 'state'):8.8s} {row_string(row, 'where')[:28]:28s} {what[:110]}"
 
 
 def main() -> None:
@@ -113,15 +146,17 @@ def main() -> None:
         count: dict[str, list[str]] = {}
         for row in rows("annoyances"):
             if row.get("class") and row.get("state") != "fixed":
-                count.setdefault(" ".join(str(row["class"]).split())[:160], []).append(row["id"])
+                count.setdefault(" ".join(str(row["class"]).split())[:160], []).append(row_string(row, "id"))
         for name, ids in sorted(count.items(), key=lambda kv: -len(kv[1])):
             print(f"{len(ids):3d}  {name}  [{', '.join(ids[:6])}]")
     elif a.add is not None:
         kind = {"annoyance": "annoyances", "howto": "howto"}.get(str(a.add.get("kind")))
-        if kind is None or not isinstance(a.add.get("row"), dict):
+        added_row = a.add.get("row")
+        if kind is None or not isinstance(added_row, dict):
             sys.exit("agents.py: add takes kind (annoyance or howto) and row")
+        row = cast(dict[str, object], added_row)
         if kind == "howto":
-            print(write(kind, str(a.add.get("name", "")), a.add["row"]))
+            print(write(kind, str(a.add.get("name", "")), row))
         else:
             lane = str(a.add.get("lane", ""))
             if not lane:
@@ -129,13 +164,17 @@ def main() -> None:
             n = 1
             while (ROOT / kind / f"{lane}-{n}.json").exists():
                 n += 1
-            print(write(kind, f"{lane}-{n}", a.add["row"]))
+            print(write(kind, f"{lane}-{n}", row))
     elif a.imported is not None:
-        old = json.loads(Path(a.imported).read_text())
+        old = object_row(json.loads(Path(a.imported).read_text()), a.imported)
         have = {kind: {json.dumps({k: v for k, v in r.items() if k != "id"}, sort_keys=True) for r in rows(kind)} for kind in KINDS}
         made = 0
         for kind in KINDS:
-            for row in old.get(kind, []):
+            imported_rows = old.get(kind, [])
+            if not isinstance(imported_rows, list):
+                sys.exit(f"agents.py: {a.imported}: {kind} is a list of rows")
+            for imported_row in cast(list[object], imported_rows):
+                row = object_row(imported_row, f"{a.imported}: {kind} row")
                 body = json.dumps({k: v for k, v in row.items() if k != "id"}, sort_keys=True)
                 if body in have[kind]:
                     continue
@@ -155,8 +194,8 @@ def main() -> None:
         for kind, fields in KINDS.items():
             for path in sorted((ROOT / kind).glob("*.json")):
                 try:
-                    row = json.loads(path.read_text())
-                except ValueError as error:
+                    row = object_row(json.loads(path.read_text()), str(path))
+                except (ValueError, TypeError) as error:
                     print(f"{path}: {error}")
                     bad += 1
                     continue

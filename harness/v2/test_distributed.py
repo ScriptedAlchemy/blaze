@@ -10,7 +10,6 @@ import io
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import unittest
 from collections.abc import Callable
@@ -20,7 +19,6 @@ from typing import Any
 from unittest.mock import patch
 
 import distributed as d
-import ledger
 
 
 class DistributedLedgerTests(unittest.TestCase):
@@ -254,41 +252,29 @@ class DistributedLedgerTests(unittest.TestCase):
         self.assertIn("identity after dev cleanup", detail)
         self.assertIn("build binaries differ", detail)
 
-    def test_the_registered_check_runs_through_the_real_ledger_input_adapter(self) -> None:
-        rows = d.parse(ledger.Ledger, str(d.ROOT / ledger.DATA), ledger.SCRIPT)
+    def test_the_registered_d11_resources_drive_both_profiles(self) -> None:
+        # The Rust ledger selftest owns input injection, dispatch and status judgement.
+        # Keep this side of the boundary on the registered row and the real adapter.
+        rows: dict[str, Any] = json.loads((d.ROOT / "docs/v2/plan/objectives.json").read_text())
+        row = next(it for it in rows["rows"] if it["id"] == "D11")
+        self.assertEqual(len(row["checks"]), 1)
+        check = row["checks"][0]
+        self.assertEqual(check["script"], "harness/v2/distributed.py")
+        self.assertEqual(check["command"], "")
+        self.assertEqual(check["takes"], ["blaze", "out"])
         work = self.root / "ledger-work"
-        passed: list[d.Input] = []
-
-        def child(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-            if argv[0] == "git":
-                answer = self.source["commit"] if argv[-2:] == ["rev-parse", "HEAD"] else ""
-                return subprocess.CompletedProcess[str](argv, 0, stdout=answer)
-            self.assertEqual(argv[:4], ["uv", "run", "--frozen", "python"])
-            self.assertEqual(argv[4], "harness/v2/distributed.py")
-            given = d.parse(d.Input, argv[5], d.SCRIPT)
-            passed.append(given)
-            try:
-                d.main(given)
-            except SystemExit as ended:
-                return subprocess.CompletedProcess[str](argv, ended.code if type(ended.code) is int else 1)
-            self.fail("the adapter must finish with its ledger report's exit status")
-
-        with contextlib.redirect_stdout(io.StringIO()), \
-                patch.object(d.distv2, "main", return_value=None) as acceptance, \
-                patch.object(ledger.subprocess, "run", side_effect=child):
-            updated = ledger.run(ledger.Input("run", engine=d.EngineSpec("v2", self.given.blaze),
-                                              work=str(work), ids=("D11",)), d.ROOT, rows)
-        self.assertEqual(len(passed), 1)
-        self.assertEqual(passed[0].blaze, self.given.blaze)
-        self.assertEqual(passed[0].out, str(work / "D11-0.json"))
-        self.assertEqual((passed[0].cores, passed[0].daemon_memory_gb), (2, 6))
+        work.mkdir()
+        out = work / "D11-0.json"
+        given = d.parse(d.Input, json.dumps({**check["input"], "blaze": self.given.blaze, "out": str(out)}), d.SCRIPT)
+        with patch.object(d.distv2, "main", return_value=None) as acceptance:
+            result = self.invoke(given, code=0)
+        self.assertEqual((given.cores, given.daemon_memory_gb), (2, 6))
         self.assertEqual(acceptance.call_count, 2)
-        result = json.loads((work / "D11-0.json").read_text())
         self.assertEqual(result["counts"], {"pass": 2})
-        row = next(it for it in updated.rows if it.id == "D11")
-        self.assertEqual(row.status.state, "open" if row.missing else "met")
-        if row.missing:
-            self.assertIn("its checks pass; still to write:", row.status.detail)
+        for call in acceptance.call_args_list:
+            profile = call.args[0]
+            self.assertEqual(profile.blaze, given.blaze)
+            self.assertEqual((profile.cores, profile.daemon_memory_gb), (2, 6))
 
 
 if __name__ == "__main__":

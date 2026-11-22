@@ -218,6 +218,36 @@ class AcceptanceGateTests(unittest.TestCase):
             [*shell_command(workflow, step), "-c", shell_step(workflow, step)],
             cwd=ROOT, env={**os.environ, **env}, text=True, capture_output=True, timeout=30)
 
+    def test_partial_library_feedback_is_independent_of_bootstrap_and_tier(self):
+        source = MAIN.read_text()
+
+        def require_independent(text):
+            job = text.split("  distributed-core:\n", 1)[1].split("\n  cross-probe:", 1)[0]
+            header = job.split("    steps:\n", 1)[0].splitlines()
+            self.assertEqual([line for line in header if line.startswith("    needs:")],
+                             ["    needs: [workflows]"])
+            self.assertFalse(any(line.startswith("    if:") for line in header))
+            workflow_header = text.split("  workflows:\n", 1)[1].split("    steps:\n", 1)[0]
+            self.assertFalse(any(line.startswith(("    needs:", "    if:"))
+                                 for line in workflow_header.splitlines()))
+
+        require_independent(source)
+        header = "    name: distributed library controls with pinned Cargo (partial)\n    needs: [workflows]\n"
+        self.assertEqual(source.count(header), 1)
+        for name, replacement in (
+            ("waits for changes", header.replace("[workflows]", "[changes, workflows]")),
+            ("waits for scripts", header.replace("[workflows]", "[scripts, workflows]")),
+            ("filters a tier", header + "    if: needs.changes.outputs.tier != 'none'\n"),
+        ):
+            with self.subTest(regression=name), self.assertRaises(AssertionError):
+                require_independent(source.replace(header, replacement))
+
+        ci_header = source.split("  ci:\n", 1)[1].split("    steps:\n", 1)[0]
+        self.assertIn(
+            "    needs: [changes, scripts, workflows, lean, distributed-core, linux-6-8, linux-arm64, macos, workspace-check]\n",
+            ci_header,
+        )
+
     def test_aggregate_requires_real_acceptance_for_every_code_tier(self):
         base = {"changes": {"result": "success", "outputs": {"tier": "gate"}},
                 "scripts": {"result": "success", "outputs": {}},
@@ -243,8 +273,19 @@ class AcceptanceGateTests(unittest.TestCase):
         docs["linux-arm64"] = {"result": "skipped", "outputs": {}}
         docs["linux-6-8"]["result"] = "skipped"
         docs["workspace-check"]["result"] = "skipped"
-        docs["distributed-core"]["result"] = "skipped"
         cases.append(("docs need no build", docs, True))
+        # The independent partial library check can succeed while bootstrap is blocked.
+        # It supplies no compiler or acceptance receipt and cannot waive either gate.
+        for fixture in (base, warm, docs):
+            tier = fixture["changes"]["outputs"]["tier"]
+            for job in ("changes", "scripts"):
+                for result in (None, "", "failure", "cancelled", "skipped"):
+                    changed = copy.deepcopy(fixture)
+                    if result is None:
+                        del changed[job]
+                    else:
+                        changed[job]["result"] = result
+                    cases.append((f"{tier} partial library success with {job} {result!r}", changed, False))
         # Lean runs for every change, including docs: a missing or skipped proof job
         # cannot stand for success even when the code-tier jobs do not apply.
         for fixture in (base, warm, docs):

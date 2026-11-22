@@ -20,6 +20,7 @@ context is placed by its line in the new file, which the hunks left out had shif
 hunk that removes a line is refused: say which lines are yours by adding them."""
 import json, os, re, subprocess, sys, tempfile
 from dataclasses import dataclass, field
+from typing import cast
 
 
 @dataclass(frozen=True)
@@ -28,14 +29,46 @@ class Input:
     base: str
     message: str
     whole: tuple[str, ...] = ()
-    hunks: dict[str, str] = field(default_factory=dict)
+    hunks: dict[str, str] = field(default_factory=dict[str, str])
     push: str | None = None
 
 
-def main() -> None:
-    raw = json.loads(sys.argv[1])
+def read_input() -> Input:
+    value: object = json.loads(sys.argv[1])
+    if not isinstance(value, dict):
+        sys.exit("lane_commit.py: the input is one JSON object")
+    raw = cast(dict[str, object], value)
     assert set(raw) <= set(Input.__dataclass_fields__), sorted(raw)
-    ask = Input(**{**raw, "whole": tuple(raw.get("whole", ()))})
+    strings: dict[str, str] = {}
+    for name in ("repo", "base", "message"):
+        string = raw.get(name)
+        if not isinstance(string, str):
+            sys.exit(f"lane_commit.py: {name} is a required string")
+        strings[name] = string
+    whole_value = raw.get("whole", [])
+    if not isinstance(whole_value, list):
+        sys.exit("lane_commit.py: whole is a list of file names")
+    whole: list[str] = []
+    for path in cast(list[object], whole_value):
+        if not isinstance(path, str):
+            sys.exit("lane_commit.py: whole is a list of file names")
+        whole.append(path)
+    hunks_value = raw.get("hunks", {})
+    if not isinstance(hunks_value, dict):
+        sys.exit("lane_commit.py: hunks is an object of file names to patterns")
+    hunks: dict[str, str] = {}
+    for path, pattern in cast(dict[str, object], hunks_value).items():
+        if not isinstance(pattern, str):
+            sys.exit(f"lane_commit.py: hunks.{path} is a string pattern")
+        hunks[path] = pattern
+    push = raw.get("push")
+    if push is not None and not isinstance(push, str):
+        sys.exit("lane_commit.py: push is a string or null")
+    return Input(strings["repo"], strings["base"], strings["message"], tuple(whole), hunks, push)
+
+
+def main() -> None:
+    ask = read_input()
     with tempfile.TemporaryDirectory() as tmp:
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
 
@@ -51,7 +84,8 @@ def main() -> None:
         for path, pattern in ask.hunks.items():
             mine = re.compile(pattern)
             head, *hunks = re.split(r"(?m)^(?=@@ )", git("diff", "--no-ext-diff", "-U0", ask.base, "--", path))
-            added, kept = 0, []
+            added = 0
+            kept: list[str] = []
             for hunk in hunks:
                 lines = hunk.splitlines(keepends=True)
                 if not any(mine.search(line) for line in lines[1:] if line.startswith("+")):

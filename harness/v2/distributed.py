@@ -13,7 +13,7 @@ One typed JSON object (inline, a file, or `-`):
 The existing build-identity verifier binds all four programs to the current clean source.
 This adapter never builds or seals them. Evidence stays beside out in <out>.distv2, with a
 fresh dev and release scratch directory. Reusing out/evidence or a volume that cannot prove
-shared clone blocks is an error; pass ledger.py a new work directory on the prepared volume.
+shared clone blocks is an error; pass the Rust ledger a new work directory on the prepared volume.
 
 distv2.main is the acceptance authority, including its finally cleanup. Both profiles keep
 every cold-cache, publication and fault oracle; release also requires real LLVM and folded

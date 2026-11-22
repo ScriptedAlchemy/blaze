@@ -40,9 +40,9 @@ when there is no result at all. A gate run whose smoke did not run is red.
 finding each bound is for, in miniature, as facts the bound has to refuse, and the fixed state as
 facts it has to pass.
 
-`ratchet` is the other guard of this file, of the lints rather than the smoke: the workspace's
-lints are `deny`, and a crate is held at `warn` on one only while the lint's baseline lists it
-(`[workspace.metadata.blaze.lints-ratchet]`, docs/lints.md, "Workspace levels and the ratchet").
+`ratchet` is the retained guard of compiler-lint baselines: where a workspace declares
+`[workspace.metadata.blaze.lints-ratchet]` (docs/cargo.md, "Lints"), its lints are `deny`, and a
+crate is held at `warn` on one only while the lint's baseline lists it.
 With `base`, a git revision, it refuses a crate a `blaze.<lint>.txt` lists that the same file
 did not list at the base (a new downgrade), a count over the base's, and a count turned back to
 `unmeasured`; lowering a count, recording one in place of `unmeasured` and dropping a crate or
@@ -50,6 +50,10 @@ a file pass. A base with no ratchet is the one before it began, and nothing is c
 counts down is `blaze check ... --baselines crates/blaze-lints/baselines --bless-baselines`
 (blaze_lints::baseline), never this script. `empty`, with `lint`, holds when that lint's
 baseline lists no crate, so it is `deny` in every one: the check of ledger row S3 for `std_use`.
+The upstream compiler-lint layer and this checkout's baselines have been removed. `ratchet`
+and `empty` still fail when their metadata is missing; selftest exercises their reader on a
+temporary fixture and proves those refusals. The active source-count ratchets remain in
+scripts/src/bin/allocs.rs and scripts/src/bin/untyped.rs, independently checked by CI.
 """
 
 import json
@@ -846,7 +850,7 @@ def selftest() -> None:
 
 def ratchet_selftest() -> None:
     """The invariant: the baselines only shrink. Each way of loosening one is refused, each way of
-    tightening passes, and the tree's own baselines read."""
+    tightening passes, a fixture's baselines read, and a missing guard is refused."""
     base = {"blaze.std_use.txt": {"a": None, "b": None, "c": 4}, "blaze.wall_clock.txt": {"a": 3}}
     expect(ratchet_off(base, base) == [], "the base against itself holds")
     tightened = {"blaze.std_use.txt": {"a": 7, "c": 2}}
@@ -875,10 +879,35 @@ def ratchet_selftest() -> None:
             pass
     manifest = '[workspace.metadata.blaze.lints-ratchet]\nbaselines = "b"\n'
     expect(ratchet_dir(manifest) == "b" and ratchet_dir("[workspace]\n") is None, "the ratchet's directory")
-    found, now = baselines_at(None)
-    expect(found is not None and (ROOT / found / "TARGET").is_file(), "the tree has a ratchet and a TARGET file")
-    expect(ratchet_off(now, now) == [], "the tree's baselines read")
-    expect(empty("no_such_lint") == [], "a lint with no baseline is `deny` everywhere")
+    import tempfile
+    from unittest.mock import patch
+
+    # The upstream compiler-lint layer was removed. Test its retained reader against real
+    # files of its own, without treating an absent workspace guard as a successful ratchet.
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "Cargo.toml").write_text(manifest)
+        baselines = root / "b"
+        baselines.mkdir()
+        (baselines / "blaze.std_use.txt").write_text("a\t3\nb\tunmeasured\n")
+        with patch.object(sys.modules[__name__], "ROOT", root):
+            expect(ratchet("unused") == ["b has no TARGET file naming the target its counts are of"],
+                   "a declared ratchet with no TARGET is refused before comparing any revision")
+            (baselines / "TARGET").write_text("x86_64-unknown-linux-gnu\n")
+            found, now = baselines_at(None)
+            expect(found == "b" and now == {"blaze.std_use.txt": {"a": 3, "b": None}},
+                   "the declared baseline directory is read from its real files")
+            expect(ratchet_off(now, now) == [], "the fixture's baselines hold against themselves")
+            expect(empty("no_such_lint") == [], "a lint with no baseline is `deny` everywhere")
+            expect(empty("std_use") == ["b/blaze.std_use.txt holds 2 crates at `warn`: a, b"],
+                   "a nonempty baseline cannot pass the empty guard")
+            (root / "Cargo.toml").write_text("[workspace]\n")
+            expect(ratchet("unused") == [
+                "Cargo.toml has no [workspace.metadata.blaze.lints-ratchet]: nothing holds the lints at `deny`"
+            ], "a workspace without ratchet metadata is refused")
+            expect(empty("std_use") == [
+                "Cargo.toml has no [workspace.metadata.blaze.lints-ratchet]: `std_use` is not held at `deny`"
+            ], "missing metadata cannot make an empty guard pass")
 
 
 if __name__ == "__main__":

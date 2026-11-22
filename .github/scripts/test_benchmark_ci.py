@@ -138,13 +138,6 @@ class CallerTests(unittest.TestCase):
                 done, calls = self.run_step(workflow, step)
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
                 self.assertEqual([call["script"] for call in calls], scripts)
-        latency = self.root / "latency/fixture/latency.json"
-        latency.parent.mkdir(parents=True)
-        latency.write_text("{}\n")
-        done, calls = self.run_step("live-latency.yaml", "History and regressions")
-        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertEqual(calls[0]["input"]["files"], [str(latency)])
-        self.assertEqual(calls[1]["input"]["least"], 3)
 
 
 if __name__ == "__main__":

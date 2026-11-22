@@ -905,20 +905,24 @@ for each platform, each on a machine of its own kind.
 | `blaze.yaml` (`gate`) | pull request and merge group | on hosted Linux AArch64: blaze builds and tests itself through `harness/unittests.py`, the released blaze checks the workspace, the profile gate checks the build history, and the script, workflow and Lean jobs check the Python, rules, docs, runner policy and proofs. The store starts empty; the build hands its packs to the tests job. Cross builds and their probe run outside `ci` until their existing blockers are settled | runtime acceptance blocked by the parked compiler |
 | `blaze.yaml` (`warm`) | push to main | the build and tests on hosted Linux AArch64 and macOS, with a fresh store per job; the AArch64 smoke job also runs. The existing canary and release workflows consume the resulting checks and artifacts | |
 | `blaze-platform.yaml` (`profile-gate`) | with each platform's build, but Windows | the profile's gate (`blaze debug gate`, [profiling.md](profiling.md#the-gate-what-a-profile-must-hold)) over the history the build's self-build wrote, with the blaze it made, held to `harness/profile-gate-known.toml`, and each fixture of `crates/blaze-profile/fixtures/gate/` failing its own check (`harness/profile_gate.py`); then `harness/v2/budgets.py` smoke with the same compiler, holding [the smoke's guards](#the-smokes-guards) and uploading `budgets-smoke-<platform>` for the `ci` job; uploads the build's per-build summary as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`. No secret | runtime not measured after integration |
-| `blaze.yaml` (`distributed-core`) | code tiers, alongside the source build | Cargo on the pinned nightly executes the active distributed protocol, worker transport, wire and standalone cache-server library tests; all 44 required models, controls and transport cases must report success. The job records the toolchain and compiler versions. This partial check supplies no Stage 1 compiler or distributed acceptance receipt | native library run pending |
+| `blaze.yaml` (`distributed-core`) | every workflow trigger, after workflow validation | Cargo on the pinned nightly executes the active distributed protocol, worker transport, wire and standalone cache-server library tests; all 44 required models, controls and transport cases must report success. The job records the toolchain and compiler versions. This partial check supplies no Stage 1 compiler or distributed acceptance receipt | native library run pending |
 | `blaze-platform.yaml` (`distributed-tests`) | after the Linux AArch64 source build | the verified source-built compiler executes the full distributed/scheduler library and integration targets and `blaze-cargo`'s daemon tests in one fresh home under the Linux execution observer. All twenty release controls and fourteen bundle models/controls need exact success lines. Both groups, unchanged source/binaries and a complete C4 execution receipt are required by `ci` | runtime not yet measured |
 | `blaze-platform.yaml` (`distributed`) | after the Linux AArch64 source build | the source-built compiler builds the services and runs `harness/distv2.py` in dev and release with every fault check; a complete receipt is required by `ci` | runtime not yet measured |
 | `blaze-platform.yaml` (`forkfixes`) | after the Linux AArch64 source build | all `harness/forkfixes.py` semantic migration cases with that same compiler; complete case, mapping and provenance evidence is required by `ci` | runtime not yet measured |
 | `profile-nightly.yaml` | nightly, by hand | `slower_between_commits` over main's last 10 summaries of one runner class, the newest against the rest (`harness/profile_trend.py`); fails naming each span 1.25 times and 50 ms slower or more | 5 min |
 | `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file | 2 min |
 | `train.yaml` | push to main, by hand | everything below, then a release or the train's issue | about 45 min |
-| `blaze.yaml` | a change the build and the unit tests do not read | the two scripts | 1 min |
+| `blaze.yaml` | a change the build and the unit tests do not read | the script, workflow and Lean checks, plus the partial distributed library controls | native library run pending |
 | `blaze.yaml` (`lean`) | every change | the Lean proofs (`harness/v2/lean_gate.py`, [v2/plan/proofs.md](v2/plan/proofs.md)): `lake build` of `lean/` and `lean/analysis` with the pinned Lean, no `sorry`, and each theorem of `lean/theorems.json` held to Lean's three axioms by `#print axioms`; the checks that need no Lean run in `scripts` | about 4 min from its caches, 15 without; not measured |
 
-The expensive build and library jobs wait for the script and workflow checks, so a harness or
-workflow failure is reported before those jobs occupy the hosted runners. The build and the unit
-tests run only for a change that touches a file they read; any other
-change runs the two scripts alone. `.github/scripts/gate_changes.py` (the `changes` job) names
+The compiler build jobs wait for the script and workflow checks, so a harness or workflow
+failure is reported before those jobs occupy the hosted runners. The partial distributed
+library job waits only for workflow validation and runs on every trigger, so a failed
+`changes` or `scripts` bootstrap does not suppress its feedback. The aggregate `ci` check
+still requires those checks and every applicable compiler and acceptance gate.
+The compiler build and unit tests run only for a change that touches a file they read;
+other changes still run the script, workflow, Lean and partial library checks.
+`scripts/src/bin/gate_changes.rs` (the `changes` job) names
 those files, and why each: the crates (`crates/`, with their test data and the LLVM pin
 `crates/hir-ty-codegen/llvm.json`), the vendored crates
 (`vendor/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`, the
