@@ -382,7 +382,8 @@ export function scan(src: string): Scan {
 		const tgt = next();
 		skipNl();
 		const c = next();
-		if (rel.k !== 'id' || !isP(comma, ',') || tgt.k !== 'id' || !isP(c, ')')) {
+		// Flecs also accepts quoted entity names here, including paths with hyphenated names.
+		if ((rel.k !== 'id' && rel.k !== 'str') || !isP(comma, ',') || (tgt.k !== 'id' && tgt.k !== 'str') || !isP(c, ')')) {
 			err(o, 'Expected "(Relationship, Target)".');
 			i--;
 			return skipStmt(o, 'this pair');
