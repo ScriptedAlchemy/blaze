@@ -9,7 +9,7 @@
 //! its code's class. A blob's bytes are not CBOR; the bytes of a list are the list's own text.
 
 use std::{
-    alloc::{Allocator, Global},
+    alloc::{Allocator, AllocatorClone, Global},
     convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
@@ -381,7 +381,7 @@ pub async fn serve(config: Config) -> Result<(), ServeError> {
 
 /// Serves the connections of `listener` with `server`, until the listener fails. A test uses
 /// this with a listener of its own, so the port is one the machine gives.
-pub async fn serve_on<A: Allocator + Clone + Send + Sync + 'static>(
+pub async fn serve_on<A: AllocatorClone + Send + Sync + 'static>(
     listener: TcpListener,
     server: Arc<Server, A>,
 ) -> Result<(), ServeError> {
@@ -430,7 +430,7 @@ async fn accept(
     listener.accept().await
 }
 
-async fn connection<A: Allocator + Clone + Send + Sync + 'static>(
+async fn connection<A: AllocatorClone + Send + Sync + 'static>(
     stream: TcpStream,
     server: Arc<Server, A>,
 ) -> Result<(), ConnectionError> {

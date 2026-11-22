@@ -490,7 +490,9 @@ fn std_race(seed: u64, plant: LayerPlant) -> Result<(), String> {
     let mut effects = Vec::new();
     let mut rng = Rng::new(seed ^ 0x5eed);
     let total = (ops[0].len() + ops[1].len()) as u64;
-    // A crash at a step of the builds, for the race; the controls' at their end.
+    // A crash at a step of the builds, for the race. The record-first control crashes
+    // after its first commit, before either home puts an output; the dropped-flush control
+    // crashes at the builds' end.
     let crash_at = (plant == LayerPlant::None && rng.below(4) != 0).then(|| rng.below(total + 2));
     let mut crashed = false;
     for step in 0.. {
@@ -525,8 +527,12 @@ fn std_race(seed: u64, plant: LayerPlant) -> Result<(), String> {
             }
             LayerOp::Flush => writer.flush(&mut effects),
         }
+        let record_first = plant == LayerPlant::RecordFirst && matches!(op, LayerOp::Flush);
         let [one, two] = &mut writers;
-        pump_all(&mut sim, &mut [one, two], &mut effects, Some(rng.below(3)))?;
+        // A flush only starts the asynchronous commit. The control must wait for it before
+        // crashing, or subsequent outputs can join it and hide the planted ordering bug.
+        let polls = if record_first { None } else { Some(rng.below(3)) };
+        pump_all(&mut sim, &mut [one, two], &mut effects, polls)?;
         for (home, writer) in writers.iter().enumerate() {
             waiting[home].retain(|(unit, ticket)| {
                 let durable = writer.durable(*ticket);
@@ -535,6 +541,14 @@ fn std_race(seed: u64, plant: LayerPlant) -> Result<(), String> {
                 }
                 !durable
             });
+        }
+        if record_first {
+            if kept.is_empty() {
+                return Err("the record-first control did not make its record durable".to_owned());
+            }
+            sim.crash();
+            crashed = true;
+            break;
         }
     }
     if !crashed {
@@ -603,6 +617,7 @@ fn the_oracle_catches_layer_puts_dropped_at_job_end() {
 #[test]
 fn the_oracle_catches_a_record_visible_before_its_outputs() {
     for seed in 0..6 {
+        assert_eq!(std_race(seed, LayerPlant::None), Ok(()), "seed {seed}: outputs before their record");
         let caught = std_race(seed, LayerPlant::RecordFirst);
         assert!(caught.as_ref().is_err_and(|why| why.contains("before its output")), "seed {seed}: {caught:?}");
     }

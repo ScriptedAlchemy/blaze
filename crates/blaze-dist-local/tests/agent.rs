@@ -909,6 +909,105 @@ impl Granted for WithTail<'_> {
     }
 }
 
+/// The full manifest may repeat a committed value, but cannot accept a different value
+/// under its immutable key. Refusal precedes both the tail upload and publication.
+#[test]
+fn a_tail_conflicting_with_committed_values_is_refused_before_publication() {
+    for policy in [LocalPolicy::Never, LocalPolicy::Fallback] {
+        for change in ["none", "bytes", "kind"] {
+            let world = world(1, WorkConfig::default());
+            let unit = unit(94, 1);
+            let original = value_of(&unit.names[0]);
+            let committed = Pack::of(vec![original.clone()], Global).unwrap();
+            let mut extra = original.clone();
+            match change {
+                "bytes" => extra.bytes[0] ^= 1,
+                "kind" => extra.kind += 1,
+                "none" => {}
+                _ => unreachable!(),
+            }
+            let emitted = Pack::of(vec![extra.clone()], Global).unwrap();
+            let mut cfg = config(&world.socket, &world.blobs);
+            cfg.local = policy.clone();
+            let log = Arc::new(Mutex::new(BTreeMap::new()));
+            let mut compiler = Compiler {
+                names: unit.names.clone(),
+                log: log.clone(),
+                who: 0,
+                entered: Arc::new(AtomicUsize::new(0)),
+                wait_for: 1,
+            };
+            // Keep a subscription so the accepted publication and terminal can be
+            // inspected after the agent has released its own session.
+            let mut observer = Client::connect(&world.socket, random_id().unwrap()).unwrap();
+            let request = blaze_wire::JobRequest {
+                unit: unit.spec,
+                platform: cfg.platform,
+                namespace: cfg.namespace.clone(),
+                source: cfg.source,
+                deadline_ms: observer.welcome.now_ms + 120_000,
+                local: policy.clone(),
+            };
+            let Answer::Binding(observing) =
+                observer.call(Command::Submit(submission(&request, NEED))).unwrap()
+            else {
+                panic!("the observer's subscription was refused")
+            };
+            let result = agent::run(
+                &cfg, &unit, &mut WithTail { compiler: &mut compiler, extra },
+                &AtomicBool::new(false),
+            );
+            assert_eq!(log.lock().unwrap().len(), 1, "the compile phase must actually run");
+            assert!(world.blobs.pack(&committed.reference.pack, Global).unwrap().is_some());
+            let Answer::Publication(publication) = observer.call(Command::Publication(
+                blaze_dist_local::protocol::Packs {
+                    content: observing.subscription.content,
+                    execution: observing.subscription.execution,
+                },
+            )).unwrap() else {
+                panic!("the observer must see the publication state")
+            };
+            if change == "none" {
+                let arrived = result.unwrap();
+                assert_eq!(arrived.source, Source::Executed);
+                assert_eq!(arrived.values.len(), 1);
+                assert_eq!(arrived.values[&original.key], (original.kind, original.bytes));
+                assert_eq!(arrived.packs, [committed.reference]);
+                assert_eq!(publication.packs.as_deref(), Some(arrived.packs.as_slice()));
+                assert!(publication.accepted_attempt.is_some());
+                assert!(world.blobs.published(&unit.spec, Global).unwrap().is_some());
+            } else {
+                let failure = result.unwrap_err();
+                assert!(
+                    matches!(&failure, Error::Refused(why)
+                        if why.contains("full output conflicts with the committed value")
+                            && why.contains(&blaze_wire::json::hex(&original.key).to_string())
+                            && why.contains(&blaze_wire::json::hex(&unit.spec).to_string())),
+                    "{change}: {failure}"
+                );
+                assert!(matches!(agent::decide(&policy, failure), Err(Error::Refused(_))));
+                assert!(publication.packs.is_none(), "a conflicting full manifest was accepted");
+                assert!(publication.accepted_attempt.is_none());
+                assert!(world.blobs.published(&unit.spec, Global).unwrap().is_none());
+                assert!(
+                    world.blobs.pack(&emitted.reference.pack, Global).unwrap().is_none(),
+                    "a conflicting tail must be refused before uploading any of its packs"
+                );
+            }
+            let Answer::Terminal(blaze_dist_local::protocol::Terminal {
+                value: Some(terminal), ..
+            }) = observer.call(Command::Terminal(observing.subscription)).unwrap() else {
+                panic!("the observer must receive the unit's final verdict")
+            };
+            assert_eq!(
+                terminal.termination.outcome,
+                if change == "none" { blaze_wire::Outcome::Passed } else { blaze_wire::Outcome::Failed }
+            );
+            observer.release().unwrap();
+        }
+    }
+}
+
 #[test]
 fn a_late_subscriber_waits_for_the_one_leads_full_tail() {
     use std::sync::mpsc;

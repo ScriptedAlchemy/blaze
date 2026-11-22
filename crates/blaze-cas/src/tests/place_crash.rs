@@ -453,11 +453,12 @@ impl World {
         self.since_open = [false; PATHS.len()];
         let mut effects = Vec::new();
         let mut store = Store::open(config("store"), &mut effects);
+        // KeepsDerived changes the open's sweep, so it must be in force while opening.
+        store.plant = self.plant;
         drive(&mut self.sim, &mut store, &mut effects);
         if !store.ready() {
             return Err(format!("the store does not open: {:?}", store.broken()));
         }
-        store.plant = self.plant;
         store.names.plant_one_name = self.plant == PlacePlant::OneName;
         store.starts(&path(STARTED), true);
         self.store = Some(store);
@@ -828,7 +829,9 @@ fn the_oracle_catches_a_derive_that_skipped_a_range() {
 #[test]
 fn the_oracle_catches_a_derived_file_accepted_as_a_crash_left_it() {
     let derived = Op::Derived { base: 0, seed: 11, ranges: 3, len: Len::Same };
-    let ops = [whole(4), place(0, 0), derived, place(1, 1), Op::Crash, place(1, 2)];
+    // The reopen makes the base's file not yet known, so this place constructs the derived
+    // value's own file instead of patching the output directly from the known base.
+    let ops = [whole(4), place(0, 0), derived, Op::Reopen, place(1, 1), Op::Crash, place(1, 2)];
     let (seed, why) = caught(&ops, 0..96, PlacePlant::KeepsDerived)
         .expect("the oracle missed a torn derived file cloned from as a crash left it");
     assert!(why.contains("was placed with value 1 and holds"), "seed {seed}: {why}");

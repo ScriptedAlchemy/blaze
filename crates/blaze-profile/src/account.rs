@@ -84,9 +84,9 @@ impl Writer {
             "AllCrates" | "Crate" | "PrimaryCrates" | "LibraryRoots" | "LocalRoots"
             | "SourceRootInput" | "FileSourceRootInput" | "FrontSettings" | "NamedPaths"
             | "PathBucket" | "FrontEnd" => Writer::Plan,
-            // Where the database keeps its entries and macro definitions: set once by the
-            // driver as it opens the store, as a plan's setting is.
-            "EntryStore" | "KeptDefs" => Writer::Plan,
+            // Where the database keeps its entries and macro definitions, and the policy
+            // for demanding a keyed crate's text: supplied as the driver opens a snapshot.
+            "EntryStore" | "KeptDefs" | "TextDemand" => Writer::Plan,
             "BuiltinDerives" | "CandidateSlice" | "CrateResolution" | "DepImages"
             | "DirectorySlot" | "FieldOrder" | "FrozenDefMaps" | "FrozenDiagnosticItems"
             | "FrozenImpls" | "FrozenLangItems" | "ImplIdentities" | "InherentSlice" | "KeptConsts"
@@ -114,7 +114,7 @@ impl Writer {
             // writes that mark the crate, as for every other kind.
             "CrateResolution" | "DirectorySlot" | "ImageSlot" | "DefMapSlot" | "LangItemsSlot"
             | "DiagnosticItemsSlot" | "PagesSlot" | "ImplTablesSlot" | "SurfaceSlot" | "RuntimeSlot"
-            | "KeptSlot" | "BaseSlot" => Writer::Derived,
+            | "KeptSlot" | "BaseSlot" | "BodiesSlot" => Writer::Derived,
             _ => Writer::Unattributed,
         }
     }
@@ -1061,6 +1061,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_text_policy_and_published_bodies_have_their_writers() {
+        let wrote = [
+            QueryCountRow {
+                written: 1,
+                executed: 1,
+                ran_new: 1,
+                ..counts("hir_expand::declarative::stored::TextDemand")
+            },
+            QueryCountRow {
+                written: 4,
+                executed: 4,
+                ran_new: 4,
+                ..counts("base_db::CrateSlot")
+            },
+        ];
+        let slots = Slots::of([("hir_ty::check_cache::BodiesSlot", 4)]);
+        let account = Account::of(10, &wrote, &[], Seen { slots, ..Seen::default() });
+        assert_eq!(
+            (account.row.written_plan, account.row.written_derived, account.row.written_unattributed),
+            (1, 4, 0)
+        );
+        assert!(account.alarms().is_empty());
+
+        let unowned = Account::of(10, &wrote, &[], Seen::default());
+        assert_eq!(unowned.alarms(), [Alarm::Unattributed { writes: 4 }]);
+    }
+
+    #[test]
     fn a_file_is_placed_by_its_path() {
         assert_eq!(Origin::of_file("/w/src/lib.rs", "/w"), Origin::Workspace);
         assert_eq!(Origin::of_file("/w/src/lib.rs", "/w/"), Origin::Workspace);
@@ -1091,26 +1119,36 @@ mod tests {
         let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let mut files = Vec::new();
         walk(&crates, &mut files);
+        files.sort();
         let mut unnamed = Vec::new();
-        let mut inputs = 0;
+        let mut inputs = BTreeSet::new();
+        let mut slots = BTreeSet::new();
         for file in files {
-            let Ok(text) = std::fs::read_to_string(&file) else { continue };
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", file.display()));
             let lines: Vec<&str> = text.lines().collect();
             for (at, line) in lines.iter().enumerate() {
                 if !line.trim_start().starts_with("#[blaze_memo::input") {
                     continue;
                 }
-                let Some(name) = lines[at + 1..].iter().take(8).find_map(|it| {
-                    let rest = it.split("struct ").nth(1)?;
-                    Some(rest.split(|c: char| !c.is_alphanumeric() && c != '_').next()?.to_owned())
-                }) else {
-                    continue;
-                };
-                inputs += 1;
+                let name = lines[at + 1..]
+                    .iter()
+                    .take(8)
+                    .find_map(|it| {
+                        let rest = it.split("struct ").nth(1)?;
+                        Some(rest.split(|c: char| !c.is_alphanumeric() && c != '_').next()?.to_owned())
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "the input at {}:{} has no struct the source guard can name",
+                            file.display(), at + 1
+                        )
+                    });
                 // A crate slot's writer is its kind's (`Writer::of_slot`), held below.
                 if name != CRATE_SLOT && Writer::of_input(&name) == Writer::Unattributed {
                     unnamed.push(format!("{name} ({})", file.display()));
                 }
+                inputs.insert((file.strip_prefix(&crates).unwrap().to_path_buf(), name));
             }
             // Every kind a crate is given (`Crate::give::<K>`) has a writer too.
             for (at, _) in text.match_indices(".give::<") {
@@ -1119,12 +1157,45 @@ mod tests {
                     .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
                     .collect();
                 // A generic giver's `K`, and this test's own text, name no kind.
-                if !kind.is_empty() && kind != "K" && Writer::of_slot(&kind) == Writer::Unattributed {
-                    unnamed.push(format!("the crate slot kind {kind} ({})", file.display()));
+                if !kind.is_empty() && kind != "K" {
+                    if Writer::of_slot(&kind) == Writer::Unattributed {
+                        unnamed.push(format!("the crate slot kind {kind} ({})", file.display()));
+                    }
+                    slots.insert((file.strip_prefix(&crates).unwrap().to_path_buf(), kind));
                 }
             }
         }
-        assert!(inputs >= 20, "the walk found {inputs} inputs: it no longer reads the tree's");
+        // The memo engine replaced the old query engine's inputs. Name every current
+        // declaration instead of an obsolete count, so a missing file or a lost input
+        // cannot be hidden by other files contributing enough declarations.
+        let expected_inputs = [
+            ("base-db/src/lib.rs", "AllCrates"),
+            ("base-db/src/lib.rs", "LibraryRoots"),
+            ("base-db/src/lib.rs", "LocalRoots"),
+            ("base-db/src/lib.rs", "ProcessEnv"),
+            ("base-db/src/settings.rs", "FrontSettings"),
+            ("blaze-item-hash/src/identity/inputs.rs", "FrontEnd"),
+            ("hir-expand/src/declarative/stored.rs", "KeptDefs"),
+            ("hir-expand/src/declarative/stored.rs", "TextDemand"),
+            ("hir-ty/src/consteval/deps.rs", "KeptConsts"),
+            ("hir-ty/src/layout/field_order.rs", "FieldOrder"),
+            ("hir-ty-mir/src/mir/location.rs", "SourceNames"),
+        ];
+        for (file, name) in expected_inputs {
+            assert!(
+                inputs.contains(&(std::path::PathBuf::from(file), name.to_owned())),
+                "the source walk missed {file}'s input {name}"
+            );
+        }
+        for (file, kind) in [
+            ("hir-ty/src/check_cache.rs", "BodiesSlot"),
+            ("hir-ty/src/check_cache/runtime.rs", "RuntimeSlot"),
+        ] {
+            assert!(
+                slots.contains(&(std::path::PathBuf::from(file), kind.to_owned())),
+                "the source walk missed {file}'s crate slot {kind}"
+            );
+        }
         assert_eq!(unnamed, Vec::<String>::new(), "inputs with no writer in `Writer::of_input`");
     }
 

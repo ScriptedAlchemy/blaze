@@ -31,22 +31,9 @@ runs:
         if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
           sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
         fi
-    # The daemon pins its direct-IO buffers with io_uring (crates/blaze-core/src/uring.rs,
-    # `Registered`), which needs more locked memory than Ubuntu's 8 MiB RLIMIT_MEMLOCK; without
-    # it `blaze serve` exits at start ("io_uring registered buffers: Cannot allocate memory").
-    # Each later step's shell is a child of Runner.Worker, so its limit is the one raised.
-    - name: locked memory
-      if: runner.os == 'Linux'
-      shell: bash
-      run: |
-        worker=$(pgrep -o -f Runner.Worker) || { echo "::error::locked memory: no Runner.Worker process to raise RLIMIT_MEMLOCK of"; exit 1; }
-        sudo prlimit --pid "$worker" --memlock=unlimited:unlimited
-        prlimit --pid "$worker" --memlock
-    - name: locked memory is raised
-      if: runner.os == 'Linux'
-      shell: bash
-      run: |
-        [ "$(ulimit -l)" = unlimited ] || { echo "::error::locked memory: RLIMIT_MEMLOCK is $(ulimit -l) KiB in a step after it was raised"; exit 1; }
+    # The released daemon and the native driver tests share io_uring's locked-memory
+    # prerequisite. The action verifies that a later step inherits the raised limit.
+    - uses: ./.github/actions/locked-memory
     # A cold store (a release of other sources, or a project main has not pushed yet) builds blaze in more
     # than a hosted runner's 16 GB (rcache, #664): swap lets that run finish, slowly, where it
     # would be killed, and the warm runs after it never touch it. The pinned 0.20261030 release

@@ -103,6 +103,8 @@ pub trait Granted {
     /// front of its store. Only the current lead runs this tail; other subscribers take
     /// its full manifest. Emit any additional values through `output`; they are uploaded
     /// only after this call succeeds, before the manifest is committed.
+    /// A repeated committed key must have the same kind and bytes; a mismatch refuses
+    /// the entire tail before any of its values are uploaded.
     /// An error is a final compiler/export refusal under every local policy.
     fn complete(
         &mut self,
@@ -702,6 +704,19 @@ fn execute<A: AllocatorClone>(
                     if lost.load(Ordering::Acquire) {
                         return Ok(None);
                     }
+                    // A tail's own packs may be canonical yet disagree with the phase it
+                    // completed. Check the whole buffer before any upload or immutable
+                    // publication, while these committed values are still borrowed here.
+                    for value in &extra {
+                        if let Some((kind, bytes)) = arrived.values.get(&value.key)
+                            && (*kind != value.kind || bytes.as_slice() != value.bytes.as_slice())
+                        {
+                            return Err(refuse(format!(
+                                "full output conflicts with the committed value under key {}",
+                                hex(&value.key)
+                            )));
+                        }
+                    }
                     let mut packs = packs;
                     if !extra.is_empty() {
                         for pack in Pack::batches(extra, Global)
@@ -1246,6 +1261,42 @@ mod tests {
         ).unwrap_err();
         assert!(matches!(refused, Error::Committed(_)));
         assert_eq!(counts.allocations.get(), counts.deallocations.get());
+
+        for (changed, duplicate) in [
+            ("bytes", value(1, b"other")),
+            ("kind", Value { kind: 9, ..value(1, b"one") }),
+        ] {
+            // Each pack is valid by itself. The refusal must come from combining
+            // different values under one key, after the first pack allocated its map.
+            let conflicting = Pack::of(vec![duplicate], Global).unwrap();
+            let references = [packs[0].reference.clone(), conflicting.reference.clone()];
+            let before = counts.allocations.get();
+            let refused = import_using(
+                &references,
+                |digest| {
+                    let source = if digest == &packs[0].reference.pack {
+                        &packs[0].bytes
+                    } else {
+                        assert_eq!(digest, &conflicting.reference.pack);
+                        &conflicting.bytes
+                    };
+                    Ok(Some(source.to_vec_in(&alloc)))
+                },
+                &alloc,
+            ).unwrap_err();
+            assert!(
+                matches!(&refused, Error::Committed(why)
+                    if why.contains("two values under the key")
+                        && why.contains(&hex(&[1; 32]).to_string())
+                        && why.contains(&hex(&conflicting.reference.pack).to_string())),
+                "conflicting {changed}: {refused}"
+            );
+            assert!(counts.allocations.get() > before, "the import must allocate caller storage");
+            assert_eq!(
+                counts.allocations.get(), counts.deallocations.get(),
+                "a conflicting {changed} must release every imported payload and map node"
+            );
+        }
     }
 
     /// The invariant: a final compiler refusal retains its diagnostic and remains terminal

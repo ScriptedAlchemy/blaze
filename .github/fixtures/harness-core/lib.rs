@@ -1,5 +1,5 @@
 //! The harness's platform-independent cores, read directly from the product source.
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 
 #[path = "../../../crates/harness/harness-browser/src/cdp_ids.rs"]
 pub mod cdp_ids;

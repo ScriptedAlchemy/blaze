@@ -16,14 +16,14 @@ blaze-cargo	459	0	59	545
 blaze-cas	817	0	170	355
 blaze-certify	83	0	0	51
 blaze-check	47	0	2	34
-blaze-codegen	515	0	71	161
+blaze-codegen	511	0	93	161
 blaze-codegen-code	0	0	0	66
 blaze-command	0	0	90	0
 blaze-core	764	0	174	219
 blaze-dbsp	12	0	12	4
 blaze-diagnostics	2790	0	97	582
-blaze-dist	0	0	6	0
-blaze-dist-local	0	0	37	0
+blaze-dist	0	0	30	0
+blaze-dist-local	0	0	94	0
 blaze-doc	17	0	45	112
 blaze-engine	13	0	0	36
 blaze-fetch	116	0	0	27
@@ -63,7 +63,7 @@ blaze-memo-macros	56	0	5	5
 blaze-metadata	0	0	17	21
 blaze-new	0	0	0	6
 blaze-pack	41	0	0	36
-blaze-profile	1084	6	108	398
+blaze-profile	1081	6	108	398
 blaze-program	0	0	204	22
 blaze-protocol	69	0	2	26
 blaze-radix	3	0	1	6

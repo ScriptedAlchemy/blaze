@@ -558,6 +558,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/toolchain
         id: pinned-cargo
       - name: distributed library models and planted controls with pinned Cargo
@@ -651,6 +652,8 @@ jobs:
             fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries
             two_agents_split_a_unit_and_both_get_all_of_it
             a_unit_published_by_one_pull_request_is_taken_by_another
+            a_final_compiler_or_output_refusal_cannot_fall_back
+            a_tail_conflicting_with_committed_values_is_refused_before_publication
           )
           for case_name in "${cases[@]}"; do
             grep -Eq "^test ([[:alnum:]_]+::)*$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \
@@ -664,7 +667,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/core-evidence"
           toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
-          cargo "+$toolchain" check --release --locked --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve \
+          cargo "+$toolchain" check --release --locked --keep-going --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve \
             2>&1 | tee "$RUNNER_TEMP/core-evidence/all-targets.log"
       - name: keep retained library failures before the remaining tests
         if: ${{ !cancelled() && (steps.retained-tests.outcome == 'failure' || steps.retained-all-targets.outcome == 'failure') }}
@@ -690,6 +693,17 @@ jobs:
             -p blaze-pack -p blaze-unitkey -p blaze-record -p blaze-manifest -p syntax \
             2>&1 | tee "$RUNNER_TEMP/core-evidence/active-tests.log"
           cases=(
+            account::tests::every_input_of_the_tree_has_a_writer
+            account::tests::snapshot_text_policy_and_published_bodies_have_their_writers
+            flight::tests::a_recorded_pool_run_accounts_for_every_jobs_wall_time_and_its_critical_path_spans_the_build
+            uring::tests::a_large_tcp_send_goes_from_the_askers_pages
+            sampler::tests::every_sampler_starter_observes_the_first_outcome
+            sampler::tests::a_busy_thread_is_sampled_and_named
+            sampler::linux::tests::a_sample_inside_a_span_names_it
+            tests::the_views_are_syntax_asts
+            tests::an_outline_has_the_arrays_of_a_full_parse
+            tests::every_item_rebuilt_is_the_parsers
+            tests::self_hosting_parsing
             the_oracle_catches_a_census_omitting_unflushed_records
             the_oracle_catches_a_head_skipping_records_committed_during_rebuild
             the_oracle_catches_a_root_leaving_out_its_sealed_set

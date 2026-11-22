@@ -18,20 +18,38 @@ fn place_output(driver: &mut impl Driver, bytes: &[u8]) -> ContentId {
     store.flush(&mut effects);
     drive(driver, &mut store, &mut effects);
     assert!(store.durable(ticket));
-    for to in ["target/build/out/blaze", "target/debug/blaze"] {
+    let content = content_of(bytes);
+    let len = bytes.len() as u64;
+    for (at, to) in ["target/build/out/blaze", "target/debug/blaze"].into_iter().enumerate() {
+        if at > 0 {
+            // The first place writes the output and the store's copy beside it. A later
+            // place must find that copy sealed before asking for a strict block clone.
+            let sealed = name(&format!("store/placed/{content:x}"));
+            let mut look = vec![publish::look(&sealed, Tag(1))];
+            run_until_idle(driver, &mut look, |done, _| {
+                let Done::Stamped(stamps) = done.done else { panic!("looking at {sealed} failed") };
+                assert_eq!(stamps.len(), 1);
+                assert_eq!(stamps[0].size, len);
+                assert_eq!(stamps[0].mode & 0o777, PLACED_MODE, "sealed before cloning");
+            })
+            .expect("the source is sealed before the later place");
+        }
         let tag = store.place(&key(1), name(to), &mut effects).unwrap();
         drive(driver, &mut store, &mut effects);
         let placed = store.placed();
         assert_eq!(placed.len(), 1, "{placed:?}");
         assert_eq!((placed[0].tag, &placed[0].result), (tag, &Ok(())), "{placed:?}");
-        assert_eq!(placed[0].bytes.cloned, bytes.len() as u64);
-        assert_eq!(placed[0].bytes.copied, 0, "placement must use strict block sharing");
         assert_eq!(
-            placed[0].bytes.written,
-            if to == "target/build/out/blaze" { bytes.len() as u64 } else { 0 }
+            placed[0].bytes,
+            if at == 0 {
+                PlacedBytes { copied: len, written: len, ..PlacedBytes::default() }
+            } else {
+                PlacedBytes { cloned: len, ..PlacedBytes::default() }
+            },
+            "the first place writes directly; the later place must use strict block sharing"
         );
     }
-    content_of(bytes)
+    content
 }
 
 fn native_placement(label: &str, bytes: &[u8]) {
@@ -72,10 +90,14 @@ fn native_placement_uses_the_driver_root_and_seals_before_cloning() {
     let bytes = noise(CLONE_FROM as usize + 37, 0x94);
     let mut sim = Sim::new(94, quiet());
     let content = place_output(&mut sim, &bytes);
-    sim.crash();
     assert_eq!(sim.contents(&name("target/build/out/blaze")), bytes);
     assert_eq!(sim.contents(&name("target/debug/blaze")), bytes);
-    assert_eq!(sim.mode(&name(&format!("store/placed/{content:x}"))), Some(PLACED_MODE));
+    // Output renames wait for no sync. The store's own content-named source, in contrast,
+    // becomes a durable home before its name is committed, so a crash preserves its bytes.
+    sim.crash();
+    let sealed = name(&format!("store/placed/{content:x}"));
+    assert_eq!(sim.contents(&sealed), bytes);
+    assert_eq!(sim.mode(&sealed), Some(PLACED_MODE));
     native_placement("small", &bytes);
 }
 

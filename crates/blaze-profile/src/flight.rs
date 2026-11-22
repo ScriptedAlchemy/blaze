@@ -6213,13 +6213,21 @@ mod tests {
                 .expect("every job finishes within a minute");
             assert!(ok, "job {job} of build {build} panicked");
         }
-        // A worker writes a job's `ended` (or `ran`) row after its `done`; joining the workers
-        // is what makes every one of them written before the read.
+        // A worker writes a job's `ended` (or `ran`) row after its `done`. Wait for the
+        // workers to go idle, then read while they still own their rings: joining them
+        // first releases those bounded buffers to other tests' threads, whose rows may
+        // overwrite this run before the read. Idleness is independent of the row count
+        // below, so a missing recorder row still fails the oracle.
+        blaze_graph::spin::SpinWait::within(
+            "the pool's jobs to finish recording and its workers to go idle",
+            WAIT,
+            || pool.idle(),
+        );
+        let mut all = Read::default();
+        window(Duration::from_secs(600), &mut all);
         let pool =
             std::sync::Arc::into_inner(pool).expect("no job holds the pool once every job is done");
         drop(pool);
-        let mut all = Read::default();
-        window(Duration::from_secs(600), &mut all);
         let read = of_build(&all, build);
         let ended = read
             .switches
@@ -6228,7 +6236,9 @@ mod tests {
             .count();
         assert_eq!(
             ended, jobs,
-            "build {build}: one end row a job, all written once the pool's workers are joined"
+            "build {build}: one end row a job, all written once the pool's workers are idle: {:?}; \
+             recorder lost {}, skipped {}",
+            read.switches, all.lost, all.skipped
         );
         let input = Input {
             build: u64::from(build),

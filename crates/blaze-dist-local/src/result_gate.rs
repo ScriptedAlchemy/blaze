@@ -28,9 +28,9 @@ pub struct ResultGate {
     timeout: Duration,
 }
 
-/// One claimed result. Its real response is recorded after the normal Client call.
-pub(crate) struct Capture {
-    directory: PathBuf,
+/// One claimed result. The gate outlives the normal Client call and its recorded response.
+pub(crate) struct Capture<'gate> {
+    directory: &'gate Path,
 }
 
 impl ResultGate {
@@ -62,7 +62,7 @@ impl ResultGate {
         Self::new(PathBuf::from(directory), timeout).map(Some)
     }
 
-    pub(crate) fn hold(&self, command: &Command) -> Result<Option<Capture>, Error> {
+    pub(crate) fn hold(&self, command: &Command) -> Result<Option<Capture<'_>>, Error> {
         let Command::Result(submission) = command else { return Ok(None) };
         // An exclusive creation is the whole one-shot selection. No lock or open file is
         // retained across the wait. An old claim is intentionally never reused or erased.
@@ -71,7 +71,7 @@ impl ResultGate {
             Err(why) if why.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
             Err(why) => return Err(gate_io(&self.directory, &why)),
         }
-        let capture = Capture { directory: self.directory.clone() }; // alloc: one retained test capture
+        let capture = Capture { directory: &self.directory };
         let request = &submission.request;
         let lease = &request.lease;
         let bytes = encode(command, Global);
@@ -146,7 +146,7 @@ impl ResultGate {
     }
 }
 
-impl Capture {
+impl Capture<'_> {
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), Error> {
         let target = self.directory.join(name);
         let temporary = self.directory.join(format!(".{name}.tmp"));

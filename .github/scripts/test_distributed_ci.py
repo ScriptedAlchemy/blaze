@@ -542,6 +542,8 @@ class AcceptanceGateTests(unittest.TestCase):
             "fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries",
             "two_agents_split_a_unit_and_both_get_all_of_it",
             "a_unit_published_by_one_pull_request_is_taken_by_another",
+            "a_final_compiler_or_output_refusal_cannot_fall_back",
+            "a_tail_conflicting_with_committed_values_is_refused_before_publication",
         ]
         names = models + controls + transport_cases + allocator_cases + integration_cases
         # Read the actual job's literal setting, so removing verification from the workflow
@@ -549,6 +551,9 @@ class AcceptanceGateTests(unittest.TestCase):
         job = MAIN.read_text().split("  distributed-core:\n", 1)[1].split("\n  cross-probe:", 1)[0]
         self.assertIn("name: distributed library controls with pinned Cargo (partial)", job)
         self.assertIn("uses: ./.github/actions/toolchain", job)
+        self.assertIn("uses: ./.github/actions/locked-memory", job)
+        self.assertLess(job.index("uses: ./.github/actions/locked-memory"),
+                        job.index("uses: ./.github/actions/toolchain"))
         header = job.split("    steps:\n", 1)[0]
         mode = [line.split(":", 1)[1].strip().strip("\"'") for line in header.splitlines()
                 if line.startswith("      BLAZE_TESTS:")]
