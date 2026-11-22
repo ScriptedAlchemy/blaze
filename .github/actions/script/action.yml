@@ -45,6 +45,9 @@ runs:
       uses: ./.github/actions/blaze
       with:
         job: ${{ inputs.job }}
+        # The pinned release places even script and compiled std outputs by cloning blocks.
+        # Hosted Linux's ext4 needs the same proven filesystem as the compiler build jobs.
+        reflink: ${{ runner.os == 'Linux' }}
     - if: steps.restore.outputs.cache-hit != 'true'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/build.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'

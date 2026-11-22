@@ -1,0 +1,19 @@
+{
+  "id": "v2-bootstrap-lock-order",
+  "date": "2026-11-21",
+  "who": "GPT-6 Astra Pro, main agent",
+  "where": "Cargo.toml [patch.'crates-io']; Cargo.lock; CI jobs 137047597962 and 137048516231",
+  "what": "The pinned Blaze bootstrap rejected a Cargo-compatible lockfile as a formatting change. Its exact resolver output reordered five unused patch entries, which then made Cargo --locked refuse the same dependency graph.",
+  "cost": "Repeated bootstrap failures, followed by a partial-library job refusing to start after adopting the pinned resolver's output.",
+  "cause": "Pinned Blaze preserves patch declaration order when writing unused patches; Cargo writes those entries alphabetically.",
+  "whys": [
+    "the manifest's patch table was not sorted",
+    "the two builders serialize the unused subset differently despite agreeing on every package and dependency edge",
+    "the bootstrap's format-only refusal did not print the differing lines"
+  ],
+  "class": "a shared lockfile has incompatible canonical orders across builders",
+  "prevention": "Keep all patch declarations sorted, so every unused subset has the same order for both builders. The locked build flags and independent native library controls remain enabled.",
+  "workaround": "none",
+  "fix": "Sorted all 13 patch declarations without changing parsed manifest values. Restored the exact Cargo.lock that passed 117 native tests. A fail-closed diagnostic captures the pinned resolver's proposed files and diff in an isolated snapshot.",
+  "state": "ordering fix applied; paired CI verification pending"
+}
