@@ -3,8 +3,8 @@
 use std::alloc::Global;
 
 use blaze_dist::admission::Admission;
-use blaze_dist::jobs::Jobs;
-use blaze_wire::{JobRequest, LocalPolicy, Namespace, Reservation};
+use blaze_dist::jobs::{Effect, Jobs};
+use blaze_wire::{JobEvent, JobRequest, LocalPolicy, Namespace, Reservation, Stage};
 
 use crate::coordinator::{Config, Coordinator};
 use crate::pack::test_alloc::{Counted, Counts};
@@ -47,7 +47,17 @@ fn coordinator_outputs_and_replays_use_the_callers_allocator() {
     let (expected, expected_effects) = control.request(0, &control_request, Global).unwrap();
     assert_eq!(reply.as_slice(), expected.as_slice());
     assert_eq!(effects.as_slice(), expected_effects.as_slice());
-    assert!(!effects.is_empty(), "submitting a real execution must emit its queued stage");
+    let mut stages = effects.iter().filter_map(|(_, effect)| match effect {
+        Effect::Event(item) => match &item.event {
+            JobEvent::Stage(event) => Some(&event.stage),
+            _ => None,
+        },
+        _ => None,
+    });
+    for stage in [Stage::Queued, Stage::Admitted, Stage::Assigned] {
+        assert_eq!(stages.next(), Some(&stage), "the submit route must admit the execution");
+    }
+    assert_eq!(stages.next(), None);
     assert!(std::ptr::eq(reply.allocator().0, &counts));
     assert!(std::ptr::eq(effects.allocator().0, &counts));
     assert!(counts.allocations.get() > 0);
@@ -68,10 +78,11 @@ fn coordinator_outputs_and_replays_use_the_callers_allocator() {
     drop((replay, effects));
     assert_eq!(counts.allocations.get(), counts.deallocations.get());
 
-    // The same allocator also owns autonomous admission and shutdown output buffers.
+    // Submit already admitted the execution. An idle tick keeps this caller's allocator
+    // without repeating those transitions; shutdown then produces genuine stop effects.
     let effects = actual.tick(2, Counted(&counts));
     let expected_effects = control.tick(2, Global);
-    assert!(!effects.is_empty());
+    assert!(effects.is_empty(), "an idle tick must not repeat the submit route's admission");
     assert_eq!(effects.as_slice(), expected_effects.as_slice());
     assert!(std::ptr::eq(effects.allocator().0, &counts));
     drop(effects);

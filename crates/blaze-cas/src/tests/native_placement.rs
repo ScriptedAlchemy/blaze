@@ -1,9 +1,14 @@
 //! The store's actual placement protocol on both drivers. No cwd changes: Native must
 //! resolve FileName through its own absolute root, including seal and strict FICLONE.
+//! Native fixtures use TMPDIR, which must be on a reflink-capable file system.
 
 use super::*;
 
-fn place_output(driver: &mut impl Driver, bytes: &[u8]) -> ContentId {
+fn place_output(
+    driver: &mut impl Driver,
+    bytes: &[u8],
+    context: impl std::fmt::Display,
+) -> ContentId {
     let mut effects = Vec::new();
     let mut store = Store::open(config("store"), &mut effects);
     let drive = |driver: &mut _, store: &mut Store, effects: &mut Vec<Effect>| {
@@ -13,7 +18,12 @@ fn place_output(driver: &mut impl Driver, bytes: &[u8]) -> ContentId {
         .expect("the placement protocol ends");
     };
     drive(driver, &mut store, &mut effects);
-    assert!(store.ready(), "{:?}", store.broken());
+    assert!(store.ready(), "{context}: {:?}", store.broken());
+    assert_eq!(
+        store.place_by(),
+        Some(PlaceBy::Clone),
+        "{context}: strict placement needs block sharing; native fixtures use a reflink-capable TMPDIR"
+    );
     let ticket = store.put(key(1), Kind::Output, bytes).unwrap();
     store.flush(&mut effects);
     drive(driver, &mut store, &mut effects);
@@ -46,7 +56,7 @@ fn place_output(driver: &mut impl Driver, bytes: &[u8]) -> ContentId {
             } else {
                 PlacedBytes { cloned: len, ..PlacedBytes::default() }
             },
-            "the first place writes directly; the later place must use strict block sharing"
+            "{context}: the first place writes directly; the later place must use strict block sharing"
         );
     }
     content
@@ -61,7 +71,7 @@ fn native_placement(label: &str, bytes: &[u8]) {
     // Refuse to reuse a previous run's files; this test must exercise make_file, not a hit.
     std::fs::create_dir(&root).expect("a fresh placement root on a reflink-capable file system");
     let mut native = blaze_core::native(&root, 1).unwrap();
-    let content = place_output(&mut native, bytes);
+    let content = place_output(&mut native, bytes, root.display());
     let sealed = name(&format!("store/placed/{content:x}"));
     assert_eq!(
         std::fs::metadata(root.join(sealed.as_str())).unwrap().permissions().mode() & 0o777,
@@ -89,7 +99,7 @@ fn native_placement(label: &str, bytes: &[u8]) {
 fn native_placement_uses_the_driver_root_and_seals_before_cloning() {
     let bytes = noise(CLONE_FROM as usize + 37, 0x94);
     let mut sim = Sim::new(94, quiet());
-    let content = place_output(&mut sim, &bytes);
+    let content = place_output(&mut sim, &bytes, "Sim");
     assert_eq!(sim.contents(&name("target/build/out/blaze")), bytes);
     assert_eq!(sim.contents(&name("target/debug/blaze")), bytes);
     // Output renames wait for no sync. The store's own content-named source, in contrast,

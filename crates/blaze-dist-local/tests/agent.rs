@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use blaze_dist::admission::{Admission, AdmissionConfig};
+use blaze_dist::admission::{Admission, AdmissionConfig, ExecutorPhase, Waiting};
 use blaze_dist::holder::HolderConfig;
 use blaze_dist::jobs::{CompletionMode, ExecutionConfig, Jobs};
 use blaze_dist::work::WorkConfig;
@@ -22,7 +22,7 @@ use blaze_dist_local::coordinator::Config as CarrierConfig;
 use blaze_dist_local::pack::{Pack, Value, ValueRef};
 use blaze_dist_local::protocol::{Answer, Command, submission};
 use blaze_dist_local::server::{MonotonicClock, Server, random_id};
-use blaze_wire::{Digest, LocalPolicy, Namespace, Reservation};
+use blaze_wire::{Attempt, Digest, ExecutionId, LocalPolicy, Namespace, PrNamespace, Reservation};
 use crossbeam_channel::{Receiver, Sender, bounded};
 
 const TRIPLE: &str = "test-triple";
@@ -43,10 +43,11 @@ impl Drop for World {
 }
 
 fn world(executors: u32, work: WorkConfig) -> World {
-    world_with(executors, work, CarrierConfig::default())
+    let namespaces = vec![Namespace::Main; executors as usize];
+    world_with(&namespaces, work, CarrierConfig::default())
 }
 
-fn world_with(executors: u32, work: WorkConfig, carrier: CarrierConfig) -> World {
+fn world_with(namespaces: &[Namespace], work: WorkConfig, carrier: CarrierConfig) -> World {
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("blobs");
     std::fs::create_dir_all(&store).unwrap();
@@ -60,14 +61,43 @@ fn world_with(executors: u32, work: WorkConfig, carrier: CarrierConfig) -> World
         address
     });
     let mut admission = Admission::new(AdmissionConfig::default());
-    admission.add_machine(
-        "machine",
-        agent::platform(TRIPLE),
-        Reservation { memory: u64::from(executors), cpus: executors, disk: u64::from(executors) },
-    );
-    for _ in 0..executors {
-        admission.add_builder(0, "machine", NEED, Global).unwrap();
+    let executors = u32::try_from(namespaces.len()).unwrap();
+    let capacity = Reservation {
+        memory: u64::from(executors), cpus: executors, disk: u64::from(executors),
+    };
+    admission.add_machine("machine", agent::platform(TRIPLE), capacity.clone());
+    for (at, namespace) in namespaces.iter().enumerate() {
+        let executor = match namespace {
+            Namespace::Main => admission.add_builder(0, "machine", NEED, Global).unwrap(),
+            Namespace::Pr(_) => {
+                // A PR slot is created by real admission and kept idle after its setup job.
+                // Reserving every slot for Main would leave this namespace waiting forever.
+                let execution = ExecutionId(at as u64 + 1);
+                admission.enqueue(Waiting {
+                    execution,
+                    namespace: namespace.clone(),
+                    platform: agent::platform(TRIPLE),
+                    need: NEED,
+                    at: 0,
+                }).unwrap();
+                let mut admitted = admission.admit(0, Global);
+                assert_eq!(admitted.len(), 1, "the fixture's PR slot must fit its machine");
+                let admitted = admitted.pop().unwrap();
+                assert!(admitted.created);
+                assert_eq!(admitted.execution, execution);
+                assert_eq!(&admitted.namespace, namespace);
+                admission.finished(0, &admitted.executor, execution, Attempt(1));
+                admitted.executor
+            }
+        };
+        let slot = admission.executor(&executor).unwrap();
+        assert_eq!(&slot.namespace, namespace);
+        assert_eq!(slot.phase, ExecutorPhase::Ready);
+        assert_eq!(slot.busy, None);
+        assert_eq!(slot.reservation, NEED);
     }
+    assert_eq!(admission.used("machine"), capacity);
+    admission.check().unwrap();
     let jobs = Jobs::new(
         admission,
         ExecutionConfig { work, completion: CompletionMode::PublishedWork, ..Default::default() },
@@ -810,7 +840,11 @@ fn a_coordinator_that_is_gone_stops_the_build_unless_it_may_compile_here() {
 /// A pull request's unit and the main line's run apart, and what either published is the other's.
 #[test]
 fn a_unit_published_by_one_pull_request_is_taken_by_another() {
-    let world = world(2, WorkConfig::default());
+    let world = world_with(
+        &[Namespace::Pr(PrNamespace { n: 1 }), Namespace::Pr(PrNamespace { n: 2 })],
+        WorkConfig::default(),
+        CarrierConfig::default(),
+    );
     let unit = unit(8, 3);
     let never = AtomicBool::new(false);
     let log = Arc::new(Mutex::new(BTreeMap::new()));
@@ -842,7 +876,9 @@ fn a_unit_published_by_one_pull_request_is_taken_by_another() {
 fn a_unit_of_many_functions_is_run_under_a_builds_bounds() {
     let carrier =
         CarrierConfig { max_roots: 1 << 24, max_grants: 1 << 20, ..CarrierConfig::default() };
-    let world = world_with(1, WorkConfig { grant_roots: 1024, ..Default::default() }, carrier);
+    let world = world_with(
+        &[Namespace::Main], WorkConfig { grant_roots: 1024, ..Default::default() }, carrier,
+    );
     let names: Vec<Digest> = (0..5_000u32)
         .map(|at| {
             let mut it = [0; 32];
@@ -871,7 +907,9 @@ fn a_unit_of_many_functions_is_run_under_a_builds_bounds() {
 #[test]
 fn an_agent_that_waits_asks_in_one_session_however_often() {
     let carrier = CarrierConfig { max_sessions: 4, ..CarrierConfig::default() };
-    let world = world_with(1, WorkConfig { grant_roots: 1, ..Default::default() }, carrier);
+    let world = world_with(
+        &[Namespace::Main], WorkConfig { grant_roots: 1, ..Default::default() }, carrier,
+    );
     let unit = unit(34, 12);
     let never = AtomicBool::new(false);
     let mut compiler = Compiler {

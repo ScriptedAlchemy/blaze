@@ -559,6 +559,34 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
+      # This Cargo job has no later swap allocation. Keep its existing memory/swap
+      # policy; the canonical filesystem action budgets the backing disk after it.
+      - name: runner memory before reflink allocation
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-evidence"
+          timeout 10s swapon --show --bytes | tee "$RUNNER_TEMP/core-evidence/runner-swap.txt"
+          timeout 10s free -b | tee "$RUNNER_TEMP/core-evidence/runner-memory.txt"
+      - uses: ./.github/actions/reflink
+      - name: short native test paths on the verified reflink filesystem
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          test_temp="$RUNNER_TEMP/blaze-fs/tmp"
+          mkdir "$test_temp"
+          short_temp=$(mktemp -d /tmp/bz.XXXXXX)
+          timeout 10s sudo mount --bind "$test_temp" "$short_temp"
+          store_device=$(stat -Lc %d "$BLAZE_HOME/v2/store")
+          target_device=$(stat -Lc %d "$CARGO_TARGET_DIR")
+          temp_device=$(stat -Lc %d "$short_temp")
+          [ "$temp_device" = "$store_device" ] && [ "$temp_device" = "$target_device" ] \
+            || { echo '::error::native test temporary files, store and target must share the verified reflink device'; exit 1; }
+          printf 'TMPDIR=%s\nstore_device=%s\ntarget_device=%s\ntemp_device=%s\n' \
+            "$short_temp" "$store_device" "$target_device" "$temp_device" \
+            | tee "$RUNNER_TEMP/core-evidence/native-filesystem.txt"
+          timeout 10s findmnt -T "$short_temp"
+          echo "TMPDIR=$short_temp" >> "$GITHUB_ENV"
       - uses: ./.github/actions/toolchain
         id: pinned-cargo
       - name: distributed library models and planted controls with pinned Cargo

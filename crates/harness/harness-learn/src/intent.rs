@@ -161,10 +161,14 @@ mod tests {
 
     #[test]
     fn a_topic_borrows_the_original_bytes_after_a_unicode_greeting() {
-        let message = "İ hello, EXPLAIN ownership";
+        // The returned topic must borrow this input's storage, independent of whether
+        // the compiler merges equal string literals.
+        let storage = *b"\xc4\xb0 hello, EXPLAIN ownership";
+        let message = std::str::from_utf8(&storage).unwrap();
         let topic = learns(message);
         assert_eq!(topic, "ownership");
         assert_eq!(topic.as_ptr(), message[message.find("ownership").unwrap()..].as_ptr());
-        assert_eq!(learns("teach me something").as_ptr(), SURPRISE.as_ptr());
+        // A const has no promised address identity between its uses.
+        assert_eq!(learns("teach me something"), SURPRISE);
     }
 }

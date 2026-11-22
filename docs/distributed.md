@@ -157,6 +157,274 @@ Packs are named and checked by their content hash. Publication acceptance belong
 coordinator; the server mirrors accepted records and checks delivery. It is not a remote
 compiler or a remote transport for the Unix coordinator.
 
+## Data shapes
+
+These are the shared version-5 schema types in `crates/blaze-wire/src/shapes.rs` and
+`crates/blaze-wire/src/calls.rs`, retained by the protocol library. They describe encoded
+values; their presence does not imply a working compiler bridge or an HTTP coordinator.
+The complete inventory is `blaze_wire::vectors::every`, with golden vectors under
+`crates/blaze-wire/tests/golden/`.
+
+A struct is a CBOR map of the numbered fields below, every key present. An enum is the
+array `[discriminant, payload]`; a variant without fields has a null payload. `Digest` is
+a 32-byte CBOR byte string. A `Set<T>` is a sequence ordered by each item's canonical CBOR
+bytes, with duplicates removed when encoded and refused when decoded. `Vec<T>` preserves
+its order. An `Option<T>` is its value or null, and a tuple is an array of its fields.
+Digests are `sha256("blaze/" ‖ name ‖ "/v5" ‖ 0x00 ‖ CBOR)`.
+Comments give map keys and enum discriminants.
+
+```rust
+// Where a local build looks before it compiles.
+enum LocalPolicy {
+    Never, // 0
+    Fallback, // 1
+}
+// The namespaces of the cache, and what may write each.
+enum Namespace {
+    Main, // 0
+    Pr(PrNamespace), // 1
+}
+// The fields of `Namespace::Pr`: its pull request's number.
+struct PrNamespace {
+    n: u64, // 0
+}
+// One pack of a crate's record.
+struct PackRef {
+    pack: Digest, // 0
+    size: u64, // 1
+    keys: Digest, // 2
+    packed: Option<(Digest, u64)>, // 3
+    format: u32, // 4
+}
+// The input of a WorkName: a stable item or an edge from another work item.
+enum WorkKey {
+    Item(ItemKey), // 0
+    Edge(EdgeKey), // 1
+}
+// The fields of `WorkKey::Item`: a function with a stable name.
+struct ItemKey {
+    unit: Digest, // 0
+    stable: Digest, // 1
+    env: Digest, // 2
+}
+// The fields of `WorkKey::Edge`: a request with no stable name.
+struct EdgeKey {
+    parent: WorkName, // 0
+    ordinal: u32, // 1
+}
+// A name an executor found, and the digest of the complete local request it holds for it.
+struct Found {
+    name: WorkName, // 0
+    tuple: Digest, // 1
+}
+// What an executor computed from its front end before it may take work.
+struct RootSet {
+    spec: Digest, // 0
+    roots: Digest, // 1
+    count: u64, // 2
+    index: Digest, // 3
+    inputs: Digest, // 4
+}
+// An executor's tenure over the work it holds in one execution.
+struct Lease {
+    execution: ExecutionId, // 0
+    attempt: Attempt, // 1
+    holder: String, // 2
+    generation: u64, // 3
+}
+// Work given to a holder: a range of the sorted roots, and names granted to it.
+struct Grant {
+    lease: Lease, // 0
+    roots: Set<(u64, u64)>, // 1
+    names: Set<WorkName>, // 2
+}
+// What an executor's batch did with one name.
+enum ItemOutcome {
+    Exported(EntryRef), // 0
+    FromStore(EntryRef), // 1
+    Failed(Why), // 2
+    Local(Why), // 3
+    Lost(Why), // 4
+}
+// The fields of `ItemOutcome::Exported` and `ItemOutcome::FromStore`.
+struct EntryRef {
+    entry: EntryKey, // 0
+}
+// The fields of `ItemOutcome::Failed`, `Local` and `Lost`.
+struct Why {
+    why: String, // 0
+}
+// One name's result in a batch.
+struct ItemResult {
+    name: WorkName, // 0
+    outcome: ItemOutcome, // 1
+    found: Set<Found>, // 2
+    unnamed: Set<(u32, String)>, // 3
+}
+// One batch's results, committed at once.
+struct BatchResult {
+    lease: Lease, // 0
+    seq: u64, // 1
+    items: Vec<ItemResult>, // 2
+    packs: Vec<PackRef>, // 3
+    returned_roots: Set<(u64, u64)>, // 4
+    returned_names: Set<WorkName>, // 5
+}
+// What admission holds for an executor, a job or a test shard.
+struct Reservation {
+    memory: u64, // 0
+    cpus: u32, // 1
+    disk: u64, // 2
+}
+// Stages carried by timestamped events.
+enum Stage {
+    Queued, // 0
+    Admitted, // 1
+    Assigned, // 2
+    Fetched, // 3
+    Loaded, // 4
+    Compiled, // 5
+    Published, // 6
+    Linked, // 7
+    Reported, // 8
+    Done, // 9
+}
+// One event of an execution's stream.
+enum JobEvent {
+    Stage(StageEvent), // 0
+    Assigned(AssignedEvent), // 1
+    Refused(RefusedEvent), // 2
+    Output(OutputEvent), // 3
+    Done(DoneEvent), // 4
+}
+// The fields of `JobEvent::Stage`.
+struct StageEvent {
+    stage: Stage, // 0
+    at_ms: u64, // 1
+}
+// The fields of `JobEvent::Assigned`.
+struct AssignedEvent {
+    executor: String, // 0
+    attempt: Attempt, // 1
+}
+// The fields of `JobEvent::Refused`.
+struct RefusedEvent {
+    function: String, // 0
+    why: String, // 1
+}
+// The fields of `JobEvent::Output`.
+struct OutputEvent {
+    stream: u8, // 0
+    bytes: Vec<u8>, // 1
+}
+// The fields of `JobEvent::Done`.
+struct DoneEvent {
+    outcome: Outcome, // 0
+    counters: Vec<(String, u64)>, // 1
+}
+// How an execution ended.
+enum Outcome {
+    Passed, // 0
+    Failed, // 1
+    Refused, // 2
+    Lost, // 3
+    Cancelled, // 4
+    TimedOut, // 5
+}
+// The input of `JobContent`'s digest.
+struct JobContentInput {
+    unit: Digest, // 0
+    platform: Digest, // 1
+    namespace: Namespace, // 2
+}
+
+// Newtypes over a digest or a number, each its inner value on the wire.
+struct EntryKey(Digest);
+struct JobContent(Digest); // of a JobContentInput
+struct WorkName(Digest); // of a WorkKey
+struct ExecutionId(u64);
+struct Attempt(u32);
+```
+
+## The calls
+
+The local carrier's command and response envelopes use these shared values where their
+schema calls for them. Session creation, bindings, retirement, publication commands and
+the separately versioned terminal contract are documented in the
+[carrier reference](../crates/blaze-dist-local/README.md). The declarations below specify
+field numbers and values; they do not define HTTP endpoints.
+
+```rust
+// A unit on one platform. Fields 0 to 2 identify shared content; 3 to 5 belong to its subscriber.
+struct JobRequest {
+    unit: Digest, // 0
+    platform: Digest, // 1
+    namespace: Namespace, // 2
+    source: Digest, // 3
+    deadline_ms: u64, // 4
+    local: LocalPolicy, // 5
+}
+// A submitted job's shared content, execution and subscriber.
+struct JobAnswer {
+    content: JobContent, // 0
+    execution: ExecutionId, // 1
+    subscriber: u64, // 2
+}
+// One item of an event stream, each behind its four-byte big-endian length.
+struct EventItem {
+    sequence: u64, // 0
+    attempt: Attempt, // 1
+    event: JobEvent, // 2
+}
+// An executor's work-set join.
+struct WorkJoinRequest {
+    execution: ExecutionId, // 0
+    attempt: Attempt, // 1
+    roots: RootSet, // 2
+    rejected: Set<WorkName>, // 3
+}
+// The agreed roots and whether they are fixed.
+struct WorkJoinAnswer {
+    roots: RootSet, // 0
+    fixed: bool, // 1
+}
+// A request for work in an execution's attempt.
+struct WorkLeaseRequest {
+    execution: ExecutionId, // 0
+    attempt: Attempt, // 1
+}
+// A grant, or null when no work is granted.
+struct WorkLeaseAnswer {
+    grant: Option<Grant>, // 0
+}
+// The names granted or refused as conflicts after a batch result.
+struct WorkResultAnswer {
+    granted: Set<WorkName>, // 0
+    conflicts: Set<WorkName>, // 1
+}
+// Events reported by an executor in an execution's attempt.
+struct WorkersEventsRequest {
+    execution: ExecutionId, // 0
+    attempt: Attempt, // 1
+    events: Vec<JobEvent>, // 2
+}
+// The worker verdict: 0 to continue, 1 to cancel.
+struct WorkersEventsAnswer {
+    verdict: u8, // 0
+}
+// The one shape an error takes on every call.
+struct WireError {
+    code: u8, // 0
+    message: String, // 1
+    retry_after_ms: Option<u64>, // 2
+}
+
+// The answer of every call that has nothing to say: `{}`.
+struct Ack {}
+```
+
+The separate pack server's endpoint contracts are in `crates/blaze-serve/src/lib.rs`.
+
 ## Tests and the remaining acceptance boundary
 
 `crates/blaze-dist/tests/sim.rs` exercises the sans-IO cores deterministically, including

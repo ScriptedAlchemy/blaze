@@ -1,4 +1,4 @@
-//! The doc's types and the crate's agree: every `struct` and `enum` "Data shapes" and section 8
+//! The doc's types and the crate's agree: every `struct` and `enum` "Data shapes" and "The calls"
 //! name is a type here, and every type here is one the doc names.
 //!
 //! This is the check that a type the doc adds is not silently missing from the crate, and that the
@@ -39,7 +39,9 @@ fn names_in(text: &str) -> BTreeSet<String> {
 fn shape_sections() -> String {
     let doc = doc();
     let start = doc.find("## Data shapes").expect("the doc has no \"Data shapes\"");
-    let end = doc.find("## What it does not do").expect("no end of the doc's shapes");
+    let end = doc
+        .find("## Tests and the remaining acceptance boundary")
+        .expect("no end of the doc's shapes");
     doc[start..end].to_owned()
 }
 
@@ -59,8 +61,7 @@ fn every_type_the_crate_has_is_in_the_doc() {
     let in_crate: BTreeSet<String> =
         blaze_wire::vectors::every().iter().map(|entry| entry.name.to_owned()).collect();
     let invented: Vec<&String> = in_crate.difference(&documented).collect();
-    // The payload structs of section 8's enum list are named in a sentence, not in a code block,
-    // so they are checked by their own list.
+    // Each enum payload must be documented and present in the crate as its own type too.
     let payloads: BTreeSet<&str> = [
         "PrNamespace",
         "ItemKey",

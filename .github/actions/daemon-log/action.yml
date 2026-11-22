@@ -67,6 +67,123 @@ runs:
         metadata["stage0_pin"] = pin.read_text().strip() if pin.is_file() else None
         (evidence / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
         PY
+    - name: workspace memory scope facts
+      if: always() && runner.os == 'Linux' && github.job == 'workspace-check' && steps.collect.outputs.path != ''
+      shell: bash
+      env:
+        BLAZE_DIAGNOSTIC_DIR: ${{ steps.collect.outputs.path }}
+      run: |
+        # Read only: the pinned release subtracts its leaf cgroup's other charges
+        # from the explicit daemon ceiling. Do not create a scope or change a limit.
+        # A timed-out probe still leaves the latest complete JSON beside the logs.
+        timeout --kill-after=2s 25s python3 - "$BLAZE_DIAGNOSTIC_DIR" <<'PY'
+        from datetime import datetime, timezone
+        import json
+        import os
+        from pathlib import Path
+        import shutil
+        import subprocess
+        import sys
+
+        destination = Path(sys.argv[1]) / "memory-scope.json"
+        facts = {
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "observation": "after the failed command; observer's scope, not a live daemon measurement",
+            "observer_pid": os.getpid(),
+            "observer_uid": os.getuid(),
+            "daemon_memory_gb": os.environ.get("BLAZE_DAEMON_MEMORY_GB"),
+            "cores": os.environ.get("BLAZE_CORES"),
+            "complete": False,
+            "scope_creation": "not attempted; these read-only facts do not prove permission to create a scope",
+        }
+
+        def save():
+            temporary = destination.with_suffix(".tmp")
+            temporary.write_text(json.dumps(facts, indent=2) + "\n")
+            temporary.replace(destination)
+
+        def read(path):
+            try:
+                with path.open() as source:
+                    text = source.read(65537)
+                return {"text": text[:65536], "truncated": len(text) > 65536}
+            except (OSError, UnicodeError) as error:
+                return {"error": str(error)}
+
+        def command(argv):
+            try:
+                result = subprocess.run(argv, text=True, capture_output=True, timeout=3,
+                                        stdin=subprocess.DEVNULL)
+                return {"argv": argv, "status": result.returncode,
+                        "stdout": result.stdout[:65536], "stderr": result.stderr[:65536],
+                        "truncated": len(result.stdout) > 65536 or len(result.stderr) > 65536}
+            except (OSError, subprocess.SubprocessError) as error:
+                return {"argv": argv, "error": str(error)}
+
+        save()
+        facts["proc_cgroup"] = read(Path("/proc/self/cgroup"))
+        facts["meminfo"] = read(Path("/proc/meminfo"))
+        mountinfo = read(Path("/proc/self/mountinfo"))
+        facts["cgroup_mounts"] = {
+            **{key: value for key, value in mountinfo.items() if key != "text"},
+            "lines": [line for line in mountinfo.get("text", "").splitlines()
+                      if " - cgroup2 " in line or " - cgroup " in line],
+        }
+        group = next((line[3:] for line in facts["proc_cgroup"].get("text", "").splitlines()
+                      if line.startswith("0::")), None)
+        ancestors = []
+        facts["ancestors"] = ancestors
+        files = ("memory.max", "memory.high", "memory.current", "memory.stat", "memory.events",
+                 "memory.swap.max", "memory.swap.current", "cgroup.controllers",
+                 "cgroup.subtree_control", "cgroup.type", "cgroup.events")
+        if group is None or not group.startswith("/") or ".." in Path(group).parts:
+            facts["cgroup_error"] = "no safe unified cgroup path was reported"
+        else:
+            root = Path("/sys/fs/cgroup")
+            at = root / group.lstrip("/")
+            for _ in range(32):
+                row = {"path": str(at), "files": {name: read(at / name) for name in files}}
+                try:
+                    stat = at.stat()
+                    row["owner"] = {"uid": stat.st_uid, "gid": stat.st_gid,
+                                    "mode": oct(stat.st_mode & 0o7777)}
+                except OSError as error:
+                    row["owner"] = {"error": str(error)}
+                row["writable_by_observer"] = {
+                    name: os.access(at / name, os.W_OK)
+                    for name in (".", "cgroup.procs", "cgroup.subtree_control", "memory.max")
+                }
+                ancestors.append(row)
+                save()
+                if at == root:
+                    break
+                at = at.parent
+            else:
+                facts["ancestor_walk_truncated"] = True
+
+        facts["systemd_run"] = shutil.which("systemd-run")
+        properties = ["ControlGroup", "Delegate", "DelegateControllers", "MemoryAccounting",
+                      "MemoryMax", "MemoryHigh", "MemorySwapMax", "Slice"]
+        show = ["systemctl", "--no-pager", "--no-ask-password", "show"]
+        selected = [f"--property={name}" for name in properties]
+        units = {}
+        facts["systemd_units"] = units
+        host_unit = next((part for part in reversed(Path(group or "/").parts)
+                          if part.endswith((".service", ".scope"))), None)
+        if host_unit:
+            units["observer"] = command([*show, host_unit, *selected])
+            save()
+        units["user_service"] = command([*show, f"user@{os.getuid()}.service", *selected])
+        save()
+        facts["user_manager"] = command(["systemctl", "--user", "--no-pager", "--no-ask-password",
+                                         "show", "--property=Version", "--property=DefaultMemoryAccounting"])
+        save()
+        units["user_app_slice"] = command(["systemctl", "--user", "--no-pager", "--no-ask-password",
+                                           "show", "app.slice", *selected])
+        facts["complete"] = True
+        save()
+        print(f"workspace memory scope facts: {destination}")
+        PY
     - name: retain complete daemon logs
       if: always() && steps.collect.outputs.path != ''
       uses: actions/upload-artifact@v7

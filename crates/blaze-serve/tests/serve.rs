@@ -6,7 +6,10 @@
 //! a concurrent write of the same blob, a blob that is only visible whole, and a list that is
 //! written once.
 
+#![feature(allocator_api)]
+
 use std::{
+    alloc::Global,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener as StdListener, TcpStream},
     path::Path,
@@ -16,7 +19,7 @@ use std::{
 };
 
 use blaze_serve::{Config, Server, serve_on};
-use blaze_wire::{Digest, Limits, WireError, decode};
+use blaze_wire::{Digest, Limits, PackRef, WireError, decode};
 
 /// A server on a directory of its own, on a port the machine gives, ended when the test ends.
 struct Served {
@@ -331,11 +334,46 @@ fn a_list_is_written_once() {
     let served = Served::start();
     let path = format!("/v1/list/manifests/{}", hex(&digest(b"a unit")));
     assert_eq!(served.ask("GET", &path, &[], &[]).status, 404);
-    let first = served.ask("PUT", &path, &[], b"first\n");
-    assert_eq!(first.status, 204, "{}", first.error().message);
+
+    // A malformed first writer names nothing; a real list must name verified packs.
+    let malformed = served.ask("PUT", &path, &[], b"first\n");
+    assert_eq!(malformed.status, 400);
+    assert_eq!(malformed.error().code, 1);
+    assert!(malformed.error().message.contains("pack list line 1"));
+    assert_eq!(served.ask("GET", &path, &[], &[]).status, 404);
+
+    let key = digest(b"an item");
+    let first_pack = pack(&[(key, b"first")]);
+    let second_pack = pack(&[(key, b"second")]);
+    for bytes in [&first_pack, &second_pack] {
+        let put = served.ask("PUT", &format!("/v1/blob/{}", pack_name(bytes)), &[], bytes);
+        assert_eq!(put.status, 204, "{}", put.error().message);
+    }
+    let keys = blaze_wire::digest_of_encoded_name(
+        "blaze/dist-pack-keys",
+        &blaze_wire::encode(&vec![key], Global),
+    );
+    let list = |bytes: &[u8]| {
+        blaze_wire::pack_list::encode(
+            &[PackRef {
+                pack: digest(bytes),
+                size: bytes.len() as u64,
+                keys,
+                packed: None,
+                format: blaze_wire::DIST_PACK_FORMAT,
+            }],
+            Global,
+        )
+    };
+    let (first, second) = (list(&first_pack), list(&second_pack));
+    assert_ne!(first, second, "the two writers propose different pack lists");
+    let wrote = served.ask("PUT", &path, &[], &first);
+    assert_eq!(wrote.status, 204, "{}", wrote.error().message);
     // A second writer is told, and what is there stays: both name the same keys.
-    assert_eq!(served.ask("PUT", &path, &[], b"second\n").status, 412);
-    assert_eq!(served.ask("GET", &path, &[], &[]).body, b"first\n");
+    assert_eq!(served.ask("PUT", &path, &[], &second).status, 412);
+    let got = served.ask("GET", &path, &[], &[]);
+    assert_eq!(got.status, 200);
+    assert_eq!(got.body, first);
 }
 
 #[test]
