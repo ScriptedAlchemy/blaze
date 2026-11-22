@@ -1549,14 +1549,26 @@ def cbor(value):
     raise TypeError(value)
 
 
-# The schema of the agent API's bodies, which an envelope names (blaze_api::SCHEMA).
-SCHEMA = int(re.search(r"^pub const SCHEMA: u32 = (\d+);", open(os.path.join(ROOT, "crates/blaze-api/src/lib.rs")).read(), re.M)[1])
+def daemon_schema():
+    """Read the legacy API only when a daemon probe runs; shared helpers import without it."""
+    path = os.path.join(ROOT, "crates/blaze-api/src/lib.rs")
+    try:
+        with open(path, encoding="utf-8") as source:
+            text = source.read()
+    except FileNotFoundError as why:
+        raise storelib.Failed(
+            f"legacy daemon probe cannot run: {path} is absent; upstream removed the daemon API"
+        ) from why
+    schema = re.search(r"^pub const SCHEMA: u32 = (\d+);", text, re.M)
+    if schema is None:
+        raise storelib.Failed(f"legacy daemon probe cannot read SCHEMA from {path}")
+    return int(schema[1])
 
 
 def framed(body):
     """A request as the daemon reads one: a frame of a `blaze_api::Envelope`, its length and
     its deterministic CBOR (crates/blaze-api/src/frames.rs, `encode_into`)."""
-    item = cbor({"schema": SCHEMA, "id": 1, "body": body})
+    item = cbor({"schema": daemon_schema(), "id": 1, "body": body})
     return (len(item).to_bytes(4, "big") + item).hex()
 
 LISTEN = "import os, socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\nos.chmod(sys.argv[1], 0o666)\ns.listen()\nprint('listening', flush=True)\ns.settimeout(20)\ntry:\n    c, _ = s.accept()\n    c.settimeout(5)\n    print('heard:', len(c.recv(65536)))\nexcept OSError as e:\n    print('heard: nothing,', e)\n"
@@ -1565,6 +1577,7 @@ LISTEN = "import os, socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.bind(sys.
 def stranger(home, check):
     """A second user at the daemon's socket: kept out by the directory and the socket's
     modes, and turned away by the daemon when those are opened to it."""
+    request = framed("Status")
     name = "blaze-stranger"
     sudo = lambda *argv: subprocess.run(["sudo", "-n", *argv], capture_output=True, text=True)
     if sudo("true").returncode != 0:
@@ -1580,7 +1593,6 @@ def stranger(home, check):
     # The daemon's socket (blaze_api::client::socket). v1's request named the daemon's version,
     # read from `blaze status`; v2's carries its schema alone.
     sock = storelib.layout(home).socket
-    request = framed("Status")
     def knock(user):
         run = subprocess.run([*(["sudo", "-n", "-u", user] if user else []), sys.executable, "-c", CONNECT, sock, request], capture_output=True, text=True, cwd="/")
         # What went wrong before the request was made, where nothing was printed.

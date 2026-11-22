@@ -165,13 +165,7 @@ fn prosed(n: Id, comp: &str, ctx: &mut Ctx) -> Result<String, String> {
 }
 
 fn children(n: Id, ctx: &mut Ctx) -> Result<String, String> {
-    let kids: Vec<Id> = ctx
-        .e(n)
-        .children
-        .iter()
-        .copied()
-        .filter(|c| !is_page(ctx.e(*c)))
-        .collect();
+    let kids: Vec<Id> = ctx.e(n).children.iter().copied().filter(|c| !is_page(ctx.e(*c))).collect();
     let mut out = Vec::with_capacity(kids.len());
     for c in kids {
         out.push(block(c, ctx)?);
@@ -241,9 +235,34 @@ fn highlighted(e: &Entity) -> Option<String> {
 /// Every element type a block can be. Two blocks in one scope with the same name are one entity in Flecs, so
 /// `Art daemon(...)` beside `P daemon(...)` is one node carrying both; it is refused rather than half rendered.
 const ELEMENTS: &[&str] = &[
-    "Lede", "P", "Dim", "H3", "Li", "Code", "Command", "Img", "Art", "Section", "Issue", "Goal", "Step", "Quiz",
-    "RowChart", "LineChart", "Charts", "Picker", "BenchHistory", "Tap", "Figure", "Ul", "Ol", "Table", "Go",
-    "Race", "Chips", "Chip",
+    "Lede",
+    "P",
+    "Dim",
+    "H3",
+    "Li",
+    "Code",
+    "Command",
+    "Img",
+    "Art",
+    "Section",
+    "Issue",
+    "Goal",
+    "Step",
+    "Quiz",
+    "RowChart",
+    "LineChart",
+    "Charts",
+    "Picker",
+    "BenchHistory",
+    "Tap",
+    "Figure",
+    "Ul",
+    "Ol",
+    "Table",
+    "Go",
+    "Race",
+    "Chips",
+    "Chip",
 ];
 
 fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
@@ -496,7 +515,8 @@ fn go(n: Id, ctx: &Ctx) -> Result<String, String> {
     if target.has("Lesson") {
         let parent = target.parent.ok_or("a lesson has no parent")?;
         if let Some((at, c)) = ctx.s.world.course_of(ctx.s.pages, parent)? {
-            let node = c.nodes.iter().find(|x| x.id == to.node).expect("the lesson is on its course");
+            let node =
+                c.nodes.iter().find(|x| x.id == to.node).expect("the lesson is on its course");
             lesson = format!(
                 " data-lesson=\"{}\" data-course=\"{}\"",
                 esc(&node.key),
@@ -541,24 +561,26 @@ fn race(n: Id, ctx: &Ctx) -> Result<String, String> {
     let e = ctx.e(n);
     let path = &e.path;
     let ask = e.value("Race");
-    let raced = e
-        .value("Raced")
-        .ok_or_else(|| format!("{path}: the Race has no times (the build sets them: run the build)"))?;
+    let raced = e.value("Raced").ok_or_else(|| {
+        format!("{path}: the Race has no times (the build sets them: run the build)")
+    })?;
     let (blaze, cargo) = (js::to_number(raced.get("blaze_s")), js::to_number(raced.get("cargo_s")));
     if !(blaze.is_finite() && cargo.is_finite() && blaze > 0.0 && cargo > 0.0) {
-        return Err(format!("{path}: a Race's times are seconds above zero, not {blaze} and {cargo}"));
+        return Err(format!(
+            "{path}: a Race's times are seconds above zero, not {blaze} and {cargo}"
+        ));
     }
     let of = field(ask, "of");
     if of.is_empty() {
-        return Err(format!("{path}: a Race says which blaze its run measured (`of`, \"blaze v1\")"));
+        return Err(format!(
+            "{path}: a Race says which blaze its run measured (`of`, \"blaze v1\")"
+        ));
     }
     let more = field(ask, "more");
-    let to = ctx
-        .s
-        .pages
-        .iter()
-        .find(|p| p.url == more)
-        .ok_or_else(|| format!("{path}: Race more {more:?} is not a page of the site (/bench)"))?;
+    let to =
+        ctx.s.pages.iter().find(|p| p.url == more).ok_or_else(|| {
+            format!("{path}: Race more {more:?} is not a page of the site (/bench)")
+        })?;
     let project = field(Some(raced), "project");
     let term = |who: &str, seconds: f64, compiling: bool| {
         let (t, unit) = took(seconds);
@@ -609,18 +631,16 @@ fn chip(n: Id, ctx: &Ctx) -> Result<String, String> {
     if label.is_empty() {
         return Err(format!("{path}: a Chip needs a label"));
     }
-    let to = ctx
-        .s
-        .pages
-        .iter()
-        .find(|p| p.url == href)
-        .ok_or_else(|| format!("{path}: Chip {href:?} is not a page of the site (/learn/proofs)"))?;
+    let to = ctx.s.pages.iter().find(|p| p.url == href).ok_or_else(|| {
+        format!("{path}: Chip {href:?} is not a page of the site (/learn/proofs)")
+    })?;
     let target = ctx.e(to.node);
     let on_course = match target.parent {
         Some(parent) if target.has("Lesson") => ctx.s.world.course_of(ctx.s.pages, parent)?,
         _ => None,
     };
-    let (_, c) = on_course.ok_or_else(|| format!("{path}: Chip {href:?} is not a lesson on a course"))?;
+    let (_, c) =
+        on_course.ok_or_else(|| format!("{path}: Chip {href:?} is not a lesson on a course"))?;
     let node = c.nodes.iter().find(|x| x.id == to.node).expect("the lesson is on its course");
     let theme = &c.themes[node.theme];
     let tag = if theme.tag.is_empty() {
@@ -933,11 +953,7 @@ fn table(n: Id, ctx: &mut Ctx) -> Result<String, String> {
             html += &format!("<{tag}>{}</{tag}>", ctx.inline(&prose(&raw), &path)?);
         }
         html += "</tr>";
-        if head {
-            thead += &html
-        } else {
-            tbody += &html
-        }
+        if head { thead += &html } else { tbody += &html }
     }
     let thead = if thead.is_empty() { String::new() } else { format!("<thead>{thead}</thead>") };
     Ok(format!("<div class=\"ref\"><table>{thead}<tbody>{tbody}</tbody></table></div>"))

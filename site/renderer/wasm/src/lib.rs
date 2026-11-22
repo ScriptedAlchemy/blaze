@@ -80,11 +80,8 @@ pub unsafe extern "C" fn site_load(h: *mut Handle, ptr: *const u8, len: usize) -
 pub unsafe extern "C" fn site_pages(h: *mut Handle) -> i32 {
     let h = unsafe { &mut *h };
     let r = h.site.as_ref().ok_or_else(|| "no site loaded".to_string()).map(|s| {
-        let pages: Vec<_> = s
-            .pages()
-            .iter()
-            .map(|p| serde_json::json!({ "url": p.url, "file": p.file }))
-            .collect();
+        let pages: Vec<_> =
+            s.pages().iter().map(|p| serde_json::json!({ "url": p.url, "file": p.file })).collect();
         serde_json::to_vec(&pages).expect("serialises")
     });
     h.status(r)

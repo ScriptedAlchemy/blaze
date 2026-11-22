@@ -62,6 +62,30 @@ class InputTests(unittest.TestCase):
                 cli.load(json.dumps(value))
 
 
+class DaemonSchemaTests(unittest.TestCase):
+    def test_missing_or_invalid_schema_refuses_before_privileged_probe_setup(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(cli, "ROOT", directory), \
+                patch.object(cli.subprocess, "run") as run:
+            with self.assertRaisesRegex(cli.storelib.Failed, "upstream removed the daemon API"):
+                cli.stranger("unused-home", lambda *_args: self.fail("no probe may run"))
+            run.assert_not_called()
+            source = Path(directory) / "crates/blaze-api/src/lib.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("// no schema declaration\n")
+            with self.assertRaisesRegex(cli.storelib.Failed, "cannot read SCHEMA"):
+                cli.framed("Status")
+
+    def test_frame_uses_the_available_sources_schema(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(cli, "ROOT", directory):
+            source = Path(directory) / "crates/blaze-api/src/lib.rs"
+            source.parent.mkdir(parents=True)
+            for schema in (3, 7):
+                with self.subTest(schema=schema):
+                    source.write_text(f"pub const SCHEMA: u32 = {schema};\n")
+                    body = cli.cbor({"schema": schema, "id": 1, "body": "Status"})
+                    self.assertEqual(cli.framed("Status"), (len(body).to_bytes(4, "big") + body).hex())
+
+
 class SelectedCompilerTests(unittest.TestCase):
     def test_sides_execute_the_exact_selection_and_copied_build_not_path_or_cargo(self):
         with tempfile.TemporaryDirectory() as directory:
