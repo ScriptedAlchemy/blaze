@@ -87,7 +87,7 @@ impl Sim {
             sequence: self.next[&session],
             command,
         };
-        let (bytes, effects) = self.core.request(self.now, &request)
+        let (bytes, effects) = self.core.request(self.now, &request, Global)
             .map_err(|why| format!("carrier call refused: {}", why.message))?;
         let ServerFrame::Response(response) = decode(&bytes, &Limits::DOCUMENTED).unwrap() else {
             return Err("a request had no bound response".into());
@@ -142,7 +142,7 @@ fn scenario(queued_at: u64, extension: u64, first_read: u64, plant: Plant) -> Re
         session.expires = ORDINARY;
     }
     sim.now = queued_at + first_read;
-    sim.core.tick(sim.now);
+    sim.core.tick(sim.now, Global);
     if sim.core.hello(sim.now, &resume(owner, sim.core.epoch)).is_err() {
         return Err("verified work lost its cleanup lifetime".into());
     }
@@ -185,7 +185,7 @@ fn scenario(queued_at: u64, extension: u64, first_read: u64, plant: Plant) -> Re
                 Global,
             );
     }
-    let (replayed, effects) = sim.core.request(sim.now, &pending.request).unwrap();
+    let (replayed, effects) = sim.core.request(sim.now, &pending.request, Global).unwrap();
     if replayed != pending.bytes || !effects.is_empty()
         || sim.core.jobs.execution(execution).unwrap().events(0) != events.as_slice()
     {
@@ -199,7 +199,7 @@ fn scenario(queued_at: u64, extension: u64, first_read: u64, plant: Plant) -> Re
         sim.core.sessions.get_mut(&owner).unwrap().last.as_mut().unwrap().request =
             encode(&ClientFrame::Request(conflicting.clone()), Global);
     }
-    if sim.core.request(sim.now, &conflicting).is_ok() {
+    if sim.core.request(sim.now, &conflicting, Global).is_ok() {
         return Err("a reused replay identity accepted different request bytes".into());
     }
     finish(&mut sim, owner, binding, lookup, deadline, &events)
@@ -239,7 +239,7 @@ fn finish(
         sim.oracle(owner, deadline)?;
     }
     sim.now = deadline + 1;
-    sim.core.tick(sim.now);
+    sim.core.tick(sim.now, Global);
     let current = sim.call(owner, Command::OwnedAssignment(lookup))?;
     if current.answer != Answer::OwnedAssignment(OwnedAssignmentAnswer { attempt }) {
         return Err("the deadline discarded ownership before cleanup".into());
@@ -262,14 +262,14 @@ fn finish(
     }
     sim.oracle(owner, deadline)?;
     sim.now = deadline + CLEANUP + 1;
-    sim.core.tick(sim.now);
+    sim.core.tick(sim.now, Global);
     if sim.core.hello(sim.now, &resume(owner, sim.core.epoch)).is_ok()
-        || sim.core.request(sim.now, &stopped.request).is_ok()
+        || sim.core.request(sim.now, &stopped.request, Global).is_ok()
     {
         return Err("expired cleanup authority was revived".into());
     }
     let fresh = sim.open(1);
-    if fresh == owner || sim.core.request(sim.now, &stopped.request).is_ok() {
+    if fresh == owner || sim.core.request(sim.now, &stopped.request, Global).is_ok() {
         return Err("a new lifetime replayed an expired owner's request".into());
     }
     Ok(())

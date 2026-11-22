@@ -22,7 +22,7 @@ fn execution() -> Execution {
         ExecutionConfig::default(),
         &mut Vec::new(),
     );
-    e.assign(0, "lead", &["helper".to_owned()], &mut Vec::new()).unwrap();
+    e.assign(0, "lead", &["helper"], &mut Vec::new()).unwrap();
     e
 }
 
@@ -599,7 +599,7 @@ fn promoted_permanently_stalled_helper_is_cancelled_at_deadline_without_coverage
         config,
         &mut Vec::new(),
     );
-    e.assign(0, "lead", &["stuck".to_owned(), "healthy".to_owned()], &mut Vec::new()).unwrap();
+    e.assign(0, "lead", &["stuck", "healthy"], &mut Vec::new()).unwrap();
     let roots =
         RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
     let heartbeat = |e: &Execution| WorkersEventsRequest {
@@ -614,7 +614,7 @@ fn promoted_permanently_stalled_helper_is_cancelled_at_deadline_without_coverage
     e.tick(16, &mut out);
     assert!(out.contains(&Effect::Kill { executor: "lead".to_owned(), assignment: old }));
     assert!(out.contains(&Effect::NeedLead));
-    e.assign(16, "stuck", &["healthy".to_owned()], &mut out).unwrap();
+    e.assign(16, "stuck", &["healthy"], &mut out).unwrap();
     e.join(
         16,
         "stuck",
@@ -806,12 +806,12 @@ fn assigning_an_unstarted_helper_does_not_forge_liveness() {
         WorkersEventsRequest { execution: e.id, attempt: e.attempt(), events: Vec::new() };
     e.worker_events(9, "helper", &heartbeat, &mut Vec::new()).unwrap();
     e.add_helper(10, "silent").unwrap();
-    let recently_heard = e.heard_recently(11);
-    assert!(recently_heard.contains(&"helper".to_owned()), "{recently_heard:?}");
-    assert!(!recently_heard.contains(&"silent".to_owned()), "{recently_heard:?}");
+    let recently_heard: Vec<&str> = e.heard_recently(11).collect();
+    assert!(recently_heard.contains(&"helper"), "{recently_heard:?}");
+    assert!(!recently_heard.contains(&"silent"), "{recently_heard:?}");
 
     e.worker_events(12, "silent", &heartbeat, &mut Vec::new()).unwrap();
-    assert!(e.heard_recently(13).contains(&"silent".to_owned()));
+    assert!(e.heard_recently(13).any(|executor| executor == "silent"));
 }
 
 mod claim {
@@ -844,8 +844,12 @@ mod claim {
     fn an_executor_is_claimed_once_and_again_by_its_claimant() {
         let (mut jobs, id) = started(1);
         let mut out = Vec::new();
-        let first = jobs.claim(1, id, [1; 32], &mut out).unwrap().expect("the lead");
-        assert_eq!(jobs.claim(2, id, [1; 32], &mut out).unwrap(), Some(first.clone()));
+        let (first, attempt, storage) = {
+            let (executor, attempt) = jobs.claim(1, id, [1; 32], &mut out).unwrap().expect("the lead");
+            (executor.to_owned(), attempt, executor.as_ptr())
+        };
+        assert_eq!(jobs.execution(id).unwrap().lead().unwrap().as_ptr(), storage);
+        assert_eq!(jobs.claim(2, id, [1; 32], &mut out).unwrap(), Some((first.as_str(), attempt)));
         assert_eq!(jobs.claim(3, id, [2; 32], &mut out).unwrap(), None, "nobody else gets it");
     }
 
@@ -853,17 +857,17 @@ mod claim {
     fn a_second_claimant_gets_a_helper_when_there_is_one() {
         let (mut jobs, id) = started(2);
         let mut out = Vec::new();
-        let first = jobs.claim(1, id, [1; 32], &mut out).unwrap().expect("the lead");
+        let first = jobs.claim(1, id, [1; 32], &mut out).unwrap().expect("the lead").0.to_owned();
         let second = jobs.claim(2, id, [2; 32], &mut out).unwrap();
         // A helper is offered per tick, and only once the execution has its work set.
         if let Some(second) = second {
-            assert_ne!(first.0, second.0, "one claimant per executor");
+            assert_ne!(first, second.0, "one claimant per executor");
         }
     }
 
     #[test]
     fn work_unfinished_has_no_committed_packs() {
         let (jobs, id) = started(1);
-        assert_eq!(jobs.committed_packs(id).unwrap(), None);
+        assert!(jobs.committed_packs(id).unwrap().is_none());
     }
 }

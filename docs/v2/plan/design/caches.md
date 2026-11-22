@@ -134,6 +134,7 @@ Content identities use BLAKE3 under a domain, retaining at least 128 bits. Other
 |---|---|---|---|
 | `crates/blaze-ids/` | BLAKE3, 256 bits or the first 128 | identity | Content identity under a domain. |
 | `crates/blaze-hash/` | foldhash, SipHash and prehashed key words | probe | The map compares complete keys after probing. |
+| `crates/blaze-wire/src/allocator_tests.rs` | DefaultHasher | probe | A test checks that equal sets hash equally across allocators; it compares the complete sets first and never uses a hash as content identity. |
 | `crates/blaze-memo/src/lib.rs` | FNV-1a, 64 bits | probe | Kind names choose table hashes; kinds compare by their static Kind addresses, so a collision is not identity equality. |
 | `crates/blaze-std/src/lib.rs` | Re-exported hashers | names | Public names, not another implementation. |
 | `crates/hir-ty/src/method_resolution/frozen/pages.rs` | FNV-1a, 64 bits | probe | The persisted slot is followed by decoding and comparing the entry key. |

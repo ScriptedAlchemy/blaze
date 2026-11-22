@@ -726,6 +726,13 @@ mod tests {
         _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    fn a_walk_has_exactly_its_visible_names(shows: impl Fn(&str) -> bool) -> bool {
+        super::READ_BY_THE_SANDBOX.iter().chain(super::READ_BY_THE_C_LIBRARY).all(|name| shows(name))
+            && ["OUT_DIR", "CC", blaze_usercode::provider::VAR].into_iter().all(&shows)
+            && ["OLDPWD", "INVOCATION_ID", "LIBCLANG_PATH"].into_iter().all(|name| !shows(name))
+    }
+
     /// The invariant: what a walk of a lending run's environment shows ([`super::walk_shows`])
     /// is exactly what [`super::program_env`] leaves in the environment or lends until a walk:
     /// every visible name (given, the sandbox's, the C library's, the provider's) and the walk
@@ -735,12 +742,17 @@ mod tests {
     fn a_walk_shows_every_visible_name_and_the_walk_set() {
         let given = ["OUT_DIR".to_owned()];
         let shows = |name: &str| super::walk_shows(&given, std::ffi::OsStr::new(name));
-        for name in super::READ_BY_THE_SANDBOX.iter().chain(super::READ_BY_THE_C_LIBRARY) {
-            assert!(shows(name), "`{name}` stays in a lending run's environment, and a walk is not shown it");
-        }
+        assert!(a_walk_has_exactly_its_visible_names(shows));
         assert_eq!(super::READ_BY_THE_SANDBOX, super::VISIBLE_TO_THE_SANDBOX);
-        assert!(shows("OUT_DIR") && shows("CC") && shows(blaze_usercode::provider::VAR));
-        assert!(!shows("OLDPWD") && !shows("INVOCATION_ID") && !shows("LIBCLANG_PATH"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_oracle_catches_a_walk_showing_a_name_lent_only_by_name() {
+        let given = ["OUT_DIR".to_owned()];
+        let shows = |name: &str| super::walk_shows(&given, std::ffi::OsStr::new(name));
+        assert!(a_walk_has_exactly_its_visible_names(shows));
+        assert!(!a_walk_has_exactly_its_visible_names(|name| name == "OLDPWD" || shows(name)));
     }
 
     /// A run whose spec names the variables its key has is lent the rest: they are no

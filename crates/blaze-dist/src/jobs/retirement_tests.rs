@@ -92,11 +92,17 @@ impl Sim {
             },
         );
         let first = jobs.submit(0, &request(1), need(), &mut Vec::new()).unwrap();
-        let (lead, attempt) =
-            jobs.claim(0, first.execution, LEAD, &mut Vec::new()).unwrap().unwrap();
+        let (lead, attempt) = jobs
+            .claim(0, first.execution, LEAD, &mut Vec::new())
+            .unwrap()
+            .map(|(executor, attempt)| (executor.to_owned(), attempt))
+            .unwrap();
         let leaving = jobs.submit(0, &request(1), need(), &mut Vec::new()).unwrap();
-        let (helper, helped) =
-            jobs.claim(0, first.execution, HELPER, &mut Vec::new()).unwrap().unwrap();
+        let (helper, helped) = jobs
+            .claim(0, first.execution, HELPER, &mut Vec::new())
+            .unwrap()
+            .map(|(executor, attempt)| (executor.to_owned(), attempt))
+            .unwrap();
         assert_ne!(lead, helper);
         assert_eq!(attempt, helped);
         let original = AssignmentToken { execution: first.execution, attempt };
@@ -475,7 +481,7 @@ fn cancel_before_observing_promotion(
     join(
         &mut sim.jobs,
         sim.now,
-        &executor,
+        &sim.helper,
         AssignmentToken { execution: next.execution, attempt },
     );
     sim.jobs.admission_view().check().map_err(|why| format!("capacity: {why}"))

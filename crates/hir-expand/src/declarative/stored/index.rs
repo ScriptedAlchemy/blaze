@@ -1062,7 +1062,7 @@ mod tests {
     /// The control of the above: a signature's edit moves the item's header and its impl's,
     /// and no other row; an attribute's moves its item's attrs and header.
     #[test]
-    fn a_header_edit_moves_the_item_and_its_impl() {
+    fn the_oracle_catches_a_header_edit_treated_as_only_a_body_edit() {
         let before = rows_of(&text("1", "", "#[derive(Clone)]"), false);
         let after = rows_of(&text("1", "x: u8", "#[derive(Clone)]"), false);
         assert_eq!(moved(&before, &after), [(2, false, true, false), (4, false, true, false)]);
@@ -1259,7 +1259,7 @@ mod tests {
     /// the token is in. An operator, a literal's text (its spaces too), two tokens made one,
     /// two punctuation marks glued, a doc comment's text, a doc comment made a plain one.
     #[test]
-    fn a_changed_token_moves_its_row() {
+    fn the_oracle_catches_a_changed_token_treated_as_trivia() {
         let body = (1, false, false, true);
         let attrs = (1, true, true, false);
         let cases: [(&str, &str, (usize, bool, bool, bool)); 12] = [

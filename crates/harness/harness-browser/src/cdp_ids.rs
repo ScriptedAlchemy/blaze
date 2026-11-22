@@ -70,6 +70,20 @@ struct Head {
     id: Option<i64>,
 }
 
+/// Every host id remains reserved by a pending request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IdsPending {
+    max: i32,
+}
+
+impl std::fmt::Display for IdsPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "every DevTools request id (1..={}) is pending", self.max)
+    }
+}
+
+impl std::error::Error for IdsPending {}
+
 impl CdpIds {
     #[must_use]
     pub fn new() -> Self {
@@ -87,7 +101,7 @@ impl CdpIds {
     }
 
     /// A fresh host id: the next of 1..=max not pending. Bounded: at most `max` steps.
-    fn alloc(&mut self) -> Result<i32, String> {
+    fn alloc(&mut self) -> Result<i32, IdsPending> {
         for _ in 0..self.max {
             let id = self.next;
             self.next = if self.next >= self.max { 1 } else { self.next + 1 };
@@ -95,7 +109,7 @@ impl CdpIds {
                 return Ok(id);
             }
         }
-        Err(format!("every DevTools request id (1..={}) is pending", self.max))
+        Err(IdsPending { max: self.max })
     }
 
     /// Renumber connection `conn`'s CDP message `message` for view `view`: the host id and the JSON text to send to the

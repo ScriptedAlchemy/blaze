@@ -1,6 +1,6 @@
 //! Serialized routing, retry journal and retention for the local IO driver.
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_dist::Refusal;
@@ -216,9 +216,13 @@ impl Coordinator {
     }
 
     /// Actual timer transitions and terminal/session retention.
-    pub fn tick(&mut self, now: u64) -> Vec<(ExecutionId, Effect)> {
+    pub fn tick<A: Allocator + Clone>(
+        &mut self,
+        now: u64,
+        alloc: A,
+    ) -> Vec<(ExecutionId, Effect), A> {
         let now = self.now(now);
-        let mut effects = Vec::new();
+        let mut effects = Vec::new_in(alloc);
         self.jobs.tick(now, &mut effects);
         // A session is capacity only while it is live. Expiry removes the entry and its
         // journal, which is safe because an issued identity is never issued again: a request
@@ -229,12 +233,13 @@ impl Coordinator {
                 self.ended.entry(e.id).or_insert(now);
             }
         }
-        let expired: Vec<_> = self
-            .ended
-            .iter()
-            .filter(|(_, at)| now.saturating_sub(**at) > self.config.terminal_ms)
-            .map(|(id, _)| *id)
-            .collect();
+        let mut expired = Vec::new_in(effects.allocator().clone());
+        expired.extend(
+            self.ended
+                .iter()
+                .filter(|(_, at)| now.saturating_sub(**at) > self.config.terminal_ms)
+                .map(|(id, _)| *id),
+        );
         for id in expired {
             if self.jobs.forget_terminal(id) {
                 self.ended.remove(&id);
@@ -250,30 +255,33 @@ impl Coordinator {
         self.units.get(&execution).copied()
     }
 
-    pub(crate) fn committed_names(
+    pub(crate) fn committed_names<A: Allocator + Clone>(
         &self,
         result: &blaze_wire::BatchResult,
-    ) -> Vec<blaze_wire::WorkName> {
+        alloc: A,
+    ) -> Vec<blaze_wire::WorkName, A> {
         let Some(work) = self.jobs.execution(result.lease.execution).and_then(|e| e.work()) else {
-            return Vec::new();
+            return Vec::new_in(alloc);
         };
-        work.committed_names(result)
+        work.committed_names(result, alloc)
     }
 
     /// Orderly reactor shutdown cancels active subscriptions and emits genuine stop effects.
-    pub fn shutdown(&mut self, now: u64) -> Vec<(ExecutionId, Effect)> {
+    pub fn shutdown<A: Allocator + Clone>(
+        &mut self,
+        now: u64,
+        alloc: A,
+    ) -> Vec<(ExecutionId, Effect), A> {
         let now = self.now(now);
-        let attached: Vec<_> = self
-            .jobs
-            .executions()
-            .flat_map(|e| {
+        let mut attached = Vec::new_in(alloc.clone());
+        attached.extend(
+            self.jobs.executions().flat_map(|e| {
                 e.subscribers()
                     .filter(|s| s.state == blaze_dist::jobs::SubscriberState::Attached)
-                    .map(|s| (e.id, s.id))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let mut effects = Vec::new();
+                    .map(move |s| (e.id, s.id))
+            }),
+        );
+        let mut effects = Vec::new_in(alloc);
         for (execution, subscriber) in attached {
             let _ = self.jobs.unsubscribe(now, execution, subscriber, &mut effects);
         }
@@ -375,11 +383,13 @@ impl Coordinator {
 
     /// Execute once, journal the exact encoded response before it is written to the socket.
     /// Invalid/reused/out-of-order IDs never reach the core. Cached refusals are immutable too.
-    pub fn request(
+    /// Returned bytes and effects use `alloc`; the retry journal owns its longer-lived copies.
+    pub fn request<A: Allocator + Clone>(
         &mut self,
         now: u64,
         request: &Request,
-    ) -> Result<(Vec<u8>, Vec<(ExecutionId, Effect)>), WireError> {
+        alloc: A,
+    ) -> Result<(Vec<u8, A>, Vec<(ExecutionId, Effect), A>), WireError> {
         let now = self.now(now);
         if request.epoch != self.epoch {
             return Err(error(ErrorCode::Conflict, "daemon-moved"));
@@ -395,7 +405,7 @@ impl Coordinator {
             // waits for each answer before its next, and is refused like one out of order.
             return match &session.last {
                 Some(last) if last.sequence == request.sequence => match last.request == raw {
-                    true => Ok((last.reply.clone(), Vec::new())),
+                    true => Ok((last.reply.to_vec_in(alloc.clone()), Vec::new_in(alloc))),
                     false => Err(error(ErrorCode::Malformed, "sequence-reused")),
                 },
                 _ => Err(error(ErrorCode::Conflict, "request-out-of-order")),
@@ -403,7 +413,7 @@ impl Coordinator {
         }
         // Apply deadlines before route-level retention checks. An expired execution is
         // retained terminal work, not a live coalescing target that may bypass capacity.
-        let mut effects = self.tick(now);
+        let mut effects = self.tick(now, alloc.clone());
         let answer = match self.route(now, request.session, &request.command, &mut effects) {
             Ok(answer) => answer,
             Err(error) => Answer::Error(error),
@@ -430,7 +440,7 @@ impl Coordinator {
                 sequence: request.sequence,
                 answer,
             }),
-            Global,
+            alloc,
         );
         if reply.len() > self.config.max_frame as usize {
             // Keep the already-observed transition journaled if a future response variant
@@ -442,15 +452,18 @@ impl Coordinator {
                     sequence: request.sequence,
                     answer: Answer::Error(error(ErrorCode::Busy, "response-frame-capacity")),
                 }),
-                Global,
+                reply.allocator().clone(),
             );
         }
         // Responses are bounded structurally by event pagination and request limits.
         // The server configuration is validated to leave room for all non-event answers.
         let session = self.sessions.get_mut(&request.session).expect("validated session");
         session.next += 1;
-        session.last =
-            Some(Answered { sequence: request.sequence, request: raw, reply: reply.clone() });
+        session.last = Some(Answered {
+            sequence: request.sequence,
+            request: raw,
+            reply: reply.to_vec_in(Global),
+        });
         // A release is terminal: its answer is journaled above, then the lifetime and its
         // journal are removed. Capacity and memory return at once, and nothing is kept to
         // revive. A release performs no core transition, so a client that never saw this
@@ -502,7 +515,7 @@ impl Coordinator {
         now: u64,
         session: Digest,
         command: &Command,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<Answer, WireError> {
         if let Some((id, content)) = referenced_execution(command) {
             let execution = self
@@ -741,6 +754,7 @@ impl Coordinator {
                 let claimed = self
                     .jobs
                     .claim(now, c.execution, owned_claimant(&session, &c.claimant), out)
+                    .map(|claimed| claimed.map(|(executor, attempt)| (executor.to_owned(), attempt)))
                     .map_err(|r| r.to_wire(None))?;
                 let e = self.jobs.execution(c.execution).expect("claimed");
                 let lead = claimed.as_ref().is_some_and(|(who, _)| e.lead() == Some(who.as_str()));
@@ -756,7 +770,9 @@ impl Coordinator {
                     return Err(Refusal::NoExecution.to_wire(None));
                 }
                 let packs = self.jobs.committed_packs(p.execution).map_err(|r| r.to_wire(None))?;
-                Ok(Answer::Packs(CommittedPacks { packs }))
+                Ok(Answer::Packs(CommittedPacks {
+                    packs: packs.map(|packs| packs.cloned().collect()),
+                }))
             }
             Command::CommitPublication(p) => {
                 self.work(p.content, p.execution, p.attempt)?;
@@ -840,14 +856,14 @@ mod tests {
                 blaze_wire::Reservation { memory: 1, cpus: 1, disk: 1 },
             )),
         };
-        let (first, _) = c.request(0, &request(1, &job)).unwrap();
+        let (first, _) = c.request(0, &request(1, &job), Global).unwrap();
         let ServerFrame::Response(Response { answer: Answer::Binding(first), .. }) =
             decode(&first, &Limits::DOCUMENTED).unwrap()
         else {
             panic!("first job was not submitted")
         };
         job.deadline_ms = 100;
-        let (second, effects) = c.request(11, &request(2, &job)).unwrap();
+        let (second, effects) = c.request(11, &request(2, &job), Global).unwrap();
         let ServerFrame::Response(Response { answer: Answer::Error(error), .. }) =
             decode(&second, &Limits::DOCUMENTED).unwrap()
         else {
@@ -915,7 +931,7 @@ mod tests {
             sequence: 1,
             command: Command::Release(Release {}),
         };
-        let (_, effects) = c.request(0, &request).unwrap();
+        let (_, effects) = c.request(0, &request, Global).unwrap();
         assert!(effects.is_empty());
         assert_eq!(c.sessions.len(), 1);
         assert!(!c.sessions.contains_key(&a.session));
@@ -943,7 +959,7 @@ mod tests {
                 blaze_wire::Reservation { memory: 1, cpus: 1, disk: 1 },
             )),
         };
-        let (bound, _) = c.request(0, &submit).unwrap();
+        let (bound, _) = c.request(0, &submit, Global).unwrap();
         let ServerFrame::Response(Response { answer: Answer::Binding(binding), .. }) =
             decode(&bound, &Limits::DOCUMENTED).unwrap()
         else {
@@ -957,15 +973,15 @@ mod tests {
         };
         let mut last = Vec::new();
         for sequence in 2..=5_000 {
-            (last, _) = c.request(0, &poll(sequence)).unwrap();
+            (last, _) = c.request(0, &poll(sequence), Global).unwrap();
         }
         let session = &c.sessions[&welcome.session];
         assert_eq!(session.next, 5_001);
         assert_eq!(session.last.as_ref().map(|it| it.sequence), Some(5_000));
-        assert_eq!(c.request(0, &poll(5_000)).unwrap().0, last);
+        assert_eq!(c.request(0, &poll(5_000), Global).unwrap().0, last);
         let reused = Request { command: Command::Release(Release {}), ..poll(5_000) };
-        assert_eq!(c.request(0, &reused).unwrap_err().message, "sequence-reused");
-        let retired = c.request(0, &submit).unwrap_err();
+        assert_eq!(c.request(0, &reused, Global).unwrap_err().message, "sequence-reused");
+        let retired = c.request(0, &submit, Global).unwrap_err();
         assert_eq!(retired.code(), Some(ErrorCode::Conflict));
         assert_eq!(c.jobs.executions().count(), 1);
     }

@@ -326,6 +326,10 @@ fn the_output_is_the_stream_or_the_panic_message() {
     assert_eq!(server.output(&panicked).unwrap().unwrap_err(), "no fields");
 }
 
+fn every_answer_is_covered(asks: &[super::Asked], said: super::Asked) -> bool {
+    said.by_position() == asks.iter().all(|it| it.by_position())
+}
+
 /// The invariant: what an expansion is said to have asked is a question no key covers
 /// whenever it asked one, whatever it asked before or after; else the first it asked. An
 /// expansion's reads are known exactly when every question it asked is by position
@@ -347,9 +351,8 @@ fn a_question_no_key_covers_is_the_one_an_expansion_is_said_to_have_asked() {
             server.note_asked(asked);
         }
         assert_eq!(server.asked, Some(said), "{asks:?}");
-        assert_eq!(
-            said.by_position(),
-            asks.iter().all(|it| it.by_position()),
+        assert!(
+            every_answer_is_covered(asks, said),
             "{asks:?}: its reads are known only if a key covers every answer"
         );
     }
@@ -358,4 +361,19 @@ fn a_question_no_key_covers_is_the_one_an_expansion_is_said_to_have_asked() {
     for asked in [Asked::SourceText, Asked::ByteRange, Asked::Debug] {
         assert!(!asked.by_position(), "{asked:?}");
     }
+}
+
+#[test]
+fn the_oracle_catches_a_positional_question_hiding_a_source_text_read() {
+    use super::Asked;
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
+    let mut server = server(&db);
+    let asks = [Asked::Join, Asked::SourceText, Asked::LineColumn];
+    for asked in asks {
+        server.note_asked(asked);
+    }
+    assert!(every_answer_is_covered(&asks, server.asked.unwrap()));
+    // Plant the shortcut that keeps the first question even after an unkeyed read.
+    server.asked = Some(Asked::Join);
+    assert!(!every_answer_is_covered(&asks, server.asked.unwrap()));
 }

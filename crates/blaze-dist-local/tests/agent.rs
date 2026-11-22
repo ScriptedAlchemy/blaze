@@ -257,9 +257,9 @@ fn a_committed_pack_the_server_lost_refuses_without_compiling() {
     let unit = unit(4, 2);
     let never = AtomicBool::new(false);
     let pack = Pack::of(vec![value_of(&[9; 32])]).unwrap();
-    world.blobs.put_pack(&pack).unwrap();
+    world.blobs.put_pack(&pack, Global).unwrap();
     let list = blaze_wire::pack_list::encode(&[pack.reference.clone()], Global);
-    world.blobs.publish(&unit.spec, &list).unwrap();
+    world.blobs.publish(&unit.spec, &list, Global).unwrap();
     let path = world
         ._dir
         .path()
@@ -285,9 +285,9 @@ fn a_committed_pack_the_server_lost_refuses_without_compiling() {
     }
     assert_eq!(compiler.entered.load(Ordering::SeqCst), 0, "a committed absence must not compile");
     assert!(compiler.log.lock().unwrap().is_empty());
-    assert_eq!(world.blobs.published(&unit.spec).unwrap().unwrap(), list);
+    assert_eq!(world.blobs.published(&unit.spec, Global).unwrap().unwrap(), list);
     // Remove only the fault: the same manifest is readable again without any compilation.
-    world.blobs.put_pack(&pack).unwrap();
+    world.blobs.put_pack(&pack, Global).unwrap();
     let restored =
         agent::run(&config(&world.socket, &world.blobs), &unit, &mut compiler, &never).unwrap();
     assert_eq!(restored.source, Source::Published);
@@ -402,23 +402,23 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
     let cfg = config(&world.socket, &world.blobs);
     let first = agent::run(&cfg, &unit, &mut WithNeighbors(unit.names.clone()), &never).unwrap();
     assert_eq!(first.packs.len(), 1);
-    let old = world.blobs.published(&unit.spec).unwrap().unwrap();
+    let old = world.blobs.published(&unit.spec, Global).unwrap().unwrap();
     let mut split = Vec::new();
     for name in &unit.names {
         let pack = Pack::of(vec![value_of(name)]).unwrap();
-        world.blobs.put_pack(&pack).unwrap();
+        world.blobs.put_pack(&pack, Global).unwrap();
         split.push(pack.reference);
     }
     split.sort();
     let proposed = blaze_wire::pack_list::encode(&split, Global);
     assert_ne!(proposed, old, "the first-writer check must compare actual different partitions");
-    world.blobs.publish(&unit.spec, &proposed).unwrap();
+    world.blobs.publish(&unit.spec, &proposed, Global).unwrap();
     assert_eq!(
-        world.blobs.published(&unit.spec).unwrap().unwrap(),
+        world.blobs.published(&unit.spec, Global).unwrap().unwrap(),
         old,
         "the first writer remains immutable"
     );
-    assert_eq!(agent::import(&world.blobs, &split).unwrap(), first.values);
+    assert_eq!(agent::import(&world.blobs, &split, Global).unwrap(), first.values);
 
     // Same key sets cannot hide a different value or kind behind a different partition.
     for kind in [1, 2] {
@@ -428,10 +428,10 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
             values[0].bytes.push(99);
         }
         let wrong = Pack::of(values).unwrap();
-        world.blobs.put_pack(&wrong).unwrap();
+        world.blobs.put_pack(&wrong, Global).unwrap();
         let refused = world
             .blobs
-            .publish(&unit.spec, &blaze_wire::pack_list::encode(&[wrong.reference], Global))
+            .publish(&unit.spec, &blaze_wire::pack_list::encode(&[wrong.reference], Global), Global)
             .unwrap_err();
         assert!(matches!(agent::decide(&LocalPolicy::Fallback, refused), Err(Error::Committed(_))));
     }
@@ -758,7 +758,7 @@ fn a_final_compiler_or_output_refusal_cannot_fall_back() {
             );
             assert!(matches!(agent::decide(&policy, failure), Err(Error::Refused(_))));
             assert_eq!(compiler.calls, 1);
-            assert!(world.blobs.published(&unit.spec).unwrap().is_none());
+            assert!(world.blobs.published(&unit.spec, Global).unwrap().is_none());
             let Answer::Terminal(blaze_dist_local::protocol::Terminal {
                 value: Some(terminal), ..
             }) = observer.call(Command::Terminal(observing.subscription)).unwrap()

@@ -1411,6 +1411,10 @@ extra!();
         tree
     }
 
+    fn live_expansions_equal_to(db: &crate::test_db::TestDB, read: &ItemTree) -> usize {
+        expansions(db).iter().filter(|(_, live)| **live == *read).count()
+    }
+
     /// The invariant: a filed tree (written in a `relocating` scope, its table by structure
     /// through `deps::signatures::table`) holds no context's word, so read into a fresh
     /// database whose crate interned its contexts in another order it is that database's own
@@ -1434,7 +1438,7 @@ extra!();
         // take other indices.
         let read_db = fixture::db(MARKED_AFTER_EXTRA).into_db();
         let read_krate = fixture::test_crate(&read_db);
-        let trees = expansions(&read_db);
+        let _ = expansions(&read_db);
         let mut read_table = table::decode(&read_db, read_krate, &table_bytes).expect("decoded");
         let buffer = blaze_format::Aligned::copy_from(&bytes);
         let read = relocating(&mut read_table, || ItemTree::read(&buffer)?.decode())
@@ -1442,7 +1446,7 @@ extra!();
         // Equal trees hold equal call paths and equal context words: the one live tree equal
         // to the filed one calls `inner` (so it is `outer!`'s) under this arena's word for
         // `outer!`'s mark.
-        let equal = trees.iter().filter(|(_, live)| **live == read).count();
+        let equal = live_expansions_equal_to(&read_db, &read);
         assert_eq!(equal, 1, "the filed tree is the reading database's own tree of `outer!`");
 
         let context = |tree: &ItemTree| {
@@ -1463,5 +1467,19 @@ extra!();
             "the chain has as many marks"
         );
         assert_ne!(written.into_u32(), got.into_u32(), "the control: the words differ");
+    }
+
+    #[test]
+    fn the_oracle_catches_a_context_filed_as_its_old_arenas_word() {
+        let written_db = fixture::db(MARKED).into_db();
+        let tree = marked(&written_db);
+        // Plant the old in-process codec at the file boundary: omit relocation on both
+        // sides, so its well-formed bytes preserve the writer's context word.
+        let bytes = blaze_format::to_bytes(tree);
+        let buffer = blaze_format::Aligned::copy_from(&bytes);
+        let read = ItemTree::read(&buffer).unwrap().decode().unwrap();
+        assert_eq!(&read, tree, "the raw codec preserves its original tree");
+        let read_db = fixture::db(MARKED_AFTER_EXTRA).into_db();
+        assert_eq!(live_expansions_equal_to(&read_db, &read), 0);
     }
 }

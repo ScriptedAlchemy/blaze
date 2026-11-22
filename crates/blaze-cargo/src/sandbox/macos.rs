@@ -1047,20 +1047,13 @@ mod tests {
         std::fs::write(std::path::Path::new(&out).join("seen"), said).unwrap();
     }
 
-    /// The invariant: a sandboxed run connects to a Unix socket its read set names, by that
-    /// path (the `(remote unix-socket (path-literal (param "SOCKET<n>")))` rule, as the
-    /// daemon's in-process socket and a test's fork server's are given), and to no other
-    /// socket outside its writable directories: the control is a socket beside it, in a
-    /// directory it may read, which it is refused. Skipped where no sandbox can be made,
-    /// unless `BLAZE_VIEW_TESTS=require`.
-    #[test]
-    fn a_sandboxed_run_connects_to_a_socket_given_readable_and_to_no_other() {
+    fn only_the_named_socket_is_reached(grant_the_other: bool) -> Option<bool> {
         use std::io::Read as _;
         if let Err(why) = crate::sandbox::alone::probe(crate::sandbox::Probe::V2) {
             let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
             assert!(!required, "{why}");
             eprintln!("skipped: {why}");
-            return;
+            return None;
         }
         let exe = std::env::current_exe().unwrap();
         let made = blaze_core::temp::TempDir::for_test("blaze-macos-sock-");
@@ -1072,7 +1065,7 @@ mod tests {
         let (given, other) = (sockets.join("g.sock"), sockets.join("o.sock"));
         let given_at = std::os::unix::net::UnixListener::bind(&given).unwrap();
         let other_at = std::os::unix::net::UnixListener::bind(&other).unwrap();
-        let spec = blaze_usercode::confine::Spec {
+        let mut spec = blaze_usercode::confine::Spec {
             program: exe.clone(),
             args: [
                 "sandbox::macos::tests::helper_connects_to_the_sockets_it_is_told_of",
@@ -1098,14 +1091,15 @@ mod tests {
             not_inputs: vec![exe],
             given: None,
         };
+        if grant_the_other {
+            spec.read.push(other.clone());
+        }
         assert_eq!(crate::sandbox::alone::launch(&spec), 0);
         let seen = std::fs::read_to_string(out.join("seen")).unwrap();
         let mut lines = seen.lines();
         assert_eq!(lines.next(), Some("connected"), "the socket given readable: {seen}");
-        assert!(
-            lines.next().is_some_and(|it| it.starts_with("refused")),
-            "the socket not given: {seen}"
-        );
+        let other_result = lines.next().expect("the helper tried the second socket");
+        assert!(other_result == "connected" || other_result.starts_with("refused"), "{seen}");
         // The run has ended: its connection waits in the listener's queue, with what it wrote.
         given_at.set_nonblocking(true).unwrap();
         let (mut stream, _) = given_at.accept().expect("the sandboxed run's connection");
@@ -1115,8 +1109,30 @@ mod tests {
         stream.read_to_end(&mut got).unwrap();
         assert_eq!(got, b"hi");
         other_at.set_nonblocking(true).unwrap();
-        assert!(other_at.accept().is_err(), "no connection reached the socket not given");
+        let reached_other = other_at.accept().is_ok();
+        assert_eq!(reached_other, other_result == "connected", "the helper and listener agree");
         _ = std::fs::remove_dir_all(&dir);
+        Some(!reached_other)
+    }
+
+    /// The invariant: a sandboxed run connects to a Unix socket its read set names, by that
+    /// path (the `(remote unix-socket (path-literal (param "SOCKET<n>")))` rule, as the
+    /// daemon's in-process socket and a test's fork server's are given), and to no other
+    /// socket outside its writable directories: the control is a socket beside it, in a
+    /// directory it may read, which it is refused. Skipped where no sandbox can be made,
+    /// unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn a_sandboxed_run_connects_to_a_socket_given_readable_and_to_no_other() {
+        if let Some(held) = only_the_named_socket_is_reached(false) {
+            assert!(held, "the sandbox connected to a socket outside its read set");
+        }
+    }
+
+    #[test]
+    fn the_oracle_catches_a_socket_permission_widened_to_its_neighbor() {
+        if let Some(held) = only_the_named_socket_is_reached(true) {
+            assert!(!held, "granting the neighbor must make its connection observable");
+        }
     }
 
     /// What the environment test runs in the sandbox: `sysctl` `KERN_PROCARGS2` of the process

@@ -61,3 +61,22 @@ fn a_scalar_constant_answers_after_an_edit_remakes_the_session() {
     );
     assert_eq!(goal(fixture.db()), 9_u32.to_le_bytes(), "the edited value, asked at the new session");
 }
+
+#[test]
+fn the_oracle_catches_a_value_homed_in_the_old_session_generation() {
+    let mut fixture = fixture::db(FIXTURE);
+    let before = fixture.db().memo().session();
+    assert!(fixture.db().memo().live(before).is_ok());
+    assert_eq!(goal(fixture.db()), 7_u32.to_le_bytes());
+    let mut vars = Env::default();
+    vars.set("BLAZE_SESSION_EDIT", "1");
+    _ = fixture.edit(|edit| _ = edit.set_process_env(vars));
+    let memo = fixture.db().memo();
+    let after = memo.session();
+    assert!(memo.live(after).is_ok());
+    // Plant the stale home, with the same arena index but the writer's old generation.
+    let dead = memo.live(before).err().expect("the old session's home is refused");
+    assert_eq!(dead.named, before);
+    assert_eq!(dead.held, Some(after));
+    assert_eq!(goal(fixture.db()), 7_u32.to_le_bytes());
+}

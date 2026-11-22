@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -71,6 +72,10 @@ BUNDLE_CONTROLS = (
     "the_oracle_catches_an_old_fetch_outcome_delivered_after_a_new_manifest",
 )
 BUNDLE_CASES = BUNDLE_MODELS + BUNDLE_CONTROLS
+STANDARD_CONTROLS = (
+    "the_oracle_catches_a_main_without_its_output_capability",
+    "the_oracle_catches_a_line_written_without_its_newline",
+)
 
 
 def shell_step(workflow: Path, name: str) -> str:
@@ -390,7 +395,8 @@ class AcceptanceGateTests(unittest.TestCase):
         seed.chmod(0o700)
         protocol_output = root / "test-output.txt"
         protocol_output.write_text(f"protocol test fixture exit {test_code}\n"
-                                   + "".join(f"test tests::download::{name} ... ok\n" for name in bundle_reported))
+                                   + "".join(f"test tests::download::{name} ... ok\n" for name in bundle_reported)
+                                   + "".join(f"test stdlib::tests::{name} ... ok\n" for name in STANDARD_CONTROLS))
         release_output = root / "release-output.txt"
         release_output.write_text(f"running {len(reported)} tests\n"
                                   + "".join(f"test serve::tests::release::{name} ... ok\n" for name in reported))
@@ -491,6 +497,8 @@ class AcceptanceGateTests(unittest.TestCase):
         ]
         transport_cases = [
             "fragmented_replies_preserve_body_boundaries_and_committed_refusals",
+            "http_bodies_keep_the_callers_allocation_through_decoding",
+            "coordinator_outputs_and_replays_use_the_callers_allocator",
             "committed_reply_bounds_follow_the_native_wire_contract",
             "an_http_reply_must_end_at_its_declared_body_boundary",
             "an_interrupted_committed_get_cannot_authorize_local_recompilation",
@@ -502,12 +510,16 @@ class AcceptanceGateTests(unittest.TestCase):
         allocator_cases = [
             "nested_effect_logs_use_the_callers_allocator",
             "holder_effects_use_the_callers_allocator",
+            "committed_names_use_the_callers_allocator_and_exact_result_identity",
             "pack_lists_use_the_callers_allocator",
             "nested_schema_encoding_and_digest_scratch_use_the_callers_allocator",
             "appending_keeps_the_callers_buffer_and_allocator_without_allocating",
             "sets_keep_their_storage_and_take_encoding_scratch_from_the_output_allocator",
             "set_encoding_writes_each_canonical_sort_key_once",
             "rendering_uses_the_destination_and_reports_its_capacity",
+            "native_scan_crosses_buffer_edges_and_skips_from_the_logical_position",
+            "native_key_digest_headers_match_the_wire_at_every_length_boundary",
+            "bounded_object_reads_use_the_callers_allocator_and_preserve_size_refusals",
         ]
         integration_cases = [
             "every_type_round_trips_byte_identically",
@@ -592,6 +604,94 @@ class AcceptanceGateTests(unittest.TestCase):
                     missing = next(name for name in names if name not in reported)
                     self.assertIn("missing executed library control: " + missing, done.stdout)
 
+    def test_harness_core_feedback_requires_real_tests_and_preserves_failures(self):
+        names = [
+            "ui::tests::a_file_page_is_its_own_file",
+            "ui::tests::an_http_page_is_its_scheme_host_and_port",
+            "ui::tests::other_schemes_and_broken_urls_are_refused",
+            "keys::tests::the_table",
+            "keys::tests::down_up_and_chars",
+            "cdp_ids::tests::two_connections_with_the_same_ids_get_their_own_answers",
+            "cdp_ids::tests::events_orphans_and_forgetting",
+            "cdp_ids::tests::refuses_what_is_not_a_request_and_crossed_answers",
+            "cdp_ids::tests::ids_wrap_and_skip_pending",
+            "cdp_ids::dst::every_cdp_answer_reaches_only_its_asker_once_and_every_live_request_is_answered",
+            "cdp_ids::dst::seeded_plans_pass",
+            "cdp_ids::dst::the_oracle_catches_a_dropped_connections_ids_freed_at_once",
+            "completion::tests::completion_tracks_sessions_through_navigation_and_disappearance",
+            "completion::tests::the_oracle_catches_focus_based_completion",
+            "fileview::tests::the_cited_part_is_marked",
+            "fileview::tests::rendering_escapes_unicode_and_preserves_writer_failures",
+            "intent::tests::a_topic_borrows_the_original_bytes_after_a_unicode_greeting",
+            "memory::tests::sorted_reviews_and_key_scratch_use_the_callers_allocator",
+            "tutor::tests::a_prompt_writes_into_fixed_storage_and_reports_a_full_sink",
+            "run::tests::streamed_answers_match_unicode_lowercase_and_whitespace_normalization",
+            "run::tests::an_order_reuses_its_buffer_when_a_missed_check_returns",
+        ]
+        cases = [("complete", names, 0, 0, None), ("zero tests", [], 0, 1, None),
+                 ("compiler failed after success lines", names, 23, 23, None)]
+        cases += [(f"missing {name}", [item for item in names if item != name], 0, 1, None)
+                  for name in names]
+        cases += [(f"changed pin {field}", names, 0, 1, field)
+                  for field in ("name", "version", "source", "checksum")]
+        cases.append(("metadata failure", names, 0, 23, "metadata"))
+        toolchain = (ROOT / "harness/toolchain").read_text().strip()
+        seed = tomllib.loads((ROOT / "crates/harness/Cargo.lock").read_text())
+        pinned = next(package for package in seed["package"] if package["name"] == "serde")
+        for label, reported, code, expected, mutation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                commands = root / "commands"
+                commands.mkdir()
+                cargo = commands / "cargo"
+                cargo.write_text(
+                    "#!/bin/sh\n"
+                    'if [ "$2" = metadata ]; then\n'
+                    '  printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/core-evidence/metadata-invocation.txt"\n'
+                    '  cp "$CORE_LOCK" "${6%/*}/Cargo.lock"\n'
+                    '  printf \'%s\\n\' "{}"\n'
+                    '  exit "$METADATA_EXIT"\n'
+                    'fi\n'
+                    'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/core-evidence/invocation.txt"\n'
+                    'cat "$CORE_OUTPUT"\nexit "$CORE_EXIT"\n')
+                cargo.chmod(0o700)
+                dependency = {field: pinned[field] for field in ("name", "version", "source", "checksum")}
+                if mutation in dependency:
+                    dependency[mutation] = "changed-unpinned-value"
+                normalized = root / "normalized.lock"
+                normalized.write_text(
+                    'version = 4\n\n[[package]]\nname = "blaze-harness-core-ci"\nversion = "0.1.0"\n\n'
+                    '[[package]]\n' + "".join(f"{key} = {json.dumps(value)}\n" for key, value in dependency.items()))
+                transcript = root / "test-output.txt"
+                output = "".join(f"test {name} ... ok\n" for name in reported)
+                transcript.write_text(output)
+                env = {"RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(ROOT),
+                       "PATH": str(commands) + os.pathsep + os.environ["PATH"],
+                       "CORE_OUTPUT": str(transcript), "CORE_EXIT": str(code),
+                       "CORE_LOCK": str(normalized), "METADATA_EXIT": "23" if mutation == "metadata" else "0"}
+                done = self.run_shell(MAIN, "harness pure cores with the pinned Rust toolchain", env)
+                self.assertEqual(done.returncode, expected, done.stdout + done.stderr)
+                evidence = root / "core-evidence"
+                metadata = (evidence / "metadata-invocation.txt").read_text().splitlines()
+                manifest = metadata[-1]
+                self.assertEqual(metadata, [str(cargo), f"+{toolchain}", "metadata", "--format-version", "1",
+                                            "--manifest-path", manifest])
+                self.assertTrue(Path(manifest).is_relative_to(root))
+                self.assertEqual((Path(manifest).parent / "../../../crates").resolve(), ROOT / "crates")
+                if mutation:
+                    self.assertFalse((evidence / "invocation.txt").exists(), "unpinned metadata cannot compile")
+                    if mutation != "metadata":
+                        self.assertIn("dependency is outside the pinned lock", done.stdout + done.stderr)
+                    continue
+                self.assertEqual((evidence / "invocation.txt").read_text().splitlines(),
+                                 [str(cargo), f"+{toolchain}", "test", "--release", "--locked",
+                                  "--all-targets", "--manifest-path", manifest])
+                self.assertEqual((evidence / "harness-core.Cargo.lock").read_bytes(), normalized.read_bytes())
+                self.assertEqual((evidence / "harness-core-tests.log").read_text(), output)
+                if expected == 1:
+                    missing = next(name for name in names if name not in reported)
+                    self.assertIn("missing executed harness-core control: " + missing, done.stdout)
+
     def test_tee_preserves_a_harness_failure_even_with_a_success_line(self):
         for step in ("dev two-worker, cold-cache, cross-PR and fault acceptance",
                      "release and folded-group two-worker and fault acceptance"):
@@ -637,6 +737,7 @@ class AcceptanceGateTests(unittest.TestCase):
                                  [str(binaries / "blaze"), "--ignore-pin", "test", "--release", "--locked",
                                   "-p", "blaze-wire", "-p", "blaze-dist", "-p", "blaze-dist-local",
                                   "-p", "blaze-serve", "-p", "blaze-global", "-p", "blaze-graph",
+                                  "-p", "blaze-std",
                                   "--lib", "--tests", "--no-fail-fast"])
                 self.assertIn(f"protocol test fixture exit {test_code}", (evidence / "exec/tests.log").read_text())
                 if test_code:
@@ -729,6 +830,23 @@ class AcceptanceGateTests(unittest.TestCase):
                 self.assertEqual(accepted.returncode == 0, wanted, accepted.stdout + accepted.stderr)
                 output = root / "output"
                 self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if wanted else "")
+
+    def test_standard_library_controls_require_stage1_instead_of_a_cargo_claim(self):
+        self.assertNotIn("-p blaze-std", shell_step(MAIN, "remaining active V2 library controls"))
+        for missing in (None, *STANDARD_CONTROLS):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                evidence = root / "protocol-evidence/exec"
+                evidence.mkdir(parents=True)
+                (evidence / "release.log").write_text(
+                    "".join(f"test serve::tests::{name} ... ok\n" for name in RELEASE_CONTROLS))
+                (evidence / "tests.log").write_text(
+                    "".join(f"test tests::{name} ... ok\n"
+                            for name in (*BUNDLE_CASES, *STANDARD_CONTROLS) if name != missing))
+                checked = self.run_shell(PLATFORM, RELEASE_STEP, {"RUNNER_TEMP": str(root)})
+                self.assertEqual(checked.returncode, 1 if missing else 0, checked.stdout + checked.stderr)
+                if missing:
+                    self.assertIn("missing executed Blaze standard-library control: " + missing, checked.stdout)
 
     def test_protocol_receipt_requires_every_bundle_model_and_control_under_stage1(self):
         cases = [("complete", BUNDLE_CASES, 0), ("zero bundle tests", (), 1)]

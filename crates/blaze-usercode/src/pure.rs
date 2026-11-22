@@ -13,6 +13,7 @@
 //! - [`keep`]: the result kept under the pure key, beside the run's own.
 
 use std::{
+    alloc::Global,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
 };
@@ -292,7 +293,8 @@ fn checked_files(
     let bug = |what: String| {
         refusal(format!("its run {what}: a bug in blaze's purity proof (hir-ty-pure)"))
     };
-    let mut read = Vec::new(); // alloc: the edge, once per miss: the package files the key keeps
+    // These package-file edges outlive the check as part of the retained run's key.
+    let mut read = Vec::new_in(Global);
     for (path, hash) in files {
         if path.starts_with(places.out_dir) || path == places.program {
             continue;

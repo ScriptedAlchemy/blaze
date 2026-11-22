@@ -648,16 +648,19 @@ fn declare_local<'ctx>(
         values::{AnyValue as _, AsValueRef as _},
     };
 
+    // The diagnostic survives the lowering call; formatting owns its bytes in Global.
+    let llvm = |message: fmt::Arguments<'_>| {
+        let text = blaze_mem::text::format(Global, message);
+        Unhandled::Llvm(String::from_utf8(text.into_bytes()).expect("formatted text is UTF-8"))
+    };
     let function = block.get_parent().ok_or_else(|| {
-        // alloc: the error names the storage whose declaration was refused
-        Unhandled::Llvm(format!(
+        llvm(format_args!(
             "debug declaration of `{}` has no containing function",
             storage.print_to_string().to_string_lossy(),
         ))
     })?;
     let refused = |why| {
-        // alloc: the error names the storage and function whose declaration was refused
-        Unhandled::Llvm(format!(
+        llvm(format_args!(
             "debug declaration of `{}` in function `{}`: {why}",
             storage.print_to_string().to_string_lossy(),
             function.get_name().to_string_lossy(),
@@ -667,8 +670,7 @@ fn declare_local<'ctx>(
     if unsafe { core::LLVMIsNewDbgInfoFormat(module.as_mut_ptr()) } == 0 {
         return Err(refused("LLVM debug-record format is required"));
     }
-    // alloc: an empty expression allocates nothing
-    let expression = builder.create_expression(Vec::new());
+    let expression = builder.create_expression(Vec::new_in(Global));
     // SAFETY: the builder, storage, variable, location and block belong to the module being
     // lowered and its context, which outlive this call, as for inkwell's insertion API.
     // The module uses the debug-record format (checked above). LLVM owns the returned

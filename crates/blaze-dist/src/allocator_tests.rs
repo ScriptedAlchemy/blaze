@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 use std::ptr::NonNull;
 
 use blaze_wire::{
-    Attempt, ExecutionId, JobRequest, LocalPolicy, Namespace, Reservation, RootSet, Set,
-    WorkJoinRequest,
+    Attempt, BatchResult, EntryKey, EntryRef, ExecutionId, ItemOutcome, ItemResult, JobRequest,
+    LocalPolicy, Namespace, Reservation, RootSet, Set, WorkJoinRequest, WorkLeaseRequest, WorkName,
 };
 
 use crate::admission::Admission;
@@ -138,5 +138,55 @@ fn holder_effects_use_the_callers_allocator() {
     let control = start_holder(Global);
     assert_eq!(actual.as_slice(), control.as_slice());
     drop(actual);
+    assert_eq!(counts.allocations.get(), counts.deallocations.get());
+}
+
+#[test]
+fn committed_names_use_the_callers_allocator_and_exact_result_identity() {
+    let execution = ExecutionId(1);
+    let attempt = Attempt(1);
+    let mut work = crate::work::WorkSet::new(execution, attempt, "lead", Default::default());
+    work.join(
+        0,
+        "lead",
+        &WorkJoinRequest { execution, attempt, roots: roots(), rejected: Set::default() },
+        &mut Vec::new_in(Global),
+    ).unwrap();
+    let grant = work.lease(
+        1,
+        "lead",
+        &WorkLeaseRequest { execution, attempt },
+        &mut Vec::new_in(Global),
+    ).unwrap().grant.unwrap();
+    let name = WorkName([7; 32]);
+    let mut result = BatchResult {
+        lease: grant.lease,
+        seq: 1,
+        items: vec![ItemResult {
+            name,
+            outcome: ItemOutcome::Exported(EntryRef { entry: EntryKey(name.0) }),
+            found: Set::default(),
+            unnamed: Set::default(),
+        }],
+        packs: Vec::new(),
+        returned_roots: Set::default(),
+        returned_names: Set::default(),
+    };
+    work.result(2, "lead", &result, &mut Vec::new_in(Global)).unwrap();
+
+    let counts = Counts::default();
+    let committed = work.committed_names(&result, Counted(&counts));
+    assert_eq!(committed.as_slice(), &[name]);
+    assert!(counts.allocations.get() > 0);
+    assert!(std::ptr::eq(committed.allocator().0, &counts));
+
+    let before = counts.allocations.get();
+    assert_eq!(work.committed_names(&result, Global).as_slice(), committed.as_slice());
+    assert_eq!(counts.allocations.get(), before);
+
+    // The same shape from another result cannot claim this result's publication evidence.
+    result.seq += 1;
+    assert!(work.committed_names(&result, Counted(&counts)).is_empty());
+    drop(committed);
     assert_eq!(counts.allocations.get(), counts.deallocations.get());
 }

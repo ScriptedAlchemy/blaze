@@ -524,6 +524,10 @@ fn refused_is_blazes_a_count_or_all() {
     assert!(parse(os(&["build", "--refused"])).is_err());
 }
 
+fn no_prebuilt_is_consumed(asked: &Invocation) -> bool {
+    asked.flags.no_prebuilt && !asked.args.iter().any(|word| word == "--no-prebuilt")
+}
+
 /// The invariant: `--no-prebuilt` is blaze's, read on build, run, test and check, never passed
 /// to cargo's words. Control: `bench` and `doc` refuse it, so a list missing it is seen.
 #[test]
@@ -531,12 +535,21 @@ fn no_prebuilt_is_blazes_on_build_run_test_and_check() {
     assert!(!cargo(&["build"]).flags.no_prebuilt, "prebuilt records by default");
     for command in ["build", "run", "test", "check"] {
         let asked = cargo(&[command, "--no-prebuilt", "--release"]);
+        assert!(no_prebuilt_is_consumed(&asked), "{command}");
         assert!(asked.flags.no_prebuilt, "{command}");
         assert_eq!(asked.args, ["--release"], "cargo never sees `--no-prebuilt` ({command})");
     }
     assert!(parse(os(&["bench", "--no-prebuilt"])).is_err());
     assert!(parse(os(&["doc", "--no-prebuilt"])).is_err());
     assert!(parse(os(&["build", "--no-prebuilt=yes"])).is_err(), "a switch takes no value");
+}
+
+#[test]
+fn the_oracle_catches_a_blaze_switch_left_in_cargos_words() {
+    let mut asked = cargo(&["run", "--no-prebuilt", "--release"]);
+    assert!(no_prebuilt_is_consumed(&asked));
+    asked.args.push("--no-prebuilt".into());
+    assert!(!no_prebuilt_is_consumed(&asked));
 }
 
 #[test]

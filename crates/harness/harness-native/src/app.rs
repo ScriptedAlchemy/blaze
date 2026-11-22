@@ -23,6 +23,7 @@ use harness_native_ui_look_api::{Fill, Lift, Rgba, Shape};
 use harness_native_ui_node_api::{Laid, Level};
 use harness_native_ui_view::{self as view, View, for_each};
 use harness_vt::MouseTracking;
+use std::alloc::Global;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -226,7 +227,7 @@ pub struct App {
     /// The chat sessions' transcripts, by session id, and each chat pane's own state (src/app/chat.rs).
     chats: model::Chats,
     /// Actual daemon-session completions, independent of pane selection and transcript attachment.
-    sound_completions: crate::audio::CompletionTracker,
+    sound_completions: crate::audio::CompletionTracker<Global>,
     library: library::Library,
     external: external::External,
     chat: std::cell::RefCell<HashMap<u64, chat::ChatState>>,
@@ -596,7 +597,7 @@ impl App {
             terms,
             run_terms,
             chats,
-            sound_completions: crate::audio::CompletionTracker::default(),
+            sound_completions: crate::audio::CompletionTracker::new(Global),
             library: library::Library::default(),
             external: external::External::default(),
             chat: std::cell::RefCell::default(),
@@ -1143,7 +1144,8 @@ impl App {
                 // it works and when it started or ended are the row's tooltip.
                 let doing = if busy { o.try_cloned::<&model::Object>().and_then(|ob| me.chats.borrow().get(&ob.id).and_then(doing_of)) } else { None };
                 let when = ago(now.saturating_sub(model::when(o)));
-                let folder = o.try_cloned::<&model::Cwd>().map(|c| folder_of(c.s.as_str())).unwrap_or_default();
+                let cwd = o.try_cloned::<&model::Cwd>();
+                let folder = cwd.as_ref().map(|c| folder_of(c.s.as_str())).unwrap_or_default();
                 // What it is (its icon on the row) and its number, which its name never carries: the tooltip's last words.
                 let kind = model::kind_name(o);
                 let number = o.try_cloned::<&model::Object>().map(|ob| format!(" \u{b7} {} s{}", capitalised(kind), ob.id)).unwrap_or_default();
@@ -2923,13 +2925,13 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
 }
 
 /// The last part of directory `cwd` (the home directory as `~`): where a session works, as its row trails it.
-fn folder_of(cwd: &str) -> String {
+fn folder_of(cwd: &str) -> &str {
     let home = std::env::var("HOME").unwrap_or_default();
     let cwd = cwd.trim_end_matches('/');
     if !home.is_empty() && cwd == home.trim_end_matches('/') {
-        return "~".to_owned();
+        return "~";
     }
-    cwd.rsplit('/').next().unwrap_or(cwd).to_owned()
+    cwd.rsplit('/').next().unwrap_or(cwd)
 }
 
 fn ago(ms: u64) -> String {

@@ -9,7 +9,8 @@
 //! A folder, a binary file, a web page's own formats (html, svg, pdf, a picture) or a file too large to read whole stay
 //! what the pane showed before: the file itself.
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
-use std::fmt::Write as _;
+use std::alloc::{Allocator, Global};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// The most of a file a page is made of.
@@ -29,11 +30,17 @@ pub fn page(path: &str, line: Option<u32>) -> Option<PathBuf> {
         return None;
     }
     let text = String::from_utf8_lossy(&bytes);
-    let body = if matches!(ext.as_str(), "md" | "mdx" | "markdown") { markdown(&text, line) } else { lines(&text, line) };
-    let html = format!(
-        "<!doctype html><meta charset=utf-8><title>{}</title><style>{CSS}</style>{body}<script>{JS}</script>",
-        escape(path)
-    );
+    // The complete page lives until its one file write; every renderer writes into this buffer.
+    let mut html = Vec::new_in(Global);
+    html.write_all(b"<!doctype html><meta charset=utf-8><title>").ok()?;
+    escape(path, &mut html).ok()?;
+    write!(html, "</title><style>{CSS}</style>").ok()?;
+    if matches!(ext.as_str(), "md" | "mdx" | "markdown") {
+        markdown(&text, line, &mut html, Global).ok()?;
+    } else {
+        lines(&text, line, &mut html).ok()?;
+    }
+    write!(html, "<script>{JS}</script>").ok()?;
     let dir = crate::link::home().join("view");
     std::fs::create_dir_all(&dir).ok()?;
     // One page a source path: its name the path's hash, so opening the same file again replaces its page.
@@ -45,29 +52,39 @@ pub fn page(path: &str, line: Option<u32>) -> Option<PathBuf> {
     Some(out)
 }
 
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+fn escape(mut s: &str, out: &mut impl Write) -> io::Result<()> {
+    while let Some(at) = s.find(['&', '<', '>']) {
+        out.write_all(s[..at].as_bytes())?;
+        out.write_all(match s.as_bytes()[at] {
+            b'&' => b"&amp;",
+            b'<' => b"&lt;",
+            _ => b"&gt;",
+        })?;
+        s = &s[at + 1..];
+    }
+    out.write_all(s.as_bytes())
 }
 
 /// A text file as numbered lines, `line` marked.
-fn lines(text: &str, line: Option<u32>) -> String {
-    let mut out = String::from("<pre class=code>"); // alloc: the page, built once an open
+fn lines(text: &str, line: Option<u32>, out: &mut impl Write) -> io::Result<()> {
+    out.write_all(b"<pre class=code>")?;
     for (i, l) in text.lines().enumerate() {
         let n = i + 1;
         let cited = if line == Some(n as u32) { " class=cited id=cite" } else { "" };
-        let _ = write!(out, "<div{cited}><span class=n>{n}</span>{}</div>", escape(l));
+        write!(out, "<div{cited}><span class=n>{n}</span>")?;
+        escape(l, out)?;
+        out.write_all(b"</div>")?;
     }
-    out.push_str("</pre>");
-    out
+    out.write_all(b"</pre>")
 }
 
 /// A markdown file as a document: each top-level block its own element, the one `line` falls in marked.
-fn markdown(text: &str, line: Option<u32>) -> String {
+fn markdown<A: Allocator>(text: &str, line: Option<u32>, out: &mut impl Write, alloc: A) -> io::Result<()> {
     // The byte each line starts at, to find the block a line is in.
     let at = line.and_then(|n| text.split_inclusive('\n').take(n.saturating_sub(1) as usize).map(str::len).sum::<usize>().into());
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    let mut out = String::from("<article>"); // alloc: the page, built once an open
-    let (mut depth, mut block, mut from) = (0usize, Vec::new(), 0usize);
+    out.write_all(b"<article>")?;
+    let (mut depth, mut block, mut from) = (0usize, Vec::new_in(alloc), 0usize);
     for (ev, range) in Parser::new_ext(text, opts).into_offset_iter() {
         let (opens, closes) = (matches!(ev, Event::Start(_)), matches!(ev, Event::End(_)));
         if depth == 0 {
@@ -94,36 +111,33 @@ fn markdown(text: &str, line: Option<u32>) -> String {
             let item = cited.then(|| {
                 block.iter().find_map(|(e, r)| (matches!(e, Event::Start(Tag::Item)) && at.is_some_and(|a| r.contains(&a))).then(|| r.clone()))
             });
-            let mut inner = String::new();
             match item.flatten() {
                 Some(item) => {
-                    let mut marked = Vec::with_capacity(block.len() + 2); // alloc: one block's events
-                    for (e, r) in block.drain(..) {
+                    let marked = block.drain(..).map(|(e, r)| {
                         let (open, close) = (matches!(e, Event::Start(Tag::Item)) && r == item, matches!(e, Event::End(TagEnd::Item)) && r == item);
                         if open {
-                            marked.push(Event::Html("<li class=cited id=cite>".into()));
+                            Event::Html("<li class=cited id=cite>".into())
                         } else if close {
-                            marked.push(Event::Html("</li>".into()));
+                            Event::Html("</li>".into())
                         } else {
-                            marked.push(e);
+                            e
                         }
-                    }
-                    html::push_html(&mut inner, marked.into_iter());
-                    out.push_str(&inner);
+                    });
+                    html::write_html_io(&mut *out, marked)?;
                 }
                 None => {
-                    html::push_html(&mut inner, block.drain(..).map(|(e, _)| e));
                     if cited {
-                        let _ = write!(out, "<div class=cited id=cite>{inner}</div>");
-                    } else {
-                        out.push_str(&inner);
+                        out.write_all(b"<div class=cited id=cite>")?;
+                    }
+                    html::write_html_io(&mut *out, block.drain(..).map(|(e, _)| e))?;
+                    if cited {
+                        out.write_all(b"</div>")?;
                     }
                 }
             }
         }
     }
-    out.push_str("</article>");
-    out
+    out.write_all(b"</article>")
 }
 
 /// The page's look: the app's ground and inks in both appearances (scene/00-tokens.flecs's, as a page), one measure,
@@ -164,14 +178,36 @@ mod tests {
     #[test]
     fn the_cited_part_is_marked() {
         let md = "---\nname: x\n---\n<!-- generated -->\n# Title\n\nFirst.\n\n1. **one**: a\n2. **two**: b\n   more of two\n3. **three**: c\n";
-        let page = markdown(md, Some(11));
+        let mut rendered = Vec::new_in(Global);
+        markdown(md, Some(11), &mut rendered, Global).unwrap();
+        let page = std::str::from_utf8(&rendered).unwrap();
         assert!(!page.contains("generated") && !page.contains("name: x"), "{page}");
         assert_eq!(page.matches("id=cite").count(), 1, "{page}");
         assert!(page.contains("<li class=cited id=cite><strong>two</strong>"), "{page}");
-        let para = markdown(md, Some(7));
+        rendered.clear();
+        markdown(md, Some(7), &mut rendered, Global).unwrap();
+        let para = std::str::from_utf8(&rendered).unwrap();
         assert!(para.contains("<div class=cited id=cite><p>First.</p>"), "{para}");
-        assert_eq!(markdown(md, None).matches("cited").count(), 0);
-        let code = lines("a\n<b>\nc\n", Some(2));
+        rendered.clear();
+        markdown(md, None, &mut rendered, Global).unwrap();
+        assert_eq!(std::str::from_utf8(&rendered).unwrap().matches("cited").count(), 0);
+        rendered.clear();
+        lines("a\n<b>\nc\n", Some(2), &mut rendered).unwrap();
+        let code = std::str::from_utf8(&rendered).unwrap();
         assert!(code.contains("<div class=cited id=cite><span class=n>2</span>&lt;b&gt;</div>"), "{code}");
+    }
+
+    #[test]
+    fn rendering_escapes_unicode_and_preserves_writer_failures() {
+        let mut bytes = Vec::new_in(Global);
+        escape("a&<λ>😀", &mut bytes).unwrap();
+        assert_eq!(bytes, "a&amp;&lt;λ&gt;😀".as_bytes());
+
+        let mut full = &mut [0u8; 3][..];
+        assert_eq!(escape("&", &mut full).unwrap_err().kind(), io::ErrorKind::WriteZero);
+        let mut full = &mut [0u8; 20][..];
+        assert_eq!(lines("<λ>", Some(1), &mut full).unwrap_err().kind(), io::ErrorKind::WriteZero);
+        let mut full = &mut [0u8; 12][..];
+        assert_eq!(markdown("hello", Some(1), &mut full, Global).unwrap_err().kind(), io::ErrorKind::WriteZero);
     }
 }

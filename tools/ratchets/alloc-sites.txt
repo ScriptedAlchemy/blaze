@@ -22,6 +22,8 @@ blaze-command	0	0	90	0
 blaze-core	764	0	174	219
 blaze-dbsp	12	0	12	4
 blaze-diagnostics	2790	0	97	582
+blaze-dist	0	0	5	0
+blaze-dist-local	0	0	27	0
 blaze-doc	17	0	45	112
 blaze-engine	13	0	0	36
 blaze-fetch	116	0	0	27
@@ -74,6 +76,7 @@ blaze-resolve	8	0	100	63
 blaze-screen	254	0	0	37
 blaze-script	0	0	0	98
 blaze-serde-derive	3	0	0	29
+blaze-serve	0	0	9	0
 blaze-shader	309	0	19	57
 blaze-sim	0	0	34	27
 blaze-solo	31	0	0	28
@@ -94,6 +97,7 @@ blaze-usercode	344	0	18	109
 blaze-v2-proof	21	0	0	7
 blaze-vfs	132	0	30	75
 blaze-wasi	16	0	4	1
+blaze-wire	0	0	12	0
 cfg	0	0	10	4
 gpu-macros	6	0	0	0
 harness/harness	5	0	0	157
@@ -101,8 +105,9 @@ harness/harness-browser	27	0	0	66
 harness/harness-chat	0	0	0	17
 harness/harness-chat-library	15	0	0	44
 harness/harness-ghostty-config	0	0	0	3
+harness/harness-learn	0	0	8	0
 harness/harness-mach	7	0	0	5
-harness/harness-native	131	0	0	356
+harness/harness-native	131	0	25	356
 harness/harness-native-api	0	0	0	4
 harness/harness-native-blaze	0	0	0	7
 harness/harness-native-ecs	0	0	0	5

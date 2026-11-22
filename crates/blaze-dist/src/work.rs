@@ -15,7 +15,7 @@
 //! The machine has no clock, IO or threads of its own: every call takes `now`, answers with a
 //! wire type or a [`Refusal`], and appends what happened to `out`, the log a driver keeps.
 
-use std::alloc::Allocator;
+use std::alloc::{Allocator, AllocatorClone};
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_wire::{
@@ -459,6 +459,11 @@ impl WorkSet {
         self.phase == Phase::Done
     }
 
+    /// Committed packs, borrowed without copying the execution's diagnostic report.
+    pub fn packs(&self) -> impl Iterator<Item = &PackRef> {
+        self.packs.iter()
+    }
+
     /// The root-list epoch, advanced when a lead replaces the list the work was counted on.
     pub fn root_epoch(&self) -> u64 {
         self.epoch
@@ -787,7 +792,7 @@ impl WorkSet {
         now: Millis,
         from: &str,
         req: &BatchResult,
-        out: &mut Vec<Effect, impl Allocator>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<WorkResultAnswer, Refusal> {
         self.tick(now, out);
         let answer = self.result_inner(now, from, req, out);
@@ -802,7 +807,7 @@ impl WorkSet {
         now: Millis,
         from: &str,
         req: &BatchResult,
-        out: &mut Vec<Effect, impl Allocator>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<WorkResultAnswer, Refusal> {
         if req.lease.execution != self.execution {
             return Err(Refusal::NoExecution);
@@ -846,8 +851,9 @@ impl WorkSet {
             holder.heard = now;
         }
         let issued = self.leases[&generation].clone();
+        let alloc = out.allocator().clone();
         let (processed_roots, processed_names, returned_roots, returned_names) =
-            match shape(&issued, req) {
+            match shape(&issued, req, &alloc) {
                 Ok(shape) => shape,
                 Err(what) => {
                     self.counters.malformed += 1;
@@ -857,8 +863,8 @@ impl WorkSet {
                 }
             };
         let roots_done = processed_roots.len() as usize;
-        let mut granted = BTreeSet::new();
-        let mut conflicts = BTreeSet::new();
+        let mut granted = BTreeSet::new_in(&alloc);
+        let mut conflicts = BTreeSet::new_in(&alloc);
         for (item, index) in req.items[..roots_done].iter().zip(processed_roots.indexes()) {
             let terminal = match &item.outcome {
                 ItemOutcome::Lost(_) => Terminal::Tail(TailWhy::LostRoot),
@@ -949,7 +955,7 @@ impl WorkSet {
         item: &ItemResult,
         name: WorkName,
         by: &Commit,
-        conflicts: &mut BTreeSet<WorkName, impl Allocator + Clone>,
+        conflicts: &mut BTreeSet<WorkName, impl AllocatorClone>,
         out: &mut Vec<Effect, impl Allocator>,
     ) {
         let Some(state) = self.names.get(&name).map(|slot| slot.state.clone()) else { return };
@@ -1000,8 +1006,8 @@ impl WorkSet {
         &mut self,
         from: &str,
         found: &Found,
-        granted: &mut BTreeSet<WorkName, impl Allocator + Clone>,
-        conflicts: &mut BTreeSet<WorkName, impl Allocator + Clone>,
+        granted: &mut BTreeSet<WorkName, impl AllocatorClone>,
+        conflicts: &mut BTreeSet<WorkName, impl AllocatorClone>,
         out: &mut Vec<Effect, impl Allocator>,
     ) {
         let name = found.name;
@@ -1283,9 +1289,14 @@ impl WorkSet {
 
     /// Names actually committed by this exact result, for the driver's observation. This
     /// inspects only the bounded grant, not a copy of the entire execution's root table.
-    pub fn committed_names(&self, request: &BatchResult) -> Vec<WorkName> {
-        let Some(issued) = self.leases.get(&request.lease.generation) else { return Vec::new() };
-        let Ok((roots, names, _, _)) = shape(issued, request) else { return Vec::new() };
+    pub fn committed_names<A: Allocator + Clone>(
+        &self,
+        request: &BatchResult,
+        alloc: A,
+    ) -> Vec<WorkName, A> {
+        let mut committed = Vec::new_in(alloc.clone());
+        let Some(issued) = self.leases.get(&request.lease.generation) else { return committed };
+        let Ok((roots, names, _, _)) = shape(issued, request, &alloc) else { return committed };
         let accepted = |slot: &Slot, item: &ItemResult| {
             matches!(slot,
             Slot::Done(Terminal::Committed { outcome, by })
@@ -1294,7 +1305,7 @@ impl WorkSet {
                     && by.generation == request.lease.generation && by.seq == request.seq)
         };
         let root_count = roots.len() as usize;
-        roots
+        committed.extend(roots
             .indexes()
             .zip(&request.items[..root_count])
             .filter_map(|(index, item)| {
@@ -1305,8 +1316,8 @@ impl WorkSet {
             })
             .chain(names.iter().zip(&request.items[root_count..]).filter_map(|(name, item)| {
                 self.names.get(name).filter(|slot| accepted(&slot.state, item)).map(|_| item.name)
-            }))
-            .collect() // alloc: at most one work name per item of the bounded result
+            })));
+        committed
     }
 
     /// Every work item's state now.
@@ -1360,22 +1371,24 @@ impl std::fmt::Display for ShapeError {
 impl std::error::Error for ShapeError {}
 
 #[allow(clippy::type_complexity)]
-fn shape(
+fn shape<A: AllocatorClone>(
     issued: &Issued,
     req: &BatchResult,
-) -> Result<(Ranges, Vec<WorkName>, Ranges, BTreeSet<WorkName>), ShapeError> {
+    alloc: A,
+) -> Result<(Ranges, Vec<WorkName, A>, Ranges, BTreeSet<WorkName, A>), ShapeError> {
     let returned_roots = Ranges::from_wire(&req.returned_roots)
         .ok_or(ShapeError::RootRanges)?;
     if !issued.roots.contains_all(&returned_roots) {
         return Err(ShapeError::UngrantedRoots);
     }
-    let returned_names: BTreeSet<WorkName> = req.returned_names.iter().copied().collect();
+    let mut returned_names = BTreeSet::new_in(alloc.clone());
+    returned_names.extend(req.returned_names.iter().copied());
     if !returned_names.iter().all(|n| issued.names.contains(n)) {
         return Err(ShapeError::UngrantedNames);
     }
     let processed_roots = issued.roots.minus(&returned_roots);
-    let processed_names: Vec<WorkName> =
-        issued.names.iter().filter(|n| !returned_names.contains(n)).copied().collect();
+    let mut processed_names = Vec::new_in(alloc);
+    processed_names.extend(issued.names.iter().filter(|n| !returned_names.contains(n)).copied());
     let want = processed_roots.len() as usize + processed_names.len();
     if req.items.len() != want {
         return Err(ShapeError::ItemCount { actual: req.items.len(), processed: want });

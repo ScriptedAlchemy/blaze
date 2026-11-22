@@ -19,7 +19,7 @@
 //! executor refused) it compiles itself, by the same code, and reports. When the path fails,
 //! [`decide`] says under the caller's [`LocalPolicy`] whether the build stops or compiles here.
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -337,7 +337,7 @@ impl<G: Granted + ?Sized> BatchCompiler for Batches<'_, G> {
                     for pack in Pack::batches(grant.values)
                         .map_err(|source| BatchError::Pack { unit: self.unit.spec, source })?
                     {
-                        self.blobs.put_pack(&pack)
+                        self.blobs.put_pack(&pack, Global)
                             .map_err(|source| BatchError::Upload { unit: self.unit.spec, source })?;
                         references.push(pack.reference);
                     }
@@ -401,15 +401,19 @@ fn ensure_not_cancelled(unit: &Unit, cancelled: &AtomicBool) -> Result<(), Error
 }
 
 /// Reads the packs named, each checked against what was committed.
-pub fn import(blobs: &Blobs, packs: &[PackRef]) -> Result<BTreeMap<Digest, (u8, Vec<u8>)>, Error> {
-    import_using(packs, |digest| blobs.pack(digest))
+pub fn import(
+    blobs: &Blobs,
+    packs: &[PackRef],
+    alloc: impl Allocator,
+) -> Result<BTreeMap<Digest, (u8, Vec<u8>)>, Error> {
+    import_using(packs, |digest| blobs.pack(digest, &alloc))
 }
 
 /// The retrieval boundary is injected so loss and corruption of a committed pack can be
 /// tested without replacing the real pack decoder or requiring a live cache server.
-fn import_using(
+fn import_using<A: Allocator>(
     packs: &[PackRef],
-    mut fetch: impl FnMut(&Digest) -> Result<Option<Vec<u8>>, Error>,
+    mut fetch: impl FnMut(&Digest) -> Result<Option<Vec<u8, A>>, Error>,
 ) -> Result<BTreeMap<Digest, (u8, Vec<u8>)>, Error> {
     let mut values = BTreeMap::new();
     for reference in packs {
@@ -469,9 +473,9 @@ pub fn run(
     cancelled: &AtomicBool,
 ) -> Result<Arrived, Error> {
     ensure_not_cancelled(unit, cancelled)?;
-    if let Some(list) = config.blobs.published(&unit.spec)? {
+    if let Some(list) = config.blobs.published(&unit.spec, Global)? {
         let packs = published_packs(unit, &list)?;
-        let values = import(&config.blobs, &packs)?;
+        let values = import(&config.blobs, &packs, Global)?;
         ensure_not_cancelled(unit, cancelled)?;
         return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None) });
     }
@@ -583,7 +587,7 @@ fn execute(
             arrived.attempt = Some(u64::from(attempt.0));
             arrived.publication_attempt = Some(u64::from(accepted.0));
             let mut take = || {
-                arrived.values = import(&config.blobs, &packs)?;
+                arrived.values = import(&config.blobs, &packs, Global)?;
                 arrived.packs = packs;
                 ensure_not_cancelled(unit, cancelled)?;
                 // Delivery carries no new output authority, even after lead replacement.
@@ -661,7 +665,7 @@ fn execute(
                 now_ms,
                 cancelled,
                 |lost| {
-                    arrived.values = import(&config.blobs, &packs)?;
+                    arrived.values = import(&config.blobs, &packs, Global)?;
                     ensure_not_cancelled(unit, cancelled)?;
                     let mut refuse = |why| {
                         if !lost.load(Ordering::Acquire) {
@@ -687,7 +691,7 @@ fn execute(
                         for pack in Pack::batches(extra)
                             .map_err(|why| refuse(format!("full output cannot be packed: {why}")))?
                         {
-                            config.blobs.put_pack(&pack)?;
+                            config.blobs.put_pack(&pack, Global)?;
                             packs.push(pack.reference);
                         }
                     }
@@ -756,7 +760,7 @@ fn execute(
                 // harmless; only a current lead may make their manifest visible.
                 continue;
             };
-            arrived.values = import(&config.blobs, &packs)?;
+            arrived.values = import(&config.blobs, &packs, Global)?;
             ensure_not_cancelled(unit, cancelled)?;
             arrived.packs = packs;
             return Ok(arrived);
@@ -791,7 +795,7 @@ fn execute(
 
 fn mirror(config: &Config, unit: &Unit, packs: &[PackRef]) -> Result<(), Error> {
     let expected = list_of(packs, Global);
-    config.blobs.publish(&unit.spec, &expected)?;
+    config.blobs.publish(&unit.spec, &expected, Global)?;
     // A 412 is accepted only after the existing and proposed full outputs were
     // verified equal, even if their native pack partitions differ. Missing or
     // corrupt committed packs refuse delivery; they never start another compile.
@@ -1320,7 +1324,7 @@ mod tests {
             packed: None,
             format: blaze_wire::DIST_PACK_FORMAT,
         };
-        let missing = import_using(&[reference.clone()], |name| {
+        let missing = import_using::<Global>(&[reference.clone()], |name| {
             assert_eq!(*name, reference.pack);
             Ok(None)
         })
@@ -1334,11 +1338,11 @@ mod tests {
         ] {
             let mut error = Some(error);
             let failed =
-                import_using(&[reference.clone()], |_| Err(error.take().unwrap())).unwrap_err();
+                import_using::<Global>(&[reference.clone()], |_| Err(error.take().unwrap())).unwrap_err();
             assert!(matches!(decide(&LocalPolicy::Fallback, failed), Err(Error::Committed(_))));
         }
 
-        let corrupt = import_using(&[reference], |_| {
+        let corrupt = import_using::<Global>(&[reference], |_| {
             Ok(Some(b"bad pack".to_vec())) // alloc: deliberately corrupt committed pack fixture
         })
         .unwrap_err();

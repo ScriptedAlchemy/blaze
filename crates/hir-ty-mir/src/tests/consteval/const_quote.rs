@@ -81,7 +81,7 @@ fn a_quoted_derive_is_the_built_one() {
 /// where its parse has a name (`struct #ty;`) builds a tree that is not its tokens' parse, and
 /// the host refuses it, naming the output element.
 #[test]
-fn a_quote_that_splices_a_type_where_a_name_goes_is_refused_by_the_host() {
+fn the_oracle_catches_a_type_spliced_where_a_name_goes() {
     let fixture = with_const_ast(
         r#"
 #[proc_macro_derive(Bad)]

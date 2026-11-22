@@ -23,6 +23,7 @@
 //! built is that checkout's alone, and the standard library's is everyone's.
 
 use std::{
+    alloc::{Allocator, Global},
     io::Read as _,
     path::{Path, PathBuf},
 };
@@ -202,6 +203,7 @@ pub fn fetch() -> Result<Library, String> {
         releases.as_deref(),
         local.as_ref().map(|it| it.dir.as_path()),
         crate::release::get().version,
+        Global,
     ).map_err(|error| error.to_string())?;
     let fetched = fetch_into(&dir, &from, digest()).map_err(|e| {
         format!(
@@ -230,26 +232,31 @@ impl std::fmt::Display for InsecureReleaseSource<'_> {
 
 impl std::error::Error for InsecureReleaseSource<'_> {}
 
-fn source<'a>(
+fn source<'a, A: Allocator>(
     given: Option<&str>,
     releases: Option<&'a str>,
     checkout: Option<&Path>,
     version: &str,
-) -> Result<String, InsecureReleaseSource<'a>> {
+    alloc: A,
+) -> Result<blaze_mem::String<A>, InsecureReleaseSource<'a>> {
     if let Some(given) = given {
-        return Ok(given.to_owned()); // alloc: one library fetch's source
+        return Ok(blaze_mem::String::from_str_in(given, alloc));
     }
     if let Some(path) = checkout {
-        return Ok(path.to_string_lossy().into_owned()); // alloc: one library fetch's source
+        return Ok(blaze_mem::format_in!(alloc, "{}", path.display()));
     }
     let base = releases.unwrap_or(crate::release::RELEASES);
     if !base.contains("://") {
-        return Ok(Path::new(base).join(format!("v{version}")).to_string_lossy().into_owned());
+        let path = {
+            let version = blaze_mem::format_in!(&alloc, "v{version}");
+            Path::new(base).join(version.as_str())
+        };
+        return Ok(blaze_mem::format_in!(alloc, "{}", path.display()));
     }
     if !base.starts_with("https://") {
         return Err(InsecureReleaseSource { address: base });
     }
-    Ok(format!("{}/v{version}", base.trim_end_matches('/')))
+    Ok(blaze_mem::format_in!(alloc, "{}/v{version}", base.trim_end_matches('/')))
 }
 
 /// The name of the archive of the library with `digest` among a release's assets.
@@ -635,13 +642,13 @@ mod tests {
             ),
             (None, None, Some(local), "/checkout/library"),
         ] {
-            assert_eq!(source(given, releases, checkout, "1").unwrap(), want);
+            assert_eq!(source(given, releases, checkout, "1", Global).unwrap(), want);
         }
         assert_eq!(
-            source(None, None, None, "1").unwrap(),
+            source(None, None, None, "1", Global).unwrap().as_str(),
             format!("{}/v1", crate::release::RELEASES)
         );
-        assert!(source(None, Some("http://mirror.invalid"), None, "1").is_err());
+        assert!(source(None, Some("http://mirror.invalid"), None, "1", Global).is_err());
     }
 
     #[test]
@@ -654,6 +661,15 @@ mod tests {
         assert_eq!(upstream_commit(UPSTREAM), Some(super::super::own::commit()), "the nightly's");
     }
 
+    fn text_tree(tree: &Path) -> String {
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        std::fs::write(tree.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(tree.join("Cargo.toml"), "[package]\n").unwrap();
+        let digest = digest_of(tree).unwrap();
+        std::fs::write(tree.join(DIGEST_FILE), format!("{digest}\n")).unwrap();
+        digest
+    }
+
     /// The invariant: a tree's texts are made only for the digest its files have, and are
     /// opened only as the texts of that digest; what is opened lists every file of the tree,
     /// `DIGEST` among them, each text its file's bytes. The control: the tree's own digest
@@ -662,16 +678,7 @@ mod tests {
     fn texts_are_made_and_opened_only_for_the_digest_of_their_tree() {
         let work = tempfile::tempdir().unwrap();
         let tree = work.path().join("t/d/t");
-        std::fs::create_dir_all(tree.join("src")).unwrap();
-        std::fs::write(tree.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-        std::fs::write(tree.join("Cargo.toml"), "[package]\n").unwrap();
-        let digest = digest_of(&tree).unwrap();
-        std::fs::write(tree.join(DIGEST_FILE), format!("{digest}\n")).unwrap();
-        let other = "0".repeat(digest.len());
-        let said = write_texts(&tree, &other).unwrap_err();
-        assert!(said.contains("is not the one of digest"), "{said}");
-        assert!(open_texts(&tree, &digest).unwrap().is_none(), "nothing is written for it");
-
+        let digest = text_tree(&tree);
         write_texts(&tree, &digest).unwrap();
         let (mapping, listing) = open_texts(&tree, &digest).unwrap().expect("made");
         let paths: Vec<&str> = listing.entries.iter().map(|it| it.path.as_str()).collect();
@@ -680,6 +687,21 @@ mod tests {
             let text = &mapping.bytes()[entry.at as usize..(entry.at + entry.len) as usize];
             assert_eq!(text, std::fs::read(tree.join(&entry.path)).unwrap().as_slice());
         }
+    }
+
+    #[test]
+    fn the_oracle_catches_texts_requested_under_another_trees_digest() {
+        let work = tempfile::tempdir().unwrap();
+        let tree = work.path().join("t/d/t");
+        let digest = text_tree(&tree);
+        let other = "0".repeat(digest.len());
+        assert_ne!(digest, other);
+        let said = write_texts(&tree, &other).unwrap_err();
+        assert!(said.contains("is not the one of digest"), "{said}");
+        assert!(open_texts(&tree, &digest).unwrap().is_none(), "nothing is written for it");
+
+        write_texts(&tree, &digest).unwrap();
+        assert!(open_texts(&tree, &digest).unwrap().is_some());
         let said = open_texts(&tree, &other).unwrap_err();
         assert!(said.contains("are refused") && said.contains("texts1"), "{said}");
     }
@@ -726,7 +748,7 @@ mod tests {
         assert!(!into.exists());
 
         // The library is fetched whole, and found there after with nothing fetched.
-        let release = source(None, Some(good.to_str().unwrap()), None, "1").unwrap();
+        let release = source(None, Some(good.to_str().unwrap()), None, "1", Global).unwrap();
         archived(&one, &want, Path::new(&release));
         let fetched = fetch_into(&into, &release, &want).unwrap();
         assert_eq!((fetched.dir.as_path(), fetched.digest.as_str()), (into.as_path(), &*want));
@@ -741,7 +763,7 @@ mod tests {
         let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         unavailable.set_nonblocking(true).unwrap();
         let mirror = format!("https://{}", unavailable.local_addr().unwrap());
-        let selected = source(None, Some(&mirror), Some(&one), "0.0.0-dev").unwrap();
+        let selected = source(None, Some(&mirror), Some(&one), "0.0.0-dev", Global).unwrap();
         assert_eq!(Path::new(&selected), one);
         let copied = fetch_into(&copy, &selected, &want).unwrap();
         assert_eq!(digest_of(&copied.dir).unwrap(), want);

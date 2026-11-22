@@ -308,4 +308,25 @@ mod tests {
         assert_eq!(decode(&bytes, key, keep), Ok(Lowered { value: Some(key), ..lowered }));
         assert!(decode(&bytes[..bytes.len() - 1], key, keep).is_err(), "a cut answer read");
     }
+
+    #[test]
+    fn the_oracle_catches_a_truncated_lowering_record() {
+        let lowered = Lowered {
+            exprs: 1,
+            pats: 0,
+            bindings: 0,
+            closures: &[],
+            errors: false,
+            located: false,
+            value: None,
+        };
+        let mut bytes = Vec::new();
+        encode(&lowered, &mut bytes);
+        let key = ContentId([3; 32]);
+        let keep = |it: &[Closure]| -> &'static [Closure] { Vec::leak(it.to_vec_in(Global)) };
+        assert_eq!(decode(&bytes, key, keep), Ok(Lowered { value: Some(key), ..lowered }));
+        for len in 0..bytes.len() {
+            assert!(decode(&bytes[..len], key, keep).is_err(), "accepted a {len}-byte prefix");
+        }
+    }
 }

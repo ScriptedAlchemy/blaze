@@ -359,6 +359,7 @@ jobs:
               commands: [
                 {name: "tests", args: ["test", "--release", "--locked", "-p", "blaze-wire", "-p", "blaze-dist",
                   "-p", "blaze-dist-local", "-p", "blaze-serve", "-p", "blaze-global", "-p", "blaze-graph",
+                  "-p", "blaze-std",
                   "--lib", "--tests", "--no-fail-fast"]},
                 {name: "release", args: ["test", "--release", "--locked", "--lib", "-p", "blaze-cargo",
                   "--no-fail-fast", "--", "serve::"]}],
@@ -424,6 +425,16 @@ jobs:
           for case_name in "${bundle_cases[@]}"; do
             grep -Eq "^test .*::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/protocol-evidence/exec/tests.log" \
               || { echo "::error::missing executed bundle control: $case_name"; exit 1; }
+          done
+          # blaze-std uses Blaze-only reflection and cannot be proved by the partial
+          # Cargo library job. Its controls require this source-built Stage 1 receipt.
+          standard_cases=(
+            the_oracle_catches_a_main_without_its_output_capability
+            the_oracle_catches_a_line_written_without_its_newline
+          )
+          for case_name in "${standard_cases[@]}"; do
+            grep -Eq "^test .*::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/protocol-evidence/exec/tests.log" \
+              || { echo "::error::missing executed Blaze standard-library control: $case_name"; exit 1; }
           done
       - name: protocol tests completed with unchanged Stage 1 and source
         id: accepted

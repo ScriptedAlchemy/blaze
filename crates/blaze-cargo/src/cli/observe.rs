@@ -1527,6 +1527,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "native")]
+    #[test]
+    fn the_oracle_catches_a_run_that_asks_for_its_missing_summary() {
+        assert_eq!(summary_from(7, 3, false, false), SummaryFrom::Nowhere);
+        // Plant the build's ask flag on the same answer: it must introduce a daemon read.
+        assert_eq!(summary_from(7, 3, false, true), SummaryFrom::Daemon);
+    }
+
     fn batch() -> RecordBatch {
         let names: DictionaryArray<types::Int32Type> =
             vec![Some("parse"), None, Some("parse")].into_iter().collect();

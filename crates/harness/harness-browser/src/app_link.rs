@@ -99,9 +99,9 @@ fn handle(up: AppUp) -> Result<(), String> {
             }
             bh.was_resized();
         }
-        AppUp::Pointer { view, ev } => pointer(&host::host_of(view)?, view, &ev)?,
+        AppUp::Pointer { view, ev } => pointer(&host::host_of(view).map_err(|e| e.to_string())?, view, &ev)?,
         AppUp::Key { view, ev } => {
-            let bh = host::host_of(view)?;
+            let bh = host::host_of(view).map_err(|e| e.to_string())?;
             for f in keys::events(&ev).map_err(|e| format!("view {view}: {e}"))? {
                 let type_ = match f.kind {
                     keys::Kind::RawKeyDown => KeyEventType::RAWKEYDOWN,
@@ -122,11 +122,11 @@ fn handle(up: AppUp) -> Result<(), String> {
                 bh.send_key_event(Some(&e));
             }
         }
-        AppUp::Ime { view, ev } => ime(&host::host_of(view)?, ev),
-        AppUp::Focus { view, on } => host::host_of(view)?.set_focus(i32::from(on)),
+        AppUp::Ime { view, ev } => ime(&host::host_of(view).map_err(|e| e.to_string())?, ev),
+        AppUp::Focus { view, on } => host::host_of(view).map_err(|e| e.to_string())?.set_focus(i32::from(on)),
         AppUp::Latched { view, generation, slot } => host::latched(view, generation, slot)?,
         AppUp::Nav { view, go } => {
-            let b = host::browser_of(view)?;
+            let b = host::browser_of(view).map_err(|e| e.to_string())?;
             match go {
                 Nav::Back => b.go_back(),
                 Nav::Forward => b.go_forward(),

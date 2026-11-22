@@ -30,7 +30,7 @@ fn execution(mode: CompletionMode) -> Execution {
         ExecutionConfig { completion: mode, ..ExecutionConfig::default() },
         &mut Vec::new(),
     );
-    e.assign(0, "lead", &["helper".to_owned()], &mut Vec::new()).unwrap();
+    e.assign(0, "lead", &["helper"], &mut Vec::new()).unwrap();
     e
 }
 

@@ -3,7 +3,7 @@
 //! `timeout`; the server checks every blob against its name before it is visible, and the
 //! agent checks it again against what was committed ([`crate::pack::read`]).
 
-use std::alloc::Global;
+use std::alloc::Allocator;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -39,17 +39,24 @@ pub struct Blobs {
 }
 
 impl Blobs {
-    fn request(&self, method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), Error> {
-        self.request_matching(method, path, body, None)
+    fn request<A: Allocator>(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        alloc: A,
+    ) -> Result<(u16, Vec<u8, A>), Error> {
+        self.request_matching(method, path, body, None, alloc)
     }
 
-    fn request_matching(
+    fn request_matching<A: Allocator>(
         &self,
         method: &str,
         path: &str,
         body: &[u8],
         previous: Option<&Digest>,
-    ) -> Result<(u16, Vec<u8>), Error> {
+        alloc: A,
+    ) -> Result<(u16, Vec<u8, A>), Error> {
         let mut stream = TcpStream::connect_timeout(&self.address, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
@@ -64,14 +71,14 @@ impl Blobs {
         stream.write_all(head.as_bytes())?;
         stream.write_all(body)?;
         stream.flush()?;
-        read_response(&mut stream, method, path)
+        read_response(&mut stream, method, path, alloc)
     }
 
     /// Puts `pack` under its name. The server hashes it before it is visible, so a pack that
     /// is there is whole.
-    pub fn put_pack(&self, pack: &Pack) -> Result<(), Error> {
+    pub fn put_pack(&self, pack: &Pack, alloc: impl Allocator) -> Result<(), Error> {
         let path = format!("/v1/blob/packs/{}.pack", hex(&pack.reference.pack));
-        let (status, body) = self.request("PUT", &path, &pack.bytes)?;
+        let (status, body) = self.request("PUT", &path, &pack.bytes, alloc)?;
         match status {
             200..=299 => Ok(()),
             _ => Err(Error::Protocol(format!(
@@ -82,9 +89,9 @@ impl Blobs {
     }
 
     /// The bytes of the pack named `digest`; `None` if the server has none.
-    pub fn pack(&self, digest: &Digest) -> Result<Option<Vec<u8>>, Error> {
+    pub fn pack<A: Allocator>(&self, digest: &Digest, alloc: A) -> Result<Option<Vec<u8, A>>, Error> {
         let path = format!("/v1/blob/packs/{}.pack", hex(digest));
-        let (status, body) = self.request("GET", &path, &[])?;
+        let (status, body) = self.request("GET", &path, &[], alloc)?;
         match status {
             200 => Ok(Some(body)),
             404 => Ok(None),
@@ -96,9 +103,13 @@ impl Blobs {
     }
 
     /// The published list of the unit named `spec`; `None` if nobody published it.
-    pub fn published(&self, spec: &Digest) -> Result<Option<Vec<u8>>, Error> {
+    pub fn published<A: Allocator>(
+        &self,
+        spec: &Digest,
+        alloc: A,
+    ) -> Result<Option<Vec<u8, A>>, Error> {
         let path = format!("/v1/list/manifests/{}", hex(spec));
-        let (status, body) = self.request("GET", &path, &[])?;
+        let (status, body) = self.request("GET", &path, &[], alloc)?;
         match status {
             200 => Ok(Some(body)),
             404 => Ok(None),
@@ -112,10 +123,16 @@ impl Blobs {
     /// Repair a list whose referenced pack is gone, only if its bytes still equal `previous`.
     /// The server additionally verifies absent old bytes and every new pack under its lock;
     /// a different valid list is never replaced. False is a raced comparison, not success.
-    pub fn repair(&self, spec: &Digest, previous: &[u8], list: &[u8]) -> Result<bool, Error> {
+    pub fn repair(
+        &self,
+        spec: &Digest,
+        previous: &[u8],
+        list: &[u8],
+        alloc: impl Allocator,
+    ) -> Result<bool, Error> {
         let path = format!("/v1/list/manifests/{}", hex(spec));
         let previous: Digest = Sha256::digest(previous).into();
-        let (status, body) = self.request_matching("PUT", &path, list, Some(&previous))?;
+        let (status, body) = self.request_matching("PUT", &path, list, Some(&previous), alloc)?;
         match status {
             200..=299 => Ok(true),
             412 => Ok(false),
@@ -128,23 +145,24 @@ impl Blobs {
 
     /// Publishes a full unit. A first writer may choose a different pack partition,
     /// but its verified logical keys, kinds and bytes must be identical.
-    pub fn publish(&self, spec: &Digest, list: &[u8]) -> Result<(), Error> {
+    pub fn publish(&self, spec: &Digest, list: &[u8], alloc: impl Allocator) -> Result<(), Error> {
         let path = format!("/v1/list/manifests/{}", hex(spec));
         // After sending a publication, a lost response cannot tell us whether
         // the server committed the immutable key. It cannot authorize fallback.
-        let (status, body) = publication_response(&path, self.request("PUT", &path, list))?;
+        let (status, body) = publication_response(&path, self.request("PUT", &path, list, &alloc))?;
         publish_verdict(
             status,
             &body,
             &path,
             list,
-            || self.published(spec),
+            || self.published(spec, &alloc),
             |existing, proposed| {
-                let existing = blaze_wire::pack_list::decode(existing, Global)
+                let existing = blaze_wire::pack_list::decode(existing, &alloc)
                     .map_err(|error| Error::Committed(error.to_string()))?;
-                let proposed = blaze_wire::pack_list::decode(proposed, Global)
+                let proposed = blaze_wire::pack_list::decode(proposed, &alloc)
                     .map_err(|error| Error::Committed(error.to_string()))?;
-                Ok(crate::agent::import(self, &existing)? == crate::agent::import(self, &proposed)?)
+                Ok(crate::agent::import(self, &existing, &alloc)?
+                    == crate::agent::import(self, &proposed, &alloc)?)
             },
         )
     }
@@ -173,12 +191,13 @@ fn read_failure(method: &str, path: &str, reply: &[u8], error: std::io::Error) -
 
 /// Read the head within its own budget, then apply the validated body framing.
 /// Never let a blob's much larger allowance become an allowance for headers.
-fn read_response(
+fn read_response<A: Allocator>(
     stream: &mut impl std::io::Read,
     method: &str,
     path: &str,
-) -> Result<(u16, Vec<u8>), Error> {
-    let mut reply = Vec::new(); // alloc: this response, bounded before each read
+    alloc: A,
+) -> Result<(u16, Vec<u8, A>), Error> {
+    let mut reply = Vec::new_in(alloc);
     let mut buffer = [0u8; 8192];
     let head = loop {
         // Include the delimiter, but no bytes beyond the largest valid head.
@@ -196,7 +215,7 @@ fn read_response(
             .read(&mut buffer[..amount])
             .map_err(|error| read_failure(method, path, &reply, error))?;
         if read == 0 {
-            return decode_response(method, path, &reply);
+            return decode_response(method, path, reply);
         }
         // Only the last three old bytes can start a delimiter crossing reads.
         let from = reply.len().saturating_sub(3);
@@ -209,11 +228,14 @@ fn read_response(
     // A fixed-length response has no chunk framing. Refuse its first excess
     // byte instead of spending the remaining blob allowance on an invalid body.
     let most = head.length.map_or(most, |length| most.min(head.body as u64 + length as u64));
-    if reply.len() as u64 <= most {
-        stream
-            .take(most + 1 - reply.len() as u64)
-            .read_to_end(&mut reply)
-            .map_err(|error| read_failure(method, path, &reply, error))?;
+    while reply.len() as u64 <= most {
+        let amount = (most + 1 - reply.len() as u64).min(buffer.len() as u64) as usize;
+        match stream.read(&mut buffer[..amount]) {
+            Ok(0) => break,
+            Ok(read) => reply.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(read_failure(method, path, &reply, error)),
+        }
     }
     if reply.len() as u64 > most {
         let message = format!("{method} {path}: HTTP reply exceeds {most} bytes");
@@ -223,7 +245,7 @@ fn read_response(
             Error::Protocol(message)
         });
     }
-    decode_response(method, path, &reply)
+    decode_response(method, path, reply)
 }
 
 struct ResponseHead {
@@ -314,8 +336,12 @@ fn decode_head(method: &str, path: &str, reply: &[u8]) -> Result<ResponseHead, E
 
 /// Decode a complete HTTP/1.1 response after the peer has closed its connection.
 /// Never treat a short body as a complete persisted manifest or pack.
-fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u8>), Error> {
-    let ResponseHead { status, body, length, chunked } = decode_head(method, path, reply)?;
+fn decode_response<A: Allocator>(
+    method: &str,
+    path: &str,
+    mut reply: Vec<u8, A>,
+) -> Result<(u16, Vec<u8, A>), Error> {
+    let ResponseHead { status, body, length, chunked } = decode_head(method, path, &reply)?;
     let invalid = |why: &str| {
         let message = format!("{method} {path}: {why}");
         if method == "GET" && status == 200 {
@@ -324,72 +350,79 @@ fn decode_response(method: &str, path: &str, reply: &[u8]) -> Result<(u16, Vec<u
             Error::Protocol(message)
         }
     };
-    let body = &reply[body..];
+    let body_len = reply.len() - body;
     let limit = response_body_limit(method, path, status);
     if chunked {
-        let decoded = unchunk(body, limit)
+        reply.copy_within(body.., 0);
+        reply.truncate(body_len);
+        let decoded = unchunk(reply, limit)
             .ok_or_else(|| invalid("a broken or oversized chunked body"))?;
         if decoded.len() as u64 > limit {
             return Err(invalid("chunked body exceeds the documented response body limit"));
         }
         return Ok((status, decoded));
     }
-    if body.len() as u64 > limit {
+    if body_len as u64 > limit {
         return Err(invalid("HTTP body exceeds the documented response body limit"));
     }
     if let Some(expected) = length {
-        if body.len() != expected {
+        if body_len != expected {
             return Err(invalid("Content-Length does not match the complete body"));
         }
     }
-    Ok((status, body.to_vec()))
+    reply.copy_within(body.., 0);
+    reply.truncate(body_len);
+    Ok((status, reply))
 }
 
-fn unchunk(mut body: &[u8], limit: u64) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
+fn unchunk<A: Allocator>(mut body: Vec<u8, A>, limit: u64) -> Option<Vec<u8, A>> {
+    let mut read = 0;
+    let mut written = 0;
     loop {
-        let end = body.windows(2).position(|it| it == b"\r\n")?;
-        let text = std::str::from_utf8(&body[..end]).ok()?;
+        let end = read + body[read..].windows(2).position(|it| it == b"\r\n")?;
+        let text = std::str::from_utf8(&body[read..end]).ok()?;
         let len = usize::from_str_radix(text.split(';').next()?.trim(), 16).ok()?;
-        body = &body[end + 2..];
+        read = end + 2;
         if len == 0 {
-            if body == b"\r\n" {
-                return Some(out);
+            if &body[read..] == b"\r\n" {
+                body.truncate(written);
+                return Some(body);
             }
             // Trailer fields are allowed, but a missing final CRLF or extra
             // bytes after the terminator are an invalid response.
-            let trailers = std::str::from_utf8(body).ok()?.strip_suffix("\r\n\r\n")?;
+            let trailers = std::str::from_utf8(&body[read..]).ok()?.strip_suffix("\r\n\r\n")?;
             if trailers.split("\r\n").all(|line| {
                 line.split_once(':').is_some_and(|(name, _)| {
                     !name.is_empty() && !name.bytes().any(|byte| byte.is_ascii_whitespace())
                 })
             }) {
-                return Some(out);
+                body.truncate(written);
+                return Some(body);
             }
             return None;
         }
-        // Check before extending: a rejected response may not allocate its
-        // over-limit decoded body first, even within the framing allowance.
-        if len as u64 > limit.saturating_sub(out.len() as u64) {
+        // Check before moving bytes: the decoded budget is independent of the
+        // larger allowance for HTTP framing.
+        if len as u64 > limit.saturating_sub(written as u64) {
             return None;
         }
-        let data = body.get(..len)?;
-        let rest = body.get(len..)?;
-        if !rest.starts_with(b"\r\n") {
+        let end = read.checked_add(len)?;
+        if !body.get(end..)?.starts_with(b"\r\n") {
             return None;
         }
-        out.extend_from_slice(data);
-        body = &rest[2..];
+        body.copy_within(read..end, written);
+        written += len;
+        read = end + 2;
     }
 }
 
 /// The reply may be lost after the server has committed an immutable manifest.
 /// A transport/framing failure is therefore an unknown publication outcome,
 /// never evidence that it is safe to rebuild under the same key.
-fn publication_response(
+fn publication_response<A: Allocator>(
     path: &str,
-    response: Result<(u16, Vec<u8>), Error>,
-) -> Result<(u16, Vec<u8>), Error> {
+    response: Result<(u16, Vec<u8, A>), Error>,
+) -> Result<(u16, Vec<u8, A>), Error> {
     response.map_err(|error| {
         Error::Committed(format!(
             "PUT {path}: publication outcome unknown after request failure: {error}"
@@ -399,12 +432,12 @@ fn publication_response(
 
 /// A first publisher wins the immutable key. A 412 proves that a value exists,
 /// not that the value is identical; look up and compare it before accepting.
-fn publish_verdict(
+fn publish_verdict<A: Allocator>(
     status: u16,
     body: &[u8],
     path: &str,
     proposed: &[u8],
-    read_existing: impl FnOnce() -> Result<Option<Vec<u8>>, Error>,
+    read_existing: impl FnOnce() -> Result<Option<Vec<u8, A>>, Error>,
     equivalent: impl FnOnce(&[u8], &[u8]) -> Result<bool, Error>,
 ) -> Result<(), Error> {
     match status {
@@ -454,6 +487,8 @@ fn publish_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allocator_tests::{Counted, Counts};
+    use std::alloc::Global;
     use std::cell::Cell;
     use std::io::Read as _;
 
@@ -484,6 +519,57 @@ mod tests {
     }
 
     #[test]
+    fn http_bodies_keep_the_callers_allocation_through_decoding() {
+        let path = "/v1/list/manifests/unit";
+        for reply in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;name=value\r\nabc\r\n2\r\nde\r\n0\r\nDigest: checked\r\n\r\n".as_slice(),
+        ] {
+            let counts = Counts::default();
+            let bytes = reply.to_vec_in(Counted(&counts));
+            let pointer = bytes.as_ptr();
+            let capacity = bytes.capacity();
+            let before = counts.allocations.get();
+            let (status, body) = decode_response("GET", path, bytes).unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(body.as_slice(), b"abcde");
+            assert_eq!(body.as_ptr(), pointer, "decoding must compact the received allocation");
+            assert_eq!(body.capacity(), capacity);
+            assert!(std::ptr::eq(body.allocator().0, &counts));
+            assert_eq!(counts.allocations.get(), before);
+            assert_eq!(counts.deallocations.get(), 0);
+            drop(body);
+            assert_eq!(counts.allocations.get(), counts.deallocations.get());
+
+            // The production reader receives the complete small response in one read.
+            // A second allocation would expose a body copy after validating its framing.
+            let counts = Counts::default();
+            let (status, body) = read_response(&mut &reply[..], "GET", path, Counted(&counts)).unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(counts.allocations.get(), 1);
+            assert!(std::ptr::eq(body.allocator().0, &counts));
+            let (_, control) = read_response(&mut &reply[..], "GET", path, Global).unwrap();
+            assert_eq!(body.as_slice(), control.as_slice());
+            assert_eq!(counts.allocations.get(), 1);
+            drop(body);
+            assert_eq!(counts.allocations.get(), counts.deallocations.get());
+        }
+
+        for reply in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nextra".as_slice(),
+        ] {
+            let counts = Counts::default();
+            assert!(matches!(
+                read_response(&mut &reply[..], "GET", path, Counted(&counts)),
+                Err(Error::Committed(_))
+            ));
+            assert_eq!(counts.allocations.get(), counts.deallocations.get());
+        }
+    }
+
+    #[test]
     fn response_limits_stop_the_reader_before_buffering_a_hostile_reply() {
         let path = "/v1/blob/packs/test.pack";
         let mut oversized = b"HTTP/1.1 200 OK\r\nX-Long: ".to_vec(); // alloc: bounded hostile head
@@ -495,7 +581,7 @@ mod tests {
                 consumed: 0,
                 budget: HTTP_HEADER_LIMIT + 4,
             };
-            let error = read_response(&mut stream, "GET", path).unwrap_err();
+            let error = read_response(&mut stream, "GET", path, Global).unwrap_err();
             assert!(matches!(&error, Error::Committed(why) if why.contains("headers exceed")));
             assert!(stream.consumed <= HTTP_HEADER_LIMIT + 4);
             assert!(matches!(
@@ -522,7 +608,7 @@ mod tests {
         boundary.resize(HTTP_HEADER_LIMIT, b'a'); // alloc: one exactly legal header
         boundary.extend_from_slice(b"\r\n\r\n");
         let mut stream = boundary.as_slice();
-        assert_eq!(read_response(&mut stream, "GET", path).unwrap(), (200, Vec::new()));
+        assert_eq!(read_response(&mut stream, "GET", path, Global).unwrap(), (200, Vec::new()));
 
         for path in [path, "/v1/list/manifests/unit"] {
             let length = response_body_limit("GET", path, 200) + 1;
@@ -535,7 +621,7 @@ mod tests {
                 budget: head.len(),
             };
             assert!(matches!(
-                read_response(&mut stream, "GET", path),
+                read_response(&mut stream, "GET", path, Global),
                 Err(Error::Committed(why)) if why.contains("documented response body limit")
             ));
             assert_eq!(stream.consumed, head.len());
@@ -551,7 +637,7 @@ mod tests {
             consumed: 0,
             budget: head.len() + 2,
         };
-        assert!(matches!(read_response(&mut stream, "GET", path), Err(Error::Committed(_))));
+        assert!(matches!(read_response(&mut stream, "GET", path, Global), Err(Error::Committed(_))));
         assert_eq!(stream.consumed, head.len() + 2);
     }
 
@@ -571,20 +657,23 @@ mod tests {
                     consumed: 0,
                     budget: reply.len(),
                 };
-                match decode_response("GET", path, reply) {
+                match decode_response("GET", path, reply.to_vec_in(Global)) {
                     Ok(expected) => {
-                        assert_eq!(read_response(&mut stream, "GET", path).unwrap(), expected);
+                        assert_eq!(read_response(&mut stream, "GET", path, Global).unwrap(), expected);
                     }
                     Err(Error::Committed(_)) => assert!(matches!(
-                        read_response(&mut stream, "GET", path), Err(Error::Committed(_))
+                        read_response(&mut stream, "GET", path, Global), Err(Error::Committed(_))
                     )),
                     Err(other) => panic!("unexpected fixture refusal: {other}"),
                 }
             }
         }
         let chunks = b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
-        assert_eq!(unchunk(chunks, 5).unwrap(), b"abcde");
-        assert!(unchunk(chunks, 4).is_none(), "check the decoded budget before appending");
+        assert_eq!(unchunk(chunks.to_vec_in(Global), 5).unwrap(), b"abcde");
+        assert!(
+            unchunk(chunks.to_vec_in(Global), 4).is_none(),
+            "check the decoded budget before moving bytes"
+        );
     }
 
     #[test]
@@ -606,7 +695,7 @@ mod tests {
                 consumed: 0,
                 budget: head.len(),
             };
-            let error = read_response(&mut stream, "GET", path).unwrap_err();
+            let error = read_response(&mut stream, "GET", path, Global).unwrap_err();
             assert!(matches!(
                 error,
                 Error::Protocol(why) if why.contains("documented response body limit")
@@ -619,7 +708,7 @@ mod tests {
                 "HTTP/1.1 {status} Error\r\nTransfer-Encoding: chunked\r\n\r\n{claimed:x}\r\n"
             );
             assert!(matches!(
-                decode_response("GET", path, chunked.as_bytes()),
+                decode_response("GET", path, chunked.as_bytes().to_vec_in(Global)),
                 Err(Error::Protocol(why)) if why.contains("oversized chunked body")
             ));
         }
@@ -651,7 +740,8 @@ mod tests {
         let claimed = u64::from(Limits::DOCUMENTED.request) + 1;
         let oversized =
             format!("HTTP/1.1 200 OK\r\nContent-Length: {claimed}\r\n\r\n");
-        let refused = decode_response("GET", manifest, oversized.as_bytes()).unwrap_err();
+        let refused =
+            decode_response("GET", manifest, oversized.as_bytes().to_vec_in(Global)).unwrap_err();
         assert!(matches!(
             &refused,
             Error::Committed(why) if why.contains("documented response body limit")
@@ -664,7 +754,7 @@ mod tests {
         excessive_headers.extend(std::iter::repeat_n(b'a', HTTP_HEADER_LIMIT));
         excessive_headers.extend_from_slice(b"\r\n\r\n");
         assert!(matches!(
-            decode_response("GET", manifest, &excessive_headers),
+            decode_response("GET", manifest, excessive_headers),
             Err(Error::Committed(_))
         ));
     }
@@ -673,7 +763,10 @@ mod tests {
     fn an_http_reply_must_end_at_its_declared_body_boundary() {
         let path = "/v1/list/manifests/unit";
         let fixed = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\na b c\n";
-        assert_eq!(decode_response("GET", path, fixed).unwrap(), (200, b"a b c\n".to_vec()));
+        assert_eq!(
+            decode_response("GET", path, fixed.to_vec_in(Global)).unwrap(),
+            (200, b"a b c\n".to_vec())
+        );
         let broken = [
             b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\na b\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\na b c\nextra".as_slice(),
@@ -684,22 +777,31 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".as_slice(),
         ];
         for bytes in broken {
-            assert!(matches!(decode_response("GET", path, bytes), Err(Error::Committed(_))));
+            assert!(matches!(
+                decode_response("GET", path, bytes.to_vec_in(Global)), Err(Error::Committed(_))
+            ));
         }
 
         let chunks = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
-        assert_eq!(decode_response("GET", path, chunks).unwrap(), (200, b"abcde".to_vec()));
+        assert_eq!(
+            decode_response("GET", path, chunks.to_vec_in(Global)).unwrap(),
+            (200, b"abcde".to_vec())
+        );
         for bytes in [
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXY0\r\n\r\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nextra"
                 .as_slice(),
         ] {
-            assert!(matches!(decode_response("GET", path, bytes), Err(Error::Committed(_))));
+            assert!(matches!(
+                decode_response("GET", path, bytes.to_vec_in(Global)), Err(Error::Committed(_))
+            ));
         }
         // A legitimate 404 does not establish the existence of committed data.
         assert_eq!(
-            decode_response("GET", path, b"HTTP/1.1 404 Not Found\r\n\r\nnot here").unwrap(),
+            decode_response(
+                "GET", path, b"HTTP/1.1 404 Not Found\r\n\r\nnot here".to_vec_in(Global)
+            ).unwrap(),
             (404, b"not here".to_vec())
         );
     }
@@ -731,7 +833,9 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nSome-Header: \xff\r\n\r\n".as_slice(),
         ] {
-            assert!(matches!(decode_response("GET", path, bytes), Err(Error::Committed(_))));
+            assert!(matches!(
+                decode_response("GET", path, bytes.to_vec_in(Global)), Err(Error::Committed(_))
+            ));
         }
         // Before an HTTP 200 is observed, a transport failure can follow the
         // caller's explicit local policy. Neither 404 nor a PUT is proof of a
@@ -760,7 +864,7 @@ mod tests {
             Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
             Error::Protocol("the publication reply was truncated".to_owned()),
         ] {
-            let refused = publication_response(path, Err(error)).unwrap_err();
+            let refused = publication_response::<Global>(path, Err(error)).unwrap_err();
             assert!(
                 matches!(&refused, Error::Committed(why)
                     if why.contains(path) && why.contains("outcome unknown")),
@@ -785,7 +889,7 @@ mod tests {
             [(Some(b"same"), true), (Some(b"different"), false), (None, false)];
         for (committed, accepted) in cases {
             let read = Cell::new(false);
-            let verdict = publish_verdict(
+            let verdict = publish_verdict::<Global>(
                 412,
                 b"",
                 path,
@@ -819,7 +923,7 @@ mod tests {
             Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "verification timed out")),
             Error::Protocol("verification response was malformed".to_owned()),
         ] {
-            let refused = publish_verdict(
+            let refused = publish_verdict::<Global>(
                 412,
                 b"",
                 path,
@@ -847,7 +951,7 @@ mod tests {
             Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
             Error::Protocol("committed packs could not be decoded".to_owned()),
         ] {
-            let refused = publish_verdict(
+            let refused = publish_verdict::<Global>(
                 412,
                 b"",
                 path,
@@ -862,7 +966,7 @@ mod tests {
             ));
         }
         let read = Cell::new(false);
-        let result = publish_verdict(
+        let result = publish_verdict::<Global>(
             201,
             b"",
             path,
@@ -879,7 +983,7 @@ mod tests {
         // immutable outcome. Other statuses may arrive after a server committed
         // but failed before returning its acknowledgement.
         for status in [301, 400, 429, 500, 503] {
-            let refused = publish_verdict(
+            let refused = publish_verdict::<Global>(
                 status,
                 b"unavailable",
                 path,

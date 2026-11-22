@@ -12,7 +12,7 @@ use super::chat::Draft;
 mod page;
 use harness_learn::{Course, Input, Lesson, Mark, Progress, Run, Step, tutor};
 use harness_native_ui_layout_api::{Size, SizeKind, Sizing};
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 
 /// The name the app gives the tutor's session; a session by this name is never a sidebar row (src/app.rs).
 pub(super) const TUTOR_NAME: &str = "Tutor";
@@ -253,8 +253,12 @@ impl Learn {
 }
 
 /// Typed text as a field takes it: no control characters, no AppKit function-key code points.
-fn typed(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect()
+fn typed<'a, A: Allocator>(text: &str, out: &'a mut Vec<u8, A>) -> &'a str {
+    out.clear();
+    for c in text.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)) {
+        out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+    }
+    std::str::from_utf8(out).expect("encoded characters are UTF-8")
 }
 
 fn percent(v: View<'_>, share: f32) {
@@ -757,7 +761,9 @@ not the transcript.\n\nThe conversation:\n{}",
         if !self.learn_focused() {
             return false;
         }
-        let text = typed(text.lines().next().unwrap_or(""));
+        // Filtered input lives only until it is inserted into the field or read as a choice.
+        let mut input = Vec::new_in(Global);
+        let text = typed(text.lines().next().unwrap_or(""), &mut input);
         if text.is_empty() {
             return true;
         }
@@ -765,7 +771,7 @@ not the transcript.\n\nThe conversation:\n{}",
             let mut l = self.learn.borrow_mut();
             let l = &mut *l;
             match (&l.screen, l.run.as_mut()) {
-                (Screen::Home, _) => _ = l.edit(|d| d.insert(&text)),
+                (Screen::Home, _) => _ = l.edit(|d| d.insert(text)),
                 (Screen::Step, Some(run)) => {
                     let Some(v) = run.view() else { return true };
                     match v.step {
@@ -774,7 +780,7 @@ not the transcript.\n\nThe conversation:\n{}",
                                 run.step(Input::Choose(n - 1), &mut l.saved.progress, today());
                             }
                         }
-                        Step::Fill { .. } => _ = l.edit(|d| d.insert(&text)),
+                        Step::Fill { .. } => _ = l.edit(|d| d.insert(text)),
                         Step::Read { .. } | Step::Order { .. } => {}
                     }
                 }

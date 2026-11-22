@@ -375,6 +375,29 @@ fn c() { let _ = stringify!(); }
         }
     }
 
+    #[test]
+    fn the_oracle_catches_a_dependents_mark_that_drops_the_carried_context() {
+        let f = fixture::db(TWO_CRATES);
+        let db = f.db();
+        let (d, c) = (crate_named(db, "d"), crate_named(db, "c"));
+        let def = stringify(&f, d);
+        let root = SyntaxContext::root(EDITION);
+        let d_call = call(&f, "/d.rs", def, d, root);
+        let c_call = call(&f, "/c.rs", def, c, root);
+        let (from, to) = (d_call.arena(), c_call.arena());
+        assert_ne!(from, to);
+        let in_d = apply_mark(db, from, root, d_call, Transparency::SemiOpaque, EDITION);
+        let carried = in_d.translate(db, from, to);
+        for transparency in TRANSPARENCIES {
+            let wanted = [(d_call, Transparency::SemiOpaque), (c_call, transparency)];
+            let in_c = apply_mark(db, to, carried, c_call, transparency, EDITION);
+            assert_eq!(marks(db, in_c, to), wanted);
+            // Plant a translate that returned the root and lost the dependency's marks.
+            let lost = apply_mark(db, to, root, c_call, transparency, EDITION);
+            assert_ne!(marks(db, lost, to), wanted);
+        }
+    }
+
     /// Over seeded key sequences, the cache gives what the function gives, and computes a key
     /// again only after four others were missed since.
     #[test]

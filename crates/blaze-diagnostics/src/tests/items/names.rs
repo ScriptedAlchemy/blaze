@@ -117,7 +117,7 @@ fn main() { let _unique = select!(_ _ _); let _first = select!(_ _); let _second
 /// module of a `select!`, in each of two expansions of the same tokens, and says E0425 for a
 /// type nothing declares there, and nothing for the enum's own parameter.
 #[test]
-fn a_type_nothing_declares_in_an_enum_a_proc_macro_writes_in_a_select_is_e0425() {
+fn the_oracle_catches_an_undeclared_type_in_each_proc_macro_enum() {
     let fixture = r#"//- proc_macros: pass
 //- minicore: sized
 //- /main.rs crate:main edition:2021

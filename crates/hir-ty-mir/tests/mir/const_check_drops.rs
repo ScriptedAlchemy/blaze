@@ -277,7 +277,7 @@ fn expected_difference_a_borrow_bound_to_a_name_then_a_move_is_accepted_where_ru
 /// The control of the invariant above: borrowed and not moved out of, the value is dropped
 /// at the end and refused.
 #[test]
-fn a_value_borrowed_and_not_moved_out_of_is_dropped() {
+fn the_oracle_catches_a_borrowed_value_left_to_drop() {
     let src = borrowed_then_moved();
     let found = check("sized, copy", &src, func("dropped"));
     assert_eq!(reported(&found), [("E0493", &*destructor("S"), "mut s", Some(("}", true)))]);

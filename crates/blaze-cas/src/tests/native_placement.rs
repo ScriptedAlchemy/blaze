@@ -51,7 +51,11 @@ fn native_placement(label: &str, bytes: &[u8]) {
     );
     for file in [sealed, name("target/build/out/blaze"), name("target/debug/blaze")] {
         // Map instead of allocating another full-size copy for the optional boundary case.
-        let mut effects = vec![Effect::Map { file: file.clone(), tag: Tag(1) }];
+        let mut effects = vec![Effect::Map {
+            file: file.clone(),
+            extent: blaze_core::Extent::Whole,
+            tag: Tag(1),
+        }];
         run_until_idle(&mut native, &mut effects, |done, _| {
             let Done::Mapped(mapped) = done.done else { panic!("mapping {file} failed") };
             assert!(mapped.bytes() == bytes, "bytes differ at {file}");

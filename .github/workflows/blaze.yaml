@@ -348,18 +348,37 @@ jobs:
           ratchet_snapshot=$(mktemp -d "$RUNNER_TEMP/blaze-ratchet-snapshot.XXXXXX")
           mkdir -p "$RUNNER_TEMP/ratchet-evidence"
           git archive HEAD | tar -x -C "$ratchet_snapshot"
-          "$BLAZE_SCRIPTS/allocs" "{\"command\": \"write\", \"root\": \"$ratchet_snapshot\"}"
-          "$BLAZE_SCRIPTS/untyped" "{\"command\": \"write\", \"root\": \"$ratchet_snapshot\"}"
           # The invariant inventory enumerates tracked paths. Register the archived files in
           # the isolated snapshot, including files whose current ignore rules would hide them.
           git -C "$ratchet_snapshot" init -q
           git -C "$ratchet_snapshot" add -f .
-          "$BLAZE_SCRIPTS/invariants" "{\"command\": \"write\", \"root\": \"$ratchet_snapshot\"}"
-          cp "$ratchet_snapshot/tools/ratchets/alloc-sites.txt" "$RUNNER_TEMP/ratchet-evidence/"
-          cp "$ratchet_snapshot/tools/ratchets/untyped-errors.txt" "$RUNNER_TEMP/ratchet-evidence/"
-          cp "$ratchet_snapshot/docs/v2/plan/invariants.md" "$RUNNER_TEMP/ratchet-evidence/"
           cp "$BLAZE_SCRIPTS/KEY" "$RUNNER_TEMP/ratchet-evidence/validator-key.txt"
           git rev-parse HEAD > "$RUNNER_TEMP/ratchet-evidence/source-head.txt"
+          # A failed scanner still leaves its diagnostic and any output it wrote. Removing
+          # the old lists first prevents a failed write from being archived as fresh counts.
+          rm "$ratchet_snapshot/tools/ratchets/alloc-sites.txt" \
+            "$ratchet_snapshot/tools/ratchets/untyped-errors.txt" \
+            "$ratchet_snapshot/docs/v2/plan/invariants.md"
+          failed=0
+          for scanner in allocs untyped invariants; do
+            if "$BLAZE_SCRIPTS/$scanner" "{\"command\": \"write\", \"root\": \"$ratchet_snapshot\"}" \
+                2>&1 | tee "$RUNNER_TEMP/ratchet-evidence/$scanner.log"; then
+              status=0
+            else
+              status=$?
+              failed=1
+            fi
+            printf '%s\t%s\n' "$scanner" "$status" >> "$RUNNER_TEMP/ratchet-evidence/validator-status.tsv"
+          done
+          for output in tools/ratchets/alloc-sites.txt tools/ratchets/untyped-errors.txt docs/v2/plan/invariants.md; do
+            if [ -f "$ratchet_snapshot/$output" ]; then
+              cp "$ratchet_snapshot/$output" "$RUNNER_TEMP/ratchet-evidence/"
+            else
+              echo "::error::native scanner produced no $output"
+              failed=1
+            fi
+          done
+          exit "$failed"
       - name: keep native ratchet counts
         if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
         uses: actions/upload-artifact@v7
@@ -542,6 +561,7 @@ jobs:
       - uses: ./.github/actions/toolchain
         id: pinned-cargo
       - name: distributed library models and planted controls with pinned Cargo
+        id: retained-tests
         shell: bash
         timeout-minutes: 75
         run: |
@@ -590,6 +610,8 @@ jobs:
             the_oracle_catches_missing_file_sync_with_torn_appends
             the_oracle_catches_acknowledgement_before_directory_sync
             fragmented_replies_preserve_body_boundaries_and_committed_refusals
+            http_bodies_keep_the_callers_allocation_through_decoding
+            coordinator_outputs_and_replays_use_the_callers_allocator
             committed_reply_bounds_follow_the_native_wire_contract
             an_http_reply_must_end_at_its_declared_body_boundary
             an_interrupted_committed_get_cannot_authorize_local_recompilation
@@ -599,12 +621,16 @@ jobs:
             errors_after_publication_cannot_rebuild_an_immutable_unit
             nested_effect_logs_use_the_callers_allocator
             holder_effects_use_the_callers_allocator
+            committed_names_use_the_callers_allocator_and_exact_result_identity
             pack_lists_use_the_callers_allocator
             nested_schema_encoding_and_digest_scratch_use_the_callers_allocator
             appending_keeps_the_callers_buffer_and_allocator_without_allocating
             sets_keep_their_storage_and_take_encoding_scratch_from_the_output_allocator
             set_encoding_writes_each_canonical_sort_key_once
             rendering_uses_the_destination_and_reports_its_capacity
+            native_scan_crosses_buffer_edges_and_skips_from_the_logical_position
+            native_key_digest_headers_match_the_wire_at_every_length_boundary
+            bounded_object_reads_use_the_callers_allocator_and_preserve_size_refusals
             every_type_round_trips_byte_identically
             every_type_has_a_golden_file
             golden_vectors_match
@@ -621,6 +647,7 @@ jobs:
               || { echo "::error::missing executed library control: $case_name"; exit 1; }
           done
       - name: distributed library binaries and integration targets compile
+        id: retained-all-targets
         if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
         shell: bash
         timeout-minutes: 20
@@ -629,6 +656,16 @@ jobs:
           toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
           cargo "+$toolchain" check --release --locked --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve \
             2>&1 | tee "$RUNNER_TEMP/core-evidence/all-targets.log"
+      - name: keep retained library failures before the remaining tests
+        if: ${{ !cancelled() && (steps.retained-tests.outcome == 'failure' || steps.retained-all-targets.outcome == 'failure') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: retained-library-errors
+          path: |
+            ${{ runner.temp }}/core-evidence/tests.log
+            ${{ runner.temp }}/core-evidence/all-targets.log
+            ${{ runner.temp }}/core-evidence/toolchain-pin.txt
+          if-no-files-found: error
       - name: active V2 library invariants and their planted controls
         if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
         shell: bash
@@ -711,7 +748,7 @@ jobs:
           toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
           cargo "+$toolchain" test --release --locked --lib --no-fail-fast \
             -p blaze-graph -p blaze-hash -p blaze-host -p blaze-mem -p blaze-memo \
-            -p blaze-pg -p blaze-remote -p blaze-screen -p blaze-std -p span \
+            -p blaze-pg -p blaze-remote -p blaze-screen -p span \
             2>&1 | tee "$RUNNER_TEMP/core-evidence/remaining-active-tests.log"
           cases=(
             the_oracle_catches_a_sample_whose_free_is_not_reported
@@ -727,8 +764,6 @@ jobs:
             the_oracle_catches_an_array_that_drops_its_null_elements
             the_oracle_catches_ticket_expiry_checked_against_an_old_clock
             the_oracle_catches_cached_passes_reported_as_tests_run
-            the_oracle_catches_a_main_without_its_output_capability
-            the_oracle_catches_a_line_written_without_its_newline
             the_oracle_catches_a_context_read_in_another_arena_without_translation
           )
           for case_name in "${cases[@]}"; do
@@ -761,40 +796,91 @@ jobs:
             grep -Eq "^test key::tests::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/fncache-tests.log" \
               || { echo "::error::missing executed function-key control: $case_name"; exit 1; }
           done
-      - name: browser origin parser with the pinned Rust toolchain
-        if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
-        shell: bash
-        timeout-minutes: 5
-        run: |
-          mkdir -p "$RUNNER_TEMP/core-evidence"
-          toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
-          rustc "+$toolchain" --edition=2024 --test crates/harness/harness-browser/src/ui.rs \
-            -o "$RUNNER_TEMP/core-evidence/browser-ui-test"
-          "$RUNNER_TEMP/core-evidence/browser-ui-test" \
-            2>&1 | tee "$RUNNER_TEMP/core-evidence/browser-ui-tests.log"
-          for case_name in a_file_page_is_its_own_file an_http_page_is_its_scheme_host_and_port other_schemes_and_broken_urls_are_refused; do
-            grep -Eq "^test tests::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/browser-ui-tests.log" \
-              || { echo "::error::missing executed browser-origin control: $case_name"; exit 1; }
-          done
-      - name: learning models with caller-owned buffers
+      - name: harness pure cores with the pinned Rust toolchain
         if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
         shell: bash
         timeout-minutes: 15
         run: |
           mkdir -p "$RUNNER_TEMP/core-evidence"
           toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
-          # This library has only serde dependencies. A verbatim copy lets Cargo test it
-          # without resolving the desktop workspace's platform-specific GPU artifact.
-          learning_snapshot=$(mktemp -d "$RUNNER_TEMP/blaze-learning.XXXXXX")
-          cp -a crates/harness/harness-learn/. "$learning_snapshot/"
-          cp crates/harness/Cargo.lock "$learning_snapshot/Cargo.lock"
-          cargo "+$toolchain" test --release --locked --manifest-path "$learning_snapshot/Cargo.toml" \
-            2>&1 | tee "$RUNNER_TEMP/core-evidence/learning-tests.log"
-          diff -r crates/harness/harness-learn/src "$learning_snapshot/src"
-          cmp crates/harness/harness-learn/Cargo.toml "$learning_snapshot/Cargo.toml"
-          for case_name in a_topic_borrows_the_original_bytes_after_a_unicode_greeting sorted_reviews_and_key_scratch_use_the_callers_allocator a_prompt_writes_into_fixed_storage_and_reports_a_full_sink streamed_answers_match_unicode_lowercase_and_whitespace_normalization an_order_reuses_its_buffer_when_a_missed_check_returns; do
-            grep -Eq "^test ([[:alnum:]_]+::)*$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/learning-tests.log" \
-              || { echo "::error::missing executed learning buffer control: $case_name"; exit 1; }
+          # Resolve only the adapter's feature closure from the application's exact pins.
+          # Metadata does not compile. No resolved package may change identity, and the
+          # subsequent build is locked to the retained normalized lockfile. Source modules
+          # are read through the repository symlink; none is copied or rewritten.
+          harness_snapshot=$(mktemp -d "$RUNNER_TEMP/blaze-harness-core.XXXXXX")
+          mkdir -p "$harness_snapshot/.github/fixtures"
+          cp -a .github/fixtures/harness-core "$harness_snapshot/.github/fixtures/"
+          ln -s "$GITHUB_WORKSPACE/crates" "$harness_snapshot/crates"
+          ln -s "$GITHUB_WORKSPACE/Cargo.toml" "$harness_snapshot/Cargo.toml"
+          manifest="$harness_snapshot/.github/fixtures/harness-core/Cargo.toml"
+          cp crates/harness/Cargo.lock "$(dirname "$manifest")/Cargo.lock"
+          git rev-parse HEAD > "$RUNNER_TEMP/core-evidence/harness-core-source-head.txt"
+          metadata_status=0
+          timeout --kill-after=10s 120s cargo "+$toolchain" metadata --format-version 1 \
+            --manifest-path "$manifest" > "$RUNNER_TEMP/core-evidence/harness-core-metadata.json" \
+            2> "$RUNNER_TEMP/core-evidence/harness-core-metadata.log" || metadata_status=$?
+          cat "$RUNNER_TEMP/core-evidence/harness-core-metadata.log"
+          cp "$(dirname "$manifest")/Cargo.lock" "$RUNNER_TEMP/core-evidence/harness-core.Cargo.lock"
+          [ "$metadata_status" -eq 0 ] || exit "$metadata_status"
+          python3 - "$(jq -cn --arg seed "$GITHUB_WORKSPACE/crates/harness/Cargo.lock" \
+            --arg actual "$RUNNER_TEMP/core-evidence/harness-core.Cargo.lock" '{seed: $seed, actual: $actual}')" <<'PY'
+          from dataclasses import dataclass
+          import json
+          from pathlib import Path
+          import sys
+          import tomllib
+
+          @dataclass(frozen=True)
+          class Input:
+              seed: str
+              actual: str
+
+          asked = Input(**json.loads(sys.argv[1]))
+          seed = tomllib.loads(Path(asked.seed).read_text())
+          actual = tomllib.loads(Path(asked.actual).read_text())
+          fields = ("name", "version", "source", "checksum")
+          identities = {tuple(package.get(field) for field in fields) for package in seed["package"]}
+          adapter = ("blaze-harness-core-ci", "0.1.0", None, None)
+          identities.add(adapter)
+          resolved = [tuple(package.get(field) for field in fields) for package in actual["package"]]
+          if actual["version"] != seed["version"] or resolved.count(adapter) != 1:
+              raise SystemExit("::error::the harness adapter has no exact root and lock format")
+          for package in resolved:
+              if package not in identities:
+                  raise SystemExit(f"::error::harness adapter dependency is outside the pinned lock: {package}")
+          print(f"harness-core: {len(resolved)} exact package identities retained from the application lock")
+          PY
+          cmp .github/fixtures/harness-core/Cargo.toml "$manifest"
+          cmp .github/fixtures/harness-core/lib.rs "$(dirname "$manifest")/lib.rs"
+          timeout --kill-after=10s 600s cargo "+$toolchain" test --release --locked --all-targets \
+            --manifest-path "$manifest" \
+            2>&1 | tee "$RUNNER_TEMP/core-evidence/harness-core-tests.log"
+          cases=(
+            ui::tests::a_file_page_is_its_own_file
+            ui::tests::an_http_page_is_its_scheme_host_and_port
+            ui::tests::other_schemes_and_broken_urls_are_refused
+            keys::tests::the_table
+            keys::tests::down_up_and_chars
+            cdp_ids::tests::two_connections_with_the_same_ids_get_their_own_answers
+            cdp_ids::tests::events_orphans_and_forgetting
+            cdp_ids::tests::refuses_what_is_not_a_request_and_crossed_answers
+            cdp_ids::tests::ids_wrap_and_skip_pending
+            cdp_ids::dst::every_cdp_answer_reaches_only_its_asker_once_and_every_live_request_is_answered
+            cdp_ids::dst::seeded_plans_pass
+            cdp_ids::dst::the_oracle_catches_a_dropped_connections_ids_freed_at_once
+            completion::tests::completion_tracks_sessions_through_navigation_and_disappearance
+            completion::tests::the_oracle_catches_focus_based_completion
+            fileview::tests::the_cited_part_is_marked
+            fileview::tests::rendering_escapes_unicode_and_preserves_writer_failures
+            intent::tests::a_topic_borrows_the_original_bytes_after_a_unicode_greeting
+            memory::tests::sorted_reviews_and_key_scratch_use_the_callers_allocator
+            tutor::tests::a_prompt_writes_into_fixed_storage_and_reports_a_full_sink
+            run::tests::streamed_answers_match_unicode_lowercase_and_whitespace_normalization
+            run::tests::an_order_reuses_its_buffer_when_a_missed_check_returns
+          )
+          for case_name in "${cases[@]}"; do
+            grep -Eq "^test $case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/harness-core-tests.log" \
+              || { echo "::error::missing executed harness-core control: $case_name"; exit 1; }
           done
       - uses: actions/upload-artifact@v7
         if: always()

@@ -100,7 +100,7 @@ use hir_def::{
 use hir_expand::{EditionedFileId, ExpansionInfo, HirFileId, MacroCallId};
 use smallvec::SmallVec;
 use span::FileId;
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use stdx::impl_from;
 
 use crate::db::HirDatabase;
@@ -123,9 +123,9 @@ pub(super) struct SourceToDefCache<'db> {
 /// mod m;`), which [`relevant_crates`] (the crates of the file's own source root) leaves out.
 /// Then the crates of the file's source root not `within`: the file of a package is in the
 /// source root of each of its targets, and each would otherwise have its module tree built.
-fn crates_of<'a>(
+fn crates_of<'a, A: Allocator>(
     db: &'a Db,
-    within: Option<&'a HashSet<Crate, Global>>,
+    within: Option<&'a HashSet<Crate, A>>,
     file: FileId,
     first: bool,
 ) -> impl Iterator<Item = Crate> + 'a {

@@ -12,7 +12,7 @@ use std::{
     cmp::Reverse,
     collections::BinaryHeap,
     fs::File,
-    io::{BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -36,6 +36,58 @@ struct NativeEntry {
     kind: u8,
     length: u64,
     offset: u64,
+}
+
+/// A native scan's fixed read buffer. Small values are skipped inside it; a larger
+/// value seeks past the unread tail, so the scan never retains values or keys.
+struct NativeScan<R> {
+    reader: R,
+    bytes: [u8; 8192],
+    at: usize,
+    end: usize,
+}
+
+impl<R: Read + Seek> NativeScan<R> {
+    fn new(reader: R) -> Self {
+        Self { reader, bytes: [0; 8192], at: 0, end: 0 }
+    }
+
+    fn skip(&mut self, count: u64) -> io::Result<()> {
+        let buffered = self.end - self.at;
+        if count <= buffered as u64 {
+            self.at += count as usize;
+        } else {
+            let beyond = i64::try_from(count - buffered as u64)
+                .map_err(|_| io::ErrorKind::InvalidInput)?;
+            self.reader.seek(SeekFrom::Current(beyond))?;
+            self.at = 0;
+            self.end = 0;
+        }
+        Ok(())
+    }
+
+    fn rewind(&mut self, offset: u64) -> io::Result<()> {
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.at = 0;
+        self.end = 0;
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for NativeScan<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.at == self.end {
+            self.end = self.reader.read(&mut self.bytes)?;
+            self.at = 0;
+        }
+        let n = out.len().min(self.end - self.at);
+        out[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
 }
 
 fn native_refusal(name: &str, why: &str) -> Error {
@@ -75,10 +127,25 @@ fn native_keys_hasher(count: usize) -> Sha256 {
     let mut hash = Sha256::new();
     // The wire v5 digest domain, followed by the same array head and byte strings
     // Pack::of hashes. Streaming avoids allocating a CBOR array proportional to keys.
-    hash.update(format!("blaze/blaze/dist-pack-keys/v{}\0", blaze_wire::VERSION)); // alloc: fixed-size wire domain
-    let mut head = blaze_wire::Encoder::new();
-    head.array(count);
-    hash.update(head.into_bytes());
+    write!(Unhashed(&mut hash), "blaze/blaze/dist-pack-keys/v{}\0", blaze_wire::VERSION)
+        .expect("the hashing writer cannot fail");
+    let count = count as u64;
+    match count {
+        0..=23 => hash.update([0x80 | count as u8]),
+        24..=0xff => hash.update([0x98, count as u8]),
+        0x100..=0xffff => {
+            hash.update([0x99]);
+            hash.update((count as u16).to_be_bytes());
+        }
+        0x1_0000..=0xffff_ffff => {
+            hash.update([0x9a]);
+            hash.update((count as u32).to_be_bytes());
+        }
+        _ => {
+            hash.update([0x9b]);
+            hash.update(count.to_be_bytes());
+        }
+    }
     hash
 }
 
@@ -312,7 +379,8 @@ impl Store {
         packs: &[blaze_wire::PackRef],
         required: usize,
     ) -> Result<bool, Error> {
-        let mut frontier = BinaryHeap::new(); // alloc: one pending record per bounded manifest line
+        // The frontier lives for this bounded verification of one manifest.
+        let mut frontier = BinaryHeap::new_in(Global);
         let mut missing = false;
         for (at, pack) in packs.iter().enumerate() {
             if !self.verify_pack(pack)? {
@@ -364,7 +432,7 @@ impl Store {
         }
         self.verify_reader(&object, &mut file)?;
         file.seek(SeekFrom::Start(8)).map_err(|e| failed(&format!("rewinding {name}"), e))?;
-        let mut reader = BufReader::new(file); // alloc: one fixed-capacity native scan buffer
+        let mut reader = NativeScan::new(file);
         let mut count = 0;
         let mut previous = None;
         let mut offset = 8;
@@ -375,10 +443,10 @@ impl Store {
             previous = Some(entry.key);
             count += 1;
             offset = entry.offset + entry.length;
-            reader.seek_relative(entry.length as i64)
+            reader.skip(entry.length)
                 .map_err(|e| failed(&format!("skipping a value in {name}"), e))?;
         }
-        reader.seek(SeekFrom::Start(8)).map_err(|e| failed(&format!("rewinding {name}"), e))?;
+        reader.rewind(8).map_err(|e| failed(&format!("rewinding {name}"), e))?;
         let mut hash = native_keys_hasher(count);
         offset = 8;
         while let Some(entry) = native_entry(&mut reader, &name, offset, size)? {
@@ -386,7 +454,7 @@ impl Store {
             hash.update([0x58, 32]);
             hash.update(entry.key);
             offset = entry.offset + entry.length;
-            reader.seek_relative(entry.length as i64)
+            reader.skip(entry.length)
                 .map_err(|e| failed(&format!("skipping a value in {name}"), e))?;
         }
         if Digest::from(hash.finalize()) != pack.keys {
@@ -733,6 +801,43 @@ mod tests {
 
     fn scratch() -> tempfile::TempDir {
         tempfile::tempdir().expect("a temporary directory")
+    }
+
+    #[test]
+    fn native_scan_crosses_buffer_edges_and_skips_from_the_logical_position() {
+        let bytes: Vec<u8> = (0..25_000).map(|i| (i % 251) as u8).collect();
+        let mut scan = NativeScan::new(io::Cursor::new(&bytes));
+        let mut header = [0; 41];
+        scan.read_exact(&mut header).unwrap();
+        assert_eq!(header, bytes[..41]);
+
+        scan.skip(8192 - 41 - 17).unwrap();
+        scan.read_exact(&mut header).unwrap();
+        assert_eq!(header, bytes[8175..8216], "a header straddles the refill");
+
+        scan.skip(10_000).unwrap();
+        scan.read_exact(&mut header).unwrap();
+        assert_eq!(header, bytes[18_216..18_257], "a seek discounts the unread buffered tail");
+
+        scan.rewind(8).unwrap();
+        assert_eq!(scan.read(&mut []).unwrap(), 0);
+        scan.read_exact(&mut header).unwrap();
+        assert_eq!(header, bytes[8..49], "the second pass discards the old buffer");
+        scan.skip((bytes.len() - 49) as u64).unwrap();
+        assert_eq!(scan.read(&mut header).unwrap(), 0);
+        assert_eq!(scan.skip(u64::MAX).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn native_key_digest_headers_match_the_wire_at_every_length_boundary() {
+        for count in [0, 1, 23, 24, 0xff, 0x100, 0xffff, 0x1_0000, 0xffff_ffff, 0x1_0000_0000, u64::MAX] {
+            let Ok(count) = usize::try_from(count) else { continue };
+            let mut encoded = blaze_wire::Encoder::new(Global);
+            encoded.array(count);
+            let expected = blaze_wire::digest_of_encoded_name("blaze/dist-pack-keys", &encoded.into_bytes());
+            let actual: Digest = native_keys_hasher(count).finalize().into();
+            assert_eq!(actual, expected, "array length {count}");
+        }
     }
 
     #[test]

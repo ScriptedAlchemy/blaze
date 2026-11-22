@@ -1,10 +1,8 @@
 //! A constant an entry of the item store (`hir_ty::body_store::konst`; AGENTS.md
 //! `granular-caching`), by counts: of N constants of one crate, an edit of one finds the other
 //! N - 1 in the store, in a database whose ids differ, with none of them evaluated and no MIR
-//! built for them. The control, that the key this replaced (the crate's check key in every
-//! constant's key) moves for all N, is hir-ty's
-//! `body_store::konst::tests::keyed_by_its_crate_every_constant_misses`, which evaluates
-//! nothing. These evaluate, so they are here, where MIR builds.
+//! built for them. The control puts the crate's key in every constant's identity, then runs
+//! the same evaluation and flush observer: one edit makes all N constants evaluate again.
 //!
 //! `const_eval_query` does not go through the step yet (`hir_ty::consteval::stored_constant`
 //! says the one condition), so these go through [`stored_value`], a query that does what
@@ -116,13 +114,21 @@ impl ImageStore for Memory {
 /// fixtures' constants reads another item. Only the constant step is stored: a read of any
 /// other step is refused, so no inference or MIR record is written and none of their ids is
 /// asked for.
-struct Facts;
+struct Facts {
+    /// A planted crate-wide dependency, absent in the item-keyed case.
+    crate_key: Option<ContentId>,
+}
 
 impl BodyFacts for Facts {
     fn identity(&self, db: &TestDB, def: DefWithBodyId) -> Option<ContentId> {
         let key = body_key(db, def)?;
         let printed = Body::of(db, def).pretty_print(db, def, span::Edition::CURRENT);
-        Some(Hasher::new("blaze v2 item store constant test identity 1").id(&key).part(printed.as_bytes()).finish())
+        let mut identity = Hasher::new("blaze v2 item store constant test identity 1");
+        identity.id(&key).part(printed.as_bytes());
+        if let Some(crate_key) = self.crate_key {
+            identity.id(&crate_key);
+        }
+        Some(identity.finish())
     }
 
     fn fact_of(&self, _: &TestDB, _: DefWithBodyId, step: Step, _: blaze_memo::Read) -> Classified {
@@ -148,12 +154,21 @@ impl BodyFacts for Facts {
 /// A database of `fixture` with an item store over `memory`. The store is uninstalled before
 /// the database drops: it is declared after it where this is called.
 fn session(fixture: &str, memory: &Arc<Memory>, mode: Mode) -> (TestDB, Installed) {
+    session_with_key(fixture, memory, mode, None)
+}
+
+fn session_with_key(
+    fixture: &str,
+    memory: &Arc<Memory>,
+    mode: Mode,
+    crate_key: Option<ContentId>,
+) -> (TestDB, Installed) {
     // A step's read list is what the store files it under: only a snapshot that keeps read
     // lists records one (else every offer is refused as unshareable).
     let db: TestDB = fixture::db_with_reads(fixture).into_db();
     // dyn: hir-ty's `install` takes the driver's store and facts, a boundary
     let images = Arc::clone(memory) as Arc<dyn ImageStore + Send + Sync>;
-    let installed = install(&db, images, Arc::new(Facts), BUILD, mode).expect("a first store of a database");
+    let installed = install(&db, images, Arc::new(Facts { crate_key }), BUILD, mode).expect("a first store of a database");
     (db, installed)
 }
 
@@ -202,6 +217,10 @@ fn asked(steps: &[StepCounts; Step::COUNT], step: Step) -> u64 {
     steps[step as usize].hits + steps[step as usize].ran
 }
 
+fn one_edit_reuses_the_other_constants(counts: StepCounts, n: u64) -> bool {
+    counts == StepCounts { hits: n - 1, ran: 1, refused: 0 }
+}
+
 /// The invariant: a constant is found by its own item and what its evaluation read, so an
 /// edit of one of N leaves the other N - 1 entries found, in a database whose ids differ, with
 /// none of them evaluated and nothing of their bodies asked for (no inference, no MIR); the
@@ -227,8 +246,7 @@ fn an_edit_of_one_constant_finds_the_others_and_runs_one() {
         assert_eq!(now[at], first[at], "`{}` is the stored value", NAMES[at]);
     }
     let flushed = installed.flush().unwrap();
-    let counts = StepCounts { hits: n - 1, ran: 1, refused: 0 };
-    assert_eq!(flushed.steps[Step::Const as usize], counts, "N - 1 hit and one ran: {flushed:?}");
+    assert!(one_edit_reuses_the_other_constants(flushed.steps[Step::Const as usize], n), "N - 1 hit and one ran: {flushed:?}");
     // The saved work did not run: of the bodies of N constants, the edited one's alone was
     // asked for. (Where the first build asked for none through the item store, this holds
     // nothing: the message says how many it asked for.)
@@ -238,6 +256,28 @@ fn an_edit_of_one_constant_finds_the_others_and_runs_one() {
         "a hit asks for nothing of its body: {infer} inferences and {mir} MIR bodies asked for \
          after the edit, {mir_first} MIR bodies in the first build: {flushed:?}"
     );
+    assert_eq!(installed.errors(), Ok(()));
+}
+
+#[test]
+fn the_oracle_catches_a_crate_key_forcing_every_constant_to_run_again() {
+    let memory = Arc::new(Memory::default());
+    let n = NAMES.len() as u64;
+    let key = |value| ContentId::of("blaze v2 item store constant control 1", fixture_of(value, false).as_bytes());
+    {
+        let (db, installed) = session_with_key(&fixture_of(2, false), &memory, Mode::Serve, Some(key(2)));
+        assert_eq!(values(&db)[1], 2u32.to_le_bytes());
+        let flushed = installed.flush().unwrap();
+        assert_eq!(flushed.steps[Step::Const as usize], StepCounts { ran: n, ..StepCounts::default() });
+        assert_eq!(installed.errors(), Ok(()));
+    }
+
+    let (db, installed) = session_with_key(&fixture_of(20, true), &memory, Mode::Serve, Some(key(20)));
+    assert_eq!(values(&db)[1], 20u32.to_le_bytes());
+    let flushed = installed.flush().unwrap();
+    let counts = flushed.steps[Step::Const as usize];
+    assert_eq!(counts, StepCounts { ran: n, ..StepCounts::default() });
+    assert!(!one_edit_reuses_the_other_constants(counts, n));
     assert_eq!(installed.errors(), Ok(()));
 }
 

@@ -1,4 +1,5 @@
 //! Completion cues follow a session's observed work, never the pane that happens to be selected.
+use std::alloc::Allocator;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Cue {
@@ -16,13 +17,19 @@ impl Cue {
 }
 
 /// The busy session ids in the last authoritative snapshot. Scratch capacity is retained between frames.
-#[derive(Default)]
-pub struct Tracker {
-    busy: Vec<u64>, // alloc: observed sessions for this window's lifetime
-    next: Vec<u64>, // alloc: the next snapshot's busy ids, reused every frame
+pub struct Tracker<A: Allocator> {
+    busy: Vec<u64, A>,
+    next: Vec<u64, A>,
 }
 
-impl Tracker {
+impl<A: Allocator + Clone> Tracker<A> {
+    /// Retain both snapshot buffers in the window owner's allocator.
+    pub fn new(alloc: A) -> Self {
+        Self { busy: Vec::new_in(alloc.clone()), next: Vec::new_in(alloc) }
+    }
+}
+
+impl<A: Allocator> Tracker<A> {
     /// A complete snapshot of `(session id, busy, failed)`. A busy session that disappears is forgotten, not finished.
     /// Several endings in one snapshot produce one cue, with failure taking priority.
     pub fn update(&mut self, snapshot: impl IntoIterator<Item = (u64, bool, bool)>) -> Option<Cue> {
@@ -45,6 +52,7 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::Global;
 
     /// Each frame has its current selection and the daemon's complete session snapshot. Selection never enters the
     /// production tracker; keeping it in the fixture lets the oracle catch the old focus-based implementation.
@@ -78,7 +86,7 @@ mod tests {
     /// first snapshots, repeated snapshots and disappearance do not. Concurrent endings coalesce with failure priority.
     #[test]
     fn completion_tracks_sessions_through_navigation_and_disappearance() {
-        let mut tracker = Tracker::default();
+        let mut tracker = Tracker::new(Global);
         assert_eq!(completion_fixture(|_, snapshot| tracker.update(snapshot.iter().copied())), Ok(()));
     }
 

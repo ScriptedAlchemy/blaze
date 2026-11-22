@@ -215,6 +215,28 @@ fn send_app(app: &mut Option<SendRight>, msg: &AppDown, ports: &[&SendRight]) ->
     r
 }
 
+/// Why a view cannot provide the browser or browser host for an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserError {
+    MissingView(u64),
+    NotReady(u64),
+    MissingHost(u64),
+    NotRunning(u64),
+}
+
+impl std::fmt::Display for BrowserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingView(view) => write!(f, "there is no view {view}"),
+            Self::NotReady(view) => write!(f, "view {view} has no browser yet"),
+            Self::MissingHost(view) => write!(f, "view {view}'s browser has no host"),
+            Self::NotRunning(view) => write!(f, "view {view}: the host is not running"),
+        }
+    }
+}
+
+impl std::error::Error for BrowserError {}
+
 impl Host {
     fn to_conn(&self, conn: u64, msg: &KernelDown) {
         if let Some(c) = self.conns.get(&conn) {
@@ -275,15 +297,15 @@ impl Host {
     }
 
     /// The page's browser host, cloned out to call outside the borrow.
-    fn browser_host(&self, view: u64) -> Result<BrowserHost, String> {
-        let p = self.pages.get(&view).ok_or_else(|| format!("there is no view {view}"))?;
-        let b = p.browser.as_ref().ok_or_else(|| format!("view {view} has no browser yet"))?;
-        b.host().ok_or_else(|| format!("view {view}'s browser has no host"))
+    fn browser_host(&self, view: u64) -> Result<BrowserHost, BrowserError> {
+        let p = self.pages.get(&view).ok_or(BrowserError::MissingView(view))?;
+        let b = p.browser.as_ref().ok_or(BrowserError::NotReady(view))?;
+        b.host().ok_or(BrowserError::MissingHost(view))
     }
 
-    fn browser(&self, view: u64) -> Result<Browser, String> {
-        let p = self.pages.get(&view).ok_or_else(|| format!("there is no view {view}"))?;
-        p.browser.clone().ok_or_else(|| format!("view {view} has no browser yet"))
+    fn browser(&self, view: u64) -> Result<Browser, BrowserError> {
+        let p = self.pages.get(&view).ok_or(BrowserError::MissingView(view))?;
+        p.browser.clone().ok_or(BrowserError::NotReady(view))
     }
 }
 
@@ -305,13 +327,13 @@ fn app_kind(msg: &AppDown) -> &'static str {
 }
 
 /// The browser host of `view`, or the error naming it (taken out of the host; call CEF on it afterwards).
-pub fn host_of(view: u64) -> Result<BrowserHost, String> {
-    with("looking up a view", |h| h.browser_host(view)).unwrap_or_else(|| Err(format!("view {view}: the host is not running")))
+pub fn host_of(view: u64) -> Result<BrowserHost, BrowserError> {
+    with("looking up a view", |h| h.browser_host(view)).unwrap_or(Err(BrowserError::NotRunning(view)))
 }
 
 /// The browser of `view` (as [`host_of`]).
-pub fn browser_of(view: u64) -> Result<Browser, String> {
-    with("looking up a view", |h| h.browser(view)).unwrap_or_else(|| Err(format!("view {view}: the host is not running")))
+pub fn browser_of(view: u64) -> Result<Browser, BrowserError> {
+    with("looking up a view", |h| h.browser(view)).unwrap_or(Err(BrowserError::NotRunning(view)))
 }
 
 // ---------------------------------------------------------------- start and teardown
@@ -628,7 +650,9 @@ fn cdp(conn: u64, view: u64, message: &str) {
             (Some(p), None) if !p.attached.contains(&conn) => Err(format!("connection {conn} is not attached to view {view} (send attach first)")),
             (Some(_), None) => Ok(()),
         };
-        let r = attached.and_then(|()| h.browser_host(view)).and_then(|bh| h.cdp.outgoing(view, conn, message).map(|(id, text)| (bh, id, text)));
+        let r = attached
+            .and_then(|()| h.browser_host(view).map_err(|e| e.to_string()))
+            .and_then(|bh| h.cdp.outgoing(view, conn, message).map(|(id, text)| (bh, id, text)));
         match r {
             Ok(x) => Some(x),
             Err(e) => {
@@ -1176,7 +1200,7 @@ pub fn watch(view: u64, on: bool) -> Result<BrowserHost, String> {
         p.watched = on;
         p.frames.ring = None;
         p.frames.reported = false;
-        h.browser_host(view)
+        h.browser_host(view).map_err(|e| e.to_string())
     })
     .unwrap_or_else(|| Err(format!("watching view {view}: the host is not running")))
 }
@@ -1191,7 +1215,7 @@ pub fn resize(view: u64, w: u32, hh: u32, scale: f32) -> Result<(BrowserHost, bo
         let scaled = p.info.scale != scale;
         p.info.size = [w, hh];
         p.info.scale = scale;
-        let bh = h.browser_host(view)?;
+        let bh = h.browser_host(view).map_err(|e| e.to_string())?;
         h.views_changed();
         Ok((bh, scaled))
     })

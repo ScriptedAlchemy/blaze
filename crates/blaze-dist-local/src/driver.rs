@@ -207,7 +207,7 @@ fn drive(
                         );
                     }
                 }
-                unconfirmed.extend(holder.findings().keys().copied());
+                unconfirmed.extend(holder.findings().map(|(name, _)| *name));
                 if !unconfirmed.is_empty() {
                     let _ = tasks.send(CompilerTask::Release(unconfirmed.into_iter().collect()));
                 }

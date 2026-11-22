@@ -525,7 +525,10 @@ impl World {
         Ok(())
     }
 
-    fn effects(&mut self, out: Vec<(ExecutionId, jobs::Effect)>) -> Result<(), Violation> {
+    fn effects(
+        &mut self,
+        out: Vec<(ExecutionId, jobs::Effect), impl std::alloc::Allocator>,
+    ) -> Result<(), Violation> {
         for (id, effect) in out {
             match effect {
                 jobs::Effect::Event(item) => self.event(id, &item.event, item.attempt)?,

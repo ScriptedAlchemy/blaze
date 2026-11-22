@@ -135,7 +135,7 @@ mod tests {
             ExecutionConfig::default(),
             &mut Vec::new(),
         );
-        execution.assign(0, "lead", &["helper".to_owned()], &mut Vec::new()).unwrap();
+        execution.assign(0, "lead", &["helper"], &mut Vec::new()).unwrap();
         execution
     }
 

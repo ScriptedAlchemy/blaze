@@ -227,7 +227,7 @@ mod tests {
     use syntax::{AstPtr, ast};
 
     use super::{DynMap, keys};
-    use crate::{Lookup, src::HasSource, test_db::TestDBExt, test_items};
+    use crate::{FunctionId, Lookup, src::HasSource, test_db::TestDBExt, test_items};
 
     #[test]
     fn each_key_has_its_own_map() {
@@ -253,9 +253,9 @@ mod tests {
         assert!(map[keys::STATIC].is_empty());
     }
 
-    /// The invariant: every key of a [`DynMap`] is a pointer to a node of the map's file.
-    #[test]
-    fn a_pointer_of_another_file_is_not_of_the_map() {
+    fn a_foreign_pointer_is_absent(
+        insert: impl FnOnce(&mut DynMap, InFile<AstPtr<ast::Fn>>, FunctionId),
+    ) -> bool {
         // `f` of main.rs and `g` of m.rs are a function at the same range: one pointer.
         let fx = fixture::db("//- /main.rs\nfn f() {}\nmod m;\n//- /m.rs\nfn g() {}\n");
         let other = HirFileId::from(*fx.files().last().expect("m.rs"));
@@ -269,12 +269,29 @@ mod tests {
 
         let mut map = DynMap::of(other);
         assert_eq!(map.file(), other);
-        map.insert(keys::FUNCTION, InFile::new(file, ptr), f);
-        assert!(map[keys::FUNCTION].is_empty(), "main.rs's `f` is not a node of m.rs");
-        assert_eq!(map[keys::FUNCTION].get(&ptr), None);
+        insert(&mut map, InFile::new(file, ptr), f);
+        let absent = map[keys::FUNCTION].is_empty() && map[keys::FUNCTION].get(&ptr).is_none();
 
         let mut map = DynMap::of(file);
         map.insert(keys::FUNCTION, InFile::new(file, ptr), f);
         assert_eq!(map[keys::FUNCTION].get(&ptr), Some(&f));
+        absent
+    }
+
+    /// The invariant: every key of a [`DynMap`] is a pointer to a node of the map's file.
+    #[test]
+    fn a_pointer_of_another_file_is_not_of_the_map() {
+        assert!(a_foreign_pointer_is_absent(|map, at, function| {
+            map.insert(keys::FUNCTION, at, function);
+        }));
+    }
+
+    #[test]
+    fn the_oracle_catches_inserting_a_pointer_without_its_file_check() {
+        assert!(!a_foreign_pointer_is_absent(|map, at, function| {
+            <keys::AstPtrPolicy<ast::Fn, FunctionId> as super::Policy>::map_mut(map)
+                .map
+                .insert(at.value, function);
+        }));
     }
 }

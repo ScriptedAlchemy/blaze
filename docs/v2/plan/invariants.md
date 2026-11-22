@@ -24,7 +24,9 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 ### blaze-cargo
 
 - **`no_prebuilt_is_blazes_on_build_run_test_and_check`** *tested* (`crates/blaze-cargo/src/cli/args/tests.rs`): `--no-prebuilt` is blaze's, read on build, run, test and check, never passed to cargo's words. Control: `bench` and `doc` refuse it, so a list missing it is seen.
+  Controls: `a_blaze_switch_left_in_cargos_words`.
 - **`a_run_asks_the_daemon_for_no_summary_of_its_build`** *tested* (`crates/blaze-cargo/src/cli/observe.rs`): a `run` waits for nothing between its build's answer and its program. Where the answer does not carry why the build recomputed, a `run` says nothing of it and asks nothing; a build asks. The control is the build's row: with `ask` the daemon is the source, so the `run`'s `Nowhere` is the flag's doing.
+  Controls: `a_run_that_asks_for_its_missing_summary`.
 - **`a_run_that_exits_0_ran_a_test_or_was_told_none_is_fine`** *tested* (`crates/blaze-cargo/src/cli/test/tests.rs`): a `test` or `bench` that exits 0 ran at least one test, unless its command line says a run of none is meant (`--no-run`, `--list`, `--no-tests pass`) or a kept pass of a test stood (cached). Checked for every selection and small tally, through [`conclude`], with the exit code the executables gave: cargo's (0 unless one failed or never built).
   Controls: `a_run_of_none_that_exits_0`.
 - **`the_thin_blaze_sends_this_clis_request_byte_for_byte`** *tested* (`crates/blaze-cargo/src/cli/tests.rs`): for every command line the thin `blaze` sends itself (blaze-thin's `route`), its request is this CLI's, byte for byte in the API's deterministic CBOR, and it runs the program with the arguments this CLI's parser gives it. So the daemon builds one thing whichever sent it, and the engine can go on with an answer the thin `blaze` began (`resume`, which refuses any other request).
@@ -40,8 +42,11 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 - **`the_launchers_window_makes_no_call_the_supervisor_sees`** *tested* (`crates/blaze-cargo/src/sandbox/linux.rs`): between its filter's install and its exec the launcher's child makes no call the supervisor notes or answers (no allocation that seeds a heap, no clock): the supervisor takes every call of that process for the program's, and an answered one would move the program's stream.
   Controls: `randomness_read_without_a_provider`, `tests_given_the_stream_of_their_order`, `an_allocation_that_seeds_in_the_window`.
 - **`a_sandboxed_run_connects_to_a_socket_given_readable_and_to_no_other`** *tested* (`crates/blaze-cargo/src/sandbox/macos.rs`): a sandboxed run connects to a Unix socket its read set names, by that path (the `(remote unix-socket (path-literal (param "SOCKET<n>")))` rule, as the daemon's in-process socket and a test's fork server's are given), and to no other socket outside its writable directories: the control is a socket beside it, in a directory it may read, which it is refused. Skipped where no sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
+  Controls: `a_socket_permission_widened_to_its_neighbor`.
 - **`a_walk_shows_every_visible_name_and_the_walk_set`** *tested* (`crates/blaze-cargo/src/sandbox/v2.rs`): what a walk of a lending run's environment shows ([`super::walk_shows`]) is exactly what [`super::program_env`] leaves in the environment or lends until a walk: every visible name (given, the sandbox's, the C library's, the provider's) and the walk set, and no variable lent by name alone. The control: a name outside all of them.
+  Controls: `a_walk_showing_a_name_lent_only_by_name`.
 - **`texts_are_made_and_opened_only_for_the_digest_of_their_tree`** *tested* (`crates/blaze-cargo/src/toolchain/library.rs`): a tree's texts are made only for the digest its files have, and are opened only as the texts of that digest; what is opened lists every file of the tree, `DIGEST` among them, each text its file's bytes. The control: the tree's own digest makes and opens them.
+  Controls: `texts_requested_under_another_trees_digest`.
 - **`texts_round_trip_and_every_text_hashes_to_its_listed_id`** *simulated* (`crates/blaze-cargo/src/toolchain/library/texts/tests.rs`): a texts file decodes to the listing it was encoded from (every path, mode and length, in name order), every listed text is that file's bytes and hashes to its listed id, and the file the listing and texts encode again is the same bytes (rule persisted-state-round-trips). Control: `the_oracle_catches_a_text_changed_under_its_listing`.
   Controls: `a_text_changed_under_its_listing`, `a_rename_before_the_sync`.
 - **`a_texts_file_of_another_layout_digest_or_length_is_refused_by_name`** *simulated* (`crates/blaze-cargo/src/toolchain/library/texts/tests.rs`): a texts file of another layout, another tree's digest, a listing its hash is not of, or a length its header and listing do not say (cut inside the listing, cut inside the texts, a byte past them) is refused, and the refusal says which; the file as written decodes (the control).
@@ -53,6 +58,7 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 - **`the_oracle_catches_a_download_with_no_unpacking_bound`** *tested* (`crates/blaze-cargo/src/toolchain/own.rs`): a download is held back by its unpacking. With the unpacking taking nothing, the download of a file of 32 pieces into a channel of 4 has written at most 4 + 1 pieces (4 held, 1 waiting to be handed on) and is still waiting. The control: the same download into an unbounded channel runs to the file's end, which fails the bound.
   Controls: `a_download_with_no_unpacking_bound`.
 - **`a_download_keeps_each_byte_of_the_file_once_and_checks_it_whole`** *tested* (`crates/blaze-cargo/src/toolchain/own/keep.rs`): whatever offsets the pieces come at (a range kept to, a server that sends the whole from 0 again, a piece overlapping what is had), the bytes said new are the file's next bytes, each once, and the verdict is whole and published exactly when every byte came and they are the pinned file. The control: a gap, a byte past the end, a short end and a changed byte are each refused.
+  Controls: `a_gap_or_a_download_other_than_the_pinned_file`.
 
 ### blaze-cas
 
@@ -195,6 +201,7 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 - **`rebound_functions_are_reached_through_their_slots`** *tested* (`crates/blaze-codegen/src/driver/tests.rs`): in a build that reaches edited code through slots, every function an edit fills again under its own key is reached through its slot by every caller, so no caller a splice keeps in place holds a direct branch to code the splice replaced.
   Controls: `a_refilled_function_called_directly`.
 - **`every_function_of_a_build_has_its_abi_by_key`** *tested* (`crates/blaze-codegen/src/driver/tests/abis.rs`): `Built::abis` holds one entry a function the walk reached, by key, in key order, each its describe's `abi`.
+  Controls: `a_reached_function_whose_abi_was_omitted`.
 - **`warm_dev_and_release_grants_refuse_missing_debug_without_recompiling`** *tested* (`crates/blaze-codegen/src/driver/tests/distributed.rs`): a warm grant exports every debug table its templates name, or refuses the missing key without recompiling. This holds for both store and memo templates.
   Controls: `a_missing_debug_table_answered_as_present`, `a_restored_debug_table_that_is_not_the_original`.
 - **`removing_a_dyn_target_updates_its_callers_group_and_durable_views`** *tested* (`crates/blaze-codegen/src/driver/tests/kept.rs`): the views of a function's inputs cover its dyn facts, so removing the last fact's target drops its code from both the kept and fresh builds, even when the function is skipped until its group or durable inputs are written.
@@ -341,6 +348,7 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 - **`a_body_edit_runs_one_piece_of_s`** *tested* (`crates/blaze-diagnostics/src/pieces/tests.rs`): after a body edit of one function in a 200-function file whose bodies call no macro, `piece_clean` of the syntax group executes once, for the edited body, and verifies the rest: the outline backdates, and no other body's own syntax changed. Control: [`Plant::KeyedByFile`], a memo that reads its file's live tree, executes every piece of the file again. False by design on blaze-memo (port decision: reuse across edits comes from records, not the memo): it claimed one piece runs again after a body edit; an edit of a file now rebuilds its crate's arena, so every piece of the crate is probed again. Left failing.
   Controls: `skipped_bodies_and_incomplete_probe_settings`.
 - **`the_enum_a_proc_macro_declares_at_its_call_site_sees_its_generics_in_every_select`** *tested* (`crates/blaze-diagnostics/src/tests/items/names.rs`): a type a proc macro names at the call site inside the enum it declares is that enum's parameter, in a lone expansion and in each of two of the same tokens.
+  Controls: `an_undeclared_type_in_each_proc_macro_enum`.
 - **`the_oracle_catches_a_crate_pass_without_its_span`** *tested* (`crates/blaze-diagnostics/src/tests/passes_named.rs`): a check of a crate with one function opens a `crate pass` span for each pass of [`PASSES`] exactly once, in that order, and none other; so no pass over the whole crate spends its time under no span of its own. Control: `Plant::Unnamed` (the `names` pass run under no span) fails, naming `names`.
   Controls: `a_crate_pass_without_its_span`.
 
@@ -645,6 +653,7 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 - **`the_oracle_catches_a_raw_context_word_from_another_arena`** *tested* (`crates/blaze-macro-eval/src/kept_contexts_tests.rs`): an expansion kept with a non-root context of one session, read back for the same call in a fresh session whose arena numbers its contexts otherwise, gives the same tree with that session's context of equal structure (expansion, transparency, edition, parent). The control: the first session's raw word read in the fresh arena names another context.
   Controls: `a_raw_context_word_from_another_arena`.
 - **`a_question_no_key_covers_is_the_one_an_expansion_is_said_to_have_asked`** *tested* (`crates/blaze-macro-eval/src/server/tests.rs`): what an expansion is said to have asked is a question no key covers whenever it asked one, whatever it asked before or after; else the first it asked. An expansion's reads are known exactly when every question it asked is by position ([`super::Asked::by_position`]), so a positional question noted over a span's source text would keep a unit made from text its key does not hold.
+  Controls: `a_positional_question_hiding_a_source_text_read`.
 
 ### blaze-mem
 
@@ -757,6 +766,7 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 ### blaze-registry
 
 - **`git_answers_for_the_commit_in_a_checkout_kept_as_files`** *tested* (`crates/blaze-registry/src/git/repository.rs`): in a checkout kept as its files and [`Checkout::repository`]'s, git answers for the locked commit as it does in the clone: `HEAD` is the commit, the tree is clean, and the commit's own words are read; the history is not there and git says the repository is shallow. A changed file is seen as changed. reth-node-core's build script (vergen's `Gitcl`: `git rev-parse --is-inside-work-tree`, `rev-parse HEAD`, `describe --always --tags --dirty`, `status --porcelain`) failed in blaze's checkout of reth, which had no `.git`, and stopped tempo's build.
+  Controls: `a_kept_file_that_differs_from_the_locked_commit`.
 
 ### blaze-remote
 
@@ -1169,12 +1179,15 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 ### hir-def
 
 - **`DynMap`** *tested* (`crates/hir-def/src/dyn_map.rs`): every key of every map is a pointer to a node of `file`. [`DynMap::insert`] is the only way in, and it is given each pointer's file.
+  Controls: `inserting_a_pointer_without_its_file_check`.
 - **`a_pointer_of_another_file_is_not_of_the_map`** *tested* (`crates/hir-def/src/dyn_map.rs`): every key of a [`DynMap`] is a pointer to a node of the map's file.
+  Controls: `inserting_a_pointer_without_its_file_check`.
 - **`record_type_fields_and_defaults_round_trip`** *tested* (`crates/hir-def/src/expr_store/persist.rs`): record tags, field order, type ids and optional defaults survive the persisted view and decoding, including nested and empty records.
   Controls: `a_lost_persisted_record_default`.
 - **`a_store_or_body_of_the_previous_layout_is_refused_by_name`** *tested* (`crates/hir-def/src/expr_store/persist.rs`): a store or a body of the previous layout (version 15, before the `synthesized` column) is refused by name, its schema found against the one wanted, and never read as this layout: a reader of version 16 would take its spec clauses for the synthesized expressions and every later column one field off. The schemas of version 15 are recomputed from that version's records ([`v15`]), so the test fails if the bump is undone or the new column left out of the schema. The control: the same bytes under the current schema read.
   Controls: `a_lost_persisted_record_default`.
 - **`a_marked_call_context_is_read_into_a_fresh_arena_by_structure`** *tested* (`crates/hir-def/src/item_tree/persist.rs`): a filed tree (written in a `relocating` scope, its table by structure through `deps::signatures::table`) holds no context's word, so read into a fresh database whose crate interned its contexts in another order it is that database's own tree of the same expansion: the call's context equal in structure (its mark and its chain), its index another. The control: the two databases' words for that context differ, so a raw word written would have named another context.
+  Controls: `a_context_filed_as_its_old_arenas_word`.
 - **`every_item_maps_to_the_id_its_def_map_holds`** *tested* (`crates/hir-def/src/item_tree/tests.rs`): every item of every item tree of a crate that the collector defines (in its files, its macro expansions and its blocks) maps through its scope's `items_by_ast` to the id made of it, and the maps hold nothing else.
   Controls: `a_scope_map_without_impls`.
 - **`body_items_are_in_source_order`** *tested* (`crates/hir-def/src/item_tree/tests.rs`): `body_items` lists a body's items in source order, a block's own among those of the blocks nested in its statements and in place of the macro calls that write them. The control is the order the block trees alone give (a block's own items first), which is not it.
@@ -1191,9 +1204,13 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 - **`the_oracle_catches_raw_span_ranges_in_a_stored_definition`** *tested* (`crates/hir-expand/src/declarative/stored.rs`): two definitions of equal tokens, spaced and commented apart (one key: the row hashes tokens), are equal bytes, so no store holds two values under their key. The control: their trees as made from their text differ, in their spans alone, and those spans are what layout 2 wrote.
   Controls: `raw_span_ranges_in_a_stored_definition`.
 - **`a_body_edit_moves_only_that_body`** *tested* (`crates/hir-expand/src/declarative/stored/index.rs`): a body's edit moves that item's `body` and nothing else of any row: not its header, not its impl's header.
+  Controls: `a_header_edit_treated_as_only_a_body_edit`, `a_changed_token_treated_as_trivia`.
 - **`an_index_is_the_same_wherever_the_items_are_and_however_parsed`** *tested* (`crates/hir-expand/src/declarative/stored/index.rs`): a row is of its item's text alone: not of where the item is, and not of whether its bodies were parsed. An outline and a full parse make the same bytes.
+  Controls: `a_header_edit_treated_as_only_a_body_edit`, `a_changed_token_treated_as_trivia`.
 - **`a_respaced_commented_or_moved_item_is_the_same_row`** *tested* (`crates/hir-expand/src/declarative/stored/index.rs`): a row is of its item's tokens, not its text. Reindented, respaced and commented with plain comments, and moved down the file, every item is the same row, from a full parse and from an outline.
+  Controls: `a_header_edit_treated_as_only_a_body_edit`, `a_changed_token_treated_as_trivia`.
 - **`a_dependents_mark_over_a_carried_context_keeps_the_dependencys_marks`** *tested* (`crates/hir-expand/src/hygiene.rs`): `c`'s mark over a context of `d` carried into `c`'s table is a context of `c`'s table whose marks are `d`'s, then `c`'s call's.
+  Controls: `a_dependents_mark_that_drops_the_carried_context`.
 - **`every_builtin_attribute_is_found_at_its_index`** *tested* (`crates/hir-expand/src/inert_attr_macro.rs`): the lookup by symbol and the table's lookup by text (`syntax::builtin_attrs::find`) give the same row for every name of the table.
   Controls: `symbol_rows_shifted_by_one`.
 
@@ -1216,6 +1233,7 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 - **`reruns_after_a_mir_fact`** *tested* (`crates/hir-ty/src/body_store/entries/tests.rs`): the engine's row of a served step depends on every fact it and its earlier steps read. A first tree keeps every entry of `leaf.rs` with a struct, whose size each body's stand-in MIR reads (no inference or borrow check reads it); a second database is served every entry and asks each borrow check: none runs. The struct gains a field there; asked again, each borrow check whose MIR read the size runs, as many as in a fresh database served nothing. `Err` says the two counts.
   Controls: `a_trace_that_drops_the_identity_read`, `a_producer_that_leaves_a_change_out`, `a_trace_that_drops_the_layout_fact`, `a_trace_that_drops_an_enum_s_field_types_fact`, `a_moved_entrys_row_answered_unchecked`, `a_served_answer_used_without_its_reads_checked`, `a_join_that_ignores_the_kind`, `a_failed_keep_that_holds_its_claims`, `a_served_row_without_its_earlier_steps_facts`.
 - **`a_lowering_reads_back_as_written`** *tested* (`crates/hir-ty/src/body_store/lower.rs`): [`decode`] reads back what [`encode`] wrote, the value being the key it is filed under; the control: a byte cut off is refused, never read as another lowering.
+  Controls: `a_truncated_lowering_record`.
 - **`owners_apart`** *tested* (`crates/hir-ty/src/body_store/mir/tests.rs`): each MIR owner of a body has its own place and schema: `places` are distinct, and the place `place_of` finds by an owner's schema is that owner's. `Err` names the first owner that breaks it.
   Controls: `owners_filed_at_one_place`.
 - **`every_impl_table_boundary_is_classified_as_one`** *tested* (`crates/hir-ty/src/body_store/tests.rs`): every kind [`impl_table_boundaries`] marks is one [`is_impl_table`] calls an impl table, so a boundary row of one is classified as the impl fact.
@@ -1243,10 +1261,15 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 - **`a_sets_members_have_one_order_in_every_crate_and_every_build`** *tested* (`crates/hir-ty/src/tests/error_unions.rs`): a set's members have one order, whatever order they are written in, whatever order their items are declared in (which is the order a database numbers them in), whichever crate writes the set and whichever build lowers it; so the set is one type, with one representation, everywhere ((c) of the feature's check, rule `deterministic-output`). Two builds that declare and write the members in opposite orders agree on the order, and the crate that depends on the members' crate has the very type that crate has.
   Controls: `an_order_by_the_databases_numbering`.
 - **`a_scalar_constant_answers_after_an_edit_remakes_the_session`** *tested* (`crates/hir-ty/src/tests/session_edit.rs`): a scalar constant's query answers in a snapshot whose session arena was dropped and made again by a commit (an edit of the constant's file, and of the process's variables, a session-level input), with the edited value. The control is the generation: the commit did remake the session, so a home at its first generation would be dead.
+  Controls: `a_value_homed_in_the_old_session_generation`.
 - **`a_body_edit_with_equal_uses_reruns_no_fold`** *tested* (`crates/hir-ty/src/used_imports/tests.rs`): an edit of a body that changes none of its uses executes no imports fold; only the edited body's own records (`body_uses`, `body_trait_uses`) run again, and come out equal. The control: an edit that adds a type path through the import of `Unused`, which changes the body's uses, runs both folds; a record keyed by the body's text (the planted bug: the fold reading the body, as it did before the per-body records) would run them on the first edit too. False by design since the port to blaze-memo (port decision 3: the memo is not the incremental mechanism): it claimed the edited crate's folds are not run again after an edit of one of its bodies. Now the commit drops the edited crate's arena wholesale, and every query of that crate, the folds too, runs again in the new snapshot; what an edit costs within its crate is the item store's and the kernel's to keep small, not the memo's. Left failing until it is restated over the body entries.
+  Controls: `unresolved_reads_and_trait_uses_removed_from_a_body`, `the_only_macro_paths_removed_from_the_walk`.
 - **`the_body_records_hold_what_the_lint_reads`** *tested* (`crates/hir-ty/src/used_imports/tests.rs`): the front end's per-body records hold each unresolved path's first missing segment (lexical for a plain path's first), each method call's, field's and type-relative path's name for the traits in scope, each macro call's matched rule, each call of no macro's name, and keep type checking's uses of a trait apart from the paths'. Control: the same crate with the failing paths written to resolve records no unresolved name, and with the failing method call removed `m::Other` is not used by type checking.
+  Controls: `unresolved_reads_and_trait_uses_removed_from_a_body`, `the_only_macro_paths_removed_from_the_walk`.
 - **`derive_and_attribute_macro_paths_are_uses`** *tested* (`crates/hir-ty/src/used_imports/tests.rs`): the path of each derive and attribute macro is resolved again as a use, so an import only `#[derive(Dup)]`, a module item's `#[ga]` or an associated item's `#[ga_assoc]` reads is used by a path, and each such call is recorded invoked with no rule. Control: with the three attributes removed none of the three imports is used (the planted bug, the collector recording only `bang: true` paths and the walk only function-like calls, gives that answer for the full fixture too).
+  Controls: `unresolved_reads_and_trait_uses_removed_from_a_body`, `the_only_macro_paths_removed_from_the_walk`.
 - **`a_failed_method_call_uses_every_import_of_its_traits`** *tested* (`crates/hir-ty/src/used_imports/tests.rs`): a method call type checking resolves to nothing counts every import that brings a trait with a value item of its name into scope as used by type checking, as rustc may pick any of them, not only the first `record_trait_uses` gives. Control: the planted bug, one binding per trait, leaves `m::Other as Again` out, which the count of two catches; with the call removed neither is used.
+  Controls: `unresolved_reads_and_trait_uses_removed_from_a_body`, `the_only_macro_paths_removed_from_the_walk`.
 
 ### hir-ty-borrowck
 
@@ -1283,14 +1306,19 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 ### hir-ty-mir
 
 - **`a_token_and_a_node_lower_to_token_and_open_close`** *tested* (`crates/hir-ty-mir/src/const_macro/quote.rs`): a token is `b.token(TEXT)` and a node `open` of its kind, its children, then `close`, in the parser's own shape of the tokens.
+  Controls: `tokens_outside_the_quotes_entry_kind`, `a_repetition_that_ends_inside_a_node`.
 - **`a_splice_names_the_kinds_it_stands_in`** *tested* (`crates/hir-ty-mir/src/const_macro/quote.rs`): `#t` is one call, `t.splice`, given the kinds the parse put around its place, outer to inner; `t` and `b` keep the caller's spans and what the lowering wrote has `mixed_site`.
+  Controls: `tokens_outside_the_quotes_entry_kind`, `a_repetition_that_ends_inside_a_node`.
 - **`a_repetition_is_a_loop_over_whole_nodes`** *tested* (`crates/hir-ty-mir/src/const_macro/quote.rs`): a `#for` is a loop over its cursor around the run of whole nodes its body parsed to, written once; a hole's code is written where it stands.
+  Controls: `tokens_outside_the_quotes_entry_kind`, `a_repetition_that_ends_inside_a_node`.
 - **`early_drops_keep_every_program_as_rust_runs_it`** *tested* (`crates/hir-ty-mir/src/mir/early_drop/frontier.rs`): under early drop no local is dropped while a loan of it is live, no local is used after its drop, every initialized local is dropped exactly once on every path, the locals of one edge drop in scope order, and a scoped local drops where Rust drops it.
   Controls: `a_drop_before_the_last_use_of_a_reborrow`, `a_conditional_move_with_no_drop_flag`, `a_scoped_guard_dropped_early`, `two_locals_dropped_in_hash_order`.
 - **`a_helper_that_stops_the_program_is_held`** *tested* (`crates/hir-ty-mir/src/tests/assertion_helpers.rs`): assertion helpers that can stop the program are accepted, while a helper that silently returns is refused by the same check used for every fixture.
   Controls: `a_helper_that_returns`.
 - **`editing_a_builder_function_reruns_the_expansions_that_used_it`** *tested* (`crates/hir-ty-mir/src/tests/consteval/const_macro.rs`): the builder's code is in the expansion's key. Expanding again with nothing changed runs no expansion (the control); an edit of `Builder::close`, which every derive reaches, runs it again, and it gives the same tree.
+  Controls: `a_built_tree_that_is_not_its_tokens_parse`.
 - **`an_edit_of_one_constant_finds_the_others_and_runs_one`** *tested* (`crates/hir-ty-mir/src/tests/consteval/items.rs`): a constant is found by its own item and what its evaluation read, so an edit of one of N leaves the other N - 1 entries found, in a database whose ids differ, with none of them evaluated and nothing of their bodies asked for (no inference, no MIR); the edited one is evaluated and has its new value.
+  Controls: `a_crate_key_forcing_every_constant_to_run_again`.
 - **`the_walk_agrees_with_the_reference_model`** *tested* (`crates/hir-ty-mir/src/tests/consteval/reach.rs`): for a random program of structs whose fields are plain, boxed, in a `Vec`, behind a counted or weak pointer, in a cell or in a generic struct, in any nesting and recursion, the walk clears a struct for the cycle question exactly when the reference model ([`model_is_acyclic`]) finds no way for a value of it to own itself.
   Controls: `a_shared_pointer_inside_an_option_in_a_cell_missed`, `a_box_recursion_taken_for_a_cycle`, `a_visited_set_keyed_by_name`.
 - **`the_oracle_catches_a_check_that_does_not_hold`** *tested* (`crates/hir-ty-mir/src/tests/mir/stabilized.rs`): a fixture's `check` that does not hold stops the MIR run with a panic, and one that holds returns. This control exercises the assertion used by every test here.
@@ -1319,6 +1347,7 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 - **`an_operation_shown_to_fit_does_not_overflow`** *tested* (`crates/hir-ty-pure/src/tests/reach_oracle.rs`): an operation `overflow_of_body` shows fits does not overflow when the evaluator runs it with overflow checks, and the proof is the same in both profiles. Random guards over `a`, `b` and the length around a random `+ - * << >>`, plain or compound, random arguments at the ends of `usize`.
   Controls: `a_model_that_says_first_is_always_some`.
 - **`an_invariant_discharges_the_overflow_checks_it_implies`** *tested* (`crates/hir-ty-pure/src/tests/refined.rs`): a body that takes `&Twice` may assume `0 <= t.x <= i32::MAX / 2`, which every value of `Twice` keeps (shown where each is built), so `t.x * 2` fits; over a bare `i32` it is not shown. A struct field ordered by another (`len <= cap`) makes `cap - len` fit.
+  Controls: `multiplication_after_its_bound_is_removed`.
 
 ### hir-ty-suspend
 
@@ -1356,7 +1385,9 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 ### mir
 
 - **`an_impls_environment_with_a_constant_in_its_where_clause_answers`** *tested* (`crates/hir-ty-mir/tests/mir/anon_const_env.rs`): the trait environment of an impl with a constant in a where clause answers (it was a cycle with no recovery: the environment, the constant's evaluation, its inference, the environment), holds the where clause, and building it evaluated the constant (the premise: the run log has the evaluation and the inference). The constant is checked in rustc's environment for it (`generics_of` of an `AnonConst` under `min_const_generics` has no parent, so its `param_env` is empty): no clause, where the impl's has one.
+  Controls: `a_const_given_its_owners_where_clauses`.
 - **`a_value_borrowed_and_then_moved_out_of_is_not_dropped`** *tested* (`crates/hir-ty-mir/tests/mir/const_check_drops.rs`): a value borrowed mutably and then moved out of whole is not dropped where its scope ends, so nothing is refused. The pinned nightly accepts `set(&mut s, keep); s` (as reth's `SparseStateTrie::with_updates` and `DatabaseArguments::with_max_read_transaction_duration`, `self.set(..); self`, which failed the builds of reth-trie-sparse and reth-db with E0493) and refuses `let r = &mut s; r.keep = keep; s`, by where the blocks of the borrow and the move end (`Flow` in `const_check/qualifs.rs` says how); here both are accepted. With a borrowed local keeping its qualif across the move, as before, both report E0493 at `mut s`.
+  Controls: `a_borrowed_value_left_to_drop`.
 
 ### plan
 
@@ -1638,6 +1669,7 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 ### hir-expand
 
 - **`marking_commutes_with_carrying_into_a_dependents_table`** *tested* (`crates/hir-expand/src/hygiene.rs`): for a call homed at `d` and a context of `d`'s table, marking the context carried into `c`'s table ([`SyntaxContext::translate`]) in `c`'s table is marking it in `d`'s and carrying the result: `apply_mark` commutes with `translate`. Held for every transparency, over the root and a marked context, for a call whose call site is the root and one whose call site is marked (so the transparent and semi-opaque marks replay the context's marks over the call site's, carried from the call's table).
+  Controls: `a_dependents_mark_that_drops_the_carried_context`.
 
 ### hir-ty
 
@@ -1654,7 +1686,9 @@ By level: 473 tested, 190 simulated, 0 model-checked, 16 proved.
 - **`a_served_runtime_body_is_the_one_built_from_source`** *tested* (`crates/hir-ty-mir/src/tests/check_cache.rs`): what a database answers from the value is what it answers after the value is taken away and the bodies are built from source.
   Controls: `an_entry_of_another_owner`.
 - **`a_built_derive_is_the_tree_its_text_parsed_to`** *tested* (`crates/hir-ty-mir/src/tests/consteval/const_macro.rs`): for every struct of the real files the views' test walks, the tree the built `Fields` derive gives hir-expand has the shape of the parse of the text the text-era derive wrote for it, computed here with `syntax::ast`.
+  Controls: `a_built_tree_that_is_not_its_tokens_parse`.
 - **`a_quoted_derive_is_the_built_one`** *tested* (`crates/hir-ty-mir/src/tests/consteval/const_quote.rs`): `Fields` written with `quote!` expands, for every struct of `EVERY_VIEW`, to the tree of the text the stage-0 derive wrote for it, node for node (whitespace aside).
+  Controls: `a_type_spliced_where_a_name_goes`.
 
 ### hir-ty-pure
 

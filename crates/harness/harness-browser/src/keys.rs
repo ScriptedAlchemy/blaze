@@ -4,6 +4,7 @@
 //! the Mac code as `native_key_code`, the first UTF-16 unit of `characters` / `charactersIgnoringModifiers` as
 //! `character` / `unmodified_character`; `Down` is RAWKEYDOWN, `Up` KEYUP, and `Char` one CHAR per UTF-16 unit typed.
 use harness_proto::browser::{Key, KeyKind};
+use std::str::EncodeUtf16;
 
 /// CEF's key event types this host sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,8 +206,8 @@ pub fn windows_code(code: u16) -> Option<i32> {
 ///
 /// # Errors
 /// A Mac key code no key has, naming it.
-pub fn events(k: &Key) -> Result<Vec<Fields>, String> {
-    let windows_key_code = windows_code(k.code).ok_or_else(|| format!("Mac key code 0x{:02x} is no key harness-browser knows (keys.rs)", k.code))?;
+pub fn events(k: &Key) -> Result<Events<'_>, UnknownKey> {
+    let windows_key_code = windows_code(k.code).ok_or(UnknownKey(k.code))?;
     let base = Fields {
         kind: Kind::RawKeyDown,
         modifiers: k.mods,
@@ -215,18 +216,53 @@ pub fn events(k: &Key) -> Result<Vec<Fields>, String> {
         character: k.chars.encode_utf16().next().unwrap_or(0),
         unmodified_character: k.unmod.encode_utf16().next().unwrap_or(0),
     };
-    Ok(match k.kind {
-        KeyKind::Down => vec![base],                                        // alloc: one event
-        KeyKind::Up => vec![Fields { kind: Kind::KeyUp, ..base }], // alloc: one event
-        KeyKind::Char => {
-            let unmod: Vec<u16> = k.unmod.encode_utf16().collect(); // alloc: one key's characters
-            k.chars
-                .encode_utf16()
-                .enumerate()
-                .map(|(i, u)| Fields { kind: Kind::Char, character: u, unmodified_character: unmod.get(i).copied().unwrap_or(u), ..base })
-                .collect()
-        }
+    Ok(Events {
+        one: match k.kind {
+            KeyKind::Down => Some(base),
+            KeyKind::Up => Some(Fields { kind: Kind::KeyUp, ..base }),
+            KeyKind::Char => None,
+        },
+        chars: matches!(k.kind, KeyKind::Char).then(|| (k.chars.encode_utf16(), k.unmod.encode_utf16())),
+        base,
     })
+}
+
+/// The Mac code that has no corresponding CEF key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownKey(pub u16);
+
+impl std::fmt::Display for UnknownKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Mac key code 0x{:02x} is no key harness-browser knows (keys.rs)", self.0)
+    }
+}
+
+impl std::error::Error for UnknownKey {}
+
+/// Events borrowed from one app key, consumed as CEF receives them.
+#[derive(Debug)]
+pub struct Events<'a> {
+    one: Option<Fields>,
+    chars: Option<(EncodeUtf16<'a>, EncodeUtf16<'a>)>,
+    base: Fields,
+}
+
+impl Iterator for Events<'_> {
+    type Item = Fields;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(event) = self.one.take() {
+            return Some(event);
+        }
+        let (chars, unmod) = self.chars.as_mut()?;
+        let character = chars.next()?;
+        Some(Fields {
+            kind: Kind::Char,
+            character,
+            unmodified_character: unmod.next().unwrap_or(character),
+            ..self.base
+        })
+    }
 }
 
 #[cfg(test)]
@@ -268,14 +304,16 @@ mod tests {
 
     #[test]
     fn down_up_and_chars() {
-        let d = events(&key(KeyKind::Down, 0x00, "a", "a")).unwrap();
+        let d: Vec<_> = events(&key(KeyKind::Down, 0x00, "a", "a")).unwrap().collect();
         assert_eq!(d, vec![Fields { kind: Kind::RawKeyDown, modifiers: 0, windows_key_code: 0x41, native_key_code: 0, character: 'a' as u16, unmodified_character: 'a' as u16 }]);
-        assert_eq!(events(&key(KeyKind::Up, 0x00, "a", "a")).unwrap()[0].kind, Kind::KeyUp);
+        assert_eq!(events(&key(KeyKind::Up, 0x00, "a", "a")).unwrap().next().unwrap().kind, Kind::KeyUp);
         // An emoji is two UTF-16 units: two CHARs.
-        let c = events(&key(KeyKind::Char, 0x00, "😀", "a")).unwrap();
+        let c: Vec<_> = events(&key(KeyKind::Char, 0x00, "😀", "a")).unwrap().collect();
         assert_eq!(c.len(), 2);
         assert!(c.iter().all(|e| e.kind == Kind::Char));
         assert_eq!(c[0].unmodified_character, 'a' as u16);
-        assert!(events(&key(KeyKind::Down, 0x34, "", "")).unwrap_err().contains("0x34"));
+        assert_eq!(c[1].unmodified_character, c[1].character, "a missing unmodified unit falls back to its typed unit");
+        assert_eq!(events(&key(KeyKind::Char, 0x00, "", "unused")).unwrap().next(), None);
+        assert_eq!(events(&key(KeyKind::Down, 0x34, "", "")).unwrap_err(), UnknownKey(0x34));
     }
 }

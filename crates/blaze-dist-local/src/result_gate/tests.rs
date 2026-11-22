@@ -66,6 +66,7 @@ impl World {
                     sequence: 1,
                     command: Command::Submit(submission(&request, NEED)),
                 },
+                Global,
             )
             .unwrap();
         let ServerFrame::Response(Response { answer: Answer::Binding(binding), .. }) =
@@ -113,7 +114,7 @@ impl World {
             command,
         };
         self.sequence += 1;
-        let (bytes, _) = self.coordinator.request(now, &request).unwrap();
+        let (bytes, _) = self.coordinator.request(now, &request, Global).unwrap();
         let ServerFrame::Response(response) = decode(&bytes, &Limits::DOCUMENTED).unwrap() else {
             panic!("response")
         };

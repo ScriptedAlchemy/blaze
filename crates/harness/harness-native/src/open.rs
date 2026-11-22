@@ -78,16 +78,23 @@ fn at_line(app: &str, path: &str, line: u32) -> Option<Launch> {
     Some(Launch::Open(vec![url]))
 }
 
-/// `s` percent-encoded for a URL, keeping `/` and the unreserved characters.
-fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
+/// `s` percent-encoded into its URL's output, keeping `/` and the unreserved characters.
+fn escape(s: &str) -> Escaped<'_> {
+    Escaped(s)
+}
+
+struct Escaped<'a>(&'a str);
+
+impl std::fmt::Display for Escaped<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in self.0.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => write!(f, "{}", char::from(b))?,
+                _ => write!(f, "%{b:02X}")?,
+            }
         }
+        Ok(())
     }
-    out
 }
 
 /// The bundle id of the app the system opens the file at `path` with (Launch Services, through NSWorkspace).

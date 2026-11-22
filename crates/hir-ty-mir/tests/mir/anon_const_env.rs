@@ -77,3 +77,19 @@ fn an_impls_environment_with_a_constant_in_its_where_clause_answers() {
         assert!(!InferenceResult::of(&db, own).has_errors, "the constant `{{ A::K }}` did not check");
     });
 }
+
+#[test]
+fn the_oracle_catches_a_const_given_its_owners_where_clauses() {
+    let db = fixture::db(FIXTURE).into_db();
+    blaze_memo::attach(&db, || {
+        let imp = recyclable(&db);
+        let consts = GenericPredicates::query_with_diagnostics(&db, imp.into()).defined_anon_consts();
+        let [konst] = consts else { panic!("one constant in the where clause: {consts:?}") };
+        let own = InferBodyId::AnonConstId(*konst);
+        assert!(own.param_env(&db).clauses().is_empty());
+        // The removed guard asks the ordinary owner's environment. That actual query
+        // yields the very where clause whose normalization is evaluating this constant.
+        let leaked = db.trait_environment(own.generic_def(&db));
+        assert!(!leaked.clauses().is_empty());
+    });
+}

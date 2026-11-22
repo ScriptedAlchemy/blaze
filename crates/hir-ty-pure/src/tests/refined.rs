@@ -74,6 +74,17 @@ fn an_invariant_discharges_the_overflow_checks_it_implies() {
     });
 }
 
+#[test]
+fn the_oracle_catches_multiplication_after_its_bound_is_removed() {
+    let stated = source();
+    let db = fixture::db(&stated).into_db();
+    blaze_memo::attach(&db, || assert!(fits(&db, "doubled")));
+
+    let unstated = stated.replace("#[blaze::invariant(0 <= self.x && self.x <= i32::MAX / 2)]", "");
+    let db = fixture::db(&unstated).into_db();
+    blaze_memo::attach(&db, || assert!(!fits(&db, "doubled")));
+}
+
 /// `0 <= self.x && self.x <= i32::MAX / 2` is read as two comparisons and none is implied by
 /// `i32`; `self.small <= 255` is implied by `u8` and needs no site to show it.
 #[test]

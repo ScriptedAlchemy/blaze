@@ -152,7 +152,12 @@ mod tests {
         assert_eq!(got, file, "each byte once, in order");
         assert!(keep.whole());
         assert_eq!(keep.end(), Ok(()));
+    }
 
+    #[test]
+    fn the_oracle_catches_a_gap_or_a_download_other_than_the_pinned_file() {
+        let file: Vec<u8> = (0..1000u32).map(|it| (it * 7 % 251) as u8).collect();
+        let pin = sha256(&file);
         let mut gap = Keep::new(&pin, file.len() as u64).unwrap();
         assert_eq!(gap.piece(10, &file[10..20]), Err(Refused::Gap { offset: 10, have: 0 }));
         let mut long = Keep::new(&pin, file.len() as u64).unwrap();

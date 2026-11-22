@@ -398,7 +398,7 @@ fn refused(name: &str, refusal: &str) {
 }
 
 #[test]
-fn a_tree_that_is_not_its_tokens_parse_is_refused_naming_the_element() {
+fn the_oracle_catches_a_built_tree_that_is_not_its_tokens_parse() {
     refused(
         "Mislabeled",
         "the const macro `Mislabeled` returned a tree that is refused: built `STRUCT` (depth 1) \

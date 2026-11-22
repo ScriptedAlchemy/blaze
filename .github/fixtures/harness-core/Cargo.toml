@@ -1,0 +1,24 @@
+[package]
+name = "blaze-harness-core-ci"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "lib.rs"
+doctest = false
+
+[[test]]
+name = "learning"
+path = "../../../crates/harness/harness-learn/src/lib.rs"
+
+[dependencies]
+harness-proto = { path = "../../../crates/harness/harness-proto" }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+blaze-sim = { path = "../../../crates/blaze-sim" }

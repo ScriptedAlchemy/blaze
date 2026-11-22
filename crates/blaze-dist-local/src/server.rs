@@ -149,7 +149,7 @@ impl Server {
         let mut connections = Vec::new();
         while !stop.load(Ordering::Acquire) {
             let now = self.coordinator.now(self.clock.now_ms());
-            let timed = self.coordinator.tick(now);
+            let timed = self.coordinator.tick(now, Global);
             self.outcomes(&timed);
             self.effects.deliver(timed);
             // One accept per loop prevents an accept flood starving existing clients/timers.
@@ -183,7 +183,7 @@ impl Server {
         }
         // Deliver stops for every active subscription on orderly shutdown. No automatic ack.
         // Abrupt process death is fenced by the next daemon epoch, not replayed as success.
-        let effects = self.coordinator.shutdown(self.clock.now_ms());
+        let effects = self.coordinator.shutdown(self.clock.now_ms(), Global);
         self.outcomes(&effects);
         self.effects.deliver(effects);
         Ok(())
@@ -276,7 +276,7 @@ impl Server {
                             Effect::Work(blaze_dist::work::Effect::Committed { by, .. } | blaze_dist::work::Effect::Replayed { by })
                                 if by.holder == request.lease.holder && by.generation == request.lease.generation && by.seq == request.seq)
                     }) => {
-                        let work: Vec<String> = self.coordinator.committed_names(request)
+                        let work: Vec<String> = self.coordinator.committed_names(request, Global)
                             .iter().map(|name| crate::pack::hex(&name.0)).collect();
                         fields.push(("work", json(&work)));
                         emit("result_accepted", &fields);
@@ -368,7 +368,7 @@ impl Server {
                 // before it is written. The connection is closed after that answer, because
                 // the session it named no longer exists.
                 let releases = matches!(request.command, Command::Release(_));
-                match self.coordinator.request(now, &request) {
+                match self.coordinator.request(now, &request, Global) {
                     Ok((reply, effects)) => {
                         self.evidence(&request.command, &reply, &effects);
                         self.effects.deliver(effects);
@@ -393,7 +393,7 @@ pub fn frame(body: &[u8]) -> Vec<u8> {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let effects = self.coordinator.shutdown(self.clock.now_ms());
+        let effects = self.coordinator.shutdown(self.clock.now_ms(), Global);
         self.effects.deliver(effects);
         if fs::metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.inode) {
             let _ = fs::remove_file(&self.path);

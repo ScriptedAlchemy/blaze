@@ -762,7 +762,7 @@ mod tests {
     /// The control: tokens that are not the entry's are refused by the parser, naming the
     /// quote, when the macro crate is analyzed; a quote that parses is not.
     #[test]
-    fn tokens_that_do_not_parse_are_refused_where_the_macro_is_written() {
+    fn the_oracle_catches_tokens_outside_the_quotes_entry_kind() {
         let refused = lowered("b, items => impl for {}").expect_err("not an item");
         assert!(refused.starts_with("const_ast::quote!: the tokens are not items: "), "{refused}");
         assert!(lowered("b, items => impl X for Y {}").is_ok());
@@ -771,7 +771,7 @@ mod tests {
     /// The control: a body that ends inside a node (`a + b` of `a + b * c`, whose parse is
     /// `a + (b * c)`) is refused naming the node; the same body around whole nodes is not.
     #[test]
-    fn a_repetition_inside_a_node_is_refused_naming_it() {
+    fn the_oracle_catches_a_repetition_that_ends_inside_a_node() {
         assert_eq!(
             lowered("b, expr => #for x in (xs) { a + b } * c"),
             Err("const_ast::quote!: a `#for` body must be whole nodes of one parent; it ends \

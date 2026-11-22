@@ -11,7 +11,7 @@
 //! Effect buffers belong to the caller. Routing through an execution or its work set uses
 //! the same allocator for temporary effect logs, so a driver's task allocator owns them all.
 
-use std::alloc::Allocator;
+use std::alloc::{Allocator, Global};
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_wire::job_terminal_v2::{
@@ -301,15 +301,14 @@ impl Execution {
     }
 
     /// Executors heard from within the lead-loss window: who a reassignment may pick.
-    pub fn heard_recently(&self, now: Millis) -> Vec<String> {
+    pub fn heard_recently(&self, now: Millis) -> impl Iterator<Item = &str> {
         let window = self.config.heartbeat_ms * self.config.missed_heartbeats;
         self.heard
             .iter()
-            .filter(|&(id, &at)| {
+            .filter(move |&(id, &at)| {
                 now <= at + window && Some(id) != self.lead.as_ref() && !self.lost.contains(id)
             })
-            .map(|(id, _)| id.clone())
-            .collect()
+            .map(|(id, _)| id.as_str())
     }
 
     /// Another subscriber of the same content.
@@ -365,7 +364,7 @@ impl Execution {
         &mut self,
         now: Millis,
         lead: &str,
-        helpers: &[String],
+        helpers: &[&str],
         out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<(), Refusal> {
         if let ExecState::Ended(_) = self.state {
@@ -376,12 +375,12 @@ impl Execution {
             self.attempt = Attempt(self.attempt.0 + 1);
         }
         for old in self.executors().map(str::to_owned).collect::<Vec<_>>() {
-            if old != lead && !helpers.contains(&old) {
+            if old != lead && !helpers.contains(&old.as_str()) {
                 out.push(Effect::Kill { executor: old, assignment: previous });
             }
         }
         self.lead = Some(lead.to_owned());
-        self.helpers = helpers.iter().filter(|h| *h != lead).cloned().collect();
+        self.helpers = helpers.iter().copied().filter(|h| *h != lead).map(str::to_owned).collect();
         self.lead_heard = now;
         self.heard.insert(lead.to_owned(), now);
         let mut log = Vec::new_in(out.allocator().clone());
@@ -646,7 +645,7 @@ impl Execution {
         }) {
             return Err(Refusal::Malformed("publication omits committed work".to_owned()));
         }
-        self.publication = Some(packs.to_vec()); // alloc: one bounded full manifest per execution
+        self.publication = Some(packs.to_vec_in(Global));
         self.publication_attempt = Some(attempt);
         self.lead_heard = now;
         self.heard.insert(from.to_owned(), now);
@@ -1097,14 +1096,15 @@ impl Jobs {
     /// admission assigns one. A claim names who acts for an executor, including who may retire
     /// it; compile work still requires its own fenced lease. A continuing reservation retains
     /// its owner across attempt changes; fresh assignments must be claimed. A prior assignment's
-    /// pending stop also retains its original owner until acknowledgment.
+    /// pending stop also retains its original owner until acknowledgment. The returned
+    /// executor label borrows the registry; callers copy it only if they keep it past a change.
     pub fn claim(
         &mut self,
         now: Millis,
         execution: ExecutionId,
         claimant: Digest,
         out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
-    ) -> Result<Option<(String, Attempt)>, Refusal> {
+    ) -> Result<Option<(&str, Attempt)>, Refusal> {
         self.tick(now, out);
         let e = self.executions.get(&execution).ok_or(Refusal::NoExecution)?;
         if let ExecState::Ended(_) = e.state() {
@@ -1118,7 +1118,7 @@ impl Jobs {
                     && assignment.claimant == Some(claimant)
             })
         }) {
-            return Ok(Some((executor.to_owned(), token.attempt)));
+            return Ok(Some((executor, token.attempt)));
         }
         let free = e
             .executors()
@@ -1128,10 +1128,9 @@ impl Jobs {
                         && !assignment.stopping
                         && assignment.claimant.is_none()
                 })
-            })
-            .map(str::to_owned);
+            });
         Ok(free.map(|executor| {
-            self.assignments.get_mut(&executor).expect("assigned").claimant = Some(claimant);
+            self.assignments.get_mut(executor).expect("assigned").claimant = Some(claimant);
             (executor, token.attempt)
         }))
     }
@@ -1182,11 +1181,13 @@ impl Jobs {
 
     /// The packs of the results `execution` committed, once its compile phase is done: what an
     /// executor imports. `None` while work is outstanding.
-    pub fn committed_packs(&self, execution: ExecutionId) -> Result<Option<Vec<PackRef>>, Refusal> {
+    pub fn committed_packs(
+        &self,
+        execution: ExecutionId,
+    ) -> Result<Option<impl Iterator<Item = &PackRef>>, Refusal> {
         let e = self.executions.get(&execution).ok_or(Refusal::NoExecution)?;
         let Some(work) = e.work() else { return Ok(None) };
-        let report = work.report();
-        Ok(report.done.then(|| report.packs.into_iter().collect()))
+        Ok(work.is_done().then(|| work.packs()))
     }
 
     /// Submits a job, with the reservation the server measured for its lead. An equal
@@ -1492,14 +1493,14 @@ impl Jobs {
 
     /// A continuing reservation did not stop when its attempt changed. Keep its owner;
     /// only a fresh or reused slot can acquire a new owner through `claim`.
-    fn track_reassignment(&mut self, executor: String, assignment: AssignmentToken) {
-        if let Some(held) = self.assignments.get_mut(&executor)
+    fn track_reassignment(&mut self, executor: &str, assignment: AssignmentToken) {
+        if let Some(held) = self.assignments.get_mut(executor)
             && held.token.execution == assignment.execution
             && !held.stopping
         {
             held.token = assignment;
         } else {
-            self.assignments.insert(executor, Assignment::new(assignment));
+            self.assignments.insert(executor.to_owned(), Assignment::new(assignment));
         }
     }
 
@@ -1522,7 +1523,8 @@ impl Jobs {
                 // holds a reservation that the idle pool cannot offer. A stale claimed
                 // helper cannot be taken over while its owner might still be running;
                 // prefer an idle replacement over that unavailable reservation.
-                let mut heard = e.heard_recently(now);
+                let mut heard = Vec::new_in(out.allocator().clone());
+                heard.extend(e.heard_recently(now).map(str::to_owned));
                 for helper in e.executors() {
                     if Some(helper) != e.lead()
                         && !except.iter().any(|lost| lost == helper)
@@ -1543,14 +1545,14 @@ impl Jobs {
                 let e = self.executions.get_mut(&id).expect("present");
                 match lead {
                     Some(lead) => {
-                        let helpers: Vec<String> =
-                            heard.iter().filter(|h| *h != &lead).cloned().collect();
+                        let mut helpers = Vec::new_in(out.allocator().clone());
+                        helpers.extend(heard.iter().map(String::as_str).filter(|h| *h != lead.as_str()));
                         if e.assign(now, &lead, &helpers, &mut more).is_ok() {
                             let assignment = e.assignment();
                             self.admission.take(&lead, id, e.attempt());
-                            self.track_reassignment(lead, assignment);
+                            self.track_reassignment(&lead, assignment);
                             for helper in helpers {
-                                self.admission.take(&helper, id, assignment.attempt);
+                                self.admission.take(helper, id, assignment.attempt);
                                 self.track_reassignment(helper, assignment);
                             }
                         }

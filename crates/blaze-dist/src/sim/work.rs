@@ -522,8 +522,8 @@ enum RootOrName {
     Name(WorkName),
 }
 
-fn short(name: &WorkName) -> String {
-    name.0[..4].iter().map(|b| format!("{b:02x}")).collect()
+fn short(name: &WorkName) -> blaze_wire::json::Hex<'_> {
+    blaze_wire::json::hex(&name.0[..4])
 }
 
 struct World {
@@ -628,7 +628,7 @@ impl World {
             &mut log,
         );
         execution.admitted(0, &mut log);
-        let helpers: Vec<String> = nodes.iter().skip(1).map(|n| n.id.clone()).collect();
+        let helpers: Vec<&str> = nodes.iter().skip(1).map(|n| n.id.as_str()).collect();
         execution.assign(0, &nodes[0].id, &helpers, &mut log).expect("queued");
         checker.observe(0, &log, None).expect("no work yet");
         let mut world = World {
@@ -777,7 +777,7 @@ impl World {
                 if self.faulty() && self.rng.chance(self.profile.drop_ppm) {
                     let knows = self.rng.chance(500_000);
                     if let Some(h) = &mut self.nodes[node].holder
-                        && let Some((&name, _)) = h.findings().iter().next()
+                        && let Some((&name, _)) = h.findings().next()
                     {
                         h.drop_finding(&name, knows);
                     }
@@ -845,7 +845,11 @@ impl World {
         self.apply(node, out)
     }
 
-    fn apply(&mut self, node: usize, effects: Vec<holder::Effect>) -> Result<(), Violation> {
+    fn apply(
+        &mut self,
+        node: usize,
+        effects: Vec<holder::Effect, impl std::alloc::Allocator>,
+    ) -> Result<(), Violation> {
         for effect in effects {
             if !self.nodes[node].alive {
                 break;
@@ -1013,7 +1017,7 @@ impl World {
 
     fn effects(
         &mut self,
-        fx: Vec<jobs::Effect>,
+        fx: Vec<jobs::Effect, impl std::alloc::Allocator>,
         result: Option<(&BatchResult, &WorkResultAnswer)>,
     ) -> Result<(), Violation> {
         self.checker.observe(self.now, &fx, result).map_err(|v| self.violation(v))?;
@@ -1064,9 +1068,9 @@ impl World {
     /// as admission would choose, never the one whose front end differs (the truth the
     /// checker holds results to is the first lead's front end).
     fn reassign(&mut self) -> Result<(), Violation> {
-        let heard = self.execution.heard_recently(self.now);
+        let heard: Vec<&str> = self.execution.heard_recently(self.now).collect();
         let candidates: Vec<usize> = (0..self.nodes.len())
-            .filter(|&i| heard.contains(&self.nodes[i].id))
+            .filter(|&i| heard.contains(&self.nodes[i].id.as_str()))
             .filter(|&i| self.profile.divergent.is_none_or(|(at, _)| at != i))
             .collect();
         let mut fx = Vec::new();
@@ -1074,13 +1078,12 @@ impl World {
             self.execution.end(self.now, blaze_wire::Outcome::Failed, EndWhy::NoLead, &mut fx);
         } else {
             let lead = candidates[self.rng.below(candidates.len() as u64) as usize];
-            let helpers: Vec<String> = candidates
+            let helpers: Vec<&str> = candidates
                 .iter()
                 .filter(|&&i| i != lead)
-                .map(|&i| self.nodes[i].id.clone())
+                .map(|&i| self.nodes[i].id.as_str())
                 .collect();
-            let lead_id = self.nodes[lead].id.clone();
-            self.execution.assign(self.now, &lead_id, &helpers, &mut fx).expect("running");
+            self.execution.assign(self.now, &self.nodes[lead].id, &helpers, &mut fx).expect("running");
             self.checker.attempt = self.execution.attempt();
             let attempt = self.execution.attempt();
             for &i in &candidates {

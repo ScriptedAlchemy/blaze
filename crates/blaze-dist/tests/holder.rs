@@ -88,7 +88,7 @@ fn reporting(rejected: bool) -> (Holder, u64) {
     let mut effects = Vec::new();
     holder.step(3, Event::Compiled(batch), &mut effects);
     let id = sent(&effects);
-    assert!(holder.findings().is_empty(), "the result has not been acknowledged");
+    assert_eq!(holder.findings().len(), 0, "the result has not been acknowledged");
     (holder, id)
 }
 
@@ -119,7 +119,7 @@ fn review_a_fresh_conflicting_finding_is_released() {
         &mut effects,
     );
     assert_eq!(released(&effects), BTreeSet::from([FOUND]));
-    assert!(holder.findings().is_empty());
+    assert_eq!(holder.findings().len(), 0);
     assert!(!holder.is_stopped());
 }
 
@@ -139,7 +139,7 @@ fn review_a_fresh_rejected_finding_is_released() {
         &mut effects,
     );
     assert_eq!(released(&effects), BTreeSet::from([FOUND]));
-    assert!(holder.findings().is_empty());
+    assert_eq!(holder.findings().len(), 0);
 }
 
 #[test]

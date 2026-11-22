@@ -69,18 +69,34 @@ fn codes(built: &Built) -> BTreeMap<String, CodeHash> {
     named(built, &built.inputs)
 }
 
+fn every_abi_is_present(program: &Program, built: &Built) -> bool {
+    if !built.abis.iter().map(|it| it.0).eq(built.inputs.iter().map(|it| it.0))
+        || !built.abis.is_sorted_by_key(|it| it.0)
+    {
+        return false;
+    }
+    let abis = abis(built);
+    [(1, "f1"), (2, "f2"), (3, "f3"), (4, "f4")]
+        .into_iter()
+        .all(|(id, name)| abis.get(name) == Some(&program.abi(id)))
+}
+
 /// The invariant: `Built::abis` holds one entry a function the walk reached, by key, in key
 /// order, each its describe's `abi`.
 #[test]
 fn every_function_of_a_build_has_its_abi_by_key() {
     let program = passing_a_reference();
     let built = built(&program, None);
-    let keys = |list: &[(InstanceKey, ContentId)]| list.iter().map(|it| it.0).collect::<Vec<_>>();
-    assert_eq!(keys(&built.abis), built.inputs.iter().map(|it| it.0).collect::<Vec<_>>());
-    assert!(built.abis.is_sorted_by_key(|it| it.0));
-    for (id, name) in [(1, "f1"), (2, "f2"), (3, "f3"), (4, "f4")] {
-        assert_eq!(abis(&built)[name], program.abi(id), "{name}");
-    }
+    assert!(every_abi_is_present(&program, &built));
+}
+
+#[test]
+fn the_oracle_catches_a_reached_function_whose_abi_was_omitted() {
+    let program = passing_a_reference();
+    let mut built = built(&program, None);
+    assert!(every_abi_is_present(&program, &built));
+    built.abis.pop().expect("the walk reached a function");
+    assert!(!every_abi_is_present(&program, &built));
 }
 
 /// An edit of a body changes that function's code and no function's `abi` or identity: no

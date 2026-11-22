@@ -247,8 +247,8 @@ impl Holder {
     }
 
     /// The findings it holds: name and tuple.
-    pub fn findings(&self) -> &BTreeMap<WorkName, Digest> {
-        &self.findings
+    pub fn findings(&self) -> impl ExactSizeIterator<Item = (&WorkName, &Digest)> {
+        self.findings.iter()
     }
 
     /// Starts: heartbeats from now, while the front end loads; [`Event::Loaded`] joins. No

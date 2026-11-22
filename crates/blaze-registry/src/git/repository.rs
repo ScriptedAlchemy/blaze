@@ -350,8 +350,18 @@ mod tests {
         assert_eq!(sh(&to, &["ls-files"]), sh(&from.root, &["ls-files"]));
         assert_eq!(sh(&to, &["rev-parse", "--is-shallow-repository"]), "true");
         assert_eq!(sh(&to, &["rev-list", "--count", "HEAD"]), "1");
+    }
 
-        // The control: git reads the kept files, so one that differs is seen.
+    #[test]
+    fn the_oracle_catches_a_kept_file_that_differs_from_the_locked_commit() {
+        let dir = Scratch::new("changed-answers");
+        let from = clone(&dir.path().join("clone"));
+        let kept = from.repository().unwrap();
+        let to = dir.path().join("kept");
+        keep(&from, &to, &kept);
+        assert_eq!(sh(&to, &["status", "--porcelain"]), "");
+        assert!(!sh(&to, &["describe", "--always", "--dirty"]).ends_with("-dirty"));
+
         std::fs::write(to.join("first"), "two\n").unwrap();
         assert_eq!(sh(&to, &["status", "--porcelain"]), "M first");
         assert!(sh(&to, &["describe", "--always", "--dirty"]).ends_with("-dirty"));

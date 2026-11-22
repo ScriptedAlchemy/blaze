@@ -15,6 +15,9 @@ pub mod result_gate;
 pub mod server;
 pub mod telemetry;
 
+#[cfg(test)]
+mod allocator_tests;
+
 use std::io;
 
 /// A distributed execution, compiler, protocol or IO failure. None permits implicit fallback.

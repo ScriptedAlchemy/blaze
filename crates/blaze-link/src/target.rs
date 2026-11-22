@@ -240,29 +240,32 @@ fn bundle_with<A: Ask>(
         out: Vec::new(),
         listings: RefCell::default(),
     };
+    // A refusal is returned to the link's owner after this temporary search is gone.
+    let refusal = |message: std::fmt::Arguments<'_>| {
+        let text = blaze_mem::text::format(Global, message);
+        fail(String::from_utf8(text.into_bytes()).expect("formatted text is UTF-8"))
+    };
     for lib in libs.iter_mut().filter(|lib| bundled(lib)) {
         let (path, _) = line.find(&lib.name, lib.kind, lib.verbatim, &[])?;
         // alloc: once per bundled declaration, the path carried into the final link
         let path = std::path::absolute(&path).map_err(|error| {
-            // alloc: error path
-            fail(format!(
+            refusal(format_args!(
                 "the bundled native library `{}` at {}: {error}",
                 lib.name,
                 path.display()
             ))
         })?;
-        // alloc: once per bundled declaration, the exact path carried into the final link
+        // Transfer the absolute path's existing buffer; a name must be UTF-8, never lossily rebound.
         lib.name = path
-            .to_str()
-            .ok_or_else(|| {
-                // alloc: error path; NativeLib names must be UTF-8, never lossily rebound
-                fail(format!(
+            .into_os_string()
+            .into_string()
+            .map_err(|path| {
+                refusal(format_args!(
                     "the bundled native library `{}` has a non-UTF-8 path: {}",
                     lib.name,
-                    path.display()
+                    Path::new(&path).display()
                 ))
-            })?
-            .to_owned();
+            })?;
         lib.verbatim = true;
     }
     Ok(())
@@ -1275,8 +1278,8 @@ impl Cache {
         {
             return Ok(Arc::clone(asked));
         }
-        // alloc: once per process and file content, what it asks for
-        let asked = Arc::new(read(&bytes).map_err(fail)?);
+        // The cached answer belongs to this process and file content.
+        let asked = Arc::new_in(read(&bytes).map_err(fail)?, Global);
         self.asked.lock().push((id, platform, Arc::clone(&asked)));
         Ok(asked)
     }
@@ -1955,15 +1958,15 @@ impl Line<'_> {
         let files = files(self.output.format, name, kind, verbatim)?;
         // A bundled archive is already selected by its declaring crate. Resolve its exact
         // path even on a target with no search directories (wasm32-unknown-unknown).
-        if let [(file, kind)] = files.as_slice()
+        if let [(file, _)] = files.as_slice()
             && Path::new(file).is_absolute()
         {
             let path = Path::new(file);
-            return match path.is_file() {
-                // alloc: once per exact native input on the final link line
-                true => Ok((path.to_path_buf(), *kind)),
-                false => Err(not_found(name, &files, std::iter::empty(), &[])),
-            };
+            if !path.is_file() {
+                return Err(not_found(name, &files, std::iter::empty(), &[]));
+            }
+            let (file, kind) = files.into_iter().next().expect("one absolute native input");
+            return Ok((PathBuf::from(file), kind));
         }
         let framework = matches!(kind, NativeLibKind::Framework);
         for dir in self.dirs(framework, own) {

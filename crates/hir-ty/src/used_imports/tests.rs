@@ -194,6 +194,12 @@ fn the_body_records_hold_what_the_lint_reads() {
     assert_eq!(invoked, ["Some(1)"]);
     assert_eq!(unknown, ["unknown_mac"]);
     assert!(other, "a failed method call's candidate trait is type checking's, not a path's");
+}
+
+#[test]
+fn the_oracle_catches_unresolved_reads_and_trait_uses_removed_from_a_body() {
+    let (names, _, _, _, other) = records(RECORDS);
+    assert!(!names.is_empty() && other);
     let fixed = RECORDS
         .replace("nowhere::g();", "m::Method::method(&0u8);")
         .replace("m::absent();", "")
@@ -357,6 +363,12 @@ fn derive_and_attribute_macro_paths_are_uses() {
     );
     // `Dup`'s derive and `global_allocator` (both attributes name it, one record) at least.
     assert!(no_rule >= 2, "the derive and the attribute are invoked with no rule: {no_rule}");
+}
+
+#[test]
+fn the_oracle_catches_the_only_macro_paths_removed_from_the_walk() {
+    let (texts, _) = macro_path_uses(MACRO_PATHS);
+    assert_eq!(texts.len(), 3);
     let bare = MACRO_PATHS
         .replace("#[derive(Dup)]\n", "")
         .replace("#[ga]\n", "")
