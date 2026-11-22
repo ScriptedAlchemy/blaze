@@ -56,7 +56,7 @@ jobs:
       - uses: ./.github/actions/nix
         with:
           cache: true
-      - name: graph refresh isolation regressions
+      - name: graph refresh isolation and process cleanup regressions
         run: python3 .github/scripts/test_refresh_nix_graphs.py
       - id: graphs
         run: python3 tools/nix/unit_graph.py

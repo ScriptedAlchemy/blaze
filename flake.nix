@@ -291,7 +291,7 @@
         # toolchain with libstdc++.a, so `cargo build -p blaze-engine` links it in. Rust is
         # rustup at the pinned nightly: plain `cargo` is harness/toolchain's and `cargo +<toolchain>` works.
         devShells.default = pkgs.mkShell (llvmEnv // {
-          packages = scripts.packages ++ [ pkgs.rustup llvm ];
+          packages = scripts.packages ++ [ pkgs.rustup llvm pkgs.unixtools.ps ];
           inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
           # The pinned DuckDB that `blaze slow`, `blaze debug sql` and `blaze explain` run (blaze

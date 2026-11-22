@@ -26,7 +26,11 @@ import argparse
 import asyncio
 import json
 import os
+import signal
+import subprocess
 import sys
+import tempfile
+import time
 import tomllib
 from pathlib import Path
 
@@ -50,20 +54,128 @@ class StepError(Exception):
     pass
 
 
-async def run_step(step: str, cmd: list[str], timeout: float, cwd: Path, env: dict | None = None) -> str:
-    full_env = {**os.environ, **(env or {})}
+CLEANUP_SECONDS = 2.0
+
+
+def observed_exit(proc: subprocess.Popen) -> int | None:
+    # As in seed_preflight.py, a waitable session leader pins the process group.
+    # poll()/wait() would release that PID before its descendants are stopped.
+    if proc.returncode is not None:
+        raise StepError(f"step process {proc.pid} was reaped before group cleanup")
+    result = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    if result is None:
+        return None
+    if result.si_code == os.CLD_EXITED:
+        return result.si_status
+    if result.si_code in (os.CLD_KILLED, os.CLD_DUMPED):
+        return -result.si_status
+    raise StepError(f"step process {proc.pid} has unexpected wait status {result.si_code}")
+
+
+def live_group(proc: subprocess.Popen, seconds: float) -> list[int]:
+    observed_exit(proc)  # Refuse to signal a group whose leader we no longer own.
+    # ps -A and these fields are shared by Linux and macOS; /proc is Linux-only.
+    result = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                            timeout=seconds, check=True)
+    members = []
+    for line in result.stdout.splitlines():
+        pid, group, state = line.split()
+        if int(group) == proc.pid and state[0] not in ("Z", "X"):
+            members.append(int(pid))
+    return members
+
+
+def cleanup_step(proc: subprocess.Popen) -> bool:
+    """Stop the owned group, then reap its pinned leader, with no cancellation await."""
+    forced = False
     try:
-        async with asyncio.timeout(timeout):
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=cwd, env=full_env,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            out, err = await proc.communicate()
-    except TimeoutError:
-        raise StepError(f"step '{step}' timed out after {timeout:.0f}s\n  command: {' '.join(cmd)}") from None
-    if proc.returncode != 0:
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            if not live_group(proc, CLEANUP_SECONDS):
+                break
+            try:
+                os.killpg(proc.pid, signum)
+            except ProcessLookupError:
+                pass  # The final live member exited after the snapshot.
+            else:
+                forced = True
+            deadline = time.monotonic() + CLEANUP_SECONDS
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                if not live_group(proc, left):
+                    break
+                time.sleep(min(0.025, max(0, deadline - time.monotonic())))
+        remaining = live_group(proc, CLEANUP_SECONDS)
+        if remaining:
+            raise StepError(f"owned step group {proc.pid} still has live processes {remaining} after SIGKILL")
+    except BaseException:
+        # A failed observation must not abandon the owned processes. Keep the
+        # original cleanup error, but still attempt the final kill and bounded reap.
+        observed_exit(proc)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raise
+    finally:
+        proc.wait(timeout=CLEANUP_SECONDS)
+    return forced
+
+
+async def run_step(step: str, cmd: list[str], timeout: float, cwd: Path, env: dict | None = None) -> str:
+    if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "P_PID")):
+        raise StepError(f"step '{step}' requires waitid/WNOWAIT to retain its owned process group "
+                        "(on macOS, use the repository's Python 3.13)")
+    full_env = {**os.environ, **(env or {})}
+    proc = None
+    status = None
+    failure = None
+    cleanup_error = None
+    forced = False
+    # File-backed output cannot keep a pipe transport alive after a launcher exits.
+    # Popen has no await between child creation and retaining its ownership handle;
+    # TaskGroup cancellation is delivered only after that handle is ours.
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        deadline = time.monotonic() + timeout
+        try:
+            proc = subprocess.Popen(cmd, cwd=cwd, env=full_env, stdout=output, stderr=errors,
+                                    start_new_session=True)
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError
+                status = observed_exit(proc)
+                if status is not None:
+                    break
+                await asyncio.sleep(min(0.025, left))
+        except TimeoutError:
+            failure = StepError(f"step '{step}' timed out after {timeout:.0f}s\n  command: {' '.join(cmd)}")
+        except BaseException as error:
+            failure = error
+        finally:
+            if proc is not None:
+                try:
+                    forced = cleanup_step(proc)
+                except (OSError, ValueError, StepError, subprocess.SubprocessError) as error:
+                    cleanup_error = StepError(f"step '{step}' cleanup failed: {error}")
+            output.seek(0)
+            errors.seek(0)
+            out, err = output.read(), errors.read()
+    # Cleanup must not replace the command's original failure (including timeout
+    # and cancellation), but a secondary cleanup failure remains visible.
+    if cleanup_error is not None and (failure is not None or status not in (None, 0)):
+        print(f"error: {cleanup_error}", file=sys.stderr)
+    if failure is not None:
+        raise failure
+    if status != 0:
         tail = "\n".join(err.decode(errors="replace").strip().splitlines()[-30:])
-        raise StepError(f"step '{step}' failed\n  command: {' '.join(cmd)}\n  exit code: {proc.returncode}\n  stderr tail:\n{tail}")
+        raise StepError(f"step '{step}' failed\n  command: {' '.join(cmd)}\n  exit code: {status}\n  stderr tail:\n{tail}")
+    if cleanup_error is not None:
+        raise cleanup_error
+    if forced:
+        raise StepError(f"step '{step}' left live processes after it exited; its group was stopped")
     return out.decode()
 
 
