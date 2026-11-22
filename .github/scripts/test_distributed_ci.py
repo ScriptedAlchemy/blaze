@@ -222,6 +222,7 @@ class AcceptanceGateTests(unittest.TestCase):
         base = {"changes": {"result": "success", "outputs": {"tier": "gate"}},
                 "scripts": {"result": "success", "outputs": {}},
                 "workflows": {"result": "success"},
+                "lean": {"result": "success"},
                 "linux-6-8": {"result": "success"},
                 "workspace-check": {"result": "success"},
                 "distributed-core": {"result": "success"},
@@ -244,6 +245,17 @@ class AcceptanceGateTests(unittest.TestCase):
         docs["workspace-check"]["result"] = "skipped"
         docs["distributed-core"]["result"] = "skipped"
         cases.append(("docs need no build", docs, True))
+        # Lean runs for every change, including docs: a missing or skipped proof job
+        # cannot stand for success even when the code-tier jobs do not apply.
+        for fixture in (base, warm, docs):
+            tier = fixture["changes"]["outputs"]["tier"]
+            for result in (None, "", "failure", "cancelled", "skipped"):
+                changed = copy.deepcopy(fixture)
+                if result is None:
+                    del changed["lean"]
+                else:
+                    changed["lean"]["result"] = result
+                cases.append((f"{tier} with lean {result!r}", changed, False))
         for receipt in ("distributed_acceptance", "forkfixes_acceptance", "protocol_tests"):
             for value in (None, "", "false"):
                 changed = copy.deepcopy(base)
@@ -395,18 +407,23 @@ class AcceptanceGateTests(unittest.TestCase):
                 output = root / "output"
                 self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if wanted else "")
 
-    def test_partial_b0_library_feedback_requires_every_model_and_control(self):
+    def test_partial_cargo_library_feedback_requires_every_model_and_control(self):
         models = [
             "retirement_preserves_survivors_and_exact_assignment_ownership",
             "cancellation_cleans_a_promotion_the_worker_has_not_observed",
             "stale_claimed_helpers_do_not_block_available_replacements",
             "execution_bindings_retain_cleanup_without_sliding_replay_or_expiry",
-            "reclamation_preserves_full_grants_reservations_and_worker_limits",
-            "reclamation_refuses_invalid_shapes_and_respects_actual_machine_bounds",
-            "parked_unposted_work_releases_the_lane_without_losing_its_continuation",
-            "parked_work_unblocks_reclamation_with_one_worker_and_no_budget",
-            "a_reclamation_hold_is_respected_without_a_configured_budget",
-        ] + list(BUNDLE_MODELS)
+            "every_success_has_one_immutable_full_manifest",
+            "an_accepted_refusal_cannot_publish_success_after_reassignment",
+            "a_late_worker_verdict_cannot_rewrite_an_accepted_manifest",
+            "a_failed_heartbeat_cannot_publish_a_successful_tail",
+            "virtual_clock_and_actor_order_preserve_the_captured_results_authority",
+            "first_publication_cannot_name_missing_or_corrupt_packs",
+            "first_writer_requires_equal_values_for_keys_mirrored_across_packs",
+            "native_partitions_preserve_values_through_publication_faults_and_reopen",
+            "conditional_publication_preserves_comparison_and_whole_file_integrity",
+            "failed_syncs_rename_and_every_crash_boundary_reopen_authorized_whole_lists",
+        ]
         controls = [
             "the_oracle_catches_leaving_without_retirement",
             "the_oracle_catches_release_without_a_pending_stop",
@@ -421,27 +438,33 @@ class AcceptanceGateTests(unittest.TestCase):
             "the_oracle_catches_a_sliding_session_ceiling",
             "the_oracle_catches_a_lost_reply_with_changed_replay_identity",
             "the_oracle_catches_different_bytes_reusing_a_replay_identity",
-            "the_oracle_catches_reclamation_treated_as_ordinary_work",
-            "the_oracle_catches_a_reclamation_grant_clamped_to_the_pressure_cap",
-            "the_oracle_catches_a_lost_held_compile_reservation",
-            "the_oracle_catches_positive_work_overlapping_reclamation",
-            "the_oracle_catches_reclamation_spending_unreserved_machine_room",
-            "the_oracle_catches_a_park_that_eagerly_readmits_unposted_work",
-            "the_oracle_catches_a_stale_continuation_replaced_with_the_current_token",
-            "the_oracle_catches_a_rejected_reclamation_prefix_entering_the_plane",
-            "the_oracle_catches_a_reclamation_hold_bypassed_without_a_budget",
-        ] + list(BUNDLE_CONTROLS)
-        tls_cases = [
-            "tls_bundle_publication_downloads_into_an_empty_local_store",
-            "tls_bundle_refuses_an_untrusted_certificate_or_wrong_server_name",
-            "tls_bundle_refuses_a_manifest_with_an_unpinned_or_damaged_signature",
-            "tls_values_need_a_pinned_record_or_a_matching_trusted_manifest",
-            "tls_bundle_refuses_a_value_not_matching_its_verified_manifest",
+            "the_oracle_catches_an_early_done_plant",
+            "the_oracle_catches_a_late_worker_verdict_plant",
+            "the_oracle_catches_a_dropped_heartbeat_failure",
+            "the_oracle_catches_a_compiler_refusal_reclassified_as_transport_loss",
+            "the_identity_oracle_catches_reissuing_the_captured_result_under_a_new_lease",
+            "the_oracle_catches_removing_cross_pack_comparison",
+            "the_oracle_catches_the_comparison_bypass_plant",
+            "the_oracle_catches_missing_file_sync_with_torn_appends",
+            "the_oracle_catches_acknowledgement_before_directory_sync",
         ]
-        names = models + controls + tls_cases
+        transport_cases = [
+            "fragmented_replies_preserve_body_boundaries_and_committed_refusals",
+            "committed_reply_bounds_follow_the_native_wire_contract",
+            "an_http_reply_must_end_at_its_declared_body_boundary",
+            "an_interrupted_committed_get_cannot_authorize_local_recompilation",
+            "a_lost_publication_reply_cannot_authorize_local_recompilation",
+            "a_first_writer_conflict_must_compare_the_immutable_manifest",
+            "bounded_packs_keep_every_key_and_refuse_conflicts_across_boundaries",
+            "errors_after_publication_cannot_rebuild_an_immutable_unit",
+        ]
+        names = models + controls + transport_cases
         # Read the actual job's literal setting, so removing verification from the workflow
         # cannot be hidden by this shell fixture supplying its own unrelated default.
-        header = MAIN.read_text().split("  distributed-core:\n", 1)[1].split("    steps:\n", 1)[0]
+        job = MAIN.read_text().split("  distributed-core:\n", 1)[1].split("\n  cross-probe:", 1)[0]
+        self.assertIn("name: distributed library controls with pinned Cargo (partial)", job)
+        self.assertIn("uses: ./.github/actions/toolchain", job)
+        header = job.split("    steps:\n", 1)[0]
         mode = [line.split(":", 1)[1].strip().strip("\"'") for line in header.splitlines()
                 if line.startswith("      BLAZE_TESTS:")]
         self.assertEqual(mode, ["verify"])
@@ -451,21 +474,29 @@ class AcceptanceGateTests(unittest.TestCase):
                   for name in models]
         cases += [(f"missing control {name}", [item for item in names if item != name], 0, 1)
                   for name in controls]
-        cases += [(f"missing TLS case {name}", [item for item in names if item != name], 0, 1)
-                  for name in tls_cases]
+        cases += [(f"missing transport case {name}", [item for item in names if item != name], 0, 1)
+                  for name in transport_cases]
         cases.append(("compiler failed after success lines", names, 23, 23))
+        toolchain = (ROOT / "harness/toolchain").read_text().strip()
         for label, reported, code, expected in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 commands = root / "commands"
                 commands.mkdir()
-                blaze = commands / "blaze"
-                blaze.write_text(
+                cargo = commands / "cargo"
+                cargo.write_text(
                     "#!/bin/sh\n"
+                    'if [ "$2" = --version ]; then printf \'%s\\n\' \'cargo fixture\'; exit 0; fi\n'
                     'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/core-evidence/invocation.txt"\n'
                     'printf \'%s\\n\' "$BLAZE_TESTS" > "$RUNNER_TEMP/core-evidence/mode.txt"\n'
                     'cat "$CORE_OUTPUT"\nexit "$CORE_EXIT"\n')
-                blaze.chmod(0o700)
+                cargo.chmod(0o700)
+                rustc = commands / "rustc"
+                rustc.write_text(
+                    "#!/bin/sh\n"
+                    'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/core-evidence/rustc-invocation.txt"\n'
+                    'printf \'%s\\n\' \'rustc fixture\'\n')
+                rustc.chmod(0o700)
                 output = f"running {len(reported)} tests\n"
                 output += "".join(f"test fixture::{name} ... ok\n" for name in reported)
                 output += f"test result: ok. {len(reported)} passed; 0 failed; 0 ignored\n"
@@ -474,18 +505,21 @@ class AcceptanceGateTests(unittest.TestCase):
                 env = {"RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(ROOT),
                        "PATH": str(commands) + os.pathsep + os.environ["PATH"],
                        "BLAZE_TESTS": mode[0], "CORE_OUTPUT": str(transcript), "CORE_EXIT": str(code)}
-                done = self.run_shell(MAIN, "distributed library models and planted controls with B0", env)
+                done = self.run_shell(MAIN, "distributed library models and planted controls with pinned Cargo", env)
                 self.assertEqual(done.returncode, expected, done.stdout + done.stderr)
                 evidence = root / "core-evidence"
                 invocation = (evidence / "invocation.txt").read_text().splitlines()
-                self.assertEqual(invocation, [str(blaze), "--ignore-pin", "test", "--release", "--locked",
+                self.assertEqual(invocation, [str(cargo), f"+{toolchain}", "test", "--release", "--locked",
                                               "--lib", "-p", "blaze-dist", "-p", "blaze-dist-local",
-                                              "-p", "blaze-graph", "-p", "blaze-global", "--no-fail-fast"])
+                                              "-p", "blaze-wire", "-p", "blaze-serve", "--no-fail-fast"])
                 self.assertEqual((evidence / "mode.txt").read_text(), "verify\n")
                 self.assertEqual((evidence / "tests.log").read_text(), output)
-                self.assertEqual((evidence / "bootstrap-pin.txt").read_bytes(),
-                                 (ROOT / ".github/blaze-version").read_bytes())
-                self.assertTrue((evidence / "bootstrap-sha256.txt").read_text().rstrip().endswith("  " + str(blaze)))
+                self.assertEqual((evidence / "toolchain-pin.txt").read_bytes(),
+                                 (ROOT / "harness/toolchain").read_bytes())
+                self.assertEqual((evidence / "cargo-version.txt").read_text(), "cargo fixture\n")
+                self.assertEqual((evidence / "rustc-version.txt").read_text(), "rustc fixture\n")
+                self.assertEqual((evidence / "rustc-invocation.txt").read_text().splitlines(),
+                                 [str(rustc), f"+{toolchain}", "--version", "--verbose"])
                 if expected == 1:
                     missing = next(name for name in names if name not in reported)
                     self.assertIn("missing executed library control: " + missing, done.stdout)

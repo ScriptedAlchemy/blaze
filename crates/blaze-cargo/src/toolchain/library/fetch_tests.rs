@@ -42,6 +42,7 @@ fn clean_home_preserves_checkout_precedence_and_selected_release() {
     for hidden in [false, true] {
         let name = if hidden { "selected-release" } else { "matching-checkout" };
         let home = work.path().join(name);
+        let caches = home.join("cache");
         std::fs::create_dir(&home).unwrap();
         let mut command = if hidden {
             let mut wrapped = Command::new("bwrap");
@@ -61,6 +62,7 @@ fn clean_home_preserves_checkout_precedence_and_selected_release() {
             .args(["--ignored", "--exact", TEST, "--nocapture"])
             .env(CHILD, "1")
             .env("BLAZE_HOME", &home)
+            .env("XDG_CACHE_HOME", &caches)
             .env("HOME", &home)
             .env_remove(super::VAR)
             .env_remove("BLAZE_LIBRARY_FROM");
@@ -71,7 +73,10 @@ fn clean_home_preserves_checkout_precedence_and_selected_release() {
         }
         checked(&mut command, &home.join("fetch.log"));
         assert_eq!(
-            super::digest_of(&home.join("library").join(super::digest()).join("library")).unwrap(),
+            super::digest_of(
+                &caches.join("blaze/library").join(super::digest()).join("library"),
+            )
+            .unwrap(),
             super::digest()
         );
         println!("clean home {name}: fetched and verified {}", super::digest());

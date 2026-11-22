@@ -15,6 +15,7 @@ use crate::{
         },
         print_mir_body,
     },
+    mir_pretty::MirEvalErrorPretty as _,
     test_db::TestDBExt as _,
 };
 
@@ -291,7 +292,7 @@ fn mir_of(source: &str, name: &str) -> String {
     let fx = fixture::db(source);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let function = function(&db, *file_ids.last().unwrap(), name);
         let body = db.mir_body(function.into()).unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
         print_mir_body(&db, body, name)
@@ -453,7 +454,7 @@ fn which_types_are_dropped_early() {
     let fx = fixture::db(TYPES);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let function = function(&db, *file_ids.last().unwrap(), "probe");
         let body = db.mir_body(function.into()).unwrap_or_else(|e| panic!("`probe`: {e:?}"));
         let classes = local_classes(&db, body);

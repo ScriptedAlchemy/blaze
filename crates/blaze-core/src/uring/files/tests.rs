@@ -5,8 +5,6 @@ use crate::{
     run_until_idle,
     sim::{Faults, Rng, Sim},
 };
-use hegel::generators as gs;
-
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,24 +210,31 @@ fn simulate(case: Case, plant: bool) -> Result<(), String> {
     Err("whole-file write exceeded its positive-progress bound".into())
 }
 
-#[hegel::test(test_cases = 128)]
-fn whole_write_publication_survives_import_limits_faults_and_crashes(tc: hegel::TestCase) {
-    let case = Case {
-        seed: tc.draw(gs::integers()),
-        len: tc.draw(gs::integers::<u16>().max_value(128)) as usize,
-        import_limit: tc.draw(gs::integers().min_value(1).max_value(32)),
-        short: tc.draw(gs::booleans()),
-        fault: [
-            Fault::None,
-            Fault::Write,
-            Fault::Zero,
-            Fault::FileSync,
-            Fault::Rename,
-            Fault::DirSync,
-        ][tc.draw(gs::integers::<u8>().max_value(5)) as usize],
-        crash_after: tc.draw(gs::integers::<u16>().max_value(64)) as usize,
-    };
-    assert_eq!(simulate(case, false), Ok(()), "{case:?}");
+#[test]
+fn whole_write_publication_survives_import_limits_faults_and_crashes() {
+    blaze_sim::check(blaze_sim::Config::cases(128), |tape| {
+        let case = Case {
+            seed: tape.next_u64("sim seed"),
+            len: tape.int_in(0..=128, "length"),
+            import_limit: tape.int_in(1..=32, "import limit"),
+            short: tape.coin("short write"),
+            fault: *tape
+                .pick(
+                    &[
+                        Fault::None,
+                        Fault::Write,
+                        Fault::Zero,
+                        Fault::FileSync,
+                        Fault::Rename,
+                        Fault::DirSync,
+                    ],
+                    "fault",
+                )
+                .unwrap(),
+            crash_after: tape.int_in(0..=64, "crash after"),
+        };
+        assert_eq!(simulate(case, false), Ok(()), "{case:?}");
+    });
 }
 
 #[test]

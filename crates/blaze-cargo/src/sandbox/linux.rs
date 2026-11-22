@@ -80,7 +80,7 @@ use std::{
 use blaze_core::{Untraceable, exit::Exit, utf8::push_lossy};
 use blaze_hash::HashMap;
 use blaze_usercode::{
-    provider::{Answers, Provider, SOURCE_DATE_EPOCH, Wall},
+    provider::{Answers, Asker, Provider, SOURCE_DATE_EPOCH, Wall},
     trace::{ANSWERED_DEVICE, ANSWERED_RANDOM},
 };
 use std::alloc::Global;
@@ -105,9 +105,12 @@ const INTERPOSING: &str = "__BLAZE_INTERPOSE";
 /// by its contents in the user's cache directory, as the macOS sandbox keeps its library.
 fn interposer() -> Result<PathBuf, String> {
     let caches = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
-    let caches = caches
-        .or_else(|| std::env::home_dir().map(|it| it.join(".cache")))
-        .ok_or("no XDG_CACHE_HOME or home directory to keep the sandbox's interposer in")?;
+    let caches = match caches {
+        Some(caches) => caches,
+        None => blaze_core::home::user()
+            .map_err(|why| format!("no XDG_CACHE_HOME says where to keep the sandbox's interposer, and {why}"))?
+            .join(".cache"),
+    };
     let dir = caches
         .join("blaze/sandbox")
         .join(crate::content::hex(&blaze_ids::b3::hash(INTERPOSER)[..12]));
@@ -129,6 +132,11 @@ fn interposer() -> Result<PathBuf, String> {
 }
 
 /// The directories that are the sandbox's own: the kernel's views and the empty ones.
+#[expect(
+    blaze::tmp_path,
+    reason = "the sandbox mounts its own empty /tmp and /var/tmp in its namespace: the real \
+              directories by name are the policy"
+)]
 const OWN: &[&str] = &["/proc", "/sys", "/dev", "/tmp", "/var/tmp", "/run"];
 
 /// The directories a confined sandbox has as its own besides its `TMPDIR`: the kernel's
@@ -149,6 +157,11 @@ enum Around {
 /// The directories the sandbox mounts empty besides `/tmp`, where they are: the machine's
 /// sockets live in `/run` (`/var/run` is a link to it, or one more), and the Nix daemon's,
 /// through which a program could have the store build or keep what it likes, in its own.
+#[expect(
+    blaze::tmp_path,
+    reason = "the machine's /var/tmp is one of the directories the sandbox mounts empty, so the \
+              mount table names it"
+)]
 const EMPTIED: &[&str] =
     &["/var/tmp", "/dev/shm", "/run", "/var/run", "/nix/var/nix/daemon-socket"];
 
@@ -459,7 +472,14 @@ pub(super) fn run_as(
 ) -> Result<i32, String> {
     // The run's provider, which its environment names: the supervisor answers from it what
     // the program asks the kernel for.
-    let provider = run_provider(spec, also.live.is_some())?;
+    let provider = Provider::among(spec.env.iter().map(|(name, value)| (&**name, &**value)))?;
+    if provider.is_some() && !(spec.record_reads && also.live.is_some()) {
+        // alloc: the error, once, and no sandbox is made.
+        return Err(format!(
+            "the program is given a provider (`{}`), and its run is not traced: the sandbox answers `getrandom` and an open of `/dev/urandom` only for a run whose reads it records",
+            blaze_usercode::provider::VAR
+        ));
+    }
     // The interposer is seen where it is, read-only, and is no input of what runs.
     let interposer = match also.live.is_some() && spec.record_reads {
         true => Some(interposer()?),
@@ -501,43 +521,21 @@ pub(super) fn run_as(
     // empty `/tmp`.
     let scratch = match unshared {
         Some(_) => {
-            // alloc: once per sandbox, its temporary directory's name.
-            let dir = std::env::temp_dir().join(format!(
-                "blaze-sandbox-tmp-{}-{}",
-                std::process::id(),
-                unique()
-            ));
-            // alloc: the error, once, and no sandbox is made.
-            std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
-            Some(dir)
+            // alloc: once per sandbox, its temporary directory, removed when the run is done.
+            let made = blaze_core::temp::TempDir::new("blaze-sandbox-tmp-");
+            // alloc: the error, once, naming the directory, and no sandbox is made.
+            Some(made.map_err(|it| it.to_string())?)
         }
         None => None,
     };
-    let ran = run_in(spec, program, scratch.as_deref(), also, interposer.as_deref(), provider);
-    if let Some(dir) = &scratch {
-        _ = std::fs::remove_dir_all(dir);
-    }
-    ran
-}
-
-/// A provider is accepted only in a run whose complete reads are recorded. Otherwise an
-/// answered call could disappear without a trace showing what the supervisor supplied.
-fn run_provider(spec: &Spec, live: bool) -> Result<Option<Provider>, String> {
-    let provider = Provider::among(spec.env.iter().map(|(name, value)| (&**name, &**value)))?;
-    if provider.is_some() && !(spec.record_reads && live) {
-        // alloc: the error, once, and no sandbox is made.
-        return Err(format!(
-            "the program is given a provider (`{}`), and its run is not traced: the sandbox answers `getrandom` and an open of `/dev/urandom` only for a run whose reads it records",
-            blaze_usercode::provider::VAR
-        ));
-    }
-    Ok(provider)
-}
-
-/// A number no other run of this process has.
-fn unique() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    run_in(
+        spec,
+        program,
+        scratch.as_ref().map(blaze_core::temp::TempDir::path),
+        also,
+        interposer.as_deref(),
+        provider,
+    )
 }
 
 /// Whether this user may make a user namespace and map itself in it, which a sandbox in
@@ -750,6 +748,11 @@ fn run_in(
     }
     if let (Some(live), Some(why)) = (also.live, recorder.live_failed()) {
         live.failed(why);
+    }
+    if let Some(live) = also.live {
+        // Who made the calls the run can't be traced for, for the launcher to leave beside its
+        // report ([`blaze_usercode::calls`]).
+        live.calls.borrow_mut().extend(recorder.take_calls());
     }
     Ok(ended(status))
 }
@@ -1333,6 +1336,12 @@ impl Passed {
 /// Puts the machine's file system in place for a sandbox without a view: every mount
 /// read-only, the overlays, the writable and the readable entries (each a directory or a file)
 /// and the empty directories on it.
+#[expect(
+    blaze::tmp_path,
+    reason = "the sandbox's mount namespace stages its overlays on the machine's /tmp, mounts it \
+              empty and keeps a TMPDIR found under the emptied directories: the real /tmp is the \
+              mount table here"
+)]
 fn machine(spec: &Spec) -> Result<(), String> {
     let root = c(Path::new("/"));
     let opened = |at: &Path| -> Result<std::os::fd::OwnedFd, String> {
@@ -1600,6 +1609,11 @@ fn overlay(dir: &Path, lower: &Path, upper: &Path, work: &Path) -> Result<(), St
 
 /// Where a view's root is put together before it becomes `/`: the machine's `/tmp`, which the
 /// view's tmpfs hides in the mount namespace.
+#[expect(
+    blaze::tmp_path,
+    reason = "a view's root is put together on the machine's /tmp inside the mount namespace, \
+              which its tmpfs then hides: the real directory is the policy"
+)]
 const VIEW_ROOT: &str = "/tmp";
 
 /// The machine's devices a view's `/dev` has: those that hold nothing of the machine's.
@@ -1666,6 +1680,11 @@ fn check_view(spec: &Spec, view: &View) -> Result<(), String> {
 /// group `gid`, with the directory of `env`'s `TMPDIR` made when it is in its `/tmp` or
 /// `/dev/shm`. The first process of the PID namespace mounts its `/proc` and makes it `/`
 /// ([`enter_view`]).
+#[expect(
+    blaze::tmp_path,
+    reason = "a TMPDIR under the view's own /tmp is made inside the view: the view's /tmp by name \
+              is the policy"
+)]
 fn put_view(
     view: &View,
     uid: libc::uid_t,
@@ -2412,6 +2431,19 @@ impl Watch {
         number
     }
 
+    /// `thread` of `process`, which asks the provider, as its answers see it: the scope the
+    /// thread runs in (a test's name; [`Answers`] gives a process of a scope a stream of that
+    /// scope, not of its number), the process's id and its number in the run.
+    fn asker<'r>(
+        &mut self,
+        recorder: &'r Recorder,
+        thread: u64,
+        process: u64,
+        procs: &mut Procs,
+    ) -> Asker<'r> {
+        Asker { scope: recorder.scope(thread), id: process, number: self.number(process, procs) }
+    }
+
     /// As the run ends: a random device's file the program read to its end was not enough for
     /// it, and what it did then is not known, so the run read what can't be traced.
     fn devices_read_out(&mut self, recorder: &mut Recorder) {
@@ -2679,11 +2711,11 @@ fn provided(
                 return Some(failed(libc::EINVAL));
             }
             let process = watch.process(recorder, thread, &mut scratch.procs);
-            let number = watch.number(process, &mut scratch.procs);
+            let asker = watch.asker(recorder, thread, process, &mut scratch.procs);
             let len = usize::try_from(len).unwrap_or(RANDOM_MOST).min(RANDOM_MOST);
             scratch.memory.clear();
             scratch.memory.resize(len, 0);
-            watch.provided.as_mut()?.answers.random(number, &mut scratch.memory);
+            watch.provided.as_mut()?.answers.random(asker, &mut scratch.memory);
             recorder.answered(thread, ANSWERED_RANDOM);
             if len == 0 {
                 return Some(value(0));
@@ -2747,14 +2779,14 @@ fn handed_device(
 ) -> bool {
     let thread = u64::from(notif.pid);
     let process = watch.process(recorder, thread, &mut scratch.procs);
-    let number = watch.number(process, &mut scratch.procs);
+    let asker = watch.asker(recorder, thread, process, &mut scratch.procs);
     let Some(provided) = &mut watch.provided else { return false };
     if provided.devices.len() >= DEVICES_MOST {
         return false;
     }
     scratch.memory.clear();
     scratch.memory.resize(DEVICE_BYTES, 0);
-    if provided.answers.device(number, &mut scratch.memory).is_none() {
+    if provided.answers.device(asker, &mut scratch.memory).is_none() {
         return false;
     }
     let Some(file) = raw::memfd(c"blaze-random-device") else { return false };
@@ -2821,10 +2853,12 @@ fn noted(
             return None;
         }
         Does::Random => {
+            describe(notif, "random", None, process, recorder, &mut scratch.procs);
             recorder.random();
             return None;
         }
         Does::Clock(_) => {
+            describe(notif, "clock", None, process, recorder, &mut scratch.procs);
             recorder.untraceable(thread, Untraceable::Clock);
             return None;
         }
@@ -2857,6 +2891,7 @@ fn noted(
         // With the network every address is the machine's, the loopback too: what comes back
         // is not traced.
         Some(Address::Ip { .. }) if watch.network => {
+            describe(notif, "network", None, process, recorder, &mut scratch.procs);
             recorder.untraceable(thread, Untraceable::Network)
         }
         // Confined, the loopback is the machine's, and every address a call reaches is refused
@@ -2917,7 +2952,20 @@ fn noted(
             if scratch.raw.starts_with(MARK.as_bytes()) {
                 watch.forked(recorder, thread, process, &mut scratch.procs);
             }
+            if scratch.raw == super::CLOCK_MARK.as_bytes() {
+                // The sandbox's library says a clock read that made no system call: the call
+                // seen is its lookup of the marker, and the process is the one that read.
+                let said = "a clock read through the vDSO, which makes no system call: said by the sandbox's library's lookup of its marker";
+                describe(notif, "clock", Some(said), process, recorder, &mut scratch.procs);
+            }
             if recorder.marked(thread, process, &scratch.raw) {
+                // A test's child took its mark: its scope's streams start from it, so what the
+                // test is given is a function of its name, not of the order its server forked.
+                if let Some(provided) = &mut watch.provided
+                    && scratch.raw.starts_with(MARK.as_bytes())
+                {
+                    provided.answers.marked(recorder.scope(thread), process);
+                }
                 continue;
             }
         }
@@ -2945,7 +2993,8 @@ fn noted(
             Does::Look | Does::Access(_) => recorder.looked(thread, path),
             Does::Run => {
                 recorder.read(thread, path);
-                ran(recorder, pid, thread, process, path, &mut scratch.inside);
+                let (room, procs) = (&mut scratch.inside, &mut scratch.procs);
+                ran(recorder, notif, thread, process, path, room, procs);
             }
             // Read-only, in a run with a provider: answered once the call is noted
             // (`handed_device`), and noted as what can't be traced only if it can't be.
@@ -2957,6 +3006,7 @@ fn noted(
                 scratch.device = Some(notif.args[flags] as i32 & libc::O_CLOEXEC != 0);
             }
             Does::Open(_) | Does::Change if path == "/dev/random" || path == "/dev/urandom" => {
+                describe(notif, "random", None, process, recorder, &mut scratch.procs);
                 recorder.random()
             }
             _ => recorder.read(thread, path),
@@ -2971,12 +3021,14 @@ fn noted(
 /// whose scope it can't be told to keep: the process is in none from then on.
 fn ran(
     recorder: &mut Recorder,
-    pid: u32,
+    notif: &Notif,
     thread: u64,
     process: u64,
     path: &str,
     room: &mut Vec<u8>,
+    procs: &mut Procs,
 ) {
+    let pid = notif.pid;
     inside(room, pid, path);
     room.push(0);
     let runnable = CStr::from_bytes_with_nul(room).ok().and_then(|it| raw::stat(it, true));
@@ -2984,6 +3036,14 @@ fn ran(
         .is_some_and(|it| it.st_mode & libc::S_IFMT == libc::S_IFREG && it.st_mode & 0o111 != 0);
     if !runnable {
         return;
+    }
+    // The program started, by the process as it is before the new image replaces it: what
+    // `blaze explain script` lists as the run's children.
+    if recorder.describes_exec() {
+        let mut made = caller(notif, blaze_usercode::calls::EXEC, None, process, recorder, procs);
+        // alloc: once a program started that is described.
+        made.program = path.to_owned();
+        recorder.described(made);
     }
     let elsewhere = thread != process && recorder.scope_of(thread) != recorder.scope_of(process);
     let scope = match elsewhere {
@@ -2994,6 +3054,144 @@ fn ran(
         false => recorder.scope_of(thread),
     };
     recorder.runs(process, path, scope);
+}
+
+/// Describes the process that made the call `notif`, which got `what` (`random`, `clock`,
+/// `network`), once a process and kind and within the run's bound ([`Recorder::describes`]):
+/// what a refusal of the run names beside the effect, and what `blaze explain script` lists.
+/// `said` names the call where the system call seen is not the read itself.
+fn describe(
+    notif: &Notif,
+    what: &str,
+    said: Option<&str>,
+    process: u64,
+    recorder: &mut Recorder,
+    procs: &mut Procs,
+) {
+    if recorder.describes(process, what) {
+        let made = caller(notif, what, said, process, recorder, procs);
+        recorder.described(made);
+    }
+}
+
+/// The process `process` as it is now, held in the call `notif` (the kernel answers it only
+/// after this returns, so its maps and its program are the ones the call came from): its
+/// program, `argv[0]` and id inside the sandbox by `/proc`, and where its instruction pointer
+/// is by its maps. Four reads of `/proc`, asked once a process and kind of call. What can't
+/// be read (the process was killed meanwhile) is left empty, which is said as not known.
+fn caller(
+    notif: &Notif,
+    what: &str,
+    said: Option<&str>,
+    process: u64,
+    recorder: &Recorder,
+    procs: &mut Procs,
+) -> blaze_usercode::calls::Made {
+    use blaze_usercode::calls::{self, Made, Module, Phase};
+    let mut name = [0u8; 64];
+    let program = proc_path(&mut name, format_args!("/proc/{process}/exe"))
+        .and_then(|it| link_text(it, &mut procs.file))
+        .unwrap_or_default();
+    let argv0 = match proc_path(&mut name, format_args!("/proc/{process}/cmdline")) {
+        Some(path) if read_file(path, &mut procs.file) => calls::argv0(&procs.file),
+        _ => String::new(), // alloc: none, empty
+    };
+    let inside_pid = match proc_path(&mut name, format_args!("/proc/{process}/status")) {
+        Some(path) if read_file(path, &mut procs.file) => {
+            std::str::from_utf8(&procs.file).ok().and_then(calls::inside_pid)
+        }
+        _ => None,
+    };
+    let ip = notif.instruction_pointer;
+    let placed = match proc_path(&mut name, format_args!("/proc/{process}/maps")) {
+        Some(path) if read_file(path, &mut procs.file) => {
+            std::str::from_utf8(&procs.file).ok().and_then(|maps| calls::module_at(maps, ip))
+        }
+        _ => None,
+    };
+    let (module, kind) = match placed {
+        // alloc: once a call described, its module's path.
+        Some(path) => (path.to_owned(), Module::of_mapping(path, &program)),
+        None => (String::new(), Module::NotKnown), // alloc: none, empty
+    };
+    // A heuristic, as `Phase` says: the loader's own calls come before `main`, and so does
+    // any call of a process whose loader has not yet loaded the sandbox's library.
+    let phase = match (kind, recorder.loading(process)) {
+        (Module::Loader, _) => Phase::Loader,
+        (_, Some(true)) => Phase::Loading,
+        (_, Some(false)) => Phase::Loaded,
+        (_, None) => Phase::NotKnown,
+    };
+    Made {
+        what: what.to_owned(), // alloc: once a call described
+        pid: u32::try_from(process).unwrap_or(notif.pid),
+        inside_pid,
+        program,
+        argv0,
+        // alloc: once a call described
+        syscall: said.map_or_else(|| call_name(notif.nr), str::to_owned),
+        number: i64::from(notif.nr),
+        phase,
+        ip,
+        module,
+        kind,
+    }
+}
+
+/// The link of `/proc` at `path`, as text; `None` when it can't be read or is longer than a
+/// path may be.
+fn link_text(path: &CStr, room: &mut Vec<u8>) -> Option<String> {
+    room.clear();
+    room.reserve(libc::PATH_MAX as usize);
+    let read = raw::readlink_into(path, room);
+    // alloc: once a call described, its program's path.
+    (read >= 0 && (read as usize) < room.capacity())
+        .then(|| String::from_utf8_lossy(room).into_owned())
+}
+
+/// The names of the system calls a described call can be ([`describe`]): those of [`CALLS`]
+/// that read what can't be traced, start a program, or carry the sandbox's library's marker.
+#[cfg(target_arch = "x86_64")]
+const CALL_NAMES: &[(i32, &str)] = &[
+    (2, "open"),
+    (21, "access"),
+    (42, "connect"),
+    (44, "sendto"),
+    (46, "sendmsg"),
+    (59, "execve"),
+    (96, "gettimeofday"),
+    (201, "time"),
+    (228, "clock_gettime"),
+    (257, "openat"),
+    (269, "faccessat"),
+    (318, "getrandom"),
+    (322, "execveat"),
+    (437, "openat2"),
+    (439, "faccessat2"),
+];
+#[cfg(target_arch = "aarch64")]
+const CALL_NAMES: &[(i32, &str)] = &[
+    (48, "faccessat"),
+    (56, "openat"),
+    (113, "clock_gettime"),
+    (169, "gettimeofday"),
+    (203, "connect"),
+    (206, "sendto"),
+    (211, "sendmsg"),
+    (221, "execve"),
+    (278, "getrandom"),
+    (281, "execveat"),
+    (437, "openat2"),
+    (439, "faccessat2"),
+];
+
+/// The system call numbered `nr` by name, or `system call N` for one [`CALL_NAMES`] lacks:
+/// its number is said beside it either way.
+fn call_name(nr: i32) -> String {
+    match CALL_NAMES.iter().find(|it| it.0 == nr) {
+        Some((_, name)) => (*name).to_owned(), // alloc: once a call described
+        None => format!("system call {nr}"),   // alloc: as above
+    }
 }
 
 /// `path` as the process `pid` sees it, through its root (`/proc/PID/root`), into `into`.
@@ -3319,7 +3517,8 @@ mod tests {
 
     #[test]
     fn a_unix_socket_is_where_its_links_lead() {
-        let dir = std::env::temp_dir().join(format!("blaze-resolved-{}", std::process::id()));
+        let made = blaze_core::temp::TempDir::for_test("blaze-resolved-");
+        let dir = made.path().to_owned();
         let real = dir.join("real");
         std::fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, dir.join("abs")).unwrap();
@@ -3552,7 +3751,7 @@ mod tests {
             eprintln!("skipped: {why}");
             return;
         }
-        let dir = scratch("interposer");
+        let (_made, dir) = scratch("interposer");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("a"), "").unwrap();
@@ -3587,6 +3786,74 @@ for it in "$OUT"/*; do :; done
         _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A traced run that reads randomness leaves, beside its report, who read it: the
+    /// process (`head`, not the shell that started it), the system call, and where in the
+    /// process the call came from; and each program the run started. On 2026-11-10 a build
+    /// script was refused for `Random` with nothing saying which of its processes read it.
+    /// Skipped where no sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn a_traced_run_that_reads_randomness_says_which_process_did() {
+        use blaze_usercode::{
+            calls::{self, Call, Module},
+            confine,
+        };
+        if let Err(why) = alone::probe(crate::sandbox::Probe::V2) {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "{why}");
+            eprintln!("skipped: {why}");
+            return;
+        }
+        let (_made, dir) = scratch("who-read-random");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        // The fixture script: a child reads four bytes of randomness, and nothing else does
+        // by name.
+        let script = "head -c 4 /dev/urandom > \"$OUT/four\"";
+        let spec = confine::Spec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: vec![("OUT".into(), out.clone().into()), ("PATH".into(), "/usr/bin:/bin".into())],
+            dir: out.clone(),
+            read: vec![dir.clone()],
+            write: vec![out.clone()],
+            network: false,
+            trace: true,
+            services: Vec::new(),
+            live: dir.join("live"),
+            report: dir.join("report"),
+            not_inputs: vec!["/bin/sh".into()],
+            given: None,
+        };
+        assert_eq!(alone::launch(&spec), 0);
+        assert_eq!(std::fs::read(out.join("four")).unwrap().len(), 4);
+        let said = calls::read(&dir).unwrap();
+        let made: Vec<&calls::Made> = said
+            .iter()
+            .filter_map(|it| match it {
+                Call::Made(it) => Some(it),
+                Call::More(_) => None,
+            })
+            .collect();
+        let by_head = made
+            .iter()
+            .find(|it| it.what == "random" && it.argv0 == "head")
+            .unwrap_or_else(|| panic!("no call of `head` for randomness among {said:#?}"));
+        assert!(by_head.pid > 0 && by_head.inside_pid.is_some(), "{by_head:?}");
+        assert!(by_head.program.starts_with('/'), "its program by path: {by_head:?}");
+        assert!(by_head.number >= 0 && !by_head.syscall.starts_with("system call"), "{by_head:?}");
+        assert_ne!(by_head.kind, Module::NotKnown, "its maps were read: {by_head:?}");
+        assert!(by_head.ip != 0, "{by_head:?}");
+        // The program `head` is, started by the shell: one of the run's children.
+        assert!(
+            made.iter().any(|it| it.what == calls::EXEC && it.program.ends_with("/head")),
+            "{said:#?}"
+        );
+        // The refusal's text names it.
+        let text = calls::said(&said, "random");
+        assert!(text.contains("by process") && text.contains("argv[0] `head`"), "{text}");
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The variable that has the launcher's child ask the kernel for randomness between its
     /// filter's install and its exec, as an allocator seeding a heap there would.
     pub(super) const PLANT_WINDOW: &[u8] = b"__BLAZE_TEST_WINDOW_SEED=";
@@ -3606,7 +3873,7 @@ for it in "$OUT"/*; do :; done
             eprintln!("skipped: {why}");
             return None;
         }
-        let dir = scratch(name);
+        let (_made, dir) = scratch(name);
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> =
@@ -3701,6 +3968,81 @@ head -c 24 /dev/urandom | od -An -tx1
         assert!(untraced(&lines).contains(&"random"), "{lines:?}");
     }
 
+    /// A run as a fork server's: the server asks for randomness first (as std's and the C
+    /// library's start do), then one process per test of `names`, in that order, takes the
+    /// test's mark through `mark` (a prefix of a path bash's `[ -r ]` asks `faccessat2` of)
+    /// and runs a program that asks `getrandom` for a name. What each test was given, by
+    /// test.
+    fn forked_tests(
+        name: &str,
+        mark: &str,
+        names: &[&str],
+    ) -> Option<(std::collections::BTreeMap<String, String>, Vec<blaze_usercode::trace::Line>)>
+    {
+        let mut script = String::from("mktemp -u XXXXXXXXXXXX > /dev/null\n{\n");
+        for test in names {
+            script.push_str(&format!(
+                "bash -c '[ -r \"{mark}{test}\" ]; printf \"%s \" \"{test}\"; mktemp -u XXXXXXXXXXXX'\n"
+            ));
+        }
+        script.push_str("} > \"$OUT/said\"");
+        let (said, lines) = provided_run(name, &script, &[test_provider(4).entry()])?;
+        let given = said
+            .lines()
+            .map(|line| {
+                let (test, bytes) = line.split_once(' ').expect("a line is a test and its name");
+                (test.to_owned(), bytes.to_owned())
+            })
+            .collect();
+        Some((given, lines))
+    }
+
+    /// The invariant: in a run given a provider, a process that took a test's mark, and the
+    /// programs it runs, are given the stream of that test's name, whichever tests ran before
+    /// it and whatever the server asked first; and the server's own asks at its start, like
+    /// the tests', are answered, so nothing in the trace is left that can't be traced (which
+    /// would keep no test).
+    #[test]
+    fn a_marked_test_is_given_its_names_randomness_whatever_ran_before_it() {
+        if !["/bin/bash", "/usr/bin/bash"].iter().any(|it| Path::new(it).exists()) {
+            eprintln!("skipped: no bash");
+            return;
+        }
+        let orders: [&[&str]; 3] = [
+            &["tests::adds", "tests::muls", "a::b"],
+            &["a::b", "tests::muls", "tests::adds"],
+            &["tests::muls"],
+        ];
+        let mark = crate::sandbox::MARK;
+        let Some((first, lines)) = forked_tests("marked-1", mark, orders[0]) else { return };
+        assert_eq!(untraced(&lines), Vec::<&str>::new(), "{lines:?}");
+        assert_eq!(first.len(), 3, "{first:?}");
+        assert_ne!(first["tests::adds"], first["tests::muls"], "each test has a stream of its own");
+        for (at, order) in orders.iter().enumerate().skip(1) {
+            let (given, lines) = forked_tests(&format!("marked-{}", at + 1), mark, order).unwrap();
+            assert_eq!(untraced(&lines), Vec::<&str>::new(), "{lines:?}");
+            for (test, bytes) in &given {
+                assert_eq!(&first[test], bytes, "{test} in the order {order:?}");
+            }
+        }
+    }
+
+    /// The control: the same runs with the mark taken away (the path asked is beside
+    /// [`crate::sandbox::MARK`], not under it) number the tests' processes in the order they ran, and a test
+    /// run after others is given other bytes than when it ran first.
+    #[test]
+    fn the_oracle_catches_tests_given_the_stream_of_their_order() {
+        if !["/bin/bash", "/usr/bin/bash"].iter().any(|it| Path::new(it).exists()) {
+            eprintln!("skipped: no bash");
+            return;
+        }
+        let beside = "/.blaze-not-a-test/";
+        let order = ["tests::adds", "tests::muls"];
+        let Some((first, _)) = forked_tests("unmarked-1", beside, &order) else { return };
+        let (turned, _) = forked_tests("unmarked-2", beside, &["tests::muls", "tests::adds"]).unwrap();
+        assert_ne!(first["tests::adds"], turned["tests::adds"], "{first:?} {turned:?}");
+    }
+
     /// Whether the launcher's child got randomness, answered or not, before the program it
     /// runs: a `T` line of randomness or the clock before the line of the program's exec.
     /// Each kind of line is kept once, where it was first seen, so one the program's own
@@ -3762,7 +4104,7 @@ head -c 24 /dev/urandom | od -An -tx1
         let given: Vec<(OsString, OsString)> = vec![
             ("A".into(), OsString::from_vec(b"\xff".to_vec())),
             ("LD_PRELOAD".into(), "".into()),
-            ("TMPDIR".into(), "/tmp".into()),
+            ("TMPDIR".into(), "/given".into()),
         ];
         let tmp = ("TMPDIR".to_owned(), "/own".to_owned());
         let env = super::environment(&given, Some(&tmp), Some(lib)).unwrap();
@@ -3804,6 +4146,11 @@ head -c 24 /dev/urandom | od -An -tx1
     /// and what it leaves running is killed as it ends. Skipped where the kernel has no
     /// Landlock, unless `BLAZE_VIEW_TESTS=require`.
     #[test]
+    #[expect(
+        blaze::tmp_path,
+        reason = "the run is given the machine's real /tmp as its TMPDIR to show the confined \
+                  sandbox replaces it with one of its own"
+    )]
     fn a_confined_sandbox_writes_only_where_it_may_and_reaches_nothing() {
         if let Err(why) = super::landlock::abi() {
             let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
@@ -3817,7 +4164,7 @@ head -c 24 /dev/urandom | od -An -tx1
             eprintln!("skipped: no bash on PATH");
             return;
         };
-        let dir = scratch("confined");
+        let (_made, dir) = scratch("confined");
         let (out, outside) = (dir.join("out"), dir.join("outside"));
         std::fs::create_dir_all(&out).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
@@ -3946,7 +4293,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
             eprintln!("skipped: {why}");
             return;
         }
-        let dir = scratch("busy");
+        let (_made, dir) = scratch("busy");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let spec = Spec {
@@ -3994,11 +4341,11 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
         alone::run(&spec, Some(&program))
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-view-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A test's directory, removed when the guard drops, and its path.
+    fn scratch(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+        let made = blaze_core::temp::TempDir::for_test(&format!("blaze-view-{name}-"));
+        let dir = made.path().to_owned();
+        (made, dir)
     }
 
     const FAIL: &str = "fail() { echo \"$*\" >&2; exit 1; }\n";
@@ -4022,7 +4369,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
             eprintln!("skipped: no bash on PATH");
             return;
         };
-        let dir = scratch("readable-file");
+        let (_made, dir) = scratch("readable-file");
         let (given, beside, out) = (dir.join("given"), dir.join("beside"), dir.join("out"));
         std::fs::write(&given, "given alone\n").unwrap();
         std::fs::write(&beside, "not given\n").unwrap();
@@ -4099,7 +4446,7 @@ echo hi > "$OUT/written" || fail "it could not write $OUT"
     #[test]
     fn an_entry_is_a_directory_a_file_or_a_socket_to_read_and_nothing_else() {
         use super::{Given, Passed};
-        let dir = scratch("entry-kinds");
+        let (_made, dir) = scratch("entry-kinds");
         let (file, linked, pipe, socket) =
             (dir.join("file"), dir.join("linked"), dir.join("pipe"), dir.join("socket"));
         std::fs::write(&file, "").unwrap();
@@ -4134,7 +4481,7 @@ echo hi > "$OUT/written" || fail "it could not write $OUT"
     #[test]
     fn each_entry_is_written_or_read_only_as_given_wherever_it_is() {
         let Some(bash) = namespaced_bash() else { return };
-        let dir = scratch("nested-entries");
+        let (_made, dir) = scratch("nested-entries");
         let at = |it: &str| dir.join(it);
         for it in ["w/ro", "r/out", "out"] {
             std::fs::create_dir_all(at(it)).unwrap();
@@ -4211,7 +4558,7 @@ true
             eprintln!("skipped: {why}");
             return;
         }
-        let dir = scratch("confined-entries");
+        let (_made, dir) = scratch("confined-entries");
         let at = |it: &str| dir.join(it);
         std::fs::create_dir_all(at("out")).unwrap();
         std::fs::write(at("written"), "before\n").unwrap();
@@ -4380,9 +4727,14 @@ if connect other; then fail "a socket not given was reached"; fi"#,
     }
 
     #[test]
+    #[expect(
+        blaze::tmp_path,
+        reason = "a view's root is put together on the machine's /tmp, and the record must name \
+                  nothing under it: the real directory is what the test checks against"
+    )]
     fn a_view_shows_its_binds_and_nothing_of_the_machine() {
         let Some((bash, closure)) = store_bash() else { return };
-        let dir = scratch("binds");
+        let (_made, dir) = scratch("binds");
         let (out, src) = (dir.join("out"), dir.join("src"));
         for it in [&out, &src.join("gen"), &dir.join("gen")] {
             std::fs::create_dir_all(it).unwrap();
@@ -4478,7 +4830,7 @@ echo hi > /out/written
     #[test]
     fn a_view_binds_a_store_path_from_anywhere() {
         let Some((bash, closure)) = store_bash() else { return };
-        let dir = scratch("relocated");
+        let (_made, dir) = scratch("relocated");
         let (out, copy) = (dir.join("out"), dir.join("copy"));
         std::fs::create_dir_all(&out).unwrap();
         std::fs::create_dir_all(&copy).unwrap();
@@ -4509,7 +4861,7 @@ echo hi > /out/written
 
     #[test]
     fn a_view_that_cannot_be_made_says_why_before_anything_runs() {
-        let dir = scratch("refused");
+        let (_made, dir) = scratch("refused");
         let missing = dir.join("missing");
         let made = |binds: Vec<Bind>, overlays: Vec<PathBuf>| {
             let spec =

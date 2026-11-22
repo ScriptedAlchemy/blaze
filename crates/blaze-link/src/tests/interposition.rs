@@ -90,10 +90,28 @@ fn elf_executable_interposes_shared_definitions() {
 fn elf_loader_resolves_the_executables_allocator() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let mut native_output =
-        crate::target::output("x86_64-unknown-linux-gnu", None, Debug::None, false).unwrap();
-    let located =
-        crate::target::locate(&mut native_output, &[], &[], std::path::Path::new("/")).unwrap();
+    let mut native_output = crate::target::output(
+        "x86_64-unknown-linux-gnu",
+        None,
+        Debug::None,
+        false,
+        crate::target::RunsOn::Here,
+    )
+    .unwrap();
+    // This proof exercises the host loader and libc, so ask for the native soname rather
+    // than the ordinary `c` declaration whose implementation blaze now ships itself.
+    let libs = [blaze_codegen::NativeLib {
+        name: "libc.so.6".into(),
+        kind: blaze_codegen::NativeLibKind::Dylib,
+        verbatim: true,
+    }];
+    let located = crate::target::locate(
+        &mut native_output,
+        &[crate::target::CrateLibs { libs: &libs, search: &[] }],
+        &[],
+        std::path::Path::new("/"),
+    )
+    .unwrap();
     let libc_file = located
         .iter()
         .find(|it| it.path.file_name().is_some_and(|name| name == "libc.so.6"))

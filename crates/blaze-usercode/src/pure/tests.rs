@@ -27,9 +27,9 @@ const TOOLS: &[&str] = &["/toolchain"];
 
 fn roots() -> crate::roots::RootMap {
     crate::roots::RootMap::default()
-        .with(crate::roots::Role::Package, Path::new("/ws/p"))
-        .with(crate::roots::Role::OutDir, Path::new("/ws/p/target/debug/build/p-0123/out"))
-        .with(crate::roots::Role::Target, Path::new("/ws/p/target"))
+        .with(crate::roots::Role::Package, Path::new("/ws/p"), &blaze_vfs::outside::Looks::none())
+        .with(crate::roots::Role::OutDir, Path::new("/ws/p/target/debug/build/p-0123/out"), &blaze_vfs::outside::Looks::none())
+        .with(crate::roots::Role::Target, Path::new("/ws/p/target"), &blaze_vfs::outside::Looks::none())
 }
 
 fn places(toolchain: &[PathBuf]) -> Places<'_> {
@@ -110,6 +110,47 @@ fn an_effect_the_proof_said_absent_is_an_error_naming_the_script() {
     let mut listed = traced(&[]);
     listed.dirs.push(("/ws/p/src".into(), [1; 32]));
     assert!(refused(listed, &proof()).contains("listed /ws/p/src"));
+}
+
+/// A pure script refused for randomness says which process read it, by which system call and
+/// from where: on 2026-11-10 the error said `Random` alone, and the script's processes could
+/// not be traced from outside (its launcher starts them).
+#[test]
+fn an_untraceable_read_names_the_process_that_made_it() {
+    use crate::calls::{self, Call, Made, Module, Phase};
+    let tools: Vec<PathBuf> = TOOLS.iter().map(PathBuf::from).collect();
+    let places = places(&tools);
+    let made = Made {
+        what: "random".to_owned(),
+        pid: 4711,
+        inside_pid: Some(7),
+        program: places.program.display().to_string(),
+        argv0: "build-script-build".to_owned(),
+        syscall: "getrandom".to_owned(),
+        number: 318,
+        phase: Phase::Loading,
+        ip: 0x7f1c_2a0e_4b2d,
+        module: "/usr/lib/libc.so.6".to_owned(),
+        kind: Module::Libc,
+    };
+    calls::left(places.program, vec![Call::Made(made)]);
+    let mut random = traced(&[]);
+    random.untraceable.push(Untraceable::Random);
+    let error = check("p v0.1.0", &proof(), &places, &random).unwrap_err().0;
+    calls::left(places.program, Vec::new());
+    assert!(error.starts_with("the build script of `p v0.1.0` was proved pure"), "{error}");
+    for part in [
+        "(Random)",
+        "by process 4711 (7 in the sandbox)",
+        "(argv[0] `build-script-build`), made `getrandom` (system call 318)",
+        "from libc (`/usr/lib/libc.so.6`, at 0x7f1c2a0e4b2d)",
+        "before the program's `main` (a heuristic",
+    ] {
+        assert!(error.contains(part), "{part}: {error}");
+    }
+    // With no caller described, the error says so: never a caller of another kind or run.
+    let error = check("p v0.1.0", &proof(), &places, &random).unwrap_err().0;
+    assert!(error.contains("which process read it is not known"), "{error}");
 }
 
 /// A trace of `(path, hash)` files, as a run's sandbox assembles it.
@@ -319,6 +360,18 @@ fn the_loaders_reads_before_main_are_passed_whole() {
     refused(&t("debug/build"), dir, "in the target directory");
     // A file under another package.
     refused("/root/m1/registry/q-0.2.0/Cargo.toml", found, "outside its package and OUT_DIR");
+    // What refuses says what it saw (2026-11-12: a sandbox library whose RUNPATH named one
+    // machine's build directory made every run's loader look there, and the refusal blamed
+    // the purity proof): a directory only looked at, or a name with nothing there, is a
+    // loader's search and is said so, the proof not blamed; a file read is the proof's to
+    // answer for. The control is that second half: the blame is still there for a real read.
+    let stray = "/root/trees/other/target/release/build/blaze-cargo/0123456789abcdef/out";
+    let looked = with(&[(stray, dir)]).unwrap_err();
+    assert!(looked.contains(stray) && looked.contains("looked at"), "{looked}");
+    assert!(looked.contains("RUNPATH") && !looked.contains("purity proof"), "{looked}");
+    assert!(!with(&[("/opt/lib/libc.so.6", missed)]).unwrap_err().contains("purity proof"));
+    let read = with(&[("/root/m1/registry/q-0.2.0/Cargo.toml", found)]).unwrap_err();
+    assert!(read.contains("read the file") && read.contains("purity proof"), "{read}");
     // A library found on the search path was loaded: an input no pure key covers.
     refused(&t("debug/deps/libgcc_s.so.1"), found, "its pure key does not cover");
     refused(&t("debug/libplugin.so"), found, "its pure key does not cover");
@@ -363,7 +416,12 @@ fn what_a_run_printed_and_wrote_is_checked_against_the_proof() {
         files,
     };
     let file =
-        || OutFile { path: "x.rs".into(), executable: false, bytes: Some(b"fn x() {}".to_vec()) };
+        || OutFile {
+            path: "x.rs".into(),
+            executable: false,
+            bytes: Some(b"fn x() {}".to_vec().into()),
+            link: None,
+        };
     checked_value("p", &proof(), &value(b"cargo:rustc-cfg=x\n", vec![file()])).unwrap();
     let mut silent = proof();
     silent.prints = false;
@@ -440,7 +498,8 @@ fn a_kept_pure_result_is_found_until_a_variable_or_file_it_read_changes() {
         files: vec![OutFile {
             path: "x.rs".into(),
             executable: false,
-            bytes: Some(b"fn x() {}".to_vec()),
+            bytes: Some(b"fn x() {}".to_vec().into()),
+            link: None,
         }],
     };
     let read = vec![(PathBuf::from("/ws/p/data.txt"), Some([3; 32]))];
@@ -510,12 +569,13 @@ fn a_pure_result_kept_in_one_checkout_is_found_in_another() {
     let mut store = opened(&mut sim);
     let at = |home: &str| {
         let roots = crate::roots::RootMap::default()
-            .with(crate::roots::Role::Package, Path::new(&format!("{home}/p")))
+            .with(crate::roots::Role::Package, Path::new(&format!("{home}/p")), &blaze_vfs::outside::Looks::none())
             .with(
                 crate::roots::Role::OutDir,
                 Path::new(&format!("{home}/p/target/debug/build/p-0123/out")),
+                &blaze_vfs::outside::Looks::none(),
             )
-            .with(crate::roots::Role::Target, Path::new(&format!("{home}/p/target")));
+            .with(crate::roots::Role::Target, Path::new(&format!("{home}/p/target")), &blaze_vfs::outside::Looks::none());
         let inputs = Fixed {
             files: [(PathBuf::from(format!("{home}/p/data.txt")), [3; 32])].into(),
             env: vec![

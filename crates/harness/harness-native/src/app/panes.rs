@@ -19,7 +19,7 @@ fn pane_prefab(kind: Option<PaneKind>) -> &'static str {
         Some(PaneKind::Archive) => "hn.ArchivePane",
         Some(PaneKind::Chat) => "hn.ChatPane",
         Some(_) => "hn.TermPane",
-        None => "hn.EmptyPane",
+        None => "hn.LearnPane",
     }
 }
 
@@ -183,7 +183,7 @@ impl App {
                 Some((e, PaneKind::Run)) => self.fill_run_pane(pane, e),
                 Some((_, PaneKind::Archive)) => self.fill_archive_pane(pane),
                 Some((e, PaneKind::Chat)) => self.fill_chat_pane(pane, e),
-                None => self.fill_empty_pane(pane),
+                None => self.fill_learn_pane(pane),
                 _ => {}
             }
         }
@@ -695,6 +695,9 @@ impl App {
 
     /// The pointer moved to `(x, y)` (window points).
     pub fn pointer_move(&mut self, x: f32, y: f32, m: KeyMods) {
+        if [self.pointer.x, self.pointer.y] != [x / self.zoom(), y / self.zoom()] {
+            self.tooltip_moved();
+        }
         self.set_pointer(x, y);
         self.mods = m;
         if self.drag.active() {
@@ -705,6 +708,7 @@ impl App {
             self.web_drag_move();
             return;
         }
+        if self.palette.is_some() { self.palette_pointer_drag(); self.poke(); return; }
         // Over a live browser page, or holding a press on one: the page's (app/browser.rs).
         if self.browser_pointer_move(m) {
             self.poke();
@@ -744,6 +748,7 @@ impl App {
 
     /// A button went down at `(x, y)`: the `clicks`th in a row.
     pub fn pointer_down(&mut self, x: f32, y: f32, b: Button, clicks: isize, m: KeyMods) {
+        self.dismiss_tooltip();
         self.set_pointer(x, y);
         self.mods = m;
         self.poke();
@@ -774,6 +779,7 @@ impl App {
         // A press off the row whose name is being renamed saves the rename (chat/rename.rs), and does what it does.
         self.rename_press();
         if self.palette.is_some() {
+            if b == Button::Left { self.palette_pointer_down(clicks); }
             return;
         }
         // A press on a live browser page focuses it and goes there; one elsewhere takes the keyboard from it.
@@ -832,6 +838,10 @@ impl App {
         if b == Button::Left {
             self.pointer.down = false;
             self.pointer.went_up = true;
+        }
+        if self.palette.is_some() {
+            if let Some(p) = self.palette.as_mut() { p.query_drag = None; }
+            return;
         }
         if self.browser_pointer_up(b, m) {
             self.poke();
@@ -952,6 +962,7 @@ impl App {
     /// add up in `frac` until they make a row); a program with a mouse mode
     /// gets wheel reports, a full-screen one arrows.
     pub fn wheel(&mut self, dy: f32, precise: bool, m: KeyMods) {
+        self.dismiss_tooltip();
         let Some(t) = self.term_at().or_else(|| self.focused_term()) else { return };
         let lines = if precise { dy / self.grid.ch } else { dy };
         let input = self.input_of(t);
@@ -1024,6 +1035,7 @@ impl App {
     /// A key from the window's keyDown: its binding's action when one takes it (a selector, `copy:`, is the window's to
     /// send up the responder chain), else typing for whatever has the keyboard.
     pub fn key(&mut self, k: &term::KeyIn<'_>) -> super::Outcome {
+        self.dismiss_tooltip();
         self.poke_why("key");
         // An open row menu has the keys while it is open, as NSMenu has (row_menu.rs).
         if self.row_menu_key(k) {
@@ -1059,6 +1071,12 @@ impl App {
             if self.archive_focused() {
                 if !k.mods.cmd && !k.mods.ctrl {
                     self.archive_search(super::archive::SearchEdit::Type(k.text));
+                }
+                return;
+            }
+            if self.learn_focused() {
+                if !k.mods.cmd && !k.mods.ctrl {
+                    self.learn_text(k.text);
                 }
                 return;
             }
@@ -1106,14 +1124,11 @@ impl App {
             return;
         }
         self.set_marked(None);
-        if let Some(p) = self.palette.as_mut() {
-            if p.mode == super::Mode::Commands {
-                p.query.push_str(text);
-                p.at = 0;
-            }
+        if self.palette.is_some() {
+            self.palette_type(text);
             return;
         }
-        if self.archive_text(text) || self.chat_type(text) {
+        if self.archive_text(text) || self.learn_text(text) || self.chat_type(text) {
             return;
         }
         self.typed();
@@ -1251,13 +1266,10 @@ impl App {
             return;
         }
         if self.palette.is_some() {
-            if let Some(p) = self.palette.as_mut().filter(|p| p.mode == super::Mode::Commands) {
-                p.query.push_str(text.lines().next().unwrap_or(""));
-            }
-            self.poke();
+            self.palette_type(&text.replace(['\n', '\r', '\t'], " "));
             return;
         }
-        if self.archive_text(text) || self.chat_type(text) {
+        if self.archive_text(text) || self.learn_text(text) || self.chat_type(text) {
             return;
         }
         let Some(t) = self.focused_term() else { return };

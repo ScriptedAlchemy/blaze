@@ -1,23 +1,23 @@
 //! The plane as core-plane wrote it, before its state moved to columns: nodes and tasks as
 //! structs of `Vec`s, ready sets as `BTreeSet`s. Kept unchanged but for its imports and visibility, as the
 //! model [`crate::plane::Plane`] is compared with step by step (`plane_tests`), and for the one
-//! [`Event::Nodes`] a batch of columns is said in, and for the idle class: idle requests,
-//! [`PlaneInput::Promote`], [`PlaneOutput::Yield`] and [`PlaneInput::Yielded`], the bounded
-//! reclamation lane and parked continuations. The model keeps its own slot generations and
-//! ledger bounds; it shares neither admission predicates nor token checks with the columns.
+//! [`Event::Nodes`] a batch of columns is said in, for the idle class: idle requests,
+//! [`PlaneInput::Promote`], [`PlaneOutput::Yield`] and [`PlaneInput::Yielded`]. Admission is
+//! by threads alone, as the plane's. Written plainly, one ordered set of ready nodes per
+//! request and pool, where the plane keeps a heap.
 
 #![forbid(unsafe_code)]
 
 use std::{cmp::Reverse, collections::BTreeSet};
 
-use blaze_hash::{HashMap, HashSet};
-use blaze_protocol::events::{Event, Level, NodeKind, NodeState, Record};
+use blaze_hash::HashMap;
+use blaze_protocol::events::{Event, Level, NodeState, Record};
 use std::alloc::Global;
 
 use crate::{
     machine::{Error, NodeId, Outcome, Pool, Spec},
     plane::{
-        Counts, Key, Memo, NoMemo, Parked, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
+        Counts, Key, Memo, NoMemo, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
     },
 };
 
@@ -52,24 +52,18 @@ struct Node {
     group: Option<u32>,
     /// It failed open ([`Outcome::FailedOpen`]): under keep-going what waits for it runs.
     open: bool,
-    reclaim: bool,
-    parked: Option<u64>,
 }
 
 struct Task {
-    generation: u32,
     key: Option<Key>,
     pool: Pool,
-    memory: u64,
     /// The node whose id the task runs as, and whose request it counts against: the member
     /// that started it, once it runs.
     runner: usize,
-    /// Every node that settles when it does. While it is not running, each is ready in its own
-    /// request.
+    /// Every node that settles when it does. While it is not running, each is ready in its
+    /// own request.
     members: Vec<usize>,
     running: bool,
-    /// How many times a task with memory started while it did not fit.
-    passed: u32,
     /// Running, and asked to give way.
     yielding: bool,
 }
@@ -113,27 +107,16 @@ pub(crate) struct Plane<M = NoMemo> {
     /// Keys of tasks not yet settled.
     flight: HashMap<Key, usize, Global>, // alloc: a test's model
     running: [usize; 2],
-    granted: u64,
-    reclaim: Option<usize>,
-    held: u64,
-    /// The pressure cap on the budget ([`PlaneInput::Cap`]).
-    cap: Option<u64>,
-    allowance: u64,
-    room: u64,
-    allowed: bool,
     /// The virtual time of each pool: that of the request not idle that started a task last.
     vclock: [u128; 2],
     /// The same, of the idle requests.
     idle_vclock: [u128; 2],
     /// The running tasks an idle request started, in the order they started.
     idle_running: Vec<usize>,
-    /// The running tasks asked to give way, of each pool, and the memory they were granted.
+    /// The running tasks asked to give way, of each pool.
     yielding: [usize; 2],
-    yielding_memory: u64,
-    /// The task passed over for memory long enough that it holds back the others.
-    hold: Option<usize>,
-    /// Nodes to settle once the move under way is done, as the memo or the budget says, in
-    /// order: settling them where they are found would nest without bound.
+    /// Nodes to settle once the move under way is done, as the memo says, in order: settling
+    /// them where they are found would nest without bound.
     deferred: Vec<(usize, NodeState)>,
     last_ns: u64,
     counts: Counts,
@@ -144,10 +127,6 @@ fn pool_at(pool: Pool) -> usize {
         Pool::Io => 0,
         Pool::Work => 1,
     }
-}
-
-fn gb(bytes: u64) -> String {
-    format!("{:.2} GB", bytes as f64 / f64::from(1 << 30))
 }
 
 impl Plane {
@@ -180,19 +159,10 @@ impl<M: Memo> Plane<M> {
             memo,
             flight: HashMap::new_in(Global), // alloc: a test's model
             running: [0; 2],
-            granted: 0,
-            reclaim: None,
-            held: 0,
-            cap: None,
-            allowance: u64::MAX,
-            room: u64::MAX,
-            allowed: false,
             vclock: [0; 2],
             idle_vclock: [0; 2],
             idle_running: Vec::new(),
             yielding: [0; 2],
-            yielding_memory: 0,
-            hold: None,
             deferred: Vec::new(),
             last_ns: 0,
             counts: Counts::default(),
@@ -207,22 +177,6 @@ impl<M: Memo> Plane<M> {
         self.counts
     }
 
-    /// The memory granted to the tasks running now.
-    pub(crate) fn granted(&self) -> u64 {
-        self.granted
-    }
-
-    pub(crate) fn parked(&self, id: NodeId) -> Option<Parked> {
-        let &me = self.index.get(&id)?;
-        let node = &self.nodes[me];
-        let epoch = node.parked?;
-        let task = node.task?;
-        let it = &self.tasks[task];
-        (node.state == NodeState::Waiting && !it.running && it.runner == me).then_some(Parked {
-            id, task: (u64::from(it.generation) << 32) | task as u64, epoch,
-        })
-    }
-
     /// The state of `id`, if it was added.
     pub(crate) fn state(&self, id: NodeId) -> Option<&NodeState> {
         Some(&self.nodes[*self.index.get(&id)?].state)
@@ -231,17 +185,6 @@ impl<M: Memo> Plane<M> {
     /// What `request` did so far, if it is known: open, or finished and not released.
     pub(crate) fn stats(&self, request: RequestId) -> Option<RequestStats> {
         Some(self.requests[*self.request_index.get(&request)?].stats)
-    }
-
-    /// A node of the task that holds back every other task with memory until it fits, if one
-    /// does.
-    pub(crate) fn holding(&self) -> Option<NodeId> {
-        let hold = self.hold?;
-        let task = &self.tasks[hold];
-        if task.running || !self.wanted(hold) {
-            return None;
-        }
-        Some(self.nodes[*task.members.first()?].spec.id)
     }
 
     /// Whether a node of `task` is of a request not idle.
@@ -281,11 +224,19 @@ impl<M: Memo> Plane<M> {
     }
 
     fn free_task(&mut self, task: usize) {
-        if self.hold == Some(task) {
-            self.hold = None;
-        }
-        self.tasks[task].generation += 1;
         self.free_tasks.push(task);
+    }
+
+    /// Drops `task`, not running, once no node is left of it.
+    fn drop_if_empty(&mut self, task: usize) {
+        let t = &self.tasks[task];
+        if !t.members.is_empty() {
+            return;
+        }
+        if let Some(key) = t.key {
+            self.flight.remove(&key);
+        }
+        self.free_task(task);
     }
 
     fn seq(&mut self) -> u64 {
@@ -358,34 +309,6 @@ impl<M: Memo> Plane<M> {
                 self.add(at, r, nodes, false, &mut out);
                 touched.push(r);
             }
-            PlaneInput::Reclaim { request, nodes, .. } => {
-                let given: Vec<Spec> = (0..nodes.len()).map(|at| nodes.spec(at)).collect();
-                let why = match given.as_slice() {
-                    [node] if node.kind != NodeKind::Store || node.pool != Pool::Work => {
-                        Some("the node must be Store work")
-                    }
-                    [node] if node.key.is_some() || !node.deps.is_empty() => {
-                        Some("the node must be unkeyed and dependency-free")
-                    }
-                    [node] if node.memory == 0 => Some("the memory prediction must be positive"),
-                    [_] => None,
-                    _ => Some("exactly one node is required"),
-                };
-                if let Some(why) = why {
-                    return Err(Error::InvalidReclaim { request: request.0, first: nodes.first(), why });
-                }
-                let r = self.open_request(request)?;
-                if self.requests[r].closed {
-                    return Err(Error::Closed);
-                }
-                let first = nodes.first();
-                let record = nodes_record(first, &given);
-                let given = self.check(r, given)?;
-                out.push(said(request, at, record));
-                self.add(at, r, given, false, &mut out);
-                self.nodes[self.index[&first]].reclaim = true;
-                touched.push(r);
-            }
             PlaneInput::Close { request, .. } => {
                 let r = self.open_request(request)?;
                 if self.requests[r].closed {
@@ -413,19 +336,6 @@ impl<M: Memo> Plane<M> {
                 self.add(at, r, added, true, &mut out);
                 touched.push(r);
             }
-            PlaneInput::Held { bytes, .. } => self.held = bytes,
-            PlaneInput::Allowance { bytes, .. } => {
-                self.allowance = bytes;
-                self.room = u64::MAX;
-                self.allowed = true;
-            }
-            PlaneInput::Cap { bytes, .. } => self.cap = bytes,
-            // Admission by footprint is not modelled: the differential tests give no footprint
-            // and no realized bytes, and a plane never given one charges `max(granted, held)`
-            // as this model does. `crate::footprint`'s DST proves it.
-            PlaneInput::Footprint { .. } | PlaneInput::Realized { .. } => {
-                unreachable!("the differential tests give no footprint")
-            }
             PlaneInput::Promote { request, .. } => {
                 if let Some(&r) = self.request_index.get(&request)
                     && self.requests[r].idle
@@ -439,43 +349,10 @@ impl<M: Memo> Plane<M> {
             }
             PlaneInput::Yielded { id, .. } => {
                 let task = self.running_task(id)?;
-                self.yielded(at, task, false, &mut out, &mut touched);
-            }
-            PlaneInput::Park { id, .. } => {
-                let task = self.running_task(id)?;
-                let t = &self.tasks[task];
-                if t.key.is_some() || t.pool != Pool::Work || t.members.as_slice() != [t.runner] {
-                    return Err(Error::NotParkable(id));
-                }
-                self.yielded(at, task, true, &mut out, &mut touched);
-            }
-            PlaneInput::Resume { parked, .. } => {
-                let task = self.parked_task(parked)?;
-                let me = self.tasks[task].runner;
-                self.nodes[me].parked = None;
-                self.make_ready(me, pool_at(self.tasks[task].pool));
-                self.moved(at, me, NodeState::Ready, &mut out);
-                touched.push(self.nodes[me].request);
-            }
-            PlaneInput::RefuseParked { parked, why, .. } => {
-                let task = self.parked_task(parked)?;
-                let me = self.tasks[task].runner;
-                self.nodes[me].task = None;
-                self.nodes[me].parked = None;
-                self.tasks[task].members.clear();
-                self.free_task(task);
-                self.settle(at, me, NodeState::Failed { why }, &mut out);
-                touched.push(self.nodes[me].request);
+                self.yielded(at, task, &mut out, &mut touched);
             }
         }
         self.after(at, out, touched)
-    }
-
-    fn parked_task(&self, parked: Parked) -> Result<usize, Error> {
-        if self.parked(parked.id) != Some(parked) {
-            return Err(Error::NotParked(parked.id));
-        }
-        Ok(self.nodes[self.index[&parked.id]].task.expect("a parked task"))
     }
 
     /// The task the plane asked to run as `id`, running.
@@ -493,29 +370,23 @@ impl<M: Memo> Plane<M> {
         }
     }
 
-    /// Running `task` gave way: its thread and memory free, no start of its runner's request,
-    /// and each of its nodes ready again in its own request, or skipped as a node added to
-    /// that request now would be.
+    /// Running `task` gave way: its thread free, no start of its runner's request, and each of
+    /// its nodes ready again in its own request, or skipped as a node added to that request
+    /// now would be.
     fn yielded(
         &mut self,
         at: u64,
         task: usize,
-        park: bool,
         out: &mut Vec<PlaneOutput>,
         touched: &mut Vec<usize>,
     ) {
         let t = &mut self.tasks[task];
-        let (p, memory, yielding, runner) = (pool_at(t.pool), t.memory, t.yielding, t.runner);
+        let (p, yielding, runner) = (pool_at(t.pool), t.yielding, t.runner);
         t.running = false;
         t.yielding = false;
         self.running[p] -= 1;
-        self.granted -= memory;
-        if self.reclaim == Some(task) {
-            self.reclaim = None;
-        }
         if yielding {
             self.yielding[p] -= 1;
-            self.yielding_memory -= memory;
         }
         self.idle_running.retain(|&it| it != task);
         self.requests[self.nodes[runner].request].stats.ran -= 1;
@@ -537,22 +408,12 @@ impl<M: Memo> Plane<M> {
                     self.moved(at, member, NodeState::Skipped { because }, out);
                 }
                 None => {
-                    if park {
-                        self.nodes[member].parked = Some(self.seq());
-                        self.moved(at, member, NodeState::Waiting, out);
-                    } else {
-                        self.make_ready(member, p);
-                        self.moved(at, member, NodeState::Ready, out);
-                    }
+                    self.make_ready(member, p);
+                    self.moved(at, member, NodeState::Ready, out);
                 }
             }
         }
-        if self.tasks[task].members.is_empty() {
-            if let Some(key) = self.tasks[task].key {
-                self.flight.remove(&key);
-            }
-            self.free_task(task);
-        }
+        self.drop_if_empty(task);
     }
 
     /// Cancels `request`: each of its nodes not started is skipped, because of the request's
@@ -611,9 +472,6 @@ impl<M: Memo> Plane<M> {
         self.settle_deferred(at, &mut out, &mut touched);
         self.last_ns = at;
         self.dispatch(at, &mut out);
-        if std::mem::take(&mut self.allowed) {
-            self.room = self.allowance.min(self.granted.max(self.held));
-        }
         touched.sort_unstable_by_key(|&r| self.requests[r].seq);
         touched.dedup();
         for r in touched {
@@ -769,8 +627,6 @@ impl<M: Memo> Plane<M> {
                 task: None,
                 group: None,
                 open: false,
-                reclaim: false,
-                parked: None,
             };
             if me == self.nodes.len() {
                 self.nodes.push(node);
@@ -893,34 +749,10 @@ impl<M: Memo> Plane<M> {
             }
         }
         let spec = &self.nodes[me].spec;
-        if let Some(budget) = &self.config.budget
-            && spec.memory > budget.bytes
-        {
-            let why = format!(
-                "{} needs {} of memory as predicted, more than blaze may use here: {} ({}); {}",
-                spec.name,
-                gb(spec.memory),
-                gb(budget.bytes),
-                budget.from,
-                budget.advice(spec.memory)
-            );
-            self.deferred.push((me, NodeState::Failed { why }));
-            return;
-        }
-        let mut made = Task {
-            generation: 1,
-            key,
-            pool: spec.pool,
-            memory: spec.memory,
-            runner: me,
-            members: vec![me],
-            running: false,
-            passed: 0,
-            yielding: false,
-        };
+        let made =
+            Task { key, pool: spec.pool, runner: me, members: vec![me], running: false, yielding: false };
         let task = match self.free_tasks.pop() {
             Some(task) => {
-                made.generation = self.tasks[task].generation + 1;
                 self.tasks[task] = made;
                 task
             }
@@ -1009,16 +841,10 @@ impl<M: Memo> Plane<M> {
         if t.running {
             return;
         }
-        self.nodes[me].parked = None;
         let (p, r) = (pool_at(t.pool), self.nodes[me].request);
         let entry = self.entry(me);
         self.requests[r].ready[p].remove(&entry);
-        if self.tasks[task].members.is_empty() {
-            if let Some(key) = self.tasks[task].key {
-                self.flight.remove(&key);
-            }
-            self.free_task(task);
-        }
+        self.drop_if_empty(task);
     }
 
     fn finish_task(
@@ -1032,17 +858,12 @@ impl<M: Memo> Plane<M> {
     ) {
         let t = &mut self.tasks[task];
         t.running = false;
-        let (pool, memory, key, yielding) = (pool_at(t.pool), t.memory, t.key, t.yielding);
+        let (pool, key, yielding) = (pool_at(t.pool), t.key, t.yielding);
         t.yielding = false;
         let members = std::mem::take(&mut t.members);
         self.running[pool] -= 1;
-        self.granted -= memory;
-        if self.reclaim == Some(task) {
-            self.reclaim = None;
-        }
         if yielding {
             self.yielding[pool] -= 1;
-            self.yielding_memory -= memory;
         }
         self.idle_running.retain(|&it| it != task);
         if let Some(key) = key {
@@ -1065,63 +886,27 @@ impl<M: Memo> Plane<M> {
         }
     }
 
-    /// All ordinary bounds, including what the machine reserved at its last locked turn.
-    fn budget_now(&self) -> Option<u64> {
-        let budget = self.config.budget.as_ref()?.bytes;
-        Some(self.cap.map_or(budget, |cap| budget.min(cap)).min(self.allowance).min(self.room))
-    }
-
-    fn reclaim_budget(&self) -> u64 {
-        [self.config.budget.as_ref().map_or(u64::MAX, |it| it.bytes), self.allowance, self.room]
-            .into_iter().min().expect("three bounds")
-    }
-
-    fn memory_free(&self) -> Option<u64> {
-        Some(self.budget_now()?.saturating_sub(self.granted.max(self.held)))
-    }
-
-    /// The task that holds back the others, while it is still to start and wanted by a
-    /// request not idle.
-    fn hold(&mut self) -> Option<usize> {
-        if let Some(task) = self.hold
-            && (self.tasks[task].running
-                || self.tasks[task].members.is_empty()
-                || !self.wanted(task))
-        {
-            self.hold = None;
-        }
-        self.hold
-    }
-
     fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>) {
         for pool in [Pool::Io, Pool::Work] {
             let (p, limit) = (pool_at(pool), self.threads(pool));
-            'next: while self.running[p] < limit {
-                let mut order: Vec<usize> = (0..self.requests.len())
-                    .filter(|&r| !self.requests[r].ready[p].is_empty())
-                    .collect();
-                order.sort_by_key(|&r| self.turn(r, p));
-                let mut passed = Vec::new();
-                for r in order {
-                    match self.pick(r, p, &mut passed) {
-                        Pick::Start(_) if self.requests[r].idle && self.yield_for(p, out) => {
-                            break 'next;
-                        }
-                        Pick::Start(me) => {
-                            let task = self.nodes[me].task.expect("a ready node's task");
-                            if self.tasks[task].memory > 0 {
-                                self.pass(&passed);
-                            }
-                            self.start(at, me, out);
-                            continue 'next;
-                        }
-                        Pick::None => {}
-                    }
+            while self.running[p] < limit {
+                let Some(me) = self.next(p) else { break };
+                if self.requests[self.nodes[me].request].idle && self.yield_for(p, out) {
+                    break;
                 }
-                break;
+                self.start(at, me, out);
             }
             self.yield_for(p, out);
         }
+    }
+
+    /// The ready node that starts next in pool `p`: the first of the request whose turn it is.
+    fn next(&self, p: usize) -> Option<usize> {
+        let r = (0..self.requests.len())
+            .filter(|&r| !self.requests[r].ready[p].is_empty())
+            .min_by_key(|&r| self.turn(r, p))?;
+        let &(_, _, me) = self.requests[r].ready[p].first()?;
+        Some(me)
     }
 
     /// The order requests take turns in pool `p`: those not idle first, then by virtual
@@ -1131,96 +916,33 @@ impl<M: Memo> Plane<M> {
         (request.idle, request.vtime[p], Reverse(request.weight), request.seq)
     }
 
-    /// Asks running idle tasks to give way, the newest first, when the task of a request not
-    /// idle that would start next in `p` waits only for their threads or the memory granted
-    /// them, as few as that takes, and none if what gives way already is enough or all of
-    /// them would not be: whether such a task waits for them.
+    /// Asks a running idle task to give way, the newest, when a task of a request not idle is
+    /// ready in `p` and waits for nothing but a thread an idle task holds; none if what gives
+    /// way already is enough: whether such a task waits, so no idle task starts in `p` now.
     fn yield_for(&mut self, p: usize, out: &mut Vec<PlaneOutput>) -> bool {
-        if self.idle_running.is_empty() {
+        if self.idle_running.is_empty() || !self.waiting(p) {
             return false;
         }
-        let Some(wants) = self.waiting(p) else { return false };
         let pool = if p == 0 { Pool::Io } else { Pool::Work };
-        let mut thread = self.running[p] - self.yielding[p] >= self.threads(pool);
-        let mut memory = 0;
-        if let Some(budget) = self.budget_now() {
-            let needs = self.tasks[wants].memory;
-            if needs > budget.saturating_sub(self.held) {
-                return false;
-            }
-            memory = (self.granted - self.yielding_memory).saturating_sub(budget - needs);
-        }
-        if !thread && memory == 0 {
+        if self.running[p] - self.yielding[p] < self.threads(pool) {
             return true;
         }
-        let mut yields = Vec::new();
-        for &task in self.idle_running.iter().rev() {
-            if !thread && memory == 0 {
-                break;
-            }
+        let found = self.idle_running.iter().rev().copied().find(|&task| {
             let t = &self.tasks[task];
-            if t.yielding || self.wanted(task) {
-                continue;
-            }
-            let frees_thread = thread && pool_at(t.pool) == p;
-            let frees_memory = memory > 0 && t.memory > 0;
-            if frees_thread || frees_memory {
-                yields.push(task);
-                thread &= !frees_thread;
-                memory = memory.saturating_sub(t.memory);
-            }
-        }
-        let enough = !thread && memory == 0;
-        if enough {
-            for task in yields {
-                let t = &mut self.tasks[task];
-                t.yielding = true;
-                self.yielding[pool_at(t.pool)] += 1;
-                self.yielding_memory += t.memory;
-                out.push(PlaneOutput::Yield { id: self.nodes[t.runner].spec.id });
-            }
-        }
-        enough
+            !t.yielding && pool_at(t.pool) == p && !self.wanted(task)
+        });
+        let Some(task) = found else { return false };
+        let t = &mut self.tasks[task];
+        t.yielding = true;
+        self.yielding[p] += 1;
+        out.push(PlaneOutput::Yield { id: self.nodes[t.runner].spec.id });
+        true
     }
 
-    /// The task of a request not idle that starts next in `p` once it can: the held task, if
-    /// of `p`; else the first ready node of the request not idle whose turn it is, unless the
-    /// held task holds it back.
-    fn waiting(&mut self, p: usize) -> Option<usize> {
-        let hold = self.hold();
-        if let Some(held) = hold
-            && pool_at(self.tasks[held].pool) == p
-        {
-            return Some(held);
-        }
-        let r = (0..self.requests.len())
-            .filter(|&r| !self.requests[r].ready[p].is_empty() && !self.requests[r].idle)
-            .min_by_key(|&r| self.turn(r, p))?;
-        let &(_, _, me) = self.requests[r].ready[p].first()?;
-        let task = self.nodes[me].task.expect("a ready node's task");
-        match hold {
-            Some(held) if held != task && self.tasks[task].memory > 0 => None,
-            _ => Some(task),
-        }
-    }
-
-    /// Each of the tasks `passed` over was so once more; the first of them to have been so
-    /// [`PlaneConfig::starve_after`] times holds back the rest, if none does.
-    fn pass(&mut self, passed: &[usize]) {
-        if passed.is_empty() {
-            return;
-        }
-        let mut seen = HashSet::new_in(Global); // alloc: a test's model
-        for &task in passed {
-            if !seen.insert(task) {
-                continue;
-            }
-            let t = &mut self.tasks[task];
-            t.passed = t.passed.saturating_add(1);
-            if t.passed >= self.config.starve_after && self.hold().is_none() {
-                self.hold = Some(task);
-            }
-        }
+    /// Whether a task of a request not idle is ready in `p`.
+    fn waiting(&self, p: usize) -> bool {
+        (0..self.requests.len())
+            .any(|r| !self.requests[r].ready[p].is_empty() && !self.requests[r].idle)
     }
 
     fn threads(&self, pool: Pool) -> usize {
@@ -1230,64 +952,8 @@ impl<M: Memo> Plane<M> {
         }
     }
 
-    /// The node of request `r` whose task starts next on pool `p`, as memory allows; the tasks
-    /// of it that did not fit, before that one, are added to `passed`.
-    fn pick(&mut self, r: usize, p: usize, passed: &mut Vec<usize>) -> Pick {
-        let free = self.memory_free().unwrap_or(u64::MAX);
-        // A task that fits the budget starts once nothing granted memory runs, whatever the
-        // process holds besides: waiting could never make room for it. Under pressure it
-        // could, so none does.
-        let whole = self.budget_now().unwrap_or(u64::MAX);
-        let ceiling = self.config.budget.as_ref().map_or(u64::MAX, |it| it.bytes);
-        let reclaim_budget = self.reclaim_budget();
-        let alone = self.granted == 0 && self.cap.is_none();
-        let hold = self.hold();
-        let counts = !self.requests[r].idle;
-        for &(_, _, me) in &self.requests[r].ready[p] {
-            let task = self.nodes[me].task.expect("a ready node's task");
-            let memory = self.tasks[task].memory;
-            if self.nodes[me].reclaim {
-                if self.granted == 0 && self.reclaim.is_none() && memory <= reclaim_budget {
-                    return Pick::Start(me);
-                }
-                if counts && hold.is_none() {
-                    passed.push(task);
-                }
-                continue;
-            }
-            if self.reclaim.is_some() && memory > 0 {
-                continue;
-            }
-            match hold {
-                // Only it, and what takes no memory, may start until it does.
-                Some(held) if held != task => {
-                    if memory == 0 {
-                        return Pick::Start(me);
-                    }
-                }
-                _ if self.config.budget.is_none() || memory <= free
-                    || (alone && (memory <= whole || (memory >= ceiling && whole > 0))) =>
-                {
-                    return Pick::Start(me);
-                }
-                Some(_) => {}
-                None => {
-                    if counts {
-                        passed.push(task);
-                    }
-                }
-            }
-        }
-        Pick::None
-    }
-
     fn start(&mut self, at: u64, me: usize, out: &mut Vec<PlaneOutput>) {
         let task = self.nodes[me].task.expect("a ready node's task");
-        if self.nodes[me].reclaim {
-            self.reclaim = Some(task);
-        } else if let Some(budget) = self.budget_now() {
-            self.tasks[task].memory = self.tasks[task].memory.min(budget);
-        }
         let p = pool_at(self.tasks[task].pool);
         for at_member in 0..self.tasks[task].members.len() {
             let member = self.tasks[task].members[at_member];
@@ -1307,8 +973,6 @@ impl<M: Memo> Plane<M> {
         t.runner = me;
         t.running = true;
         self.running[p] += 1;
-        self.granted += t.memory;
-        self.counts.granted_most = self.counts.granted_most.max(self.granted);
         self.counts.ran += 1;
         for at_member in 0..self.tasks[task].members.len() {
             let member = self.tasks[task].members[at_member];
@@ -1341,11 +1005,6 @@ impl<M: Memo> Plane<M> {
         path.reverse();
         path
     }
-}
-
-enum Pick {
-    Start(usize),
-    None,
 }
 
 fn said(request: RequestId, at_ns: u64, event: Event) -> PlaneOutput {

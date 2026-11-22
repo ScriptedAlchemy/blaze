@@ -54,9 +54,6 @@ pub struct Spec {
     /// single flight; `None` for work that is not a pure function of its inputs.
     #[serde(default)]
     pub key: Option<Key>,
-    /// Its predicted peak memory in bytes ([`crate::admission`]), for the plane's admission.
-    #[serde(default)]
-    pub memory: u64,
 }
 
 /// What came of a node's work.
@@ -146,10 +143,6 @@ pub enum Error {
     /// Nodes of one input that wait for one another.
     Cycle(Vec<NodeId>),
     NotRunning(NodeId),
-    /// Parking is only for one unposted, unkeyed work task, never a shared flight.
-    NotParkable(NodeId),
-    /// The parked task's generation or state no longer agrees with its token.
-    NotParked(NodeId),
     Closed,
     Over,
     /// A plane's request opened twice.
@@ -157,7 +150,6 @@ pub enum Error {
     /// A plane's request opened with no share of the threads.
     NoWeight(u32),
     UnknownRequest(u32),
-    InvalidReclaim { request: u32, first: NodeId, why: &'static str },
 }
 
 impl fmt::Display for Error {
@@ -174,18 +166,11 @@ impl fmt::Display for Error {
                 write!(f, "nodes {} wait for one another", nodes.join(", "))
             }
             Error::NotRunning(id) => write!(f, "node {id} is said done, but it is not running"),
-            Error::NotParkable(id) => {
-                write!(f, "node {id} cannot be parked: it must be one unkeyed work task")
-            }
-            Error::NotParked(id) => write!(f, "node {id} no longer names this parked task"),
             Error::Closed => write!(f, "nodes added or the build closed after it was closed"),
             Error::Over => write!(f, "an input after the build finished"),
             Error::RequestTwice(id) => write!(f, "request {id} is opened twice"),
             Error::NoWeight(id) => write!(f, "request {id} is opened with a weight of 0"),
             Error::UnknownRequest(id) => write!(f, "request {id} is not open"),
-            Error::InvalidReclaim { request, first, why } => {
-                write!(f, "request {request}'s reclamation at node {first} is refused: {why}")
-            }
         }
     }
 }
@@ -205,12 +190,7 @@ pub struct Machine {
 
 impl Machine {
     pub fn new(config: Config) -> Result<Machine, Error> {
-        let mut plane = Plane::new(PlaneConfig {
-            io: config.io,
-            work: config.work,
-            budget: None,
-            starve_after: u32::MAX,
-        })?;
+        let mut plane = Plane::new(PlaneConfig { io: config.io, work: config.work })?;
         let opened = plane.step(PlaneInput::Open {
             at_ns: 0,
             request: BUILD,

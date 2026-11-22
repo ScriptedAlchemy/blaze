@@ -39,6 +39,7 @@ const HANDLERS: &[(&str, Handler)] = &[
     }),
     // cmd+N: a chat of the last-used agent kind, at once.
     ("NewChat", |a, _, _| a.new_chat()),
+    ("OpenChat", |a, _, _| a.open_chat_library()),
     // File > New…: the new-object picker, or closed again.
     ("Picker", |a, _, _| {
         if a.picking() {
@@ -72,7 +73,7 @@ const HANDLERS: &[(&str, Handler)] = &[
         a.palette = if a.palette.as_ref().is_some_and(|p| p.mode == Mode::Commands) {
             None
         } else {
-            Some(Palette::new())
+            Some(Palette::new(a.time))
         }
     }),
     ("Zoom", |a, act, _| {
@@ -103,22 +104,28 @@ const HANDLERS: &[(&str, Handler)] = &[
     ("PaletteUp", |a, _, _| a.palette_step(-1)),
     ("PaletteDown", |a, _, _| a.palette_step(1)),
     ("PaletteRun", |a, _, _| {
+        if a.palette.as_ref().is_some_and(|p| p.mode == Mode::Chats) {
+            a.choose_library_highlight();
+            return;
+        }
         let at = a.palette.as_ref().map_or(0, |p| p.at);
         if let Some((.., d)) = a.entries().into_iter().nth(at) {
             a.choose(d);
         }
     }),
-    ("PaletteErase", |a, _, _| {
-        let time = a.time;
-        if let Some(p) = a.palette.as_mut() {
-            p.query.pop();
-            p.at = 0;
-            p.changed = time;
-        }
-    }),
+    ("PaletteErase", |a, _, _| a.palette_edit("backspace")),
     ("SearchClear", |a, _, _| a.archive_search(SearchEdit::Clear)),
     ("SearchErase", |a, _, _| a.archive_search(SearchEdit::Erase)),
     ("ArchiveOpenFirst", |a, _, _| a.archive_open_first()),
+    ("LearnNext", |a, _, _| a.learn_key("next")),
+    ("LearnCourse", |a, _, _| a.learn_key("course")),
+    ("LearnForward", |a, _, _| a.learn_key("forward")),
+    ("LearnBack", |a, _, _| a.learn_key("back")),
+    ("LearnUp", |a, _, _| a.learn_key("up")),
+    ("LearnDown", |a, _, _| a.learn_key("down")),
+    ("LearnMoveUp", |a, _, _| a.learn_key("move_up")),
+    ("LearnMoveDown", |a, _, _| a.learn_key("move_down")),
+    ("LearnErase", |a, _, _| a.learn_key("erase")),
     ("SendBytes", |a, act, _| {
         let bytes = a
             .world
@@ -235,11 +242,15 @@ impl App {
         let names: &[&str] = if self.picking() {
             &[keys::PICKER]
         } else if self.palette.is_some() {
-            &[keys::PALETTE]
+            &[keys::PALETTE, keys::CHAT]
         } else if self.browser_focused() {
             &[keys::BROWSER]
         } else if self.archive_focused() {
             &[keys::ARCHIVE]
+        } else if self.learn_focused() && !self.renaming() {
+            // The start page or a lesson has the keys: Return asks, checks or goes on, Escape leaves. A field there
+            // (the start page's, a fill-in's) is edited as the chat's input is: the editing keys under Learn's own.
+            if self.learn_editing() { &[keys::LEARN, keys::CHAT] } else { &[keys::LEARN] }
         } else if self.renaming() {
             // A name being renamed in its row has the keys: the chat input's edits act on it (chat/rename.rs).
             &[keys::CHAT]

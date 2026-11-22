@@ -21,6 +21,9 @@
 
 #![deny(unsafe_code)]
 #![feature(allocator_api)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 extern crate rustc_lexer;
 
@@ -41,6 +44,7 @@ mod validation;
 
 pub mod algo;
 pub mod ast;
+pub mod builtin_attrs;
 pub mod empty_crate;
 #[doc(hidden)]
 pub mod fuzz;
@@ -66,7 +70,7 @@ pub use crate::{
         SyntaxNodeChildren, SyntaxToken, SyntaxTreeBuilder, Tree,
     },
 };
-pub use parser::{Edition, Extensions, LexedStr, SyntaxKind, T};
+pub use parser::{BlazeEdition, Edition, Extensions, LexedStr, SyntaxKind, T, UnknownBlazeEdition};
 pub use rustc_literal_escaper as unescape;
 pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 pub use syntax_tree::{
@@ -154,16 +158,22 @@ impl<T> Parse<T> {
         self.tree.as_ref().unwrap().root()
     }
 
-    /// The heap this parse holds, in bytes, for a query that keeps parses by their bytes: its
-    /// share of the tree (the tree's arrays and the lazy parts walked so far, over the counts
-    /// of it, so the values sharing a tree count it once between them) and its errors. Not the
-    /// source text the tree indexes, which a file's text holds; a tree built by appending text
-    /// (a macro expansion) owns its text, [`Parse::source_bytes`].
+    /// The heap this parse holds, in bytes, for a query that keeps parses by their bytes: the
+    /// tree (its arrays and the lazy parts walked so far) and its errors. Not the source text
+    /// the tree indexes, which a file's text holds; a tree built by appending text (a macro
+    /// expansion) owns its text, [`Parse::source_bytes`].
+    ///
+    /// The whole tree, whoever else holds it: a weight is of the value alone. It was the tree
+    /// over its strong count, so that two values sharing a tree counted it once; but a count
+    /// is also taken by what is no weighed value (the body lowering's thread cache keeps a
+    /// file's own tree for a body anchored at the file's root, `hir_def::expr_store::body`),
+    /// and the table adds a value's weight when it is put and takes its weight off when it is
+    /// dropped: a tree put alone and dropped while that cache held it left half its bytes in
+    /// the count at every edit of its file, for good. Two values of one tree (a parse made
+    /// again while something else kept its tree alive) now count it twice, the same at put
+    /// and at drop.
     pub fn heap_bytes(&self) -> usize {
-        let tree = self.tree.as_ref().map_or(0, |tree| {
-            let flat = tree.flat();
-            flat.heap_size() / std::sync::Arc::strong_count(flat)
-        });
+        let tree = self.tree.as_ref().map_or(0, |tree| tree.flat().heap_size());
         let errors = self.errors.as_deref().map_or(0, |errors| {
             size_of_val(errors) + errors.iter().map(SyntaxError::heap_bytes).sum::<usize>()
         });
@@ -256,6 +266,10 @@ impl<T> Parse<T> {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread parse scratch kept at the largest it grew to, uncapped"
+)]
 thread_local! {
     /// The lists a parse's errors are gathered in, kept at the largest they grew to.
     static ERRORS: RefCell<Scratch<SyntaxError>> = const { RefCell::new(Scratch::new()) };
@@ -483,9 +497,15 @@ impl ast::Expr {
     /// ast::Expr::parse("let fail = true;", Edition::CURRENT).tree();
     /// ```
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::Expr> {
+        Self::parse_with(text, edition, Extensions::NONE)
+    }
+
+    /// [`ast::Expr::parse`] under `extensions`, the syntax extensions of the crate whose
+    /// source `text` is from.
+    pub fn parse_with(text: &str, edition: Edition, extensions: Extensions) -> Parse<ast::Expr> {
         let _p = tracing::info_span!(target: "blaze", "Expr::parse").entered();
-        let (tree, errors) =
-            parsing::parse_text_at(&text.into(), parser::TopEntryPoint::Expr, edition);
+        let entry = parser::TopEntryPoint::Expr;
+        let (tree, errors) = parsing::parse_text_at(&text.into(), entry, edition, extensions);
         let root = tree.root();
 
         assert!(
@@ -502,8 +522,9 @@ impl ast::MacroStmts {
     /// rustc retries an expansion that is no expression (`failed_to_match_macro`).
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::MacroStmts> {
         let _p = tracing::info_span!(target: "blaze", "MacroStmts::parse").entered();
+        let entry = parser::TopEntryPoint::MacroStmts;
         let (tree, errors) =
-            parsing::parse_text_at(&text.into(), parser::TopEntryPoint::MacroStmts, edition);
+            parsing::parse_text_at(&text.into(), entry, edition, Extensions::NONE);
         assert_eq!(tree.root().kind(), SyntaxKind::MACRO_STMTS);
         Parse::new(tree, errors)
     }

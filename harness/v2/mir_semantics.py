@@ -29,7 +29,7 @@ The input is one JSON object (inline, a file's path, or `-`):
     fuel      the steps (blocks run) the Lean semantics gives each call (100000)
     work      where the corpus is written and built; empty for a new directory under the system's
               temporary directory, removed at the end
-    out       where the result is written (report.py's shape), for harness/v2/ledger.py
+    out       where the result is written (report.py's shape), for the ledger (scripts/src/bin/ledger.rs)
 
 A program is a crate with `pub fn entry(..) -> T` over integers and one `pub fn case_N() -> T`
 per call, which calls `entry` with that call's arguments. The Lean side runs `entry` with the
@@ -416,8 +416,8 @@ def selftest() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root, home = Path(tmp) / "root", Path(tmp) / "home"
         (root / "lean").mkdir(parents=True)
-        (root / "lean/lean-toolchain").write_text("leanprover/lean4:v4.20.0\n")
-        pinned = home / ".elan/toolchains/leanprover--lean4---v4.20.0/bin"
+        (root / "lean/lean-toolchain").write_text("leanprover/lean4:v4.35.0\n")
+        pinned = home / ".elan/toolchains/leanprover--lean4---v4.35.0/bin"
         try:
             lake_of("", root, home)
             expect(False, "a missing toolchain is refused")

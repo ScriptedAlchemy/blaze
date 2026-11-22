@@ -1,10 +1,12 @@
 //! The pool's deterministic simulation test (docs/v2/plan/design/store-pool.md, section 7): the
 //! real word, reading, pins, pin set, optimistic reads, loads core, sweep and windows, over files
-//! the test writes, driven by `blaze_core::sim::Sim`. The store does not read through the pool yet
-//! (lane 4), so the files stand in for its packs: records of drawn sizes laid out at 16 bytes,
-//! padded to a block, each file written whole and durable, with its blocks' checks.
+//! the test writes, driven by `blaze_core::sim::Sim`. The files stand in for the store's packs
+//! (which the store reads through the pool: `crate::hot`, `crate::read`): records of drawn sizes
+//! laid out at 16 bytes, padded to a block, each file written whole and durable, with its
+//! blocks' checks.
 //!
-//! What it draws, as one plan (Hegel's, shrunk; or a seed's, for the controls and replay):
+//! What it draws from the case's tape, as one plan (shrunk on a failure; a seed's for the
+//! controls and replay):
 //!
 //! - files and their records (16 bytes to several pages, a file longer than a window taking a
 //!   run of them; one in four an index file, which the sweep weighs four times);
@@ -14,7 +16,9 @@
 //!   batch given back as its own step; the loader's completions, delayed and shuffled. Which
 //!   takes its next step is drawn, at the granularity of word operations (`Sim` is one thread,
 //!   so the test steps each machine itself; two threads' atomics interleaving at every operation
-//!   waits for `hegel::sim`'s scheduled atomics);
+//!   are `blaze-check`'s (docs/v2/plan/design/model-checker.md), and one case that interleaves
+//!   threads and crashes a disk waits for the tape to drive both (docs/v2/plan/design/sim.md,
+//!   "Order"));
 //! - faults, as a swarm: failed reads, short reads, held reads, any effect failed once in a
 //!   while, and a block of a file changed on disk (rot);
 //! - the commit: an append to a file, as the store's commit makes one. It pins the file's last
@@ -53,7 +57,8 @@
 //! Planted bugs 1 to 6, 8, 9 and 10 ([`Plant`]), each a safeguard of the pool's removed, must each be caught on
 //! the plan built to expose it ([`directed`]), which passes with nothing planted; the
 //! [`CONTROL_SEEDS`] seeded plans are searched too, and whether one catches it is reported. Replay: a failure names its plan and the simulator's
-//! seed in it; a control names a seed of [`plan_of`] for [`REPLAY`].
+//! seed in it, and `blaze_sim` prints the case's seed and tape (`BLAZE_SIM_SEED`, `BLAZE_SIM_TAPE`);
+//! a control names a case's seed for [`REPLAY`].
 
 use std::{
     cell::RefCell,
@@ -65,11 +70,11 @@ use std::{
 
 use blaze_core::{
     Cache, Completion, Done, Driver, Effect, FileName, Priority, Tag,
-    sim::{Faults, Rng, SCRIBBLE, Sim},
+    sim::{Faults, SCRIBBLE, Sim},
     wait::Deadline,
 };
 use blaze_mem::MemError;
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::{
     Append, BLOCK, Ended, FileId, Give, Kernel, LoadFailure, Loads, Opened, Optimistic, PAGE, PinSet, Pins,
@@ -111,7 +116,7 @@ const TRIES: u32 = 64;
 /// The most an optimistic read copies: the store's are 16 to 96 bytes.
 const OPTIMISTIC_MOST: u64 = 256;
 /// Seeded plans a control searches, after its built plan, for one its plant breaks.
-const CONTROL_SEEDS: u64 = 1024;
+const CONTROL_SEEDS: u32 = 1024;
 /// The seed [`replay_one_seed`] runs, and its plant: set them to what a failure names.
 const REPLAY: (u64, Plant) = (0, Plant::None);
 
@@ -235,66 +240,40 @@ struct Plan {
     acts: Vec<Act>,
 }
 
-/// A source of draws: Hegel's (shrunk, replayed by Hegel) or a seed's ([`plan_of`]).
-trait Draw {
-    /// In `lo..=hi`.
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn coin(&mut self) -> bool {
-        self.int(0, 1) == 1
-    }
-}
-
-struct Drawn<'a>(&'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-impl Draw for Rng {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        match (hi - lo).checked_add(1) {
-            Some(n) => lo + self.below(n),
-            None => self.next_u64(),
-        }
-    }
-}
-
-fn spec(d: &mut impl Draw) -> Spec {
-    let records = d.int(1, 3);
+fn spec(tape: &Tape) -> Spec {
+    let records = tape.int_in(1..=3u64, "records");
     let sizes = (0..records)
-        .map(|_| match d.int(0, 5) {
-            0..=2 => d.int(16, 512),
-            3 | 4 => d.int(4 << 10, 40 << 10),
-            _ => d.int(60 << 10, 200 << 10),
+        .map(|_| match tape.int_in(0..=5u64, "record size kind") {
+            0..=2 => tape.int_in(16..=512u64, "record size"),
+            3 | 4 => tape.int_in((4u64 << 10)..=(40 << 10), "record size"),
+            _ => tape.int_in((60u64 << 10)..=(200 << 10), "record size"),
         })
         .collect();
-    let rank = match d.int(0, 3) {
+    let rank = match tape.int_in(0..=3u64, "rank") {
         0 => Rank::Index,
         _ => Rank::Plain,
     };
-    Spec { sizes, fill: d.int(0, u64::from(CONTENT) - 2) as u8, rank }
+    Spec { sizes, fill: tape.int_in(0..=u64::from(CONTENT) - 2, "fill") as u8, rank }
 }
 
 /// A plan: the simulator's seed, the fault classes it turns on (a swarm, so a rare class is not
 /// drowned by a common one), its files, and its acts.
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let fail_one_in = match d.coin() {
-        true => d.int(4, 40) as u32,
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let fail_one_in = match tape.coin("effects fail") {
+        true => tape.int_in(4..=40u64, "fail one in") as u32,
         false => 0,
     };
-    let (fail_reads, short_reads, hold_reads, rot) = (d.coin(), d.coin(), d.coin(), d.coin());
-    let files = (0..d.int(1, 3)).map(|_| spec(d)).collect();
-    let spares = (0..2).map(|_| spec(d)).collect();
-    let n = d.int(1, MOST_ACTS);
+    let (fail_reads, short_reads, hold_reads, rot) =
+        (tape.coin("fail reads"), tape.coin("short reads"), tape.coin("hold reads"), tape.coin("rot"));
+    let files = (0..tape.int_in(1..=3u64, "files")).map(|_| spec(tape)).collect();
+    let spares = (0..2).map(|_| spec(tape)).collect();
+    let n = tape.int_in(1..=MOST_ACTS, "acts");
     let mut acts = Vec::new();
     for _ in 0..n {
-        let reader = d.int(0, READERS as u64 - 1) as u8;
-        let (file, rec) = (d.int(0, 2) as u8, d.int(0, 2) as u8);
-        acts.push(match d.int(0, 29) {
+        let reader = tape.int_in(0..=READERS as u64 - 1, "reader") as u8;
+        let (file, rec) = (tape.int_in(0..=2u64, "file") as u8, tape.int_in(0..=2u64, "record") as u8);
+        acts.push(match tape.int_in(0..=29u64, "act") {
             0..=3 => Act::Read { reader, file, rec, set: false },
             4 | 5 => Act::Read { reader, file, rec, set: true },
             6 | 7 => Act::Optimistic { reader, file, rec },
@@ -305,8 +284,8 @@ fn plan(d: &mut impl Draw) -> Plan {
             15 | 16 => Act::Evict,
             17 => Act::Visit,
             18 => Act::Give,
-            19 | 20 => Act::Step { us: d.int(0, 400) as u16 },
-            21 if rot => Act::Rot { file, block: d.int(0, 255) as u8 },
+            19 | 20 => Act::Step { us: tape.int_in(0..=400u64, "step us") as u16 },
+            21 if rot => Act::Rot { file, block: tape.int_in(0..=255u64, "rotted block") as u8 },
             21 if hold_reads => Act::ReleaseReads,
             21 => Act::Step { us: 0 },
             22 => Act::Retire { file },
@@ -314,15 +293,11 @@ fn plan(d: &mut impl Draw) -> Plan {
             25 => Act::Prefetch { file },
             26 => Act::BuildEnd,
             27 => Act::BuildStart,
-            28 => Act::Budget { pages: d.int(0, 12) as u8 },
+            28 => Act::Budget { pages: tape.int_in(0..=12u64, "budget pages") as u8 },
             _ => Act::Crash,
         });
     }
     Plan { seed, fail_one_in, fail_reads, short_reads, hold_reads, rot, files, spares, acts }
-}
-
-fn plan_of(seed: u64) -> Plan {
-    plan(&mut Rng::new(seed))
 }
 
 /// The bytes of a file of `spec`'s records, padded to a block, and each record's place.
@@ -852,7 +827,7 @@ impl World {
         for completion in out.drain(..) {
             match self.loads.owns(completion.tag) {
                 true => self.loads.complete(&self.pool, completion, &mut self.ended),
-                false => self.written(completion)?,
+                false => self.written(&completion)?,
             }
         }
         self.out = out;
@@ -958,7 +933,7 @@ impl World {
     /// completed, the sync is asked; once the sync has, the append is the file's, in the pool
     /// and in the model (the head's flip). A write or a sync that failed gives the append up:
     /// nothing of it was committed.
-    fn written(&mut self, completion: Completion) -> Result<(), Broke> {
+    fn written(&mut self, completion: &Completion) -> Result<(), Broke> {
         let actor = std::mem::replace(&mut self.actors[COMMITTER], Actor::Idle);
         let Actor::Appending { file, append, bytes, records, checks, mut writes, mut failed, syncing } = actor else {
             return Err(Broke::Harness(format!("a completion neither a load nor the commit asked for: {completion:?}")));
@@ -1234,11 +1209,27 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), Broke> {
 /// The invariant: whatever the faults, the schedule, the evictions and the crashes, a read hands
 /// back the bytes its file holds or a refusal its faults explain, nothing pinned or loading is
 /// given back, the process holds exactly the pages in use, and every load ends.
-#[hegel::test(test_cases = 200)]
-fn the_pool_reads_back_what_its_files_hold(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None) {
-        panic!("{broke}\nreplay: simulator seed {}, plan {plan:?}", plan.seed);
+#[test]
+fn the_pool_reads_back_what_its_files_hold() {
+    blaze_sim::check(SimConfig::cases(200), |tape| {
+        let plan = plan(tape);
+        if let Err(broke) = run(&plan, Plant::None) {
+            panic!("{broke}\nreplay: simulator seed {}, plan {plan:?}", plan.seed);
+        }
+    });
+}
+
+/// The words a finding of `rule` says as a `blaze_sim` finding: `[<rule>]` first, so a search
+/// tells one rule's findings from another's.
+fn said_by(rule: Rule) -> String {
+    format!("[{rule:?}]")
+}
+
+/// `broke` as `blaze_sim` takes it: an oracle's finding headed by the words of its rule.
+fn sim_broke(broke: Broke) -> blaze_sim::Broke {
+    match broke {
+        Broke::Oracle(rule, why) => blaze_sim::Broke::Oracle(format!("{} {why}", said_by(rule))),
+        Broke::Harness(why) => blaze_sim::Broke::Harness(why),
     }
 }
 
@@ -1319,6 +1310,15 @@ fn directed(plant: Plant) -> Plan {
             let acts = vec![Act::Rot { file: 0, block: 0 }, Act::Rot { file: 0, block: 28 }];
             Plan { rot: true, ..by_hand(&[110_004, 4096, 4096], acts) }
         }
+        // Reader 0's load of the record's page is in flight as reader 1 comes to it: a slot,
+        // then its look at the page. With nothing planted it waits for that load, and both
+        // are served by the one read.
+        Plant::DoubleClaim => {
+            by_hand(&[300], vec![read(0), read(0), read(1), read(1), read(1), step, read(0), read(1)])
+        }
+        // A plan of a file of eight pages or more, with a budget of six (`BUDGET`): the
+        // prefetch reads six and waits for them to be read.
+        Plant::PrefetchUncharged => by_hand(&[300, 500_000], vec![Act::Prefetch { file: 0 }]),
     }
 }
 
@@ -1331,12 +1331,13 @@ fn rule_of(plant: Plant) -> Rule {
         Plant::SameVersion | Plant::LoadedAtAsk | Plant::NoCheck | Plant::FailedLoadKept | Plant::FirstBadBlock => {
             Rule::Bytes
         }
-        // The kernel's stand-in was given a page that was pinned, or not `Evicting`.
-        Plant::EvictPinned | Plant::NoEvicting => Rule::GivenBack,
+        // The kernel's stand-in was given a page that was pinned, or not `Evicting`; or was
+        // asked to make a page the process's that a load in flight had made so already.
+        Plant::EvictPinned | Plant::NoEvicting | Plant::DoubleClaim => Rule::GivenBack,
         // The append reached the disk as whatever the kernel left: its block fails its check
         // when it is read back, and nothing rotted.
         Plant::UnpinnedTail => Rule::Unexplained,
-        Plant::PrefetchFirst => Rule::Prefetch,
+        Plant::PrefetchFirst | Plant::PrefetchUncharged => Rule::Prefetch,
     }
 }
 
@@ -1357,23 +1358,40 @@ fn control(plant: Plant) {
         Err(broke) => panic!("the plan built for Plant::{plant:?} must end in the oracle's {rule:?}, and ended in {broke}\nplan {plan:?}"),
         Ok(()) => panic!("the oracle did not catch Plant::{plant:?} on the plan built to expose it: {plan:?}"),
     }
-    let mut other = None;
-    for seed in 0..CONTROL_SEEDS {
-        match run(&plan_of(seed), plant) {
-            Err(Broke::Oracle(found, why)) if found == rule => {
-                eprintln!("{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})) by {rule:?}: {why}");
-                return;
+    // The drawn plans, searched unshrunk (`blaze_sim::control`'s planted half, but reported, not
+    // required: see above). Another rule's finding under the plant is kept, not counted as the
+    // catch, and the search goes on.
+    let says = said_by(rule);
+    let other: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+    let verdict = blaze_sim::search(SimConfig::cases(CONTROL_SEEDS).shrink_runs(0), |tape| {
+        // `self::`: the built plan above is named `plan` too.
+        match run(&self::plan(tape), plant).map_err(sim_broke) {
+            Err(blaze_sim::Broke::Oracle(why)) if !why.contains(&says) => {
+                let first = other.take();
+                other.set(Some(first.unwrap_or(why)));
+                Ok(())
             }
-            // Another rule's finding under the plant: reported, not counted as its catch.
-            Err(Broke::Oracle(found, why)) => _ = other.get_or_insert((seed, found, why)),
-            Err(broke @ Broke::Harness(_)) => panic!("seed {seed}, {plant:?}: {broke}"),
-            Ok(()) => {}
+            ran => ran,
         }
+    });
+    match verdict {
+        blaze_sim::Verdict::Failed(failed) if failed.failure.origin == blaze_sim::Origin::Oracle => {
+            let seed = failed.seed.expect("a generated case has a seed");
+            eprintln!(
+                "{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})) by {rule:?}: {}",
+                failed.failure.text
+            );
+        }
+        blaze_sim::Verdict::Failed(failed) => {
+            panic!("seed {:?}, {plant:?}: {:?}: {}", failed.seed, failed.failure.origin, failed.failure.text)
+        }
+        blaze_sim::Verdict::Passed(_) => eprintln!(
+            "{plant:?} caught on its built plan and by {rule:?} in none of {CONTROL_SEEDS} drawn plans: drawn plans \
+             rarely make its shape (the first finding of another rule: {:?})",
+            other.take()
+        ),
+        verdict => panic!("the drawn plans of {plant:?}'s control did not run: {verdict:?}"),
     }
-    eprintln!(
-        "{plant:?} caught on its built plan and by {rule:?} at none of seeds 0..{CONTROL_SEEDS}: drawn plans rarely \
-         make its shape (the first finding of another rule: {other:?})"
-    );
 }
 
 #[test]
@@ -1414,6 +1432,18 @@ fn the_oracle_catches_a_commit_that_does_not_pin_its_file_s_last_page() {
 #[test]
 fn the_oracle_catches_a_prefetch_issued_while_a_demand_load_is_in_flight() {
     control(Plant::PrefetchFirst);
+}
+
+/// Two loads of one page racing: the read that lands last is what is served, whatever the
+/// first read, and the page is made the process's twice.
+#[test]
+fn the_oracle_catches_two_loads_of_one_page() {
+    control(Plant::DoubleClaim);
+}
+
+#[test]
+fn the_oracle_catches_a_prefetch_the_budget_is_not_charged_for() {
+    control(Plant::PrefetchUncharged);
 }
 
 #[test]
@@ -1542,9 +1572,7 @@ fn an_append_is_the_file_s_once_its_sync_completes_and_reads_back() {
 #[test]
 fn replay_one_seed() {
     let (seed, plant) = REPLAY;
-    if let Err(broke) = run(&plan_of(seed), plant) {
-        panic!("seed {seed}, Plant::{plant:?}: {broke}");
-    }
+    blaze_sim::check(SimConfig::cases(1).first(seed), |tape| run(&plan(tape), plant).map_err(sim_broke));
 }
 
 /// A plan of one file of one short record, with no acts and no faults: for the tests that step a
@@ -1608,13 +1636,39 @@ fn the_sweep_takes_a_page_read_once_and_passes_over_one_read_again() {
     world.check().unwrap_or_else(|broke| panic!("{broke}"));
 }
 
+/// The invariant ([`Sweep::lap`]): one lap visits at most the open pages, gives back no page
+/// read again since it was loaded, and a second lap with no read between gives that page back;
+/// a page read once goes on the first lap.
+#[test]
+fn a_lap_keeps_what_was_read_again_and_the_next_lap_gives_it_back() {
+    let plan = quiet_plan();
+    let mut world = World::new(&plan, Plant::None).unwrap_or_else(|broke| panic!("{broke}"));
+    let page = world.files[0].window.first_page();
+    let open = world.windows.open_pages();
+    let state = |world: &World| world.pool.word_now(page).state();
+
+    read_once(&mut world, &plan);
+    let once = world.sweep.lap(&world.pool, &world.windows);
+    assert!(once.visited <= open, "a lap visits each open page at most once: {once:?} of {open}");
+    assert!(once.freed >= PAGE && state(&world) == State::Unloaded, "read once, it goes: {once:?}");
+
+    read_once(&mut world, &plan);
+    read_once(&mut world, &plan);
+    let first = world.sweep.lap(&world.pool, &world.windows);
+    assert!(first.visited <= open, "a lap visits each open page at most once: {first:?} of {open}");
+    assert_eq!((first.freed, state(&world)), (0, State::Loaded), "read again since its load, it stays");
+    let second = world.sweep.lap(&world.pool, &world.windows);
+    assert!(second.freed >= PAGE && state(&world) == State::Unloaded, "not read since the lap before, it goes: {second:?}");
+    assert_eq!(world.sweep.lap(&world.pool, &world.windows).freed, 0, "nothing loaded, nothing given");
+    world.check().unwrap_or_else(|broke| panic!("{broke}"));
+}
+
 /// The loader's thread end to end on a real file system: a file's records pinned through it,
 /// loaded by its driver's reads and checked, every page given back by the kernel (the real
 /// `Region::evict`), and pinned again, loading again.
 #[test]
 fn the_loader_pins_a_file_s_records_and_loads_them_again_after_eviction() {
-    let root = std::env::temp_dir().join(format!("blaze-pool-loader-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&root);
+    let root = blaze_core::temp::TempDir::for_test("blaze-pool-loader-");
     std::fs::create_dir_all(root.join("pool")).unwrap();
     let spec = Spec { sizes: vec![300, 30 << 10, 150 << 10, 5000], fill: 5, rank: Rank::Plain };
     let (bytes, records) = file_bytes(&spec);
@@ -1622,7 +1676,7 @@ fn the_loader_pins_a_file_s_records_and_loads_them_again_after_eviction() {
     let pool = Pool::new(8, Kernel).unwrap();
     let mut windows = Windows::new(8);
     let window = windows.open(&pool, FileId::Pack(0), bytes.len() as u64, Rank::Plain).unwrap();
-    let theirs = root.clone();
+    let theirs = root.path().to_path_buf();
     let made = move || Ok(blaze_core::threads::Threads::new(theirs, 2));
     let loader = Loader::start(pool, made, TAGS, Cache::Kept).unwrap();
     loader.open(Opened { window, name: FileName::new("pool/pack-0").unwrap(), checks: checks_of(&bytes) });
@@ -1636,7 +1690,6 @@ fn the_loader_pins_a_file_s_records_and_loads_them_again_after_eviction() {
         assert_eq!(loader.pool().held(), 0, "round {round}: every page given back ({swept:?})");
     }
     drop(loader);
-    _ = std::fs::remove_dir_all(&root);
 }
 
 /// The census is the words' own count: loaded pages, those pinned, and what an eviction could
@@ -1674,4 +1727,223 @@ fn the_census_counts_what_is_loaded_pinned_and_can_be_given_back() {
     assert_eq!(swept.refused, None);
     assert_eq!((swept.freed, sweep.evicted()), (free.evictable, free.evictable), "{swept:?}");
     assert_eq!(census(&pool, &windows), Census::default());
+}
+
+// --- What a read costs, counted -----------------------------------------------------------------
+
+/// What one pinned read asked of the loads core.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Asked {
+    /// Loads asked.
+    loads: u64,
+    /// Reads submitted to the driver.
+    reads: u64,
+    /// Pages they read.
+    pages: u64,
+}
+
+/// The `len` bytes at the pool's byte `at` pinned, with no faults, in load slot 0, and what it
+/// asked: a reading stepped to its end on the simulation.
+fn pin_counting(sim: &mut Sim, pool: &Handle, loads: &mut Loads, at: u64, len: u64) -> (Pins<Poison, Handle>, Asked) {
+    let mut reading = Reading::new(at, len);
+    let (mut effects, mut ended, mut out) = (Vec::new(), Vec::new(), Vec::new());
+    let mut asked = Asked::default();
+    for _ in 0..DRAIN {
+        match reading.step(pool) {
+            ReadStep::Pinned(pins) => {
+                reading.take_slot();
+                return (pins, asked);
+            }
+            ReadStep::Failed(error) => panic!("a read with no faults failed: {error}"),
+            ReadStep::NeedSlot => reading.give_slot(0),
+            ReadStep::Ask(load) => {
+                loads.ask(pool, load, &mut effects, &mut ended);
+                asked.loads += 1;
+                asked.pages += u64::from(load.pages);
+                asked.reads += effects.iter().filter(|it| matches!(it, Effect::ReadInto { .. })).count() as u64;
+                sim.submit(&mut effects);
+            }
+            ReadStep::Pending | ReadStep::Wait { .. } | ReadStep::Spin { .. } => {
+                sim.advance(Duration::from_micros(400));
+                sim.poll(&mut out, Deadline::PASSED);
+                for completion in out.drain(..) {
+                    loads.complete(pool, completion, &mut ended);
+                }
+            }
+        }
+        for Ended { outcome, .. } in ended.drain(..) {
+            reading.loaded(pool, outcome);
+        }
+    }
+    panic!("a read with no faults did not end in {DRAIN} steps");
+}
+
+/// One file of `spec` in a pool of its own with windows enough for it, on a simulation with no
+/// faults: the pool, its windows and loads, the file's window, bytes and records.
+fn one_file(spec: &Spec) -> (Sim, Handle, Windows, Loads, Window, Vec<u8>, Vec<(u64, u64)>) {
+    let (bytes, records) = file_bytes(spec);
+    let count = (bytes.len() as u64).div_ceil(WINDOW) as u32 + 1;
+    let pool: Handle = Rc::new(Pool::planted_with(count, Poison::default(), Plant::None).unwrap());
+    let (mut windows, mut loads) = (Windows::new(count), loads());
+    let mut sim = Sim::new(11, Faults::default());
+    let name = FileName::new("pool/pack-0").expect("a name");
+    sim.change(&name, &bytes);
+    let window = open(&mut windows, &mut loads, &pool, FileId::Pack(0), &name, &bytes, Rank::Plain)
+        .unwrap_or_else(|broke| panic!("{broke}"));
+    (sim, pool, windows, loads, window, bytes, records)
+}
+
+/// A read of one small record loads the record's pages and no others, however long its pack:
+/// one load, one read, and of a pack a thousand pages long one page is the process's after.
+/// (The pack is 64 MiB, not the GiB a pack may grow to: the simulation holds a file's bytes in
+/// memory, twice while it is written, and what is counted does not depend on the length.)
+#[test]
+fn a_read_of_one_small_record_of_a_long_pack_loads_only_the_record_s_pages() {
+    const LONG: u64 = 64 << 20;
+    let spec = Spec { sizes: vec![LONG / 2, 300, LONG / 2 - (64 << 10)], fill: 9, rank: Rank::Plain };
+    let (mut sim, pool, _windows, mut loads, window, bytes, records) = one_file(&spec);
+    assert!(window.pages() >= 1000, "the pack is {} pages", window.pages());
+    let (at, len) = records[1];
+    let run = Run::of(window.at(at), len);
+    let (pins, asked) = pin_counting(&mut sim, &pool, &mut loads, window.at(at), len);
+    assert_eq!(pins.bytes(), &bytes[at as usize..(at + len) as usize]);
+    assert_eq!(asked, Asked { loads: 1, reads: 1, pages: u64::from(run.pages) }, "of {} pages", window.pages());
+    assert_eq!(pool.give().held.borrow().len() as u64, u64::from(run.pages), "the pages the process holds");
+    // A second read of it is a hit: nothing is asked.
+    let (again, asked) = pin_counting(&mut sim, &pool, &mut loads, window.at(at), len);
+    assert_eq!((again.bytes(), asked), (pins.bytes(), Asked::default()));
+}
+
+/// A prefetch of records that are neighbours in their pack is one batched read: the run of
+/// their pages is asked once, and the reads of the records after it ask nothing and count
+/// each page as a prefetch hit.
+#[test]
+fn a_prefetch_of_neighbouring_records_is_one_read_and_their_reads_ask_nothing() {
+    let spec = Spec { sizes: vec![40_000; 5], fill: 4, rank: Rank::Plain };
+    let (mut sim, pool, _windows, mut loads, window, bytes, records) = one_file(&spec);
+    let (first, last) = (records[0], records[4]);
+    let run = Run::of(window.at(first.0), last.0 + last.1 - first.0);
+    assert!(run.pages >= 3 && u64::from(run.pages) <= BUDGET, "the records lie over {} pages", run.pages);
+    loads.prefetch(&pool, [run]);
+    let (mut effects, mut ended, mut out) = (Vec::new(), Vec::new(), Vec::new());
+    assert_eq!(loads.pump(&pool, &mut effects, &mut ended), 1, "one load of the whole run");
+    let reads = effects.iter().filter(|it| matches!(it, Effect::ReadInto { .. })).count();
+    assert_eq!(reads, 1, "{} records, {} pages: {effects:?}", records.len(), run.pages);
+    sim.submit(&mut effects);
+    for _ in 0..DRAIN {
+        if loads.in_flight() == 0 {
+            break;
+        }
+        sim.advance(Duration::from_micros(400));
+        sim.poll(&mut out, Deadline::PASSED);
+        for completion in out.drain(..) {
+            loads.complete(&pool, completion, &mut ended);
+        }
+    }
+    assert_eq!(loads.in_flight(), 0, "the prefetch's load ended");
+    assert_eq!(pool.prefetch_counts().loaded, u64::from(run.pages));
+    for &(at, len) in &records {
+        let (pins, asked) = pin_counting(&mut sim, &pool, &mut loads, window.at(at), len);
+        assert_eq!(pins.bytes(), &bytes[at as usize..(at + len) as usize], "the record at {at}");
+        assert_eq!(asked, Asked::default(), "the record at {at} was prefetched");
+    }
+    let counts = pool.prefetch_counts();
+    assert_eq!((counts.hit, counts.late, counts.wasted), (u64::from(run.pages), 0, 0), "{counts:?}");
+}
+
+/// Two readers of one page not in memory are served by one load: the second waits on the
+/// first's, and one read is asked.
+#[test]
+fn two_readers_of_one_page_are_served_by_one_load() {
+    let plan = quiet_plan();
+    let mut world = World::new(&plan, Plant::None).unwrap_or_else(|broke| panic!("{broke}"));
+    let ok = |done: Result<(), Broke>| done.unwrap_or_else(|broke| panic!("{broke}"));
+    // Reader 0: a slot, then its load asked. Reader 1 comes to the page while it is loading.
+    ok(world.read(&plan, 0, 0, 0, Keep::Hold));
+    ok(world.advance(&plan, 0));
+    assert_eq!(world.loads.in_flight(), 1, "reader 0's load is in flight");
+    for _ in 0..3 {
+        ok(world.read(&plan, 1, 0, 0, Keep::Hold));
+    }
+    assert_eq!(world.loads.in_flight(), 1, "reader 1 asked no load of its own");
+    ok(world.step(400));
+    ok(world.advance(&plan, 0));
+    ok(world.advance(&plan, 1));
+    assert!(matches!(world.actors[0], Actor::Holding { .. }) && matches!(world.actors[1], Actor::Holding { .. }));
+    assert_eq!(world.recorder.runs().len(), 1, "one miss: {:?}", world.recorder.runs());
+    ok(world.check());
+}
+
+// --- The budget ---------------------------------------------------------------------------------
+
+/// Readers pinning records of one file and letting them go, under a budget of `ROOM` resident
+/// pages, each read making room first ([`Sweep::make_room`]) when `room` says so: `Err` at the
+/// first read after which the pool holds more than the budget and more than what is pinned.
+fn reads_under_a_budget(tape: &Tape, room: bool) -> Result<(), String> {
+    const ROOM: u64 = 3;
+    const RECORDS: u64 = 12;
+    let spec = Spec { sizes: vec![40_000; RECORDS as usize], fill: 5, rank: Rank::Plain };
+    let seed = tape.next_u64("sim seed");
+    let plan = Plan { seed, files: vec![spec], ..quiet_plan() };
+    let said = |broke: Broke| broke.to_string();
+    let mut world = World::new(&plan, Plant::None).map_err(said)?;
+    let resident = |world: &World| world.pool.give().held.borrow().len() as u64 * PAGE;
+    for n in 0..200 {
+        let reader = tape.below(READERS as u64, "reader") as usize;
+        // The reader's last read is let go as its next begins.
+        if matches!(world.actors[reader], Actor::Holding { .. }) {
+            world.actors[reader] = Actor::Idle;
+        }
+        let rec = tape.below(RECORDS, "record") as usize;
+        let (at, len) = world.place(0, rec);
+        let load = u64::from(Run::of(at, len).pages) * PAGE;
+        if room {
+            let held = resident(&world);
+            world.sweep.make_room(&world.pool, &world.windows, held, ROOM * PAGE, load, 0);
+        }
+        world.read(&plan, reader as u8, 0, rec as u8, Keep::Hold).map_err(said)?;
+        for _ in 0..DRAIN {
+            if matches!(world.actors[reader], Actor::Holding { .. }) {
+                break;
+            }
+            world.step(100).map_err(said)?;
+            world.advance(&plan, reader).map_err(said)?;
+        }
+        world.check().map_err(said)?;
+        let pinned: u64 = world
+            .actors
+            .iter()
+            .map(|it| match it {
+                Actor::Holding { pins, .. } => u64::from(pins.run().pages) * PAGE,
+                _ => 0,
+            })
+            .sum();
+        let held = resident(&world);
+        if held > (ROOM * PAGE).max(pinned) {
+            return Err(format!(
+                "after read {n} (record {rec}, reader {reader}) the pool holds {held} bytes: more than its budget \
+                 of {} and more than the {pinned} its readers pin",
+                ROOM * PAGE
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The invariant: the pool's resident bytes never exceed its budget plus what its readers pin,
+/// when every load makes room first: after each read the pool holds at most the budget, or,
+/// where readers pin more than that, at most what they pin.
+#[test]
+fn a_load_that_makes_room_first_keeps_the_pool_within_its_budget_and_what_is_pinned() {
+    blaze_sim::check(SimConfig::cases(64), |tape| reads_under_a_budget(tape, true));
+}
+
+/// The cause removed: with no room made before a load, nothing gives a page back, and the pool
+/// passes its budget and what is pinned on every case (the 64 seeds it looped by hand before).
+#[test]
+fn the_oracle_catches_a_load_that_makes_no_room() {
+    blaze_sim::check(SimConfig::cases(64), |tape| {
+        let why = reads_under_a_budget(tape, false).expect_err("a pool that gives nothing back stays within no budget");
+        assert!(why.contains("more than its budget"), "{why}");
+    });
 }

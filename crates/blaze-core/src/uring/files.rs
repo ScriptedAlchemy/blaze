@@ -32,7 +32,8 @@ use blaze_mem::RegionVec;
 use super::{
     flight::{error, failed, filled, raw, spare_of},
     ops::{
-        DIRECT, LINKS, MADE, MAKE, NO_FOLLOW, NO_SLOT, NOT_REGULAR, SECOND, UNSYNCED, WHOLE,
+        DIRECT, LINKS, MADE, MAKE, NO_FOLLOW, NO_SLOT, NOT_REGULAR, READ_ONLY, SECOND, UNSYNCED,
+        WHOLE,
         arena_of,
     },
     *,
@@ -149,6 +150,9 @@ mod whole {
         }
     }
 }
+/// A write at an offset done, its slot being emptied: its completion is told only once the
+/// file is closed ([`Uring::wrote_at`]).
+const CLOSING: u8 = 10;
 
 /// The most reads of files no request keeps that hold a descriptor at once (fewer where the
 /// table, sized to `RLIMIT_NOFILE`, is smaller): a batch of 50 000 opens whose reads wait
@@ -402,9 +406,14 @@ impl Uring {
     /// linked to the write.
     ///
     /// Through the page cache, whatever its size and alignment: the write completes once the
-    /// kernel holds the bytes (durable only once a later sync of the file completes).
-    /// Cache bypass is requested explicitly by [`Effect::WriteFrom`] with
-    /// [`crate::Cache::Bypassed`]. This path needs no registered buffer pool at startup.
+    /// kernel holds the bytes and waits for no device, as its effect says (durable only once
+    /// a later sync of the file completes). Until 2026-11-11 a write of a MiB or more at a
+    /// sector's offset was opened `O_DIRECT` here, on the driver's own judgement: a linked
+    /// image's runs are cut at multiples of 8 MiB, so every run of an edit's output placed
+    /// from its maker's bytes (`blaze_cas::Store::place_made`) waited for the device, a MiB
+    /// a piece through four buffers, behind whatever else the disk was doing (the profile's
+    /// fsync: 1513 ms of an edit's 2760). A write around the cache is asked for by name
+    /// ([`Effect::WriteFrom`] with [`crate::Cache::Bypassed`]), never chosen here.
     pub(super) fn write_at(
         &mut self,
         tag: Tag,
@@ -521,8 +530,8 @@ impl Uring {
         Ok(())
     }
 
-    /// Starts [`Effect::Map`] (with `kind` [`Kind::Map`]) or [`Effect::Stat`] (with
-    /// [`Kind::Stat`]; with `follow` false [`Effect::Lstat`]) `tag` of `file`.
+    /// Starts [`Effect::Stat`] (with [`Kind::Stat`]; with `follow` false [`Effect::Lstat`]) `tag`
+    /// of `file` ([`Uring::map`] starts a [`Kind::Map`]).
     pub(super) fn look(
         &mut self,
         tag: Tag,
@@ -542,6 +551,25 @@ impl Uring {
             hot.flags |= NO_FOLLOW;
         }
         self.named(hot, ops::NO_BYTES, Cold::EMPTY, push, file)?;
+        Ok(())
+    }
+
+    /// Starts [`Effect::Map`] `tag` of `extent` of `file`: the open on the ring, the map at its
+    /// completion ([`Uring::mapped`]), a range's offset and length kept in the cold record.
+    pub(super) fn map(&mut self, tag: Tag, file: &FileName, extent: crate::Extent) -> io::Result<()> {
+        let push = |path: &Path, names: &mut RegionVec<u8>, at: &mut [u32; 5]| {
+            at[0] = push_c(names, path.as_os_str().as_bytes())?;
+            Ok(())
+        };
+        let mut hot = Hot::new(tag, Kind::Map, 0);
+        let mut cold = Cold::EMPTY;
+        if let crate::Extent::Range { at, len } = extent {
+            hot.flags |= ops::RANGE;
+            cold.at = at;
+            cold.names[3] = len as u32;
+            cold.names[4] = (len >> 32) as u32;
+        }
+        self.named(hot, ops::NO_BYTES, cold, push, file)?;
         Ok(())
     }
 
@@ -655,7 +683,9 @@ impl Uring {
         Step::Ends(Some(Done::Read(mem::take(bytes))))
     }
 
-    /// Starts the open of the kept file `file`, named `name`, made if missing with `make`.
+    /// Starts the open of the kept file `file`, named `name`, made if missing with `make`. A
+    /// file kept read-only ([`Kept::read_only`]) is opened `O_RDONLY` first, with no `make`:
+    /// where it is missing, [`Uring::opened`] opens it again to make it.
     pub(super) fn open(
         &mut self,
         file: Handle<Kept>,
@@ -663,10 +693,12 @@ impl Uring {
         make: bool,
     ) -> io::Result<()> {
         let mut hot = Hot::new(NOBODYS, Kind::Open, file.to_bits());
-        if make {
+        let kept = self.kept.get(file).expect("a file just kept");
+        if kept.read_only {
+            hot.flags |= READ_ONLY;
+        } else if make {
             hot.flags |= MAKE;
         }
-        let kept = self.kept.get(file).expect("a file just kept");
         if kept.positional {
             hot.flags |= ops::POSITIONAL;
         }
@@ -855,6 +887,16 @@ impl Uring {
                 };
                 1
             }
+            (Kind::WriteAt, CLOSING) => {
+                sqes[0] = Sqe {
+                    opcode: OP_CLOSE,
+                    fd: 0,
+                    splice_fd_in: cold.slots[0] as i32 + 1,
+                    user_data: ud(0),
+                    ..Sqe::default()
+                };
+                1
+            }
             (Kind::WriteAt, _) => {
                 let slot = cold.slots[0];
                 let off = cold.at + hot.done;
@@ -914,7 +956,12 @@ impl Uring {
                 let flags = match (hot.flags & ops::POSITIONAL != 0, hot.flags & DIRECT != 0) {
                     (true, true) => POSITIONAL_KEEP | libc::O_DIRECT,
                     (true, false) => POSITIONAL_KEEP,
-                    (false, _) => KEEP | if hot.flags & MAKE != 0 { libc::O_CREAT } else { 0 },
+                    // Made where missing is opened to append, a sync's too (`Kept::read_only`).
+                    (false, _) => match (hot.flags & MAKE != 0, hot.flags & READ_ONLY != 0) {
+                        (true, _) => KEEP | libc::O_CREAT,
+                        (false, true) => libc::O_RDONLY,
+                        (false, false) => KEEP,
+                    },
                 };
                 sqes[0] = open(name(0), flags, 0o644, NO_SLOT, 0, ud(0));
                 1
@@ -1038,12 +1085,21 @@ impl Uring {
     }
 
     fn wrote_at(&mut self, id: Id, hot: Hot, results: [i32; LINKS]) -> Step {
+        if hot.phase == CLOSING {
+            // Closed (or the close failed, and the request's end empties the slot as any
+            // other's does): only now is the write told. Until here the slot held the file
+            // open for writing, and an exec of it met `ETXTBSY`.
+            if results[0] >= 0 {
+                self.ops.cold_mut(id).opened[0] = false;
+            }
+            return Step::Ends(Some(Done::Written));
+        }
         if hot.phase == OPENING && !self.opened_slot(id, 0, results[0]) {
             return self.failed_on(id, "opening", 0, results[0]);
         }
         let len = self.ops.buf(id).len();
         if len == 0 {
-            return Step::Ends(Some(Done::Written));
+            return self.close_written(id);
         }
         let res = results[1];
         if res < 0 {
@@ -1052,10 +1108,24 @@ impl Uring {
         let put = self.progress(id, res);
         self.ops.get_mut(id).expect("in flight").phase = OPENED;
         match (put < len, res) {
-            (false, _) => Step::Ends(Some(Done::Written)),
+            (false, _) => self.close_written(id),
             (true, 0) => Step::Ends(failed(-libc::EIO)),
             (true, _) => Step::Again,
         }
+    }
+
+    /// The write at an offset `id` has written all of its bytes: its slot is emptied through
+    /// the ring before its completion is told ([`CLOSING`]). A file's writer hears `Written`
+    /// only once the driver holds the file open for writing no more, so what it does next
+    /// with the file (a rename onto an executable's path, then a run of it) never meets a
+    /// descriptor of the driver's own: an exec of a file open for writing is `ETXTBSY`. Told
+    /// as the write ended, with the close left to follow, a build script placed from its
+    /// maker's runs (a write a run) was run with slots still open, 3.4 to 4.1 s of retries a
+    /// run (2026-11-10).
+    fn close_written(&mut self, id: Id) -> Step {
+        let hot = self.ops.get_mut(id).expect("in flight");
+        hot.phase = CLOSING;
+        Step::Again
     }
 
     fn wrote(&mut self, id: Id, hot: Hot, results: [i32; LINKS]) -> Step {
@@ -1171,7 +1241,10 @@ impl Uring {
             // alloc: an error.
             let why = format!("opening {}: {}", self.name_of(id, 0).to_string_lossy(), error(res));
             self.wake(file, Some((res, &why)), true);
-            self.ops.get_mut(id).expect("in flight").flags |= MAKE;
+            // Made, it is opened to append: no longer read-only (`Kept::read_only`).
+            self.kept.get_mut(file).expect("held by its open").read_only = false;
+            let open = self.ops.get_mut(id).expect("in flight");
+            open.flags = open.flags & !READ_ONLY | MAKE;
             return Step::Again;
         }
         if res == -libc::ENOENT && hot.flags & MAKE != 0 && hot.flags & MADE == 0 {
@@ -1213,6 +1286,11 @@ impl Uring {
             }
             self.on_open.remove(at);
             let (tag, whole) = (hot.tag, hot.flags & WHOLE != 0);
+            // A part of a batched read ends into its batch (`WHOLE` is `IDLE` on a read into
+            // memory, so it is read only for a `Kind::Read`).
+            let part = (hot.kind == Kind::ReadInto && hot.flags & ops::PART != 0)
+                .then(|| self.ops.cold(id).names[3]);
+            let whole = whole && hot.kind == Kind::Read;
             let Some((res, why)) = failed else {
                 self.queue(id);
                 continue;
@@ -1221,7 +1299,10 @@ impl Uring {
                 true => Done::Read(mem::take(self.ops.buf_mut(id))),
                 false => Done::Failed(IoError(why.to_owned())), // alloc: clone: an error.
             };
-            self.ready.push(Completion { tag, done });
+            match part {
+                Some(index) => self.read_part_ended(tag, index, done),
+                None => self.ready.push(Completion { tag, done }),
+            }
             self.end(id);
         }
     }
@@ -1310,18 +1391,36 @@ impl Uring {
             }
             Err(error) => error.raw_os_error().unwrap_or(libc::EIO),
             Ok((true, _)) => {
-                /// `_IOW(0x94, 9, int)` of `linux/fs.h`.
-                const FICLONE: libc::c_ulong = 0x4004_9409;
                 // No io_uring op shares blocks: one `FICLONE` of the two files the ring opened,
-                // here.
-                // SAFETY: two open descriptors; the call reads the first's blocks into the
-                // second.
-                let cloned =
-                    unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
-                if cloned == 0 {
-                    return Step::Ends(Some(Done::Cloned));
-                }
-                io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+                // on a thread of its own, never here. The call waits for the device where the
+                // source has data not written back (a file system that shares blocks writes
+                // it out first): made on this thread, the daemon's loop, it held every
+                // request for 0.9 s and 1.4 s of one edit, in no span (strace, 2026-11-10).
+                // The request ends here with no completion of its own; the thread's is the
+                // effect's, taken in at a poll once it wakes the ring.
+                // alloc: clone: the two names, for the thread's span and its errors; once a clone
+                let from = self.name_of(id, 0).to_string_lossy().into_owned();
+                // alloc: clone: as above
+                let to = self.name_of(id, 1).to_string_lossy().into_owned();
+                // alloc: clone: the name of what the opens made, removed here if no thread starts
+                let unmade = to.clone();
+                let started = self.off_ring_with(hot.tag, move |_| {
+                    Ok(crate::lock::io_wait("clone", &from, || {
+                        share_blocks(&source, target, &from, &to)
+                    }))
+                });
+                return match started {
+                    Ok(()) => Step::Ends(None),
+                    Err(error) => {
+                        // The closure went with the thread that did not start, and the two
+                        // files with it: the empty file the open made is removed by name.
+                        _ = std::fs::remove_file(&unmade);
+                        // alloc: an error path.
+                        Step::Ends(Some(Done::Failed(IoError(format!(
+                            "{unmade}: starting the thread that clones it: {error}"
+                        )))))
+                    }
+                };
             }
         };
         drop((source, target));
@@ -1340,12 +1439,27 @@ impl Uring {
         }
         // SAFETY: the open's completion: a descriptor of the driver's, owned by no other.
         let file = File::from(unsafe { OwnedFd::from_raw_fd(res) });
-        // SAFETY: `Effect::Map`'s contract: while any `Mapping` of the file lives, no effect
-        // writes, appends to or truncates it in place; the store and the image replace a file
+        let hot = *self.ops.get(id).expect("in flight");
+        let cold = self.ops.cold(id);
+        let range = (hot.flags & ops::RANGE != 0)
+            .then(|| (cold.at, u64::from(cold.names[3]) | u64::from(cold.names[4]) << 32));
+        // SAFETY: `Effect::Map`'s contract: while any `Mapping` of the file lives, the bytes
+        // below the length it had when mapped are never written again and it is never
+        // truncated (it may be appended to); the store and the image otherwise replace a file
         // only by renaming another over it.
-        let done = match unsafe { crate::fs::Mapped::map(&file) } {
+        let mapped = unsafe {
+            match range {
+                None => crate::fs::Mapped::map(&file),
+                Some((at, len)) => crate::fs::MapOptions::new().map_range(&file, at, len),
+            }
+        };
+        let done = match mapped {
             Ok(mapped) => Done::Mapped(crate::Mapping::file(mapped)),
-            Err(error) => Done::Failed(IoError(error.to_string())), // alloc: an error.
+            Err(error) => {
+                // alloc: an error.
+                let path = self.name_of(id, 0).to_string_lossy().into_owned();
+                Done::Failed(IoError(format!("{path}: {error}")))
+            }
         };
         Step::Ends(Some(done))
     }
@@ -1471,4 +1585,33 @@ impl Uring {
             _ => {}
         }
     }
+}
+
+/// The `FICLONE` of [`Effect::Clone`], whose two files the ring opened, made on a thread off
+/// the ring ([`Uring::cloned`]): `target`, the new empty file at `to`, made to share
+/// `source`'s blocks. One that fails is removed, and the completion says why as the ring's
+/// own did: a file system that cannot share blocks is named with both volumes, and nothing
+/// copies instead.
+fn share_blocks(source: &File, target: OwnedFd, from: &str, to: &str) -> Done {
+    use std::os::fd::AsFd as _;
+    let Err(failed) = crate::raw::ficlone(target.as_fd(), source.as_fd()) else {
+        return Done::Cloned;
+    };
+    drop(target);
+    _ = std::fs::remove_file(to);
+    let code = failed.raw_os_error().unwrap_or(libc::EIO);
+    let why = match matches!(code, libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL) {
+        // alloc: an error path.
+        true => format!(
+            "the file system of {to} ({}) cannot share blocks with {from} ({}): {}; blaze does not copy \
+             instead",
+            crate::fs::volume_of(
+                std::path::Path::new(to).parent().unwrap_or(std::path::Path::new(to))
+            ),
+            crate::fs::volume_of(std::path::Path::new(from)),
+            error(-code)
+        ),
+        false => error(-code),
+    };
+    Done::Failed(IoError(why))
 }

@@ -188,6 +188,37 @@ mod unix {
         checked_size(unsafe { libc::read(fd.as_raw_fd(), into.as_mut_ptr().cast(), into.len()) })
     }
 
+    /// One `preadv` of `fd` at `at` into `into`, in order: how many bytes, fewer at the file's
+    /// end. A run of adjacent ranges of one file is one call.
+    pub(crate) fn preadv(
+        fd: BorrowedFd<'_>,
+        into: &mut [io::IoSliceMut<'_>],
+        at: u64,
+    ) -> io::Result<usize> {
+        let count = libc::c_int::try_from(into.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "a preadv of more buffers than an int counts")
+        })?;
+        let at = libc::off_t::try_from(at).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "a preadv at an offset past off_t")
+        })?;
+        // SAFETY: `IoSliceMut` is ABI-compatible with `iovec` on unix (std documents it), each
+        // a live, exclusive buffer the call writes at most its length of; `into` outlives the
+        // call, which keeps none of them, and `fd` is borrowed open for it.
+        checked_size(unsafe { libc::preadv(fd.as_raw_fd(), into.as_ptr().cast(), count, at) })
+    }
+
+    /// The process's soft limit of open descriptors (`RLIMIT_NOFILE`), `u64::MAX` where it
+    /// has none.
+    pub(crate) fn nofile() -> io::Result<u64> {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: `&mut limit` is a live, aligned `rlimit` the call writes and does not keep.
+        checked(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) })?;
+        Ok(match limit.rlim_cur == libc::RLIM_INFINITY {
+            true => u64::MAX,
+            false => u64::try_from(limit.rlim_cur).unwrap_or(u64::MAX),
+        })
+    }
+
     /// One `write` of `bytes` to `fd`: how many it took.
     pub(crate) fn write(fd: BorrowedFd<'_>, bytes: &[u8]) -> io::Result<usize> {
         // SAFETY: `bytes` is a live buffer of `bytes.len()` bytes the call only reads, and `fd`
@@ -421,6 +452,30 @@ mod unix {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
+    /// A pipe, its read end first, both ends close-on-exec: on Linux at once (`pipe2`), on the
+    /// other Unixes, which have no `pipe2` everywhere, by `FD_CLOEXEC` straight after (a spawn
+    /// of another thread's in between could inherit them; blaze's spawns close what they are
+    /// not given).
+    pub(crate) fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+        let mut ends = [0; 2];
+        #[cfg(target_os = "linux")]
+        // SAFETY: room for the two descriptors the call writes.
+        checked(unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) })?;
+        #[cfg(not(target_os = "linux"))]
+        // SAFETY: room for the two descriptors the call writes.
+        checked(unsafe { libc::pipe(ends.as_mut_ptr()) })?;
+        // SAFETY: the call succeeded, so both are new descriptors nothing else owns; each is
+        // owned once, here.
+        let (read, write) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        #[cfg(not(target_os = "linux"))]
+        for fd in [&read, &write] {
+            // SAFETY: `fd` is open, owned above; `F_SETFD` takes an integer.
+            checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+        }
+        Ok((read, write))
+    }
+
     /// The running kernel's `uname`.
     #[cfg(target_os = "linux")]
     pub(crate) fn uname() -> io::Result<libc::utsname> {
@@ -454,18 +509,19 @@ mod unix {
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::Aligned;
 
     /// The aligned view against the safe reference, the bytes themselves.
-    #[hegel::test]
-    fn aligned_bytes_are_the_bytes_copied(tc: TestCase) {
-        let bytes: Vec<u8> = tc.draw(gs::binary().max_size(299));
-        let aligned = Aligned::copy(&bytes);
-        assert_eq!(aligned.bytes(), &bytes[..]);
-        assert_eq!(aligned.bytes().as_ptr() as usize % 16, 0);
+    #[test]
+    fn aligned_bytes_are_the_bytes_copied() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let bytes: Vec<u8> = tape.bytes(0..=299, "bytes");
+            let aligned = Aligned::copy(&bytes);
+            assert_eq!(aligned.bytes(), &bytes[..]);
+            assert_eq!(aligned.bytes().as_ptr() as usize % 16, 0);
+        })
     }
 
     #[cfg(unix)]

@@ -205,6 +205,7 @@
      "blaze-mem",
      "blaze-radix",
      "blaze-rng",
+     "blaze-sys",
      "crossbeam-channel",
      "crossbeam-queue",
      "libc",
@@ -228,7 +229,6 @@
     "dependencies": [
      "blaze-check",
      "blaze-core",
-     "blaze-format",
      "blaze-hash",
      "blaze-image",
      "blaze-mem",
@@ -328,10 +328,6 @@
     "version": "0.0.0"
    },
    {
-    "name": "blaze-phf",
-    "version": "0.0.0"
-   },
-   {
     "dependencies": [
      "blaze-hash",
      "blaze-serde",
@@ -342,7 +338,6 @@
    },
    {
     "dependencies": [
-     "blaze-bytes",
      "blaze-check",
      "blaze-core",
      "blaze-format",
@@ -354,13 +349,13 @@
      "blaze-protocol",
      "blaze-query-macros",
      "blaze-reclaim",
+     "blaze-report",
      "blaze-serde",
      "blaze-vfs",
      "crossbeam-queue",
      "either",
      "hashbrown 0.17.1",
      "indexmap",
-     "intern",
      "serde",
      "smallvec",
      "thin-vec",
@@ -373,6 +368,7 @@
    {
     "dependencies": [
      "blaze-hash",
+     "blaze-report",
      "proc-macro2",
      "quote",
      "syn 2.0.119"
@@ -429,6 +425,10 @@
     "version": "0.0.0"
    },
    {
+    "name": "blaze-sys",
+    "version": "0.0.0"
+   },
+   {
     "dependencies": [
      "blaze-bytes",
      "blaze-check",
@@ -440,6 +440,7 @@
      "blaze-mem",
      "blaze-protocol",
      "blaze-reclaim",
+     "blaze-report",
      "blaze-serde",
      "hashbrown 0.17.1",
      "serde",
@@ -1342,20 +1343,6 @@
     "name": "indexmap",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "2.14.2"
-   },
-   {
-    "dependencies": [
-     "blaze-check",
-     "blaze-core",
-     "blaze-format",
-     "blaze-hash",
-     "blaze-ids",
-     "blaze-image",
-     "blaze-mem",
-     "blaze-phf"
-    ],
-    "name": "intern",
-    "version": "0.0.0"
    },
    {
     "checksum": "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc",
@@ -4227,23 +4214,6 @@
    },
    "version": "0.0.0"
   },
-  "blaze-phf@0.0.0": {
-   "authors": "blaze contributors",
-   "description": "Perfect hashes of fixed name sets (keywords, lints, attributes), built by const fn when the crate declaring the set compiles",
-   "homepage": "",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "blaze-phf",
-   "readme": "",
-   "repository": "https://github.com/indexable-inc/blaze",
-   "rust_version": "1.101",
-   "source": {
-    "dir": "crates/blaze-phf",
-    "kind": "path"
-   },
-   "version": "0.0.0"
-  },
   "blaze-protocol@0.0.0": {
    "authors": "blaze contributors",
    "description": "blaze's wire protocol between the daemon and its clients: length-prefixed frames of deterministic CBOR (RFC 8949 4.2.1)",
@@ -4427,6 +4397,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-spin",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-sys@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's one home for system calls (docs/v2/plan/design/sys.md): `#![no_std]`, no dependency but `core`, typed per operation. Linux by raw system call (no libc), macOS through libSystem's symbols, Windows through ntdll and kernel32; what is not built is a typed refusal naming it",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-sys",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-sys",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -5960,23 +5947,6 @@
     "kind": "registry"
    },
    "version": "2.14.2"
-  },
-  "intern@0.0.0": {
-   "authors": "blaze contributors",
-   "description": "Global interning in sharded, append-only arenas for blaze's front end.",
-   "homepage": "",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "intern",
-   "readme": "",
-   "repository": "https://github.com/indexable-inc/blaze",
-   "rust_version": "1.101",
-   "source": {
-    "dir": "crates/intern",
-    "kind": "path"
-   },
-   "version": "0.0.0"
   },
   "itertools@0.15.0": {
    "authors": "bluss",
@@ -9974,7 +9944,7 @@
      "src": "src/lib.rs",
      "target": "adler2"
     },
-    "ahash@0.8.12 custom-build build-script-build build host": {
+    "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,no-rng,runtime-rng,std": {
      "crate_type": "bin",
      "deps": [
       {
@@ -10005,12 +9975,42 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,runtime-rng,std": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "version_check",
+       "unit": "version_check@0.9.5 lib version_check build host"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "ahash@0.8.12 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "ahash@0.8.12 custom-build build-script-build build host"
+       "unit": "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,no-rng,runtime-rng,std"
       }
      ],
      "edition": "2018",
@@ -10030,6 +10030,36 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "ahash@0.8.12 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,runtime-rng,std"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -10077,6 +10107,52 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "ahash"
+    },
+    "ahash@0.8.12 lib ahash build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ahash@0.8.12 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.3.4 lib getrandom build host"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build host"
+      },
+      {
+       "name": "zerocopy",
+       "unit": "zerocopy@0.8.63 lib zerocopy build host"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -10584,10 +10660,6 @@
        "unit": "blaze-core@0.0.0 lib blaze_core build"
       },
       {
-       "name": "blaze_format",
-       "unit": "blaze-format@0.0.0 lib blaze_format build"
-      },
-      {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
@@ -10977,26 +11049,6 @@
      "src": "src/lib.rs",
      "target": "blaze_mem"
     },
-    "blaze-phf@0.0.0 lib blaze_phf build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-phf@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_phf"
-    },
     "blaze-protocol@0.0.0 lib blaze_protocol build": {
      "crate_type": "lib",
      "deps": [
@@ -11038,6 +11090,10 @@
        "unit": "blaze-hash@0.0.0 lib blaze_hash build host"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build host"
+      },
+      {
        "name": "proc_macro2",
        "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
       },
@@ -11070,10 +11126,6 @@
     "blaze-query@0.0.0 lib blaze_query build": {
      "crate_type": "lib",
      "deps": [
-      {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
-      },
       {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
@@ -11115,6 +11167,10 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
+      },
+      {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
@@ -11137,10 +11193,6 @@
       {
        "name": "indexmap",
        "unit": "indexmap@2.14.2 lib indexmap build"
-      },
-      {
-       "name": "intern",
-       "unit": "intern@0.0.0 lib intern build"
       },
       {
        "name": "serde",
@@ -11251,6 +11303,43 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_report"
+    },
+    "blaze-report@0.0.0 lib blaze_report build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "sonic_rs",
+       "unit": "sonic-rs@0.5.10 lib sonic_rs build host"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.2.0+spec-1.1.0 lib toml build host"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-report@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -11406,6 +11495,10 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
+      },
+      {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
@@ -11513,6 +11606,28 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bumpalo"
+    },
+    "bumpalo@3.20.3 lib bumpalo build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bumpalo@3.20.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -11628,6 +11743,29 @@
      "src": "src/lib.rs",
      "target": "bytes"
     },
+    "bytes@1.12.1 lib bytes build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bytes@1.12.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bytes"
+    },
     "cc@1.9.0 lib cc build host": {
      "crate_type": "lib",
      "deps": [
@@ -11681,6 +11819,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "cfg_if"
+    },
+    "cfg-if@1.0.5 lib cfg_if build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2018",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "cfg-if@1.0.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -13115,6 +13273,43 @@
      "src": "src/lib.rs",
      "target": "faststr"
     },
+    "faststr@0.2.34 lib faststr build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bytes",
+       "unit": "bytes@1.12.1 lib bytes build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "simdutf8",
+       "unit": "simdutf8@0.1.5 lib simdutf8 build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "faststr@0.2.34",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "faststr"
+    },
     "fdeflate@0.3.7 lib fdeflate build": {
      "crate_type": "lib",
      "deps": [
@@ -13424,6 +13619,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "getrandom@0.3.4 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "getrandom@0.3.4 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "getrandom@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "getrandom@0.3.4 lib getrandom build": {
      "crate_type": "lib",
      "deps": [
@@ -13451,6 +13671,39 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "getrandom"
+    },
+    "getrandom@0.3.4 lib getrandom build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "getrandom@0.3.4 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "getrandom@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -13944,55 +14197,6 @@
      "src": "src/lib.rs",
      "target": "indexmap"
     },
-    "intern@0.0.0 lib intern build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_format",
-       "unit": "blaze-format@0.0.0 lib blaze_format build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_ids",
-       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
-      },
-      {
-       "name": "blaze_image",
-       "unit": "blaze-image@0.0.0 lib blaze_image build"
-      },
-      {
-       "name": "blaze_mem",
-       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
-      },
-      {
-       "name": "blaze_phf",
-       "unit": "blaze-phf@0.0.0 lib blaze_phf build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "intern@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "intern"
-    },
     "itertools@0.15.0 lib itertools build": {
      "crate_type": "lib",
      "deps": [
@@ -14036,6 +14240,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "itoa"
+    },
+    "itoa@1.0.18 lib itoa build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "itoa@1.0.18",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -15332,6 +15556,29 @@
      "src": "src/lib.rs",
      "target": "once_cell"
     },
+    "once_cell@1.21.4 lib once_cell build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "alloc",
+      "race"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "once_cell@1.21.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "once_cell"
+    },
     "papaya@0.2.5 lib papaya build": {
      "crate_type": "lib",
      "deps": [
@@ -16083,6 +16330,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "ref-cast@1.0.27 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ref-cast@1.0.27 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "ref-cast@1.0.27",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "ref-cast@1.0.27 lib ref_cast build": {
      "crate_type": "lib",
      "deps": [
@@ -16106,6 +16378,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "ref_cast"
+    },
+    "ref-cast@1.0.27 lib ref_cast build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "ref_cast_impl",
+       "unit": "ref-cast-impl@1.0.27 proc-macro ref_cast_impl build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "ref-cast@1.0.27 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "ref-cast@1.0.27",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -16210,7 +16511,7 @@
      "src": "src/lib.rs",
      "target": "self_cell"
     },
-    "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std": {
+    "serde@1.0.229 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -16237,35 +16538,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde@1.0.229 custom-build build-script-build build host features=default,std": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "default",
-      "std"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "serde@1.0.229",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "serde@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std"
+       "unit": "serde@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
@@ -16297,12 +16575,16 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host features=default,std"
+       "unit": "serde@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "default",
+      "derive",
+      "rc",
+      "serde_derive",
       "std"
      ],
      "kind": "custom-build",
@@ -16370,11 +16652,19 @@
       {
        "name": "serde_core",
        "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_derive",
+       "unit": "serde_derive@1.0.229 proc-macro serde_derive build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "default",
+      "derive",
+      "rc",
+      "serde_derive",
       "std"
      ],
      "kind": "lib",
@@ -16392,7 +16682,7 @@
      "src": "src/lib.rs",
      "target": "serde"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std": {
+    "serde_core@1.0.229 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -16417,35 +16707,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "result",
-      "std"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "serde_core@1.0.229",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "serde_core@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
@@ -16475,11 +16742,13 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
+      "rc",
       "result",
       "std"
      ],
@@ -16538,6 +16807,8 @@
      ],
      "edition": "2021",
      "features": [
+      "alloc",
+      "rc",
       "result",
       "std"
      ],
@@ -16715,6 +16986,35 @@
      "src": "src/lib.rs",
      "target": "serde_spanned"
     },
+    "serde_spanned@1.1.2 lib serde_spanned build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
     "shlex@2.0.1 lib shlex build host": {
      "crate_type": "lib",
      "deps": [],
@@ -16780,6 +17080,30 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "simdutf8"
+    },
+    "simdutf8@0.1.5 lib simdutf8 build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2018",
+     "features": [
+      "aarch64_neon",
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "simdutf8@0.1.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -16890,6 +17214,31 @@
      "src": "src/lib.rs",
      "target": "sonic_number"
     },
+    "sonic-number@0.1.3 lib sonic_number build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-number@0.1.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_number"
+    },
     "sonic-rs@0.5.10 lib sonic_rs build": {
      "crate_type": "lib",
      "deps": [
@@ -16963,6 +17312,79 @@
      "src": "src/lib.rs",
      "target": "sonic_rs"
     },
+    "sonic-rs@0.5.10 lib sonic_rs build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "ahash",
+       "unit": "ahash@0.8.12 lib ahash build host"
+      },
+      {
+       "name": "bumpalo",
+       "unit": "bumpalo@3.20.3 lib bumpalo build host"
+      },
+      {
+       "name": "bytes",
+       "unit": "bytes@1.12.1 lib bytes build host"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "faststr",
+       "unit": "faststr@0.2.34 lib faststr build host"
+      },
+      {
+       "name": "itoa",
+       "unit": "itoa@1.0.18 lib itoa build host"
+      },
+      {
+       "name": "ref_cast",
+       "unit": "ref-cast@1.0.27 lib ref_cast build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "simdutf8",
+       "unit": "simdutf8@0.1.5 lib simdutf8 build host"
+      },
+      {
+       "name": "sonic_number",
+       "unit": "sonic-number@0.1.3 lib sonic_number build host"
+      },
+      {
+       "name": "sonic_simd",
+       "unit": "sonic-simd@0.1.4 lib sonic_simd build host"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.21 lib thiserror build host"
+      },
+      {
+       "name": "zmij",
+       "unit": "zmij@1.0.23 lib zmij build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-rs@0.5.10",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_rs"
+    },
     "sonic-simd@0.1.4 lib sonic_simd build": {
      "crate_type": "lib",
      "deps": [
@@ -16982,6 +17404,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_simd"
+    },
+    "sonic-simd@0.1.4 lib sonic_simd build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-simd@0.1.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -17328,6 +17775,34 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "thiserror@2.0.21 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "thiserror@2.0.21 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "thiserror@2.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "thiserror@2.0.21 lib thiserror build": {
      "crate_type": "lib",
      "deps": [
@@ -17354,6 +17829,38 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "thiserror"
+    },
+    "thiserror@2.0.21 lib thiserror build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "thiserror_impl",
+       "unit": "thiserror-impl@2.0.21 proc-macro thiserror_impl build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "thiserror@2.0.21 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "thiserror@2.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -17411,6 +17918,57 @@
      "src": "src/lib.rs",
      "target": "toml"
     },
+    "toml@1.2.0+spec-1.1.0 lib toml build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build host"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build host"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
     "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
      "crate_type": "lib",
      "deps": [
@@ -17434,6 +17992,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -17468,6 +18055,34 @@
      "src": "src/lib.rs",
      "target": "toml_parser"
     },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
     "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build": {
      "crate_type": "lib",
      "deps": [],
@@ -17485,6 +18100,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
+    "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -17722,6 +18360,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "unicode_width"
+    },
+    "unicode-width@0.2.3 lib unicode_width build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "cjk",
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "unicode-width@0.2.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -18064,6 +18725,26 @@
      "src": "src/lib.rs",
      "target": "winnow"
     },
+    "winnow@1.0.4 lib winnow build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
+    },
     "zerocopy@0.8.63 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
@@ -18113,6 +18794,33 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zerocopy@0.8.63 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zerocopy@0.8.63 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "simd"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zerocopy@0.8.63",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zerocopy@0.8.63 lib zerocopy build": {
      "crate_type": "lib",
      "deps": [
@@ -18134,6 +18842,33 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zerocopy"
+    },
+    "zerocopy@0.8.63 lib zerocopy build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zerocopy@0.8.63 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "simd"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zerocopy@0.8.63",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -18185,6 +18920,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zmij@1.0.23 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.23 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zmij@1.0.23",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zmij@1.0.23 lib zmij build": {
      "crate_type": "lib",
      "deps": [
@@ -18204,6 +18964,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zmij"
+    },
+    "zmij@1.0.23 lib zmij build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.23 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zmij@1.0.23",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -18471,7 +19256,7 @@
      "src": "src/lib.rs",
      "target": "adler2"
     },
-    "ahash@0.8.12 custom-build build-script-build build host": {
+    "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,no-rng,runtime-rng,std": {
      "crate_type": "bin",
      "deps": [
       {
@@ -18502,12 +19287,42 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,runtime-rng,std": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "version_check",
+       "unit": "version_check@0.9.5 lib version_check build host"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "ahash@0.8.12 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "ahash@0.8.12 custom-build build-script-build build host"
+       "unit": "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,no-rng,runtime-rng,std"
       }
      ],
      "edition": "2018",
@@ -18527,6 +19342,36 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "ahash@0.8.12 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,runtime-rng,std"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -18574,6 +19419,52 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "ahash"
+    },
+    "ahash@0.8.12 lib ahash build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ahash@0.8.12 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.3.4 lib getrandom build host"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build host"
+      },
+      {
+       "name": "zerocopy",
+       "unit": "zerocopy@0.8.63 lib zerocopy build host"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -19004,6 +19895,10 @@
        "unit": "blaze-rng@0.0.0 lib blaze_rng build"
       },
       {
+       "name": "blaze_sys",
+       "unit": "blaze-sys@0.0.0 lib blaze_sys build"
+      },
+      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
       },
@@ -19080,10 +19975,6 @@
       {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_format",
-       "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
        "name": "blaze_hash",
@@ -19475,26 +20366,6 @@
      "src": "src/lib.rs",
      "target": "blaze_mem"
     },
-    "blaze-phf@0.0.0 lib blaze_phf build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-phf@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_phf"
-    },
     "blaze-protocol@0.0.0 lib blaze_protocol build": {
      "crate_type": "lib",
      "deps": [
@@ -19536,6 +20407,10 @@
        "unit": "blaze-hash@0.0.0 lib blaze_hash build host"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build host"
+      },
+      {
        "name": "proc_macro2",
        "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
       },
@@ -19568,10 +20443,6 @@
     "blaze-query@0.0.0 lib blaze_query build": {
      "crate_type": "lib",
      "deps": [
-      {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
-      },
       {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
@@ -19613,6 +20484,10 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
+      },
+      {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
@@ -19635,10 +20510,6 @@
       {
        "name": "indexmap",
        "unit": "indexmap@2.14.2 lib indexmap build"
-      },
-      {
-       "name": "intern",
-       "unit": "intern@0.0.0 lib intern build"
       },
       {
        "name": "serde",
@@ -19755,6 +20626,43 @@
      "src": "src/lib.rs",
      "target": "blaze_report"
     },
+    "blaze-report@0.0.0 lib blaze_report build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "sonic_rs",
+       "unit": "sonic-rs@0.5.10 lib sonic_rs build host"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.2.0+spec-1.1.0 lib toml build host"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-report@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_report"
+    },
     "blaze-rng@0.0.0 lib blaze_rng build": {
      "crate_type": "lib",
      "deps": [],
@@ -19864,6 +20772,26 @@
      "src": "src/lib.rs",
      "target": "blaze_spin"
     },
+    "blaze-sys@0.0.0 lib blaze_sys build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-sys@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_sys"
+    },
     "blaze-vfs@0.0.0 lib blaze_vfs build": {
      "crate_type": "lib",
      "deps": [
@@ -19902,6 +20830,10 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
       },
       {
        "name": "blaze_serde",
@@ -19953,6 +20885,28 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bumpalo"
+    },
+    "bumpalo@3.20.3 lib bumpalo build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bumpalo@3.20.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -20062,6 +21016,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bytes"
+    },
+    "bytes@1.12.1 lib bytes build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bytes@1.12.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -20203,6 +21180,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "cfg_if"
+    },
+    "cfg-if@1.0.5 lib cfg_if build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2018",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "cfg-if@1.0.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -21450,6 +22447,43 @@
      "src": "src/lib.rs",
      "target": "faststr"
     },
+    "faststr@0.2.34 lib faststr build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bytes",
+       "unit": "bytes@1.12.1 lib bytes build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "simdutf8",
+       "unit": "simdutf8@0.1.5 lib simdutf8 build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "faststr@0.2.34",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "faststr"
+    },
     "fdeflate@0.3.7 lib fdeflate build": {
      "crate_type": "lib",
      "deps": [
@@ -21697,6 +22731,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "getrandom@0.3.4 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "getrandom@0.3.4 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "getrandom@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "getrandom@0.3.4 lib getrandom build": {
      "crate_type": "lib",
      "deps": [
@@ -21724,6 +22783,39 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "getrandom"
+    },
+    "getrandom@0.3.4 lib getrandom build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "getrandom@0.3.4 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "getrandom@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -22396,55 +23488,6 @@
      "src": "src/lib.rs",
      "target": "indexmap"
     },
-    "intern@0.0.0 lib intern build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_format",
-       "unit": "blaze-format@0.0.0 lib blaze_format build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_ids",
-       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
-      },
-      {
-       "name": "blaze_image",
-       "unit": "blaze-image@0.0.0 lib blaze_image build"
-      },
-      {
-       "name": "blaze_mem",
-       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
-      },
-      {
-       "name": "blaze_phf",
-       "unit": "blaze-phf@0.0.0 lib blaze_phf build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "intern@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "intern"
-    },
     "itertools@0.15.0 lib itertools build": {
      "crate_type": "lib",
      "deps": [
@@ -22488,6 +23531,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "itoa"
+    },
+    "itoa@1.0.18 lib itoa build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "itoa@1.0.18",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -23412,6 +24475,29 @@
      "src": "src/lib.rs",
      "target": "once_cell"
     },
+    "once_cell@1.21.4 lib once_cell build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "alloc",
+      "race"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "once_cell@1.21.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "once_cell"
+    },
     "papaya@0.2.5 lib papaya build": {
      "crate_type": "lib",
      "deps": [
@@ -24243,6 +25329,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "ref-cast@1.0.27 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ref-cast@1.0.27 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "ref-cast@1.0.27",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "ref-cast@1.0.27 lib ref_cast build": {
      "crate_type": "lib",
      "deps": [
@@ -24266,6 +25377,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "ref_cast"
+    },
+    "ref-cast@1.0.27 lib ref_cast build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "ref_cast_impl",
+       "unit": "ref-cast-impl@1.0.27 proc-macro ref_cast_impl build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "ref-cast@1.0.27 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "ref-cast@1.0.27",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -24621,7 +25761,7 @@
      "src": "src/lib.rs",
      "target": "self_cell"
     },
-    "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std": {
+    "serde@1.0.229 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -24648,35 +25788,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde@1.0.229 custom-build build-script-build build host features=default,std": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "default",
-      "std"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "serde@1.0.229",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "serde@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std"
+       "unit": "serde@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
@@ -24708,12 +25825,16 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host features=default,std"
+       "unit": "serde@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "default",
+      "derive",
+      "rc",
+      "serde_derive",
       "std"
      ],
      "kind": "custom-build",
@@ -24781,11 +25902,19 @@
       {
        "name": "serde_core",
        "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_derive",
+       "unit": "serde_derive@1.0.229 proc-macro serde_derive build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "default",
+      "derive",
+      "rc",
+      "serde_derive",
       "std"
      ],
      "kind": "lib",
@@ -24803,7 +25932,7 @@
      "src": "src/lib.rs",
      "target": "serde"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std": {
+    "serde_core@1.0.229 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -24828,35 +25957,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "result",
-      "std"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "serde_core@1.0.229",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "serde_core@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
@@ -24886,11 +25992,13 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
+      "rc",
       "result",
       "std"
      ],
@@ -24949,6 +26057,8 @@
      ],
      "edition": "2021",
      "features": [
+      "alloc",
+      "rc",
       "result",
       "std"
      ],
@@ -25126,6 +26236,35 @@
      "src": "src/lib.rs",
      "target": "serde_spanned"
     },
+    "serde_spanned@1.1.2 lib serde_spanned build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
     "shlex@2.0.1 lib shlex build host": {
      "crate_type": "lib",
      "deps": [],
@@ -25191,6 +26330,30 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "simdutf8"
+    },
+    "simdutf8@0.1.5 lib simdutf8 build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2018",
+     "features": [
+      "aarch64_neon",
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "simdutf8@0.1.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -25471,6 +26634,31 @@
      "src": "src/lib.rs",
      "target": "sonic_number"
     },
+    "sonic-number@0.1.3 lib sonic_number build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-number@0.1.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_number"
+    },
     "sonic-rs@0.5.10 lib sonic_rs build": {
      "crate_type": "lib",
      "deps": [
@@ -25544,6 +26732,79 @@
      "src": "src/lib.rs",
      "target": "sonic_rs"
     },
+    "sonic-rs@0.5.10 lib sonic_rs build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "ahash",
+       "unit": "ahash@0.8.12 lib ahash build host"
+      },
+      {
+       "name": "bumpalo",
+       "unit": "bumpalo@3.20.3 lib bumpalo build host"
+      },
+      {
+       "name": "bytes",
+       "unit": "bytes@1.12.1 lib bytes build host"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "faststr",
+       "unit": "faststr@0.2.34 lib faststr build host"
+      },
+      {
+       "name": "itoa",
+       "unit": "itoa@1.0.18 lib itoa build host"
+      },
+      {
+       "name": "ref_cast",
+       "unit": "ref-cast@1.0.27 lib ref_cast build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "simdutf8",
+       "unit": "simdutf8@0.1.5 lib simdutf8 build host"
+      },
+      {
+       "name": "sonic_number",
+       "unit": "sonic-number@0.1.3 lib sonic_number build host"
+      },
+      {
+       "name": "sonic_simd",
+       "unit": "sonic-simd@0.1.4 lib sonic_simd build host"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.21 lib thiserror build host"
+      },
+      {
+       "name": "zmij",
+       "unit": "zmij@1.0.23 lib zmij build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-rs@0.5.10",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_rs"
+    },
     "sonic-simd@0.1.4 lib sonic_simd build": {
      "crate_type": "lib",
      "deps": [
@@ -25563,6 +26824,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_simd"
+    },
+    "sonic-simd@0.1.4 lib sonic_simd build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-simd@0.1.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -26015,6 +27301,34 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "thiserror@2.0.21 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "thiserror@2.0.21 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "thiserror@2.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "thiserror@2.0.21 lib thiserror build": {
      "crate_type": "lib",
      "deps": [
@@ -26041,6 +27355,38 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "thiserror"
+    },
+    "thiserror@2.0.21 lib thiserror build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "thiserror_impl",
+       "unit": "thiserror-impl@2.0.21 proc-macro thiserror_impl build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "thiserror@2.0.21 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "thiserror@2.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -26098,6 +27444,57 @@
      "src": "src/lib.rs",
      "target": "toml"
     },
+    "toml@1.2.0+spec-1.1.0 lib toml build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build host"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build host"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
     "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
      "crate_type": "lib",
      "deps": [
@@ -26121,6 +27518,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -26155,6 +27581,34 @@
      "src": "src/lib.rs",
      "target": "toml_parser"
     },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
     "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build": {
      "crate_type": "lib",
      "deps": [],
@@ -26172,6 +27626,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
+    "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -26409,6 +27886,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "unicode_width"
+    },
+    "unicode-width@0.2.3 lib unicode_width build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "cjk",
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "unicode-width@0.2.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -27305,6 +28805,26 @@
      "src": "src/lib.rs",
      "target": "winnow"
     },
+    "winnow@1.0.4 lib winnow build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
+    },
     "x11-dl@2.21.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
@@ -27632,6 +29152,33 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zerocopy@0.8.63 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zerocopy@0.8.63 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "simd"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zerocopy@0.8.63",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zerocopy@0.8.63 lib zerocopy build": {
      "crate_type": "lib",
      "deps": [
@@ -27653,6 +29200,33 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zerocopy"
+    },
+    "zerocopy@0.8.63 lib zerocopy build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zerocopy@0.8.63 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "simd"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zerocopy@0.8.63",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -27704,6 +29278,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zmij@1.0.23 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.23 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zmij@1.0.23",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zmij@1.0.23 lib zmij build": {
      "crate_type": "lib",
      "deps": [
@@ -27723,6 +29322,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zmij"
+    },
+    "zmij@1.0.23 lib zmij build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.23 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zmij@1.0.23",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -27990,7 +29614,7 @@
      "src": "src/lib.rs",
      "target": "adler2"
     },
-    "ahash@0.8.12 custom-build build-script-build build host": {
+    "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,no-rng,runtime-rng,std": {
      "crate_type": "bin",
      "deps": [
       {
@@ -28021,12 +29645,42 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,runtime-rng,std": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "version_check",
+       "unit": "version_check@0.9.5 lib version_check build host"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "ahash@0.8.12 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "ahash@0.8.12 custom-build build-script-build build host"
+       "unit": "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,no-rng,runtime-rng,std"
       }
      ],
      "edition": "2018",
@@ -28046,6 +29700,36 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "ahash@0.8.12 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,runtime-rng,std"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -28093,6 +29777,52 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "ahash"
+    },
+    "ahash@0.8.12 lib ahash build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ahash@0.8.12 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.3.4 lib getrandom build host"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build host"
+      },
+      {
+       "name": "zerocopy",
+       "unit": "zerocopy@0.8.63 lib zerocopy build host"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -28507,10 +30237,6 @@
        "unit": "blaze-core@0.0.0 lib blaze_core build"
       },
       {
-       "name": "blaze_format",
-       "unit": "blaze-format@0.0.0 lib blaze_format build"
-      },
-      {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
@@ -28896,26 +30622,6 @@
      "src": "src/lib.rs",
      "target": "blaze_mem"
     },
-    "blaze-phf@0.0.0 lib blaze_phf build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-phf@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_phf"
-    },
     "blaze-protocol@0.0.0 lib blaze_protocol build": {
      "crate_type": "lib",
      "deps": [
@@ -28957,6 +30663,10 @@
        "unit": "blaze-hash@0.0.0 lib blaze_hash build host"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build host"
+      },
+      {
        "name": "proc_macro2",
        "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
       },
@@ -28989,10 +30699,6 @@
     "blaze-query@0.0.0 lib blaze_query build": {
      "crate_type": "lib",
      "deps": [
-      {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
-      },
       {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
@@ -29034,6 +30740,10 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
+      },
+      {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
@@ -29056,10 +30766,6 @@
       {
        "name": "indexmap",
        "unit": "indexmap@2.14.2 lib indexmap build"
-      },
-      {
-       "name": "intern",
-       "unit": "intern@0.0.0 lib intern build"
       },
       {
        "name": "serde",
@@ -29170,6 +30876,43 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_report"
+    },
+    "blaze-report@0.0.0 lib blaze_report build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "sonic_rs",
+       "unit": "sonic-rs@0.5.10 lib sonic_rs build host"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.2.0+spec-1.1.0 lib toml build host"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-report@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -29325,6 +31068,10 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
+      },
+      {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
@@ -29432,6 +31179,28 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bumpalo"
+    },
+    "bumpalo@3.20.3 lib bumpalo build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bumpalo@3.20.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -29547,6 +31316,29 @@
      "src": "src/lib.rs",
      "target": "bytes"
     },
+    "bytes@1.12.1 lib bytes build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bytes@1.12.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bytes"
+    },
     "cc@1.9.0 lib cc build host": {
      "crate_type": "lib",
      "deps": [
@@ -29600,6 +31392,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "cfg_if"
+    },
+    "cfg-if@1.0.5 lib cfg_if build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2018",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "cfg-if@1.0.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -31054,6 +32866,43 @@
      "src": "src/lib.rs",
      "target": "faststr"
     },
+    "faststr@0.2.34 lib faststr build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bytes",
+       "unit": "bytes@1.12.1 lib bytes build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "simdutf8",
+       "unit": "simdutf8@0.1.5 lib simdutf8 build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "faststr@0.2.34",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "faststr"
+    },
     "fdeflate@0.3.7 lib fdeflate build": {
      "crate_type": "lib",
      "deps": [
@@ -31363,6 +33212,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "getrandom@0.3.4 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "getrandom@0.3.4 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "getrandom@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "getrandom@0.3.4 lib getrandom build": {
      "crate_type": "lib",
      "deps": [
@@ -31390,6 +33264,39 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "getrandom"
+    },
+    "getrandom@0.3.4 lib getrandom build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "getrandom@0.3.4 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "getrandom@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -31883,55 +33790,6 @@
      "src": "src/lib.rs",
      "target": "indexmap"
     },
-    "intern@0.0.0 lib intern build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_format",
-       "unit": "blaze-format@0.0.0 lib blaze_format build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_ids",
-       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
-      },
-      {
-       "name": "blaze_image",
-       "unit": "blaze-image@0.0.0 lib blaze_image build"
-      },
-      {
-       "name": "blaze_mem",
-       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
-      },
-      {
-       "name": "blaze_phf",
-       "unit": "blaze-phf@0.0.0 lib blaze_phf build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "intern@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "intern"
-    },
     "itertools@0.15.0 lib itertools build": {
      "crate_type": "lib",
      "deps": [
@@ -31975,6 +33833,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "itoa"
+    },
+    "itoa@1.0.18 lib itoa build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "itoa@1.0.18",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -33271,6 +35149,29 @@
      "src": "src/lib.rs",
      "target": "once_cell"
     },
+    "once_cell@1.21.4 lib once_cell build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "alloc",
+      "race"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "once_cell@1.21.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "once_cell"
+    },
     "papaya@0.2.5 lib papaya build": {
      "crate_type": "lib",
      "deps": [
@@ -34022,6 +35923,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "ref-cast@1.0.27 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ref-cast@1.0.27 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "ref-cast@1.0.27",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "ref-cast@1.0.27 lib ref_cast build": {
      "crate_type": "lib",
      "deps": [
@@ -34045,6 +35971,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "ref_cast"
+    },
+    "ref-cast@1.0.27 lib ref_cast build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "ref_cast_impl",
+       "unit": "ref-cast-impl@1.0.27 proc-macro ref_cast_impl build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "ref-cast@1.0.27 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "ref-cast@1.0.27",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -34149,7 +36104,7 @@
      "src": "src/lib.rs",
      "target": "self_cell"
     },
-    "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std": {
+    "serde@1.0.229 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -34176,35 +36131,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde@1.0.229 custom-build build-script-build build host features=default,std": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "default",
-      "std"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "serde@1.0.229",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "serde@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std"
+       "unit": "serde@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
@@ -34236,12 +36168,16 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host features=default,std"
+       "unit": "serde@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "default",
+      "derive",
+      "rc",
+      "serde_derive",
       "std"
      ],
      "kind": "custom-build",
@@ -34309,11 +36245,19 @@
       {
        "name": "serde_core",
        "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_derive",
+       "unit": "serde_derive@1.0.229 proc-macro serde_derive build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "default",
+      "derive",
+      "rc",
+      "serde_derive",
       "std"
      ],
      "kind": "lib",
@@ -34331,7 +36275,7 @@
      "src": "src/lib.rs",
      "target": "serde"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std": {
+    "serde_core@1.0.229 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -34356,35 +36300,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "result",
-      "std"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "serde_core@1.0.229",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "serde_core@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
@@ -34414,11 +36335,13 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
+      "rc",
       "result",
       "std"
      ],
@@ -34477,6 +36400,8 @@
      ],
      "edition": "2021",
      "features": [
+      "alloc",
+      "rc",
       "result",
       "std"
      ],
@@ -34654,6 +36579,35 @@
      "src": "src/lib.rs",
      "target": "serde_spanned"
     },
+    "serde_spanned@1.1.2 lib serde_spanned build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
     "shlex@2.0.1 lib shlex build host": {
      "crate_type": "lib",
      "deps": [],
@@ -34719,6 +36673,30 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "simdutf8"
+    },
+    "simdutf8@0.1.5 lib simdutf8 build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2018",
+     "features": [
+      "aarch64_neon",
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "simdutf8@0.1.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -34829,6 +36807,31 @@
      "src": "src/lib.rs",
      "target": "sonic_number"
     },
+    "sonic-number@0.1.3 lib sonic_number build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-number@0.1.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_number"
+    },
     "sonic-rs@0.5.10 lib sonic_rs build": {
      "crate_type": "lib",
      "deps": [
@@ -34902,6 +36905,79 @@
      "src": "src/lib.rs",
      "target": "sonic_rs"
     },
+    "sonic-rs@0.5.10 lib sonic_rs build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "ahash",
+       "unit": "ahash@0.8.12 lib ahash build host"
+      },
+      {
+       "name": "bumpalo",
+       "unit": "bumpalo@3.20.3 lib bumpalo build host"
+      },
+      {
+       "name": "bytes",
+       "unit": "bytes@1.12.1 lib bytes build host"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "faststr",
+       "unit": "faststr@0.2.34 lib faststr build host"
+      },
+      {
+       "name": "itoa",
+       "unit": "itoa@1.0.18 lib itoa build host"
+      },
+      {
+       "name": "ref_cast",
+       "unit": "ref-cast@1.0.27 lib ref_cast build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "simdutf8",
+       "unit": "simdutf8@0.1.5 lib simdutf8 build host"
+      },
+      {
+       "name": "sonic_number",
+       "unit": "sonic-number@0.1.3 lib sonic_number build host"
+      },
+      {
+       "name": "sonic_simd",
+       "unit": "sonic-simd@0.1.4 lib sonic_simd build host"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.21 lib thiserror build host"
+      },
+      {
+       "name": "zmij",
+       "unit": "zmij@1.0.23 lib zmij build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-rs@0.5.10",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_rs"
+    },
     "sonic-simd@0.1.4 lib sonic_simd build": {
      "crate_type": "lib",
      "deps": [
@@ -34921,6 +36997,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_simd"
+    },
+    "sonic-simd@0.1.4 lib sonic_simd build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-simd@0.1.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -35267,6 +37368,34 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "thiserror@2.0.21 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "thiserror@2.0.21 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "thiserror@2.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "thiserror@2.0.21 lib thiserror build": {
      "crate_type": "lib",
      "deps": [
@@ -35293,6 +37422,38 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "thiserror"
+    },
+    "thiserror@2.0.21 lib thiserror build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "thiserror_impl",
+       "unit": "thiserror-impl@2.0.21 proc-macro thiserror_impl build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "thiserror@2.0.21 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "thiserror@2.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -35350,6 +37511,57 @@
      "src": "src/lib.rs",
      "target": "toml"
     },
+    "toml@1.2.0+spec-1.1.0 lib toml build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build host"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build host"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
     "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
      "crate_type": "lib",
      "deps": [
@@ -35373,6 +37585,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -35407,6 +37648,34 @@
      "src": "src/lib.rs",
      "target": "toml_parser"
     },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
     "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build": {
      "crate_type": "lib",
      "deps": [],
@@ -35424,6 +37693,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
+    "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -35661,6 +37953,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "unicode_width"
+    },
+    "unicode-width@0.2.3 lib unicode_width build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "cjk",
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "unicode-width@0.2.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -36003,6 +38318,26 @@
      "src": "src/lib.rs",
      "target": "winnow"
     },
+    "winnow@1.0.4 lib winnow build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
+    },
     "zerocopy@0.8.63 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
@@ -36052,6 +38387,33 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zerocopy@0.8.63 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zerocopy@0.8.63 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "simd"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zerocopy@0.8.63",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zerocopy@0.8.63 lib zerocopy build": {
      "crate_type": "lib",
      "deps": [
@@ -36073,6 +38435,33 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zerocopy"
+    },
+    "zerocopy@0.8.63 lib zerocopy build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zerocopy@0.8.63 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "simd"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zerocopy@0.8.63",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -36124,6 +38513,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zmij@1.0.23 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.23 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zmij@1.0.23",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zmij@1.0.23 lib zmij build": {
      "crate_type": "lib",
      "deps": [
@@ -36143,6 +38557,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zmij"
+    },
+    "zmij@1.0.23 lib zmij build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.23 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zmij@1.0.23",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -36410,7 +38849,7 @@
      "src": "src/lib.rs",
      "target": "adler2"
     },
-    "ahash@0.8.12 custom-build build-script-build build host": {
+    "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,no-rng,runtime-rng,std": {
      "crate_type": "bin",
      "deps": [
       {
@@ -36441,12 +38880,42 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,runtime-rng,std": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "version_check",
+       "unit": "version_check@0.9.5 lib version_check build host"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "ahash@0.8.12 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "ahash@0.8.12 custom-build build-script-build build host"
+       "unit": "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,no-rng,runtime-rng,std"
       }
      ],
      "edition": "2018",
@@ -36466,6 +38935,36 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "ahash@0.8.12 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ahash@0.8.12 custom-build build-script-build build host features=default,getrandom,runtime-rng,std"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -36513,6 +39012,52 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "ahash"
+    },
+    "ahash@0.8.12 lib ahash build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ahash@0.8.12 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.3.4 lib getrandom build host"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build host"
+      },
+      {
+       "name": "zerocopy",
+       "unit": "zerocopy@0.8.63 lib zerocopy build host"
+      }
+     ],
+     "edition": "2018",
+     "features": [
+      "default",
+      "getrandom",
+      "runtime-rng",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "ahash@0.8.12",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -36943,6 +39488,10 @@
        "unit": "blaze-rng@0.0.0 lib blaze_rng build"
       },
       {
+       "name": "blaze_sys",
+       "unit": "blaze-sys@0.0.0 lib blaze_sys build"
+      },
+      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
       },
@@ -37019,10 +39568,6 @@
       {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_format",
-       "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
        "name": "blaze_hash",
@@ -37414,26 +39959,6 @@
      "src": "src/lib.rs",
      "target": "blaze_mem"
     },
-    "blaze-phf@0.0.0 lib blaze_phf build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-phf@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_phf"
-    },
     "blaze-protocol@0.0.0 lib blaze_protocol build": {
      "crate_type": "lib",
      "deps": [
@@ -37475,6 +40000,10 @@
        "unit": "blaze-hash@0.0.0 lib blaze_hash build host"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build host"
+      },
+      {
        "name": "proc_macro2",
        "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
       },
@@ -37507,10 +40036,6 @@
     "blaze-query@0.0.0 lib blaze_query build": {
      "crate_type": "lib",
      "deps": [
-      {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
-      },
       {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
@@ -37552,6 +40077,10 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
+      },
+      {
        "name": "blaze_serde",
        "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
@@ -37574,10 +40103,6 @@
       {
        "name": "indexmap",
        "unit": "indexmap@2.14.2 lib indexmap build"
-      },
-      {
-       "name": "intern",
-       "unit": "intern@0.0.0 lib intern build"
       },
       {
        "name": "serde",
@@ -37694,6 +40219,43 @@
      "src": "src/lib.rs",
      "target": "blaze_report"
     },
+    "blaze-report@0.0.0 lib blaze_report build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "sonic_rs",
+       "unit": "sonic-rs@0.5.10 lib sonic_rs build host"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.2.0+spec-1.1.0 lib toml build host"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.3 lib unicode_width build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-report@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_report"
+    },
     "blaze-rng@0.0.0 lib blaze_rng build": {
      "crate_type": "lib",
      "deps": [],
@@ -37803,6 +40365,26 @@
      "src": "src/lib.rs",
      "target": "blaze_spin"
     },
+    "blaze-sys@0.0.0 lib blaze_sys build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-sys@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_sys"
+    },
     "blaze-vfs@0.0.0 lib blaze_vfs build": {
      "crate_type": "lib",
      "deps": [
@@ -37841,6 +40423,10 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "blaze_report",
+       "unit": "blaze-report@0.0.0 lib blaze_report build"
       },
       {
        "name": "blaze_serde",
@@ -37892,6 +40478,28 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bumpalo"
+    },
+    "bumpalo@3.20.3 lib bumpalo build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bumpalo@3.20.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -38001,6 +40609,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "bytes"
+    },
+    "bytes@1.12.1 lib bytes build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "bytes@1.12.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -38142,6 +40773,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "cfg_if"
+    },
+    "cfg-if@1.0.5 lib cfg_if build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2018",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "cfg-if@1.0.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -39409,6 +42060,43 @@
      "src": "src/lib.rs",
      "target": "faststr"
     },
+    "faststr@0.2.34 lib faststr build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bytes",
+       "unit": "bytes@1.12.1 lib bytes build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "simdutf8",
+       "unit": "simdutf8@0.1.5 lib simdutf8 build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "faststr@0.2.34",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "faststr"
+    },
     "fdeflate@0.3.7 lib fdeflate build": {
      "crate_type": "lib",
      "deps": [
@@ -39656,6 +42344,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "getrandom@0.3.4 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "getrandom@0.3.4 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "getrandom@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "getrandom@0.3.4 lib getrandom build": {
      "crate_type": "lib",
      "deps": [
@@ -39683,6 +42396,39 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "getrandom"
+    },
+    "getrandom@0.3.4 lib getrandom build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "getrandom@0.3.4 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "getrandom@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -40355,55 +43101,6 @@
      "src": "src/lib.rs",
      "target": "indexmap"
     },
-    "intern@0.0.0 lib intern build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "blaze_core",
-       "unit": "blaze-core@0.0.0 lib blaze_core build"
-      },
-      {
-       "name": "blaze_format",
-       "unit": "blaze-format@0.0.0 lib blaze_format build"
-      },
-      {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
-      },
-      {
-       "name": "blaze_ids",
-       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
-      },
-      {
-       "name": "blaze_image",
-       "unit": "blaze-image@0.0.0 lib blaze_image build"
-      },
-      {
-       "name": "blaze_mem",
-       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
-      },
-      {
-       "name": "blaze_phf",
-       "unit": "blaze-phf@0.0.0 lib blaze_phf build"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "intern@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "intern"
-    },
     "itertools@0.15.0 lib itertools build": {
      "crate_type": "lib",
      "deps": [
@@ -40447,6 +43144,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "itoa"
+    },
+    "itoa@1.0.18 lib itoa build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "itoa@1.0.18",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -41371,6 +44088,29 @@
      "src": "src/lib.rs",
      "target": "once_cell"
     },
+    "once_cell@1.21.4 lib once_cell build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "alloc",
+      "race"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "once_cell@1.21.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "once_cell"
+    },
     "papaya@0.2.5 lib papaya build": {
      "crate_type": "lib",
      "deps": [
@@ -42202,6 +44942,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "ref-cast@1.0.27 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "ref-cast@1.0.27 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "ref-cast@1.0.27",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "ref-cast@1.0.27 lib ref_cast build": {
      "crate_type": "lib",
      "deps": [
@@ -42225,6 +44990,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "ref_cast"
+    },
+    "ref-cast@1.0.27 lib ref_cast build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "ref_cast_impl",
+       "unit": "ref-cast-impl@1.0.27 proc-macro ref_cast_impl build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "ref-cast@1.0.27 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "ref-cast@1.0.27",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -42580,7 +45374,7 @@
      "src": "src/lib.rs",
      "target": "self_cell"
     },
-    "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std": {
+    "serde@1.0.229 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -42607,35 +45401,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde@1.0.229 custom-build build-script-build build host features=default,std": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "default",
-      "std"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "serde@1.0.229",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "serde@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std"
+       "unit": "serde@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
@@ -42667,12 +45438,16 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host features=default,std"
+       "unit": "serde@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "default",
+      "derive",
+      "rc",
+      "serde_derive",
       "std"
      ],
      "kind": "custom-build",
@@ -42740,11 +45515,19 @@
       {
        "name": "serde_core",
        "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_derive",
+       "unit": "serde_derive@1.0.229 proc-macro serde_derive build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "default",
+      "derive",
+      "rc",
+      "serde_derive",
       "std"
      ],
      "kind": "lib",
@@ -42762,7 +45545,7 @@
      "src": "src/lib.rs",
      "target": "serde"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std": {
+    "serde_core@1.0.229 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -42787,35 +45570,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
-     "crate_type": "bin",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "result",
-      "std"
-     ],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "serde_core@1.0.229",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "serde_core@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
@@ -42845,11 +45605,13 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
+      "rc",
       "result",
       "std"
      ],
@@ -42908,6 +45670,8 @@
      ],
      "edition": "2021",
      "features": [
+      "alloc",
+      "rc",
       "result",
       "std"
      ],
@@ -43085,6 +45849,35 @@
      "src": "src/lib.rs",
      "target": "serde_spanned"
     },
+    "serde_spanned@1.1.2 lib serde_spanned build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
     "shlex@2.0.1 lib shlex build host": {
      "crate_type": "lib",
      "deps": [],
@@ -43150,6 +45943,30 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "simdutf8"
+    },
+    "simdutf8@0.1.5 lib simdutf8 build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2018",
+     "features": [
+      "aarch64_neon",
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "simdutf8@0.1.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -43430,6 +46247,31 @@
      "src": "src/lib.rs",
      "target": "sonic_number"
     },
+    "sonic-number@0.1.3 lib sonic_number build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-number@0.1.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_number"
+    },
     "sonic-rs@0.5.10 lib sonic_rs build": {
      "crate_type": "lib",
      "deps": [
@@ -43503,6 +46345,79 @@
      "src": "src/lib.rs",
      "target": "sonic_rs"
     },
+    "sonic-rs@0.5.10 lib sonic_rs build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "ahash",
+       "unit": "ahash@0.8.12 lib ahash build host"
+      },
+      {
+       "name": "bumpalo",
+       "unit": "bumpalo@3.20.3 lib bumpalo build host"
+      },
+      {
+       "name": "bytes",
+       "unit": "bytes@1.12.1 lib bytes build host"
+      },
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      },
+      {
+       "name": "faststr",
+       "unit": "faststr@0.2.34 lib faststr build host"
+      },
+      {
+       "name": "itoa",
+       "unit": "itoa@1.0.18 lib itoa build host"
+      },
+      {
+       "name": "ref_cast",
+       "unit": "ref-cast@1.0.27 lib ref_cast build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      },
+      {
+       "name": "simdutf8",
+       "unit": "simdutf8@0.1.5 lib simdutf8 build host"
+      },
+      {
+       "name": "sonic_number",
+       "unit": "sonic-number@0.1.3 lib sonic_number build host"
+      },
+      {
+       "name": "sonic_simd",
+       "unit": "sonic-simd@0.1.4 lib sonic_simd build host"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.21 lib thiserror build host"
+      },
+      {
+       "name": "zmij",
+       "unit": "zmij@1.0.23 lib zmij build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-rs@0.5.10",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_rs"
+    },
     "sonic-simd@0.1.4 lib sonic_simd build": {
      "crate_type": "lib",
      "deps": [
@@ -43522,6 +46437,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "sonic_simd"
+    },
+    "sonic-simd@0.1.4 lib sonic_simd build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "cfg_if",
+       "unit": "cfg-if@1.0.5 lib cfg_if build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "sonic-simd@0.1.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -43974,6 +46914,34 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "thiserror@2.0.21 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "thiserror@2.0.21 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "thiserror@2.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "thiserror@2.0.21 lib thiserror build": {
      "crate_type": "lib",
      "deps": [
@@ -44000,6 +46968,38 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "thiserror"
+    },
+    "thiserror@2.0.21 lib thiserror build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "thiserror_impl",
+       "unit": "thiserror-impl@2.0.21 proc-macro thiserror_impl build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "thiserror@2.0.21 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "thiserror@2.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -44057,6 +47057,57 @@
      "src": "src/lib.rs",
      "target": "toml"
     },
+    "toml@1.2.0+spec-1.1.0 lib toml build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build host"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build host"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
     "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
      "crate_type": "lib",
      "deps": [
@@ -44080,6 +47131,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -44114,6 +47194,34 @@
      "src": "src/lib.rs",
      "target": "toml_parser"
     },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
     "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build": {
      "crate_type": "lib",
      "deps": [],
@@ -44131,6 +47239,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
+    "toml_writer@1.2.0+spec-1.1.0 lib toml_writer build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.2.0+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -44368,6 +47499,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "unicode_width"
+    },
+    "unicode-width@0.2.3 lib unicode_width build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "cjk",
+      "default"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "unicode-width@0.2.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -45264,6 +48418,26 @@
      "src": "src/lib.rs",
      "target": "winnow"
     },
+    "winnow@1.0.4 lib winnow build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
+    },
     "x11-dl@2.21.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
@@ -45591,6 +48765,33 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zerocopy@0.8.63 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zerocopy@0.8.63 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "simd"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zerocopy@0.8.63",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zerocopy@0.8.63 lib zerocopy build": {
      "crate_type": "lib",
      "deps": [
@@ -45612,6 +48813,33 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zerocopy"
+    },
+    "zerocopy@0.8.63 lib zerocopy build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zerocopy@0.8.63 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "simd"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zerocopy@0.8.63",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -45663,6 +48891,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zmij@1.0.23 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.23 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zmij@1.0.23",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zmij@1.0.23 lib zmij build": {
      "crate_type": "lib",
      "deps": [
@@ -45682,6 +48935,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zmij"
+    },
+    "zmij@1.0.23 lib zmij build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.23 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zmij@1.0.23",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },

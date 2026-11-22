@@ -239,6 +239,55 @@ impl Sweep {
         }
     }
 
+    /// Room for a load of `bytes` made within `budget` resident bytes, of which `held` are
+    /// resident now: what a load does before it claims its pages. Nothing when the load
+    /// fits; else the sweep gives back what the load would pass the budget by, and `slack`
+    /// more, so the loads after it find room without a sweep each.
+    ///
+    /// The bound it keeps: after it, and the load, the pool's resident bytes are within the
+    /// budget, or, when the sweep stopped short, are what is pinned (and each hot tail, and
+    /// what is loading) plus the load. So resident bytes never pass the budget plus what
+    /// readers pin, and readers pin at most their bound.
+    pub(crate) fn make_room<G: Give>(
+        &mut self,
+        pool: &Pool<G>,
+        windows: &Windows,
+        held: u64,
+        budget: u64,
+        bytes: u64,
+        slack: u64,
+    ) -> Option<Swept> {
+        let over = held.saturating_add(bytes).saturating_sub(budget);
+        (over > 0).then(|| self.evict(pool, windows, over.saturating_add(slack)))
+    }
+
+    /// One lap of the open files: every page visited once, each unpinned page not read again
+    /// since it was loaded or since the sweep last came by given back, and each read again
+    /// left with its bit cleared for the next lap. What an idle daemon asks
+    /// (`Store::trim_pool`): what the last builds read more than once stays, so the next edit
+    /// loads little, and what nothing read since the lap before goes.
+    ///
+    /// The invariant: it visits at most the open pages, takes no pinned page and no page whose
+    /// second-chance bit is set, and a second lap with no read between gives back every
+    /// unpinned page the first passed over for its bit.
+    pub(crate) fn lap<G: Give>(&mut self, pool: &Pool<G>, windows: &Windows) -> Swept {
+        let bound = windows.open_pages();
+        let mut swept = Swept { freed: 0, visited: 0, short: false, refused: None };
+        let give = |sweep: &mut Sweep, swept: &mut Swept| match sweep.give(pool) {
+            Ok(freed) => swept.freed += freed,
+            Err(why) => swept.refused = Some(why),
+        };
+        while swept.visited < bound && swept.refused.is_none() {
+            match self.visit(pool, windows) {
+                Visit::Taken { .. } | Visit::Passed { .. } => swept.visited += 1,
+                Visit::Full => give(self, &mut swept),
+                Visit::Empty => break,
+            }
+        }
+        give(self, &mut swept);
+        swept
+    }
+
     /// At least `bytes` given back, if the sweep can find them within twice the open pages'
     /// visits: the pool's `evict(bytes) -> freed`.
     pub(crate) fn evict<G: Give>(&mut self, pool: &Pool<G>, windows: &Windows, bytes: u64) -> Swept {

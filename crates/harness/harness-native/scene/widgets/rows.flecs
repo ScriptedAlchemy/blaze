@@ -33,6 +33,8 @@ hn {
     prop edit: bool = false
     prop menu: bool = false
     (IsA, hn.TreeRowLook)
+    // Optional slots own their spacing; empty mood/status text must not leave phantom gaps.
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
     Action: {name: "select:{obj}"}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
@@ -43,6 +45,7 @@ hn {
     kind_icon : hn.tree.Kind {}
     name : hn.tree.Head {
       Text: {s: $name}
+      Padding: {l: 0, r: $tree_gap, t: 0, b: 0}
       // What it is doing while it works ("Running a command: cargo test"), where it works and when it started or ended
       // (the trailing words carry only what is new: what it works on, how it failed).
       Tooltip: {text: $why}
@@ -63,6 +66,7 @@ hn {
     // (or Right) opens it. Gone when nothing works under it, or once it is open and they show.
     if $under != "" {
       under : ui.Row {
+        Padding: {l: 0, r: $tree_gap, t: 0, b: 0}
         Flex: {axis: Row, gap: $tree_under_gap, align: Center, justify: End, wrap: false}
         FixedSize: {h: true, v: false}
         Tooltip: {text: "$under at work under it"}
@@ -79,7 +83,8 @@ hn {
     meta : hn.tree.Trail {
       Text: {s: $meta}
       Tooltip: {text: $why}
-      // Gone while hovered when the shortcut shows in its place.
+      if $meta != "" { Padding: {l: 0, r: $tree_gap, t: 0, b: 0} }
+      else { Padding: {l: 0, r: 0, t: 0, b: 0} }
       if $hint == "" {
         HoverShow: {row: 0, keep: true, away: false}
       } else {

@@ -26,6 +26,8 @@
 //! partially written one never appears under its name.
 
 #![deny(missing_docs)]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
 mod blob;
 mod error;

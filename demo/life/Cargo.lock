@@ -207,6 +207,7 @@ dependencies = [
  "blaze-mem",
  "blaze-radix",
  "blaze-rng",
+ "blaze-sys",
  "crossbeam-channel",
  "crossbeam-queue",
  "libc",
@@ -230,7 +231,6 @@ version = "0.0.0"
 dependencies = [
  "blaze-check",
  "blaze-core",
- "blaze-format",
  "blaze-hash",
  "blaze-image",
  "blaze-mem",
@@ -328,10 +328,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-phf"
-version = "0.0.0"
-
-[[package]]
 name = "blaze-protocol"
 version = "0.0.0"
 dependencies = [
@@ -344,7 +340,6 @@ dependencies = [
 name = "blaze-query"
 version = "0.0.0"
 dependencies = [
- "blaze-bytes",
  "blaze-check",
  "blaze-core",
  "blaze-format",
@@ -356,13 +351,13 @@ dependencies = [
  "blaze-protocol",
  "blaze-query-macros",
  "blaze-reclaim",
+ "blaze-report",
  "blaze-serde",
  "blaze-vfs",
  "crossbeam-queue",
  "either",
  "hashbrown 0.17.1",
  "indexmap",
- "intern",
  "serde",
  "smallvec",
  "thin-vec",
@@ -375,6 +370,7 @@ name = "blaze-query-macros"
 version = "0.0.0"
 dependencies = [
  "blaze-hash",
+ "blaze-report",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -429,6 +425,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-sys"
+version = "0.0.0"
+
+[[package]]
 name = "blaze-vfs"
 version = "0.0.0"
 dependencies = [
@@ -442,6 +442,7 @@ dependencies = [
  "blaze-mem",
  "blaze-protocol",
  "blaze-reclaim",
+ "blaze-report",
  "blaze-serde",
  "hashbrown 0.17.1",
  "serde",
@@ -1341,20 +1342,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
-]
-
-[[package]]
-name = "intern"
-version = "0.0.0"
-dependencies = [
- "blaze-check",
- "blaze-core",
- "blaze-format",
- "blaze-hash",
- "blaze-ids",
- "blaze-image",
- "blaze-mem",
- "blaze-phf",
 ]
 
 [[package]]

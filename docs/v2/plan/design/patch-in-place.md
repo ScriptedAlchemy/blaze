@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: What a link after a one-function edit costs, step by step, and the design that makes it cost the edit. Built - the link as a patch of its file (ranges written, a Merkle digest of the file), link inputs kept beside the database and brought forward by the build's delta, function, static and span rows kept per image with one keyed Merkle digest as the link's id, and the spans that count each. Not built - the address and perf maps as patches, the writer's tables built by block, a store that takes a patch, the patch regions' room out of the file (designed here).
+summary: What a link after a one-function edit costs, step by step, and the design that makes it cost the edit. Built - the link as a patch of its file (ranges written, a Merkle digest of the file), link inputs kept beside the database and brought forward by the build's delta, function, static and span rows kept per image with one keyed Merkle digest as the link's id, and the spans that count each. Not built - the address and perf maps as patches, the writer's tables built by block, the patch regions' room out of the file's length (the compact file, designed here; the room already costs no bytes written, hashed, copied or stored, written 2026-11-11 and not yet built or run).
 date: 2026-11-10
 ---
 # Patch in place
@@ -15,7 +15,7 @@ numbers after it are the main lane's to measure.
 
 | Step | Span | Cost after a one-function edit |
 |---|---|---|
-| Span tables the code names | `link inputs` | the functions the delta lists are read for their anchors; the workspace's named bodies are each one memo verification (`verified`); the tables whose positions moved are encoded (`made`). A library's bodies are not asked. One call a file the tables name, to check its name. |
+| Span tables the code names | `link inputs` | the functions the delta lists are read for their anchors; the bodies whose positions the engine's changed set names since the last link have their kept tables encoded again (`verified`, `made`). No body is asked for being watched. One call a file the tables name, to check its name. |
 | Native inputs | `link delta` | one `stat` a library, as before |
 | Function, static and span rows | `link delta` (`rows`, `hashed`) | the delta's functions hashed (`filled_id`); a search of the build's sorted lists for each |
 | The link's id | `link delta` | a leaf and about `log2(n)` nodes for each changed row (`blaze_ids::keyed`) |
@@ -23,7 +23,7 @@ numbers after it are the main lane's to measure.
 | Slots of a live image | `link delta` | the patchable (workspace) functions, each a search |
 | What running code assumes | `live assumed` | the workspace's items (`crate_hashes` columns), as before |
 | Stage and commit | `link patch` | the linker's: the new code, its callers, the cell, and the writer's tables (see Not built) |
-| Whole file for the store | `link copy` | the file's length, until the store takes a patch |
+| The file for the store | `link copy` | nothing for an edit the store derives; else the bytes of the file's runs, never its length |
 | Maps | `link tables` | nothing unless the target directory keeps layout profiles or a `perf` directory; then the whole map (see Not built) |
 
 ## Why `link inputs` varied
@@ -48,11 +48,15 @@ since the last link".
 1. **Link inputs are kept beside the database** (`crates/hir-ty-codegen/v2/linked.rs`,
    `Kept`): per program, found by `Built::id` or `Built::delta.base`, four programs a
    process. Kept: which anchors each function and static names, a count of namers per
-   anchor, each anchor's owner, the id of each table's encoding, and a stamp per owner that
-   is not durable. No table's bytes are kept. A link applies the delta's functions and
-   statics to the counts, encodes the tables named anew, and asks the database again only
-   for the watched owners (`positions_stamp`, `declared_stamp`: memos whose one input is
-   the positions, so they run only when those are found again). `LinkInputs` is a change of
+   anchor, each anchor's owner, the id of each table's encoding, and the kept tables of each
+   owner that is not durable (`watched`). No table's bytes are kept. A link applies the
+   delta's functions and statics to the counts, encodes the tables named anew, and encodes
+   again the kept tables of the watched owners the engine names as changed since the view
+   the tables are of (`positions::changed_since`, `declaration_location::changed_since`:
+   the changed set, walked from what was written). Until 2026-11-11 it asked a stamp memo
+   of every watched owner each link (`positions_stamp`): 4,841 memos verified and 1.9 ms
+   for a one-line edit of hello world, since std's bodies read `MEDIUM` inputs and are
+   watched; now 0 and 0.17 ms (`link inputs`, 30 edits each). `LinkInputs` is a change of
    a snapshot (`serial`, `base`, `tables`, `removed`); a consumer that holds neither asks
    for every table (`HirFrontend::span_tables`).
 2. **File names** are the job's, not the database's, and are in the encodings. The kept
@@ -86,10 +90,42 @@ since the last link".
    (`compile::linked_key`). The file a client runs is never written in place: clone,
    `pwrite` the ranges, rename. A patched clone is not synced; `Image::verify` refuses a
    torn file (`Refusal::Torn`) for whoever patches a file it did not just write.
+   Built for the edit path's place 2026-11-11 (`Store::place_patched`, `work::Made::Patch`):
+   the link hands the loop the ranges it wrote, and the loop, having looked that the path
+   still holds the file it placed there, clones that file beside it, writes the ranges and
+   renames it on. Before, the image's runs were read whole every link (`link runs`, 21 MB
+   for hello world) and written whole at each path. Each place asks for its file's
+   write-back as it ends and waits for none, so the next clone finds the file clean.
 8. Live: a dev executable's link is committed into the daemon's code memory
    (`Loaded::patch` -> `Image::commit_into`); the running program switches slots in one
    atomic store. New code never goes where old code was; a changed signature or layout is
    a restart with the reason (`changed_assumptions`).
+
+## `.rela.dyn` by slot (ELF, 2026-11-11)
+
+A one-function edit takes the old body's constants out of the slid addresses in one place
+and puts the new body's in at another (the patch room). In a table packed in address order
+every entry between the two moves: 303 KB of hello world's 442 KB `.rela.dyn` was written
+each edit, 95% of the patch, of the store's record of it and of each place's writes.
+
+A kept table (`elf/dynamic.rs`, `KeptRela`) now holds each slid address's `RELATIVE` entry
+in a slot that stays its own: an address gone leaves its slot zeroed (`R_*_NONE` at offset
+0), an address added takes the lowest empty slot or one more at the run's end, and the
+binds' and GOT cells' entries follow the run. `DT_RELACOUNT` is the slots before the first
+empty one, so what it counts is all `RELATIVE`; a `RELATIVE` past it and an `R_*_NONE` are
+taken by the general path of glibc's and musl's loaders (`elf_machine_rela`, `do_relocs`).
+Only an output a dynamic loader relocates is kept so (a shared library, or an executable
+with an interpreter). A table made whole (a first link, a link from scratch, a delta of
+another synthesis, a run whose empty slots outgrow the region's room) is in address order
+with no empty slot, as before. So a patched file's `.rela.dyn` is a history's, not the clean
+link's bytes; what a loader applies of it is the same set of entries
+(`elf/tests.rs`, `relinks_as_loaded`).
+
+Mach-O needs none of this on a platform with chained fixups (macOS 12 on,
+`macho/chained.rs`): a slid slot holds its target and the distance to the next slot of its
+16 KiB page, so a changed slot rewrites its 8 bytes and its predecessor's. A platform
+without them keeps the rebase opcodes, which `linkedit::rebases` makes whole each link:
+not changed here, and not measured (no macOS run in this lane).
 
 ## Not built, and why
 
@@ -99,6 +135,16 @@ since the last link".
   with tombstones (48 bytes a function: address, size, identity), the last id's file cloned
   and the edit's records written, compacted when half are tombstones; readers sort on load.
   The perf map's nodes hold names and edges and need a log, not slots.
+- **A stage that costs the edit.** Measured 2026-11-12 on hello world (12,071 functions, 30
+  one-line body edits, a Linux VM, tree a9325666d): `link patch` is 9.5 ms, of which
+  `link stage: lists` 2.9 (each of the core's four lists is copied whole by
+  `Owned::splice`, and where a symbol changed every function is scanned for it), `apply the change`
+  2.0, `the writer's tables` 1.25 (`.eh_frame_hdr` is made whole: its patch asks for
+  `Delta::same_regions`, which no edit that places new code keeps), `the writer's file` 0.8
+  (the symbol table, made whole for the same reason) and `dev run commit` 1.2 beside it.
+  Each is a pass over the image. The lists need a structure a splice does not copy (blocks
+  shared between links, as `CowBytes` is for bytes); the two tables need the slot treatment
+  `.rela.dyn` got.
 - **The writer's tables by block.** `file.rs` rebuilds each synthetic region (symbols,
   names, unwind header) every stage and compares it with the last in 4 KiB blocks. Building
   only the blocks that can have changed is a change of each format's writer. What each
@@ -110,21 +156,67 @@ since the last link".
 - **`blaze why`** names `Full::NoRoom`, `NoThunk`, `Output`, `Layout` on the link line. Why
   the rows or the inputs were made whole is on the spans only (`whole`); a line needs a
   field in `blaze_api::LinkHow`.
-- **A store that takes a patch**, and the dev run's whole-file copy: the store lane's.
 - **A test binary** still reads every span table (`Generated::spans`) for its execution
   table and its tests' selection.
 
-## The patch room out of the file (designed 2026-11-10, not built)
+## The patch room (2026-11-11; written, not built or run)
 
-Hello world's dev executable is 162,021,720 bytes, and at least 134,217,728 of them are the
-room of `Class::Patch` and `Class::PatchData` (64 MiB each, `place.rs` `patch_room`). The
-room is zeros the digest never hashes (its tree is sparse) and a clone never copies; it
-costs where the file is made whole (`Image::file`, `Filed::written`'s `link copy`, a store
-put of `Written::Linked`): 162 MB allocated, zeroed and written. Expected once built: about
-27.8 MB (162,021,720 less 134,217,728, less nothing else: each used part is rounded up to
-64 KiB), a few MB less with the debug info beside it. Measure with `ls -l`, `du`, and
-`readelf -lW` (two more `LOAD`s, `MemSiz` past `FileSiz` on the two that end in a patch
-region).
+Hello world's dev executable is 162,021,720 bytes long, and at least 134,217,728 of them are
+the room of `Class::Patch` and `Class::PatchData` (64 MiB each, `place.rs` `patch_room`).
+
+**The design chosen, for ELF, Mach-O and PE alike: the room is a hole.** Addresses, the order
+of regions and `offset = addr - base` stay, so the room has file offsets (a splice writes the
+code it adds there, a dev run's code memory holds it there, and a live patch names it there)
+and no bytes: no step writes, reads, hashes, copies or stores a byte of room nothing used. A
+splice fills only what it uses, as before. Every step that made the file at its length is
+changed to work on the runs of it that hold bytes:
+
+| Where the room cost | Was, per link that writes the whole file | Now |
+|---|---|---|
+| The file for the store (`link copy`, `Filed::written`) | the file's length allocated, zeroed and copied | `Written::Runs`: the patch's writes moved, or `Image::file_runs`; the span's `bytes` are the runs' |
+| The store's record (`Put`) | the file's length hashed for its content id and chunked (`CHUNK_FROM`) into the pack | the recipe of the runs over the base of holes (`blaze_cas::derived::holes`, 16 KiB of zeros put once): `Kind::Derived`, as an edit's is |
+| The store's file of it (`placed/`) and a place from it | the file's length written twice (where it goes and as the store's file), then written back | the base's clone cut to the length (holes) with the runs written; a place of it is a clone, which keeps holes |
+| A dev run's code memory (`Image::commit_into`, `write_into`) | the gaps of a file written whole filled with zeros and published: the room's length of memory in the object and an instruction-cache pass over it | `CodeMemory::zero` fills only pages something wrote since the object was made |
+| The Mach-O signature (`sign.rs`) | every page of the room gathered and hashed (SHA-256 of 128 MiB) | a page nothing is in takes the zero page's hash (`View::hole`) |
+
+The place of the build that made the file (`Store::place_made`, the file's runs into a file
+of holes), the commit's own file (`Truncate`, then `WriteAt` of the extents) and the digest
+(a sparse Merkle tree) never touched the room.
+
+What this leaves: the file's *length* is still its addresses' (`ls -l` says 162 MB, `du`
+says the content), each segment's file size still spans the hole (`readelf -l` shows the room
+as file bytes of `LOAD`s), and Mach-O's signature still holds 32 bytes a 4 KiB page of room
+(about 1 MiB). A tool that copies without looking for holes (`cat`, an upload) writes the
+zeros. The key of a link is unchanged: what decides the layout (`Output::incremental`) was in
+it already.
+
+**Why not the room as memory only (`p_filesz = 0`, `vmsize > filesize`).** The room is in the
+middle of its segment (code, room, stubs; data, room, thread-locals), so it splits each into
+three; on ELF the room of the code would be anonymous executable memory, which SELinux's
+`execmem` refuses where a mapping of a file's hole is ordinary; on Mach-O an executable page
+must be in the signed file. And it would save nothing the hole does not: the kernel reads no
+disk for a hole.
+
+**Why not no room in the file's offsets (the compact file, below).** It is the better file:
+its length is its content. It needs two coordinates (the file's offset and the image's),
+segments split at each hole, and what follows a room moved in the file when the room's used
+part doubles. It is still the design to build, with the linker's tests and a dev run at each
+step; nothing here is in its way, since every consumer above already takes runs.
+
+**Release.** `Output::incremental` stays on for every native profile. `blaze_lazy::allow`
+decides only live patching; the room is what makes the next `blaze build` of a release
+profile a splice of its file (`Linking::Spliced`), which no profile refuses, and what lets an
+image nothing changed keep its file byte for byte (`relink`'s `unchanged`). A release file
+without room is a decision of release edit time against a file that copies whole anywhere;
+it is not made here.
+
+**`strip`.** Not honoured in the writer (ledger D44's lane). `strip --strip-debug` on an
+image fails to load because the tool lays the file out again by its section headers: the
+relro `PT_LOAD` ends in memory past its file bytes with file-backed segments after it, and
+every offset is an address, neither of which it keeps (read from the writer, `elf/image.rs`;
+not run).
+
+### The compact file (designed 2026-11-10, not built)
 
 - **Why it is not a change of the writers alone.** Every writer gives a region the offset
   `addr - base` (`elf.rs` `offset`), and three things rest on that: a dev run's code memory
@@ -156,7 +248,8 @@ region).
   patch`, `file`, `verify` and the store's derive ranges stay in file offsets; the digest is
   of the compact file, its length the real one, and the holes are in the headers it hashes.
   `blaze-inproc`'s hook checks a code overlay against the segment's address, not its file
-  offset, and `host::write_executable` writes the compact file from the image.
+  offset, and the linker's file, which the build places, is the compact one (the host
+  writes no file).
 - **Why not in this pass.** It changes the three writers' headers, the dev run's rule
   (`elf/image.rs` `dev_run`: "is all file bytes"), the code memory's contract and the start
   hook's check in running programs, on three systems. Written without a build or a run, a
@@ -165,6 +258,13 @@ region).
 
 ## Tests
 
+- The room: `crates/blaze-cas/src/tests/place_crash.rs`, the invariant
+  `an_image_put_as_its_runs_over_holes_is_placed_writing_its_runs_and_none_of_its_room` and
+  its control `the_oracle_catches_an_image_put_whole_with_its_room`;
+  `crates/blaze-cas/src/derived.rs` `a_file_of_runs_over_the_base_of_holes_is_a_recipe_of_its_runs_alone`;
+  `crates/blaze-inproc/src/tests.rs` `zeroing_fills_only_the_pages_that_were_written`;
+  `crates/blaze-link/src/macho/sign.rs` `a_view_with_room_signs_as_the_assembled_file`.
+
 - `crates/blaze-ids/src/keyed.rs`: the refinement
   `a_keyed_set_kept_by_edits_is_the_set_made_whole`, control
   `the_oracle_catches_a_removed_entry_left_in_the_root`, counter
@@ -172,7 +272,8 @@ region).
 - `crates/hir-ty-codegen/v2/linked/tests.rs`: the refinement
   `the_link_inputs_kept_are_the_tables_made_whole` (reformat, body edit, function gone or
   back, another table named), control `the_oracle_catches_a_moved_body_not_encoded_again`,
-  counter `a_body_edit_among_many_makes_its_own_tables`.
+  counter `a_body_edit_among_many_makes_its_own_tables` (100 and 2,000 functions) and its
+  control `the_oracle_catches_a_link_that_asks_of_every_body`.
 - `crates/blaze-cargo/src/serve/unit/codegen/kept/tests.rs`: the refinement
   `the_rows_kept_by_deltas_are_the_rows_made_whole` (rows, span tables, id and the lists of
   what changed against rows made whole), controls
@@ -182,3 +283,7 @@ region).
   (100 and 10,000 functions).
 - `crates/blaze-link/src/tests/patch.rs` and `digest.rs`: the file's patch and digest, as
   before (`a_patched_file_behaves_as_a_fresh_link` and its controls).
+- `crates/blaze-link/src/elf/tests.rs`: `.rela.dyn` by slot,
+  `a_relink_from_another_synthesis_is_built_and_one_of_another_length_takes_a_slot`, the
+  counter `an_edit_that_moves_slid_addresses_writes_their_entries_alone` (1,000 and 16,000
+  functions) and its control `the_oracle_catches_a_table_made_whole_for_an_address_moved`.

@@ -1561,7 +1561,10 @@ fn settled(outcome: u8, before: u8, after: u8, full: bool) -> Next {
     let rebuild = match kind {
         O_RUST => false,
         // A root went: what it kept may go.
-        O_FIXED | O_MARKS => after == 0,
+        O_FIXED => after == 0,
+        // Also: a `__start_X` only weak references name is 0 without a section `X`
+        // ([`Special::WeakSection`]), and an error once a strong one names it.
+        O_MARKS => after == 0 || (still && flips),
         // The member may no longer be pulled.
         O_PULLED => after < before,
         // A full link drops an import nothing refers to.
@@ -1923,9 +1926,10 @@ pub(crate) struct Resolved {
     /// The piece count and removals Rust's references were counted to.
     pieces: u32,
     removals: u64,
-    /// What it was resolved from.
-    inputs: Arc<Vec<Input>>,
-    names: Arc<BTreeMap<NameId, crate::state::RustName>>,
+    /// What it was resolved from: the state's, shared, which an opened state gives it
+    /// ([`Resolved::open`]).
+    pub inputs: Arc<Vec<Input>>,
+    pub names: Arc<BTreeMap<NameId, crate::state::RustName>>,
     wasm: Arc<HashMap<NameId, blaze_codegen::wasm::Import, std::alloc::Global>>,
     graph: Option<Arc<Graph>>,
     marks: Marks,
@@ -2769,7 +2773,16 @@ impl<'a> Stage<'a> {
             return Err(crate::lazy::no_hook(self.output.format));
         }
         if let Some(special) = self.writer.special(name) {
-            return Ok(Decision::Special(special));
+            return Ok(Decision::Special(match special {
+                // ELF's `__start_X` is defined only when a section `X` is: one only weak
+                // references name is 0 when none is ([`Special::WeakSection`]).
+                Special::Section { name, end }
+                    if weak && self.output.format == crate::Format::Elf =>
+                {
+                    Special::WeakSection { name, end }
+                }
+                special => special,
+            }));
         }
         if let Some(export) = graph.exports.find(name) {
             let import = Import {
@@ -2914,7 +2927,7 @@ impl<'a> Stage<'a> {
             }
             scratch.fixups.push(Fixup {
                 at: f.at,
-                apply: f.apply,
+                apply: crate::reloc::in_output(f.apply, self.output.format, &self.output.kind),
                 target,
                 addend: f.addend,
                 minus: f.minus.map(|m| parsed.sym(m)),
@@ -3274,7 +3287,9 @@ impl<'a> Stage<'a> {
                 | if others { O_OTHERS } else { 0 };
             let decision = self.decide(&graph, sym, weak)?;
             let kind = match &decision {
-                Decision::Special(Special::Section { .. } | Special::Got { .. }) => {
+                Decision::Special(
+                    Special::Section { .. } | Special::WeakSection { .. } | Special::Got { .. },
+                ) => {
                     return Ok(None);
                 }
                 Decision::Special(_) | Decision::Zero | Decision::Skip => O_OTHER,
@@ -3525,7 +3540,10 @@ impl<'a> Stage<'a> {
                             None,
                             // alloc: error path
                             format!(
-                                "`{name}` is defined outside every section (an absolute symbol) by {}, and a shared                                  library {} links defines or refers to it or an `--export-dynamic-symbol` pattern                                  matches it, so the executable exports it: blaze's ELF writer exports only what is                                  in the image",
+                                "`{name}` is defined outside every section (an absolute symbol) by {}, and a shared \
+                                 library {} links defines or refers to it or an `--export-dynamic-symbol` pattern \
+                                 matches it, so the executable exports it: blaze's ELF writer exports only what is \
+                                 in the image",
                                 self.input_name(graph.loads[load as usize].input),
                                 self.name
                             ),
@@ -4006,12 +4024,16 @@ impl<'a> Stage<'a> {
                 Some(kind) => kind,
                 None => match self.decide(&graph, sym, weak)? {
                     Decision::Special(special) => {
-                        let kind =
-                            if matches!(special, Special::Section { .. } | Special::Got { .. }) {
-                                O_MARKS
-                            } else {
-                                O_OTHER
-                            };
+                        let kind = if matches!(
+                            special,
+                            Special::Section { .. }
+                                | Special::WeakSection { .. }
+                                | Special::Got { .. }
+                        ) {
+                            O_MARKS
+                        } else {
+                            O_OTHER
+                        };
                         specials.push((sym, special));
                         kind
                     }
@@ -4185,6 +4207,10 @@ fn keep<T: PartialEq>(was: &Arc<Vec<T>>, now: Vec<T>) -> Arc<Vec<T>> {
         Arc::new(now)
     }
 }
+
+mod kept;
+
+pub(crate) use kept::open_input;
 
 #[cfg(test)]
 mod ties_tests;

@@ -35,10 +35,69 @@ fn resident(status: &str) -> Option<u64> {
 
 /// Bytes of memory this process holds as the system counts it, what a limit on it is held to
 /// (`blaze_mem::tag::resident_by`): its physical footprint on macOS ([`footprint`]). Allocates
-/// nothing, as it is read once a run ends.
+/// nothing, as it is read once a run ends. Asks the system every call: what decides on the
+/// footprint many times a millisecond reads [`own_footprint`].
 #[cfg(target_os = "macos")]
-pub fn own_footprint() -> Option<u64> {
+pub fn own_footprint_now() -> Option<u64> {
     footprint(std::process::id())
+}
+
+/// How long one reading of the process's footprint stands ([`own_footprint`]): the loop asked
+/// for it twice a turn, a turn every half millisecond while busy, which was 40,000 opens of
+/// `/proc/self/statm` in 14 s of one build (2026-11-10). Admission, the releases and the plots
+/// decide on a number that moves by megabytes a millisecond at most, so one reading a tick
+/// is the same decision.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub const FOOTPRINT_TICK_NS: u64 = 10_000_000;
+
+/// The last reading of the footprint and when it was made ([`Reading::at`]).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static READING: Reading = Reading::new();
+
+/// One reading kept for a tick: `stamp` is the clock's nanoseconds it was made at plus one
+/// (zero: none yet), `bytes` what it read (`u64::MAX`: the system did not say). Two words
+/// written apart: a reader that sees a new stamp with the last tick's bytes is one tick
+/// stale, which a cache of a tick allows anyway.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+struct Reading {
+    stamp: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+impl Reading {
+    const fn new() -> Reading {
+        Reading {
+            stamp: std::sync::atomic::AtomicU64::new(0),
+            bytes: std::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// The footprint as of `now_ns` on the caller's clock: the kept reading where it is
+    /// younger than [`FOOTPRINT_TICK_NS`], else `read`'s, kept. `read` is called at most once
+    /// a tick by each caller that finds the reading old (two threads at a tick's edge may
+    /// both read; each keeps what it read).
+    fn at(&self, now_ns: u64, read: impl FnOnce() -> Option<u64>) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let stamp = self.stamp.load(Ordering::Acquire);
+        if stamp != 0 && now_ns.saturating_sub(stamp - 1) < FOOTPRINT_TICK_NS {
+            let bytes = self.bytes.load(Ordering::Acquire);
+            return (bytes != u64::MAX).then_some(bytes);
+        }
+        let read = read();
+        self.bytes.store(read.unwrap_or(u64::MAX), Ordering::Release);
+        self.stamp.store(now_ns.saturating_add(1), Ordering::Release);
+        read
+    }
+}
+
+/// [`own_footprint_now`], read from the system at most once each [`FOOTPRINT_TICK_NS`] of the
+/// profile's monotonic clock for the whole process: what the loop's plots, the plane's
+/// admission and the releases ask (`blaze_mem::tag::resident_by`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn own_footprint() -> Option<u64> {
+    let now = u64::try_from(blaze_profile::clock::mono_ns()).unwrap_or(0);
+    READING.at(now, own_footprint_now)
 }
 
 /// The daemon's own cgroup's `memory.current` and `memory.stat`, once the kernel holds its
@@ -66,8 +125,10 @@ pub fn count_own_cgroup(dir: &std::path::Path) {
 ///
 /// A cgroup that cannot be read is `None`, never the resident set in its place. Allocates
 /// nothing: each path fits std's stack buffer and each file is read into a buffer here.
+/// Opens and reads a file every call: what decides on the footprint many times a millisecond
+/// reads [`own_footprint`].
 #[cfg(target_os = "linux")]
-pub fn own_footprint() -> Option<u64> {
+pub fn own_footprint_now() -> Option<u64> {
     match OWN_CGROUP.get() {
         Some((current, stat)) => cgroup_charge(current, stat),
         None => own_resident(),
@@ -143,6 +204,12 @@ pub fn own_footprint() -> Option<u64> {
     None
 }
 
+/// No reading of the process's footprint here.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn own_footprint_now() -> Option<u64> {
+    None
+}
+
 /// Bytes of memory the machine has.
 #[cfg(target_os = "macos")]
 pub fn machine_bytes() -> Option<u64> {
@@ -161,6 +228,22 @@ pub fn machine_bytes() -> Option<u64> {
         )
     };
     (ok == 0 && bytes != 0).then_some(bytes)
+}
+
+/// Bytes of memory the machine has: its physical pages times the page size.
+#[cfg(target_os = "linux")]
+pub fn machine_bytes() -> Option<u64> {
+    // SAFETY: sysconf reads a constant of the system; no memory of ours.
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    u64::try_from(pages).ok()?.checked_mul(page_bytes()?)
+}
+
+/// The machine's page size, in bytes.
+#[cfg(unix)]
+pub fn page_bytes() -> Option<u64> {
+    // SAFETY: sysconf reads a constant of the system; no memory of ours.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(page).ok().filter(|it| *it != 0)
 }
 
 // SAFETY: libsystem_kernel's `int memorystatus_control(uint32_t command, int32_t pid, uint32_t
@@ -245,14 +328,18 @@ pub fn hold_own_footprint(bytes: u64) -> std::io::Result<i32> {
     }
 }
 
-/// Gives the system back the pages of what was freed, which the allocator keeps to reuse
-/// otherwise. Only where blaze names its allocator, mimalloc (`native`); the seed profile runs
-/// on std's, which has no such call.
-#[cfg(feature = "native")]
+/// Gives the system back the pages of what was freed, which the system's allocator keeps to
+/// reuse otherwise: glibc's `malloc_trim(0)` on Linux (every arena, top and inner free pages
+/// madvised away), every malloc zone's pressure relief on macOS ([`relieve_system_zones`]).
 pub fn purge_freed_pages() {
-    // SAFETY: `mi_collect` reads and writes no memory of the caller's, and may be called from
-    // any thread at any time.
-    unsafe { libmimalloc_sys::mi_collect(true) };
+    // SAFETY: `malloc_trim` takes each arena's lock itself and touches no memory of the
+    // caller's; a pad of 0 keeps nothing at the top of the heap.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    #[cfg(target_os = "macos")]
+    relieve_system_zones();
 }
 
 // SAFETY: libsystem_malloc's `size_t malloc_zone_pressure_relief(malloc_zone_t *zone, size_t
@@ -261,15 +348,14 @@ pub fn purge_freed_pages() {
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     // Undocumented (rule macos-private-apis): declared in <malloc/malloc.h> with no man page.
-    // The system zones (nano and scalable, which std, the C libraries blaze links and every
-    // `malloc` outside mimalloc use) keep freed pages until memory is short; this has them
-    // madvise those pages away now, which no documented call does. A purge before the plane
-    // refuses work or the guard ends the daemon (docs/v2/plan/admission-by-footprint.md).
+    // The system zones (nano and scalable, which blaze's global allocator and every C library
+    // it links use) keep freed pages until memory is short; this has them madvise those pages
+    // away now, which no documented call does.
     fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: usize) -> usize;
 }
 
 /// Has every malloc zone of the system give back the freed pages it keeps; the bytes they
-/// gave. The system's allocator only: mimalloc's are [`purge_freed_pages`]'.
+/// gave: macOS's half of [`purge_freed_pages`].
 #[cfg(target_os = "macos")]
 pub fn relieve_system_zones() -> u64 {
     // SAFETY: a null zone and a goal of 0 are the documented "every zone, all it can"; the call
@@ -277,24 +363,12 @@ pub fn relieve_system_zones() -> u64 {
     unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) as u64 }
 }
 
-/// The most a purge waits for every pool worker's heap give-back before it reads the footprint
-/// ([`purge`]): a worker gives back as it next allocates for a task or goes idle, and an idle
-/// one is woken for it, so a quarter of a second covers every worker but one that runs code
-/// allocating nothing of the global heap (LLVM's, on the system's malloc), which the reading
-/// then still holds and the purge's span names (`gave` of `of`).
-pub const SETTLE_WITHIN: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// How often a purge looks whether every worker gave back, as it waits.
-const SETTLE_LOOK: std::time::Duration = std::time::Duration::from_millis(1);
-
 /// What one [`purge`] did: the footprint before it and after (`None` where the system does not
-/// say), and whether every worker had given back its heaps' free pages before the second
-/// reading.
+/// say).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Purged {
     pub before: Option<u64>,
     pub after: Option<u64>,
-    pub settle: blaze_mem::tag::Settle,
 }
 
 impl Purged {
@@ -313,31 +387,13 @@ pub fn purged_bytes() -> u64 {
     PURGED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Gives back every freed page the process keeps that a purge can reach, then reads the
-/// footprint once they are out of it, and says what it returned:
-///
-/// 1. Asks every thread of the global allocator to give back what its mimalloc heaps keep and
-///    wakes the idle pool workers for it (`blaze_mem::tag::ask_heap_give_back`). The pages a
-///    thread's heaps allocate from or retired empty, and the blocks other threads freed into
-///    them, are that thread's alone to collect (mimalloc 3's `mi_heap_collect` collects only
-///    the calling thread's theap), so the purge cannot do it for them.
-/// 2. Waits, at most [`SETTLE_WITHIN`], until every pool worker has
-///    (`blaze_mem::tag::heap_give_back_settled`). A purge that read the footprint at once,
-///    as this one did before 2026-11-09, read it with all they kept still in it: the daemon
-///    then stopped at its 47 GiB ceiling with up to 7.5 GiB of the heap freed and resident.
-/// 3. Purges mimalloc's arenas, every one, now (`mi_collect(true)`: forced, so not after
-///    `purge_delay`, and visiting every arena). A worker's own forced purge skips them all
-///    while another thread holds mimalloc's purge guard (arena.c's `mi_atomic_guard`), so
-///    this one, after every worker, is what reaches each page they gave back. mimalloc
-///    decommits a purged range with `MADV_FREE_REUSABLE` on macOS (prim.c's
-///    `_mi_prim_decommit`), which takes it out of the footprint at once, where `MADV_FREE`
-///    leaves it counted until the kernel takes it; `MADV_DONTNEED` on Linux.
-/// 4. Purges the warm chunks `blaze_mem` caches (`blaze_mem::chunks::trim`, the same
-///    `MADV_FREE_REUSABLE`) and on macOS the system's malloc zones.
-/// 5. Reads the footprint again.
-///
-/// What admission asks before it refuses work (on [`purger`]'s thread, never the loop's), and
-/// the guard before it ends the daemon at its ceiling (docs/memory-footprint.md, step 2).
+/// Gives back every freed page the process keeps that a purge can reach, reads the footprint
+/// before and after, and says what it returned: the system allocator's freed pages
+/// ([`purge_freed_pages`]), then the warm chunks `blaze_mem` caches
+/// (`blaze_mem::chunks::trim`, `MADV_FREE_REUSABLE` on macOS, which takes them out of the
+/// footprint at once). It reports, and never decides: nothing refuses or waits on what it
+/// returned, since the kernel's limit is the one ceiling. Runs on [`purger`]'s thread, never
+/// the daemon loop's.
 pub fn purge() -> Purged {
     let span = tracing::info_span!(
         target: "blaze",
@@ -345,20 +401,14 @@ pub fn purge() -> Purged {
         before = tracing::field::Empty,
         after = tracing::field::Empty,
         returned = tracing::field::Empty,
-        gave = tracing::field::Empty,
-        of = tracing::field::Empty,
     )
     .entered();
-    let before = own_footprint();
-    blaze_mem::tag::ask_heap_give_back();
-    let settle = settle_heaps();
-    #[cfg(feature = "native")]
+    // Read from the system both times: a purge measures what it gave back between them.
+    let before = own_footprint_now();
     purge_freed_pages();
     blaze_mem::chunks::trim();
-    #[cfg(target_os = "macos")]
-    relieve_system_zones();
-    let after = own_footprint();
-    let purged = Purged { before, after, settle };
+    let after = own_footprint_now();
+    let purged = Purged { before, after };
     PURGED.fetch_add(purged.returned(), std::sync::atomic::Ordering::Relaxed);
     if let Some(before) = before {
         span.record("before", before);
@@ -367,43 +417,12 @@ pub fn purge() -> Purged {
         span.record("after", after);
     }
     span.record("returned", purged.returned());
-    if let blaze_mem::tag::Settle::Pending { gave, of } = settle {
-        span.record("gave", gave);
-        span.record("of", of);
-    }
     purged
 }
 
-/// Waits until every pool worker gave back for the give-back asked now, or [`SETTLE_WITHIN`]
-/// passes: looks every [`SETTLE_LOOK`], under a span naming the wait (rule
-/// every-wait-says-what), on the deadline's clock (rules bounded-progress, deadline-waits).
-/// Where it stood as it stopped.
-fn settle_heaps() -> blaze_mem::tag::Settle {
-    use blaze_core::wait::{Clock as _, Deadline, Monotonic};
-    use blaze_mem::tag::Settle;
-    let _span =
-        tracing::info_span!(target: "blaze", "memory purge waits for each worker's heaps")
-            .entered();
-    let clock = Monotonic::new();
-    let deadline = Deadline::after(clock.now(), SETTLE_WITHIN);
-    loop {
-        let settle = blaze_mem::tag::heap_give_back_settled();
-        if matches!(settle, Settle::Settled { .. }) || deadline.passed(clock.now()) {
-            return settle;
-        }
-        let next = Deadline::after(clock.now(), SETTLE_LOOK).min(deadline);
-        let what = "every pool worker's heap give-back, before a purge reads the footprint";
-        if let Err(error) = blaze_core::wait::sleep_until(what, next, &clock) {
-            tracing::warn!(target: "blaze", "a memory purge stopped waiting for {what}: {error}");
-            return settle;
-        }
-    }
-}
-
 /// The thread that purges for the daemon's loop ([`purger`]): the loop asks and goes on, and
-/// hears the purge done at a later turn, since a purge waits up to [`SETTLE_WITHIN`] for the
-/// workers and walks every heap (docs/memory-footprint.md, step 2: "the evictor's thread
-/// releases kept memory, never the loop").
+/// hears the purge done at a later turn, since a purge walks every arena and zone of the
+/// system's allocator, which the loop never waits on.
 pub struct Purger {
     /// Purges asked, so far.
     asked: std::sync::atomic::AtomicU64,
@@ -583,6 +602,29 @@ mod tests {
         assert!(super::own_footprint().is_some_and(|it| it > 0));
     }
 
+    /// The footprint is read from the system at most once a tick: a second ask inside the
+    /// tick is the kept reading and reads nothing, the first ask after it reads again, and a
+    /// reading the system refused is kept as refused for its tick.
+    #[test]
+    fn the_footprint_is_read_once_a_tick() {
+        let reading = super::Reading::new();
+        let tick = super::FOOTPRINT_TICK_NS;
+        let mut reads = 0;
+        let mut ask = |now: u64, says: Option<u64>| {
+            reading.at(now, || {
+                reads += 1;
+                says
+            })
+        };
+        assert_eq!(ask(0, Some(7)), Some(7), "the first ask reads");
+        assert_eq!(ask(tick - 1, Some(8)), Some(7), "inside the tick: the kept reading");
+        assert_eq!(ask(tick, Some(9)), Some(9), "a tick on: read again");
+        assert_eq!(ask(tick + 1, Some(10)), Some(9));
+        assert_eq!(ask(3 * tick, None), None, "the system did not say");
+        assert_eq!(ask(3 * tick + 1, Some(11)), None, "and that stands for its tick");
+        assert_eq!(reads, 3);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn this_process_and_the_machine_hold_some() {
@@ -633,7 +675,6 @@ mod tests {
         assert_eq!(align_of::<super::MemlimitProperties>(), 4);
     }
 
-    #[cfg(feature = "native")]
     #[test]
     fn a_purge_leaves_what_is_live() {
         let kept = vec![7u8; 1 << 20];

@@ -22,7 +22,9 @@
 //! other. That is the design, not a fallback.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 
 pub mod drop_effects;
 pub mod effect_attrs;
@@ -30,11 +32,18 @@ pub mod effects;
 pub mod facts;
 mod function;
 mod identity;
+pub mod locks;
 mod loops;
-pub mod may;
+pub mod expect;
 mod memory;
 pub mod models;
+pub mod own;
 pub mod program_lifetime;
+pub mod reach;
+pub mod refined;
+pub mod roles;
+pub mod steps;
+pub mod trust;
 mod values;
 mod walk;
 
@@ -50,10 +59,12 @@ use intern::Symbol;
 
 pub use effects::{EFFECTS, EffectDef, EffectSet, PURE, Rule};
 pub use function::{
-    EffectProof, FnPurity, Place, PureProof, Refusal, Step, Trusted, check, check_generic,
-    derived_pure, fn_memory, fn_purity, fn_purity_generic, instance_effects,
+    EffectProof, FnPurity, Place, PureProof, Refusal, Step, Trusted, call_effects, check,
+    check_generic, derived_pure, fn_memory, fn_purity, fn_purity_generic, instance_effects,
 };
 pub use memory::{Access, MemoryEffects};
+pub use own::{OwnEffects, own_effects};
+pub use steps::{OutOfSteps, with_steps};
 pub use walk::{ScriptProof, main_of, script_proof, script_purity};
 /// What a pure script's code may do, as its proof says: what the first sandboxed run of it is
 /// checked against (`blaze_usercode::pure::check`), and what its key is made of.
@@ -85,6 +96,12 @@ impl Effects {
     pub const PROBE: Effects = Effects(1 << 3);
     /// Ends the run with `process::exit` or `process::abort`.
     pub const EXIT: Effects = Effects(1 << 4);
+    /// Draws randomness from std (`RandomState::new`): the run's provider gives it, made of
+    /// the run's key.
+    pub const SEEDED: Effects = Effects(1 << 5);
+    /// Asks the wall clock (`SystemTime::now`): the run's provider gives the build's
+    /// `SOURCE_DATE_EPOCH`, a variable of its key.
+    pub const WALL: Effects = Effects(1 << 6);
 
     pub const fn union(self, other: Effects) -> Effects {
         Effects(self.0 | other.0)

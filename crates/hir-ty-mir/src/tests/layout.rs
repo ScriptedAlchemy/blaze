@@ -21,6 +21,7 @@ use crate::{
 };
 
 mod closure;
+mod error_unions;
 mod errors;
 mod field_order;
 
@@ -86,7 +87,7 @@ fn eval_goal(
             Some(adt_or_type_alias_id)
         })
         .unwrap();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         let goal_ty = match adt_or_type_alias_id {
             Either::Left(adt_id) => crate::next_solver::Ty::new_adt(
@@ -122,7 +123,7 @@ fn eval_expr(
     let fx = fixture::db(&ra_fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
@@ -673,6 +674,25 @@ fn arbitrary_ints_layout() {
         1,
         1,
     );
+}
+
+/// blaze: a refinement of an enum by a set of its variants (`#![blaze::pattern_types]`,
+/// docs/v2/plan/design/edition.md, section 8) has its enum's layout, field for field: a value
+/// widens to the enum for free, and a `&(E is ..)` is a `&E`.
+#[test]
+fn pattern_type_of_variants_has_its_enums_layout() {
+    let fixture = |goal: &str| {
+        format!(
+            "#![blaze::pattern_types]\n\
+             enum E {{ A(u32, u8), B, C {{ x: u64 }} }}\n\
+             type Goal = {goal};"
+        )
+    };
+    let base = eval_goal(&fixture("E"), "").unwrap();
+    for refined in ["E is E::A(..)", "E is E::A(_, _) | E::B", "E is E::C { .. }", "E is E::B"] {
+        let layout = eval_goal(&fixture(refined), "").unwrap();
+        assert_eq!(*layout, *base, "`{refined}` has the layout of `E`");
+    }
 }
 
 #[test]
