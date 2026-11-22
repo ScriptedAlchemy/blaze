@@ -1,4 +1,7 @@
 //! The compiler is not allowed to run or publish work outside its exact lease.
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use std::collections::BTreeSet;
 
 use blaze_dist::Ranges;
@@ -22,7 +25,7 @@ fn sent(effects: &[Effect]) -> u64 {
         .expect("expected a coordinator request")
 }
 
-fn ready(index: BTreeSet<WorkName>) -> (Holder, u64) {
+fn ready(index: BTreeSet<WorkName>) -> (Holder<Global>, u64) {
     let roots =
         RootSet { spec: [1; 32], roots: [2; 32], count: 2, index: [3; 32], inputs: [4; 32] };
     let mut holder = Holder::new(
@@ -59,7 +62,7 @@ fn grant(roots: Vec<(u64, u64)>, names: Vec<WorkName>) -> Grant {
     }
 }
 
-fn compiling(roots: Vec<(u64, u64)>, names: Vec<WorkName>) -> Holder {
+fn compiling(roots: Vec<(u64, u64)>, names: Vec<WorkName>) -> Holder<Global> {
     let (mut holder, id) = ready(names.iter().copied().collect());
     let mut out = Vec::new();
     holder.step(
@@ -94,7 +97,7 @@ fn batch(roots: Vec<ItemResult>, names: Vec<ItemResult>) -> Compiled {
     }
 }
 
-fn refuses_batch(holder: &mut Holder, compiled: Compiled) {
+fn refuses_batch(holder: &mut Holder<Global>, compiled: Compiled) {
     let retained: BTreeSet<_> = compiled
         .roots
         .iter()

@@ -19,7 +19,7 @@ use blaze_dist_local::agent::{self, Grant, Granted, NEED, Source, Unit};
 use blaze_dist_local::blobs::Blobs;
 use blaze_dist_local::client::Client;
 use blaze_dist_local::coordinator::Config as CarrierConfig;
-use blaze_dist_local::pack::{Pack, Value};
+use blaze_dist_local::pack::{Pack, Value, ValueRef};
 use blaze_dist_local::protocol::{Answer, Command, submission};
 use blaze_dist_local::server::{MonotonicClock, Server, random_id};
 use blaze_wire::{Digest, LocalPolicy, Namespace, Reservation};
@@ -66,7 +66,7 @@ fn world_with(executors: u32, work: WorkConfig, carrier: CarrierConfig) -> World
         Reservation { memory: u64::from(executors), cpus: executors, disk: u64::from(executors) },
     );
     for _ in 0..executors {
-        admission.add_builder(0, "machine", NEED).unwrap();
+        admission.add_builder(0, "machine", NEED, Global).unwrap();
     }
     let jobs = Jobs::new(
         admission,
@@ -74,12 +74,13 @@ fn world_with(executors: u32, work: WorkConfig, carrier: CarrierConfig) -> World
     );
     let tag: String = random_id().unwrap()[..6].iter().map(|b| format!("{b:02x}")).collect();
     let socket = PathBuf::from(format!("/tmp/blaze-agent-{tag}.sock"));
-    let server =
-        Server::bind(&socket, jobs, carrier, Arc::new(MonotonicClock::default()), |_: Vec<_>| {})
-            .unwrap();
+    let server = Server::bind(
+        &socket, jobs, carrier, Arc::new(MonotonicClock::default()),
+        |_: &mut dyn Iterator<Item = (blaze_wire::ExecutionId, blaze_dist::jobs::Effect)>| {},
+    ).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let signal = stop.clone();
-    std::thread::spawn(move || server.run(signal).unwrap());
+    std::thread::spawn(move || server.run(&signal).unwrap());
     World {
         socket,
         blobs: Blobs { address, timeout: Duration::from_secs(30) },
@@ -256,7 +257,7 @@ fn a_committed_pack_the_server_lost_refuses_without_compiling() {
     let world = world(1, WorkConfig::default());
     let unit = unit(4, 2);
     let never = AtomicBool::new(false);
-    let pack = Pack::of(vec![value_of(&[9; 32])]).unwrap();
+    let pack = Pack::of(vec![value_of(&[9; 32])], Global).unwrap();
     world.blobs.put_pack(&pack, Global).unwrap();
     let list = blaze_wire::pack_list::encode(&[pack.reference.clone()], Global);
     world.blobs.publish(&unit.spec, &list, Global).unwrap();
@@ -264,7 +265,7 @@ fn a_committed_pack_the_server_lost_refuses_without_compiling() {
         ._dir
         .path()
         .join("blobs/packs")
-        .join(format!("{}.pack", blaze_dist_local::pack::hex(&pack.reference.pack)));
+        .join(format!("{}.pack", blaze_wire::json::hex(&pack.reference.pack)));
     std::fs::remove_file(&path).unwrap();
     let mut compiler = Compiler {
         names: unit.names.clone(),
@@ -278,7 +279,7 @@ fn a_committed_pack_the_server_lost_refuses_without_compiling() {
             .unwrap_err();
         assert!(
             matches!(&error, Error::Committed(why)
-            if why.contains(&blaze_dist_local::pack::hex(&pack.reference.pack))),
+            if why.contains(&blaze_wire::json::hex(&pack.reference.pack).to_string())),
             "{error}"
         );
         assert!(agent::decide(&policy, error).is_err());
@@ -405,7 +406,7 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
     let old = world.blobs.published(&unit.spec, Global).unwrap().unwrap();
     let mut split = Vec::new();
     for name in &unit.names {
-        let pack = Pack::of(vec![value_of(name)]).unwrap();
+        let pack = Pack::of(vec![value_of(name)], Global).unwrap();
         world.blobs.put_pack(&pack, Global).unwrap();
         split.push(pack.reference);
     }
@@ -427,7 +428,7 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
         if kind == 1 {
             values[0].bytes.push(99);
         }
-        let wrong = Pack::of(values).unwrap();
+        let wrong = Pack::of(values, Global).unwrap();
         world.blobs.put_pack(&wrong, Global).unwrap();
         let refused = world
             .blobs
@@ -705,20 +706,26 @@ fn a_final_compiler_or_output_refusal_cannot_fall_back() {
             panic!("this fixture has no distributable roots")
         }
 
-        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, Self::Error> {
+        fn complete(
+            &mut self,
+            _: &mut dyn Iterator<Item = ValueRef<'_>>,
+            output: &mut dyn FnMut(Value),
+        ) -> Result<(), Self::Error> {
             self.calls += 1;
             if self.succeeds {
-                return Ok(Vec::new());
+                return Ok(());
             }
+            let first = value_of(&[92; 32]);
+            output(first.clone());
             if !self.malformed_output {
                 return Err(std::io::Error::other(
                     "fixture::tail: output export refused conflicting immutable bytes",
                 ));
             }
-            let first = value_of(&[92; 32]);
             let mut second = first.clone();
             second.bytes.push(1);
-            Ok(vec![first, second])
+            output(second);
+            Ok(())
         }
     }
 
@@ -748,7 +755,7 @@ fn a_final_compiler_or_output_refusal_cannot_fall_back() {
                 agent::run(&cfg, &unit, &mut compiler, &AtomicBool::new(false)).unwrap_err();
             assert!(
                 matches!(&failure, Error::Refused(why)
-                    if why.contains(&blaze_dist_local::pack::hex(&unit.spec))
+                    if why.contains(&blaze_wire::json::hex(&unit.spec).to_string())
                         && why.contains(if malformed_output {
                             "full output cannot be packed"
                         } else {
@@ -759,6 +766,11 @@ fn a_final_compiler_or_output_refusal_cannot_fall_back() {
             assert!(matches!(agent::decide(&policy, failure), Err(Error::Refused(_))));
             assert_eq!(compiler.calls, 1);
             assert!(world.blobs.published(&unit.spec, Global).unwrap().is_none());
+            let emitted_before_refusal = Pack::of(vec![value_of(&[92; 32])], Global).unwrap();
+            assert!(
+                world.blobs.pack(&emitted_before_refusal.reference.pack, Global).unwrap().is_none(),
+                "an emitted value cannot be uploaded before the compiler finishes successfully"
+            );
             let Answer::Terminal(blaze_dist_local::protocol::Terminal {
                 value: Some(terminal), ..
             }) = observer.call(Command::Terminal(observing.subscription)).unwrap()
@@ -887,8 +899,13 @@ impl Granted for WithTail<'_> {
         self.compiler.compile(names)
     }
 
-    fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, Self::Error> {
-        Ok(vec![self.extra.clone()])
+    fn complete(
+        &mut self,
+        _: &mut dyn Iterator<Item = ValueRef<'_>>,
+        output: &mut dyn FnMut(Value),
+    ) -> Result<(), Self::Error> {
+        output(self.extra.clone());
+        Ok(())
     }
 }
 
@@ -908,11 +925,16 @@ fn a_late_subscriber_waits_for_the_one_leads_full_tail() {
         fn compile(&mut self, _: &[usize]) -> Result<Grant, Self::Error> {
             panic!("empty work set")
         }
-        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, Self::Error> {
+        fn complete(
+            &mut self,
+            _: &mut dyn Iterator<Item = ValueRef<'_>>,
+            output: &mut dyn FnMut(Value),
+        ) -> Result<(), Self::Error> {
             assert_eq!(self.tails.fetch_add(1, Ordering::SeqCst), 0);
             self.entered.send(()).unwrap();
             self.release.recv_timeout(Duration::from_secs(20)).unwrap();
-            Ok(vec![self.extra.clone()])
+            output(self.extra.clone());
+            Ok(())
         }
     }
     struct Reader;
@@ -922,7 +944,11 @@ fn a_late_subscriber_waits_for_the_one_leads_full_tail() {
         fn compile(&mut self, _: &[usize]) -> Result<Grant, Self::Error> {
             panic!("late subscriber compiled")
         }
-        fn complete(&mut self, _: &BTreeMap<Digest, (u8, Vec<u8>)>) -> Result<Vec<Value>, Self::Error> {
+        fn complete(
+            &mut self,
+            _: &mut dyn Iterator<Item = ValueRef<'_>>,
+            _: &mut dyn FnMut(Value),
+        ) -> Result<(), Self::Error> {
             panic!("late subscriber ran a second tail")
         }
     }

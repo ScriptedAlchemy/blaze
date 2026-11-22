@@ -15,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::Error;
 use crate::protocol::{Answer, Command};
-use crate::telemetry::{emit, json};
+use crate::telemetry::{emit, json, quoted};
 
 /// An opt-in test gate, shared by the units of one daemon and claimed once. The caller
 /// supplies a new empty directory and a finite timeout; retained captures are evidence,
@@ -76,27 +76,32 @@ impl ResultGate {
         let lease = &request.lease;
         let bytes = encode(command, Global);
         let digest: blaze_wire::Digest = Sha256::digest(&bytes).into();
-        let work: Vec<String> =
-            request.items.iter().map(|item| crate::pack::hex(&item.name.0)).collect(); // alloc: bounded test evidence
+        let mut work = Vec::new_in(Global);
+        work.extend(request.items.iter().map(|item| item.name.0));
         let fields = [
-            ("pid", json(&std::process::id())),
-            ("execution", json(&lease.execution.0)),
-            ("attempt", json(&lease.attempt.0)),
-            ("holder", json(&lease.holder)),
-            ("generation", json(&lease.generation)),
-            ("seq", json(&request.seq)),
-            ("work", json(&work)),
-            ("command_sha256", json(&crate::pack::hex(&digest))),
+            ("pid", json(&std::process::id(), Global)),
+            ("execution", json(&lease.execution.0, Global)),
+            ("attempt", json(&lease.attempt.0, Global)),
+            ("holder", json(&lease.holder, Global)),
+            ("generation", json(&lease.generation, Global)),
+            ("seq", json(&request.seq, Global)),
+            ("work", json(&work, Global)),
+            ("command_sha256", json(&digest, Global)),
         ];
         let result = (|| {
             capture.write("result.cbor", &bytes)?;
             // The wire renderer reads the canonical CBOR. This view lets the harness bind
             // every captured lease field and item to its real grant without another codec.
-            let mut ready = String::from("{\"event\":\"result_held\""); // alloc: one bounded capture view
+            let mut ready = blaze_mem::String::from_str_in("{\"event\":\"result_held\"", Global);
             for (name, value) in &fields {
-                ready.push_str(&format!(",{}:{}", json(&name.to_string()), value));
+                ready.push(',');
+                quoted(name, &mut ready, Global).expect("formatting into a string cannot fail");
+                ready.push(':');
+                ready.push_str(value);
             }
-            ready.push_str(&format!(",\"command\":{}}}\n", json(command)));
+            ready.push_str(",\"command\":");
+            ready.push_str(&json(command, Global));
+            ready.push_str("}\n");
             capture.write("ready.json", ready.as_bytes())?;
             emit("result_held", &fields);
             let _waiting = tracing::info_span!(target: "blaze", "dist: test result gate release", path = %self.directory.display()).entered();
@@ -170,10 +175,11 @@ impl Capture {
         self.write("answer.cbor", &bytes)?;
         self.write(
             "answer.json",
-            format!(
+            blaze_mem::format_in!(
+                Global,
                 "{{\"sha256\":{},\"answer\":{}}}\n",
-                json(&crate::pack::hex(&digest)),
-                json(answer)
+                json(&digest, Global),
+                json(answer, Global)
             )
             .as_bytes(),
         )

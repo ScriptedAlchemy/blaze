@@ -63,7 +63,7 @@ impl Fixture {
                 [1; 32],
                 Reservation { memory: 16, cpus: 4, disk: 16 },
             );
-            admission.add_builder(0, "machine", need()).unwrap()
+            admission.add_builder(0, "machine", need(), Global).unwrap().into_string()
         } else {
             String::new()
         };
@@ -77,14 +77,16 @@ impl Fixture {
             jobs,
             config,
             clock.clone(),
-            move |batch: Vec<(ExecutionId, Effect)>| {
-                callback(&batch);
-                delivered.lock().unwrap().extend(batch);
+            move |batch: &mut dyn Iterator<Item = (ExecutionId, Effect)>| {
+                let mut owned = Vec::new_in(Global);
+                owned.extend(batch);
+                callback(&owned);
+                delivered.lock().unwrap().extend(owned);
             },
         )
         .unwrap();
         let signal = stop.clone();
-        let thread = std::thread::spawn(move || server.run(signal).unwrap());
+        let thread = std::thread::spawn(move || server.run(&signal).unwrap());
         let executors = if executor.is_empty() { Vec::new() } else { vec![executor.clone()] };
         Self { path, stop, clock, effects, thread: Some(thread), executor, executors }
     }
@@ -99,18 +101,22 @@ impl Fixture {
         let mut admission = Admission::new(AdmissionConfig::default());
         admission.add_machine("machine", [1; 32], Reservation { memory: 64, cpus: 16, disk: 64 });
         let executors: Vec<String> =
-            (0..builders).map(|_| admission.add_builder(0, "machine", need()).unwrap()).collect();
+            (0..builders)
+                .map(|_| admission.add_builder(0, "machine", need(), Global).unwrap().into_string())
+                .collect();
         let jobs = Jobs::new(admission, exec);
         let clock = Arc::new(TestClock::default());
         let stop = Arc::new(AtomicBool::new(false));
         let effects = Arc::new(Mutex::new(Vec::new()));
         let delivered = effects.clone();
-        let server = Server::bind(&path, jobs, Config::default(), clock.clone(), move |batch| {
-            delivered.lock().unwrap().extend(batch);
-        })
+        let server = Server::bind(&path, jobs, Config::default(), clock.clone(),
+            move |batch: &mut dyn Iterator<Item = (ExecutionId, Effect)>| {
+                delivered.lock().unwrap().extend(batch);
+            },
+        )
         .unwrap();
         let signal = stop.clone();
-        let thread = std::thread::spawn(move || server.run(signal).unwrap());
+        let thread = std::thread::spawn(move || server.run(&signal).unwrap());
         Self {
             path,
             stop,
@@ -186,7 +192,7 @@ fn raw(f: &Fixture) -> UnixStream {
 }
 
 fn hello_raw(stream: &mut UnixStream, value: LocalHello) -> LocalWelcome {
-    stream.write_all(&frame(&encode(&ClientFrame::Hello(value), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(value), Global), Global)).unwrap();
     let ServerFrame::Welcome(w) = read(stream) else {
         panic!("hello");
     };
@@ -211,7 +217,7 @@ fn request_raw(
     command: Command,
 ) -> Response {
     let request = Request { epoch: welcome.epoch, session: welcome.session, sequence, command };
-    stream.write_all(&frame(&encode(&ClientFrame::Request(request), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Request(request), Global), Global)).unwrap();
     let ServerFrame::Response(response) = read(stream) else {
         panic!("request {sequence} had no bound response");
     };
@@ -225,7 +231,7 @@ fn request_raw(
 fn fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries() {
     let f = Fixture::new(false, Config::default());
     let mut stream = raw(&f);
-    let bytes = frame(&encode(&ClientFrame::Hello(hello([1; 32])), Global));
+    let bytes = frame(&encode(&ClientFrame::Hello(hello([1; 32])), Global), Global);
     for byte in bytes {
         stream.write_all(&[byte]).unwrap();
     }
@@ -234,15 +240,15 @@ fn fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries() {
     bad.write_all(&[0, 16, 0, 1]).unwrap(); // oversize before any allocation/body.
     assert!(matches!(read(&mut bad), ServerFrame::Error(_)));
     let mut bad = raw(&f);
-    bad.write_all(&frame(&[0xff])).unwrap();
+    bad.write_all(&frame(&[0xff], Global)).unwrap();
     assert!(matches!(read(&mut bad), ServerFrame::Error(_)));
     let mut bad = raw(&f);
     bad.write_all(&[0, 0, 0, 0]).unwrap();
     assert!(matches!(read(&mut bad), ServerFrame::Error(_)));
     let mut coalesced = raw(&f);
     let h = hello([2; 32]);
-    let mut bytes = frame(&encode(&ClientFrame::Hello(h.clone()), Global));
-    bytes.extend(frame(&encode(&ClientFrame::Hello(h), Global)));
+    let mut bytes = frame(&encode(&ClientFrame::Hello(h.clone()), Global), Global);
+    bytes.extend(frame(&encode(&ClientFrame::Hello(h), Global), Global));
     coalesced.write_all(&bytes).unwrap();
     assert!(matches!(read(&mut coalesced), ServerFrame::Welcome(_)));
     assert!(matches!(read(&mut coalesced), ServerFrame::Error(_)));
@@ -254,7 +260,7 @@ fn versions_content_session_and_terminal_bindings_fail_closed() {
     let mut stream = raw(&f);
     let mut h = hello([3; 32]);
     h.codec += 1;
-    stream.write_all(&frame(&encode(&ClientFrame::Hello(h), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(h), Global), Global)).unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
     let mut c = f.client();
     let mut s = submission(&job(1000), need());
@@ -277,13 +283,13 @@ fn disconnect_retry_has_identical_response_and_no_duplicate_submit_or_multistage
         sequence: 1,
         command: Command::Submit(submission(&job(1000), need())),
     };
-    stream.write_all(&frame(&encode(&ClientFrame::Request(req.clone()), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Request(req.clone()), Global), Global)).unwrap();
     // Submit can commit before its response is lost. The retry key survives the socket.
     drop(stream);
     std::thread::sleep(Duration::from_millis(20));
     let mut stream = raw(&f);
     resume_raw(&mut stream, &w);
-    let bytes = frame(&encode(&ClientFrame::Request(req.clone()), Global));
+    let bytes = frame(&encode(&ClientFrame::Request(req.clone()), Global), Global);
     stream.write_all(&bytes).unwrap();
     let first = read(&mut stream);
     stream.write_all(&bytes).unwrap();
@@ -308,7 +314,7 @@ fn disconnect_retry_has_identical_response_and_no_duplicate_submit_or_multistage
             },
         }),
     };
-    let bytes = frame(&encode(&ClientFrame::Request(progress), Global));
+    let bytes = frame(&encode(&ClientFrame::Request(progress), Global), Global);
     stream.write_all(&bytes).unwrap();
     let first = read(&mut stream);
     stream.write_all(&bytes).unwrap();
@@ -529,7 +535,7 @@ fn released_lifetimes_exceed_the_live_cap_without_restart_or_capacity_loss() {
     let mut held: Vec<Client> =
         (0..4u8).map(|nonce| Client::connect(&cap.path, [nonce; 32]).unwrap()).collect();
     let mut overflow = raw(&cap);
-    overflow.write_all(&frame(&encode(&ClientFrame::Hello(hello([99; 32])), Global))).unwrap();
+    overflow.write_all(&frame(&encode(&ClientFrame::Hello(hello([99; 32])), Global), Global)).unwrap();
     let ServerFrame::Error(refused) = read(&mut overflow) else { panic!("cap not enforced") };
     assert_eq!(refused.code(), Some(ErrorCode::Busy));
     // Releasing one live lifetime returns exactly one slot, without a restart.
@@ -550,7 +556,7 @@ fn released_and_expired_lifetimes_never_revive_an_old_sequence() {
     c.release().unwrap();
     let mut stream = raw(&f);
     stream
-        .write_all(&frame(&encode(&ClientFrame::Hello(resume(first.session, first.epoch)), Global)))
+        .write_all(&frame(&encode(&ClientFrame::Hello(resume(first.session, first.epoch)), Global), Global))
         .unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
     // The old session's exact request bytes are refused, not replayed into a new lifetime.
@@ -563,7 +569,7 @@ fn released_and_expired_lifetimes_never_revive_an_old_sequence() {
         sequence: 1,
         command: Command::Submit(submission(&job(1000), need())),
     };
-    stream.write_all(&frame(&encode(&ClientFrame::Request(stale), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Request(stale), Global), Global)).unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
     // No second Submit happened: exactly one Assigned event was ever delivered. The count
     // is taken out of the guard so a failed assertion cannot poison the fixture's mutex.
@@ -585,12 +591,12 @@ fn hello_shape_is_strict_and_pre_retirement_peers_are_refused() {
     let mut stream = raw(&f);
     let mut half = hello([5; 32]);
     half.epoch = Some([1; 32]);
-    stream.write_all(&frame(&encode(&ClientFrame::Hello(half), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(half), Global), Global)).unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
     let mut stream = raw(&f);
     let mut half = hello([5; 32]);
     half.resume = Some([1; 32]);
-    stream.write_all(&frame(&encode(&ClientFrame::Hello(half), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(half), Global), Global)).unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
     // The original transport and the last version before owned retirement cannot
     // negotiate this version's assignment ownership semantics.
@@ -598,7 +604,7 @@ fn hello_shape_is_strict_and_pre_retirement_peers_are_refused() {
         let mut stream = raw(&f);
         let mut legacy = hello([5; 32]);
         legacy.transport = version;
-        stream.write_all(&frame(&encode(&ClientFrame::Hello(legacy), Global))).unwrap();
+        stream.write_all(&frame(&encode(&ClientFrame::Hello(legacy), Global), Global)).unwrap();
         let ServerFrame::Error(error) = read(&mut stream) else { panic!() };
         assert!(error.message.contains("version-mismatch"));
     }
@@ -624,7 +630,7 @@ fn expired_lifetime_creation_retry_is_not_mistaken_for_the_old_one() {
     assert_ne!(fresh.session, first.session);
     let mut stream = raw(&f);
     stream
-        .write_all(&frame(&encode(&ClientFrame::Hello(resume(first.session, first.epoch)), Global)))
+        .write_all(&frame(&encode(&ClientFrame::Hello(resume(first.session, first.epoch)), Global), Global))
         .unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
 }
@@ -639,7 +645,7 @@ fn lifetime_retention_is_bounded() {
     assert!(c.reconnect(&f.path).is_err());
     let mut stream = raw(&f);
     stream
-        .write_all(&frame(&encode(&ClientFrame::Hello(resume(expired.session, expired.epoch)), Global)))
+        .write_all(&frame(&encode(&ClientFrame::Hello(resume(expired.session, expired.epoch)), Global), Global))
         .unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
     // A fresh creation after expiry is ordinary use, not capacity exhaustion.
@@ -668,7 +674,7 @@ fn carrier_refusal(answer: Answer, code: ErrorCode, message: &str) {
 fn expired_resume(f: &Fixture, welcome: &LocalWelcome) {
     let mut stream = raw(f);
     stream
-        .write_all(&frame(&encode(&ClientFrame::Hello(resume(welcome.session, welcome.epoch)), Global)))
+        .write_all(&frame(&encode(&ClientFrame::Hello(resume(welcome.session, welcome.epoch)), Global), Global))
         .unwrap();
     let ServerFrame::Error(error) = read(&mut stream) else {
         panic!("an expired session resumed");
@@ -772,7 +778,7 @@ fn queued_requesters_keep_exact_reply_bytes_until_their_real_final_expiry() {
         sequence: 1,
         command: Command::Submit(submission(&job(30), need())),
     };
-    let request_bytes = frame(&encode(&ClientFrame::Request(request.clone()), Global));
+    let request_bytes = frame(&encode(&ClientFrame::Request(request.clone()), Global), Global);
     stream.write_all(&request_bytes).unwrap();
     let first_reply = read_body(&mut stream);
     let ServerFrame::Response(response) = decode(&first_reply, &Limits::DOCUMENTED).unwrap()
@@ -808,7 +814,7 @@ fn queued_requesters_keep_exact_reply_bytes_until_their_real_final_expiry() {
     assert_eq!(read_body(&mut resumed), first_reply);
     let mut changed = request.clone();
     changed.command = Command::Submit(submission(&job(31), need()));
-    resumed.write_all(&frame(&encode(&ClientFrame::Request(changed), Global))).unwrap();
+    resumed.write_all(&frame(&encode(&ClientFrame::Request(changed), Global), Global)).unwrap();
     let ServerFrame::Error(error) = read(&mut resumed) else { panic!("changed replay accepted") };
     assert!(error.message.contains("sequence-reused"), "{error:?}");
     assert_eq!(*f.effects.lock().unwrap(), effects);
@@ -1064,12 +1070,12 @@ fn bounded_retention_and_replay_identity_fail_closed() {
         sequence: 1,
         command: Command::Submit(submission(&job(1000), need())),
     };
-    stream.write_all(&frame(&encode(&ClientFrame::Request(r.clone()), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Request(r.clone()), Global), Global)).unwrap();
     let first = read(&mut stream);
-    stream.write_all(&frame(&encode(&ClientFrame::Request(r.clone()), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Request(r.clone()), Global), Global)).unwrap();
     assert_eq!(read(&mut stream), first);
     r.command = Command::Submit(submission(&job(2000), need()));
-    stream.write_all(&frame(&encode(&ClientFrame::Request(r), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Request(r), Global), Global)).unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
 }
 
@@ -1120,8 +1126,8 @@ fn retained_terminals_do_not_spend_a_new_executions_subscriber_capacity() {
 fn late_attempt_work_after_reconnect_is_refused_and_typed_terminal_is_bound() {
     let mut admission = Admission::new(AdmissionConfig::default());
     admission.add_machine("machine", [1; 32], Reservation { memory: 16, cpus: 4, disk: 16 });
-    let old = admission.add_builder(0, "machine", need()).unwrap();
-    let replacement = admission.add_builder(0, "machine", need()).unwrap();
+    let old = admission.add_builder(0, "machine", need(), Global).unwrap().into_string();
+    let replacement = admission.add_builder(0, "machine", need(), Global).unwrap().into_string();
     let jobs = Jobs::new(admission, ExecutionConfig::default());
     let clock = Arc::new(TestClock::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -1129,9 +1135,11 @@ fn late_attempt_work_after_reconnect_is_refused_and_typed_terminal_is_bound() {
         "/tmp/blaze-late-{}.sock",
         random_id().unwrap()[0..8].iter().map(|b| format!("{b:02x}")).collect::<String>()
     ));
-    let server = Server::bind(&path, jobs, Config::default(), clock.clone(), |_| {}).unwrap();
+    let server = Server::bind(&path, jobs, Config::default(), clock.clone(),
+        |_: &mut dyn Iterator<Item = (ExecutionId, Effect)>| {},
+    ).unwrap();
     let signal = stop.clone();
-    let thread = std::thread::spawn(move || server.run(signal).unwrap());
+    let thread = std::thread::spawn(move || server.run(&signal).unwrap());
     let mut c = Client::connect(&path, random_id().unwrap()).unwrap();
     let b = submit(&mut c, 100_000);
     clock.0.store(15_001, Ordering::Release);
@@ -1180,7 +1188,7 @@ fn coalesced_requests_and_partial_disconnect_do_not_duplicate_effects() {
         sequence: 1,
         command: Command::Submit(submission(&job(1000), need())),
     };
-    let mut bytes = frame(&encode(&ClientFrame::Request(r.clone()), Global));
+    let mut bytes = frame(&encode(&ClientFrame::Request(r.clone()), Global), Global);
     bytes.extend(bytes.clone());
     stream.write_all(&bytes).unwrap();
     assert_eq!(read(&mut stream), read(&mut stream));
@@ -1201,7 +1209,7 @@ fn coalesced_requests_and_partial_disconnect_do_not_duplicate_effects() {
         sequence: 2,
         command: Command::Submit(submission(&job(2000), need())),
     };
-    let bytes = frame(&encode(&ClientFrame::Request(r.clone()), Global));
+    let bytes = frame(&encode(&ClientFrame::Request(r.clone()), Global), Global);
     stream.write_all(&bytes[..bytes.len() / 2]).unwrap();
     drop(stream);
     let mut stream = raw(&f);
@@ -1222,11 +1230,11 @@ fn daemon_epoch_and_out_of_order_ids_cannot_create_a_new_transition() {
         sequence: 2,
         command: Command::Submit(submission(&job(1000), need())),
     };
-    stream.write_all(&frame(&encode(&ClientFrame::Request(r), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Request(r), Global), Global)).unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
     let g = Fixture::new(false, Config::default());
     let mut stream = raw(&g);
-    stream.write_all(&frame(&encode(&ClientFrame::Hello(resume(w.session, w.epoch)), Global))).unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(resume(w.session, w.epoch)), Global), Global)).unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
 }
 

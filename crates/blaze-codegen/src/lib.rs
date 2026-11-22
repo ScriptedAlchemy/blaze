@@ -12,7 +12,7 @@
 //! Code dedupe never merges statics or anything whose address the program can compare as
 //! distinct: those are [`Target::Static`], keyed by which item they are, never by content.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, btreemap_alloc)]
 // `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
 #![feature(register_tool)]
 #![register_tool(blaze)]

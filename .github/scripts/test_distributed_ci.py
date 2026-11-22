@@ -499,6 +499,16 @@ class AcceptanceGateTests(unittest.TestCase):
             "fragmented_replies_preserve_body_boundaries_and_committed_refusals",
             "http_bodies_keep_the_callers_allocation_through_decoding",
             "coordinator_outputs_and_replays_use_the_callers_allocator",
+            "admission_names_and_scratch_use_the_callers_allocator",
+            "holder_keeps_the_callers_index_storage",
+            "simulation_trace_writes_directly_into_the_callers_buffer",
+            "agent::tests::imported_pack_storage_uses_the_callers_allocator",
+            "pack::tests::packs_and_record_views_use_the_callers_allocator",
+            "store::repair_tests::native_pack::tests::packs_and_record_views_use_the_callers_allocator",
+            "server::tests::effect_sink_moves_one_batch_from_the_callers_allocator",
+            "server::tests::framing_uses_the_callers_allocator_without_changing_the_body",
+            "telemetry::tests::evidence_keeps_wire_json_escaping_and_the_callers_allocator",
+            "telemetry::tests::digest_evidence_matches_the_previous_hex_string_fields",
             "committed_reply_bounds_follow_the_native_wire_contract",
             "an_http_reply_must_end_at_its_declared_body_boundary",
             "an_interrupted_committed_get_cannot_authorize_local_recompilation",
@@ -648,7 +658,8 @@ class AcceptanceGateTests(unittest.TestCase):
                     "#!/bin/sh\n"
                     'if [ "$2" = metadata ]; then\n'
                     '  printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/core-evidence/metadata-invocation.txt"\n'
-                    '  cp "$CORE_LOCK" "${6%/*}/Cargo.lock"\n'
+                    '  cp "${7%/*}/Cargo.lock" "$RUNNER_TEMP/core-evidence/input.Cargo.lock"\n'
+                    '  cp "$CORE_LOCK" "${7%/*}/Cargo.lock"\n'
                     '  printf \'%s\\n\' "{}"\n'
                     '  exit "$METADATA_EXIT"\n'
                     'fi\n'
@@ -659,9 +670,12 @@ class AcceptanceGateTests(unittest.TestCase):
                 if mutation in dependency:
                     dependency[mutation] = "changed-unpinned-value"
                 normalized = root / "normalized.lock"
-                normalized.write_text(
-                    'version = 4\n\n[[package]]\nname = "blaze-harness-core-ci"\nversion = "0.1.0"\n\n'
-                    '[[package]]\n' + "".join(f"{key} = {json.dumps(value)}\n" for key, value in dependency.items()))
+                if mutation in dependency:
+                    normalized.write_text(
+                        'version = 4\n\n[[package]]\nname = "blaze-harness-core-ci"\nversion = "0.1.0"\n\n'
+                        '[[package]]\n' + "".join(f"{key} = {json.dumps(value)}\n" for key, value in dependency.items()))
+                else:
+                    normalized.write_bytes((ROOT / ".github/fixtures/harness-core/Cargo.lock").read_bytes())
                 transcript = root / "test-output.txt"
                 output = "".join(f"test {name} ... ok\n" for name in reported)
                 transcript.write_text(output)
@@ -674,8 +688,10 @@ class AcceptanceGateTests(unittest.TestCase):
                 evidence = root / "core-evidence"
                 metadata = (evidence / "metadata-invocation.txt").read_text().splitlines()
                 manifest = metadata[-1]
-                self.assertEqual(metadata, [str(cargo), f"+{toolchain}", "metadata", "--format-version", "1",
+                self.assertEqual(metadata, [str(cargo), f"+{toolchain}", "metadata", "--locked", "--format-version", "1",
                                             "--manifest-path", manifest])
+                self.assertEqual((evidence / "input.Cargo.lock").read_bytes(),
+                                 (ROOT / ".github/fixtures/harness-core/Cargo.lock").read_bytes())
                 self.assertTrue(Path(manifest).is_relative_to(root))
                 self.assertEqual((Path(manifest).parent / "../../../crates").resolve(), ROOT / "crates")
                 if mutation:

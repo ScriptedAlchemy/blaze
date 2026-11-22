@@ -21,7 +21,7 @@ fn hello_golden_separates_transport_global_codec_and_terminal_versions() {
     expected.extend([4, 0xf6, 5, 0xf6]);
     assert_eq!(encode(&value, Global), expected);
     assert_eq!(decode::<ClientFrame>(&expected, &Limits::DOCUMENTED).unwrap(), value);
-    let framed = blaze_dist_local::server::frame(&expected);
+    let framed = blaze_dist_local::server::frame(&expected, Global);
     assert_eq!(u32::from_be_bytes(framed[..4].try_into().unwrap()) as usize, expected.len());
     assert_eq!(&framed[4..], expected);
 }

@@ -30,14 +30,22 @@ fn release_grants_keep_whole_unit_imports_and_the_tail_only_binds() {
     let wa = ba.work_set(&[(1, member())], &[], &[], &empty).unwrap();
     let wb = bb.work_set(&[(1, member())], &[], &[], &empty).unwrap();
     assert_eq!(wa.digest(), wb.digest());
-    assert_eq!(wa.names(), wb.names());
+    assert_eq!(wa.names(Global), wb.names(Global));
+    frame::task(Tag::Codegen, |frame| {
+        let names = wa.names(frame);
+        let released = wa.release_keys(frame);
+        assert!(std::ptr::eq(*names.allocator(), frame));
+        assert!(std::ptr::eq(*released.allocator(), frame));
+        assert_eq!(names.as_slice(), wa.names(Global).as_slice());
+        assert_eq!(released.as_slice(), wa.release_keys(Global).as_slice());
+    });
     assert_eq!(a.emitted.load(Ordering::Relaxed), 0, "planning emits nothing");
     assert!(
         wa.release.iter().any(|t| !t.imports.imported.is_empty()),
         "no per-function no-import shortcut"
     );
-    assert_eq!(wa.names().len(), 5, "every release function is grantable");
-    let names = wa.names();
+    assert_eq!(wa.names(Global).len(), 5, "every release function is grantable");
+    let names = wa.names(Global);
     let mut arrived = Store::default();
     let mut emitted = Vec::new();
     for (worker, work, granted) in [(&ba, &wa, &names[..2]), (&bb, &wb, &names[2..])] {
@@ -50,7 +58,7 @@ fn release_grants_keep_whole_unit_imports_and_the_tail_only_binds() {
     unique.dedup();
     assert_eq!(unique.len(), emitted.len(), "no template emitted by both holders");
     assert_eq!(
-        wa.release_keys(),
+        wa.release_keys(Global),
         unique,
         "release evidence names exactly the canonical emitted store keys"
     );
@@ -68,7 +76,7 @@ fn release_grants_keep_whole_unit_imports_and_the_tail_only_binds() {
     let build = Build::new(&warm, &program, &policy, &memo);
     let work = build.work_set(&[(1, member())], &[], &[], &arrived).unwrap();
     assert_eq!(work.digest(), wa.digest(), "cold, memo and stored summary plans agree");
-    let values = build.compile_granted(&work, &work.names(), &arrived).unwrap();
+    let values = build.compile_granted(&work, &work.names(Global), &arrived).unwrap();
     assert!(values.stats.compiled_keys.is_empty());
     let mut exported = Store::default();
     outputs(values, &mut exported);
@@ -119,7 +127,7 @@ fn release_work_identity_and_keys_follow_imports_settings_and_resolved_refs() {
     let changed = plan(&program, &policy);
     assert_ne!(original.digest(), changed.digest());
     assert!(
-        original.names().iter().all(|name| !changed.names().contains(name)),
+        original.names(Global).iter().all(|name| !changed.names(Global).contains(name)),
         "settings invalidate release blob tasks"
     );
 }
@@ -135,7 +143,7 @@ fn invalid_and_repeated_grants_fail_before_emission() {
     );
     let build = Build::new(&machine, &program, &policy, &memo);
     let work = build.work_set(&[(1, member())], &[], &[], &store).unwrap();
-    let first = work.names()[0];
+    let first = work.names(Global)[0];
     let errors = build.compile_granted(&work, &[first, first], &store).unwrap_err();
     assert!(errors.iter().any(|e| e.what.contains("duplicate task")));
     let errors =
@@ -200,7 +208,7 @@ fn successive_dev_grants_reexport_debug_of_a_shared_memo_shape() {
     let work = build.work_set(&[(1, member())], &[], &[], &holder_values).unwrap();
     let mut reused = 0;
     let mut receiver = Store::default();
-    for name in work.names() {
+    for name in work.names(Global) {
         let values = build.compile_granted(&work, &[name], &holder_values).unwrap();
         reused += values.stats.memo;
         // The caller retains prior grant outputs in its existing store overlay.
@@ -267,7 +275,7 @@ fn warm_grants_refuse_missing_debug(bug: Option<Bug>) {
             );
             let build = Build::new(&machine, &program, &policy, &memo);
             let work = build.work_set(&[(1, member())], &[], &[], &Store::default()).unwrap();
-            let first = build.compile_granted(&work, &work.names(), &Store::default()).unwrap();
+            let first = build.compile_granted(&work, &work.names(Global), &Store::default()).unwrap();
             let debug: Vec<_> = first
                 .compiled
                 .iter()
@@ -290,7 +298,7 @@ fn warm_grants_refuse_missing_debug(bug: Option<Bug>) {
             let emitted = machine.emitted.load(Ordering::Relaxed);
             let planted = Planted { store: &input, bug, at: missing, changed: &changed };
             let errors = build
-                .compile_granted(&work, &work.names(), &planted)
+                .compile_granted(&work, &work.names(Global), &planted)
                 .expect_err("granted a bundle that lacks a debug table");
             assert!(
                 errors.iter().any(|error| {
@@ -308,7 +316,7 @@ fn warm_grants_refuse_missing_debug(bug: Option<Bug>) {
             // Restoring only the omitted table makes exactly the original grant transferable.
             input.0.insert(missing, bytes);
             let planted = Planted { store: &input, bug, at: missing, changed: &changed };
-            let restored = build.compile_granted(&work, &work.names(), &planted).unwrap();
+            let restored = build.compile_granted(&work, &work.names(Global), &planted).unwrap();
             assert_eq!(restored.stats.compiled, 0, "{case}: the restored grant compiled");
             let mut receiver = Store::default();
             outputs(restored, &mut receiver);

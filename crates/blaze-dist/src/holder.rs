@@ -11,7 +11,7 @@
 //! compile threads (D0's `compile_ahead` batch), and [`Event::Compiled`] brings back what they
 //! did.
 
-use std::alloc::Allocator;
+use std::alloc::{Allocator, AllocatorClone, Global};
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_wire::{
@@ -187,14 +187,14 @@ struct Outstanding {
 
 /// One executor's part in one execution.
 #[derive(Clone, Debug)]
-pub struct Holder {
+pub struct Holder<A: AllocatorClone> {
     config: HolderConfig,
     id: String,
     execution: ExecutionId,
     attempt: Attempt,
     roots: RootSet,
     rejected: BTreeSet<WorkName>,
-    index: BTreeSet<WorkName>,
+    index: BTreeSet<WorkName, A>,
     findings: BTreeMap<WorkName, Digest>,
     lost: BTreeSet<WorkName>,
     phase: Phase,
@@ -205,28 +205,31 @@ pub struct Holder {
     next_beat: Millis,
 }
 
-impl Holder {
+impl<A: AllocatorClone> Holder<A> {
     /// The holder `id` of `execution` at `attempt`, with the root set its front end computed,
     /// the names its daemon rejects, and its pre-index: the names it resolves with no finding.
+    /// The pre-index keeps its existing storage and allocator for the holder's lifetime.
     pub fn new(
         id: &str,
         execution: ExecutionId,
         attempt: Attempt,
         roots: RootSet,
         rejected: Set<WorkName>,
-        index: BTreeSet<WorkName>,
+        index: BTreeSet<WorkName, A>,
         config: HolderConfig,
-    ) -> Holder {
+    ) -> Holder<A> {
+        let mut rejected_names = BTreeSet::new_in(Global);
+        rejected_names.extend(rejected.into_vec());
         Holder {
             config,
-            id: id.to_owned(),
+            id: Box::clone_from_ref_in(id, Global).into_string(),
             execution,
             attempt,
             roots,
-            rejected: rejected.into_vec().into_iter().collect(),
+            rejected: rejected_names,
             index,
-            findings: BTreeMap::new(),
-            lost: BTreeSet::new(),
+            findings: BTreeMap::new_in(Global),
+            lost: BTreeSet::new_in(Global),
             phase: Phase::Loading,
             seq: 0,
             next_id: 1,

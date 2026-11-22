@@ -1414,13 +1414,13 @@ impl Jobs {
             e.tick(now, &mut log);
             self.after(now, id, log, out);
         }
-        for admitted in self.admission.admit(now) {
+        for admitted in self.admission.admit(now, out.allocator().clone()) {
             let e = self.executions.get_mut(&admitted.execution).expect("queued");
             let mut log = Vec::new_in(out.allocator().clone());
             e.admitted(now, &mut log);
             if e.assign(now, &admitted.executor, &[], &mut log).is_ok() {
                 self.assignments
-                    .insert(admitted.executor.clone(), Assignment::new(e.assignment()));
+                    .insert(Box::clone_from_ref_in(admitted.executor.as_ref(), Global).into_string(), Assignment::new(e.assignment()));
             }
             self.after(now, admitted.execution, log, out);
         }
@@ -1467,12 +1467,14 @@ impl Jobs {
                 continue;
             }
             let namespace = e.namespace.clone();
-            let except: Vec<String> =
-                e.executors().map(str::to_owned).chain(e.lost.iter().cloned()).collect();
+            let mut except = Vec::new_in(out.allocator().clone());
+            except.extend(e.executors().chain(e.lost.iter().map(String::as_str)));
             let Some(helper) = self.admission.idle_for(&namespace, &platform, &need, &except)
             else {
                 continue;
             };
+            let helper = Box::clone_from_ref_in(helper, Global).into_string();
+            drop(except);
             let e = self.executions.get_mut(&id).expect("present");
             let Ok(attempt) = e.add_helper(now, &helper) else { continue };
             let assignment = e.assignment();
@@ -1514,7 +1516,8 @@ impl Jobs {
         for effect in log {
             if effect == Effect::NeedLead {
                 let e = &self.executions[&id];
-                let except: Vec<String> = e.lost.iter().cloned().collect();
+                let mut except = Vec::new_in(out.allocator().clone());
+                except.extend(e.lost.iter().map(String::as_str));
                 let (platform, need) = self.platforms[&id].clone();
                 let namespace = e.namespace.clone();
                 // Helpers heard from inside the lead-loss window keep helping under the
@@ -1524,29 +1527,31 @@ impl Jobs {
                 // helper cannot be taken over while its owner might still be running;
                 // prefer an idle replacement over that unavailable reservation.
                 let mut heard = Vec::new_in(out.allocator().clone());
-                heard.extend(e.heard_recently(now).map(str::to_owned));
+                heard.extend(e.heard_recently(now).map(|name| Box::clone_from_ref_in(name, out.allocator().clone())));
                 for helper in e.executors() {
                     if Some(helper) != e.lead()
-                        && !except.iter().any(|lost| lost == helper)
-                        && !heard.iter().any(|candidate| candidate == helper)
+                        && !except.contains(&helper)
+                        && !heard.iter().any(|candidate| candidate.as_ref() == helper)
                         && self
                             .assignments
                             .get(helper)
                             .is_some_and(|assignment| assignment.claimant.is_none())
                     {
-                        heard.push(helper.to_owned());
+                        heard.push(Box::clone_from_ref_in(helper, out.allocator().clone()));
                     }
                 }
                 let lead = heard
                     .first()
                     .cloned()
-                    .or_else(|| self.admission.idle_for(&namespace, &platform, &need, &except));
+                    .or_else(|| self.admission.idle_for(&namespace, &platform, &need, &except)
+                        .map(|name| Box::clone_from_ref_in(name, out.allocator().clone())));
+                drop(except);
                 let mut more = Vec::new_in(out.allocator().clone());
                 let e = self.executions.get_mut(&id).expect("present");
                 match lead {
                     Some(lead) => {
                         let mut helpers = Vec::new_in(out.allocator().clone());
-                        helpers.extend(heard.iter().map(String::as_str).filter(|h| *h != lead.as_str()));
+                        helpers.extend(heard.iter().map(|name| name.as_ref()).filter(|h| *h != lead.as_ref()));
                         if e.assign(now, &lead, &helpers, &mut more).is_ok() {
                             let assignment = e.assignment();
                             self.admission.take(&lead, id, e.attempt());

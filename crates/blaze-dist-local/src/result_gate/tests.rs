@@ -32,8 +32,8 @@ impl World {
     fn new(seed: u64) -> Self {
         let mut admission = Admission::new(AdmissionConfig::default());
         admission.add_machine("machine", [1; 32], Reservation { memory: 8, cpus: 8, disk: 8 });
-        let lead = admission.add_builder(0, "machine", NEED).unwrap();
-        let helper = admission.add_builder(0, "machine", NEED).unwrap();
+        let lead = admission.add_builder(0, "machine", NEED, Global).unwrap().into_string();
+        let helper = admission.add_builder(0, "machine", NEED, Global).unwrap().into_string();
         let jobs = Jobs::new(
             admission,
             ExecutionConfig {

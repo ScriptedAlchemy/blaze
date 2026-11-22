@@ -1,6 +1,6 @@
 //! Nonblocking Unix reactor. Socket fragmentation/coalescing is unrelated to CBOR boundaries.
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -26,6 +26,12 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
+impl<C: Clock + ?Sized, A: Allocator + Send + Sync> Clock for Arc<C, A> {
+    fn now_ms(&self) -> u64 {
+        (**self).now_ms()
+    }
+}
+
 /// Real monotonic clock used by the production reactor.
 pub struct MonotonicClock(Instant);
 
@@ -47,12 +53,13 @@ impl Clock for MonotonicClock {
 /// Production callbacks must enqueue backend work without blocking the reactor. The backend
 /// sends its independently completed acknowledgment over the same carrier API.
 pub trait Effects: Send {
-    /// Deliver actual core effects to the holder/agent backend.
-    fn deliver(&mut self, effects: Vec<(ExecutionId, Effect)>);
+    /// Deliver one transition's batch, moving its effects to the holder/agent backend.
+    /// The iterator is borrowed only for this call; yielded effects may be retained.
+    fn deliver(&mut self, effects: &mut dyn Iterator<Item = (ExecutionId, Effect)>);
 }
 
-impl<F: FnMut(Vec<(ExecutionId, Effect)>) + Send> Effects for F {
-    fn deliver(&mut self, effects: Vec<(ExecutionId, Effect)>) {
+impl<F: FnMut(&mut dyn Iterator<Item = (ExecutionId, Effect)>) + Send> Effects for F {
+    fn deliver(&mut self, effects: &mut dyn Iterator<Item = (ExecutionId, Effect)>) {
         self(effects)
     }
 }
@@ -68,21 +75,21 @@ struct Connection {
 }
 
 /// Owns one socket path and its inode. Drop removes only that original socket, never a replacement.
-pub struct Server {
+pub struct Server<C: Clock> {
     listener: UnixListener,
     path: PathBuf,
     inode: (u64, u64),
     coordinator: Coordinator,
-    clock: Arc<dyn Clock>,
+    clock: C,
     effects: Box<dyn Effects>,
     #[cfg(test)]
     accept_errors: VecDeque<io::Error>,
 }
 
-fn fail(text: &str) -> Vec<u8> {
+fn fail<A: Allocator + Clone>(text: &str, alloc: A) -> Vec<u8, A> {
     encode(
         &ServerFrame::Error(blaze_wire::WireError::new(ErrorCode::Malformed, format_args!("{text}"))),
-        Global,
+        alloc,
     )
 }
 
@@ -93,14 +100,14 @@ pub fn random_id() -> io::Result<Digest> {
     Ok(id)
 }
 
-impl Server {
+impl<C: Clock> Server<C> {
     /// Bind a new path; an existing socket is an error, not permission to unlink another daemon.
     /// Parent directory policy is the caller's; this local socket is owner-only, no new auth layer.
     pub fn bind(
         path: &Path,
         jobs: blaze_dist::jobs::Jobs,
         config: Config,
-        clock: Arc<dyn Clock>,
+        clock: C,
         effects: impl Effects + 'static,
     ) -> Result<Self, Error> {
         if config.max_frame < 1 << 20
@@ -130,7 +137,7 @@ impl Server {
             inode: (metadata.dev(), metadata.ino()),
             coordinator: Coordinator::new(jobs, config, epoch),
             clock,
-            effects: Box::new(effects),
+            effects: Box::new_in(effects, Global),
             #[cfg(test)]
             accept_errors: VecDeque::new(),
         };
@@ -141,17 +148,13 @@ impl Server {
 
     /// Run until shutdown. IO cannot block a timer: reads/writes are nonblocking and each
     /// connection gets a bounded frame budget per pass. Shutdown drops sockets and the registry.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "the reactor owns its share of the stop flag for its life"
-    )]
-    pub fn run(mut self, stop: Arc<AtomicBool>) -> Result<(), Error> {
-        let mut connections = Vec::new();
+    pub fn run(mut self, stop: &AtomicBool) -> Result<(), Error> {
+        let mut connections = Vec::new_in(Global);
         while !stop.load(Ordering::Acquire) {
             let now = self.coordinator.now(self.clock.now_ms());
             let timed = self.coordinator.tick(now, Global);
             self.outcomes(&timed);
-            self.effects.deliver(timed);
+            self.effects.deliver(&mut timed.into_iter());
             // One accept per loop prevents an accept flood starving existing clients/timers.
             match self.accept() {
                 Ok((stream, _)) => {
@@ -159,8 +162,8 @@ impl Server {
                         stream.set_nonblocking(true)?;
                         connections.push(Connection {
                             stream,
-                            input: Vec::new(),
-                            output: VecDeque::new(),
+                            input: Vec::new_in(Global),
+                            output: VecDeque::new_in(Global),
                             written: 0,
                             session: None,
                             last_io: now,
@@ -185,7 +188,7 @@ impl Server {
         // Abrupt process death is fenced by the next daemon epoch, not replayed as success.
         let effects = self.coordinator.shutdown(self.clock.now_ms(), Global);
         self.outcomes(&effects);
-        self.effects.deliver(effects);
+        self.effects.deliver(&mut effects.into_iter());
         Ok(())
     }
 
@@ -221,14 +224,14 @@ impl Server {
             if c.input.len() >= 4 {
                 let size = u32::from_be_bytes(c.input[..4].try_into().expect("length")) as usize;
                 if size == 0 || size > self.coordinator.config.max_frame as usize {
-                    c.output.push_back(frame(&fail("frame-size")));
+                    c.output.push_back(frame(&fail("frame-size", Global), Global));
                     c.closing = true;
                     c.input.clear();
                 } else if c.input.len() >= size + 4 {
-                    let body = c.input[4..size + 4].to_vec();
+                    let body = c.input[4..size + 4].to_vec_in(Global);
                     c.input.drain(..size + 4);
-                    let (reply, close) = self.handle(now, c, &body);
-                    c.output.push_back(frame(&reply));
+                    let (reply, close) = self.handle(now, c, &body, Global);
+                    c.output.push_back(frame(&reply, Global));
                     c.closing = close;
                 }
             }
@@ -264,11 +267,11 @@ impl Server {
             (Command::Result(result), answer) => {
                 let request = &result.request;
                 let mut fields = vec![
-                    ("execution", json(&request.lease.execution.0)),
-                    ("attempt", json(&request.lease.attempt.0)),
-                    ("holder", json(&request.lease.holder)),
-                    ("generation", json(&request.lease.generation)),
-                    ("seq", json(&request.seq)),
+                    ("execution", json(&request.lease.execution.0, Global)),
+                    ("attempt", json(&request.lease.attempt.0, Global)),
+                    ("holder", json(&request.lease.holder, Global)),
+                    ("generation", json(&request.lease.generation, Global)),
+                    ("seq", json(&request.seq, Global)),
                 ];
                 match answer {
                     Answer::Result(_) if effects.iter().any(|(execution, effect)| {
@@ -276,14 +279,17 @@ impl Server {
                             Effect::Work(blaze_dist::work::Effect::Committed { by, .. } | blaze_dist::work::Effect::Replayed { by })
                                 if by.holder == request.lease.holder && by.generation == request.lease.generation && by.seq == request.seq)
                     }) => {
-                        let work: Vec<String> = self.coordinator.committed_names(request, Global)
-                            .iter().map(|name| crate::pack::hex(&name.0)).collect();
-                        fields.push(("work", json(&work)));
+                        let mut work = Vec::new_in(Global);
+                        work.extend(
+                            self.coordinator.committed_names(request, Global)
+                                .iter().map(|name| name.0),
+                        );
+                        fields.push(("work", json(&work, Global)));
                         emit("result_accepted", &fields);
                     }
                     Answer::Error(error) => {
                         if let Some(why @ (blaze_dist::Refusal::DeadLease | blaze_dist::Refusal::AttemptMoved)) = blaze_dist::Refusal::of(error) {
-                            fields.push(("refusal", json(&format!("{why:?}"))));
+                            fields.push(("refusal", json(&format!("{why:?}"), Global)));
                             emit("result_refused", &fields);
                         }
                     }
@@ -310,15 +316,15 @@ impl Server {
                     &publication.packs,
                     publication.accepted_attempt,
                 ) {
-                    let packs: Vec<String> =
-                        packs.iter().map(|pack| crate::pack::hex(&pack.pack)).collect();
+                    let mut digests = Vec::new_in(Global);
+                    digests.extend(packs.iter().map(|pack| pack.pack));
                     emit(
                         "published",
                         &[
-                            ("unit_digest", json(&crate::pack::hex(&unit))),
-                            ("execution", json(&request.execution.0)),
-                            ("attempt", json(&accepted.0)),
-                            ("packs", json(&packs)),
+                            ("unit_digest", json(&unit, Global)),
+                            ("execution", json(&request.execution.0, Global)),
+                            ("attempt", json(&accepted.0, Global)),
+                            ("packs", json(&digests, Global)),
                         ],
                     );
                 }
@@ -341,26 +347,32 @@ impl Server {
                 emit(
                     "done",
                     &[
-                        ("unit_digest", json(&crate::pack::hex(&unit))),
-                        ("execution", json(&execution.0)),
-                        ("attempt", json(&item.attempt.0)),
-                        ("outcome", json(&format!("{:?}", done.outcome))),
+                        ("unit_digest", json(&unit, Global)),
+                        ("execution", json(&execution.0, Global)),
+                        ("attempt", json(&item.attempt.0, Global)),
+                        ("outcome", json(&format!("{:?}", done.outcome), Global)),
                     ],
                 );
             }
         }
     }
 
-    fn handle(&mut self, now: u64, c: &mut Connection, body: &[u8]) -> (Vec<u8>, bool) {
+    fn handle<A: Allocator + Clone>(
+        &mut self,
+        now: u64,
+        c: &mut Connection,
+        body: &[u8],
+        alloc: A,
+    ) -> (Vec<u8, A>, bool) {
         let decoded = decode::<ClientFrame>(body, &Limits::DOCUMENTED);
         match decoded {
             Ok(ClientFrame::Hello(hello)) if c.session.is_none() => {
                 match self.coordinator.hello(now, &hello) {
                     Ok(welcome) => {
                         c.session = Some(welcome.session);
-                        (encode(&ServerFrame::Welcome(welcome), Global), false)
+                        (encode(&ServerFrame::Welcome(welcome), alloc), false)
                     }
-                    Err(e) => (encode(&ServerFrame::Error(e), Global), true),
+                    Err(e) => (encode(&ServerFrame::Error(e), alloc), true),
                 }
             }
             Ok(ClientFrame::Request(request)) if c.session == Some(request.session) => {
@@ -368,33 +380,33 @@ impl Server {
                 // before it is written. The connection is closed after that answer, because
                 // the session it named no longer exists.
                 let releases = matches!(request.command, Command::Release(_));
-                match self.coordinator.request(now, &request, Global) {
+                match self.coordinator.request(now, &request, alloc.clone()) {
                     Ok((reply, effects)) => {
                         self.evidence(&request.command, &reply, &effects);
-                        self.effects.deliver(effects);
+                        self.effects.deliver(&mut effects.into_iter());
                         (reply, releases)
                     }
-                    Err(e) => (encode(&ServerFrame::Error(e), Global), true),
+                    Err(e) => (encode(&ServerFrame::Error(e), alloc), true),
                 }
             }
-            Ok(_) => (fail("hello/session-binding"), true),
-            Err(_) => (fail("canonical-cbor"), true),
+            Ok(_) => (fail("hello/session-binding", alloc), true),
+            Err(_) => (fail("canonical-cbor", alloc), true),
         }
     }
 }
 
 /// Four-byte big-endian length plus the exact canonical body.
-pub fn frame(body: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(body.len() + 4);
+pub fn frame<A: Allocator>(body: &[u8], alloc: A) -> Vec<u8, A> {
+    let mut bytes = Vec::with_capacity_in(body.len() + 4, alloc);
     bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
     bytes.extend_from_slice(body);
     bytes
 }
 
-impl Drop for Server {
+impl<C: Clock> Drop for Server<C> {
     fn drop(&mut self) {
         let effects = self.coordinator.shutdown(self.clock.now_ms(), Global);
-        self.effects.deliver(effects);
+        self.effects.deliver(&mut effects.into_iter());
         if fs::metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.inode) {
             let _ = fs::remove_file(&self.path);
         }
@@ -406,6 +418,49 @@ mod tests {
     use super::*;
     use blaze_dist::admission::{Admission, AdmissionConfig};
     use blaze_dist::jobs::{ExecutionConfig, Jobs};
+
+    #[test]
+    fn effect_sink_moves_one_batch_from_the_callers_allocator() {
+        let execution = ExecutionId(7);
+        let assignment = blaze_dist::jobs::AssignmentToken {
+            execution,
+            attempt: blaze_wire::Attempt(8),
+        };
+        let executor = "one owned executor name".to_owned();
+        let original = executor.as_ptr();
+        let mut received = Vec::new_in(Global);
+        let mut calls = 0;
+        blaze_mem::frame::task(blaze_mem::Tag::Plane, |alloc| {
+            let mut batch = Vec::new_in(alloc);
+            batch.push((execution, Effect::Kill { executor, assignment }));
+            batch.push((execution, Effect::NeedLead));
+            let mut pending = batch.into_iter();
+            let mut sink = |effects: &mut dyn Iterator<Item = (ExecutionId, Effect)>| {
+                calls += 1;
+                received.extend(effects);
+            };
+            sink.deliver(&mut pending);
+            assert!(pending.next().is_none(), "the one callback consumed the whole batch");
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].0, execution);
+        let Effect::Kill { executor, assignment: delivered } = &received[0].1 else {
+            panic!("the first effect changed kind");
+        };
+        assert_eq!(executor.as_ptr(), original, "the callback moves the owned effect without cloning");
+        assert_eq!(*delivered, assignment);
+        assert_eq!(received[1], (execution, Effect::NeedLead));
+    }
+
+    #[test]
+    fn framing_uses_the_callers_allocator_without_changing_the_body() {
+        blaze_mem::frame::task(blaze_mem::Tag::Plane, |alloc| {
+            let framed = frame(&[0, 1, 255], alloc);
+            assert!(std::ptr::eq(*framed.allocator(), alloc));
+            assert_eq!(framed.as_slice(), &[0, 0, 0, 3, 0, 1, 255]);
+        });
+    }
 
     #[test]
     fn transient_accept_errors_leave_the_reactor_available_to_healthy_clients() {
@@ -421,7 +476,7 @@ mod tests {
             jobs,
             Config::default(),
             Arc::new(MonotonicClock::default()),
-            |_| {},
+            |_: &mut dyn Iterator<Item = (ExecutionId, Effect)>| {},
         )
         .unwrap();
         server.accept_errors.extend(
@@ -435,7 +490,7 @@ mod tests {
         );
         let stop = Arc::new(AtomicBool::new(false));
         let signal = stop.clone();
-        let thread = std::thread::spawn(move || server.run(signal));
+        let thread = std::thread::spawn(move || server.run(&signal));
         let connected = crate::client::Client::connect(&path, random_id().unwrap());
         stop.store(true, Ordering::Release);
         let result = thread.join().unwrap();

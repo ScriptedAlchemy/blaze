@@ -9,6 +9,7 @@
 //! Nothing here compiles by itself and nothing falls back: a transport failure is
 //! returned to the caller, whose `LocalPolicy` decides what happens next.
 
+use std::alloc::AllocatorClone;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,7 +50,7 @@ impl Default for DriverConfig {
 pub fn run_holder(
     client: &mut Client,
     socket: &Path,
-    holder: &mut Holder,
+    holder: &mut Holder<impl AllocatorClone + Send>,
     content: JobContent,
     executor: &str,
     config: &DriverConfig,
@@ -68,7 +69,7 @@ pub fn run_holder(
 pub fn run_holder_until(
     client: &mut Client,
     socket: &Path,
-    holder: &mut Holder,
+    holder: &mut Holder<impl AllocatorClone + Send>,
     content: JobContent,
     executor: &str,
     config: &DriverConfig,
@@ -90,7 +91,7 @@ enum CompilerTask {
 /// The same event loop as the socket driver, with the transport boundary injected
 /// so cancellation, late results and transport loss can be tested deterministically.
 fn drive(
-    holder: &mut Holder,
+    holder: &mut Holder<impl AllocatorClone + Send>,
     config: &DriverConfig,
     now_ms: impl Fn() -> u64 + Send,
     compiler: &mut (impl BatchCompiler + ?Sized),
@@ -344,6 +345,7 @@ fn reply(call: &Call, answer: Answer) -> Result<Reply, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::Global;
     use std::cell::Cell;
     use std::collections::BTreeSet;
     use std::rc::Rc;
@@ -403,7 +405,7 @@ mod tests {
         }
     }
 
-    fn test_holder() -> (Holder, RootSet, Grant) {
+    fn test_holder() -> (Holder<Global>, RootSet, Grant) {
         let roots =
             RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
         let grant = Grant {

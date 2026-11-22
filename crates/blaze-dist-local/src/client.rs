@@ -38,7 +38,7 @@ fn connect(path: &Path, hello: LocalHello) -> Result<(UnixStream, LocalWelcome),
     let mut stream = socket::connect_until(path, deadline, &clock)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    stream.write_all(&frame(&encode(&ClientFrame::Hello(hello.clone()), Global)))?;
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(hello.clone()), Global), Global))?;
     let response = read(&mut stream, 1 << 20)?;
     let ServerFrame::Welcome(welcome) = response else {
         return Err(Error::Protocol(format!("hello refused: {response:?}")));
@@ -150,7 +150,7 @@ impl Client {
         if bytes.len() > self.welcome.max_frame as usize {
             return Err(Error::Protocol("request-size".to_owned()));
         }
-        self.stream.write_all(&frame(&bytes))?;
+        self.stream.write_all(&frame(&bytes, Global))?;
         let response = read(&mut self.stream, self.welcome.max_frame)?;
         let ServerFrame::Response(response) = response else {
             return Err(Error::Protocol(format!("request refused: {response:?}")));

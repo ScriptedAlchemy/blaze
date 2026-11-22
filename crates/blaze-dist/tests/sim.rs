@@ -10,6 +10,10 @@
 //!
 //! `BLAZE_DIST_SEEDS=<n>` changes the number of seeds per invariant set.
 
+#![feature(allocator_api)]
+
+use std::alloc::Global;
+use std::io::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
@@ -166,11 +170,7 @@ fn replay() {
     let Some(seed) = std::env::var("BLAZE_DIST_SEED").ok().and_then(|s| s.parse().ok()) else {
         return;
     };
-    let mut events = Vec::new();
-    let work = sim::work::trace(seed, &mut events);
-    for event in events {
-        eprintln!("{event}");
-    }
+    let work = sim::work::trace(seed, &mut |event| eprintln!("{event}"));
     let jobs = sim::jobs::run(seed);
     eprintln!("work: {work:?}");
     eprintln!("jobs: {jobs:?}");
@@ -183,8 +183,11 @@ fn deterministic() {
     for seed in [0, 1, 42, 9_999] {
         assert_eq!(sim::work::run(seed), sim::work::run(seed));
         assert_eq!(sim::jobs::run(seed), sim::jobs::run(seed));
-        let (mut first, mut second) = (Vec::new(), Vec::new());
-        assert_eq!(sim::work::trace(seed, &mut first), sim::work::trace(seed, &mut second),);
+        let (mut first, mut second) = (Vec::new_in(Global), Vec::new_in(Global));
+        assert_eq!(
+            sim::work::trace(seed, &mut |event| writeln!(&mut first, "{event}").unwrap()),
+            sim::work::trace(seed, &mut |event| writeln!(&mut second, "{event}").unwrap()),
+        );
         assert_eq!(first, second, "seed {seed} changed its event trace");
     }
 }

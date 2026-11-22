@@ -10,7 +10,9 @@
 //! beside the old one only if both fit; otherwise the old one
 //! drains first. Past `Q` waiting jobs a platform answers `busy`.
 
+use std::alloc::{Allocator, Global};
 use std::collections::{BTreeMap, VecDeque};
+use std::io::Write as _;
 
 use blaze_wire::{Attempt, Digest, ExecutionId, Namespace, Reservation};
 
@@ -117,24 +119,65 @@ pub struct ExecutorSlot {
 }
 
 /// A job let in, and the executor it runs on.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Admitted {
+pub struct Admitted<A: Allocator> {
     /// The execution.
     pub execution: ExecutionId,
     /// Its namespace.
     pub namespace: Namespace,
     /// Its platform.
     pub platform: Digest,
-    /// The lead executor.
-    pub executor: String,
+    /// The lead executor's name, held in the caller's allocator.
+    pub executor: Box<str, A>,
     /// Whether the executor was created for it.
     pub created: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+impl<A: Allocator + Clone> Clone for Admitted<A> {
+    fn clone(&self) -> Self {
+        Self {
+            execution: self.execution,
+            namespace: self.namespace.clone(),
+            platform: self.platform,
+            executor: self.executor.clone(),
+            created: self.created,
+        }
+    }
+}
+
+impl<A: Allocator> std::fmt::Debug for Admitted<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Admitted")
+            .field("execution", &self.execution)
+            .field("namespace", &self.namespace)
+            .field("platform", &self.platform)
+            .field("executor", &self.executor)
+            .field("created", &self.created)
+            .finish()
+    }
+}
+
+impl<A: Allocator, B: Allocator> PartialEq<Admitted<B>> for Admitted<A> {
+    fn eq(&self, other: &Admitted<B>) -> bool {
+        self.execution == other.execution
+            && self.namespace == other.namespace
+            && self.platform == other.platform
+            && self.executor.as_ref() == other.executor.as_ref()
+            && self.created == other.created
+    }
+}
+
+impl<A: Allocator> Eq for Admitted<A> {}
+
+#[derive(Clone, Debug)]
 struct Queue {
     main: VecDeque<Waiting>,
     pr: VecDeque<Waiting>,
+}
+
+impl Default for Queue {
+    fn default() -> Self {
+        Self { main: VecDeque::new_in(Global), pr: VecDeque::new_in(Global) }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -171,17 +214,17 @@ impl Admission {
     pub fn new(config: AdmissionConfig) -> Admission {
         Admission {
             config,
-            machines: BTreeMap::new(),
-            executors: BTreeMap::new(),
-            queues: BTreeMap::new(),
-            rebuilds: BTreeMap::new(),
+            machines: BTreeMap::new_in(Global),
+            executors: BTreeMap::new_in(Global),
+            queues: BTreeMap::new_in(Global),
+            rebuilds: BTreeMap::new_in(Global),
             next_executor: 1,
         }
     }
 
     /// A machine and its declared capacity.
     pub fn add_machine(&mut self, name: &str, platform: Digest, capacity: Reservation) {
-        self.machines.insert(name.to_owned(), Machine { platform, capacity });
+        self.machines.insert(Box::clone_from_ref_in(name, Global).into_string(), Machine { platform, capacity });
     }
 
     /// The capacity of a machine.
@@ -233,36 +276,41 @@ impl Admission {
         machine: &str,
         namespace: Namespace,
         reservation: Reservation,
-    ) -> Option<String> {
+    ) -> Option<&str> {
         let m = self.machines.get(machine)?;
         if !fits(&self.used(machine), &reservation, &m.capacity) {
             return None;
         }
-        let id = format!("exec:{}", self.next_executor);
+        let mut bytes = Vec::new_in(Global);
+        write!(&mut bytes, "exec:{}", self.next_executor).expect("writing an executor name to a vector");
+        let id = String::from_utf8(bytes).expect("executor names contain only ASCII");
         self.next_executor += 1;
-        self.executors.insert(
-            id.clone(),
-            ExecutorSlot {
-                id: id.clone(),
-                machine: machine.to_owned(),
+        let slot = self.executors
+            .entry(Box::clone_from_ref_in(id.as_str(), Global).into_string())
+            .insert_entry(ExecutorSlot {
+                id,
+                machine: Box::clone_from_ref_in(machine, Global).into_string(),
                 namespace,
                 reservation,
                 busy: None,
                 phase: ExecutorPhase::Ready,
                 idle_since: now,
-            },
-        );
-        Some(id)
+            })
+            .into_mut();
+        Some(slot.id.as_str())
     }
 
-    /// A builder on `machine`, as the operator starts one: only if it fits.
-    pub fn add_builder(
+    /// A builder on `machine`, as the operator starts one: only if it fits. Its returned
+    /// name belongs to `alloc`; the fleet retains its own name.
+    pub fn add_builder<A: Allocator>(
         &mut self,
         now: Millis,
         machine: &str,
         reservation: Reservation,
-    ) -> Option<String> {
+        alloc: A,
+    ) -> Option<Box<str, A>> {
         self.create(now, machine, Namespace::Main, reservation)
+            .map(|id| Box::clone_from_ref_in(id, alloc))
     }
 
     /// Queues a job, or answers `busy` past `Q`.
@@ -294,13 +342,17 @@ impl Admission {
 
     /// Lets in what fits, in order: per platform, the head of `Main`'s queue first, and a pull
     /// request's job only while no `Main` job waits. A head that cannot run blocks its class.
-    pub fn admit(&mut self, now: Millis) -> Vec<Admitted> {
+    /// Returned names and transient lists use `alloc`.
+    pub fn admit<A: Allocator + Clone>(&mut self, now: Millis, alloc: A) -> Vec<Admitted<A>, A> {
         // A rebuild that waits for room tries again whenever admission runs.
-        for old in self.rebuilds.keys().cloned().collect::<Vec<_>>() {
+        let mut rebuilds = Vec::new_in(alloc.clone());
+        rebuilds.extend(self.rebuilds.keys().map(|old| Box::clone_from_ref_in(old.as_str(), alloc.clone())));
+        for old in rebuilds {
             self.start_rebuild(now, &old);
         }
-        let mut admitted = Vec::new();
-        let platforms: Vec<Digest> = self.queues.keys().copied().collect();
+        let mut admitted = Vec::new_in(alloc.clone());
+        let mut platforms = Vec::new_in(alloc.clone());
+        platforms.extend(self.queues.keys().copied());
         for platform in platforms {
             loop {
                 let queue = &self.queues[&platform];
@@ -308,13 +360,13 @@ impl Admission {
                     Some(head) => head.clone(),
                     None => break,
                 };
-                let Some((executor, created)) = self.place(now, &head) else { break };
+                let Some((executor, created)) = self.place(now, &head, alloc.clone()) else { break };
                 let queue = self.queues.get_mut(&platform).expect("platform");
                 match Class::of(&head.namespace) {
                     Class::Main => queue.main.pop_front(),
                     Class::Pr => queue.pr.pop_front(),
                 };
-                self.executors.get_mut(&executor).expect("placed").busy =
+                self.executors.get_mut(executor.as_ref()).expect("placed").busy =
                     Some((head.execution, Attempt(1)));
                 admitted.push(Admitted {
                     execution: head.execution,
@@ -330,7 +382,7 @@ impl Admission {
 
     /// An executor for `job`: an idle one of its lifecycle namespace on its platform, or, for a pull
     /// request, a new one where its reservation fits.
-    fn place(&mut self, now: Millis, job: &Waiting) -> Option<(String, bool)> {
+    fn place<A: Allocator + Clone>(&mut self, now: Millis, job: &Waiting, alloc: A) -> Option<(Box<str, A>, bool)> {
         // An idle executor runs it only within what it reserved: a job never runs past its
         // executor's share of the machine.
         let idle = self.executors.values().find(|e| {
@@ -341,47 +393,43 @@ impl Admission {
                 && self.machines.get(&e.machine).is_some_and(|m| m.platform == job.platform)
         });
         if let Some(e) = idle {
-            return Some((e.id.clone(), false));
+            return Some((Box::clone_from_ref_in(e.id.as_str(), alloc), false));
         }
         if job.namespace == Namespace::Main {
             // Persistent builders are started by the operator, never on demand for a job.
             return None;
         }
-        let machines: Vec<String> = self
-            .machines
-            .iter()
+        let mut machines = Vec::new_in(alloc.clone());
+        machines.extend(self.machines.iter()
             .filter(|(_, m)| m.platform == job.platform)
-            .map(|(name, _)| name.clone())
-            .collect();
+            .map(|(name, _)| Box::clone_from_ref_in(name.as_str(), alloc.clone())));
         machines
             .iter()
-            .find_map(|machine| self.create(now, machine, job.namespace.clone(), job.need.clone()))
+            .find_map(|machine| self.create(now, machine, job.namespace.clone(), job.need.clone())
+                .map(|id| Box::clone_from_ref_in(id, alloc.clone())))
             .map(|id| (id, true))
     }
 
     /// Another idle executor of `namespace` on `platform` that covers `need`, for a
     /// reassignment, not one of `except`.
     pub fn idle_for(
-        &mut self,
+        &self,
         namespace: &Namespace,
         platform: &Digest,
         need: &Reservation,
-        except: &[String],
-    ) -> Option<String> {
-        let id = self
-            .executors
+        except: &[&str],
+    ) -> Option<&str> {
+        self.executors
             .values()
             .find(|e| {
                 e.phase == ExecutorPhase::Ready
                     && e.busy.is_none()
                     && e.namespace == *namespace
                     && covers(&e.reservation, need)
-                    && !except.contains(&e.id)
+                    && !except.contains(&e.id.as_str())
                     && self.machines.get(&e.machine).is_some_and(|m| m.platform == *platform)
-            })?
-            .id
-            .clone();
-        Some(id)
+            })
+            .map(|e| e.id.as_str())
     }
 
     /// Marks `executor` as running `execution`, for a reassignment.
@@ -422,24 +470,24 @@ impl Admission {
     }
 
     /// The pull request closed: its executors are destroyed. Answers the ones that were busy,
-    /// whose jobs end.
-    pub fn close_pr(&mut self, n: u64) -> Vec<(String, Option<(ExecutionId, Attempt)>)> {
-        let mut gone = Vec::new();
+    /// whose jobs end, with the result and its names held in `alloc`.
+    pub fn close_pr<A: Allocator + Clone>(&mut self, n: u64, alloc: A) -> Vec<(Box<str, A>, Option<(ExecutionId, Attempt)>), A> {
+        let mut gone = Vec::new_in(alloc.clone());
         for e in self.executors.values_mut() {
             if e.namespace == Namespace::Pr(blaze_wire::PrNamespace { n })
                 && e.phase != ExecutorPhase::Stopped
             {
                 e.phase = ExecutorPhase::Stopped;
-                gone.push((e.id.clone(), e.busy.take()));
+                gone.push((Box::clone_from_ref_in(e.id.as_str(), alloc.clone()), e.busy.take()));
             }
         }
         gone
     }
 
-    /// Destroys pull-request executors idle past the bound.
-    pub fn reap(&mut self, now: Millis) -> Vec<String> {
+    /// Destroys pull-request executors idle past the bound, returning their names in `alloc`.
+    pub fn reap<A: Allocator + Clone>(&mut self, now: Millis, alloc: A) -> Vec<Box<str, A>, A> {
         let bound = self.config.pr_idle_ms;
-        let mut gone = Vec::new();
+        let mut gone = Vec::new_in(alloc.clone());
         for e in self.executors.values_mut() {
             if matches!(e.namespace, Namespace::Pr(_))
                 && e.phase == ExecutorPhase::Ready
@@ -447,7 +495,7 @@ impl Admission {
                 && now > e.idle_since + bound
             {
                 e.phase = ExecutorPhase::Stopped;
-                gone.push(e.id.clone());
+                gone.push(Box::clone_from_ref_in(e.id.as_str(), alloc.clone()));
             }
         }
         gone
@@ -455,19 +503,22 @@ impl Admission {
 
     /// A trusted builder's rebuild (a new identity, a new front end, growth, its job count):
     /// the new one starts beside the old only if both fit; otherwise the old drains, stops, and
-    /// the new one loads in its place. Answers the new builder when it started now.
-    pub fn rebuild(
+    /// the new one loads in its place. Answers the new builder's name in `alloc` when it
+    /// started now.
+    pub fn rebuild<A: Allocator + Clone>(
         &mut self,
         now: Millis,
         builder: &str,
         reservation: Reservation,
-    ) -> Option<String> {
+        alloc: A,
+    ) -> Option<Box<str, A>> {
         let e = self.executors.get(builder)?;
         if e.namespace != Namespace::Main || e.phase != ExecutorPhase::Ready {
             return None;
         }
-        let machine = e.machine.clone();
+        let machine = Box::clone_from_ref_in(e.machine.as_str(), alloc.clone());
         if let Some(id) = self.create(now, &machine, Namespace::Main, reservation.clone()) {
+            let id = Box::clone_from_ref_in(id, alloc);
             let old = self.executors.get_mut(builder).expect("present");
             if old.busy.is_some() {
                 old.phase = ExecutorPhase::Draining;
@@ -476,7 +527,7 @@ impl Admission {
             }
             return Some(id);
         }
-        self.rebuilds.insert(builder.to_owned(), reservation);
+        self.rebuilds.insert(Box::clone_from_ref_in(builder, Global).into_string(), reservation);
         let old = self.executors.get_mut(builder).expect("present");
         if old.busy.is_some() {
             old.phase = ExecutorPhase::Draining;
@@ -494,10 +545,10 @@ impl Admission {
             return;
         }
         let Some(reservation) = self.rebuilds.remove(old) else { return };
-        let machine = self.executors[old].machine.clone();
+        let machine = Box::clone_from_ref_in(self.executors[old].machine.as_str(), Global);
         if self.create(now, &machine, Namespace::Main, reservation.clone()).is_none() {
             // Still does not fit beside what runs there: it waits for the next stop.
-            self.rebuilds.insert(old.to_owned(), reservation);
+            self.rebuilds.insert(Box::clone_from_ref_in(old, Global).into_string(), reservation);
         }
     }
 

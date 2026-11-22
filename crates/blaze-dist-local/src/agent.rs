@@ -19,7 +19,7 @@
 //! executor refused) it compiles itself, by the same code, and reports. When the path fails,
 //! [`decide`] says under the caller's [`LocalPolicy`] whether the build stops or compiles here.
 
-use std::alloc::{Allocator, Global};
+use std::alloc::{Allocator, AllocatorClone, Global};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +38,8 @@ use crate::Error;
 use crate::blobs::Blobs;
 use crate::client::Client;
 use crate::driver::{DriverConfig, run_holder_until};
-use crate::pack::{Pack, Value, hex, read};
+use crate::pack::{Pack, Value, ValueRef, read};
+use blaze_wire::json::hex;
 use crate::protocol::{self as carrier, Answer, Binding, Command};
 use crate::server::random_id;
 use blaze_wire::pack_list::{decode as parse_list, encode as list_of};
@@ -100,13 +101,15 @@ pub trait Granted {
 
     /// Complete the unit through its ordinary build with the committed phase values in
     /// front of its store. Only the current lead runs this tail; other subscribers take
-    /// its full manifest. Returned values are uploaded before the manifest is committed.
+    /// its full manifest. Emit any additional values through `output`; they are uploaded
+    /// only after this call succeeds, before the manifest is committed.
     /// An error is a final compiler/export refusal under every local policy.
     fn complete(
         &mut self,
-        _values: &BTreeMap<Digest, (u8, Vec<u8>)>,
-    ) -> Result<Vec<Value>, Self::Error> {
-        Ok(Vec::new())
+        _values: &mut dyn Iterator<Item = ValueRef<'_>>,
+        _output: &mut dyn FnMut(Value),
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 
@@ -306,22 +309,22 @@ impl<G: Granted + ?Sized> BatchCompiler for Batches<'_, G> {
             names.push(at.ok_or(BatchError::RootIndex { unit: self.unit.spec, index: *index })?);
         }
         if std::env::var_os("BLAZE_DIST_EVENTS").is_some() {
-            let work: Vec<String> = names
+            let work: Vec<Digest> = names
                 .iter()
-                .map(|at| hex(&wire_name(&self.unit.spec, &self.unit.names[*at]).0))
-                .chain(plan.grant.names.iter().map(|name| hex(&name.0)))
+                .map(|at| wire_name(&self.unit.spec, &self.unit.names[*at]).0)
+                .chain(plan.grant.names.iter().map(|name| name.0))
                 .collect();
             crate::telemetry::emit(
                 "grant",
                 &[
-                    ("pid", crate::telemetry::json(&std::process::id())),
-                    ("unit_digest", crate::telemetry::json(&hex(&self.unit.spec))),
-                    ("execution", crate::telemetry::json(&plan.grant.lease.execution.0)),
-                    ("attempt", crate::telemetry::json(&plan.grant.lease.attempt.0)),
-                    ("holder", crate::telemetry::json(&plan.grant.lease.holder)),
-                    ("generation", crate::telemetry::json(&plan.grant.lease.generation)),
-                    ("seq", crate::telemetry::json(&plan.seq)),
-                    ("work", crate::telemetry::json(&work)),
+                    ("pid", crate::telemetry::json(&std::process::id(), Global)),
+                    ("unit_digest", crate::telemetry::json(&self.unit.spec, Global)),
+                    ("execution", crate::telemetry::json(&plan.grant.lease.execution.0, Global)),
+                    ("attempt", crate::telemetry::json(&plan.grant.lease.attempt.0, Global)),
+                    ("holder", crate::telemetry::json(&plan.grant.lease.holder, Global)),
+                    ("generation", crate::telemetry::json(&plan.grant.lease.generation, Global)),
+                    ("seq", crate::telemetry::json(&plan.seq, Global)),
+                    ("work", crate::telemetry::json(&work, Global)),
                 ],
             );
         }
@@ -332,9 +335,9 @@ impl<G: Granted + ?Sized> BatchCompiler for Batches<'_, G> {
                     self.compiled += grant.compiled;
                     self.stored += grant.stored;
                     self.compiled_keys.extend(grant.compiled_keys);
-                    let mut references = Vec::new(); // alloc: one reference per bounded pack
+                    let mut references = Vec::new_in(Global);
                     // Every pack is uploaded before this grant's result is posted.
-                    for pack in Pack::batches(grant.values)
+                    for pack in Pack::batches(grant.values, Global)
                         .map_err(|source| BatchError::Pack { unit: self.unit.spec, source })?
                     {
                         self.blobs.put_pack(&pack, Global)
@@ -393,7 +396,8 @@ const CANCELLED: &str = "the build was cancelled";
 /// A cancelled request is terminal even if the carrier or local policy permits a retry.
 fn ensure_not_cancelled(unit: &Unit, cancelled: &AtomicBool) -> Result<(), Error> {
     if cancelled.load(Ordering::Acquire) {
-        let reason = format!("unit {}: {CANCELLED}", hex(&unit.spec)); // alloc: terminal reason
+        let reason = blaze_mem::format_in!(Global, "unit {}: {CANCELLED}", hex(&unit.spec))
+            .into_boxed_str().into_string();
         Err(Error::Cancelled(reason))
     } else {
         Ok(())
@@ -401,21 +405,22 @@ fn ensure_not_cancelled(unit: &Unit, cancelled: &AtomicBool) -> Result<(), Error
 }
 
 /// Reads the packs named, each checked against what was committed.
-pub fn import(
+pub fn import<A: AllocatorClone>(
     blobs: &Blobs,
     packs: &[PackRef],
-    alloc: impl Allocator,
-) -> Result<BTreeMap<Digest, (u8, Vec<u8>)>, Error> {
-    import_using(packs, |digest| blobs.pack(digest, &alloc))
+    alloc: A,
+) -> Result<BTreeMap<Digest, (u8, Vec<u8, A>), A>, Error> {
+    import_using(packs, |digest| blobs.pack(digest, &alloc), alloc.clone())
 }
 
 /// The retrieval boundary is injected so loss and corruption of a committed pack can be
 /// tested without replacing the real pack decoder or requiring a live cache server.
-fn import_using<A: Allocator>(
+fn import_using<A: AllocatorClone, B: Allocator>(
     packs: &[PackRef],
-    mut fetch: impl FnMut(&Digest) -> Result<Option<Vec<u8, A>>, Error>,
-) -> Result<BTreeMap<Digest, (u8, Vec<u8>)>, Error> {
-    let mut values = BTreeMap::new();
+    mut fetch: impl FnMut(&Digest) -> Result<Option<Vec<u8, B>>, Error>,
+    alloc: A,
+) -> Result<BTreeMap<Digest, (u8, Vec<u8, A>), A>, Error> {
+    let mut values = BTreeMap::new_in(alloc.clone());
     for reference in packs {
         let name = hex(&reference.pack);
         let bytes = fetch(&reference.pack)
@@ -423,13 +428,15 @@ fn import_using<A: Allocator>(
                 Error::Committed(format!("pack {name}: committed retrieval failed: {error}"))
             })?
             .ok_or_else(|| Error::Committed(format!("pack {name} was committed and is gone")))?;
-        for value in read(&bytes, reference).map_err(|error| Error::Committed(error.to_string()))? {
+        for value in read(&bytes, reference, bytes.allocator())
+            .map_err(|error| Error::Committed(error.to_string()))?
+        {
             match values.entry(value.key) {
                 std::collections::btree_map::Entry::Vacant(at) => {
-                    at.insert((value.kind, value.bytes));
+                    at.insert((value.kind, value.bytes.to_vec_in(alloc.clone())));
                 }
                 std::collections::btree_map::Entry::Occupied(at) => {
-                    if at.get() != &(value.kind, value.bytes) {
+                    if at.get().0 != value.kind || at.get().1.as_slice() != value.bytes {
                         return Err(Error::Committed(format!(
                             "two values under the key {} in the packs of one unit, the second in {name}",
                             hex(&value.key)
@@ -443,8 +450,8 @@ fn import_using<A: Allocator>(
 }
 
 /// A corrupted published manifest cannot authorize recompilation.
-fn published_packs(unit: &Unit, list: &[u8]) -> Result<Vec<PackRef>, Error> {
-    parse_list(list, Global).map_err(|why| {
+fn published_packs<A: Allocator>(unit: &Unit, list: &[u8], alloc: A) -> Result<Vec<PackRef, A>, Error> {
+    parse_list(list, alloc).map_err(|why| {
         Error::Committed(format!(
             "unit {}: published pack list is not canonical: {why}",
             hex(&unit.spec)
@@ -474,7 +481,7 @@ pub fn run(
 ) -> Result<Arrived, Error> {
     ensure_not_cancelled(unit, cancelled)?;
     if let Some(list) = config.blobs.published(&unit.spec, Global)? {
-        let packs = published_packs(unit, &list)?;
+        let packs = published_packs(unit, &list, Global)?;
         let values = import(&config.blobs, &packs, Global)?;
         ensure_not_cancelled(unit, cancelled)?;
         return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None) });
@@ -504,8 +511,7 @@ pub fn run(
             other => return Err(Error::Protocol(format!("submit answered {other:?}"))),
         }
     };
-    // alloc: one claim per observed attempt, retained until its local work has stopped
-    let mut assignments = BTreeSet::new();
+    let mut assignments = BTreeSet::new_in(Global);
     let result = execute(
         config,
         unit,
@@ -516,6 +522,7 @@ pub fn run(
         &binding,
         &mut client,
         &mut assignments,
+        Global,
     );
     let result = ensure_not_cancelled(unit, cancelled).and(result);
     if result.is_err() {
@@ -543,7 +550,7 @@ pub fn run(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute(
+fn execute<A: AllocatorClone>(
     config: &Config,
     unit: &Unit,
     granted: &mut (impl Granted + ?Sized),
@@ -552,7 +559,8 @@ fn execute(
     now_ms: &(impl Fn() -> u64 + Sync),
     binding: &Binding,
     client: &mut Client,
-    assignments: &mut BTreeSet<(String, Attempt)>,
+    assignments: &mut BTreeSet<(Box<str, A>, Attempt), A>,
+    alloc: A,
 ) -> Result<Arrived, Error> {
     let content = binding.subscription.content;
     let execution = binding.subscription.execution;
@@ -580,10 +588,12 @@ fn execute(
             && let Some(executor) = &claimed.executor
         {
             arrived.attempt = Some(u64::from(claimed.attempt.0));
-            assignments.insert((executor.clone(), claimed.attempt));
+            let label = Box::clone_from_ref_in(executor.as_str(), alloc.clone());
+            assignments.insert((label, claimed.attempt));
         }
-        let published = publication(client, content, execution)?;
-        if let Some((packs, attempt, accepted)) = published {
+        if let carrier::Publication {
+            packs: Some(packs), attempt, accepted_attempt: Some(accepted),
+        } = publication(client, content, execution)? {
             arrived.attempt = Some(u64::from(attempt.0));
             arrived.publication_attempt = Some(u64::from(accepted.0));
             let mut take = || {
@@ -644,7 +654,7 @@ fn execute(
                 other => return Err(Error::Protocol(format!("join answered {other:?}"))),
             }
         }
-        if let Some(packs) = committed(client, content, execution)? {
+        if let Some(packs) = committed(client, content, execution)?.packs {
             if !claimed.lead {
                 // The helper's work is committed, but the whole unit is not. It must not
                 // independently compile the tail during the lead's publication window.
@@ -680,15 +690,21 @@ fn execute(
                         }
                         Error::Refused(format!("unit {}: {why}", hex(&unit.spec)))
                     };
-                    let extra = granted.complete(&arrived.values)
-                        .map_err(|error| refuse(error.to_string()))?;
+                    let mut extra = Vec::new_in(Global);
+                    {
+                        let mut values = arrived.values.iter().map(|(key, (kind, bytes))| ValueRef {
+                            key: *key, kind: *kind, bytes,
+                        });
+                        granted.complete(&mut values, &mut |value| extra.push(value))
+                            .map_err(|error| refuse(error.to_string()))?;
+                    }
                     ensure_not_cancelled(unit, cancelled)?;
                     if lost.load(Ordering::Acquire) {
                         return Ok(None);
                     }
                     let mut packs = packs;
                     if !extra.is_empty() {
-                        for pack in Pack::batches(extra)
+                        for pack in Pack::batches(extra, Global)
                             .map_err(|why| refuse(format!("full output cannot be packed: {why}")))?
                         {
                             config.blobs.put_pack(&pack, Global)?;
@@ -806,17 +822,18 @@ fn publication(
     client: &mut Client,
     content: blaze_wire::JobContent,
     execution: ExecutionId,
-) -> Result<Option<(Vec<PackRef>, Attempt, Attempt)>, Error> {
+) -> Result<carrier::Publication, Error> {
     match answer(
         client,
         Command::Publication(carrier::Packs { content, execution }),
         "publication",
     )? {
-        Answer::Publication(value) => match (value.packs, value.accepted_attempt) {
-            (Some(packs), Some(accepted)) => Ok(Some((packs, value.attempt, accepted))),
-            (None, None) => Ok(None),
-            _ => Err(Error::Protocol("publication lacks its acceptance provenance".to_owned())),
-        },
+        Answer::Publication(value) => {
+            if value.packs.is_some() != value.accepted_attempt.is_some() {
+                return Err(Error::Protocol("publication lacks its acceptance provenance".to_owned()));
+            }
+            Ok(value)
+        }
         other => Err(Error::Protocol(format!("publication answered {other:?}"))),
     }
 }
@@ -938,9 +955,9 @@ fn committed(
     client: &mut Client,
     content: blaze_wire::JobContent,
     execution: ExecutionId,
-) -> Result<Option<Vec<PackRef>>, Error> {
+) -> Result<carrier::CommittedPacks, Error> {
     match answer(client, Command::Packs(carrier::Packs { content, execution }), "packs")? {
-        Answer::Packs(packs) => Ok(packs.packs),
+        Answer::Packs(packs) => Ok(packs),
         other => Err(Error::Protocol(format!("packs answered {other:?}"))),
     }
 }
@@ -1004,11 +1021,11 @@ fn hold(
                     break;
                 }
                 match committed(&mut watcher, content, execution) {
-                    Ok(Some(_)) => {
+                    Ok(carrier::CommittedPacks { packs: Some(_) }) => {
                         leave.store(true, Ordering::Release);
                         break;
                     }
-                    Ok(None) => {}
+                    Ok(carrier::CommittedPacks { packs: None }) => {}
                     // The holder's own calls say what this is; its heartbeat ends it.
                     Err(_) => {}
                 }
@@ -1068,7 +1085,7 @@ fn deliver(client: &mut Client, binding: &Binding, packs: &[PackRef]) -> Result<
     let command = Command::DeliverPublication(carrier::DeliverPublication {
         content: binding.subscription.content,
         execution: binding.subscription.execution,
-        packs: packs.to_vec(), // alloc: the bounded immutable delivery record
+        packs: packs.to_vec_in(Global),
     });
     match client.call(command)? {
         Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => {
@@ -1171,7 +1188,65 @@ fn acknowledge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pack::test_alloc::{Counted, Counts};
     use hegel::generators as gs;
+
+    #[test]
+    fn imported_pack_storage_uses_the_callers_allocator() {
+        let value = |key, bytes: &[u8]| Value {
+            key: [key; 32], kind: key, bytes: bytes.to_vec_in(Global),
+        };
+        let packs = [
+            Pack::of(vec![value(1, b"one")], Global).unwrap(),
+            Pack::of(vec![value(1, b"one"), value(2, b"two")], Global).unwrap(),
+        ];
+        let references = [packs[0].reference.clone(), packs[1].reference.clone()];
+        let counts = Counts::default();
+        let alloc = Counted(&counts);
+        let values = import_using(
+            &references,
+            |digest| Ok(packs.iter().find(|pack| &pack.reference.pack == digest)
+                .map(|pack| pack.bytes.to_vec_in(&alloc))),
+            &alloc,
+        ).unwrap();
+        assert_eq!(values.len(), 2, "an identical value in two packs is retained only once");
+        assert!(
+            counts.allocations.get() - counts.deallocations.get() > values.len(),
+            "the map's nodes and each retained payload use the supplied allocator"
+        );
+        for (key, (kind, bytes)) in &values {
+            assert_eq!(*kind, key[0]);
+            assert!(std::ptr::eq(bytes.allocator().0, &counts));
+        }
+        assert_eq!(values[&[1; 32]].1.as_slice(), b"one");
+        assert_eq!(values[&[2; 32]].1.as_slice(), b"two");
+        let before = counts.allocations.get();
+        let control = import_using(
+            &references,
+            |digest| Ok(packs.iter().find(|pack| &pack.reference.pack == digest)
+                .map(|pack| pack.bytes.to_vec_in(Global))),
+            Global,
+        ).unwrap();
+        assert_eq!(control.len(), values.len());
+        for (key, (kind, bytes)) in &control {
+            assert_eq!(*kind, values[key].0);
+            assert_eq!(bytes.as_slice(), values[key].1.as_slice());
+        }
+        assert_eq!(counts.allocations.get(), before);
+        drop(values);
+        assert_eq!(counts.allocations.get(), counts.deallocations.get());
+
+        let mut broken = references;
+        broken[1].keys = [9; 32];
+        let refused = import_using(
+            &broken,
+            |digest| Ok(packs.iter().find(|pack| &pack.reference.pack == digest)
+                .map(|pack| pack.bytes.to_vec_in(&alloc))),
+            &alloc,
+        ).unwrap_err();
+        assert!(matches!(refused, Error::Committed(_)));
+        assert_eq!(counts.allocations.get(), counts.deallocations.get());
+    }
 
     /// The invariant: a final compiler refusal retains its diagnostic and remains terminal
     /// under every local policy despite a concurrent heartbeat failure; a successful tail
@@ -1247,7 +1322,7 @@ mod tests {
             let refused = after_publication(&unit, Err::<(), _>(error)).unwrap_err();
             assert!(matches!(
                 &refused,
-                Error::Committed(why) if why.contains(&hex(&unit.spec))
+                Error::Committed(why) if why.contains(&hex(&unit.spec).to_string())
                     && why.contains("already accepted")
             ));
             assert!(matches!(decide(&LocalPolicy::Fallback, refused), Err(Error::Committed(_))));
@@ -1279,7 +1354,7 @@ mod tests {
         assert!(ensure_not_cancelled(&unit, &cancelled).is_ok());
         cancelled.store(true, Ordering::Release);
         let refused = ensure_not_cancelled(&unit, &cancelled).unwrap_err();
-        assert!(matches!(&refused, Error::Cancelled(why) if why.contains(&hex(&unit.spec))));
+        assert!(matches!(&refused, Error::Cancelled(why) if why.contains(&hex(&unit.spec).to_string())));
         assert!(matches!(decide(&LocalPolicy::Fallback, refused), Err(Error::Cancelled(_))));
     }
 
@@ -1295,8 +1370,8 @@ mod tests {
         };
         let second = PackRef { pack: [0x22; 32], ..first.clone() };
         let canonical = list_of(&[first.clone(), second.clone()], Global);
-        assert!(published_packs(&unit, &canonical).is_ok());
-        assert!(published_packs(&unit, b"").is_ok(), "an empty unit is canonical");
+        assert!(published_packs(&unit, &canonical, Global).is_ok());
+        assert!(published_packs(&unit, b"", Global).is_ok(), "an empty unit is canonical");
 
         let noncanonical = [
             canonical[..canonical.len() - 1].to_vec(),
@@ -1309,7 +1384,7 @@ mod tests {
         ]; // alloc: corrupted manifest fixtures
         for bytes in noncanonical {
             assert!(
-                matches!(published_packs(&unit, &bytes), Err(Error::Committed(_))),
+                matches!(published_packs(&unit, &bytes, Global), Err(Error::Committed(_))),
                 "a damaged published manifest must be refused, not rebuilt"
             );
         }
@@ -1324,12 +1399,12 @@ mod tests {
             packed: None,
             format: blaze_wire::DIST_PACK_FORMAT,
         };
-        let missing = import_using::<Global>(&[reference.clone()], |name| {
+        let missing = import_using::<Global, Global>(&[reference.clone()], |name| {
             assert_eq!(*name, reference.pack);
             Ok(None)
-        })
+        }, Global)
         .unwrap_err();
-        assert!(matches!(&missing, Error::Committed(why) if why.contains(&hex(&reference.pack))));
+        assert!(matches!(&missing, Error::Committed(why) if why.contains(&hex(&reference.pack).to_string())));
         assert!(matches!(decide(&LocalPolicy::Fallback, missing), Err(Error::Committed(_))));
 
         for error in [
@@ -1338,18 +1413,18 @@ mod tests {
         ] {
             let mut error = Some(error);
             let failed =
-                import_using::<Global>(&[reference.clone()], |_| Err(error.take().unwrap())).unwrap_err();
+                import_using::<Global, Global>(&[reference.clone()], |_| Err(error.take().unwrap()), Global).unwrap_err();
             assert!(matches!(decide(&LocalPolicy::Fallback, failed), Err(Error::Committed(_))));
         }
 
-        let corrupt = import_using::<Global>(&[reference], |_| {
+        let corrupt = import_using::<Global, Global>(&[reference], |_| {
             Ok(Some(b"bad pack".to_vec())) // alloc: deliberately corrupt committed pack fixture
-        })
+        }, Global)
         .unwrap_err();
         assert!(matches!(decide(&LocalPolicy::Fallback, corrupt), Err(Error::Committed(_))));
 
         let unit = Unit { spec: [0x33; 32], names: Vec::new() }; // alloc: test fixture
-        let malformed = published_packs(&unit, b"not a pack").unwrap_err();
+        let malformed = published_packs(&unit, b"not a pack", Global).unwrap_err();
         assert!(matches!(decide(&LocalPolicy::Fallback, malformed), Err(Error::Committed(_))));
     }
 }

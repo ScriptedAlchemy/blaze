@@ -84,7 +84,8 @@ fn markdown<A: Allocator>(text: &str, line: Option<u32>, out: &mut impl Write, a
     let at = line.and_then(|n| text.split_inclusive('\n').take(n.saturating_sub(1) as usize).map(str::len).sum::<usize>().into());
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
     out.write_all(b"<article>")?;
-    let (mut depth, mut block, mut from) = (0usize, Vec::new_in(alloc), 0usize);
+    // Blocks only live during this render; borrowing also permits draining on the pinned std.
+    let (mut depth, mut block, mut from) = (0usize, Vec::new_in(&alloc), 0usize);
     for (ev, range) in Parser::new_ext(text, opts).into_offset_iter() {
         let (opens, closes) = (matches!(ev, Event::Start(_)), matches!(ev, Event::End(_)));
         if depth == 0 {

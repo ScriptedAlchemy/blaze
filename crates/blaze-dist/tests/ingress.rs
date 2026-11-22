@@ -288,7 +288,7 @@ fn no_lead_lost_delivery_is_not_a_completed_failed_verdict() {
         blaze_dist::admission::Admission::new(blaze_dist::admission::AdmissionConfig::default());
     let reservation = blaze_wire::Reservation { memory: 4, cpus: 4, disk: 4 };
     admission.add_machine("machine", [1; 32], reservation.clone());
-    admission.add_builder(0, "machine", reservation.clone()).unwrap();
+    admission.add_builder(0, "machine", reservation.clone(), Global).unwrap();
     let mut jobs = blaze_dist::jobs::Jobs::new(admission, ExecutionConfig::default());
     let answer = jobs
         .submit(

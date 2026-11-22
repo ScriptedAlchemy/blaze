@@ -2670,7 +2670,7 @@ fn distributed_unit_identity_covers_static_templates() {
         let work = Build::new(&machine, program, policy, &memo)
             .work_set(&[], &[7], &[], &Store::default())
             .unwrap();
-        assert!(work.names().is_empty(), "a static-only unit has no dev functions");
+        assert!(work.names(Global).is_empty(), "a static-only unit has no dev functions");
         work.digest()
     };
     let original = identity(&program, &dev);
@@ -2700,7 +2700,7 @@ fn distributed_unit_identity_covers_root_selection() {
     let single = build.work_set(&[(1, member())], &[], &[], &Store::default()).unwrap();
     let both =
         build.work_set(&[(1, member()), (2, member())], &[], &[], &Store::default()).unwrap();
-    assert_eq!(single.names(), both.names(), "the two walks reach the same functions");
+    assert_eq!(single.names(Global), both.names(Global), "the two walks reach the same functions");
     assert_ne!(single.digest(), both.digest(), "their root sets are different");
     assert_eq!(
         single.digest(),
@@ -2722,7 +2722,7 @@ fn distributed_work_grants_each_shared_template_once() {
     let mut build = Build::new(&machine, &program, &policy, &memo);
     let work = build.work_set(&[(1, member())], &[], &[], &Store::default()).unwrap();
     assert_eq!(work.functions(), 4, "two distinct instances share one relative template");
-    let names = work.names();
+    let names = work.names(Global);
     assert_eq!(names.len(), 3, "the shared template is granted to one holder only");
     let mut store = Store::default();
     let granted = build.compile_granted(&work, &names, &store).unwrap();

@@ -1,5 +1,8 @@
 //! The coordinator of a machine's daemons, over the local transport. It compiles nothing.
 
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use std::io::{self, BufRead};
 use std::path::Path;
 use std::sync::{
@@ -14,24 +17,63 @@ use blaze_dist_local::server::{MonotonicClock, Server};
 
 const USAGE: &str = "usage: blaze-dist-local coordinate SOCKET TRIPLE EXECUTORS [LEASE_MS]";
 
+#[derive(Debug)]
+enum CommandError {
+    Usage,
+    NotText(&'static str),
+    InvalidNumber { argument: &'static str, source: std::num::ParseIntError },
+    MachineFull,
+    Carrier(blaze_dist_local::Error),
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Usage => f.write_str(USAGE),
+            Self::NotText(argument) => write!(f, "{argument} is not text"),
+            Self::InvalidNumber { argument, source } => write!(f, "invalid {argument}: {source}"),
+            Self::MachineFull => f.write_str("the machine has no room"),
+            Self::Carrier(source) => write!(f, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for CommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidNumber { source, .. } => Some(source),
+            Self::Carrier(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<blaze_dist_local::Error> for CommandError {
+    fn from(source: blaze_dist_local::Error) -> Self {
+        Self::Carrier(source)
+    }
+}
+
 /// The coordinator a machine's daemons build through: `EXECUTORS` builders of one host triple,
 /// each of the daemons' units one execution, until stdin closes or says `stop`. Its bounds are
 /// a whole build's: the carrier's defaults are one client's. `LEASE_MS` is how long a holder may
 /// be silent before its lease ends. What fences a holder or moves an attempt goes to stdout, one
 /// line each, for the person or the harness reading what happened.
-fn coordinate(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Error>> {
+fn coordinate(args: &[std::ffi::OsString]) -> Result<(), CommandError> {
     let (path, triple, executors, lease) = match args {
         [path, triple, executors] => (path, triple, executors, None),
         [path, triple, executors, lease] => (path, triple, executors, Some(lease)),
-        _ => return Err(USAGE.into()),
+        _ => return Err(CommandError::Usage),
     };
     let (triple, executors): (&str, u32) = (
-        triple.to_str().ok_or("TRIPLE is not text")?,
-        executors.to_str().ok_or("EXECUTORS is not text")?.parse()?,
+        triple.to_str().ok_or(CommandError::NotText("TRIPLE"))?,
+        executors.to_str().ok_or(CommandError::NotText("EXECUTORS"))?.parse()
+            .map_err(|source| CommandError::InvalidNumber { argument: "EXECUTORS", source })?,
     );
     let defaults = blaze_dist::work::WorkConfig::default();
     let lease_ms = match lease {
-        Some(it) => it.to_str().ok_or("LEASE_MS is not text")?.parse()?,
+        Some(it) => it.to_str().ok_or(CommandError::NotText("LEASE_MS"))?.parse()
+            .map_err(|source| CommandError::InvalidNumber { argument: "LEASE_MS", source })?,
         None => defaults.lease_ms,
     };
     let need = blaze_dist_local::agent::NEED;
@@ -50,7 +92,7 @@ fn coordinate(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Err
         },
     );
     for _ in 0..executors {
-        admission.add_builder(0, "machine", need.clone()).ok_or("the machine has no room")?;
+        admission.add_builder(0, "machine", need.clone(), Global).ok_or(CommandError::MachineFull)?;
     }
     let jobs = Jobs::new(
         admission,
@@ -86,14 +128,14 @@ fn coordinate(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Err
             ..Config::default()
         },
         Arc::new(MonotonicClock::default()),
-        |effects: Vec<(blaze_wire::ExecutionId, blaze_dist::jobs::Effect)>| {
+        |effects: &mut dyn Iterator<Item = (blaze_wire::ExecutionId, blaze_dist::jobs::Effect)>| {
             for (execution, effect) in effects {
                 report(execution, &effect);
             }
         },
     )?;
     println!("ready {}", Path::new(path).display());
-    server.run(stop)?;
+    server.run(&stop)?;
     Ok(())
 }
 
@@ -116,10 +158,10 @@ fn report(execution: blaze_wire::ExecutionId, effect: &blaze_dist::jobs::Effect)
     println!("execution {}: {what}", execution.0);
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<(), CommandError> {
     let args: Vec<_> = std::env::args_os().collect();
     if args.get(1).and_then(|it| it.to_str()) != Some("coordinate") {
-        return Err(USAGE.into());
+        return Err(CommandError::Usage);
     }
     coordinate(&args[2..])
 }

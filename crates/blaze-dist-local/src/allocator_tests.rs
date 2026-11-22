@@ -1,46 +1,20 @@
 //! Allocation ownership observed through the transport's real request paths.
 
-use std::alloc::{AllocError, Allocator, Global, Layout};
-use std::cell::Cell;
-use std::ptr::NonNull;
+use std::alloc::Global;
 
 use blaze_dist::admission::Admission;
 use blaze_dist::jobs::Jobs;
 use blaze_wire::{JobRequest, LocalPolicy, Namespace, Reservation};
 
 use crate::coordinator::{Config, Coordinator};
+use crate::pack::test_alloc::{Counted, Counts};
 use crate::protocol::{Command, Request, hello, submission};
-
-#[derive(Default)]
-pub(crate) struct Counts {
-    pub(crate) allocations: Cell<usize>,
-    pub(crate) deallocations: Cell<usize>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct Counted<'a>(pub(crate) &'a Counts);
-
-// SAFETY: each allocation and deallocation delegates unchanged to Global. The
-// borrowed counters outlive all returned buffers and do not own their storage.
-unsafe impl Allocator for Counted<'_> {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let allocation = Global.allocate(layout)?;
-        self.0.allocations.set(self.0.allocations.get() + 1);
-        Ok(allocation)
-    }
-
-    unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
-        self.0.deallocations.set(self.0.deallocations.get() + 1);
-        // SAFETY: this allocator returns only Global's allocations with this layout.
-        unsafe { Global.deallocate(pointer, layout) };
-    }
-}
 
 fn coordinator() -> (Coordinator, Request) {
     const NEED: Reservation = Reservation { memory: 1, cpus: 1, disk: 1 };
     let mut admission = Admission::new(Default::default());
     admission.add_machine("machine", [1; 32], Reservation { memory: 8, cpus: 8, disk: 8 });
-    admission.add_builder(0, "machine", NEED).unwrap();
+    admission.add_builder(0, "machine", NEED, Global).unwrap();
     let jobs = Jobs::new(admission, Default::default());
     let mut coordinator = Coordinator::new(jobs, Config::default(), [7; 32]);
     let welcome = coordinator.hello(0, &hello([8; 32])).unwrap();

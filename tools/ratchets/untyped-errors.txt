@@ -61,7 +61,7 @@ blaze-usercode	48	0	0	0	0
 blaze-v2-proof	2	0	0	0	0
 blaze-vfs	0	6	0	0	0
 harness/harness	6	0	0	25	1
-harness/harness-browser	41	0	0	0	0
+harness/harness-browser	35	0	0	0	0
 harness/harness-chat-library	36	0	0	0	0
 harness/harness-mach	3	0	0	0	0
 harness/harness-native	67	0	0	0	1

@@ -176,10 +176,13 @@ fn first_publication_refuses_forged_keys_and_truncated_native_values() {
 
 #[test]
 fn native_record_boundaries_and_order_are_checked_before_publication() {
-    let producer = native_pack::Pack::of(vec![
-        native_pack::Value { key: [1; 32], kind: 255, bytes: Vec::new() },
-        native_pack::Value { key: [2; 32], kind: 0, bytes: Vec::new() },
-    ])
+    let producer = native_pack::Pack::of(
+        vec![
+            native_pack::Value { key: [1; 32], kind: 255, bytes: Vec::new() },
+            native_pack::Value { key: [2; 32], kind: 0, bytes: Vec::new() },
+        ],
+        Global,
+    )
     .unwrap();
     for fault in 0..5 {
         let dir = tempfile::tempdir().unwrap();
@@ -203,7 +206,7 @@ fn native_record_boundaries_and_order_are_checked_before_publication() {
             size: bytes.len() as u64,
             ..producer.reference.clone()
         };
-        assert!(native_pack::read(&bytes, &reference).is_err());
+        assert!(native_pack::read(&bytes, &reference, Global).is_err());
         store.put_blob(&path(&reference), &bytes).unwrap();
         let error = store.put_list(&name(), &pack_list::encode(&[reference], Global)).unwrap_err();
         let why = if fault < 2 { "unordered keys" } else { "native value" };
@@ -617,7 +620,7 @@ fn scenario(ops: &[u16], seed: u64, plant: Plant) -> Result<(), String> {
 
 /// Full output plus its even/odd partitions: every key is mirrored, while the
 /// manifest's SHA order has no relationship to the order of the keys it contains.
-fn native_partitions(count: usize, conflict: u8) -> Vec<native_pack::Pack> {
+fn native_partitions(count: usize, conflict: u8) -> Vec<native_pack::Pack<Global>> {
     let values: Vec<_> = (0..count)
         .map(|i| {
             let mut key = [0; 32];
@@ -646,13 +649,13 @@ fn native_partitions(count: usize, conflict: u8) -> Vec<native_pack::Pack> {
     // A byte-bounded historical whole pack must agree with the current producer's
     // partitions, even when it exceeds the newer upload item target.
     let whole = (count > blaze_wire::Limits::DOCUMENTED.batch_items as usize)
-        .then(|| native_pack::Pack::of(values.clone()).unwrap()); // alloc: bounded legacy compatibility fixture
-    let mut packs = native_pack::Pack::batches(values).unwrap(); // alloc: bounded producer outputs
+        .then(|| native_pack::Pack::of(values.clone(), Global).unwrap()); // alloc: bounded legacy compatibility fixture
+    let mut packs = native_pack::Pack::batches(values, Global).unwrap(); // alloc: bounded producer outputs
     if let Some(whole) = whole {
         packs.push(whole);
     }
     for half in halves {
-        packs.extend(native_pack::Pack::batches(half).unwrap());
+        packs.extend(native_pack::Pack::batches(half, Global).unwrap());
     }
     packs.sort_by_key(|pack| pack.reference.pack);
     packs.dedup_by_key(|pack| pack.reference.pack);
@@ -661,12 +664,12 @@ fn native_partitions(count: usize, conflict: u8) -> Vec<native_pack::Pack> {
 
 /// Use the real import codec as the semantic oracle; the server's comparison is
 /// never consulted to decide whether a producer's partitions contain one value.
-fn partitions_agree(packs: &[native_pack::Pack]) -> bool {
+fn partitions_agree<A: Allocator>(packs: &[native_pack::Pack<A>]) -> bool {
     let mut values = std::collections::BTreeMap::new(); // alloc: bounded logical-output oracle
     for pack in packs {
-        for value in native_pack::read(&pack.bytes, &pack.reference).unwrap() {
+        for value in native_pack::read(&pack.bytes, &pack.reference, Global).unwrap() {
             let content = (value.kind, value.bytes);
-            if let Some(previous) = values.insert(value.key, content.clone())
+            if let Some(previous) = values.insert(value.key, content)
                 && previous != content
             {
                 return false;
@@ -708,7 +711,7 @@ fn native_partition_scenario(
         let whole = packs
             .iter()
             .position(|pack| {
-                native_pack::read(&pack.bytes, &pack.reference).unwrap().len() == count
+                native_pack::read(&pack.bytes, &pack.reference, Global).unwrap().len() == count
             })
             .expect("the original complete pack");
         previous.push(references.remove(whole));

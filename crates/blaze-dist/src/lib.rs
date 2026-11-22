@@ -18,7 +18,7 @@
 //! Nothing here does IO, starts a thread or reads a clock: every machine takes events and `now`
 //! and returns its answers and effects. Every message is a `blaze-wire` type.
 
-#![feature(allocator_api)]
+#![feature(allocator_api, btreemap_alloc, clone_from_ref)]
 #![deny(missing_docs)]
 
 pub mod admission;

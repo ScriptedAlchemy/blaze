@@ -612,6 +612,16 @@ jobs:
             fragmented_replies_preserve_body_boundaries_and_committed_refusals
             http_bodies_keep_the_callers_allocation_through_decoding
             coordinator_outputs_and_replays_use_the_callers_allocator
+            admission_names_and_scratch_use_the_callers_allocator
+            holder_keeps_the_callers_index_storage
+            simulation_trace_writes_directly_into_the_callers_buffer
+            agent::tests::imported_pack_storage_uses_the_callers_allocator
+            pack::tests::packs_and_record_views_use_the_callers_allocator
+            store::repair_tests::native_pack::tests::packs_and_record_views_use_the_callers_allocator
+            server::tests::effect_sink_moves_one_batch_from_the_callers_allocator
+            server::tests::framing_uses_the_callers_allocator_without_changing_the_body
+            telemetry::tests::evidence_keeps_wire_json_escaping_and_the_callers_allocator
+            telemetry::tests::digest_evidence_matches_the_previous_hex_string_fields
             committed_reply_bounds_follow_the_native_wire_contract
             an_http_reply_must_end_at_its_declared_body_boundary
             an_interrupted_committed_get_cannot_authorize_local_recompilation
@@ -667,6 +677,7 @@ jobs:
             ${{ runner.temp }}/core-evidence/toolchain-pin.txt
           if-no-files-found: error
       - name: active V2 library invariants and their planted controls
+        id: active-tests
         if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
         shell: bash
         timeout-minutes: 30
@@ -739,7 +750,19 @@ jobs:
           # This control exists independently in the kernel and the record store.
           [ "$(grep -Ec '^test ([[:alnum:]_]+::)*the_oracle_catches_a_negative_read_dropped \.\.\. ok[[:space:]]*$' "$RUNNER_TEMP/core-evidence/active-tests.log")" -eq 2 ] \
             || { echo '::error::both negative-read controls must execute'; exit 1; }
+      - name: keep active V2 library failures before the remaining tests
+        if: ${{ !cancelled() && steps.active-tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: active-v2-library-errors
+          path: |
+            ${{ runner.temp }}/core-evidence/active-tests.log
+            ${{ runner.temp }}/core-evidence/toolchain-pin.txt
+            ${{ runner.temp }}/core-evidence/cargo-version.txt
+            ${{ runner.temp }}/core-evidence/rustc-version.txt
+          if-no-files-found: error
       - name: remaining active V2 library controls
+        id: remaining-active-tests
         if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
         shell: bash
         timeout-minutes: 20
@@ -770,6 +793,17 @@ jobs:
             grep -Eq "^test ([[:alnum:]_]+::)*$case_name( - should panic)? \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/remaining-active-tests.log" \
               || { echo "::error::missing executed active library control: $case_name"; exit 1; }
           done
+      - name: keep remaining library failures before the integration tests
+        if: ${{ !cancelled() && steps.remaining-active-tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: remaining-v2-library-errors
+          path: |
+            ${{ runner.temp }}/core-evidence/remaining-active-tests.log
+            ${{ runner.temp }}/core-evidence/toolchain-pin.txt
+            ${{ runner.temp }}/core-evidence/cargo-version.txt
+            ${{ runner.temp }}/core-evidence/rustc-version.txt
+          if-no-files-found: error
       - name: memo invariant integration controls
         if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
         shell: bash
@@ -803,20 +837,18 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/core-evidence"
           toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
-          # Resolve only the adapter's feature closure from the application's exact pins.
-          # Metadata does not compile. No resolved package may change identity, and the
-          # subsequent build is locked to the retained normalized lockfile. Source modules
-          # are read through the repository symlink; none is copied or rewritten.
+          # The adapter's feature closure is locked to the application's exact pins.
+          # Metadata does not compile or update the lock. Source modules are read through
+          # the repository symlink; none is copied or rewritten.
           harness_snapshot=$(mktemp -d "$RUNNER_TEMP/blaze-harness-core.XXXXXX")
           mkdir -p "$harness_snapshot/.github/fixtures"
           cp -a .github/fixtures/harness-core "$harness_snapshot/.github/fixtures/"
           ln -s "$GITHUB_WORKSPACE/crates" "$harness_snapshot/crates"
           ln -s "$GITHUB_WORKSPACE/Cargo.toml" "$harness_snapshot/Cargo.toml"
           manifest="$harness_snapshot/.github/fixtures/harness-core/Cargo.toml"
-          cp crates/harness/Cargo.lock "$(dirname "$manifest")/Cargo.lock"
           git rev-parse HEAD > "$RUNNER_TEMP/core-evidence/harness-core-source-head.txt"
           metadata_status=0
-          timeout --kill-after=10s 120s cargo "+$toolchain" metadata --format-version 1 \
+          timeout --kill-after=10s 120s cargo "+$toolchain" metadata --locked --format-version 1 \
             --manifest-path "$manifest" > "$RUNNER_TEMP/core-evidence/harness-core-metadata.json" \
             2> "$RUNNER_TEMP/core-evidence/harness-core-metadata.log" || metadata_status=$?
           cat "$RUNNER_TEMP/core-evidence/harness-core-metadata.log"
@@ -852,6 +884,7 @@ jobs:
           PY
           cmp .github/fixtures/harness-core/Cargo.toml "$manifest"
           cmp .github/fixtures/harness-core/lib.rs "$(dirname "$manifest")/lib.rs"
+          cmp .github/fixtures/harness-core/Cargo.lock "$(dirname "$manifest")/Cargo.lock"
           timeout --kill-after=10s 600s cargo "+$toolchain" test --release --locked --all-targets \
             --manifest-path "$manifest" \
             2>&1 | tee "$RUNNER_TEMP/core-evidence/harness-core-tests.log"

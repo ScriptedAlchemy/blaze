@@ -87,8 +87,8 @@ struct World {
 }
 
 impl World {
-    fn violation(&self, invariant: &'static str, detail: String) -> Violation {
-        Violation { seed: self.seed, invariant, at: self.now, detail }
+    fn violation(&self, invariant: &'static str, detail: std::fmt::Arguments<'_>) -> Violation {
+        Violation::new(self.seed, self.now, invariant, detail)
     }
 
     fn new(seed: u64) -> World {
@@ -112,7 +112,7 @@ impl World {
                         cpus: rng.range(4, 16) as u32,
                         disk: rng.range(20, 80),
                     };
-                    let _ = admission.add_builder(0, &name, r);
+                    let _ = admission.add_builder(0, &name, r, Global);
                 }
             }
         }
@@ -169,7 +169,7 @@ impl World {
             self.effects(out)?;
             self.check_assignments()?;
             self.jobs.admission_view().check()
-                .map_err(|error| self.violation("capacity", error.to_string()))?;
+                .map_err(|error| self.violation("capacity", format_args!("{error}")))?;
             self.assignments()?;
             if self.now >= horizon
                 && self.kills.is_empty()
@@ -184,7 +184,7 @@ impl World {
             if !matches!(e.state(), ExecState::Ended(_)) {
                 return Err(self.violation(
                     "progress",
-                    format!("execution {:?} never ended: {:?}", e.id, e.state()),
+                    format_args!("execution {:?} never ended: {:?}", e.id, e.state()),
                 ));
             }
             stages(e, self.seed, self.now)?;
@@ -211,8 +211,9 @@ impl World {
             }
             15 => {
                 let n = self.rng.range(1, 4);
-                let gone = self.jobs.admission().close_pr(n);
+                let gone = self.jobs.admission().close_pr(n, Global);
                 for (executor, busy) in gone {
+                    let executor = executor.into_string();
                     self.dead.insert(executor.clone());
                     self.live.remove(&executor);
                     if let Some((execution, _)) = busy
@@ -255,13 +256,13 @@ impl World {
                         cpus: self.rng.range(4, 16) as u32,
                         disk: self.rng.range(20, 80),
                     };
-                    let _ = self.jobs.admission().rebuild(self.now, b, r);
+                    let _ = self.jobs.admission().rebuild(self.now, b, r, Global);
                 }
                 Ok(())
             }
             19 => {
-                let gone = self.jobs.admission().reap(self.now);
-                self.dead.extend(gone);
+                let gone = self.jobs.admission().reap(self.now, Global);
+                self.dead.extend(gone.into_iter().map(|name| name.into_string()));
                 Ok(())
             }
             20 => {
@@ -300,7 +301,7 @@ impl World {
                     if answer.is_ok() || !out.is_empty() || after != before {
                         return Err(self.violation(
                             "ingress",
-                            "forged stage batch changed public stream".to_owned(),
+                            format_args!("forged stage batch changed public stream"),
                         ));
                     }
                 }
@@ -373,7 +374,7 @@ impl World {
                     Some(id) if id != answer.execution => {
                         return Err(self.violation(
                             "subscribers",
-                            format!(
+                            format_args!(
                                 "equal content running as {id:?} started {:?}",
                                 answer.execution
                             ),
@@ -384,7 +385,7 @@ impl World {
                         if waiting >= self.queue_limit {
                             return Err(self.violation(
                                 "queue",
-                                format!(
+                                format_args!(
                                     "{waiting} waiting and a job queued past Q {}",
                                     self.queue_limit
                                 ),
@@ -406,12 +407,12 @@ impl World {
                 if running.is_some() || waiting < self.queue_limit {
                     return Err(self.violation(
                         "queue",
-                        format!("busy with {waiting} waiting under Q {}", self.queue_limit),
+                        format_args!("busy with {waiting} waiting under Q {}", self.queue_limit),
                     ));
                 }
             }
             Err((other, _)) => {
-                return Err(self.violation("queue", format!("a submit refused: {other:?}")));
+                return Err(self.violation("queue", format_args!("a submit refused: {other:?}")));
             }
         }
         self.effects(submitted)
@@ -427,7 +428,7 @@ impl World {
         let attached = e.subscribers().any(|x| x.state == jobs::SubscriberState::Attached);
         if !attached && !matches!(e.state(), ExecState::Ended(_)) {
             return Err(
-                self.violation("subscribers", format!("{execution:?} runs with no subscriber"))
+                self.violation("subscribers", format_args!("{execution:?} runs with no subscriber"))
             );
         }
         Ok(())
@@ -465,7 +466,7 @@ impl World {
                 if !ended {
                     return Err(self.violation(
                         "attempts",
-                        format!("a dead attempt's events answered {answer:?}"),
+                        format_args!("a dead attempt's events answered {answer:?}"),
                     ));
                 }
             }
@@ -484,7 +485,7 @@ impl World {
             if !ended && answer != Err(Refusal::AttemptMoved) {
                 return Err(self.violation(
                     "attempts",
-                    format!("a late event of {attempt:?} answered {answer:?}"),
+                    format_args!("a late event of {attempt:?} answered {answer:?}"),
                 ));
             }
             self.effects(out)?;
@@ -518,7 +519,7 @@ impl World {
             }) {
                 return Err(self.violation(
                     "assignment",
-                    format!("live assignment {assignment:?} lost its slot {executor}: {slot:?}"),
+                    format_args!("live assignment {assignment:?} lost its slot {executor}: {slot:?}"),
                 ));
             }
         }
@@ -557,32 +558,32 @@ impl World {
                     {
                         return Err(self.violation(
                             "terminal",
-                            "lost or invalid terminal classification".to_owned(),
+                            format_args!("lost or invalid terminal classification"),
                         ));
                     }
                     if self.left.contains(&subscriber) {
                         return Err(self.violation(
                             "subscribers",
-                            format!("subscriber {subscriber} ended after it left"),
+                            format_args!("subscriber {subscriber} ended after it left"),
                         ));
                     }
                     if !self.ended_subs.insert(subscriber) {
                         return Err(self.violation(
                             "subscribers",
-                            format!("subscriber {subscriber} ended twice"),
+                            format_args!("subscriber {subscriber} ended twice"),
                         ));
                     }
                     let (_, deadline) = self.subscribers[&subscriber];
                     if outcome == Outcome::TimedOut && self.now <= deadline {
                         return Err(self.violation(
                             "subscribers",
-                            format!("subscriber {subscriber} timed out before its deadline"),
+                            format_args!("subscriber {subscriber} timed out before its deadline"),
                         ));
                     }
                     if self.now > deadline && outcome != Outcome::TimedOut {
                         return Err(self.violation(
                             "subscribers",
-                            format!("subscriber {subscriber} got {outcome:?} past its deadline"),
+                            format_args!("subscriber {subscriber} got {outcome:?} past its deadline"),
                         ));
                     }
                 }
@@ -593,7 +594,7 @@ impl World {
                 jobs::Effect::HelperAssigned { .. } => {
                     return Err(self.violation(
                         "helpers",
-                        "a helper was assigned to a no-compile-work execution".to_owned(),
+                        format_args!("a helper was assigned to a no-compile-work execution"),
                     ));
                 }
             }
@@ -616,7 +617,7 @@ impl World {
                     let first = queue.front().copied();
                     return Err(self.violation(
                         "order",
-                        format!("{id:?} admitted before {first:?} of its class"),
+                        format_args!("{id:?} admitted before {first:?} of its class"),
                     ));
                 }
                 queue.pop_front();
@@ -626,7 +627,7 @@ impl World {
                 {
                     return Err(self.violation(
                         "order",
-                        format!("pull request {id:?} admitted while Main {main:?} waits"),
+                        format_args!("pull request {id:?} admitted while Main {main:?} waits"),
                     ));
                 }
             }
@@ -635,7 +636,7 @@ impl World {
                 if let Some(old) = self.live.insert(assigned.executor.clone(), token) {
                     return Err(self.violation(
                         "assignment",
-                        format!(
+                        format_args!(
                             "slot {} assigned {token:?} while {old:?} is still live",
                             assigned.executor
                         ),
@@ -653,14 +654,14 @@ impl World {
                     other => {
                         return Err(self.violation(
                             "placement",
-                            format!("{id:?} of {namespace:?} assigned to {other:?}"),
+                            format_args!("{id:?} of {namespace:?} assigned to {other:?}"),
                         ));
                     }
                 }
                 if assigned.attempt.0 > 2 {
                     return Err(self.violation(
                         "attempts",
-                        format!("{id:?} at attempt {}", assigned.attempt.0),
+                        format_args!("{id:?} at attempt {}", assigned.attempt.0),
                     ));
                 }
                 if let Some(old) = self.leads.remove(&id)
@@ -688,7 +689,7 @@ impl World {
                 if e.losses() >= 2 && done.outcome != Outcome::Lost {
                     return Err(self.violation(
                         "attempts",
-                        format!("{id:?} lost twice ended {:?}", done.outcome),
+                        format_args!("{id:?} lost twice ended {:?}", done.outcome),
                     ));
                 }
                 if let Some(lead) = self.leads.remove(&id)
@@ -697,7 +698,7 @@ impl World {
                     && lead.finish_at <= self.now
                 {
                     return Err(self
-                        .violation("subscribers", format!("{id:?} ended Passed after a refusal")));
+                        .violation("subscribers", format_args!("{id:?} ended Passed after a refusal")));
                 }
                 for queue in self.shadow.values_mut() {
                     queue.retain(|x| *x != id);
@@ -720,7 +721,7 @@ impl World {
             if let Some(other) = owners.insert(lead, execution.id) {
                 return Err(self.violation(
                     "placement",
-                    format!("{lead} leads both {other:?} and {:?}", execution.id),
+                    format_args!("{lead} leads both {other:?} and {:?}", execution.id),
                 ));
             }
             let expected = Some((execution.id, execution.attempt()));
@@ -733,7 +734,7 @@ impl World {
             {
                 return Err(self.violation(
                     "placement",
-                    format!("{lead} lost the reservation of {:?}", execution.id),
+                    format_args!("{lead} lost the reservation of {:?}", execution.id),
                 ));
             }
         }

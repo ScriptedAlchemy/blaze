@@ -53,7 +53,7 @@ impl Sim {
     fn new() -> Sim {
         let mut admission = Admission::new(AdmissionConfig::default());
         admission.add_machine("machine", [1; 32], need());
-        admission.add_builder(0, "machine", need()).unwrap();
+        admission.add_builder(0, "machine", need(), Global).unwrap();
         let jobs = Jobs::new(
             admission,
             ExecutionConfig { heartbeat_ms: 10_000, ..ExecutionConfig::default() },

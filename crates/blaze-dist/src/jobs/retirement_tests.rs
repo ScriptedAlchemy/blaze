@@ -81,7 +81,7 @@ impl Sim {
         let mut admission = Admission::new(AdmissionConfig::default());
         admission.add_machine("machine", [1; 32], Reservation { memory: 2, cpus: 2, disk: 2 });
         for _ in 0..2 {
-            admission.add_builder(0, "machine", need()).unwrap();
+            admission.add_builder(0, "machine", need(), Global).unwrap();
         }
         let mut jobs = Jobs::new(
             admission,
@@ -501,7 +501,7 @@ fn cancellation_cleans_a_promotion_the_worker_has_not_observed(tc: hegel::TestCa
 fn stale_claimed_helper(unclaimed_helper: bool, forget_owner: bool) -> Result<(), String> {
     let mut sim = Sim::new(Plant::None);
     sim.jobs.admission.add_machine("spare", [1; 32], need());
-    let spare = sim.jobs.admission.add_builder(0, "spare", need()).unwrap();
+    let spare = sim.jobs.admission.add_builder(0, "spare", need(), Global).unwrap().into_string();
     if unclaimed_helper {
         // Offer the spare as an unclaimed helper; otherwise it remains in the idle pool.
         sim.jobs.tick(0, &mut Vec::new());

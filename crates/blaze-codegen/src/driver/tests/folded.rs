@@ -220,7 +220,7 @@ fn folded_grants_export_whole_groups_and_debug_tables_to_an_empty_tail() {
     let wa = ba.work_set(&[(1, member())], &[], &[], &empty).unwrap();
     let wb = bb.work_set(&[(1, member())], &[], &[], &empty).unwrap();
     assert_eq!(wa.digest(), wb.digest());
-    assert_eq!(wa.names(), wb.names());
+    assert_eq!(wa.names(Global), wb.names(Global));
     assert_eq!(wa.groups.len(), 2);
     assert_eq!(a.merged.load(Ordering::Relaxed), 0, "planning never merges");
     let mut arrived = Store::default();
@@ -242,8 +242,13 @@ fn folded_grants_export_whole_groups_and_debug_tables_to_an_empty_tail() {
     unique.sort_unstable();
     unique.dedup();
     assert_eq!(unique.len(), emitted.len(), "no duplicate body, thunk or standalone template");
-    assert_eq!(wa.folded_keys().len(), 6);
-    assert!(wa.folded_keys().iter().all(|key| unique.contains(key)));
+    assert_eq!(wa.folded_keys(Global).len(), 6);
+    assert!(wa.folded_keys(Global).iter().all(|key| unique.contains(key)));
+    frame::task(Tag::Codegen, |frame| {
+        let folded = wa.folded_keys(frame);
+        assert!(std::ptr::eq(*folded.allocator(), frame));
+        assert_eq!(folded.as_slice(), wa.folded_keys(Global).as_slice());
+    });
     let (tail, memo) = (Merging { debug: true, ..Merging::default() }, Memo::new());
     let restored =
         Build::new(&tail, &program, &policy, &memo).run(&[(1, member())], &arrived).unwrap();
@@ -256,7 +261,7 @@ fn folded_grants_export_whole_groups_and_debug_tables_to_an_empty_tail() {
     assert_eq!(restored.digests, fresh.digests);
     let work = ba.work_set(&[(1, member())], &[], &[], &arrived).unwrap();
     assert_eq!(work.digest(), wa.digest());
-    let warm = ba.compile_granted(&work, &work.names(), &arrived).unwrap();
+    let warm = ba.compile_granted(&work, &work.names(Global), &arrived).unwrap();
     assert_eq!(warm.stats.compiled, 0);
     let mut exported = Store::default();
     super::distributed::outputs(warm, &mut exported);
@@ -265,7 +270,7 @@ fn folded_grants_export_whole_groups_and_debug_tables_to_an_empty_tail() {
     // A missing debug table is refused; a holder cannot publish an incomplete bundle.
     let side = fresh.functions.iter().find_map(|f| f.side).unwrap();
     arrived.0.remove(&keys::side(&side));
-    assert!(ba.compile_granted(&work, &work.names(), &arrived).is_err());
+    assert!(ba.compile_granted(&work, &work.names(Global), &arrived).is_err());
 }
 
 #[test]
@@ -279,7 +284,7 @@ fn fold_task_identity_follows_members_settings_and_resolved_targets() {
     };
     let first = plan(&program, &policy);
     let name = group_flight(&first.groups[0]);
-    assert!(first.names().contains(&name), "one grant contains all folded members");
+    assert!(first.names(Global).contains(&name), "one grant contains all folded members");
     assert_eq!(first.digest(), plan(&program, &policy).digest());
     program.function(99, 0x99, &[]);
     assert_eq!(
@@ -300,9 +305,9 @@ fn fold_task_identity_follows_members_settings_and_resolved_targets() {
     let changed = plan(&program, &policy);
     assert!(changed.groups.is_empty(), "one member no longer has the masked form");
     assert_ne!(first.digest(), changed.digest());
-    assert!(!changed.names().contains(&name));
+    assert!(!changed.names(Global).contains(&name));
     assert_eq!(
-        changed.names().len(),
+        changed.names(Global).len(),
         changed.functions(),
         "ungrouped fold candidates are grantable"
     );

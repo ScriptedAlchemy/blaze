@@ -3,14 +3,15 @@
 //! `timeout`; the server checks every blob against its name before it is visible, and the
 //! agent checks it again against what was committed ([`crate::pack::read`]).
 
-use std::alloc::Allocator;
+use std::alloc::{Allocator, Global};
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use crate::Error;
-use crate::pack::{Pack, hex};
+use crate::pack::Pack;
 use blaze_wire::{Digest, Limits};
+use blaze_wire::json::hex;
 use sha2::{Digest as _, Sha256};
 
 /// Extra room for HTTP framing (including chunked transfers), not for value bytes.
@@ -76,7 +77,11 @@ impl Blobs {
 
     /// Puts `pack` under its name. The server hashes it before it is visible, so a pack that
     /// is there is whole.
-    pub fn put_pack(&self, pack: &Pack, alloc: impl Allocator) -> Result<(), Error> {
+    pub fn put_pack(
+        &self,
+        pack: &Pack<impl Allocator>,
+        alloc: impl Allocator,
+    ) -> Result<(), Error> {
         let path = format!("/v1/blob/packs/{}.pack", hex(&pack.reference.pack));
         let (status, body) = self.request("PUT", &path, &pack.bytes, alloc)?;
         match status {
@@ -182,8 +187,9 @@ fn committed_get_head(method: &str, reply: &[u8]) -> bool {
 
 fn read_failure(method: &str, path: &str, reply: &[u8], error: std::io::Error) -> Error {
     if committed_get_head(method, reply) {
-        // alloc: an error path names the committed key and the interrupted transport.
-        Error::Committed(format!("{method} {path}: interrupted committed HTTP 200 reply: {error}"))
+        Error::Committed(blaze_mem::format_in!(
+            Global, "{method} {path}: interrupted committed HTTP 200 reply: {error}"
+        ).into_boxed_str().into_string())
     } else {
         Error::Io(error)
     }
@@ -261,8 +267,9 @@ fn decode_head(method: &str, path: &str, reply: &[u8]) -> Result<ResponseHead, E
     let invalid = |why: &str| Error::Protocol(format!("{method} {path}: {why}"));
     let end = reply.windows(4).position(|it| it == b"\r\n\r\n").ok_or_else(|| {
         if committed_get_head(method, reply) {
-            // alloc: an incomplete committed reply cannot authorize local recompilation.
-            Error::Committed(format!("{method} {path}: truncated committed HTTP 200 headers"))
+            Error::Committed(blaze_mem::format_in!(
+                Global, "{method} {path}: truncated committed HTTP 200 headers"
+            ).into_boxed_str().into_string())
         } else {
             invalid("no HTTP head")
         }
@@ -277,8 +284,9 @@ fn decode_head(method: &str, path: &str, reply: &[u8]) -> Result<ResponseHead, E
     }
     let head = std::str::from_utf8(&reply[..end]).map_err(|_| {
         if committed_get_head(method, reply) {
-            // alloc: a corrupt committed reply must not be treated as a cache miss.
-            Error::Committed(format!("{method} {path}: committed HTTP 200 headers are not text"))
+            Error::Committed(blaze_mem::format_in!(
+                Global, "{method} {path}: committed HTTP 200 headers are not text"
+            ).into_boxed_str().into_string())
         } else {
             invalid("the head is not text")
         }
@@ -487,8 +495,7 @@ fn publish_verdict<A: Allocator>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocator_tests::{Counted, Counts};
-    use std::alloc::Global;
+    use crate::pack::test_alloc::{Counted, Counts};
     use std::cell::Cell;
     use std::io::Read as _;
 

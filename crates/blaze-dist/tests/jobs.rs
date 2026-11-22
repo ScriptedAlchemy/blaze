@@ -1,5 +1,8 @@
 //! Lifecycle boundaries that must hold independently of the randomized load.
 
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use blaze_dist::admission::{Admission, AdmissionConfig};
 use blaze_dist::jobs::{
     AssignmentToken, Effect, ExecState, Execution, ExecutionConfig, Jobs, Subscriber,
@@ -256,7 +259,7 @@ fn review_a_late_kill_ack_cannot_release_a_new_execution() {
     for alive in [true, false] {
         let mut admission = Admission::new(AdmissionConfig::default());
         admission.add_machine("machine", [1; 32], reservation());
-        let builder = admission.add_builder(0, "machine", reservation()).unwrap();
+        let builder = admission.add_builder(0, "machine", reservation(), Global).unwrap().into_string();
         let mut jobs = Jobs::new(admission, ExecutionConfig::default());
         let mut effects = Vec::new();
         let first = jobs.submit(0, &request(1), reservation(), &mut effects).unwrap();
@@ -500,7 +503,7 @@ fn completion_and_timer_order_preserve_each_subscribers_deadline() {
 fn registry() -> (blaze_dist::jobs::Jobs, String) {
     let mut a = blaze_dist::admission::Admission::new(Default::default());
     a.add_machine("machine", [1; 32], reservation());
-    let slot = a.add_builder(0, "machine", reservation()).unwrap();
+    let slot = a.add_builder(0, "machine", reservation(), Global).unwrap().into_string();
     (blaze_dist::jobs::Jobs::new(a, Default::default()), slot)
 }
 
@@ -550,7 +553,7 @@ fn a_duplicate_kill_ack_cannot_release_a_new_assignment_or_its_draining_slot() {
             jobs.tick(3, &mut Vec::new());
             assert_eq!(jobs.admission_view().executor(&slot).unwrap().busy, Some((b, Attempt(1))));
             if draining {
-                assert!(jobs.admission().rebuild(4, &slot, reservation()).is_none());
+                assert!(jobs.admission().rebuild(4, &slot, reservation(), Global).is_none());
             }
             let before = jobs.admission_view().executor(&slot).unwrap().clone();
             jobs.killed(5, &slot, token, alive);
@@ -668,8 +671,8 @@ fn promoted_permanently_stalled_helper_is_cancelled_at_deadline_without_coverage
 fn an_idle_builder_is_assigned_as_a_helper_and_both_workers_lease() {
     let mut admission = Admission::new(AdmissionConfig::default());
     admission.add_machine("machine", [1; 32], Reservation { memory: 16, cpus: 16, disk: 16 });
-    let lead = admission.add_builder(0, "machine", reservation()).unwrap();
-    let helper = admission.add_builder(0, "machine", reservation()).unwrap();
+    let lead = admission.add_builder(0, "machine", reservation(), Global).unwrap().into_string();
+    let helper = admission.add_builder(0, "machine", reservation(), Global).unwrap().into_string();
     let config = ExecutionConfig {
         work: blaze_dist::work::WorkConfig { grant_roots: 1, ..Default::default() },
         ..Default::default()
@@ -770,7 +773,7 @@ fn idle_helpers_are_shared_round_robin_between_running_builds() {
     let mut admission = Admission::new(AdmissionConfig::default());
     admission.add_machine("machine", [1; 32], Reservation { memory: 32, cpus: 32, disk: 32 });
     for _ in 0..4 {
-        admission.add_builder(0, "machine", reservation()).unwrap();
+        admission.add_builder(0, "machine", reservation(), Global).unwrap();
     }
     let mut jobs = Jobs::new(admission, ExecutionConfig::default());
     // Every effect counts, submits included: a submit ticks admission before
@@ -824,7 +827,7 @@ mod claim {
         let mut admission = Admission::new(AdmissionConfig::default());
         admission.add_machine("machine", [1; 32], Reservation { memory: 64, cpus: 64, disk: 64 });
         for _ in 0..executors {
-            admission.add_builder(0, "machine", need.clone()).unwrap();
+            admission.add_builder(0, "machine", need.clone(), Global).unwrap();
         }
         let mut jobs = Jobs::new(admission, ExecutionConfig::default());
         let request = JobRequest {

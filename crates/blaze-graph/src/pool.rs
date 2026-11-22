@@ -3496,16 +3496,32 @@ mod tests {
         assert_eq!(flights.running(), 0);
     }
 
-    std::thread_local! {
-        static MARK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
+    /// Resolve the thread-local on each side of a wait. A direct access in the job's closure
+    /// can keep its old thread's address across the switch, even though its value was carried.
+    mod carried_mark {
+        std::thread_local! {
+            static MARK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
 
-    fn take_mark() -> Option<std::num::NonZeroUsize> {
-        std::num::NonZeroUsize::new(MARK.replace(0))
-    }
+        #[inline(never)]
+        pub(super) fn take() -> Option<std::num::NonZeroUsize> {
+            std::num::NonZeroUsize::new(MARK.replace(0))
+        }
 
-    fn put_mark(taken: std::num::NonZeroUsize) {
-        MARK.set(taken.get());
+        #[inline(never)]
+        pub(super) fn put(taken: std::num::NonZeroUsize) {
+            MARK.set(taken.get());
+        }
+
+        #[inline(never)]
+        pub(super) fn get() -> usize {
+            MARK.get()
+        }
+
+        #[inline(never)]
+        pub(super) fn set(value: usize) {
+            MARK.set(value);
+        }
     }
 
     /// A job inside a frame task that waits resumes in its own frame, on whichever worker takes
@@ -3516,7 +3532,9 @@ mod tests {
     fn a_waiting_job_keeps_its_frame_on_any_worker() {
         use blaze_mem::{Tag, frame};
         static CARRIED: std::sync::Once = std::sync::Once::new();
-        CARRIED.call_once(|| crate::sched::carry(crate::sched::Carried::word(take_mark, put_mark)));
+        CARRIED.call_once(|| {
+            crate::sched::carry(crate::sched::Carried::word(carried_mark::take, carried_mark::put))
+        });
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
         let mut moved = 0;
@@ -3535,7 +3553,7 @@ mod tests {
                                 let before = super::with_local(|local| local.index).unwrap();
                                 *mine.alloc(1u64) += 1;
                                 let used = mine.used();
-                                MARK.set(round as usize + 1);
+                                carried_mark::set(round as usize + 1);
                                 waiting.store(1, Ordering::SeqCst);
                                 assert_eq!(
                                     flights.get_or_run(at, || panic!("the client runs the key")),
@@ -3553,11 +3571,11 @@ mod tests {
                                     "the job allocated outside its own frame"
                                 );
                                 assert_eq!(
-                                    MARK.get(),
+                                    carried_mark::get(),
                                     round as usize + 1,
                                     "a carried thread-local stayed behind"
                                 );
-                                MARK.set(0);
+                                carried_mark::set(0);
                                 let after = super::with_local(|local| local.index).unwrap();
                                 Some((before, after))
                             })
@@ -3581,7 +3599,7 @@ mod tests {
                                 "a job began inside a parked job's frame task"
                             );
                             assert_eq!(
-                                MARK.get(),
+                                carried_mark::get(),
                                 0,
                                 "a job began with a parked job's carried thread-local"
                             );

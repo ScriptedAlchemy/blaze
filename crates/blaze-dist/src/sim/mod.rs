@@ -34,6 +34,18 @@ pub struct Violation {
     pub detail: String,
 }
 
+impl Violation {
+    fn new(seed: u64, at: Millis, invariant: &'static str, detail: std::fmt::Arguments<'_>) -> Self {
+        use std::alloc::Global;
+        use std::io::Write as _;
+
+        let mut bytes = Vec::new_in(Global);
+        bytes.write_fmt(detail).expect("formatting a simulation failure into its owned bytes");
+        let detail = String::from_utf8(bytes).expect("formatting produces UTF-8");
+        Self { seed, invariant, at, detail }
+    }
+}
+
 impl std::fmt::Display for Violation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

@@ -555,6 +555,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-core",
  "blaze-dist",
+ "blaze-mem",
  "blaze-serve",
  "blaze-wire",
  "crossbeam-channel",

@@ -19,6 +19,7 @@
 //!   left; a run that reaches its deadline did not make progress;
 //! - **protocol**: a correct holder is never told its calls are malformed.
 
+use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_wire::{
@@ -124,7 +125,7 @@ struct Node {
     id: String,
     alive: bool,
     front: FrontEnd,
-    holder: Option<Holder>,
+    holder: Option<Holder<Global>>,
     attempt: Attempt,
     lead: bool,
     offset: Millis,
@@ -694,22 +695,22 @@ impl World {
         self.push(at, kind);
     }
 
-    fn violation(&self, (invariant, detail): (&'static str, String)) -> Violation {
-        Violation { seed: self.seed, invariant, at: self.now, detail }
+    fn violation(&self, invariant: &'static str, detail: std::fmt::Arguments<'_>) -> Violation {
+        Violation::new(self.seed, self.now, invariant, detail)
     }
 
-    fn run(mut self, mut trace: Option<&mut Vec<String>>) -> Result<Summary, Violation> {
+    fn run(mut self, mut trace: Option<&mut dyn FnMut(std::fmt::Arguments<'_>)>) -> Result<Summary, Violation> {
         let mut events = 0u64;
         while let Some(((at, _), kind)) = self.queue.pop_first() {
             self.now = at;
             events += 1;
             if events > EVENT_CAP {
                 return Err(
-                    self.violation(("progress", format!("{EVENT_CAP} events without an end")))
+                    self.violation("progress", format_args!("{EVENT_CAP} events without an end"))
                 );
             }
             if let Some(trace) = trace.as_mut() {
-                trace.push(format!("{at:>9} {kind:?}"));
+                trace(format_args!("{at:>9} {kind:?}"));
             }
             self.event(kind)?;
             if let ExecState::Ended(_) = self.execution.state() {
@@ -724,18 +725,20 @@ impl World {
         let work = self.execution.work().expect("assigned");
         let report = work.report();
         if report.done {
-            self.checker.coverage(&self.program, &report).map_err(|v| self.violation(v))?;
+            self.checker.coverage(&self.program, &report).map_err(|(invariant, detail)| Violation {
+                seed: self.seed, invariant, at: self.now, detail,
+            })?;
         } else {
             match work.ended() {
                 Some(EndWhy::LeadLostTwice | EndWhy::NoLead) => {}
                 other => {
-                    return Err(self.violation((
+                    return Err(self.violation(
                         "progress",
-                        format!(
+                        format_args!(
                             "the compile phase did not end Done: {other:?}, {:?}",
                             work.counters()
                         ),
-                    )));
+                    ));
                 }
             }
         }
@@ -776,10 +779,11 @@ impl World {
                 }
                 if self.faulty() && self.rng.chance(self.profile.drop_ppm) {
                     let knows = self.rng.chance(500_000);
-                    if let Some(h) = &mut self.nodes[node].holder
-                        && let Some((&name, _)) = h.findings().next()
-                    {
-                        h.drop_finding(&name, knows);
+                    if let Some(h) = &mut self.nodes[node].holder {
+                        let name = h.findings().next().map(|(name, _)| *name);
+                        if let Some(name) = name {
+                            h.drop_finding(&name, knows);
+                        }
                     }
                 }
                 self.step(node, holder::Event::Tick)?;
@@ -889,10 +893,10 @@ impl World {
             holder::Effect::Release(_) => {}
             holder::Effect::Stop(why) => {
                 if let StopWhy::Protocol(what) = &why {
-                    return Err(self.violation((
+                    return Err(self.violation(
                         "protocol",
-                        format!("{} stopped: {what}", self.nodes[node].id),
-                    )));
+                        format_args!("{} stopped: {what}", self.nodes[node].id),
+                    ));
                 }
                 if why == StopWhy::FrontEndDiffers {
                     self.nodes[node].refused = true;
@@ -985,10 +989,10 @@ impl World {
                     refusal @ (Refusal::Malformed(_) | Refusal::SeqReused | Refusal::NotHolder),
                 ) = &answer
                 {
-                    return Err(self.violation((
+                    return Err(self.violation(
                         "protocol",
-                        format!("{holder_id}'s result refused: {refusal:?}"),
-                    )));
+                        format_args!("{holder_id}'s result refused: {refusal:?}"),
+                    ));
                 }
                 let ok = answer.as_ref().ok().cloned();
                 self.effects(fx, ok.as_ref().map(|a| (req, a)))?;
@@ -1004,10 +1008,10 @@ impl World {
         if let Reply::Join(Err(e)) | Reply::Lease(Err(e)) = &reply
             && let Some(Refusal::Malformed(what)) = Refusal::of(e)
         {
-            return Err(self.violation((
+            return Err(self.violation(
                 "protocol",
-                format!("{holder_id}'s call refused as malformed: {what}"),
-            )));
+                format_args!("{holder_id}'s call refused as malformed: {what}"),
+            ));
         }
         self.effects(fx, None)?;
         self.checker.heard(now, &holder_id);
@@ -1020,7 +1024,9 @@ impl World {
         fx: Vec<jobs::Effect, impl std::alloc::Allocator>,
         result: Option<(&BatchResult, &WorkResultAnswer)>,
     ) -> Result<(), Violation> {
-        self.checker.observe(self.now, &fx, result).map_err(|v| self.violation(v))?;
+        self.checker.observe(self.now, &fx, result).map_err(|(invariant, detail)| Violation {
+            seed: self.seed, invariant, at: self.now, detail,
+        })?;
         for effect in fx {
             match effect {
                 jobs::Effect::NeedLead => self.reassign()?,
@@ -1099,7 +1105,8 @@ pub fn run(seed: u64) -> Result<Summary, Violation> {
     World::new(seed).run(None)
 }
 
-/// Runs the simulation of `seed`, appending every event to the caller's trace.
-pub fn trace(seed: u64, events: &mut Vec<String>) -> Result<Summary, Violation> {
+/// Runs the simulation of `seed`, presenting each event to the caller's synchronous writer.
+/// Formatting borrows the live event; the caller chooses its output buffer and allocator.
+pub fn trace(seed: u64, events: &mut impl FnMut(std::fmt::Arguments<'_>)) -> Result<Summary, Violation> {
     World::new(seed).run(Some(events))
 }

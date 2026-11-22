@@ -1,5 +1,7 @@
 //! HirDisplay implementations for various hir types.
 
+use std::alloc::Allocator;
+
 use base_db::Db;
 use either::Either;
 use hir_def::{
@@ -457,9 +459,9 @@ impl<'db> HirDisplay<'db> for Union {
 }
 
 /// The fields of `fields` that `f` shows, in `shown`, and whether any was hidden.
-fn visible_fields<'db>(
+fn visible_fields<'db, A: Allocator>(
     fields: impl Iterator<Item = Field>,
-    shown: &mut Vec<Field>,
+    shown: &mut Vec<Field, A>,
     f: &mut HirFormatter<'_, 'db>,
 ) -> bool {
     if f.render_private_fields() {

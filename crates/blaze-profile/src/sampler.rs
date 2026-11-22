@@ -25,7 +25,7 @@
 //! (docs/v2/plan/design/deadline-waits.md).
 //! - Elsewhere [`start`] says there is no sampler.
 
-use std::{sync::atomic::AtomicBool, time::Instant};
+use std::time::Instant;
 
 use blaze_core::lock::{Lock, LockGuard};
 
@@ -126,10 +126,56 @@ struct Samples {
     ring: Vec<Sample>,
     next: u64,
     /// What the sampler is: on and how, or why it is off.
-    state: String,
+    state: State,
+}
+
+/// The first startup attempt's outcome. Every caller sees it, including a refusal: a call
+/// made while the first starts waits on the same ring lock until that outcome is known.
+enum State {
+    NotStarted,
+    On { hz: u32, how: &'static str },
+    Off(Unsampled),
+}
+
+impl std::fmt::Display for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStarted => {
+                f.write_str("off: not started in this process (`blaze serve` starts it)")
+            }
+            Self::On { hz, how } => write!(f, "on: {hz} Hz, {how}"),
+            Self::Off(why) => write!(f, "off: {}", why.0),
+        }
+    }
 }
 
 impl Samples {
+    /// Starts once under the ring's lock. Injecting the platform boundary lets the startup
+    /// contract be checked even on a kernel that refuses sampling.
+    fn start(
+        &mut self,
+        hz: u32,
+        run: impl FnOnce(u32) -> Result<&'static str, Unsampled>,
+    ) -> Result<(), Unsampled> {
+        match &self.state {
+            State::On { .. } => return Ok(()),
+            State::Off(why) => return Err(why.clone()),
+            State::NotStarted => {}
+        }
+        let hz = hz.max(1);
+        match run(hz) {
+            Ok(how) => {
+                self.state = State::On { hz, how };
+                self.ring.reserve_exact(KEPT);
+                Ok(())
+            }
+            Err(why) => {
+                self.state = State::Off(why.clone());
+                Err(why)
+            }
+        }
+    }
+
     /// Keeps `batch`, over the oldest once [`KEPT`] are.
     fn keep(&mut self, batch: &[Sample]) {
         for sample in batch {
@@ -154,7 +200,9 @@ impl Ring {
     /// An empty ring.
     pub const fn new() -> Ring {
         // alloc: none until the first sample, then once a ring
-        Ring(Lock::unrecorded("profile.sampler.ring", Samples { ring: Vec::new(), next: 0, state: String::new() }))
+        Ring(Lock::unrecorded("profile.sampler.ring", Samples {
+            ring: Vec::new(), next: 0, state: State::NotStarted,
+        }))
     }
 
     fn lock(&self) -> LockGuard<'_, Samples> {
@@ -223,22 +271,10 @@ impl std::error::Error for Unsampled {}
 /// Starts the sampler's thread, once a process, at `hz` samples a CPU second a thread. A
 /// sampler that cannot be made is an error saying why, and every dump says it too.
 pub fn start(hz: u32) -> Result<(), Unsampled> {
-    static STARTED: AtomicBool = AtomicBool::new(false);
-    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return Ok(());
-    }
-    let started = run(hz.max(1));
-    let mut samples = SAMPLES.lock();
-    samples.state = match &started {
-        // alloc: once a process
-        Ok(how) => format!("on: {hz} Hz, {how}"),
-        // alloc: once a process
-        Err(why) => format!("off: {}", why.0),
-    };
-    if started.is_ok() {
-        samples.ring.reserve_exact(KEPT);
-    }
-    started.map(drop)
+    // The platform check and spawn never read this ring. The new sampler can wait here to
+    // keep its first batch: both platforms release each thread's sampled lock (and macOS
+    // resumes any suspended thread) before keeping a batch.
+    SAMPLES.lock().start(hz, run)
 }
 
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
@@ -321,12 +357,8 @@ fn said() -> String {
 /// The samples taken since `since`, named, and what the sampler is.
 pub(crate) fn taken(since: Instant, epoch: &Epoch) -> (Vec<Sampled>, String) {
     let samples = SAMPLES.lock();
-    let state = match samples.state.is_empty() {
-        // alloc: a dump, on demand
-        true => "off: not started in this process (`blaze serve` starts it)".to_owned(),
-        // alloc: a dump, on demand
-        false => format!("{}{}", samples.state, said()),
-    };
+    // alloc: a dump, on demand
+    let state = format!("{}{}", samples.state, said());
     // alloc: a dump's copy of the samples, on demand
     let kept: Vec<Sample> = samples.ring.iter().filter(|it| it.at >= since).copied().collect();
     drop(samples);
@@ -364,6 +396,49 @@ pub(crate) fn taken(since: Instant, epoch: &Epoch) -> (Vec<Sampled>, String) {
 mod tests {
     use super::*;
 
+    /// Starting is idempotent for both outcomes. A refused first caller cannot turn into a
+    /// later caller's success just because initialization was attempted.
+    #[test]
+    fn every_sampler_starter_observes_the_first_outcome() {
+        for outcome in [
+            Ok("fixture sampler"),
+            Err(Unsampled("fixture kernel refused the event".to_owned())),
+        ] {
+            let samples = Ring::new();
+            let expected = outcome.as_ref().map(|_| ()).map_err(Clone::clone);
+            let mut calls = 0;
+            assert_eq!(
+                samples.lock().start(0, |hz| {
+                    calls += 1;
+                    assert_eq!(hz, 1, "the actual frequency is at least one sample a second");
+                    outcome
+                }),
+                expected,
+            );
+            for hz in [HZ, HZ * 20] {
+                assert_eq!(
+                    samples.lock().start(hz, |_| {
+                        calls += 1;
+                        Ok("a second startup must not replace the first outcome")
+                    }),
+                    expected,
+                );
+            }
+            assert_eq!(calls, 1);
+            let samples = samples.lock();
+            match expected {
+                Ok(()) => {
+                    assert_eq!(samples.state.to_string(), "on: 1 Hz, fixture sampler");
+                    assert!(samples.ring.capacity() >= KEPT);
+                }
+                Err(why) => {
+                    assert_eq!(samples.state.to_string(), format!("off: {}", why.0));
+                    assert_eq!(samples.ring.capacity(), 0);
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_ring_keeps_the_newest_samples() {
         let at = Instant::now();
@@ -380,7 +455,7 @@ mod tests {
         };
         let batch: Vec<Sample> = (0..KEPT as u64 + 10).map(sample).collect();
         // A ring of its own: the process's is the sampler's, which another test runs.
-        let mut samples = Samples { ring: Vec::new(), next: 0, state: String::new() };
+        let mut samples = Samples { ring: Vec::new(), next: 0, state: State::NotStarted };
         samples.keep(&batch);
         assert_eq!(samples.ring.len(), KEPT);
         let mut tids: Vec<u64> = samples.ring.iter().map(|it| it.tid).collect();

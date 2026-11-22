@@ -2,6 +2,9 @@
 //! an accepted result: conflicting discoveries, rejected names and cancellation during a
 //! result round trip all leave the compiler holding requests.
 
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use std::collections::BTreeSet;
 
 use blaze_dist::Ranges;
@@ -25,7 +28,7 @@ fn sent(effects: &[Effect]) -> u64 {
 }
 
 /// The compiler is working on a grant; its eventual batch retains FOUND.
-fn compiling(rejected: bool) -> (Holder, Compiled) {
+fn compiling(rejected: bool) -> (Holder<Global>, Compiled) {
     let roots =
         RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
     let mut holder = Holder::new(
@@ -83,7 +86,7 @@ fn compiling(rejected: bool) -> (Holder, Compiled) {
 }
 
 /// A compiler has retained FOUND and reported it. Its result is awaiting acknowledgment.
-fn reporting(rejected: bool) -> (Holder, u64) {
+fn reporting(rejected: bool) -> (Holder<Global>, u64) {
     let (mut holder, batch) = compiling(rejected);
     let mut effects = Vec::new();
     holder.step(3, Event::Compiled(batch), &mut effects);
