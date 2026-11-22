@@ -4,7 +4,7 @@
 
 use std::alloc::Global;
 use blaze_dist_local::protocol::*;
-use blaze_wire::{Attempt, ExecutionId, JobContent, Limits, decode, encode};
+use blaze_wire::{Ack, Attempt, ExecutionId, JobContent, Limits, decode, encode};
 
 #[test]
 fn hello_golden_separates_transport_global_codec_and_terminal_versions() {

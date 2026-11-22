@@ -203,6 +203,7 @@ impl CdpIds {
 }
 
 #[cfg(test)]
+#[path = "cdp_ids/dst.rs"]
 mod dst;
 
 #[cfg(test)]

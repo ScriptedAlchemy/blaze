@@ -818,6 +818,8 @@ fn assigning_an_unstarted_helper_does_not_forge_liveness() {
 }
 
 mod claim {
+    use std::alloc::Global;
+
     use blaze_dist::admission::{Admission, AdmissionConfig};
     use blaze_dist::jobs::{ExecutionConfig, Jobs};
     use blaze_wire::{JobRequest, LocalPolicy, Namespace, Reservation};

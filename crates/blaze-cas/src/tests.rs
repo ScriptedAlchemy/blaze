@@ -2398,7 +2398,7 @@ fn a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename() {
             Effect::Prewarm { like, file, .. } => {
                 Some(format!("prewarm {like} into {}", if *file == to { "the path" } else { "its clone" }))
             }
-            Effect::Mode { file, mode, .. } if file.ends_with(".placing") => {
+            Effect::Mode { file, mode, .. } if file.as_str().ends_with(".placing") => {
                 assert_eq!(*mode, publish::EXECUTABLE_MODE);
                 Some("make executable".to_owned())
             }
