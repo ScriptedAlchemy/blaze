@@ -73,15 +73,19 @@ tree that does not compile must still be checked, landed on and released from. S
   uses it. CI runs every script with the stage-0 binary, as it builds blaze with it: built by
   it once per change of their inputs and kept in the Actions cache under a key of all of them
   (`.github/actions/script`).
-- A script builds from its own file and its helper crate alone, never from blaze's crates: the
-  helper (`crates/blaze-script`) depends on nothing in `crates/` and only on registry crates
-  the lock already holds, so a broken compiler crate cannot stop `land` or the gate's checkers
-  from building. A script that measures the tree's blaze takes it as data (the `engine` field
-  of its input, as harness/v2 does now) and starts it as a program.
+- Scripts and their helper have local dependencies: `scripts` uses `crates/blaze-sha256`,
+  and `crates/blaze-script` uses `crates/blaze-core`. The bootstrap key follows their whole
+  lockfile dependency closure, hashes every local package's sources (vendored ones too),
+  the manifests and both lockfiles' relevant inputs, and requires a complete checkout.
+  Pinned Bun parses manifests before hashing; missing, ambiguous or unsupported dependency
+  identities and sources refuse the key. Hashing never invokes a compiler. These
+  dependencies must also build under stage 0.
+  A script that measures the tree's blaze takes it as data (the `engine` field of its input,
+  as harness/v2 does now) and starts it as a program.
 - The helper crate is held to the same rule as the scripts: it must build under stage 0. Its
   own change is checked by stage 0 building every script (the gate's `scripts` job).
-- `land.py`'s successor is the `land` script: stage 0 builds it from `scripts/` and
-  `crates/blaze-script`, both of which build whatever state main's compiler is in.
+- `land.py`'s successor is the `land` script: stage 0 builds it from `scripts/` and the
+  helper's dependency closure, independently of the tree's compiler executable.
 
 ### Tier 0: now, on the released blaze
 

@@ -1,8 +1,18 @@
 ---
-status: current
-summary: Every blaze command and setting: cargo's commands and flags, what a build does, sandboxing, manifests.
+status: record
+summary: The daemon-based v2 command and configuration guide before the old daemon was removed on 2026-11-15, retained for releases built from that implementation.
+date: 2026-11-15
 ---
 # Using blaze
+
+This is the command guide for the daemon-based v2 implementation that preceded upstream
+commit `8e87a017ff` (2026-11-15). It is retained for users of releases built from that
+implementation; a release's `blaze help` describes the commands that binary provides.
+The current source checkout has removed the daemon and parked the old command and compiler
+crates ([parked crates](v2/plan/parked.md)). Its replacement is being built under
+[the fresh-core design](v2/plan/design/target.md) and
+[the item-layer design](v2/plan/design/bottom.md). The commands, source paths and settings
+below are historical, not a claim that the current checkout can build or run them.
 
 `blaze <command>` takes cargo's commands and flags (`blaze build`, `blaze test`, `blaze run`),
 described here. Plain `cargo` never goes through blaze (the section at the end).

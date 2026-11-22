@@ -8,33 +8,29 @@ are left out here; each names what replaced it. docs/upstream/ holds others' tex
 
 How blaze is now. Kept true: CI checks their links, paths and settings against the tree.
 
-- [agents.md](agents.md): blaze for coding agents: `blaze agents install|status|remove` wires Claude Code and Codex to blaze (a hook after each edit that says the new errors and warnings, a hook before each shell command that steers cargo and rustc to blaze, and a block of instructions); `blaze agents hook` is that hook; `blaze diagnostics --since` is the request under it, for any agent; `blaze doctor` says whether all of it is installed and current.
 - [benchmarks.md](benchmarks.md): Blaze benchmark measurement and regression checks, with historical Cargo comparisons kept under their original labels.
-- [borrowck.md](borrowck.md): blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's verdicts, how it is scored, what is left.
-- [cargo.md](cargo.md): Every blaze command and setting: cargo's commands and flags, what a build does, sandboxing, manifests.
+- [borrowck.md](borrowck.md): The retained borrow checker (hir-ty-borrowck): its rules, historical rustc comparisons and scoring harness; compiler integration is parked while the item layer is replaced.
 - [compiletest.md](compiletest.md): rustc's own test suites under blaze: which suites run and why, what is compared, the pinned corpus, the ratchet.
-- [const.md](const.md): Const evaluation: blaze's own interpreter for constants and const fns, and what it covers.
+- [const.md](const.md): The retained interpreter for constants and const fns, its language support and tests; compiler integration is parked while the item layer is replaced.
 - [contributing.md](contributing.md): How to build, test and change blaze: AI use, where new code goes, rules for code, working in parallel, landing.
-- [distributed.md](distributed.md): A build across several daemons on V2's one build: executors, leases, the shared cache of packs, the requester's fallback and the wire.
-- [gc.md](gc.md): What blaze removes from disk and when: the collector of build dirs, shared std stores, temporaries and trash; the pacer that works harder as a volume fills, leases, records, roots and the grace, and why nothing in use is removed; the daemon's store under the home's budget, its pins and what a build says of it.
+- [distributed.md](distributed.md): The retained distributed protocol, coordinator, pack cache and test controls; compiler integration awaits the replacement command and item layers.
 - [harness.md](harness.md): The harnesses that test blaze (real crates' own tests, and blaze held to itself), what each checks, and how CI runs them.
 - [install.md](install.md): Installing blaze: the install script, the release channels and what gets installed.
 - [ix-prof.md](ix-prof.md): Profiling any Rust program, not only blaze, like Go's pprof. Covers the ix-prof crate (CPU samples of every thread, tracing spans with their own CPU time and allocations, named waits, allocations by stack), `IX_PROF=<dir>`, the loopback `/debug/pprof` endpoint and live stream, and `blaze pprof` with top, peek, tree, list, flame, diff, export and --http.
-- [macos.md](macos.md): Which macOS interfaces blaze uses where a private, undocumented or Apple-only call beats the portable one (rule macos-private-apis), what each buys, its risk, and what is still to measure.
+- [lints.md](lints.md): The retained lint definitions and workspace-level parser, their current limits after the old runner's removal, and the rules referenced by surviving code.
 - [mir-passes.md](mir-passes.md): The MIR passes from built MIR to runtime MIR, ported from rustc, that codegen and the interpreter run on.
 - [no-rustc.md](no-rustc.md): The no-rustc rule, what counts as running rustc, the end state, and the live list of the places that still name rustc or cargo.
 - [release.md](release.md): Releases: the canary and stable channels, how a release is cut and what gates promotion to stable.
 - [resolve.md](resolve.md): Reading Cargo.toml and .cargo/config.toml as cargo does (blaze-manifest), and how it measured against cargo.
+- [shared-cache.md](shared-cache.md): The retained blaze-remote library's signed segment cache, its configuration and command interface, and the parked CLI boundary.
 - [terminal.md](terminal.md): What `blaze build`, `run`, `check` and `test` show: on a terminal a region redrawn while a build runs and at most one line when it ends, off one stable `blaze:` lines; and the one sans-IO core (blaze-screen) that makes both from the build's events.
 - [toolchain.md](toolchain.md): blaze's own pinned nightly: what it is, how it is fetched and checked, and the daily bump.
-- [usage.md](usage.md): Getting started: using blaze on a project, in short.
 - [future/harness-chat-library.md](future/harness-chat-library.md): Open and search Harness, Claude and Codex conversations with Command-O.
 - [future/harness-model-cues.md](future/harness-model-cues.md): Quiet completion sounds and readable model capability and effort in Harness.
 - [future/harness-questions-overlays.md](future/harness-questions-overlays.md): A native question view and Harness-owned hover cards.
 - [v2/plan/invariants.md](v2/plan/invariants.md): Every invariant, refinement and reference model blaze states in its code, with the test that checks it and the planted bugs that prove the check; generated by scripts/src/bin/invariants.rs.
 - [v2/plan/parked.md](v2/plan/parked.md): The crates kept on disk but out of the build (the root Cargo.toml's `[workspace] exclude`) since the old item layer, the query database, the daemon and the lints were deleted on 2026-11-15, each with what it waits on.
 - [v2/plan/proofs.md](v2/plan/proofs.md): Every theorem blaze claims is proved in Lean, with its statement as its module states it and its ledger row; generated by harness/v2/lean_gate.py from lean/theorems.json, and held by the gate to the axioms listed.
-- [v2/plan/design/astlog-sema.md](v2/plan/design/astlog-sema.md): astlog over blaze's own syntax trees and semantic database: Rust code patterns with `$name` metavariables whose paths match by resolution, demand-driven semantic relations (resolves, type-of, implements, callee, references, enclosing items, in-unsafe, in-test), a semi-naive evaluator shared with the tree-sitter source, and rewrites that go out through blaze-intent. One versioned CBOR request for an edit and one for a read-only query; the CLI is a client of both.
 - [v2/plan/design/bundled-native-archives.md](v2/plan/design/bundled-native-archives.md): Bundled static native libraries are resolved using their declaring crate's search paths before V2 combines the final link line, so dependencies can carry different archives with the same file name.
 - [v2/plan/design/distributed-publication.md](v2/plan/design/distributed-publication.md): One attempt-owned distributed unit through its full output record, followed by idempotent cache delivery.
 - [v2/plan/design/profile-names.md](v2/plan/design/profile-names.md): The flight recorder names strings per thread. Each thread interns into a private table whose ids are scoped to its own ring, defines each name in the ring the first time it uses it, and starts a new generation at chunk boundaries. Readers turn per-thread ids into global ones as they decode, so the hot path shares nothing and the profile parquet is unchanged.
@@ -182,8 +178,14 @@ Designs not (fully) built, newest first.
 
 Research, reports and measurements, true on their date and not brought up to date. Newest first.
 
+- [usage.md](usage.md) (2026-11-15): Getting started with the daemon-based v2 releases, before the daemon was removed from the source tree on 2026-11-15.
+- [gc.md](gc.md) (2026-11-15): The daemon-based collector and store budget before 2026-11-15: pacing, leases, roots and grace periods, including the daemon integration that has since been removed.
+- [cargo.md](cargo.md) (2026-11-15): The daemon-based v2 command and configuration guide before the old daemon was removed on 2026-11-15, retained for releases built from that implementation.
+- [agents.md](agents.md) (2026-11-15): The daemon-based v2 integration for coding agents before 2026-11-15: installable hooks, incremental diagnostics and installation checks, retained as a reference for that implementation.
+- [v2/plan/design/astlog-sema.md](v2/plan/design/astlog-sema.md) (2026-11-13): The 2026-11-13 astlog integration with blaze's old semantic database and daemon API: semantic patterns, demand-driven relations and rewrites through blaze-intent, removed with the old layers on 2026-11-15.
 - [language.md](language.md) (2026-11-12): Each language change of Rust 1.80 to 1.100 checked against blaze's front end on 2026-11-12, with the test that holds it and what was fixed or is still missing.
 - [v2/plan/design/verus.md](v2/plan/design/verus.md) (2026-11-10): The spec form blaze kept from lane verus (Verus's clause syntax as native grammar, gated by `#![feature(blaze_verify)]`, lowered to clause groups in hir-def), and the record of the Z3 tier that proved it until 2026-11-10, when it was retired for Lean.
+- [macos.md](macos.md) (2026-11-10): The 2026-11-10 audit of macOS interfaces: what each call bought, its risks and measurements still needed, including the subsequently deleted daemon and live-patching integration.
 - [reports/V2-REBASE.md](reports/V2-REBASE.md) (2026-11-07): The fork's rebase onto v2 and its handoff: why its builds ended, what was deleted, what became of every fork commit, what ran, what failed, and what is left.
 - [CHANGELOG.md](CHANGELOG.md) (2026-11-03): Changelog: every user-visible change, by release, with [Unreleased] on top.
 - [support.md](support.md) (2026-10-30): What blaze v1 supported, cell by cell, each pointing at the report or harness run behind it. v2 has none of these measurements yet.

@@ -1,96 +1,81 @@
 #!/usr/bin/env bash
-# The cache key of the repository's built scripts (scripts/, docs/v2/plan/design/scripts.md):
-# prints `scripts-<os>-<arch>-<blaze version>-<sha256>`, run from the checkout's top. No
-# argument, and it reads only the files below, so the `changes` job's sparse checkout has them.
+# The built scripts' source key, from a complete checkout, with no compiler invocation.
+# lock.awk validates Cargo's generated lockfile subset and the complete scripts closure;
+# packages.mjs uses Bun's TOML parser to resolve local identities through their declared
+# paths. Unsupported or missing inputs are errors, never successful partial keys.
 #
-# Why the key covers every input of what `build.sh` makes (AGENTS.md keys-cover-every-input):
-# the binaries are what the pinned release builds from these, and nothing else is read:
-# - the compiler: .github/blaze-version (the release, with its own toolchain; rule own-nightly),
-#   harness/toolchain (the nightly blaze pins), and the runner's OS and architecture;
-# - the sources: every file under scripts/ and crates/blaze-script/, by content;
-# - the dependencies: the Cargo.lock blocks of the scripts package's whole dependency closure
-#   (name, version, registry and checksum, so each crate's source is fixed by its checksum); a
-#   package in it with no checksum (a path or a [patch]) is refused below, as its source is not
-#   hashed here;
-# - the manifests: the root Cargo.toml whole but for what cannot reach these packages (the
-#   workspace's member and exclude lists, which the lock's closure already resolves; the
-#   [workspace.dependencies] entries scripts and blaze-script do not name; [patch] entries, each
-#   of which a closure package would show by losing its checksum), and .cargo/config.toml whole;
-# - the checkout's absolute path: docs, rustcsites and guards find the tree as
-#   `env!("CARGO_MANIFEST_DIR")/..`, baked in at build time, so a binary built in another checkout
-#   would read that one;
-# - the environment: build.sh unsets every variable cargo or blaze reads from the caller
-#   (engine.py's SCRUBBED), so none is an input;
-# - this action's own files, which make the binaries.
+# Hash every local package's files (including vendor packages), the relevant lock blocks,
+# Cargo.toml and blaze.lock whole, the compiler/toolchain pins, .cargo/config.toml, this
+# action, the host and the absolute checkout path (baked-in CARGO_MANIFEST_DIR). Hashing the
+# whole root manifest deliberately includes transitive workspace and patch settings.
+# Only .git and target directories are excluded from source trees. Symlinks and special
+# files are refused. This repairs source/manifest/lock coverage; it makes no new claim about
+# native compiler or ambient environment inputs beyond build.sh's existing policy.
 set -euo pipefail
+export LC_ALL=C
 
 sha() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
 die() { echo "::error::$*" >&2; echo "key.sh: $*" >&2; exit 1; }
-
-for need in .github/blaze-version harness/toolchain Cargo.toml Cargo.lock .cargo/config.toml scripts/Cargo.toml crates/blaze-script/Cargo.toml; do
-  [ -f "$need" ] || die "no $need in $(pwd -P): run from the checkout's top, with this file checked out"
+root=$(pwd -P)
+here=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+top=$(git rev-parse --show-toplevel) || die "no checkout at $root"
+[ "$top" = "$root" ] || die "run from the checkout's top, not $root"
+if sparse=$(git config --bool core.sparseCheckout); then
+  [ "$sparse" = false ] || die "sparse checkout: materialize the whole checkout before computing the key"
+else
+  status=$?
+  [ "$status" = 1 ] || die "cannot read sparse checkout configuration"
+fi
+for need in .github/blaze-version harness/toolchain Cargo.toml Cargo.lock blaze.lock .cargo/config.toml scripts/Cargo.toml; do
+  [ -f "$need" ] && [ ! -L "$need" ] || die "missing or symlinked input $need"
 done
-export LC_ALL=C
+command -v bun >/dev/null || die "Bun 1.4.5 is required to parse Cargo manifests"
+bun_version=$(bun --version) || die "cannot read Bun version"
+[ "$bun_version" = 1.4.5 ] || die "Bun 1.4.5 is required, found $bun_version"
 
-# The workspace dependencies the two path packages name in their dependency tables
-# (`x.workspace = true`, `x = { workspace = true ... }`).
-direct=$(awk '/^\[/ { deps = $0 ~ /dependencies\]$/ } deps' scripts/Cargo.toml crates/blaze-script/Cargo.toml |
-  sed -nE 's/^([A-Za-z0-9_-]+)(\.workspace *= *true| *= *\{.*workspace *= *true).*/\1/p' | sort -u | tr '\n' ' ')
+work=$(mktemp -d "${TMPDIR:-/tmp}/blaze-script-key.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+: > "$work/locals"
+awk -v locals="$work/locals" -f "$here/lock.awk" Cargo.lock > "$work/closure"
 
-closure=$(awk '
-  function flush() { if (n) text[n] = block }
-  /^\[\[package\]\]/ { flush(); n++; block = $0 "\n"; next }
-  n { block = block $0 "\n" }
-  n && /^name = / { v = $3; gsub(/"/, "", v); name[n] = v; byname[v] = byname[v] " " n }
-  n && /^version = / { v = $3; gsub(/"/, "", v); ver[n] = v }
-  n && /^checksum = / { sum[n] = 1 }
-  n && /^dependencies = \[/ { indeps = 1; next }
-  indeps && /^\]/ { indeps = 0; next }
-  indeps { d = $0; gsub(/[",]/, "", d); sub(/^ +/, "", d); deps[n] = deps[n] "|" d }
-  END {
-    flush()
-    q[1] = "scripts"; h = 1; t = 1
-    while (h <= t) {
-      split(q[h++], w, " ")
-      c = split(byname[w[1]], ids, " ")
-      if (c == 0) { print "MISSING " w[1]; exit }
-      for (k = 1; k <= c; k++) {
-        i = ids[k]
-        if (w[2] != "" && ver[i] != w[2]) continue
-        if (seen[i]++) continue
-        if (!sum[i] && name[i] != "scripts" && name[i] != "blaze-script") { print "UNHASHED " name[i] " " ver[i]; exit }
-        printf "%s", text[i]
-        m = split(deps[i], ds, "|"); for (j = 2; j <= m; j++) q[++t] = ds[j]
-      }
-    }
-  }' Cargo.lock)
-case "$closure" in
-  MISSING*) die "Cargo.lock has no package ${closure#MISSING } in the scripts package's dependencies" ;;
-  UNHASHED*) die "${closure#UNHASHED } in the scripts package's dependencies has no checksum in Cargo.lock (a path or a [patch]): its source is no input of this key, so add its directory to the sources key.sh hashes" ;;
-esac
-
-manifest=$(awk -v direct=" $direct " '
-  /^\[/ { table = $0; skip = 0; depth = 0 }
-  table == "[workspace]" && /^(members|exclude|default-members) *= *\[/ { skip = 1 }
-  table ~ /^\[patch[.]/ && !/^\[/ { next }
-  table == "[workspace.dependencies]" && depth == 0 && /^[A-Za-z0-9_-]+ *=/ { key = $1; sub(/=.*/, "", key); drop = index(direct, " " key " ") == 0 }
-  table == "[workspace.dependencies]" && !/^\[/ {
-    line = $0; o = gsub(/[[{]/, "", line); line = $0; c = gsub(/[]}]/, "", line); depth += o - c
-    if (drop) next
-  }
-  skip { line = $0; if (line ~ /\]/) skip = 0; next }
-  { print }' Cargo.toml)
-
-digest=$({
-  printf 'blaze-version %s\n' "$(cat .github/blaze-version)"
-  printf 'toolchain %s\n' "$(cat harness/toolchain)"
+# Actual dependency paths bind identities to sources; a same-name directory elsewhere
+# cannot substitute for a missing declared package. The helper also records ancestors
+# that supply workspace inputs, whether tracked by git or ignored.
+bun "$here/packages.mjs" "$work/locals" "$work/used-manifests" > "$work/directories"
+printf '%s\n' .github/actions/script >> "$work/directories"
+sort -u "$work/directories" > "$work/sorted-directories"
+: > "$work/files"
+cat "$work/used-manifests" >> "$work/files"
+while IFS= read -r dir; do
+  physical=$(CDPATH= cd -- "$dir" && pwd -P) || die "missing local source directory $dir"
+  expected=$root
+  [ "$dir" = . ] || expected="$root/$dir"
+  [ "$physical" = "$expected" ] || die "symlinked or unsupported local source directory $dir"
+  find "$dir" \( -type d \( -name .git -o -name target \) -prune \) -o -print0 > "$work/tree"
+  while IFS= read -r -d '' file; do
+    case "$file" in *$'\n'*|*$'\t'*) die "unsupported source path: $file" ;; esac
+    [ ! -L "$file" ] || die "symlinked source input $file"
+    [ -f "$file" ] || [ -d "$file" ] || die "unsupported source input $file"
+    printf '%s\n' "$file" >> "$work/files"
+  done < "$work/tree"
+done < "$work/sorted-directories"
+printf '%s\n' .github/blaze-version harness/toolchain Cargo.toml blaze.lock .cargo/config.toml >> "$work/files"
+sort -u "$work/files" > "$work/sorted-files"
+{
   printf 'host %s %s\n' "$(uname -s)" "$(uname -m)"
-  printf 'checkout %s\n' "$(pwd -P)"
-  printf 'direct %s\n' "$direct"
-  find scripts crates/blaze-script .github/actions/script -type f ! -path '*/target/*' | sort | while read -r f; do
-    printf 'file %s %s\n' "$f" "$(sha < "$f" | cut -d' ' -f1)"
-  done
-  printf '%s\n' "$closure" "$manifest"
-  cat .cargo/config.toml
-} | sha | cut -d' ' -f1)
-echo "scripts-$(uname -s)-$(uname -m)-$(cat .github/blaze-version)-$digest"
+  printf 'checkout %s\n' "$root"
+  cat "$work/closure"
+} > "$work/inputs"
+while IFS= read -r file; do
+  if [ -d "$file" ]; then
+    printf 'directory %s\n' "$file" >> "$work/inputs"
+  else
+    sum=$(sha < "$file") || die "cannot hash source input $file"
+    sum=${sum%% *}
+    [ "${#sum}" = 64 ] || die "invalid SHA-256 for $file"
+    case "$sum" in *[!0-9a-f]*) die "invalid SHA-256 for $file" ;; esac
+    printf 'file %s %s\n' "$file" "$sum" >> "$work/inputs"
+  fi
+done < "$work/sorted-files"
+digest=$(sha < "$work/inputs") || die "cannot hash the complete inputs"
+echo "scripts-$(uname -s)-$(uname -m)-$(cat .github/blaze-version)-${digest%% *}"

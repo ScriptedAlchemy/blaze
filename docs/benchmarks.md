@@ -334,11 +334,12 @@ Measured by v1's runbench.py on each platform's benchmark machine, the last resu
 ## Over time
 
 `harness/benchcharts.py` draws these from `docs/benchmarks/history` (below) into the same section
-of the README and this page, each run of a workflow that appends to the history (bench-readme,
-bench-counts and live-latency) right after it appends, and the workflow commits them with the
+of the README and this page, each run of a workflow that appends to the history (bench-readme
+and bench-counts) right after it appends, and the workflow commits them with the
 history. A platform's trend draws only the runs of the machine of its last run, as the check
 compares them; a chart with fewer than two such runs is a line saying so. Regressions are not
-marked on them yet: the history does not record what the check found.
+marked on them yet: the history does not record what the check found. The removed live-latency
+workflow also used this publisher; its stored history remains part of the historical charts.
 
 <!-- benchtrend:start -->
 How blaze's own numbers move from run to run, each platform on its own benchmark machine: the instructions each merge to main retires, how long an edit takes and how soon a live edit runs, from [the history](benchmarks/history) ([how it is kept](#history-and-regressions)). Every workflow that adds to the history draws these again and commits them with it.
@@ -634,9 +635,9 @@ when:
 It then draws [the trends](#over-time) again (`harness/benchcharts.py`, after the history below is
 appended) and commits those files to main as `github-actions[bot]` with `[skip ci]` in the
 message (so the commit starts no other workflow), once for every platform, rebasing onto main if
-main moved during the run (`.github/scripts/bench_commit.py`, which bench-counts.yaml and
-live-latency.yaml commit through too). bench-readme, bench-counts and live-latency each draw
-every trend, so two of them running at once can conflict in the trend charts and sections: a
+main moved during the run (`.github/scripts/bench_commit.py`, which bench-counts.yaml uses
+too, as the removed live-latency workflow did). bench-readme and bench-counts each draw
+every trend, so both running at once can conflict in the trend charts and sections: a
 conflict only there is settled by drawing them again from the merged history, and one anywhere
 else stops the commit with the files named. It pushes with the secret `BLAZE_BOT_TOKEN`, a repository admin's token, which
 the ruleset on main lets past its required check; the job's own `GITHUB_TOKEN` is refused
@@ -727,13 +728,13 @@ On a regression the workflow opens an issue
 labelled `bench-regression` with a table of what moved (or comments on the one already open),
 writes the table to the run's summary and fails.
 
-Live edits are checked the same way. `.github/workflows/live-latency.yaml` runs every night on
-main on a GitHub macOS arm64 runner (`macos-15`), times edits of the four live programs through
-`blaze build` (`harness/live_latency.py cargo`; its socket, burst and replay modes are refused
-until they are clients of `blaze_api::client`, [live.md](live.md#latency-under-typing)), appends
-one line for all of them to `docs/benchmarks/history/macos-arm64-live.jsonl`, checks the p50
-and p90 of each program and mode (floor 1 ms), and draws the trends again before it commits. A shared runner is noisier than the benchmark
-machine; the band widens with the spread its own history shows.
+Live edits were checked the same way by the former `live-latency.yaml` workflow, which is
+absent from the current tree along with the old live implementation. It ran nightly on a
+GitHub macOS arm64 runner (`macos-15`), timed edits of four live programs through `blaze build`,
+appended one line for all of them to `docs/benchmarks/history/macos-arm64-live.jsonl`, and
+checked each program and mode's p50 and p90 (floor 1 ms) before publishing the trends.
+That history and [the old live design](live.md#latency-under-typing) remain available;
+they do not establish current live-edit support or an active latency gate.
 
 ## Run it yourself
 

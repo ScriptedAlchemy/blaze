@@ -1,8 +1,15 @@
 ---
-status: current
-summary: Which macOS interfaces blaze uses where a private, undocumented or Apple-only call beats the portable one (rule macos-private-apis), what each buys, its risk, and what is still to measure.
+status: record
+summary: The 2026-11-10 audit of macOS interfaces: what each call bought, its risks and measurements still needed, including the subsequently deleted daemon and live-patching integration.
+date: 2026-11-10
 ---
 # macOS interfaces
+
+This is the audit of the 2026-11-10 tree, not an inventory of the current build. Upstream
+commit `8e87a017ff` (2026-11-15) later removed the daemon and blaze-live, including the
+live-patch page remapping listed below; other compiler integration is
+[parked](v2/plan/parked.md). The historical decisions and measurement proposals are kept
+here with their original scope. Retained low-level implementations are named in their rows.
 
 Rule `macos-private-apis`: on macOS blaze uses a private, undocumented or Apple-only interface
 where it is more efficient or more capable than the portable one, and the public one where
@@ -11,8 +18,8 @@ resolves the symbol at run time (`dlsym(RTLD_DEFAULT, ..)`) and fails naming it.
 fallback to the portable call (rule `no-fallback`): a symbol blaze links against that the
 system lacks stops blaze at launch, dyld naming the symbol.
 
-This is the audit of 2026-11-10 (macOS 27.0.1, Apple silicon). "In use" rows are how the tree
-is; "measure" rows name the measurement that decides them, below the tables.
+The audit used macOS 27.0.1 on Apple silicon. "In use" rows say what that tree used;
+"measure" rows name the proposed measurement, below the tables.
 
 ## Parking and locks
 

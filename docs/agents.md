@@ -1,8 +1,16 @@
 ---
-status: current
-summary: blaze for coding agents: `blaze agents install|status|remove` wires Claude Code and Codex to blaze (a hook after each edit that says the new errors and warnings, a hook before each shell command that steers cargo and rustc to blaze, and a block of instructions); `blaze agents hook` is that hook; `blaze diagnostics --since` is the request under it, for any agent; `blaze doctor` says whether all of it is installed and current.
+status: record
+summary: The daemon-based v2 integration for coding agents before 2026-11-15: installable hooks, incremental diagnostics and installation checks, retained as a reference for that implementation.
+date: 2026-11-15
 ---
 # blaze for coding agents
+
+This records the agent integration before upstream commit `8e87a017ff` (2026-11-15)
+removed the daemon and its API. The hook decision code and command sources remain in
+`crates/blaze-cargo/src/cli/agents/decide.rs` and `crates/blaze-cargo/src/cli/agents.rs`, but
+blaze-cargo is [parked](v2/plan/parked.md) and its diagnostics client still depends on the
+deleted API. The instructions below apply to binaries built with that daemon integration;
+they do not describe a working integration in the current source checkout.
 
 An agent that edits Rust should hear about the error it just made at the write that made it, not
 at the next build it thinks to run, and should build with blaze, not cargo. blaze does both

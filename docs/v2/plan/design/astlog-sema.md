@@ -1,9 +1,16 @@
 ---
-status: current
-summary: astlog over blaze's own syntax trees and semantic database: Rust code patterns with `$name` metavariables whose paths match by resolution, demand-driven semantic relations (resolves, type-of, implements, callee, references, enclosing items, in-unsafe, in-test), a semi-naive evaluator shared with the tree-sitter source, and rewrites that go out through blaze-intent. One versioned CBOR request for an edit and one for a read-only query; the CLI is a client of both.
+status: record
+summary: The 2026-11-13 astlog integration with blaze's old semantic database and daemon API: semantic patterns, demand-driven relations and rewrites through blaze-intent, removed with the old layers on 2026-11-15.
 date: 2026-11-13
 ---
 # astlog over blaze's semantics
+
+This records the integration designed for the old semantic database and daemon. Upstream
+commit `8e87a017ff` (2026-11-15) deleted blaze-astlog, blaze-intent and the daemon API.
+The standalone astlog evaluator and tree-sitter source remain under `tools/astlog/engine`
+and `tools/astlog/core`; they do not provide the blaze semantic source described here.
+The replacement item layer is specified in [bottom.md](bottom.md), and the dependent
+compiler crates are listed in [parked.md](../parked.md).
 
 ## What
 

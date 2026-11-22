@@ -1,15 +1,20 @@
 ---
 status: current
-summary: Const evaluation: blaze's own interpreter for constants and const fns, and what it covers.
+summary: The retained interpreter for constants and const fns, its language support and tests; compiler integration is parked while the item layer is replaced.
 ---
 # Const
+
+The interpreter and its front-end dependencies are [parked](v2/plan/parked.md) while
+the item layer is replaced. This page describes their retained source and tests; it does
+not claim that the current source-built compiler can run those tests or compile a program.
 
 A `const fn` is blaze's pure function: deterministic, touching no mutable state, so its result
 can be computed at compile time, cached by its code and arguments, and trusted to be the same
 on every machine. blaze evaluates constants with its own interpreter
-(`crates/hir-ty-mir/src/mir/eval.rs`) and never asks rustc. Everything the pinned nightly
-(`harness/toolchain`) accepts in const is accepted, and gives the value rustc gives; what goes
-further is an extension a workspace opts into.
+(`crates/hir-ty-mir/src/mir/eval.rs`) rather than asking rustc. The compatibility goal is to
+accept the pinned nightly's const programs (`harness/toolchain`) and give the same values;
+the retained tests cover the cases named below. Features beyond that nightly are extensions
+a workspace opts into.
 
 ## Const traits, closures and std's const impls
 
@@ -221,10 +226,10 @@ const G: u3 = 9;                // error: literal `9` out of range for `u3`
 
 The evaluator's arithmetic is `crates/hir-ty-mir/src/mir/eval/narrow.rs`, codegen's
 `crates/hir-ty-codegen/arbitrary_int.rs`. Tests: `arbitrary_ints_*` in
-`crates/hir-ty-mir/src/tests/` (`consteval.rs`, `layout.rs`, `simple.rs`), the literal error
-in `crates/blaze-diagnostics/src/tests/lints/bodies/types/limits.rs`, and the smoke case
+`crates/hir-ty-mir/src/tests/` (`consteval.rs`, `layout.rs`, `simple.rs`) and the smoke case
 `harness/smoke/arbitrary_ints`, which runs the same calls compiled and in const eval, in dev
-and release.
+and release when the compiler is available. The old literal-range diagnostic test was
+removed with the old lints on 2026-11-15; it is not coverage supplied by the retained tests.
 
 Not yet: `From<bool>`, `Sum`, `Product`, `FromStr`, `Step` (a `for` loop over a range of `u3`),
 `LowerExp` and `UpperExp`; `abs`, `signum`, `rotate_*`, `ilog`, `isqrt`, `strict_*`,
@@ -236,6 +241,7 @@ Plan: [v2/plan/lanes/frontend/arbitrary-ints.md](v2/plan/design/arbitrary-ints.m
 blaze checks const bodies against rustc's `check_consts` rules (#914, #1440,
 `crates/hir-ty-mir/src/mir/const_check.rs`): E0015 for a non-const call, a call of a `fn`
 pointer, an intrinsic not declared `const`, and const stability (`const_check/calls.rs`: the
-nightly's atomics are `const` only under `#![feature(const_atomic)]`). Its errors are part of a
-unit's check (`crates/hir/src/diagnostics.rs`, `crates/blaze-cargo/src/serve/unit/checks.rs`),
-so they fail the build as rustc's do.
+nightly's atomics are `const` only under `#![feature(const_atomic)]`). Its errors feed the
+retained front-end diagnostics entry point in `crates/hir/src/diagnostics.rs`. The deleted
+daemon used those diagnostics to fail a unit's check; the replacement command layer still
+needs that integration before the same build-failure behavior is established.

@@ -1,8 +1,16 @@
 ---
-status: current
-summary: Getting started: using blaze on a project, in short.
+status: record
+summary: Getting started with the daemon-based v2 releases, before the daemon was removed from the source tree on 2026-11-15.
+date: 2026-11-15
 ---
 # Using blaze
+
+This quick start describes the daemon-based v2 implementation before upstream commit
+`8e87a017ff` (2026-11-15), for users of releases built from that code. The source checkout
+now has [parked compiler and command crates](v2/plan/parked.md); the replacement
+[fresh core](v2/plan/design/target.md) and [item layer](v2/plan/design/bottom.md) are under
+development. The build, daemon and live-edit instructions below are historical. Check an
+installed release's `blaze help` for the commands that binary provides.
 
 Not installed yet: [install.md](install.md). Every command and setting in detail:
 [cargo.md](cargo.md).

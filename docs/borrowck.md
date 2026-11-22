@@ -1,32 +1,40 @@
 ---
 status: current
-summary: blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's verdicts, how it is scored, what is left.
+summary: The retained borrow checker (hir-ty-borrowck): its rules, historical rustc comparisons and scoring harness; compiler integration is parked while the item layer is replaced.
 ---
 # The borrow checker
 
-blaze has its own borrow checker, the crate `hir-ty-borrowck` in the front end
+The borrow checker and its front-end dependencies are [parked](v2/plan/parked.md) while
+the item layer is replaced. This page describes the retained implementation and earlier
+measurements; they do not establish that the current source-built compiler can check a
+program. The daemon that previously scheduled unit checks was removed by upstream commit
+`8e87a017ff` on 2026-11-15.
+
+The retained borrow checker is the crate `hir-ty-borrowck` in the front end
 (`crates/hir-ty-borrowck`, next to `hir-ty`). It checks the MIR `hir-ty-mir`
 lowers (from rust-analyzer's lowering), the same MIR the code generator compiles, and it is meant to give exactly rustc's
 verdict: the same errors, on the same lines, and none where rustc gives none. At its last
 scoring it gave rustc's verdict on 99.8% of the rustc borrow-check tests in scope, and on
 every one rustc accepts; how they were scored and what is left is below.
 
-It runs as part of the front end's diagnostics (`crates/hir/src/diagnostics.rs`), in each
-unit's check beside its codegen (`crates/blaze-cargo/src/serve/unit/checks.rs`), and `blaze
-check` reports what it finds. A build it finds a borrow-check error in fails (below), but the
-checker still misses some errors rustc gives (What is left, below).
+Its front-end diagnostics entry point remains in `crates/hir/src/diagnostics.rs`.
+The deleted daemon ran each unit's check beside codegen and reported its findings through
+`blaze check`. A borrow-check error failed that build (below); the replacement command
+layer still needs that integration. The checker also misses some errors rustc gives
+(What is left, below).
 
 ## Refusing builds
 
-A build with a borrow-check error fails, with the file, line and error, as one with a type
-error does: the unit's check failed, so what its codegen made is dropped. Nothing else runs;
-no cargo or rustc is asked.
+In the daemon-based implementation, a build with a borrow-check error failed with the file,
+line and error, as one with a type error did: the unit's check failed, so what its codegen
+made was dropped. No cargo or rustc was asked. This was the integration's contract; the
+parked checker alone does not demonstrate it for the new command layer.
 
-This is safe because the checker reports nothing on any test rustc accepts, nor on ripgrep,
-fd, bat, hyperfine, just, axum, nushell, helix or biome: a refused build is one rustc refuses too. A
-borrow-check error blaze reports where rustc reports none is a bug. What it does not do: it
-misses some errors rustc gives (it accepts code rustc rejects, listed below), so code with
-such an error still builds.
+The earlier corpus runs reported no error on a test rustc accepted, nor on ripgrep, fd, bat,
+hyperfine, just, axum, nushell, helix or biome. Those results are evidence for that corpus,
+not a proof that every refusal matches rustc. A borrow-check error blaze reports where
+rustc reports none is a bug. The checker misses some errors rustc gives (it accepts code
+rustc rejects, listed below), so those checks alone cannot reject all such programs.
 
 ## Modes
 
@@ -686,8 +694,8 @@ missed rather than errors made up:
 
 ## What it costs
 
-A unit's check runs beside its codegen (`crates/blaze-cargo/src/serve/unit/checks.rs`), so
-it adds to a build only when it takes longer than the codegen. The numbers below are v1's,
+The deleted v2 daemon ran a unit's check beside codegen, so a check added to a build's
+critical path when it took longer than codegen. The numbers below are v1's,
 whose daemon checked the edited files on a thread of their own beside the build.
 For an edit of the corpus's largest file, the check went from a median of 40 ms with the
 checker off to 52-74 ms with it on, while the build took 250-400 ms. A cold check of all of

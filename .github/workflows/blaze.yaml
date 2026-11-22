@@ -71,20 +71,11 @@ jobs:
     outputs:
       tier: ${{ steps.files.outputs.tier }}
     steps:
-      # Only what the script action's key reads (.github/actions/script/key.sh); a miss checks
-      # the rest out.
+      # The script key hashes its complete local dependency closure, including vendor sources.
+      # Materialize it before keying; an incomplete checkout cannot produce a cache key.
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            /.github/
-            /.cargo/
-            /scripts/
-            /crates/blaze-script/
-            /harness/toolchain
-            /Cargo.toml
-            /Cargo.lock
       - id: bootstrap
         uses: ./.github/actions/script
         with:
@@ -138,6 +129,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.5"
+      - name: script cache key closure and refusal controls
+        run: timeout 60s bun .github/actions/script/test-key.mjs
       - uses: ./.github/actions/toolchain
       - name: kernel execution tracing for the observer controls
         run: |
@@ -195,7 +191,6 @@ jobs:
       # library/DIGEST is the digest of library/ as it is (a stale one stops every fresh home).
       - run: uv run --frozen python harness/library.py check '{}'
       # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates.
-      - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile --cwd site
       # Use the same bun runtime as the rule generator.
       - run: bun site/node_modules/.bin/tsc -p tools/agents

@@ -1,0 +1,20 @@
+{
+  "id": "v2-script-cache-closure",
+  "date": "2026-11-21",
+  "who": "GPT-6 Astra Pro, frontend_merge lane",
+  "where": ".github/actions/script/key.sh and action.yml; changes job checkout in .github/workflows/blaze.yaml",
+  "what": "A throwaway checkout audit changed actual blaze-sha256 and blaze-core source, a transitive workspace requirement, and a registry checksum without changing the successful script cache key. Removing a needed local source directory also preserved that key, and missing lock identities still produced successful keys.",
+  "cost": "The key could restore stale validator binaries after their inputs changed. Eight isolated probes established the omission; no production stale-cache incident was claimed.",
+  "cause": "The lock walker printed successful package blocks before an UNHASHED sentinel, while the shell checked only the start of its output. The source list and workspace projection assumed only scripts and blaze-script were local. The action's echo masked key-command failure.",
+  "whys": [
+    "the helper's new local dependency closure outgrew the hard-coded source pair",
+    "diagnostics and successful closure bytes shared stdout without a failing exit status",
+    "the sparse changes checkout could not supply the newly required source inputs",
+    "review found that package identity discovery without declared-path binding could select a same-name decoy, so manifest interpretation now uses a real TOML parser"
+  ],
+  "class": "cache identity omitted transitive inputs and failure propagation",
+  "prevention": "Validate the complete lock closure before output; resolve actual local paths with pinned Bun's TOML parser; hash complete selected local and vendor trees, ancestor manifests, the root manifest and blaze.lock; refuse incomplete or unsupported sources. Run isolated positive and negative controls in the scripts job, including planted source omissions and the old masking wrapper.",
+  "workaround": "none; an incomplete source closure refuses the key before cache restore",
+  "fix": "Replaced the key's partial closure and manifest projection, required full materialization before hashing, pinned Bun 1.4.5, and separated the action's key assignment from output. All 50 focused controls passed in 5.13 seconds with the real parser and shell program; no compiler was invoked by key construction. Native compiler and ambient environment policy were not redesigned.",
+  "state": "validated locally and independently reviewed; pending publication and native CI"
+}

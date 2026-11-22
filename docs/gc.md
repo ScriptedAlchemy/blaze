@@ -1,8 +1,17 @@
 ---
-status: current
-summary: What blaze removes from disk and when: the collector of build dirs, shared std stores, temporaries and trash; the pacer that works harder as a volume fills, leases, records, roots and the grace, and why nothing in use is removed; the daemon's store under the home's budget, its pins and what a build says of it.
+status: record
+summary: The daemon-based collector and store budget before 2026-11-15: pacing, leases, roots and grace periods, including the daemon integration that has since been removed.
+date: 2026-11-15
 ---
 # Collecting what blaze keeps on disk
+
+This records collection in the old daemon, removed by upstream commit `8e87a017ff`
+(2026-11-15). The collector library remains in `crates/blaze-gc`: its state machine,
+filesystem driver, leases and tests are still present. The daemon jobs, automatic scheduling,
+home-expiry setting and command integration described below were removed with the daemon;
+their presence here does not establish automatic collection in the replacement compiler.
+See [parked crates](v2/plan/parked.md) for the current integration boundary and
+[the fresh-core design](v2/plan/design/target.md) for the replacement store plan.
 
 blaze writes outside the checkout only: a build dir per workspace under blaze's root
 (`<root>/build/<name>-<id>`, [cargo.md](cargo.md#where-a-build-writes)), the daemon's state

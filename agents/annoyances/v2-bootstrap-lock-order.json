@@ -15,5 +15,5 @@
   "prevention": "Keep all patch declarations sorted, so every unused subset has the same order for both builders. The locked build flags and independent native library controls remain enabled.",
   "workaround": "none",
   "fix": "Sorted all 13 patch declarations without changing parsed manifest values. Restored the exact Cargo.lock that passed 117 native tests. A fail-closed diagnostic captures the pinned resolver's proposed files and diff in an isolated snapshot.",
-  "state": "ordering fix applied; paired CI verification pending"
+  "state": "fixed in 73a2cdbc0a5cd071c2f719dc487f68501ac2054c; pinned Blaze built all 21 scripts in job 137049635636, and pinned Cargo passed 117 native library tests in job 137049678450 with the same locked graph"
 }

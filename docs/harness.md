@@ -315,6 +315,11 @@ written from cargo again, and a change to one is a change to what blaze expects.
 
 ### Incremental cost
 
+This harness targets the old daemon and query database, removed on 2026-11-15. Its source
+and acceptance bounds remain, but the replacement compiler needs an equivalent measurement
+interface before this gate can run against it. The profile schema and behavior below are
+the daemon-era contract, not a passing result for the [parked compiler](v2/plan/parked.md).
+
 `incremental.py` is the gate on what an incremental `blaze check` of blaze's own workspace costs,
 by count. Until it, no harness measured that cost, and on 2026-11-04 a check after a one-line
 edit had grown to about 40 minutes unnoticed, through five unrelated bugs of one class: memory
@@ -337,8 +342,8 @@ the warm check's, and the undo's the no-op's, by at most `heap_growth_bytes`.
 It reads every count from the profile history with `blaze debug sql --json`, under the DuckDB the
 flake pins (`nix build .#duckdb`, or `duckdb` in its input): the check's `builds` row, its
 `query_counts` and its `misses` ([profiling.md](profiling.md)). `query_counts.written`, each
-input's fields its setters wrote in the build, names what the build changed; the counter was
-added for this gate (`crates/blaze-query/src/db/counts.rs`, `WRITTEN`). On a failure it prints,
+input's fields its setters wrote in the build, names what the build changed; that counter
+belonged to the deleted query database. On a failure the harness prints,
 in one pass, every bound each check broke and, for those checks, the query functions that ran
 most, the inputs written and every `misses` row with its cause and what changed. Wall time and
 the daemon's peak heap are printed beside the counts and gate nothing. The edited file is
@@ -813,8 +818,9 @@ a `#![no_std]` library with a struct, a trait with a provided method and two imp
 through `dyn`, a generic, a `macro_rules!`-made module, a `cfg` pair and a feature pair, and a
 `main.rs`; and, each drawn, `up` with a generic `app` instantiates, `mid`, a library built over
 `up` whose text never changes while `up`'s bodies, lines, a signature and a method it selects do
-(early cutoff between crates: a record of `mid` found across an edit below it), `vendor/made` with a build
-script that reads two files, writes `OUT_DIR` for an `include!` and sets a `cfg`, and the proc
+(early cutoff between crates: a record of `mid` found across an edit below it), a generated
+`made` package under the fixture's `vendor` directory with a build script that reads two
+files, writes `OUT_DIR` for an `include!` and sets a `cfg`, and the proc
 macro `mac`) and one to five turns. A turn is up to two edits (a body, a signature, a layout, a
 trait impl, an override, the only `dyn` call, an item added or removed, a rename, a `cfg`, a
 feature, the build script, its input, its `cfg` file, the proc macro, a comment, an indent,
@@ -1212,9 +1218,11 @@ repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-
 small projects, judged by instruction counts first
 ([benchmarks.md](benchmarks.md#the-stress-corpus-and-the-per-merge-run)).
 `bench.yaml` (the store's microbenchmarks, two minutes) runs on pull requests and pushes too.
-`bench-bun.yaml`, `live-latency.yaml` and `realprojects.yaml` ([Real projects](#real-projects-the-verdict)) keep
+`bench-bun.yaml` and `realprojects.yaml` ([Real projects](#real-projects-the-verdict)) keep
 schedules of their own: each takes hours or a dedicated machine, and the train would wait on
-them. On a pull request that changes the flake, `nix/` or the dependencies, `nix-live.yaml`
+them. The old `live-latency.yaml` workflow was removed with the live implementation; its
+stored measurements remain historical. On a pull request that changes the flake, `nix/`
+or the dependencies, `nix-live.yaml`
 checks only the unit graphs. The flake's `dist` still calls `build_release.py` with the retired
 cargo recipe's flags, which the script now refuses (blaze builds blaze). `live-*.yaml` run on their own branches. None of them is part of `ci`. `site.yaml` deploys the
 site, and `release.yaml` builds releases from tags, each target through

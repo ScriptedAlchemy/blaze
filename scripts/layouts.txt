@@ -54,6 +54,7 @@ crates/blaze-diagnostics/src/cache.rs	MAGIC	none
 crates/blaze-diagnostics/src/checks/attrs/parsers/stability.rs	VERSION_PLACEHOLDER	not persisted: rustc's placeholder text for an unknown version
 crates/blaze-diagnostics/src/checks/features/library.rs	VERSION_PLACEHOLDER	not persisted: rustc's placeholder text for an unknown version
 crates/blaze-diagnostics/src/lints/syntax/attrs/diagnostic/directive.rs	FORMAT_LITERALS	not persisted: a lint's name
+crates/blaze-dist-local/src/protocol.rs	TRANSPORT_VERSION	not persisted: the local carrier's hello/welcome negotiation for live in-memory sessions
 crates/blaze-explore-core/src/wire.rs	SCHEMAS	not persisted: the explorer's messages
 crates/blaze-ext/src/lib.rs	VERSION	not persisted: the extension interface's version
 crates/blaze-fmt/src/cargo_fmt.rs	MESSAGE_FORMATS	not persisted: the values a flag takes
@@ -174,6 +175,11 @@ crates/blaze-vfs/src/image.rs	TREE_SCHEMA	none
 crates/blaze-vfs/src/journal.rs	MAGIC	none
 crates/blaze-vfs/src/texts.rs	TEXT_SCHEMA	none
 crates/blaze-wasi/src/seed.rs	VERSION	not persisted: the ABI's version
+crates/blaze-wire/src/job_terminal_v2.rs	VERSION	not persisted: a subscriber's terminal response on the transport, retained only in the job's memory
+crates/blaze-wire/src/lib.rs	DIST_PACK_FORMAT	none
+crates/blaze-wire/src/lib.rs	DIST_PACK_MAGIC	none
+crates/blaze-wire/src/lib.rs	DOMAIN_VERSION	none
+crates/blaze-wire/src/lib.rs	VERSION	none
 crates/const-ast/src/kinds.rs	FORMAT_ARGS_ARG	not persisted: a syntax kind's number
 crates/const-ast/src/kinds.rs	FORMAT_ARGS_EXPR	not persisted: a syntax kind's number
 crates/harness/harness-native-render/src/gpu.rs	PIXEL_FORMAT	not persisted: a GPU pixel format

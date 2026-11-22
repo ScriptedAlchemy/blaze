@@ -4,6 +4,12 @@ summary: How to build, test and change blaze: AI use, where new code goes, rules
 ---
 # Contributing
 
+The current tree is rebuilding its item and command layers. The old daemon was removed
+on 2026-11-15, and the compiler crates listed in [parked crates](v2/plan/parked.md) are
+excluded from the active workspace until their dependencies are replaced. The compiler
+build and end-to-end harness recipes below describe the required acceptance path; they
+are not evidence that this checkout currently produces a working compiler.
+
 ## AI use
 
 This code was written largely with AI assistance under human direction. The same is true
@@ -45,8 +51,8 @@ one level down:
 
 The crates to know first:
 
-    crates/blaze-engine/       the program `blaze`: what runs before blaze's cargo, and pinning
-    crates/blaze-cargo/        blaze's cargo: the client (`cli`), the daemon (`serve`), the sandbox
+    crates/blaze-engine/       the old `blaze` program and pinning, parked during the replacement
+    crates/blaze-cargo/        retained CLI and sandbox code, parked; its daemon was removed
     crates/hir-ty-codegen/    the code generator: MIR to Cranelift IR, the producers
     crates/blaze-cas/        the content-addressed store of everything blaze keeps, which knows nothing about Rust
     crates/blaze-fuzz/       made-up and damaged inputs for the tests of what reads the store
@@ -426,9 +432,11 @@ reports/RELEASE-BUILD.md has the numbers of the older cargo build.
 PGO is off: releases build with `"pgo": "off"`. The `pgo` workflow trains profiles with
 `tools/pgo/pgo.py`, which builds blaze instrumented with the stage-0 blaze, and `"pgo": "pinned"`
 builds with the profile `tools/pgo/profiles.json` pins, only one trained on blaze's own build
-(`"builder": "blaze"`). Neither works yet: blaze refuses `-C profile-generate`, since its linker
-writes no profile sections (`crates/blaze-cargo/src/serve/unit/codegen.rs`, `pgo`), and the
-profiles pinned today are cargo's, which the script refuses with that error.
+(`"builder": "blaze"`). The old daemon refused `-C profile-generate` because its linker
+wrote no profile sections; that code path was removed with the daemon. The retained command
+implementation selects `Pgo::None` (`crates/blaze-command/src/run.rs`), and the compiler
+integration remains parked. The pinned profiles are from cargo's build, which the release
+script refuses: they are not evidence of PGO support in the replacement compiler.
 
 ## LLVM
 
