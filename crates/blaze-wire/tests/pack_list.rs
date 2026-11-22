@@ -1,3 +1,7 @@
+#![feature(allocator_api)]
+
+use std::alloc::Global;
+
 use blaze_wire::{DIST_PACK_FORMAT, PackRef, pack_list};
 
 fn pack() -> PackRef {
@@ -6,17 +10,17 @@ fn pack() -> PackRef {
 
 #[test]
 fn the_native_three_field_layout_round_trips_including_empty() {
-    assert_eq!(pack_list::decode(b"").unwrap(), Vec::<PackRef>::new());
-    assert_eq!(pack_list::encode(&[]), b"");
+    assert_eq!(pack_list::decode(b"", Global).unwrap(), Vec::<PackRef>::new());
+    assert_eq!(pack_list::encode(&[], Global), b"");
     let packs = vec![pack()];
     let expected = format!("{} 80 {}\n", "ab".repeat(32), "cd".repeat(32));
-    assert_eq!(pack_list::encode(&packs), expected.as_bytes());
-    assert_eq!(pack_list::decode(expected.as_bytes()).unwrap(), packs);
+    assert_eq!(pack_list::encode(&packs, Global), expected.as_bytes());
+    assert_eq!(pack_list::decode(expected.as_bytes(), Global).unwrap(), packs);
 }
 
 #[test]
 fn malformed_lists_never_become_empty_cache_entries() {
-    let good = String::from_utf8(pack_list::encode(&[pack()])).unwrap();
+    let good = String::from_utf8(pack_list::encode(&[pack()], Global)).unwrap();
     let cases = [
         "\n".to_owned(),
         good.trim_end().to_owned(),
@@ -33,11 +37,11 @@ fn malformed_lists_never_become_empty_cache_entries() {
         good.clone() + &good.replace("ab", "aa"),
     ];
     for bytes in cases {
-        assert!(pack_list::decode(bytes.as_bytes()).is_err(), "accepted {bytes:?}");
+        assert!(pack_list::decode(bytes.as_bytes(), Global).is_err(), "accepted {bytes:?}");
     }
-    assert!(pack_list::decode(&[0xff]).is_err());
+    assert!(pack_list::decode(&[0xff], Global).is_err());
     assert!(
-        pack_list::decode(&vec![b'x'; blaze_wire::Limits::DOCUMENTED.request as usize + 1])
+        pack_list::decode(&vec![b'x'; blaze_wire::Limits::DOCUMENTED.request as usize + 1], Global)
             .is_err()
     );
 }

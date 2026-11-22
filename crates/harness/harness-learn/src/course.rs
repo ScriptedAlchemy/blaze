@@ -1,6 +1,7 @@
 //! A course as data: what a tutor writes (as JSON) and what a run walks.
 
 use serde::{Deserialize, Serialize};
+use std::alloc::Allocator;
 
 /// The most words a [`Step::Read`] may tell before the lesson must ask something: a screen, read in under half a minute.
 pub const READ_WORDS_MAX: usize = 90;
@@ -260,9 +261,26 @@ impl Lesson {
     }
 }
 
-/// The key a check's memory is kept under: its course, lesson and own id.
-pub fn check_key(course: &str, lesson: &str, check: &str) -> String {
-    format!("{course}/{lesson}/{check}")
+/// The key a check's memory is kept under: its course, lesson and own id. Reuses `out`, so a scan of checks needs only
+/// one scratch buffer and each lookup borrows its key.
+pub fn check_key<'a, A: Allocator>(course: &str, lesson: &str, check: &str, out: &'a mut Vec<u8, A>) -> &'a str {
+    key(&[course, lesson, check], out)
+}
+
+/// A finished lesson's key in the same namespace as its checks.
+pub(crate) fn lesson_key<'a, A: Allocator>(course: &str, lesson: &str, out: &'a mut Vec<u8, A>) -> &'a str {
+    key(&[course, lesson], out)
+}
+
+fn key<'a, A: Allocator>(parts: &[&str], out: &'a mut Vec<u8, A>) -> &'a str {
+    out.clear();
+    for (i, part) in parts.iter().enumerate() {
+        if i != 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(part.as_bytes());
+    }
+    std::str::from_utf8(out).expect("learning keys join UTF-8 identifiers with ASCII separators")
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@
 //! compile threads (D0's `compile_ahead` batch), and [`Event::Compiled`] brings back what they
 //! did.
 
+use std::alloc::Allocator;
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_wire::{
@@ -252,7 +253,7 @@ impl Holder {
 
     /// Starts: heartbeats from now, while the front end loads; [`Event::Loaded`] joins. No
     /// executor waits for the lead to load, and a lead that is loading is not a lost one.
-    pub fn start(&mut self, now: Millis, out: &mut Vec<Effect>) {
+    pub fn start(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator>) {
         self.next_beat = now;
         self.tick(now, out);
     }
@@ -267,7 +268,7 @@ impl Holder {
     }
 
     /// One step.
-    pub fn step(&mut self, now: Millis, event: Event, out: &mut Vec<Effect>) {
+    pub fn step(&mut self, now: Millis, event: Event, out: &mut Vec<Effect, impl Allocator>) {
         if self.phase == Phase::Stopped {
             // Cancellation can race a compile already in flight. Its discoveries were
             // never reported, but the compiler retained them before returning this batch.
@@ -323,7 +324,7 @@ impl Holder {
         }
     }
 
-    fn tick(&mut self, now: Millis, out: &mut Vec<Effect>) {
+    fn tick(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator>) {
         if now >= self.next_beat {
             self.next_beat = now + self.config.heartbeat_ms;
             // A slow or lost heartbeat response must not become obsolete merely
@@ -363,7 +364,7 @@ impl Holder {
         }
     }
 
-    fn reply(&mut self, now: Millis, reply: Reply, out: &mut Vec<Effect>) {
+    fn reply(&mut self, now: Millis, reply: Reply, out: &mut Vec<Effect, impl Allocator>) {
         match (std::mem::replace(&mut self.phase, Phase::Leasing), reply) {
             (Phase::Joining, Reply::Join(Ok(answer))) => {
                 if answer.roots != self.roots {
@@ -430,7 +431,12 @@ impl Holder {
         clippy::needless_pass_by_value,
         reason = "what the core refused with, whole; matched by its variants"
     )]
-    fn refused(&mut self, refusal: Option<Refusal>, error: &WireError, out: &mut Vec<Effect>) {
+    fn refused(
+        &mut self,
+        refusal: Option<Refusal>,
+        error: &WireError,
+        out: &mut Vec<Effect, impl Allocator>,
+    ) {
         let why = match refusal {
             Some(Refusal::AttemptMoved) => StopWhy::AttemptMoved,
             Some(Refusal::Ended | Refusal::NoExecution) => StopWhy::Ended,
@@ -442,7 +448,7 @@ impl Holder {
 
     /// The coordinator dropped this holder: what it found is no longer counted on, so it is
     /// released, and the holder joins as new.
-    fn rejoin(&mut self, now: Millis, out: &mut Vec<Effect>) {
+    fn rejoin(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator>) {
         let held: Vec<WorkName> = self.findings.keys().copied().collect();
         if !held.is_empty() {
             out.push(Effect::Release(held));
@@ -452,7 +458,7 @@ impl Holder {
         self.join(now, out);
     }
 
-    fn plan(&mut self, grant: Grant, out: &mut Vec<Effect>) {
+    fn plan(&mut self, grant: Grant, out: &mut Vec<Effect, impl Allocator>) {
         if grant.lease.holder != self.id
             || grant.lease.attempt != self.attempt
             || grant.lease.execution != self.execution
@@ -493,7 +499,7 @@ impl Holder {
         out.push(Effect::Compile(Plan { grant, seq: self.seq + 1, compile }));
     }
 
-    fn compiled(&mut self, now: Millis, batch: Compiled, out: &mut Vec<Effect>) {
+    fn compiled(&mut self, now: Millis, batch: Compiled, out: &mut Vec<Effect, impl Allocator>) {
         let Phase::Compiling { grant, lost } = &self.phase else { return };
         if batch.generation != grant.lease.generation {
             return;
@@ -560,7 +566,7 @@ impl Holder {
         result: &BatchResult,
         root_items: usize,
         answer: &WorkResultAnswer,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator>,
     ) {
         let conflicts: BTreeSet<WorkName> = answer.conflicts.iter().copied().collect();
         let mut release = conflicts.clone();
@@ -579,7 +585,7 @@ impl Holder {
         self.release(release, out);
     }
 
-    fn join(&mut self, now: Millis, out: &mut Vec<Effect>) {
+    fn join(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator>) {
         self.phase = Phase::Joining;
         let call = Call::Join(WorkJoinRequest {
             execution: self.execution,
@@ -590,14 +596,14 @@ impl Holder {
         self.send(now, call, out);
     }
 
-    fn lease(&mut self, now: Millis, out: &mut Vec<Effect>) {
+    fn lease(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator>) {
         self.phase = Phase::Leasing;
         let call =
             Call::Lease(WorkLeaseRequest { execution: self.execution, attempt: self.attempt });
         self.send(now, call, out);
     }
 
-    fn send(&mut self, now: Millis, call: Call, out: &mut Vec<Effect>) {
+    fn send(&mut self, now: Millis, call: Call, out: &mut Vec<Effect, impl Allocator>) {
         let id = self.take_id();
         self.outstanding = Some(Outstanding { id, call: call.clone(), sent_at: now });
         out.push(Effect::Send { id, call });
@@ -609,7 +615,7 @@ impl Holder {
         id
     }
 
-    fn stop(&mut self, why: StopWhy, out: &mut Vec<Effect>) {
+    fn stop(&mut self, why: StopWhy, out: &mut Vec<Effect, impl Allocator>) {
         let mut held: BTreeSet<WorkName> = self.findings.keys().copied().collect();
         if let Phase::Reporting { result, .. } = &self.phase {
             held.extend(result.items.iter().flat_map(|item| item.found.iter().map(|f| f.name)));
@@ -621,7 +627,11 @@ impl Holder {
         out.push(Effect::Stop(why));
     }
 
-    fn release(&mut self, names: impl IntoIterator<Item = WorkName>, out: &mut Vec<Effect>) {
+    fn release(
+        &mut self,
+        names: impl IntoIterator<Item = WorkName>,
+        out: &mut Vec<Effect, impl Allocator>,
+    ) {
         let names: BTreeSet<WorkName> = names.into_iter().collect();
         for name in &names {
             self.findings.remove(name);

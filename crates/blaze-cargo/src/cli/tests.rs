@@ -804,7 +804,7 @@ fn the_thin_blaze_sends_this_clis_request_byte_for_byte() {
 /// The control of the test above: a request that differs in one word is other bytes, so the
 /// equality there is of the whole request.
 #[test]
-fn a_request_of_other_words_is_other_bytes() {
+fn the_oracle_catches_a_request_with_changed_words() {
     let frame = |it: &Request| blaze_api::frames::encode(&blaze_api::Envelope::new(2, it)).unwrap();
     let quiet = request_of(&invocation(os(&["build", "-q"]).collect()));
     let long = request_of(&invocation(os(&["build", "--quiet"]).collect()));

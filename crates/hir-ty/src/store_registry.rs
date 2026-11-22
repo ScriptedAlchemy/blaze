@@ -191,7 +191,7 @@ mod tests {
     /// table grows. Control: a slot cleared behind the registry's back (a link that lost its
     /// store) makes the oracle miss that store, so it is not vacuous.
     #[test]
-    fn a_registry_holds_any_number_of_stores_and_finds_each_until_it_is_unlinked() {
+    fn the_oracle_catches_a_linked_store_lost_from_its_slot() {
         static REGISTRY: Registry<u64> = Registry::new("ty.store_registry.test");
         let count = 3 * SEGMENT as u64 + 5;
         let ids: Vec<u64> = (0..count).collect();

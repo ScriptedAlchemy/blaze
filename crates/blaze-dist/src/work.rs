@@ -15,6 +15,7 @@
 //! The machine has no clock, IO or threads of its own: every call takes `now`, answers with a
 //! wire type or a [`Refusal`], and appends what happened to `out`, the log a driver keeps.
 
+use std::alloc::Allocator;
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_wire::{
@@ -498,7 +499,7 @@ impl WorkSet {
         now: Millis,
         from: &str,
         req: &WorkJoinRequest,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator>,
     ) -> Result<WorkJoinAnswer, Refusal> {
         self.tick(now, out);
         let answer = self.join_inner(now, from, req, out);
@@ -513,7 +514,7 @@ impl WorkSet {
         now: Millis,
         from: &str,
         req: &WorkJoinRequest,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator>,
     ) -> Result<WorkJoinAnswer, Refusal> {
         if req.execution != self.execution {
             return Err(Refusal::NoExecution);
@@ -583,7 +584,7 @@ impl WorkSet {
     }
 
     /// The lead's join: its root set is the execution's, whatever the work set held.
-    fn join_lead(&mut self, req: &WorkJoinRequest, out: &mut Vec<Effect>) {
+    fn join_lead(&mut self, req: &WorkJoinRequest, out: &mut Vec<Effect, impl Allocator>) {
         self.rejected = req.rejected.iter().copied().collect();
         let held = self.fixed.clone().or_else(|| self.provisional.clone());
         match held {
@@ -620,7 +621,7 @@ impl WorkSet {
     /// Starts again on the lead's root list: every executor that joined with the other root
     /// set is fenced and refused, what was committed under it is dropped, and the difference
     /// is counted as a determinism bug.
-    fn reset(&mut self, roots: &RootSet, out: &mut Vec<Effect>) {
+    fn reset(&mut self, roots: &RootSet, out: &mut Vec<Effect, impl Allocator>) {
         let holders: Vec<String> = self.holders.keys().cloned().collect();
         for holder in holders {
             let theirs = self.holders[&holder].roots.clone();
@@ -673,7 +674,7 @@ impl WorkSet {
         now: Millis,
         from: &str,
         req: &WorkLeaseRequest,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator>,
     ) -> Result<WorkLeaseAnswer, Refusal> {
         self.tick(now, out);
         let answer = self.lease_inner(now, from, req, out);
@@ -688,7 +689,7 @@ impl WorkSet {
         now: Millis,
         from: &str,
         req: &WorkLeaseRequest,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator>,
     ) -> Result<WorkLeaseAnswer, Refusal> {
         if req.execution != self.execution {
             return Err(Refusal::NoExecution);
@@ -713,7 +714,12 @@ impl WorkSet {
         Ok(WorkLeaseAnswer { grant: self.grant(now, from, out) })
     }
 
-    fn grant(&mut self, now: Millis, holder: &str, out: &mut Vec<Effect>) -> Option<Grant> {
+    fn grant(
+        &mut self,
+        now: Millis,
+        holder: &str,
+        out: &mut Vec<Effect, impl Allocator>,
+    ) -> Option<Grant> {
         // Names come before roots, so a finder compiles what it found while its database holds
         // it. A name goes to its first finder while that one holds it, else to any finder.
         let names: Vec<WorkName> = self.holders[holder]
@@ -781,7 +787,7 @@ impl WorkSet {
         now: Millis,
         from: &str,
         req: &BatchResult,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator>,
     ) -> Result<WorkResultAnswer, Refusal> {
         self.tick(now, out);
         let answer = self.result_inner(now, from, req, out);
@@ -796,7 +802,7 @@ impl WorkSet {
         now: Millis,
         from: &str,
         req: &BatchResult,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator>,
     ) -> Result<WorkResultAnswer, Refusal> {
         if req.lease.execution != self.execution {
             return Err(Refusal::NoExecution);
@@ -810,7 +816,7 @@ impl WorkSet {
         let generation = req.lease.generation;
         let by = Commit { holder: from.to_owned(), generation, seq: req.seq };
         let key = (from.to_owned(), generation, req.seq);
-        let digest = blaze_wire::digest_of(req);
+        let digest = blaze_wire::digest_of(req, out.allocator());
         // A result committed in this attempt gets the same answer after its lease ended.
         // An earlier attempt must not replay or keep a newly joined holder alive.
         if let Some((committed, answer)) = self.replies.get(&key) {
@@ -870,8 +876,10 @@ impl WorkSet {
                 continue;
             }
             for (ordinal, why) in item.unnamed.iter() {
-                let edge =
-                    WorkName::of(&WorkKey::Edge(EdgeKey { parent: item.name, ordinal: *ordinal }));
+                let edge = WorkName::of(
+                    &WorkKey::Edge(EdgeKey { parent: item.name, ordinal: *ordinal }),
+                    out.allocator(),
+                );
                 self.edges.entry(edge).or_insert(EdgeSlot {
                     parent: item.name,
                     ordinal: *ordinal,
@@ -941,8 +949,8 @@ impl WorkSet {
         item: &ItemResult,
         name: WorkName,
         by: &Commit,
-        conflicts: &mut BTreeSet<WorkName>,
-        out: &mut Vec<Effect>,
+        conflicts: &mut BTreeSet<WorkName, impl Allocator + Clone>,
+        out: &mut Vec<Effect, impl Allocator>,
     ) {
         let Some(state) = self.names.get(&name).map(|slot| slot.state.clone()) else { return };
         match state {
@@ -992,9 +1000,9 @@ impl WorkSet {
         &mut self,
         from: &str,
         found: &Found,
-        granted: &mut BTreeSet<WorkName>,
-        conflicts: &mut BTreeSet<WorkName>,
-        out: &mut Vec<Effect>,
+        granted: &mut BTreeSet<WorkName, impl Allocator + Clone>,
+        conflicts: &mut BTreeSet<WorkName, impl Allocator + Clone>,
+        out: &mut Vec<Effect, impl Allocator>,
     ) {
         let name = found.name;
         let Some(slot) = self.names.get_mut(&name) else {
@@ -1069,7 +1077,7 @@ impl WorkSet {
         now: Millis,
         from: &str,
         attempt: Attempt,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator>,
     ) -> WorkersEventsAnswer {
         self.tick(now, out);
         if matches!(self.phase, Phase::Ended(_)) || attempt != self.attempt {
@@ -1087,7 +1095,7 @@ impl WorkSet {
     /// Ends what has run out of time: holders not heard from for the lease time, and leases
     /// past their progress timeout. Every call runs it first, so a lease that ended is dead
     /// whether or not a timer fired.
-    pub fn tick(&mut self, now: Millis, out: &mut Vec<Effect>) {
+    pub fn tick(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator>) {
         if self.phase != Phase::Open {
             return;
         }
@@ -1127,7 +1135,7 @@ impl WorkSet {
 
     /// Drops a holder: its live lease is fenced, and the names it found go to other finders or
     /// to the lead's tail.
-    fn lose(&mut self, holder: &str, why: FenceWhy, out: &mut Vec<Effect>) {
+    fn lose(&mut self, holder: &str, why: FenceWhy, out: &mut Vec<Effect, impl Allocator>) {
         let Some(slot) = self.holders.get(holder) else { return };
         if let Some(generation) = slot.lease {
             self.fence(generation, why, out);
@@ -1149,7 +1157,7 @@ impl WorkSet {
     }
 
     /// The owned assignment is retiring. Revoke its work before its reservation can be released.
-    pub(crate) fn retire(&mut self, holder: &str, out: &mut Vec<Effect>) {
+    pub(crate) fn retire(&mut self, holder: &str, out: &mut Vec<Effect, impl Allocator>) {
         self.lose(holder, FenceWhy::Retired, out);
         self.check_done(out);
     }
@@ -1157,7 +1165,7 @@ impl WorkSet {
     /// Ends a live lease without its result: its roots go back to the pool and its names to
     /// another finder, each counted as revoked when the end is the holder's; past the bound,
     /// to the lead's tail.
-    fn fence(&mut self, generation: u64, why: FenceWhy, out: &mut Vec<Effect>) {
+    fn fence(&mut self, generation: u64, why: FenceWhy, out: &mut Vec<Effect, impl Allocator>) {
         let Some(issued) = self.leases.get_mut(&generation) else { return };
         if !issued.live {
             return;
@@ -1214,7 +1222,12 @@ impl WorkSet {
     /// the old attempt is dead, outstanding roots return to the pool, and every outstanding
     /// name goes to the new lead's tail, since findings of the dead attempt are invalid.
     /// Committed outcomes stay. Every executor joins again under the new attempt.
-    pub fn new_attempt(&mut self, attempt: Attempt, lead: &str, out: &mut Vec<Effect>) {
+    pub fn new_attempt(
+        &mut self,
+        attempt: Attempt,
+        lead: &str,
+        out: &mut Vec<Effect, impl Allocator>,
+    ) {
         for slot in self.names.values_mut() {
             slot.finders.clear();
             slot.prefer = None;
@@ -1239,7 +1252,7 @@ impl WorkSet {
 
     /// The execution ended: its deadline, its last subscriber, no lead. Every lease dies and
     /// no coverage is claimed.
-    pub fn end(&mut self, why: EndWhy, out: &mut Vec<Effect>) {
+    pub fn end(&mut self, why: EndWhy, out: &mut Vec<Effect, impl Allocator>) {
         // A compile phase that was done stays done: what ends after it is the job's.
         if self.phase != Phase::Open {
             return;
@@ -1252,7 +1265,7 @@ impl WorkSet {
         out.push(Effect::Ended { why });
     }
 
-    fn check_done(&mut self, out: &mut Vec<Effect>) {
+    fn check_done(&mut self, out: &mut Vec<Effect, impl Allocator>) {
         // The root list's length is fixed only by the lead's root set, so an empty work set
         // before it is in does not signal done.
         if self.phase == Phase::Open

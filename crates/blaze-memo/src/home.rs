@@ -279,7 +279,7 @@ tuple!(A, B, C, D, E, F, G, H);
 mod tests {
     use std::alloc::Global;
 
-    use super::named_home;
+    use super::{Home, Homes, named_home};
     use crate::{ArenaId, Gid};
 
     /// The invariant: a box is homed by what it holds (the control: a box of plain data names
@@ -290,5 +290,24 @@ mod tests {
         assert_eq!(named_home(&Box::new_in(id, Global)), Some(id.arena()));
         assert_eq!(named_home(&Box::new_in(Some(id), Global)), Some(id.arena()));
         assert_eq!(named_home(&Box::new_in(7_u32, Global)), None);
+    }
+
+    #[test]
+    fn the_oracle_catches_a_box_whose_arena_id_was_erased() {
+        struct MissingTraversal(Gid);
+
+        impl Home for MissingTraversal {
+            fn home(&self, _homes: &mut Homes<'_>) {
+                // Plant a visitor that skips the arena-bearing field.
+            }
+        }
+
+        let id = Gid::in_arena(ArenaId::new(3, 2), 9);
+        let expected = Some(id.arena());
+        assert_eq!(named_home(&Box::new_in(id, Global)), expected);
+        let lost = Box::new_in(MissingTraversal(id), Global);
+        assert_eq!(lost.0, id, "the plant keeps the same arena-bearing contents");
+        assert_ne!(named_home(&lost), expected, "the oracle must reject an omitted traversal");
+        assert_eq!(named_home(&lost), None);
     }
 }

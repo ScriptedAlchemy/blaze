@@ -64,7 +64,7 @@ reinterpreted as transport 2.
 
 `Submission.request` is an opaque CBOR byte string containing exactly a JobRequest.
 The server decodes it only in the negotiated global codec, recomputes
-`JobContent::of(JobContentInput {unit, platform, namespace})`, and compares
+`JobContent::of(&JobContentInput {unit, platform, namespace}, Global)`, and compares
 the supplied content before submission.
 
 ## Commands and bindings

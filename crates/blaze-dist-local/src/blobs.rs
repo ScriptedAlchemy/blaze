@@ -3,6 +3,7 @@
 //! `timeout`; the server checks every blob against its name before it is visible, and the
 //! agent checks it again against what was committed ([`crate::pack::read`]).
 
+use std::alloc::Global;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -139,9 +140,9 @@ impl Blobs {
             list,
             || self.published(spec),
             |existing, proposed| {
-                let existing = blaze_wire::pack_list::decode(existing)
+                let existing = blaze_wire::pack_list::decode(existing, Global)
                     .map_err(|error| Error::Committed(error.to_string()))?;
-                let proposed = blaze_wire::pack_list::decode(proposed)
+                let proposed = blaze_wire::pack_list::decode(proposed, Global)
                     .map_err(|error| Error::Committed(error.to_string()))?;
                 Ok(crate::agent::import(self, &existing)? == crate::agent::import(self, &proposed)?)
             },

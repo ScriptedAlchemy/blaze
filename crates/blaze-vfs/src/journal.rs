@@ -996,12 +996,7 @@ mod tests {
         (disk.root, names)
     }
 
-    /// The invariant: `SEEN` entries too many for one record are split between entries into
-    /// records that each fit, which replayed in order leave the column one record leaves, and
-    /// every cut between them leaves a column that vouches for no root. Control: the split
-    /// records under the whole bound are one record, the same column.
-    #[test]
-    fn a_seen_record_split_to_fit_replays_as_the_whole_one() {
+    fn seen_fixture() -> (Vec<u8>, Vec<u8>) {
         let mut disks = Disks::default();
         let disk = disks.of("main", &FileName::new("w").unwrap());
         disk.root = Some(ContentId([7; 32]));
@@ -1017,22 +1012,62 @@ mod tests {
         // Room for the fixed part and about three entries a record.
         let most = 4 + 4 + 4 + 1 + Cursor::BYTES + 33 + 4 + 150;
         frame_seen(&mut split, "main", disk, 50, &entries, most);
+        (whole, split)
+    }
+
+    fn replayed(records: &[&[u8]]) -> (Option<ContentId>, Vec<(String, Stamp)>) {
+        let mut disks = Disks::default();
+        for it in records {
+            disks.replay(it).expect("a record that replays");
+        }
+        column(&disks)
+    }
+
+    fn partial_column_is_untrusted(records: &[&[u8]]) -> bool {
+        replayed(records).0.is_none()
+    }
+
+    /// The invariant: `SEEN` entries too many for one record are split between entries into
+    /// records that each fit, which replayed in order leave the column one record leaves, and
+    /// every cut between them leaves a column that vouches for no root. Control: the split
+    /// records under the whole bound are one record, the same column.
+    #[test]
+    fn a_seen_record_split_to_fit_replays_as_the_whole_one() {
+        let (whole, split) = seen_fixture();
         let (whole, split) = (payloads(&whole), payloads(&split));
         assert_eq!(whole.len(), 1);
         assert!(split.len() > 10, "{} records", split.len());
-        let replayed = |records: &[&[u8]]| {
-            let mut disks = Disks::default();
-            for it in records {
-                disks.replay(it).expect("a record that replays");
-            }
-            column(&disks)
-        };
         let want = replayed(&whole);
         assert_eq!(want.0, Some(ContentId([7; 32])));
         assert_eq!(want.1.len(), 50);
         assert_eq!(replayed(&split), want);
         for cut in 1..split.len() {
-            assert_eq!(replayed(&split[..cut]).0, None, "a cut after {cut} records vouches for none");
+            assert!(partial_column_is_untrusted(&split[..cut]), "a cut after {cut} records vouches for none");
         }
+    }
+
+    #[test]
+    fn the_oracle_catches_a_split_seen_record_that_vouches_for_its_root_too_soon() {
+        let (_, split) = seen_fixture();
+        let records = payloads(&split);
+        assert!(records.len() > 1);
+        assert!(partial_column_is_untrusted(&records[..1]));
+        let mut first = records[0].to_vec();
+        let root_at = {
+            let mut read = Reader::new(&first);
+            read.str_u32().unwrap();
+            read.str_u32().unwrap();
+            read.skip(Cursor::BYTES).unwrap();
+            read.at()
+        };
+        // Plant the encoder's missing `last` guard: the first, still-partial record now
+        // carries the full column's root. Every entry and its framing remains valid.
+        first[root_at] = 1;
+        first[root_at + 1..root_at + 33].copy_from_slice(&[7; 32]);
+        let bad = [first.as_slice()];
+        assert!(!partial_column_is_untrusted(&bad), "the cut oracle missed a premature root");
+        let (root, entries) = replayed(&bad);
+        assert_eq!(root, Some(ContentId([7; 32])));
+        assert!(entries.len() < 50, "the planted record is still only a prefix");
     }
 }

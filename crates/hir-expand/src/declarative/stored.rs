@@ -1073,7 +1073,7 @@ mod tests {
     /// key. The control: their trees as made from their text differ, in their spans alone,
     /// and those spans are what layout 2 wrote.
     #[test]
-    fn two_definitions_of_equal_tokens_spaced_apart_are_equal_bytes() {
+    fn the_oracle_catches_raw_span_ranges_in_a_stored_definition() {
         let ((a_place, _, a, a_hash), (b_place, _, b, b_hash)) = (made(WRITTEN), made(MOVED));
         assert_eq!(a_hash, b_hash, "one key: the row hashes tokens");
         assert_eq!(rules_written(&a_place, &a), rules_written(&b_place, &b));

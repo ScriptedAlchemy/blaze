@@ -965,6 +965,19 @@ mod tests {
         assert!(twice.unwrap_err().contains("twice"));
     }
 
+    #[test]
+    fn the_oracle_catches_a_table_edit_that_keeps_the_old_part() {
+        let before = built(&numbered(40, None));
+        let table = Table::read(&before).expect("a table");
+        let expected = built(&numbered(40, Some(17)));
+        let edited = table.edit(&[(&b"key 17"[..], Some(&b"changed"[..]))]).unwrap();
+        assert_eq!(edited, expected, "the real edit agrees with a fresh build");
+        // Plant an omitted update: a still-valid table whose retained part is stale.
+        let skipped = table.edit(&[]).unwrap();
+        Table::read(&skipped).unwrap().verify().unwrap();
+        assert_ne!(skipped, expected, "the fresh-build oracle missed the stale part");
+    }
+
     /// One part of 1000 edited hashes the part, its key and the nodes on its path, where a
     /// build hashes every key, every part and every node.
     #[test]

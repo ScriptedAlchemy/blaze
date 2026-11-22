@@ -95,7 +95,7 @@ impl Refusal {
             Refusal::NoSubscriber => "no such subscriber",
             Refusal::Superseded => "a newer source of this pull request replaced this one",
         };
-        let error = WireError::new(self.code(), format!("{}: {text}", self.token()));
+        let error = WireError::new(self.code(), format_args!("{}: {text}", self.token()));
         match retry_after_ms {
             Some(ms) => error.retry_after(ms),
             None => error,

@@ -85,6 +85,10 @@ impl Host {
 mod tests {
     use super::*;
 
+    fn names_error(read: &Result<Host, String>, name: &str) -> bool {
+        matches!(read, Err(why) if why.contains(name))
+    }
+
     /// The invariant: the file says the host, unset is the daemon, and anything else is refused
     /// naming the key. Controls: a misspelt value and an unknown key are refused, not read as the
     /// default.
@@ -94,13 +98,27 @@ mod tests {
         assert_eq!(Host::from_toml("[terminal]\ncolor = \"never\"\n"), Ok(Host::Daemon));
         assert_eq!(Host::from_toml("[serve]\nhost = \"daemon\"\n"), Ok(Host::Daemon));
         assert_eq!(Host::from_toml("[serve]\nhost = \"process\"\n"), Ok(Host::Process));
-        let bad = Host::from_toml("[serve]\nhost = \"proces\"\n").unwrap_err();
-        assert!(bad.contains("serve.host") && bad.contains("\"process\""), "{bad}");
-        let unknown = Host::from_toml("[serve]\nhots = \"process\"\n").unwrap_err();
-        assert!(unknown.contains("`hots`"), "{unknown}");
-        assert!(Host::from_toml("serve = 1\n").unwrap_err().contains("not a table"));
+        let bad = Host::from_toml("[serve]\nhost = \"proces\"\n");
+        assert!(names_error(&bad, "serve.host") && names_error(&bad, "\"process\""), "{bad:?}");
+        let unknown = Host::from_toml("[serve]\nhots = \"process\"\n");
+        assert!(names_error(&unknown, "`hots`"), "{unknown:?}");
+        assert!(names_error(&Host::from_toml("serve = 1\n"), "not a table"));
         for host in [Host::Daemon, Host::Process] {
             assert_eq!(Host::from_toml(&format!("[serve]\nhost = \"{}\"\n", host.word())), Ok(host));
+        }
+    }
+
+    #[test]
+    fn the_oracle_catches_a_bad_host_silently_replaced_by_the_default() {
+        for (text, name) in [
+            ("[serve]\nhost = \"proces\"\n", "serve.host"),
+            ("[serve]\nhots = \"process\"\n", "`hots`"),
+            ("serve = 1\n", "not a table"),
+        ] {
+            assert!(names_error(&Host::from_toml(text), name));
+            // Plant the fallback which would hide an invalid configuration.
+            let read = Host::from_toml(text).or(Ok(Host::Daemon));
+            assert!(!names_error(&read, name), "{text}");
         }
     }
 }

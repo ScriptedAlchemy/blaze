@@ -2,6 +2,9 @@
 //! c3-B2.3, rb-M3): the root agreement, fencing, replays, returned work, finders, conflicts,
 //! unknown names, lead loss, the progress timeout and the revocation bound.
 
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use blaze_dist::work::{
     Effect, FenceWhy, LOST_FINDING, TailWhy, Terminal, UNKNOWN_NAME, WorkConfig, WorkSet,
 };
@@ -19,7 +22,7 @@ fn rootset(count: u64, tag: u8) -> RootSet {
 }
 
 fn name(tag: u8) -> WorkName {
-    WorkName::of(&WorkKey::Item(ItemKey { unit: [9; 32], stable: [tag; 32], env: [0; 32] }))
+    WorkName::of(&WorkKey::Item(ItemKey { unit: [9; 32], stable: [tag; 32], env: [0; 32] }), Global)
 }
 
 fn set(config: WorkConfig) -> WorkSet {

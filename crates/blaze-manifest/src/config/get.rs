@@ -414,7 +414,7 @@ mod env_quoting_tests {
 
     #[test]
     fn cargo_config_annotation_output_is_host_independent() {
-        let scratch = stdx::tempfile::NamedTempDir::new("blaze-config-annotations-").unwrap();
+        let scratch = blaze_core::temp::TempDir::for_test("blaze-config-annotations-");
         let root = scratch.path();
         let home = root.join("cargo-home");
         std::fs::create_dir_all(&home).unwrap();

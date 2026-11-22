@@ -1,6 +1,7 @@
 //! Local Unix IO carrier for the sans-IO distributed protocol. This crate runs no compiler.
 //! A single nonblocking reactor owns the coordinator; clocks and effect delivery are injected.
 
+#![feature(allocator_api)]
 #![deny(missing_docs)]
 
 pub mod agent;

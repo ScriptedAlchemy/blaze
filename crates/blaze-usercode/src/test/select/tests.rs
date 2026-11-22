@@ -1,5 +1,14 @@
 use super::*;
 
+fn sandbox_modes_have_distinct_keys(outside: impl Fn(&Suite) -> ContentId) -> bool {
+    let suite = Suite {
+        package: "sel".to_owned(),
+        target: "lib".to_owned(),
+        context: ContentId::of("blaze test select context", b"x86_64-unknown-linux-gnu"),
+    };
+    suite.given() != outside(&suite)
+}
+
 /// The invariant: a test run outside the sandbox is keyed apart from the same test run inside,
 /// so no pass kept of a sandboxed run is ever read for it; the control is the suite's own
 /// `given`, which is stable.
@@ -13,6 +22,14 @@ fn a_run_outside_the_sandbox_is_keyed_apart_from_one_inside() {
     assert_eq!(suite.given(), suite.given());
     assert_eq!(suite.given_outside(), suite.given_outside());
     assert_ne!(suite.given(), suite.given_outside());
+    assert!(sandbox_modes_have_distinct_keys(Suite::given_outside));
+}
+
+#[test]
+fn the_oracle_catches_an_outside_run_keyed_without_its_sandbox_mode() {
+    assert!(sandbox_modes_have_distinct_keys(Suite::given_outside));
+    // Reuse the actual process key without the outside mode's extra part.
+    assert!(!sandbox_modes_have_distinct_keys(Suite::given));
 }
 
 fn ignored() -> Attrs {

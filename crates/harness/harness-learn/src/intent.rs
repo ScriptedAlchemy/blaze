@@ -7,9 +7,9 @@
 
 /// What a message asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Intent {
+pub enum Intent<'a> {
     /// To understand `topic`: taught as a lesson.
-    Learn { topic: String },
+    Learn { topic: &'a str },
     /// Something done: an agent's work.
     Do,
 }
@@ -61,48 +61,59 @@ const WORK: [&str; 31] = [
 
 /// What `message` asks for.
 #[must_use]
-pub fn of(message: &str) -> Intent {
+pub fn of(message: &str) -> Intent<'_> {
     let text = message.trim();
-    let lower = text.to_lowercase();
     // A path, a URL or code is about something in front of the person.
-    if text.contains(['/', '`', '{', '\n']) || lower.contains("http") {
-        return teach(text, &lower).map_or(Intent::Do, |topic| Intent::Learn { topic });
+    if text.contains(['/', '`', '{', '\n']) || find(text, "http").is_some() {
+        return teach(text).map_or(Intent::Do, |topic| Intent::Learn { topic });
     }
-    if let Some(topic) = teach(text, &lower) {
+    if let Some(topic) = teach(text) {
         return Intent::Learn { topic };
     }
-    let words = lower.split_whitespace().count();
-    let starts_work = WORK.iter().any(|w| lower.starts_with(w) || lower.starts_with(&format!("please {w}")));
-    let about_mine = [" my ", " this ", " our ", " the repo", " the build", " the test"].iter().any(|w| lower.contains(w));
-    if let Some(q) = QUESTION.iter().find(|q| lower.starts_with(*q)) {
+    let words = text.split_whitespace().count();
+    let polite = if starts(text, "please ") { &text["please ".len()..] } else { "" };
+    let starts_work = WORK.iter().any(|w| starts(text, w) || starts(polite, w));
+    let about_mine = [" my ", " this ", " our ", " the repo", " the build", " the test"].iter().any(|w| find(text, w).is_some());
+    if let Some(q) = QUESTION.iter().find(|q| starts(text, q)) {
         if !about_mine {
-            return Intent::Learn { topic: clean(&text[q.len()..]).to_owned() };
+            return Intent::Learn { topic: clean(&text[q.len()..]) };
         }
         return Intent::Do;
     }
     // A bare topic: a few words with no verb of work and no question of another kind ("bloom filters").
-    if words <= 5 && !starts_work && !about_mine && !lower.ends_with('?') && lower.chars().any(char::is_alphabetic) {
-        return Intent::Learn { topic: clean(text).to_owned() };
+    if words <= 5 && !starts_work && !about_mine && !text.ends_with('?') && text.chars().any(char::is_alphabetic) {
+        return Intent::Learn { topic: clean(text) };
     }
     Intent::Do
 }
 
 /// The topic after an opening that asks to be taught anywhere in `text` ("hello, teach me something"), if one does.
-fn teach(text: &str, lower: &str) -> Option<String> {
-    let (at, len) = TEACH.iter().filter_map(|k| lower.find(k).map(|i| (i, k.len()))).min_by_key(|&(i, _)| i)?;
+fn teach(text: &str) -> Option<&str> {
+    let (at, len) = TEACH.iter().filter_map(|k| find(text, k).map(|i| (i, k.len()))).min_by_key(|&(i, _)| i)?;
     // "explain" only opens a request at the start ("can you explain" too): mid-sentence it is a word ("this doesn't
     // explain the crash").
-    let opening = lower[..at].trim();
-    if !opening.is_empty() && !["can you", "could you", "please", "hey", "hi", "hello", "pls"].iter().any(|p| opening.trim_end_matches([',', '!']).ends_with(p)) {
+    let opening = text[..at].trim();
+    if !opening.is_empty() && !["can you", "could you", "please", "hey", "hi", "hello", "pls"].iter().any(|p| {
+        let opening = opening.trim_end_matches([',', '!']);
+        opening.as_bytes().get(opening.len().saturating_sub(p.len())..).is_some_and(|end| end.eq_ignore_ascii_case(p.as_bytes()))
+    }) {
         return None;
     }
-    // Lowercasing changes lengths only outside ASCII: cut where the original has a boundary.
-    let rest = text.get(at + len..).unwrap_or("");
+    // ASCII keywords occupy the same byte positions in the original text, including after a Unicode greeting.
+    let rest = &text[at + len..];
     let rest = clean(rest);
     let rest = ["about ", "how to ", "how ", "to ", "me ", "what "].iter().find_map(|p| rest.strip_prefix(p)).unwrap_or(rest).trim();
     let vague = rest.chars().filter(|c| c.is_alphanumeric()).count() < 3
-        || ["something", "somthing", "anything", "a thing", "stuff"].iter().any(|v| rest.to_lowercase().starts_with(v));
-    Some(if vague { SURPRISE.to_owned() } else { rest.to_owned() })
+        || ["something", "somthing", "anything", "a thing", "stuff"].iter().any(|v| starts(rest, v));
+    Some(if vague { SURPRISE } else { rest })
+}
+
+fn starts(text: &str, word: &str) -> bool {
+    text.as_bytes().get(..word.len()).is_some_and(|head| head.eq_ignore_ascii_case(word.as_bytes()))
+}
+
+fn find(text: &str, word: &str) -> Option<usize> {
+    text.as_bytes().windows(word.len()).position(|part| part.eq_ignore_ascii_case(word.as_bytes()))
 }
 
 /// A topic without the punctuation and filler around it ("bloom filters work?" is "bloom filters").
@@ -115,7 +126,7 @@ fn clean(s: &str) -> &str {
 mod tests {
     use super::*;
 
-    fn learns(m: &str) -> String {
+    fn learns(m: &str) -> &str {
         match of(m) {
             Intent::Learn { topic } => topic,
             Intent::Do => panic!("{m:?} was taken as work"),
@@ -146,5 +157,14 @@ mod tests {
         ] {
             assert_eq!(of(m), Intent::Do, "{m:?}");
         }
+    }
+
+    #[test]
+    fn a_topic_borrows_the_original_bytes_after_a_unicode_greeting() {
+        let message = "İ hello, EXPLAIN ownership";
+        let topic = learns(message);
+        assert_eq!(topic, "ownership");
+        assert_eq!(topic.as_ptr(), message[message.find("ownership").unwrap()..].as_ptr());
+        assert_eq!(learns("teach me something").as_ptr(), SURPRISE.as_ptr());
     }
 }

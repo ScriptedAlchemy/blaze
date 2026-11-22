@@ -19,6 +19,7 @@
 //! executor refused) it compiles itself, by the same code, and reports. When the path fails,
 //! [`decide`] says under the caller's [`LocalPolicy`] whether the build stops or compiles here.
 
+use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -178,7 +179,7 @@ impl Arrived {
 
 /// The coordinator's work identity for an opaque compiler task in one unit.
 pub fn wire_name(unit: &Digest, name: &Digest) -> WorkName {
-    WorkName::of(&WorkKey::Item(ItemKey { unit: *unit, stable: *name, env: [0; 32] }))
+    WorkName::of(&WorkKey::Item(ItemKey { unit: *unit, stable: *name, env: [0; 32] }), Global)
 }
 
 /// The set every executor of `unit` joins with.
@@ -187,11 +188,11 @@ pub fn root_set(unit: &Unit) -> RootSet {
         unit.names.iter().map(|name| (wire_name(&unit.spec, name), *name)).collect();
     RootSet {
         spec: unit.spec,
-        roots: digest_of_encoded_name("blaze/root-set", &encode(&pairs)),
+        roots: digest_of_encoded_name("blaze/root-set", &encode(&pairs, Global)),
         count: pairs.len() as u64,
         index: digest_of_encoded_name(
             "blaze/pre-index",
-            &encode(&Vec::<(WorkName, Digest)>::new()),
+            &encode(&Vec::<(WorkName, Digest)>::new(), Global),
         ),
         inputs: [0; 32],
     }
@@ -439,7 +440,7 @@ fn import_using(
 
 /// A corrupted published manifest cannot authorize recompilation.
 fn published_packs(unit: &Unit, list: &[u8]) -> Result<Vec<PackRef>, Error> {
-    parse_list(list).map_err(|why| {
+    parse_list(list, Global).map_err(|why| {
         Error::Committed(format!(
             "unit {}: published pack list is not canonical: {why}",
             hex(&unit.spec)
@@ -789,7 +790,7 @@ fn execute(
 }
 
 fn mirror(config: &Config, unit: &Unit, packs: &[PackRef]) -> Result<(), Error> {
-    let expected = list_of(packs);
+    let expected = list_of(packs, Global);
     config.blobs.publish(&unit.spec, &expected)?;
     // A 412 is accepted only after the existing and proposed full outputs were
     // verified equal, even if their native pack partitions differ. Missing or
@@ -1289,7 +1290,7 @@ mod tests {
             format: blaze_wire::DIST_PACK_FORMAT,
         };
         let second = PackRef { pack: [0x22; 32], ..first.clone() };
-        let canonical = list_of(&[first.clone(), second.clone()]);
+        let canonical = list_of(&[first.clone(), second.clone()], Global);
         assert!(published_packs(&unit, &canonical).is_ok());
         assert!(published_packs(&unit, b"").is_ok(), "an empty unit is canonical");
 
@@ -1297,8 +1298,8 @@ mod tests {
             canonical[..canonical.len() - 1].to_vec(),
             [canonical.as_slice(), b"extra\n"].concat(),
             [canonical.as_slice(), b"\n"].concat(),
-            list_of(&[second, first.clone()]),
-            list_of(&[first.clone(), first]),
+            list_of(&[second, first.clone()], Global),
+            list_of(&[first.clone(), first], Global),
             b"not-a-pack\n".to_vec(),
             vec![0xff],
         ]; // alloc: corrupted manifest fixtures

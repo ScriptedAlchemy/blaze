@@ -183,7 +183,7 @@ fn an_edited_function_misses_its_record_and_the_rest_are_found() {
 /// The control: with a key that leaves the body out, the same edit finds the record of the
 /// body before it, and the oracle says the build is another than the fresh one.
 #[test]
-fn a_key_that_leaves_an_input_out_is_caught() {
+fn the_oracle_catches_a_key_leaving_out_the_body() {
     let shelf = Shelf::new(&[1], true);
     let first = over(&shelf, &program());
     shelf.keep(&built(&first, Some(&shelf)).unwrap().puts);

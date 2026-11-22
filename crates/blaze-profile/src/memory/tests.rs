@@ -169,6 +169,35 @@ fn cell(column: &dyn Array, row: usize) -> Cell {
     }
 }
 
+fn answer_difference(ours: &[RecordBatch], theirs: &[RecordBatch]) -> Option<&'static str> {
+    let (ours, theirs) = (cells_of(ours), cells_of(theirs));
+    if ours.1 != theirs.1 {
+        Some("the rows")
+    } else if !theirs.1.is_empty() && ours.0 != theirs.0 {
+        Some("the columns")
+    } else {
+        None
+    }
+}
+
+#[test]
+fn the_oracle_catches_a_memory_answer_that_loses_a_double_bit_or_column() {
+    let batch = |name: &str, value: f64| {
+        let column: arrow_array::ArrayRef = std::sync::Arc::new(
+            arrow_array::Float64Array::from(vec![Some(value), None]),
+        );
+        vec![RecordBatch::try_from_iter([(name, column)]).unwrap()]
+    };
+    let value = f64::from_bits(1.0_f64.to_bits() + 1);
+    let expected = batch("gib", value);
+    assert_eq!(answer_difference(&batch("gib", value), &expected), None);
+    // The view comparison must notice one lost mantissa bit, even when rounded display
+    // would print the same value, and must distinguish a column with the wrong meaning.
+    assert_eq!(answer_difference(&batch("gib", 1.0), &expected), Some("the rows"));
+    assert_eq!(answer_difference(&batch("bytes", value), &expected), Some("the columns"));
+    assert_eq!(answer_difference(&[], &expected), Some("the rows"));
+}
+
 /// The fixture: build 1 with its own counters (two processes, a peak tied in value, derived
 /// `kept`, tags), tasks and their unit phases, give-backs of the build and of no build in its
 /// window, allocation samples with a tie in GiB; build 2 with only counters of no build in its
@@ -277,11 +306,9 @@ fn each_part_answered_without_duckdb_is_its_views_answer() {
         let sqls: Vec<&str> = sqls.iter().map(String::as_str).collect();
         let viewed = crate::sql::run_all(&duckdb, &dir, Scope::All, &sqls).unwrap();
         for ((part, ours), theirs) in native.iter().zip(&viewed) {
-            let (ours, theirs) = (cells_of(ours), cells_of(theirs));
             let at = format!("{} of build {build}, limit {limit:?}", part.view());
-            assert_eq!(ours.1, theirs.1, "{at}: the rows");
-            if !theirs.1.is_empty() {
-                assert_eq!(ours.0, theirs.0, "{at}: the columns");
+            assert_eq!(answer_difference(ours, theirs), None, "{at}");
+            if !cells_of(theirs).1.is_empty() {
                 nonempty += 1;
             }
         }

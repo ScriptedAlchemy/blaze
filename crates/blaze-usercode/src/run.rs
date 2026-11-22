@@ -1460,6 +1460,41 @@ mod tests {
         }
     }
 
+    fn moved_read_result(moved: bool) -> (Option<NotKept>, bool, bool) {
+        let mut sim = Sim::new(7, Faults::default());
+        let mut store = opened(&mut sim);
+        let data = Rc::new(RefCell::new([1; 32]));
+        let printed = Rc::new(RefCell::new(b"cargo:rustc-cfg=one\n".to_vec()));
+        let runs = Rc::new(RefCell::new(0));
+        script(&mut sim, data.clone(), printed.clone(), runs.clone());
+        let mut inputs = Fixed {
+            files: [("/ws/data".into(), [1; 32])].into(),
+            env: vec![("CC".into(), "cc".into())],
+        };
+        let first = go_moved(&mut sim, &mut store, &mut inputs, spec(Mode::Normal), moved).unwrap();
+        assert!(first.1, "the first run runs");
+        if let Some(not_kept) = &first.2 {
+            assert!(
+                not_kept.to_string().starts_with("/ws/data changed after the run began, so "),
+                "a run not kept names what moved: {not_kept}"
+            );
+        }
+        let again = go_with(&mut sim, &mut store, &mut inputs, spec(Mode::Normal)).unwrap();
+        // Kept by the run just made in either case: one result, and a verify of a rerun
+        // that gives otherwise under a moved read says no difference.
+        *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
+        let verified = go_moved(&mut sim, &mut store, &mut inputs, spec(Mode::Verify), moved);
+        let compared = match verified {
+            Ok((_, _, Some(NotKept::Moved(why)))) => {
+                assert_eq!(why, data_moved());
+                false
+            }
+            Err(RunError::Differs { .. }) => true,
+            other => panic!("the changed output was neither refused nor compared: {other:?}"),
+        };
+        (first.2, again.1, compared)
+    }
+
     /// The invariant: a run whose reads can have changed after it began (its trace is hashed
     /// as it ends) is kept under no key, so the next run with the same inputs runs it again
     /// rather than reuse a result for bytes it may never have read; and in verify mode it is
@@ -1467,38 +1502,16 @@ mod tests {
     /// control: the same runs with nothing moved are kept, reused, and their difference said.
     #[test]
     fn a_run_whose_reads_moved_after_it_began_is_kept_under_no_key() {
-        for moved in [true, false] {
-            let mut sim = Sim::new(7, Faults::default());
-            let mut store = opened(&mut sim);
-            let data = Rc::new(RefCell::new([1; 32]));
-            let printed = Rc::new(RefCell::new(b"cargo:rustc-cfg=one\n".to_vec()));
-            let runs = Rc::new(RefCell::new(0));
-            script(&mut sim, data.clone(), printed.clone(), runs.clone());
-            let mut inputs = Fixed {
-                files: [("/ws/data".into(), [1; 32])].into(),
-                env: vec![("CC".into(), "cc".into())],
-            };
-            let first =
-                go_moved(&mut sim, &mut store, &mut inputs, spec(Mode::Normal), moved).unwrap();
-            assert!(first.1, "the first run runs");
-            assert_eq!(first.2, moved.then(|| NotKept::Moved(data_moved())), "moved: {moved}");
-            if let Some(not_kept) = &first.2 {
-                assert!(
-                    not_kept.to_string().starts_with("/ws/data changed after the run began, so "),
-                    "a run not kept names what moved: {not_kept}"
-                );
-            }
-            let again = go_with(&mut sim, &mut store, &mut inputs, spec(Mode::Normal)).unwrap();
-            assert_eq!(again.1, moved, "a run kept under no key runs again; moved: {moved}");
-            // Kept by the run just made in either case: one result, and a verify of a rerun
-            // that gives otherwise under a moved read says no difference.
-            *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
-            let verified = go_moved(&mut sim, &mut store, &mut inputs, spec(Mode::Verify), moved);
-            match moved {
-                true => assert_eq!(verified.unwrap().2, Some(NotKept::Moved(data_moved()))),
-                false => assert!(matches!(verified, Err(RunError::Differs { .. })), "{verified:?}"),
-            }
-        }
+        assert_eq!(moved_read_result(true), (Some(NotKept::Moved(data_moved())), true, false));
+    }
+
+    #[test]
+    fn the_oracle_catches_a_moved_read_reported_as_unchanged() {
+        let want = (Some(NotKept::Moved(data_moved())), true, false);
+        assert_eq!(moved_read_result(true), want);
+        let lost_mark = moved_read_result(false);
+        assert_eq!(lost_mark, (None, false, true), "kept, reused, and its differing output compared");
+        assert_ne!(lost_mark, want);
     }
 
     #[test]

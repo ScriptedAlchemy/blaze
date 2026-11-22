@@ -1818,6 +1818,18 @@ fn relisted_by_changed_files(vfs: &Vfs, from: ContentId, to: ContentId) -> Vec<S
     out
 }
 
+#[test]
+fn the_oracle_catches_relisting_only_changed_files_parents() {
+    let mut vfs = new_vfs();
+    let from = vfs.empty();
+    let to = vfs.commit("h", from, &[write("src/deep/a.rs", "a")]).unwrap().root;
+    let expected = relisted_model(&vfs, from, to);
+    assert_eq!(expected, ["", "src", "src/deep"]);
+    assert_eq!(vfs.relisted(from, to), expected);
+    // The previous rule sees the file's own parent and misses both directories above it.
+    assert_ne!(relisted_by_changed_files(&vfs, from, to), expected);
+}
+
 /// Whether `path` is a directory (`Some(true)`), a file (`Some(false)`) or nothing in `root`.
 fn kind_at(vfs: &Vfs, root: ContentId, path: &str) -> Option<bool> {
     let reader = vfs.reader();

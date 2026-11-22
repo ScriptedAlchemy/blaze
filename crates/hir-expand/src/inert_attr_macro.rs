@@ -42,6 +42,17 @@ mod tests {
         INERT_ATTRIBUTES.iter().rposition(|it| Symbol::intern(it.name) == *name)
     }
 
+    fn rows_match(lookup: impl Fn(&Symbol) -> Option<usize>) -> Result<(), &'static str> {
+        for (at, attr) in INERT_ATTRIBUTES.iter().enumerate() {
+            if lookup(&Symbol::intern(attr.name)) != Some(at)
+                || lookup(&Symbol::intern(&attr.name.to_owned())) != Some(at)
+            {
+                return Err(attr.name);
+            }
+        }
+        Ok(())
+    }
+
     /// The invariant: the lookup by symbol and the table's lookup by text
     /// (`syntax::builtin_attrs::find`) give the same row for every name of the table.
     #[test]
@@ -50,10 +61,18 @@ mod tests {
             let name = Symbol::intern(attr.name);
             let declared = INERT_ATTRIBUTE_SYMBOLS[at];
             assert_eq!(name.declared_index(), Some(declared as u16), "{}", attr.name);
-            assert_eq!(find_builtin_attr_idx(&name), Some(at), "{}", attr.name);
-            assert_eq!(find_builtin_attr_idx(&Symbol::intern(&attr.name.to_owned())), Some(at));
             assert_eq!(syntax::builtin_attrs::find(attr.name), Some(at), "{}", attr.name);
         }
+        assert_eq!(rows_match(find_builtin_attr_idx), Ok(()));
+    }
+
+    #[test]
+    fn the_oracle_catches_symbol_rows_shifted_by_one() {
+        assert_eq!(rows_match(find_builtin_attr_idx), Ok(()));
+        let shifted = |name: &Symbol| {
+            find_builtin_attr_idx(name).map(|at| (at + 1) % INERT_ATTRIBUTES.len())
+        };
+        assert_eq!(rows_match(shifted), Err(INERT_ATTRIBUTES[0].name));
     }
 
     #[test]

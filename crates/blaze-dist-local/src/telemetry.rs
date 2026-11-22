@@ -2,13 +2,15 @@
 //! locked append so processes sharing BLAZE_DIST_EVENTS cannot interleave JSON lines.
 
 use std::fs::{File, OpenOptions, TryLockError};
+use std::alloc::Global;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 /// Render a field through the existing wire JSON renderer, including string escaping.
 pub fn json<T: blaze_wire::Wire>(value: &T) -> String {
     let mut out = String::new();
-    blaze_wire::json::render(value, &mut out);
+    blaze_wire::json::render(value, &mut out, Global)
+        .expect("formatting into a string cannot fail");
     out
 }
 

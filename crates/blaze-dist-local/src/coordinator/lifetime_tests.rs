@@ -175,12 +175,15 @@ fn scenario(queued_at: u64, extension: u64, first_read: u64, plant: Plant) -> Re
     let events = sim.core.jobs.execution(execution).unwrap().events(0).to_vec();
     if matches!(plant, Plant::LostReplayIdentity) {
         sim.core.sessions.get_mut(&owner).unwrap().last.as_mut().unwrap().reply =
-            encode(&ServerFrame::Response(Response {
-                epoch: sim.core.epoch,
-                session: watcher,
-                sequence: pending.request.sequence,
-                answer: pending.answer.clone(),
-            }));
+            encode(
+                &ServerFrame::Response(Response {
+                    epoch: sim.core.epoch,
+                    session: watcher,
+                    sequence: pending.request.sequence,
+                    answer: pending.answer.clone(),
+                }),
+                Global,
+            );
     }
     let (replayed, effects) = sim.core.request(sim.now, &pending.request).unwrap();
     if replayed != pending.bytes || !effects.is_empty()
@@ -194,7 +197,7 @@ fn scenario(queued_at: u64, extension: u64, first_read: u64, plant: Plant) -> Re
     };
     if matches!(plant, Plant::ReusedRequestIdentity) {
         sim.core.sessions.get_mut(&owner).unwrap().last.as_mut().unwrap().request =
-            encode(&ClientFrame::Request(conflicting.clone()));
+            encode(&ClientFrame::Request(conflicting.clone()), Global);
     }
     if sim.core.request(sim.now, &conflicting).is_ok() {
         return Err("a reused replay identity accepted different request bytes".into());

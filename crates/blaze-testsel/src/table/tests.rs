@@ -62,6 +62,27 @@ fn a_table_that_is_not_one_is_refused() {
     );
 }
 
+fn linked_image() -> Image {
+    let linked = Table { lineage: [4; 16], generation: 2, slots: 70 };
+    let fns = vec![version(0, 0), version(1, 0), version(2, 0)];
+    Image::new(fns, vec![2, 0, 1], ContentId::default(), linked).unwrap()
+}
+
+fn region(of: &Table, set: &[u32]) -> Record {
+    use crate::record::{HEADER, header, mark_armed};
+    let mut bytes = header(of.slots).to_vec();
+    bytes.resize(HEADER + of.slots as usize, 0);
+    for &slot in set {
+        bytes[HEADER + slot as usize] = 1;
+    }
+    assert!(mark_armed(&mut bytes));
+    Record::of_region(&bytes, *of, Ok(()))
+}
+
+fn refuses_other_table(image: &Image, record: &Record, from: Table) -> bool {
+    image.of_record(record) == Some(Err(TableError::OtherBinary { record: from, table: image.table() }))
+}
+
 /// The invariant: a record is read against a binary's table only when the jump table it
 /// names (what the binary's runtime said) is the one the table's link made, by identity. A
 /// record of that table reads, a slot of it the link has not given out included as no
@@ -71,23 +92,12 @@ fn a_table_that_is_not_one_is_refused() {
 /// refused before a slot is read.
 #[test]
 fn a_record_is_read_only_against_the_table_it_names() {
-    use crate::record::{HEADER, header, mark_armed};
     // A link that gave out 3 slots of a jump table of 70, its capacity.
-    let linked = Table { lineage: [4; 16], generation: 2, slots: 70 };
-    let fns = vec![version(0, 0), version(1, 0), version(2, 0)];
-    let image = Image::new(fns, vec![2, 0, 1], ContentId::default(), linked).unwrap();
+    let image = linked_image();
+    let linked = image.table();
     assert_eq!((image.slots(), image.table()), (3, linked));
     // A region as the server maps it and the runtime arms it: a byte for each of the
     // table's slots, slot 1 called (and, in the second, slot 5, which the link never gave).
-    let region = |of: &Table, set: &[u32]| {
-        let mut bytes = header(of.slots).to_vec();
-        bytes.resize(HEADER + of.slots as usize, 0);
-        for &slot in set {
-            bytes[HEADER + slot as usize] = 1;
-        }
-        assert!(mark_armed(&mut bytes));
-        Record::of_region(&bytes, *of, Ok(()))
-    };
     let record = region(&linked, &[1]);
     assert_eq!(record, Record::Complete { table: linked, hits: vec![1] });
     assert_eq!(image.of_record(&record), Some(Ok(Set::of(image.unlogged(), vec![version(0, 0)]))));
@@ -100,15 +110,30 @@ fn a_record_is_read_only_against_the_table_it_names() {
         Table { lineage: [5; 16], ..linked },
         Table { slots: 3, ..linked },
     ] {
-        assert_eq!(
-            image.of_record(&region(&other, &[1])),
-            Some(Err(TableError::OtherBinary { record: other, table: linked })),
-            "{other:?}"
-        );
+        assert!(refuses_other_table(&image, &region(&other, &[1]), other), "{other:?}");
     }
     let said = TableError::OtherBinary { record: Table { generation: 3, ..linked }, table: linked };
     let said = said.to_string();
     assert!(said.contains("generation 3 of 70 slots") && said.contains("generation 2 of 70"), "{said}");
+}
+
+#[test]
+fn the_oracle_catches_a_record_relabelled_as_the_current_table() {
+    let image = linked_image();
+    let linked = image.table();
+    for other in [
+        Table { generation: 3, ..linked },
+        Table { lineage: [5; 16], ..linked },
+        Table { slots: 3, ..linked },
+    ] {
+        let mut record = region(&other, &[1]);
+        assert!(refuses_other_table(&image, &record, other));
+        let Record::Complete { table, .. } = &mut record else { panic!("a whole region") };
+        // Plant the loss of the runtime's identity before interpreting its hits.
+        *table = linked;
+        assert!(!refuses_other_table(&image, &record, other), "{other:?}");
+        assert!(matches!(image.of_record(&record), Some(Ok(_))));
+    }
 }
 
 #[test]
@@ -176,47 +201,75 @@ fn sets_are_sorted_and_the_reached_set_leaves_out_what_has_no_slot() {
     assert_eq!(image.reached(&[9, 8, 7, 4, 0, 4]).unwrap(), set);
 }
 
-/// The invariant: `changed_since` names exactly the functions whose bound code differs between
-/// two binaries (gone and new ones included), and `UNLOGGED` exactly when the unlogged hash
-/// moved; the program state is equal exactly when nothing is named.
-#[test]
-fn changes_since_a_state_are_the_functions_whose_bound_moved() {
+fn changes(now: &Image, then: &Image) -> Vec<FnId> {
+    let mut out = Vec::new_in(std::alloc::Global);
+    now.changed_since(then, &mut out);
+    let mut out = out.to_vec();
+    out.sort();
+    out
+}
+
+fn change_problem(changed: impl Fn(&Image, &Image) -> Vec<FnId>) -> Option<&'static str> {
     let image = |versions: &[Option<u32>]| {
         let fns: Vec<Version> =
             versions.iter().enumerate().filter_map(|(n, v)| v.map(|v| version(n as u32, v))).collect();
         let slots = (fns.len() as u32).min(4);
         Image::new(fns, (0..slots).collect(), ContentId::default(), jump(4)).unwrap()
     };
-    let changes = |now: &Image, then: &Image| {
-        let mut out = Vec::new_in(std::alloc::Global);
-        now.changed_since(then, &mut out);
-        let mut out = out.to_vec();
-        out.sort();
-        out
-    };
     let before = image(&[Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)]);
-    assert_eq!(changes(&before, &before), Vec::new());
+    if !changed(&before, &before).is_empty() {
+        return Some("a state compared with itself changed");
+    }
     let same = image(&[Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)]);
     assert_eq!(same.state(), before.state());
 
     let edited = image(&[Some(0), Some(1), Some(0), Some(0), Some(0), Some(0)]);
-    assert_eq!(changes(&edited, &before), vec![id(1)]);
+    if changed(&edited, &before) != vec![id(1)] {
+        return Some("the bound edit did not name exactly its function");
+    }
     assert_ne!(edited.state(), before.state());
     // An undone edit is the old state.
-    assert_eq!(changes(&before, &edited), vec![id(1)]);
+    if changed(&before, &edited) != vec![id(1)] {
+        return Some("the undone edit did not name exactly its function");
+    }
 
     // Function 1 gone and 6 new: the first four functions have slots, so 4 moves from the
     // unlogged code to a slot, and the unlogged hash moves too.
     let gone_and_new = image(&[Some(0), None, Some(0), Some(0), Some(0), Some(0), Some(0)]);
     let mut want = vec![id(1), id(6), crate::ask::UNLOGGED];
     want.sort();
-    assert_eq!(changes(&gone_and_new, &before), want);
+    if changed(&gone_and_new, &before) != want {
+        return Some("the gone and new functions were not both named");
+    }
 
     // Function 5 has no slot: its edit moves the unlogged hash too.
     let unlogged = image(&[Some(0), Some(0), Some(0), Some(0), Some(0), Some(1)]);
     let mut want = vec![id(5), crate::ask::UNLOGGED];
     want.sort();
-    assert_eq!(changes(&unlogged, &before), want);
+    if changed(&unlogged, &before) != want {
+        return Some("the unlogged edit did not move both its function and UNLOGGED");
+    }
+    None
+}
+
+/// The invariant: `changed_since` names exactly the functions whose bound code differs between
+/// two binaries (gone and new ones included), and `UNLOGGED` exactly when the unlogged hash
+/// moved; the program state is equal exactly when nothing is named.
+#[test]
+fn changes_since_a_state_are_the_functions_whose_bound_moved() {
+    assert_eq!(change_problem(changes), None);
+}
+
+#[test]
+fn the_oracle_catches_a_changes_list_that_forgets_deleted_functions() {
+    assert_eq!(change_problem(changes), None);
+    let missing_deletions = change_problem(|now, then| {
+        changes(now, then)
+            .into_iter()
+            .filter(|id| *id == crate::ask::UNLOGGED || now.bound_of(id).is_some())
+            .collect()
+    });
+    assert_eq!(missing_deletions, Some("the gone and new functions were not both named"));
 }
 
 /// The unlogged hash as it was first written: 64-byte compares, a call per identity and bound.

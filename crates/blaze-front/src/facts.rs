@@ -444,18 +444,35 @@ mod tests {
     use super::*;
     use crate::body::exports::Export;
 
-    /// Every query kind of lane items and of blaze-item-hash has exactly one rule: a kind added
-    /// to either crate fails here until it is mapped.
-    #[test]
-    fn every_kind_has_one_rule() {
+    #[derive(Debug, PartialEq, Eq)]
+    enum RuleCount {
+        Kind { code: u16, count: usize },
+        Total { expected: usize, actual: usize },
+    }
+
+    fn kinds_have_one_rule(rules: &[Rule]) -> Result<(), RuleCount> {
         let lane: u16 = 0x101a - 0x1000;
-        // blaze-item-hash's own list of its kinds, read from it, so a kind it adds fails here
-        // unmapped (its `RANGE` is a reservation, wider than the kinds it gives).
         let expected = (0..lane).map(|it| 0x1000 + it).chain(own::ALL.iter().map(|kind| kind.0));
         for code in expected {
-            assert_eq!(RULES.iter().filter(|rule| rule.code == code).count(), 1, "{code:#06x}");
+            let count = rules.iter().filter(|rule| rule.code == code).count();
+            if count != 1 {
+                return Err(RuleCount::Kind { code, count });
+            }
         }
-        assert_eq!(RULES.len(), usize::from(lane) + own::ALL.len());
+        let expected = usize::from(lane) + own::ALL.len();
+        if rules.len() != expected {
+            return Err(RuleCount::Total { expected, actual: rules.len() });
+        }
+        Ok(())
+    }
+
+    /// The invariant: every query kind of lane items and of blaze-item-hash has exactly one
+    /// rule: a kind added to either crate fails here until it is mapped.
+    #[test]
+    fn every_kind_has_one_rule() {
+        // blaze-item-hash's own list of its kinds, read from it, so a kind it adds fails here
+        // unmapped (its `RANGE` is a reservation, wider than the kinds it gives).
+        assert_eq!(kinds_have_one_rule(RULES), Ok(()));
         // Every fact kind byte is its own kind back; the retired byte (42, once `BlockScope`)
         // and the bytes past the last are none.
         for byte in (1..=46u8).filter(|&byte| byte != 42) {
@@ -499,9 +516,18 @@ mod tests {
 
     /// The control of [`every_kind_has_one_rule`]: a table missing one kind is caught.
     #[test]
-    fn a_missing_rule_is_caught() {
-        let without: Vec<u16> = RULES.iter().skip(1).map(|rule| rule.code).collect();
-        assert!(!without.contains(&items::SIGNATURE.0));
+    fn the_oracle_catches_a_missing_fact_rule() {
+        assert_eq!(kinds_have_one_rule(RULES), Ok(()));
+        assert_eq!(
+            kinds_have_one_rule(&RULES[1..]),
+            Err(RuleCount::Kind { code: items::SIGNATURE.0, count: 0 })
+        );
+    }
+
+    fn made_id_matches_export(subject: &ContentId, export: Export, read: ContentId) -> bool {
+        read == export.id(subject)
+            && record::route(&read) == Ok(record::Route::Made(Owner::of_subject(subject)))
+            && record::maker_row_of(&read) == Some(maker_id(subject))
     }
 
     /// The invariant: a reader's id of a fact a body makes (a const's value, an opaque type's
@@ -516,11 +542,9 @@ mod tests {
         let owner = Owner::of_subject(&subject);
         for (code, export) in [(items::CONST_VALUE, Export::ConstValue), (items::HIDDEN_TYPES, Export::HiddenType)] {
             let read = id_of(&FactRef { kind: code, subject, object: FactObject::None }).expect("an id");
-            assert_eq!(read, export.id(&subject), "{code:?}");
-            assert_eq!(record::route(&read), Ok(record::Route::Made(owner)), "{code:?}");
             // The driver forms the subject's maker row from the made fact's id alone: the
             // surface's row ([`maker_id`]), a row of the owner's surface.
-            assert_eq!(record::maker_row_of(&read), Some(maker_id(&subject)), "{code:?}");
+            assert!(made_id_matches_export(&subject, export, read), "{code:?}: {read:?}");
         }
         assert_eq!(record::route(&maker_id(&subject)), Ok(record::Route::Surface(owner)));
         // Control: another subject of the crate, another maker row.
@@ -535,5 +559,24 @@ mod tests {
         let a = id_of(&FactRef { kind: items::FIELD, subject, object: FactObject::Field(0) }).expect("an id");
         let b = id_of(&FactRef { kind: items::FIELD, subject, object: FactObject::Field(1) }).expect("an id");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn the_oracle_catches_a_made_fact_routed_to_the_surface() {
+        let subject = ContentId([7; 32]);
+        for (code, export) in [(items::CONST_VALUE, Export::ConstValue), (items::HIDDEN_TYPES, Export::HiddenType)] {
+            let read = id_of(&FactRef { kind: code, subject, object: FactObject::None }).unwrap();
+            assert!(made_id_matches_export(&subject, export, read));
+            // Plant the wrong kind in the actual id constructor: an item row routes to the
+            // surface even though the body exports the value into its made table.
+            let misplaced = record::fact(
+                FactKind::Signature,
+                Owner::of_subject(&subject),
+                code.0,
+                &StableId(subject),
+                b"",
+            );
+            assert!(!made_id_matches_export(&subject, export, misplaced), "{code:?}");
+        }
     }
 }

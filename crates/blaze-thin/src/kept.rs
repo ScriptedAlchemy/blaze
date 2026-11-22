@@ -40,15 +40,8 @@ pub fn keep(state: &std::path::Path, kept: &Kept) -> Result<std::path::PathBuf, 
 mod tests {
     use super::*;
 
-    /// The invariant: what [`keep`] writes is one whole file under the record's name, which
-    /// reads back as the record, and no `.part` is left. Control: the bytes read back are
-    /// compared whole, so a record written without its rename (only `<pid>.part`) fails the
-    /// read of `<pid>`.
-    #[test]
-    fn a_kept_record_is_one_whole_file_and_no_part() {
-        let held = blaze_core::temp::TempDir::for_test("blaze-thin-kept-");
-        let state = held.path();
-        let record = Kept {
+    fn record() -> Kept {
+        Kept {
             pid: 41,
             started_ns: 10,
             ended_ns: 90,
@@ -57,10 +50,42 @@ mod tests {
             workspace: "/w".to_owned(),
             command: "run".to_owned(),
             timed: vec![blaze_api::Timed { name: crate::talk::SOLO_CHECK.to_owned(), start_ns: 20, end_ns: 60 }],
-        };
+        }
+    }
+
+    fn kept_whole(state: &Path, record: &Kept) -> bool {
+        let (name, part) = names(record.pid);
+        let dir = state.join(DIR);
+        let Ok(bytes) = std::fs::read(dir.join(name)) else { return false };
+        Kept::read(&bytes).as_ref() == Ok(record) && !dir.join(part).exists()
+    }
+
+    /// The invariant: what [`keep`] writes is one whole file under the record's name, which
+    /// reads back as the record, and no `.part` is left. Control: the bytes read back are
+    /// compared whole, so a record written without its rename (only `<pid>.part`) fails the
+    /// read of `<pid>`.
+    #[test]
+    fn a_kept_record_is_one_whole_file_and_no_part() {
+        let held = blaze_core::temp::TempDir::for_test("blaze-thin-kept-");
+        let state = held.path();
+        let record = record();
         let path = keep(&state, &record).unwrap();
         assert_eq!(path, state.join(DIR).join("41"));
-        assert_eq!(Kept::read(&std::fs::read(&path).unwrap()), Ok(record));
-        assert!(!state.join(DIR).join("41.part").exists());
+        assert!(kept_whole(&state, &record));
+    }
+
+    #[test]
+    fn the_oracle_catches_a_kept_record_without_its_rename() {
+        let held = blaze_core::temp::TempDir::for_test("blaze-thin-kept-part-");
+        let state = held.path();
+        let record = record();
+        let dir = state.join(DIR);
+        std::fs::create_dir(&dir).unwrap();
+        let (name, part) = names(record.pid);
+        let part = dir.join(part);
+        std::fs::write(&part, record.write().unwrap()).unwrap();
+        assert!(!kept_whole(&state, &record), "the bytes are still only in the part file");
+        std::fs::rename(part, dir.join(name)).unwrap();
+        assert!(kept_whole(&state, &record));
     }
 }

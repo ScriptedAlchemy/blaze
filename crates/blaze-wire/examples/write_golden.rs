@@ -17,7 +17,9 @@ fn main() -> std::io::Result<()> {
     let mut written = 0;
     for entry in blaze_wire::vectors::every() {
         let vector = (entry.vector)(1);
-        std::fs::write(root.join(format!("{}.txt", entry.name)), vector.to_golden())?;
+        let mut file = std::io::BufWriter::new(std::fs::File::create(root.join(format!("{}.txt", entry.name)))?);
+        vector.to_golden(&mut file)?;
+        std::io::Write::flush(&mut file)?;
         written += 1;
     }
     eprintln!("wrote {written} golden vectors to {}", root.display());

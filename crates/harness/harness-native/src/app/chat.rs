@@ -23,6 +23,7 @@ use harness_native_ui_text_api::{MarkdownText, Text};
 use model::chat::group::{self, Act, Grouped, Piece};
 use model::chat::{Detail, Item, Transcript};
 use serde_json::Value;
+use std::alloc::Global;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -2561,7 +2562,10 @@ impl App {
             None
         } else {
             self.chat.borrow().get(&sid).filter(|st| st.images.is_empty()).and_then(|st| match harness_learn::intent::of(&st.draft.text) {
-                harness_learn::Intent::Learn { topic } => Some(topic),
+                harness_learn::Intent::Learn { topic } => {
+                    let bytes = topic.as_bytes().to_vec_in(Global);
+                    Some(String::from_utf8(bytes).expect("a borrowed learning topic is UTF-8"))
+                }
                 harness_learn::Intent::Do => None,
             })
         };

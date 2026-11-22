@@ -261,7 +261,7 @@ macro_rules! digest_newtype {
         pub struct $name(pub Digest);
 
         impl Wire for $name {
-            fn encode(&self, e: &mut crate::Encoder) {
+            fn encode<A: std::alloc::Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
                 e.bytes(&self.0);
             }
 
@@ -278,8 +278,8 @@ macro_rules! digest_newtype {
 
         impl $name {
             /// The digest of one input value, under this type's domain separation.
-            pub fn of(value: &$input) -> $name {
-                $name(crate::digest_of_encoded::<Self>(&crate::encode(value)))
+            pub fn of<A: std::alloc::Allocator + Clone>(value: &$input, alloc: A) -> $name {
+                $name(crate::digest_of_encoded::<Self>(&crate::encode(value, alloc)))
             }
         }
 
@@ -298,7 +298,7 @@ macro_rules! digest_newtype {
 pub struct EntryKey(pub Digest);
 
 impl Wire for EntryKey {
-    fn encode(&self, e: &mut crate::Encoder) {
+    fn encode<A: std::alloc::Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
         e.bytes(&self.0);
     }
 
@@ -335,7 +335,7 @@ digest_newtype! {
 pub struct ExecutionId(pub u64);
 
 impl Wire for ExecutionId {
-    fn encode(&self, e: &mut crate::Encoder) {
+    fn encode<A: std::alloc::Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
         e.uint(self.0);
     }
 
@@ -359,7 +359,7 @@ impl crate::vectors::Sample for ExecutionId {
 pub struct Attempt(pub u32);
 
 impl Wire for Attempt {
-    fn encode(&self, e: &mut crate::Encoder) {
+    fn encode<A: std::alloc::Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
         e.uint(u64::from(self.0));
     }
 

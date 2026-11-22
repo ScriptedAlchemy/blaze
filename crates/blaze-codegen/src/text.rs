@@ -141,7 +141,7 @@ mod tests {
     /// compose to the bytes alone, so the names came from the relocations; and a hole whose
     /// relocation has an addend is refused by name.
     #[test]
-    fn a_recipe_composes_to_its_literals_and_the_files_named() {
+    fn the_oracle_catches_a_recipe_with_missing_or_offset_relocations() {
         let parts = [
             TextPart::Bytes(b"at "),
             TextPart::FileOf(span(0)),

@@ -284,7 +284,7 @@ fn a_busy_lease_answer_waits_and_asks_again() {
     );
     let id = sent(&effects);
     effects.clear();
-    let busy = WireError::new(ErrorCode::Busy, "grant-retention-capacity").retry_after(500);
+    let busy = WireError::new(ErrorCode::Busy, format_args!("grant-retention-capacity")).retry_after(500);
     holder.step(2, Event::Reply { id, reply: Reply::Lease(Err(busy)) }, &mut effects);
     assert!(!holder.is_stopped(), "{effects:?}");
     assert!(effects.is_empty(), "{effects:?}");

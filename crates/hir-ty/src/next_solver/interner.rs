@@ -6607,7 +6607,7 @@ pub(crate) mod table {
         /// release, which frees them anyway. Control: a release that leaves the retired
         /// tables (`plant::KEEPS_RETIRED`) is caught by the oracle.
         #[test]
-        fn a_release_leaves_the_tables_as_a_fresh_process() {
+        fn the_oracle_catches_retired_tables_left_after_release() {
             static ROWS: Rows<u32> = Rows::new("released rows", 1 << 20);
             static LISTS: Lists<u32> = Lists::new("released lists");
             static VALUES: Values<String> = Values::new("released values");

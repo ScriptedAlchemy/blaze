@@ -242,6 +242,21 @@ mod tests {
         out.write_str("the_query(the key)").expect("a name is written");
     }
 
+    fn refusal_from_another_task(alone: &Alone, key: FlightKey) -> Option<String> {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        alone.single(key, &named, &mut || Hold::End);
+                    }))
+                    .err()
+                    .and_then(|payload| payload.downcast_ref::<String>().cloned())
+                })
+                .join()
+                .expect("the refusal is caught on its thread")
+        })
+    }
+
     /// The invariant: on [`Alone`] a key's holder asking it again is `Mine`, and another task
     /// (here another thread, one job of the scheduler for its life) asking it while it is held
     /// is refused with a panic that names the key, the flight and what to take instead; never
@@ -256,18 +271,7 @@ mod tests {
             // The holder again: a cycle on its own stack.
             inner = Some(matches!(alone.single(key, &named, &mut || Hold::End), Flown::Mine));
             // Another task, while this one holds the key.
-            refused = Some(std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        catch_unwind(AssertUnwindSafe(|| {
-                            alone.single(key, &named, &mut || Hold::End);
-                        }))
-                        .err()
-                        .and_then(|payload| payload.downcast_ref::<String>().cloned())
-                    })
-                    .join()
-                    .expect("the refusal is caught on its thread")
-            }));
+            refused = Some(refusal_from_another_task(&alone, key));
             Hold::End
         });
         assert!(matches!(flown, Flown::Ran), "the holder ran its key: {flown:?}");
@@ -284,5 +288,18 @@ mod tests {
                 .expect("an ask of a free key does not panic")
         });
         assert!(after, "another task runs a key nobody holds");
+    }
+
+    #[test]
+    fn the_oracle_catches_a_retained_flight_released_too_soon() {
+        let alone = Alone::new();
+        let key = FlightKey([8; 32]);
+        let held = alone.single(key, &named, &mut || Hold::Keep);
+        assert!(matches!(&held, Flown::Kept(_)));
+        assert!(refusal_from_another_task(&alone, key).is_some());
+        // Plant a dropped retention token while the caller still regards the work as held.
+        // The same refusal observer now finds that another task can run the key.
+        drop(held);
+        assert_eq!(refusal_from_another_task(&alone, key), None);
     }
 }

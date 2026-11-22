@@ -25,6 +25,10 @@ fn output_bytes(store: &Store) -> u64 {
     store.census().kinds[Kind::Output.code() as usize].stored
 }
 
+fn has_one_home_and_no_packed_copy(store: &Store, len: u64) -> bool {
+    output_bytes(store) == 0 && store.census().whole_files == (1, len)
+}
+
 /// The invariant: once a placed output's file is synced and the commit after it is durable,
 /// its bytes are on disk once: the file, which the census counts as a whole file of the
 /// store's, and no bytes of it in a pack; the record reads the value through the file. The
@@ -36,13 +40,20 @@ fn a_placed_outputs_bytes_are_on_disk_once_after_its_file_is_made_its_home() {
         let (store, out, file) = homed(&mut sim, PlacePlant::None, seed);
         let len = out.len() as u64;
         assert!(sim.exists(&file));
+        assert!(has_one_home_and_no_packed_copy(&store, len), "seed {seed}");
         assert_eq!(output_bytes(&store), 0, "seed {seed}: the pack keeps no byte of it");
         assert_eq!(store.census().whole_files, (1, len), "seed {seed}: the file is its home");
         assert_eq!(bytes_of(&store, &key(1)).unwrap(), out, "seed {seed}: read through the file");
         assert_eq!(store.problems(), &[] as &[String]);
+    }
+}
 
+#[test]
+fn the_oracle_catches_a_home_also_kept_in_its_pack() {
+    for seed in 0..8 {
         let mut sim = Sim::new(500 + seed, quiet());
         let (store, out, _) = homed(&mut sim, PlacePlant::HomesNothing, seed);
+        assert!(!has_one_home_and_no_packed_copy(&store, out.len() as u64), "seed {seed}: missed the packed copy");
         assert!(
             output_bytes(&store) >= out.len() as u64 / 2,
             "seed {seed}: the control keeps the bytes in the pack as well"

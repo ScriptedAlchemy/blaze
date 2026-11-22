@@ -172,7 +172,7 @@ impl World {
 fn scenario(seed: u64, elapsed: u64, replacement_first: bool, rewrite: bool) -> Result<(), String> {
     let mut world = World::new(seed);
     let mut held = world.result(&world.helper.clone());
-    let captured = encode(&held);
+    let captured = encode(&held, Global);
     world.sim.advance(Duration::from_millis(elapsed));
     let expired = elapsed > 10;
     let replacement = expired.then(|| world.result(&world.lead.clone()));
@@ -186,7 +186,7 @@ fn scenario(seed: u64, elapsed: u64, replacement_first: bool, rewrite: bool) -> 
     if rewrite && let Some(command) = &replacement {
         held = command.clone();
     }
-    if encode(&held) != captured {
+    if encode(&held, Global) != captured {
         return Err("the gated carrier changed before submission".to_owned());
     }
     let answer = world.call(held);
@@ -232,7 +232,7 @@ fn a_capture_roundtrips_the_exact_command_and_actual_answer_and_is_claimed_once(
     let capture = gate.hold(&command).unwrap().unwrap();
     let saved = fs::read(directory.path().join("result.cbor")).unwrap();
     assert_eq!(decode::<Command>(&saved, &Limits::DOCUMENTED).unwrap(), command);
-    assert_eq!(saved, encode(&command));
+    assert_eq!(saved, encode(&command, Global));
     let answer = world.call(command.clone());
     assert!(matches!(answer, Answer::Result(_)), "{answer:?}");
     capture.answer(&answer).unwrap();

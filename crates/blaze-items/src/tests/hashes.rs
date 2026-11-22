@@ -180,7 +180,7 @@ fn g() -> u32 { f(1) }
 }
 
 /// The invariant: a signature that names another nominal type of the same shape (a newtype for
-/// another, a unit marker for another) moves its signature and interface hashes, as it changes
+/// another, a unit marker for another) moves its signature hash, as it changes
 /// what every caller of it type-checks against: `f(Meters(1))` is accepted with `f(_: Meters)`
 /// and rejected with `f(_: Feet)`. A body's stored inference, MIR and borrow check are checked
 /// by the callee's `Signature` fact, whose value is the signature hash
@@ -190,7 +190,7 @@ fn g() -> u32 { f(1) }
 /// types' layouts are name-free, which is right (what a compiled body does depends on a shape,
 /// never a name; which item it calls is bound by key beside its code), so codegen shares them.
 #[test]
-fn a_signature_naming_another_type_of_the_same_shape_moves_its_signature_hash() {
+fn the_oracle_catches_a_shape_hash_used_as_a_signature_hash() {
     let cases = [
         (
             "pub struct Meters(pub u32);\npub struct Feet(pub u32);\npub fn f(_x: Meters) {}\n",
@@ -205,15 +205,15 @@ fn a_signature_naming_another_type_of_the_same_shape_moves_its_signature_hash() 
             "pub struct Meters(pub u32);\npub struct Feet(pub u32);\npub fn f() -> Feet { Feet(1) }\n",
         ),
     ];
+    let change_seen = |before, after| before != after;
     for (before, after) in cases {
         let (mut db, file) = single(before);
         let f = item(&db, "f");
         let (signature, interface) = (signature_hash(&db, f).unwrap(), of(&db, "f").interface);
         edit(&mut db, file, after);
         let f = item(&db, "f");
-        assert_ne!(
-            signature_hash(&db, f).unwrap(),
-            signature,
+        assert!(
+            change_seen(signature_hash(&db, f).unwrap().0, signature.0),
             "`f`'s signature hash did not move when the type it names became another of the \
              same shape:\n{before}---\n{after}"
         );
@@ -221,6 +221,10 @@ fn a_signature_naming_another_type_of_the_same_shape_moves_its_signature_hash() 
             of(&db, "f").interface,
             interface,
             "`f`'s interface hash is name-free:\n{before}---\n{after}"
+        );
+        assert!(
+            !change_seen(of(&db, "f").interface.0, interface.0),
+            "using the actual name-free interface hash as a signature key must fail the change oracle"
         );
     }
     // A field's type, by its `Field` fact's value.

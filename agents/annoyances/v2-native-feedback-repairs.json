@@ -1,0 +1,12 @@
+{
+  "id": "v2-native-feedback-repairs",
+  "date": "2026-11-21",
+  "who": "GPT-6 Astra Pro",
+  "where": "native run 44982739668; Unix distributed integration tests, manifest configuration annotations and the budget work-directory selftest",
+  "what": "The first repair run passed the typed-error, domain and layout gates and 172 native tests across the independently executed groups. Expanding compilation exposed nine uses of Ack without its import and a retained test using the removed stdx NamedTempDir. A cold script-tool build also exposed a budget selftest that predicted no usable filesystem before the new cache base existed.",
+  "cause": "The earlier partial check compiled only library targets; the retained integration and manifest tests still named old interfaces. The work-directory selftest filtered candidates by isdir while production correctly creates missing bases before checking whether they support cloning.",
+  "class": "incomplete target coverage and an environment-dependent test oracle",
+  "prevention": "Keep all-target compilation and the expanded active-library groups in CI. Exercise both a newly created usable base and the case where every probe refuses, then observe real candidate filesystems after creating the candidate directories as the chooser does.",
+  "fix": "Imported the wire Ack type, switched the manifest test to blaze-core TempDir, and repaired the budget selftest's oracle without changing work-directory selection or its cloning requirement. Its deterministic controls check probe order, creation before probing, selection of the second candidate and named refusal of every candidate. Native scanner rows are retained from an isolated source snapshot as CI evidence; no source gate is relaxed.",
+  "state": "Budget selftest passes locally with the locked Python environment; repository ruff and pyright gates pass. Rust follow-ups and the new allocator/invariant controls await the next native run. The source compiler is still blocked by the upstream frontend reconstruction; these library tests do not establish a whole-compiler build."
+}

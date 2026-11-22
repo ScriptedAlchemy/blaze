@@ -411,15 +411,40 @@ mod tests {
     /// Recurses `depth` frames of 16 KiB each, writing every one, then suspends from the
     /// deepest.
     #[inline(never)]
-    fn deep(yielder: &Yielder<(), ()>, depth: usize) -> u8 {
+    fn deep(yielder: &Yielder<(), ()>, depth: usize, count: bool) -> u8 {
         let mut frame = [0u8; 16 << 10];
         std::hint::black_box(&mut frame).fill(depth as u8);
         if depth == 0 {
-            yielder.suspend(());
+            if count {
+                yielder.suspend(());
+            } else {
+                // Plant a suspend that bypasses the wrapper's depth observation.
+                yielder.0.suspend(());
+            }
             return frame[0];
         }
-        let below = deep(yielder, depth - 1);
+        let below = deep(yielder, depth - 1, count);
         std::hint::black_box(&frame)[100].wrapping_add(below)
+    }
+
+    fn held_at_suspend(frames: usize, count: bool) -> usize {
+        let stack = Stack::new(16 << 20).expect("a fiber stack");
+        let mut fiber: Stackful<(), ()> =
+            Stackful::new(stack, 0, move |yielder: &Yielder<(), ()>, ()| {
+                if frames == 0 {
+                    yielder.suspend(());
+                } else {
+                    std::hint::black_box(deep(yielder, frames, count));
+                }
+            });
+        assert!(matches!(fiber.resume(()), Resumed::Yield(())));
+        let held = fiber.1.region.held();
+        assert!(matches!(fiber.resume(()), Resumed::Return));
+        held
+    }
+
+    fn counted_depth(held: usize, at_least: usize, at_most: usize) -> bool {
+        (at_least..=at_most).contains(&held)
     }
 
     /// The invariant: a fiber's stack is in its tag's count from its start, by its standing
@@ -436,22 +461,19 @@ mod tests {
         for (frames, at_least, at_most) in
             [(DEPTH / (16 << 10), DEPTH, 16 << 20), (0, STANDING, STANDING)]
         {
-            let stack = Stack::new(16 << 20).expect("a fiber stack");
-            let mut fiber: Stackful<(), ()> =
-                Stackful::new(stack, 0, move |yielder: &Yielder<(), ()>, ()| {
-                if frames == 0 {
-                    yielder.suspend(());
-                } else {
-                    std::hint::black_box(deep(yielder, frames));
-                }
-            });
-            assert!(matches!(fiber.resume(()), Resumed::Yield(())));
-            let held = fiber.1.region.held();
+            let held = held_at_suspend(frames, true);
             assert!(
-                (at_least..=at_most).contains(&held),
+                counted_depth(held, at_least, at_most),
                 "{frames} frames deep, the stack's count is {held} B, not in {at_least}..={at_most}"
             );
-            assert!(matches!(fiber.resume(()), Resumed::Return));
         }
+    }
+
+    #[test]
+    fn the_oracle_catches_a_deep_suspend_that_does_not_count_its_stack() {
+        const DEPTH: usize = 2 << 20;
+        let held = held_at_suspend(DEPTH / (16 << 10), false);
+        assert_eq!(held, STANDING, "the unobserved deep frames were not counted");
+        assert!(!counted_depth(held, DEPTH, 16 << 20), "the depth oracle missed the omitted observation");
     }
 }

@@ -326,7 +326,7 @@ mod tests {
     /// The control (rule test-the-cause): with the record the same, taking `HOME` away is what
     /// moves the answer, and with `HOME` the same, changing the record moves nothing.
     #[test]
-    fn the_variable_is_what_overrides_the_record() {
+    fn the_oracle_catches_a_home_override_ignored() {
         let with = decide(env(&[("HOME", "/u")]), recorded);
         let without = decide(env(&[]), recorded);
         assert_ne!(with, without);

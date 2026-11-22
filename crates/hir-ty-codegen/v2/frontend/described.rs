@@ -1272,7 +1272,7 @@ pub fn x() {}
     /// is not a root. Its control: a naming of the home alone (the dependencies left out)
     /// is caught by renaming a dependency's root.
     #[test]
-    fn a_naming_moves_with_a_root_files_name_and_with_nothing_else() {
+    fn the_oracle_catches_a_naming_that_omits_dependency_roots() {
         let fixture: &'static fixture::Fixture = Box::leak(Box::new(fixture::db(CRATES)));
         let db = fixture.db();
         let all: Vec<Crate> = all_crates(db).iter().copied().collect();

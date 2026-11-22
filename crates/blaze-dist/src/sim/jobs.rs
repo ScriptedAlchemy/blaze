@@ -22,6 +22,7 @@
 //! - **progress**: every execution ends.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::alloc::Global;
 
 use blaze_wire::{
     Attempt, Digest, DoneEvent, ExecutionId, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome,
@@ -355,11 +356,14 @@ impl World {
                 !matches!(e.state(), ExecState::Ended(_))
                     && self.meta.get(&e.id).is_some_and(|(_, ns, _)| *ns == namespace)
                     && e.content
-                        == blaze_wire::JobContent::of(&blaze_wire::JobContentInput {
-                            unit: spec.unit,
-                            platform: spec.platform,
-                            namespace: namespace.clone(),
-                        })
+                        == blaze_wire::JobContent::of(
+                            &blaze_wire::JobContentInput {
+                                unit: spec.unit,
+                                platform: spec.platform,
+                                namespace: namespace.clone(),
+                            },
+                            Global,
+                        )
             })
             .map(|e| e.id);
         match answer {

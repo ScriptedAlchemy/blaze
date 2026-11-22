@@ -648,6 +648,26 @@ mod tests {
         assert_ne!(b.outer_mark(&db, upper), b.outer_mark(&db, lower));
     }
 
+    #[test]
+    fn the_oracle_catches_a_context_read_in_another_arena_without_translation() {
+        let (db, lower, upper) = two_crates();
+        let root = SyntaxContext::root(Edition::Edition2021);
+        let own = SyntaxContext::new(
+            &db, upper, call(upper, 2), Transparency::Transparent,
+            Edition::Edition2021, root, None, None,
+        );
+        let context = SyntaxContext::new(
+            &db, lower, call(lower, 2), Transparency::Opaque,
+            Edition::Edition2021, root, None, None,
+        );
+        let expected = context.outer_mark(&db, lower);
+        let translated = context.translate(&db, lower, upper);
+        assert_eq!(translated.outer_mark(&db, upper), expected);
+        // Plant an omitted translation: the same word is upper's own first context.
+        assert_eq!(context.outer_mark(&db, upper), own.outer_mark(&db, upper));
+        assert_ne!(context.outer_mark(&db, upper), expected);
+    }
+
     /// A word past every index an arena hands out panics when looked up instead of reading
     /// another table.
     #[test]

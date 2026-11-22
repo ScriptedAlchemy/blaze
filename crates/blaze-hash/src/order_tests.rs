@@ -34,6 +34,20 @@ unsafe impl Allocator for Counted<'_> {
     }
 }
 
+fn contents_agree(map: &IndexMap<u8, u32, Global>, model: &[(u8, u32)]) -> Result<(), String> {
+    // alloc: what the map iterates, to compare with the model
+    let held: Vec<(u8, u32)> = map.iter().map(|(&key, &value)| (key, value)).collect();
+    if held != model {
+        return Err(format!("the map iterates {held:?}, the model {model:?}"));
+    }
+    for (at, &(key, value)) in model.iter().enumerate() {
+        if map.get_full(&key) != Some((at, &key, &value)) || map.get_index(at) != Some((&key, &value)) {
+            return Err(format!("key {key} is not found at {at} with {value}"));
+        }
+    }
+    Ok(())
+}
+
 /// One run of random operations on a map and on the model, compared after each.
 fn agrees(tape: &Tape) -> Result<(), String> {
     let mut map: IndexMap<u8, u32, Global> = IndexMap::new_in(Global); // alloc: a test's map
@@ -108,16 +122,7 @@ fn agrees(tape: &Tape) -> Result<(), String> {
                 model.retain(|it| it.0 % 4 != cut);
             }
         }
-        // alloc: what the map iterates, to compare with the model
-        let held: Vec<(u8, u32)> = map.iter().map(|(&key, &value)| (key, value)).collect();
-        if held != model {
-            return Err(format!("the map iterates {held:?}, the model {model:?}"));
-        }
-        for (at, &(key, value)) in model.iter().enumerate() {
-            if map.get_full(&key) != Some((at, &key, &value)) || map.get_index(at) != Some((&key, &value)) {
-                return Err(format!("key {key} is not found at {at} with {value}"));
-            }
-        }
+        contents_agree(&map, &model)?;
         if map.len() != model.len() || map.contains_key(&key) != place(&model, key).is_some() {
             return Err("len or contains_key disagrees".to_owned());
         }
@@ -135,13 +140,16 @@ fn an_ordered_map_is_a_vec_of_pairs_under_any_operations() {
 /// The two removals are two orders, so the model above tells them apart: `swap_remove` moves
 /// the last entry into the hole, `shift_remove` keeps the order, and each index follows.
 #[test]
-fn the_two_removals_leave_two_orders() {
+fn the_oracle_catches_swap_removing_when_order_must_shift() {
     let mut swapped: IndexMap<u8, u32, Global> = IndexMap::new_in(Global); // alloc: a test's map
     swapped.extend([(1, 10), (2, 20), (3, 30), (4, 40)]);
     let mut shifted = swapped.clone();
     assert_eq!((swapped.swap_remove(&1), shifted.shift_remove(&1)), (Some(10), Some(10)));
     assert_eq!(swapped.keys().copied().collect::<Vec<_>>(), [4, 2, 3]);
     assert_eq!(shifted.keys().copied().collect::<Vec<_>>(), [2, 3, 4]);
+    let expected = [(2, 20), (3, 30), (4, 40)];
+    assert_eq!(contents_agree(&shifted, &expected), Ok(()));
+    assert!(contents_agree(&swapped, &expected).unwrap_err().contains("the map iterates"));
     assert_ne!(swapped, shifted, "equality is of the order too");
     assert_eq!((swapped.get_index_of(&4), shifted.get_index_of(&4)), (Some(0), Some(2)));
     shifted.sort_keys();
@@ -237,13 +245,6 @@ fn insertion_order_is_the_same_under_any_hasher_and_in_another_process() {
         keyed.extend(inserts());
         assert_eq!(order_of(keyed.iter().map(|(&key, &value)| (key, value))), expected);
     }
-    // The control: the hasher decides a hash map's order.
-    let hashed = |key: SipKey| {
-        let mut map: KeyedMap<u64, u64, Global> = KeyedMap::with_hasher_in(key, Global); // alloc: a test's map
-        map.extend(inserts());
-        order_of(map.iter().map(|(&key, &value)| (key, value)))
-    };
-    assert_ne!(hashed(SipKey::new(1, 2)), hashed(SipKey::new(3, 4)));
     // Two more processes, each a run of this test that prints its order.
     let this = std::env::current_exe().expect("the test's own program");
     for _ in 0..2 {
@@ -264,6 +265,21 @@ fn insertion_order_is_the_same_under_any_hasher_and_in_another_process() {
             "the other process's order, from: {text}"
         );
     }
+}
+
+#[test]
+fn the_oracle_catches_hash_bucket_order_used_for_insertion_order() {
+    let expected = order_of(inserts());
+    // Replace insertion ordering with bucket ordering; the same order digest must reject it.
+    let hashed = |key: SipKey| {
+        let mut map: KeyedMap<u64, u64, Global> = KeyedMap::with_hasher_in(key, Global); // alloc: a test's map
+        map.extend(inserts());
+        order_of(map.iter().map(|(&key, &value)| (key, value)))
+    };
+    let (one, two) = (hashed(SipKey::new(1, 2)), hashed(SipKey::new(3, 4)));
+    assert_ne!(one, expected);
+    assert_ne!(two, expected);
+    assert_ne!(one, two);
 }
 
 /// Keys an attacker picks: under a hasher they can compute, as many keys as they like have one

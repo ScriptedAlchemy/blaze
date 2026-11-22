@@ -487,7 +487,7 @@ mod tests {
     /// while an absolute one (another file's) stays. The control: a span's own change is a
     /// change before the bases.
     #[test]
-    fn a_moved_item_changes_its_bases_and_nothing_else() {
+    fn the_oracle_catches_a_changed_span_row_in_a_base_only_move() {
         let was = table();
         let before = was.encode();
         let spans = Spans::new(&before).unwrap();

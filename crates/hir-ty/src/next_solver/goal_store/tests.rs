@@ -956,7 +956,7 @@ fn traces_in(order: &[usize]) -> Vec<(&'static str, Vec<String>)> {
 /// recorded ([`super::planted::RECORDED`], the code before the guard), the body run first
 /// lists the facts' knob and the orders' traces differ.
 #[test]
-fn a_body_s_trace_is_the_same_whichever_body_solved_the_goal_first() {
+fn the_oracle_catches_goal_store_bookkeeping_in_a_body_trace() {
     let orders: [&[usize]; 3] = [&[0, 1, 2], &[2, 1, 0], &[1, 2, 0]];
     let want = |own: &'static str| (own, vec![String::from("goal"), String::from(own)]);
     let first = traces_in(orders[0]);

@@ -49,15 +49,40 @@ fn an_edit_outside_the_item_keeps_the_early_identity() {
 /// changes the early identity.
 #[test]
 fn an_edit_of_the_item_or_its_owner_changes_the_early_identity() {
+    assert_eq!(item_inputs_change(early), Ok(()));
+}
+
+fn item_inputs_change(key: impl Fn(&str) -> ContentId) -> Result<(), usize> {
     let base = with_dep("pub fn f(a: u8) -> u8 { a }");
-    differ(&base, &with_dep("pub fn f(a: u8) -> u8 { a + 1 }"));
-    differ(&base, &with_dep("pub fn f(mut a: u8) -> u8 { a }"));
-    differ(&base, &with_dep("#[inline]\npub fn f(a: u8) -> u8 { a }"));
-    differ(&base, &with_dep("pub mod m { pub fn f(a: u8) -> u8 { a } }"));
-    differ(
-        &with_dep("pub struct S; pub struct T;\nimpl S { pub fn f(&self) -> u8 { 1 } }"),
-        &with_dep("pub struct S; pub struct T;\nimpl T { pub fn f(&self) -> u8 { 1 } }"),
-    );
+    let cases = [
+        (base.as_str(), with_dep("pub fn f(a: u8) -> u8 { a + 1 }")),
+        (base.as_str(), with_dep("pub fn f(mut a: u8) -> u8 { a }")),
+        (base.as_str(), with_dep("#[inline]\npub fn f(a: u8) -> u8 { a }")),
+        (base.as_str(), with_dep("pub mod m { pub fn f(a: u8) -> u8 { a } }")),
+    ];
+    for (at, (before, after)) in cases.iter().enumerate() {
+        if key(before) == key(after) {
+            return Err(at);
+        }
+    }
+    let before = with_dep("pub struct S; pub struct T;\nimpl S { pub fn f(&self) -> u8 { 1 } }");
+    let after = with_dep("pub struct S; pub struct T;\nimpl T { pub fn f(&self) -> u8 { 1 } }");
+    if key(&before) == key(&after) {
+        return Err(cases.len());
+    }
+    Ok(())
+}
+
+#[test]
+fn the_oracle_catches_an_early_identity_using_only_its_owner() {
+    assert_eq!(item_inputs_change(early), Ok(()));
+    let owner_only = |fixture: &str| {
+        let db = db(fixture);
+        let parts = early_parts(&db, body(&db, "f")).unwrap();
+        assert_eq!(parts[1].0, "owner");
+        parts[1].1
+    };
+    assert_eq!(item_inputs_change(owner_only), Err(0), "the body changed under the same owner");
 }
 
 /// A body a macro writes is keyed by the call and by each macro of the chain of calls that

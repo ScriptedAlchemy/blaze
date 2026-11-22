@@ -145,20 +145,28 @@ impl Began {
 mod tests {
     use super::*;
 
+    fn handed() -> Held<'static> {
+        let timed = vec![
+            blaze_api::Timed { name: crate::talk::EXEC_TO_MAIN.to_owned(), start_ns: 5, end_ns: 9 },
+            blaze_api::Timed { name: crate::talk::CONNECT.to_owned(), start_ns: 12, end_ns: 14 },
+        ];
+        Held { request: b"request", answer: b"answer so far", timed, started_ns: 5 }
+    }
+
+    fn reads_whole(bytes: &[u8], held: &Held<'_>) -> bool {
+        Held::read(bytes).as_ref() == Ok(held)
+    }
+
     /// The invariant: the file round-trips whole, the thin `blaze`'s spans with it, and any cut
     /// of it before its answer is refused. Controls: a file of version 1's layout is refused
     /// by name, and one byte changed in the magic is refused.
     #[test]
     fn the_file_round_trips_and_a_cut_one_is_refused() {
-        let timed = vec![
-            blaze_api::Timed { name: crate::talk::EXEC_TO_MAIN.to_owned(), start_ns: 5, end_ns: 9 },
-            blaze_api::Timed { name: crate::talk::CONNECT.to_owned(), start_ns: 12, end_ns: 14 },
-        ];
-        let held = Held { request: b"request", answer: b"answer so far", timed, started_ns: 5 };
+        let held = handed();
         let bytes = held.write().unwrap();
-        assert_eq!(Held::read(&bytes), Ok(held.clone()));
+        assert!(reads_whole(&bytes, &held));
         let none = Held { request: b"r", answer: b"", timed: Vec::new(), started_ns: 0 };
-        assert_eq!(Held::read(&none.write().unwrap()), Ok(none));
+        assert!(reads_whole(&none.write().unwrap(), &none));
         let answer_at = bytes.len() - held.answer.len();
         for cut in [0, 5, MAGIC.len(), MAGIC.len() + 7, MAGIC.len() + 8 + 3, MAGIC.len() + 12 + 3, answer_at - 1] {
             assert!(Held::read(&bytes[..cut]).is_err(), "{cut}");
@@ -170,6 +178,17 @@ mod tests {
         let mut other = bytes.clone();
         other[0] = b'B';
         assert!(Held::read(&other).is_err());
+    }
+
+    #[test]
+    fn the_oracle_catches_handover_without_its_client_spans() {
+        let held = handed();
+        assert!(reads_whole(&held.write().unwrap(), &held));
+        // The framing is valid, but the sender forgot its spans before serializing.
+        let without_spans = Held { timed: Vec::new(), ..held.clone() };
+        let bytes = without_spans.write().unwrap();
+        assert!(Held::read(&bytes).is_ok(), "the control is a whole, readable file");
+        assert!(!reads_whole(&bytes, &held));
     }
 
     #[test]

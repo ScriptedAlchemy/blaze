@@ -21,6 +21,10 @@ fn hello(cx: &Cx, io: Io) -> Result<(), Error> {
     Ok(())
 }
 
+fn hello_succeeded(status: Status, said: &str, output: &str) -> bool {
+    status == Status::OK && said.is_empty() && output == "Hello, world!\n"
+}
+
 /// The invariant: a `main` that writes a line and returns `Ok` leaves exactly that line on
 /// its world's standard output, says nothing, and ends `Status::OK`.
 #[test]
@@ -28,16 +32,18 @@ fn a_main_writes_its_line_through_out_and_ends_ok() {
     let io = Io::sim(1);
     let mut said = String::new();
     let status = run_in(io.clone(), &mut said, hello);
+    assert!(hello_succeeded(status, &said, &written(&io)));
     assert_eq!((status, said.as_str(), written(&io).as_str()), (Status::OK, "", "Hello, world!\n"));
 }
 
 /// A `main` that returns `Err` ends `Status::FAILED` and the entry is handed what the error
 /// says: here the capability the host withheld, named.
 #[test]
-fn a_main_that_fails_ends_failed_and_says_its_error() {
+fn the_oracle_catches_a_main_without_its_output_capability() {
     let io = Io::sim_with(2, Offers { out: false, ..Offers::ALL });
     let mut said = String::new();
     let status = run_in(io.clone(), &mut said, hello);
+    assert!(!hello_succeeded(status, &said, &written(&io)));
     assert_eq!(status, Status::FAILED);
     assert!(said.contains("`out`"), "the error names the missing capability: {said}");
     assert_eq!(written(&io), "", "nothing was written");
@@ -97,6 +103,10 @@ fn written_err(io: &Io) -> String {
     String::from_utf8(io.script(|host| host.err.clone()).expect("a simulated world")).expect("UTF-8")
 }
 
+fn stream_matches(io: &Io, expected: &str) -> bool {
+    written(io) == expected && written_err(io).is_empty()
+}
+
 /// The invariant: what `line` and `write` put on a stream is exactly what `format!` of the
 /// same values gives, for text, for formatted values, and for text longer than what one call
 /// holds (which is handed over in pieces and loses nothing).
@@ -115,8 +125,21 @@ fn line_and_write_say_what_format_gives() {
     assert!(long.len() > 2 * HELD);
     out.line(&cx, format_args!("<{long}>")).unwrap();
     let expected = format!("plain\nx = {x}, name = {name:?}\n{x:>5}|7.5\n<{long}>\n");
+    assert!(stream_matches(&io, &expected));
     assert_eq!(written(&io), expected);
     assert_eq!(written_err(&io), "", "nothing went to standard error");
+}
+
+#[test]
+fn the_oracle_catches_a_line_written_without_its_newline() {
+    let io = Io::sim(60);
+    let cx = super::root(&io);
+    let out = io.out().expect("Io::sim offers out");
+    // Remove `line`'s newline while retaining the real formatting and stream write.
+    out.write(&cx, format_args!("value = {}", 42)).unwrap();
+    assert!(!stream_matches(&io, "value = 42\n"));
+    out.write_all(&cx, b"\n").unwrap();
+    assert!(stream_matches(&io, "value = 42\n"));
 }
 
 /// Standard error is a capability of its own: what is written through `io.err()` is on

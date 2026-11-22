@@ -499,7 +499,29 @@ class AcceptanceGateTests(unittest.TestCase):
             "bounded_packs_keep_every_key_and_refuse_conflicts_across_boundaries",
             "errors_after_publication_cannot_rebuild_an_immutable_unit",
         ]
-        names = models + controls + transport_cases
+        allocator_cases = [
+            "nested_effect_logs_use_the_callers_allocator",
+            "holder_effects_use_the_callers_allocator",
+            "pack_lists_use_the_callers_allocator",
+            "nested_schema_encoding_and_digest_scratch_use_the_callers_allocator",
+            "appending_keeps_the_callers_buffer_and_allocator_without_allocating",
+            "sets_keep_their_storage_and_take_encoding_scratch_from_the_output_allocator",
+            "set_encoding_writes_each_canonical_sort_key_once",
+            "rendering_uses_the_destination_and_reports_its_capacity",
+        ]
+        integration_cases = [
+            "every_type_round_trips_byte_identically",
+            "every_type_has_a_golden_file",
+            "golden_vectors_match",
+            "bytes_the_validator_accepts_are_canonical",
+            "every_digest_input_is_the_encoding_the_golden_digest_uses",
+            "the_native_three_field_layout_round_trips_including_empty",
+            "malformed_lists_never_become_empty_cache_entries",
+            "fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries",
+            "two_agents_split_a_unit_and_both_get_all_of_it",
+            "a_unit_published_by_one_pull_request_is_taken_by_another",
+        ]
+        names = models + controls + transport_cases + allocator_cases + integration_cases
         # Read the actual job's literal setting, so removing verification from the workflow
         # cannot be hidden by this shell fixture supplying its own unrelated default.
         job = MAIN.read_text().split("  distributed-core:\n", 1)[1].split("\n  cross-probe:", 1)[0]
@@ -517,6 +539,10 @@ class AcceptanceGateTests(unittest.TestCase):
                   for name in controls]
         cases += [(f"missing transport case {name}", [item for item in names if item != name], 0, 1)
                   for name in transport_cases]
+        cases += [(f"missing allocator case {name}", [item for item in names if item != name], 0, 1)
+                  for name in allocator_cases]
+        cases += [(f"missing integration case {name}", [item for item in names if item != name], 0, 1)
+                  for name in integration_cases]
         cases.append(("compiler failed after success lines", names, 23, 23))
         toolchain = (ROOT / "harness/toolchain").read_text().strip()
         for label, reported, code, expected in cases:
@@ -539,7 +565,8 @@ class AcceptanceGateTests(unittest.TestCase):
                     'printf \'%s\\n\' \'rustc fixture\'\n')
                 rustc.chmod(0o700)
                 output = f"running {len(reported)} tests\n"
-                output += "".join(f"test fixture::{name} ... ok\n" for name in reported)
+                output += "".join(f"test {'' if name in integration_cases else 'fixture::'}{name} ... ok\n"
+                                  for name in reported)
                 output += f"test result: ok. {len(reported)} passed; 0 failed; 0 ignored\n"
                 transcript = root / "test-output.txt"
                 transcript.write_text(output)
@@ -551,7 +578,7 @@ class AcceptanceGateTests(unittest.TestCase):
                 evidence = root / "core-evidence"
                 invocation = (evidence / "invocation.txt").read_text().splitlines()
                 self.assertEqual(invocation, [str(cargo), f"+{toolchain}", "test", "--release", "--locked",
-                                              "--lib", "-p", "blaze-dist", "-p", "blaze-dist-local",
+                                              "--all-targets", "-p", "blaze-dist", "-p", "blaze-dist-local",
                                               "-p", "blaze-wire", "-p", "blaze-serve", "--no-fail-fast"])
                 self.assertEqual((evidence / "mode.txt").read_text(), "verify\n")
                 self.assertEqual((evidence / "tests.log").read_text(), output)

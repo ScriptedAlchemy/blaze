@@ -962,12 +962,7 @@ pub fn key_input<K: Serialize>(domain: &'static str, key: &K) -> ContentId {
 mod tests {
     use super::*;
 
-    /// The invariant: a plan's key (what its view is opened with) holds, of the request's
-    /// environment, the variables the load reads and no other, so two requests that differ in
-    /// a variable no plan reads are one plan, and two that differ in one it reads are not.
-    /// The control: the whole configuration, which the key was before, differs in both.
-    #[test]
-    fn a_plan_is_keyed_by_the_variables_the_load_reads_alone() {
+    fn plan_key_problem(key: impl Fn(&BuildConfig) -> Vec<u8>) -> Option<String> {
         let with = |env: &[(&str, &str)]| {
             let mut env: Vec<(String, String)> =
                 env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
@@ -993,9 +988,9 @@ mod tests {
         let base = with(&[("HOME", "/home/u"), ("TERM", "xterm")]);
         for unread in [("TERM", "dumb"), ("COLUMNS", "80"), ("INVOCATION_ID", "1"), ("LIBCLANG_PATH", "/lib")] {
             let other = with(&[("HOME", "/home/u"), ("TERM", "xterm"), unread]);
-            assert_eq!(base.planned(), other.planned(), "{unread:?} is in a plan's key, and no plan reads it");
-            // The control.
-            assert_ne!(base.encode(), other.encode(), "{unread:?}");
+            if key(&base) != key(&other) {
+                return Some(format!("{unread:?} is in a plan's key, and no plan reads it"));
+            }
         }
         for read in [
             ("RUSTFLAGS", "-Cdebuginfo=0"),
@@ -1011,10 +1006,31 @@ mod tests {
             assert!(read_by_plan(read.0), "{read:?}");
             let other = with(&[("TERM", "xterm"), read]);
             let base = with(&[("TERM", "xterm")]);
-            assert_ne!(base.planned(), other.planned(), "{read:?} is read by the plan, and not in its key");
+            if key(&base) == key(&other) {
+                return Some(format!("{read:?} is read by the plan, and not in its key"));
+            }
         }
         // What is kept decodes as a configuration: the load's first query reads it as one.
-        assert!(BuildConfig::decode(&base.planned()).is_ok());
+        if BuildConfig::decode(&key(&base)).is_err() {
+            return Some("the plan's key does not decode as a configuration".to_owned());
+        }
+        None
+    }
+
+    /// The invariant: a plan's key (what its view is opened with) holds, of the request's
+    /// environment, the variables the load reads and no other, so two requests that differ in
+    /// a variable no plan reads are one plan, and two that differ in one it reads are not.
+    /// The control: the whole configuration, which the key was before, differs in both.
+    #[test]
+    fn a_plan_is_keyed_by_the_variables_the_load_reads_alone() {
+        assert_eq!(plan_key_problem(BuildConfig::planned), None);
+    }
+
+    #[test]
+    fn the_oracle_catches_a_plan_key_that_keeps_unread_environment() {
+        assert_eq!(plan_key_problem(BuildConfig::planned), None);
+        let problem = plan_key_problem(BuildConfig::encode).expect("the old whole-configuration key differs");
+        assert!(problem.contains("TERM") && problem.contains("no plan reads it"), "{problem}");
     }
 
     fn env(vars: &[(&str, &str)]) -> Vec<(String, String)> {

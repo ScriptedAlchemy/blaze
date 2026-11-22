@@ -245,6 +245,18 @@ mod tests {
         assert_eq!(held(11), 0);
     }
 
+    #[test]
+    fn the_oracle_catches_a_sample_whose_free_is_not_reported() {
+        keep();
+        let block = 0x8000_0040usize as *mut u8;
+        put(block.addr(), [31, 2, 3].into_iter());
+        // Remove the allocator's `freed` callback: the same census used above still sees
+        // the sample, although a caller that lost the callback considers its block gone.
+        assert_ne!(held(31), 0, "the oracle missed the unreported free");
+        freed(block);
+        assert_eq!(held(31), 0, "restoring the callback removes the sample");
+    }
+
     /// A bucket holds [`WAYS`] samples: one more is lost and counted, never put over another.
     #[test]
     fn a_full_bucket_loses_the_sample_and_counts_it() {

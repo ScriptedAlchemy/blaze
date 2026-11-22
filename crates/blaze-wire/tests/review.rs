@@ -4,9 +4,11 @@
 //! enums as the same two-element array, as documented in `json.rs`.
 
 #![allow(missing_docs)]
+#![feature(allocator_api)]
 
 use blaze_wire::*;
 use sha2::{Digest as _, Sha256};
+use std::alloc::{Allocator, Global};
 use std::collections::BTreeSet;
 
 fn head(major: u8, n: u64) -> Vec<u8> {
@@ -43,14 +45,14 @@ fn kind(bytes: &[u8]) -> ErrorKind {
 fn identity<T: Wire + std::fmt::Debug>(bytes: &[u8], l: &Limits) {
     validate(bytes, l).unwrap();
     let v = decode::<T>(bytes, l).unwrap();
-    assert_eq!(encode(&v), bytes);
+    assert_eq!(encode(&v, Global), bytes);
 }
 
 #[test]
 fn uint_encoder_and_decoder_all_boundaries() {
     for n in EDGES {
         let b = head(0, n);
-        assert_eq!(encode(&n), b);
+        assert_eq!(encode(&n, Global), b);
         identity::<u64>(&b, &limits());
     }
 }
@@ -58,10 +60,10 @@ fn uint_encoder_and_decoder_all_boundaries() {
 #[test]
 fn array_map_encoder_all_length_boundaries() {
     for n in EDGES.into_iter().filter(|n| *n <= usize::MAX as u64) {
-        let mut e = Encoder::new();
+        let mut e = Encoder::new(Global);
         e.array(n as usize);
         assert_eq!(e.into_bytes(), head(4, n));
-        let mut e = Encoder::new();
+        let mut e = Encoder::new(Global);
         e.map(n as usize);
         assert_eq!(e.into_bytes(), head(5, n));
     }
@@ -74,13 +76,13 @@ fn bytes_and_text_encoder_length_boundaries_through_65536() {
         let body = vec![b'a'; n as usize];
         let mut b = head(2, n);
         b.extend(&body);
-        let v = Bytes::new(body.clone());
-        assert_eq!(encode(&v), b);
+        let v = Bytes { bytes: body.clone() };
+        assert_eq!(encode(&v, Global), b);
         identity::<Bytes>(&b, &l);
         let mut t = head(3, n);
         t.extend(&body);
         let s = String::from_utf8(body).unwrap();
-        assert_eq!(encode(&s), t);
+        assert_eq!(encode(&s, Global), t);
         identity::<String>(&t, &l);
     }
 }
@@ -142,10 +144,10 @@ fn length_prefixes_truncated_or_oversize_no_allocation_bombs() {
 #[test]
 fn every_proper_prefix_of_representative_items_is_truncated() {
     let values = [
-        encode(&u64::MAX),
-        encode(&"hello".to_owned()),
-        encode(&Bytes::new(vec![0; 24])),
-        encode(&vec![u64::MAX, 24]),
+        encode(&u64::MAX, Global),
+        encode(&"hello".to_owned(), Global),
+        encode(&Bytes { bytes: vec![0; 24] }, Global),
+        encode(&vec![u64::MAX, 24], Global),
     ];
     for b in values {
         for end in 0..b.len() {
@@ -171,7 +173,7 @@ fn utf8_and_bytes_are_distinct() {
         b.extend(&bad);
         identity::<Bytes>(&b, &limits());
     }
-    identity::<String>(&encode(&"é😀".to_owned()), &limits());
+    identity::<String>(&encode(&"é😀".to_owned(), Global), &limits());
     assert!(decode::<String>(&[0x41, 0x61], &limits()).is_err());
     assert!(decode::<Bytes>(&[0x61, 0x61], &limits()).is_err());
 }
@@ -239,7 +241,7 @@ enum Node {
 }
 
 impl Wire for Node {
-    fn encode(&self, e: &mut Encoder) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
         match self {
             Self::Array(a) => a.encode(e),
             Self::Leaf(n) => n.encode(e),
@@ -278,7 +280,7 @@ fn decode_enforces_whole_request_size() {
 /// A 16 MiB blob plus its CBOR head exceeds the default request limit.
 #[test]
 fn ordinary_decoder_enforces_real_documented_16mib_request_limit() {
-    let b = encode(&Bytes::new(vec![0; limits().request as usize]));
+    let b = encode(&Bytes { bytes: vec![0; limits().request as usize] }, Global);
     assert!(matches!(
         validate(&b, &limits()).unwrap_err().kind,
         ErrorKind::OversizeItem { what: "message", .. }
@@ -304,13 +306,13 @@ fn a_batch_keeps_the_batch_limit_not_the_lookup_limit() {
         names: Set::new(vec![]),
     };
     assert!(
-        validate_as::<Grant>(&encode(&grant), &limits()).is_ok(),
+        validate_as::<Grant>(&encode(&grant, Global), &limits()).is_ok(),
         "a batch's set of 4097 was narrowed to the lookup limit"
     );
     // And a batch's array is still held to its own limit: 65,536 is accepted, one more is not.
     let roots: Vec<(u64, u64)> = (0..65537u64).map(|n| (n, 0)).collect();
     let grant = Grant { roots: Set::new(roots), ..grant };
-    assert!(validate_as::<Grant>(&encode(&grant), &limits()).is_err());
+    assert!(validate_as::<Grant>(&encode(&grant, Global), &limits()).is_err());
 }
 
 /// P1: the public digest input is the hash preimage, and it is not empty.
@@ -318,9 +320,9 @@ fn a_batch_keeps_the_batch_limit_not_the_lookup_limit() {
 fn digest_input_matches_documented_formula() {
     let v = Attempt(24);
     let mut expected = b"blaze/Attempt/v5\0".to_vec();
-    expected.extend(encode(&v));
-    assert_eq!(digest_of(&v), <[u8; 32]>::from(Sha256::digest(&expected)));
-    assert_eq!(digest_input(&v), expected, "public digest_input must return actual hash preimage");
+    expected.extend(encode(&v, Global));
+    assert_eq!(digest_of(&v, Global), <[u8; 32]>::from(Sha256::digest(&expected)));
+    assert_eq!(digest_input(&v, Global), expected, "public digest_input must return actual hash preimage");
 }
 
 /// P1: `digest_input` is the encoding the golden digest is taken over, for every type.
@@ -341,14 +343,14 @@ fn every_digest_input_is_the_encoding_the_golden_digest_uses() {
     // The public function's output for a type whose value is written here: non-empty, and the
     // preimage of `digest_of`.
     let v = Attempt(24);
-    let input = digest_input(&v);
+    let input = digest_input(&v, Global);
     assert!(!input.is_empty(), "digest_input returned no bytes");
-    assert_eq!(<[u8; 32]>::from(Sha256::digest(&input)), digest_of(&v));
+    assert_eq!(<[u8; 32]>::from(Sha256::digest(&input)), digest_of(&v, Global));
     // It is exactly the bytes the golden digest is taken over for the same value.
     let mut expected = b"blaze/Attempt/v5\0".to_vec();
-    expected.extend(encode(&v));
+    expected.extend(encode(&v, Global));
     assert_eq!(input, expected);
-    assert_eq!(<[u8; 32]>::from(Sha256::digest(&expected)), digest_of(&v));
+    assert_eq!(<[u8; 32]>::from(Sha256::digest(&expected)), digest_of(&v, Global));
 }
 
 /// The validator reports the specific `f8` encoding error.
@@ -402,7 +404,7 @@ fn all_domains_are_unique_and_prefix_free() {
 #[test]
 fn namespace_pr_agrees_with_doc_payload_map() {
     assert_eq!(
-        encode(&Namespace::Pr(PrNamespace { n: 1 })),
+        encode(&Namespace::Pr(PrNamespace { n: 1 }), Global),
         [0x82, 1, 0xa1, 0x00, 0x01],
         "a Pr payload is the map [1, {{0: n}}], as the doc's payload list says"
     );
@@ -414,7 +416,7 @@ fn accepted_negative_u64_max_json_does_not_overflow() {
     let b = head(1, u64::MAX);
     validate(&b, &limits()).unwrap();
     let mut out = String::new();
-    json::render_cbor(&b, &mut out);
+    json::render_cbor(&b, &mut out).unwrap();
     assert_eq!(out, "-18446744073709551616");
 }
 
@@ -477,10 +479,10 @@ fn builtin_vec_decoder_never_accepts_validator_rejected_depth() {
 
 fn ordinary_audit<T: Wire + Named + Sample>(seed: u64) {
     let mut g = Gen::new(seed);
-    let original = encode(&T::sample(&mut g));
+    let original = encode(&T::sample(&mut g), Global);
     assert!(validate(&original, &limits()).is_ok());
     let back = decode::<T>(&original, &limits()).unwrap();
-    assert_eq!(encode(&back), original);
+    assert_eq!(encode(&back, Global), original);
     for i in 0..original.len().min(300) {
         for mask in [1, 0x80, 0xff] {
             let mut bytes = original.clone();
@@ -491,7 +493,7 @@ fn ordinary_audit<T: Wire + Named + Sample>(seed: u64) {
                     "{} decoded validator-rejected bytes {bytes:02x?}",
                     T::NAME
                 );
-                assert_eq!(encode(&value), bytes, "{} accepted nonidentity", T::NAME);
+                assert_eq!(encode(&value, Global), bytes, "{} accepted nonidentity", T::NAME);
             }
         }
     }
@@ -500,7 +502,7 @@ fn ordinary_audit<T: Wire + Named + Sample>(seed: u64) {
 #[test]
 fn full_array_and_map_lengths_at_65535_65536() {
     for n in [23, 24, 255, 256, 65535, 65536] {
-        let mut e = Encoder::new();
+        let mut e = Encoder::new(Global);
         e.array(n);
         for _ in 0..n {
             e.uint(0);
@@ -508,7 +510,7 @@ fn full_array_and_map_lengths_at_65535_65536() {
         let b = e.into_bytes();
         validate(&b, &limits()).unwrap();
         identity::<Vec<u64>>(&b, &limits());
-        let mut e = Encoder::new();
+        let mut e = Encoder::new(Global);
         e.map(n);
         for i in 0..n {
             e.uint(i as u64);
@@ -534,8 +536,10 @@ fn simple_value_sweep_reports_all_illegal_encodings() {
 /// JSON renders enums as the protocol's two-element array, as documented in `json.rs`.
 #[test]
 fn json_enum_rendering_agrees_with_public_docs() {
+    let mut json = String::new();
+    to_json(&Namespace::Main, &mut json, Global).unwrap();
     assert_eq!(
-        to_json(&Namespace::Main),
+        json,
         r#"{"Namespace":[0,null]}"#,
         "json.rs documents the wire's [discriminant, payload] array"
     );

@@ -3,6 +3,10 @@
 
 use super::*;
 
+fn is_requested_part(value: &[u8], part: &[u8], at: u64, len: u64) -> bool {
+    part == &value[at as usize..(at + len) as usize]
+}
+
 /// Each part of `value` asked for is the value's bytes there; a part past its end is an
 /// error naming its length; a key the store lacks is `None`.
 fn parts_read(store: &Store, value: &[u8], when: &str) {
@@ -11,6 +15,7 @@ fn parts_read(store: &Store, value: &[u8], when: &str) {
     let parts = [(0, 16), (4095, 2), (len / 3, 300), (len - 10, 10), (0, len), (5, 0), (8192, 4096)];
     for (at, part_len) in parts {
         let part = store.look().part(&key(1), at, part_len).unwrap().unwrap();
+        assert!(is_requested_part(value, &part, at, part_len), "{when}: {at}+{part_len}");
         assert_eq!(part, &value[at as usize..(at + part_len) as usize], "{when}: {at}+{part_len}");
     }
     let said = format!("were asked of its {len} bytes");
@@ -41,6 +46,21 @@ fn a_part_of_a_value_is_that_range_of_it_wherever_it_is_kept() {
     let store = open(&mut sim, "store");
     parts_read(&store, &value, "after a reopen");
     parts_read(&store, &value, "after a reopen, verified");
+}
+
+#[test]
+fn the_oracle_catches_a_part_read_from_the_next_byte() {
+    let mut sim = Sim::new(9, quiet());
+    let mut store = open(&mut sim, "store");
+    let value: Vec<u8> = (0..24_000).map(|at| at as u8).collect();
+    store.put(key(1), Kind::Query, &value).unwrap();
+    let (at, len) = (4095, 2);
+    let look = store.look();
+    let correct = look.part(&key(1), at, len).unwrap().unwrap();
+    assert!(is_requested_part(&value, &correct, at, len));
+    // Plant a reader that advances the request's offset, while keeping its length.
+    let shifted = look.part(&key(1), at + 1, len).unwrap().unwrap();
+    assert!(!is_requested_part(&value, &shifted, at, len));
 }
 
 /// The control: a compressed value has no bytes to read in place, so its parts are of the

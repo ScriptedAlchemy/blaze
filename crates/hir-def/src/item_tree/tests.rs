@@ -885,7 +885,7 @@ fn every_item_maps_to_the_id_its_def_map_holds() {
 
 /// The control: a map without the impls, a collector that made no impl, is caught.
 #[test]
-fn a_scope_map_without_impls_is_caught() {
+fn the_oracle_catches_a_scope_map_without_impls() {
     use crate::item_scope::ItemOfAst;
     let skipped = check_scoped(|db, scope| {
         scope.items_by_ast(db).without(|it| matches!(it, ItemOfAst::Impl(_)))

@@ -170,7 +170,7 @@ fn a_function_reading_its_line_recompiles_nothing_below_an_inserted_line() {
 /// The control: the same build with the shift and an edit of a body below it (`mix`'s) does
 /// compile again, so the property above is not met by a build that compiles nothing at all.
 #[test]
-fn the_control_a_body_edited_below_the_lines_compiles_again() {
+fn the_oracle_catches_an_edited_body_reused_after_a_line_shift() {
     let mut model = Model::new();
     let (mut db, file) = database(&model.source());
     let (memo, mut store) = (Memo::new(), Kept::default());

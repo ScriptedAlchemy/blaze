@@ -1189,7 +1189,7 @@ mod tests {
     /// 4 + 1 pieces (4 held, 1 waiting to be handed on) and is still waiting. The control: the
     /// same download into an unbounded channel runs to the file's end, which fails the bound.
     #[test]
-    fn a_download_waits_for_its_unpacking_by_the_channels_bound() {
+    fn the_oracle_catches_a_download_with_no_unpacking_bound() {
         const BOUND: usize = 4;
         const PIECES: usize = 32;
         let work = tempfile::tempdir().unwrap();

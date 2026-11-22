@@ -1,5 +1,8 @@
 //! Worker ingress and typed terminal policy, checked against the public stream.
 
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use blaze_dist::Refusal;
 use blaze_dist::jobs::{
     CompletionMode, Effect, ExecState, Execution, ExecutionConfig, LocalAction, Subscriber,
@@ -253,7 +256,7 @@ fn terminal_delivery_retains_reason_through_wire_and_client_policy() {
             _ => None,
         })
         .unwrap();
-    let decoded = decode_terminal(&encode(delivered), &Limits::DOCUMENTED).unwrap();
+    let decoded = decode_terminal(&encode(delivered, Global), &Limits::DOCUMENTED).unwrap();
     assert_eq!(e.terminal(1), Some(&decoded));
     assert_eq!(decoded.termination.reason, Reason::Reported);
     assert_eq!(
@@ -308,7 +311,7 @@ fn no_lead_lost_delivery_is_not_a_completed_failed_verdict() {
     let terminal = jobs.terminal(answer.execution, answer.subscriber).unwrap();
     assert_eq!(terminal.termination.reason, Reason::NoLead);
     assert_eq!(terminal.termination.outcome, Outcome::Lost);
-    let decoded = decode_terminal(&encode(terminal), &Limits::DOCUMENTED).unwrap();
+    let decoded = decode_terminal(&encode(terminal, Global), &Limits::DOCUMENTED).unwrap();
     assert_eq!(
         local_action(&LocalPolicy::Fallback, &decoded.termination).unwrap(),
         LocalAction::BuildLocally

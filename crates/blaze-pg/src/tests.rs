@@ -496,6 +496,23 @@ fn base64_is_the_crate_s() {
 // ---------------------------------------------------------------------------------------------
 // The codecs.
 
+fn decoded_value(storage: Storage, bytes: &[u8]) -> Owned {
+    let mut rest = bytes;
+    let body = codec::split_value(&mut rest, "value").unwrap();
+    assert!(rest.is_empty());
+    Owned::of(codec::decode(storage, body).unwrap())
+}
+
+fn decoded_array(storage: Storage, bytes: &[u8]) -> Vec<Owned> {
+    let mut rest = bytes;
+    let body = codec::split_value(&mut rest, "array").unwrap().expect("an array is not null");
+    assert!(rest.is_empty());
+    let mut elements = codec::decode_array(storage, body).unwrap();
+    let got = elements.by_ref().map(|it| Owned::of(it.unwrap())).collect();
+    elements.finish().unwrap();
+    got
+}
+
 /// The refinement: decoding what `encode` wrote gives the value back, for every storage.
 #[test]
 fn a_value_round_trips() {
@@ -504,10 +521,7 @@ fn a_value_round_trips() {
         let value = value(tape, storage, true);
         let mut bytes = Vec::new();
         codec::encode(value.as_ref(), &mut bytes).unwrap();
-        let mut rest = &bytes[..];
-        let body = codec::split_value(&mut rest, "value").unwrap();
-        assert!(rest.is_empty());
-        assert_eq!(Owned::of(codec::decode(storage, body).unwrap()), value);
+        assert_eq!(decoded_value(storage, &bytes), value);
     });
 }
 
@@ -520,15 +534,33 @@ fn an_array_round_trips() {
         let refs: Vec<ValueRef<'_>> = items.iter().map(Owned::as_ref).collect();
         let mut bytes = Vec::new();
         codec::encode_array(storage, &refs, &mut bytes).unwrap();
-        let mut rest = &bytes[..];
-        let body =
-            codec::split_value(&mut rest, "array").unwrap().expect("an array is not null");
-        assert!(rest.is_empty());
-        let mut elements = codec::decode_array(storage, body).unwrap();
-        let got: Vec<Owned> = elements.by_ref().map(|it| Owned::of(it.unwrap())).collect();
-        elements.finish().unwrap();
-        assert_eq!(got, items);
+        assert_eq!(decoded_array(storage, &bytes), items);
     });
+}
+
+#[test]
+fn the_oracle_catches_a_value_encoded_in_the_wrong_byte_order() {
+    let value = Owned::Integer(0x0102_0304_0506_0708);
+    let mut bytes = Vec::new();
+    codec::encode(value.as_ref(), &mut bytes).unwrap();
+    assert_eq!(decoded_value(Storage::Integer, &bytes), value);
+    // Keep the framing intact and plant the opposite byte order in the eight-byte integer.
+    assert_eq!(bytes.len(), 4 + 8);
+    bytes[4..].reverse();
+    assert_ne!(decoded_value(Storage::Integer, &bytes), value);
+}
+
+#[test]
+fn the_oracle_catches_an_array_that_drops_its_null_elements() {
+    let items = [Owned::Integer(1), Owned::Null, Owned::Integer(2)];
+    let refs: Vec<ValueRef<'_>> = items.iter().map(Owned::as_ref).collect();
+    let mut bytes = Vec::new();
+    codec::encode_array(Storage::Integer, &refs, &mut bytes).unwrap();
+    assert_eq!(decoded_array(Storage::Integer, &bytes), items);
+    let nonnull = [items[0].as_ref(), items[2].as_ref()];
+    bytes.clear();
+    codec::encode_array(Storage::Integer, &nonnull, &mut bytes).unwrap();
+    assert_ne!(decoded_array(Storage::Integer, &bytes), items);
 }
 
 #[test]

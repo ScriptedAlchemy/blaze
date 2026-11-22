@@ -1,5 +1,6 @@
 //! Serialized routing, retry journal and retention for the local IO driver.
 
+use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_dist::Refusal;
@@ -114,7 +115,7 @@ pub struct Coordinator {
 }
 
 fn error(code: ErrorCode, text: &str) -> WireError {
-    WireError::new(code, text)
+    WireError::new(code, format_args!("{text}"))
 }
 
 /// A claimant label alone carries no authority. Its owned session is part of the core identity.
@@ -383,7 +384,7 @@ impl Coordinator {
         if request.epoch != self.epoch {
             return Err(error(ErrorCode::Conflict, "daemon-moved"));
         }
-        let raw = encode(&ClientFrame::Request(request.clone()));
+        let raw = encode(&ClientFrame::Request(request.clone()), Global);
         let session = self
             .sessions
             .get(&request.session)
@@ -422,21 +423,27 @@ impl Coordinator {
                 .insert(execution);
             self.refresh_work_sessions(now);
         }
-        let mut reply = encode(&ServerFrame::Response(Response {
-            epoch: self.epoch,
-            session: request.session,
-            sequence: request.sequence,
-            answer,
-        }));
-        if reply.len() > self.config.max_frame as usize {
-            // Keep the already-observed transition journaled if a future response variant
-            // breaks its structural bound; never transmit an oversize frame or retry it.
-            reply = encode(&ServerFrame::Response(Response {
+        let mut reply = encode(
+            &ServerFrame::Response(Response {
                 epoch: self.epoch,
                 session: request.session,
                 sequence: request.sequence,
-                answer: Answer::Error(error(ErrorCode::Busy, "response-frame-capacity")),
-            }));
+                answer,
+            }),
+            Global,
+        );
+        if reply.len() > self.config.max_frame as usize {
+            // Keep the already-observed transition journaled if a future response variant
+            // breaks its structural bound; never transmit an oversize frame or retry it.
+            reply = encode(
+                &ServerFrame::Response(Response {
+                    epoch: self.epoch,
+                    session: request.session,
+                    sequence: request.sequence,
+                    answer: Answer::Error(error(ErrorCode::Busy, "response-frame-capacity")),
+                }),
+                Global,
+            );
         }
         // Responses are bounded structurally by event pagination and request limits.
         // The server configuration is validated to leave room for all non-event answers.
@@ -595,7 +602,7 @@ impl Coordinator {
                 for event in events.iter().take(r.limit as usize) {
                     page.events.push(event.clone());
                     // Leave framing/response envelope headroom, never split a CBOR event.
-                    if encode(&page).len() + 256 > self.config.max_frame as usize {
+                    if encode(&page, Global).len() + 256 > self.config.max_frame as usize {
                         page.events.pop();
                         break;
                     }
@@ -645,7 +652,7 @@ impl Coordinator {
                 if r.request.items.iter().map(|item| item.found.len()).sum::<usize>() > 4096 {
                     return Err(error(ErrorCode::Busy, "discovery-frame-capacity"));
                 }
-                let bytes = encode(&r.request).len();
+                let bytes = encode(&r.request, Global).len();
                 let held = self.work_bytes.get(&r.request.lease.execution).copied().unwrap_or(0);
                 if held.saturating_add(bytes) > self.config.work_bytes {
                     return Err(error(ErrorCode::Busy, "work-retention-capacity"));
@@ -665,8 +672,8 @@ impl Coordinator {
                 {
                     return Err(error(ErrorCode::Busy, "event-retention-capacity"));
                 }
-                let held: usize = e.events(0).iter().map(|event| encode(event).len()).sum();
-                if held.saturating_add(encode(&r.request).len()).saturating_add(1024)
+                let held: usize = e.events(0).iter().map(|event| encode(event, Global).len()).sum();
+                if held.saturating_add(encode(&r.request, Global).len()).saturating_add(1024)
                     > self.config.event_bytes
                 {
                     return Err(error(ErrorCode::Busy, "event-byte-capacity"));
@@ -753,7 +760,7 @@ impl Coordinator {
             }
             Command::CommitPublication(p) => {
                 self.work(p.content, p.execution, p.attempt)?;
-                if encode(&p.packs).len() > self.config.work_bytes {
+                if encode(&p.packs, Global).len() > self.config.work_bytes {
                     return Err(error(ErrorCode::Busy, "publication-retention-capacity"));
                 }
                 self.jobs

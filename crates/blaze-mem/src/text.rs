@@ -444,17 +444,41 @@ mod tests {
 
     use super::String;
 
+    fn append_problem(temporary: bool) -> Option<&'static str> {
+        let mut buf = String::with_capacity_in(64, Global);
+        let capacity = buf.capacity();
+        let ((), used) = blaze_alloc_count::measure(|| {
+            for n in 0..3 {
+                if temporary {
+                    // Plant the allocating implementation while keeping the resulting text
+                    // and the destination's capacity exactly the same.
+                    buf.push_str(&std::hint::black_box(std::format!("{n}-")));
+                } else {
+                    format_into!(&mut buf, "{n}-");
+                }
+            }
+            format_into!(&mut buf, "end");
+        });
+        if &*buf != "0-1-2-end" {
+            Some("formatting did not append all of the text")
+        } else if buf.capacity() != capacity {
+            Some("formatting grew the destination despite its spare capacity")
+        } else if used.allocations != 0 {
+            Some("formatting allocated a temporary buffer")
+        } else {
+            None
+        }
+    }
+
     /// The invariant: `format_into!` appends to the caller's buffer and allocates nothing
     /// while what it writes fits the capacity the buffer has.
     #[test]
     fn format_into_appends_to_the_callers_buffer_without_growing_it() {
-        let mut buf = String::with_capacity_in(64, Global);
-        let capacity = buf.capacity();
-        for n in 0..3 {
-            format_into!(&mut buf, "{n}-");
-        }
-        format_into!(&mut buf, "end");
-        assert_eq!(&*buf, "0-1-2-end");
-        assert_eq!(buf.capacity(), capacity, "it wrote into the buffer it was given");
+        assert_eq!(append_problem(false), None);
+    }
+
+    #[test]
+    fn the_oracle_catches_formatting_through_a_temporary_buffer() {
+        assert_eq!(append_problem(true), Some("formatting allocated a temporary buffer"));
     }
 }

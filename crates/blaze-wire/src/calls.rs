@@ -8,13 +8,15 @@ use crate::cbor::Wire;
 use crate::shapes::*;
 use crate::wire_struct;
 use crate::{Digest, Named};
+use std::alloc::{Allocator, Global};
+use std::io::Write as _;
 
 /// The answer of every call that has nothing to say: `{}`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Ack {}
 
 impl Wire for Ack {
-    fn encode(&self, e: &mut crate::Encoder) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
         e.map(0);
     }
 
@@ -144,8 +146,14 @@ wire_struct! {
 
 impl WireError {
     /// The error of one code, with its message.
-    pub fn new(code: ErrorCode, message: impl Into<String>) -> WireError {
-        WireError { code: code as u8, message: message.into(), retry_after_ms: None }
+    pub fn new(code: ErrorCode, message: std::fmt::Arguments<'_>) -> WireError {
+        let mut bytes = Vec::new_in(Global);
+        bytes.write_fmt(message).expect("formatting a wire error into Vec cannot fail");
+        WireError {
+            code: code as u8,
+            message: String::from_utf8(bytes).expect("formatting a wire error writes UTF-8"),
+            retry_after_ms: None,
+        }
     }
 
     /// The error with the milliseconds a client waits.

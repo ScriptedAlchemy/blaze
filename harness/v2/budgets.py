@@ -2281,6 +2281,27 @@ def selftest_work() -> None:
     probe passes, refused by name where it does not."""
     bases = storelib.work_bases()
     expect(bases[0] == "/tmp" and bases[1].endswith("blaze-harness"), f"/tmp, then the cache directory: {bases}")
+    # A cache base may not exist yet on a fresh runner. The real chooser creates it before
+    # probing; exercise that transition independently of the host's filesystem capabilities.
+    with tempfile.TemporaryDirectory() as tmp:
+        offered = [str(Path(tmp) / "refused"), str(Path(tmp) / "new-cache" / "blaze-harness")]
+        probed: list[str] = []
+
+        def probe(base: str) -> str | None:
+            expect(Path(base).is_dir(), f"a candidate is made before the clone probe: {base}")
+            probed.append(base)
+            return "FICLONE: planted refusal" if base == offered[0] else None
+
+        with patch.object(storelib, "work_bases", return_value=offered), patch.object(storelib, "cannot_clone", side_effect=probe):
+            made = engine.work_dir("", "bz-selftest-")
+            expect(probed == offered and made.parent == Path(offered[1]).resolve(),
+                   f"the absent second base is created and selected after the first refuses: {probed}, {made}")
+            made.rmdir()
+        with patch.object(storelib, "work_bases", return_value=offered), patch.object(
+            storelib, "cannot_clone", return_value="FICLONE: planted refusal"
+        ):
+            said = refused("every candidate refuses cloning", lambda: engine.work_dir("", "bz-selftest-"), engine.Failed)
+            expect(all(base in said for base in offered) and "give `work`" in said, said)
     with tempfile.TemporaryDirectory() as tmp:
         why = storelib.cannot_clone(tmp)
         expect(os.listdir(tmp) == [], "the probe leaves nothing behind")
@@ -2290,7 +2311,16 @@ def selftest_work() -> None:
         else:
             said = refused("a work directory that cannot clone", lambda: engine.work_dir(str(named), "x-"), engine.Failed)
             expect(str(named.resolve()) in said and "FICLONE" in said and why in said, said)
-    clones = [base for base in bases if os.path.isdir(base) and storelib.cannot_clone(base) is None]
+    clones: list[str] = []
+    for base in bases:
+        try:
+            # Observe the filesystem the chooser will probe, including a not-yet-made cache
+            # base. Checking only existing directories incorrectly predicts refusal there.
+            os.makedirs(base, exist_ok=True)
+            if storelib.cannot_clone(base) is None:
+                clones.append(base)
+        except OSError:
+            continue
     if clones:
         made = engine.work_dir("", "bz-selftest-")
         expect(made.is_dir() and str(made.parent) == os.path.realpath(clones[0]), f"a new one in {clones[0]}: {made}")

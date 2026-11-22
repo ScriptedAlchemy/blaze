@@ -20,6 +20,7 @@
 //! **JSON** ([`to_json`]) is only a rendering for people; it is never the wire, and no value's
 //! identity is taken from it.
 
+#![feature(allocator_api)]
 #![deny(missing_docs)]
 
 pub mod calls;
@@ -29,6 +30,9 @@ pub mod json;
 pub mod pack_list;
 pub mod shapes;
 pub mod vectors;
+
+#[cfg(test)]
+mod allocator_tests;
 
 pub use calls::*;
 pub use cbor::Limits;
@@ -41,6 +45,7 @@ pub use shapes::*;
 pub use vectors::{Gen, Sample, Vector, every};
 
 use sha2::{Digest as _, Sha256};
+use std::alloc::Allocator;
 
 /// A SHA-256 digest: 32 bytes, a byte string on the wire.
 pub type Digest = [u8; 32];
@@ -68,8 +73,8 @@ const DIGEST_PREFIX: &str = "blaze/";
 const DOMAIN_VERSION: &str = "/v5";
 
 /// The bytes a digest of `value` is taken over: `"blaze/" ‖ name ‖ "/v5" ‖ 0x00 ‖ CBOR`.
-pub fn digest_input<T: Wire + Named>(value: &T) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64);
+pub fn digest_input<T: Wire + Named, A: Allocator + Clone>(value: &T, alloc: A) -> Vec<u8, A> {
+    let mut out = Vec::with_capacity_in(64, alloc);
     out.extend_from_slice(DIGEST_PREFIX.as_bytes());
     out.extend_from_slice(T::NAME.as_bytes());
     out.extend_from_slice(DOMAIN_VERSION.as_bytes());
@@ -93,8 +98,8 @@ pub fn digest_of_encoded_name(name: &str, cbor: &[u8]) -> Digest {
 }
 
 /// The SHA-256 of `value`'s domain-separated encoding.
-pub fn digest_of<T: Wire + Named>(value: &T) -> Digest {
-    digest_of_encoded::<T>(&encode(value))
+pub fn digest_of<T: Wire + Named, A: Allocator + Clone>(value: &T, alloc: A) -> Digest {
+    digest_of_encoded::<T>(&encode(value, alloc))
 }
 
 /// The SHA-256 of `cbor` behind the domain separation of type `T`, for a value whose canonical

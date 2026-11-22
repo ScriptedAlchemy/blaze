@@ -109,12 +109,23 @@ pub fn tests_line(tally: &Tally, ok: bool, why: Option<&str>, elapsed_ms: u64) -
 mod tests {
     use super::*;
 
+    fn counts_match(line: &str, selected: u64, ran: u64) -> bool {
+        let count = |name| {
+            line.split_whitespace().find_map(|field| {
+                let (key, value) = field.split_once('=')?;
+                (key == name).then(|| value.parse::<u64>().ok()).flatten()
+            })
+        };
+        count("selected") == Some(selected) && count("ran") == Some(ran)
+    }
+
     /// The invariant: every line a run's end is said by carries how many tests were selected
     /// and how many ran, so a run of nothing cannot read as a pass of something.
     #[test]
     fn the_line_always_says_how_many_were_selected_and_ran() {
         let none = Tally { binaries: 3, filtered_out: 312, ..Tally::default() };
         assert_eq!((none.selected(), none.ran()), (0, 0));
+        assert!(counts_match(&tests_line(&none, false, Some("no test ran"), 12), 0, 0));
         assert_eq!(
             tests_line(&none, false, Some("no test ran"), 12),
             "blaze: tests failed selected=0 ran=0 passed=0 failed=0 ignored=0 measured=0 filtered_out=312 \
@@ -123,11 +134,24 @@ mod tests {
         let some = Tally { binaries: 3, passed: 7, failed: 1, ignored: 1, ..Tally::default() };
         assert_eq!((some.selected(), some.ran()), (9, 8));
         assert_eq!(some.ran_of(), "8 of 9 ran");
+        assert!(counts_match(&tests_line(&some, false, None, 31_800), 9, 8));
         assert_eq!(
             tests_line(&some, false, None, 31_800),
             "blaze: tests failed selected=9 ran=8 passed=7 failed=1 ignored=1 measured=0 filtered_out=0 \
              cached=0 binaries=3 unbuilt=0 elapsed_ms=31800"
         );
+    }
+
+    #[test]
+    fn the_oracle_catches_cached_passes_reported_as_tests_run() {
+        let cached = Tally { passed: 7, cached: 7, ..Tally::default() };
+        let correct = tests_line(&cached, true, None, 12);
+        assert!(counts_match(&correct, 7, 0));
+        // Plant the old ambiguity: a passing cached result is reported as a test executed.
+        let wrong = correct.replace("ran=0", "ran=7");
+        assert!(!counts_match(&wrong, 7, 0));
+        let missing = correct.replace(" selected=7 ran=0", "");
+        assert!(!counts_match(&missing, 7, 0), "omitting the counts must also be visible");
     }
 
     /// A test that is selected and not run (ignored, or cached: a pass that stands) is

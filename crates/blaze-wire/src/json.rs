@@ -7,68 +7,115 @@
 //! rendering is made by reading the value's canonical CBOR back, so it is a view of the same bytes
 //! the encoder writes and not a second schema.
 
+use std::alloc::Allocator;
+use std::fmt::{self, Write as _};
+
 use crate::cbor::{Encoder, Named, Wire};
 
 /// Renders one wire value as JSON, with its type's name as the outer key.
 ///
 /// The rendering is built by reading the value's own canonical CBOR, so a byte string is hex and
 /// not an array of integers. It ends without a newline.
-pub fn to_json<T: Wire + Named>(value: &T) -> String {
-    let mut out = String::new();
-    out.push_str("{\"");
-    out.push_str(T::NAME);
-    out.push_str("\":");
-    render(value, &mut out);
-    out.push('}');
-    out
+pub fn to_json<T: Wire + Named, A: Allocator + Clone>(
+    value: &T,
+    out: &mut dyn fmt::Write,
+    alloc: A,
+) -> fmt::Result {
+    write!(out, "{{\"{}\":", T::NAME)?;
+    render(value, out, alloc)?;
+    out.write_char('}')
 }
 
 /// Renders one wire value as its JSON form, without its type's name around it.
-pub fn render<T: Wire>(value: &T, out: &mut String) {
-    render_cbor(&Encoder::of(value), out);
+pub fn render<T: Wire, A: Allocator + Clone>(
+    value: &T,
+    out: &mut dyn fmt::Write,
+    alloc: A,
+) -> fmt::Result {
+    render_cbor(&Encoder::of(value, alloc), out)
 }
 
 /// Renders one value's canonical CBOR as JSON, which is what a message's bytes are.
-pub fn render_cbor(cbor: &[u8], out: &mut String) {
-    render_item(cbor, out);
+pub fn render_cbor(cbor: &[u8], out: &mut dyn fmt::Write) -> fmt::Result {
+    render_item(cbor, out)
 }
 
-/// `bytes` as lowercase hex.
-pub fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(DIGITS[(b >> 4) as usize] as char);
-        out.push(DIGITS[(b & 15) as usize] as char);
+/// A borrowed lowercase hexadecimal rendering. Formatting writes directly to its destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hex<'a> {
+    bytes: &'a [u8],
+}
+
+impl Hex<'_> {
+    /// The number of ASCII digits in this rendering.
+    pub fn len(&self) -> usize {
+        self.bytes.len() * 2
     }
-    out
+
+    /// Whether there are no digits.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// The digits, without allocating a string.
+    pub fn chars(&self) -> impl Iterator<Item = char> + '_ {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        self.bytes.iter().flat_map(|byte| {
+            [DIGITS[(byte >> 4) as usize] as char, DIGITS[(byte & 15) as usize] as char]
+        })
+    }
 }
 
-fn render_item(bytes: &[u8], out: &mut String) {
+impl fmt::Display for Hex<'_> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for digit in self.chars() {
+            out.write_char(digit)?;
+        }
+        Ok(())
+    }
+}
+
+/// `bytes` as lowercase hex, borrowed until its destination formats it.
+pub fn hex(bytes: &[u8]) -> Hex<'_> {
+    Hex { bytes }
+}
+
+fn render_item(bytes: &[u8], out: &mut dyn fmt::Write) -> fmt::Result {
     let mut at = 0;
-    render_at(bytes, &mut at, out);
+    render_at(bytes, &mut at, out)
 }
 
-fn push_hex(bytes: &[u8], out: &mut String) {
-    out.push('"');
-    out.push_str(&hex(bytes));
-    out.push('"');
+fn push_hex(bytes: &[u8], out: &mut dyn fmt::Write) -> fmt::Result {
+    write!(out, "\"{}\"", hex(bytes))
 }
 
-fn push_string(text: &str, out: &mut String) {
-    out.push('"');
+fn escaped(text: &str, out: &mut dyn fmt::Write) -> fmt::Result {
     for c in text.chars() {
         match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
+            '"' => out.write_str("\\\""),
+            '\\' => out.write_str("\\\\"),
+            '\n' => out.write_str("\\n"),
+            '\r' => out.write_str("\\r"),
+            '\t' => out.write_str("\\t"),
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32),
+            c => out.write_char(c),
+        }?;
     }
-    out.push('"');
+    Ok(())
+}
+
+fn push_string(text: &str, out: &mut dyn fmt::Write) -> fmt::Result {
+    out.write_char('"')?;
+    escaped(text, out)?;
+    out.write_char('"')
+}
+
+struct Escaped<'a>(&'a mut dyn fmt::Write);
+
+impl fmt::Write for Escaped<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        escaped(text, self.0)
+    }
 }
 
 /// Reads one head and its argument, advancing `at` past both.
@@ -110,53 +157,89 @@ fn head(bytes: &[u8], at: &mut usize) -> (u8, u64) {
     (major, arg)
 }
 
-fn render_at(bytes: &[u8], at: &mut usize, out: &mut String) {
+fn render_at(bytes: &[u8], at: &mut usize, out: &mut dyn fmt::Write) -> fmt::Result {
     let (major, arg) = head(bytes, at);
     match major {
-        0 => out.push_str(&arg.to_string()),
+        0 => write!(out, "{arg}"),
         // `-1 - arg` in an `i128`: `-2^64` is a well-formed CBOR item the validator accepts, and
         // `arg + 1` would overflow a `u64` in debug and render `-0` in release.
-        1 => out.push_str(&(-1 - i128::from(arg)).to_string()),
+        1 => write!(out, "{}", -1 - i128::from(arg)),
         2 => {
             let end = *at + arg as usize;
-            push_hex(&bytes[*at..end], out);
+            push_hex(&bytes[*at..end], out)?;
             *at = end;
+            Ok(())
         }
         3 => {
             let end = *at + arg as usize;
-            push_string(std::str::from_utf8(&bytes[*at..end]).unwrap_or(""), out);
+            push_string(std::str::from_utf8(&bytes[*at..end]).unwrap_or(""), out)?;
             *at = end;
+            Ok(())
         }
         4 => {
-            out.push('[');
+            out.write_char('[')?;
             for i in 0..arg {
                 if i > 0 {
-                    out.push(',');
+                    out.write_char(',')?;
                 }
-                render_at(bytes, at, out);
+                render_at(bytes, at, out)?;
             }
-            out.push(']');
+            out.write_char(']')
         }
         5 => {
-            out.push('{');
+            out.write_char('{')?;
             for i in 0..arg {
                 if i > 0 {
-                    out.push(',');
+                    out.write_char(',')?;
                 }
                 // A schema map's key is a field number, which JSON writes as text.
-                let mut key = String::new();
-                render_at(bytes, at, &mut key);
-                push_string(&key, out);
-                out.push(':');
-                render_at(bytes, at, out);
+                out.write_char('"')?;
+                render_at(bytes, at, &mut Escaped(out))?;
+                out.write_str("\":")?;
+                render_at(bytes, at, out)?;
             }
-            out.push('}');
+            out.write_char('}')
         }
         _ => match arg {
-            20 => out.push_str("false"),
-            21 => out.push_str("true"),
-            22 => out.push_str("null"),
-            _ => out.push_str("null"),
+            20 => out.write_str("false"),
+            21 => out.write_str("true"),
+            22 => out.write_str("null"),
+            _ => out.write_str("null"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixed<const N: usize> {
+        bytes: [u8; N],
+        len: usize,
+    }
+
+    impl<const N: usize> fmt::Write for Fixed<N> {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            let end = self.len.checked_add(text.len()).ok_or(fmt::Error)?;
+            let target = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+            target.copy_from_slice(text.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn rendering_uses_the_destination_and_reports_its_capacity() {
+        // A real canonical map with a field number and text requiring all three escape paths.
+        let cbor = [0xa1, 0x00, 0x65, b'a', b'"', b'\\', b'\n', 1];
+        let mut enough = Fixed { bytes: [0; 64], len: 0 };
+        render_cbor(&cbor, &mut enough).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&enough.bytes[..enough.len]).unwrap(),
+            r#"{"0":"a\"\\\n\u0001"}"#,
+        );
+        // Control: the same renderer and bytes with the destination capacity removed.
+        let mut short = Fixed { bytes: [0; 8], len: 0 };
+        assert_eq!(render_cbor(&cbor, &mut short), Err(fmt::Error));
     }
 }

@@ -411,15 +411,36 @@ mod tests {
         assert_eq!(trusted.license(Spend::UnwindEdge), None);
     }
 
+    fn proof_modes_match(mode: impl Fn(Tier) -> Proofs) -> Result<(), Tier> {
+        for (tier, expected) in [
+            (Tier::Zero, Proofs::None),
+            (Tier::Shipped, Proofs::None),
+            (Tier::Optimizing, Proofs::Spent),
+        ] {
+            if mode(tier) != expected {
+                return Err(tier);
+            }
+        }
+        Ok(())
+    }
+
     /// The invariant: tier 0 spends no proof and an optimizing tier does (for `SpendFacts`,
     /// when it runs there); the two modes are two values, so no key that holds one can hold
     /// the other.
     #[test]
     fn tier_zero_spends_no_proof() {
-        assert_eq!(proofs_at(Tier::Zero), Proofs::None);
-        assert_eq!(proofs_at(Tier::Shipped), Proofs::None);
-        assert_eq!(proofs_at(Tier::Optimizing), Proofs::Spent);
+        assert_eq!(proof_modes_match(proofs_at), Ok(()));
         assert_ne!(Proofs::None, Proofs::Spent);
+    }
+
+    #[test]
+    fn the_oracle_catches_proof_spending_at_tier_zero() {
+        assert_eq!(proof_modes_match(proofs_at), Ok(()));
+        let spends_at_zero = |tier| match tier {
+            Tier::Zero => Proofs::Spent,
+            _ => proofs_at(tier),
+        };
+        assert_eq!(proof_modes_match(spends_at_zero), Err(Tier::Zero));
     }
 
     #[test]

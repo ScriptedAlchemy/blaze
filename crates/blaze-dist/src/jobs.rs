@@ -7,7 +7,11 @@
 //! it is reassigned once with a new `Attempt`, and the dead attempt's late events and work
 //! calls are refused; a second loss ends it `Lost`. The work set lives inside the
 //! execution, so a reassignment fences its leases in the same transition.
+//!
+//! Effect buffers belong to the caller. Routing through an execution or its work set uses
+//! the same allocator for temporary effect logs, so a driver's task allocator owns them all.
 
+use std::alloc::Allocator;
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_wire::job_terminal_v2::{
@@ -207,7 +211,7 @@ impl Execution {
         namespace: Namespace,
         first: Subscriber,
         config: ExecutionConfig,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Execution {
         let mut execution = Execution {
             config,
@@ -323,7 +327,7 @@ impl Execution {
         &mut self,
         now: Millis,
         id: u64,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<(), Refusal> {
         let Some(subscriber) = self.subscribers.get_mut(&id) else {
             return Err(Refusal::NoSubscriber);
@@ -351,7 +355,7 @@ impl Execution {
     }
 
     /// Admission let it run.
-    pub fn admitted(&mut self, now: Millis, out: &mut Vec<Effect>) {
+    pub fn admitted(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator + Clone>) {
         self.stage(now, Stage::Admitted, out);
     }
 
@@ -362,7 +366,7 @@ impl Execution {
         now: Millis,
         lead: &str,
         helpers: &[String],
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<(), Refusal> {
         if let ExecState::Ended(_) = self.state {
             return Err(Refusal::Ended);
@@ -380,7 +384,7 @@ impl Execution {
         self.helpers = helpers.iter().filter(|h| *h != lead).cloned().collect();
         self.lead_heard = now;
         self.heard.insert(lead.to_owned(), now);
-        let mut log = Vec::new();
+        let mut log = Vec::new_in(out.allocator().clone());
         match &mut self.work {
             None => {
                 self.work =
@@ -431,14 +435,14 @@ impl Execution {
         now: Millis,
         from: &str,
         attempt: Attempt,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<(), Refusal> {
         if attempt != self.attempt {
             return Err(Refusal::AttemptMoved);
         }
         self.member(from)?;
         if let Some(work) = &mut self.work {
-            let mut log = Vec::new();
+            let mut log = Vec::new_in(out.allocator().clone());
             work.retire(from, &mut log);
             out.extend(log.into_iter().map(Effect::Work));
         }
@@ -454,13 +458,13 @@ impl Execution {
         Ok(())
     }
 
-    fn work_call<T>(
+    fn work_call<T, A: Allocator + Clone>(
         &mut self,
         now: Millis,
         from: &str,
         attempt: Attempt,
-        out: &mut Vec<Effect>,
-        call: impl FnOnce(&mut WorkSet, &mut Vec<work::Effect>) -> Result<T, Refusal>,
+        out: &mut Vec<Effect, A>,
+        call: impl FnOnce(&mut WorkSet, &mut Vec<work::Effect, A>) -> Result<T, Refusal>,
     ) -> Result<T, Refusal> {
         // A capability names its attempt: a dead attempt's calls are refused as such before
         // anything else, so its executor stops rather than errs.
@@ -476,7 +480,7 @@ impl Execution {
         }
         self.heard.insert(from.to_owned(), now);
         let work = self.work.as_mut().ok_or(Refusal::NotJoined)?;
-        let mut log = Vec::new();
+        let mut log = Vec::new_in(out.allocator().clone());
         let answer = call(work, &mut log);
         out.extend(log.into_iter().map(Effect::Work));
         self.after_work(now, out);
@@ -489,7 +493,7 @@ impl Execution {
         now: Millis,
         from: &str,
         req: &WorkJoinRequest,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<WorkJoinAnswer, Refusal> {
         self.work_call(now, from, req.attempt, out, |work, log| work.join(now, from, req, log))
     }
@@ -500,7 +504,7 @@ impl Execution {
         now: Millis,
         from: &str,
         req: &WorkLeaseRequest,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<WorkLeaseAnswer, Refusal> {
         self.work_call(now, from, req.attempt, out, |work, log| work.lease(now, from, req, log))
     }
@@ -511,7 +515,7 @@ impl Execution {
         now: Millis,
         from: &str,
         req: &BatchResult,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<WorkResultAnswer, Refusal> {
         self.work_call(now, from, req.lease.attempt, out, |work, log| {
             work.result(now, from, req, log)
@@ -527,7 +531,7 @@ impl Execution {
         now: Millis,
         from: &str,
         req: &WorkersEventsRequest,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<WorkersEventsAnswer, Refusal> {
         if req.execution != self.id {
             return Err(Refusal::NoExecution);
@@ -578,7 +582,7 @@ impl Execution {
             self.end(now, outcome, EndWhy::Reported, out);
             return Ok(WorkersEventsAnswer::CANCEL);
         }
-        let mut log = Vec::new();
+        let mut log = Vec::new_in(out.allocator().clone());
         let answer = match &mut self.work {
             Some(work) => work.heartbeat(now, from, req.attempt, &mut log),
             None => WorkersEventsAnswer::CONTINUE,
@@ -608,7 +612,7 @@ impl Execution {
         from: &str,
         attempt: Attempt,
         packs: &[PackRef],
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<(), Refusal> {
         self.tick(now, out);
         if matches!(self.state, ExecState::Ended(_)) {
@@ -657,7 +661,7 @@ impl Execution {
         &mut self,
         now: Millis,
         packs: &[PackRef],
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<(), Refusal> {
         self.tick(now, out);
         if self.publication.as_deref() != Some(packs) {
@@ -700,7 +704,7 @@ impl Execution {
 
     /// Ends what has run out of time: subscribers past their deadline, the execution past the
     /// latest, a lead that missed its heartbeats, and the work set's leases.
-    pub fn tick(&mut self, now: Millis, out: &mut Vec<Effect>) {
+    pub fn tick(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator + Clone>) {
         if let ExecState::Ended(_) = self.state {
             return;
         }
@@ -717,7 +721,7 @@ impl Execution {
             return self.lose_lead(now, out);
         }
         if let Some(work) = &mut self.work {
-            let mut log = Vec::new();
+            let mut log = Vec::new_in(out.allocator().clone());
             work.tick(now, &mut log);
             out.extend(log.into_iter().map(Effect::Work));
         }
@@ -725,7 +729,7 @@ impl Execution {
     }
 
     /// Both heartbeat expiry and owned retirement use the same bounded reassignment rule.
-    fn lose_lead(&mut self, now: Millis, out: &mut Vec<Effect>) {
+    fn lose_lead(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator + Clone>) {
         let lost = self.lead.take().expect("lead");
         self.lost.insert(lost.clone());
         out.push(Effect::Kill { executor: lost, assignment: self.assignment() });
@@ -737,7 +741,7 @@ impl Execution {
     }
 
     /// When the compile phase is done, the stream says so: the lead reads it and assembles.
-    fn after_work(&mut self, now: Millis, out: &mut Vec<Effect>) {
+    fn after_work(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator + Clone>) {
         if let Some(work) = &self.work
             && work.is_done()
             && work.lead_joined()
@@ -758,7 +762,7 @@ impl Execution {
         now: Millis,
         mut outcome: Outcome,
         mut why: EndWhy,
-        out: &mut Vec<Effect>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
     ) {
         if let ExecState::Ended(_) = self.state {
             return;
@@ -774,7 +778,7 @@ impl Execution {
         }
         self.state = ExecState::Ended(outcome.clone());
         if let Some(work) = &mut self.work {
-            let mut log = Vec::new();
+            let mut log = Vec::new_in(out.allocator().clone());
             work.end(why, &mut log);
             out.extend(log.into_iter().map(Effect::Work));
         }
@@ -782,13 +786,13 @@ impl Execution {
     }
 
     /// Cancel an execution administratively, preserving a typed cancellation for subscribers.
-    pub fn cancel(&mut self, now: Millis, out: &mut Vec<Effect>) {
+    pub fn cancel(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator + Clone>) {
         self.end(now, Outcome::Cancelled, EndWhy::Cancelled, out);
     }
 
     /// Detaches subscribers whose own deadlines have passed, once, before either a timer or
     /// a final result can report an outcome to them.
-    fn expire_subscribers(&mut self, now: Millis, out: &mut Vec<Effect>) -> bool {
+    fn expire_subscribers(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator + Clone>) -> bool {
         let late: Vec<u64> =
             self.attached().filter(|s| now > s.deadline_ms).map(|s| s.id).collect();
         let expired = !late.is_empty();
@@ -816,7 +820,13 @@ impl Execution {
         expired
     }
 
-    fn finish(&mut self, now: Millis, outcome: Outcome, why: EndWhy, out: &mut Vec<Effect>) {
+    fn finish(
+        &mut self,
+        now: Millis,
+        outcome: Outcome,
+        why: EndWhy,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
+    ) {
         for executor in self.executors().map(str::to_owned).collect::<Vec<_>>() {
             out.push(Effect::Kill { executor, assignment: self.assignment() });
         }
@@ -852,12 +862,12 @@ impl Execution {
         self.push(JobEvent::Done(DoneEvent { outcome, counters: Vec::new() }), out);
     }
 
-    fn stage(&mut self, now: Millis, stage: Stage, out: &mut Vec<Effect>) {
+    fn stage(&mut self, now: Millis, stage: Stage, out: &mut Vec<Effect, impl Allocator + Clone>) {
         self.stages.push((stage.clone(), now));
         self.push(JobEvent::Stage(StageEvent { stage, at_ms: now }), out);
     }
 
-    fn push(&mut self, event: JobEvent, out: &mut Vec<Effect>) {
+    fn push(&mut self, event: JobEvent, out: &mut Vec<Effect, impl Allocator + Clone>) {
         let item =
             EventItem { sequence: self.events.len() as u64 + 1, attempt: self.attempt, event };
         self.events.push(item.clone());
@@ -1002,7 +1012,7 @@ impl Jobs {
         content: JobContent,
         deadline_ms: Millis,
         policy: LocalPolicy,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<JobAnswer, Refusal> {
         let e = self.executions.get(&execution).ok_or(Refusal::NoExecution)?;
         if e.content != content {
@@ -1019,15 +1029,15 @@ impl Jobs {
         Ok(JobAnswer { content, execution, subscriber: id })
     }
 
-    fn work_route<T>(
+    fn work_route<T, A: Allocator + Clone>(
         &mut self,
         now: Millis,
         execution: ExecutionId,
-        out: &mut Vec<(ExecutionId, Effect)>,
-        call: impl FnOnce(&mut Execution, &mut Vec<Effect>) -> Result<T, Refusal>,
+        out: &mut Vec<(ExecutionId, Effect), A>,
+        call: impl FnOnce(&mut Execution, &mut Vec<Effect, A>) -> Result<T, Refusal>,
     ) -> Result<T, Refusal> {
         let e = self.executions.get_mut(&execution).ok_or(Refusal::NoExecution)?;
-        let mut log = Vec::new();
+        let mut log = Vec::new_in(out.allocator().clone());
         let result = call(e, &mut log);
         self.after(now, execution, log, out);
         result
@@ -1039,7 +1049,7 @@ impl Jobs {
         now: Millis,
         from: &str,
         req: &WorkJoinRequest,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<WorkJoinAnswer, Refusal> {
         self.work_route(now, req.execution, out, |e, log| e.join(now, from, req, log))
     }
@@ -1050,7 +1060,7 @@ impl Jobs {
         now: Millis,
         from: &str,
         req: &WorkLeaseRequest,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<WorkLeaseAnswer, Refusal> {
         self.work_route(now, req.execution, out, |e, log| e.lease(now, from, req, log))
     }
@@ -1061,7 +1071,7 @@ impl Jobs {
         now: Millis,
         from: &str,
         req: &BatchResult,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<WorkResultAnswer, Refusal> {
         self.work_route(now, req.lease.execution, out, |e, log| e.result(now, from, req, log))
     }
@@ -1093,7 +1103,7 @@ impl Jobs {
         now: Millis,
         execution: ExecutionId,
         claimant: Digest,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<Option<(String, Attempt)>, Refusal> {
         self.tick(now, out);
         let e = self.executions.get(&execution).ok_or(Refusal::NoExecution)?;
@@ -1152,7 +1162,7 @@ impl Jobs {
         executor: &str,
         assignment: AssignmentToken,
         claimant: Digest,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<(), Refusal> {
         self.tick(now, out);
         let held = self.assignments.get(executor).ok_or(Refusal::NotHolder)?;
@@ -1189,7 +1199,7 @@ impl Jobs {
         now: Millis,
         req: &JobRequest,
         need: Reservation,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<JobAnswer, (Refusal, Option<u64>)> {
         // Coalescing is only for live executions. Expire prior subscribers before a new
         // deadline can extend their execution, even when the driver's timer has not run.
@@ -1199,11 +1209,14 @@ impl Jobs {
         {
             return Err((Refusal::Superseded, None));
         }
-        let content = JobContent::of(&JobContentInput {
-            unit: req.unit,
-            platform: req.platform,
-            namespace: req.namespace.clone(),
-        });
+        let content = JobContent::of(
+            &JobContentInput {
+                unit: req.unit,
+                platform: req.platform,
+                namespace: req.namespace.clone(),
+            },
+            out.allocator(),
+        );
         let subscriber = Subscriber {
             id: self.next_subscriber,
             deadline_ms: req.deadline_ms,
@@ -1231,7 +1244,7 @@ impl Jobs {
         self.admission.enqueue(waiting).map_err(|(r, retry)| (r, Some(retry)))?;
         self.next_execution += 1;
         self.next_subscriber += 1;
-        let mut log = Vec::new();
+        let mut log = Vec::new_in(out.allocator().clone());
         let execution = Execution::new(
             now,
             id,
@@ -1254,7 +1267,7 @@ impl Jobs {
         now: Millis,
         req: &JobRequest,
         id: ExecutionId,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) {
         let Namespace::Pr(pr) = &req.namespace else { return };
         let jobs = self.pr_jobs.entry(pr.n).or_insert_with(|| PrJobs {
@@ -1293,10 +1306,10 @@ impl Jobs {
         now: Millis,
         execution: ExecutionId,
         subscriber: u64,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<(), Refusal> {
         let e = self.executions.get_mut(&execution).ok_or(Refusal::NoExecution)?;
-        let mut log = Vec::new();
+        let mut log = Vec::new_in(out.allocator().clone());
         let answer = e.unsubscribe(now, subscriber, &mut log);
         self.after(now, execution, log, out);
         answer
@@ -1311,11 +1324,11 @@ impl Jobs {
         from: &str,
         attempt: Attempt,
         packs: &[PackRef],
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<(), Refusal> {
         self.tick(now, out);
         let e = self.executions.get_mut(&execution).ok_or(Refusal::NoExecution)?;
-        let mut log = Vec::new();
+        let mut log = Vec::new_in(out.allocator().clone());
         let answer = e.commit_publication(now, from, attempt, packs, &mut log);
         self.after(now, execution, log, out);
         answer
@@ -1327,11 +1340,11 @@ impl Jobs {
         now: Millis,
         execution: ExecutionId,
         packs: &[PackRef],
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<(), Refusal> {
         self.tick(now, out);
         let e = self.executions.get_mut(&execution).ok_or(Refusal::NoExecution)?;
-        let mut log = Vec::new();
+        let mut log = Vec::new_in(out.allocator().clone());
         let answer = e.deliver_publication(now, packs, &mut log);
         self.after(now, execution, log, out);
         answer
@@ -1343,10 +1356,10 @@ impl Jobs {
         now: Millis,
         from: &str,
         req: &WorkersEventsRequest,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<WorkersEventsAnswer, Refusal> {
         let e = self.executions.get_mut(&req.execution).ok_or(Refusal::NoExecution)?;
-        let mut log = Vec::new();
+        let mut log = Vec::new_in(out.allocator().clone());
         let answer = e.worker_events(now, from, req, &mut log);
         self.after(now, req.execution, log, out);
         answer
@@ -1389,20 +1402,20 @@ impl Jobs {
     }
 
     /// Time passed: executions' deadlines and lead losses, reassignments, then admission.
-    pub fn tick(&mut self, now: Millis, out: &mut Vec<(ExecutionId, Effect)>) {
+    pub fn tick(&mut self, now: Millis, out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>) {
         let ids: Vec<ExecutionId> = self.executions.keys().copied().collect();
         for id in ids {
             let e = self.executions.get_mut(&id).expect("present");
             if matches!(e.state(), ExecState::Ended(_)) {
                 continue;
             }
-            let mut log = Vec::new();
+            let mut log = Vec::new_in(out.allocator().clone());
             e.tick(now, &mut log);
             self.after(now, id, log, out);
         }
         for admitted in self.admission.admit(now) {
             let e = self.executions.get_mut(&admitted.execution).expect("queued");
-            let mut log = Vec::new();
+            let mut log = Vec::new_in(out.allocator().clone());
             e.admitted(now, &mut log);
             if e.assign(now, &admitted.executor, &[], &mut log).is_ok() {
                 self.assignments
@@ -1419,7 +1432,11 @@ impl Jobs {
     /// a helper, and an execution whose compile phase is done takes none. While a job
     /// waits for a lead on the same platform, idle executors stay leads-in-waiting, so
     /// one wide build cannot starve the queue behind it.
-    fn offer_helpers(&mut self, now: Millis, out: &mut Vec<(ExecutionId, Effect)>) {
+    fn offer_helpers(
+        &mut self,
+        now: Millis,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
+    ) {
         // At most one helper per execution per tick, fewest executors first.
         // Rounds within one tick still hoard: `submit` ticks before it enqueues,
         // so a second build is not yet waiting when the first is admitted, and
@@ -1486,12 +1503,12 @@ impl Jobs {
         }
     }
 
-    fn after(
+    fn after<A: Allocator + Clone>(
         &mut self,
         now: Millis,
         id: ExecutionId,
-        log: Vec<Effect>,
-        out: &mut Vec<(ExecutionId, Effect)>,
+        log: Vec<Effect, A>,
+        out: &mut Vec<(ExecutionId, Effect), A>,
     ) {
         for effect in log {
             if effect == Effect::NeedLead {
@@ -1522,7 +1539,7 @@ impl Jobs {
                     .first()
                     .cloned()
                     .or_else(|| self.admission.idle_for(&namespace, &platform, &need, &except));
-                let mut more = Vec::new();
+                let mut more = Vec::new_in(out.allocator().clone());
                 let e = self.executions.get_mut(&id).expect("present");
                 match lead {
                     Some(lead) => {

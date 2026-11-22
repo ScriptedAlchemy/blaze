@@ -10,11 +10,13 @@
 //! vectors can be generated and checked in one place.
 
 use sha2::{Digest as _, Sha256};
+use std::alloc::{Allocator, Global};
+use std::io::{self, Write};
 
 use crate::calls::*;
 use crate::cbor::{Named, Wire};
 use crate::shapes::*;
-use crate::{Digest, Set, digest_of, encode};
+use crate::{Digest, Set, encode};
 
 /// A deterministic stream of random values.
 #[derive(Clone, Debug)]
@@ -86,22 +88,21 @@ impl Gen {
         T::sample(self)
     }
 
-    /// A text string of printable ASCII, which keeps a JSON rendering simple to read.
-    pub fn text(&mut self) -> String {
+    /// The bytes of printable ASCII text, which keeps a JSON rendering simple to read. The caller chooses where to
+    /// keep them; the iterator reports its exact length before it consumes the random stream.
+    pub fn text(&mut self) -> impl ExactSizeIterator<Item = u8> + '_ {
         const ALPHABET: &[u8] =
             b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -_./:";
         let len = self.len(40);
-        let mut out = String::with_capacity(len);
-        for _ in 0..len {
-            out.push(ALPHABET[self.below(ALPHABET.len() as u64) as usize] as char);
-        }
-        out
+        (0..len).map(|_| ALPHABET[self.below(ALPHABET.len() as u64) as usize])
     }
 
     /// Bytes at a length whose head changes width.
-    pub fn bytes(&mut self) -> Vec<u8> {
+    pub fn bytes<A: Allocator>(&mut self, alloc: A) -> Vec<u8, A> {
         let len = self.len(300);
-        (0..len).map(|_| self.next_u64() as u8).collect()
+        let mut out = Vec::with_capacity_in(len, alloc);
+        out.extend((0..len).map(|_| self.next_u64() as u8));
+        out
     }
 }
 
@@ -136,7 +137,10 @@ impl Sample for bool {
 
 impl Sample for String {
     fn sample(g: &mut Gen) -> Self {
-        g.text()
+        let text = g.text();
+        let mut bytes = Vec::with_capacity_in(text.len(), Global);
+        bytes.extend(text);
+        String::from_utf8(bytes).expect("the sample alphabet is ASCII")
     }
 }
 
@@ -206,7 +210,9 @@ impl Vector {
 
     /// The vector of `value`.
     pub fn of_value<T: Wire + Named>(value: &T) -> Vector {
-        Vector { name: T::NAME, cbor: encode(value), digest: digest_of(value) }
+        let cbor = encode(value, Global);
+        let digest = crate::digest_of_encoded::<T>(&cbor);
+        Vector { name: T::NAME, cbor, digest }
     }
 
     /// Whether the digest is the one this vector's name and CBOR make.
@@ -215,8 +221,9 @@ impl Vector {
     }
 
     /// The vector as the text of a golden file.
-    pub fn to_golden(&self) -> String {
-        format!(
+    pub fn to_golden(&self, out: &mut (impl Write + ?Sized)) -> io::Result<()> {
+        write!(
+            out,
             "type: {}\ncbor: {}\ndigest: {}\n",
             self.name,
             crate::json::hex(&self.cbor),
@@ -231,7 +238,7 @@ impl Vector {
             let (field, value) = line.split_once(": ")?;
             match field {
                 "type" => name = Some(value),
-                "cbor" => cbor = Some(unhex(value)?),
+                "cbor" => cbor = Some(unhex(value, Global)?),
                 "digest" => digest = Some(unhex32(value)?),
                 _ => return None,
             }
@@ -247,23 +254,31 @@ fn leak(name: &str) -> &'static str {
     Box::leak(name.to_owned().into_boxed_str())
 }
 
-fn unhex(text: &str) -> Option<Vec<u8>> {
+fn unhex<A: Allocator>(text: &str, alloc: A) -> Option<Vec<u8, A>> {
     if !text.len().is_multiple_of(2) {
         return None;
     }
-    let mut out = Vec::with_capacity(text.len() / 2);
+    let mut out = Vec::with_capacity_in(text.len() / 2, alloc);
     let bytes = text.as_bytes();
     for pair in bytes.chunks(2) {
-        let hi = (pair[0] as char).to_digit(16)?;
-        let lo = (pair[1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
+        out.push(unhex_byte([pair[0], pair[1]])?);
     }
     Some(out)
 }
 
 fn unhex32(text: &str) -> Option<[u8; 32]> {
-    let bytes = unhex(text)?;
-    <[u8; 32]>::try_from(bytes.as_slice()).ok()
+    if text.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (byte, pair) in out.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+        *byte = unhex_byte([pair[0], pair[1]])?;
+    }
+    Some(out)
+}
+
+fn unhex_byte([hi, lo]: [u8; 2]) -> Option<u8> {
+    Some(((hi as char).to_digit(16)? * 16 + (lo as char).to_digit(16)?) as u8)
 }
 
 /// The codec property violated by a seeded schema round trip.
@@ -331,21 +346,21 @@ pub struct Entry {
 ///
 /// This is the strictest check a message gets: the validator's bytes pass first, then the schema,
 /// and the bytes that come back must be the ones that went in.
-pub fn reencode<T: Wire + Named>(cbor: &[u8]) -> Result<Vec<u8>, crate::Error> {
+pub fn reencode<T: Wire + Named, A: Allocator + Clone>(cbor: &[u8], alloc: A) -> Result<Vec<u8, A>, crate::Error> {
     let value: T = crate::validate_as(cbor, &crate::Limits::DOCUMENTED)?;
-    Ok(encode(&value))
+    Ok(encode(&value, alloc))
 }
 
 /// Decodes one value of `T` from a seed and encodes it again; `Err` says how it differed.
-pub fn round_trip<T: Wire + Named + Sample + PartialEq>(seed: u64) -> Result<(), RoundTripError> {
+pub fn round_trip<T: Wire + Named + Sample + PartialEq, A: Allocator + Clone>(seed: u64, alloc: A) -> Result<(), RoundTripError> {
     let mut g = Gen::new(seed);
     let value: T = T::sample(&mut g);
-    let bytes = encode(&value);
+    let bytes = encode(&value, alloc.clone());
     let limits = crate::Limits::DOCUMENTED;
     let refused = |kind| RoundTripError { type_name: T::NAME, seed, kind };
     let decoded: T = crate::validate_as(&bytes, &limits)
         .map_err(|source| refused(RoundTripErrorKind::Decode(source)))?;
-    let again = encode(&decoded);
+    let again = encode(&decoded, alloc);
     if again != bytes {
         return Err(refused(RoundTripErrorKind::Bytes {
             original: bytes.len(), reencoded: again.len(),
@@ -366,20 +381,24 @@ pub fn round_trip<T: Wire + Named + Sample + PartialEq>(seed: u64) -> Result<(),
 macro_rules! wire_types {
     ($($ty:ty),* $(,)?) => {
         /// Every type of the schema, one entry each.
-        pub fn every() -> Vec<$crate::vectors::Entry> {
-            vec![
+        pub fn every() -> [$crate::vectors::Entry; $crate::wire_types!(@count $($ty),*)] {
+            [
                 $($crate::vectors::Entry {
                     name: <$ty as $crate::Named>::NAME,
                     vector: (|seed| $crate::vectors::Vector::of::<$ty>(seed))
                         as fn(u64) -> $crate::vectors::Vector,
-                    round_trip: (|seed| $crate::vectors::round_trip::<$ty>(seed))
+                    round_trip: (|seed| $crate::vectors::round_trip::<$ty, _>(seed, ::std::alloc::Global))
                         as fn(u64) -> Result<(), $crate::vectors::RoundTripError>,
-                    reencode: (|cbor| $crate::vectors::reencode::<$ty>(cbor))
+                    reencode: (|cbor| $crate::vectors::reencode::<$ty, _>(cbor, ::std::alloc::Global))
                         as fn(&[u8]) -> Result<Vec<u8>, $crate::Error>,
                 }),*
             ]
         }
     };
+    (@count $($ty:ty),*) => {
+        <[()]>::len(&[$($crate::wire_types!(@one $ty)),*])
+    };
+    (@one $ty:ty) => { () };
 }
 
 wire_types! {

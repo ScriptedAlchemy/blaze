@@ -1,6 +1,9 @@
 //! The agent over the real carrier and the real cache server, with a batch compiler standing in
 //! for the code generator: what a daemon's unit does, without a front end.
 
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -255,7 +258,7 @@ fn a_committed_pack_the_server_lost_refuses_without_compiling() {
     let never = AtomicBool::new(false);
     let pack = Pack::of(vec![value_of(&[9; 32])]).unwrap();
     world.blobs.put_pack(&pack).unwrap();
-    let list = blaze_wire::pack_list::encode(&[pack.reference.clone()]);
+    let list = blaze_wire::pack_list::encode(&[pack.reference.clone()], Global);
     world.blobs.publish(&unit.spec, &list).unwrap();
     let path = world
         ._dir
@@ -407,7 +410,7 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
         split.push(pack.reference);
     }
     split.sort();
-    let proposed = blaze_wire::pack_list::encode(&split);
+    let proposed = blaze_wire::pack_list::encode(&split, Global);
     assert_ne!(proposed, old, "the first-writer check must compare actual different partitions");
     world.blobs.publish(&unit.spec, &proposed).unwrap();
     assert_eq!(
@@ -428,7 +431,7 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
         world.blobs.put_pack(&wrong).unwrap();
         let refused = world
             .blobs
-            .publish(&unit.spec, &blaze_wire::pack_list::encode(&[wrong.reference]))
+            .publish(&unit.spec, &blaze_wire::pack_list::encode(&[wrong.reference], Global))
             .unwrap_err();
         assert!(matches!(agent::decide(&LocalPolicy::Fallback, refused), Err(Error::Committed(_))));
     }

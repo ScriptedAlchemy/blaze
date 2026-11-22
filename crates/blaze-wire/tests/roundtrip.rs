@@ -13,7 +13,7 @@ fn golden_path(name: &str) -> String {
     format!("{}/tests/golden/{name}.txt", env!("CARGO_MANIFEST_DIR"))
 }
 
-fn entries() -> Vec<Entry> {
+fn entries() -> [Entry; 43] {
     every()
 }
 

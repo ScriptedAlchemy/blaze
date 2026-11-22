@@ -394,6 +394,10 @@ fn a_signed_request_is_never_sent_over_http3() {
     assert!(bucket.wire().served.is_empty(), "nothing reached the server");
 }
 
+fn tickets_match(got: &[Kept], expected: &[Kept]) -> bool {
+    got == expected
+}
+
 /// The invariant: a tickets file decodes to the tickets encoded, at most [`TICKETS_KEPT`] of
 /// them, without those past their age; a file of another layout, cut short, or with bytes
 /// past its last ticket is refused, naming the file.
@@ -408,8 +412,9 @@ fn the_tickets_file_round_trips_and_refuses_what_it_is_not() {
     let tickets: Vec<Kept> = (0..TICKETS_KEPT as u64 + 2).map(|i| ticket(i, 3_600)).collect();
     let file = encode_tickets(&tickets);
     let kept = decode_tickets(&file, 1_000).unwrap();
+    assert!(tickets_match(&kept, &tickets[2..]));
     assert_eq!(kept.as_slice(), &tickets[2..], "the newest are kept");
-    assert!(decode_tickets(&file, 1_000 + 3_600 + TICKETS_KEPT as u64 + 2).unwrap().is_empty(), "all are past their lifetime");
+    assert!(tickets_match(&decode_tickets(&file, 1_000 + 3_600 + TICKETS_KEPT as u64 + 2).unwrap(), &[]), "all are past their lifetime");
 
     let mut other = file.to_vec();
     other[TICKETS_MAGIC.len()] = TICKETS_LAYOUT + 1;
@@ -420,6 +425,21 @@ fn the_tickets_file_round_trips_and_refuses_what_it_is_not() {
     longer.push(0);
     assert!(decode_tickets(&longer, 1_000).unwrap_err().contains("past its last ticket"));
     assert!(decode_tickets(b"not a tickets file", 1_000).is_err());
+}
+
+#[test]
+fn the_oracle_catches_ticket_expiry_checked_against_an_old_clock() {
+    let ticket = Kept {
+        server_name: "localhost".to_owned(),
+        issued_unix_s: 1_000,
+        lifetime_s: 10,
+        bytes: vec![7; 40],
+    };
+    let file = encode_tickets(&[ticket]);
+    let expected = [];
+    assert!(tickets_match(&decode_tickets(&file, 1_011).unwrap(), &expected));
+    // Plant a decoder that keeps the issuance-time clock at a later process's reopen.
+    assert!(!tickets_match(&decode_tickets(&file, 1_000).unwrap(), &expected));
 }
 
 #[test]

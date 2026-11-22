@@ -17,7 +17,7 @@ fn limits() -> Limits {
 /// or read back as a value whose encoding is the bytes themselves.
 #[test]
 fn bytes_the_validator_accepts_are_canonical() {
-    let entries: Vec<Entry> = every();
+    let entries: [Entry; 43] = every();
     let mut g = Gen::new(0x5eed);
     let mut accepted = 0u64;
     let mut refused = 0u64;

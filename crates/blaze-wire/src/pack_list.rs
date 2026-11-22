@@ -1,8 +1,8 @@
 //! The native full-manifest format shared by the agent and the cache server: exactly
 //! `<pack sha256> <byte length> <keys digest>\n` per pack, with an empty list valid.
 
-use std::collections::BTreeSet;
-use std::fmt::Write as _;
+use std::alloc::Allocator;
+use std::io::Write as _;
 
 use crate::{DIST_PACK_FORMAT, DIST_PACK_MAGIC, Digest, Limits, PackRef};
 
@@ -89,8 +89,8 @@ impl std::error::Error for DecodeError {
 
 /// Render the native list, whose references use the current raw pack format. Order is kept:
 /// callers canonicalize their set before its attempt-owned commit.
-pub fn encode(packs: &[PackRef]) -> Vec<u8> {
-    let mut out = String::new();
+pub fn encode<A: Allocator>(packs: &[PackRef], alloc: A) -> Vec<u8, A> {
+    let mut out = Vec::new_in(alloc);
     for pack in packs {
         writeln!(
             out,
@@ -99,9 +99,9 @@ pub fn encode(packs: &[PackRef]) -> Vec<u8> {
             pack.size,
             crate::json::hex(&pack.keys)
         )
-        .expect("writing a string");
+        .expect("writing bytes to a vector");
     }
-    out.into_bytes()
+    out
 }
 
 fn digest(text: &str) -> Option<Digest> {
@@ -119,9 +119,9 @@ fn digest(text: &str) -> Option<Digest> {
 
 /// Read one bounded native list. Noncanonical fields, unknown fields, invalid lengths and
 /// repeated pack digests are errors rather than an empty or partial cache entry.
-pub fn decode(bytes: &[u8]) -> Result<Vec<PackRef>, DecodeError> {
+pub fn decode<A: Allocator>(bytes: &[u8], alloc: A) -> Result<Vec<PackRef, A>, DecodeError> {
     if bytes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Vec::new_in(alloc));
     }
     if bytes.len() > Limits::DOCUMENTED.request as usize {
         return Err(DecodeError { line: None, kind: DecodeErrorKind::RequestLimit });
@@ -131,8 +131,8 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<PackRef>, DecodeError> {
     if !text.is_empty() && !text.ends_with('\n') {
         return Err(DecodeError { line: None, kind: DecodeErrorKind::LineTerminator });
     }
-    let mut packs = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut packs = Vec::new_in(alloc);
+    let mut previous = None;
     for (at, line) in text.split_terminator('\n').enumerate() {
         let bad = |kind| DecodeError { line: Some(at + 1), kind };
         if line.len() > 151 {
@@ -158,12 +158,13 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<PackRef>, DecodeError> {
         if fields.next().is_some() {
             return Err(bad(DecodeErrorKind::ExtraFields));
         }
-        if seen.last().is_some_and(|previous| *previous > pack) {
+        if previous.is_some_and(|previous| previous > pack) {
             return Err(bad(DecodeErrorKind::PackOrder));
         }
-        if !seen.insert(pack) {
+        if previous == Some(pack) {
             return Err(bad(DecodeErrorKind::DuplicatePack));
         }
+        previous = Some(pack);
         packs.push(PackRef { pack, size, keys, packed: None, format: DIST_PACK_FORMAT });
     }
     Ok(packs)
@@ -172,24 +173,25 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<PackRef>, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::Global;
     use std::error::Error as _;
 
     #[test]
     fn refusals_retain_the_record_and_the_parsing_cause() {
-        let invalid_utf8 = decode(&[0xff]).unwrap_err();
+        let invalid_utf8 = decode(&[0xff], Global).unwrap_err();
         assert_eq!(invalid_utf8.line, None);
         assert!(matches!(invalid_utf8.kind, DecodeErrorKind::Utf8(_)));
         assert!(invalid_utf8.source().is_some());
 
         let first = format!("{} 80 {}\n", "ab".repeat(32), "cd".repeat(32));
-        let repeated = decode(format!("{first}{first}").as_bytes()).unwrap_err();
+        let repeated = decode(format!("{first}{first}").as_bytes(), Global).unwrap_err();
         assert_eq!(repeated.line, Some(2));
         assert_eq!(repeated.kind, DecodeErrorKind::DuplicatePack);
-        let overflow = decode(first.replace(" 80 ", " 18446744073709551616 ").as_bytes())
+        let overflow = decode(first.replace(" 80 ", " 18446744073709551616 ").as_bytes(), Global)
             .unwrap_err();
         assert_eq!(overflow.line, Some(1));
         assert!(matches!(overflow.kind, DecodeErrorKind::LengthOverflow(_)));
         assert!(overflow.source().is_some());
-        assert!(decode(first.as_bytes()).is_ok());
+        assert!(decode(first.as_bytes(), Global).is_ok());
     }
 }

@@ -139,7 +139,7 @@ fn a_borrow_error_is_traced_and_its_fix_traces_a_pass() {
 /// with it, nothing is served, the gate refuses the body by its own check, and the trace says
 /// the error.
 #[test]
-fn under_trace_the_old_cache_is_not_read() {
+fn the_oracle_catches_a_false_pass_from_the_old_cache() {
     let first = fixture::db(SERVED).into_db();
     let bytes = check_cache::encode(&first, crate_named(&first, "dep"), &|_: DefWithBodyId| true).unwrap();
     let mut db = fixture::db_with_reads(SERVED).into_db();

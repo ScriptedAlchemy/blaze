@@ -17,6 +17,8 @@
 //! The host draws a [`Run`]'s [`View`], sends it [`Input`]s, and persists [`Progress`] (it is plain data, serde both
 //! ways). Days are passed in as a count since any fixed epoch ([`Day`]), so nothing here reads a clock.
 
+#![feature(allocator_api, case_ignorable, titlecase)]
+
 pub mod course;
 pub mod intent;
 pub mod memory;

@@ -215,7 +215,7 @@ impl Pack {
 
 fn keys_digest(keys: impl Iterator<Item = Digest>) -> Digest {
     let keys: Vec<Digest> = keys.collect();
-    digest_of_encoded_name("blaze/dist-pack-keys", &encode(&keys))
+    digest_of_encoded_name("blaze/dist-pack-keys", &encode(&keys, std::alloc::Global))
 }
 
 /// The values of `bytes`, which must be the pack `reference` names: its digest, size, format

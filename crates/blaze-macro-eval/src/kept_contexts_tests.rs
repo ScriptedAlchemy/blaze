@@ -89,7 +89,7 @@ fn spans_of(input: &tt::TopSubtree, env: &Env) -> Spans {
 /// with that session's context of equal structure (expansion, transparency, edition, parent).
 /// The control: the first session's raw word read in the fresh arena names another context.
 #[test]
-fn a_kept_expansion_reads_back_its_contexts_by_structure_in_a_fresh_arena() {
+fn the_oracle_catches_a_raw_context_word_from_another_arena() {
     let env: Env = [("CARGO_PKG_NAME".to_owned(), "a".to_owned())].into_iter().collect();
     let root = SyntaxContext::root(Edition::Edition2021);
 

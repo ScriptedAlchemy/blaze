@@ -31,7 +31,7 @@ fn pack(tag: u8) -> (PackRef, Vec<u8>) {
         size: bytes.len() as u64,
         keys: blaze_wire::digest_of_encoded_name(
             "blaze/dist-pack-keys",
-            &blaze_wire::encode(&vec![key]),
+            &blaze_wire::encode(&vec![key], Global),
         ),
         packed: None,
         format: DIST_PACK_FORMAT,
@@ -49,7 +49,7 @@ fn put(store: &Store, pack: &(PackRef, Vec<u8>)) {
     store.put_blob(&path(&pack.0), &pack.1).unwrap();
 }
 fn current(store: &Store) -> Vec<u8> {
-    store.read_small(&name(), 1 << 20).unwrap().unwrap()
+    store.read_small(&name(), 1 << 20, Global).unwrap().unwrap()
 }
 
 #[hegel::test(test_cases = 32)]
@@ -63,7 +63,7 @@ fn first_publication_cannot_name_missing_or_corrupt_packs(tc: hegel::TestCase) {
         references[0].keys = [0x99; 32];
     }
     references.sort();
-    let list = pack_list::encode(&references);
+    let list = pack_list::encode(&references, Global);
     if failure != 1 {
         put(&store, &a);
     }
@@ -80,7 +80,7 @@ fn first_publication_cannot_name_missing_or_corrupt_packs(tc: hegel::TestCase) {
     } else {
         assert!(outcome.is_err(), "missing or corrupt packs must refuse first publication");
         assert!(
-            store.read_small(&name(), 1 << 20).unwrap().is_none(),
+            store.read_small(&name(), 1 << 20, Global).unwrap().is_none(),
             "refused first publication must not name an immutable manifest"
         );
     }
@@ -106,7 +106,7 @@ fn first_writer_requires_equal_values_for_keys_mirrored_across_packs(tc: hegel::
         size: combined.len() as u64,
         keys: blaze_wire::digest_of_encoded_name(
             "blaze/dist-pack-keys",
-            &blaze_wire::encode(&vec![[1; 32], [2; 32]]),
+            &blaze_wire::encode(&vec![[1; 32], [2; 32]], Global),
         ),
         packed: None,
         format: DIST_PACK_FORMAT,
@@ -115,12 +115,12 @@ fn first_writer_requires_equal_values_for_keys_mirrored_across_packs(tc: hegel::
     put(&store, &(second.clone(), combined));
     let mut refs = vec![first, second];
     refs.sort();
-    let list = pack_list::encode(&refs);
+    let list = pack_list::encode(&refs, Global);
     let result = store.put_list(&name(), &list);
     if conflict {
         let error = result.unwrap_err();
         assert!(error.to_string().contains("conflicting bytes"), "{error}");
-        assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+        assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
     } else {
         assert!(result.unwrap(), "byte-identical overlap is a valid published list");
         assert_eq!(current(&store), list);
@@ -134,9 +134,9 @@ fn first_publication_refuses_forged_keys_and_truncated_native_values() {
     let (mut reference, bytes) = pack(1);
     store.put_blob(&path(&reference), &bytes).unwrap();
     reference.keys = [0x99; 32];
-    let error = store.put_list(&name(), &pack_list::encode(&[reference])).unwrap_err();
+    let error = store.put_list(&name(), &pack_list::encode(&[reference], Global)).unwrap_err();
     assert!(error.to_string().contains("keys"), "{error}");
-    assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+    assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
 
     // A correct content hash and key commitment cannot legitimize another format's
     // bytes: this is a native pack, not any eight-byte header followed by records.
@@ -148,9 +148,9 @@ fn first_publication_refuses_forged_keys_and_truncated_native_values() {
     // refuses it, even with a matching content digest and keys commitment.
     assert!(store.put_blob(&path(&alien), &alien_bytes).is_err());
     std::fs::write(store.dir().join(path(&alien)), &alien_bytes).unwrap();
-    let error = store.put_list(&name(), &pack_list::encode(&[alien])).unwrap_err();
+    let error = store.put_list(&name(), &pack_list::encode(&[alien], Global)).unwrap_err();
     assert!(error.to_string().contains("not a pack of format"), "{error}");
-    assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+    assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
 
     // A correct SHA and magic header do not prove complete native records.
     let mut truncated = DIST_PACK_MAGIC.to_vec();
@@ -163,15 +163,15 @@ fn first_publication_refuses_forged_keys_and_truncated_native_values() {
         size: truncated.len() as u64,
         keys: blaze_wire::digest_of_encoded_name(
             "blaze/dist-pack-keys",
-            &blaze_wire::encode(&vec![[7; 32]]),
+            &blaze_wire::encode(&vec![[7; 32]], Global),
         ),
         packed: None,
         format: DIST_PACK_FORMAT,
     };
     store.put_blob(&path(&reference), &truncated).unwrap();
-    let error = store.put_list(&name(), &pack_list::encode(&[reference])).unwrap_err();
+    let error = store.put_list(&name(), &pack_list::encode(&[reference], Global)).unwrap_err();
     assert!(error.to_string().contains("native value"), "{error}");
-    assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+    assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
 }
 
 #[test]
@@ -205,10 +205,10 @@ fn native_record_boundaries_and_order_are_checked_before_publication() {
         };
         assert!(native_pack::read(&bytes, &reference).is_err());
         store.put_blob(&path(&reference), &bytes).unwrap();
-        let error = store.put_list(&name(), &pack_list::encode(&[reference])).unwrap_err();
+        let error = store.put_list(&name(), &pack_list::encode(&[reference], Global)).unwrap_err();
         let why = if fault < 2 { "unordered keys" } else { "native value" };
         assert!(error.to_string().contains(why), "{error}");
-        assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+        assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
     }
 }
 
@@ -225,7 +225,7 @@ fn an_old_missing_pack_cannot_hide_conflicting_present_native_partitions() {
             references.push(pack.reference);
         }
         references.sort();
-        let old = pack_list::encode(&references);
+        let old = pack_list::encode(&references, Global);
         std::fs::write(store.dir().join(name()), &old).unwrap();
         let error = store.repair_list(&name(), &digest(&old), b"").unwrap_err();
         assert!(error.to_string().contains("conflicting"), "{error}");
@@ -238,7 +238,7 @@ fn malformed_first_publication_does_not_claim_the_key() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     assert!(store.put_list(&name(), b"not a pack list\n").is_err());
-    assert!(store.read_small(&name(), 1 << 20).unwrap().is_none());
+    assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
     assert!(store.put_list(&name(), b"").unwrap(), "an empty canonical list is valid");
 }
 
@@ -249,8 +249,8 @@ fn only_an_exact_stale_list_can_be_repaired_and_the_replacement_survives_reopen(
     let (a, b) = (pack(1), pack(2));
     put(&store, &a);
     put(&store, &b);
-    let old = pack_list::encode(&[a.0.clone()]);
-    let new = pack_list::encode(&[b.0.clone()]);
+    let old = pack_list::encode(&[a.0.clone()], Global);
+    let new = pack_list::encode(&[b.0.clone()], Global);
     store.put_list(&name(), &old).unwrap();
     assert!(!store.repair_list(&name(), &digest(&old), &new).unwrap(), "a valid list is immutable");
     std::fs::remove_file(store.dir().join(path(&a.0))).unwrap();
@@ -273,8 +273,8 @@ fn absent_or_corrupt_replacements_and_corrupt_old_packs_leave_the_old_list_untou
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let (a, b, c) = (pack(1), pack(2), pack(3));
-    let old = pack_list::encode(&[a.0.clone()]);
-    let new = pack_list::encode(&[b.0.clone()]);
+    let old = pack_list::encode(&[a.0.clone()], Global);
+    let new = pack_list::encode(&[b.0.clone()], Global);
     // Seed legacy stale state: new first-writer PUTs must reject absent packs.
     std::fs::write(store.dir().join(name()), &old).unwrap();
     assert!(store.repair_list(&name(), &digest(&old), &new).is_err());
@@ -289,11 +289,11 @@ fn absent_or_corrupt_replacements_and_corrupt_old_packs_leave_the_old_list_untou
     put(&store, &c);
     let mut references = [a.0.clone(), b.0.clone()];
     references.sort();
-    let old_two = pack_list::encode(&references);
+    let old_two = pack_list::encode(&references, Global);
     std::fs::write(store.dir().join(name()), &old_two).unwrap();
     std::fs::remove_file(store.dir().join(path(&a.0))).unwrap();
     let refused =
-        store.repair_list(&name(), &digest(&old_two), &pack_list::encode(&[c.0])).unwrap_err();
+        store.repair_list(&name(), &digest(&old_two), &pack_list::encode(&[c.0], Global)).unwrap_err();
     assert!(
         refused.to_string().contains(&path(&b.0)),
         "one absent pack must not hide another corrupt old pack: {refused}"
@@ -309,7 +309,7 @@ fn malformed_old_or_new_lists_are_explicit_refusals() {
     std::fs::write(store.dir().join(name()), b"not a pack list\n").unwrap();
     assert!(store.repair_list(&name(), &digest(b"not a pack list\n"), b"").is_err());
     assert_eq!(current(&store), b"not a pack list\n");
-    let old = pack_list::encode(&[pack(1).0]);
+    let old = pack_list::encode(&[pack(1).0], Global);
     std::fs::write(store.dir().join(name()), &old).unwrap();
     assert!(store.repair_list(&name(), &digest(&old), b"not a pack list\n").is_err());
     assert_eq!(current(&store), old);
@@ -324,7 +324,7 @@ fn two_native_cas_writers_cannot_both_replace_the_same_list() {
     let c = pack(3);
     put(&store, &b);
     put(&store, &c);
-    let old = pack_list::encode(&[a.0]);
+    let old = pack_list::encode(&[a.0], Global);
     // Seed legacy stale state: new first-writer PUTs must reject absent packs.
     std::fs::write(store.dir().join(name()), &old).unwrap();
     let expected = digest(&old);
@@ -335,7 +335,7 @@ fn two_native_cas_writers_cannot_both_replace_the_same_list() {
             .map(|pack| {
                 let (store, barrier) = (&store, &barrier);
                 scope.spawn(move || {
-                    let new = pack_list::encode(&[pack]);
+                    let new = pack_list::encode(&[pack], Global);
                     barrier.wait();
                     (store.repair_list(&name(), &expected, &new).unwrap(), new)
                 })
@@ -354,8 +354,8 @@ fn failed_native_publication_barriers_never_acknowledge_a_repair() {
         let store = Store::open(dir.path()).unwrap();
         let (a, b) = (pack(1), pack(2));
         put(&store, &b);
-        let old = pack_list::encode(&[a.0]);
-        let new = pack_list::encode(&[b.0]);
+        let old = pack_list::encode(&[a.0], Global);
+        let new = pack_list::encode(&[b.0], Global);
         // Seed legacy stale state: new first-writer PUTs must reject absent packs.
         std::fs::write(store.dir().join(name()), &old).unwrap();
         *store.publication_failure.lock().unwrap() = Some(step);
@@ -479,7 +479,7 @@ fn scenario(ops: &[u16], seed: u64, plant: Plant) -> Result<(), String> {
     for pack in &packs {
         put(&store, pack)
     }
-    let mut model = pack_list::encode(&[packs[0].0.clone()]);
+    let mut model = pack_list::encode(&[packs[0].0.clone()], Global);
     store.put_list(&name(), &model).unwrap();
     let mut sim = Sim::new(seed, Faults::default());
     let published = slot("objects/published");
@@ -492,9 +492,9 @@ fn scenario(ops: &[u16], seed: u64, plant: Plant) -> Result<(), String> {
             0 | 1 => expected[usize::from(op)] = digest(&model),
             2 | 3 => {
                 let actor = usize::from(op - 2);
-                let replacement = pack_list::encode(&[packs[pack_at].0.clone()]);
+                let replacement = pack_list::encode(&[packs[pack_at].0.clone()], Global);
                 // Independent authority oracle, using byte snapshots, not Store's predicate.
-                let old = pack_list::decode(&model).unwrap();
+                let old = pack_list::decode(&model, Global).unwrap();
                 let mut missing = false;
                 let mut invalid_old = false;
                 for reference in old {
@@ -526,7 +526,7 @@ fn scenario(ops: &[u16], seed: u64, plant: Plant) -> Result<(), String> {
                         if ack {
                             Ok(())
                         } else {
-                            Err(Error::internal("simulated IO failure or power loss"))
+                            Err(Error::internal(format_args!("simulated IO failure or power loss")))
                         }
                     });
                 if attempted.is_some() != authorized {
@@ -714,8 +714,8 @@ fn native_partition_scenario(
         previous.push(references.remove(whole));
     }
     previous.sort();
-    let new = pack_list::encode(&references);
-    let old = pack_list::encode(&previous);
+    let new = pack_list::encode(&references, Global);
+    let old = pack_list::encode(&previous, Global);
     let mut sim = Sim::new(seed, Faults::default());
     let published = slot("objects/published");
     if repair {
@@ -731,7 +731,7 @@ fn native_partition_scenario(
         if ack {
             Ok(())
         } else {
-            Err(Error::internal("simulated IO failure or power loss"))
+            Err(Error::internal(format_args!("simulated IO failure or power loss")))
         }
     };
     let outcome = if repair {
@@ -765,13 +765,13 @@ fn native_partition_scenario(
             std::fs::write(store.dir().join(name()), &surviving).unwrap();
         }
         let reopened = Store::open(dir.path()).unwrap();
-        let actual = reopened.read_small(&name(), 1 << 20).unwrap();
+        let actual = reopened.read_small(&name(), 1 << 20, Global).unwrap();
         let expected = if surviving.is_empty() { None } else { Some(surviving) };
         if actual != expected {
             return Err("partition oracle: reopen changed manifest bytes".to_owned()); // alloc: oracle failure
         }
     } else if outcome.is_ok()
-        || store.read_small(&name(), 1 << 20).unwrap() != if repair { Some(before) } else { None }
+        || store.read_small(&name(), 1 << 20, Global).unwrap() != if repair { Some(before) } else { None }
     {
         return Err("partition oracle: refused validation changed the manifest".to_owned()); // alloc: oracle failure
     }

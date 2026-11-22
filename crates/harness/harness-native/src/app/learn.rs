@@ -12,6 +12,7 @@ use super::chat::Draft;
 mod page;
 use harness_learn::{Course, Input, Lesson, Mark, Progress, Run, Step, tutor};
 use harness_native_ui_layout_api::{Size, SizeKind, Sizing};
+use std::alloc::Global;
 
 /// The name the app gives the tutor's session; a session by this name is never a sidebar row (src/app.rs).
 pub(super) const TUTOR_NAME: &str = "Tutor";
@@ -240,7 +241,7 @@ impl Learn {
             _ => "Done. It will come back.".to_owned(),
         };
         let score = format!("{} of {} right the first time.", sum.right_first, sum.asked);
-        let more = c.is_some_and(|c| self.saved.progress.next_lesson(c).is_some());
+        let more = c.is_some_and(|c| self.saved.progress.next_lesson(c, Global).is_some());
         let next = match (sum.missed.len(), more) {
             (0, true) => "Each of these comes back tomorrow, then further apart as you keep getting it.".to_owned(),
             (0, false) => "That was the course's last lesson. Reviews keep it: each comes back tomorrow, then further apart.".to_owned(),
@@ -417,15 +418,21 @@ impl App {
         let (inbox, ask) = (l.inbox.clone(), l.ask);
         match want {
             Want::Outline { topic } => {
-                self.link.chat_aside(tutor, &tutor::outline(&topic), move |answer| {
+                let mut prompt = Vec::new_in(Global);
+                tutor::outline(&topic, &mut prompt).expect("writing a tutor prompt into Vec cannot fail");
+                let prompt = std::str::from_utf8(&prompt).expect("tutor prompts contain UTF-8 text");
+                self.link.chat_aside(tutor, prompt, move |answer| {
                     inbox.lock().unwrap_or_else(|e| e.into_inner()).push(Arrived::Outline { ask, answer });
                 });
             }
             Want::Steps { course, lesson } => {
                 let Some(c) = l.course(&course) else { return };
                 let Some(outline) = c.lesson(&lesson) else { return };
-                let prompt = tutor::steps(c, outline, &l.saved.progress.shaky(c));
-                self.link.chat_aside(tutor, &prompt, move |answer| {
+                let mut prompt = Vec::new_in(Global);
+                tutor::steps(c, outline, l.saved.progress.shaky(c, Global), &mut prompt)
+                    .expect("writing a tutor prompt into Vec cannot fail");
+                let prompt = std::str::from_utf8(&prompt).expect("tutor prompts contain UTF-8 text");
+                self.link.chat_aside(tutor, prompt, move |answer| {
                     inbox.lock().unwrap_or_else(|e| e.into_inner()).push(Arrived::Steps { ask, course, lesson, answer });
                 });
             }
@@ -448,13 +455,13 @@ impl App {
     /// Continue `course` (the home's card): what is due first, as a review, then its next lesson.
     fn learn_continue(&self, l: &mut Learn, course: &str) {
         let Some(c) = l.course(course) else { return };
-        let due = l.saved.progress.due(c, today());
-        if let Some(run) = Run::review(c, &due, model::now_ms()) {
+        let due = l.saved.progress.due(c, today(), Global);
+        if let Some(run) = Run::review(c, due, model::now_ms()) {
             l.run = Some(run);
             l.screen = Screen::Step;
             return;
         }
-        let next = l.saved.progress.next_lesson(c).map(|x| x.id.clone());
+        let next = l.saved.progress.next_lesson(c, Global).map(|x| x.id.clone());
         match next {
             Some(lesson) => self.learn_open(l, course, &lesson),
             None => l.note = format!("\u{201c}{}\u{201d} is finished and nothing is due today.", c.title),
@@ -661,12 +668,12 @@ not the transcript.\n\nThe conversation:\n{}",
         }
         let topic = match harness_learn::intent::of(&text) {
             harness_learn::Intent::Learn { topic } => Some(topic),
-            harness_learn::Intent::Do => course.then_some(text.clone()),
+            harness_learn::Intent::Do => course.then_some(text.as_str()),
         };
         if let Some(topic) = topic {
             let me = &*self;
             let mut l = me.learn.borrow_mut();
-            l.draft = line_draft(&topic);
+            l.draft = line_draft(topic);
             me.learn_next(&mut l);
             return true;
         }
@@ -841,7 +848,7 @@ not the transcript.\n\nThe conversation:\n{}",
         view::for_each_of(list, rows, |row, c, _| {
             row.action(&format!("learn:course:{}", c.id));
             set_text(row, "title", &c.title);
-            let due = l.saved.progress.due(c, day).len();
+            let due = l.saved.progress.due(c, day, Global).len();
             set_text(row, "due", &if due == 0 { String::new() } else { due.to_string() });
         });
     }
@@ -908,7 +915,7 @@ not the transcript.\n\nThe conversation:\n{}",
                 set_text(v, "score", score);
                 set_text(v, "next", next);
                 let more = l.course(course).is_some_and(|c| {
-                    l.saved.progress.next_lesson(c).is_some() || !l.saved.progress.due(c, today()).is_empty()
+                    l.saved.progress.next_lesson(c, Global).is_some() || l.saved.progress.due(c, today(), Global).len() != 0
                 });
                 if let Some(go) = v.part("row").and_then(|r| r.part("go")) {
                     if more {
@@ -980,20 +987,20 @@ fn fill_home(v: View<'_>, l: &Learn) {
             row.action(&format!("learn:course:{}", c.id));
             if let Some(head) = row.part("head") {
                 set_text(head, "title", &c.title);
-                let due = l.saved.progress.due(c, day).len();
+                let due = l.saved.progress.due(c, day, Global).len();
                 set_text(head, "due", &match due {
                     0 => String::new(),
                     n => format!("{n} to review"),
                 });
             }
-            let done = c.lessons.iter().filter(|x| l.saved.progress.finished(&c.id, &x.id)).count();
-            let next = match l.saved.progress.next_lesson(c) {
+            let done = c.lessons.iter().filter(|x| l.saved.progress.finished(&c.id, &x.id, Global)).count();
+            let next = match l.saved.progress.next_lesson(c, Global) {
                 Some(x) => format!("Lesson {} of {} \u{b7} {}", done + 1, c.lessons.len(), x.title),
                 None => format!("All {} lessons done \u{b7} {}", c.lessons.len(), c.goal),
             };
             set_text(row, "next", &next);
             if let Some(fill) = row.part("meter").and_then(|m| m.part("fill")) {
-                percent(fill, l.saved.progress.mastery(c));
+                percent(fill, l.saved.progress.mastery(c, Global));
             }
         });
     }
@@ -1010,9 +1017,9 @@ fn fill_home(v: View<'_>, l: &Learn) {
 fn fill_path(v: View<'_>, l: &Learn, c: &Course) {
     let day = today();
     let p = &l.saved.progress;
-    let done = c.lessons.iter().filter(|x| p.finished(&c.id, &x.id)).count();
-    let next = p.next_lesson(c).map(|x| x.id.as_str());
-    let due = p.due(c, day).len();
+    let done = c.lessons.iter().filter(|x| p.finished(&c.id, &x.id, Global)).count();
+    let next = p.next_lesson(c, Global).map(|x| x.id.as_str());
+    let due = p.due(c, day, Global).len();
     let kicker = match (next, due) {
         (Some(_), _) => format!("Lesson {} of {}", done + 1, c.lessons.len()),
         (None, 0) => "Course finished".to_owned(),
@@ -1025,7 +1032,7 @@ fn fill_path(v: View<'_>, l: &Learn, c: &Course) {
     let rows = c.lessons.iter().enumerate().map(|(i, x)| {
         let look = if next == Some(x.id.as_str()) {
             "hn.LearnLessonNext"
-        } else if p.finished(&c.id, &x.id) {
+        } else if p.finished(&c.id, &x.id, Global) {
             "hn.LearnLesson"
         } else {
             "hn.LearnLessonLater"
@@ -1058,7 +1065,7 @@ fn fill_path(v: View<'_>, l: &Learn, c: &Course) {
             set_text(d, "label", &number);
         }
         set_text(row, "title", &x.title);
-        let held = if look == "hn.LearnLesson" { format!("{:.0}% held", p.lesson_mastery(&c.id, x) * 100.0) } else { String::new() };
+        let held = if look == "hn.LearnLesson" { format!("{:.0}% held", p.lesson_mastery(&c.id, x, Global) * 100.0) } else { String::new() };
         set_text(row, "state", &held);
         if look == "hn.LearnLesson" {
             row.action(&format!("learn:lesson:{}/{}", c.id, x.id));

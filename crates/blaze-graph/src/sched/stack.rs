@@ -70,6 +70,10 @@ pub(super) enum Resumed<O> {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[allow(unsafe_code, reason = "reads the page size from the system (`sysconf`)")]
 mod tests {
+    const DEEP: usize = 4 << 20;
+    // Kept clear of the frames at the two ends: this one's, and the advice's own room.
+    const MARGIN: usize = 64 << 10;
+
     /// Recurses `depth` frames of 16 KiB each, writing every one, and returns: the stack is
     /// committed that deep below the caller.
     #[inline(never)]
@@ -96,6 +100,43 @@ mod tests {
         held.iter().filter(|it| **it & 1 != 0).count()
     }
 
+    fn observed_stack(give: bool) -> (usize, usize, usize, usize) {
+        std::thread::Builder::new()
+            .name("a parked worker's stack test".to_owned()) // alloc: a test's
+            .stack_size(4 * DEEP)
+            .spawn(move || {
+                touch_deep(DEEP / (16 << 10));
+                let marker = 0u8;
+                let here = std::ptr::from_ref(std::hint::black_box(&marker)).addr();
+                // SAFETY: reads a constant of the system.
+                let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+                    .expect("a page size");
+                let to = (here - MARGIN) & !(page - 1);
+                let from = (here - DEEP + MARGIN) & !(page - 1);
+                let pages = (to - from) / page;
+                #[cfg(target_os = "linux")]
+                let before = resident_pages(from, to, page);
+                let advised = if give {
+                    super::give_back_below_here().expect("the advice on this thread's stack")
+                } else {
+                    0
+                };
+                #[cfg(target_os = "linux")]
+                let after = resident_pages(from, to, page);
+                // Not read on macOS: the advised pages stay resident until taken.
+                #[cfg(not(target_os = "linux"))]
+                let (before, after) = (pages, 0);
+                (before, after, advised, pages)
+            })
+            .expect("the test's thread starts")
+            .join()
+            .expect("the test's thread")
+    }
+
+    fn pages_were_returned(after: usize, advised: usize) -> bool {
+        advised >= DEEP - 2 * MARGIN && after <= 2
+    }
+
     /// The invariant: a worker that parks after an idle daemon's ask gives back its own
     /// stack's pages below its frame: 4 MiB a deep call left committed under the calling frame
     /// are out of the resident set once `give_back_below_here` returns, and it says it advised
@@ -105,61 +146,17 @@ mod tests {
     /// the call removed: the pages stay resident.
     #[test]
     fn a_parked_worker_gives_its_stack_pages_back() {
-        const DEEP: usize = 4 << 20;
-        // Kept clear of the frames at the two ends: this one's, and the advice's own room.
-        const MARGIN: usize = 64 << 10;
-        for give in [true, false] {
-            let seen = std::thread::Builder::new()
-                .name("a parked worker's stack test".to_owned()) // alloc: a test's
-                .stack_size(4 * DEEP)
-                .spawn(move || {
-                    touch_deep(DEEP / (16 << 10));
-                    let marker = 0u8;
-                    let here = std::ptr::from_ref(std::hint::black_box(&marker)).addr();
-                    // SAFETY: reads a constant of the system.
-                    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-                        .expect("a page size");
-                    let to = (here - MARGIN) & !(page - 1);
-                    let from = (here - DEEP + MARGIN) & !(page - 1);
-                    let pages = (to - from) / page;
-                    #[cfg(target_os = "linux")]
-                    let before = resident_pages(from, to, page);
-                    let advised = if give {
-                        super::give_back_below_here().expect("the advice on this thread's stack")
-                    } else {
-                        0
-                    };
-                    #[cfg(target_os = "linux")]
-                    let after = resident_pages(from, to, page);
-                    // Not read on macOS: the advised pages stay resident until taken.
-                    #[cfg(not(target_os = "linux"))]
-                    let (before, after) = (pages, 0);
-                    (before, after, advised, pages)
-                })
-                .expect("the test's thread starts")
-                .join()
-                .expect("the test's thread");
-            let (before, after, advised, pages) = seen;
-            assert!(
-                before * 10 >= pages * 9,
-                "the deep call committed the range: {before} of {pages} pages"
-            );
-            match give {
-                true => {
-                    assert!(
-                        advised >= DEEP - 2 * MARGIN,
-                        "advised {advised} bytes, under the {DEEP} touched"
-                    );
-                    assert!(after <= 2, "{after} of {pages} pages resident after the give-back");
-                }
-                #[cfg(target_os = "linux")]
-                false => assert!(
-                    after * 10 >= pages * 9,
-                    "control: with no give-back the pages stay, yet {after} of {pages} are resident"
-                ),
-                #[cfg(not(target_os = "linux"))]
-                false => {}
-            }
-        }
+        let (before, after, advised, pages) = observed_stack(true);
+        assert!(before * 10 >= pages * 9, "the deep call committed the range: {before} of {pages} pages");
+        assert!(pages_were_returned(after, advised), "advised {advised} bytes, {after} of {pages} pages resident");
+    }
+
+    #[test]
+    fn the_oracle_catches_a_parked_stack_without_the_give_back() {
+        let (before, after, advised, pages) = observed_stack(false);
+        assert!(before * 10 >= pages * 9, "the deep call committed the range: {before} of {pages} pages");
+        assert!(!pages_were_returned(after, advised), "the oracle missed the omitted advice");
+        #[cfg(target_os = "linux")]
+        assert!(after * 10 >= pages * 9, "with no give-back the pages stay: {after} of {pages} pages");
     }
 }

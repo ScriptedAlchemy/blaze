@@ -338,6 +338,35 @@ jobs:
           if [ "$(git show FETCH_HEAD:crates/blaze-profile/src/schema.rs | version)" != "$(version crates/blaze-profile/src/schema.rs)" ]; then
             uv run --frozen python .github/scripts/explore_page.py '{}'
           fi
+      # Keep the native scanners' exact rows for a failing gate. They write only an isolated
+      # snapshot; the checked lists and the preceding failures remain unchanged.
+      - name: record current allocation and error counts
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          ratchet_snapshot=$(mktemp -d "$RUNNER_TEMP/blaze-ratchet-snapshot.XXXXXX")
+          mkdir -p "$RUNNER_TEMP/ratchet-evidence"
+          git archive HEAD | tar -x -C "$ratchet_snapshot"
+          "$BLAZE_SCRIPTS/allocs" "{\"command\": \"write\", \"root\": \"$ratchet_snapshot\"}"
+          "$BLAZE_SCRIPTS/untyped" "{\"command\": \"write\", \"root\": \"$ratchet_snapshot\"}"
+          # The invariant inventory enumerates tracked paths. Register the archived files in
+          # the isolated snapshot, including files whose current ignore rules would hide them.
+          git -C "$ratchet_snapshot" init -q
+          git -C "$ratchet_snapshot" add -f .
+          "$BLAZE_SCRIPTS/invariants" "{\"command\": \"write\", \"root\": \"$ratchet_snapshot\"}"
+          cp "$ratchet_snapshot/tools/ratchets/alloc-sites.txt" "$RUNNER_TEMP/ratchet-evidence/"
+          cp "$ratchet_snapshot/tools/ratchets/untyped-errors.txt" "$RUNNER_TEMP/ratchet-evidence/"
+          cp "$ratchet_snapshot/docs/v2/plan/invariants.md" "$RUNNER_TEMP/ratchet-evidence/"
+          cp "$BLAZE_SCRIPTS/KEY" "$RUNNER_TEMP/ratchet-evidence/validator-key.txt"
+          git rev-parse HEAD > "$RUNNER_TEMP/ratchet-evidence/source-head.txt"
+      - name: keep native ratchet counts
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-ratchet-counts
+          path: ${{ runner.temp }}/ratchet-evidence/
+          if-no-files-found: error
 
   # The Lean proofs hold (rule verified-compiler; harness/v2/lean_gate.py, docs/v2/plan/proofs.md):
   # with the Lean lean/lean-toolchain pins, `lake build` of lean/ (core Lean: the semantics of
@@ -521,7 +550,7 @@ jobs:
           cp "$GITHUB_WORKSPACE/harness/toolchain" "$RUNNER_TEMP/core-evidence/toolchain-pin.txt"
           cargo "+$toolchain" --version --verbose > "$RUNNER_TEMP/core-evidence/cargo-version.txt"
           rustc "+$toolchain" --version --verbose > "$RUNNER_TEMP/core-evidence/rustc-version.txt"
-          cargo "+$toolchain" test --release --locked --lib -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve --no-fail-fast \
+          cargo "+$toolchain" test --release --locked --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve --no-fail-fast \
             2>&1 | tee "$RUNNER_TEMP/core-evidence/tests.log"
           cases=(
             retirement_preserves_survivors_and_exact_assignment_ownership
@@ -568,9 +597,27 @@ jobs:
             a_first_writer_conflict_must_compare_the_immutable_manifest
             bounded_packs_keep_every_key_and_refuse_conflicts_across_boundaries
             errors_after_publication_cannot_rebuild_an_immutable_unit
+            nested_effect_logs_use_the_callers_allocator
+            holder_effects_use_the_callers_allocator
+            pack_lists_use_the_callers_allocator
+            nested_schema_encoding_and_digest_scratch_use_the_callers_allocator
+            appending_keeps_the_callers_buffer_and_allocator_without_allocating
+            sets_keep_their_storage_and_take_encoding_scratch_from_the_output_allocator
+            set_encoding_writes_each_canonical_sort_key_once
+            rendering_uses_the_destination_and_reports_its_capacity
+            every_type_round_trips_byte_identically
+            every_type_has_a_golden_file
+            golden_vectors_match
+            bytes_the_validator_accepts_are_canonical
+            every_digest_input_is_the_encoding_the_golden_digest_uses
+            the_native_three_field_layout_round_trips_including_empty
+            malformed_lists_never_become_empty_cache_entries
+            fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries
+            two_agents_split_a_unit_and_both_get_all_of_it
+            a_unit_published_by_one_pull_request_is_taken_by_another
           )
           for case_name in "${cases[@]}"; do
-            grep -Eq "^test .*::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \
+            grep -Eq "^test ([[:alnum:]_]+::)*$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \
               || { echo "::error::missing executed library control: $case_name"; exit 1; }
           done
       - name: distributed library binaries and integration targets compile
@@ -631,6 +678,22 @@ jobs:
             the_oracle_catches_a_column_omitting_its_persisted_names
             the_oracle_catches_an_image_copying_its_files_bytes
             the_oracle_catches_a_rebuilt_size_off_by_one
+            the_oracle_catches_a_rename_before_the_prewarm_ends
+            the_oracle_catches_a_home_also_kept_in_its_pack
+            the_oracle_catches_a_part_read_from_the_next_byte
+            the_oracle_catches_a_home_override_ignored
+            the_oracle_catches_a_shared_wait_with_no_wake
+            the_oracle_catches_a_temp_directory_whose_drop_does_not_run
+            the_oracle_catches_a_table_edit_that_keeps_the_old_part
+            the_oracle_catches_an_absence_not_posted
+            the_oracle_catches_a_removed_key_the_comparison_missed
+            the_oracle_catches_a_part_digested_as_another
+            the_oracle_catches_a_maintainer_that_forgets_a_deletion_under_verify
+            the_oracle_catches_a_maintainer_that_forgets_a_deletion_with_verify_off
+            the_oracle_catches_a_memory_answer_that_loses_a_double_bit_or_column
+            the_oracle_catches_a_split_seen_record_that_vouches_for_its_root_too_soon
+            the_oracle_catches_relisting_only_changed_files_parents
+            the_oracle_catches_an_attribute_lookup_with_shifted_rows
           )
           for case_name in "${cases[@]}"; do
             grep -Eq "^test ([[:alnum:]_]+::)*$case_name( - should panic)? \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/active-tests.log" \
@@ -639,6 +702,39 @@ jobs:
           # This control exists independently in the kernel and the record store.
           [ "$(grep -Ec '^test ([[:alnum:]_]+::)*the_oracle_catches_a_negative_read_dropped \.\.\. ok[[:space:]]*$' "$RUNNER_TEMP/core-evidence/active-tests.log")" -eq 2 ] \
             || { echo '::error::both negative-read controls must execute'; exit 1; }
+      - name: remaining active V2 library controls
+        if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-evidence"
+          toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
+          cargo "+$toolchain" test --release --locked --lib --no-fail-fast \
+            -p blaze-graph -p blaze-hash -p blaze-host -p blaze-mem -p blaze-memo \
+            -p blaze-pg -p blaze-remote -p blaze-screen -p blaze-std -p span \
+            2>&1 | tee "$RUNNER_TEMP/core-evidence/remaining-active-tests.log"
+          cases=(
+            the_oracle_catches_a_sample_whose_free_is_not_reported
+            the_oracle_catches_a_parked_stack_without_the_give_back
+            the_oracle_catches_a_deep_suspend_that_does_not_count_its_stack
+            the_oracle_catches_swap_removing_when_order_must_shift
+            the_oracle_catches_hash_bucket_order_used_for_insertion_order
+            the_oracle_catches_task_order_in_a_record_payload
+            the_oracle_catches_formatting_through_a_temporary_buffer
+            the_oracle_catches_a_retained_flight_released_too_soon
+            the_oracle_catches_a_box_whose_arena_id_was_erased
+            the_oracle_catches_a_value_encoded_in_the_wrong_byte_order
+            the_oracle_catches_an_array_that_drops_its_null_elements
+            the_oracle_catches_ticket_expiry_checked_against_an_old_clock
+            the_oracle_catches_cached_passes_reported_as_tests_run
+            the_oracle_catches_a_main_without_its_output_capability
+            the_oracle_catches_a_line_written_without_its_newline
+            the_oracle_catches_a_context_read_in_another_arena_without_translation
+          )
+          for case_name in "${cases[@]}"; do
+            grep -Eq "^test ([[:alnum:]_]+::)*$case_name( - should panic)? \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/remaining-active-tests.log" \
+              || { echo "::error::missing executed active library control: $case_name"; exit 1; }
+          done
       - name: memo invariant integration controls
         if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
         shell: bash
@@ -679,6 +775,26 @@ jobs:
           for case_name in a_file_page_is_its_own_file an_http_page_is_its_scheme_host_and_port other_schemes_and_broken_urls_are_refused; do
             grep -Eq "^test tests::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/browser-ui-tests.log" \
               || { echo "::error::missing executed browser-origin control: $case_name"; exit 1; }
+          done
+      - name: learning models with caller-owned buffers
+        if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-evidence"
+          toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
+          # This library has only serde dependencies. A verbatim copy lets Cargo test it
+          # without resolving the desktop workspace's platform-specific GPU artifact.
+          learning_snapshot=$(mktemp -d "$RUNNER_TEMP/blaze-learning.XXXXXX")
+          cp -a crates/harness/harness-learn/. "$learning_snapshot/"
+          cp crates/harness/Cargo.lock "$learning_snapshot/Cargo.lock"
+          cargo "+$toolchain" test --release --locked --manifest-path "$learning_snapshot/Cargo.toml" \
+            2>&1 | tee "$RUNNER_TEMP/core-evidence/learning-tests.log"
+          diff -r crates/harness/harness-learn/src "$learning_snapshot/src"
+          cmp crates/harness/harness-learn/Cargo.toml "$learning_snapshot/Cargo.toml"
+          for case_name in a_topic_borrows_the_original_bytes_after_a_unicode_greeting sorted_reviews_and_key_scratch_use_the_callers_allocator a_prompt_writes_into_fixed_storage_and_reports_a_full_sink streamed_answers_match_unicode_lowercase_and_whitespace_normalization an_order_reuses_its_buffer_when_a_missed_check_returns; do
+            grep -Eq "^test ([[:alnum:]_]+::)*$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/learning-tests.log" \
+              || { echo "::error::missing executed learning buffer control: $case_name"; exit 1; }
           done
       - uses: actions/upload-artifact@v7
         if: always()

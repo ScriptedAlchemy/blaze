@@ -576,7 +576,7 @@ fn summaries_and_proofs(options: MirOptions, spend_facts: Option<Tier>) -> (u64,
 /// not the fixture's. The optimizing tier, whose list has no `SpendFacts` for now
 /// (`passes_at`), makes none either; switched on there, the pass makes them and spends proofs.
 #[test]
-fn a_tier_zero_body_computes_no_effect_summary() {
+fn the_oracle_catches_effect_summary_work_at_tier_zero() {
     let zero = MirOptions { inline: true, tier: Tier::Zero, ..release() };
     assert_eq!(proofs_at(Tier::Zero), Proofs::None, "tier 0 spends no proof");
     assert_eq!(summaries_and_proofs(zero, None), (0, 0), "a tier 0 body asked for summaries");

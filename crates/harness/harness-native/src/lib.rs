@@ -2,6 +2,8 @@
 //! A library so that other hosts stand on the same scene: [`scene::world`] is the app's world before anything runs in it
 //! (its tokens, the prims and the `hn.*` widgets), which harness-video loads a video's scene into. The binary
 //! (src/main.rs) is [`main`].
+#![feature(allocator_api)]
+
 mod app;
 mod audio;
 mod music;

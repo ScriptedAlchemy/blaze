@@ -4494,11 +4494,11 @@ fn shapes_let_go(text: &str) -> Vec<Shape> {
     shapes
 }
 
-/// What a child prints its shapes after, one line, for [`a_build_after_a_release_equals_a_fresh_build`].
+/// What a child prints its shapes after, one line, for [`the_oracle_catches_erased_rows_kept_across_release`].
 const SHAPES_AFTER: &str = "shapes of the build after: ";
 
 /// Builds [`RELEASED`], releases the process's tables, then builds [`AFTER_RELEASE`] and prints
-/// its shapes: run alone in a process by [`a_build_after_a_release_equals_a_fresh_build`], as a
+/// its shapes: run alone in a process by [`the_oracle_catches_erased_rows_kept_across_release`], as a
 /// release needs no other test's task or database in the process.
 fn built_after_a_release() {
     let before = shapes_let_go(RELEASED);
@@ -4521,19 +4521,19 @@ fn built_after_a_release() {
 const STALE_AFTER: &str = "stale erased rows: ";
 
 #[test]
-#[ignore = "a child of `a_build_after_a_release_equals_a_fresh_build`, alone in its process"]
+#[ignore = "a child of `the_oracle_catches_erased_rows_kept_across_release`, alone in its process"]
 fn child_builds_fresh() {
     println!("{SHAPES_AFTER}{:?}", shapes_let_go(AFTER_RELEASE));
 }
 
 #[test]
-#[ignore = "a child of `a_build_after_a_release_equals_a_fresh_build`, alone in its process"]
+#[ignore = "a child of `the_oracle_catches_erased_rows_kept_across_release`, alone in its process"]
 fn child_builds_after_a_release() {
     built_after_a_release();
 }
 
 #[test]
-#[ignore = "a child of `a_build_after_a_release_equals_a_fresh_build`, alone in its process"]
+#[ignore = "a child of `the_oracle_catches_erased_rows_kept_across_release`, alone in its process"]
 fn child_builds_after_a_release_keeping_erased() {
     crate::plant::KEEPS_ERASED.store(true, std::sync::atomic::Ordering::Relaxed);
     built_after_a_release();
@@ -4574,7 +4574,7 @@ fn child(name: &str) -> (bool, Option<String>) {
 /// Control: `plant::KEEPS_ERASED` keeps `erase_regions`' map across the release, so a row it
 /// names was another value when it was kept: that build differs or fails.
 #[test]
-fn a_build_after_a_release_equals_a_fresh_build() {
+fn the_oracle_catches_erased_rows_kept_across_release() {
     let (fresh_passed, fresh) = child("child_builds_fresh");
     assert!(fresh_passed, "the fresh build failed");
     let (after_passed, after) = child("child_builds_after_a_release");

@@ -4,6 +4,7 @@
 use super::{App, Learn, Screen, today};
 use harness_learn::{Input, Mark, Run, Step};
 use serde_json::{Value, json};
+use std::alloc::Global;
 
 /// The page to load: `$HARNESS_WEB_URL` (the dev server, while designing), else the build in crates/harness/web/dist.
 fn page_url() -> String {
@@ -27,26 +28,26 @@ fn screen(l: &Learn) -> Value {
         (Screen::Step, Some(run)) => step(l, run),
         (Screen::Course { course }, _) if l.course(course).is_some() => {
             let c = l.course(course).expect("checked above");
-            let next = p.next_lesson(c).map(|x| x.id.as_str());
+            let next = p.next_lesson(c, Global).map(|x| x.id.as_str());
             let lessons: Vec<Value> = c
                 .lessons
                 .iter()
                 .map(|x| {
                     let state = if next == Some(x.id.as_str()) {
                         "next"
-                    } else if p.finished(&c.id, &x.id) {
+                    } else if p.finished(&c.id, &x.id, Global) {
                         "done"
                     } else {
                         "later"
                     };
-                    json!({"id": x.id, "title": x.title, "about": x.about, "state": state, "mastery": p.lesson_mastery(&c.id, x)})
+                    json!({"id": x.id, "title": x.title, "about": x.about, "state": state, "mastery": p.lesson_mastery(&c.id, x, Global)})
                 })
                 .collect();
-            json!({"kind": "course", "id": c.id, "title": c.title, "goal": c.goal, "mastery": p.mastery(c),
-                   "due": p.due(c, day).len(), "lessons": lessons})
+            json!({"kind": "course", "id": c.id, "title": c.title, "goal": c.goal, "mastery": p.mastery(c, Global),
+                   "due": p.due(c, day, Global).len(), "lessons": lessons})
         }
         (Screen::Done { kicker, title, score, next: _, course }, _) => {
-            let next = l.course(course).and_then(|c| p.next_lesson(c)).map_or(String::new(), |x| x.title.clone());
+            let next = l.course(course).and_then(|c| p.next_lesson(c, Global)).map_or(String::new(), |x| x.title.clone());
             json!({"kind": "done", "kicker": kicker, "title": title, "score": score, "next": next})
         }
         _ => {
@@ -55,7 +56,7 @@ fn screen(l: &Learn) -> Value {
                 .courses
                 .iter()
                 .take(3)
-                .map(|c| json!({"id": c.id, "title": c.title, "due": p.due(c, day).len(), "mastery": p.mastery(c)}))
+                .map(|c| json!({"id": c.id, "title": c.title, "due": p.due(c, day, Global).len(), "mastery": p.mastery(c, Global)}))
                 .collect();
             json!({"kind": "start", "note": l.note, "continue": rows})
         }

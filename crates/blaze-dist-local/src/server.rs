@@ -1,5 +1,6 @@
 //! Nonblocking Unix reactor. Socket fragmentation/coalescing is unrelated to CBOR boundaries.
 
+use std::alloc::Global;
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -79,7 +80,10 @@ pub struct Server {
 }
 
 fn fail(text: &str) -> Vec<u8> {
-    encode(&ServerFrame::Error(blaze_wire::WireError::new(ErrorCode::Malformed, text)))
+    encode(
+        &ServerFrame::Error(blaze_wire::WireError::new(ErrorCode::Malformed, format_args!("{text}"))),
+        Global,
+    )
 }
 
 /// Read an OS-random instance/session ID without a hashing or timestamp uniqueness guess.
@@ -354,9 +358,9 @@ impl Server {
                 match self.coordinator.hello(now, &hello) {
                     Ok(welcome) => {
                         c.session = Some(welcome.session);
-                        (encode(&ServerFrame::Welcome(welcome)), false)
+                        (encode(&ServerFrame::Welcome(welcome), Global), false)
                     }
-                    Err(e) => (encode(&ServerFrame::Error(e)), true),
+                    Err(e) => (encode(&ServerFrame::Error(e), Global), true),
                 }
             }
             Ok(ClientFrame::Request(request)) if c.session == Some(request.session) => {
@@ -370,7 +374,7 @@ impl Server {
                         self.effects.deliver(effects);
                         (reply, releases)
                     }
-                    Err(e) => (encode(&ServerFrame::Error(e)), true),
+                    Err(e) => (encode(&ServerFrame::Error(e), Global), true),
                 }
             }
             Ok(_) => (fail("hello/session-binding"), true),

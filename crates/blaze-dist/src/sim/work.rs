@@ -498,10 +498,10 @@ impl Checker {
             }
         }
         for (parent, ordinal) in &edges {
-            let edge = WorkName::of(&WorkKey::Edge(blaze_wire::EdgeKey {
-                parent: *parent,
-                ordinal: *ordinal,
-            }));
+            let edge = WorkName::of(
+                &WorkKey::Edge(blaze_wire::EdgeKey { parent: *parent, ordinal: *ordinal }),
+                std::alloc::Global,
+            );
             match report.edges.get(&edge) {
                 Some((p, o, t)) if p == parent && o == ordinal && t.is_local() => {}
                 other => {

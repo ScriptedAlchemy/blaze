@@ -139,6 +139,10 @@ fn one(marks: Marks) -> Verdict {
     request(&mut BTreeMap::new(), None, 5, marks).0
 }
 
+fn not_kept_as(verdict: Verdict, why: NotKept) -> bool {
+    verdict == Verdict::NotKept { passed: true, micros: 5, why, missed: Missed::RunAll }
+}
+
 /// The invariant: a detached selection files a traceable pass as the attached one does, and a
 /// pass the tracer can't see all of (foreign code, no trace) or whose reads may not be what it
 /// read (a file stamped since it began) is reported not kept, by name.
@@ -147,28 +151,52 @@ fn a_detached_selection_keeps_a_traced_pass_and_names_what_it_does_not_keep() {
     assert!(matches!(one(PLAIN), Verdict::Ran { .. }), "{:?}", one(PLAIN));
     let foreign = Marks { foreign: true, ..PLAIN };
     // Each request runs its test whatever its head holds: `--run-all` is why it ran.
-    let missed = Missed::RunAll;
-    assert_eq!(one(foreign), Verdict::NotKept { passed: true, micros: 5, why: NotKept::Foreign, missed });
+    assert!(not_kept_as(one(foreign), NotKept::Foreign));
     let untraced = Marks { traced: false, ..PLAIN };
-    assert_eq!(one(untraced), Verdict::NotKept { passed: true, micros: 5, why: NotKept::Untraced, missed });
+    assert!(not_kept_as(one(untraced), NotKept::Untraced));
     let moved = Marks { moved: true, ..PLAIN };
-    assert_eq!(one(moved), Verdict::NotKept { passed: true, micros: 5, why: NotKept::Moved, missed });
+    assert!(not_kept_as(one(moved), NotKept::Moved));
     assert_eq!(NotKept::Foreign.code(), "foreign");
     assert_eq!(NotKept::Untraced.code(), "untraced");
     assert_eq!(NotKept::Moved.code(), "moved");
+}
+
+#[test]
+fn the_oracle_catches_a_run_kept_after_its_trace_marks_were_lost() {
+    for (marks, why) in [
+        (Marks { foreign: true, ..PLAIN }, NotKept::Foreign),
+        (Marks { traced: false, ..PLAIN }, NotKept::Untraced),
+        (Marks { moved: true, ..PLAIN }, NotKept::Moved),
+    ] {
+        assert!(not_kept_as(one(marks), why));
+        // The runner drops the one mark that made this pass unsafe to keep.
+        assert!(!not_kept_as(one(PLAIN), why));
+    }
+}
+
+fn observed_durations(keep_old_head: bool) -> [Option<u64>; 3] {
+    let mut store = BTreeMap::new();
+    let (_, first_head, first) = request(&mut store, None, 5, PLAIN);
+    let (_, next_head, second) = request(&mut store, Some(first_head), 7, PLAIN);
+    let head = if keep_old_head { first_head } else { next_head };
+    let (_, _, third) = request(&mut store, Some(head), 9, PLAIN);
+    [first, second, third]
 }
 
 /// The invariant: a test's expected duration, what the queue orders its runs by, is its head
 /// row's last run, and a test with no row has none.
 #[test]
 fn a_test_is_expected_to_take_what_its_last_run_took() {
-    let mut store = BTreeMap::new();
-    let (_, head, first) = request(&mut store, None, 5, PLAIN);
-    assert_eq!(first, None, "a test with no head row has no expected duration");
-    let (_, head, second) = request(&mut store, Some(head), 7, PLAIN);
-    assert_eq!(second, Some(5), "the head's row holds the first run's time");
-    let (_, _, third) = request(&mut store, Some(head), 9, PLAIN);
-    assert_eq!(third, Some(7), "each new head holds the run before it");
+    assert_eq!(observed_durations(false), [None, Some(5), Some(7)]);
+}
+
+#[test]
+fn the_oracle_catches_a_duration_read_from_the_previous_head() {
+    let want = [None, Some(5), Some(7)];
+    assert_eq!(observed_durations(false), want);
+    let stale = observed_durations(true);
+    assert_eq!(stale, [None, Some(5), Some(5)]);
+    assert_ne!(stale, want);
 }
 
 /// A selection is detached only once nothing reads a record under its snapshot: never before

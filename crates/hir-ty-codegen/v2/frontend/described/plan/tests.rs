@@ -98,7 +98,7 @@ fn held_names(plans: &[(ContentId, Vec<u8>)]) -> Result<(), String> {
 /// its plan made in either database is the same bytes; its describe read back from the plan
 /// equals a describe now; each function edge is the name and ask of the callee asked for by
 /// the plan's origin, and each other edge is of its reference's kind. Its control is
-/// [`a_name_without_its_origin_is_caught_by_the_oracle`].
+/// [`the_oracle_catches_a_plan_name_without_its_origin`].
 #[test]
 fn a_plan_reads_back_in_a_second_database_as_the_plan_it_was_made_as() {
     let policy = crate::v2::tests::policy(OptLevel::O0);
@@ -154,7 +154,7 @@ fn a_plan_reads_back_in_a_second_database_as_the_plan_it_was_made_as() {
 /// then two plans of other bytes under one name, which the oracle names; the real names are
 /// two and pass.
 #[test]
-fn a_name_without_its_origin_is_caught_by_the_oracle() {
+fn the_oracle_catches_a_plan_name_without_its_origin() {
     let policy = crate::v2::tests::policy(OptLevel::O0);
     let fixture = fixture::db(PROGRAM);
     let db = fixture.db();

@@ -4,10 +4,13 @@
 //! Each case writes bytes by hand, because the encoder never writes what the validator refuses, so
 //! the only way to see the refusal is to write the offence itself.
 
+#![feature(allocator_api)]
+
 use blaze_wire::vectors::every;
 use blaze_wire::{
     ErrorKind, Limits, Set, Wire, decode, encode, validate, validate_as, wire_struct,
 };
+use std::alloc::Global;
 
 fn limits() -> Limits {
     Limits::DOCUMENTED
@@ -357,7 +360,7 @@ fn a_unit_variant_with_a_payload_is_refused() {
 fn an_unknown_key_is_refused() {
     // `Reservation`'s three keys and then `3: 0`: key 3 is not `Reservation`'s.
     let v = blaze_wire::Reservation { memory: 1, cpus: 1, disk: 1 };
-    let mut bytes = encode(&v);
+    let mut bytes = encode(&v, Global);
     bytes[0] = 0xa4;
     bytes.extend_from_slice(&[0x03, 0x00]);
     let (named, kind) = refused_as::<blaze_wire::Reservation>(&bytes);
@@ -369,7 +372,7 @@ fn an_unknown_key_is_refused() {
 fn a_missing_key_is_refused() {
     // `Reservation` without key 2: its value is one byte, its key one, so drop two.
     let v = blaze_wire::Reservation { memory: 1, cpus: 1, disk: 1 };
-    let mut bytes = encode(&v);
+    let mut bytes = encode(&v, Global);
     bytes.truncate(bytes.len() - 2);
     bytes[0] = 0xa2;
     let (named, kind) = refused_as::<blaze_wire::Reservation>(&bytes);

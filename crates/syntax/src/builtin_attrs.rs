@@ -739,13 +739,12 @@ blaze_phf::phf_table! {
 mod tests {
     use super::{INERT_ATTRIBUTES, find, is_built_in};
 
-    /// The invariant: the lookup finds each name of the table at its row, and nothing else.
-    #[test]
-    fn every_name_is_found_at_its_row() {
+    fn lookup_problem(lookup: impl Fn(&str) -> Option<usize>) -> Option<String> {
         for (at, attr) in INERT_ATTRIBUTES.iter().enumerate() {
             let name = attr.name;
-            assert_eq!(find(name), Some(at), "{name}");
-            assert!(is_built_in(name), "{name}");
+            if lookup(name) != Some(at) {
+                return Some(format!("{name} was not found at its row {at}"));
+            }
             for near in [
                 format!("{name}_"),
                 format!("r#{name}"),
@@ -754,13 +753,37 @@ mod tests {
                 name[1..].to_owned(),
             ] {
                 let by_text = INERT_ATTRIBUTES.iter().position(|it| it.name == near);
-                assert_eq!(find(&near), by_text, "{near}");
+                if lookup(&near) != by_text {
+                    return Some(format!("{near} disagrees with its row {by_text:?}"));
+                }
             }
         }
         for other in ["", "derive", "macro_rules", "not_an_attribute", "test", "rustfmt"] {
-            assert_eq!(find(other), None, "{other}");
+            if lookup(other).is_some() {
+                return Some(format!("{other} has no row but was found"));
+            }
+        }
+        None
+    }
+
+    /// The invariant: the lookup finds each name of the table at its row, and nothing else.
+    #[test]
+    fn every_name_is_found_at_its_row() {
+        assert_eq!(lookup_problem(find), None);
+        for attr in INERT_ATTRIBUTES {
+            assert!(is_built_in(attr.name), "{}", attr.name);
+        }
+        for other in ["", "derive", "macro_rules", "not_an_attribute", "test", "rustfmt"] {
             assert!(!is_built_in(other), "{other}");
         }
+    }
+
+    #[test]
+    fn the_oracle_catches_an_attribute_lookup_with_shifted_rows() {
+        // The lookup still recognizes every name, but points to the next attribute's data.
+        let problem = lookup_problem(|name| find(name).map(|at| (at + 1) % INERT_ATTRIBUTES.len()))
+            .expect("the oracle missed a shifted row");
+        assert!(problem.contains("was not found at its row"), "{problem}");
     }
 
     /// rustc's own names are built in whether or not the table has them; a path is not.

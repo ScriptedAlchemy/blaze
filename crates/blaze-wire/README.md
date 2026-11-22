@@ -12,12 +12,17 @@ key present; an enum is the two-element array `[discriminant, payload]`; a tuple
 `Vec` marked **set** in the doc is a [`Set`], sorted by the bytes of each item's encoding.
 
 ```rust
+use std::alloc::Global;
+
 let job = JobRequest { unit, platform, namespace: Namespace::Main, source: [0; 32], deadline_ms, local };
-let bytes = blaze_wire::encode(&job);
+let bytes = blaze_wire::encode(&job, Global);
 let back: JobRequest = blaze_wire::decode(&bytes, &Limits::DOCUMENTED)?;
 ```
 
 One value has one encoding, so a request or a result can be hashed and kept under that hash.
+Encoding and digest scratch use the caller's allocator, including nested sets. A set keeps its
+input buffer and allocator; writing it uses the encoder's allocator for canonicalization scratch.
+JSON rendering writes into the caller's `fmt::Write` destination and returns any formatting error.
 
 ## The validator
 

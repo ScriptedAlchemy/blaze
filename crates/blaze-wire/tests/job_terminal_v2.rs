@@ -1,5 +1,8 @@
 //! Isolated v2 terminal vectors; no v1 shape or digest changes.
 
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use blaze_wire::job_terminal_v2::{
     SubscriberTerminalV2, TerminalDecodeError, TerminationReasonV2, TerminationV2, decode_terminal,
 };
@@ -23,7 +26,7 @@ fn terminal_v2_golden_and_roundtrip() {
     let value = terminal();
     // {0:1, 1:2, 2:3, 3:{0:2, 1:[3,null], 2:[1,null]}}
     let golden = [0xa4, 0, 1, 1, 2, 2, 3, 3, 0xa3, 0, 2, 1, 0x82, 3, 0xf6, 2, 0x82, 1, 0xf6];
-    assert_eq!(encode(&value), golden);
+    assert_eq!(encode(&value, Global), golden);
     assert_eq!(decode_terminal(&golden, &Limits::DOCUMENTED).unwrap(), value);
 }
 
@@ -32,7 +35,7 @@ fn terminal_v2_rejects_version_semantics_size_and_trailing_frames() {
     let mut value = terminal();
     value.termination.version = 1;
     assert!(matches!(
-        decode_terminal(&encode(&value), &Limits::DOCUMENTED),
+        decode_terminal(&encode(&value, Global), &Limits::DOCUMENTED),
         Err(TerminalDecodeError::InvalidTermination)
     ));
     value.termination.version = 2;
@@ -40,15 +43,15 @@ fn terminal_v2_rejects_version_semantics_size_and_trailing_frames() {
     // alias of canonical Lost+NoLead and requires an explicitly pinned old codec.
     value.termination.outcome = Outcome::Failed;
     assert!(matches!(
-        decode_terminal(&encode(&value), &Limits::DOCUMENTED),
+        decode_terminal(&encode(&value, Global), &Limits::DOCUMENTED),
         Err(TerminalDecodeError::InvalidTermination)
     ));
     value.termination.outcome = Outcome::Passed;
     assert!(matches!(
-        decode_terminal(&encode(&value), &Limits::DOCUMENTED),
+        decode_terminal(&encode(&value, Global), &Limits::DOCUMENTED),
         Err(TerminalDecodeError::InvalidTermination)
     ));
-    let bytes = encode(&terminal());
+    let bytes = encode(&terminal(), Global);
     let limits = Limits { event: bytes.len() as u32 - 1, ..Limits::DOCUMENTED };
     assert!(matches!(decode_terminal(&bytes, &limits), Err(TerminalDecodeError::TooLarge)));
     let mut trailing = bytes.clone();
@@ -76,6 +79,6 @@ fn terminal_v2_every_reason_roundtrips() {
         let mut value = terminal();
         value.termination.reason = reason;
         value.termination.outcome = outcome;
-        assert_eq!(decode_terminal(&encode(&value), &Limits::DOCUMENTED).unwrap(), value);
+        assert_eq!(decode_terminal(&encode(&value, Global), &Limits::DOCUMENTED).unwrap(), value);
     }
 }

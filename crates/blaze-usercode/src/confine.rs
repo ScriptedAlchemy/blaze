@@ -681,6 +681,24 @@ mod tests {
         assert!(given_value([std::ffi::OsStr::new("A=B")]).unwrap_err().contains("`A=B`"));
     }
 
+    #[cfg(unix)]
+    fn walk_has_only_fixed_variables() -> Result<(), (&'static str, bool)> {
+        for (names, expected) in [
+            (&["PATH", "HOME", "CC", "CFLAGS", "CC_aarch64_unknown_linux_gnu", "SDKROOT"][..], true),
+            (&["NIX_CFLAGS_COMPILE", "RUSTFLAGS", "CARGO_HOME", "LC_ALL", "DEP_Z_INCLUDE"][..], true),
+            (&["TERM", "COLUMNS", "SHLVL", "OLDPWD", "PWD", "INVOCATION_ID"][..], false),
+            (&["IO_PRESSURE_WATCH", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "LIBCLANG_PATH"][..], false),
+        ] {
+            for &name in names {
+                let visible = walk_sees(std::ffi::OsStr::new(name));
+                if visible != expected {
+                    return Err((name, visible));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The invariant: the walk set is a fixed list, sorted (it is searched), that holds what a
     /// C toolchain is pointed by and none of what differs from one pane or service to the
     /// next.
@@ -688,23 +706,21 @@ mod tests {
     fn a_walk_sees_the_fixed_set_and_nothing_of_a_shell_session() {
         assert!(WALK_NAMES.is_sorted(), "WALK_NAMES is searched: keep it sorted");
         assert!(WALK_NAMES.windows(2).all(|pair| pair[0] != pair[1]));
-        let sees = |name: &str| walk_sees(std::ffi::OsStr::new(name));
-        if cfg!(unix) {
-            for name in ["PATH", "HOME", "CC", "CFLAGS", "CC_aarch64_unknown_linux_gnu", "SDKROOT"] {
-                assert!(sees(name), "{name}");
-            }
-            for name in ["NIX_CFLAGS_COMPILE", "RUSTFLAGS", "CARGO_HOME", "LC_ALL", "DEP_Z_INCLUDE"] {
-                assert!(sees(name), "{name}");
-            }
-            for name in ["TERM", "COLUMNS", "SHLVL", "OLDPWD", "PWD", "INVOCATION_ID"] {
-                assert!(!sees(name), "{name}");
-            }
-            for name in ["IO_PRESSURE_WATCH", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "LIBCLANG_PATH"] {
-                assert!(!sees(name), "{name}");
-            }
-        } else {
-            assert!(sees("TERM"));
-        }
+        #[cfg(unix)]
+        assert_eq!(walk_has_only_fixed_variables(), Ok(()));
+        #[cfg(not(unix))]
+        assert!(walk_sees(std::ffi::OsStr::new("TERM")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_oracle_catches_a_walk_of_the_whole_environment() {
+        assert_eq!(walk_has_only_fixed_variables(), Ok(()));
+        PLANTED_WHOLE_WALK.set(true);
+        let observed = walk_has_only_fixed_variables();
+        PLANTED_WHOLE_WALK.set(false);
+        assert_eq!(observed, Err(("TERM", true)));
+        assert_eq!(walk_has_only_fixed_variables(), Ok(()));
     }
 
     #[test]

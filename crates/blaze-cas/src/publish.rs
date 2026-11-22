@@ -979,7 +979,10 @@ mod tests {
             let writes = events.iter().filter(|it| **it == Event::Told(Step::Write)).count();
             assert_eq!(writes, 2, "the place fails once its writes ended: {events:?}");
         }
+    }
 
+    #[test]
+    fn the_oracle_catches_a_rename_before_the_prewarm_ends() {
         // The planted bug, with the prewarm told last: the rename is asked, and the place
         // ends, with the prewarm still in flight.
         let (events, _) = driven(true, false, true, true);

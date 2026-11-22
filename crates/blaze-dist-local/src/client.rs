@@ -1,6 +1,7 @@
 //! Blocking CLI/client IO over the carrier's nonblocking server. A lost response leaves the
 //! exact pending request available for retry, including after reconnect.
 
+use std::alloc::Global;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -37,7 +38,7 @@ fn connect(path: &Path, hello: LocalHello) -> Result<(UnixStream, LocalWelcome),
     let mut stream = socket::connect_until(path, deadline, &clock)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    stream.write_all(&frame(&encode(&ClientFrame::Hello(hello.clone()))))?;
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(hello.clone()), Global)))?;
     let response = read(&mut stream, 1 << 20)?;
     let ServerFrame::Welcome(welcome) = response else {
         return Err(Error::Protocol(format!("hello refused: {response:?}")));
@@ -145,7 +146,7 @@ impl Client {
             .pending
             .as_ref()
             .ok_or_else(|| Error::Protocol("no pending request".to_owned()))?;
-        let bytes = encode(&ClientFrame::Request(pending.clone()));
+        let bytes = encode(&ClientFrame::Request(pending.clone()), Global);
         if bytes.len() > self.welcome.max_frame as usize {
             return Err(Error::Protocol("request-size".to_owned()));
         }

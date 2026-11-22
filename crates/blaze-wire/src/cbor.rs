@@ -16,6 +16,7 @@
 //! which the bytes-only validator cannot tell apart from any other array, so a lookup's schema
 //! field holds its own collection to that limit ([`Reader::lookup`]).
 
+use std::alloc::{Allocator, Global};
 use std::fmt;
 
 /// The deepest nesting a message may have, counting every item and not only containers.
@@ -71,7 +72,7 @@ impl Default for Limits {
 /// array, a [`Set`](crate::Set) a sorted array, a [`Bytes`](crate::Bytes) a byte string.
 pub trait Wire: Sized {
     /// Writes this value in canonical CBOR.
-    fn encode(&self, e: &mut Encoder);
+    fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>);
 
     /// Reads one value, refusing anything the encoder would not have written.
     fn decode(r: &mut Reader<'_>) -> Result<Self, Error>;
@@ -87,15 +88,14 @@ pub trait Named {
 }
 
 /// Writes canonical CBOR.
-#[derive(Default)]
-pub struct Encoder {
-    out: Vec<u8>,
+pub struct Encoder<A: Allocator + Clone> {
+    out: Vec<u8, A>,
 }
 
-impl Encoder {
+impl<A: Allocator + Clone> Encoder<A> {
     /// An empty encoder.
-    pub fn new() -> Encoder {
-        Encoder::default()
+    pub fn new(alloc: A) -> Encoder<A> {
+        Encoder { out: Vec::new_in(alloc) }
     }
 
     /// An encoder that writes onto the end of `out`, for a prefix and then one value.
@@ -111,13 +111,19 @@ impl Encoder {
     /// }
     /// assert_eq!(out, b"prefix\x01");
     /// ```
-    pub fn new_into(out: &mut Vec<u8>) -> Appender<'_> {
-        Appender { encoder: Encoder { out: std::mem::take(out) }, back: out }
+    pub fn new_into(out: &mut Vec<u8, A>) -> Appender<'_, A> {
+        let empty = Vec::new_in(out.allocator().clone());
+        Appender { encoder: Encoder { out: std::mem::replace(out, empty) }, back: out }
     }
 
     /// The bytes written so far.
-    pub fn into_bytes(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Vec<u8, A> {
         self.out
+    }
+
+    /// The allocator for the output and any scratch needed to canonicalize a nested value.
+    pub fn allocator(&self) -> &A {
+        self.out.allocator()
     }
 
     /// The major type and argument as one head, in the shortest form that holds the argument.
@@ -178,8 +184,8 @@ impl Encoder {
     }
 
     /// The canonical CBOR of one value.
-    pub fn of<T: Wire>(v: &T) -> Vec<u8> {
-        let mut e = Encoder::new();
+    pub fn of<T: Wire>(v: &T, alloc: A) -> Vec<u8, A> {
+        let mut e = Encoder::new(alloc);
         v.encode(&mut e);
         e.into_bytes()
     }
@@ -197,32 +203,30 @@ impl Encoder {
 /// drop(e);
 /// assert_eq!(out.last(), Some(&24));
 /// ```
-pub struct Appender<'a> {
-    encoder: Encoder,
-    back: &'a mut Vec<u8>,
+pub struct Appender<'a, A: Allocator + Clone> {
+    encoder: Encoder<A>,
+    back: &'a mut Vec<u8, A>,
 }
 
-impl std::ops::Deref for Appender<'_> {
-    type Target = Encoder;
+impl<A: Allocator + Clone> std::ops::Deref for Appender<'_, A> {
+    type Target = Encoder<A>;
 
-    fn deref(&self) -> &Encoder {
+    fn deref(&self) -> &Encoder<A> {
         &self.encoder
     }
 }
 
-impl std::ops::DerefMut for Appender<'_> {
-    fn deref_mut(&mut self) -> &mut Encoder {
+impl<A: Allocator + Clone> std::ops::DerefMut for Appender<'_, A> {
+    fn deref_mut(&mut self) -> &mut Encoder<A> {
         &mut self.encoder
     }
 }
 
-impl Drop for Appender<'_> {
+impl<A: Allocator + Clone> Drop for Appender<'_, A> {
     fn drop(&mut self) {
-        // The encoder's buffer began as the caller's, and `take` leaves it empty rather than
-        // moving it, so putting the bytes back is one move and no copy.
-        let mut bytes = std::mem::take(&mut self.encoder.out);
-        bytes.append(self.back);
-        *self.back = bytes;
+        // The caller cannot access `back` while this borrow is live. Its placeholder has the
+        // same allocator and no storage; swap returns the original buffer without allocating.
+        std::mem::swap(&mut self.encoder.out, self.back);
     }
 }
 
@@ -818,12 +822,12 @@ pub fn decode<T: Wire>(bytes: &[u8], limits: &Limits) -> Result<T, Error> {
 }
 
 /// Writes one value of `T` as canonical CBOR.
-pub fn encode<T: Wire>(value: &T) -> Vec<u8> {
-    Encoder::of(value)
+pub fn encode<T: Wire, A: Allocator + Clone>(value: &T, alloc: A) -> Vec<u8, A> {
+    Encoder::of(value, alloc)
 }
 
 impl Wire for u64 {
-    fn encode(&self, e: &mut Encoder) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
         e.uint(*self);
     }
 
@@ -836,7 +840,7 @@ macro_rules! wire_uint {
     ($($ty:ty),* $(,)?) => {
         $(
             impl Wire for $ty {
-                fn encode(&self, e: &mut Encoder) {
+                fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
                     e.uint(u64::from(*self));
                 }
 
@@ -856,7 +860,7 @@ macro_rules! wire_uint {
 wire_uint!(u8, u16, u32);
 
 impl Wire for bool {
-    fn encode(&self, e: &mut Encoder) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
         e.bool(*self);
     }
 
@@ -872,7 +876,7 @@ impl Wire for bool {
 }
 
 impl<const N: usize> Wire for [u8; N] {
-    fn encode(&self, e: &mut Encoder) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
         e.bytes(self);
     }
 
@@ -885,7 +889,7 @@ impl<const N: usize> Wire for [u8; N] {
 }
 
 impl Wire for String {
-    fn encode(&self, e: &mut Encoder) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
         e.text(self);
     }
 
@@ -895,7 +899,7 @@ impl Wire for String {
 }
 
 impl<T: Wire> Wire for Option<T> {
-    fn encode(&self, e: &mut Encoder) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
         match self {
             Some(v) => v.encode(e),
             None => e.null(),
@@ -914,7 +918,7 @@ impl<T: Wire> Wire for Option<T> {
 }
 
 impl<T: Wire> Wire for Vec<T> {
-    fn encode(&self, e: &mut Encoder) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
         e.array(self.len());
         for v in self {
             v.encode(e);
@@ -933,7 +937,7 @@ impl<T: Wire> Wire for Vec<T> {
 }
 
 impl<A: Wire, B: Wire> Wire for (A, B) {
-    fn encode(&self, e: &mut Encoder) {
+    fn encode<Alloc: Allocator + Clone>(&self, e: &mut Encoder<Alloc>) {
         e.array(2);
         self.0.encode(e);
         self.1.encode(e);
@@ -949,7 +953,7 @@ impl<A: Wire, B: Wire> Wire for (A, B) {
 }
 
 impl<A: Wire, B: Wire, C: Wire> Wire for (A, B, C) {
-    fn encode(&self, e: &mut Encoder) {
+    fn encode<Alloc: Allocator + Clone>(&self, e: &mut Encoder<Alloc>) {
         e.array(3);
         self.0.encode(e);
         self.1.encode(e);
@@ -967,19 +971,79 @@ impl<A: Wire, B: Wire, C: Wire> Wire for (A, B, C) {
 }
 
 /// The keys of a map, held in ascending order of their encoded bytes and without duplicates.
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Set<T> {
-    items: Vec<T>,
+#[derive(Clone)]
+pub struct Set<T, A: Allocator + Clone = Global> {
+    items: Vec<T, A>,
 }
 
-impl<T: Wire> Set<T> {
+impl<T: fmt::Debug, A: Allocator + Clone> fmt::Debug for Set<T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Set").field("items", &self.items).finish()
+    }
+}
+
+impl<T> Default for Set<T> {
+    fn default() -> Self {
+        Self { items: Vec::new_in(Global) }
+    }
+}
+
+impl<T: PartialEq, A: Allocator + Clone, B: Allocator + Clone> PartialEq<Set<T, B>> for Set<T, A> {
+    fn eq(&self, other: &Set<T, B>) -> bool {
+        self.items.as_slice() == other.items.as_slice()
+    }
+}
+
+impl<T: Eq, A: Allocator + Clone> Eq for Set<T, A> {}
+
+impl<T: PartialOrd, A: Allocator + Clone, B: Allocator + Clone> PartialOrd<Set<T, B>> for Set<T, A> {
+    fn partial_cmp(&self, other: &Set<T, B>) -> Option<std::cmp::Ordering> {
+        self.items.as_slice().partial_cmp(other.items.as_slice())
+    }
+}
+
+impl<T: Ord, A: Allocator + Clone> Ord for Set<T, A> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.items.as_slice().cmp(other.items.as_slice())
+    }
+}
+
+impl<T: std::hash::Hash, A: Allocator + Clone> std::hash::Hash for Set<T, A> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(self.items.as_slice(), state);
+    }
+}
+
+impl<T: Wire, A: Allocator + Clone> Set<T, A> {
     /// A set of `items`, sorted by the bytes of each item's encoding, duplicates dropped.
-    pub fn new(items: Vec<T>) -> Set<T> {
-        let mut keyed: Vec<(Vec<u8>, T)> =
-            items.into_iter().map(|item| (Encoder::of(&item), item)).collect();
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        keyed.dedup_by(|a, b| a.0 == b.0);
-        Set { items: keyed.into_iter().map(|(_, item)| item).collect() }
+    /// The set keeps the input buffer and its allocator; encoding keys and the permutation are scratch in that same
+    /// allocator. Each item is encoded once, and equal encodings keep the first input item.
+    pub fn new(mut items: Vec<T, A>) -> Set<T, A> {
+        let alloc = items.allocator().clone();
+        let mut keyed = Vec::with_capacity_in(items.len(), alloc.clone());
+        keyed.extend(items.iter().enumerate().map(|(i, item)| (Encoder::of(item, alloc.clone()), i)));
+        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut destination = Vec::with_capacity_in(items.len(), alloc);
+        destination.resize(items.len(), 0);
+        for (to, (_, from)) in keyed.iter().enumerate() {
+            destination[*from] = to;
+        }
+        for at in 0..items.len() {
+            // Each swap settles one item at its destination, so the whole permutation takes at most len - 1 swaps.
+            while destination[at] != at {
+                let to = destination[at];
+                items.swap(at, to);
+                destination.swap(at, to);
+            }
+        }
+        let mut at = 0;
+        items.retain(|_| {
+            let unique = at == 0 || keyed[at - 1].0 != keyed[at].0;
+            at += 1;
+            unique
+        });
+        Set { items }
     }
 
     /// The items, in their canonical order.
@@ -988,7 +1052,7 @@ impl<T: Wire> Set<T> {
     }
 
     /// The items, in their canonical order.
-    pub fn into_vec(self) -> Vec<T> {
+    pub fn into_vec(self) -> Vec<T, A> {
         self.items
     }
 
@@ -1007,14 +1071,32 @@ impl<T: Wire> Set<T> {
         self.items.iter()
     }
 
+    /// Writes the canonical array using the encoder's allocator for its temporary keys. This is also available for
+    /// a set whose storage uses a non-global allocator; protocol decoding owns the default storage.
+    pub fn encode<B: Allocator + Clone>(&self, e: &mut Encoder<B>) {
+        // A user-defined Wire value may have interior mutability. Canonicalize its current bytes, then write those
+        // exact bytes rather than asking the value to encode a second time after its sort key was computed.
+        let alloc = e.allocator().clone();
+        let mut keyed = Vec::with_capacity_in(self.items.len(), alloc.clone());
+        keyed.extend(self.items.iter().map(|item| Encoder::of(item, alloc.clone())));
+        keyed.sort_unstable();
+        keyed.dedup();
+        e.array(keyed.len());
+        for bytes in keyed {
+            e.out.extend_from_slice(&bytes);
+        }
+    }
+}
+
+impl<T: Wire> Set<T> {
     /// The items of an array whose header is already read, in their canonical order.
     fn items_of(r: &mut Reader<'_>, len: u64) -> Result<Set<T>, Error> {
-        let mut items = Vec::with_capacity(usize::try_from(len).unwrap_or(0).min(1024));
+        let mut items = Vec::with_capacity_in(usize::try_from(len).unwrap_or(0).min(1024), Global);
         let mut previous: Option<Vec<u8>> = None;
         for _ in 0..len {
             let at = r.position();
             let item = T::decode(r)?;
-            let bytes = Encoder::of(&item);
+            let bytes = Encoder::of(&item, Global);
             if let Some(before) = &previous {
                 match bytes.cmp(before) {
                     std::cmp::Ordering::Greater => {}
@@ -1038,22 +1120,15 @@ impl<T: Wire> Set<T> {
 
 impl<T: Wire> FromIterator<T> for Set<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Set<T> {
-        Set::new(iter.into_iter().collect())
+        let mut items = Vec::new_in(Global);
+        items.extend(iter);
+        Set::new(items)
     }
 }
 
 impl<T: Wire> Wire for Set<T> {
-    fn encode(&self, e: &mut Encoder) {
-        // A set built by `new` is already sorted; one built by hand is sorted here, so the bytes
-        // are canonical either way.
-        let mut keyed: Vec<(Vec<u8>, &T)> =
-            self.items.iter().map(|item| (Encoder::of(item), item)).collect();
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        keyed.dedup_by(|a, b| a.0 == b.0);
-        e.array(keyed.len());
-        for (_, item) in keyed {
-            item.encode(e);
-        }
+    fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
+        Set::encode(self, e);
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
@@ -1069,13 +1144,6 @@ pub struct Bytes {
     pub bytes: Vec<u8>,
 }
 
-impl Bytes {
-    /// These bytes.
-    pub fn new(bytes: Vec<u8>) -> Bytes {
-        Bytes { bytes }
-    }
-}
-
 impl From<Vec<u8>> for Bytes {
     fn from(bytes: Vec<u8>) -> Bytes {
         Bytes { bytes }
@@ -1084,12 +1152,12 @@ impl From<Vec<u8>> for Bytes {
 
 impl crate::vectors::Sample for Bytes {
     fn sample(g: &mut crate::vectors::Gen) -> Self {
-        Bytes { bytes: g.bytes() }
+        Bytes { bytes: g.bytes(Global) }
     }
 }
 
 impl Wire for Bytes {
-    fn encode(&self, e: &mut Encoder) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
         e.bytes(&self.bytes);
     }
 
@@ -1123,7 +1191,7 @@ macro_rules! wire_struct {
         }
 
         impl $crate::Wire for $name {
-            fn encode(&self, e: &mut $crate::Encoder) {
+            fn encode<__Alloc: ::std::alloc::Allocator + Clone>(&self, e: &mut $crate::Encoder<__Alloc>) {
                 e.map($crate::wire_struct!(@count $($field),*));
                 $(
                     e.uint($key);
@@ -1217,7 +1285,7 @@ macro_rules! wire_enum {
         }
 
         impl $crate::Wire for $name {
-            fn encode(&self, e: &mut $crate::Encoder) {
+            fn encode<__Alloc: ::std::alloc::Allocator + Clone>(&self, e: &mut $crate::Encoder<__Alloc>) {
                 e.array(2);
                 $crate::wire_enum!(@write self, e, $name, $($orig)*);
                 unreachable!("every variant is written")

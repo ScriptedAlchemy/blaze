@@ -131,6 +131,10 @@ fn named(path: &Path, what: &str, e: io::Error) -> io::Error {
 mod tests {
     use super::*;
 
+    fn directory_removed(path: &Path) -> bool {
+        !path.exists()
+    }
+
     /// The invariant: a `TempDir` is a new empty directory of its own, and is gone, with what
     /// it held, once dropped.
     #[test]
@@ -144,7 +148,19 @@ mod tests {
         std::fs::write(first.join("a/b/c"), b"x").unwrap();
         let path = first.path().to_path_buf();
         drop(first);
-        assert!(!path.exists(), "{} outlived its TempDir", path.display());
+        assert!(directory_removed(&path), "{} outlived its TempDir", path.display());
         assert!(second.path().is_dir());
+    }
+
+    #[test]
+    fn the_oracle_catches_a_temp_directory_whose_drop_does_not_run() {
+        let held = std::mem::ManuallyDrop::new(TempDir::for_test("blaze-core-temp-control-"));
+        std::fs::create_dir_all(held.join("a/b")).unwrap();
+        std::fs::write(held.join("a/b/c"), b"x").unwrap();
+        let path = held.path().to_path_buf();
+        // The planted bug removes the destructor, so its files survive the supposed drop.
+        assert!(!directory_removed(&path), "the oracle missed a retained directory");
+        drop(std::mem::ManuallyDrop::into_inner(held));
+        assert!(directory_removed(&path), "the control cleans up through the real destructor");
     }
 }

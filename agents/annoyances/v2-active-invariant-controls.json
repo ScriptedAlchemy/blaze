@@ -1,0 +1,14 @@
+{
+  "id": "v2-active-invariant-controls",
+  "date": "2026-11-21",
+  "who": "GPT-6 Astra Pro, repair_catalogs lane",
+  "where": "43 stated invariants and refinements in 25 active-library source files; scripts/src/bin/invariants.rs",
+  "what": "The strict invariant inventory could not associate these statements with a named causal control. Several controls already planted real bugs but were inline or named only as ordinary tests; others had no negative observation of the stated property.",
+  "cost": "The inventory gate failed, and the existing successful tests did not by themselves establish that their observations could distinguish an omitted safeguard from correct behavior.",
+  "cause": "Causal tests and their discovery convention evolved separately. Some assertions observed a proxy for the promise, notably destination capacity in place of actual allocation calls while formatting.",
+  "class": "undiscoverable or incomplete negative controls for stated test properties",
+  "prevention": "Keep genuine planted controls in the statement's file under the established the_oracle_catches_ name, and run the same observer on the correct path and the planted path. Keep the strict inventory and all original statements unchanged.",
+  "workaround": "none; no scanner, allowance, ignored-test setting or production behavior changed",
+  "fix": "Registered or added 32 controls across the 25 files. Existing prewarm, cache-home, audit, kernel-posting and maintenance controls retain their mechanisms. New controls exercise concrete omitted operations, stale data, wrong byte order, lost nulls, wrong table rows and mismatched observations. Formatting now measures allocator calls, and the fiber control bypasses the actual suspend wrapper's depth observation. All Rust changes are inside test modules or test-only source files.",
+  "state": "implemented; whitespace and inventory-presence checks passed, native tests pending. The existing DuckDB differential test remains explicitly ignored until run with pinned DuckDB 1.5.5; its new unignored comparator control does not substitute for that run."
+}

@@ -495,13 +495,7 @@ mod tests {
         (ended, link)
     }
 
-    /// The invariant: a `run` after an edit, answered here, times its request on the wire
-    /// exactly once, from its send to its answer's `Done`, hears its build's id, and its rows
-    /// are that build's with each of the client's spans once and nothing of another's.
-    /// Controls: an answer handed to the engine times no wire (its spans are the engine's),
-    /// and a command whose answer named no build has no rows.
-    #[test]
-    fn a_run_times_its_request_on_the_wire_once_and_its_rows_are_its_builds() {
+    fn answered_run_timings() -> Timings {
         let asked = asked(&["run", "-q"]);
         let mut link = Scripted::answering([status(), edit(), launched()].concat());
         let shown = Shown::pipe(blaze_screen::Command::Run, false);
@@ -515,26 +509,57 @@ mod tests {
         assert_eq!(timings.answered_ns, Some(20));
         assert_eq!(timings.build, Some(7));
         timings.span(blaze_api::Timed::ANSWER_TO_EXEC, 20, 25);
+        timings
+    }
+
+    fn client_spans_are_once(timed: &[blaze_api::Timed]) -> bool {
+        timed.len() == 4
+            && [EXEC_TO_MAIN, CONNECT, ON_THE_WIRE, blaze_api::Timed::ANSWER_TO_EXEC]
+                .iter()
+                .all(|name| timed.iter().filter(|it| it.name == *name).count() == 1)
+    }
+
+    /// The invariant: a `run` after an edit, answered here, times its request on the wire
+    /// exactly once, from its send to its answer's `Done`, hears its build's id, and its rows
+    /// are that build's with each of the client's spans once and nothing of another's.
+    /// Controls: an answer handed to the engine times no wire (its spans are the engine's),
+    /// and a command whose answer named no build has no rows.
+    #[test]
+    fn a_run_times_its_request_on_the_wire_once_and_its_rows_are_its_builds() {
+        let timings = answered_run_timings();
         let Some(Request::ClientRows { pid, build, timed, spans, started_ns, ended_ns, .. }) = timings.rows(41, 0, 25)
         else {
             panic!("a build was heard, so there are rows");
         };
         assert_eq!((pid, build, started_ns, ended_ns, spans.len()), (41, 7, 0, 25, 0));
-        for name in [EXEC_TO_MAIN, CONNECT, ON_THE_WIRE, blaze_api::Timed::ANSWER_TO_EXEC] {
-            assert_eq!(timed.iter().filter(|it| it.name == name).count(), 1, "{name}: {timed:?}");
-        }
-        assert_eq!(timed.len(), 4, "{timed:?}");
+        assert!(client_spans_are_once(&timed), "{timed:?}");
         assert_eq!(blaze_api::Timed::exec_of(&timed), Some(25));
 
         // The controls.
         let asked = asked_build();
         let mut link = Scripted::answering([status(), edit()].concat());
+        let shown = Shown::pipe(blaze_screen::Command::Run, false);
         let spoken = Spoken { asked: &asked, request: &COMMAND, shown: &shown, cwd: Path::new("/w"), pid: 41 };
         let mut timings = Timings::default();
         let ended = talk(&mut link, &spoken, |_| Ok(()), || Duration::ZERO, &mut timings);
         assert!(matches!(ended, Ended::HandOver { .. }), "{ended:?}");
         assert!(timings.timed.iter().all(|it| it.name != ON_THE_WIRE), "{:?}", timings.timed);
         assert_eq!(Timings::default().rows(41, 0, 1), None);
+    }
+
+    #[test]
+    fn the_oracle_catches_a_request_timed_on_the_wire_twice() {
+        let mut timings = answered_run_timings();
+        let Some(Request::ClientRows { timed, .. }) = timings.rows(41, 0, 25) else {
+            panic!("a build was heard, so there are rows");
+        };
+        assert!(client_spans_are_once(&timed));
+        // Plant a second caller recording the span already recorded by `talk`.
+        timings.span(ON_THE_WIRE, 2, 20);
+        let Some(Request::ClientRows { timed, .. }) = timings.rows(41, 0, 25) else {
+            panic!("a build was heard, so there are rows");
+        };
+        assert!(!client_spans_are_once(&timed));
     }
 
     fn asked_build() -> Asked {

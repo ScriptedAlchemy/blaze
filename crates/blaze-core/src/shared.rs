@@ -258,6 +258,10 @@ mod tests {
     const LEN: usize = 16;
     const HEADER: [u64; 4] = [0x6e68_6361_6d7a_6c62, 1, 4096, 8];
 
+    fn was_woken(waited: &Waited<()>) -> bool {
+        matches!(waited, Waited::Ready(()))
+    }
+
     /// A directory of this test's own, removed when the guard drops: hold it for the test.
     fn dir(name: &str) -> crate::temp::TempDir {
         crate::temp::TempDir::for_test(&format!("blaze-shared-{name}-"))
@@ -311,9 +315,9 @@ mod tests {
         assert!(matches!(error.why, SharedWhy::Identity { word: 1, found: 1, want: 2 }), "{error}");
     }
 
-    /// A wait on a word that holds what is expected, with no wake, ends at its deadline.
+    /// Removing the wake makes the same readiness oracle reject the wait's outcome.
     #[test]
-    fn a_wait_nobody_wakes_ends_at_its_deadline() {
+    fn the_oracle_catches_a_shared_wait_with_no_wake() {
         let held = dir("deadline");
         let path = held.join("machine.1");
         let shared = Shared::open_or_create(&path, &HEADER, LEN, 2).expect("the file is made");
@@ -322,6 +326,7 @@ mod tests {
         let waited = shared
             .wait("a test's wait nobody wakes", 5, 0, Deadline::after(clock.now(), wait), &clock)
             .unwrap();
+        assert!(!was_woken(&waited), "the oracle accepted a wait with no wake");
         assert_eq!(waited, Waited::Deadline);
         assert!(clock.now() >= wait);
     }
@@ -355,7 +360,7 @@ mod tests {
             assert!(clock.now() < Duration::from_secs(30), "the waiter was never woken");
         }
         let (waited, took) = waiter.join().unwrap();
-        assert_eq!(waited.unwrap(), Waited::Ready(()));
+        assert!(was_woken(&waited.unwrap()));
         assert!(took < Duration::from_secs(30), "the wait took {took:?}");
         assert_eq!(waiter_side.words()[4].load(SeqCst), 0);
     }

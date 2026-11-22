@@ -667,11 +667,19 @@ fn a_binary_that_cannot_start_loses_its_tests_with_why() {
     assert_eq!(fake.queue.take_unsandboxable(), None, "said once");
 }
 
+fn launched_with_provider(fake: &Fake, provider: &Provider) -> bool {
+    !fake.spawns.is_empty() && fake.spawns.iter().all(|(_, command)| command.env.contains(&provider.entry()))
+}
+
 /// The invariant: every sandboxed binary's processes are given a provider. The control is a
 /// sandboxed binary with none: refused before anything is spawned, naming it, its tests lost
 /// with why, never started with the kernel's randomness.
 #[test]
 fn a_sandboxed_binary_given_no_provider_is_refused_naming_it() {
+    let supplied = binary("lib", vec![job("a", 0)]);
+    let provider = supplied.provider.unwrap();
+    let supplied = Fake::new(config(4), vec![supplied]);
+    assert!(launched_with_provider(&supplied, &provider));
     let mut fake =
         Fake::new(config(4), vec![Binary { provider: None, ..binary("lib", vec![job("a", 0)]) }]);
     assert!(fake.spawns.is_empty(), "nothing is spawned: {:?}", fake.spawns);
@@ -679,6 +687,29 @@ fn a_sandboxed_binary_given_no_provider_is_refused_naming_it() {
         panic!("{:?}", fake.results)
     };
     assert!(why.contains("/bin/lib is to run sandboxed and was given no provider"), "{why}");
+}
+
+#[test]
+fn the_oracle_catches_a_spawn_without_the_suites_provider() {
+    let supplied = binary("lib", vec![job("a", 0)]);
+    let provider = supplied.provider.unwrap();
+    let mut fake = Fake::new(config(4), vec![supplied]);
+    assert!(launched_with_provider(&fake, &provider));
+    // Plant the loss of the provider while handing the command to the driver.
+    for (_, command) in &mut fake.spawns {
+        command.env.retain(|(name, _)| name != crate::provider::VAR);
+    }
+    assert!(!launched_with_provider(&fake, &provider));
+}
+
+fn launch_sandbox(read: Vec<PathBuf>, write: Vec<PathBuf>) -> Sandbox {
+    Sandbox::On {
+        read,
+        write,
+        network: false,
+        trace: true,
+        services: vec!["dev.blaze.inproc.7".to_owned()],
+    }
 }
 
 /// The invariant: a dev executable's launch adds nothing writable to a test's sandbox, so no
@@ -691,19 +722,24 @@ fn a_sandboxed_binary_given_no_provider_is_refused_naming_it() {
 fn a_launch_adds_nothing_writable_to_a_tests_sandbox() {
     let planned = [PathBuf::from("/scratch/t")];
     let socket = PathBuf::from("/home/u/.cache/blaze/v2/inproc/inproc-7.sock");
-    let on = |read: Vec<PathBuf>, write: Vec<PathBuf>| Sandbox::On {
-        read,
-        write,
-        network: false,
-        trace: true,
-        services: vec!["dev.blaze.inproc.7".to_owned()],
-    };
-    let now = on(vec!["/ws".into(), "/bin/lib".into(), socket.clone()], planned.to_vec());
+    let now = launch_sandbox(vec!["/ws".into(), "/bin/lib".into(), socket], planned.to_vec());
     assert_eq!(adds_no_write(&planned, &now), Ok(()));
-    let old = on(vec!["/ws".into(), "/bin/lib".into()], vec!["/scratch/t".into(), socket.clone()]);
-    assert_eq!(adds_no_write(&planned, &old), Err(&socket));
     assert_eq!(adds_no_write(&planned, &Sandbox::Off), Ok(()));
-    assert_eq!(adds_no_write(&[], &on(Vec::new(), Vec::new())), Ok(()));
+    assert_eq!(adds_no_write(&[], &launch_sandbox(Vec::new(), Vec::new())), Ok(()));
+}
+
+#[test]
+fn the_oracle_catches_a_launch_that_adds_a_writable_socket() {
+    let planned = [PathBuf::from("/scratch/t")];
+    let socket = PathBuf::from("/home/u/.cache/blaze/v2/inproc/inproc-7.sock");
+    let now = launch_sandbox(vec!["/ws".into(), "/bin/lib".into(), socket.clone()], planned.to_vec());
+    assert_eq!(adds_no_write(&planned, &now), Ok(()));
+    let old = launch_sandbox(vec!["/ws".into(), "/bin/lib".into()], vec!["/scratch/t".into(), socket.clone()]);
+    assert_eq!(adds_no_write(&planned, &old), Err(&socket));
+}
+
+fn other_tests_stopped(fake: &Fake, names: &[&str]) -> bool {
+    names.iter().all(|name| fake.result(name).outcome == Outcome::NotRun)
 }
 
 /// The invariant: a sandboxed fork server whose spawn fails stops the run: no test of any
@@ -724,9 +760,7 @@ fn a_sandbox_that_cannot_be_made_stops_the_run() {
     fake.spawns.retain(|it| it.0 != lib);
     fake.complete(lib, Done::Failed(IoError("no user namespaces".into())));
     assert!(matches!(fake.result("a").outcome, Outcome::Failed(Failure::Lost(_))));
-    for test in ["c", "d"] {
-        assert_eq!(fake.result(test).outcome, Outcome::NotRun, "{test}");
-    }
+    assert!(other_tests_stopped(&fake, &["c", "d"]), "{:?}", fake.results);
     assert!(
         fake.spawns.iter().all(|it| it.0 == other),
         "nothing starts after the stop, the binary outside neither: {:?}",
@@ -738,7 +772,10 @@ fn a_sandbox_that_cannot_be_made_stops_the_run() {
     fake.complete(other, Done::Failed(IoError("no user namespaces".into())));
     assert_eq!(fake.queue.take_unsandboxable(), None);
     assert!(fake.queue.finished());
+}
 
+#[test]
+fn the_oracle_catches_a_failed_spawn_treated_as_outside_the_sandbox() {
     let mut control = Fake::new(
         config(4),
         vec![outside("away", vec![job("d", 0)]), outside("near", vec![job("e", 0)])],
@@ -751,6 +788,7 @@ fn a_sandbox_that_cannot_be_made_stops_the_run() {
     let e = control.run(near, 0);
     control.end(near, e, End::Exited(0), b"");
     assert_eq!(control.result("e").outcome, Outcome::Passed);
+    assert!(!other_tests_stopped(&control, &["e"]));
 }
 
 /// Outside the sandbox the server is spawned at once, with no sandbox, no record and no
@@ -1059,6 +1097,10 @@ fn a_cancel_kills_what_runs_and_runs_nothing_more() {
     assert!(fake.queue.finished());
 }
 
+fn files_wait_for_server(fake: &Fake) -> bool {
+    fake.removed.is_empty() && !fake.queue.finished()
+}
+
 /// The invariant: a request leaves nothing in its directory and not the directory. Once the
 /// last result is in and the server's process ended (its sandbox appends to the record until
 /// then), its socket and record are removed, then the directory, and only then is the queue
@@ -1075,8 +1117,7 @@ fn a_request_s_directory_is_removed_once_its_last_result_is_in_and_its_server_en
     assert_eq!(fake.result("a").outcome, Outcome::Passed);
     assert_eq!(fake.frames(conn), vec![Frame::Quit]);
     // The control: every result is in, and the server can still append to its record.
-    assert!(fake.removed.is_empty(), "removed while the server runs: {:?}", fake.removed);
-    assert!(!fake.queue.finished());
+    assert!(files_wait_for_server(&fake), "removed while the server runs: {:?}", fake.removed);
     fake.exit("/bin/lib", exited(Some(0), None, Some(Traced::default())));
     assert_eq!(fake.removed, ours, "the files, then the directory");
     assert!(fake.records.is_empty() && fake.queue.finished());
@@ -1120,6 +1161,25 @@ fn a_request_s_directory_is_removed_once_its_last_result_is_in_and_its_server_en
     let mut fake = Fake::new(config(1), vec![whole]);
     fake.exit("/bin/lib", exited(Some(0), None, Some(Traced::default())));
     assert!(fake.queue.finished() && fake.removed.is_empty());
+}
+
+#[test]
+fn the_oracle_catches_cleanup_after_forgetting_the_live_server() {
+    let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 0)])]);
+    let conn = fake.hello(0, &["a"]);
+    let a = fake.run(conn, 0);
+    fake.end(conn, a, End::Exited(0), b"");
+    assert!(files_wait_for_server(&fake));
+    // Forget the outstanding process without ever delivering its exit. The real cleanup
+    // now runs while that server could still append to its record.
+    let spawn = fake.queue.server(0).spawn.take().expect("the server has not exited");
+    fake.queue.release_tag(spawn);
+    assert!(fake.queue.done_with_files());
+    let mut effects = Vec::new();
+    fake.queue.tidy(&mut effects);
+    fake.pump(effects);
+    assert!(!files_wait_for_server(&fake));
+    assert_eq!(fake.removed, [name("req/1/t0"), name("req/1/r0"), name("req/1")]);
 }
 
 /// What the fork server read of a test's region comes with its result, as it was sent.
@@ -1355,18 +1415,14 @@ fn a_line_of_every_scope_is_given_once_however_often_it_comes() {
     assert_eq!(fake.result("b").trace, lines(&[common[0], common[1], (Seen::Read, "/ws/b")]));
 }
 
-/// The invariant: the server's own start of its program is no test's read. A line of no test's
-/// scope that runs or looks at the binary's own file (the exec, and on macOS the loader's reads,
-/// under either spelling of a `/private` path) is in no test's trace, so a relink is not a
-/// changed read of every test; a test that opens its own executable reads it in its own scope,
-/// and that line stays. The control is the line beside it: another file read at the start is
-/// in every test's trace.
-#[test]
-fn the_servers_start_of_its_own_program_is_no_tests_read() {
+fn startup_record(know_program: bool) -> Fake {
     let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 0), job("b", 0)])]);
     // The path `binary("lib", ..)` is started from.
     let program = String::from("/bin/lib");
     let conn = fake.hello(0, &["a", "b"]);
+    if !know_program {
+        fake.queue.server(0).program.clear();
+    }
     let a = fake.run(conn, 0);
     fake.append(
         0,
@@ -1379,12 +1435,35 @@ fn the_servers_start_of_its_own_program_is_no_tests_read() {
         ],
     );
     fake.end(conn, a, End::Exited(0), b"");
-    assert_eq!(fake.result("a").trace, lines(&[(Seen::Read, "/lib/libc.so"), (Seen::Read, "/ws/a")]));
     // `b` opens its own executable: its read.
     let b = fake.run(conn, 1);
     fake.append(0, &[Line::new(Seen::Read, "b", &program)]);
     fake.end(conn, b, End::Exited(0), b"");
-    assert_eq!(fake.result("b").trace, lines(&[(Seen::Read, "/lib/libc.so"), (Seen::Read, program.as_str())]));
+    fake
+}
+
+fn startup_reads_match(fake: &Fake) -> bool {
+    fake.result("a").trace == lines(&[(Seen::Read, "/lib/libc.so"), (Seen::Read, "/ws/a")])
+        && fake.result("b").trace == lines(&[(Seen::Read, "/lib/libc.so"), (Seen::Read, "/bin/lib")])
+}
+
+/// The invariant: the server's own start of its program is no test's read. A line of no test's
+/// scope that runs or looks at the binary's own file (the exec, and on macOS the loader's reads,
+/// under either spelling of a `/private` path) is in no test's trace, so a relink is not a
+/// changed read of every test; a test that opens its own executable reads it in its own scope,
+/// and that line stays. The control is the line beside it: another file read at the start is
+/// in every test's trace.
+#[test]
+fn the_servers_start_of_its_own_program_is_no_tests_read() {
+    let fake = startup_record(true);
+    assert!(startup_reads_match(&fake), "{:?}", fake.results);
+}
+
+#[test]
+fn the_oracle_catches_startup_reads_after_forgetting_the_program_identity() {
+    assert!(startup_reads_match(&startup_record(true)));
+    let lost_program = startup_record(false);
+    assert!(!startup_reads_match(&lost_program), "{:?}", lost_program.results);
 }
 
 #[test]

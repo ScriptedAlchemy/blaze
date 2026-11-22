@@ -479,6 +479,21 @@ mod tests {
         assert_eq!(package(None, member).unwrap(), PackageOptOut::default());
     }
 
+    fn named_test_exemptions() -> TestSandbox {
+        package(
+            Some(&metadata(
+                "[blaze.sandbox]\ntests = true\nunsandboxed-tests = [\"b\", \"a::c\", \"b\"]\n",
+            )),
+            Path::new("/w/a/Cargo.toml"),
+        )
+        .unwrap()
+        .tests
+    }
+
+    fn honors_named_exemptions(tests: &TestSandbox) -> bool {
+        tests.outside("b") && tests.outside("a::c") && !tests.outside("a")
+    }
+
     /// The invariant: a member's manifest says how its tests run: nothing said is the host's
     /// default; `tests = true` is every test sandboxed (an opt-in where the host's default is
     /// outside); `tests = false` is none; `unsandboxed-tests` is all but those named.
@@ -492,19 +507,12 @@ mod tests {
         let said_true = package(Some(&metadata("[blaze.sandbox]\ntests = true\n")), member).unwrap();
         assert_eq!(said_true.tests, TestSandbox::default());
         assert!(said_true.tests_opted_in);
-        let named = package(
-            Some(&metadata(
-                "[blaze.sandbox]\ntests = true\nunsandboxed-tests = [\"b\", \"a::c\", \"b\"]\n",
-            )),
-            member,
-        )
-        .unwrap()
-        .tests;
+        let named = named_test_exemptions();
         assert_eq!(
             named,
             TestSandbox { tests: vec!["a::c".to_owned(), "b".to_owned()], ..TestSandbox::default() }
         );
-        assert!(named.outside("b") && named.outside("a::c") && !named.outside("a"));
+        assert!(honors_named_exemptions(&named));
         let out = package(Some(&metadata("[blaze.sandbox]\ntests = false\n")), member).unwrap();
         assert_eq!(out.tests, TestSandbox { all: true, ..TestSandbox::default() });
         assert!(!out.tests_opted_in);
@@ -513,6 +521,25 @@ mod tests {
                 .unwrap()
                 .tests;
         assert_eq!(only_named, TestSandbox { tests: vec!["t".to_owned()], ..TestSandbox::default() });
+    }
+
+    #[test]
+    fn the_oracle_catches_a_members_named_exemptions_being_dropped() {
+        let mut named = named_test_exemptions();
+        assert!(honors_named_exemptions(&named));
+        // Plant the loss of the parsed list while passing the policy to the runner.
+        named.tests.clear();
+        assert!(!honors_named_exemptions(&named));
+    }
+
+    fn follows_host_default(on: impl Fn(TestSandbox, bool, &str) -> TestSandbox) -> bool {
+        let plain = TestSandbox::default();
+        let off = TestSandbox { all: true, ..TestSandbox::default() };
+        on(plain.clone(), false, LINUX) == plain
+            && on(plain.clone(), false, MAC).outside_by_host
+            && on(plain.clone(), true, MAC) == plain
+            && on(off.clone(), false, MAC) == off
+            && on(off.clone(), false, LINUX) == off
     }
 
     /// The invariant: on a host that sandboxes tests by default a member's tests run sandboxed
@@ -524,13 +551,13 @@ mod tests {
         assert!(tests_sandboxed_by_default("aarch64-unknown-linux-gnu"));
         assert!(!tests_sandboxed_by_default(MAC));
         assert!(!tests_sandboxed_by_default("x86_64-apple-darwin"));
-        let plain = TestSandbox::default();
-        let off = TestSandbox { all: true, ..TestSandbox::default() };
-        assert!(!tests_on(plain.clone(), false, LINUX).outside_by_host);
-        assert!(tests_on(plain.clone(), false, MAC).outside_by_host, "the control");
-        assert!(!tests_on(plain, true, MAC).outside_by_host, "opted in");
-        assert!(!tests_on(off.clone(), false, MAC).outside_by_host);
-        assert_eq!(tests_on(off.clone(), false, LINUX), off);
+        assert!(follows_host_default(tests_on));
+    }
+
+    #[test]
+    fn the_oracle_catches_a_test_policy_that_ignores_the_host() {
+        assert!(follows_host_default(tests_on));
+        assert!(!follows_host_default(|tests, opted_in, _host| tests_on(tests, opted_in, LINUX)));
     }
 
     /// `sandboxed-tests` is the workspace's opt-in on a host that does not sandbox tests by

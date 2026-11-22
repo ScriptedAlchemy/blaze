@@ -15,6 +15,7 @@
 //! cleanup; this does not revive an expired session or permit cross-session request replay.
 
 use blaze_wire::job_terminal_v2::SubscriberTerminalV2;
+use std::alloc::Global;
 use blaze_wire::{
     Ack, Attempt, BatchResult, Bytes, Digest, EventItem, ExecutionId, JobContent, LocalPolicy,
     PackRef, Reservation, Set, WireError, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
@@ -333,12 +334,15 @@ wire_enum! {
 /// Exact opaque submission envelope from a request in this pinned codec.
 pub fn submission(request: &blaze_wire::JobRequest, need: Reservation) -> Submission {
     Submission {
-        content: JobContent::of(&blaze_wire::JobContentInput {
-            unit: request.unit,
-            platform: request.platform,
-            namespace: request.namespace.clone(),
-        }),
-        request: Bytes::new(blaze_wire::encode(request)),
+        content: JobContent::of(
+            &blaze_wire::JobContentInput {
+                unit: request.unit,
+                platform: request.platform,
+                namespace: request.namespace.clone(),
+            },
+            Global,
+        ),
+        request: Bytes { bytes: blaze_wire::encode(request, Global) },
         need,
     }
 }

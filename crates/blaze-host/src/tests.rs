@@ -1026,7 +1026,10 @@ fn an_audit_redoes_every_hit_and_finds_no_difference() {
         }
         last = asked.manifests;
     }
+}
 
+#[test]
+fn the_oracle_catches_task_order_in_a_record_payload() {
     let bench = Bench::new("blaze-host-audit-control");
     let store = bench.store();
     // One counting front for every request: its count goes on from one request to the next, so

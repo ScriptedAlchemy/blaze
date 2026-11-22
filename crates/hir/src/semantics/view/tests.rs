@@ -740,7 +740,7 @@ fn two_expansions_map_to_their_own_defs(fx: fixture::Fixture) {
 /// planted old behaviour), the later expansion's block replaces the earlier one's at the same
 /// range, and both `mod util` are one module.
 #[test]
-fn planted_blocks_of_any_file_make_the_two_expansions_modules_one() {
+fn the_oracle_catches_blocks_assigned_to_another_expansions_file() {
     let fx = fixture::db(TWO_SELECTS);
     let file_id = fx.only_file();
     let db = fx.into_db();

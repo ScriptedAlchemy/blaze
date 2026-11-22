@@ -63,8 +63,8 @@ impl ObjectName {
 }
 
 /// A digest as its name writes it: 64 lower-case hex digits.
-pub(crate) fn hex(digest: &Digest) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+pub(crate) fn hex(digest: &Digest) -> blaze_wire::json::Hex<'_> {
+    blaze_wire::json::hex(digest)
 }
 
 #[cfg(test)]
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn a_name_that_is_not_of_the_layout_is_refused() {
-        let digest = hex(&[0xab; 32]);
+        let digest = hex(&[0xab; 32]).to_string();
         for text in [
             "".to_owned(),
             "packs".to_owned(),

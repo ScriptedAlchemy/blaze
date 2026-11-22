@@ -1624,17 +1624,17 @@ fn every_sequence_of_table_edits_gives_what_the_rows_give() {
 }
 
 #[test]
-fn an_absence_not_posted_is_caught() {
+fn the_oracle_catches_an_absence_not_posted() {
     assert!(first_stale_table(crate::nest::planted::Bug::AbsenceUnposted).is_some());
 }
 
 #[test]
-fn a_removed_key_the_comparison_missed_is_caught() {
+fn the_oracle_catches_a_removed_key_the_comparison_missed() {
     assert!(first_stale_table(crate::nest::planted::Bug::DiffRemoved).is_some());
 }
 
 #[test]
-fn a_part_digested_as_another_is_caught() {
+fn the_oracle_catches_a_part_digested_as_another() {
     assert!(first_stale_table(crate::nest::planted::Bug::PartDigest).is_some());
 }
 
@@ -1989,7 +1989,7 @@ fn a_maintained_table_is_the_table_computed() {
 /// refused where the setting runs `compute` beside it, naming the step and the first read
 /// that differs, and nothing is kept.
 #[test]
-fn a_maintainer_that_forgets_a_deletion_is_refused_under_verify() {
+fn the_oracle_catches_a_maintainer_that_forgets_a_deletion_under_verify() {
     let mut it = kept::<LossyReader>(40, true);
     it.edit(6, Some(2), &Setting::ALL).expect("an edit of a part, which it maintains rightly");
     let Err(KernelError::Maintained { of, why }) = it.edit(5, None, &Setting::ALL) else {
@@ -2003,7 +2003,7 @@ fn a_maintainer_that_forgets_a_deletion_is_refused_under_verify() {
 /// The control of the oracle: with the check off, the same maintainer's table is not the one
 /// a run with no kernel makes.
 #[test]
-fn a_maintainer_that_forgets_a_deletion_is_stale_with_verify_off() {
+fn the_oracle_catches_a_maintainer_that_forgets_a_deletion_with_verify_off() {
     let mut it = kept::<LossyReader>(40, true);
     it.edit(5, None, &Setting::OFF).unwrap();
     assert!(it.table::<Lossy>() != it.fresh(), "the planted bug was not caught: the key that went is gone");

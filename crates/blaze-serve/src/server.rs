@@ -8,7 +8,14 @@
 //! Every answer that is not a success is a [`WireError`] in CBOR, with the status of
 //! its code's class. A blob's bytes are not CBOR; the bytes of a list are the list's own text.
 
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    alloc::{Allocator, Global},
+    convert::Infallible,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use blaze_wire::{ErrorCode, Limits, encode};
 use bytes::Bytes;
@@ -106,12 +113,14 @@ impl Server {
             || config.limits.request == 0
             || config.limits.batch_items == 0
         {
-            return Err(Error::malformed("server resource leases and wire limits must be positive"));
+            return Err(Error::malformed(format_args!(
+                "server resource leases and wire limits must be positive"
+            )));
         }
         let limits = config.limits;
         let ceiling = Limits::DOCUMENTED;
         if limits.request > ceiling.request || limits.blob < 32 || limits.blob > ceiling.blob {
-            return Err(Error::malformed("unsupported server wire limits"));
+            return Err(Error::malformed(format_args!("unsupported server wire limits")));
         }
         let store = Store::open(&config.dir)?;
         Ok(Server {
@@ -145,7 +154,7 @@ impl Server {
         let answered = self.route(&parts.method, &path, &parts.headers, body).await;
         match answered {
             Ok(answer) => answer,
-            Err(error) => error_answer(&error),
+            Err(error) => error_answer(error),
         }
     }
 
@@ -161,12 +170,12 @@ impl Server {
         }
         let Some((endpoint, name)) = path.strip_prefix("/v1/").and_then(|it| it.split_once('/'))
         else {
-            return Err(Error::not_found(format!("{path} is not a call of this server")));
+            return Err(Error::not_found(format_args!("{path} is not a call of this server")));
         };
         match endpoint {
             "blob" => self.blob(method, name, headers, body).await,
             "list" => self.list(method, name, headers, body).await,
-            _ => Err(Error::not_found(format!("{path} is not a call of this server"))),
+            _ => Err(Error::not_found(format_args!("{path} is not a call of this server"))),
         }
     }
 
@@ -178,16 +187,16 @@ impl Server {
         body: Incoming,
     ) -> Result<HttpResponse<Body>, Error> {
         let object = ObjectName::parse(name)
-            .ok_or_else(|| Error::not_found(format!("`{name}` is not an object of this cache")))?;
+            .ok_or_else(|| Error::not_found(format_args!("`{name}` is not an object of this cache")))?;
         if !object.is_blob() {
-            return Err(Error::not_found(format!("`{name}` is a list, not a blob")));
+            return Err(Error::not_found(format_args!("`{name}` is a list, not a blob")));
         }
         match *method {
             Method::GET => {
                 let owned = object.name.clone();
                 let opened = self.disk(move |store| store.open_blob(&owned)).await?;
                 let Some((file, len)) = opened else {
-                    return Err(Error::not_found(format!("{name} is not here")));
+                    return Err(Error::not_found(format_args!("{name} is not here")));
                 };
                 Ok(HttpResponse::builder()
                     .status(StatusCode::OK)
@@ -220,7 +229,7 @@ impl Server {
         if let Some(len) = content_length(headers)
             && len > self.limits.blob
         {
-            return Err(Error::too_large(format!(
+            return Err(Error::too_large(format_args!(
                 "{len} bytes is more than the {} a blob may be",
                 self.limits.blob
             )));
@@ -238,15 +247,17 @@ impl Server {
         let mut taken = 0u64;
         while let Some(frame) = tokio::time::timeout(self.resources.idle, body.frame())
             .await
-            .map_err(|_| Error::new(ErrorCode::Refused, "upload body idle deadline expired"))?
+            .map_err(|_| {
+                Error::new(ErrorCode::Refused, format_args!("upload body idle deadline expired"))
+            })?
         {
             let frame =
-                frame.map_err(|e| Error::malformed(format!("the body of a PUT broke: {e}")))?;
+                frame.map_err(|e| Error::malformed(format_args!("the body of a PUT broke: {e}")))?;
             let Some(data) = frame.into_data().ok() else { continue };
             taken += data.len() as u64;
             if taken > self.limits.blob {
                 drop(file);
-                return Err(Error::too_large(format!(
+                return Err(Error::too_large(format_args!(
                     "a blob of more than the {} bytes the server takes",
                     self.limits.blob
                 )));
@@ -277,26 +288,26 @@ impl Server {
         body: Incoming,
     ) -> Result<HttpResponse<Body>, Error> {
         let object = ObjectName::parse(name)
-            .ok_or_else(|| Error::not_found(format!("`{name}` is not an object of this cache")))?;
+            .ok_or_else(|| Error::not_found(format_args!("`{name}` is not an object of this cache")))?;
         if object.is_blob() {
-            return Err(Error::not_found(format!("`{name}` is a blob, not a list")));
+            return Err(Error::not_found(format_args!("`{name}` is a blob, not a list")));
         }
         let owned = object.name.clone();
         match *method {
             Method::GET => {
                 let most = u64::from(self.limits.request);
-                let read = self.disk(move |store| store.read_small(&owned, most)).await?;
+                let read = self.disk(move |store| store.read_small(&owned, most, Global)).await?;
                 let Some(bytes) = read else {
-                    return Err(Error::not_found(format!("{name} is not here")));
+                    return Err(Error::not_found(format_args!("{name} is not here")));
                 };
                 Ok(HttpResponse::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
                     .header(header::CONTENT_LENGTH, bytes.len().to_string())
-                    .body(full(bytes))?)
+                    .body(full(Bytes::from(bytes)))?)
             }
             Method::PUT => {
-                let bytes = self.read_whole(headers, body).await?;
+                let bytes = self.read_whole(headers, body, Global).await?;
                 let expected = manifest_match(headers)?;
                 let wrote = self
                     .disk(move |store| match expected {
@@ -314,28 +325,31 @@ impl Server {
         }
     }
 
-    async fn read_whole(
+    async fn read_whole<A: Allocator>(
         &self,
         headers: &hyper::HeaderMap,
         mut body: Incoming,
-    ) -> Result<Vec<u8>, Error> {
+        alloc: A,
+    ) -> Result<Vec<u8, A>, Error> {
         if let Some(len) = content_length(headers)
             && len > u64::from(self.limits.request)
         {
-            return Err(Error::too_large(format!(
+            return Err(Error::too_large(format_args!(
                 "{len} bytes is more than the {} a request may be",
                 self.limits.request
             )));
         }
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::new_in(alloc);
         while let Some(frame) = tokio::time::timeout(self.resources.idle, body.frame())
             .await
-            .map_err(|_| Error::new(ErrorCode::Refused, "request body idle deadline expired"))?
+            .map_err(|_| {
+                Error::new(ErrorCode::Refused, format_args!("request body idle deadline expired"))
+            })?
         {
-            let frame = frame.map_err(|e| Error::malformed(format!("the body broke: {e}")))?;
+            let frame = frame.map_err(|e| Error::malformed(format_args!("the body broke: {e}")))?;
             let Ok(data) = frame.into_data() else { continue };
             if bytes.len().saturating_add(data.len()) > self.limits.request as usize {
-                return Err(Error::too_large("the request exceeds the advertised limit"));
+                return Err(Error::too_large(format_args!("the request exceeds the advertised limit")));
             }
             bytes.extend_from_slice(&data);
         }
@@ -349,7 +363,7 @@ pub async fn serve(config: Config) -> Result<(), ServeError> {
     let opened = tokio::task::spawn_blocking(move || Server::open(&setup)).await
         .map_err(|source| ServeError::StoreTask { directory: config.dir.clone(), source })?
         .map_err(|source| ServeError::Store { directory: config.dir.clone(), source })?;
-    let server = Arc::new(opened);
+    let server = Arc::new_in(opened, Global);
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|source| ServeError::Listen { address: config.listen, source })?;
@@ -367,9 +381,12 @@ pub async fn serve(config: Config) -> Result<(), ServeError> {
 
 /// Serves the connections of `listener` with `server`, until the listener fails. A test uses
 /// this with a listener of its own, so the port is one the machine gives.
-pub async fn serve_on(listener: TcpListener, server: Arc<Server>) -> Result<(), ServeError> {
+pub async fn serve_on<A: Allocator + Clone + Send + Sync + 'static>(
+    listener: TcpListener,
+    server: Arc<Server, A>,
+) -> Result<(), ServeError> {
     let address = listener.local_addr().map_err(ServeError::ListenerAddress)?;
-    let permits = Arc::new(Semaphore::new(server.resources.connections));
+    let permits = Arc::new_in(Semaphore::new(server.resources.connections), Global);
     let mut connections = tokio::task::JoinSet::new();
     let mut sweep = tokio::time::interval(server.resources.sweep_every);
     loop {
@@ -413,7 +430,10 @@ async fn accept(
     listener.accept().await
 }
 
-async fn connection(stream: TcpStream, server: Arc<Server>) -> Result<(), ConnectionError> {
+async fn connection<A: Allocator + Clone + Send + Sync + 'static>(
+    stream: TcpStream,
+    server: Arc<Server, A>,
+) -> Result<(), ConnectionError> {
     let idle = server.resources.idle;
     let peer = stream.peer_addr().map_err(ConnectionError::PeerAddress)?;
     let socket = socket2::SockRef::from(&stream);
@@ -477,8 +497,8 @@ fn retry_accept(error: &std::io::Error) -> bool {
 /// The body of every answer: bytes, or a file streamed from it, or nothing.
 pub type Body = BoxBody<Bytes, std::io::Error>;
 
-fn full(bytes: Vec<u8>) -> Body {
-    Full::new(Bytes::from(bytes)).map_err(|never| match never {}).boxed()
+fn full(bytes: Bytes) -> Body {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
 }
 
 fn empty_body() -> Body {
@@ -510,7 +530,7 @@ fn text(status: StatusCode, text: &'static str) -> HttpResponse<Body> {
     HttpResponse::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(full(text.as_bytes().to_vec()))
+        .body(full(Bytes::from_static(text.as_bytes())))
         .expect("a text answer")
 }
 
@@ -518,14 +538,15 @@ fn empty(status: StatusCode) -> HttpResponse<Body> {
     HttpResponse::builder().status(status).body(empty_body()).expect("an empty answer")
 }
 
-fn error_answer(error: &Error) -> HttpResponse<Body> {
+fn error_answer(error: Error) -> HttpResponse<Body> {
     let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let retry_after_ms = error.retry_after_ms;
     let mut answer = HttpResponse::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/cbor")
-        .body(full(encode(&error.wire())))
+        .body(full(Bytes::from(encode(&error.into_wire(), Global))))
         .expect("an error answer");
-    if let Some(ms) = error.retry_after_ms
+    if let Some(ms) = retry_after_ms
         && let Ok(value) = HeaderValue::from_str(&ms.div_ceil(1000).to_string())
     {
         answer.headers_mut().insert(header::RETRY_AFTER, value);
@@ -534,7 +555,7 @@ fn error_answer(error: &Error) -> HttpResponse<Body> {
 }
 
 fn method_not_allowed(method: &Method, allowed: &str) -> Error {
-    Error::malformed(format!("{method} is not how this call is made: {allowed}"))
+    Error::malformed(format_args!("{method} is not how this call is made: {allowed}"))
 }
 
 /// Only one quoted, lowercase SHA256 is a conditional repair token. Wildcards, weak
@@ -543,16 +564,20 @@ fn manifest_match(headers: &hyper::HeaderMap) -> Result<Option<blaze_wire::Diges
     let mut values = headers.get_all(header::IF_MATCH).iter();
     let Some(value) = values.next() else { return Ok(None) };
     if values.next().is_some() {
-        return Err(Error::malformed("manifest repair takes exactly one If-Match header"));
+        return Err(Error::malformed(format_args!(
+            "manifest repair takes exactly one If-Match header"
+        )));
     }
-    let text = value.to_str().map_err(|_| Error::malformed("If-Match is not text"))?;
+    let text = value.to_str().map_err(|_| Error::malformed(format_args!("If-Match is not text")))?;
     let digest = text
         .strip_prefix('"')
         .and_then(|text| text.strip_suffix('"'))
         .filter(|text| text.len() == 64)
         .and_then(|text| ObjectName::parse(&format!("manifests/{text}")))
         .ok_or_else(|| {
-            Error::malformed("manifest repair If-Match must be one quoted lowercase SHA256")
+            Error::malformed(format_args!(
+                "manifest repair If-Match must be one quoted lowercase SHA256"
+            ))
         })?;
     Ok(Some(digest.digest))
 }
@@ -567,6 +592,46 @@ fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn consuming_error_answers_preserves_http_and_wire_failures() {
+        for (code, status) in [
+            (ErrorCode::Malformed, 400),
+            (ErrorCode::Version, 400),
+            (ErrorCode::Unauthenticated, 401),
+            (ErrorCode::NotAllowed, 403),
+            (ErrorCode::NotFound, 404),
+            (ErrorCode::Conflict, 409),
+            (ErrorCode::TooLarge, 413),
+            (ErrorCode::Busy, 429),
+            (ErrorCode::Refused, 422),
+            (ErrorCode::Internal, 500),
+        ] {
+            for retry_after_ms in [None, Some(0), Some(1), Some(1001)] {
+                let mut error = Error::new(code, format_args!("pack {}: exact refusal", 17));
+                error.retry_after_ms = retry_after_ms;
+                let response = error_answer(error);
+                assert_eq!(response.status().as_u16(), status);
+                assert_eq!(response.headers()[header::CONTENT_TYPE], "application/cbor");
+                let retry_header = response.headers().get(header::RETRY_AFTER);
+                match retry_after_ms {
+                    Some(ms) => {
+                        assert_eq!(
+                            retry_header.unwrap().to_str().unwrap(),
+                            ms.div_ceil(1000).to_string()
+                        );
+                    }
+                    None => assert!(retry_header.is_none()),
+                }
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let wire: blaze_wire::WireError =
+                    blaze_wire::decode(&body, &Limits::DOCUMENTED).unwrap();
+                assert_eq!(wire.code(), Some(code));
+                assert_eq!(wire.message, "pack 17: exact refusal");
+                assert_eq!(wire.retry_after_ms, retry_after_ms);
+            }
+        }
+    }
 
     struct Running {
         _dir: tempfile::TempDir,
@@ -674,7 +739,7 @@ mod tests {
         let name = {
             use sha2::Digest as _;
             let digest: blaze_wire::Digest = sha2::Sha256::digest(&bytes).into();
-            hex(&digest)
+            hex(&digest).to_string()
         };
         (bytes, name)
     }
@@ -901,8 +966,8 @@ mod tests {
                 204
             );
         }
-        let first = blaze_wire::pack_list::encode(&[manifest_ref(&first_bytes, &first_name)]);
-        let second = blaze_wire::pack_list::encode(&[manifest_ref(&second_bytes, &second_name)]);
+        let first = blaze_wire::pack_list::encode(&[manifest_ref(&first_bytes, &first_name)], Global);
+        let second = blaze_wire::pack_list::encode(&[manifest_ref(&second_bytes, &second_name)], Global);
         let (a, b) = tokio::join!(
             run.request("PUT", &path, "", &first),
             run.request("PUT", &path, "", &second),
@@ -953,7 +1018,7 @@ mod tests {
             size: bytes.len() as u64,
             keys: blaze_wire::digest_of_encoded_name(
                 "blaze/dist-pack-keys",
-                &blaze_wire::encode(&vec![[1; 32]]),
+                &blaze_wire::encode(&vec![[1; 32]], Global),
             ),
             packed: None,
             format: blaze_wire::DIST_PACK_FORMAT,
@@ -966,8 +1031,8 @@ mod tests {
         let run = Running::start().await;
         let (a, aname) = pack(b"old pack");
         let (b, bname) = pack(b"replacement pack");
-        let old = blaze_wire::pack_list::encode(&[manifest_ref(&a, &aname)]);
-        let new = blaze_wire::pack_list::encode(&[manifest_ref(&b, &bname)]);
+        let old = blaze_wire::pack_list::encode(&[manifest_ref(&a, &aname)], Global);
+        let new = blaze_wire::pack_list::encode(&[manifest_ref(&b, &bname)], Global);
         let path = format!("/v1/list/manifests/{}", hex(&[8; 32]));
         assert_eq!(
             run.request("PUT", &format!("/v1/blob/packs/{aname}.pack"), "", &a).await.0,
@@ -1042,9 +1107,9 @@ mod tests {
                 204
             );
         }
-        let old = blaze_wire::pack_list::encode(&[manifest_ref(&a, &aname)]);
-        let left = blaze_wire::pack_list::encode(&[manifest_ref(&b, &bname)]);
-        let right = blaze_wire::pack_list::encode(&[manifest_ref(&c, &cname)]);
+        let old = blaze_wire::pack_list::encode(&[manifest_ref(&a, &aname)], Global);
+        let left = blaze_wire::pack_list::encode(&[manifest_ref(&b, &bname)], Global);
+        let right = blaze_wire::pack_list::encode(&[manifest_ref(&c, &cname)], Global);
         let path = format!("/v1/list/manifests/{}", hex(&[9; 32]));
         // Seed a preexisting list with a lost pack; the new PUT path rejects it.
         std::fs::write(run.server.store().dir().join(format!("manifests/{}", hex(&[9; 32]))), &old)

@@ -16,7 +16,7 @@ blaze-cargo	459	0	58	545
 blaze-cas	817	0	170	355
 blaze-certify	83	0	0	51
 blaze-check	47	0	2	34
-blaze-codegen	515	0	66	161
+blaze-codegen	515	0	71	161
 blaze-codegen-code	0	0	0	66
 blaze-command	0	0	90	0
 blaze-core	764	0	174	219
@@ -32,7 +32,7 @@ blaze-front	0	0	23	0
 blaze-front-items	87	0	0	36
 blaze-fuzz	0	0	0	4
 blaze-gc	66	0	10	104
-blaze-global	212	0	8	89
+blaze-global	212	0	8	88
 blaze-graph	193	0	21	112
 blaze-hash	2	0	0	0
 blaze-hashcons	2	0	0	2
@@ -123,7 +123,7 @@ harness/harness-video	0	0	0	20
 harness/harness-vt	0	0	0	10
 harness/vendor/hyperion-ecs	0	0	0	13
 harness/vendor/hyperion-manifest-types	0	0	0	3
-hir	233	0	61	121
+hir	233	0	62	121
 hir-def	210	0	58	144
 hir-expand	117	0	5	22
 hir-lint-levels	12	0	2	2

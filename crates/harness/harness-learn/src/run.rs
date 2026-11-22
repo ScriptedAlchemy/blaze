@@ -6,6 +6,7 @@
 
 use crate::course::{Course, Lesson, Step, check_key};
 use crate::memory::{Day, Progress};
+use std::alloc::Global;
 use std::collections::VecDeque;
 
 /// How many steps later a missed check comes back.
@@ -89,6 +90,7 @@ pub struct Run {
     picked: Option<usize>,
     typed: String,
     order: Vec<usize>,
+    key: Vec<u8>,
     mark: Option<Mark>,
     seed: u64,
     summary: Option<Summary>,
@@ -104,21 +106,31 @@ fn next(seed: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// `0..n` shuffled, never in order when `n > 1` (an order check shown already solved asks nothing).
-fn shuffled(n: usize, seed: &mut u64) -> Vec<usize> {
-    let mut v: Vec<usize> = (0..n).collect();
+/// Shuffle an order's existing buffer, never leaving it in order when it has more than one item (an order check
+/// shown already solved asks nothing).
+fn shuffle(v: &mut [usize], seed: &mut u64) {
+    let n = v.len();
     for i in (1..n).rev() {
         v.swap(i, (next(seed) % (i as u64 + 1)) as usize);
     }
     if n > 1 && v.iter().enumerate().all(|(i, &x)| i == x) {
         v.rotate_left(1);
     }
-    v
 }
 
 /// A typed answer as it is compared: lower case, blanks trimmed and runs of them one space.
-fn plain(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+fn plain(s: &str) -> impl Iterator<Item = char> + Clone {
+    s.split_whitespace().enumerate().flat_map(|(at, word)| {
+        let lower = word.char_indices().flat_map(move |(i, c)| {
+            // The only contextual mapping in str::to_lowercase is Greek final sigma. Keep the same Unicode Cased
+            // and Case_Ignorable rules while streaming, including combining marks around the sigma.
+            let final_sigma = c == 'Σ'
+                && word[..i].chars().rev().find(|c| !c.is_case_ignorable()).is_some_and(char::is_cased)
+                && !word[i + c.len_utf8()..].chars().find(|c| !c.is_case_ignorable()).is_some_and(char::is_cased);
+            (if final_sigma { 'ς' } else { c }).to_lowercase()
+        });
+        (at != 0).then_some(' ').into_iter().chain(lower)
+    })
 }
 
 impl Run {
@@ -127,28 +139,32 @@ impl Run {
         if lesson.steps.is_empty() {
             return None;
         }
-        let steps = lesson.steps.iter().map(|s| (lesson.id.clone(), s.clone()));
+        let steps = lesson.steps.iter().map(|s| (lesson.id.as_str(), s));
         Some(Self::of(course, Of::Lesson(lesson.id.clone()), steps, seed))
     }
 
     /// A review of `due` (from [`Progress::due`]): those checks alone, no reading. `None` when nothing is due.
-    pub fn review(course: &Course, due: &[(&str, &str)], seed: u64) -> Option<Run> {
-        let steps: Vec<(String, Step)> = due
-            .iter()
+    pub fn review<'a>(course: &Course, due: impl IntoIterator<Item = (&'a str, &'a str)>, seed: u64) -> Option<Run> {
+        let mut steps = due
+            .into_iter()
             .filter_map(|(l, c)| {
                 let step = course.lesson(l)?.steps.iter().find(|s| s.check_id() == Some(c))?;
-                Some(((*l).to_owned(), step.clone()))
+                Some((l, step))
             })
-            .collect();
-        if steps.is_empty() {
+            .peekable();
+        if steps.peek().is_none() {
             return None;
         }
-        Some(Self::of(course, Of::Review, steps.into_iter(), seed))
+        Some(Self::of(course, Of::Review, steps, seed))
     }
 
-    fn of(course: &Course, of: Of, steps: impl Iterator<Item = (String, Step)>, seed: u64) -> Run {
-        let items: Vec<Item> = steps.map(|(lesson, step)| Item { lesson, step, first: None, passed: false, seen: 0 }).collect();
-        let queue = (0..items.len()).collect();
+    fn of<'a>(course: &Course, of: Of, steps: impl Iterator<Item = (&'a str, &'a Step)>, seed: u64) -> Run {
+        // The UI keeps the run while its saved course can be edited. Copy each borrowed step once into that run;
+        // the two constructors used to make these same copies into a separate iterator or intermediate vector.
+        let mut items = Vec::new_in(Global);
+        items.extend(steps.map(|(lesson, step)| Item { lesson: lesson.to_owned(), step: step.clone(), first: None, passed: false, seen: 0 }));
+        let mut queue = VecDeque::new_in(Global);
+        queue.extend(0..items.len());
         let mut run = Run {
             course: course.id.clone(),
             of,
@@ -156,7 +172,8 @@ impl Run {
             queue,
             picked: None,
             typed: String::new(),
-            order: Vec::new(),
+            order: Vec::new_in(Global),
+            key: Vec::new_in(Global),
             mark: None,
             seed,
             summary: None,
@@ -174,7 +191,8 @@ impl Run {
         if let Some(&i) = self.queue.front() {
             self.items[i].seen += 1;
             if let Step::Order { items, .. } = &self.items[i].step {
-                self.order = shuffled(items.len(), &mut self.seed);
+                self.order.extend(0..items.len());
+                shuffle(&mut self.order, &mut self.seed);
             }
         }
     }
@@ -225,7 +243,7 @@ impl Run {
             Step::Choice { answer, .. } => self.picked == Some(*answer),
             Step::Fill { answer, accept, .. } => {
                 let typed = plain(&self.typed);
-                std::iter::once(answer).chain(accept).any(|a| plain(a) == typed)
+                std::iter::once(answer).chain(accept).any(|a| plain(a).eq(typed.clone()))
             }
             Step::Order { .. } => self.order.iter().enumerate().all(|(i, &x)| i == x),
         }
@@ -267,7 +285,7 @@ impl Run {
         if item.first.is_none() {
             item.first = Some(mark);
             if let Some(id) = item.step.check_id() {
-                progress.record(&check_key(&self.course, &item.lesson, id), right, today);
+                progress.record(check_key(&self.course, &item.lesson, id, &mut self.key), right, today);
             }
         }
     }
@@ -282,13 +300,18 @@ impl Run {
         }
         if self.queue.is_empty() {
             let checks = || self.items.iter().filter(|it| it.step.check_id().is_some());
+            let mut missed = Vec::new_in(Global);
+            for it in checks().filter(|it| it.first == Some(Mark::Wrong)) {
+                if let Some(id) = it.step.check_id() {
+                    let key = check_key(&self.course, &it.lesson, id, &mut self.key);
+                    let bytes = key.as_bytes().to_vec_in(Global);
+                    missed.push(String::from_utf8(bytes).expect("check keys are UTF-8"));
+                }
+            }
             let summary = Summary {
                 asked: checks().count(),
                 right_first: checks().filter(|it| it.first == Some(Mark::Right)).count(),
-                missed: checks()
-                    .filter(|it| it.first == Some(Mark::Wrong))
-                    .filter_map(|it| Some(check_key(&self.course, &it.lesson, it.step.check_id()?)))
-                    .collect(),
+                missed,
             };
             match &self.of {
                 Of::Lesson(lesson) => progress.finish_lesson(&self.course, lesson, today),
@@ -303,6 +326,20 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_answers_match_unicode_lowercase_and_whitespace_normalization() {
+        let words = ["", "A", "ǅ", "ᾈ", "Σ", "ΟΣ", "ΟΣΑ", "Ο\u{301}Σ\u{301}", "ΟΣ\u{301}Α", "İ", "I\u{307}", "𐐀", "a'Σ", "a:Σ", "a.Σ", "a-Σ", "ΣΣ", "中文", "\u{0345}Σ", "\u{02b0}Σ"];
+        for first in words {
+            for second in words {
+                for between in ["", " ", "\t\n", "\u{a0}", "\u{2003}", "\u{2028}"] {
+                    let input = format!("\t{first}{between}{second}\n");
+                    let expected = input.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+                    assert_eq!(plain(&input).collect::<String>(), expected, "{input:?}");
+                }
+            }
+        }
+    }
 
     fn course() -> Course {
         let steps = vec![
@@ -351,7 +388,7 @@ mod tests {
         run.step(Input::Next, &mut p, 0);
         assert!(run.view().is_none());
         assert_eq!(run.summary(), Some(&Summary { asked: 3, right_first: 3, missed: Vec::new() }));
-        assert!(p.finished("k", "l"));
+        assert!(p.finished("k", "l", Global));
         assert_eq!(p.checks.len(), 3);
         assert_eq!(p.streak.days, 1);
     }
@@ -384,7 +421,7 @@ mod tests {
         assert_eq!(run.summary().unwrap().missed, ["k/l/c"]);
         let m = p.checks["k/l/c"];
         assert_eq!((m.recalled, m.missed, m.due), (0, 1, 3), "right on the second look is not a recall");
-        assert_eq!(p.due(&c, 3), [("l", "c")]);
+        assert_eq!(p.due(&c, 3, Global).collect::<Vec<_>>(), [("l", "c")]);
     }
 
     #[test]
@@ -394,9 +431,9 @@ mod tests {
         p.finish_lesson("k", "l", 0);
         p.record("k/l/c", true, 0);
         p.record("k/l/f", true, 0);
-        assert!(Run::review(&c, &p.due(&c, 0), 1).is_none(), "nothing is due the day it was learned");
-        let due = p.due(&c, 1);
-        let mut run = Run::review(&c, &due, 1).unwrap();
+        assert!(Run::review(&c, p.due(&c, 0, Global), 1).is_none(), "nothing is due the day it was learned");
+        let due = p.due(&c, 1, Global);
+        let mut run = Run::review(&c, due, 1).unwrap();
         assert!(run.lesson_id().is_none());
         for _ in 0..2 {
             match run.view().unwrap().step.clone() {
@@ -408,7 +445,23 @@ mod tests {
             run.step(Input::Next, &mut p, 1);
         }
         assert!(run.view().is_none());
-        assert!(p.due(&c, 1).is_empty());
+        assert_eq!(p.due(&c, 1, Global).len(), 0);
         assert_eq!(p.streak.days, 2);
+    }
+
+    #[test]
+    fn an_order_reuses_its_buffer_when_a_missed_check_returns() {
+        let mut c = course();
+        c.lessons[0].steps.drain(..3);
+        let mut p = Progress::default();
+        let mut run = Run::lesson(&c, &c.lessons[0], 5).unwrap();
+        let address = run.view().unwrap().order.as_ptr();
+        run.step(Input::Submit, &mut p, 0);
+        assert_eq!(run.view().unwrap().mark, Some(Mark::Wrong), "a new order is not already solved");
+        run.step(Input::Next, &mut p, 0);
+        let view = run.view().unwrap();
+        assert!(view.again);
+        assert_eq!(view.order.as_ptr(), address);
+        assert_ne!(view.order, [0, 1, 2]);
     }
 }

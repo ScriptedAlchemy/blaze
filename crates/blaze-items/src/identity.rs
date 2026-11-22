@@ -92,12 +92,19 @@ mod tests {
     /// Each item of the fixture's crate: its path, its id and its key, sorted by path then key.
     /// Fails, naming the item, where resolving the key does not give the id back.
     fn keyed(db: &TestDB) -> Result<Vec<(String, ItemId, ItemKey), Global>, Broke> {
+        keyed_with(db, |krate, key| blaze_id::resolve::<ItemId, TestDB>(db, krate, key))
+    }
+
+    fn keyed_with(
+        db: &TestDB,
+        resolve: impl Fn(CrateItemKey, ItemKey) -> Result<ItemId, blaze_id::NoItem>,
+    ) -> Result<Vec<(String, ItemId, ItemKey), Global>, Broke> {
         let krate = CrateItemKey(key::crate_key(db, fixture::test_crate(db)));
         let ids = items(db);
         let mut out = Vec::with_capacity_in(ids.len(), Global);
         for id in ids {
             let key = blaze_id::key_of(db, id);
-            let back = blaze_id::resolve::<ItemId, TestDB>(db, krate, key);
+            let back = resolve(krate, key);
             if back != Ok(id) {
                 let path = key::path(db, id);
                 return Err(Broke::Oracle(format!("`{path}` ({id:?}) has key {key:x}, which resolves to {back:?}")));
@@ -175,5 +182,18 @@ mod tests {
             blaze_id::resolve::<ItemId, TestDB>(db, other, key),
             Err(blaze_id::NoItem { krate: other, key })
         );
+    }
+
+    #[test]
+    fn the_oracle_catches_a_resolver_reusing_one_items_key() {
+        let fixture = fixture::db(&fixture_text(&MODULES));
+        let db = fixture.db();
+        let rows = keyed(db).expect("every real key resolves to its own item");
+        assert!(rows.len() > 1, "the fixture must distinguish items");
+        let kept = rows[0].2;
+        let wrong = keyed_with(db, |krate, _asked| {
+            blaze_id::resolve::<ItemId, TestDB>(db, krate, kept)
+        });
+        assert!(matches!(wrong, Err(Broke::Oracle(_))), "one cached key answered every lookup: {wrong:?}");
     }
 }

@@ -3,6 +3,7 @@
 //! it records the real command, pauses its sender's heartbeats, then sends that same command
 //! through Client. Only the coordinator decides whether the issued lease is still live.
 
+use std::alloc::Global;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -73,7 +74,7 @@ impl ResultGate {
         let capture = Capture { directory: self.directory.clone() }; // alloc: one retained test capture
         let request = &submission.request;
         let lease = &request.lease;
-        let bytes = encode(command);
+        let bytes = encode(command, Global);
         let digest: blaze_wire::Digest = Sha256::digest(&bytes).into();
         let work: Vec<String> =
             request.items.iter().map(|item| crate::pack::hex(&item.name.0)).collect(); // alloc: bounded test evidence
@@ -164,7 +165,7 @@ impl Capture {
     }
 
     pub(crate) fn answer(&self, answer: &Answer) -> Result<(), Error> {
-        let bytes = encode(answer);
+        let bytes = encode(answer, Global);
         let digest: blaze_wire::Digest = Sha256::digest(&bytes).into();
         self.write("answer.cbor", &bytes)?;
         self.write(

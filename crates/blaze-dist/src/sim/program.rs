@@ -99,7 +99,7 @@ fn name(rng: &mut Rng, units: &[Digest]) -> (WorkName, WorkKey) {
         stable: rng.digest(),
         env: if rng.chance(700_000) { [0; 32] } else { rng.digest() },
     });
-    (WorkName::of(&key), key)
+    (WorkName::of(&key, std::alloc::Global), key)
 }
 
 fn outcome(rng: &mut Rng, name: &WorkName, tuple: &Digest) -> ItemOutcome {
@@ -195,7 +195,7 @@ impl Program {
         let spec = rng.digest();
         let index_digest = blaze_wire::digest_of_encoded_name(
             "PreIndex",
-            &blaze_wire::encode(&Set::new(index.iter().copied().collect())),
+            &blaze_wire::encode(&Set::new(index.iter().copied().collect()), std::alloc::Global),
         );
         let inputs = rng.digest();
         let lead =
@@ -240,7 +240,10 @@ fn rootset(spec: Digest, roots: &[Item], index: Digest, inputs: Digest) -> RootS
     let pairs: Vec<(WorkName, Digest)> = roots.iter().map(|r| (r.name, r.tuple)).collect();
     RootSet {
         spec,
-        roots: blaze_wire::digest_of_encoded_name("RootList", &blaze_wire::encode(&pairs)),
+        roots: blaze_wire::digest_of_encoded_name(
+            "RootList",
+            &blaze_wire::encode(&pairs, std::alloc::Global),
+        ),
         count: roots.len() as u64,
         index,
         inputs,

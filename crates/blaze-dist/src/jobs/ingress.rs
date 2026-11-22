@@ -246,12 +246,15 @@ mod tests {
             })
             .unwrap();
         let decoded: DoneEvent =
-            blaze_wire::decode(&blaze_wire::encode(verdict), &blaze_wire::Limits::default())
+            blaze_wire::decode(
+                &blaze_wire::encode(verdict, std::alloc::Global),
+                &blaze_wire::Limits::default(),
+            )
                 .unwrap();
         assert_eq!(decoded.outcome, Outcome::Lost);
         let terminal = execution.terminal(1).unwrap();
         let typed = blaze_wire::job_terminal_v2::decode_terminal(
-            &blaze_wire::encode(terminal),
+            &blaze_wire::encode(terminal, std::alloc::Global),
             &blaze_wire::Limits::default(),
         )
         .unwrap();

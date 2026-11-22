@@ -8,6 +8,7 @@
 //! appears: a reader sees all of it or none.
 
 use std::{
+    alloc::{Allocator, Global},
     cmp::Reverse,
     collections::BinaryHeap,
     fs::File,
@@ -38,7 +39,7 @@ struct NativeEntry {
 }
 
 fn native_refusal(name: &str, why: &str) -> Error {
-    Error::new(blaze_wire::ErrorCode::Refused, format!("{name}: {why}"))
+    Error::new(blaze_wire::ErrorCode::Refused, format_args!("{name}: {why}"))
 }
 
 /// Read just a header. Validate the end before any skip or value comparison, so even
@@ -106,7 +107,7 @@ impl Store {
             std::fs::create_dir_all(&at)
                 .map_err(|e| failed(&format!("making {}", at.display()), e))?;
             if std::fs::symlink_metadata(&at)?.file_type().is_symlink() {
-                return Err(Error::malformed(format!(
+                return Err(Error::malformed(format_args!(
                     "{} is a symlink, not a cache directory",
                     at.display()
                 )));
@@ -151,12 +152,17 @@ impl Store {
     }
 
     /// The bytes of a small object, when it is at most `most`.
-    pub fn read_small(&self, name: &str, most: u64) -> Result<Option<Vec<u8>>, Error> {
+    pub fn read_small<A: Allocator>(
+        &self,
+        name: &str,
+        most: u64,
+        alloc: A,
+    ) -> Result<Option<Vec<u8, A>>, Error> {
         let Some((file, _)) = self.open_blob(name)? else { return Ok(None) };
-        let mut bytes = Vec::new();
-        file.take(most.saturating_add(1)).read_to_end(&mut bytes)?;
+        let mut bytes = Vec::new_in(alloc);
+        std::io::copy(&mut file.take(most.saturating_add(1)), &mut bytes)?;
         if bytes.len() as u64 > most {
-            return Err(Error::too_large(format!(
+            return Err(Error::too_large(format_args!(
                 "`{name}` is longer than the {most} bytes that are taken of it: {}",
                 bytes.len()
             )));
@@ -169,7 +175,7 @@ impl Store {
     pub fn put_blob(&self, name: &str, bytes: &[u8]) -> Result<bool, Error> {
         let object = self.object(name)?;
         if !object.is_blob() {
-            return Err(Error::malformed(format!("{name} is a list, not a blob")));
+            return Err(Error::malformed(format_args!("{name} is a list, not a blob")));
         }
         self.verify(&object, bytes)?;
         let _gate = self.publication.lock().unwrap_or_else(|e| e.into_inner());
@@ -184,7 +190,7 @@ impl Store {
     pub fn put_blob_from(&self, name: &str, from: &Path) -> Result<bool, Error> {
         let object = self.object(name)?;
         if !object.is_blob() {
-            return Err(Error::malformed(format!("{name} is a list, not a blob")));
+            return Err(Error::malformed(format_args!("{name} is a list, not a blob")));
         }
         self.verify_file(&object, from)?;
         let _gate = self.publication.lock().unwrap_or_else(|e| e.into_inner());
@@ -212,11 +218,11 @@ impl Store {
         publish: impl FnOnce(&ObjectName, &[u8]) -> Result<(), Error>,
     ) -> Result<bool, Error> {
         if bytes.len() > blaze_wire::Limits::DOCUMENTED.request as usize {
-            return Err(Error::too_large("the list exceeds the request limit"));
+            return Err(Error::too_large(format_args!("the list exceeds the request limit")));
         }
         let object = self.object(name)?;
         if object.is_blob() {
-            return Err(Error::malformed(format!("{name} is a blob, not a list")));
+            return Err(Error::malformed(format_args!("{name} is a blob, not a list")));
         }
         // The look and the write are one step: the gate is held across both.
         let _gate = self.publication.lock().unwrap_or_else(|e| e.into_inner());
@@ -226,8 +232,8 @@ impl Store {
         // A first writer must not publish a missing, corrupt or noncanonical
         // pack list. Keep validation under the same publication lock as the
         // atomic name, so concurrent PUTs cannot change the verified packs.
-        let packs = blaze_wire::pack_list::decode(bytes)
-            .map_err(|why| Error::malformed(format!("the new {name}: {why}")))?;
+        let packs = blaze_wire::pack_list::decode(bytes, Global)
+            .map_err(|why| Error::malformed(format_args!("the new {name}: {why}")))?;
         self.verify_manifest_packs(name, &packs, packs.len())?;
         publish(&object, bytes)?;
         Ok(true)
@@ -252,15 +258,17 @@ impl Store {
         publish: impl FnOnce(&ObjectName, &[u8]) -> Result<(), Error>,
     ) -> Result<bool, Error> {
         if bytes.len() > blaze_wire::Limits::DOCUMENTED.request as usize {
-            return Err(Error::too_large("the replacement list exceeds the request limit"));
+            return Err(Error::too_large(format_args!(
+                "the replacement list exceeds the request limit"
+            )));
         }
         let object = self.object(name)?;
         if object.is_blob() {
-            return Err(Error::malformed(format!("{name} is a blob, not a manifest")));
+            return Err(Error::malformed(format_args!("{name} is a blob, not a manifest")));
         }
         let _gate = self.publication.lock().unwrap_or_else(|error| error.into_inner());
         let Some(current) =
-            self.read_small(name, u64::from(blaze_wire::Limits::DOCUMENTED.request))?
+            self.read_small(name, u64::from(blaze_wire::Limits::DOCUMENTED.request), Global)?
         else {
             return Ok(false);
         };
@@ -270,16 +278,16 @@ impl Store {
         if !same {
             return Ok(false);
         }
-        let old = blaze_wire::pack_list::decode(&current)
-            .map_err(|why| Error::malformed(format!("the current {name}: {why}")))?;
+        let old = blaze_wire::pack_list::decode(&current, Global)
+            .map_err(|why| Error::malformed(format_args!("the current {name}: {why}")))?;
         // Inspect every present old pack, even when another is missing: a
         // conflicting immutable key is not a repairable cache miss.
         let missing = self.verify_manifest_packs(name, &old, 0)?;
         if !missing {
             return Ok(false);
         }
-        let mut replacement = blaze_wire::pack_list::decode(bytes)
-            .map_err(|why| Error::malformed(format!("the replacement {name}: {why}")))?;
+        let mut replacement = blaze_wire::pack_list::decode(bytes, Global)
+            .map_err(|why| Error::malformed(format_args!("the replacement {name}: {why}")))?;
         let required = replacement.len();
         // A missing pack does not release the immutable keys in surviving old packs.
         // Compare both manifests together: validating each in isolation would permit a
@@ -311,7 +319,7 @@ impl Store {
                 if at < required {
                     return Err(Error::new(
                         blaze_wire::ErrorCode::Refused,
-                        format!("{name} names absent pack {}", hex(&pack.pack)),
+                        format_args!("{name} names absent pack {}", hex(&pack.pack)),
                     ));
                 }
                 missing = true;
@@ -557,25 +565,29 @@ impl Store {
         reader.read_exact(&mut start).map_err(|e| {
             Error::new(
                 blaze_wire::ErrorCode::Refused,
-                format!("{} has no pack header: {e}", object.name),
+                format_args!("{} has no pack header: {e}", object.name),
             )
         })?;
         if !blaze_wire::is_dist_pack(&start) {
             return Err(Error::new(
                 blaze_wire::ErrorCode::Refused,
-                format!("{} is not a pack of format {}", object.name, blaze_wire::DIST_PACK_FORMAT),
+                format_args!(
+                    "{} is not a pack of format {}",
+                    object.name,
+                    blaze_wire::DIST_PACK_FORMAT
+                ),
             ));
         }
         hash.update(start);
         std::io::copy(&mut reader, &mut Unhashed(&mut hash)).map_err(|e| {
             Error::new(
                 blaze_wire::ErrorCode::Refused,
-                format!("{} does not read: {e}", object.name),
+                format_args!("{} does not read: {e}", object.name),
             )
         })?;
         let got: Digest = hash.finalize().into();
         if got != object.digest {
-            return Err(wrong(&object.name, &hex(&got), &hex(&object.digest)));
+            return Err(wrong(&object.name, &got, &object.digest));
         }
         Ok(())
     }
@@ -648,12 +660,12 @@ impl Store {
 
     fn object(&self, name: &str) -> Result<ObjectName, Error> {
         let object = ObjectName::parse(name)
-            .ok_or_else(|| Error::not_found(format!("`{name}` is not an object of this cache")))?;
+            .ok_or_else(|| Error::not_found(format_args!("`{name}` is not an object of this cache")))?;
         let at = object.path(&self.dir);
         for path in [at.parent().expect("an object has a directory"), at.as_path()] {
             match std::fs::symlink_metadata(path) {
                 Ok(meta) if meta.file_type().is_symlink() => {
-                    return Err(Error::malformed("a cache object cannot be a symlink"));
+                    return Err(Error::malformed(format_args!("a cache object cannot be a symlink")));
                 }
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -678,10 +690,10 @@ impl Write for Unhashed<'_> {
     }
 }
 
-fn wrong(name: &str, got: &str, want: &str) -> Error {
+fn wrong(name: &str, got: &Digest, want: &Digest) -> Error {
     Error::new(
         blaze_wire::ErrorCode::Refused,
-        format!("{name} is named by {want}, and the bytes sent hash to {got}"),
+        format_args!("{name} is named by {}, and the bytes sent hash to {}", hex(want), hex(got)),
     )
 }
 
@@ -698,8 +710,63 @@ pub(crate) fn temporary(to: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    use std::alloc::{AllocError, Layout};
+    use std::cell::Cell;
+    use std::ptr::NonNull;
+
+    #[derive(Clone, Copy)]
+    struct Counted<'a>(&'a Cell<usize>);
+
+    // SAFETY: allocations and deallocations forward the same pointer and layout to Global.
+    unsafe impl Allocator for Counted<'_> {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            let block = Global.allocate(layout)?;
+            self.0.set(self.0.get() + 1);
+            Ok(block)
+        }
+
+        unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
+            // SAFETY: every block produced here came from Global with this layout.
+            unsafe { Global.deallocate(pointer, layout) };
+        }
+    }
+
     fn scratch() -> tempfile::TempDir {
         tempfile::tempdir().expect("a temporary directory")
+    }
+
+    #[test]
+    fn bounded_object_reads_use_the_callers_allocator_and_preserve_size_refusals() {
+        let dir = scratch();
+        let store = Store::open(dir.path()).unwrap();
+        let bytes = pack(&[([1; 32], b"a complete value")]);
+        let name = format!("packs/{}.pack", hex(&digest(&bytes)));
+        store.put_blob(&name, &bytes).unwrap();
+
+        let allocations = Cell::new(0);
+        let read = store
+            .read_small(&name, bytes.len() as u64, Counted(&allocations))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.as_slice(), bytes.as_slice());
+        assert!(allocations.get() > 0, "the caller owns the returned buffer");
+        assert!(std::ptr::eq(read.allocator().0, &allocations));
+
+        // The same real reader with another allocator returns the same bytes without using ours.
+        allocations.set(0);
+        let control = store.read_small(&name, bytes.len() as u64, Global).unwrap().unwrap();
+        assert_eq!(control.as_slice(), read.as_slice());
+        assert_eq!(allocations.get(), 0);
+        for most in [0, bytes.len() as u64 - 1] {
+            let error = store.read_small(&name, most, Counted(&allocations)).unwrap_err();
+            assert_eq!(error.code, blaze_wire::ErrorCode::TooLarge);
+            assert!(error.message.contains(&name), "{error}");
+        }
+        assert_eq!(std::fs::read(store.dir().join(&name)).unwrap(), bytes);
+        let absent = format!("packs/{}.pack", hex(&[0; 32]));
+        allocations.set(0);
+        assert!(store.read_small(&absent, 0, Counted(&allocations)).unwrap().is_none());
+        assert_eq!(allocations.get(), 0, "a missing object needs no output buffer");
     }
 
     #[test]
@@ -721,7 +788,7 @@ mod tests {
                 .unwrap();
         }
         store.sweep_temporaries(std::time::Duration::from_secs(3600)).unwrap();
-        assert_eq!(store.read_small(&name, 100).unwrap(), Some(b"published\n".to_vec()));
+        assert_eq!(store.read_small(&name, 100, Global).unwrap(), Some(b"published\n".to_vec()));
         assert!(!stale.exists(), "abandoned hidden staging file was not swept");
     }
 
@@ -799,7 +866,7 @@ mod tests {
         for writer in writers {
             writer.join().expect("a writer").expect("a write");
         }
-        assert_eq!(store.read_small(&name, 1 << 20).expect("a read"), Some(bytes));
+        assert_eq!(store.read_small(&name, 1 << 20, Global).expect("a read"), Some(bytes));
         // One file under the name, and no temporary file of any of the writers.
         let left: Vec<String> = std::fs::read_dir(dir.path().join("packs"))
             .expect("the packs directory")
@@ -816,19 +883,22 @@ mod tests {
         let bytes = pack(&[([1; 32], b"first")]);
         let digest = digest(&bytes);
         store.put_blob(&format!("packs/{}.pack", hex(&digest)), &bytes).unwrap();
-        let first = blaze_wire::pack_list::encode(&[blaze_wire::PackRef {
-            pack: digest,
-            size: bytes.len() as u64,
-            keys: blaze_wire::digest_of_encoded_name(
-                "blaze/dist-pack-keys",
-                &blaze_wire::encode(&vec![[1; 32]]),
-            ),
-            packed: None,
-            format: blaze_wire::DIST_PACK_FORMAT,
-        }]);
+        let first = blaze_wire::pack_list::encode(
+            &[blaze_wire::PackRef {
+                pack: digest,
+                size: bytes.len() as u64,
+                keys: blaze_wire::digest_of_encoded_name(
+                    "blaze/dist-pack-keys",
+                    &blaze_wire::encode(&vec![[1; 32]], Global),
+                ),
+                packed: None,
+                format: blaze_wire::DIST_PACK_FORMAT,
+            }],
+            Global,
+        );
         assert!(store.put_list(name, &first).expect("a write"));
         assert!(!store.put_list(name, b"").expect("a second write"));
-        assert_eq!(store.read_small(name, 1000).unwrap().unwrap(), first);
+        assert_eq!(store.read_small(name, 1000, Global).unwrap().unwrap(), first);
     }
 
     #[test]

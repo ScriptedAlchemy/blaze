@@ -121,32 +121,33 @@ pub struct Error {
 
 impl Error {
     /// An error of `code`, saying `message`.
-    pub fn new(code: ErrorCode, message: impl Into<String>) -> Error {
-        Error { code, message: message.into(), retry_after_ms: None }
+    pub fn new(code: ErrorCode, message: std::fmt::Arguments<'_>) -> Error {
+        let wire = WireError::new(code, message);
+        Error { code, message: wire.message, retry_after_ms: None }
     }
 
     /// Code 1: the bytes are not the message they claim to be.
-    pub fn malformed(message: impl Into<String>) -> Error {
+    pub fn malformed(message: std::fmt::Arguments<'_>) -> Error {
         Error::new(ErrorCode::Malformed, message)
     }
 
     /// Code 2: the version is not one this server speaks.
-    pub fn version(message: impl Into<String>) -> Error {
+    pub fn version(message: std::fmt::Arguments<'_>) -> Error {
         Error::new(ErrorCode::Version, message)
     }
 
     /// Code 5: no such blob, list or path.
-    pub fn not_found(message: impl Into<String>) -> Error {
+    pub fn not_found(message: std::fmt::Arguments<'_>) -> Error {
         Error::new(ErrorCode::NotFound, message)
     }
 
     /// Code 7: past one of the limits the server answered `hello` with.
-    pub fn too_large(message: impl Into<String>) -> Error {
+    pub fn too_large(message: std::fmt::Arguments<'_>) -> Error {
         Error::new(ErrorCode::TooLarge, message)
     }
 
     /// Code 10: the server's own fault.
-    pub fn internal(message: impl Into<String>) -> Error {
+    pub fn internal(message: std::fmt::Arguments<'_>) -> Error {
         Error::new(ErrorCode::Internal, message)
     }
 
@@ -155,11 +156,9 @@ impl Error {
         self.code.status()
     }
 
-    /// This error as the wire's shape, for the body of the answer.
-    pub fn wire(&self) -> WireError {
-        let mut error = WireError::new(self.code, self.message.clone());
-        error.retry_after_ms = self.retry_after_ms;
-        error
+    /// Consume this error as the wire's shape, preserving its owned message without copying.
+    pub fn into_wire(self) -> WireError {
+        WireError { code: self.code as u8, message: self.message, retry_after_ms: self.retry_after_ms }
     }
 }
 
@@ -173,17 +172,34 @@ impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Error {
-        Error::internal(error.to_string())
+        Error::internal(format_args!("{error}"))
     }
 }
 
 impl From<hyper::http::Error> for Error {
     fn from(error: hyper::http::Error) -> Error {
-        Error::internal(error.to_string())
+        Error::internal(format_args!("{error}"))
     }
 }
 
 /// Code 10, with what the server was doing.
 pub(crate) fn failed(what: &str, error: impl std::fmt::Display) -> Error {
-    Error::internal(format!("{what}: {error}"))
+    Error::internal(format_args!("{what}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wire_answer_keeps_the_original_message_allocation() {
+        let mut error = Error::new(ErrorCode::Busy, format_args!("pack {} is publishing", 17));
+        error.retry_after_ms = Some(250);
+        let message = error.message.as_ptr();
+        let wire = error.into_wire();
+        assert_eq!(wire.message, "pack 17 is publishing");
+        assert_eq!(wire.message.as_ptr(), message, "serialization must move the owned message");
+        assert_eq!(wire.code(), Some(ErrorCode::Busy));
+        assert_eq!(wire.retry_after_ms, Some(250));
+    }
 }

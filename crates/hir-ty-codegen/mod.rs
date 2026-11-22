@@ -16975,7 +16975,7 @@ mod tests {
     /// `PRINT_DOMAIN`, the same in every process, and other code has another print. The
     /// control is the hash it replaced: SipHash-128 of the same value is not the print.
     #[test]
-    fn a_print_is_blake3_under_its_domain() {
+    fn the_oracle_catches_the_previous_hash_as_a_code_print() {
         use std::hash::Hash as _;
         let code = (7u32, "body", [1u8, 2, 3]);
         let mut hasher = blaze_ids::Hasher::new(super::PRINT_DOMAIN);
