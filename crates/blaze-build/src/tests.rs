@@ -1012,6 +1012,21 @@ fn build_instance_refusing(
     ground: &mut PortableTys<'static>,
     refused: &[blaze_lir::Op],
 ) -> Result<Built<Global>, String> {
+    build_instance_in(world, body, owner, root, args, ground, refused, Global)
+}
+
+/// The checked fixture's output belongs to the caller's allocator; checking and baseline
+/// emission keep the same fixture machinery as [`build_instance_refusing`].
+fn build_instance_in<A: core::alloc::Allocator + Copy>(
+    world: &TestWorld,
+    body: &BodyBuf,
+    owner: ItemKey,
+    root: ExprId,
+    args: &[PTy],
+    ground: &mut PortableTys<'static>,
+    refused: &[blaze_lir::Op],
+    alloc: A,
+) -> Result<Built<A>, String> {
     let view = body.view(owner, root);
     let mut ty = InferCtx::new_in(Alloc::global());
     let checked = match blaze_typeck::check(&view, world, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
@@ -1024,7 +1039,7 @@ fn build_instance_refusing(
     }
     let sig = world.sig(owner).ok_or_else(|| String::from("no signature for the owner"))?;
     let mut subst = Subst { args, ground, scratch: Alloc::global() };
-    let built = crate::build(&view, &checked, &sig, &mut subst, &TestAdts { world, body }, Global)
+    let built = crate::build(&view, &checked, &sig, &mut subst, &TestAdts { world, body }, alloc)
         .map_err(|error| format!("the build failed: {error}"))?;
     blaze_lir::verify(built.func.view()).map_err(|error| format!("does not verify: {error}"))?;
     emits(&built, refused);
@@ -1034,7 +1049,7 @@ fn build_instance_refusing(
 /// Rule 54: every function the walk builds is also emitted by the baseline tier (blaze-emit,
 /// each reference `Via::Address`), so a walk that makes an op the tier cannot emit fails
 /// here, not in the ladder. `refused` names the ops a test expects the tier to refuse.
-fn emits(built: &Built<Global>, refused: &[blaze_lir::Op]) {
+fn emits<A: core::alloc::Allocator>(built: &Built<A>, refused: &[blaze_lir::Op]) {
     let mut vias = Vec::new_in(Global);
     vias.resize(built.refs.len(), blaze_emit::Via::Address);
     let mut code = blaze_emit::Code::new_in(Global);
@@ -1047,7 +1062,7 @@ fn emits(built: &Built<Global>, refused: &[blaze_lir::Op]) {
 }
 
 /// Runs a built function, expecting it to return.
-fn run(built: &Built<Global>, args: &[Val]) -> Result<Vec<Val, Global>, String> {
+fn run<A: core::alloc::Allocator>(built: &Built<A>, args: &[Val]) -> Result<Vec<Val, Global>, String> {
     match blaze_lir::eval::run_in(built.func.view(), args, 10_000_000, Global) {
         Ok(Run::Returned(vals)) => Ok(vals),
         Ok(Run::Trapped(t)) => Err(format!("trapped: {t:?}")),
@@ -1057,7 +1072,7 @@ fn run(built: &Built<Global>, args: &[Val]) -> Result<Vec<Val, Global>, String> 
     }
 }
 
-fn one(built: &Built<Global>, args: &[Val]) -> u128 {
+fn one<A: core::alloc::Allocator>(built: &Built<A>, args: &[Val]) -> u128 {
     let vals = run(built, args).unwrap_or_else(|e| panic!("{e}"));
     match vals.as_slice() {
         [Val::Int(v)] => *v,
@@ -1489,7 +1504,7 @@ const USIZE: PNode = PNode::Uint(UintTy::Usize);
 const SU32: Option<IntSuffix> = Some(IntSuffix::Uint(UintTy::U32));
 
 /// A signature's parameter and result types.
-fn sig_tys(built: &Built<Global>, sig: SigId) -> (Vec<Ty, Global>, Vec<Ty, Global>) {
+fn sig_tys<A: core::alloc::Allocator>(built: &Built<A>, sig: SigId) -> (Vec<Ty, Global>, Vec<Ty, Global>) {
     let view = built.func.view();
     let s = view.sig(sig);
     let mut params = Vec::new_in(Global);
@@ -1500,7 +1515,7 @@ fn sig_tys(built: &Built<Global>, sig: SigId) -> (Vec<Ty, Global>, Vec<Ty, Globa
 }
 
 /// The function's own signature.
-fn own_sig(built: &Built<Global>) -> (Vec<Ty, Global>, Vec<Ty, Global>) {
+fn own_sig<A: core::alloc::Allocator>(built: &Built<A>) -> (Vec<Ty, Global>, Vec<Ty, Global>) {
     sig_tys(built, SigId(built.func.view().head.sig))
 }
 
@@ -1509,7 +1524,7 @@ fn own_sig(built: &Built<Global>) -> (Vec<Ty, Global>, Vec<Ty, Global>) {
 /// `sig`), so a call whose signature equals the function's own (a tracked fn calling a tracked
 /// fn of its shape) names the head's: the call's operand is read, never "every signature but
 /// the head's".
-fn has_call_sig(built: &Built<Global>, params: &[Ty], rets: &[Ty]) -> bool {
+fn has_call_sig<A: core::alloc::Allocator>(built: &Built<A>, params: &[Ty], rets: &[Ty]) -> bool {
     use blaze_lir::Op;
     let view = built.func.view();
     (0..view.len()).any(|inst| {
@@ -3913,6 +3928,7 @@ mod ref_bind;
 mod drop_patterns;
 mod wide;
 mod halfquad;
+mod cabi_i128;
 mod index;
 mod fmt;
 mod expr_shapes;

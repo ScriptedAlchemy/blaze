@@ -445,6 +445,7 @@ dependencies = [
  "blaze-lir",
  "blaze-own",
  "blaze-sim",
+ "blaze-tier",
  "blaze-typeck",
 ]
 

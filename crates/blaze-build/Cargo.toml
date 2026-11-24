@@ -46,6 +46,8 @@ blaze-sim.workspace = true
 # Thread-locals' two-thread test: the getter emitted and run for real.
 blaze-emit.workspace = true
 blaze-inproc.workspace = true
+# Exercise source C signatures through Sota directly, with no fallback tier.
+blaze-tier.workspace = true
 
 [lints]
 workspace = true

@@ -54,16 +54,20 @@
 //! An `extern "C"` fn, built or called, and a call through an `extern "C"` fn pointer follow
 //! AAPCS64 as Apple's arm64 varies it, each value classed by [`cabi::class_of`]:
 //!
-//! - An integer, `bool` or pointer (or a newtype of one) is one register; one under 32 bits
-//!   is zero- or sign-extended by the caller.
+//! - An integer, `bool` or pointer (or a newtype of one) is one LIR scalar; one under 32 bits
+//!   is zero- or sign-extended by the caller. An `i128` or `u128` takes two general registers,
+//!   starting at an even register on AAPCS64 and the next available register on Apple. If
+//!   the pair does not fit, all 16 bytes go on the stack at 16-byte alignment. Its result
+//!   is the pair `x0:x1`, the low word first on these little-endian targets.
 //! - A composite of at most 16 bytes is one or two `i64` registers read from its place; the
 //!   last is read in loads of falling powers of two inside the size (12 bytes: an `i64`,
 //!   then an `i32` zero-extended), so no byte past the value is read. A result of 9 to 16
 //!   bytes is two `i64` returns (`project` 0 and 1) stored at offsets 0 and 8.
 //! - A composite past 16 bytes is passed by the address of a copy (`byval`) and returned
 //!   through `sret`.
-//! - Refused by name ([`BuildError::CAbi`]): a float, a homogeneous float aggregate (the SIMD
-//!   registers), a 16-byte-aligned composite (its even register pair), a 128-bit integer, and
+//! - A float is one LIR scalar of its width, passed and returned in a SIMD register.
+//! - Refused by name ([`BuildError::CAbi`]): a homogeneous float aggregate (the SIMD
+//!   registers), a 16-byte-aligned composite (its even register pair), and
 //!   what [`cabi`] refuses (a union, an enum with fields).
 //!
 //! # Fn pointers

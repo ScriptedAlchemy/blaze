@@ -24,7 +24,8 @@
 //! and NSAA (next stacked argument address):
 //! - C.1: a float takes `v[NSRN]` if NSRN < 8. C.2: an HFA of `n` takes `v[NSRN..NSRN+n]` if
 //!   they fit; C.3: otherwise NSRN becomes 8 and it goes on the stack.
-//! - C.8: an argument of 16-byte alignment rounds NGRN up to even. C.9/C.10: an integer or a
+//! - C.8: an argument of 16-byte alignment rounds NGRN up to even (Apple permits an odd
+//!   starting register). C.9/C.10: an integer or a
 //!   composite of `w` 8-byte words takes `x[NGRN..NGRN+w]` if they fit; C.11: otherwise NGRN
 //!   becomes 8 and it goes on the stack.
 //! - The stack: AAPCS64 rounds NSAA to the larger of 8 and the argument's alignment and its
@@ -301,7 +302,7 @@ pub fn assign<A: Allocator>(args: &[Class], variadic_from: Option<usize>, platfo
                     _ => Ext::None,
                 };
                 let words = size.div_ceil(8);
-                let at = match (on_stack, s.gprs(words, size == 16)) {
+                let at = match (on_stack, s.gprs(words, size == 16 && platform == Platform::Aapcs)) {
                     (false, Some(at)) => at,
                     _ => s.stack(u64::from(size), size.trailing_zeros() as u8, platform, variadic)?,
                 };
@@ -316,7 +317,7 @@ pub fn assign<A: Allocator>(args: &[Class], variadic_from: Option<usize>, platfo
             }
             Class::Composite { size, align } => {
                 let words = size.div_ceil(8) as u8;
-                let at = match (on_stack, s.gprs(words, align == 4)) {
+                let at = match (on_stack, s.gprs(words, align == 4 && platform == Platform::Aapcs)) {
                     (false, Some(at)) => at,
                     _ => s.stack(size, align, platform, variadic)?,
                 };

@@ -1,0 +1,21 @@
+{
+  "id": "export-aarch64-scalar-128-20261124",
+  "date": "2026-11-24",
+  "who": "GPT-6 Astra Pro, continuation coordinator",
+  "where": "crates/blaze-build/src/walk.rs pass; source export in CI run 45358330723",
+  "what": "The real source CLI passed cold, warm, edit, invalid, recovered and complete-check phases, then export refused __aarch64_cas16_acq because its extern C signature contains a 128-bit integer register pair.",
+  "cost": "The exported executable and standalone smoke receipt were not produced; the later production acceptance job could not start.",
+  "cause": "The builder's C signature adapter unconditionally refuses Class::Int with size 16 before its scalar path. The scalar representation and AArch64 emitters already have I128 register-pair argument and return machinery. The audit also found that the ABI placement model and Sota parameter placer incorrectly applied AAPCS even-register alignment on Apple targets, whose ABI permits an odd starting register.",
+  "class": "a signature adapter retains a refusal after its lower layer gains the required representation",
+  "prevention": "Drive the ordinary C signature adapter through signed and unsigned 128-bit scalar arguments and returns, preserving both halves and validating register alignment and stack placement against the host ABI. Keep the actual source export and standalone execution as the end-to-end acceptance.",
+  "workaround": "None. The atomic helper remains in the real export closure; no symbol exclusion, compiler fallback or successful stand-in receipt is permitted.",
+  "fix": "Removed the stale refusal while retaining one I128 LIR scalar, so a pair is placed or spilled as one value. Corrected the ABI model and all Sota entry/call placement users to apply the target's alignment rule. Five new source-body controls exercise signed and unsigned pairs, transparent wrappers, direct and indirect calls, register exhaustion and stack alignment; native controls require both Reference and standalone Sota, with independent host ABI crossings and high/low-half perturbations. Caller-owned test heaps supply Built outputs and both emitters; generic borrowing helpers preserve existing fixtures without new Global sites. Pure placement controls cover Linux and Apple rules. The focused CI receipt requires all nine named source/model/emitter controls and preserves the original Cargo failure. Static peer review and local workflow counterexamples pass; Rust execution, actual source export and standalone replay remain required.",
+  "state": "open",
+  "evidence": {
+    "head": "cf20ef262fe07e8aed3f087d29753a22c01e1bea",
+    "tree": "82cc34a97458a3c996a3870546d6cb990386d921",
+    "run": 45358330723,
+    "artifact": 14904786480,
+    "sha256": "84c8a74996d6d97d116143ada249649aeafdb4aab450517280b01c224ead3475"
+  }
+}

@@ -49,6 +49,7 @@ fn classes_follow_the_fundamental_types_and_homogeneous_aggregates() {
     let mixed = w.strukt(0, &[F::Leaf(F32), F::Leaf(F64)], ReprAttrs { c: true, ..ReprAttrs::RUST });
     let twelve = w.strukt(0, &[F::Leaf(U32), F::Leaf(U32), F::Leaf(U32)], ReprAttrs { c: true, ..ReprAttrs::RUST });
     let newtype = w.strukt(0, &[F::Leaf(U8)], ReprAttrs { transparent: true, ..ReprAttrs::RUST });
+    let wide_newtype = w.strukt(0, &[F::Leaf(PNode::Uint(UintTy::U128))], ReprAttrs { transparent: true, ..ReprAttrs::RUST });
     let unit = w.strukt(0, &[], ReprAttrs { c: true, ..ReprAttrs::RUST });
     let union = w.def(AdtKind::Union, 0, &[&[F::Leaf(U32), F::Leaf(F32)]], ReprAttrs { c: true, ..ReprAttrs::RUST });
     let data_enum = w.def(AdtKind::Enum, 0, &[&[F::Leaf(U32)], &[]], ReprAttrs { c: true, ..ReprAttrs::RUST });
@@ -56,6 +57,8 @@ fn classes_follow_the_fundamental_types_and_homogeneous_aggregates() {
     let f32_ = g.n(F32);
     let f64_ = g.n(F64);
     let i16_ = g.n(PNode::Int(IntTy::I16));
+    let i128_ = g.n(PNode::Int(IntTy::I128));
+    let u128_ = g.n(PNode::Uint(UintTy::U128));
     let u8_ = g.n(U8);
     let arr4 = g.array(f64_, 4);
     let arr5 = g.array(f64_, 5);
@@ -63,6 +66,8 @@ fn classes_follow_the_fundamental_types_and_homogeneous_aggregates() {
     let wide = g.r(slice);
     let cases: Vec<(PTy, Class)> = vec![
         (i16_, Class::Int { size: 2, signed: true }),
+        (i128_, Class::Int { size: 16, signed: true }),
+        (u128_, Class::Int { size: 16, signed: false }),
         (f32_, Class::Float { size: 4 }),
         (g.adt(three_f32, &[]), Class::Hfa { count: 3, size: 4 }),
         // 5.9.5.1: the members must be one float type.
@@ -73,6 +78,7 @@ fn classes_follow_the_fundamental_types_and_homogeneous_aggregates() {
         (g.adt(twelve, &[]), Class::Composite { size: 12, align: 2 }),
         // A `repr(transparent)` newtype is its field.
         (g.adt(newtype, &[]), Class::Int { size: 1, signed: false }),
+        (g.adt(wide_newtype, &[]), Class::Int { size: 16, signed: false }),
         (g.adt(unit, &[]), Class::Ignore),
         (wide, Class::Composite { size: 16, align: 3 }),
     ];
@@ -130,11 +136,35 @@ fn sixteen_byte_alignment_rounds_to_an_even_register() {
     let pair = Class::Composite { size: 16, align: 3 };
     let twelve = Class::Composite { size: 12, align: 2 };
     assert_eq!(locs(&[I64, i128_], None, Platform::Aapcs), [gpr(0, 1), gpr(2, 2)]);
+    assert_eq!(locs(&[I64, i128_], None, Platform::Apple), [gpr(0, 1), gpr(1, 2)]);
+    let aligned = Class::Composite { size: 16, align: 4 };
+    assert_eq!(locs(&[I64, aligned], None, Platform::Aapcs), [gpr(0, 1), gpr(2, 2)]);
+    assert_eq!(locs(&[I64, aligned], None, Platform::Apple), [gpr(0, 1), gpr(1, 2)]);
     assert_eq!(locs(&[I64, pair, twelve], None, Platform::Aapcs), [gpr(0, 1), gpr(1, 2), gpr(3, 2)]);
     // C.11: seven registers taken, a two-word composite does not fit and closes them.
     let mut args = vec![I64; 7];
     args.extend([pair, I64]);
     assert_eq!(&locs(&args, None, Platform::Aapcs)[7..], &[stack(0, 16), stack(16, 8)]);
+}
+
+/// AAPCS64 6.8.2 C.10/C.11 and C.13..C.17: a 128-bit integer takes a whole pair, or
+/// closes the general registers and takes a 16-aligned stack slot. Apple permits an odd
+/// starting register, but still never splits a pair between a register and the stack.
+#[test]
+fn i128_pairs_fit_or_spill_whole_and_return_in_x0_x1() {
+    let wide = Class::Int { size: 16, signed: false };
+    for platform in [Platform::Aapcs, Platform::Apple] {
+        let mut args = [I64; 10];
+        args[6] = wide;
+        assert_eq!(&locs(&args[..8], None, platform)[6..], &[gpr(6, 2), stack(0, 8)]);
+        args[6] = I64;
+        args[7] = wide;
+        assert_eq!(&locs(&args[..9], None, platform)[7..], &[stack(0, 16), stack(16, 8)]);
+        args[7] = I64;
+        args[9] = wide;
+        assert_eq!(&locs(&args, None, platform)[8..], &[stack(0, 8), stack(16, 16)]);
+    }
+    assert_eq!(ret(wide), RetLoc::Direct(Place::Gpr { first: 0, count: 2 }));
 }
 
 /// B.4: a composite over 16 bytes is passed as a pointer to a caller's copy; 6.9: returned

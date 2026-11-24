@@ -279,6 +279,53 @@ class AcceptanceGateTests(unittest.TestCase):
                 self.assertEqual(int((root / "owner-field-bound-evidence/exit-code.txt").read_text()),
                                  0 if wanted else code or 1)
 
+    def test_cabi_receipt_requires_both_emitters_all_cases_and_original_failures(self):
+        cases = (
+            "cabi::tests::classes_follow_the_fundamental_types_and_homogeneous_aggregates",
+            "cabi::tests::sixteen_byte_alignment_rounds_to_an_even_register",
+            "cabi::tests::i128_pairs_fit_or_spill_whole_and_return_in_x0_x1",
+            "tests::cabi_i128::c_i128_signatures_keep_wide_scalars",
+            "tests::cabi_i128::native::c_i128_register_pairs_match_host_abi",
+            "tests::cabi_i128::native::c_i128_last_register_pair_matches_host_abi",
+            "tests::cabi_i128::native::c_i128_spilled_pair_matches_host_abi",
+            "tests::cabi_i128::native::c_i128_aligned_stack_pair_matches_host_abi",
+            "sota::isel::abi_tests::i128_placement_uses_the_target_pair_rule_and_spills_whole",
+        )
+        for omitted, build_code, emit_code, failed in (
+            (None, 0, 0, False), (cases[0], 0, 0, False), (cases[-1], 0, 0, False),
+            ("all", 0, 0, False), (None, 0, 0, True), (None, 23, 0, False),
+            (None, 0, 37, False), (None, 23, 37, False),
+        ):
+            with self.subTest(omitted=omitted, build=build_code, emit=emit_code, failed=failed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                env = self.fixture(root)
+                for package, names in (("build", cases[:-1]), ("emit", cases[-1:])):
+                    log = "".join(f"test {name} ... ok\n" for name in names if omitted != "all" and name != omitted)
+                    (root / f"{package}.log").write_text(log.replace(" ... ok", " ... FAILED", 1) if failed else log)
+                cargo = root / "commands/cargo"
+                cargo.write_text(
+                    '#!/bin/sh\nprintf "%s\\n" "$@" > "$ABI_TRACE/$5.argv"\n'
+                    'case "$5" in\n'
+                    ' blaze-build) cat "$ABI_BUILD_LOG"; exit "$ABI_BUILD_EXIT" ;;\n'
+                    ' blaze-emit) cat "$ABI_EMIT_LOG"; exit "$ABI_EMIT_EXIT" ;;\n'
+                    ' *) exit 93 ;;\nesac\n')
+                cargo.chmod(0o700)
+                done = self.run_shell("source C ABI integer pairs through both emitters", {
+                    **env, "ABI_TRACE":str(root), "ABI_BUILD_LOG":str(root / "build.log"),
+                    "ABI_EMIT_LOG":str(root / "emit.log"), "ABI_BUILD_EXIT":str(build_code),
+                    "ABI_EMIT_EXIT":str(emit_code),
+                })
+                wanted = build_code or emit_code or (1 if omitted or failed else 0)
+                self.assertEqual(done.returncode, wanted, done.stdout + done.stderr)
+                pin = "+" + (ROOT / "pins/toolchain").read_text().strip()
+                self.assertEqual((root / "blaze-build.argv").read_text().splitlines(), [
+                    pin, "test", "--locked", "-p", "blaze-build", "--lib", "cabi", "--", "--nocapture",
+                ])
+                self.assertEqual((root / "blaze-emit.argv").read_text().splitlines(), [
+                    pin, "test", "--locked", "-p", "blaze-emit", "--lib", cases[-1], "--", "--exact", "--nocapture",
+                ])
+                self.assertEqual(int((root / "cabi-integer-evidence/exit-code.txt").read_text()), wanted)
+
     def test_source_smoke_failure_or_absent_completion_cannot_issue_receipt(self):
         for code, said, identity_code in ((0,"source CLI: every check passed",0),
                                           (23,"source CLI: every check passed",0),

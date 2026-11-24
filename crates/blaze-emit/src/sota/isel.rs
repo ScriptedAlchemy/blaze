@@ -755,6 +755,7 @@ fn place_param(
     gpr_n: &mut usize,
     fp_n: &mut usize,
     nsaa: &mut Nsaa,
+    os: crate::Os,
 ) -> Option<ParamPlace> {
     if ParamKind::from_byte(p.kind) == Some(ParamKind::Sret) {
         return Some(ParamPlace::Sret);
@@ -768,7 +769,9 @@ fn place_param(
             nsaa.place(ty).map(ParamPlace::Stack)
         }
     } else if ty == Ty::I128 {
-        let aligned = (*gpr_n + 1) & !1;
+        // AAPCS64 C.10 starts a 16-byte integer at an even register; Apple's arm64
+        // variant permits the next odd one. Keep both halves together on either target.
+        let aligned = if os == crate::Os::MacOs { *gpr_n } else { (*gpr_n + 1) & !1 };
         if let (Some(&lo), Some(&hi)) = (ARG_REGS.get(aligned), ARG_REGS.get(aligned + 1)) {
             *gpr_n = aligned + 2;
             Some(ParamPlace::GprPair(lo, hi))
@@ -781,6 +784,43 @@ fn place_param(
         Some(ParamPlace::Gpr(r))
     } else {
         nsaa.place(ty).map(ParamPlace::Stack)
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::{Nsaa, ParamPlace, place_param};
+    use blaze_lir::{Ty, func::ParamRec};
+    use crate::Os;
+
+    /// The target is explicit: this checks Apple's odd pair rule on a Linux test host too.
+    /// Whole-pair exhaustion and the following scalar must agree with AAPCS64 on both.
+    #[test]
+    fn i128_placement_uses_the_target_pair_rule_and_spills_whole() {
+        let wide = ParamRec { ty: Ty::I128.0, ..ParamRec::default() };
+        let scalar = ParamRec { ty: Ty::I64.0, ..ParamRec::default() };
+        for (os, odd_first) in [(Os::Linux, 2), (Os::MacOs, 1)] {
+            for (prefix, first) in [(1, odd_first), (6, 6)] {
+                let (mut gpr, mut fp, mut nsaa) = (prefix, 0, Nsaa::new(os));
+                let got = place_param(&wide, &mut gpr, &mut fp, &mut nsaa, os);
+                assert!(matches!(got, Some(ParamPlace::GprPair(lo, hi)) if lo == first && hi == first + 1), "{os:?}: {got:?}");
+                assert_eq!(gpr, usize::try_from(first + 2).expect("an argument register index"));
+                assert_eq!(nsaa.end(), 0);
+            }
+            for prefix in [7, 8] {
+                let (mut gpr, mut fp, mut nsaa) = (prefix, 0, Nsaa::new(os));
+                let got = place_param(&wide, &mut gpr, &mut fp, &mut nsaa, os);
+                assert!(matches!(got, Some(ParamPlace::Stack(at)) if at.at == 0 && at.bytes == 16), "{os:?}: {got:?}");
+                assert_eq!(gpr, 8, "a spilled pair closes the general registers");
+                let next = place_param(&scalar, &mut gpr, &mut fp, &mut nsaa, os);
+                assert!(matches!(next, Some(ParamPlace::Stack(at)) if at.at == 16 && at.bytes == 8), "{os:?}: {next:?}");
+            }
+            let (mut gpr, mut fp, mut nsaa) = (8, 0, Nsaa::new(os));
+            let byte = ParamRec { ty: Ty::I8.0, ..ParamRec::default() };
+            assert!(matches!(place_param(&byte, &mut gpr, &mut fp, &mut nsaa, os), Some(ParamPlace::Stack(_))));
+            let got = place_param(&wide, &mut gpr, &mut fp, &mut nsaa, os);
+            assert!(matches!(got, Some(ParamPlace::Stack(at)) if at.at == 16 && at.bytes == 16), "{os:?}: {got:?}");
+        }
     }
 }
 
@@ -840,7 +880,7 @@ fn check_sota_sig(view: &View<'_>, sig_id: SigId, inst: Option<u32>, os: crate::
         if ty != Ty::I128 && (!is_supported_scalar(ty) || ty == Ty::NONE) {
             return Err(TierError::Refused { tier: TIER, inst, what: "unsupported parameter type" });
         }
-        if place_param(p, &mut gpr_n, &mut fp_n, &mut nsaa).is_none() {
+        if place_param(p, &mut gpr_n, &mut fp_n, &mut nsaa, os).is_none() {
             return Err(TierError::Refused { tier: TIER, inst, what: "unplaceable stacked parameter" });
         }
     }
@@ -1717,7 +1757,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                     byval_cur = byval_cur.next_multiple_of(align);
                     byval_cur += u64::from(facts.size);
                 }
-                let _ = place_param(p, &mut gpr_n, &mut fp_n, &mut nsaa);
+                let _ = place_param(p, &mut gpr_n, &mut fp_n, &mut nsaa, os);
             }
             max_out_area = max_out_area.max(u64::from(nsaa.end()));
             max_byval_bytes = max_byval_bytes.max(byval_cur);
@@ -1733,7 +1773,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
         let mut fp_n = 0usize;
         let mut nsaa = Nsaa::new(os);
         for p in view.sig(SigId(view.head.sig)).params {
-            if matches!(place_param(p, &mut gpr_n, &mut fp_n, &mut nsaa), Some(ParamPlace::Stack(_))) {
+            if matches!(place_param(p, &mut gpr_n, &mut fp_n, &mut nsaa, os), Some(ParamPlace::Stack(_))) {
                 has_stacked_in = true;
             }
         }
@@ -3140,7 +3180,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
     let mut entry_nsaa = Nsaa::new(os);
     for (p, param) in entry_params.clone().zip(func_sig.params.iter().copied()) {
         let ty = ty_at(view.tys, p);
-        let Some(placed) = place_param(&param, &mut gpr_arg_idx, &mut fp_arg_idx, &mut entry_nsaa) else {
+        let Some(placed) = place_param(&param, &mut gpr_arg_idx, &mut fp_arg_idx, &mut entry_nsaa, os) else {
             return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(p)), what: "unplaceable entry param" });
         };
         match placed {
@@ -7487,7 +7527,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                         } else {
                             None
                         };
-                        let placed = place_param(&param, &mut gpr_k, &mut fp_k, &mut call_nsaa).ok_or(TierError::Refused {
+                        let placed = place_param(&param, &mut gpr_k, &mut fp_k, &mut call_nsaa, os).ok_or(TierError::Refused {
                             tier: TIER,
                             inst: Some(u32_of(inst)),
                             what: "unplaceable call arg",

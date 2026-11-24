@@ -3278,9 +3278,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         })?;
         Ok(match class {
             Class::Ignore => Pass::Ignore,
-            Class::Int { size: 16, .. } => return Err(refuse("a 128-bit integer (a register pair)")),
             // A scalar, or a one-scalar aggregate (a newtype) read and written at offset 0;
-            // Apple widens an integer under 32 bits (`cabi::Ext`).
+            // Apple widens an integer under 32 bits (`cabi::Ext`). Keep an i128 as ONE LIR
+            // scalar: the emitter assigns its pair together (even on AAPCS64, contiguous on
+            // Apple), or stacks all 16 bytes. Two independent i64s would lose that rule.
             Class::Int { size, signed } => {
                 let ext = match (size < 4, signed) {
                     (true, true) => Ext::Sext,

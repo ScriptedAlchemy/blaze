@@ -334,6 +334,53 @@ jobs:
           name: owner-field-bound-evidence
           path: ${{ runner.temp }}/owner-field-bound-evidence
           if-no-files-found: warn
+      - name: source C ABI integer pairs through both emitters
+        if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
+        run: |
+          evidence="$RUNNER_TEMP/cabi-integer-evidence"
+          mkdir -p "$evidence"
+          git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
+          git status --short >> "$evidence/source.txt"
+          git diff HEAD --binary > "$evidence/source.patch"
+          export BLAZE_NO_DAEMON=1 TMPDIR="$HOME"
+          result=0
+          if timeout -k 30 1200 cargo +"$(cat pins/toolchain)" test --locked -p blaze-build --lib cabi -- --nocapture 2>&1 | tee "$evidence/tests.log"; then
+            :
+          else
+            result=$?
+          fi
+          case_name='sota::isel::abi_tests::i128_placement_uses_the_target_pair_rule_and_spills_whole'
+          if timeout -k 30 600 cargo +"$(cat pins/toolchain)" test --locked -p blaze-emit --lib "$case_name" -- --exact --nocapture 2>&1 | tee -a "$evidence/tests.log"; then
+            :
+          else
+            code=$?
+            if [ "$result" -eq 0 ]; then result=$code; fi
+          fi
+          while IFS= read -r case_name; do
+            if ! grep -Fxq "test $case_name ... ok" "$evidence/tests.log"; then
+              echo "::error::C ABI control did not execute and pass: $case_name"
+              if [ "$result" -eq 0 ]; then result=1; fi
+            fi
+          done <<'CASES'
+          cabi::tests::classes_follow_the_fundamental_types_and_homogeneous_aggregates
+          cabi::tests::sixteen_byte_alignment_rounds_to_an_even_register
+          cabi::tests::i128_pairs_fit_or_spill_whole_and_return_in_x0_x1
+          tests::cabi_i128::c_i128_signatures_keep_wide_scalars
+          tests::cabi_i128::native::c_i128_register_pairs_match_host_abi
+          tests::cabi_i128::native::c_i128_last_register_pair_matches_host_abi
+          tests::cabi_i128::native::c_i128_spilled_pair_matches_host_abi
+          tests::cabi_i128::native::c_i128_aligned_stack_pair_matches_host_abi
+          sota::isel::abi_tests::i128_placement_uses_the_target_pair_rule_and_spills_whole
+          CASES
+          printf '%s\n' "$result" > "$evidence/exit-code.txt"
+          exit "$result"
+      - name: keep source C ABI execution evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cabi-integer-evidence
+          path: ${{ runner.temp }}/cabi-integer-evidence
+          if-no-files-found: warn
       - name: cargo check --workspace --exclude blaze-std --all-targets
         if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
         run: timeout -k 30 3600 cargo +"$(cat pins/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short
