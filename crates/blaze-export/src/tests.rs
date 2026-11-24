@@ -1101,3 +1101,80 @@ fn elf_synthesizes_dso_handle_and_auto_needed_libs() {
     assert_eq!(facts.binds, 3, "__libc_start_main, _Unwind_RaiseException, sin (not __dso_handle)");
     assert_eq!(summary.imports, 3, "Exported::imports excludes internal __dso_handle");
 }
+
+/// ELF export strips the `\x02` extern_weak marker from program imports and emits `STB_WEAK`
+/// in `.dynsym` so undefined weak symbols resolve to NULL at load time.
+#[test]
+fn elf_weak_program_import_emits_stb_weak() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let main_rec = rec(
+        &[ADRP_X16, LDR_X16, BLR_X16, RET],
+        &[],
+        &[(0, "\x02gettid")],
+    );
+    let fs = [Function { symbol: sym("main"), record: CodeView::read(&main_rec).unwrap(), tier: Tier::Fast }];
+    let prog = ProgramIn {
+        name: "weak-import",
+        functions: &fs,
+        data: &[],
+        entry: Entry::CMain { main: sym("main") },
+        panic: Panic::Abort,
+        personality: None,
+        tls: None,
+        profile: None,
+        natives: None,
+        exports: &[],
+    };
+    let mut out = Vec::new_in(alloc);
+    export(&prog, Platform::LinuxArm64, &mut out, alloc).unwrap();
+    let facts = check::elf(&out).unwrap();
+    assert_eq!(facts.binds, 2, "__libc_start_main + weak gettid");
+    // Locate `.dynsym` and `.dynstr` via PT_DYNAMIC and verify `gettid` has STB_WEAK (2) and no `\x02`.
+    let u16_at = |at: usize| u16::from_le_bytes(out[at..at + 2].try_into().unwrap());
+    let u32_at = |at: usize| u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+    let u64_at = |at: usize| u64::from_le_bytes(out[at..at + 8].try_into().unwrap());
+    let phoff = u64_at(32) as usize;
+    let phnum = u16_at(56) as usize;
+    let mut dyn_off = None;
+    let mut meta_off = None;
+    let mut meta_va = None;
+    for k in 0..phnum {
+        let p = phoff + 56 * k;
+        match u32_at(p) {
+            2 => dyn_off = Some((u64_at(p + 8) as usize, u64_at(p + 32) as usize)),
+            1 => {
+                meta_off = Some(u64_at(p + 8));
+                meta_va = Some(u64_at(p + 16));
+            }
+            _ => {}
+        }
+    }
+    let (doff, dsz) = dyn_off.expect("PT_DYNAMIC");
+    let bias = meta_va.unwrap() - meta_off.unwrap();
+    let (mut symtab, mut strtab, mut strsz) = (0usize, 0usize, 0usize);
+    for i in 0..(dsz / 16) {
+        let tag = u64_at(doff + i * 16);
+        let val = u64_at(doff + i * 16 + 8);
+        match tag {
+            5 => strtab = (val - bias) as usize,
+            6 => symtab = (val - bias) as usize,
+            10 => strsz = val as usize,
+            0 => break,
+            _ => {}
+        }
+    }
+    let mut found_weak = false;
+    for idx in 1..3usize {
+        let s = symtab + idx * 24;
+        let name_off = u32_at(s) as usize;
+        let bind = out[s + 4] >> 4;
+        let end = out[strtab + name_off..strtab + strsz].iter().position(|&b| b == 0).unwrap();
+        let name = &out[strtab + name_off..strtab + name_off + end];
+        assert!(!name.starts_with(b"\x02"), "weak marker must be stripped from .dynstr");
+        if name == b"gettid" {
+            assert_eq!(bind, 2, "gettid must have STB_WEAK (2)");
+            found_weak = true;
+        }
+    }
+    assert!(found_weak, "gettid symbol present in .dynsym");
+}

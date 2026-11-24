@@ -129,17 +129,21 @@ impl Loaded {
         if let Some(known) = externs.get(name) {
             return *known;
         }
-        let found = own(name).or_else(|| {
-            let name = CString::new(name).ok()?;
+        let (real_name, weak) = match name.strip_prefix('\x02') {
+            Some(real) => (real, true),
+            None => (name, false),
+        };
+        let found = own(real_name).or_else(|| {
+            let c_name = CString::new(real_name).ok()?;
             #[cfg(target_os = "macos")]
             // SAFETY: RTLD_DEFAULT searches loaded images and name is a live C string.
-            let at = unsafe { blaze_sys::posix::thread::dlsym(blaze_sys::posix::thread::RTLD_DEFAULT, name.as_ptr()) };
+            let at = unsafe { blaze_sys::posix::thread::dlsym(blaze_sys::posix::thread::RTLD_DEFAULT, c_name.as_ptr()) };
             #[cfg(target_os = "linux")]
             // SAFETY: a C string that lives across the call; `RTLD_DEFAULT` searches the
             // images of the process in load order, as a linked program's lookup would.
-            let at = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            let at = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
             (!at.is_null()).then_some(at as u64)
-        });
+        }).or(if weak { Some(0) } else { None });
         externs.insert(name.into(), found);
         found
     }

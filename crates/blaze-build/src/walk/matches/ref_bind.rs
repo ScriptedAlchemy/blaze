@@ -33,19 +33,13 @@ use core::alloc::Allocator;
 use blaze_own::Vec;
 use blaze_typeck::{ExprId, Pat, PatId};
 
-use super::super::{V, Walk, malformed};
+use super::super::{Repr, V, Walk, malformed};
 use super::At;
 use crate::BuildError;
 
 impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
-    /// Whether `let pat = init;` binds at `init`'s place: `pat` holds an explicit `ref` or
-    /// `ref mut` binding and `init` is a place expression with no adjustment. A pure fact of the
-    /// body, asked twice (walk.rs `stmt`, which then builds `init` by `Task::Place`, and
-    /// `Task::Let`, which then binds here): both answers are the same.
-    pub(in crate::walk) fn let_borrows_place(&self, pat: PatId, init: ExprId) -> Result<bool, BuildError> {
-        if !self.adjust_rows(init).is_empty() || !self.is_place_expr(init)? {
-            return Ok(false);
-        }
+    /// Whether `pat` contains an explicit `ref` or `ref mut` binding anywhere inside it.
+    pub(in crate::walk) fn pat_has_ref(&self, pat: PatId) -> Result<bool, BuildError> {
         let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(pat);
         while let Some(p) = todo.pop() {
@@ -71,11 +65,20 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(false)
     }
 
-    /// Binds `pat` at `v`, the place of its `let`'s initializer (built by `Task::Place`): each
-    /// `ref` binding the address of its part, each other binding a copy of a `Copy` part; the
-    /// place is not the binder's own, so nothing in it moves or is dropped here.
-    pub(in crate::walk) fn bind_let_place(&mut self, pat: PatId, v: V) -> Result<(), BuildError> {
-        // A by-value binding of a part that needs drop: a move out of the place.
+    /// Whether `let pat = init;` binds at `init`'s place: `pat` holds an explicit `ref` or
+    /// `ref mut` binding and `init` is a place expression with no adjustment. A pure fact of the
+    /// body, asked twice (walk.rs `stmt`, which then builds `init` by `Task::Place`, and
+    /// `Task::Let`, which then binds here): both answers are the same.
+    pub(in crate::walk) fn let_borrows_place(&self, pat: PatId, init: ExprId) -> Result<bool, BuildError> {
+        if !self.adjust_rows(init).is_empty() || !self.is_place_expr(init)? {
+            return Ok(false);
+        }
+        self.pat_has_ref(pat)
+    }
+
+    /// Refuses a by-value binding of a part that needs drop inside a `let` whose pattern borrows
+    /// its initializer by `ref` (would require partial-move tracking out of the borrowed place).
+    fn refuse_drop_by_value_in_ref_let(&mut self, pat: PatId) -> Result<(), BuildError> {
         let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(pat);
         while let Some(p) = todo.pop() {
@@ -103,6 +106,14 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    /// Binds `pat` at `v`, the place of its `let`'s initializer (built by `Task::Place`): each
+    /// `ref` binding the address of its part, each other binding a copy of a `Copy` part; the
+    /// place is not the binder's own, so nothing in it moves or is dropped here.
+    pub(in crate::walk) fn bind_let_place(&mut self, pat: PatId, v: V) -> Result<(), BuildError> {
+        self.refuse_drop_by_value_in_ref_let(pat)?;
         let t = *self.checked.pat_ty.get(pat.ix()).ok_or(malformed("a pattern without a type in the record"))?;
         let g = self.ground_ty(t).map_err(|error| Self::pat_ty_err(pat, error))?;
         let at = match v {
@@ -111,6 +122,33 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             V::Place(p, off) | V::Unsized(p, off) => (p, off),
             _ => return Err(malformed("a `let` initializer built as a place left a value")),
         };
+        self.bind_pattern_at(pat, At { at, g, by_ref: false, copy: false }, false)
+    }
+
+    /// Binds `pat` (which contains an explicit `ref`/`ref mut` binding) over a VALUE initializer
+    /// `init` whose evaluated value is `v`: materializes `v` in a dedicated stack slot, extends
+    /// its temporary lifetime to the enclosing block if it needs drop (the Reference, "Temporary
+    /// lifetime extension"), and binds `pat` at that place.
+    pub(in crate::walk) fn bind_let_value_ref(&mut self, pat: PatId, init: ExprId, v: V) -> Result<(), BuildError> {
+        self.refuse_drop_by_value_in_ref_let(pat)?;
+        let t = self.adjusted_ty(init)?;
+        let g = self.ground_ty(t).map_err(|error| Self::ty_err(init, error))?;
+        let repr = self.repr(g).map_err(|error| Self::pat_ty_err(pat, error))?;
+        let at = match v {
+            V::Place(p, off) if self.live && self.is_fresh(init)? => (p, off),
+            V::Unsized(..) => {
+                return Err(BuildError::UnsupportedPat { pat, what: "a `ref` binding over an unsized temporary value" });
+            }
+            other => {
+                let at = self.temp(repr);
+                self.store(other, repr, at)?;
+                at
+            }
+        };
+        if self.needs_drop(g).map_err(|error| Self::pat_ty_err(pat, error))? {
+            let Repr::Agg(l) = repr else { return Err(malformed("a value that needs drop not held as an aggregate")) };
+            self.hold_extended_let_temp(init, at, l)?;
+        }
         self.bind_pattern_at(pat, At { at, g, by_ref: false, copy: false }, false)
     }
 }

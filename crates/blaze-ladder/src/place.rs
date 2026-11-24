@@ -351,15 +351,23 @@ fn routine_library(routine: Routine) -> &'static str {
 
 /// The address of `name` in this process.
 fn symbol(name: &str) -> Option<u64> {
-    let name = CString::new(name).ok()?;
+    let (real_name, weak) = match name.strip_prefix('\x02') {
+        Some(real) => (real, true),
+        None => (name, false),
+    };
+    let c_name = CString::new(real_name).ok()?;
     // SAFETY: `dlsym` reads a live NUL-terminated name and returns an address or null; the
     // handle `RTLD_DEFAULT` searches every image loaded, as a static link of the program
     // against the system's libraries would bind it.
     #[cfg(target_os = "macos")]
-    let at = unsafe { blaze_sys::posix::thread::dlsym(blaze_sys::posix::thread::RTLD_DEFAULT, name.as_ptr()) };
+    let at = unsafe { blaze_sys::posix::thread::dlsym(blaze_sys::posix::thread::RTLD_DEFAULT, c_name.as_ptr()) };
     #[cfg(not(target_os = "macos"))]
-    let at = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-    (!at.is_null()).then_some(at as u64)
+    let at = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
+    if at.is_null() {
+        weak.then_some(0)
+    } else {
+        Some(at as u64)
+    }
 }
 
 impl Records for Table<'_> {

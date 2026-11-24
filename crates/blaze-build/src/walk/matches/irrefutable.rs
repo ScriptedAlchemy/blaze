@@ -471,7 +471,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// local's field flags), `stmt` (`init` pushed as a scrutinee) and `Task::Let` (bound by
     /// `bind_let_owned`): all three answers are the same.
     pub(in crate::walk) fn let_owns_parts(&mut self, pat: PatId, init: ExprId) -> Result<bool, BuildError> {
-        if matches!(self.pat(pat)?, Pat::Bind { .. } | Pat::Wild) || self.let_borrows_place(pat, init)? {
+        if matches!(self.pat(pat)?, Pat::Bind { .. } | Pat::Wild) || self.let_borrows_place(pat, init)? || self.pat_has_ref(pat)? {
             return Ok(false);
         }
         // An initializer that needs no drop (a reference the pattern peels: the check records

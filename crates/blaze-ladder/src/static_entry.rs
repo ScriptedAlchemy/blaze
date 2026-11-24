@@ -406,7 +406,7 @@ mod tests {
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
         let erased = blaze_own::Erased::new(&frame);
         let alloc = erased.handle();
-        let tls = StaticItem { thread_local: true, mutable: false };
+        let tls = StaticItem { thread_local: true, mutable: false, extern_weak: false };
         let made = make_template_entry(&value(false, DataTarget::Local(1)), tls, alloc).expect("the template");
         let view = StaticEntryView::read(&made).expect("the template's entry reads as a static's");
         assert_eq!((view.datum.place(), view.datum.bytes().len(), view.datum.words()), (Place::ReadOnly, 26, 1));
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(shared, Err(StaticRecordError::SharedMutable { alloc: 1 }));
         let selfish = make_template_entry(&value(false, DataTarget::Local(0)), tls, alloc).map(|_| ());
         assert_eq!(selfish, Err(StaticRecordError::SelfPointer { alloc: 0, at: 0 }));
-        let plain = make_template_entry(&value(false, DataTarget::Local(1)), StaticItem { thread_local: false, mutable: false }, alloc).map(|_| ());
+        let plain = make_template_entry(&value(false, DataTarget::Local(1)), StaticItem { thread_local: false, mutable: false, extern_weak: false }, alloc).map(|_| ());
         assert_eq!(plain, Err(StaticRecordError::NotThreadLocal));
         std::println!("template: read-only, 26 bytes, one own word at +24; a thread-local as a static, a shared mutable, a self pointer and a plain static refused");
     }
@@ -440,7 +440,7 @@ mod tests {
         let mut expected = [0; 20];
         expected[..16].copy_from_slice(&item.0.to_le_bytes());
         for thread_local in [false, true] {
-            let kind = StaticItem { thread_local, mutable: false };
+            let kind = StaticItem { thread_local, mutable: false, extern_weak: false };
             let missing = if thread_local {
                 make_template_entry(&value, kind, alloc)
             } else {
@@ -508,7 +508,7 @@ mod tests {
                         DataReloc { offset: 16, target: DataTarget::Static(OTHER_ITEM) }] },
                 DataAlloc { align: 0, mutable: false, bytes: b"/ab".to_vec(), relocs: vec![] },
             ] };
-            let entry = make_static_entry(&value, StaticItem { mutable: false, thread_local: false }, erased.handle()).expect("the slice's entry");
+            let entry = make_static_entry(&value, StaticItem { mutable: false, thread_local: false, extern_weak: false }, erased.handle()).expect("the slice's entry");
             let datum = StaticEntryView::read(&entry).expect("the slice's datum").datum;
             let mut bytes = vec![0; datum.bytes().len()];
             datum::fill(&datum, static_symbol(ItemKey(23)), OWN, &mut OtherStatic, &mut bytes).expect("place the slice");

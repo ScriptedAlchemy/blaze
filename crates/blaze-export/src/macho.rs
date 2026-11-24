@@ -450,7 +450,14 @@ fn chained<'a>(laid: &Laid<'_, '_>, native: Option<&Merged<'_, '_>>, segs: &[Seg
     let program = kept.len();
     let import = |i: usize| match (i.checked_sub(program), native) {
         (Some(k), Some(m)) => m.imports[k],
-        _ => ChainImport { lead: b"_", name: laid.imports[kept[i] as usize].name.as_bytes(), ordinal: 1, weak: false, addend: 0 },
+        _ => {
+            let raw = laid.imports[kept[i] as usize].name;
+            let (name, weak) = match raw.strip_prefix('\x02') {
+                Some(real) => (real, true),
+                None => (raw, false),
+            };
+            ChainImport { lead: b"_", name: name.as_bytes(), ordinal: 1, weak, addend: 0 }
+        }
     };
     let (rows, count) = match native {
         None => (ImportRows::Plain, program),

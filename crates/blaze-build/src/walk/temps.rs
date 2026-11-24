@@ -103,6 +103,20 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(())
     }
 
+    /// Registers a `let` initializer's temporary value (extended by a `ref` binding pattern in
+    /// `let ref x = value_expr;`) in the enclosing block's drop scope right before the `let`'s
+    /// bindings, so it drops after them and in reverse declaration order of the block.
+    pub(in crate::walk) fn hold_extended_let_temp(&mut self, init: ExprId, at: (Value, i32), l: u32) -> Result<(), BuildError> {
+        self.name_at(at, blaze_flow_lower::identity::Identity::Temp(init, blaze_flow_lower::identity::Role::Value));
+        let t = self.temp_scope_index(init.0).ok_or(malformed("an extended `let` temporary whose statement is not open"))?;
+        let pos = usize::try_from(*self.temp_marks.get(t).ok_or(malformed("a temporary scope past `temp_marks`"))?)
+            .map_err(|_| malformed("a temporary scope mark past `usize`"))?;
+        let depth = usize::try_from(self.temp_scopes.get(t).ok_or(malformed("a temporary scope past `temp_scopes`"))?.1)
+            .map_err(|_| malformed("a drop scope depth past `usize`"))?;
+        self.insert_held(pos, t, depth, Held::Temp { at, l, flag: None });
+        Ok(())
+    }
+
     /// Puts `h` at `pos` of `scope_pats`; the scopes opened after it (the temporary scopes from
     /// `temps` on, the drop scopes from `depth` on), which all start at or past `pos`, move up
     /// by one.

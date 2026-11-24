@@ -1273,6 +1273,17 @@ impl<M: Memory> Binder<'_, '_, M> {
         let Some(name) = self.names.name(symbol) else {
             return Err(RunModeError::Outside { record: self.record, symbol, name: CName::NONE, why: "the record keeps no name for it" });
         };
+        if let Some(real) = name.strip_prefix('\x02') {
+            let real_sym = CodeSymbol::of_name(real);
+            if let Some(slot) = self.slots.declared(real_sym) {
+                return Ok(Bound::Slot(slot));
+            }
+            if let Ok(at) = self.statics.binary_search_by_key(&real_sym, |&(it, _)| it)
+                && let Some(&(_, addr)) = self.statics.get(at)
+            {
+                return Ok(Bound::Static(addr));
+            }
+        }
         let bound = self.memory.outside(self.record, symbol, name)?;
         if let Err(at) = self.slots.bound_outside.binary_search(&symbol) {
             self.slots.bound_outside.insert_shift(at, symbol);
@@ -1911,12 +1922,16 @@ impl<B: Bind> Memory for NativeMemory<'_, B> {
                 if count >= MOST_OUTSIDE {
                     return Err(RunModeError::OutsideFull);
                 }
-                let refused = |why| RunModeError::Outside { record, symbol, name: CName::new(name), why };
+                let (real_name, weak) = match name.strip_prefix('\x02') {
+                    Some(real) => (real, true),
+                    None => (name, false),
+                };
+                let refused = |why| RunModeError::Outside { record, symbol, name: CName::new(real_name), why };
                 let mut cname = [0u8; 512];
-                if name.len() >= cname.len() || name.as_bytes().contains(&0) {
+                if real_name.len() >= cname.len() || real_name.as_bytes().contains(&0) {
                     return Err(refused("its name is longer than 511 bytes or holds a NUL"));
                 }
-                cname[..name.len()].copy_from_slice(name.as_bytes());
+                cname[..real_name.len()].copy_from_slice(real_name.as_bytes());
                 let Ok(cname) = core::ffi::CStr::from_bytes_until_nul(&cname) else {
                     return Err(refused("its name is longer than 511 bytes or holds a NUL"));
                 };
@@ -1925,11 +1940,21 @@ impl<B: Bind> Memory for NativeMemory<'_, B> {
                 //    `_Unwind_RaiseException`, and telemetry wrappers are never bypassed.
                 // 2. Otherwise, a run with its native library binds through the library handle;
                 //    without one, through the run's strategy (`Dlsym` or `Table`).
-                let address = match self.bind.intercept(name) {
+                // 3. For `#[linkage = "extern_weak"]` symbols (`\x02`-prefixed), a missing
+                //    symbol resolves to `0` (`NULL`) instead of refusing.
+                let address = match self.bind.intercept(real_name) {
                     Some(addr) => addr,
                     None => match self.natives.as_mut() {
-                        Some(natives) => crate::native_lib::bind(Some(natives), record, symbol, name)?,
-                        None => self.bind.address(name, cname).map_err(|err| refused(err.reason()))?,
+                        Some(natives) => match crate::native_lib::bind(Some(natives), record, symbol, real_name) {
+                            Ok(addr) => addr,
+                            Err(RunModeError::Outside { .. }) if weak => 0,
+                            Err(err) => return Err(err),
+                        },
+                        None => match self.bind.address(real_name, cname) {
+                            Ok(addr) => addr,
+                            Err(BindError::NotFound) if weak => 0,
+                            Err(err) => return Err(refused(err.reason())),
+                        },
                     },
                 };
                 self.code.store(self.layout.outside + count as usize * 8, address).map_err(RunModeError::Sys)?;

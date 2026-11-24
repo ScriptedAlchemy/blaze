@@ -2122,10 +2122,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     }
                     continue;
                 }
-                Pat::Bind { .. } => {
+                Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none() => {
                     let (home, repr) = self.bind(p)?;
                     let at = self.home(home);
                     self.store(v, repr, at)?;
+                    continue;
+                }
+                Pat::Bind { .. } => {
+                    self.bind_irrefutable(p, v)?;
                     continue;
                 }
                 Pat::Tuple { elems, rest } => (elems, rest),
@@ -3125,7 +3129,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     V::Place(at.0, at.1)
                 };
                 match v {
-                    V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
+                    V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none()) => {
                         self.bind_at(p, (at, off))?;
                         self.own_pat(p)?;
                     }
@@ -3140,7 +3144,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             // The caller's copy (or the one a C parameter's registers are written to) is the
             // callee's to keep: a binding lives in it.
             match self.take_passed(repr, passes[i], &mut next)? {
-                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
+                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none()) => {
                     self.bind_at(p, (at, off))?;
                     self.own_pat(p)?;
                 }
@@ -3628,14 +3632,21 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     Some(e) => self.let_borrows_place(p, e)?,
                     None => false,
                 };
+                let borrows_value = match init {
+                    Some(e) if !borrows && self.pat_has_ref(p)? => Some(e),
+                    _ => None,
+                };
                 let fresh = match (init, v, self.pat(p)?) {
-                    _ if borrows => None,
-                    (Some(e), V::Place(at, off), Pat::Bind { .. }) if self.live && self.is_fresh(e)? => Some((at, off)),
+                    _ if borrows || borrows_value.is_some() => None,
+                    (Some(e), V::Place(at, off), Pat::Bind { ann, sub: None, .. }) if ann.by_ref.is_none() && self.live && self.is_fresh(e)? => {
+                        Some((at, off))
+                    }
                     _ => None,
                 };
                 match fresh {
                     Some(at) => self.bind_at(p, at)?,
                     None if borrows => self.bind_let_place(p, v)?,
+                    None if let Some(e) = borrows_value => self.bind_let_value_ref(p, e, v)?,
                     // The initializer's own type: a pattern that peels a reference is recorded
                     // at the peeled one (`bind_value_of`).
                     None => match init {
@@ -5327,8 +5338,21 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.push_val(V::Place(at.0, at.1), None);
             }
             Expr::Path(_) if matches!(self.expr_def(e), Some(Def::Static(..))) => {
+                let Some(Def::Static(item, _)) = self.expr_def(e) else {
+                    return Err(malformed("a static's place of a path to other than a static"));
+                };
+                let s = self.adts.static_item(item).ok_or(BuildError::NoStatic { expr: e, item })?;
                 let at = self.static_addr(e)?;
-                self.push_val(V::Place(at, 0), None);
+                if s.extern_weak {
+                    // `#[linkage = "extern_weak"]`: the static's storage holds the symbol's
+                    // address (null when undefined), materialized into a local pointer slot.
+                    let repr = self.expr_repr(e)?;
+                    let to = self.temp(repr);
+                    self.b.store(Flags::NONE, at, to.0, to.1, MemAttrs::aligned(3));
+                    self.push_val(V::Place(to.0, to.1), None);
+                } else {
+                    self.push_val(V::Place(at, 0), None);
+                }
             }
             Expr::Paren(inner) => self.work.push(Task::Place(inner)),
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
@@ -5432,17 +5456,31 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         let v = self.const_param_value(e, index)?;
                         self.push_val(v, None);
                     }
-                    // A static by value: a copy read from its memory.
-                    (_, Some(Def::Static(..))) => {
+                    // A static by value: a copy read from its memory, or for
+                    // `#[linkage = "extern_weak"]` the weak symbol's address itself.
+                    (_, Some(Def::Static(item, _))) => {
+                        let s = self.adts.static_item(item).ok_or(BuildError::NoStatic { expr: e, item })?;
                         let at = self.static_addr(e)?;
                         let repr = self.expr_repr(e)?;
-                        let v = match repr {
-                            Repr::Agg(_) => {
-                                let to = self.temp(repr);
-                                self.copy(repr, (at, 0), to)?;
-                                V::Place(to.0, to.1)
+                        let v = if s.extern_weak {
+                            match repr {
+                                Repr::Ptr => V::Scalar(at),
+                                Repr::Agg(l) if usize::try_from(l).ok().and_then(|i| self.layouts.get(i)).is_some_and(|lay| lay.size == 8) => {
+                                    let to = self.temp(repr);
+                                    self.b.store(Flags::NONE, at, to.0, to.1, MemAttrs::aligned(3));
+                                    V::Place(to.0, to.1)
+                                }
+                                _ => return Err(unsupported(e, "an `extern_weak` static of a non-pointer-sized type")),
                             }
-                            _ => self.load(repr, (at, 0)),
+                        } else {
+                            match repr {
+                                Repr::Agg(_) => {
+                                    let to = self.temp(repr);
+                                    self.copy(repr, (at, 0), to)?;
+                                    V::Place(to.0, to.1)
+                                }
+                                _ => self.load(repr, (at, 0)),
+                            }
                         };
                         self.push_val(v, None);
                     }

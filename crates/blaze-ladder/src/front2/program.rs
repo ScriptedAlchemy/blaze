@@ -1479,6 +1479,8 @@ struct Symbols {
     track_caller: bool,
     /// `#[inline]`, `#[inline(always)]`, `#[inline(never)]`, `#[cold]`.
     fn_attrs: blaze_lir::func::FnAttrs,
+    /// `#[linkage = "extern_weak"]` on an extern static.
+    extern_weak: bool,
 }
 
 /// The identifier a signature's lowering declares, `r#` dropped: the symbol `#[no_mangle]`
@@ -1505,7 +1507,7 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, valu
     // `sig::HAS_BODY`), as the frozen fn head's qualifiers read by const_fn_fact.rs.
     let has_body = v.head[head::FLAGS] & blaze_lower::machine::sig::HAS_BODY != 0;
     let intrinsic_declared = super::intrinsic_rule::Declared { has_body, must_be_overridden: false };
-    let mut out = Symbols { export: None, link_name: None, intrinsic: false, intrinsic_declared, nounwind: false, track_caller: false, fn_attrs: blaze_lir::func::FnAttrs::default() };
+    let mut out = Symbols { export: None, link_name: None, intrinsic: false, intrinsic_declared, nounwind: false, track_caller: false, fn_attrs: blaze_lir::func::FnAttrs::default(), extern_weak: false };
     for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {
         let a = v.attr(n).map_err(|e| refuse(format!("{e:?}")))?;
         // The cooked string, as the native image reads it (links.rs `symbol_of`): escapes
@@ -1532,6 +1534,13 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, valu
             super::intrinsic_rule::MUST_BE_OVERRIDDEN => out.intrinsic_declared.must_be_overridden = true,
             "rustc_nounwind" => out.nounwind = true,
             "track_caller" => out.track_caller = true,
+            "linkage" => {
+                let args = v.text_at(a.args).map_or("", str::trim);
+                let val = args.strip_prefix('=').unwrap_or(args).trim();
+                if val == "\"extern_weak\"" {
+                    out.extern_weak = true;
+                }
+            }
             "cold" => out.fn_attrs.0 |= blaze_lir::func::FnAttrs::COLD,
             "inline" => {
                 let args = v.text_at(a.args).map_or("", str::trim);
@@ -1596,7 +1605,25 @@ pub(super) fn foreign_static_symbol<'n, S: super::source::NamesSource<'n>>(names
     let values_at = super::links::values_key(names, store, lib);
     let symbols = symbols_of(names, lib, values_at, text, row_path.text()).map_err(said)?;
     let declared = super::panic_entry::local_name(store, k).map_err(|why| Box::<str>::from(why.form()))?;
-    Ok(Some(Box::from(symbols.link_name.as_deref().or(declared).unwrap_or(row_path.ident()))))
+    let sym = symbols.link_name.as_deref().or(declared).unwrap_or(row_path.ident());
+    let mut stack = [0u8; 512];
+    let text = if symbols.extern_weak {
+        let Some((first, rest)) = stack.split_first_mut() else {
+            return Err("extern_weak static symbol buffer empty".into());
+        };
+        let Some(dst) = rest.get_mut(..sym.len()) else {
+            return Err("extern_weak static symbol longer than 511 bytes".into());
+        };
+        *first = 2;
+        dst.copy_from_slice(sym.as_bytes());
+        match stack.get(..1 + sym.len()).and_then(|bytes| core::str::from_utf8(bytes).ok()) {
+            Some(prefixed) => prefixed,
+            None => return Err("extern_weak static symbol is not valid utf-8".into()),
+        }
+    } else {
+        sym
+    };
+    Ok(Some(Box::from(text)))
 }
 
 /// Where `lib`'s text begins ([`item_at`]) and the abi of the `extern` block declaring it

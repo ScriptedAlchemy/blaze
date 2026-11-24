@@ -127,33 +127,13 @@ fn match_on_deref_with_ref_binding() {
     let mut ground = PortableTys::new_in(Alloc::global());
     let main = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
 
-    // The glue of G, of E and of (G, i32), each an instance of `drop_in_place` at its type.
-    let mut gb = BodyBuf::new();
-    let to_drop = gb.bind("to_drop");
-    gb.params.push(to_drop);
-    let groot = gb.block(&[], None);
-    let view = gb.view(DROP_IN_PLACE, groot);
-    let mut cx = InferCtx::new_in(Alloc::global());
-    let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
-        Ok(Outcome::Done(c)) => c,
-        other => panic!("the check did not finish: {:?}", other.err()),
-    };
-    let sig = w.sig(DROP_IN_PLACE).expect("a signature");
     let g_ty = ground.intern(g).expect("intern");
     let i32_ty = ground.intern(I32).expect("intern");
     let elems = ground.intern_list(&[g_ty, i32_ty]).expect("intern");
     let pair = PNode::Tuple(elems);
-    let mut glue = |t: PNode| -> (List, Built<Global>) {
-        let ty = ground.intern(t).expect("intern");
-        let args = ground.intern_list(&[ty]).expect("intern");
-        let mut subst = Subst { args: &[ty], ground: &mut ground, scratch: Alloc::global() };
-        let built = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &gb }, Global)
-            .unwrap_or_else(|e| panic!("{e}"));
-        (args, built)
-    };
-    let (g_args, g_glue) = glue(g);
-    let (e_args, e_glue) = glue(e_ty);
-    let (pair_args, pair_glue) = glue(pair);
+    let (g_args, g_glue) = build_drop_glue_for(&w, &mut ground, g);
+    let (e_args, e_glue) = build_drop_glue_for(&w, &mut ground, e_ty);
+    let (pair_args, pair_glue) = build_drop_glue_for(&w, &mut ground, pair);
     DROPPED.with(|d| d.borrow_mut().clear());
     let ret = run_native_with(
         &[(G_DROP, host_g_drop as usize as u64)],
@@ -167,4 +147,91 @@ fn match_on_deref_with_ref_binding() {
     let seen = DROPPED.with(|d| d.borrow().clone());
     assert_eq!(ret as u32, 4564);
     assert_eq!(seen.as_slice(), &[5, 4]);
+}
+
+/// Builds `drop_in_place::<t>` glue for tests in this module.
+fn build_drop_glue_for(w: &TestWorld, ground: &mut PortableTys<'_>, t: PNode) -> (List, Built<Global>) {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut gb = BodyBuf::new();
+    let to_drop = gb.bind("to_drop");
+    gb.params.push(to_drop);
+    let groot = gb.block(&[], None);
+    let view = gb.view(DROP_IN_PLACE, groot);
+    let mut cx = InferCtx::new_in(alloc);
+    let checked = match blaze_typeck::check(&view, w, &mut cx, &Needs::new_in(alloc), alloc) {
+        Ok(Outcome::Done(c)) => c,
+        other => panic!("the check did not finish: {:?}", other.err()),
+    };
+    let sig = w.sig(DROP_IN_PLACE).expect("a signature");
+    let ty = ground.intern(t).expect("intern");
+    let args = ground.intern_list(&[ty]).expect("intern");
+    let mut subst = Subst { args: &[ty], ground, scratch: alloc };
+    let built = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: w, body: &gb }, Global)
+        .unwrap_or_else(|e| panic!("{e}"));
+    (args, built)
+}
+
+/// `let ref x = value_expr;` (such as std's Linux `weak!` macro `let ref gettid = { ... };`)
+/// materializes the initializer into a stack slot, extends its temporary lifetime to the
+/// enclosing block when it needs drop, and binds `ref` to the slot's address:
+/// ```text
+/// fn main() -> i32 {
+///     let ref a = { G { x: 7 } };
+///     let b = G { x: 9 };
+///     let ref c = { 40 + 2 };
+///     a.x * 100 + b.x * 10 + *c   // 790 + 42 = 832; drops b (9) then a's extended temp (7)
+/// }
+/// ```
+#[test]
+fn let_ref_over_value_extends_temporary() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], I32);
+    let g = g_world(&mut w);
+
+    let mut b = BodyBuf::new();
+    // let ref a = { G { x: 7 } };
+    let a = ref_bind(&mut b, "a");
+    let g7 = g_lit(&mut b, 7);
+    let g7_blk = b.block(&[], Some(g7));
+    // let b_var = G { x: 9 };
+    let b_var = b.bind("b");
+    let g9 = g_lit(&mut b, 9);
+    // let ref c = { 40 + 2 };
+    let c = ref_bind(&mut b, "c");
+    let forty = b.int(40, None);
+    let two = b.int(2, None);
+    let forty_two = b.bin(BinOp::Add, forty, two);
+    let c_blk = b.block(&[], Some(forty_two));
+    let stmts = [let_stmt(a, g7_blk), let_stmt(b_var, g9), let_stmt(c, c_blk)];
+    // a.x * 100 + b.x * 10 + *c
+    let a_e = b.local(a);
+    let a_x = b.field(a_e, "x");
+    let b_e = b.local(b_var);
+    let b_x = b.field(b_e, "x");
+    let c_e = b.local(c);
+    let star_c = b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: c_e });
+    let hundred = b.int(100, None);
+    let ten = b.int(10, None);
+    let a100 = b.bin(BinOp::Mul, a_x, hundred);
+    let b10 = b.bin(BinOp::Mul, b_x, ten);
+    let s1 = b.bin(BinOp::Add, a100, b10);
+    let sum = b.bin(BinOp::Add, s1, star_c);
+    let root = b.block(&stmts, Some(sum));
+
+    let mut ground = PortableTys::new_in(alloc);
+    let main = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
+    let (g_args, g_glue) = build_drop_glue_for(&w, &mut ground, g);
+
+    DROPPED.with(|d| d.borrow_mut().clear());
+    let ret = run_native_with(
+        &[(G_DROP, host_g_drop as usize as u64)],
+        &[
+            (DROP_IN_PLACE, Some(g_args), &g_glue),
+            (MAIN, None, &main),
+        ],
+    );
+    let seen = DROPPED.with(|d| d.borrow().clone());
+    assert_eq!(ret as u32, 832);
+    assert_eq!(seen.as_slice(), &[9, 7], "b drops before a's extended temporary");
 }

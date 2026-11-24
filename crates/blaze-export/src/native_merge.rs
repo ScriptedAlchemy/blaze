@@ -403,13 +403,14 @@ fn resolve_direct<'a>(
     let mut direct: AVec<'a, (u32, u64)> = Vec::new_in(alloc);
     let mut mangled: AVec<'_, u8> = Vec::new_in(alloc);
     for (k, import) in laid.imports.iter().enumerate() {
+        let raw_name = import.name.strip_prefix('\x02').unwrap_or(import.name);
         let needle: &[u8] = if add_underscore {
             mangled.clear();
             mangled.push(b'_');
-            mangled.extend_from_slice(import.name.as_bytes());
+            mangled.extend_from_slice(raw_name.as_bytes());
             &mangled[..]
         } else {
-            import.name.as_bytes()
+            raw_name.as_bytes()
         };
         if let Ok(i) = image.exports.binary_search_by(|&(name, _)| name.cmp(needle))
             && let Some(&(_, at)) = image.exports.get(i)

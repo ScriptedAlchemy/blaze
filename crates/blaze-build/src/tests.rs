@@ -2435,8 +2435,8 @@ fn a_static_and_a_thread_local_are_places() {
     w.func(1, "main", &[], U32);
     w.func(20, "N", &[], U32);
     w.func(21, "T", &[], U32);
-    w.statics.push((ItemKey(20), StaticItem { thread_local: false, mutable: true }));
-    w.statics.push((ItemKey(21), StaticItem { thread_local: true, mutable: false }));
+    w.statics.push((ItemKey(20), StaticItem { thread_local: false, mutable: true, extern_weak: false }));
+    w.statics.push((ItemKey(21), StaticItem { thread_local: true, mutable: false, extern_weak: false }));
     let mut b = BodyBuf::new();
     let n_path = b.path("N");
     let n_lhs = b.e(Expr::Path(n_path));
@@ -2457,6 +2457,27 @@ fn a_static_and_a_thread_local_are_places() {
     assert_eq!(built.thread_locals.as_slice(), &[ItemKey(21)]);
     // N is written once, through its address.
     assert_eq!(text.lines().filter(|l| l.contains("store")).count(), 1, "{text}");
+}
+
+/// An `#[linkage = "extern_weak"]` static's value IS the symbol's address (0 when undefined),
+/// never the bytes loaded from that address: reading it emits `data_addr` and zero `load`s.
+#[test]
+fn extern_weak_static_yields_symbol_address_without_load() {
+    let mut w = TestWorld::new();
+    let u8_ = w.ty(U8);
+    let ptr_u8 = PNode::Ptr(Mutbl::Not, u8_);
+    w.func(1, "main", &[], ptr_u8);
+    w.func(22, "WEAK_SYM", &[], ptr_u8);
+    w.statics.push((ItemKey(22), StaticItem { thread_local: false, mutable: false, extern_weak: true }));
+    let mut b = BodyBuf::new();
+    let path = b.path("WEAK_SYM");
+    let read = b.e(Expr::Path(path));
+    let root = b.block(&[], Some(read));
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    let text = blaze_lir::print(built.func.view());
+    assert!(text.contains("data_addr"), "{text}");
+    assert!(!text.contains("load"), "extern_weak static must not dereference symbol address:\n{text}");
+    assert_eq!(built.statics.as_slice(), &[ItemKey(22)]);
 }
 
 /// The record of one allocation of `bytes`, aligned to `2^align`, with no relocation.

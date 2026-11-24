@@ -193,3 +193,29 @@ fn let_chains_while_let_and_let_else_take_the_right_branch() {
     assert_eq!(run_native(&[(MAIN, &built)]) as u32, 340_760_448);
     let _ = built;
 }
+
+/// `let ref c = { 40 + 2 }; *c` materializes the value expression into a stack slot and binds
+/// `c` to its address (matching std's `weak!` macro `let ref sym = { ... };`).
+#[test]
+fn let_ref_over_value_expression_builds() {
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], U32);
+    let mut b = BodyBuf::new();
+    let c = b.pat(Pat::Bind {
+        ann: BindAnn { by_ref: Some(Mutbl::Not), mutable: false },
+        name: Name::of("c"),
+        sub: None,
+        ty: None,
+    });
+    let forty = b.int(40, None);
+    let two = b.int(2, None);
+    let sum = b.bin(BinOp::Add, forty, two);
+    let init = b.block(&[], Some(sum));
+    let c_use = b.local(c);
+    let deref = b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: c_use });
+    let root = b.block(&[Stmt::Let { pat: c, ty: None, init: Some(init), else_: None }], Some(deref));
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(run_native(&[(MAIN, &built)]) as u32, 42);
+    let _ = built;
+}

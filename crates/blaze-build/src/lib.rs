@@ -798,6 +798,9 @@ pub struct StaticItem {
     pub thread_local: bool,
     /// `static mut`.
     pub mutable: bool,
+    /// `#[linkage = "extern_weak"]` on an `extern` block's static: its value is the address of
+    /// the weak foreign symbol (null when undefined at link/load time), never a load from it.
+    pub extern_weak: bool,
 }
 
 /// A compiler intrinsic the build makes in place (module doc, "Intrinsics").

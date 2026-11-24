@@ -112,6 +112,16 @@ const DSO_HANDLE: &str = "__dso_handle";
 const ID_DOMAIN: &str = "blaze-export elf build id 1";
 
 /// Returns true if `name` is a standard C math symbol provided by `libm.so.6` on glibc Linux.
+/// Leading marker placed on `Space::Outside` names declared with `#[linkage = "extern_weak"]`.
+const WEAK_MARK: char = '\x02';
+
+fn split_weak(name: &str) -> (&str, bool) {
+    match name.strip_prefix(WEAK_MARK) {
+        Some(real) => (real, true),
+        None => (name, false),
+    }
+}
+
 fn is_libm_symbol(name: &str) -> bool {
     matches!(
         name,
@@ -254,7 +264,7 @@ pub fn write_native<'a>(
             return Some(target);
         }
         let idx = usize::try_from(import).ok()?;
-        if laid.imports.get(idx).is_some_and(|imp| imp.name == DSO_HANDLE) {
+        if laid.imports.get(idx).is_some_and(|imp| split_weak(imp.name).0 == DSO_HANDLE) {
             return dso_handle_at;
         }
         None
@@ -270,13 +280,14 @@ pub fn write_native<'a>(
         if direct(idx).is_none() {
             kept.push(idx);
             if let Some(imp) = laid.imports.get(k) {
-                if imp.name.starts_with("_Unwind_") {
+                let (sym_name, _) = split_weak(imp.name);
+                if sym_name.starts_with("_Unwind_") {
                     needs_gcc_s = true;
-                } else if is_libm_symbol(imp.name) {
+                } else if is_libm_symbol(sym_name) {
                     needs_libm = true;
                 }
             }
-        } else if laid.imports.get(k).is_some_and(|imp| imp.name == DSO_HANDLE) {
+        } else if laid.imports.get(k).is_some_and(|imp| split_weak(imp.name).0 == DSO_HANDLE) {
             needs_dso_handle = true;
         }
     }
@@ -343,13 +354,15 @@ pub fn write_native<'a>(
             return Err(ExportError::TooLarge { what: "a program import index", len: u64::from(idx) });
         };
         // `Elf64_Sym`: st_name, st_info, st_other, st_shndx (SHN_UNDEF), st_value, st_size.
+        let (sym_name, weak) = split_weak(import.name);
+        let info = if weak { (STB_WEAK << 4) | STT_NOTYPE } else { GLOBAL_FUNC };
         bytes::u32(&mut meta, u32_of(dynstr.len(), "DT_STRTAB offset")?);
-        bytes::u8(&mut meta, GLOBAL_FUNC);
+        bytes::u8(&mut meta, info);
         bytes::u8(&mut meta, 0);
         bytes::u16(&mut meta, 0);
         bytes::u64(&mut meta, 0);
         bytes::u64(&mut meta, 0);
-        dynstr.extend_from_slice(import.name.as_bytes());
+        dynstr.extend_from_slice(sym_name.as_bytes());
         dynstr.push(0);
     }
     let native_sym_base = 1u64 + u64_of(kept.len(), "ELF symbol count")?;
