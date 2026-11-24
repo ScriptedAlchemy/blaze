@@ -1,0 +1,19 @@
+{
+  "id": "fork-source-observer-command-lifetime-20261124",
+  "date": "2026-11-24",
+  "who": "GPT-6 Astra Pro, runtime repair lane",
+  "where": "harness/v2/exec_observer.py and exec_observer_child.py, source protocol CI receipt",
+  "what": "The source protocol observer always invoked the removed blaze stop command, so successful current source tests could not earn a complete execution receipt.",
+  "cost": "The active run/check/test/export CLI was incompatible with the observer's legacy daemon shutdown protocol.",
+  "cause": "The acceptance observer retained a command lifecycle from the deleted daemon CLI while its test commands were ported to the active source interface.",
+  "whys": [
+    "The source CLI no longer dispatches stop.",
+    "The supervisor still required a successful stop after every command sequence.",
+    "The workflow receipt and fixtures encoded that obsolete lifecycle instead of observed process termination."
+  ],
+  "class": "acceptance receipts coupled to a removed command lifecycle",
+  "prevention": "Schema 2 records actual command PIDs, exit statuses and timeout outcomes. The observer binds them to successful selected-executable launches and terminations in the kernel trace, requires every launched descendant to finish, and preserves the original command failure if descendant cleanup also times out. A fresh HOME and the source-supported resident-daemon opt-out prevent use of an unobserved resident daemon; all other helpers remain traced.",
+  "workaround": "None. Missing kernel tracing, incomplete descendants and old receipts still fail.",
+  "fix": "Prepared; 12 pure observer controls and 12 workflow receipt tests passed locally. Native controls could not start because this workspace denies PTRACE_TRACEME; their hosted execution remains required.",
+  "state": "open"
+}

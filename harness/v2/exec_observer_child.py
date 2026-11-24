@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Private traced supervisor for exec_observer.py; receives its exact saved input.
 
-Every selected command and the unconditional stop is a child of this process, so
-strace follows both the daemon and its late children until they have all exited.
-No pipe can stay open in a descendant and prevent writing the shutdown receipt.
+Every selected command is a child of this process. strace follows all its descendants,
+including detached helpers and their late children, until they have all exited. A
+receipt records command outcomes only; complete tree termination is the observer's job.
 """
 
 from __future__ import annotations
@@ -15,49 +15,61 @@ from pathlib import Path
 import subprocess
 import sys
 
-from exec_observer import Failed, Input, load
+from exec_observer import SCHEMA, SCOPE, Command, CommandResult, Failed, Input, load
 
 
-def command(given: Input, args: tuple[str, ...], log: Path, seconds: int) -> int:
+def command(given: Input, item: Command, log: Path) -> CommandResult:
     environment = dict(os.environ)
     environment["HOME"] = given.home
-    environment["BLAZE_HOME"] = given.home
-    environment["BLAZE_CACHE"] = str(Path(given.home) / "v2" / "store")
+    # daemon_client::try_run and spawn_detached_daemon honor this before connecting
+    # to or spawning the resident check daemon. Other helpers are still fully traced.
+    environment["BLAZE_NO_DAEMON"] = "1"
     # Keep machine-readable stdout intact; diagnostic stderr remains a separate full artifact.
     with log.open("xb") as output, log.with_suffix(".stderr").open("xb") as errors:
         try:
-            return subprocess.run([given.blaze, *args], cwd=given.cwd,
-                                  env=environment, stdin=subprocess.DEVNULL, stdout=output,
-                                  stderr=errors, timeout=seconds, check=False).returncode
-        except subprocess.TimeoutExpired:
-            return 124
+            process = subprocess.Popen([given.blaze, *item.args], cwd=given.cwd,
+                                       env=environment, stdin=subprocess.DEVNULL, stdout=output,
+                                       stderr=errors)
         except OSError as error:
             output.write(f"could not execute selected Blaze: {error}\n".encode())
-            return 127
+            return CommandResult(item.name, None, 127, False)
+        try:
+            status = process.wait(timeout=given.command_seconds)
+            return CommandResult(item.name, process.pid, status, False)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            status = process.wait(timeout=given.reap_seconds)
+            return CommandResult(item.name, process.pid, status, True)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                process.wait(timeout=given.reap_seconds)
 
 
 def main(given: Input) -> int:
     out = Path(given.out)
-    result: dict[str, object] = {"pid": os.getpid(), "commands": [], "stop": None, "complete": False}
+    result: dict[str, object] = {"schema": SCHEMA, "scope": SCOPE, "pid": os.getpid(),
+                                 "commands": [], "complete": False}
     rows: list[dict[str, object]] = []
     result["commands"] = rows
     status = 0
-    stop = 1
     try:
         for item in given.commands:
             print(f"observe {item.name}: {json.dumps(asdict(item))}", flush=True)
-            status = command(given, item.args, out / f"{item.name}.log", given.command_seconds)
-            rows.append({"name": item.name, "returncode": status})
+            outcome = command(given, item, out / f"{item.name}.log")
+            rows.append(asdict(outcome))
+            status = outcome.status
             if status != 0:
                 break
+        result["complete"] = True
     finally:
-        stop = command(given, ("stop",), out / "stop.log", given.stop_seconds)
-        result["stop"], result["complete"] = stop, True
-        with (out / "supervisor.json").open("x", encoding="utf-8") as output:
+        # Publication ends the command interval; no reader sees a partial receipt.
+        temporary = out / "supervisor.tmp"
+        with temporary.open("x", encoding="utf-8") as output:
             json.dump(result, output, sort_keys=True)
             output.write("\n")
-    code = status or stop
-    return code if code >= 0 else 128 - code
+        temporary.replace(out / "supervisor.json")
+    return status if status >= 0 else 128 - status
 
 
 if __name__ == "__main__":

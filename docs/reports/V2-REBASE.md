@@ -362,15 +362,18 @@ controls are in `crates/blaze-global/src/tests/download.rs`. Both the B0 partial
 50-name list and the source-built protocol receipt require these fourteen cases to report
 success; their execution on this changed tree is still pending.
 
-The Linux protocol job now sends its full library/integration command and daemon release
-controls through `harness/v2/exec_observer.py` in one fresh daemon home. Kernel fork/exec
-evidence extends through the selected compiler's stop and the end of every descendant.
-Client, engine and tracer identities are checked before and after; missing or incomplete
-evidence, a forbidden named-tool execution, a command failure or failed cleanup prevents the
-acceptance receipt. The scripts job has real-observer controls using harmless fake client
-and engine programs. This covers only wrapped Linux launches and observed executable names;
-other operating systems, unwrapped work, prior artifacts and renamed compiler programs are
-outside its claim. C4 remains open.
+The Linux protocol job sends its source test commands through `harness/v2/exec_observer.py`
+in one fresh HOME with `BLAZE_NO_DAEMON=1`, the resident check-daemon opt-out. Kernel fork/exec
+evidence extends through every command's actual exit and the end of every descendant,
+including other helpers. Schema 2 names this scope `linux-command-descendants-through-exit`;
+each claimed command PID and exit must match its successful selected-executable launch and
+termination in the trace. Source CLI, launcher, fact shim and tracer identities are checked
+before and after; missing or incomplete evidence, a forbidden named-tool execution, a command
+failure or failed cleanup prevents acceptance. A command's original failure survives a later
+descendant timeout. The scripts job has real-observer controls using harmless fake programs;
+those controls establish no source compiler or distributed-worker acceptance. The observer
+covers only wrapped Linux launches and observed executable names; other operating systems,
+unwrapped work, prior artifacts and renamed compiler programs are outside its claim. C4 remains open.
 
 The promotion smoke harness also binds selection, project specifications, fixture files and
 expected outputs to the named release commit's corpus, records its commit/tree/content digest,

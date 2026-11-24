@@ -555,11 +555,20 @@ jobs:
           result = json.loads((out / "result.json").read_text())
           supervisor = json.loads((out / "supervisor.json").read_text())
           packages = ["blaze-dist", "blaze-dist-local", "blaze-wire", "blaze-serve"]
-          if (result.get("schema") != 1 or result.get("passed") is not True or result.get("returncode") != 0
-                  or result.get("scope") != "linux-launched-descendants-through-blaze-stop"
-                  or supervisor.get("complete") is not True or supervisor.get("stop") != 0
-                  or supervisor.get("commands") != [{"name":name,"returncode":0} for name in packages]):
-              raise SystemExit("missing complete source protocol execution and shutdown evidence")
+          scope = "linux-command-descendants-through-exit"
+          commands = supervisor.get("commands")
+          if (result.get("schema") != 2 or result.get("passed") is not True or result.get("returncode") != 0
+                  or result.get("scope") != scope or result.get("command_status") != 0
+                  or result.get("environment", {}).get("BLAZE_NO_DAEMON") != "1"
+                  or supervisor.get("schema") != 2 or supervisor.get("scope") != scope
+                  or supervisor.get("complete") is not True or "stop" in supervisor
+                  or not isinstance(commands, list) or len(commands) != len(packages)
+                  or any(not isinstance(row, dict) or set(row) != {"name","pid","returncode","timed_out"}
+                         or row["name"] != name or type(row["pid"]) is not int or row["pid"] <= 0
+                         or row["returncode"] != 0 or row["timed_out"] is not False
+                         for row, name in zip(commands, packages))
+                  or result.get("commands") != commands):
+              raise SystemExit("missing complete source protocol launch, exit and descendant evidence")
           passed = []
           for package in packages:
               rows = [json.loads(line) for line in (out / (package + ".log")).read_text().splitlines() if line.strip()]

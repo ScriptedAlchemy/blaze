@@ -280,17 +280,25 @@ class AcceptanceGateTests(unittest.TestCase):
                 output=root/"output"
                 self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if wanted else "")
 
-    def test_source_protocol_needs_all_causal_cases_actual_execution_and_shutdown(self):
+    def test_source_protocol_needs_all_causal_cases_actual_launches_and_termination(self):
         packages=["blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"]
         for plant in (None,"missing-control","reused","filtered","not-built","empty-package",
-                      "failed-test","bad-stop","lost-trace","changed-binary"):
+                      "failed-test","old-schema","old-scope","missing-command-pid","timed-out",
+                      "bad-command","mismatched-command","missing-mode","lost-trace","changed-binary"):
             with self.subTest(plant=plant), tempfile.TemporaryDirectory() as directory:
                 root=Path(directory);env=self.fixture(root)
                 out=root/"dist-evidence/exec";out.mkdir()
-                (out/"result.json").write_text(json.dumps({"schema":1,"passed":plant != "lost-trace",
-                    "returncode":0,"scope":"linux-launched-descendants-through-blaze-stop"}))
-                (out/"supervisor.json").write_text(json.dumps({"complete":True,"stop":7 if plant == "bad-stop" else 0,
-                    "commands":[{"name":name,"returncode":0} for name in packages]}))
+                commands=[{"name":name,"pid":100+at,"returncode":0,"timed_out":False} for at,name in enumerate(packages)]
+                if plant == "missing-command-pid": commands[0].pop("pid")
+                elif plant == "timed-out": commands[0]["timed_out"]=True
+                elif plant == "bad-command": commands[0]["returncode"]=23
+                scope="linux-launched-descendants-through-blaze-stop" if plant == "old-scope" else "linux-command-descendants-through-exit"
+                (out/"result.json").write_text(json.dumps({"schema":1 if plant == "old-schema" else 2,
+                    "passed":plant != "lost-trace","returncode":0,"command_status":0,"scope":scope,
+                    "environment":{} if plant == "missing-mode" else {"BLAZE_NO_DAEMON":"1"},
+                    "commands":[] if plant == "mismatched-command" else commands}))
+                (out/"supervisor.json").write_text(json.dumps({"schema":2,"scope":scope,"complete":True,
+                    "commands":commands}))
                 for at,package in enumerate(packages):
                     names=CONTROLS[at::len(packages)]
                     if at == 0 and plant == "missing-control": names=names[1:]

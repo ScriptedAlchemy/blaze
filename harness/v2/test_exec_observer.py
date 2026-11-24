@@ -11,12 +11,14 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from dataclasses import asdict, replace
 from typing import cast
+from unittest.mock import patch
 
 import exec_observer as observer
 
@@ -124,17 +126,52 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 observer.load(json.dumps({**value, field: change}))
 
-    def test_command_failure_and_shutdown_failure_cannot_produce_a_success_receipt(self) -> None:
+    def test_command_outcomes_require_the_current_receipt_and_real_process_identity(self) -> None:
         given = observer.Input("/tmp/blaze", "/tmp", "/tmp/home", "/tmp/out",
                                (observer.Command("protocol", ("test",)),))
         receipt = self.root / "supervisor.json"
-        for command, stop, expected in ((23, 0, 23), (0, 7, 7), (23, 7, 23)):
-            receipt.write_text(json.dumps({"pid": 10, "complete": True, "stop": stop,
-                                          "commands": [{"name": "protocol", "returncode": command}]}))
-            self.assertEqual(observer.read_receipt(receipt, given), (10, expected))
-        receipt.write_text(json.dumps({"pid": 10, "complete": True, "stop": 0, "commands": []}))
+        def record(command: int, pid: int | None = 11, timed_out: bool = False) -> dict[str, object]:
+            return {"schema": observer.SCHEMA, "scope": observer.SCOPE, "pid": 10, "complete": True,
+                    "commands": [{"name": "protocol", "pid": pid, "returncode": command, "timed_out": timed_out}]}
+        for command, pid, timed_out, expected in ((0,11,False,0), (23,11,False,23),
+                                                  (-9,11,True,124), (127,None,False,127)):
+            receipt.write_text(json.dumps(record(command, pid, timed_out)))
+            self.assertEqual(observer.read_receipt(receipt, given).status, expected)
+        for invalid in ({**record(0), "schema": 1}, {**record(0), "scope": "through-stop"},
+                        record(0, None), record(0, 10), {**record(0), "stop": 0}):
+            receipt.write_text(json.dumps(invalid))
+            with self.assertRaises((observer.Failed, ValueError)):
+                observer.read_receipt(receipt, given)
+        receipt.write_text(json.dumps({**record(0), "commands": []}))
         with self.assertRaisesRegex(observer.Failed, "omitted"):
             observer.read_receipt(receipt, given)
+
+    def test_the_oracle_catches_a_missing_selected_launch_or_mismatched_claimed_exit(self) -> None:
+        command = observer.CommandResult("protocol", 11, 0, False)
+        receipt = observer.Receipt(10, (command,))
+        observer.verify_commands(self.inspect(), receipt, "/tmp/blaze")
+        for claimed in (23, -9):
+            with self.subTest(claimed=claimed), self.assertRaisesRegex(observer.Failed, "claimed exit"):
+                observer.verify_commands(self.inspect(), replace(receipt, commands=(replace(command, returncode=claimed),)), "/tmp/blaze")
+        for launched in (execute("/tmp/another"), execute("/tmp/blaze").replace(" = 0", " = -1 ENOENT (No such file)")):
+            self.traces[11] = launched + END
+            with self.subTest(launched=launched), self.assertRaisesRegex(observer.Failed, "no successful launch"):
+                observer.verify_commands(self.inspect(), receipt, "/tmp/blaze")
+
+    def test_a_command_failure_survives_a_later_descendant_deadline(self) -> None:
+        given = observer.Input("/tmp/blaze", "/tmp", "/tmp/home", str(self.root),
+                               (observer.Command("protocol", ("test",)),), command_seconds=10, reap_seconds=1)
+        class Running:
+            def wait(self, timeout: float) -> int:
+                raise subprocess.TimeoutExpired("tracer", timeout)
+        for command, expected in ((0,124), (23,23)):
+            (self.root / "supervisor.json").write_text(json.dumps({
+                "schema": observer.SCHEMA, "scope": observer.SCOPE, "pid": 10, "complete": True,
+                "commands": [{"name": "protocol", "pid": 11, "returncode": command, "timed_out": False}]}))
+            with patch.object(observer.time, "monotonic", side_effect=[0.0,0.0,2.0]):
+                with self.assertRaisesRegex(observer.Failed, "descendants after commands") as failed:
+                    observer.wait_tree(cast(subprocess.Popen[bytes], Running()), given)
+            self.assertEqual(failed.exception.code, expected)
 
 
 FAKE_BLAZE = r'''#!PYTHON
@@ -145,43 +182,46 @@ import subprocess
 import sys
 import time
 
-home = Path(os.environ["BLAZE_HOME"])
+home = Path(os.environ["HOME"])
+assert os.environ.get("BLAZE_NO_DAEMON") == "1"
 tools = Path(__file__).parent
 action = sys.argv[1]
 if action == "stop":
-    if (home / "stop-fails").exists():
-        sys.exit(7)
-    if (home / "daemon.pid").exists():
-        os.kill(int((home / "daemon.pid").read_text()), signal.SIGTERM)
-    sys.exit(0)
+    (home / "obsolete-stop").write_text("called")
+    sys.exit(7)
 if action == "fail":
     sys.exit(23)
-if action == "stop-fails":
-    (home / "stop-fails").write_text("yes")
-elif action == "absolute":
+if action == "absolute":
     subprocess.run([str(tools / "rustc")], check=True)
 elif action == "descriptor":
     fd = os.open(tools / "rustdoc", os.O_RDONLY)
     os.execve(fd, ["unrelated-argv-zero"], dict(os.environ))
-elif action in ("late", "leak"):
+elif action in ("late", "leak", "fail-leak"):
     read, write = os.pipe()
     child = os.fork()
     if child == 0:
         os.close(read)
         os.setsid()
-        def stopped(_number, _frame):
-            if action == "late":
-                subprocess.run([str(tools / "cargo")], check=True)
-                os._exit(0)
-        signal.signal(signal.SIGTERM, stopped)
         (home / "daemon.pid").write_text(str(os.getpid()))
         os.write(write, b"ready")
         os.close(write)
-        time.sleep(60)
+        if action == "late":
+            receipt = home.parent / "evidence" / "supervisor.json"
+            deadline = time.monotonic() + 5
+            while not receipt.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert receipt.exists()
+            subprocess.run([str(tools / "cargo")], check=True)
+        else:
+            time.sleep(60)
         os._exit(0)
     os.close(write)
     assert os.read(read, 5) == b"ready"
     os.close(read)
+    if action == "fail-leak":
+        sys.exit(23)
+elif action == "slow":
+    time.sleep(60)
 elif action == "drift":
     with (tools / "blaze-fact-shim").open("ab") as output:
         output.write(b"changed")
@@ -213,7 +253,7 @@ class NativeObserverTests(unittest.TestCase):
             shutil.copy2(true, binary / name)
         self.given = observer.Input(str(binary / "blaze"), str(self.root), str(self.root / "home"),
                                     str(self.root / "evidence"), (observer.Command("control", ("pass",)),),
-                                    command_seconds=10, stop_seconds=5, reap_seconds=1)
+                                    command_seconds=10, reap_seconds=1)
 
     def run_case(self, action: str) -> tuple[int, dict[str, object]]:
         given = replace(self.given, commands=(observer.Command("control", (action,)),))
@@ -222,11 +262,19 @@ class NativeObserverTests(unittest.TestCase):
         value: object = json.loads((Path(given.out) / "result.json").read_text())
         return code, cast(dict[str, object], value)
 
-    def test_native_positive_control_covers_the_selected_command_and_stop(self) -> None:
+    def test_native_positive_control_observes_command_exit_without_an_obsolete_stop(self) -> None:
         code, result = self.run_case("pass")
         self.assertEqual(code, 0, result)
         self.assertIs(result["passed"], True)
-        self.assertTrue((Path(self.given.out) / "stop.log").exists())
+        self.assertEqual(result["schema"], 2)
+        self.assertEqual(result["scope"], "linux-command-descendants-through-exit")
+        self.assertFalse((Path(self.given.out) / "stop.log").exists())
+        self.assertFalse((Path(self.given.home) / "obsolete-stop").exists())
+        commands = cast(list[dict[str, object]], result["commands"])
+        self.assertEqual(len(commands), 1)
+        self.assertIsInstance(commands[0]["pid"], int)
+        self.assertEqual(commands[0]["returncode"], 0)
+        self.assertIs(commands[0]["timed_out"], False)
 
     def test_the_native_oracle_catches_an_absolute_short_lived_compiler(self) -> None:
         code, result = self.run_case("absolute")
@@ -243,10 +291,10 @@ class NativeObserverTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("forbidden compiler", str(result))
 
-    def test_the_native_oracle_catches_a_descendant_left_after_successful_stop(self) -> None:
+    def test_the_native_oracle_catches_a_descendant_left_after_command_exit(self) -> None:
         code, result = self.run_case("leak")
         self.assertEqual(code, 124)
-        self.assertIn("descendants after Blaze stop", str(result))
+        self.assertIn("descendants after commands", str(result))
         # Refusal alone is insufficient: removing strace's EXITKILL would refuse
         # but leave this deliberately detached daemon alive after the tracer died.
         pid = int((Path(self.given.home) / "daemon.pid").read_text())
@@ -267,9 +315,18 @@ class NativeObserverTests(unittest.TestCase):
         self.assertEqual(code, 23, result)
         self.assertIs(result["passed"], False)
 
-    def test_the_native_oracle_catches_failed_shutdown(self) -> None:
-        code, result = self.run_case("stop-fails")
-        self.assertEqual(code, 7, result)
+    def test_the_native_oracle_preserves_command_failure_when_cleanup_also_fails(self) -> None:
+        code, result = self.run_case("fail-leak")
+        self.assertEqual(code, 23, result)
+        self.assertIn("descendants after commands", str(result))
+
+    def test_the_native_oracle_records_the_actual_exit_after_command_timeout(self) -> None:
+        self.given = replace(self.given, command_seconds=1)
+        code, result = self.run_case("slow")
+        self.assertEqual(code, 124, result)
+        commands = cast(list[dict[str, object]], result["commands"])
+        self.assertEqual(commands[0]["returncode"], -9)
+        self.assertIs(commands[0]["timed_out"], True)
 
     def test_the_native_oracle_catches_compiler_identity_drift(self) -> None:
         code, result = self.run_case("drift")

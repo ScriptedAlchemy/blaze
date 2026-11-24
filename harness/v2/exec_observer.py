@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Observe a selected Blaze's complete Linux process tree, including its shutdown.
+"""Observe a selected source Blaze's complete Linux process tree through termination.
 
 One JSON object (inline, a path, or `-`), compatible with Python 3.10:
     blaze, cwd, home, out  absolute paths; home and out must not exist
     commands              [{"name": "protocol", "args": ["test", ...]}, ...]
     command_seconds       positive bound per command (4500)
-    stop_seconds          positive bound for the selected Blaze's stop (60)
-    reap_seconds          positive bound after stop for every descendant to exit (30)
+    reap_seconds          positive bound after commands for every descendant to exit (30)
     tracer                absolute strace executable (/usr/bin/strace)
     shelf                 optional absolute canonical shelf to copy into the new HOME
 
 The source CLI, launcher and fact shim are SHA-256 bound before and after the run. The
-helper uses a new private BLAZE_HOME/store, and runs stop in
-the traced tree even when a command fails. HOME and the sandbox are unchanged.
+helper uses a new private HOME/store and BLAZE_NO_DAEMON=1, the source CLI's resident
+check-daemon opt-out. Every other helper remains subject to the full descendant bound.
+Each selected command's successful launch and actual exit must match its kernel trace;
+there is no synthetic shutdown command or success receipt.
 
 Linux strace 6.8's launch-only -ff and --kill-on-exit use kernel fork/clone/exec
 events and PTRACE_O_EXITKILL; a detached daemon remains traced. No PATH wrapper,
@@ -41,6 +42,8 @@ from typing import cast
 
 
 SCRIPT = "exec_observer.py"
+SCHEMA = 2
+SCOPE = "linux-command-descendants-through-exit"
 HERE = Path(__file__).resolve().parent
 FORBIDDEN = frozenset(("cargo", "rustc", "rustdoc"))
 MAX_TRACE_BYTES = 128 * 1024 * 1024
@@ -75,10 +78,31 @@ class Input:
     out: str
     commands: tuple[Command, ...]
     command_seconds: int = 4500
-    stop_seconds: int = 60
     reap_seconds: int = 30
     tracer: str = "/usr/bin/strace"
     shelf: str | None = None
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    name: str
+    pid: int | None
+    returncode: int
+    timed_out: bool
+
+    @property
+    def status(self) -> int:
+        return 124 if self.timed_out else self.returncode
+
+
+@dataclass(frozen=True)
+class Receipt:
+    pid: int
+    commands: tuple[CommandResult, ...]
+
+    @property
+    def status(self) -> int:
+        return next((command.status for command in self.commands if command.status != 0), 0)
 
 
 def mapping(value: object, names: set[str], where: str) -> dict[str, object]:
@@ -142,7 +166,6 @@ def load(value: str) -> Input:
         out=path_value(given.get("out"), "out"),
         commands=tuple(commands),
         command_seconds=seconds(given.get("command_seconds", 4500), "command_seconds"),
-        stop_seconds=seconds(given.get("stop_seconds", 60), "stop_seconds"),
         reap_seconds=seconds(given.get("reap_seconds", 30), "reap_seconds"),
         tracer=path_value(given.get("tracer", "/usr/bin/strace"), "tracer"),
         shelf=path_value(given["shelf"], "shelf") if given.get("shelf") is not None else None,
@@ -227,6 +250,7 @@ class Trace:
     moved_call: str | None = None
     resumed: list[tuple[int, int, str]] = field(default_factory=list[tuple[int, int, str]])
     ended: bool = False
+    terminal: str | None = None
 
 
 def parse_trace(pid: int, data: str) -> Trace:
@@ -255,6 +279,7 @@ def parse_trace(pid: int, data: str) -> Trace:
             if pending is not None or switched is not None:
                 raise Failed(f"{where}: process ended with an incomplete syscall")
             result.ended = True
+            result.terminal = line
             continue
         if match := RESUMED.fullmatch(line):
             if switched is not None:
@@ -346,7 +371,31 @@ def inspect_traces(directory: Path, root_pid: int, python: str) -> dict[str, obj
         raise Failed("execution tracing did not begin at the supervised helper's launch")
     if violations:
         raise Failed("forbidden compiler execution: " + "; ".join(violations))
-    return {"processes": len(traces), "creations": forks, "bytes": total, "executions": executions}
+    return {"processes": len(traces), "creations": forks, "bytes": total, "executions": executions,
+            "terminations": {str(pid): trace.terminal for pid, trace in traces.items() if trace.ended}}
+
+
+def verify_commands(trace: dict[str, object], receipt: Receipt, blaze: str) -> None:
+    """A command receipt cannot substitute for the selected executable's kernel events."""
+    executions = cast(list[dict[str, object]], trace["executions"])
+    terminations = cast(dict[str, str], trace["terminations"])
+    for command in receipt.commands:
+        if command.pid is None:
+            # A failed spawn has no child to bind, and its nonzero status still refuses the run.
+            continue
+        if not any(item["pid"] == command.pid and item["path"] == blaze
+                   and item["succeeded"] is True for item in executions):
+            raise Failed(f"command {command.name} pid {command.pid} has no successful launch of {blaze}")
+        terminal = terminations.get(str(command.pid))
+        if command.returncode >= 0:
+            matched = terminal == f"+++ exited with {command.returncode} +++"
+        else:
+            signame = signal.Signals(-command.returncode).name
+            matched = terminal is not None and re.fullmatch(
+                rf"\+\+\+ killed by {signame}(?: \(core dumped\))? \+\+\+", terminal) is not None
+        if not matched:
+            raise Failed(f"command {command.name} pid {command.pid} claimed exit {command.returncode}, "
+                         f"but its trace ended {terminal!r}")
 
 
 def tracer_argv(given: Input, config: Path, python: str) -> list[str]:
@@ -373,56 +422,69 @@ def interrupted(number: int, _frame: object) -> None:
 
 
 def wait_tree(process: subprocess.Popen[bytes], given: Input) -> int:
-    """Bound the commands, and start the separate descendant bound after stop."""
-    total = len(given.commands) * given.command_seconds + given.stop_seconds + given.reap_seconds
+    """Bound the commands, then every remaining descendant after their receipt is published."""
+    total = len(given.commands) * given.command_seconds + given.reap_seconds
     deadline = time.monotonic() + total
     receipt = Path(given.out) / "supervisor.json"
-    stopping = False
+    draining = False
     while True:
         now = time.monotonic()
-        if not stopping and receipt.exists():
+        if not draining and receipt.exists():
             deadline = min(deadline, now + given.reap_seconds)
-            stopping = True
+            draining = True
         left = deadline - now
         if left <= 0:
-            phase = "descendants after Blaze stop" if stopping else "commands and shutdown"
-            raise Failed(f"execution tree exceeded its bound waiting for {phase}", 124)
+            phase = "descendants after commands" if draining else "commands and descendants"
+            why = f"execution tree exceeded its bound waiting for {phase}"
+            if draining:
+                status = read_receipt(receipt, given).status
+                if status != 0:
+                    raise Failed(f"selected Blaze command failed with status {status}; {why}", status)
+            raise Failed(why, 124)
         try:
             return process.wait(timeout=min(left, 0.1))
         except subprocess.TimeoutExpired:
             pass
 
 
-def read_receipt(path: Path, given: Input) -> tuple[int, int]:
+def read_receipt(path: Path, given: Input) -> Receipt:
     value: object = json.loads(path.read_text(encoding="utf-8"))
-    receipt = mapping(value, {"pid", "commands", "stop", "complete"}, "supervisor receipt")
+    receipt = mapping(value, {"schema", "scope", "pid", "commands", "complete"}, "supervisor receipt")
     pid = receipt.get("pid")
-    if type(pid) is not int or pid <= 0 or receipt.get("complete") is not True:
+    if (type(pid) is not int or pid <= 0 or receipt.get("complete") is not True
+            or receipt.get("schema") != SCHEMA or receipt.get("scope") != SCOPE):
         raise Failed("supervised process has no complete receipt")
     rows = receipt.get("commands")
     if not isinstance(rows, list):
         raise Failed("supervised process has no command outcomes")
     outcomes = cast(list[object], rows)
+    commands: list[CommandResult] = []
+    seen: set[int] = {pid}
     code = 0
     for index, value in enumerate(outcomes):
-        row = mapping(value, {"name", "returncode"}, "command receipt")
+        row = mapping(value, {"name", "pid", "returncode", "timed_out"}, "command receipt")
         if index >= len(given.commands) or row.get("name") != given.commands[index].name:
             raise Failed("supervised command receipt changed the command sequence")
         status = row.get("returncode")
-        if type(status) is not int:
+        child, timed_out = row.get("pid"), row.get("timed_out")
+        if type(status) is not int or not -signal.NSIG < status <= 255 or type(timed_out) is not bool:
             raise Failed("supervised command has no exit status")
-        if status != 0:
-            code = status
+        if child is None:
+            if status != 127 or timed_out:
+                raise Failed("supervised command has no launched process")
+        elif type(child) is not int or child <= 0 or child in seen:
+            raise Failed("supervised commands do not name distinct launched processes")
+        else:
+            seen.add(child)
+        command = CommandResult(given.commands[index].name, child, status, timed_out)
+        commands.append(command)
+        if command.status != 0:
+            code = command.status
             if index + 1 != len(outcomes):
                 raise Failed("supervised command sequence continued after failure")
     if len(outcomes) != len(given.commands) and code == 0:
         raise Failed("supervised command receipt omitted a required command")
-    stop = receipt.get("stop")
-    if type(stop) is not int:
-        raise Failed("supervised command receipt has no shutdown status")
-    if code == 0:
-        code = stop
-    return pid, code
+    return Receipt(pid, tuple(commands))
 
 
 def observe(given: Input) -> int:
@@ -456,7 +518,7 @@ def observe(given: Input) -> int:
     config.write_text(json.dumps(asdict(given), indent=2) + "\n", encoding="utf-8")
     python = str(Path(sys.executable).resolve(strict=True))
     record: dict[str, object] = {
-        "schema": 1, "scope": "linux-launched-descendants-through-blaze-stop",
+        "schema": SCHEMA, "scope": SCOPE, "environment": {"HOME": given.home, "BLAZE_NO_DAEMON": "1"},
         "compiler": identity, "tracer_sha256": tracer_identity, "passed": False,
     }
     process: subprocess.Popen[bytes] | None = None
@@ -472,11 +534,14 @@ def observe(given: Input) -> int:
             status = wait_tree(process, given)
         if (out / "tracer.log").stat().st_size:
             raise Failed("strace reported a diagnostic; execution evidence is not complete (see tracer.log)")
-        pid, command_status = read_receipt(out / "supervisor.json", given)
-        record["trace"] = inspect_traces(out, pid, python)
-        record["command_status"] = command_status
-        if command_status != 0:
-            raise Failed(f"selected Blaze command or shutdown failed with status {command_status}", command_status)
+        receipt = read_receipt(out / "supervisor.json", given)
+        trace = inspect_traces(out, receipt.pid, python)
+        verify_commands(trace, receipt, given.blaze)
+        record["trace"] = trace
+        record["commands"] = [asdict(command) for command in receipt.commands]
+        record["command_status"] = receipt.status
+        if receipt.status != 0:
+            raise Failed(f"selected Blaze command failed with status {receipt.status}", receipt.status)
         if status != 0:
             raise Failed(f"execution tracer exited with status {status}", status)
     except Failed as error:
