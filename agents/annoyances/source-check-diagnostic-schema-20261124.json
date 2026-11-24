@@ -9,13 +9,13 @@
   "class": "a receipt matcher and its stand-in agree on a stale producer schema",
   "prevention": "Anchor the positive fixture to the observed source JSON and canonical body-finding/report-printer contract. Require the types category plus the specific unresolved-path detail, planted function and source location, error severity, exit 1, exactly one error and no unchecked items. Keep negative controls for unrelated errors and incomplete or failed checks.",
   "workaround": "None. The real invalid program must still fail for the planted undefined function; a generic types error or nonzero exit cannot satisfy the control.",
-  "fix": "Aligned the matcher and process fixture with the source schema. The exact saved CI invalid receipt fails the old matcher and passes the revised one; all nine local smoke-harness controls pass, including independent wrong-code, detail, symbol, span, severity, summary and status controls. The complete exact-tree source smoke remains required.",
-  "state": "open",
+  "fix": "Aligned the matcher and process fixture with the source schema. The exact saved CI invalid receipt fails the old matcher and passes the revised one; all nine local smoke-harness controls pass, including independent wrong-code, detail, symbol, span, severity, summary and status controls. On exact tree 82cc34a97458a3c996a3870546d6cb990386d921 the real invalid phase passed with exit 1 and its precise E0425 finding, restored source printed 7, and complete check returned zero errors and no unchecked items. The later export phase exposed a separate AArch64 128-bit C ABI refusal.",
+  "state": "fixed",
   "evidence": {
-    "head": "2fa426d1436597fed55b8decb437db5e54480495",
-    "tree": "57c5ea0b381a9e0ecdf1cd86953f45db76ebb86f",
-    "run": 45354438642,
-    "artifact": 14903146677,
-    "sha256": "e1e9e3c6c39683b7992abd371643ec8a2c3b1eb3960d1ff8802c1eb10f132946"
+    "head": "cf20ef262fe07e8aed3f087d29753a22c01e1bea",
+    "tree": "82cc34a97458a3c996a3870546d6cb990386d921",
+    "run": 45358330723,
+    "artifact": 14904786480,
+    "sha256": "84c8a74996d6d97d116143ada249649aeafdb4aab450517280b01c224ead3475"
   }
 }

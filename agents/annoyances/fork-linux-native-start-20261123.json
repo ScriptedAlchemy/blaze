@@ -13,14 +13,14 @@
   ],
   "class": "a platform's native record producer and reader exist without an executed launcher contract",
   "prevention": "Complete the existing shared-object path with one owned process-argument view, binding before ordered constructors, and explicit control-thread shutdown on refusal. Exercise real generated ELF images through DlNatives on Linux ARM64, retain named failures and the source smoke, and refuse TLS templates with post-load Rust-pointer patches until those pointers can be bound before TLS copies are made.",
-  "workaround": "None. The native-image requirement and smoke failure remain visible until the implementation executes successfully.",
-  "fix": "Implemented the shared-object startup path, process-owned constructor/main arguments and libc environment alias, stop/join on initializer refusal, and loader-metadata validation that refuses Rust pointer cells in TLS. At tree 57c5ea0b381a9e0ecdf1cd86953f45db76ebb86f all seven real Linux native-load tests, five load-core tests and new argument/atexit/cleanup controls passed; the release source CLI then passed cold, warm and edited hello runs. Three existing stub tests exposed independent process-wide wait-driver initialization, recorded in native-test-wait-driver-20261124. The remaining source smoke stopped on the stale invalid-diagnostic matcher recorded in source-check-diagnostic-schema-20261124; later phases and the final exact-tree replay remain required.",
-  "state": "open",
+  "workaround": "None. The native-image requirement is retained, and unsupported post-load Rust pointer patches in TLS remain typed refusals.",
+  "fix": "Implemented the shared-object startup path, process-owned constructor/main arguments and libc environment alias, stop/join on initializer refusal, and loader-metadata validation that refuses Rust pointer cells in TLS. Exact tree 82cc34a97458a3c996a3870546d6cb990386d921 passed all 137 launcher tests: 125 library, five load-core and seven real Linux native-loader tests. Its release source CLI passed cold, warm and edited hello runs, rejected the planted invalid source, recovered to output 7, and completed check with no errors or unchecked items. The shared wait-driver and diagnostic-matcher findings are fixed in their own cause records. Export then reached a separate AArch64 128-bit C ABI refusal; that later phase is not claimed as passed.",
+  "state": "fixed",
   "evidence": {
-    "head": "841e7b8c8df7010fcafc1bd1205372290f02ce6a",
-    "tree": "e525abcbfcaa6f0754db8374893f457a501feae6",
-    "run": 45347130082,
-    "artifact": 14899034030,
-    "sha256": "f6fd94d5a4ea887a8b936492c71a41b7ee967c28bc502f05f1a71858c813f33e"
+    "head": "cf20ef262fe07e8aed3f087d29753a22c01e1bea",
+    "tree": "82cc34a97458a3c996a3870546d6cb990386d921",
+    "run": 45358330723,
+    "artifact": 14904786480,
+    "sha256": "84c8a74996d6d97d116143ada249649aeafdb4aab450517280b01c224ead3475"
   }
 }
