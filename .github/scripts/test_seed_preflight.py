@@ -32,10 +32,17 @@ def action_step(name, path=ACTION):
     if len(matches) != 1:
         raise AssertionError(f"{path} needs one {name} step")
     start = matches[0] + 1
-    while start < len(lines) and lines[start].strip() != "run: |":
+    while start < len(lines) and not lines[start].strip().startswith("run:"):
         if lines[start].lstrip().startswith("- "):
             raise AssertionError(f"{name} has no shell body")
         start += 1
+    if start == len(lines):
+        raise AssertionError(f"{name} has no shell body")
+    value = lines[start].strip().removeprefix("run:").strip()
+    if value != "|":
+        if value.startswith("'") and value.endswith("'"):
+            value = value[1:-1].replace("''", "'")
+        return value + "\n"
     indent = len(lines[start]) - len(lines[start].lstrip()) + 2
     body = []
     for line in lines[start + 1:]:
@@ -739,99 +746,65 @@ class WorkspaceScopeTests(unittest.TestCase):
                 preflight.load(json.dumps({**raw, "scope": {**raw["scope"], **changes}}))
 
 
-class WorkspaceScopeWiringTests(unittest.TestCase):
+class CompilerWorkflowWiringTests(unittest.TestCase):
     def fixture(self, root, *, fail="", code=0):
         (root / "bin").mkdir()
-        (root / ".github/scripts").mkdir(parents=True)
-        (root / "tmp").mkdir()
-        target = root / "target with spaces"
-        (target / "debug").mkdir(parents=True)
-        astlog = target / "debug/astlog"
-        astlog.write_text("#!/bin/sh\nexit 0\n")
-        astlog.chmod(0o700)
-        # The real shell hands a typed argv to its supervisor. The fixture executes
-        # that argv directly; cap/identity refusal is exercised by the entry tests.
-        (root / ".github/scripts/seed_preflight.py").write_text('''
-import json, os, pathlib, subprocess, sys
-given = json.load(sys.stdin)
-pathlib.Path(os.environ["SCOPE_INPUT"]).write_text(json.dumps(given))
-sys.exit(subprocess.run(given["scope"]["command"], check=False, timeout=10).returncode)
-''')
+        (root / "pins").mkdir()
+        (root / "pins/toolchain").write_text("nightly-fixture\n")
         program = root / "command.py"
         program.write_text('''
 import json, os, pathlib, sys
 name, *args = sys.argv[1:]
 with pathlib.Path(os.environ["TRACE"]).open("a") as out:
     out.write(json.dumps([name, *args]) + "\\n")
-if name == "changed":
-    print("--workspace")
-if name == "jq":
-    print(json.dumps({"astlog": args[args.index("--arg")+2]}))
-which = ("all-targets" if "--all-targets" in args else "check") if name == "blaze" and args[0] == "check" else name
-sys.exit(int(os.environ["FAIL_CODE"]) if which == os.environ["FAIL_STAGE"] else 0)
+sys.exit(int(os.environ["FAIL_CODE"]) if name == os.environ["FAIL_STAGE"] else 0)
 ''')
-        for name in ("blaze", "git", "changed", "jq", "build.sh"):
+        for name in ("cargo", "ci_test", "build.sh"):
             exe = root / "bin" / name
             exe.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " -I "
                            + shlex.quote(str(program)) + " " + shlex.quote(name) + ' "$@"\n')
             exe.chmod(0o700)
-        python = root / "bin/python3"
-        python.write_text("#!/bin/sh\nif [ \"${1:-}\" = tools/astlog/scan.py ]; then exec "
-                          + shlex.quote(sys.executable) + " -I " + shlex.quote(str(program))
-                          + ' scan "$@"; fi\nexec ' + shlex.quote(sys.executable) + ' -I "$@"\n')
-        python.chmod(0o700)
         env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ.get("PATH", ""),
-                   BASE="", RUNNER_TEMP=str(root / "tmp"), GITHUB_WORKSPACE=str(root),
-                   GITHUB_ENV=str(root / "github-env"), CARGO_TARGET_DIR=str(target),
-                   BLAZE_SCRIPTS=str(root / "bin"), BLAZE_DAEMON_MEMORY_GB="6",
-                   SCOPE_INPUT=str(root / "scope-input.json"), TRACE=str(root / "trace.jsonl"),
+                   BLAZE_SCRIPTS=str(root / "bin"), TRACE=str(root / "trace.jsonl"),
                    FAIL_STAGE=fail, FAIL_CODE=str(code), GITHUB_ACTION_PATH=str(root / "bin"),
                    SCRIPT_DIR=str(root / "scripts with spaces"), SCRIPT_KEY="literal-$key")
-        return env, target
+        return env
 
     def trace(self, root):
         return [json.loads(line) for line in (root / "trace.jsonl").read_text().splitlines()]
 
-    def test_no_narrow_check_still_runs_whole_workspace_all_targets_and_astlog(self):
+    def test_workspace_commands_keep_locked_all_targets_and_propagate_failures(self):
         workflow = SCRIPT.parents[1] / "workflows/blaze.yaml"
-        body = action_step("workspace compiler checks in an owned bounded user scope", workflow)
-        for fail, code in (("", 0), ("check", 23), ("all-targets", 29), ("scan", 31)):
-            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                env, target = self.fixture(root, fail=fail, code=code)
-                done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=root,
-                                      env=env, text=True, capture_output=True, timeout=15)
-                self.assertEqual(done.returncode, code, done.stdout + done.stderr)
-                trace = self.trace(root)
-                wanted = [["blaze", "check", "--workspace", "--message-format", "short", "--target-dir", str(target)]]
-                if fail != "check":
-                    wanted.append(["blaze", "check", "--workspace", "--all-targets", "--message-format", "short",
-                                   "--target-dir", str(target)])
-                if fail not in ("check", "all-targets"):
-                    wanted.append(["blaze", "build", "-p", "astlog", "--target-dir", str(target)])
-                self.assertEqual([row for row in trace if row[0] == "blaze"], wanted)
-                self.assertEqual(any(row[0] == "scan" for row in trace), fail not in ("check", "all-targets"))
-                given = json.loads((root / "scope-input.json").read_text())
-                self.assertEqual(given["scope"]["memory_gb"], "6")
-
-    def test_script_cache_miss_preserves_build_argv_and_failure_in_either_explicit_mode(self):
-        action = SCRIPT.parents[1] / "actions/script/action.yml"
-        body = action_step("build missing scripts", action)
-        for budget in ("", "6"):
-            for code in (0, 37):
-                with self.subTest(budget=budget, code=code), tempfile.TemporaryDirectory() as directory:
+        commands = (
+            ("cargo check --workspace --exclude blaze-std --all-targets",
+             ["cargo", "+nightly-fixture", "check", "--locked", "--workspace", "--exclude",
+              "blaze-std", "--all-targets", "--message-format", "short"]),
+            ("cargo test --workspace --exclude blaze-std", ["ci_test", '{"exclude": ["blaze-std"]}']),
+        )
+        for name, wanted in commands:
+            body = action_step(name, workflow)
+            for code in (0, 23):
+                with self.subTest(name=name, code=code), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
-                    env, _ = self.fixture(root, fail="build.sh", code=code)
-                    env["SCOPE_MEMORY_GB"] = budget
+                    env = self.fixture(root, fail=wanted[0], code=code)
                     done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=root,
                                           env=env, text=True, capture_output=True, timeout=15)
                     self.assertEqual(done.returncode, code, done.stdout + done.stderr)
-                    self.assertEqual(self.trace(root), [["build.sh", env["SCRIPT_DIR"], env["SCRIPT_KEY"]]])
-                    self.assertEqual((root / "scope-input.json").exists(), bool(budget))
-                    if budget:
-                        given = json.loads((root / "scope-input.json").read_text())
-                        self.assertEqual(given["scope"]["command"],
-                                         [str(root / "bin/build.sh"), env["SCRIPT_DIR"], env["SCRIPT_KEY"]])
+                    self.assertEqual(self.trace(root), [wanted])
+
+    def test_script_cache_miss_preserves_build_argv_and_failure(self):
+        action = SCRIPT.parents[1] / "actions/script/action.yml"
+        body = action_step("build missing scripts", action)
+        body = body.replace("${{ steps.key.outputs.dir }}", "$SCRIPT_DIR")
+        body = body.replace("${{ steps.key.outputs.key }}", "$SCRIPT_KEY")
+        for code in (0, 37):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                env = self.fixture(root, fail="build.sh", code=code)
+                done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=root,
+                                      env=env, text=True, capture_output=True, timeout=15)
+                self.assertEqual(done.returncode, code, done.stdout + done.stderr)
+                self.assertEqual(self.trace(root), [["build.sh", env["SCRIPT_DIR"], env["SCRIPT_KEY"]]])
 
 
 if __name__ == "__main__":

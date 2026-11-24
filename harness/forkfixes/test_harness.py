@@ -198,7 +198,7 @@ class HarnessChecks(unittest.TestCase):
                 with patch.object(runner, "command", side_effect=fake_command):
                     self.assertEqual(runner.run_case(daemon, case)[0], expected)
 
-    def test_all_blaze_commands_ignore_pins_and_fresh_fixtures_can_write_locks(self):
+    def test_all_blaze_commands_use_selected_binary_and_fresh_fixtures_can_write_locks(self):
         case = {"name": "reject", "files": {"src/main.rs": "invalid"}, "diagnostic": "E0252"}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -229,10 +229,10 @@ class HarnessChecks(unittest.TestCase):
                 daemon.start()
                 self.assertTrue(runner.run_case(daemon, case)[0])
                 daemon.stop()
-                self.assertEqual(spawn.call_args.args[0], ["fake", "--ignore-pin", "serve"])
+                self.assertEqual(spawn.call_args.args[0], ["fake", "serve"])
                 self.assertEqual(spawn.call_args.kwargs["env"]["BLAZE_LOCK"], "write")
-            self.assertEqual({argv[2] for argv in commands}, {"status", "build", "stop"})
-            self.assertTrue(all(argv[:2] == ["fake", "--ignore-pin"] for argv in commands))
+            self.assertEqual({argv[1] for argv in commands}, {"status", "build", "stop"})
+            self.assertTrue(all(argv[0] == "fake" for argv in commands))
 
     def test_replay_checks_library_bytes_and_the_complete_artifact_set(self):
         case = {"name": "replay", "files": {"src/main.rs": "fn main() {}"},

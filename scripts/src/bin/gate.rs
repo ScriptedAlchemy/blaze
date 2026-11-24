@@ -460,7 +460,9 @@ fn selftest() {
     expect(matches!(check_workflow(&python), Err(GateError::Step { line: 9, what: "runs Python", .. })), "a Python step beside the gate is refused by its line");
     let inline = flow.replace("      - uses: actions/checkout@v7\n", "      - uses: actions/checkout@v7\n      - run: '\"$BLAZE_SCRIPTS/rustcsites\"'\n");
     expect(matches!(check_workflow(&inline), Err(GateError::Step { what: "calls a script", .. })), "an inline script step is refused");
-    let elsewhere = flow.replace("lake build", "\"$BLAZE_SCRIPTS/docs\" check");
+    let exported = flow.replace("lake build", "\"$BLAZE_SCRIPTS/docs\" write");
+    expect(check_workflow(&exported).is_ok(), "a named diagnostic generator is accepted outside the gate");
+    let elsewhere = flow.replace("lake build", "\"$BLAZE_SCRIPTS/rustcsites\"");
     expect(matches!(check_workflow(&elsewhere), Err(GateError::Script { line: 21, .. })), "a script another job calls is refused unless named");
     let twice = flow.replace("      - name: ix.dev", "      - run: '\"$BLAZE_SCRIPTS/gate\" \"{\\\"command\\\": \\\"run\\\"}\"'\n      - name: ix.dev");
     expect(check_workflow(&twice) == Err(GateError::GateSteps { count: 2 }), "two gate steps are refused");

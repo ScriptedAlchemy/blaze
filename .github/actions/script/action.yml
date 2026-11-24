@@ -34,7 +34,8 @@ runs:
         echo "install=$(cargo +"$tc" --version >/dev/null 2>&1 && echo false || echo true)" >> "$GITHUB_OUTPUT"
     - if: steps.need.outputs.install == 'true'
       uses: ./.github/actions/toolchain
-    - if: steps.restore.outputs.cache-hit != 'true'
+    - name: build missing scripts
+      if: steps.restore.outputs.cache-hit != 'true'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/build.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'
     - if: steps.restore.outputs.cache-hit != 'true'
