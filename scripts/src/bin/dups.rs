@@ -1243,7 +1243,7 @@ fn collect_sources(root: &Path, dirs: &[String], skip: &HashSet<String>, include
         },
     );
 
-    ratchet::production_roots(SCRIPT, root, &manifests, |path| {
+    ratchet::production_roots(SCRIPT, root, manifests.iter().filter(|(_, present)| **present).map(|(parts, _)| parts.join("/")), |path| {
         for (_, source, _, _, _, entry) in &mut loaded {
             if source == path {
                 *entry = true;

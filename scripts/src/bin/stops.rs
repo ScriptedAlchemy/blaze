@@ -360,7 +360,9 @@ fn test_module_paths(tests: &Tests) {
     const PATH: &str = "crates/a/src/signals_tests.rs";
     const DEEP: &str = "crates/a/src/fixture/deep.rs";
     const WRONG: &str = "crates/a/src/signals/tests.rs";
-    put("crates/a/src/lib.rs", ROOT);
+    // The deliberately wrong default target is named tests.rs, so its production use must
+    // be explicit; an orphan with that name is test-only by the existing path convention.
+    put("crates/a/src/lib.rs", &format!("{ROOT}#[path = \"signals/tests.rs\"]\nmod unrelated;\n"));
     put("crates/a/src/signals.rs", DECL);
     put(PATH, HELPER);
     put(DEEP, "fn deep() { None::<u8>.unwrap(); }\n");
@@ -368,6 +370,7 @@ fn test_module_paths(tests: &Tests) {
     let has = |counts: &BTreeMap<String, Vec<Hit<Kind>>>, path: &str| counts.values().flatten().any(|site| site.path == path);
     let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
     expect(!has(&counts, PATH) && !has(&counts, DEEP) && has(&counts, WRONG), &format!("the compound cfg and explicit path exclude only their real subtree: {counts:?}"));
+    put("crates/a/src/lib.rs", ROOT);
 
     for cfg in ["", "#[cfg(any(test, feature = \"production\"))]\n", "#[cfg(all(test = \"value\", unix))]\n", "#[cfg_attr(test, cfg(test))]\n"] {
         put("crates/a/src/signals.rs", &format!("{cfg}#[path = \"signals_tests.rs\"]\npub(crate) mod tests;\n"));
@@ -404,12 +407,19 @@ fn test_module_paths(tests: &Tests) {
         let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
         expect(!has(&counts, PATH) && !has(&counts, DEEP), &format!("an unrelated cfg_attr cannot change the module path: {counts:?}"));
     }
-    put("crates/a/src/signals.rs", "#[path = \"signals_tests.rs\"]\nfn unrelated() {}\n#[cfg(test)]\nmod tests;\n");
+    // This default target has no test-file naming convention: its disappearance must be
+    // caused by the actual gated declaration, not by its basename.
+    let default = "crates/a/src/signals/checks.rs";
+    put(default, "fn default_target() { panic!(\"the actual default target\"); }\n");
+    put("crates/a/src/signals.rs", "#[path = \"signals_tests.rs\"]\nfn unrelated() {}\n#[cfg(test)]\nmod checks;\n");
     let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
-    expect(has(&counts, PATH) && !has(&counts, WRONG), &format!("a prior item's path never leaks onto the next module: {counts:?}"));
-    put("crates/a/src/signals.rs", "#[cfg(test)]\n#[path_hint(path = \"signals_tests.rs\")]\nmod tests;\n");
+    expect(has(&counts, PATH) && !has(&counts, default), &format!("a prior item's path never leaks onto the next module: {counts:?}"));
+    put("crates/a/src/signals.rs", "#[path = \"signals_tests.rs\"]\nfn unrelated() {}\nmod checks;\n");
     let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
-    expect(has(&counts, PATH) && !has(&counts, WRONG), &format!("only the exact built-in path attribute changes a module's file: {counts:?}"));
+    expect(has(&counts, PATH) && has(&counts, default), &format!("removing the default module's test gate restores its stops: {counts:?}"));
+    put("crates/a/src/signals.rs", "#[cfg(test)]\n#[path_hint(path = \"signals_tests.rs\")]\nmod checks;\n");
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(has(&counts, PATH) && !has(&counts, default), &format!("only the exact built-in path attribute changes a module's file: {counts:?}"));
     put("crates/a/src/signals.rs", &DECL.replace("signals_tests.rs", "fixture/../signals_tests.rs"));
     let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
     expect(!has(&counts, PATH) && !has(&counts, DEEP), &format!("literal parent components are normalized: {counts:?}"));

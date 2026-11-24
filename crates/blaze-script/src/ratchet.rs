@@ -27,7 +27,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{fail, git, regex::Regex, universal_newlines};
+use crate::{fail, git, read_text_lossy, regex::Regex};
 
 const TEST_DIRS: [&str; 2] = ["tests", "benches"];
 const TEST_FILES: [&str; 2] = ["tests.rs", "test.rs"];
@@ -381,12 +381,13 @@ pub fn walk_with<T>(
     mut skip: impl FnMut(&File<'_>) -> bool,
     mut scan: impl FnMut(&File<'_>, &mut dyn FnMut(usize, T)),
 ) -> Counts<T> {
+    let unreadable = |path: &Path, error: &dyn fmt::Display| -> ! { fail(script, &format!("{}: {error}", path.display())) };
     let files = match scope {
         // Only the root workspace's code: a directory under crates/ it does not hold (its own
         // workspace, or a parked crate) is not built and not counted.
         CrateScope::Members => {
             let manifest = root.join("Cargo.toml");
-            let text = read_text(script, &manifest);
+            let text = read_text_lossy(&manifest).unwrap_or_else(|error| unreadable(&manifest, &error));
             let members = Members::of(&text);
             rust_files(root).into_iter().filter(|parts| parts.len() < 2 || members.holds(&parts[..2].join("/"))).collect()
         }
@@ -398,7 +399,7 @@ pub fn walk_with<T>(
         let path = parts.join("/");
         let krate = crate_of(root, &parts, &mut manifests);
         let full = parts.iter().fold(root.to_path_buf(), |path, part| path.join(part));
-        let text = read_text(script, &full);
+        let text = read_text_lossy(&full).unwrap_or_else(|error| unreadable(&full, &error));
         let found = tests.of(&text);
         let file = File { parts: &parts, text: &text, tests: &found };
         let is_skipped = found.whole || skip(&file);
@@ -412,7 +413,7 @@ pub fn walk_with<T>(
         }
         scanned.push((path, krate, found, Cell::new(is_skipped), test_path(&parts), false, sites));
     }
-    production_roots(script, root, &manifests, |path| {
+    production_roots(script, root, manifests.iter().filter(|(_, present)| **present).map(|(parts, _)| parts.join("/")), |path| {
         for (source, _, _, _, _, entry, _) in &mut scanned {
             if source == path {
                 *entry = true;
@@ -434,25 +435,19 @@ pub fn walk_with<T>(
     out
 }
 
-/// The shared read boundary for source and manifests. As in the source inventory, invalid
-/// UTF-8 becomes U+FFFD and line endings are normalized before either reader sees the text.
-fn read_text(script: &str, path: &Path) -> String {
-    let Ok(bytes) = std::fs::read(path) else { fail(script, &format!("{} could not be read", path.display())) };
-    universal_newlines(String::from_utf8_lossy(&bytes).into_owned())
-}
-
 /// Explicit production entry paths from the manifests the caller already found while naming
 /// its crates. Each manifest is read once; the existing TOML parser handles quoting, dotted
-/// keys and array tables. No target/feature resolution or separate owned path index is needed.
-pub fn production_roots(script: &str, root: &Path, manifests: &BTreeMap<Vec<String>, bool>, mut emit: impl FnMut(&str)) {
-    for (parts, present) in manifests {
-        if !present || parts.iter().any(|part| TEST_DIRS.contains(&part.as_str())) {
+/// keys and array tables. Directory views leave their storage and cache to the caller; no
+/// target/feature resolution or separate owned path index is needed.
+pub fn production_roots<S: AsRef<str>>(script: &str, root: &Path, directories: impl Iterator<Item = S>, mut emit: impl FnMut(&str)) {
+    for directory in directories {
+        let directory = directory.as_ref();
+        if directory.split('/').any(|part| TEST_DIRS.contains(&part)) {
             continue;
         }
-        let directory = parts.join("/");
-        let manifest = root.join(&directory).join("Cargo.toml");
+        let manifest = root.join(directory).join("Cargo.toml");
         let refused = |message: &dyn fmt::Display| -> ! { fail(script, &format!("{}: {message}", manifest.display())) };
-        let text = read_text(script, &manifest);
+        let text = read_text_lossy(&manifest).unwrap_or_else(|error| refused(&error));
         let doc = crate::toml::read(&text).unwrap_or_else(|error| refused(&error.display(&text)));
         let mut target = |table: crate::toml::Node<'_, '_>| {
             if !table.is_table() {
@@ -460,7 +455,7 @@ pub fn production_roots(script: &str, root: &Path, manifests: &BTreeMap<Vec<Stri
             }
             if let Some(path) = table.get("path") {
                 let Some(path) = path.as_str() else { refused(&"a production target path must be a string") };
-                emit(&crate::pypath::normpath(&crate::pypath::join(&directory, path)));
+                emit(&crate::pypath::normpath(&crate::pypath::join(directory, path)));
             }
         };
         if let Some(lib) = doc.root().get("lib") {
@@ -478,7 +473,7 @@ pub fn production_roots(script: &str, root: &Path, manifests: &BTreeMap<Vec<Stri
         }
         if let Some(build) = doc.root().get("package").and_then(|package| package.get("build")) {
             if let Some(path) = build.as_str() {
-                emit(&crate::pypath::normpath(&crate::pypath::join(&directory, path)));
+                emit(&crate::pypath::normpath(&crate::pypath::join(directory, path)));
             } else if build.as_bool().is_none() {
                 refused(&"package.build must be a path string or a boolean");
             }
