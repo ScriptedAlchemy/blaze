@@ -278,6 +278,27 @@ jobs:
           job: cargo
       - uses: ./.github/actions/toolchain-shelf
         id: shelf
+      # Keep the canonical shelf's profile unchanged. The later workspace test build retains
+      # every executable before running any: CI does not need their debug metadata, while
+      # optimization, debug assertions and the complete target set stay as declared.
+      - name: workspace test builds without debug metadata
+        if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
+        run: |
+          printf 'CARGO_PROFILE_DEV_DEBUG=0\nCARGO_PROFILE_TEST_DEBUG=0\n' >> "$GITHUB_ENV"
+          evidence="$RUNNER_TEMP/workspace-storage-evidence"
+          mkdir -p "$evidence"
+          git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
+          git status --short >> "$evidence/source.txt"
+          git diff HEAD --binary > "$evidence/source.patch"
+      - name: storage before workspace compiler tests
+        if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
+        run: |
+          input=$(timeout 10 jq -cn \
+            --arg volume "$RUNNER_TEMP/blaze-fs" --arg target "$CARGO_TARGET_DIR" \
+            --arg home "$HOME" --arg cargo_home "${CARGO_HOME:-$HOME/.cargo}" \
+            --arg output "$RUNNER_TEMP/workspace-storage-evidence" \
+            '{volume:$volume,target:$target,home:$home,cargo_home:$cargo_home,output:$output,phase:"before-tests"}')
+          timeout -k 10 90 "$BLAZE_SCRIPTS/ci_storage" "$input"
       # Exercise the actual native-image loader before the full workspace's test-binary
       # build. Constructors, TLS and refusal cleanup need execution receipts, not only an
       # all-target type check. The full workspace checks below remain required.
@@ -387,7 +408,25 @@ jobs:
       - name: cargo test --workspace --exclude blaze-std
         if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
         run: |
-          timeout -k 30 5400 "$BLAZE_SCRIPTS/ci_test" '{"exclude": ["blaze-std"]}'
+          input=$(timeout 10 jq -cn --arg evidence "$RUNNER_TEMP/workspace-storage-evidence" \
+            '{exclude:["blaze-std"],evidence:$evidence}')
+          timeout -k 30 5400 "$BLAZE_SCRIPTS/ci_test" "$input"
+      - name: storage after workspace compiler tests
+        if: ${{ always() && env.BLAZE_SCRIPTS != '' }}
+        run: |
+          input=$(timeout 10 jq -cn \
+            --arg volume "$RUNNER_TEMP/blaze-fs" --arg target "$CARGO_TARGET_DIR" \
+            --arg home "$HOME" --arg cargo_home "${CARGO_HOME:-$HOME/.cargo}" \
+            --arg output "$RUNNER_TEMP/workspace-storage-evidence" \
+            '{volume:$volume,target:$target,home:$home,cargo_home:$cargo_home,output:$output,phase:"after-tests"}')
+          timeout -k 10 90 "$BLAZE_SCRIPTS/ci_storage" "$input"
+      - name: keep workspace storage and partial build evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: workspace-storage-evidence
+          path: ${{ runner.temp }}/workspace-storage-evidence
+          if-no-files-found: warn
       # D180: blaze-sys's compiled objects reference no C-library symbol on Linux (both
       # architectures), and on macOS only the libSystem symbols of
       # tools/ratchets/blaze-sys-libsystem.txt (scripts/src/bin/sys_imports.rs). Its lib alone,

@@ -8,7 +8,7 @@
 
 const DOC: &str = r#"ci_test: builds and runs workspace cargo test binaries in parallel.
 
-    ci_test '{"exclude": ["blaze-std"], "jobs": 0, "threads": 4, "timeout_s": 600, "doc": true, "root": "."}'
+    ci_test '{"exclude": ["blaze-std"], "jobs": 0, "threads": 4, "timeout_s": 600, "doc": true, "root": ".", "evidence": ""}'
     ci_test selftest
 
     exclude    workspace packages to pass to `--exclude` ([])
@@ -17,6 +17,7 @@ const DOC: &str = r#"ci_test: builds and runs workspace cargo test binaries in p
     timeout_s  per-binary timeout in seconds, process-group killed (600)
     doc        also run `cargo test --doc --no-fail-fast` (true)
     root       workspace root (".")
+    evidence   directory for raw Cargo build JSON and completed test executables, also on failure ("")
 "#;
 
 use std::{
@@ -43,10 +44,11 @@ struct Args {
     timeout_s: u64,
     doc: bool,
     root: String,
+    evidence: String,
 }
 
 impl Input for Args {
-    const FIELDS: &'static [&'static str] = &["exclude", "jobs", "threads", "timeout_s", "doc", "root"];
+    const FIELDS: &'static [&'static str] = &["exclude", "jobs", "threads", "timeout_s", "doc", "root", "evidence"];
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         let jobs = f.int("jobs", Some(0))?;
@@ -68,6 +70,7 @@ impl Input for Args {
             timeout_s: u64::try_from(timeout_s).unwrap_or(600),
             doc: f.bool("doc", Some(true))?,
             root: f.str("root", Some("."))?,
+            evidence: f.str("evidence", Some(""))?,
         })
     }
 }
@@ -98,6 +101,37 @@ fn parse_artifacts(stdout: &str) -> Vec<(String, String)> {
         found.insert((dir, exe.to_owned()));
     }
     found.into_iter().collect()
+}
+
+/// Keep a failed build's partial inventory too: its completed links still occupied storage,
+/// although no test binary ran. CI puts this directory outside the build filesystem.
+fn preserve_build(
+    directory: &Path,
+    stdout: &[u8],
+    bins: &[(String, String)],
+    success: bool,
+    exit_code: Option<i32>,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(directory)?;
+    std::fs::write(directory.join("cargo-test.jsonl"), stdout)?;
+    let executables: Vec<Value> = bins
+        .iter()
+        .map(|(manifest, executable)| {
+            serde_json::json!({
+                "manifest_directory": manifest,
+                "path": executable,
+                "bytes": std::fs::metadata(executable).ok().map(|m| m.len()),
+            })
+        })
+        .collect();
+    let inventory = serde_json::json!({
+        "schema": 1,
+        "build_success": success,
+        "build_exit_code": exit_code,
+        "executables": executables,
+    });
+    let bytes = serde_json::to_vec_pretty(&inventory).map_err(std::io::Error::other)?;
+    std::fs::write(directory.join("executables.json"), bytes)
 }
 
 /// Default worker count: `clamp(cpus / 4, 1, 16)`.
@@ -173,10 +207,15 @@ fn main_with(args: &Args) {
         build.args(["--exclude", pkg]);
     }
     let built = build.output().unwrap_or_else(|e| fail(SCRIPT, &format!("cargo test --no-run did not start: {e}")));
+    let bins = parse_artifacts(&String::from_utf8_lossy(&built.stdout));
+    if !args.evidence.is_empty() {
+        preserve_build(Path::new(&args.evidence), &built.stdout, &bins, built.status.success(), built.status.code())
+            .unwrap_or_else(|e| fail(SCRIPT, &format!("cargo test --no-run exited with {}; preserving build evidence: {e}", built.status)));
+    }
+    println!("{SCRIPT}: cargo test --no-run emitted {} completed test executables ({}); no tests run yet", bins.len(), built.status);
     if !built.status.success() {
         fail(SCRIPT, &format!("cargo test --no-run exited with {}", built.status));
     }
-    let bins = parse_artifacts(&String::from_utf8_lossy(&built.stdout));
 
     // Shared library path for rustc's sysroot & target-libdir.
     let sysroot_lib = format!("{}/lib", rustc_print(&tc, "sysroot", &root));
@@ -311,6 +350,23 @@ not json at all
         "filters test executables, strips /Cargo.toml, deduplicates and sorts",
     );
     expect(SCRIPT, default_jobs(1) == 1 && default_jobs(4) == 1 && default_jobs(64) == 16 && default_jobs(128) == 16, "default_jobs clamps to 1..=16");
+    let tmp = make_tmp_dir();
+    let executable = tmp.0.join("completed-test");
+    std::fs::write(&executable, b"completed").expect("the completed test artifact writes");
+    let partial = vec![("/w/crates/a".to_owned(), executable.to_string_lossy().into_owned())];
+    preserve_build(&tmp.0, sample.as_bytes(), &partial, false, Some(101)).expect("failed-build evidence writes");
+    let raw = std::fs::read(tmp.0.join("cargo-test.jsonl")).expect("raw Cargo JSON reads");
+    let inventory: Value = serde_json::from_slice(&std::fs::read(tmp.0.join("executables.json")).expect("the inventory reads"))
+        .expect("the inventory is JSON");
+    expect(SCRIPT, raw == sample.as_bytes(), "failed-build evidence keeps the exact Cargo stream");
+    expect(
+        SCRIPT,
+        inventory["build_success"] == false
+            && inventory["build_exit_code"] == 101
+            && inventory["executables"][0]["manifest_directory"] == "/w/crates/a"
+            && inventory["executables"][0]["bytes"] == 9,
+        "a partial build records completed bytes without claiming execution or build success",
+    );
     println!("{SCRIPT} selftest: ok");
 }
 

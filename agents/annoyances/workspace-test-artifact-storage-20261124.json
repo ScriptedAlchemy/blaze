@@ -1,0 +1,22 @@
+{
+  "id": "workspace-test-artifact-storage-20261124",
+  "date": "2026-11-24",
+  "who": "GPT-6 Astra Pro, continuation coordinator",
+  "where": "CI run 45358330723 workspace job 138322133737; scripts/src/bin/ci_test.rs; .github/workflows/blaze.yaml",
+  "what": "The full workspace all-target check passed, then cargo test --no-run exhausted the 84 GiB Btrfs filesystem after 38 minutes 52 seconds while linking blaze-file-items' outline integration test and writing the huge example. No full-workspace test binary ran.",
+  "cost": "The job spent its build budget without a full-suite execution receipt. Its raw Cargo artifact stream and completed executable inventory were discarded before the error was reported, so the final log alone cannot apportion occupied bytes.",
+  "cause": "The test driver builds and retains every workspace test executable before running any. The recorded compiler invocations retain debug metadata at debug=1 alongside opt-level=3 and enabled debug assertions. The filesystem was already the declared 84 GiB; its mount and reflink proof passed. Debug metadata contributes to retained artifacts, but its byte share and any other contributors were not measured by the failed job.",
+  "class": "a build retains all outputs before execution but loses its partial inventory when storage is exhausted",
+  "prevention": "Keep bounded before/after filesystem and directory observations outside the measured volume, and preserve Cargo's raw build stream plus completed executable sizes before deciding whether a no-run build succeeded. Keep diagnostic failures explicit and separate from the original compiler result.",
+  "workaround": "None. Do not enlarge the volume, skip required targets, remove debug assertions, claim tests executed after a failed no-run, or attribute the failure to incremental compilation without evidence.",
+  "fix": "The cargo job removes debug metadata from its dev and test profiles only after the canonical toolchain shelf is produced; optimization, debug assertions, required targets and capacity remain unchanged. The test driver writes cargo-test.jsonl and executables.json even for a failed build. A Rust storage reader takes six explicit JSON fields and bounded read-only observations; always-run CI steps retain the after-build snapshot and evidence artifact. Causal runner/storage controls are required gate rows. Savings and complete workspace execution remain pending on the next hosted tree.",
+  "state": "open",
+  "evidence": {
+    "head": "cf20ef262fe07e8aed3f087d29753a22c01e1bea",
+    "tree": "82cc34a97458a3c996a3870546d6cb990386d921",
+    "run": 45358330723,
+    "job": 138322133737,
+    "log_sha256": "63711d8f086128bda925e70ea2eb4dc92077c9462a7d4c62e59442755a76fc5d",
+    "volume_bytes": 90194313216
+  }
+}

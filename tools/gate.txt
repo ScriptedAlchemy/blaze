@@ -24,6 +24,8 @@ python imports | 300 | - | uv run --frozen python harness/imports.py
 script cache controls | 120 | - | bun .github/actions/script/test-key.mjs
 distributed oracle controls | 120 | - | uv run --frozen python harness/distv2/selfcheck.py
 source identity and CI controls | 120 | - | uv run --frozen python -m unittest discover -s .github/scripts -p test_distributed_ci.py
+workspace test runner selftest | 120 | - | "$BLAZE_SCRIPTS/ci_test" selftest
+workspace storage evidence selftest | 120 | - | "$BLAZE_SCRIPTS/ci_storage" selftest
 source CLI smoke controls | 120 | - | uv run --frozen python -m unittest discover -s .github/scripts -p test_blaze_cli.py
 native Bun preparation controls | 120 | - | uv run --frozen python -I .github/scripts/test_bunprep.py
 benchmark evidence reader controls | 120 | - | uv run --frozen python -m unittest discover -s harness -p test_bench.py

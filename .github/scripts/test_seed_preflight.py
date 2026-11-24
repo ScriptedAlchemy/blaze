@@ -759,7 +759,7 @@ with pathlib.Path(os.environ["TRACE"]).open("a") as out:
     out.write(json.dumps([name, *args]) + "\\n")
 sys.exit(int(os.environ["FAIL_CODE"]) if name == os.environ["FAIL_STAGE"] else 0)
 ''')
-        for name in ("cargo", "ci_test", "build.sh"):
+        for name in ("cargo", "ci_test", "ci_storage", "git", "build.sh"):
             exe = root / "bin" / name
             exe.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " -I "
                            + shlex.quote(str(program)) + " " + shlex.quote(name) + ' "$@"\n')
@@ -767,7 +767,11 @@ sys.exit(int(os.environ["FAIL_CODE"]) if name == os.environ["FAIL_STAGE"] else 0
         env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ.get("PATH", ""),
                    BLAZE_SCRIPTS=str(root / "bin"), TRACE=str(root / "trace.jsonl"),
                    FAIL_STAGE=fail, FAIL_CODE=str(code), GITHUB_ACTION_PATH=str(root / "bin"),
-                   SCRIPT_DIR=str(root / "scripts with spaces"), SCRIPT_KEY="literal-$key")
+                   SCRIPT_DIR=str(root / "scripts with spaces"), SCRIPT_KEY="literal-$key",
+                   RUNNER_TEMP=str(root / 'runner temp-$literal"'),
+                   CARGO_TARGET_DIR=str(root / 'runner temp-$literal"/blaze-fs/target'),
+                   HOME=str(root / "workspace home"), CARGO_HOME=str(root / "cargo cache"),
+                   GITHUB_ENV=str(root / "github-env"))
         return env
 
     def trace(self, root):
@@ -779,7 +783,7 @@ sys.exit(int(os.environ["FAIL_CODE"]) if name == os.environ["FAIL_STAGE"] else 0
             ("cargo check --workspace --exclude blaze-std --all-targets",
              ["cargo", "+nightly-fixture", "check", "--locked", "--workspace", "--exclude",
               "blaze-std", "--all-targets", "--message-format", "short"]),
-            ("cargo test --workspace --exclude blaze-std", ["ci_test", '{"exclude": ["blaze-std"]}']),
+            ("cargo test --workspace --exclude blaze-std", ["ci_test"]),
         )
         for name, wanted in commands:
             body = action_step(name, workflow)
@@ -790,7 +794,69 @@ sys.exit(int(os.environ["FAIL_CODE"]) if name == os.environ["FAIL_STAGE"] else 0
                     done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=root,
                                           env=env, text=True, capture_output=True, timeout=15)
                     self.assertEqual(done.returncode, code, done.stdout + done.stderr)
-                    self.assertEqual(self.trace(root), [wanted])
+                    trace = self.trace(root)
+                    if wanted[0] == "ci_test":
+                        self.assertEqual(len(trace), 1)
+                        self.assertEqual(trace[0][0], "ci_test")
+                        self.assertEqual(len(trace[0]), 2)
+                        self.assertEqual(json.loads(trace[0][1]), {
+                            "exclude": ["blaze-std"],
+                            "evidence": env["RUNNER_TEMP"] + "/workspace-storage-evidence",
+                        })
+                    else:
+                        self.assertEqual(trace, [wanted])
+
+    def test_workspace_profile_changes_only_debug_metadata_after_the_shelf(self):
+        workflow = SCRIPT.parents[1] / "workflows/blaze.yaml"
+        name = "workspace test builds without debug metadata"
+        body = action_step(name, workflow)
+        cargo_job = workflow.read_text().split("\n  cargo:\n", 1)[1].split("\n  distributed-core:\n", 1)[0]
+        self.assertLess(cargo_job.index("uses: ./.github/actions/toolchain-shelf"), cargo_job.index(name))
+        self.assertLess(cargo_job.index(name), cargo_job.index("native launcher, constructors, TLS and cleanup"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self.fixture(root)
+            done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=root,
+                                  env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual(Path(env["GITHUB_ENV"]).read_text().splitlines(), [
+                "CARGO_PROFILE_DEV_DEBUG=0", "CARGO_PROFILE_TEST_DEBUG=0"])
+            self.assertEqual(self.trace(root), [["git", "rev-parse", "HEAD", "HEAD^{tree}"],
+                                                ["git", "status", "--short"],
+                                                ["git", "diff", "HEAD", "--binary"]])
+
+    def test_workspace_storage_passes_explicit_paths_and_keeps_failure_evidence(self):
+        workflow = SCRIPT.parents[1] / "workflows/blaze.yaml"
+        source = workflow.read_text()
+        before = "storage before workspace compiler tests"
+        after = "storage after workspace compiler tests"
+        self.assertLess(source.index(before), source.index("native launcher, constructors, TLS and cleanup"))
+        self.assertLess(source.index("name: cargo test --workspace --exclude blaze-std"), source.index(after))
+        self.assertIn("if: ${{ always() && env.BLAZE_SCRIPTS != '' }}",
+                      source.split("- name: " + after, 1)[1].split("run:", 1)[0])
+        artifact = source.split("- name: keep workspace storage and partial build evidence", 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("if: always()", artifact)
+        self.assertIn("name: workspace-storage-evidence", artifact)
+        for name, phase in ((before, "before-tests"), (after, "after-tests")):
+            for code in (0, 23):
+                with self.subTest(name=name, code=code), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    env = self.fixture(root, fail="ci_storage", code=code)
+                    done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", action_step(name, workflow)],
+                                          cwd=root, env=env, text=True, capture_output=True, timeout=15)
+                    self.assertEqual(done.returncode, code, done.stdout + done.stderr)
+                    trace = self.trace(root)
+                    self.assertEqual(len(trace), 1)
+                    self.assertEqual(trace[0][0], "ci_storage")
+                    self.assertEqual(len(trace[0]), 2)
+                    self.assertEqual(json.loads(trace[0][1]), {
+                        "volume": env["RUNNER_TEMP"] + "/blaze-fs",
+                        "target": env["CARGO_TARGET_DIR"],
+                        "home": env["HOME"],
+                        "cargo_home": env["CARGO_HOME"],
+                        "output": env["RUNNER_TEMP"] + "/workspace-storage-evidence",
+                        "phase": phase,
+                    })
 
     def test_script_cache_miss_preserves_build_argv_and_failure(self):
         action = SCRIPT.parents[1] / "actions/script/action.yml"
