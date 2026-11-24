@@ -445,7 +445,7 @@ fn completion_refusal_releases_mapping(seed: u64, step: Step, plant: CompletionP
     // A disk read folds dropped mappings through Sim::complete; hosted effects such as
     // Now bypass that path. Keep the error alive: its completion must already be released.
     let Done::Read(observed) = finish(&mut sim, Effect::ReadAll {
-        file: mapped_file.share(), tag: Tag(74),
+        file: mapped_file.clone(), tag: Tag(74),
     }).done else {
         panic!("the ownership oracle must read the mapped file");
     };
