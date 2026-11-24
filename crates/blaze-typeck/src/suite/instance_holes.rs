@@ -71,41 +71,118 @@ fn a_drop_impl_through_an_unmade_bucket_names_the_bucket() {
 /// inside an owner with the same field bound. A missing bound, another container, or another
 /// argument cannot justify the impl; the successful selection preserves the owner's parameters.
 #[test]
-fn owner_field_bounds_select_only_the_matching_impl() {
-    use crate::fixture::Fx;
+fn owner_field_bounds_select_only_the_matching_impl() -> Result<(), crate::world::SplitSelf> {
+    use crate::ids::{LangItem, PathIdx, ScopeId};
     use crate::infer::InferCtx;
-    use crate::world::{PClause, Reads};
+    use crate::portable::{PTy, PTys};
+    use crate::world::{
+        Adt, ArgsAfterSelf, AssocItem, AssocParent, ClosureFacts, ConstHolds, ConstParams, Def,
+        Fetch, FnSig, Hidden, ImplHeader, ImplPolarity, Missing, PClause, Predicates, Reads, Seal,
+        TraitDef, TraitDefaults, TraitFlags, TraitMembers, TypeAttrs, World,
+    };
 
-    let mut fx = Fx::new();
-    let t = fx.param(0);
-    let u = fx.param(1);
-    let v = fx.param(2);
-    let unit = fx.unit();
-    let field = fx.tr("Field", 2, std::vec![], &[]);
-    let wanted = fx.tr("Wanted", 2, std::vec![], &[]);
-    let bound = PClause::ForFields { container: t, trait_: field, args: fx.list(&[u]) };
-    let other_container = PClause::ForFields { container: v, trait_: field, args: fx.list(&[u]) };
-    let other_arg = PClause::ForFields { container: t, trait_: field, args: fx.list(&[v]) };
-    let imp = fx.imp("field-bounded impl", 2, t, Some((wanted, &[u])), &[], std::vec![bound]);
-    let matching = fx.func("matching", 3, &[], unit, std::vec![bound]);
-    let absent = fx.func("absent", 3, &[], unit, std::vec![]);
-    let wrong_container = fx.func("wrong_container", 3, &[], unit, std::vec![other_container]);
-    let wrong_arg = fx.func("wrong_arg", 3, &[], unit, std::vec![other_arg]);
-    fx.finish();
+    const FIELD: ItemKey = ItemKey(1);
+    const WANTED: ItemKey = ItemKey(2);
+    const IMP: ItemKey = ItemKey(3);
+    const MATCHING: ItemKey = ItemKey(4);
+    const ABSENT: ItemKey = ItemKey(5);
+    const WRONG_CONTAINER: ItemKey = ItemKey(6);
+    const WRONG_ARG: ItemKey = ItemKey(7);
 
-    for (owner, expected) in [(matching, Some(imp)), (absent, None), (wrong_container, None), (wrong_arg, None)] {
-        let alloc = Alloc::global();
+    // These facts borrow fixed tables: building the fixture itself needs no collections.
+    // Any question outside this selection's facts is a hole, never an empty answer.
+    struct FieldBoundsWorld<'a> {
+        types: PTys<'a>,
+        owners: [(ItemKey, &'a [PClause]); 4],
+        impl_predicates: &'a [PClause],
+        header: ImplHeader<'a>,
+    }
+    impl World for FieldBoundsWorld<'_> {
+        fn predicates(&self, _: Seal, item: ItemKey) -> Fetch<Predicates<'_>> {
+            let clauses = if item == IMP {
+                self.impl_predicates
+            } else {
+                self.owners.iter().find(|(key, _)| *key == item).map(|(_, clauses)| *clauses).ok_or(Missing)?
+            };
+            Ok(Predicates { clauses, types: self.types })
+        }
+        fn impls_of(&self, _: Seal, trait_: ItemKey, shape: Shape) -> Fetch<&[ItemKey]> {
+            if trait_ == WANTED && shape == Shape::Param { Ok(&[IMP]) } else { Err(Missing) }
+        }
+        fn impl_header(&self, _: Seal, item: ItemKey) -> Fetch<Option<ImplHeader<'_>>> {
+            if item == IMP { Ok(Some(self.header)) } else { Err(Missing) }
+        }
+        fn trait_def(&self, _: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>> {
+            if trait_ != FIELD && trait_ != WANTED {
+                return Err(Missing);
+            }
+            Ok(Some(TraitDef {
+                generics: 2,
+                flags: TraitFlags(0),
+                lang: None,
+                supertraits: &[],
+                assoc_types: &[],
+                types: self.types,
+                members: TraitMembers::Known(&[]),
+                defaults: TraitDefaults::Known(&[None]),
+            }))
+        }
+        fn stops_at_holes(&self) -> bool { true }
+        fn fn_sig(&self, _: Seal, _: ItemKey) -> Fetch<Option<FnSig<'_>>> { Err(Missing) }
+        fn adt(&self, _: Seal, _: ItemKey) -> Fetch<Option<Adt<'_>>> { Err(Missing) }
+        fn inherent(&self, _: Seal, _: Shape, _: Name) -> Fetch<&[AssocItem]> { Err(Missing) }
+        fn assoc_item(&self, _: Seal, _: ItemKey, _: Name) -> Fetch<Option<AssocItem>> { Err(Missing) }
+        fn traits_in_scope(&self, _: Seal, _: ScopeId) -> Fetch<&[ItemKey]> { Err(Missing) }
+        fn resolve_path(&self, _: Seal, _: ScopeId, _: PathIdx, _: &[Name]) -> Fetch<crate::path_miss::PathAnswer> {
+            Err(Missing)
+        }
+        fn lang_item(&self, _: Seal, _: LangItem) -> Fetch<Option<ItemKey>> { Err(Missing) }
+        fn lang_path(&self, _: Seal, _: LangItem) -> Fetch<Option<Def>> { Err(Missing) }
+        fn const_value(&self, _: Seal, _: ItemKey) -> Fetch<Option<u64>> { Err(Missing) }
+        fn opaque_hidden(&self, _: Seal, _: ItemKey) -> Fetch<Option<Hidden<'_>>> { Err(Missing) }
+        fn closure(&self, _: Seal, _: ItemKey, _: u32) -> Fetch<Option<ClosureFacts<'_>>> { Err(Missing) }
+        fn attrs(&self, _: Seal, _: ItemKey) -> Fetch<TypeAttrs> { Err(Missing) }
+        fn assoc_parent(&self, _: Seal, _: ItemKey) -> Fetch<Option<AssocParent>> { Err(Missing) }
+        fn const_holds(&self, _: Seal, _: ItemKey, _: &[PTy], _: PTys<'_>) -> Fetch<ConstHolds> { Err(Missing) }
+        fn const_params(&self, _: Seal, _: ItemKey) -> Fetch<ConstParams<'_>> { Err(Missing) }
+    }
+
+    let nodes = [PNode::Param(0), PNode::Param(1), PNode::Param(2)];
+    let elements = [PTy(0), PTy(1), PTy(2)];
+    let types = PTys::flat(&nodes, &elements);
+    let bound = [PClause::ForFields { container: PTy(0), trait_: FIELD, args: List { start: 1, len: 1 } }];
+    let other_container = [PClause::ForFields { container: PTy(2), trait_: FIELD, args: List { start: 1, len: 1 } }];
+    let other_arg = [PClause::ForFields { container: PTy(0), trait_: FIELD, args: List { start: 2, len: 1 } }];
+    let world = FieldBoundsWorld {
+        types,
+        owners: [(MATCHING, &bound), (ABSENT, &[]), (WRONG_CONTAINER, &other_container), (WRONG_ARG, &other_arg)],
+        impl_predicates: &bound,
+        header: ImplHeader {
+            generics: 2,
+            self_ty: PTy(0),
+            trait_: Some(WANTED),
+            trait_args: ArgsAfterSelf::split(types, List { start: 0, len: 2 }, PTy(0))?,
+            assoc_types: &[],
+            types,
+            polarity: ImplPolarity::Positive,
+        },
+    };
+
+    let alloc = blaze_own::testing::heap().alloc();
+    for (owner, expected) in [(MATCHING, Some(IMP)), (ABSENT, None), (WRONG_CONTAINER, None), (WRONG_ARG, None)] {
         let mut ground = PortableTys::new_in(alloc);
         let t = ground.intern(PNode::Param(0)).expect("owner T");
         let u = ground.intern(PNode::Param(1)).expect("owner U");
         let mut cx = InferCtx::post_analysis_in(alloc);
-        let mut reads = Reads::new_in(&fx, alloc);
+        let mut reads = Reads::new_in(&world, alloc);
         let selected = crate::instance::select_owning_owner(
-            &mut cx, &mut reads, owner, None, wanted, &[t, u], &mut ground,
+            &mut cx, &mut reads, owner, None, WANTED, &[t, u], &mut ground,
         ).expect("the owner-bound selection is decided");
+        assert!(!reads.holed(), "owner {owner:?} must be selected from complete facts");
         assert_eq!(selected.map(|(chosen, _)| chosen), expected, "owner {owner:?}");
         if let Some((_, args)) = selected {
             assert_eq!(ground.view().list(args).expect("the selected arguments"), &[t, u]);
         }
     }
+    Ok(())
 }
