@@ -997,8 +997,12 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             work_names.push(item.key.0.0);
         }
         let is_final = idx == 0 || cname == program_crate_name;
-        let extra = if is_final { prior_digests.as_slice() } else { &[] };
-        let spec = unit_digest_of(cname, builder, release, work_names.as_slice(), extra, scratch_alloc);
+        let mut extra: AVec<'a, Digest> = Vec::with_capacity_in(1 + if is_final { prior_digests.len() } else { 0 }, scratch_alloc);
+        extra.push(key.0.0);
+        if is_final {
+            extra.extend_from_slice(prior_digests.as_slice());
+        }
+        let spec = unit_digest_of(cname, builder, release, work_names.as_slice(), extra.as_slice(), scratch_alloc);
         prior_digests.push(spec);
         plans.push(CratePlan {
             unit_name: own_str(cname, alloc),

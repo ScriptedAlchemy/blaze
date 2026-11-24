@@ -185,7 +185,8 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
             };
             let eh = eh_sections_with(&laid, &members, program.personality, platform, outside.as_ref(), alloc)?;
             let identity = elf::write_native(&laid, &eh, merged.as_ref(), &seed, out, alloc)?;
-            let bound = merged.as_ref().map_or(laid.imports.len(), |m| m.bound(laid.imports.len()));
+            let synthetic_dso = usize::from(laid.imports.iter().any(|imp| imp.name == "__dso_handle"));
+            let bound = merged.as_ref().map_or(laid.imports.len(), |m| m.bound(laid.imports.len())).saturating_sub(synthetic_dso);
             (eh, identity, bound)
         }
         Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),

@@ -1241,17 +1241,17 @@ fn build_args_env(
     let req_cwd = core::str::from_utf8(req.cwd).map_err(|_| ReqInputError::CwdNotUtf8)?;
     let fs_root_abs = daemon_fs_root_abs(checkout_root_abs, checkout_dir_rel);
     let mut argv: Vec<&str, &Frame> = Vec::with_capacity_in(req.argv.len(), frame);
-    let mut next_is_origin = false;
+    let mut next_is_path = false;
     for (index, raw) in req.argv.iter().enumerate() {
         let s = core::str::from_utf8(raw).map_err(|_| ReqInputError::ArgvNotUtf8 { index })?;
-        if next_is_origin {
-            next_is_origin = false;
+        if next_is_path {
+            next_is_path = false;
             if let Some(rebased) = rebase_relative_path(req_cwd, s, fs_root_abs, frame) {
                 argv.push(rebased);
                 continue;
             }
-        } else if s == "--origin" {
-            next_is_origin = true;
+        } else if s == "--origin" || s == "-o" || s == "--output" {
+            next_is_path = true;
         }
         argv.push(s);
     }

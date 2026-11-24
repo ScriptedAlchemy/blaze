@@ -86,6 +86,13 @@ const DF_STATIC_TLS: u64 = 0x10;
 const DF_1: u64 = 0x1 | 0x0800_0000;
 /// The base dynamic section's entries (excluding extra native `DT_NEEDED` and `DT_INIT_ARRAY`).
 const DYN_COUNT: u64 = 14;
+/// Room for auto-added standard Linux libraries (`libgcc_s.so.1`, `libm.so.6`) when program
+/// imports reference `_Unwind_*` or libm math functions without a native image already listing them.
+const AUTO_NEEDED_ROOM: u64 = 2;
+/// 16-byte reserved tail in `const_head` right before the GOT holding the self-referential
+/// 8-byte `__dso_handle` word (at `got_at - 8`, relocated via `R_AARCH64_RELATIVE` so both
+/// `&__dso_handle` and `*(&__dso_handle)` equal `load_bias + dso_handle_at`).
+const DSO_HANDLE_ROOM: u64 = 16;
 
 pub(crate) const R_AARCH64_ABS64: u64 = 257;
 pub(crate) const R_AARCH64_GLOB_DAT: u64 = 1025;
@@ -99,7 +106,35 @@ const STB_WEAK: u8 = 2;
 const STT_NOTYPE: u8 = 0;
 
 pub(crate) const LIBC: &str = "libc.so.6";
+const LIBGCC_S: &str = "libgcc_s.so.1";
+const LIBM: &str = "libm.so.6";
+const DSO_HANDLE: &str = "__dso_handle";
 const ID_DOMAIN: &str = "blaze-export elf build id 1";
+
+/// Returns true if `name` is a standard C math symbol provided by `libm.so.6` on glibc Linux.
+fn is_libm_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "acos" | "acosf" | "acosh" | "acoshf"
+        | "asin" | "asinf" | "asinh" | "asinhf"
+        | "atan" | "atanf" | "atan2" | "atan2f" | "atanh" | "atanhf"
+        | "cbrt" | "cbrtf" | "ceil" | "ceilf" | "copysign" | "copysignf"
+        | "cos" | "cosf" | "cosh" | "coshf"
+        | "erf" | "erff" | "erfc" | "erfcf"
+        | "exp" | "expf" | "exp2" | "exp2f" | "expm1" | "expm1f"
+        | "fabs" | "fabsf" | "fdim" | "fdimf" | "floor" | "floorf"
+        | "fma" | "fmaf" | "fmax" | "fmaxf" | "fmin" | "fminf" | "fmod" | "fmodf"
+        | "frexp" | "frexpf" | "hypot" | "hypotf" | "ilogb" | "ilogbf"
+        | "ldexp" | "ldexpf" | "lgamma" | "lgammaf" | "lgamma_r" | "lgammaf_r"
+        | "log" | "logf" | "log10" | "log10f" | "log1p" | "log1pf" | "log2" | "log2f" | "logb" | "logbf"
+        | "modf" | "modff" | "nan" | "nanf" | "nearbyint" | "nearbyintf" | "nextafter" | "nextafterf"
+        | "pow" | "powf" | "remainder" | "remainderf" | "remquo" | "remquof"
+        | "rint" | "rintf" | "round" | "roundf" | "roundeven" | "roundevenf"
+        | "scalbn" | "scalbnf" | "sin" | "sinf" | "sincos" | "sincosf" | "sinh" | "sinhf"
+        | "sqrt" | "sqrtf" | "tan" | "tanf" | "tanh" | "tanhf" | "tgamma" | "tgammaf"
+        | "trunc" | "truncf"
+    )
+}
 
 /// The layout plan an ELF file with no native image needs: the dynamic section heads the const region.
 pub fn plan() -> Plan {
@@ -107,12 +142,13 @@ pub fn plan() -> Plan {
 }
 
 /// The layout plan for an ELF file with an optional merged native image: reserves room at the head
-/// of the const region for every `DT_NEEDED` soname and optional `DT_INIT_ARRAY` / `DT_INIT_ARRAYSZ`.
+/// of the const region for every `DT_NEEDED` soname, optional `DT_INIT_ARRAY` / `DT_INIT_ARRAYSZ`,
+/// and the self-referential `__dso_handle` word right before the GOT.
 pub fn plan_for(native_libraries: Option<&[AString<'_>]>, has_inits: bool) -> Plan {
     let extra_libs = native_libraries.map_or(0, |libs| u64::try_from(libs.len()).unwrap_or(u64::MAX));
     let init_entries = if has_inits { 2u64 } else { 0u64 };
-    let dyn_count = DYN_COUNT + extra_libs + init_entries;
-    Plan { page: PAGE, text_at: TEXT_AT, const_head: dyn_count * 16 }
+    let dyn_count = DYN_COUNT + extra_libs + AUTO_NEEDED_ROOM + init_entries;
+    Plan { page: PAGE, text_at: TEXT_AT, const_head: dyn_count * 16 + DSO_HANDLE_ROOM }
 }
 
 /// Computes the `tpidr_el0`-relative byte offset of Rust's 8-byte `ROOT` pointer in the
@@ -204,15 +240,28 @@ pub fn write_native<'a>(
     out: &mut AVec<'a, u8>,
     alloc: Alloc<'a>,
 ) -> Result<[u8; 16], ExportError> {
-    // Program imports defined by the native image become R_AARCH64_RELATIVE and leave `.dynsym`.
-    let direct = |import: u32| {
-        native.and_then(|m| {
+    // Program imports defined by the native image, or the linker-synthetic `__dso_handle`
+    // (placed at `laid.got_at - 8` inside RELRO, self-relocated so both `&__dso_handle` and
+    // `*(&__dso_handle)` equal `load_bias + dso_handle_at`), become R_AARCH64_RELATIVE and leave `.dynsym`.
+    let dso_handle_at = laid.got_at.checked_sub(8);
+    let direct = |import: u32| -> Option<u64> {
+        if let Some(target) = native.and_then(|m| {
             m.direct
                 .binary_search_by_key(&import, |&(row, _)| row)
                 .ok()
                 .and_then(|i| m.direct.get(i).map(|&(_, at)| at))
-        })
+        }) {
+            return Some(target);
+        }
+        let idx = usize::try_from(import).ok()?;
+        if laid.imports.get(idx).is_some_and(|imp| imp.name == DSO_HANDLE) {
+            return dso_handle_at;
+        }
+        None
     };
+    let mut needs_dso_handle = false;
+    let mut needs_gcc_s = false;
+    let mut needs_libm = false;
     let mut kept: AVec<'_, u32> = Vec::with_capacity_in(laid.imports.len(), alloc);
     let mut row_of: AVec<'_, u32> = Vec::with_capacity_in(laid.imports.len(), alloc);
     for k in 0..laid.imports.len() {
@@ -220,6 +269,15 @@ pub fn write_native<'a>(
         let idx = u32_of(k, "a program import index")?;
         if direct(idx).is_none() {
             kept.push(idx);
+            if let Some(imp) = laid.imports.get(k) {
+                if imp.name.starts_with("_Unwind_") {
+                    needs_gcc_s = true;
+                } else if is_libm_symbol(imp.name) {
+                    needs_libm = true;
+                }
+            }
+        } else if laid.imports.get(k).is_some_and(|imp| imp.name == DSO_HANDLE) {
+            needs_dso_handle = true;
         }
     }
 
@@ -255,12 +313,29 @@ pub fn write_native<'a>(
     dynstr.extend_from_slice(LIBC.as_bytes());
     dynstr.push(0);
     let mut extra_needed: AVec<'_, u32> = Vec::new_in(alloc);
+    let mut has_libm = false;
+    let mut has_gcc_s = false;
     if let Some(m) = native {
         for lib in m.libraries.iter() {
+            if lib.as_str() == LIBM {
+                has_libm = true;
+            } else if lib.as_str() == LIBGCC_S {
+                has_gcc_s = true;
+            }
             extra_needed.push(u32_of(dynstr.len(), "DT_STRTAB offset")?);
             dynstr.extend_from_slice(lib.as_str().as_bytes());
             dynstr.push(0);
         }
+    }
+    if needs_libm && !has_libm {
+        extra_needed.push(u32_of(dynstr.len(), "DT_STRTAB offset")?);
+        dynstr.extend_from_slice(LIBM.as_bytes());
+        dynstr.push(0);
+    }
+    if needs_gcc_s && !has_gcc_s {
+        extra_needed.push(u32_of(dynstr.len(), "DT_STRTAB offset")?);
+        dynstr.extend_from_slice(LIBGCC_S.as_bytes());
+        dynstr.push(0);
     }
     for &idx in kept.iter() {
         let imp_idx = usize::try_from(idx).map_err(|_| ExportError::TooLarge { what: "a program import index", len: u64::from(idx) })?;
@@ -325,6 +400,12 @@ pub fn write_native<'a>(
                 }
             }
         }
+    }
+    if needs_dso_handle && let Some(at) = dso_handle_at {
+        bytes::u64(&mut meta, at);
+        bytes::u64(&mut meta, R_AARCH64_RELATIVE);
+        bytes::u64(&mut meta, at);
+        relative += 1;
     }
     if let Some(m) = native {
         for &(at, target) in m.relative.iter() {
@@ -442,7 +523,8 @@ pub fn write_native<'a>(
         (DT_NULL, 0),
     ]);
     let dyn_bytes = u64_of(dyn_entries.len(), "PT_DYNAMIC entry count")? * 16;
-    let dyn_room = laid.got_at.saturating_sub(laid.const_at);
+    let dyn_limit = if needs_dso_handle { dso_handle_at.unwrap_or(laid.got_at) } else { laid.got_at };
+    let dyn_room = dyn_limit.saturating_sub(laid.const_at);
     if dyn_bytes > dyn_room {
         return Err(ExportError::HeaderRoom { what: "the ELF dynamic section", need: dyn_bytes, room: dyn_room });
     }

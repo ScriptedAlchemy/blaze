@@ -196,6 +196,13 @@ class Run:
         self.lease: list[str] = []
         self.sequence = 0
         self.artifacts: list[dict] = []
+        host_shelf = Path(os.environ.get("HOME", "")) / ".blaze" / "v2" / "toolchain"
+        if host_shelf.is_dir():
+            cached_shelf = self.root / ".toolchain-shelf"
+            shutil.copytree(host_shelf, cached_shelf)
+            self.shelf_source: Path | None = cached_shelf
+        else:
+            self.shelf_source = None
 
     def provenance(self) -> None:
         repository = HERE.parent
@@ -259,6 +266,20 @@ class Run:
         if process.stdin:
             process.stdin.close()
 
+    def _prepare_home(self, home: str) -> Path:
+        home_dir = self.root / home
+        shelf = getattr(self, "shelf_source", None)
+        if shelf is not None and shelf.is_dir():
+            dst = home_dir / ".blaze" / "v2" / "toolchain"
+            if not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copytree(shelf, dst, copy_function=os.link)
+                except OSError:
+                    shutil.rmtree(dst, ignore_errors=True)
+                    shutil.copytree(shelf, dst)
+        return home_dir
+
     def env(self, home: str, dist: bool, **extra) -> dict:
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CARGO", "RUST", "BLAZE_"))}
         env.update(self.given.env)
@@ -267,7 +288,8 @@ class Run:
                 env[name] = str(value)
             elif name not in env and name in os.environ:
                 env[name] = os.environ[name]
-        env.update(BLAZE_HOME=str(self.root / home), TMPDIR=str(self.root / "tmp"), RUST_BACKTRACE="0", BLAZE_DIST_EVENTS=str(self.root / "logs" / "events.jsonl"))
+        home_dir = self._prepare_home(home)
+        env.update(HOME=str(home_dir), BLAZE_HOME=str(home_dir), TMPDIR=str(self.root / "tmp"), RUST_BACKTRACE="0", BLAZE_DIST_EVENTS=str(self.root / "logs" / "events.jsonl"))
         (self.root / "tmp").mkdir(exist_ok=True)
         if dist:
             env.update(
@@ -324,7 +346,7 @@ class Run:
         self.services.append(coordinator)
         self.until("coordinator binds its socket", self.socket.exists, [coordinator], timeout=30)
 
-    def daemon(self, home: str, result_gate: Path | None = None) -> None:
+    def daemon(self, home: str, result_gate: Path | None = None, project: Path | None = None) -> None:
         """Own every daemon explicitly, including ones whose startup fails."""
         if home in self.daemons and self.daemons[home].poll() is None:
             if result_gate is not None:
@@ -337,21 +359,23 @@ class Run:
             gate_env["BLAZE_DIST_TEST_RESULT_GATE"] = str(result_gate.resolve())
         # Status is only for this run's private home, never a shared daemon.
         log = open(self.root / "logs" / f"{home}.daemon.log", "a")
-        args = [self.given.blaze, "serve"]
+        args = [self.given.blaze, "daemon"]
         if self.given.stall_bound is not None:
             args += ["--stall-bound", str(self.given.stall_bound)]
         with log:
-            daemon = subprocess.Popen(args, cwd=self.project, env=self.env(home, False, **gate_env),
+            daemon = subprocess.Popen(args, cwd=project or self.project, env=self.env(home, False, **gate_env),
                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         self.daemons[home] = daemon
-        self.until(f"{home} daemon becomes ready", lambda: daemon_pid(self, home) == daemon.pid, [daemon], timeout=300)
+        self.until(f"{home} daemon becomes ready", lambda: daemon_pid(self, home, project) == daemon.pid, [daemon], timeout=300)
 
     def build(self, home: str, dist: bool = True, wait: bool = True, project: Path | None = None, **extra):
-        self.daemon(home)
+        self.daemon(home, project=project)
         self.sequence += 1
         log = open(self.root / "logs" / f"{home}.{self.sequence}.log", "w")
+        out = self.program(home, project)
+        out.parent.mkdir(parents=True, exist_ok=True)
         process = subprocess.Popen(
-            [self.given.blaze, "build", *self.given.args],
+            [self.given.blaze, "export", "-p", self.given.program, "-o", str(out), *self.given.args],
             cwd=project or self.project,
             env={**self.env(home, dist, **extra), "CARGO_TARGET_DIR": str(self.target(home, project))},
             stdout=log,
@@ -447,9 +471,9 @@ class Run:
         return self.until(f"{home} holds uncommitted compile work (requires BLAZE_DIST_EVENTS)", suspend, [process])
 
 
-def daemon_pid(run: Run, home: str) -> int | None:
+def daemon_pid(run: Run, home: str, project: Path | None = None) -> int | None:
     out = subprocess.run(
-        [run.given.blaze, "status", "--json"], cwd=run.project, env=run.env(home, False), capture_output=True, text=True, timeout=run.given.command_timeout
+        [run.given.blaze, "daemon", "--status"], cwd=project or run.project, env=run.env(home, False), capture_output=True, text=True, timeout=run.given.command_timeout
     )
     try:
         return (json.loads(out.stdout).get("daemon") or {}).get("pid")
