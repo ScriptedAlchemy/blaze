@@ -442,16 +442,24 @@ fn completion_refusal_releases_mapping(seed: u64, step: Step, plant: CompletionP
             "native-cache/manifests/output: {step:?} refused completion MappedWrite(MappingWrite(4 bytes)) with tag Tag(73)"
         ));
     }
-    // An unrelated effect lets Sim collect a dropped mapping. Keep the error alive:
-    // ownership must already be released, without acknowledging any publication.
-    finish(&mut sim, Effect::Now { tag: Tag(74) });
-    let released = sim.contents(&mapped_file) == bytes;
+    // A disk read folds dropped mappings through Sim::complete; hosted effects such as
+    // Now bypass that path. Keep the error alive: its completion must already be released.
+    let Done::Read(observed) = finish(&mut sim, Effect::ReadAll {
+        file: mapped_file.share(), tag: Tag(74),
+    }).done else {
+        panic!("the ownership oracle must read the mapped file");
+    };
+    let released = observed == bytes;
     assert_eq!(sim.contents(&slot("objects/published")), published);
     assert!(!publication.acknowledged());
     drop(error);
     drop(retained);
-    finish(&mut sim, Effect::Now { tag: Tag(75) });
-    assert_eq!(sim.contents(&mapped_file), bytes, "the control must release its mapping too");
+    let Done::Read(observed) = finish(&mut sim, Effect::ReadAll {
+        file: mapped_file, tag: Tag(75),
+    }).done else {
+        panic!("the control must read the mapped file after releasing it");
+    };
+    assert_eq!(observed, bytes, "the control must release its mapping too");
     released
 }
 
