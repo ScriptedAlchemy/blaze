@@ -91,7 +91,8 @@ A site in test code is not counted. Test code is, and nothing else is:
   - the file of a module declared out of line in test code (`#[cfg(test)] mod t;`, or any
     `mod m;` in a test file): `m.rs` or `m/mod.rs` beside a crate root (`lib.rs`, `main.rs`,
     `mod.rs`, `build.rs`, a file of a `bin` directory), else in the directory named for the
-    declaring file. A `#[path]` is not followed, so such a module counts.
+    declaring file. Literal top-level `#[path]` declarations are followed. A production alias
+    keeps a file counted; an uncertain nested or conditional path never proves an exclusion.
 Everything else counts, `*_tests.rs` files a test module does not declare included.
 
 A crate is the nearest directory above the file, under crates/, that holds a Cargo.toml, named
@@ -863,11 +864,14 @@ fn selftest(p: &Patterns) {
     ];
     expect(sites == want, &format!("the sites outside test code (line 18 is a test's): {sites:?}"));
     expect(
-        found.mods == [("t".to_owned(), true), ("live".to_owned(), false)],
+        found.mods == [
+            ratchet::Module { file: ratchet::ModuleFile::Name("t".to_owned()), in_test: true, certain: true },
+            ratchet::Module { file: ratchet::ModuleFile::Name("live".to_owned()), in_test: false, certain: true },
+        ],
         &format!("the modules declared out of line: {:?}", found.mods),
     );
     let (inner, inner_sites) = scan_file(p, "#![cfg(test)]\nmod deep;\nfn x() { Vec::new_in(Global) } // alloc: a test file's\n");
-    expect(inner.whole && inner_sites.is_empty() && inner.mods == [("deep".to_owned(), true)], &format!("{inner:?}"));
+    expect(inner.whole && inner_sites.is_empty() && inner.mods == [ratchet::Module { file: ratchet::ModuleFile::Name("deep".to_owned()), in_test: true, certain: true }], &format!("{inner:?}"));
     // A field's attribute: the item ends with its struct, so the attribute's line alone is test.
     let (_, field_sites) = scan_file(p, "struct S {\n    #[cfg(test)]\n    a: Vec<u8, Global>, // alloc: counted\n}\n");
     expect(
@@ -877,17 +881,16 @@ fn selftest(p: &Patterns) {
     expect(item_end("{ \"\\\"}\" }", 0) == Some(9), "an escaped quote does not end a string");
     expect(item_end("br##\"}\"#\"##;", 0) == Some(12), "a raw byte string with hashes");
 
-    let parts = |path: &str| -> Vec<String> { path.split('/').map(str::to_owned).collect() };
     expect(
-        module_files(&parts("crates/a/src/lib.rs"), "t") == ["crates/a/src/t.rs".to_owned(), "crates/a/src/t/mod.rs".to_owned()],
+        module_files("crates/a/src/lib.rs", "t", false) == ["crates/a/src/t.rs".to_owned(), "crates/a/src/t/mod.rs".to_owned()],
         "a crate root's module is beside it",
     );
     expect(
-        module_files(&parts("crates/a/src/t.rs"), "deep")
+        module_files("crates/a/src/t.rs", "deep", false)
             == ["crates/a/src/t/deep.rs".to_owned(), "crates/a/src/t/deep/mod.rs".to_owned()],
         "another file's module is in the directory named for it",
     );
-    expect(module_files(&parts("crates/a/src/bin/x.rs"), "m")[0] == "crates/a/src/bin/m.rs", "a bin's module");
+    expect(module_files("crates/a/src/bin/x.rs", "m", false)[0] == "crates/a/src/bin/m.rs", "a bin's module");
 
     // A tree: crates, test files by path and by declaration (transitively), a nested crate.
     let tmp = TempDir::new("allocs-selftest-").unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));

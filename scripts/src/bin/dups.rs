@@ -135,7 +135,6 @@ const DISMISSALS_SCHEMA: &str = "blaze-dups-not/1";
 const REPORT_SCHEMA: &str = "blaze-dups/1";
 const TEST_DIRS: [&str; 4] = ["tests", "benches", "test_data", "fixtures"];
 const TEST_FILES: [&str; 2] = ["tests.rs", "test.rs"];
-const ROOT_FILES: [&str; 4] = ["lib.rs", "main.rs", "mod.rs", "build.rs"];
 const RATCHET_HEADER: &str = "# Unreviewed duplicate code items outside test code, by crate (its directory under\n\
                               # crates/), excluding dismissed non-duplicates in tools/ratchets/dups-not.json\n\
                               # (AGENTS.md one-concept-one-home, rule 30).\n\
@@ -1211,7 +1210,6 @@ fn collect_sources(root: &Path, dirs: &[String], skip: &HashSet<String>, include
         }
     }
 
-    let known: BTreeSet<String> = all_paths.iter().map(|p| p.join("/")).collect();
     let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
     let mut work: Vec<(Vec<String>, String, String, PathBuf)> = Vec::with_capacity(all_paths.len());
     for parts in all_paths {
@@ -1224,11 +1222,10 @@ fn collect_sources(root: &Path, dirs: &[String], skip: &HashSet<String>, include
         work.push((parts, rel, krate, full));
     }
 
-    // Parallel file read + test-line scan across cores (`Tests::of` runs regexes per line).
+    // Parallel file read + test-line scan across cores.
     let jobs = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get).min(16);
-    let mut test_files: BTreeSet<String> = BTreeSet::new();
-    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut loaded: Vec<(Vec<String>, String, String, Vec<bool>)> = Vec::with_capacity(work.len());
+    let mut test_files = BTreeSet::new();
+    let mut loaded = Vec::with_capacity(work.len());
 
     fan_out(
         jobs,
@@ -1242,41 +1239,29 @@ fn collect_sources(root: &Path, dirs: &[String], skip: &HashSet<String>, include
             (parts.clone(), rel.clone(), krate.clone(), text, found)
         },
         |(parts, rel, krate, text, found)| {
-            if is_test_path(&parts) || found.whole {
-                test_files.insert(rel.clone());
-            }
-            for (mod_name, in_test) in &found.mods {
-                for target in module_files(&parts, mod_name) {
-                    if !known.contains(&target) {
-                        continue;
-                    }
-                    if *in_test {
-                        test_files.insert(target.clone());
-                    }
-                    children.entry(rel.clone()).or_default().push(target);
-                }
-            }
-            loaded.push((parts, krate, text, found.test));
+            loaded.push((parts, rel, krate, text, found, false));
         },
     );
 
-    let mut todo: Vec<String> = test_files.iter().cloned().collect();
-    while let Some(path) = todo.pop() {
-        for child in children.get(&path).into_iter().flatten() {
-            if test_files.insert(child.clone()) {
-                todo.push(child.clone());
+    ratchet::production_roots(SCRIPT, root, &manifests, |path| {
+        for (_, source, _, _, _, entry) in &mut loaded {
+            if source == path {
+                *entry = true;
             }
         }
-    }
+    });
+    ratchet::test_module_files(loaded.iter().map(|(parts, path, _, _, found, entry)| (path.as_str(), found, false, is_test_path(parts), *entry)), |position| {
+        test_files.insert(position);
+    });
 
     loaded
         .into_iter()
-        .filter_map(|(parts, krate, text, tlines)| {
-            let rel = parts.join("/");
-            if test_files.contains(&rel) {
+        .enumerate()
+        .filter_map(|(position, (_, rel, krate, text, found, _))| {
+            if test_files.contains(&position) {
                 None
             } else {
-                Some((SourceFile { krate, rel_path: rel, text }, tlines))
+                Some((SourceFile { krate, rel_path: rel, text }, found.test))
             }
         })
         .collect()
@@ -1327,25 +1312,14 @@ fn is_test_path(parts: &[String]) -> bool {
     TEST_FILES.contains(&file) || file.ends_with("_tests.rs") || file.ends_with("_test.rs")
 }
 
-fn module_files(parts: &[String], name: &str) -> Vec<String> {
-    let Some((file, dir)) = parts.split_last() else { return Vec::new() };
-    let is_root = ROOT_FILES.contains(&file.as_str()) || dir.last().map(String::as_str) == Some("bin");
-    let mut base = dir.to_vec();
-    if !is_root {
-        base.push(file.trim_end_matches(".rs").to_owned());
-    }
-    let prefix = if base.is_empty() { String::new() } else { format!("{}/", base.join("/")) };
-    vec![format!("{prefix}{name}.rs"), format!("{prefix}{name}/mod.rs")]
-}
-
 fn crate_name_of(root: &Path, parts: &[String], cache: &mut BTreeMap<Vec<String>, bool>) -> String {
     let mut dir = parts[..parts.len().saturating_sub(1)].to_vec();
-    while dir.len() >= 2 {
+    while !dir.is_empty() {
         let has = *cache.entry(dir.clone()).or_insert_with(|| {
             dir.iter().fold(root.to_path_buf(), |p, s| p.join(s)).join("Cargo.toml").is_file()
         });
         if has {
-            return if dir[0] == "crates" { dir[1..].join("/") } else { dir.join("/") };
+            return if dir.len() > 1 && dir[0] == "crates" { dir[1..].join("/") } else { dir.join("/") };
         }
         dir.pop();
     }

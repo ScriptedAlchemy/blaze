@@ -1,0 +1,21 @@
+{
+  "id": "ratchet-explicit-test-module-path-20261124",
+  "date": "2026-11-24",
+  "who": "GPT-6 Astra Pro, continuation coordinator",
+  "where": "crates/blaze-script/src/ratchet.rs Tests::of and walk_with; crates/blaze-launch-rt/src/signals.rs",
+  "what": "Sharing the native test-process runner exposed eight intentional stop sites in the ordinary child_case helper of signals_tests.rs. The old duplicate runner had six counted stops, so the launcher row rose from 219 to 221 even though the complete 137-test launcher run passed.",
+  "cost": "The current gate reports a launcher stop increase inside the broader failed stops row; raising its ceiling would preserve a source-classification error.",
+  "cause": "The classifier recognizes the module's cfg(all(test, not(blaze_check))) and pub(crate) visibility but drops its path attribute. The walker searches signals/tests.rs instead of the declared signals_tests.rs. The former child function's own test attribute masked the missing file-level classification until it became a shared helper.",
+  "class": "a source inventory follows logical module names without their explicit source paths",
+  "prevention": "Carry the literal path attached to the module declaration through shared source classification. Follow test-only reach to the actual file while keeping files and descendants also reachable from production counted. A source exclusion needs a certain declaration or a whole-file test cfg; unknown module-directory ownership never supplies that proof. Preserve production roots declared by Cargo, including a physical source used as both a root and an ordinary module.",
+  "workaround": "None. Keep the signal and panic controls and existing policy ceilings; do not hide the helper behind an extra test-file exemption.",
+  "fix": "The shared classifier now carries typed module paths, reads attributes lexically outside strings and comments, and proves test-only files before revoking candidates reachable from production. Cargo root paths use the existing TOML reader; nested fixture manifests retain the existing test-directory policy. The duplicate scanner consumes the same reachability classifier. Causal controls remove test guards, add ordinary/conditional/raw/escaped production aliases, exercise custom and example roots and their descendants, and retain production beside tests on one line or behind macro input. Unsupported path syntax conservatively keeps possible production files counted. Independent static correctness and policy reviews found no remaining blocker or increased allocation/effect sites. Exact-tree hosted selftests and canonical inventories remain required; no policy ceiling was raised.",
+  "state": "open",
+  "evidence": {
+    "head": "cf20ef262fe07e8aed3f087d29753a22c01e1bea",
+    "tree": "82cc34a97458a3c996a3870546d6cb990386d921",
+    "run": 45358330723,
+    "artifact": 14904310216,
+    "sha256": "9cb96c4185895947f32d426461ad57ac59ea0266fe17a56582598a26332d1ac7"
+  }
+}

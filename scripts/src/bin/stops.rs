@@ -339,7 +339,165 @@ fn selftest(tests: &Tests) {
     let said = ratchet::problems(&POLICY, &counts, &fewer, None, Some(&added), named);
     expect(said.len() == 1 && said[0].contains("over its row's 9") && said[0].contains("new: crates/a/src/lib.rs:1 (unwrap)"), &format!("a rise: {said:?}"));
     expect(summary(&counts).contains("(most: a 10)"), "the crates with the most");
+    test_module_paths(tests);
     println!("{SCRIPT} selftest: ok");
+}
+
+/// The actual module graph decides which helpers are test-only, not their filenames. Each
+/// planted production edge below must restore the same helper's stops without editing it.
+fn test_module_paths(tests: &Tests) {
+    let tmp = TempDir::new("stops-paths-").unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
+    let put = |path: &str, text: &str| {
+        let full = tmp.path().join(path);
+        full.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&full, text))
+            .unwrap_or_else(|e| fail(SCRIPT, &format!("{path}: {e}")));
+    };
+    put("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+    put("crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
+    const ROOT: &str = "mod signals;\n";
+    const DECL: &str = "#[cfg(all(test, not(blaze_check)))]\n#[path = \"signals_tests.rs\"]\npub(crate) mod tests;\n";
+    const HELPER: &str = "#[path = \"fixture/deep.rs\"]\nmod deep;\nfn child_case() { panic!(\"a real helper stop\"); }\n";
+    const PATH: &str = "crates/a/src/signals_tests.rs";
+    const DEEP: &str = "crates/a/src/fixture/deep.rs";
+    const WRONG: &str = "crates/a/src/signals/tests.rs";
+    put("crates/a/src/lib.rs", ROOT);
+    put("crates/a/src/signals.rs", DECL);
+    put(PATH, HELPER);
+    put(DEEP, "fn deep() { None::<u8>.unwrap(); }\n");
+    put(WRONG, "fn unrelated() { panic!(\"not the path target\"); }\n");
+    let has = |counts: &BTreeMap<String, Vec<Hit<Kind>>>, path: &str| counts.values().flatten().any(|site| site.path == path);
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(!has(&counts, PATH) && !has(&counts, DEEP) && has(&counts, WRONG), &format!("the compound cfg and explicit path exclude only their real subtree: {counts:?}"));
+
+    for cfg in ["", "#[cfg(any(test, feature = \"production\"))]\n", "#[cfg(all(test = \"value\", unix))]\n", "#[cfg_attr(test, cfg(test))]\n"] {
+        put("crates/a/src/signals.rs", &format!("{cfg}#[path = \"signals_tests.rs\"]\npub(crate) mod tests;\n"));
+        let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+        expect(has(&counts, PATH) && has(&counts, DEEP), &format!("{cfg:?} cannot prove a production helper is test-only: {counts:?}"));
+    }
+    put("crates/a/src/signals.rs", DECL);
+    for alias in [
+        "#[path = \"signals_tests.rs\"] mod shared;\n",
+        "#[cfg(any(test, feature = \"production\"))]\n#[path = \"signals_tests.rs\"] mod shared;\n",
+        "#[cfg_attr(feature = \"production\", path = \"signals_tests.rs\")] mod shared;\n",
+        "#[cfg_attr(feature = \"production\", path = r#\"signals_tests.rs\"#)] mod shared;\n",
+        "#[cfg_attr(feature = \"production\", path = \"signals_\\x74ests.rs\")] mod shared;\n",
+        "mod inline { #[path = \"../signals_tests.rs\"] mod shared; }\n",
+        "mod /* real module */ signals_tests;\n",
+        "#[path /* trivia */ = \"signals_tests.rs\"] mod shared;\n",
+        "#[path = /* trivia */ \"signals_tests.rs\"] mod shared;\n",
+        "#[cfg_attr(feature = \"production\", path /* trivia */ = \"signals_tests.rs\")] mod shared;\n",
+        "#[r#path = \"signals_tests.rs\"] mod shared;\n",
+        "#[r#cfg_attr(feature = \"production\", r#path = \"signals_tests.rs\")] mod shared;\n",
+        "# [path = \"signals_tests.rs\"] mod shared;\n",
+        "# /* trivia */ [path = \"signals_tests.rs\"] mod shared;\n",
+    ] {
+        put("crates/a/src/lib.rs", &format!("{ROOT}{alias}"));
+        let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+        expect(has(&counts, PATH) && has(&counts, DEEP), &format!("a possible production alias keeps the helper and descendants counted: {alias:?}: {counts:?}"));
+    }
+    put("crates/a/src/lib.rs", ROOT);
+    for prefix in [
+        "#[cfg_attr(feature = \"lint\", allow(dead_code))]\n",
+        "#[cfg_attr(feature = \"fmt\", rustfmt::skip)]\n",
+    ] {
+        put("crates/a/src/signals.rs", &format!("{prefix}{DECL}"));
+        let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+        expect(!has(&counts, PATH) && !has(&counts, DEEP), &format!("an unrelated cfg_attr cannot change the module path: {counts:?}"));
+    }
+    put("crates/a/src/signals.rs", "#[path = \"signals_tests.rs\"]\nfn unrelated() {}\n#[cfg(test)]\nmod tests;\n");
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(has(&counts, PATH) && !has(&counts, WRONG), &format!("a prior item's path never leaks onto the next module: {counts:?}"));
+    put("crates/a/src/signals.rs", "#[cfg(test)]\n#[path_hint(path = \"signals_tests.rs\")]\nmod tests;\n");
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(has(&counts, PATH) && !has(&counts, WRONG), &format!("only the exact built-in path attribute changes a module's file: {counts:?}"));
+    put("crates/a/src/signals.rs", &DECL.replace("signals_tests.rs", "fixture/../signals_tests.rs"));
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(!has(&counts, PATH) && !has(&counts, DEEP), &format!("literal parent components are normalized: {counts:?}"));
+
+    // A path-loaded file's ordinary child is a sibling. The bounded scanner retains both
+    // possible ownership contexts, so it must not exclude an unrelated stem/leaf.rs.
+    put("crates/a/src/signals.rs", DECL);
+    put(PATH, "mod leaf;\nfn child_case() { panic!(\"helper\"); }\n");
+    put("crates/a/src/leaf.rs", "fn sibling() { panic!(\"retained conservatively\"); }\n");
+    put("crates/a/src/signals_tests/leaf.rs", "fn production() { panic!(\"not the path-loaded child\"); }\n");
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(!has(&counts, PATH) && has(&counts, "crates/a/src/leaf.rs") && has(&counts, "crates/a/src/signals_tests/leaf.rs"), &format!("uncertain ownership cannot exclude either possible child: {counts:?}"));
+
+    put(PATH, HELPER);
+    put("crates/a/src/lib.rs", &format!("{ROOT}#[cfg(test)]\n#[path = \"unsupported\\x2ers\"] mod uncertain_test;\n"));
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(!has(&counts, PATH) && !has(&counts, DEEP), &format!("an unknown test-only path cannot invalidate a proved test subtree: {counts:?}"));
+    let quoted = tests.of("const TEXT: &str = r#\"\n#[cfg(test)]\n#[path = \"live.rs\"]\nmod fake;\n\"#;\nmod live;\n");
+    expect(quoted.mods.len() == 1 && !quoted.whole && !quoted.test.iter().any(|test| *test), &format!("quoted attributes are not source declarations: {quoted:?}"));
+    for text in [
+        "fn live() { panic!(\"count me\"); } #[cfg(test)] mod tests;\n",
+        "#[cfg(test)] mod tests; fn live() { panic!(\"count me\"); }\n",
+        "fn live() { panic!(\"count me\"); } #[test] fn a_test() {}\n",
+        "#[test] fn a_test() {} fn live() { panic!(\"count me\"); }\n",
+    ] {
+        let found = tests.of(text);
+        expect(stops(text).iter().any(|(line, _)| !found.test.get(line - 1).copied().unwrap_or(false)), &format!("a test never masks neighboring production code: {text:?}: {found:?}"));
+    }
+    let complete = tests.of("  #[test] fn a_test() { panic!(\"test only\"); } // trailing trivia\n");
+    expect(complete.test.first() == Some(&true), "a complete test item with only surrounding trivia is excluded");
+    for (open, close) in [("(", ")"), ("[", "]")] {
+        put("crates/a/src/lib.rs", ROOT);
+        put("crates/a/src/signals.rs", &format!("ignore!{open}\n#![cfg(test)]\n#[cfg(test)]\n#[path = \"signals_tests.rs\"]\nmod fake;\n{close};\n"));
+        let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+        expect(has(&counts, PATH), &format!("macro input cannot prove a physical file is test-only: {open}: {counts:?}"));
+    }
+    put("crates/a/src/signals.rs", DECL);
+    for (open, close) in [("(", ")"), ("[", "]"), ("{", "}")] {
+        let invocation = format!("make!{open}#[cfg(test)] #[path=\"signals_tests.rs\"] mod alias;{close};\n");
+        put("crates/a/src/lib.rs", &format!("{ROOT}{invocation}"));
+        let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+        expect(has(&counts, PATH), &format!("a macro may consume an apparent test attribute and emit production: {open}: {counts:?}"));
+        put("crates/a/src/lib.rs", &format!("{ROOT}#[cfg(test)]\n{invocation}"));
+        let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+        expect(!has(&counts, PATH), &format!("a guard around the entire macro invocation is a real test gate: {open}: {counts:?}"));
+    }
+    put("crates/a/src/lib.rs", "fn library_entry() { panic!(\"Cargo's library root\"); }\n");
+    put("crates/a/src/bin/tool.rs", "fn main() { panic!(\"Cargo's binary root\"); }\n");
+    put("crates/a/src/main.rs", "#[cfg(test)]\n#[path = \"lib.rs\"] mod fixture;\n#[cfg(test)]\n#[path = \"bin/tool.rs\"] mod tool_fixture;\n#[cfg(test)]\n#[path = \"../examples/auto.rs\"] mod example_fixture;\n");
+    put("crates/a/examples/auto.rs", "fn main() { panic!(\"Cargo's example root\"); }\n");
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(has(&counts, "crates/a/src/lib.rs") && has(&counts, "crates/a/src/bin/tool.rs") && has(&counts, "crates/a/examples/auto.rs"), &format!("test aliases cannot hide implicit production entry roots: {counts:?}"));
+
+    put("crates/a/Cargo.toml", "[package]\nname = 'a'\nbuild = 'setup/custom.rs'\n[lib]\npath = 'library/custom.rs'\n[[bin]]\nname = 'tool'\npath = 'tools/custom.rs'\n[[bin]]\nname = 'mixed'\npath = 'library/main.rs'\n[[bin]]\nname = 'named-tests'\npath = 'tests.rs'\n[[example]]\nname = 'demo'\npath = 'demos/custom.rs'\n");
+    put("crates/a/src/main.rs", "#[cfg(test)]\n#[path = \"../library/custom.rs\"] mod library_fixture;\n#[cfg(test)]\n#[path = \"../tools/custom.rs\"] mod binary_fixture;\n#[cfg(test)]\n#[path = \"../setup/custom.rs\"] mod build_fixture;\n#[cfg(test)]\n#[path = \"../demos/custom.rs\"] mod demo_fixture;\n");
+    for target in ["library", "tools", "setup", "demos"] {
+        put(&format!("crates/a/{target}/custom.rs"), "fn entry() { panic!(\"manifest's production root\"); }\n");
+    }
+    put("crates/a/tests.rs", "fn main() { panic!(\"a production target can be named tests.rs\"); }\n");
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(["library", "tools", "setup", "demos"].iter().all(|target| has(&counts, &format!("crates/a/{target}/custom.rs"))) && has(&counts, "crates/a/tests.rs"), &format!("manifest-declared lib, bin, build and example paths are production roots regardless of filename: {counts:?}"));
+    put("crates/a/library/custom.rs", "#![cfg(test)]\nfn entry() { panic!(\"the whole source requires test\"); }\n");
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(!has(&counts, "crates/a/library/custom.rs") && has(&counts, "crates/a/tools/custom.rs"), &format!("a root's own whole-file test cfg remains authoritative: {counts:?}"));
+
+    // Only the children are test-aliased here. Aliasing the roots too would already widen
+    // their possible directories and hide a missing Cargo-root ownership fact.
+    put("crates/a/src/main.rs", "#[cfg(test)]\n#[path = \"../library/child.rs\"] mod library_child;\n#[cfg(test)]\n#[path = \"../examples/child/mod.rs\"] mod example_child;\n");
+    for (directory, entry, child, deep) in [("library", "custom", "child.rs", "deep.rs"), ("examples", "auto", "child/mod.rs", "child/deep.rs")] {
+        put(&format!("crates/a/{directory}/{entry}.rs"), "mod child;\nfn entry() { panic!(\"production root\"); }\n");
+        put(&format!("crates/a/{directory}/{child}"), "#[path = \"deep.rs\"] mod deep;\nfn child() { panic!(\"production child\"); }\n");
+        put(&format!("crates/a/{directory}/{deep}"), "fn deep() { panic!(\"production descendant\"); }\n");
+    }
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(["library/child.rs", "library/deep.rs", "examples/child/mod.rs", "examples/child/deep.rs"].iter().all(|file| has(&counts, &format!("crates/a/{file}"))), &format!("custom and example roots own sibling children, transitively: {counts:?}"));
+    put("crates/a/library/main.rs", "mod custom;\nfn main() {}\n");
+    put("crates/a/src/main.rs", "#[cfg(test)]\n#[path = \"../library/child.rs\"] mod library_child;\n#[cfg(test)]\n#[path = \"../examples/child/mod.rs\"] mod example_child;\n#[cfg(test)]\n#[path = \"../library/custom/child.rs\"] mod ordinary_child;\n");
+    put("crates/a/library/custom/child.rs", "fn child() { panic!(\"the binary's ordinary module context\"); }\n");
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(has(&counts, "crates/a/library/child.rs") && has(&counts, "crates/a/library/custom/child.rs"), &format!("a file can be both a Cargo root and an ordinary module: {counts:?}"));
+    put("crates/a/library/custom.rs", "#![cfg(test)]\nmod child;\n");
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(!has(&counts, "crates/a/library/child.rs") && !has(&counts, "crates/a/library/deep.rs") && !has(&counts, "crates/a/library/custom/child.rs") && has(&counts, "crates/a/examples/child/mod.rs"), &format!("removing only the root's production use removes its subtree: {counts:?}"));
+
+    put("crates/a/tests/nested/Cargo.toml", "[package]\nname = 'fixture'\n[lib]\npath = 'custom.rs'\n");
+    put("crates/a/tests/nested/custom.rs", "fn fixture() { panic!(\"fixture manifest, not a production root\"); }\n");
+    let counts = ratchet::walk(SCRIPT, tmp.path(), tests, stops);
+    expect(!has(&counts, "crates/a/tests/nested/custom.rs"), &format!("fixture manifests retain the caller's test-directory policy: {counts:?}"));
 }
 
 fn main() {

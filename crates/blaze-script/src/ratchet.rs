@@ -13,10 +13,14 @@
 //!   - the file of a module declared out of line in test code (`#[cfg(test)] mod t;`, or any
 //!     `mod m;` in a test file): `m.rs` or `m/mod.rs` beside a crate root (`lib.rs`, `main.rs`,
 //!     `mod.rs`, `build.rs`, a file of a `bin` directory), else in the directory named for the
-//!     declaring file. A `#[path]` is not followed.
+//!     declaring file. A top-level literal `#[path]` names a file beside the declaring file.
+//!     A file also reachable from production is counted. Nested or conditional paths, and
+//!     ordinary children of a path-loaded file, only protect possible production files: their
+//!     uncertain module-directory context never justifies excluding a file.
 //! A crate is the nearest directory above a file, under crates/, that holds a Cargo.toml, named
 //! by its path under crates/; a directory named `target` is not read.
 
+use core::cell::Cell;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -37,8 +41,24 @@ pub struct Tests {
     /// enabled (`None` for [`Tests::cfg_test_only`]).
     test_fn: Option<Regex>,
     inner_cfg_test: Regex,
-    /// `mod <name>;`, attributes before it on the line allowed.
+    /// The name after the `mod` token (trivia is skipped separately).
     module: Regex,
+}
+
+/// Where an out-of-line declaration may load its module. Unknown syntax is conservative:
+/// it can keep files counted, never establish that one is test-only.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ModuleFile {
+    Name(String),
+    Path(String),
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Module {
+    pub file: ModuleFile,
+    pub in_test: bool,
+    pub certain: bool,
 }
 
 /// What one file says of test code.
@@ -47,7 +67,7 @@ pub struct FileTests {
     /// Whether each line (from 0) is test code.
     pub test: Vec<bool>,
     /// Each `mod <name>;` it declares, and whether test code declares it.
-    pub mods: Vec<(String, bool)>,
+    pub mods: Vec<Module>,
     /// `#![cfg(test)]`: the whole file is test code.
     pub whole: bool,
 }
@@ -66,45 +86,243 @@ impl Tests {
     fn make(script: &str, test_fns: bool) -> Tests {
         let re = |pattern: &str| Regex::new(pattern).unwrap_or_else(|e| fail(script, &e.to_string()));
         Tests {
-            cfg_test: re(r"\A\s*#\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
+            cfg_test: re(r"\A\s*#\[cfg\((?:test\s*|all\(\s*test\s*(?:,|\))[^\]]*)\)\]"),
             // To the attribute's `]`, so that the item read after it starts after the attribute.
             test_fn: test_fns.then(|| re(r"\A\s*#\[(?:\w+::)*test\b[^\]]*\]")),
-            inner_cfg_test: re(r"\A\s*#!\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
-            module: re(r"\A\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?(\w+)\s*;"),
+            inner_cfg_test: re(r"\A\s*#!\[cfg\((?:test\s*|all\(\s*test\s*(?:,|\))[^\]]*)\)\]"),
+            module: re(r"\A(?:r#)?(\w+)"),
         }
     }
 
     /// The test code of one file's text.
     pub fn of(&self, text: &str) -> FileTests {
-        let lines: Vec<&str> = text.split('\n').collect();
-        let mut out = FileTests { test: vec![false; lines.len()], ..FileTests::default() };
-        // The byte where line `at` starts.
-        let mut start = 0;
-        for (at, line) in lines.iter().enumerate() {
-            if self.inner_cfg_test.is_match(line) {
-                out.whole = true;
-            }
-            if let Some(found) = self.cfg_test.find(line).or_else(|| self.test_fn.as_ref().and_then(|re| re.find(line))) {
-                // The item runs from after the attribute to its `}` or `;`, on the line of that byte.
-                let last = match item_end(text, start + found.end()) {
-                    Some(end) => at + text[start..end - 1].matches('\n').count(),
-                    None => at,
-                };
-                for it in &mut out.test[at..=last] {
-                    *it = true;
+        let mut out = FileTests { test: vec![false; text.split('\n').count()], ..FileTests::default() };
+        let mut paths = Vec::new();
+        let mut test_until = 0;
+        let mut macro_until = 0;
+        let (mut at, mut line, mut depth) = (0, 0, 0usize);
+        let mut non_items = 0usize;
+        let (mut conditional, mut gated, mut clean_line) = (false, false, true);
+        // One lexical pass: attributes inside strings/comments are not declarations. Pending
+        // attributes survive whitespace and visibility, but no intervening item.
+        while let Some(rest) = text.get(at..).filter(|it| !it.is_empty()) {
+            let bytes = rest.as_bytes();
+            let mut clean = true;
+            let end = if rest.starts_with("//") {
+                at + rest.find('\n').unwrap_or(rest.len())
+            } else if rest.starts_with("/*") {
+                comment_end(text.as_bytes(), at)
+            } else if let Some((open, inner)) = attribute_open(text, at) {
+                let Some(close) = close_of(text, open) else { break };
+                let Some(attr) = text.get(at..=close) else { break };
+                if inner {
+                    out.whole |= depth == 0 && self.inner_cfg_test.is_match(attr);
+                } else {
+                    let is_test = non_items == 0 && at >= macro_until && (self.cfg_test.is_match(attr) || self.test_fn.as_ref().is_some_and(|re| re.is_match(attr)));
+                    gated |= is_test;
+                    if is_test {
+                        let end = item_end(text, close + 1).unwrap_or(close + 1);
+                        test_until = test_until.max(end);
+                        mark_test_lines(text, at..end, line, &mut out.test);
+                    }
+                    let body = text.get(open + 1..close).unwrap_or("");
+                    let body = body.get(trivia_end(body, 0)..).unwrap_or("");
+                    let head = body.strip_prefix("r#").unwrap_or(body);
+                    let head = head.get(..ident_len(head.as_bytes())).unwrap_or("");
+                    if matches!(head, "path" | "cfg_attr") {
+                        let before = paths.len();
+                        path_literals(body, |path| paths.push(path));
+                        conditional |= head == "cfg_attr" && paths.len() != before;
+                    }
                 }
-            }
-            if let Some(found) = self.module.captures(line) {
-                out.mods.push((found[1].to_owned(), out.test[at]));
-            }
-            start += line.len() + 1;
+                close + 1
+            } else if bytes.first().is_some_and(|b| b.is_ascii_whitespace()) {
+                at + 1
+            } else if bytes.first() == Some(&b'"') {
+                paths.clear();
+                gated = false;
+                conditional = false;
+                clean = false;
+                string_end(text.as_bytes(), at + 1)
+            } else if bytes.first() == Some(&b'\'') {
+                clean = false;
+                quote_end(text, at)
+            } else if bytes.first().is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') {
+                let end = word_end(text, at);
+                let word = text.get(at..end).unwrap_or("");
+                if matches!(word, "macro" | "macro_rules") {
+                    macro_until = macro_until.max(item_end(text, end).unwrap_or(end));
+                }
+                if word == "mod" {
+                    let name_at = trivia_end(text, end);
+                    if let Some(decl) = text.get(name_at..).and_then(|rest| self.module.captures(rest))
+                        && let Some(all) = decl.get(0)
+                        && let Some(name) = decl.get(1)
+                        && text.get(trivia_end(text, name_at + all.end())..).is_some_and(|rest| rest.starts_with(';'))
+                    {
+                        let certain = depth == 0 && clean_line && !conditional;
+                        let in_test = gated || at < test_until;
+                        if paths.is_empty() || conditional {
+                            out.mods.push(Module { file: ModuleFile::Name(name.as_str().to_owned()), in_test, certain });
+                        }
+                        for path in paths.drain(..) {
+                            let file = match path {
+                                Some(PathLiteral::Raw(path)) => ModuleFile::Path(path.to_owned()),
+                                Some(PathLiteral::Cooked(path)) => serde_json::from_str(path).map_or(ModuleFile::Unknown, ModuleFile::Path),
+                                None => ModuleFile::Unknown,
+                            };
+                            out.mods.push(Module { file, in_test, certain });
+                        }
+                    }
+                }
+                if word == "pub" {
+                    // A restricted visibility is part of this item, not an intervening one.
+                    let after = text.get(trivia_end(text, end)..).unwrap_or("");
+                    if after.starts_with('(') {
+                        let open = text.len() - after.len();
+                        close_of(text, open).map_or(end, |close| close + 1)
+                    } else {
+                        end
+                    }
+                } else if word == "unsafe" {
+                    end
+                } else {
+                    paths.clear();
+                    gated = false;
+                    conditional = false;
+                    clean = false;
+                    end
+                }
+            } else {
+                if bytes.first() == Some(&b'!') {
+                    let open = trivia_end(text, at + 1);
+                    if text.as_bytes().get(open).is_some_and(|byte| matches!(byte, b'(' | b'[' | b'{')) {
+                        macro_until = macro_until.max(close_of(text, open).map_or(open, |close| close + 1));
+                    }
+                }
+                match bytes.first() {
+                    Some(b'{' | b'(' | b'[') => {
+                        depth += 1;
+                        if bytes.first() != Some(&b'{') {
+                            non_items += 1;
+                        }
+                    }
+                    Some(b'}' | b')' | b']') => {
+                        depth = depth.saturating_sub(1);
+                        if bytes.first() != Some(&b'}') {
+                            non_items = non_items.saturating_sub(1);
+                        }
+                    }
+                    _ => {}
+                }
+                paths.clear();
+                gated = false;
+                conditional = false;
+                clean = false;
+                at + rest.chars().next().map_or(1, char::len_utf8)
+            };
+            let crossed = text.get(at..end).map_or(0, |part| part.matches('\n').count());
+            line += crossed;
+            clean_line = (clean_line || crossed != 0) && clean;
+            at = end;
         }
         if out.whole {
             for it in &mut out.mods {
-                it.1 = true;
+                it.in_test = true;
             }
         }
         out
+    }
+}
+
+enum PathLiteral<'a> {
+    Raw(&'a str),
+    Cooked(&'a str),
+}
+
+fn attribute_open(text: &str, at: usize) -> Option<(usize, bool)> {
+    text.get(at..)?.strip_prefix('#')?;
+    let mut open = trivia_end(text, at + 1);
+    let inner = text.get(open..)?.starts_with('!');
+    if inner {
+        open = trivia_end(text, open + 1);
+    }
+    text.get(open..)?.starts_with('[').then_some((open, inner))
+}
+
+/// Only trivia may precede or follow a test item on a line the bitmap excludes. The complete
+/// source is already available when its attribute is read; no second table of ranges is kept.
+fn mark_test_lines(text: &str, item: core::ops::Range<usize>, first_line: usize, lines: &mut [bool]) {
+    let mut start = text.get(..item.start).and_then(|prefix| prefix.rfind('\n')).map_or(0, |at| at + 1);
+    let Some(rest) = text.get(start..) else { return };
+    for (offset, text_line) in rest.split('\n').enumerate() {
+        if start > item.end {
+            break;
+        }
+        let end = start + text_line.len();
+        let before = text.get(start..item.start.clamp(start, end)).unwrap_or("");
+        let after = text.get(item.end.clamp(start, end)..end).unwrap_or("");
+        if trivia_end(before, 0) == before.len() && trivia_end(after, 0) == after.len()
+            && let Some(line) = lines.get_mut(first_line + offset)
+        {
+            *line = true;
+        }
+        start = end + 1;
+    }
+}
+
+/// Whitespace and comments between Rust tokens, without interpreting any following token.
+fn trivia_end(text: &str, mut at: usize) -> usize {
+    while let Some(rest) = text.get(at..).filter(|it| !it.is_empty()) {
+        if rest.starts_with("//") {
+            at += rest.find('\n').unwrap_or(rest.len());
+        } else if rest.starts_with("/*") {
+            at = comment_end(text.as_bytes(), at);
+        } else if let Some(ch) = rest.chars().next().filter(|ch| ch.is_whitespace()) {
+            at += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    at
+}
+
+/// Literal path values in one attribute, skipping quoted text that merely mentions `path`.
+/// Cooked literals use the JSON-compatible Rust escape subset; an unsupported escape is an
+/// Unknown module, not permission to fall back to the module's default filename.
+fn path_literals<'a>(text: &'a str, mut emit: impl FnMut(Option<PathLiteral<'a>>)) {
+    let mut at = 0;
+    while let Some(rest) = text.get(at..).filter(|it| !it.is_empty()) {
+        if rest.starts_with('"') {
+            at = string_end(text.as_bytes(), at + 1);
+        } else if rest.starts_with("/*") {
+            at = comment_end(text.as_bytes(), at);
+        } else if rest.starts_with("//") {
+            at += rest.find('\n').unwrap_or(rest.len());
+        } else if rest.as_bytes().first().is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') {
+            let end = word_end(text, at);
+            if text.get(at..end).is_some_and(|word| word.strip_prefix("r#").unwrap_or(word) == "path")
+                && let Some(value) = text.get(trivia_end(text, end)..).and_then(|it| it.strip_prefix('='))
+            {
+                let value = value.get(trivia_end(value, 0)..).unwrap_or("");
+                let literal = if value.starts_with('"') {
+                    value.get(..string_end(value.as_bytes(), 1)).map(PathLiteral::Cooked)
+                } else if let Some(raw) = value.strip_prefix('r') {
+                    let hashes = raw.bytes().take_while(|b| *b == b'#').count();
+                    let end = word_end(value, 0);
+                    let from = hashes + 2;
+                    let to = end.checked_sub(hashes + 1);
+                    to.filter(|to| value.get(*to..end).is_some_and(|tail| tail.starts_with('"') && tail.bytes().skip(1).all(|b| b == b'#')))
+                        .and_then(|to| value.get(from..to)).map(PathLiteral::Raw)
+                } else {
+                    None
+                };
+                emit(literal);
+            }
+            at = end;
+        } else {
+            at += rest.chars().next().map_or(1, char::len_utf8);
+        }
     }
 }
 
@@ -168,39 +386,22 @@ pub fn walk_with<T>(
         // workspace, or a parked crate) is not built and not counted.
         CrateScope::Members => {
             let manifest = root.join("Cargo.toml");
-            let Ok(text) = std::fs::read_to_string(&manifest) else { fail(script, &format!("{} could not be read", manifest.display())) };
+            let text = read_text(script, &manifest);
             let members = Members::of(&text);
             rust_files(root).into_iter().filter(|parts| parts.len() < 2 || members.holds(&parts[..2].join("/"))).collect()
         }
         CrateScope::AllDirs => rust_files(root),
     };
-    let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
-    let mut scanned: Vec<(Vec<String>, Vec<(usize, T)>)> = Vec::new();
-    let mut skipped: BTreeSet<String> = BTreeSet::new();
-    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut scanned = Vec::new();
+    let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
     for parts in files {
         let path = parts.join("/");
+        let krate = crate_of(root, &parts, &mut manifests);
         let full = parts.iter().fold(root.to_path_buf(), |path, part| path.join(part));
-        // What is not UTF-8 becomes U+FFFD.
-        let Ok(bytes) = std::fs::read(&full) else { fail(script, &format!("{} could not be read", full.display())) };
-        let text = universal_newlines(String::from_utf8_lossy(&bytes).into_owned());
+        let text = read_text(script, &full);
         let found = tests.of(&text);
         let file = File { parts: &parts, text: &text, tests: &found };
-        let is_skipped = test_path(&parts) || found.whole || skip(&file);
-        if is_skipped {
-            skipped.insert(path.clone());
-        }
-        for (name, in_test) in &found.mods {
-            for child in module_files(&parts, name) {
-                if !known.contains(&child) {
-                    continue;
-                }
-                if *in_test {
-                    skipped.insert(child.clone());
-                }
-                children.entry(path.clone()).or_default().push(child);
-            }
-        }
+        let is_skipped = found.whole || skip(&file);
         let mut sites = Vec::new();
         if !is_skipped {
             scan(&file, &mut |line, what| {
@@ -209,29 +410,224 @@ pub fn walk_with<T>(
                 }
             });
         }
-        scanned.push((parts, sites));
+        scanned.push((path, krate, found, Cell::new(is_skipped), test_path(&parts), false, sites));
     }
-    // A module that skipped code declares is skipped, and so is every module it declares.
-    let mut todo: Vec<String> = skipped.iter().cloned().collect();
-    // Bounded: a file enters `skipped` once, and only a file that entered is taken again.
-    while let Some(path) = todo.pop() {
-        for child in children.get(&path).into_iter().flatten() {
-            if skipped.insert(child.clone()) {
-                todo.push(child.clone());
+    production_roots(script, root, &manifests, |path| {
+        for (source, _, _, _, _, entry, _) in &mut scanned {
+            if source == path {
+                *entry = true;
             }
         }
-    }
-    let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
+    });
+    test_module_files(scanned.iter().map(|(path, _, found, forced, by_path, entry, _)| (path.as_str(), found, forced.get(), *by_path, *entry)), |position| {
+        if let Some((_, _, _, skipped, _, _, _)) = scanned.get(position) {
+            skipped.set(true);
+        }
+    });
     let mut out: Counts<T> = Default::default();
-    for (parts, sites) in scanned {
-        let path = parts.join("/");
-        if sites.is_empty() || skipped.contains(&path) {
+    for (path, krate, _, skipped, _, _, sites) in scanned {
+        if sites.is_empty() || skipped.get() {
             continue;
         }
-        let krate = crate_of(root, &parts, &mut manifests);
         out.entry(krate).or_default().extend(sites.into_iter().map(|(line, what)| Hit { path: path.clone(), line, what }));
     }
     out
+}
+
+/// The shared read boundary for source and manifests. As in the source inventory, invalid
+/// UTF-8 becomes U+FFFD and line endings are normalized before either reader sees the text.
+fn read_text(script: &str, path: &Path) -> String {
+    let Ok(bytes) = std::fs::read(path) else { fail(script, &format!("{} could not be read", path.display())) };
+    universal_newlines(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Explicit production entry paths from the manifests the caller already found while naming
+/// its crates. Each manifest is read once; the existing TOML parser handles quoting, dotted
+/// keys and array tables. No target/feature resolution or separate owned path index is needed.
+pub fn production_roots(script: &str, root: &Path, manifests: &BTreeMap<Vec<String>, bool>, mut emit: impl FnMut(&str)) {
+    for (parts, present) in manifests {
+        if !present || parts.iter().any(|part| TEST_DIRS.contains(&part.as_str())) {
+            continue;
+        }
+        let directory = parts.join("/");
+        let manifest = root.join(&directory).join("Cargo.toml");
+        let refused = |message: &dyn fmt::Display| -> ! { fail(script, &format!("{}: {message}", manifest.display())) };
+        let text = read_text(script, &manifest);
+        let doc = crate::toml::read(&text).unwrap_or_else(|error| refused(&error.display(&text)));
+        let mut target = |table: crate::toml::Node<'_, '_>| {
+            if !table.is_table() {
+                refused(&"a production target must be a table");
+            }
+            if let Some(path) = table.get("path") {
+                let Some(path) = path.as_str() else { refused(&"a production target path must be a string") };
+                emit(&crate::pypath::normpath(&crate::pypath::join(&directory, path)));
+            }
+        };
+        if let Some(lib) = doc.root().get("lib") {
+            target(lib);
+        }
+        for kind in ["bin", "example"] {
+            if let Some(targets) = doc.root().get(kind) {
+                if !targets.is_array() {
+                    refused(&"bin and example must be arrays of production targets");
+                }
+                for item in targets.children() {
+                    target(item);
+                }
+            }
+        }
+        if let Some(build) = doc.root().get("package").and_then(|package| package.get("build")) {
+            if let Some(path) = build.as_str() {
+                emit(&crate::pypath::normpath(&crate::pypath::join(&directory, path)));
+            } else if build.as_bool().is_none() {
+                refused(&"package.build must be a path string or a boolean");
+            }
+        }
+    }
+}
+
+/// Files proven test-only by their own cfg, or by every incoming module declaration. `forced`
+/// is the caller's own skip policy; `by_path` is its test-file convention, used only for files
+/// with no incoming declaration; `entry` is a manifest-declared production root. A production
+/// alias wins transitively. A cycle without such a proof stays counted. No unresolved
+/// module-directory context can prove an exclusion. Emits
+/// input positions, so callers retain their existing path storage instead of copying its keys.
+pub fn test_module_files<'a>(files: impl Iterator<Item = (&'a str, &'a FileTests, bool, bool, bool)>, mut emit: impl FnMut(usize)) {
+    struct Source<'a> {
+        tests: &'a FileTests,
+        position: usize,
+        forced: bool,
+        by_path: bool,
+        entry: bool,
+        root: bool,
+        path_loaded: Cell<bool>,
+        excluded: Cell<bool>,
+        production: Cell<bool>,
+    }
+    let files: BTreeMap<_, _> = files.enumerate().map(|(position, (path, tests, forced, by_path, entry))| {
+        let ordinary = path.ends_with("/src/lib.rs") || path.ends_with("/src/main.rs") || path.ends_with("/build.rs")
+            || ["/src/bin/", "/examples/"].iter().any(|directory| path.rsplit_once(*directory).is_some_and(|(_, tail)| {
+                tail.ends_with(".rs") && !tail.contains('/') || tail.strip_suffix("/main.rs").is_some_and(|name| !name.contains('/'))
+            }));
+        (path, Source {
+            tests, position, forced, by_path, entry: entry || ordinary && !by_path, root: entry || ordinary,
+            path_loaded: Cell::new(false), excluded: Cell::new(false), production: Cell::new(false),
+        })
+    }).collect();
+    let mut parents: BTreeMap<&str, Vec<(&str, bool, bool)>> = BTreeMap::new();
+    // First record every literal path alias, so ordinary children of a path-loaded file never
+    // inherit the wrong directory (a #[path] file's children are siblings, not stem/children).
+    for (&source, state) in &files {
+        for module in &state.tests.mods {
+            match &module.file {
+                ModuleFile::Path(named) => {
+                    let directory = source.rsplit_once('/').map_or("", |(directory, _)| directory);
+                    let path = crate::pypath::normpath(&crate::pypath::join(directory, named));
+                    let certain = module.certain && !path.starts_with('/') && !path.starts_with("../");
+                    if certain {
+                        if let Some((&target, target_state)) = files.get_key_value(path.as_str()) {
+                            target_state.path_loaded.set(true);
+                            parents.entry(target).or_default().push((source, module.in_test, true));
+                        }
+                    } else {
+                        // The final filename is invariant even when an inline/conditional
+                        // directory is unknown. Every matching file remains a possible use.
+                        for (&target, target_state) in files.iter().filter(|(target, _)| target.rsplit('/').next() == path.rsplit('/').next()) {
+                            target_state.path_loaded.set(true);
+                            parents.entry(target).or_default().push((source, module.in_test, false));
+                        }
+                    }
+                }
+                ModuleFile::Unknown => {
+                    // An escaped/raw/computed path the bounded reader cannot interpret must
+                    // not disappear behind a separate test alias of the same physical file.
+                    for &target in files.keys() {
+                        parents.entry(target).or_default().push((source, module.in_test, false));
+                    }
+                }
+                ModuleFile::Name(_) => {}
+            }
+        }
+    }
+    for (&source, state) in &files {
+        for module in &state.tests.mods {
+            let ModuleFile::Name(name) = &module.file else { continue };
+            if !module.certain || state.path_loaded.get() {
+                for &target in files.keys().filter(|target| {
+                    let (directory, file) = target.rsplit_once('/').unwrap_or(("", target));
+                    file.strip_suffix(".rs") == Some(name.as_str()) || (file == "mod.rs" && directory.rsplit('/').next() == Some(name.as_str()))
+                }) {
+                    parents.entry(target).or_default().push((source, module.in_test, false));
+                }
+            } else {
+                for named in module_files(source, name, state.root) {
+                    if let Some((&target, _)) = files.get_key_value(named.as_str()) {
+                        parents.entry(target).or_default().push((source, module.in_test, true));
+                    }
+                }
+                if state.root {
+                    // A custom root can also be loaded as an ordinary module by another
+                    // target. Its stem-directory children are then possible production uses;
+                    // that extra context may protect files, never prove them test-only.
+                    for named in module_files(source, name, false) {
+                        if let Some((&target, _)) = files.get_key_value(named.as_str()) {
+                            parents.entry(target).or_default().push((source, module.in_test, false));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (&path, state) in &files {
+        if state.tests.whole || state.forced || (state.by_path && !parents.get(path).is_some_and(|edges| edges.iter().any(|(_, _, certain)| *certain))) {
+            state.excluded.set(true);
+        }
+    }
+    // First prove exclusions using certain declarations only. An uncertain declaration never
+    // supplies a proof. Then follow every possible production edge to revoke a candidate:
+    // known test-only syntax cannot turn an uncertain path into a production use.
+    // Bounded: each successful round adds a file, and there are files.len() files.
+    loop {
+        let mut changed = false;
+        for (&target, incoming) in &parents {
+            let Some(state) = files.get(target) else { continue };
+            if !state.excluded.get() && incoming.iter().any(|(_, _, certain)| *certain)
+                && incoming.iter().filter(|(_, _, certain)| *certain).all(|(source, in_test, _)| *in_test || files.get(source).is_some_and(|state| state.excluded.get()))
+            {
+                state.excluded.set(true);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for state in files.values() {
+        // Cargo's ordinary entry files have an implicit production use, even when a test
+        // module also names the same file. Fixture trees remain the caller's by-path tests.
+        state.production.set(!state.excluded.get() || (state.entry && !state.forced && !state.tests.whole));
+    }
+    loop {
+        let mut changed = false;
+        for (&target, incoming) in &parents {
+            let Some(state) = files.get(target) else { continue };
+            if state.tests.whole || state.forced || state.production.get() {
+                continue;
+            }
+            if incoming.iter().any(|(source, in_test, _)| !*in_test && files.get(source).is_some_and(|state| state.production.get())) {
+                state.production.set(true);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for state in files.into_values() {
+        if state.excluded.get() && !state.production.get() {
+            emit(state.position);
+        }
+    }
 }
 
 pub fn is_ident(b: u8) -> bool {
@@ -400,15 +796,13 @@ pub fn test_path(parts: &[String]) -> bool {
     dirs.iter().any(|part| TEST_DIRS.contains(&part.as_str())) || TEST_FILES.contains(&name)
 }
 
-/// The two files the module `name`, declared out of line in the file `parts`, can be.
-pub fn module_files(parts: &[String], name: &str) -> [String; 2] {
-    let Some((file, dirs)) = parts.split_last() else { return [String::new(), String::new()] };
-    let mut base: Vec<&str> = dirs.iter().map(String::as_str).collect();
-    let root = ROOT_FILES.contains(&file.as_str()) || dirs.last().is_some_and(|it| it == "bin");
-    if !root {
-        base.push(file.strip_suffix(".rs").unwrap_or(file));
-    }
-    let base = base.join("/");
+/// The two files the module `name`, declared out of line in `source`, can be. `entry` supplies
+/// a Cargo root's module-directory ownership when its filename alone cannot (custom targets
+/// and examples). Conventional lib/main/mod/build and bin names keep their existing rule.
+pub fn module_files(source: &str, name: &str, entry: bool) -> [String; 2] {
+    let (directory, file) = source.rsplit_once('/').unwrap_or(("", source));
+    let root = entry || ROOT_FILES.contains(&file) || directory.ends_with("/bin");
+    let base = if root { directory } else { source.strip_suffix(".rs").unwrap_or(source) };
     [format!("{base}/{name}.rs"), format!("{base}/{name}/mod.rs")]
 }
 

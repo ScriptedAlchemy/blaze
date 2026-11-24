@@ -87,7 +87,8 @@ A site in test code is not counted. Test code is, and nothing else is:
   - the file of a module declared out of line in test code (`#[cfg(test)] mod t;`, or any
     `mod m;` in a test file): `m.rs` or `m/mod.rs` beside a crate root (`lib.rs`, `main.rs`,
     `mod.rs`, `build.rs`, a file of a `bin` directory), else in the directory named for the
-    declaring file. A `#[path]` is not followed, so such a module counts.
+    declaring file. Literal top-level `#[path]` declarations are followed. A production alias
+    keeps a file counted; an uncertain nested or conditional path never proves an exclusion.
 Everything else counts, build scripts and binaries included.
 
 A crate is the nearest directory above the file, under crates/, that holds a Cargo.toml, named

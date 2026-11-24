@@ -990,7 +990,7 @@ fn walk(root: &Path) -> Result<Walked, TreeError> {
         for decl in &found.mods {
             let files = match &decl.path {
                 Some(named) => vec![path_file(&parts, named)],
-                None => module_files(&parts, &decl.name).into(),
+                None => module_files(&path, &decl.name, false).into(),
             };
             for file in files {
                 if !known.contains(&file) {
