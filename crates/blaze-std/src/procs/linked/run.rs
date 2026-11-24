@@ -290,6 +290,23 @@ impl Spawner {
         Ok(Started { child: Served { run, channel: parent }, pipes })
     }
 
+    /// `spec` started with its channel as [`CHILD_FD`] and Linux confinement entered in the child
+    /// before `execve` (Landlock + seccomp + resource limits; rule 9).
+    #[cfg(target_os = "linux")]
+    pub fn start_served_confined(
+        &self,
+        cx: &Cx,
+        spec: &RunSpec<'_>,
+        confine: &blaze_core::linked::run::ChildConfine<'_>,
+    ) -> Result<Started<Served>, RunError> {
+        let refuse = |fault| RunError { step: RunStep::Start, proc: None, fault };
+        let (parent, child_end) = channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?;
+        let given = [(child_end.fd(), CHILD_FD)];
+        let Started { child: run, pipes } = self.start_with(cx, spec, &given, Some(confine))?;
+        drop(child_end);
+        Ok(Started { child: Served { run, channel: parent }, pipes })
+    }
+
     fn start_with(
         &self,
         cx: &Cx,

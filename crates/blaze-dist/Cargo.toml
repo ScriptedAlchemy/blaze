@@ -14,10 +14,11 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-own.workspace = true
 blaze-wire.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-own = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

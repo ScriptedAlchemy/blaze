@@ -18,8 +18,12 @@
 //! Nothing here does IO, starts a thread or reads a clock: every machine takes events and `now`
 //! and returns its answers and effects. Every message is a `blaze-wire` type.
 
-#![feature(allocator_api, btreemap_alloc, clone_from_ref)]
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
 #![deny(missing_docs)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod admission;
 pub mod holder;

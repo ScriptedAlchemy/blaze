@@ -1,9 +1,9 @@
 //! A dependency as a manifest declares it (cargo's `Dependency`), and the feature map of a
 //! package (cargo's `build_feature_map`), with cargo's checks and messages.
 
+use core::fmt;
 use std::alloc::Global;
 use std::collections::BTreeMap;
-use std::fmt;
 use std::path::PathBuf;
 
 use blaze_resolve::{FeatureDep, InternedString, Platform};
@@ -20,15 +20,15 @@ pub use blaze_resolve::DepKind;
 #[derive(Debug)]
 pub struct MetadataPathError {
     /// The dependency whose path was being serialized.
-    pub dependency: String,
+    pub dependency: InternedString,
     /// The path passed to the workspace's filesystem reader.
     pub path: PathBuf,
     /// The reader's original canonicalization error.
     pub source: std::io::Error,
 }
 
-impl std::fmt::Display for MetadataPathError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for MetadataPathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f,
             "the path dependency `{}` at `{}` could not be canonicalized: {}",
             self.dependency, self.path.display(), self.source,
@@ -36,8 +36,8 @@ impl std::fmt::Display for MetadataPathError {
     }
 }
 
-impl std::error::Error for MetadataPathError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for MetadataPathError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         Some(&self.source)
     }
 }
@@ -239,7 +239,7 @@ impl Dependency {
         let path = path
             .map(|path| {
                 _files.canonicalize(&path).map_err(|source| MetadataPathError {
-                    dependency: self.name.clone(),
+                    dependency: InternedString::new(&self.name),
                     path,
                     source,
                 })
@@ -653,7 +653,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_metadata_path_tests {
     use super::*;
-    use std::{borrow::Cow, path::Path};
+    use std::{borrow::Cow, io, path::Path};
 
     #[test]
     fn dependency_metadata_uses_its_reader_and_reports_a_missing_identity() {
@@ -662,20 +662,20 @@ mod windows_metadata_path_tests {
             Missing,
         }
         impl Files for View {
-            fn read(&self, _: &Path) -> std::io::Result<Cow<'_, [u8]>> {
+            fn read(&self, _: &Path) -> io::Result<Cow<'_, [u8]>> {
                 panic!("serializing metadata must not read files")
             }
             fn kind(&self, _: &Path) -> Option<crate::files::FileKind> {
                 panic!("the supplied view owns canonicalization")
             }
-            fn list(&self, _: &Path) -> std::io::Result<Vec<(String, bool)>> {
+            fn list(&self, _: &Path) -> io::Result<Vec<(String, bool)>> {
                 panic!("serializing metadata must not list directories")
             }
-            fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
                 assert_eq!(path, Path::new("/C:/view/helper"));
                 match self {
                     View::Present => Ok(PathBuf::from("/C:/canonical/helper")),
-                    View::Missing => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                    View::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
                 }
             }
         }

@@ -1,5 +1,4 @@
 use std::alloc::Global;
-use std::vec::Vec;
 
 use crate::flow::{BorrowKind, Bound, Flow, FlowBuilder, Loan, Operand, Place, Point, Span, Stmt};
 use crate::record::Plant;
@@ -58,15 +57,19 @@ fn generated_logging_bodies_stay_within_quadratic_steps() {
         let mut meter = Meter::new(bound.min(LIMIT));
         let found = solve(BODY, &flow, &facts, Plant::None, Global, &mut meter)
             .expect("short consecutive loans fit the quadratic work bound");
-        let expected: Vec<_> = (0..n)
-            .map(|i| BorrowFinding::Invalidated {
-                at: Point::start(Stmt(3 * i + 1)),
-                loan: Loan(i),
-                span: SPAN,
-                returned: false,
-            })
-            .collect();
-        assert_eq!(found.as_slice(), expected.as_slice());
+        assert_eq!(found.len(), usize::try_from(n).unwrap_or(usize::MAX));
+        for (i, finding) in found.iter().enumerate() {
+            let i = u32::try_from(i).unwrap_or(u32::MAX);
+            assert_eq!(
+                *finding,
+                BorrowFinding::Invalidated {
+                    at: Point::start(Stmt(3 * i + 1)),
+                    loan: Loan(i),
+                    span: SPAN,
+                    returned: false,
+                }
+            );
+        }
         assert!(meter.used() > 0 && meter.used() <= bound);
         std::println!(
             "N={n} steps={} old_cells={} bound={bound} findings={n}",
@@ -177,12 +180,19 @@ fn later_return_marks_invalidated_loans_on_both_sides_of_word_boundary() {
         .expect("all loans reach the return origin");
     let oracle = tier_two_oracle(&flow, &facts, Plant::None, Global).expect("65 loans reach the return origin");
     assert_eq!(found.as_slice(), oracle.as_slice());
-    let expected: Vec<_> = (0..65)
-        .map(|l| BorrowFinding::Invalidated {
-            at: Point::start(Stmt(65)), loan: Loan(l), span: SPAN, returned: true,
-        })
-        .collect();
-    assert_eq!(found.as_slice(), expected.as_slice());
+    assert_eq!(found.len(), 65);
+    for (l, finding) in found.iter().enumerate() {
+        let l = u32::try_from(l).unwrap_or(u32::MAX);
+        assert_eq!(
+            *finding,
+            BorrowFinding::Invalidated {
+                at: Point::start(Stmt(65)),
+                loan: Loan(l),
+                span: SPAN,
+                returned: true,
+            }
+        );
+    }
 }
 
 #[test]

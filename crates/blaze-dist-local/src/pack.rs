@@ -6,16 +6,18 @@
 //! [`PackRef::keys`] is the digest of its keys, so a reader checks it has what was committed
 //! before it believes one value.
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
+use core::fmt;
 
-use blaze_wire::{
-    DIST_PACK_FORMAT, DIST_PACK_MAGIC, Digest, Encoder, Limits, PackRef, digest_of_encoded_name,
-};
+use blaze_int::Int as _;
+use blaze_own::Vec;
+use blaze_sha256::digest as sha256_digest;
 use blaze_wire::json::hex;
-use sha2::{Digest as _, Sha256};
+use blaze_wire::{
+    DIST_PACK_FORMAT, DIST_PACK_MAGIC, Digest, Encoder, Limits, PackRef, WireVec,
+    digest_of_encoded_name,
+};
 
-// This codec is also compiled directly by the cache's native-publication tests.
-// Keep its allocator oracle independent of local carrier modules.
 #[cfg(test)]
 #[path = "test_alloc.rs"]
 pub(crate) mod test_alloc;
@@ -71,8 +73,8 @@ impl PackError {
     }
 }
 
-impl std::fmt::Display for PackError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for PackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use PackErrorKind as Kind;
         if let Some(pack) = &self.pack {
             write!(f, "pack {} ", hex(pack))?;
@@ -90,7 +92,8 @@ impl std::fmt::Display for PackError {
             Kind::ValueLimit(key) => write!(
                 f,
                 "native value {} exceeds the {}-byte pack limit",
-                hex(key), Limits::DOCUMENTED.blob,
+                hex(key),
+                Limits::DOCUMENTED.blob,
             ),
             Kind::Format(format) => write!(f, "is of format {format}"),
             Kind::Length { actual, committed } => {
@@ -105,7 +108,7 @@ impl std::fmt::Display for PackError {
     }
 }
 
-impl std::error::Error for PackError {}
+impl core::error::Error for PackError {}
 
 /// One value: a store key, its kind's code, its bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,7 +118,7 @@ pub struct Value {
     /// The kind's code, which only the store reads.
     pub kind: u8,
     /// The value.
-    pub bytes: Vec<u8>,
+    pub bytes: WireVec<u8>,
 }
 
 /// One checked value borrowed from the complete native pack that contains it.
@@ -150,9 +153,12 @@ pub struct Pack<A: Allocator> {
     pub reference: PackRef,
 }
 
-impl<A: Allocator> std::fmt::Debug for Pack<A> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pack").field("bytes", &self.bytes).field("reference", &self.reference).finish()
+impl<A: Allocator> fmt::Debug for Pack<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pack")
+            .field("bytes", &self.bytes)
+            .field("reference", &self.reference)
+            .finish()
     }
 }
 
@@ -170,8 +176,10 @@ fn canonical<A: Allocator>(mut values: Vec<Value, A>) -> Result<Vec<Value, A>, P
     values.sort_unstable_by(|a, b| a.key.cmp(&b.key));
     values.dedup();
     for pair in values.windows(2) {
-        if pair[0].key == pair[1].key {
-            return Err(PackError::producing(PackErrorKind::ConflictingKey(pair[0].key)));
+        if let [first, second] = pair
+            && first.key == second.key
+        {
+            return Err(PackError::producing(PackErrorKind::ConflictingKey(first.key)));
         }
     }
     Ok(values)
@@ -185,10 +193,13 @@ impl<A: Allocator> Pack<A> {
     /// Use [`Self::batches`] to partition new uploads without refusing older whole packs.
     pub fn of(values: Vec<Value, impl Allocator>, alloc: A) -> Result<Pack<A>, PackError> {
         let values = canonical(values)?;
-        let size = values.iter().try_fold(DIST_PACK_MAGIC.len(), |size: usize, value| {
-            size.checked_add(41)?.checked_add(value.bytes.len())
-        }).ok_or_else(|| PackError::producing(PackErrorKind::SizeOverflow))?;
-        if u64::try_from(size).map_or(true, |size| size > Limits::DOCUMENTED.blob) {
+        let size = values
+            .iter()
+            .try_fold(DIST_PACK_MAGIC.len(), |size: usize, value| {
+                size.checked_add(41)?.checked_add(value.bytes.len())
+            })
+            .ok_or_else(|| PackError::producing(PackErrorKind::SizeOverflow))?;
+        if !u64::try_from(size).is_ok_and(|size| size <= Limits::DOCUMENTED.blob) {
             return Err(PackError::producing(PackErrorKind::BlobLimit));
         }
         let mut bytes = Vec::with_capacity_in(size, alloc);
@@ -196,12 +207,12 @@ impl<A: Allocator> Pack<A> {
         for value in &values {
             bytes.extend_from_slice(&value.key);
             bytes.push(value.kind);
-            bytes.extend_from_slice(&(value.bytes.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&value.bytes.len().widen_to::<u64>().to_le_bytes());
             bytes.extend_from_slice(&value.bytes);
         }
         let reference = PackRef {
-            pack: Sha256::digest(&bytes).into(),
-            size: bytes.len() as u64,
+            pack: sha256_digest(&bytes),
+            size: bytes.len().widen_to::<u64>(),
             keys: keys_digest(values.iter().map(|it| it.key), bytes.allocator()),
             packed: None,
             format: DIST_PACK_FORMAT,
@@ -220,7 +231,8 @@ impl<A: Allocator> Pack<A> {
     where
         A: Clone,
     {
-        Self::batches_with_limits(values, Limits::DOCUMENTED.batch_items as usize, 64 << 20, alloc)
+        let max_items = usize::try_from(Limits::DOCUMENTED.batch_items).unwrap_or(usize::MAX);
+        Self::batches_with_limits(values, max_items, 64 << 20, alloc)
     }
 
     // A small limit makes the real partitioning path testable without allocating
@@ -248,7 +260,10 @@ impl<A: Allocator> Pack<A> {
         let mut group = Vec::new_in(&alloc);
         let mut size = DIST_PACK_MAGIC.len();
         for value in values {
-            let entry = value.bytes.len().checked_add(41)
+            let entry = value
+                .bytes
+                .len()
+                .checked_add(41)
                 .ok_or_else(|| PackError::producing(PackErrorKind::ValueSizeOverflow(value.key)))?;
             if entry > blob_limit.saturating_sub(DIST_PACK_MAGIC.len()) {
                 return Err(PackError::producing(PackErrorKind::ValueLimit(value.key)));
@@ -258,11 +273,12 @@ impl<A: Allocator> Pack<A> {
                     || size.saturating_add(entry) > target_bytes
                     || size.saturating_add(entry) > blob_limit)
             {
-                let complete = std::mem::replace(&mut group, Vec::new_in(&alloc));
+                let complete = core::mem::replace(&mut group, Vec::new_in(&alloc));
                 packs.push(Self::of(complete, alloc.clone())?);
                 size = DIST_PACK_MAGIC.len();
             }
-            size = size.checked_add(entry)
+            size = size
+                .checked_add(entry)
                 .ok_or_else(|| PackError::producing(PackErrorKind::SizeOverflow))?;
             group.push(value);
         }
@@ -297,13 +313,14 @@ pub fn read<'a, A: Allocator>(
     if reference.size > Limits::DOCUMENTED.blob {
         return Err(refused(PackErrorKind::BlobLimit));
     }
-    if bytes.len() as u64 != reference.size {
+    let actual_len = bytes.len().widen_to::<u64>();
+    if actual_len != reference.size {
         return Err(refused(PackErrorKind::Length {
-            actual: bytes.len() as u64,
+            actual: actual_len,
             committed: reference.size,
         }));
     }
-    let got: Digest = Sha256::digest(bytes).into();
+    let got: Digest = sha256_digest(bytes);
     if got != reference.pack {
         return Err(refused(PackErrorKind::Digest(got)));
     }
@@ -316,10 +333,9 @@ pub fn read<'a, A: Allocator>(
         let (kind, after) = after.split_first().ok_or_else(short)?;
         let (len, after) = after.split_first_chunk::<8>().ok_or_else(short)?;
         let len = usize::try_from(u64::from_le_bytes(*len)).map_err(|_| short())?;
-        if after.len() < len {
+        let Some((value, after)) = after.split_at_checked(len) else {
             return Err(short());
-        }
-        let (value, after) = after.split_at(len);
+        };
         if values.last().is_some_and(|last: &ValueRef<'_>| last.key >= *key) {
             return Err(refused(PackErrorKind::KeyOrder));
         }
@@ -334,31 +350,37 @@ pub fn read<'a, A: Allocator>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_alloc::{Counted, Counts};
-    use std::alloc::Global;
+    use super::*;
+    use blaze_own::vec_in;
+    use blaze_wire::WireAlloc;
+
+    fn test_alloc() -> WireAlloc {
+        blaze_own::testing::heap().shared()
+    }
 
     fn value(key: u8, bytes: &[u8]) -> Value {
-        Value { key: [key; 32], kind: 1, bytes: bytes.to_vec_in(Global) }
+        Value { key: [key; 32], kind: 1, bytes: Vec::from_slice_in(bytes, test_alloc()) }
     }
 
     #[test]
     fn packs_and_record_views_use_the_callers_allocator() {
+        let alloc = test_alloc();
         let counts = Counts::default();
         let mut input = Vec::new_in(Counted(&counts));
         input.extend([value(2, b"two"), value(1, b"one"), value(1, b"one")]);
         let pointer = input.as_ptr();
         let input = canonical(input).unwrap();
         assert_eq!(input.as_ptr(), pointer, "canonicalization must retain the input allocation");
-        assert!(std::ptr::eq(input.allocator().0, &counts));
+        assert!(core::ptr::eq(input.allocator().0, &counts));
         assert_eq!(input.len(), 2);
 
         let pack = Pack::of(input, Counted(&counts)).unwrap();
-        let control = Pack::of(vec![value(1, b"one"), value(2, b"two")], Global).unwrap();
+        let control = Pack::of(vec_in![alloc; value(1, b"one"), value(2, b"two")], alloc).unwrap();
         assert_eq!(pack, control);
-        assert!(std::ptr::eq(pack.bytes.allocator().0, &counts));
+        assert!(core::ptr::eq(pack.bytes.allocator().0, &counts));
         let views = read(&pack.bytes, &pack.reference, Counted(&counts)).unwrap();
-        assert!(std::ptr::eq(views.allocator().0, &counts));
+        assert!(core::ptr::eq(views.allocator().0, &counts));
         assert_eq!(views.as_slice(), &[value(1, b"one"), value(2, b"two")]);
         let start = pack.bytes.as_ptr() as usize;
         let end = start + pack.bytes.len();
@@ -367,23 +389,23 @@ mod tests {
             assert!(pointer >= start && pointer + view.bytes.len() <= end);
         }
         // The streaming key digest must remain identical to the wire array's encoding.
-        let keys = [[1u8; 32], [2u8; 32]].to_vec_in(Global);
+        let keys = vec_in![alloc; [1u8; 32], [2u8; 32]];
         assert_eq!(
             pack.reference.keys,
-            digest_of_encoded_name("blaze/dist-pack-keys", &blaze_wire::encode(&keys, Global))
+            digest_of_encoded_name("blaze/dist-pack-keys", &blaze_wire::encode(&keys, alloc))
         );
         drop(views);
         drop(pack);
         assert_eq!(counts.allocations.get(), counts.deallocations.get());
 
-        let source = || vec![value(3, b"three"), value(1, b"one"), value(2, b"two")];
+        let source = || vec_in![alloc; value(3, b"three"), value(1, b"one"), value(2, b"two")];
         let packs = Pack::batches_with_limits(source(), 2, usize::MAX, Counted(&counts)).unwrap();
-        let control = Pack::batches_with_limits(source(), 2, usize::MAX, Global).unwrap();
+        let control = Pack::batches_with_limits(source(), 2, usize::MAX, alloc).unwrap();
         assert_eq!(packs, control);
         assert_eq!(packs.len(), 2);
-        assert!(std::ptr::eq(packs.allocator().0, &counts));
+        assert!(core::ptr::eq(packs.allocator().0, &counts));
         for pack in &packs {
-            assert!(std::ptr::eq(pack.bytes.allocator().0, &counts));
+            assert!(core::ptr::eq(pack.bytes.allocator().0, &counts));
         }
         drop(packs);
         assert_eq!(counts.allocations.get(), counts.deallocations.get());
@@ -391,53 +413,87 @@ mod tests {
 
     #[test]
     fn a_pack_reads_back_whatever_order_it_was_made_in() {
-        let one = Pack::of(vec![value(2, b"two"), value(1, b"one")], Global).unwrap();
-        let other = Pack::of(vec![value(1, b"one"), value(2, b"two")], Global).unwrap();
+        let alloc = test_alloc();
+        let one = Pack::of(vec_in![alloc; value(2, b"two"), value(1, b"one")], alloc).unwrap();
+        let other = Pack::of(vec_in![alloc; value(1, b"one"), value(2, b"two")], alloc).unwrap();
         assert_eq!(one, other, "two executors with the same values name one pack");
         assert_eq!(
-            read(&one.bytes, &one.reference, Global).unwrap(),
-            vec![value(1, b"one"), value(2, b"two")]
+            read(&one.bytes, &one.reference, alloc).unwrap().as_slice(),
+            &[value(1, b"one"), value(2, b"two")]
         );
     }
 
     #[test]
     fn bounded_packs_keep_every_key_and_refuse_conflicts_across_boundaries() {
-        let source = vec![value(3, b"three"), value(1, b"one"), value(2, b"two"),
-            value(2, b"two")];
-        let by_items = Pack::batches_with_limits(source.clone(), 2, usize::MAX, Global).unwrap();
+        let alloc = test_alloc();
+        let source = vec_in![
+            alloc;
+            value(3, b"three"),
+            value(1, b"one"),
+            value(2, b"two"),
+            value(2, b"two"),
+        ];
+        let by_items = Pack::batches_with_limits(source.clone(), 2, usize::MAX, alloc).unwrap();
         assert_eq!(by_items.len(), 2, "three distinct keys must span two item-bounded packs");
-        let recovered = by_items.iter().flat_map(|pack| read(&pack.bytes, &pack.reference, Global).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(recovered, vec![value(1, b"one"), value(2, b"two"), value(3, b"three")]);
-        let by_bytes = Pack::batches_with_limits(source.clone(), 5, DIST_PACK_MAGIC.len() + 45, Global).unwrap();
+        let mut recovered = Vec::new_in(alloc);
+        for pack in &by_items {
+            recovered.extend(read(&pack.bytes, &pack.reference, alloc).unwrap());
+        }
+        assert_eq!(recovered.as_slice(), &[value(1, b"one"), value(2, b"two"), value(3, b"three")]);
+        let by_bytes =
+            Pack::batches_with_limits(source.clone(), 5, DIST_PACK_MAGIC.len() + 45, alloc)
+                .unwrap();
         assert_eq!(by_bytes.len(), 3, "byte-bounded groups must retain every value");
-        let recovered = by_bytes.iter().flat_map(|pack| read(&pack.bytes, &pack.reference, Global).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(recovered, vec![value(1, b"one"), value(2, b"two"), value(3, b"three")]);
-        let reordered = Pack::batches_with_limits(source.into_iter().rev().collect(), 2, usize::MAX, Global).unwrap();
+        let mut recovered = Vec::new_in(alloc);
+        for pack in &by_bytes {
+            recovered.extend(read(&pack.bytes, &pack.reference, alloc).unwrap());
+        }
+        assert_eq!(recovered.as_slice(), &[value(1, b"one"), value(2, b"two"), value(3, b"three")]);
+        let mut reversed = Vec::new_in(alloc);
+        reversed.extend(source.into_iter().rev());
+        let reordered = Pack::batches_with_limits(reversed, 2, usize::MAX, alloc).unwrap();
         assert_eq!(reordered, by_items, "partition names may not depend on producer order");
         assert_eq!(
-            Pack::batches(Vec::new(), Global).unwrap(),
-            vec![Pack::of(Vec::new(), Global).unwrap()]
+            Pack::batches(Vec::new_in(alloc), alloc).unwrap(),
+            vec_in![alloc; Pack::of(Vec::new_in(alloc), alloc).unwrap()]
         );
-        assert!(matches!(Pack::batches_with_limits(vec![value(1, b"a"), value(1, b"b")], 1, usize::MAX, Global)
-            .unwrap_err().kind, PackErrorKind::ConflictingKey(_)),
-            "conflicting keys on different partitions refuse");
-        assert!(Pack::batches_with_limits(vec![value(1, b"a")], 0, usize::MAX, Global).is_err());
+        assert!(
+            matches!(
+                Pack::batches_with_limits(
+                    vec_in![alloc; value(1, b"a"), value(1, b"b")],
+                    1,
+                    usize::MAX,
+                    alloc,
+                )
+                .unwrap_err()
+                .kind,
+                PackErrorKind::ConflictingKey(_)
+            ),
+            "conflicting keys on different partitions refuse"
+        );
+        assert!(
+            Pack::batches_with_limits(vec_in![alloc; value(1, b"a")], 0, usize::MAX, alloc)
+                .is_err()
+        );
     }
 
     #[test]
     fn large_native_packs_remain_readable_while_new_uploads_stay_partitioned() {
-        let target = Limits::DOCUMENTED.batch_items as usize;
-        let mut values = Vec::new_in(Global);
+        let alloc = test_alloc();
+        let target = usize::try_from(Limits::DOCUMENTED.batch_items).unwrap();
+        let mut values = Vec::new_in(alloc);
         values.extend((0..=target).map(|i| {
-                let mut key = [0; 32];
-                key[24..].copy_from_slice(&(i as u64).to_be_bytes());
-                Value { key, kind: (i % 256) as u8, bytes: [i as u8].to_vec_in(Global) }
+            let mut key = [0; 32];
+            key[24..].copy_from_slice(&(i as u64).to_be_bytes());
+            Value {
+                key,
+                kind: (i % 256) as u8,
+                bytes: Vec::from_slice_in(&[i as u8], alloc),
+            }
         }));
         // Encode the historical whole-pack layout independently of Pack::of, so
         // restoring either the reader's or producer's erroneous item cap fails.
-        let mut bytes = DIST_PACK_MAGIC.to_vec_in(Global);
+        let mut bytes = Vec::from_slice_in(&DIST_PACK_MAGIC, alloc);
         for value in &values {
             bytes.extend_from_slice(&value.key);
             bytes.push(value.kind);
@@ -445,61 +501,70 @@ mod tests {
             bytes.extend_from_slice(&value.bytes);
         }
         let reference = PackRef {
-            pack: Sha256::digest(&bytes).into(),
+            pack: sha256_digest(&bytes),
             size: bytes.len() as u64,
-            keys: keys_digest(values.iter().map(|value| value.key), &Global),
+            keys: keys_digest(values.iter().map(|value| value.key), &alloc),
             packed: None,
             format: DIST_PACK_FORMAT,
         };
         let legacy = Pack { bytes, reference };
-        assert_eq!(read(&legacy.bytes, &legacy.reference, Global).unwrap(), values);
-        assert_eq!(Pack::of(values.clone(), Global).unwrap(), legacy);
+        assert_eq!(read(&legacy.bytes, &legacy.reference, alloc).unwrap().as_slice(), values.as_slice());
+        assert_eq!(Pack::of(values.clone(), alloc).unwrap(), legacy);
 
-        let batches = Pack::batches(values.clone(), Global).unwrap();
+        let batches = Pack::batches(values.clone(), alloc).unwrap();
         assert_eq!(batches.len(), 2, "new uploads still obey their item target");
-        let mut recovered = Vec::new_in(Global);
+        let mut recovered = Vec::new_in(alloc);
         for batch in &batches {
             assert!(batch.reference.size <= Limits::DOCUMENTED.blob);
-            let decoded = read(&batch.bytes, &batch.reference, Global).unwrap();
+            let decoded = read(&batch.bytes, &batch.reference, alloc).unwrap();
             assert!(decoded.len() <= target);
             recovered.extend(decoded);
         }
-        assert_eq!(recovered, values, "partitioning cannot drop or change native values");
+        assert_eq!(recovered.as_slice(), values.as_slice(), "partitioning cannot drop or change native values");
 
         // Removing the unrelated item cap must not remove the native byte cap.
         let mut oversized = legacy.reference.clone();
         oversized.size = Limits::DOCUMENTED.blob + 1;
-        assert_eq!(read(&legacy.bytes, &oversized, Global).unwrap_err().kind, PackErrorKind::BlobLimit);
+        assert_eq!(read(&legacy.bytes, &oversized, alloc).unwrap_err().kind, PackErrorKind::BlobLimit);
     }
 
     #[test]
     fn two_values_under_one_key_are_refused() {
-        let error = Pack::of(vec![value(1, b"a"), value(1, b"b")], Global).unwrap_err();
+        let alloc = test_alloc();
+        let error =
+            Pack::of(vec_in![alloc; value(1, b"a"), value(1, b"b")], alloc).unwrap_err();
         assert_eq!(error.kind, PackErrorKind::ConflictingKey([1; 32]), "{error}");
-        assert!(Pack::of(vec![value(1, b"a"), value(1, b"a")], Global).is_ok(), "one value, twice");
+        assert!(
+            Pack::of(vec_in![alloc; value(1, b"a"), value(1, b"a")], alloc).is_ok(),
+            "one value, twice"
+        );
     }
 
     #[test]
     fn a_reader_believes_nothing_the_commit_does_not_name() {
-        let pack = Pack::of(vec![value(1, b"one")], Global).unwrap();
+        let alloc = test_alloc();
+        let pack = Pack::of(vec_in![alloc; value(1, b"one")], alloc).unwrap();
         let mut flipped = pack.bytes.clone();
         *flipped.last_mut().unwrap() ^= 1;
-        let refused = read(&flipped, &pack.reference, Global).unwrap_err();
+        let refused = read(&flipped, &pack.reference, alloc).unwrap_err();
         assert_eq!(refused.pack, Some(pack.reference.pack));
         assert!(matches!(refused.kind, PackErrorKind::Digest(_)));
         let mut short = pack.reference.clone();
         short.size -= 1;
-        assert!(matches!(read(&pack.bytes, &short, Global).unwrap_err().kind, PackErrorKind::Length { .. }));
+        assert!(matches!(
+            read(&pack.bytes, &short, alloc).unwrap_err().kind,
+            PackErrorKind::Length { .. }
+        ));
         let mut keys = pack.reference.clone();
         keys.keys = [9; 32];
-        assert_eq!(read(&pack.bytes, &keys, Global).unwrap_err().kind, PackErrorKind::Keys);
+        assert_eq!(read(&pack.bytes, &keys, alloc).unwrap_err().kind, PackErrorKind::Keys);
         // The right digest over bytes that are not a pack: refused by their shape.
-        let junk = b"not a pack".to_vec();
+        let junk = Vec::from_slice_in(b"not a pack", alloc);
         let reference = PackRef {
-            pack: Sha256::digest(&junk).into(),
+            pack: sha256_digest(&junk),
             size: junk.len() as u64,
             ..pack.reference.clone()
         };
-        assert_eq!(read(&junk, &reference, Global).unwrap_err().kind, PackErrorKind::Header);
+        assert_eq!(read(&junk, &reference, alloc).unwrap_err().kind, PackErrorKind::Header);
     }
 }

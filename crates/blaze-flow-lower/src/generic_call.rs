@@ -473,6 +473,16 @@ fn own_slots(t: PTy, node: PNode, arity: &dyn Arity, part: u32) -> Result<u32, S
     })
 }
 
+#[inline]
+fn to_usize(n: u32) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+#[inline]
+fn to_u32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 /// Sorts and dedups `joins[lo..]`; its new end.
 fn dedup_from<A: Allocator>(joins: &mut Vec<u32, A>, lo: usize) -> u32 {
     joins[lo..].sort_unstable();
@@ -484,7 +494,7 @@ fn dedup_from<A: Allocator>(joins: &mut Vec<u32, A>, lo: usize) -> u32 {
         }
     }
     joins.truncate(kept);
-    kept as u32
+    to_u32(kept)
 }
 
 /// Reads the generic shape of a head whose erased inputs and output are `inputs` and `output`
@@ -511,7 +521,7 @@ pub fn read_shape<A: Allocator + Copy>(
     // A work list in the lowering's order: popped last first, so children go in reversed.
     let mut stack: Vec<PTy, A> = Vec::new_in(alloc);
     for (j, &top) in inputs.iter().chain(core::iter::once(&output)).enumerate() {
-        let part = j as u32;
+        let part = to_u32(j);
         let output_part = j == inputs.len();
         stack.clear();
         stack.push(top);
@@ -529,7 +539,7 @@ pub fn read_shape<A: Allocator + Copy>(
                     PNode::Tuple(l) => Skel::Tuple(u32::try_from(tys.list(l).map_err(unread(part))?.len()).map_err(|_| ShapeRefusal::Bound { part })?),
                     PNode::Record(s, l) => Skel::Record(s, u32::try_from(tys.list(l).map_err(unread(part))?.len()).map_err(|_| ShapeRefusal::Bound { part })?),
                     PNode::Union(l) => Skel::Union(u32::try_from(tys.list(l).map_err(unread(part))?.len()).map_err(|_| ShapeRefusal::Bound { part })?),
-                    PNode::FnPtr(l, _) => Skel::FnPtr(tys.list(l).map_err(unread(part))?.len() as u32),
+                    PNode::FnPtr(l, _) => Skel::FnPtr(to_u32(tys.list(l).map_err(unread(part))?.len())),
                     PNode::Adt(k, _) => Skel::Adt(k),
                     PNode::Alias { .. } | PNode::Opaque(..) => Skel::Proj,
                     _ => Skel::Skip,
@@ -559,9 +569,9 @@ pub fn read_shape<A: Allocator + Copy>(
                 // The object bound, then what its bounds' arguments write (the column's slots
                 // of the node's children: `region_arity` counts `dyn` one, its children theirs).
                 PNode::Dynamic(l) => {
-                    let lo = out.joins.len() as u32;
+                    let lo = to_u32(out.joins.len());
                     let written = under(tys, l, arity, &mut out.joins, &mut scratch, &mut steps, part)?;
-                    let hi = dedup_from(&mut out.joins, lo as usize);
+                    let hi = dedup_from(&mut out.joins, to_usize(lo));
                     let regions = written.checked_add(1).ok_or(ShapeRefusal::Bound { part })?;
                     out.marks.push(Mark::Object { lo, hi, regions });
                 }
@@ -569,9 +579,9 @@ pub fn read_shape<A: Allocator + Copy>(
                 PNode::Alias { args, .. } | PNode::Opaque(_, args) => {
                     projections |= output_part;
                     let own = own_slots(t, node, arity, part)?;
-                    let lo = out.joins.len() as u32;
+                    let lo = to_u32(out.joins.len());
                     let written = under(tys, args, arity, &mut out.joins, &mut scratch, &mut steps, part)?;
-                    let hi = dedup_from(&mut out.joins, lo as usize);
+                    let hi = dedup_from(&mut out.joins, to_usize(lo));
                     let regions = own.checked_add(written).ok_or(ShapeRefusal::Bound { part })?;
                     let opaque = match node {
                         PNode::Opaque(k, _) => Some(k),
@@ -584,7 +594,7 @@ pub fn read_shape<A: Allocator + Copy>(
             }
         }
         if j < inputs.len() {
-            out.ends.push(out.marks.len() as u32);
+            out.ends.push(to_u32(out.marks.len()));
         }
     }
     if !projections {
@@ -690,15 +700,15 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 (PNode::Tuple(_), PNode::Tuple(al)) => {
                     let Ok(dkids) = blaze_borrow::RegionTypes::kids(&heads, decl) else { return Ok(None) };
                     let alist = self.list(al, e)?;
-                    if dkids.len() as usize != alist.len() {
+                    if to_usize(dkids.len()) != alist.len() {
                         return Ok(None);
                     }
                     let mut doff = 0usize;
                     let mut poff = pos_off;
                     for (i, &ak) in alist.iter().enumerate() {
-                        let Some(dk) = dkids.get(i as u32) else { return Ok(None) };
+                        let Some(dk) = dkids.get(to_u32(i)) else { return Ok(None) };
                         let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk) else { return Ok(None) };
-                        let dn = dc.get() as usize;
+                        let dn = to_usize(dc.get());
                         let Some(ds) = dslots.get(doff..doff + dn) else { return Ok(None) };
                         doff += dn;
                         let pn = self.npos(ak, e)?;
@@ -710,7 +720,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     }
                 }
                 (PNode::Adt(dk, _), PNode::Adt(ak, al)) if dk == ak => {
-                    let lts = self.adt_facts(ak, e)?.lifetimes as usize;
+                    let lts = to_usize(self.adt_facts(ak, e)?.lifetimes);
                     if dslots.len() < lts {
                         return Ok(None);
                     }
@@ -718,20 +728,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         if let Region::Param(ir) = r
                             && !reg_pos.iter().any(|&(q, _)| q == ir)
                         {
-                            reg_pos.push((ir, pos_off + i as u32));
+                            reg_pos.push((ir, pos_off + to_u32(i)));
                         }
                     }
                     let Ok(dkids) = blaze_borrow::RegionTypes::kids(&heads, decl) else { return Ok(None) };
                     let alist = self.list(al, e)?;
-                    if dkids.len() as usize != alist.len() {
+                    if to_usize(dkids.len()) != alist.len() {
                         return Ok(None);
                     }
                     let mut doff = lts;
-                    let mut poff = pos_off + lts as u32;
+                    let mut poff = pos_off + to_u32(lts);
                     for (i, &ak_ty) in alist.iter().enumerate() {
-                        let Some(dk_ty) = dkids.get(i as u32) else { return Ok(None) };
+                        let Some(dk_ty) = dkids.get(to_u32(i)) else { return Ok(None) };
                         let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk_ty) else { return Ok(None) };
-                        let dn = dc.get() as usize;
+                        let dn = to_usize(dc.get());
                         let Some(ds) = dslots.get(doff..doff + dn) else { return Ok(None) };
                         doff += dn;
                         let pn = self.npos(ak_ty, e)?;
@@ -758,13 +768,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             Ty(PTy, &'r [Region]),
             Slot(ImplAssocSlot),
         }
-        let mut out: Vec<ImplAssocSlot, A> = Vec::with_capacity_in(expected_out as usize, self.alloc);
+        let mut out: Vec<ImplAssocSlot, A> = Vec::with_capacity_in(to_usize(expected_out), self.alloc);
         let mut ostack: Vec<OutStep<'_>, A> = Vec::new_in(self.alloc);
         ostack.push(OutStep::Ty(assoc_col.ty(), assoc_col.as_slice()));
         let mut osteps = 0u32;
         while let Some(step) = ostack.pop() {
             osteps += 1;
-            if osteps > MOST_POSITIONS || out.len() as u32 > expected_out {
+            if osteps > MOST_POSITIONS || to_u32(out.len()) > expected_out {
                 return Ok(None);
             }
             let (decl, dslots) = match step {
@@ -812,7 +822,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     for i in 0..dkids.len() {
                         let Some(dk) = dkids.get(i) else { return Ok(None) };
                         let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk) else { return Ok(None) };
-                        let dn = dc.get() as usize;
+                        let dn = to_usize(dc.get());
                         if off + dn > dslots.len() {
                             return Ok(None);
                         }
@@ -828,7 +838,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 }
                 PNode::Adt(dk, _) => {
                     let Some(af) = facts.adt(dk) else { return Ok(None) };
-                    let lts = af.lifetimes as usize;
+                    let lts = to_usize(af.lifetimes);
                     if dslots.len() < lts {
                         return Ok(None);
                     }
@@ -838,7 +848,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     for i in 0..dkids.len() {
                         let Some(dk_ty) = dkids.get(i) else { return Ok(None) };
                         let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk_ty) else { return Ok(None) };
-                        let dn = dc.get() as usize;
+                        let dn = to_usize(dc.get());
                         if off + dn > dslots.len() {
                             return Ok(None);
                         }
@@ -868,7 +878,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 _ => return Ok(None),
             }
         }
-        if out.len() as u32 != expected_out {
+        if to_u32(out.len()) != expected_out {
             return Ok(None);
         }
         Ok(Some(out))
@@ -884,19 +894,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     /// made when first asked (`arg_at[p]`: where its origins start in `arg_origs`, `u32::MAX`
     /// until made; its position count). `p` and `k` were checked by the caller.
     fn arg_origin(&mut self, arg_at: &mut [(u32, u32)], arg_origs: &mut Vec<Origin, A>, p: u32, k: u32) -> Origin {
-        let (start, n) = arg_at[p as usize];
+        let (start, n) = arg_at[to_usize(p)];
         let start = if start == u32::MAX {
-            let s = arg_origs.len() as u32;
+            let s = to_u32(arg_origs.len());
             for _ in 0..n {
                 let o = self.b.origin(false);
                 arg_origs.push(o);
             }
-            arg_at[p as usize].0 = s;
+            arg_at[to_usize(p)].0 = s;
             s
         } else {
             start
         };
-        arg_origs[(start + k) as usize]
+        arg_origs[to_usize(start + k)]
     }
 
     /// Walks the head's output nodes `skel` ([`Skel`]) and the destination's type in step,
@@ -921,7 +931,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 | (Skel::Union(n), PNode::Union(l))
                 | (Skel::FnPtr(n), PNode::FnPtr(l, _)) => {
                     let xs = self.list(l, e)?;
-                    if xs.len() as u32 != n {
+                    if to_u32(xs.len()) != n {
                         return Ok(false);
                     }
                     for &x in xs.iter().rev() {
@@ -996,7 +1006,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let own = facts.ties(self.body.owner);
         let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
-        for l in 0..=nparams as usize {
+        for l in 0..=to_usize(nparams) {
             if l == 0 && !matches!(sig.body(), BodyOut::Output) {
                 continue;
             }
@@ -1037,7 +1047,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         if at >= start + n {
                             break;
                         }
-                        let o = self.origs[at as usize];
+                        let o = self.origs[to_usize(at)];
                         at += 1;
                         let xs = self.list(args, root)?;
                         held.clear();
@@ -1060,7 +1070,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         if !row.read {
                             continue;
                         }
-                        let Some(mine) = own.regions.get(row.lo as usize..row.hi as usize) else { return self.refuse(Form::Malformed, root) };
+                        let Some(mine) = own.regions.get(to_usize(row.lo)..to_usize(row.hi)) else { return self.refuse(Form::Malformed, root) };
                         for &r in mine {
                             let x = self.universal(r);
                             self.b.known(x, o);
@@ -1132,10 +1142,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     ) -> Result<bool, Refusal> {
         self.misfit = Misfit::NotTried;
         if !life.well_formed() {
-            return self.misfit(Misfit::Malformed { part: vs.len() as u32 });
+            return self.misfit(Misfit::Malformed { part: to_u32(vs.len()) });
         }
-        if shape.ends.len() != vs.len() || life.inputs() as usize != vs.len() {
-            return self.misfit(Misfit::Inputs { shape: shape.ends.len() as u32, sig: life.inputs(), call: vs.len() as u32 });
+        if shape.ends.len() != vs.len() || to_usize(life.inputs()) != vs.len() {
+            return self.misfit(Misfit::Inputs { shape: to_u32(shape.ends.len()), sig: life.inputs(), call: to_u32(vs.len()) });
         }
         // The column's slots, every part's in order (`SigLife::slots`: the inputs', then the
         // output's; the root has none of its own), and where each input's end.
@@ -1144,11 +1154,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let mut at = 0u32;
         for k in 0..life.inputs() {
             let Some(s) = life.input(k) else { return self.misfit(Misfit::Malformed { part: k }) };
-            at += s.len() as u32;
+            at += to_u32(s.len());
             life_ends.push(at);
         }
-        if life.output().map(|o| at as usize + o.len()) != Some(column.len()) {
-            return self.misfit(Misfit::Malformed { part: vs.len() as u32 });
+        if life.output().map(|o| to_usize(at) + o.len()) != Some(column.len()) {
+            return self.misfit(Misfit::Malformed { part: to_u32(vs.len()) });
         }
         // The slots the destination's part reads after the inputs': the output's, or an
         // awaited call's written return type's (`CallValue::Awaited`).
@@ -1156,7 +1166,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let all: &[Region] = match value {
             CallValue::Returned => column,
             CallValue::Awaited { slots, .. } => {
-                joined.extend_from_slice(&column[..at as usize]);
+                joined.extend_from_slice(&column[..to_usize(at)]);
                 joined.extend_from_slice(slots);
                 &joined
             }
@@ -1171,20 +1181,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         // of the body is related by its placeholder (param_outlives.rs); any other type
         // without positions is refused.
         let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
-        for i in 0..(bounds.unread_below as usize).min(args.len()) {
+        for i in 0..to_usize(bounds.unread_below).min(args.len()) {
             held.clear();
             let positions = arg_at[i].1;
             let unplaced = self.unplaced(args[i], e, &mut held)?;
             if positions > 0 || unplaced || !held.is_empty() {
                 let why = crate::OutlivesUnreadWhy::BoundsUnread { positions, unplaced, body_param: !held.is_empty() };
-                return self.refuse(Form::CallOutlivesUnread { callee, param: i as u32, why }, e);
+                return self.refuse(Form::CallOutlivesUnread { callee, param: to_u32(i), why }, e);
             }
         }
         let mut param_bounds: Vec<(u32, Region), A> = Vec::new_in(self.alloc);
         for &(subject, region) in bounds.outlives {
             let p = subject.param();
-            let Some(&t) = args.get(p as usize) else {
-                return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: arg_at.len() as u32 }, e);
+            let Some(&t) = args.get(to_usize(p)) else {
+                return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: to_u32(arg_at.len()) }, e);
             };
             held.clear();
             let unread = match subject {
@@ -1232,8 +1242,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let mut projection = 0usize;
         let (mut mlo, mut rlo) = (0usize, 0usize);
         for i in 0..=vs.len() {
-            let (mhi, rhi) = if i < vs.len() { (shape.ends[i] as usize, life_ends[i] as usize) } else { (shape.marks.len(), all.len()) };
-            let part = i as u32;
+            let (mhi, rhi) = if i < vs.len() { (to_usize(shape.ends[i]), to_usize(life_ends[i])) } else { (shape.marks.len(), all.len()) };
+            let part = to_u32(i);
             if mhi < mlo || mhi > shape.marks.len() || rhi < rlo || rhi > all.len() {
                 return self.misfit(Misfit::Malformed { part });
             }
@@ -1252,31 +1262,31 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     }
                     Mark::Object { lo, hi, regions } => {
                         // One position: the object bound and what its bounds write, both ways.
-                        let n = regions as usize;
+                        let n = to_usize(regions);
                         if n == 0 || r + n > rhi {
                             return self.misfit(Misfit::RegionCount { part });
                         }
-                        let Some(ps) = shape.joins.get(lo as usize..hi as usize) else { return self.misfit(Misfit::Malformed { part }) };
-                        if let Some(&p) = ps.iter().find(|&&p| p as usize >= args.len()) {
-                            return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: args.len() as u32 }, e);
+                        let Some(ps) = shape.joins.get(to_usize(lo)..to_usize(hi)) else { return self.misfit(Misfit::Malformed { part }) };
+                        if let Some(&p) = ps.iter().find(|&&p| to_usize(p) >= args.len()) {
+                            return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: to_u32(args.len()) }, e);
                         }
-                        projs.push(Proj { lo, hi, rlo: r as u32, rhi: (r + n) as u32, alias: false, opaque: false, live: crate::OpaqueLive::Captures });
+                        projs.push(Proj { lo, hi, rlo: to_u32(r), rhi: to_u32(r + n), alias: false, opaque: false, live: crate::OpaqueLive::Captures });
                         r += n;
-                        seq.push(Slot::Joined((projs.len() - 1) as u32));
+                        seq.push(Slot::Joined(to_u32(projs.len() - 1)));
                     }
                     Mark::Proj { lo, hi, regions, opaque } => {
                         // Its own slots and those its arguments write: the column's, in order.
-                        let n = regions as usize;
+                        let n = to_usize(regions);
                         if r + n > rhi {
                             return self.misfit(Misfit::RegionCount { part });
                         }
-                        let (prlo, prhi) = (r as u32, (r + n) as u32);
+                        let (prlo, prhi) = (to_u32(r), to_u32(r + n));
                         r += n;
                         let this = projection;
                         if opaque.is_none() {
                             projection += 1;
                         }
-                        let Some(ps) = shape.joins.get(lo as usize..hi as usize) else { return self.misfit(Misfit::Malformed { part }) };
+                        let Some(ps) = shape.joins.get(to_usize(lo)..to_usize(hi)) else { return self.misfit(Misfit::Malformed { part }) };
                         if let Some(input) = vs.get(i) {
                             // E0207: a closed associated type can only take free regions
                             // from its own trait arguments. Other parameters of the call
@@ -1287,7 +1297,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             let why = if opaque.is_some() {
                                 Some(InputProjectionWhy::Opaque)
                             } else if n != 0 {
-                                Some(InputProjectionWhy::OwnRegions { regions: n as u32 })
+                                Some(InputProjectionWhy::OwnRegions { regions: to_u32(n) })
                             } else if mhi - mlo != 1 {
                                 Some(InputProjectionWhy::Several)
                             } else if rows.len() != nprojections
@@ -1301,10 +1311,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                 return self.misfit(Misfit::InputProjection { part, why });
                             }
                             for &p in ps {
-                                let Some(&t) = args.get(p as usize) else {
-                                    return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: args.len() as u32 }, e);
+                                let Some(&t) = args.get(to_usize(p)) else {
+                                    return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: to_u32(args.len()) }, e);
                                 };
-                                if arg_at[p as usize].1 != 0 || self.mentions_unknown(core::slice::from_ref(&t), e)? {
+                                if arg_at[to_usize(p)].1 != 0 || self.mentions_unknown(core::slice::from_ref(&t), e)? {
                                     return self.misfit(Misfit::InputProjection { part, why: InputProjectionWhy::ArgumentHolds });
                                 }
                             }
@@ -1349,13 +1359,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         if !alias
                             && opaque.is_none()
                             && let &[self_p] = ps
-                            && let Some(&self_ty) = args.get(self_p as usize)
+                            && let Some(&self_ty) = args.get(to_usize(self_p))
                             && let rows = self.ck.selected_at(e)
                             && let Some(row) = rows.get(this)
                             && let Some(assoc_name) = row.name
                             && let blaze_typeck::Selected::Impl { imp, .. } = row.selected
                             && self.list(row.args, e)?.first() == Some(&self_ty)
-                            && let Some(mapped) = self.map_impl_assoc_slots(imp, assoc_name, self_ty, arg_at[self_p as usize].1, n, e)?
+                            && let Some(mapped) = self.map_impl_assoc_slots(imp, assoc_name, self_ty, arg_at[to_usize(self_p)].1, n, e)?
                         {
                             for slot in mapped {
                                 match slot {
@@ -1366,8 +1376,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             continue;
                         }
                         for &p in ps {
-                            let Some(&t) = args.get(p as usize) else {
-                                return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: arg_at.len() as u32 }, e);
+                            let Some(&t) = args.get(to_usize(p)) else {
+                                return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: to_u32(arg_at.len()) }, e);
                             };
                             // An argument whose lifetimes are not all positions (a trait
                             // object's `Item = &'a u8`, an alias): not taken. Opaques and
@@ -1385,7 +1395,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                 return self.misfit(Misfit::ProjectionLoose { part, held: true });
                             }
                         }
-                        let ix = (projs.len() - 1) as u32;
+                        let ix = to_u32(projs.len() - 1);
                         for _ in 0..n {
                             seq.push(Slot::Joined(ix));
                         }
@@ -1397,8 +1407,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         // (`fn_def_sig(k, fargs)`, then `callees.push((e, k, fargs))`), and
                         // rules/method.rs:299 for a method call. So `p` past `g` is a malformed
                         // record: refused by name, never related some other way.
-                        let Some(&(_, n)) = arg_at.get(p as usize) else {
-                            return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: arg_at.len() as u32 }, e);
+                        let Some(&(_, n)) = arg_at.get(to_usize(p)) else {
+                            return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: to_u32(arg_at.len()) }, e);
                         };
                         for k in 0..n {
                             seq.push(Slot::Arg(p, k));
@@ -1412,7 +1422,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             if i == vs.len() && pk != counts.len() {
                 return self.misfit(Misfit::Skeleton { part });
             }
-            map_ends.push(seq.len() as u32);
+            map_ends.push(to_u32(seq.len()));
             mlo = mhi;
             rlo = rhi;
         }
@@ -1434,7 +1444,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 // region is related to nothing, whatever place it is read from.
                 let empty = i < vs.len() && hi == lo && self.npos_d(vs[i].ty, e)? == 0;
                 if !empty && (!s.exact || s.len != hi - lo) {
-                    return self.misfit(Misfit::Positions { part: i as u32, want: hi - lo, have: s.len, exact: s.exact });
+                    return self.misfit(Misfit::Positions { part: to_u32(i), want: hi - lo, have: s.len, exact: s.exact });
                 }
             }
             lo = hi;
@@ -1456,7 +1466,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             &impl_ties,
             &mut inst,
             |me, p, k| {
-                let &(_, n) = arg_at.get(p as usize)?;
+                let &(_, n) = arg_at.get(to_usize(p))?;
                 (k < n).then(|| me.arg_origin(&mut arg_at, &mut arg_origs, p, k))
             },
             e,
@@ -1464,7 +1474,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let mut map: Vec<Origin, A> = Vec::new_in(self.alloc);
         // The destination's first position, and whether it is a reference's (then only flowed
         // into, as every other path relates a destination).
-        let dest_lo = map_ends.get(vs.len().wrapping_sub(1)).copied().unwrap_or(0) as usize;
+        let dest_lo = to_usize(map_ends.get(vs.len().wrapping_sub(1)).copied().unwrap_or(0));
         let dest_top_ref = dest_ty.wrap.is_some() || matches!(self.node(dest_ty.ty, e)?, PNode::Ref(..));
         for j in 0..seq.len() {
             let o = match seq[j] {
@@ -1482,7 +1492,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 // rust-lang/rust#116733): only its bound's region flows in (`Only`), or nothing
                 // (`'static`); its arguments' positions are not live through it either.
                 Slot::Joined(ix) => {
-                    let pj = projs[ix as usize];
+                    let pj = projs[to_usize(ix)];
                     let o = self.b.origin(false);
                     let one_way = pj.alias || (j == dest_lo && dest_top_ref);
                     let joined_hi = if pj.live == crate::OpaqueLive::Captures { pj.hi } else { pj.lo };
@@ -1492,10 +1502,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     if !one_way {
                         let mut ties = 0u32;
                         for q in pj.lo..joined_hi {
-                            ties = ties.saturating_add(arg_at[shape.joins[q as usize] as usize].1);
+                            ties = ties.saturating_add(arg_at[to_usize(shape.joins[to_usize(q)])].1);
                         }
                         for at in pj.rlo..pj.rhi {
-                            let r = all[at as usize];
+                            let r = all[to_usize(at)];
                             let live = match pj.live {
                                 crate::OpaqueLive::Captures => true,
                                 crate::OpaqueLive::Only(l) => l == r,
@@ -1510,8 +1520,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         }
                     }
                     for q in pj.lo..joined_hi {
-                        let p = shape.joins[q as usize];
-                        for k in 0..arg_at[p as usize].1 {
+                        let p = shape.joins[to_usize(q)];
+                        for k in 0..arg_at[to_usize(p)].1 {
                             let a = self.arg_origin(&mut arg_at, &mut arg_origs, p, k);
                             self.b.subset(a, o);
                             if !one_way {
@@ -1520,7 +1530,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         }
                         if pj.alias {
                             held.clear();
-                            if let Some(&arg) = args.get(usize::try_from(p).unwrap_or(usize::MAX)) {
+                            if let Some(&arg) = args.get(to_usize(p)) {
                                 self.outlives_components(arg, e, &mut held, true)?;
                             }
                             for h in 0..held.len() {
@@ -1534,7 +1544,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     // a trait object's bounds write. `'static` adds nothing; a region bound
                     // inside (a fn pointer's, a `dyn Fn(&u8)`'s: `Late`) is no free one.
                     for at in pj.rlo..pj.rhi {
-                        let r = all[at as usize];
+                        let r = all[to_usize(at)];
                         if matches!(r, Region::Static | Region::Late { .. }) {
                             continue;
                         }
@@ -1581,19 +1591,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             // (variance.rs): an argument a subtype of the input, the output of the destination.
             self.variances_for(ty, s.len, &mut vars, e)?;
             for k in 0..s.len {
-                let here = self.origs[(s.start + k) as usize];
-                let there = map[(lo + k) as usize];
+                let here = self.origs[to_usize(s.start + k)];
+                let there = map[to_usize(lo + k)];
                 let (from, into) = if into_callee { (here, there) } else { (there, here) };
-                self.relate_one(from, into, vars[k as usize]);
+                self.relate_one(from, into, vars[to_usize(k)]);
             }
             // The instantiated types are well formed: each referent's positions outlive the
             // reference's (as `call_by_signature`).
             self.ref_ranges(ty, e, &mut ranges)?;
             for j in 0..ranges.len() {
                 let (at, inner) = ranges[j];
-                let outer = map[(lo + at) as usize];
+                let outer = map[to_usize(lo + at)];
                 for k in 1..=inner {
-                    let o = map[(lo + at + k) as usize];
+                    let o = map[to_usize(lo + at + k)];
                     if o != outer {
                         self.b.subset(o, outer);
                     }
@@ -1612,7 +1622,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         for &(subject, r) in bounds.outlives {
             let OutlivesType::Param(p) = subject else { continue };
             let target = self.instance(&mut inst, r);
-            for k in 0..arg_at[p as usize].1 {
+            for k in 0..arg_at[to_usize(p)].1 {
                 let o = self.arg_origin(&mut arg_at, &mut arg_origs, p, k);
                 self.b.subset(o, target);
             }
@@ -1630,7 +1640,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             args,
             &mut inst,
             |me, p, k| {
-                let &(_, n) = arg_at.get(p as usize)?;
+                let &(_, n) = arg_at.get(to_usize(p))?;
                 (k < n).then(|| me.arg_origin(&mut arg_at, &mut arg_origs, p, k))
             },
             e,
@@ -1646,9 +1656,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             let At::Place(p) = v.at else { continue };
             let s = self.info(p);
             for k in s.start..s.start + s.len {
-                let from = self.origs[k as usize];
+                let from = self.origs[to_usize(k)];
                 for j in d.start..d.start + d.len {
-                    let into = self.origs[j as usize];
+                    let into = self.origs[to_usize(j)];
                     self.b.subset(from, into);
                 }
             }

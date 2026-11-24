@@ -8,7 +8,7 @@ use std::alloc::Global;
 use std::cmp::{self, Ordering};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::ptr;
 use url::Url;
 
@@ -328,7 +328,7 @@ fn path_to_url(path: &Path) -> Result<Url> {
 /// path is that name, `file:///C:/a` as `Url::from_file_path` makes it.
 pub fn file_url(path: impl AsRef<Path>) -> Result<Url, ()> {
     let path = path.as_ref();
-    if !cfg!(windows) || matches!(path.components().next(), Some(std::path::Component::Prefix(_))) {
+    if !cfg!(windows) || matches!(path.components().next(), Some(Component::Prefix(_))) {
         return Url::from_file_path(path);
     }
     let text = path.to_str().ok_or(())?.replace('\\', "/");

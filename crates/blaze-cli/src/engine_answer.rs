@@ -88,6 +88,10 @@ const POINTER_DOMAIN: &str = "blaze-cli engine-check pointer";
 /// The root the checkout's stored answer hangs from, whichever tools wrote it (the module's doc,
 /// "THE TOOLS"; a machine's path is hashed here alone: a root is local, never shared).
 pub(crate) fn root_name<'f>(checkout: &str, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
+    root_name_for(checkout, crate::graph::FeatureAsk::DEFAULT, frame)
+}
+
+pub(crate) fn root_name_for<'f>(checkout: &str, features: crate::graph::FeatureAsk<'_>, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
     let id = ContentId::of("blaze-cli engine-check root 2", checkout.as_bytes());
     let mut name = blaze_own::String::new_in(frame);
     name.push_str("engine.");
@@ -100,6 +104,28 @@ pub(crate) fn root_name<'f>(checkout: &str, frame: &'f Frame) -> blaze_own::Stri
         // A frame string's write fails only when the frame is full: the name is then short and
         // names no root, so the request answers in full.
         let _ = write!(name, "{byte:02x}");
+    }
+    if !features.is_default() {
+        let mut tokens = blaze_own::Vec::new_in(frame);
+        for raw in features.features.iter() {
+            for item in raw.split(|c: char| c == ',' || c.is_ascii_whitespace()).filter(|item| !item.is_empty()) {
+                tokens.push(item);
+            }
+        }
+        tokens.sort_unstable();
+        tokens.dedup();
+        let mut encoded = blaze_own::Vec::new_in(frame);
+        encoded.push(u8::from(features.all_features));
+        encoded.push(u8::from(features.no_default_features));
+        for token in tokens.iter() {
+            encoded.extend_from_slice(token.as_bytes());
+            encoded.push(0);
+        }
+        let fid = ContentId::of("blaze-cli engine-check features 1", encoded.as_slice());
+        name.push('.');
+        for byte in &fid.0[..8] {
+            let _ = write!(name, "{byte:02x}");
+        }
     }
     name
 }

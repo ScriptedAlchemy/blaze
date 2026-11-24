@@ -2,7 +2,7 @@
 //! nested [`TerminationV2::version`] must be [`VERSION`]; consumers validate it and the
 //! outcome/reason pair before policy. See docs/distributed.md for what a requester does with it.
 
-use crate::{Attempt, ExecutionId, Limits, Outcome, decode, wire_enum, wire_struct};
+use crate::{Attempt, ExecutionId, Limits, Outcome, WireAlloc, decode};
 
 /// The version of this terminal-delivery contract, not the version of v1 build inputs.
 pub const VERSION: u32 = 2;
@@ -44,11 +44,13 @@ pub enum TerminalDecodeError {
 pub fn decode_terminal(
     bytes: &[u8],
     limits: &Limits,
+    alloc: WireAlloc,
 ) -> Result<SubscriberTerminalV2, TerminalDecodeError> {
-    if bytes.len() > limits.event as usize {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > u64::from(limits.event) {
         return Err(TerminalDecodeError::TooLarge);
     }
-    let value: SubscriberTerminalV2 = decode(bytes, limits).map_err(TerminalDecodeError::Cbor)?;
+    let value: SubscriberTerminalV2 =
+        decode(bytes, limits, alloc).map_err(TerminalDecodeError::Cbor)?;
     if !value.termination.is_valid() {
         return Err(TerminalDecodeError::InvalidTermination);
     }

@@ -19,12 +19,13 @@
 //!   left; a run that reaches its deadline did not make progress;
 //! - **protocol**: a correct holder is never told its calls are malformed.
 
-use std::alloc::Global;
-use std::collections::{BTreeMap, BTreeSet};
+use core::alloc::Allocator;
+use core::fmt;
 
+use blaze_own::{BTreeMap, BTreeSet, Vec, format_in, vec_in};
 use blaze_wire::{
     Attempt, BatchResult, ExecutionId, ItemOutcome, ItemResult, JobContent, LocalPolicy, Namespace,
-    PackRef, WorkKey, WorkName, WorkResultAnswer,
+    PackRef, WireAlloc, WireString, WireVec, WorkKey, WorkName, WorkResultAnswer,
 };
 
 use super::program::{Divergence, FrontEnd, Program};
@@ -76,11 +77,11 @@ pub struct Profile {
 
 impl Profile {
     fn draw(rng: &mut Rng) -> Profile {
-        let nodes = rng.range(2, 4) as usize;
-        let survivor = rng.below(nodes as u64) as usize;
+        let nodes = rng.range_usize(2, 4);
+        let survivor = rng.below_usize(nodes);
         // A helper, never the survivor or the lead, gets each of the odd faults.
         let odd = |rng: &mut Rng, ppm: u32| {
-            let at = rng.range(1, nodes as u64 - 1) as usize;
+            let at = rng.range_usize(1, nodes.saturating_sub(1));
             (rng.chance(ppm) && at != survivor).then_some(at)
         };
         let divergent = odd(rng, 250_000).map(|at| {
@@ -96,17 +97,17 @@ impl Profile {
         let calm = rng.chance(100_000);
         Profile {
             nodes,
-            loss_ppm: if calm { 0 } else { rng.range(0, 250_000) as u32 },
-            dup_ppm: if calm { 0 } else { rng.range(0, 150_000) as u32 },
+            loss_ppm: if calm { 0 } else { rng.range_u32(0, 250_000) },
+            dup_ppm: if calm { 0 } else { rng.range_u32(0, 150_000) },
             max_delay_ms: rng.range(1, 3_000),
             horizon_ms: rng.range(10_000, 240_000),
             survivor,
             divergent,
             hung,
             slow_clock,
-            death_ppm: if calm { 0 } else { rng.range(0, 20_000) as u32 },
-            drop_ppm: if calm { 0 } else { rng.range(0, 30_000) as u32 },
-            budget_ppm: rng.range(0, 300_000) as u32,
+            death_ppm: if calm { 0 } else { rng.range_u32(0, 20_000) },
+            drop_ppm: if calm { 0 } else { rng.range_u32(0, 30_000) },
+            budget_ppm: rng.range_u32(0, 300_000),
             conflicts: rng.chance(300_000),
             lead_load_ms: rng.range(0, 60_000),
         }
@@ -122,17 +123,17 @@ const EVENT_CAP: u64 = 2_000_000;
 const POLL_MS: Millis = 10_000;
 
 struct Node {
-    id: String,
+    id: WireString,
     alive: bool,
     front: FrontEnd,
-    holder: Option<Holder<Global>>,
+    holder: Option<Holder<WireAlloc>>,
     attempt: Attempt,
     lead: bool,
     offset: Millis,
     rate_ppm: u64,
     death_ppm: u32,
     hung: bool,
-    partitions: Vec<(Millis, Millis)>,
+    partitions: WireVec<(Millis, Millis)>,
     /// Refused for a front end that differs: its agent asks for no more of this execution.
     refused: bool,
     /// When its agent next asks for an assignment, while it has none.
@@ -164,29 +165,34 @@ enum Kind {
 /// One live lease, as the checker sees it.
 #[derive(Clone, Debug)]
 struct Shadow {
-    holder: String,
+    holder: WireString,
     roots: Ranges,
-    names: Vec<WorkName>,
+    names: WireVec<WorkName>,
     heard: Millis,
 }
 
 /// The checker: what the coordinator must never do, from what it can see.
 struct Checker {
+    alloc: WireAlloc,
     lease_ms: u64,
-    live: BTreeMap<u64, Shadow>,
-    dead: BTreeSet<u64>,
-    held_roots: BTreeMap<u64, u64>,
-    held_names: BTreeMap<WorkName, u64>,
+    live: BTreeMap<u64, Shadow, WireAlloc>,
+    dead: BTreeSet<u64, WireAlloc>,
+    held_roots: BTreeMap<u64, u64, WireAlloc>,
+    held_names: BTreeMap<WorkName, u64, WireAlloc>,
     /// Accepted results of the current root epoch, and their answers.
-    accepted: BTreeMap<(String, u64, u64), (BatchResult, WorkResultAnswer, Ranges, Vec<WorkName>)>,
-    root_claims: BTreeMap<u64, (String, u64, u64)>,
-    name_claims: BTreeMap<WorkName, (String, u64, u64)>,
+    accepted: BTreeMap<
+        (WireString, u64, u64),
+        (BatchResult, WorkResultAnswer, Ranges, WireVec<WorkName>),
+        WireAlloc,
+    >,
+    root_claims: BTreeMap<u64, (WireString, u64, u64), WireAlloc>,
+    name_claims: BTreeMap<WorkName, (WireString, u64, u64), WireAlloc>,
     done_at: Option<Millis>,
     attempt: Attempt,
 }
 
 /// A checker's verdict: fine, or the invariant broken and what was seen.
-type Check = Result<(), (&'static str, String)>;
+type Check = Result<(), (&'static str, WireString)>;
 
 impl Checker {
     fn granted(
@@ -198,27 +204,37 @@ impl Checker {
         names: &[WorkName],
     ) -> Check {
         if self.done_at.is_some() {
-            return Err(("exclusive", format!("a grant {g} to {holder} after Done")));
+            return Err((
+                "exclusive",
+                format_in!(self.alloc, "a grant {g} to {holder} after Done"),
+            ));
         }
         for index in roots.indexes() {
             if let Some(other) = self.held_roots.insert(index, g) {
-                return Err(("exclusive", format!("root {index} in live leases {other} and {g}")));
+                return Err((
+                    "exclusive",
+                    format_in!(self.alloc, "root {index} in live leases {other} and {g}"),
+                ));
             }
         }
         for name in names {
             if let Some(other) = self.held_names.insert(*name, g) {
                 return Err((
                     "exclusive",
-                    format!("name {:?} in live leases {other} and {g}", short(name)),
+                    format_in!(
+                        self.alloc,
+                        "name {:?} in live leases {other} and {g}",
+                        short(name)
+                    ),
                 ));
             }
         }
         self.live.insert(
             g,
             Shadow {
-                holder: holder.to_owned(),
+                holder: WireString::from_str_in(holder, self.alloc),
                 roots: roots.clone(),
-                names: names.to_vec(),
+                names: Vec::from_slice_in(names, self.alloc),
                 heard: now,
             },
         );
@@ -243,7 +259,7 @@ impl Checker {
     /// A call from `holder` arrived: its live leases were heard from.
     fn heard(&mut self, now: Millis, holder: &str) {
         for shadow in self.live.values_mut() {
-            if shadow.holder == holder {
+            if shadow.holder.as_str() == holder {
                 shadow.heard = now;
             }
         }
@@ -257,50 +273,75 @@ impl Checker {
     ) -> Check {
         let g = by.generation;
         if let Some(at) = self.done_at {
-            return Err(("fenced", format!("result {by:?} committed at {now} after Done at {at}")));
+            return Err((
+                "fenced",
+                format_in!(self.alloc, "result {by:?} committed at {now} after Done at {at}"),
+            ));
         }
         if self.dead.contains(&g) {
-            return Err(("fenced", format!("result {by:?} of a fenced lease committed")));
+            return Err((
+                "fenced",
+                format_in!(self.alloc, "result {by:?} of a fenced lease committed"),
+            ));
         }
         let Some(shadow) = self.live.get(&g) else {
-            return Err(("fenced", format!("result {by:?} of a lease never granted committed")));
+            return Err((
+                "fenced",
+                format_in!(self.alloc, "result {by:?} of a lease never granted committed"),
+            ));
         };
         if now > shadow.heard + self.lease_ms {
             return Err((
                 "fenced",
-                format!(
+                format_in!(
+                    self.alloc,
                     "result {by:?} committed at {now}, its lease expired at {}",
                     shadow.heard + self.lease_ms
                 ),
             ));
         }
         let Some((req, answer)) = result else {
-            return Err(("fenced", format!("a commit {by:?} with no result")));
+            return Err(("fenced", format_in!(self.alloc, "a commit {by:?} with no result")));
         };
         if req.lease.attempt != self.attempt {
             return Err((
                 "fenced",
-                format!(
+                format_in!(
+                    self.alloc,
                     "result {by:?} of attempt {:?} committed in {:?}",
-                    req.lease.attempt, self.attempt
+                    req.lease.attempt,
+                    self.attempt
                 ),
             ));
         }
-        let shadow = self.release(g).expect("live");
+        let Some(shadow) = self.release(g) else {
+            return Err((
+                "fenced",
+                format_in!(self.alloc, "result {by:?} lease disappeared during release"),
+            ));
+        };
         self.dead.insert(g);
-        let returned_roots = Ranges::from_wire(&req.returned_roots).unwrap_or_default();
-        let returned: BTreeSet<WorkName> = req.returned_names.iter().copied().collect();
+        let returned_roots = Ranges::from_wire(&req.returned_roots, self.alloc)
+            .unwrap_or_else(|| Ranges::new(self.alloc));
+        let mut returned = BTreeSet::new_in(self.alloc);
+        returned.extend(req.returned_names.iter().copied());
         let roots = shadow.roots.minus(&returned_roots);
-        let names: Vec<WorkName> =
-            shadow.names.iter().filter(|n| !returned.contains(n)).copied().collect();
-        let key = (by.holder.clone(), g, by.seq);
+        let names = Vec::from_iter_in(
+            shadow.names.iter().filter(|n| !returned.contains(n)).copied(),
+            self.alloc,
+        );
+        let key = (WireString::from_str_in(by.holder.as_str(), self.alloc), g, by.seq);
         for index in roots.indexes() {
             if let Some(other) = self.root_claims.insert(index, key.clone()) {
-                return Err(("once", format!("root {index} accounted by {other:?} and {key:?}")));
+                return Err((
+                    "once",
+                    format_in!(self.alloc, "root {index} accounted by {other:?} and {key:?}"),
+                ));
             }
         }
-        let k = roots.len() as usize;
-        for (item, name) in req.items[k..].iter().zip(&names) {
+        let k = usize::try_from(roots.len()).unwrap_or(req.items.len());
+        let named_items = req.items.get(k..).unwrap_or(&[]);
+        for (item, name) in named_items.iter().zip(&names) {
             // Lost is a returned finding, not accepted compute. Another finder may
             // legitimately commit this name later under a new lease.
             if matches!(item.outcome, ItemOutcome::Lost(_)) {
@@ -309,18 +350,26 @@ impl Checker {
             if let Some(other) = self.name_claims.insert(*name, key.clone()) {
                 return Err((
                     "once",
-                    format!("name {} accounted by {other:?} and {key:?}", short(name)),
+                    format_in!(
+                        self.alloc,
+                        "name {} accounted by {other:?} and {key:?}",
+                        short(name)
+                    ),
                 ));
             }
         }
-        for (item, name) in req.items[k..].iter().zip(&names) {
+        for (item, name) in named_items.iter().zip(&names) {
             if let ItemOutcome::Lost(why) = &item.outcome
-                && why.why == UNKNOWN_NAME
+                && why.why.as_str() == UNKNOWN_NAME
                 && !answer.conflicts.iter().any(|c| c == name)
             {
                 return Err((
                     "unknown",
-                    format!("unknown name {} not answered as a conflict", short(name)),
+                    format_in!(
+                        self.alloc,
+                        "unknown name {} not answered as a conflict",
+                        short(name)
+                    ),
                 ));
             }
         }
@@ -338,7 +387,7 @@ impl Checker {
             let jobs::Effect::Work(effect) = effect else { continue };
             match effect {
                 work::Effect::Granted { holder, generation, roots, names } => {
-                    self.granted(now, holder, *generation, roots, names)?;
+                    self.granted(now, holder.as_str(), *generation, roots, names)?;
                 }
                 work::Effect::Fenced { generation, .. } => {
                     self.release(*generation);
@@ -347,7 +396,10 @@ impl Checker {
                 work::Effect::Committed { by, .. } => self.committed(now, by, result)?,
                 work::Effect::Reset { .. } => {
                     if !self.live.is_empty() {
-                        return Err(("exclusive", "a reset with leases live".to_owned()));
+                        return Err((
+                            "exclusive",
+                            WireString::from_str_in("a reset with leases live", self.alloc),
+                        ));
                     }
                     self.accepted.clear();
                     self.root_claims.clear();
@@ -356,7 +408,10 @@ impl Checker {
                 }
                 work::Effect::Done => {
                     if !self.live.is_empty() {
-                        return Err(("once", format!("Done with {} leases live", self.live.len())));
+                        return Err((
+                            "once",
+                            format_in!(self.alloc, "Done with {} leases live", self.live.len()),
+                        ));
                     }
                     self.done_at = Some(now);
                 }
@@ -370,33 +425,46 @@ impl Checker {
     /// from the one result that claimed it with the lead's item, or in the tail.
     fn coverage(&self, program: &Program, report: &work::Report) -> Check {
         if report.fixed.as_ref() != Some(&program.lead.rootset) {
-            return Err(("once", "the fixed root set is not the lead's".to_owned()));
+            return Err((
+                "once",
+                WireString::from_str_in("the fixed root set is not the lead's", self.alloc),
+            ));
         }
         if report.roots.len() != program.lead.roots.len() {
             return Err((
                 "once",
-                format!("{} roots for the lead's {}", report.roots.len(), program.lead.roots.len()),
+                format_in!(
+                    self.alloc,
+                    "{} roots for the lead's {}",
+                    report.roots.len(),
+                    program.lead.roots.len()
+                ),
             ));
         }
-        let mut found = BTreeMap::new();
-        let mut edges = BTreeSet::new();
-        let mut items: BTreeMap<(String, u64, u64), BTreeMap<RootOrName, &ItemResult>> =
-            BTreeMap::new();
+        let mut found = BTreeMap::new_in(self.alloc);
+        let mut edges = BTreeSet::new_in(self.alloc);
+        let mut items: BTreeMap<
+            (WireString, u64, u64),
+            BTreeMap<RootOrName, &ItemResult, WireAlloc>,
+            WireAlloc,
+        > = BTreeMap::new_in(self.alloc);
         for (key, (req, _, roots, names)) in &self.accepted {
-            let k = roots.len() as usize;
-            let mut by = BTreeMap::new();
-            for (item, index) in req.items[..k].iter().zip(roots.indexes()) {
-                by.insert(RootOrName::Root(index), item);
-            }
-            for (item, name) in req.items[k..].iter().zip(names) {
-                by.insert(RootOrName::Name(*name), item);
+            let k = usize::try_from(roots.len()).unwrap_or(req.items.len());
+            let mut by = BTreeMap::new_in(self.alloc);
+            if let Some((root_slice, name_slice)) = req.items.split_at_checked(k) {
+                for (item, index) in root_slice.iter().zip(roots.indexes()) {
+                    by.insert(RootOrName::Root(index), item);
+                }
+                for (item, name) in name_slice.iter().zip(names) {
+                    by.insert(RootOrName::Name(*name), item);
+                }
             }
             for item in &req.items {
                 if matches!(item.outcome, ItemOutcome::Lost(_)) {
                     continue;
                 }
                 for f in item.found.iter() {
-                    found.entry(f.name).or_insert(key.clone());
+                    found.entry(f.name).or_insert_with(|| key.clone());
                 }
                 for (ordinal, _) in item.unnamed.iter() {
                     edges.insert((item.name, *ordinal));
@@ -406,28 +474,50 @@ impl Checker {
         }
         let committed_item = |by: &work::Commit, what: RootOrName| {
             items
-                .get(&(by.holder.clone(), by.generation, by.seq))
+                .get(&(WireString::from_str_in(by.holder.as_str(), self.alloc), by.generation, by.seq))
                 .and_then(|m| m.get(&what).copied())
         };
-        for (index, end) in report.roots.iter().enumerate() {
-            let index = index as u64;
+        for (idx, end) in report.roots.iter().enumerate() {
+            let index = u64::try_from(idx).unwrap_or(u64::MAX);
             match end {
-                None => return Err(("once", format!("root {index} not terminal at Done"))),
+                None => {
+                    return Err((
+                        "once",
+                        format_in!(self.alloc, "root {index} not terminal at Done"),
+                    ));
+                }
                 Some(Terminal::Tail(_)) => {}
                 Some(Terminal::Committed { by, .. }) => {
                     let claim = self.root_claims.get(&index);
-                    if claim != Some(&(by.holder.clone(), by.generation, by.seq)) {
+                    let expected_key =
+                        (WireString::from_str_in(by.holder.as_str(), self.alloc), by.generation, by.seq);
+                    if claim != Some(&expected_key) {
                         return Err((
                             "once",
-                            format!("root {index} done by {by:?}, claimed by {claim:?}"),
+                            format_in!(
+                                self.alloc,
+                                "root {index} done by {by:?}, claimed by {claim:?}"
+                            ),
                         ));
                     }
-                    let item = committed_item(by, RootOrName::Root(index)).expect("claimed");
-                    let truth = program.lead.roots[index as usize].result(program.lead.salt);
+                    let Some(item) = committed_item(by, RootOrName::Root(index)) else {
+                        return Err((
+                            "once",
+                            format_in!(self.alloc, "root {index} claimed item missing for {by:?}"),
+                        ));
+                    };
+                    let Some(lead_root) = program.lead.roots.get(idx) else {
+                        return Err((
+                            "once",
+                            format_in!(self.alloc, "root {index} out of lead root list"),
+                        ));
+                    };
+                    let truth = lead_root.result(program.lead.salt);
                     if *item != truth {
                         return Err((
                             "once",
-                            format!(
+                            format_in!(
+                                self.alloc,
                                 "root {index} done by {by:?} with {} where the lead compiles {}",
                                 short(&item.name),
                                 short(&truth.name)
@@ -439,33 +529,66 @@ impl Checker {
         }
         for (name, (_, end)) in &report.names {
             let Some(end) = end else {
-                return Err(("once", format!("name {} not terminal at Done", short(name))));
+                return Err((
+                    "once",
+                    format_in!(self.alloc, "name {} not terminal at Done", short(name)),
+                ));
             };
             if let Terminal::Committed { by, .. } = end {
                 let claim = self.name_claims.get(name);
-                if claim != Some(&(by.holder.clone(), by.generation, by.seq)) {
+                let expected_key =
+                    (WireString::from_str_in(by.holder.as_str(), self.alloc), by.generation, by.seq);
+                if claim != Some(&expected_key) {
                     return Err((
                         "once",
-                        format!("name {} done by {by:?}, claimed by {claim:?}", short(name)),
+                        format_in!(
+                            self.alloc,
+                            "name {} done by {by:?}, claimed by {claim:?}",
+                            short(name)
+                        ),
                     ));
                 }
-                let item = committed_item(by, RootOrName::Name(*name)).expect("claimed");
+                let Some(item) = committed_item(by, RootOrName::Name(*name)) else {
+                    return Err((
+                        "once",
+                        format_in!(
+                            self.alloc,
+                            "name {} claimed item missing for {by:?}",
+                            short(name)
+                        ),
+                    ));
+                };
                 if let ItemOutcome::Lost(why) = &item.outcome {
-                    let invariant = if why.why == UNKNOWN_NAME { "unknown" } else { "once" };
+                    let invariant = if why.why.as_str() == UNKNOWN_NAME { "unknown" } else { "once" };
                     return Err((
                         invariant,
-                        format!(
+                        format_in!(
+                            self.alloc,
                             "name {} taken as done from a Lost answer ({})",
                             short(name),
                             why.why
                         ),
                     ));
                 }
-                let truth = program.instances[name].result(program.lead.salt);
+                let Some(instance) = program.instances.get(name) else {
+                    return Err((
+                        "once",
+                        format_in!(
+                            self.alloc,
+                            "name {} missing from program instances",
+                            short(name)
+                        ),
+                    ));
+                };
+                let truth = instance.result(program.lead.salt);
                 if *item != truth {
                     return Err((
                         "once",
-                        format!("name {} done with another item than the lead's", short(name)),
+                        format_in!(
+                            self.alloc,
+                            "name {} done with another item than the lead's",
+                            short(name)
+                        ),
                     ));
                 }
             }
@@ -474,21 +597,26 @@ impl Checker {
             if !report.names.contains_key(name) {
                 return Err((
                     "once",
-                    format!("name {} found by {key:?} is missing from the work set", short(name)),
+                    format_in!(
+                        self.alloc,
+                        "name {} found by {key:?} is missing from the work set",
+                        short(name)
+                    ),
                 ));
             }
         }
         for (key, (req, _, _, _)) in &self.accepted {
             for item in &req.items {
                 if let ItemOutcome::Lost(why) = &item.outcome
-                    && why.why == UNKNOWN_NAME
+                    && why.why.as_str() == UNKNOWN_NAME
                 {
                     match report.names.get(&item.name) {
                         Some((_, Some(Terminal::Tail(_)))) => {}
                         other => {
                             return Err((
                                 "unknown",
-                                format!(
+                                format_in!(
+                                    self.alloc,
                                     "unknown name {} from {key:?} ended {other:?}, not a conflict or Local",
                                     short(&item.name)
                                 ),
@@ -501,14 +629,14 @@ impl Checker {
         for (parent, ordinal) in &edges {
             let edge = WorkName::of(
                 &WorkKey::Edge(blaze_wire::EdgeKey { parent: *parent, ordinal: *ordinal }),
-                std::alloc::Global,
+                self.alloc,
             );
             match report.edges.get(&edge) {
                 Some((p, o, t)) if p == parent && o == ordinal && t.is_local() => {}
                 other => {
                     return Err((
                         "once",
-                        format!("edge {ordinal} of {} is {other:?}", short(parent)),
+                        format_in!(self.alloc, "edge {ordinal} of {} is {other:?}", short(parent)),
                     ));
                 }
             }
@@ -524,18 +652,19 @@ enum RootOrName {
 }
 
 fn short(name: &WorkName) -> blaze_wire::json::Hex<'_> {
-    blaze_wire::json::hex(&name.0[..4])
+    blaze_wire::json::hex(name.0.get(..4).unwrap_or(&[]))
 }
 
 struct World {
+    alloc: WireAlloc,
     seed: u64,
     rng: Rng,
     profile: Profile,
     program: Program,
     now: Millis,
-    queue: BTreeMap<(Millis, u64), Kind>,
+    queue: BTreeMap<(Millis, u64), Kind, WireAlloc>,
     next: u64,
-    nodes: Vec<Node>,
+    nodes: WireVec<Node>,
     execution: Execution,
     checker: Checker,
     deaths: u32,
@@ -545,18 +674,18 @@ struct World {
     clippy::needless_pass_by_value,
     reason = "a refusal is consumed by the wire form it stands for"
 )]
-fn wire(refusal: Refusal) -> blaze_wire::WireError {
+fn wire(refusal: Refusal, alloc: WireAlloc) -> blaze_wire::WireError {
     let retry = (refusal == Refusal::NotYet).then_some(3_000);
-    refusal.to_wire(retry)
+    refusal.to_wire(retry, alloc)
 }
 
 impl World {
-    fn new(seed: u64) -> World {
+    fn new(seed: u64, alloc: WireAlloc) -> Result<World, Violation> {
         let mut rng = Rng::new(seed);
         let profile = Profile::draw(&mut rng);
-        let program = Program::generate(&mut rng.fork(), profile.conflicts);
+        let program = Program::generate(&mut rng.fork(), profile.conflicts, alloc);
         let horizon = profile.horizon_ms;
-        let mut nodes = Vec::new();
+        let mut nodes = Vec::with_capacity_in(profile.nodes, alloc);
         for i in 0..profile.nodes {
             let front = match profile.divergent {
                 Some((at, d)) if at == i => program.diverge(&mut rng, d),
@@ -568,7 +697,7 @@ impl World {
             } else {
                 rng.range(800_000, 1_250_000)
             };
-            let mut partitions = Vec::new();
+            let mut partitions = Vec::new_in(alloc);
             if !survivor || rng.chance(300_000) {
                 for _ in 0..rng.below(3) {
                     let start = rng.below(horizon);
@@ -577,7 +706,7 @@ impl World {
                 }
             }
             nodes.push(Node {
-                id: format!("exec:{i}"),
+                id: format_in!(alloc, "exec:{i}"),
                 alive: true,
                 front,
                 holder: None,
@@ -595,21 +724,22 @@ impl World {
         let config = ExecutionConfig {
             work: WorkConfig {
                 grant_roots: rng.range(1, 12),
-                grant_names: rng.range(1, 12) as usize,
+                grant_names: rng.range_usize(1, 12),
                 ..WorkConfig::default()
             },
             ..ExecutionConfig::default()
         };
         let mut checker = Checker {
+            alloc,
             lease_ms: config.work.lease_ms,
             attempt: Attempt(1),
-            live: BTreeMap::new(),
-            dead: BTreeSet::new(),
-            held_roots: BTreeMap::new(),
-            held_names: BTreeMap::new(),
-            accepted: BTreeMap::new(),
-            root_claims: BTreeMap::new(),
-            name_claims: BTreeMap::new(),
+            live: BTreeMap::new_in(alloc),
+            dead: BTreeSet::new_in(alloc),
+            held_roots: BTreeMap::new_in(alloc),
+            held_names: BTreeMap::new_in(alloc),
+            accepted: BTreeMap::new_in(alloc),
+            root_claims: BTreeMap::new_in(alloc),
+            name_claims: BTreeMap::new_in(alloc),
             done_at: None,
         };
         let subscriber = Subscriber {
@@ -618,7 +748,7 @@ impl World {
             policy: LocalPolicy::Never,
             state: SubscriberState::Attached,
         };
-        let mut log = Vec::new();
+        let mut log = Vec::new_in(alloc);
         let mut execution = Execution::new(
             0,
             ExecutionId(seed),
@@ -626,19 +756,34 @@ impl World {
             Namespace::Main,
             subscriber,
             config,
+            alloc,
             &mut log,
         );
         execution.admitted(0, &mut log);
-        let helpers: Vec<&str> = nodes.iter().skip(1).map(|n| n.id.as_str()).collect();
-        execution.assign(0, &nodes[0].id, &helpers, &mut log).expect("queued");
-        checker.observe(0, &log, None).expect("no work yet");
+        let helpers = Vec::from_iter_in(nodes.iter().skip(1).map(|n| n.id.as_str()), alloc);
+        let Some(lead_node) = nodes.first() else {
+            return Err(Violation::new(seed, 0, "protocol", format_args!("no lead node"), alloc));
+        };
+        if let Err(err) = execution.assign(0, lead_node.id.as_str(), &helpers, &mut log) {
+            return Err(Violation::new(
+                seed,
+                0,
+                "protocol",
+                format_args!("initial assign failed: {err:?}"),
+                alloc,
+            ));
+        }
+        if let Err((invariant, detail)) = checker.observe(0, &log, None) {
+            return Err(Violation { seed, invariant, at: 0, detail });
+        }
         let mut world = World {
+            alloc,
             seed,
             rng,
             profile,
             program,
             now: 0,
-            queue: BTreeMap::new(),
+            queue: BTreeMap::new_in(alloc),
             next: 0,
             nodes,
             execution,
@@ -655,7 +800,7 @@ impl World {
             world.push(tick, Kind::NodeTick { node: i });
         }
         world.push(COORD_TICK_MS, Kind::CoordTick);
-        world
+        Ok(world)
     }
 
     fn push(&mut self, at: Millis, kind: Kind) {
@@ -672,9 +817,9 @@ impl World {
     fn send(&mut self, node: usize, kind: Kind) {
         let delay = self.rng.range(1, self.profile.max_delay_ms);
         if self.faulty() {
-            if self.nodes[node].partitioned(self.now).is_some()
-                || self.rng.chance(self.profile.loss_ppm)
-            {
+            let partitioned =
+                self.nodes.get(node).is_some_and(|n| n.partitioned(self.now).is_some());
+            if partitioned || self.rng.chance(self.profile.loss_ppm) {
                 return;
             }
             if self.rng.chance(self.profile.dup_ppm) {
@@ -688,18 +833,21 @@ impl World {
     /// What the agents carry (assignments and kills): never lost, held by a partition.
     fn carry(&mut self, node: usize, kind: Kind) {
         let delay = self.rng.range(1, self.profile.max_delay_ms);
-        let at = match self.nodes[node].partitioned(self.now) {
+        let at = match self.nodes.get(node).and_then(|n| n.partitioned(self.now)) {
             Some(end) if self.faulty() => end + delay,
             _ => self.now + delay,
         };
         self.push(at, kind);
     }
 
-    fn violation(&self, invariant: &'static str, detail: std::fmt::Arguments<'_>) -> Violation {
-        Violation::new(self.seed, self.now, invariant, detail)
+    fn violation(&self, invariant: &'static str, detail: fmt::Arguments<'_>) -> Violation {
+        Violation::new(self.seed, self.now, invariant, detail, self.alloc)
     }
 
-    fn run(mut self, mut trace: Option<&mut dyn FnMut(std::fmt::Arguments<'_>)>) -> Result<Summary, Violation> {
+    fn run(
+        mut self,
+        mut trace: Option<&mut dyn FnMut(fmt::Arguments<'_>)>,
+    ) -> Result<Summary, Violation> {
         let mut events = 0u64;
         while let Some(((at, _), kind)) = self.queue.pop_first() {
             self.now = at;
@@ -722,11 +870,13 @@ impl World {
                 break;
             }
         }
-        let work = self.execution.work().expect("assigned");
+        let Some(work) = self.execution.work() else {
+            return Err(self.violation("progress", format_args!("execution had no work set")));
+        };
         let report = work.report();
         if report.done {
-            self.checker.coverage(&self.program, &report).map_err(|(invariant, detail)| Violation {
-                seed: self.seed, invariant, at: self.now, detail,
+            self.checker.coverage(&self.program, &report).map_err(|(invariant, detail)| {
+                Violation { seed: self.seed, invariant, at: self.now, detail }
             })?;
         } else {
             match work.ended() {
@@ -757,29 +907,29 @@ impl World {
     fn event(&mut self, kind: Kind) -> Result<(), Violation> {
         match kind {
             Kind::CoordTick => {
-                let mut fx = Vec::new();
+                let mut fx = Vec::new_in(self.alloc);
                 self.execution.tick(self.now, &mut fx);
                 self.effects(fx, None)?;
                 self.push(self.now + COORD_TICK_MS, Kind::CoordTick);
             }
             Kind::ToCoord { from, id, call } => self.call(from, id, call)?,
             Kind::ToNode { to, attempt, id, reply } => {
-                if self.nodes[to].attempt == attempt {
+                if self.nodes.get(to).is_some_and(|n| n.attempt == attempt) {
                     self.step(to, holder::Event::Reply { id, reply })?;
                 }
             }
             Kind::Compiled { node, attempt, batch } => {
-                if self.nodes[node].attempt == attempt {
+                if self.nodes.get(node).is_some_and(|n| n.attempt == attempt) {
                     self.step(node, holder::Event::Compiled(batch))?;
                 }
             }
             Kind::NodeTick { node } => {
-                if !self.nodes[node].alive {
+                if !self.nodes.get(node).is_some_and(|n| n.alive) {
                     return Ok(());
                 }
                 if self.faulty() && self.rng.chance(self.profile.drop_ppm) {
                     let knows = self.rng.chance(500_000);
-                    if let Some(h) = &mut self.nodes[node].holder {
+                    if let Some(h) = self.nodes.get_mut(node).and_then(|n| n.holder.as_mut()) {
                         let name = h.findings().next().map(|(name, _)| *name);
                         if let Some(name) = name {
                             h.drop_finding(&name, knows);
@@ -791,12 +941,12 @@ impl World {
                 self.push(self.now + TICK_MS, Kind::NodeTick { node });
             }
             Kind::Loaded { to, attempt } => {
-                if self.nodes[to].attempt == attempt {
+                if self.nodes.get(to).is_some_and(|n| n.attempt == attempt) {
                     self.step(to, holder::Event::Loaded)?;
                 }
             }
             Kind::Assign { to, attempt, lead, load_ms } => {
-                let node = &mut self.nodes[to];
+                let Some(node) = self.nodes.get_mut(to) else { return Ok(()) };
                 if !node.alive
                     || attempt < node.attempt
                     || (attempt == node.attempt && node.holder.is_some())
@@ -807,29 +957,34 @@ impl World {
                 node.attempt = attempt;
                 node.lead = lead;
                 let rejected = if lead {
-                    blaze_wire::Set::new(self.program.rejected.iter().copied().collect())
+                    blaze_wire::Set::new(Vec::from_iter_in(
+                        self.program.rejected.iter().copied(),
+                        self.alloc,
+                    ))
                 } else {
-                    blaze_wire::Set::new(Vec::new())
+                    blaze_wire::Set::empty_in(self.alloc)
                 };
                 let mut h = Holder::new(
-                    &node.id,
+                    node.id.as_str(),
                     self.execution.id,
                     attempt,
                     node.front.rootset.clone(),
                     rejected,
                     self.program.index.clone(),
                     HolderConfig::default(),
+                    self.alloc,
                 );
                 let local = node.local(self.now);
-                let mut out = Vec::new();
+                let mut out = Vec::new_in(self.alloc);
                 h.start(local, &mut out);
                 node.holder = Some(h);
                 self.apply(to, out)?;
                 self.push(self.now + load_ms, Kind::Loaded { to, attempt });
             }
             Kind::Kill { to, attempt } => {
-                let node = &mut self.nodes[to];
-                if node.attempt <= attempt {
+                if let Some(node) = self.nodes.get_mut(to)
+                    && node.attempt <= attempt
+                {
                     node.holder = None;
                 }
             }
@@ -838,13 +993,13 @@ impl World {
     }
 
     fn step(&mut self, node: usize, event: holder::Event) -> Result<(), Violation> {
-        let n = &mut self.nodes[node];
+        let Some(n) = self.nodes.get_mut(node) else { return Ok(()) };
         if !n.alive {
             return Ok(());
         }
         let local = n.local(self.now);
         let Some(h) = &mut n.holder else { return Ok(()) };
-        let mut out = Vec::new();
+        let mut out = Vec::new_in(self.alloc);
         h.step(local, event, &mut out);
         self.apply(node, out)
     }
@@ -852,19 +1007,25 @@ impl World {
     fn apply(
         &mut self,
         node: usize,
-        effects: Vec<holder::Effect, impl std::alloc::Allocator>,
+        effects: Vec<holder::Effect, impl Allocator>,
     ) -> Result<(), Violation> {
         for effect in effects {
-            if !self.nodes[node].alive {
+            let Some((alive, death_ppm)) = self.nodes.get(node).map(|n| (n.alive, n.death_ppm))
+            else {
+                break;
+            };
+            if !alive {
                 break;
             }
             // Death at any step: before the effect or just after it.
-            if self.faulty() && self.rng.chance(self.nodes[node].death_ppm) {
+            if self.faulty() && self.rng.chance(death_ppm) {
                 if self.rng.chance(500_000) {
                     self.effect(node, effect)?;
                 }
-                self.nodes[node].alive = false;
-                self.nodes[node].holder = None;
+                if let Some(n) = self.nodes.get_mut(node) {
+                    n.alive = false;
+                    n.holder = None;
+                }
                 self.deaths += 1;
                 break;
             }
@@ -879,11 +1040,14 @@ impl World {
                 self.send(node, Kind::ToCoord { from: node, id, call });
             }
             holder::Effect::Compile(plan) => {
-                let (batch, took) = self.compile(node, &plan);
-                let attempt = self.nodes[node].attempt;
+                let (batch, took) = self.compile(node, &plan)?;
+                let Some((attempt, hung)) = self.nodes.get(node).map(|n| (n.attempt, n.hung))
+                else {
+                    return Ok(());
+                };
                 // A hung batch exceeds the progress timeout, but the fault is finite.
                 // Its eventual completion exercises fencing; later batches run normally.
-                let at = if self.nodes[node].hung && self.faulty() {
+                let at = if hung && self.faulty() {
                     self.profile.horizon_ms + WorkConfig::default().progress_first_ms + took
                 } else {
                     self.now + took
@@ -893,15 +1057,15 @@ impl World {
             holder::Effect::Release(_) => {}
             holder::Effect::Stop(why) => {
                 if let StopWhy::Protocol(what) = &why {
-                    return Err(self.violation(
-                        "protocol",
-                        format_args!("{} stopped: {what}", self.nodes[node].id),
-                    ));
+                    let id = self.nodes.get(node).map_or("<missing>", |n| n.id.as_str());
+                    return Err(self.violation("protocol", format_args!("{id} stopped: {what}")));
                 }
-                if why == StopWhy::FrontEndDiffers {
-                    self.nodes[node].refused = true;
+                if let Some(n) = self.nodes.get_mut(node) {
+                    if why == StopWhy::FrontEndDiffers {
+                        n.refused = true;
+                    }
+                    n.holder = None;
                 }
-                self.nodes[node].holder = None;
             }
         }
         Ok(())
@@ -909,48 +1073,64 @@ impl World {
 
     /// The executor's compile threads over a plan: the roots of its own front end, the names
     /// from the program, stopped early at a budget now and then.
-    fn compile(&mut self, node: usize, plan: &Plan) -> (Compiled, Millis) {
-        let front = &self.nodes[node].front;
-        let granted = Ranges::from_wire(&plan.grant.roots).expect("the coordinator's ranges");
-        let total = granted.len() as usize + plan.compile.len();
+    fn compile(&mut self, node: usize, plan: &Plan) -> Result<(Compiled, Millis), Violation> {
+        let Some(front) = self.nodes.get(node).map(|n| &n.front) else {
+            return Err(self.violation("protocol", format_args!("missing node {node}")));
+        };
+        let Some(granted) = Ranges::from_wire(&plan.grant.roots, self.alloc) else {
+            return Err(
+                self.violation("protocol", format_args!("invalid root ranges in compile plan"))
+            );
+        };
+        let total = usize::try_from(granted.len()).unwrap_or(0).saturating_add(plan.compile.len());
         let stop = if self.rng.chance(self.profile.budget_ppm) {
-            self.rng.below(total as u64 + 1) as usize
+            self.rng.below_usize(total.saturating_add(1))
         } else {
             total
         };
-        let mut done = 0;
-        let mut roots = Vec::new();
-        let mut returned_roots = Ranges::new();
+        let mut done: usize = 0;
+        let mut roots = Vec::new_in(self.alloc);
+        let mut returned_roots = Ranges::new(self.alloc);
         for index in granted.indexes() {
             if done < stop {
-                roots.push(front.roots[index as usize].result(front.salt));
+                if let Ok(idx) = usize::try_from(index)
+                    && let Some(item) = front.roots.get(idx)
+                {
+                    roots.push(item.result(front.salt));
+                }
                 done += 1;
             } else {
                 returned_roots.insert(index, index + 1);
             }
         }
-        let mut names = Vec::new();
-        let mut returned_names = Vec::new();
+        let mut names = Vec::new_in(self.alloc);
+        let mut returned_names = Vec::new_in(self.alloc);
         for name in &plan.compile {
             if done < stop {
-                names.push(self.program.instances[name].result(front.salt));
+                if let Some(item) = self.program.instances.get(name) {
+                    names.push(item.result(front.salt));
+                }
                 done += 1;
             } else {
                 returned_names.push(*name);
             }
         }
+        let done_u64 = u64::try_from(done).unwrap_or(u64::MAX);
         let packs = if done > 0 {
-            vec![PackRef {
-                pack: self.rng.digest(),
-                size: done as u64,
-                keys: [0; 32],
-                packed: None,
-                format: 1,
-            }]
+            vec_in![
+                self.alloc;
+                PackRef {
+                    pack: self.rng.digest(),
+                    size: done_u64,
+                    keys: [0; 32],
+                    packed: None,
+                    format: 1,
+                }
+            ]
         } else {
-            Vec::new()
+            Vec::new_in(self.alloc)
         };
-        let took = 20 + 30 * done as u64 + self.rng.below(2_000);
+        let took = 20 + 30 * done_u64 + self.rng.below(2_000);
         let batch = Compiled {
             generation: plan.grant.lease.generation,
             roots,
@@ -959,7 +1139,7 @@ impl World {
             returned_roots,
             returned_names,
         };
-        (batch, took)
+        Ok((batch, took))
     }
 
     #[expect(
@@ -967,9 +1147,14 @@ impl World {
         reason = "a call is what the simulated network delivers, once"
     )]
     fn call(&mut self, from: usize, id: u64, call: Call) -> Result<(), Violation> {
-        let holder_id = self.nodes[from].id.clone();
+        let Some(holder_id) =
+            self.nodes.get(from).map(|n| WireString::from_str_in(n.id.as_str(), self.alloc))
+        else {
+            return Ok(());
+        };
         let now = self.now;
-        let mut fx = Vec::new();
+        let alloc = self.alloc;
+        let mut fx = Vec::new_in(alloc);
         let attempt = match &call {
             Call::Join(r) => r.attempt,
             Call::Lease(r) => r.attempt,
@@ -977,14 +1162,18 @@ impl World {
             Call::Events(r) => r.attempt,
         };
         let reply = match &call {
-            Call::Join(req) => {
-                Reply::Join(self.execution.join(now, &holder_id, req, &mut fx).map_err(wire))
-            }
-            Call::Lease(req) => {
-                Reply::Lease(self.execution.lease(now, &holder_id, req, &mut fx).map_err(wire))
-            }
+            Call::Join(req) => Reply::Join(
+                self.execution
+                    .join(now, holder_id.as_str(), req, &mut fx)
+                    .map_err(|r| wire(r, alloc)),
+            ),
+            Call::Lease(req) => Reply::Lease(
+                self.execution
+                    .lease(now, holder_id.as_str(), req, &mut fx)
+                    .map_err(|r| wire(r, alloc)),
+            ),
             Call::Result(req) => {
-                let answer = self.execution.result(now, &holder_id, req, &mut fx);
+                let answer = self.execution.result(now, holder_id.as_str(), req, &mut fx);
                 if let Err(
                     refusal @ (Refusal::Malformed(_) | Refusal::SeqReused | Refusal::NotHolder),
                 ) = &answer
@@ -996,13 +1185,15 @@ impl World {
                 }
                 let ok = answer.as_ref().ok().cloned();
                 self.effects(fx, ok.as_ref().map(|a| (req, a)))?;
-                self.checker.heard(now, &holder_id);
-                let reply = Reply::Result(answer.map_err(wire));
+                self.checker.heard(now, holder_id.as_str());
+                let reply = Reply::Result(answer.map_err(|r| wire(r, alloc)));
                 self.send(from, Kind::ToNode { to: from, attempt, id, reply });
                 return Ok(());
             }
             Call::Events(req) => Reply::Events(
-                self.execution.worker_events(now, &holder_id, req, &mut fx).map_err(wire),
+                self.execution
+                    .worker_events(now, holder_id.as_str(), req, &mut fx)
+                    .map_err(|r| wire(r, alloc)),
             ),
         };
         if let Reply::Join(Err(e)) | Reply::Lease(Err(e)) = &reply
@@ -1014,18 +1205,21 @@ impl World {
             ));
         }
         self.effects(fx, None)?;
-        self.checker.heard(now, &holder_id);
+        self.checker.heard(now, holder_id.as_str());
         self.send(from, Kind::ToNode { to: from, attempt, id, reply });
         Ok(())
     }
 
     fn effects(
         &mut self,
-        fx: Vec<jobs::Effect, impl std::alloc::Allocator>,
+        fx: Vec<jobs::Effect, impl Allocator>,
         result: Option<(&BatchResult, &WorkResultAnswer)>,
     ) -> Result<(), Violation> {
         self.checker.observe(self.now, &fx, result).map_err(|(invariant, detail)| Violation {
-            seed: self.seed, invariant, at: self.now, detail,
+            seed: self.seed,
+            invariant,
+            at: self.now,
+            detail,
         })?;
         for effect in fx {
             match effect {
@@ -1048,23 +1242,25 @@ impl World {
     /// An idle agent's long poll: an executor with no assignment, alive and not refused, is
     /// offered to the running execution as a helper of its current attempt.
     fn poll(&mut self, node: usize) {
-        let n = &self.nodes[node];
+        let Some(n) = self.nodes.get(node) else { return };
         if n.holder.is_some() || n.refused || !n.alive || self.now < n.poll_at {
             return;
         }
-        self.nodes[node].poll_at = self.now + POLL_MS;
+        let id = WireString::from_str_in(n.id.as_str(), self.alloc);
+        if let Some(n) = self.nodes.get_mut(node) {
+            n.poll_at = self.now + POLL_MS;
+        }
         let running = self.execution.state() == ExecState::Running
             && self.execution.lead().is_some()
             && !self.execution.work().is_some_and(|w| w.is_done());
         if !running {
             return;
         }
-        let id = self.nodes[node].id.clone();
         if self.execution.lead() == Some(id.as_str()) {
             // Its own assignment is on its way.
             return;
         }
-        if let Ok(attempt) = self.execution.add_helper(self.now, &id) {
+        if let Ok(attempt) = self.execution.add_helper(self.now, id.as_str()) {
             let load_ms = self.rng.below(2_000);
             self.carry(node, Kind::Assign { to: node, attempt, lead: false, load_ms });
         }
@@ -1074,22 +1270,33 @@ impl World {
     /// as admission would choose, never the one whose front end differs (the truth the
     /// checker holds results to is the first lead's front end).
     fn reassign(&mut self) -> Result<(), Violation> {
-        let heard: Vec<&str> = self.execution.heard_recently(self.now).collect();
-        let candidates: Vec<usize> = (0..self.nodes.len())
-            .filter(|&i| heard.contains(&self.nodes[i].id.as_str()))
-            .filter(|&i| self.profile.divergent.is_none_or(|(at, _)| at != i))
-            .collect();
-        let mut fx = Vec::new();
+        let heard = Vec::from_iter_in(self.execution.heard_recently(self.now), self.alloc);
+        let candidates = Vec::from_iter_in(
+            (0..self.nodes.len())
+                .filter(|&i| self.nodes.get(i).is_some_and(|n| heard.scan_for(&n.id.as_str()).is_some()))
+                .filter(|&i| self.profile.divergent.is_none_or(|(at, _)| at != i)),
+            self.alloc,
+        );
+        let mut fx = Vec::new_in(self.alloc);
         if candidates.is_empty() {
             self.execution.end(self.now, blaze_wire::Outcome::Failed, EndWhy::NoLead, &mut fx);
         } else {
-            let lead = candidates[self.rng.below(candidates.len() as u64) as usize];
-            let helpers: Vec<&str> = candidates
-                .iter()
-                .filter(|&&i| i != lead)
-                .map(|&i| self.nodes[i].id.as_str())
-                .collect();
-            self.execution.assign(self.now, &self.nodes[lead].id, &helpers, &mut fx).expect("running");
+            let Some(&lead) = candidates.get(self.rng.below_usize(candidates.len())) else {
+                return Err(self.violation("protocol", format_args!("no candidate selected")));
+            };
+            let Some(lead_id) = self.nodes.get(lead).map(|n| n.id.as_str()) else {
+                return Err(self.violation("protocol", format_args!("missing lead node {lead}")));
+            };
+            let helpers = Vec::from_iter_in(
+                candidates
+                    .iter()
+                    .filter(|&&i| i != lead)
+                    .filter_map(|&i| self.nodes.get(i).map(|n| n.id.as_str())),
+                self.alloc,
+            );
+            if let Err(err) = self.execution.assign(self.now, lead_id, &helpers, &mut fx) {
+                return Err(self.violation("protocol", format_args!("reassign failed: {err:?}")));
+            }
             self.checker.attempt = self.execution.attempt();
             let attempt = self.execution.attempt();
             for &i in &candidates {
@@ -1101,12 +1308,16 @@ impl World {
 }
 
 /// Runs the simulation of `seed`.
-pub fn run(seed: u64) -> Result<Summary, Violation> {
-    World::new(seed).run(None)
+pub fn run(seed: u64, alloc: WireAlloc) -> Result<Summary, Violation> {
+    World::new(seed, alloc)?.run(None)
 }
 
 /// Runs the simulation of `seed`, presenting each event to the caller's synchronous writer.
 /// Formatting borrows the live event; the caller chooses its output buffer and allocator.
-pub fn trace(seed: u64, events: &mut impl FnMut(std::fmt::Arguments<'_>)) -> Result<Summary, Violation> {
-    World::new(seed).run(Some(events))
+pub fn trace(
+    seed: u64,
+    alloc: WireAlloc,
+    events: &mut impl FnMut(fmt::Arguments<'_>),
+) -> Result<Summary, Violation> {
+    World::new(seed, alloc)?.run(Some(events))
 }

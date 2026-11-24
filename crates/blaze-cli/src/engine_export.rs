@@ -204,7 +204,9 @@ pub(crate) fn command(
     heap: &'static blaze_own::Heap,
 ) -> Result<Status, CliError> {
     let mut packages = Vec::new_in(cx.frame());
-    let flags = crate::parse_flags(args, |name| packages.push(name))?;
+    let mut features = Vec::new_in(cx.frame());
+    let mut flags = crate::parse_flags_with(args, |name| packages.push(name), |feat| features.push(feat))?;
+    flags.features = features.as_slice();
     check_export_flags(&flags)?;
     let select = run_package::Select { test_packages: packages.as_slice(), ..flags.select };
     let started_ns = phases.now();
@@ -550,7 +552,7 @@ fn export_program<'f>(
     let lints = crate::lints::of_root(cx, root, frame)?;
     let mut facts = start_facts(&standing, fs, phases, lints);
     let answered = run_names::FromEngine { graph: standing.graph, names: standing.names };
-    let at = run_names::program_row(cx, root, &answered, &mut *standing.store, &mut facts, picked.root, heap, frame).map_err(CliError::RunNames)?;
+    let at = run_names::program_row(cx, root, &answered, &mut *standing.store, &mut facts, picked, heap, frame).map_err(CliError::RunNames)?;
     let owner = run_names::Owner::At(at);
     let found = run_names::found_answered(cx, &answered, owner, &mut *standing.store, &mut facts.bodies, &mut read, heap, frame).map_err(CliError::RunNames)?;
     let program_found = found.program().ok_or(CliError::Start(StartError::NoProgram))?;

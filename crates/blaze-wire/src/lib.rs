@@ -20,11 +20,16 @@
 //! **JSON** ([`to_json`]) is only a rendering for people; it is never the wire, and no value's
 //! identity is taken from it.
 
-#![feature(allocator_api)]
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
 #![deny(missing_docs)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
-pub mod calls;
+#[macro_use]
 mod cbor;
+pub mod calls;
 pub mod job_terminal_v2;
 pub mod json;
 pub mod pack_list;
@@ -44,8 +49,17 @@ pub use json::to_json;
 pub use shapes::*;
 pub use vectors::{Gen, Sample, Vector, every};
 
-use sha2::{Digest as _, Sha256};
-use std::alloc::Allocator;
+use core::alloc::Allocator;
+
+use blaze_own::{SharedAlloc, String, Vec};
+use blaze_sha256::Sha256;
+
+/// The shared allocator handle carried by decoded wire values.
+pub type WireAlloc = SharedAlloc<'static>;
+/// A vector stored in a wire value's allocator.
+pub type WireVec<T> = Vec<T, WireAlloc>;
+/// A UTF-8 string stored in a wire value's allocator.
+pub type WireString = String<WireAlloc>;
 
 /// A SHA-256 digest: 32 bytes, a byte string on the wire.
 pub type Digest = [u8; 32];
@@ -92,9 +106,9 @@ pub fn digest_of_encoded_name(name: &str, cbor: &[u8]) -> Digest {
     hasher.update(DIGEST_PREFIX.as_bytes());
     hasher.update(name.as_bytes());
     hasher.update(DOMAIN_VERSION.as_bytes());
-    hasher.update([0u8]);
+    hasher.update(&[0u8]);
     hasher.update(cbor);
-    hasher.finalize().into()
+    hasher.finish()
 }
 
 /// The SHA-256 of `value`'s domain-separated encoding.

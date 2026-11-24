@@ -308,8 +308,10 @@ mod arch {
 
     impl Stack {
         pub(super) fn new(size: usize, entry: usize, arg: *mut u8) -> Stack {
-            // SAFETY: `sysconf` reads a constant of the system.
-            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            #[cfg(target_os = "linux")]
+            let page = blaze_sys::facts::Aux::from_proc().map_or(4096, |aux| aux.page_size());
+            #[cfg(target_os = "macos")]
+            let page = blaze_sys::facts::Aux::from_system().map_or(4096, |aux| aux.page_size());
             let len = size.max(64 << 10).next_multiple_of(page) + page;
             // SAFETY: this asks for a fresh private anonymous mapping at a kernel-chosen
             // address, and no references into the range exist before this call.

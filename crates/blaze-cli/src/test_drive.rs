@@ -96,6 +96,7 @@ use crate::test_run::{Answers, ChildEnd, Heard, Host as TestHost, RunError, Runn
 /// The system's launcher of `sandbox_init` (blaze-proc-macro native_sandbox.rs uses the same):
 /// it applies the profile, then executes the launcher in its place, so the launcher's process is
 /// the test's and its end is the test's end.
+#[cfg(not(target_os = "linux"))]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// How often a running test's pipes are emptied while its channel is quiet: a writer blocks on
 /// a full pipe (64 KiB) for at most this long.
@@ -208,6 +209,12 @@ pub(crate) enum OneError {
     LauncherNotLooked { launcher: Box<str>, why: Box<str> },
     /// The Seatbelt profile could not say a path, or words did not fit: in words.
     Profile { why: Box<str> },
+    /// Linux Landlock ABI is older than the minimum required to confine a test (rule 9).
+    #[cfg(target_os = "linux")]
+    LandlockAbi { abi: u32, least: u32 },
+    /// Preparing the Linux Landlock/seccomp test confinement failed (rule 9).
+    #[cfg(target_os = "linux")]
+    Confine { step: &'static str, errno: u16 },
     Start(ProcError),
     Pipe(ProcError),
     MissingPipe { stream: &'static str },
@@ -246,7 +253,17 @@ impl fmt::Display for OneError {
             ),
             OneError::LauncherNotLooked { launcher, why } => write!(f, "whether the launcher is at `{launcher}` could not be looked at: {why}"),
             OneError::Profile { why } => write!(f, "a test's sandbox profile: {why}"),
-            OneError::Start(error) => write!(f, "a test's launcher did not start under {SANDBOX_EXEC}: {error}"),
+            #[cfg(target_os = "linux")]
+            OneError::LandlockAbi { abi, least } => write!(
+                f,
+                "Linux Landlock ABI {abi} is older than {least}, required to confine tests (rule 9)"
+            ),
+            #[cfg(target_os = "linux")]
+            OneError::Confine { step, errno } => write!(
+                f,
+                "preparing the Linux test sandbox failed at {step} (errno {errno}; rule 9)"
+            ),
+            OneError::Start(error) => write!(f, "a test's launcher did not start under the test sandbox: {error}"),
             OneError::Pipe(error) => write!(f, "a test's output: {error}"),
             OneError::MissingPipe { stream } => write!(f, "the test launcher was started with piped {stream} but supplied no read end"),
             OneError::Capture(error) => write!(f, "the test's stderr capture: {error}"),
@@ -2272,6 +2289,7 @@ pub(crate) struct Launched<'c, 'h, 'a> {
 /// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
 /// executable, which `(deny default)` refuses (blaze-launch-rt native_lib.rs, step 2). That one
 /// file, by its literal path, nothing else: it is the parent's own record, named by its key.
+#[cfg(any(not(target_os = "linux"), test))]
 fn with_native<'a>(mut profile: AString<'a>, store: &str, native: Option<crate::engine_native::NativeSend<'_>>) -> Result<AString<'a>, OneError> {
     let Some(send) = native else { return Ok(profile) };
     if store.contains(['"', '\\', '\n']) || !send.hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -2283,6 +2301,99 @@ fn with_native<'a>(mut profile: AString<'a>, store: &str, native: Option<crate::
     profile.push_str(send.hex);
     profile.push_str("\"))\n");
     Ok(profile)
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxTestConfine {
+    ruleset: blaze_sys::linux::OwnedFd,
+    filter: [blaze_sys::linux::SockFilter; blaze_sys::linux::confine::MOST_FILTER],
+    filter_len: usize,
+    limits: [(blaze_sys::linux::confine::Resource, blaze_sys::linux::confine::Rlimit); 1],
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxTestConfine {
+    fn confine(&self) -> blaze_sys::linux::confine::ChildConfine<'_> {
+        blaze_sys::linux::confine::ChildConfine {
+            ruleset: self.ruleset.fd(),
+            filter: &self.filter[..self.filter_len],
+            limits: &self.limits,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn add_landlock_path(
+    ruleset: blaze_sys::Fd,
+    path: &str,
+    allowed_access: u64,
+    is_dir: bool,
+    step: &'static str,
+) -> Result<(), OneError> {
+    let bytes = path.as_bytes();
+    let mut name = [0u8; 4096];
+    if bytes.is_empty() || bytes.len() + 1 > name.len() {
+        return Err(OneError::Confine { step, errno: blaze_sys::Errno::NameTooLong.raw() });
+    }
+    name[..bytes.len()].copy_from_slice(bytes);
+    let cstr = core::ffi::CStr::from_bytes_with_nul(&name[..=bytes.len()])
+        .map_err(|_| OneError::Confine { step, errno: blaze_sys::Errno::Inval.raw() })?;
+    let mut flags = blaze_sys::linux::OpenFlags::PATH.with(blaze_sys::linux::OpenFlags::CLOSE_ON_EXEC);
+    if is_dir {
+        flags = flags.with(blaze_sys::linux::OpenFlags::DIRECTORY);
+    }
+    let fd = blaze_sys::linux::openat(blaze_sys::linux::CWD, blaze_sys::Path::new(cstr), flags, 0)
+        .map_err(|errno| OneError::Confine { step, errno: errno.raw() })?;
+    let rule = blaze_sys::linux::PathBeneath { allowed_access, parent_fd: fd.fd().raw() };
+    blaze_sys::linux::landlock_add_rule_path(ruleset, &rule)
+        .map_err(|errno| OneError::Confine { step, errno: errno.raw() })
+}
+
+/// Prepares the Linux test sandbox (Landlock ABI >= 3 + seccomp + `RLIMIT_CORE = 0`, rule 9):
+/// reads and exec anywhere under `/`, writes only under the test's `temp` dir and `/dev/null`,
+/// scoped signals/abstract sockets on ABI >= 6, and seccomp denying ptrace/mount/bpf/io_uring/
+/// keyctl and non-{UNIX,INET,INET6} sockets. Fails closed when Landlock ABI < 3.
+#[cfg(target_os = "linux")]
+fn prepare_linux_test_confine(temp: &str) -> Result<LinuxTestConfine, OneError> {
+    const LEAST_ABI: u32 = 3;
+    const SCOPES: u64 = 0b11;
+    let abi = blaze_sys::linux::landlock_abi()
+        .map_err(|errno| OneError::Confine { step: "landlock_create_ruleset(version)", errno: errno.raw() })?;
+    if abi < LEAST_ABI {
+        return Err(OneError::LandlockAbi { abi, least: LEAST_ABI });
+    }
+    let handled = blaze_sys::linux::AccessFs::ALL_ABI1
+        .with(blaze_sys::linux::AccessFs::REFER)
+        .with(blaze_sys::linux::AccessFs::TRUNCATE);
+    let attr = blaze_sys::linux::RulesetAttr {
+        handled_access_fs: handled.bits(),
+        handled_access_net: 0,
+        scoped: if abi >= 6 { SCOPES } else { 0 },
+    };
+    let ruleset = blaze_sys::linux::landlock_create_ruleset(&attr)
+        .map_err(|errno| OneError::Confine { step: "landlock_create_ruleset", errno: errno.raw() })?;
+    let read_exec = blaze_sys::linux::AccessFs::READ_FILE
+        .with(blaze_sys::linux::AccessFs::READ_DIR)
+        .with(blaze_sys::linux::AccessFs::EXECUTE)
+        .bits();
+    add_landlock_path(ruleset.fd(), "/", read_exec, true, "landlock_add_rule(/)")?;
+    let temp_write = handled.bits()
+        & !(blaze_sys::linux::AccessFs::MAKE_CHAR
+            .with(blaze_sys::linux::AccessFs::MAKE_BLOCK)
+            .bits());
+    add_landlock_path(ruleset.fd(), temp, temp_write, true, "landlock_add_rule(TMPDIR)")?;
+    let dev_null_rw = blaze_sys::linux::AccessFs::READ_FILE
+        .with(blaze_sys::linux::AccessFs::WRITE_FILE)
+        .with(blaze_sys::linux::AccessFs::TRUNCATE)
+        .bits();
+    add_landlock_path(ruleset.fd(), "/dev/null", dev_null_rw, false, "landlock_add_rule(/dev/null)")?;
+    let mut filter = [blaze_sys::linux::SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; blaze_sys::linux::confine::MOST_FILTER];
+    let filter_len = blaze_sys::linux::confine::build_test(&mut filter).len();
+    let limits = [(
+        blaze_sys::linux::confine::Resource::Core,
+        blaze_sys::linux::confine::Rlimit { soft: 0, hard: 0 },
+    )];
+    Ok(LinuxTestConfine { ruleset, filter, filter_len, limits })
 }
 
 impl RunOne for Launched<'_, '_, '_> {
@@ -2455,16 +2566,26 @@ impl<'c> Launched<'c, '_, '_> {
         if let Some(send) = self.native {
             vars.push(("BLAZE_LAUNCH_NATIVE", send.hex));
         }
-        // 4. The profile (blaze-run child.rs, the one test profile), the launcher under it.
-        let profile = blaze_run::child::seatbelt(temp.as_str(), None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) })?;
-        let profile = with_native(profile, self.store, self.native)?;
-        let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
-        args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
-        args.extend_from_slice(self.args);
-        // Its working directory: its package's root, as `cargo test` runs it (`PackageRun`).
-        let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
+        // 4. The test sandbox (macOS Seatbelt via sandbox-exec; Linux Landlock + seccomp).
         signals.begin(Doing::Starting);
-        let Started { child: mut run, pipes: given } = self.spawner.start_served(cx, &spec).map_err(OneError::Start)?;
+        #[cfg(not(target_os = "linux"))]
+        let Started { child: mut run, pipes: given } = {
+            let profile = blaze_run::child::seatbelt(temp.as_str(), None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) })?;
+            let profile = with_native(profile, self.store, self.native)?;
+            let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
+            args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
+            args.extend_from_slice(self.args);
+            // Its working directory: its package's root, as `cargo test` runs it (`PackageRun`).
+            let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
+            self.spawner.start_served(cx, &spec).map_err(OneError::Start)?
+        };
+        #[cfg(target_os = "linux")]
+        let Started { child: mut run, pipes: given } = {
+            let prepared = prepare_linux_test_confine(temp.as_str())?;
+            let confine = prepared.confine();
+            let spec = RunSpec { program: self.launcher, arg0: None, args: self.args, env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
+            self.spawner.start_served_confined(cx, &spec, &confine).map_err(OneError::Start)?
+        };
         // Its allowance runs from its start, less the time it was parked waiting for its code
         // (D194) or stalled behind command-thread host work: those waits never eat the test's own
         // execution budget.

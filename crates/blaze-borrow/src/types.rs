@@ -180,14 +180,17 @@ impl Kids<'_> {
 
     /// The `k`-th child.
     pub fn get(&self, k: u32) -> Option<PTy> {
+        let Ok(idx) = usize::try_from(k) else {
+            return None;
+        };
         match *self {
             Kids::None => None,
             Kids::One(t) => (k == 0).then_some(t),
-            Kids::List(l) => l.get(k as usize).copied(),
+            Kids::List(l) => l.get(idx).copied(),
             Kids::ListThen(l, last) => {
-                if (k as usize) < l.len() {
-                    l.get(k as usize).copied()
-                } else if k as usize == l.len() {
+                if idx < l.len() {
+                    l.get(idx).copied()
+                } else if idx == l.len() {
                     Some(last)
                 } else {
                     None

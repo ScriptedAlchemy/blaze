@@ -19,19 +19,22 @@
 //! executor refused) it compiles itself, by the same code, and reports. When the path fails,
 //! [`decide`] says under the caller's [`LocalPolicy`] whether the build stops or compiles here.
 
-use std::alloc::{Allocator, AllocatorClone, Global};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use core::alloc::{Allocator, AllocatorClone};
+use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
 
 use blaze_dist::holder::{BatchCompiler, Compiled, Holder, HolderConfig, Plan, StopWhy};
 use blaze_dist::jobs::{LocalAction, MAX_ATTEMPTS, local_action};
 use blaze_dist::{Ranges, Refusal};
+use blaze_own::{BTreeMap, BTreeSet, String, Vec, format_in};
+use blaze_wire::json::hex;
+use blaze_wire::pack_list::{decode as parse_list, encode as list_of};
 use blaze_wire::{
     Attempt, Digest, DoneEvent, EntryKey, EntryRef, ExecutionId, ItemKey, ItemOutcome, ItemResult,
     JobEvent, JobRequest, LocalPolicy, Namespace, Outcome, PackRef, Reservation, RootSet, Set, Why,
-    WorkKey, WorkName, WorkersEventsRequest, digest_of_encoded_name, encode,
+    WireAlloc, WireString, WireVec, WorkKey, WorkName, WorkersEventsRequest,
+    digest_of_encoded_name, encode,
 };
 
 use crate::Error;
@@ -39,10 +42,9 @@ use crate::blobs::Blobs;
 use crate::client::Client;
 use crate::driver::{DriverConfig, run_holder_until};
 use crate::pack::{Pack, Value, ValueRef, read};
-use blaze_wire::json::hex;
 use crate::protocol::{self as carrier, Answer, Binding, Command};
 use crate::server::random_id;
-use blaze_wire::pack_list::{decode as parse_list, encode as list_of};
+use crate::sys::{SystemClock, ThreadFailed, current_pid, env_is_set, scope, sleep};
 
 /// What every executor of a machine reserves: one holder's bookkeeping, not its compile, which
 /// the daemon's own budget admits.
@@ -58,7 +60,7 @@ pub fn platform(triple: &str) -> Digest {
 #[derive(Clone, Debug)]
 pub struct Config {
     /// The coordinator's socket.
-    pub socket: PathBuf,
+    pub socket: WireString,
     /// The cache server.
     pub blobs: Blobs,
     /// This daemon's claim label, bound by the coordinator to each owned transport session.
@@ -86,13 +88,13 @@ pub struct Unit {
     /// What the unit is: covers everything its functions' keys cover, and its name.
     pub spec: Digest,
     /// The canonical work names: sorted, the same on every executor.
-    pub names: Vec<Digest>,
+    pub names: WireVec<Digest>,
 }
 
 /// What compiles a grant: on the thread that called [`run`], which may own the front end.
 pub trait Granted {
     /// The compiler/exporter's matchable refusal, retained until the carrier reports it.
-    type Error: std::error::Error;
+    type Error: core::error::Error;
 
     /// The values of `names`, each index into [`Unit::names`]: from the store or compiled.
     /// `Err` gives the batch back: another executor or the final build gets to it, and a real
@@ -118,13 +120,13 @@ pub trait Granted {
 /// One grant's values.
 pub struct Grant {
     /// Every value the grant made or found.
-    pub values: Vec<Value>,
+    pub values: WireVec<Value>,
     /// How many functions this executor compiled for it.
     pub compiled: u64,
     /// How many it found in its own store.
     pub stored: u64,
     /// Actual emitted store keys, in emission order, including repeated compiles.
-    pub compiled_keys: Vec<Digest>,
+    pub compiled_keys: WireVec<Digest>,
 }
 
 /// How a unit's values arrived.
@@ -140,9 +142,9 @@ pub enum Source {
 #[derive(Debug)]
 pub struct Arrived {
     /// The committed values, by key.
-    pub values: BTreeMap<Digest, (u8, Vec<u8>)>,
+    pub values: BTreeMap<Digest, (u8, WireVec<u8>), WireAlloc>,
     /// The packs they came from: what this unit's published list names.
-    pub packs: Vec<PackRef>,
+    pub packs: WireVec<PackRef>,
     /// How they arrived.
     pub source: Source,
     /// The execution, for a [`Source::Executed`].
@@ -160,15 +162,15 @@ pub struct Arrived {
     /// The attempt that accepted the immutable full manifest, before any reassignment.
     pub publication_attempt: Option<u64>,
     /// Actual emitted store keys of this agent's grant compiles, never store hits.
-    pub compiled_keys: Vec<Digest>,
+    pub compiled_keys: WireVec<Digest>,
 }
 
 impl Arrived {
     /// Nothing yet, from `source`.
-    fn none(source: Source, execution: Option<u64>) -> Arrived {
+    fn none(source: Source, execution: Option<u64>, alloc: WireAlloc) -> Arrived {
         Arrived {
-            values: BTreeMap::new(),
-            packs: Vec::new(),
+            values: BTreeMap::new_in(alloc),
+            packs: Vec::new_in(alloc),
             source,
             execution,
             compiled_here: 0,
@@ -177,28 +179,38 @@ impl Arrived {
             joined: false,
             attempt: None,
             publication_attempt: None,
-            compiled_keys: Vec::new(),
+            compiled_keys: Vec::new_in(alloc),
         }
     }
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn elapsed_since(clock: SystemClock, started_ns: u64) -> Duration {
+    let now_ns = clock.monotonic_nanos().unwrap_or(started_ns);
+    Duration::from_nanos(now_ns.saturating_sub(started_ns))
+}
+
 /// The coordinator's work identity for an opaque compiler task in one unit.
-pub fn wire_name(unit: &Digest, name: &Digest) -> WorkName {
-    WorkName::of(&WorkKey::Item(ItemKey { unit: *unit, stable: *name, env: [0; 32] }), Global)
+pub fn wire_name(unit: &Digest, name: &Digest, alloc: WireAlloc) -> WorkName {
+    WorkName::of(&WorkKey::Item(ItemKey { unit: *unit, stable: *name, env: [0; 32] }), alloc)
 }
 
 /// The set every executor of `unit` joins with.
-pub fn root_set(unit: &Unit) -> RootSet {
-    let pairs: Vec<(WorkName, Digest)> =
-        unit.names.iter().map(|name| (wire_name(&unit.spec, name), *name)).collect();
+pub fn root_set(unit: &Unit, alloc: WireAlloc) -> RootSet {
+    let mut pairs = Vec::with_capacity_in(unit.names.len(), alloc);
+    for name in &unit.names {
+        pairs.push((wire_name(&unit.spec, name, alloc), *name));
+    }
+    let count = u64::try_from(pairs.len()).unwrap_or(u64::MAX);
+    let empty: WireVec<(WorkName, Digest)> = Vec::new_in(alloc);
     RootSet {
         spec: unit.spec,
-        roots: digest_of_encoded_name("blaze/root-set", &encode(&pairs, Global)),
-        count: pairs.len() as u64,
-        index: digest_of_encoded_name(
-            "blaze/pre-index",
-            &encode(&Vec::<(WorkName, Digest)>::new(), Global),
-        ),
+        roots: digest_of_encoded_name("blaze/root-set", &encode(&pairs, alloc)),
+        count,
+        index: digest_of_encoded_name("blaze/pre-index", &encode(&empty, alloc)),
         inputs: [0; 32],
     }
 }
@@ -210,7 +222,7 @@ fn request(unit: &Unit, config: &Config, now: u64) -> JobRequest {
         platform: config.platform,
         namespace: config.namespace.clone(),
         source: config.source,
-        deadline_ms: now.saturating_add(config.deadline.as_millis() as u64),
+        deadline_ms: now.saturating_add(duration_ms(config.deadline)),
         local: config.local.clone(),
     }
 }
@@ -221,10 +233,10 @@ fn request(unit: &Unit, config: &Config, now: u64) -> JobRequest {
 /// that names no outcome (like a disconnected carrier) is no verdict. A missing or corrupt
 /// committed pack and a final compiler/export refusal always fail, regardless of the
 /// requested local policy.
-pub fn decide(policy: &LocalPolicy, failure: Error) -> Result<(), Error> {
+pub fn decide(policy: &LocalPolicy, failure: Error, alloc: WireAlloc) -> Result<(), Error> {
     let action = match &failure {
-        Error::Ended(termination) => local_action(policy, termination)
-            .map_err(|why| Error::Protocol(format!("the terminal is refused: {why:?}")))?,
+        Error::Ended(termination) => local_action(policy, termination, alloc)
+            .map_err(|why| Error::Protocol(format_in!(alloc, "the terminal is refused: {why:?}")))?,
         Error::Committed(_) | Error::Refused(_) | Error::Cancelled(_) => LocalAction::Fail,
         Error::Io(_) | Error::Protocol(_) => match policy {
             LocalPolicy::Never => LocalAction::Fail,
@@ -240,10 +252,15 @@ pub fn decide(policy: &LocalPolicy, failure: Error) -> Result<(), Error> {
 /// After a full manifest has been accepted, a delivery, heartbeat or cache
 /// failure cannot authorize compiling the immutable unit again. Preserve an
 /// explicit caller cancellation, a compiler refusal and an already typed committed-data refusal.
-fn after_publication<T>(unit: &Unit, result: Result<T, Error>) -> Result<T, Error> {
+fn after_publication<T>(
+    unit: &Unit,
+    result: Result<T, Error>,
+    alloc: WireAlloc,
+) -> Result<T, Error> {
     result.map_err(|error| match error {
         Error::Committed(_) | Error::Refused(_) | Error::Cancelled(_) => error,
-        other => Error::Committed(format!(
+        other => Error::Committed(format_in!(
+            alloc,
             "unit {}: immutable publication already accepted: {other}",
             hex(&unit.spec)
         )),
@@ -257,7 +274,7 @@ struct Batches<'a, G: Granted + ?Sized> {
     compiled: u64,
     stored: u64,
     grants: u64,
-    compiled_keys: Vec<Digest>,
+    compiled_keys: WireVec<Digest>,
 }
 
 #[derive(Debug)]
@@ -268,8 +285,8 @@ enum BatchError {
     Upload { unit: Digest, source: Error },
 }
 
-impl std::fmt::Display for BatchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for BatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoncanonicalRoots { unit } => {
                 write!(f, "unit {}: granted root ranges are not canonical", hex(unit))
@@ -287,8 +304,8 @@ impl std::fmt::Display for BatchError {
     }
 }
 
-impl std::error::Error for BatchError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for BatchError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Pack { source, .. } => Some(source),
             Self::Upload { source, .. } => Some(source),
@@ -301,88 +318,105 @@ impl<G: Granted + ?Sized> BatchCompiler for Batches<'_, G> {
     type Error = BatchError;
 
     fn compile(&mut self, plan: &Plan) -> Result<Compiled, Self::Error> {
-        let ranges =
-            Ranges::from_wire(&plan.grant.roots)
-                .ok_or(BatchError::NoncanonicalRoots { unit: self.unit.spec })?;
-        let indexes: Vec<u64> = ranges.indexes().collect();
-        let mut names = Vec::with_capacity(indexes.len());
+        let alloc = self.blobs.alloc;
+        let ranges = Ranges::from_wire(&plan.grant.roots, alloc)
+            .ok_or(BatchError::NoncanonicalRoots { unit: self.unit.spec })?;
+        let mut indexes = Vec::new_in(alloc);
+        indexes.extend(ranges.indexes());
+        let mut names = Vec::with_capacity_in(indexes.len(), alloc);
         for index in &indexes {
             let at = usize::try_from(*index).ok().filter(|at| *at < self.unit.names.len());
             names.push(at.ok_or(BatchError::RootIndex { unit: self.unit.spec, index: *index })?);
         }
-        if std::env::var_os("BLAZE_DIST_EVENTS").is_some() {
-            let work: Vec<Digest> = names
-                .iter()
-                .map(|at| wire_name(&self.unit.spec, &self.unit.names[*at]).0)
-                .chain(plan.grant.names.iter().map(|name| name.0))
-                .collect();
+        if env_is_set("BLAZE_DIST_EVENTS", alloc) {
+            let mut work = Vec::with_capacity_in(names.len().saturating_add(plan.grant.names.len()), alloc);
+            for at in &names {
+                if let Some(name) = self.unit.names.get(*at) {
+                    work.push(wire_name(&self.unit.spec, name, alloc).0);
+                }
+            }
+            for name in plan.grant.names.iter() {
+                work.push(name.0);
+            }
+            let pid = current_pid();
             crate::telemetry::emit(
                 "grant",
                 &[
-                    ("pid", crate::telemetry::json(&std::process::id(), Global)),
-                    ("unit_digest", crate::telemetry::json(&self.unit.spec, Global)),
-                    ("execution", crate::telemetry::json(&plan.grant.lease.execution.0, Global)),
-                    ("attempt", crate::telemetry::json(&plan.grant.lease.attempt.0, Global)),
-                    ("holder", crate::telemetry::json(&plan.grant.lease.holder, Global)),
-                    ("generation", crate::telemetry::json(&plan.grant.lease.generation, Global)),
-                    ("seq", crate::telemetry::json(&plan.seq, Global)),
-                    ("work", crate::telemetry::json(&work, Global)),
+                    ("pid", crate::telemetry::json(&pid, alloc)),
+                    ("unit_digest", crate::telemetry::json(&self.unit.spec, alloc)),
+                    ("execution", crate::telemetry::json(&plan.grant.lease.execution.0, alloc)),
+                    ("attempt", crate::telemetry::json(&plan.grant.lease.attempt.0, alloc)),
+                    ("holder", crate::telemetry::json(&plan.grant.lease.holder, alloc)),
+                    ("generation", crate::telemetry::json(&plan.grant.lease.generation, alloc)),
+                    ("seq", crate::telemetry::json(&plan.seq, alloc)),
+                    ("work", crate::telemetry::json(&work, alloc)),
                 ],
+                alloc,
             );
         }
-        self.grants += 1;
-        let (outcome, packs): (fn(&Digest) -> ItemOutcome, Vec<PackRef>) =
-            match self.granted.compile(&names) {
-                Ok(grant) => {
-                    self.compiled += grant.compiled;
-                    self.stored += grant.stored;
-                    self.compiled_keys.extend(grant.compiled_keys);
-                    let mut references = Vec::new_in(Global);
-                    // Every pack is uploaded before this grant's result is posted.
-                    for pack in Pack::batches(grant.values, Global)
-                        .map_err(|source| BatchError::Pack { unit: self.unit.spec, source })?
-                    {
-                        self.blobs.put_pack(&pack, Global)
-                            .map_err(|source| BatchError::Upload { unit: self.unit.spec, source })?;
-                        references.push(pack.reference);
-                    }
-                    (
-                        |name| ItemOutcome::Exported(EntryRef { entry: EntryKey(*name) }),
-                        references,
-                    )
+        self.grants = self.grants.saturating_add(1);
+        let (exported, packs): (bool, WireVec<PackRef>) = match self.granted.compile(&names) {
+            Ok(grant) => {
+                self.compiled = self.compiled.saturating_add(grant.compiled);
+                self.stored = self.stored.saturating_add(grant.stored);
+                self.compiled_keys.extend(grant.compiled_keys);
+                let mut references = Vec::new_in(alloc);
+                // Every pack is uploaded before this grant's result is posted.
+                for pack in Pack::batches(grant.values, alloc)
+                    .map_err(|source| BatchError::Pack { unit: self.unit.spec, source })?
+                {
+                    self.blobs
+                        .put_pack(&pack, alloc)
+                        .map_err(|source| BatchError::Upload { unit: self.unit.spec, source })?;
+                    references.push(pack.reference);
                 }
-                Err(why) => {
-                    tracing::warn!(target: "blaze", why = %why, "a distributed grant goes back");
-                    (
-                        |_| ItemOutcome::Local(Why { why: "the batch was given back".to_owned() }),
-                        Vec::new(),
-                    )
-                }
-            };
-        let item = |at: &usize| {
-            let name = &self.unit.names[*at];
-            ItemResult {
-                name: wire_name(&self.unit.spec, name),
-                outcome: outcome(name),
-                found: Set::new(Vec::new()),
-                unnamed: Set::new(Vec::new()),
+                (true, references)
             }
+            Err(_) => (false, Vec::new_in(alloc)),
         };
-        let lost = |name: &WorkName| ItemResult {
-            name: *name,
-            outcome: ItemOutcome::Lost(Why {
-                why: "unknown-name: a V2 root set finds no names".to_owned(),
-            }),
-            found: Set::new(Vec::new()),
-            unnamed: Set::new(Vec::new()),
-        };
+        let mut root_results = Vec::with_capacity_in(names.len(), alloc);
+        for at in &names {
+            let Some(name) = self.unit.names.get(*at) else {
+                return Err(BatchError::RootIndex {
+                    unit: self.unit.spec,
+                    index: u64::try_from(*at).unwrap_or(u64::MAX),
+                });
+            };
+            let outcome = if exported {
+                ItemOutcome::Exported(EntryRef { entry: EntryKey(*name) })
+            } else {
+                ItemOutcome::Local(Why {
+                    why: WireString::from_str_in("the batch was given back", alloc),
+                })
+            };
+            root_results.push(ItemResult {
+                name: wire_name(&self.unit.spec, name, alloc),
+                outcome,
+                found: Set::new(Vec::new_in(alloc)),
+                unnamed: Set::new(Vec::new_in(alloc)),
+            });
+        }
+        let mut name_results = Vec::with_capacity_in(plan.compile.len(), alloc);
+        for name in &plan.compile {
+            name_results.push(ItemResult {
+                name: *name,
+                outcome: ItemOutcome::Lost(Why {
+                    why: WireString::from_str_in(
+                        "unknown-name: a V2 root set finds no names",
+                        alloc,
+                    ),
+                }),
+                found: Set::new(Vec::new_in(alloc)),
+                unnamed: Set::new(Vec::new_in(alloc)),
+            });
+        }
         Ok(Compiled {
             generation: plan.grant.lease.generation,
-            roots: names.iter().map(item).collect(),
-            names: plan.compile.iter().map(lost).collect(),
+            roots: root_results,
+            names: name_results,
             packs,
-            returned_roots: Ranges::new(),
-            returned_names: Vec::new(),
+            returned_roots: Ranges::new(alloc),
+            returned_names: Vec::new_in(alloc),
         })
     }
 
@@ -396,13 +430,13 @@ const GRACE: Duration = Duration::from_secs(5);
 const CANCELLED: &str = "the build was cancelled";
 
 /// A cancelled request is terminal even if the carrier or local policy permits a retry.
-fn ensure_not_cancelled(unit: &Unit, cancelled: &AtomicBool) -> Result<(), Error> {
+fn ensure_not_cancelled(
+    unit: &Unit,
+    cancelled: &AtomicBool,
+    alloc: WireAlloc,
+) -> Result<(), Error> {
     if cancelled.load(Ordering::Acquire) {
-        let reason = blaze_mem::text::into_std_boxed_str(blaze_mem::format_in!(
-            Global, "unit {}: {CANCELLED}", hex(&unit.spec)
-        ))
-        .into_string();
-        Err(Error::Cancelled(reason))
+        Err(Error::Cancelled(format_in!(alloc, "unit {}: {CANCELLED}", hex(&unit.spec))))
     } else {
         Ok(())
     }
@@ -414,7 +448,7 @@ pub fn import<A: AllocatorClone>(
     packs: &[PackRef],
     alloc: A,
 ) -> Result<BTreeMap<Digest, (u8, Vec<u8, A>), A>, Error> {
-    import_using(packs, |digest| blobs.pack(digest, &alloc), alloc.clone())
+    import_using(packs, |digest| blobs.pack(digest, &alloc), alloc.clone(), blobs.alloc)
 }
 
 /// The retrieval boundary is injected so loss and corruption of a committed pack can be
@@ -423,30 +457,37 @@ fn import_using<A: AllocatorClone, B: Allocator>(
     packs: &[PackRef],
     mut fetch: impl FnMut(&Digest) -> Result<Option<Vec<u8, B>>, Error>,
     alloc: A,
+    error_alloc: WireAlloc,
 ) -> Result<BTreeMap<Digest, (u8, Vec<u8, A>), A>, Error> {
-    let mut values = BTreeMap::new_in(alloc.clone());
+    let mut values: BTreeMap<Digest, (u8, Vec<u8, A>), A> = BTreeMap::new_in(alloc.clone());
     for reference in packs {
         let name = hex(&reference.pack);
         let bytes = fetch(&reference.pack)
             .map_err(|error| {
-                Error::Committed(format!("pack {name}: committed retrieval failed: {error}"))
+                Error::Committed(format_in!(
+                    error_alloc,
+                    "pack {name}: committed retrieval failed: {error}"
+                ))
             })?
-            .ok_or_else(|| Error::Committed(format!("pack {name} was committed and is gone")))?;
+            .ok_or_else(|| {
+                Error::Committed(format_in!(error_alloc, "pack {name} was committed and is gone"))
+            })?;
         for value in read(&bytes, reference, bytes.allocator())
-            .map_err(|error| Error::Committed(error.to_string()))?
+            .map_err(|error| Error::Committed(format_in!(error_alloc, "{error}")))?
         {
-            match values.entry(value.key) {
-                std::collections::btree_map::Entry::Vacant(at) => {
-                    at.insert((value.kind, value.bytes.to_vec_in(alloc.clone())));
+            if let Some((kind, existing)) = values.get(&value.key) {
+                if *kind != value.kind || existing.as_slice() != value.bytes {
+                    return Err(Error::Committed(format_in!(
+                        error_alloc,
+                        "two values under the key {} in the packs of one unit, the second in {name}",
+                        hex(&value.key)
+                    )));
                 }
-                std::collections::btree_map::Entry::Occupied(at) => {
-                    if at.get().0 != value.kind || at.get().1.as_slice() != value.bytes {
-                        return Err(Error::Committed(format!(
-                            "two values under the key {} in the packs of one unit, the second in {name}",
-                            hex(&value.key)
-                        )));
-                    }
-                }
+            } else {
+                values.insert(
+                    value.key,
+                    (value.kind, Vec::from_slice_in(value.bytes, alloc.clone())),
+                );
             }
         }
     }
@@ -454,9 +495,15 @@ fn import_using<A: AllocatorClone, B: Allocator>(
 }
 
 /// A corrupted published manifest cannot authorize recompilation.
-fn published_packs<A: Allocator>(unit: &Unit, list: &[u8], alloc: A) -> Result<Vec<PackRef, A>, Error> {
+fn published_packs<A: Allocator>(
+    unit: &Unit,
+    list: &[u8],
+    alloc: A,
+    error_alloc: WireAlloc,
+) -> Result<Vec<PackRef, A>, Error> {
     parse_list(list, alloc).map_err(|why| {
-        Error::Committed(format!(
+        Error::Committed(format_in!(
+            error_alloc,
             "unit {}: published pack list is not canonical: {why}",
             hex(&unit.spec)
         ))
@@ -467,11 +514,19 @@ fn published_packs<A: Allocator>(unit: &Unit, list: &[u8], alloc: A) -> Result<V
 /// state of the coordinator's that a wait of this does not miss by much.
 const POLL_MOST: Duration = Duration::from_millis(250);
 
-fn answer(client: &mut Client, command: Command, what: &str) -> Result<Answer, Error> {
+fn answer(
+    client: &mut Client,
+    command: Command,
+    what: &str,
+    alloc: WireAlloc,
+) -> Result<Answer, Error> {
     match client.call(command)? {
-        Answer::Error(error) => {
-            Err(Error::Protocol(format!("{what}: {} ({:?})", error.message, error.code())))
-        }
+        Answer::Error(error) => Err(Error::Protocol(format_in!(
+            alloc,
+            "{what}: {} ({:?})",
+            error.message,
+            error.code()
+        ))),
         other => Ok(other),
     }
 }
@@ -483,52 +538,58 @@ pub fn run(
     granted: &mut (impl Granted + ?Sized),
     cancelled: &AtomicBool,
 ) -> Result<Arrived, Error> {
-    ensure_not_cancelled(unit, cancelled)?;
-    if let Some(list) = config.blobs.published(&unit.spec, Global)? {
-        let packs = published_packs(unit, &list, Global)?;
-        let values = import(&config.blobs, &packs, Global)?;
-        ensure_not_cancelled(unit, cancelled)?;
-        return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None) });
+    let alloc = config.blobs.alloc;
+    ensure_not_cancelled(unit, cancelled, alloc)?;
+    if let Some(list) = config.blobs.published(&unit.spec, alloc)? {
+        let packs = published_packs(unit, &list, alloc, alloc)?;
+        let values = import(&config.blobs, &packs, alloc)?;
+        ensure_not_cancelled(unit, cancelled, alloc)?;
+        return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None, alloc) });
     }
-    let started = Instant::now();
-    let mut client = Client::connect(&config.socket, random_id()?)?;
+    let clock = SystemClock;
+    let started_ns = clock.monotonic_nanos()?;
+    let mut client = Client::connect(config.socket.as_str(), random_id()?, alloc)?;
     let origin = client.welcome.now_ms;
-    let now_ms = move || origin.saturating_add(started.elapsed().as_millis() as u64);
+    let now_ms = move || {
+        let elapsed_ms = duration_ms(elapsed_since(clock, started_ns));
+        origin.saturating_add(elapsed_ms)
+    };
     let job = request(unit, config, now_ms());
     let binding = loop {
-        ensure_not_cancelled(unit, cancelled)?;
-        let submit = Command::Submit(carrier::submission(&job, NEED));
+        ensure_not_cancelled(unit, cancelled, alloc)?;
+        let submit = Command::Submit(carrier::submission(&job, NEED, alloc));
         match client.call(submit)? {
             Answer::Binding(binding) => break binding,
             Answer::Error(error) if error.code() == Some(blaze_wire::ErrorCode::Busy) => {
-                ensure_not_cancelled(unit, cancelled)?;
-                if started.elapsed() > config.deadline {
-                    return Err(Error::Protocol(format!("submit: {}", error.message)));
+                ensure_not_cancelled(unit, cancelled, alloc)?;
+                if elapsed_since(clock, started_ns) > config.deadline {
+                    return Err(Error::Protocol(format_in!(alloc, "submit: {}", error.message)));
                 }
-                let _waiting =
-                    tracing::info_span!(target: "blaze", "dist: the coordinator is busy").entered();
-                std::thread::sleep(Duration::from_millis(error.retry_after_ms.unwrap_or(100)));
+                sleep(Duration::from_millis(error.retry_after_ms.unwrap_or(100)));
             }
             Answer::Error(error) => {
-                return Err(Error::Protocol(format!("submit: {}", error.message)));
+                return Err(Error::Protocol(format_in!(alloc, "submit: {}", error.message)));
             }
-            other => return Err(Error::Protocol(format!("submit answered {other:?}"))),
+            other => {
+                return Err(Error::Protocol(format_in!(alloc, "submit answered {other:?}")));
+            }
         }
     };
-    let mut assignments = BTreeSet::new_in(Global);
+    let mut assignments = BTreeSet::new_in(alloc);
     let result = execute(
         config,
         unit,
         granted,
         cancelled,
-        started,
+        clock,
+        started_ns,
         &now_ms,
         &binding,
         &mut client,
         &mut assignments,
-        Global,
+        alloc,
     );
-    let result = ensure_not_cancelled(unit, cancelled).and(result);
+    let result = ensure_not_cancelled(unit, cancelled, alloc).and(result);
     if result.is_err() {
         leave(&mut client, &binding);
     }
@@ -543,12 +604,13 @@ pub fn run(
             &mut client,
             binding.subscription.content,
             binding.subscription.execution,
-            executor,
+            executor.as_str(),
             config.claimant,
+            alloc,
         )
     });
     let result =
-        result.and_then(|arrived| after_publication(unit, acknowledged).map(|()| arrived));
+        result.and_then(|arrived| after_publication(unit, acknowledged, alloc).map(|()| arrived));
     let _ = client.release();
     result
 }
@@ -559,21 +621,24 @@ fn execute<A: AllocatorClone>(
     unit: &Unit,
     granted: &mut (impl Granted + ?Sized),
     cancelled: &AtomicBool,
-    started: Instant,
+    clock: SystemClock,
+    started_ns: u64,
     now_ms: &(impl Fn() -> u64 + Sync),
     binding: &Binding,
     client: &mut Client,
-    assignments: &mut BTreeSet<(Box<str, A>, Attempt), A>,
+    assignments: &mut BTreeSet<(String<A>, Attempt), A>,
     alloc: A,
 ) -> Result<Arrived, Error> {
+    let wire_alloc = config.blobs.alloc;
     let content = binding.subscription.content;
     let execution = binding.subscription.execution;
-    let mut arrived = Arrived::none(Source::Executed, Some(execution.0));
+    let mut arrived = Arrived::none(Source::Executed, Some(execution.0), wire_alloc);
     let mut waited = config.poll;
     loop {
-        ensure_not_cancelled(unit, cancelled)?;
-        if started.elapsed() > config.deadline.saturating_add(GRACE) {
-            return Err(Error::Protocol(format!(
+        ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+        if elapsed_since(clock, started_ns) > config.deadline.saturating_add(GRACE) {
+            return Err(Error::Protocol(format_in!(
+                wire_alloc,
                 "unit {}: its execution did not finish in {:?}",
                 hex(&unit.spec),
                 config.deadline
@@ -586,28 +651,33 @@ fn execute<A: AllocatorClone>(
         let claimed = match client.call(claim)? {
             Answer::Claimed(claimed) => Some(claimed),
             Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => None,
-            other => return Err(Error::Protocol(format!("claim answered {other:?}"))),
+            other => {
+                return Err(Error::Protocol(format_in!(wire_alloc, "claim answered {other:?}")));
+            }
         };
         if let Some(claimed) = &claimed
             && let Some(executor) = &claimed.executor
         {
             arrived.attempt = Some(u64::from(claimed.attempt.0));
-            let label = Box::clone_from_ref_in(executor.as_str(), alloc.clone());
+            let label = String::from_str_in(executor.as_str(), alloc.clone());
             assignments.insert((label, claimed.attempt));
         }
         if let carrier::Publication {
-            packs: Some(packs), attempt, accepted_attempt: Some(accepted),
-        } = publication(client, content, execution)? {
+            packs: Some(packs),
+            attempt,
+            accepted_attempt: Some(accepted),
+        } = publication(client, content, execution, wire_alloc)?
+        {
             arrived.attempt = Some(u64::from(attempt.0));
             arrived.publication_attempt = Some(u64::from(accepted.0));
-            let mut take = || {
-                arrived.values = import(&config.blobs, &packs, Global)?;
+            let take = || {
+                arrived.values = import(&config.blobs, &packs, wire_alloc)?;
                 arrived.packs = packs;
-                ensure_not_cancelled(unit, cancelled)?;
+                ensure_not_cancelled(unit, cancelled, wire_alloc)?;
                 // Delivery carries no new output authority, even after lead replacement.
                 mirror(config, unit, &arrived.packs)?;
-                ensure_not_cancelled(unit, cancelled)?;
-                deliver(client, binding, &arrived.packs)?;
+                ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                deliver(client, binding, &arrived.packs, wire_alloc)?;
                 Ok(())
             };
             let completed = if let Some(claimed) = &claimed
@@ -618,7 +688,7 @@ fn execute<A: AllocatorClone>(
                     config,
                     content,
                     execution,
-                    executor,
+                    executor.as_str(),
                     claimed.attempt,
                     now_ms,
                     cancelled,
@@ -627,16 +697,15 @@ fn execute<A: AllocatorClone>(
             } else {
                 take()
             };
-            after_publication(unit, completed)?;
+            after_publication(unit, completed, wire_alloc)?;
             return Ok(arrived);
         }
-        let Some(claimed) = claimed else { return Err(ended(client, binding)) };
+        let Some(claimed) = claimed else {
+            return Err(ended(client, binding, wire_alloc));
+        };
         let Some(executor) = claimed.executor else {
-            let _waiting =
-                tracing::info_span!(target: "blaze", "dist: waiting for a unit's publication")
-                    .entered();
-            std::thread::sleep(waited);
-            waited = (waited * 2).min(POLL_MOST);
+            sleep(waited);
+            waited = waited.saturating_mul(2).min(POLL_MOST);
             continue;
         };
         arrived.joined = true;
@@ -649,24 +718,26 @@ fn execute<A: AllocatorClone>(
                 request: blaze_wire::WorkJoinRequest {
                     execution,
                     attempt: claimed.attempt,
-                    roots: root_set(unit),
-                    rejected: Set::new(Vec::new()),
+                    roots: root_set(unit, wire_alloc),
+                    rejected: Set::new(Vec::new_in(wire_alloc)),
                 },
             });
-            match answer(client, join, "the lead joining the unit")? {
+            match answer(client, join, "the lead joining the unit", wire_alloc)? {
                 Answer::Join(_) => {}
-                other => return Err(Error::Protocol(format!("join answered {other:?}"))),
+                other => {
+                    return Err(Error::Protocol(format_in!(
+                        wire_alloc,
+                        "join answered {other:?}"
+                    )));
+                }
             }
         }
-        if let Some(packs) = committed(client, content, execution)?.packs {
+        if let Some(packs) = committed(client, content, execution, wire_alloc)?.packs {
             if !claimed.lead {
                 // The helper's work is committed, but the whole unit is not. It must not
                 // independently compile the tail during the lead's publication window.
-                let _waiting =
-                    tracing::info_span!(target: "blaze", "dist: the lead completing the unit")
-                        .entered();
-                std::thread::sleep(waited);
-                waited = (waited * 2).min(POLL_MOST);
+                sleep(waited);
+                waited = waited.saturating_mul(2).min(POLL_MOST);
                 continue;
             }
             let publication_accepted = AtomicBool::new(false);
@@ -674,35 +745,37 @@ fn execute<A: AllocatorClone>(
                 config,
                 content,
                 execution,
-                &executor,
+                executor.as_str(),
                 claimed.attempt,
                 now_ms,
                 cancelled,
                 |lost| {
-                    arrived.values = import(&config.blobs, &packs, Global)?;
-                    ensure_not_cancelled(unit, cancelled)?;
-                    let mut refuse = |why| {
+                    arrived.values = import(&config.blobs, &packs, wire_alloc)?;
+                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                    let mut refuse = |why: WireString| {
                         if !lost.load(Ordering::Acquire) {
                             let _ = verdict(
                                 client,
                                 content,
                                 execution,
-                                &executor,
+                                executor.as_str(),
                                 claimed.attempt,
                                 Outcome::Failed,
+                                wire_alloc,
                             );
                         }
-                        Error::Refused(format!("unit {}: {why}", hex(&unit.spec)))
+                        Error::Refused(format_in!(wire_alloc, "unit {}: {why}", hex(&unit.spec)))
                     };
-                    let mut extra = Vec::new_in(Global);
+                    let mut extra = Vec::new_in(wire_alloc);
                     {
-                        let mut values = arrived.values.iter().map(|(key, (kind, bytes))| ValueRef {
-                            key: *key, kind: *kind, bytes,
+                        let mut values = arrived.values.iter().map(|(key, (kind, bytes))| {
+                            ValueRef { key: *key, kind: *kind, bytes: bytes.as_slice() }
                         });
-                        granted.complete(&mut values, &mut |value| extra.push(value))
-                            .map_err(|error| refuse(error.to_string()))?;
+                        granted
+                            .complete(&mut values, &mut |value| extra.push(value))
+                            .map_err(|error| refuse(format_in!(wire_alloc, "{error}")))?;
                     }
-                    ensure_not_cancelled(unit, cancelled)?;
+                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
                     if lost.load(Ordering::Acquire) {
                         return Ok(None);
                     }
@@ -713,7 +786,8 @@ fn execute<A: AllocatorClone>(
                         if let Some((kind, bytes)) = arrived.values.get(&value.key)
                             && (*kind != value.kind || bytes.as_slice() != value.bytes.as_slice())
                         {
-                            return Err(refuse(format!(
+                            return Err(refuse(format_in!(
+                                wire_alloc,
                                 "full output conflicts with the committed value under key {}",
                                 hex(&value.key)
                             )));
@@ -721,16 +795,16 @@ fn execute<A: AllocatorClone>(
                     }
                     let mut packs = packs;
                     if !extra.is_empty() {
-                        for pack in Pack::batches(extra, Global)
-                            .map_err(|why| refuse(format!("full output cannot be packed: {why}")))?
-                        {
-                            config.blobs.put_pack(&pack, Global)?;
+                        for pack in Pack::batches(extra, wire_alloc).map_err(|why| {
+                            refuse(format_in!(wire_alloc, "full output cannot be packed: {why}"))
+                        })? {
+                            config.blobs.put_pack(&pack, wire_alloc)?;
                             packs.push(pack.reference);
                         }
                     }
                     packs.sort();
                     packs.dedup();
-                    ensure_not_cancelled(unit, cancelled)?;
+                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
                     let commit = Command::CommitPublication(carrier::CommitPublication {
                         content,
                         execution,
@@ -742,7 +816,8 @@ fn execute<A: AllocatorClone>(
                     // A transport failure cannot permit a local rebuild under
                     // this unit's immutable key.
                     let reply = client.call(commit).map_err(|error| {
-                        Error::Committed(format!(
+                        Error::Committed(format_in!(
+                            wire_alloc,
                             "unit {}: publication commit outcome unknown: {error}",
                             hex(&unit.spec)
                         ))
@@ -755,16 +830,20 @@ fn execute<A: AllocatorClone>(
                         }) => {
                             publication_accepted.store(true, Ordering::Release);
                             arrived.publication_attempt = Some(u64::from(accepted.0));
-                            after_publication(unit, (|| {
-                                ensure_not_cancelled(unit, cancelled)?;
-                                mirror(config, unit, &packs)?;
-                                ensure_not_cancelled(unit, cancelled)?;
-                                deliver(client, binding, &packs)?;
-                                Ok(Some(packs))
-                            })())
+                            after_publication(
+                                unit,
+                                (|| {
+                                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                                    mirror(config, unit, &packs)?;
+                                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                                    deliver(client, binding, &packs, wire_alloc)?;
+                                    Ok(Some(packs))
+                                })(),
+                                wire_alloc,
+                            )
                         }
                         Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => {
-                            Err(ended(client, binding))
+                            Err(ended(client, binding, wire_alloc))
                         }
                         Answer::Error(error)
                             if matches!(
@@ -774,7 +853,8 @@ fn execute<A: AllocatorClone>(
                         {
                             Ok(None)
                         }
-                        other => Err(Error::Committed(format!(
+                        other => Err(Error::Committed(format_in!(
+                            wire_alloc,
                             "unit {}: publication commit outcome unknown: {other:?}",
                             hex(&unit.spec)
                         ))),
@@ -784,7 +864,7 @@ fn execute<A: AllocatorClone>(
             // A failed heartbeat after successful publication is not evidence
             // the manifest was never accepted by the coordinator.
             let committed = if publication_accepted.load(Ordering::Acquire) {
-                after_publication(unit, committed)?
+                after_publication(unit, committed, wire_alloc)?
             } else {
                 committed?
             };
@@ -793,8 +873,8 @@ fn execute<A: AllocatorClone>(
                 // harmless; only a current lead may make their manifest visible.
                 continue;
             };
-            arrived.values = import(&config.blobs, &packs, Global)?;
-            ensure_not_cancelled(unit, cancelled)?;
+            arrived.values = import(&config.blobs, &packs, wire_alloc)?;
+            ensure_not_cancelled(unit, cancelled, wire_alloc)?;
             arrived.packs = packs;
             return Ok(arrived);
         }
@@ -803,9 +883,9 @@ fn execute<A: AllocatorClone>(
             config,
             unit,
             binding,
-            &executor,
+            executor.as_str(),
             claimed.lead,
-            config.deadline.saturating_sub(started.elapsed()),
+            config.deadline.saturating_sub(elapsed_since(clock, started_ns)),
             execution,
             claimed.attempt,
             now_ms,
@@ -816,7 +896,8 @@ fn execute<A: AllocatorClone>(
         match stopped {
             StopWhy::Ended | StopWhy::Cancelled | StopWhy::AttemptMoved => {}
             StopWhy::FrontEndDiffers => {
-                return Err(Error::Protocol(format!(
+                return Err(Error::Protocol(format_in!(
+                    wire_alloc,
                     "unit {}: another executor's front end differs from this one's",
                     hex(&unit.spec)
                 )));
@@ -827,8 +908,9 @@ fn execute<A: AllocatorClone>(
 }
 
 fn mirror(config: &Config, unit: &Unit, packs: &[PackRef]) -> Result<(), Error> {
-    let expected = list_of(packs, Global);
-    config.blobs.publish(&unit.spec, &expected, Global)?;
+    let alloc = config.blobs.alloc;
+    let expected = list_of(packs, alloc);
+    config.blobs.publish(&unit.spec, &expected, alloc)?;
     // A 412 is accepted only after the existing and proposed full outputs were
     // verified equal, even if their native pack partitions differ. Missing or
     // corrupt committed packs refuse delivery; they never start another compile.
@@ -839,19 +921,24 @@ fn publication(
     client: &mut Client,
     content: blaze_wire::JobContent,
     execution: ExecutionId,
+    alloc: WireAlloc,
 ) -> Result<carrier::Publication, Error> {
     match answer(
         client,
         Command::Publication(carrier::Packs { content, execution }),
         "publication",
+        alloc,
     )? {
         Answer::Publication(value) => {
             if value.packs.is_some() != value.accepted_attempt.is_some() {
-                return Err(Error::Protocol("publication lacks its acceptance provenance".to_owned()));
+                return Err(Error::Protocol(WireString::from_str_in(
+                    "publication lacks its acceptance provenance",
+                    alloc,
+                )));
             }
             Ok(value)
         }
-        other => Err(Error::Protocol(format!("publication answered {other:?}"))),
+        other => Err(Error::Protocol(format_in!(alloc, "publication answered {other:?}"))),
     }
 }
 
@@ -860,11 +947,13 @@ fn publication(
 fn completion_with_heartbeat<T>(
     execution: ExecutionId,
     completed: Result<T, Error>,
-    heartbeats: std::thread::Result<Result<(), Error>>,
+    heartbeats: Result<Result<(), Error>, ThreadFailed>,
+    alloc: WireAlloc,
 ) -> Result<T, Error> {
     let value = completed?;
     heartbeats.map_err(|_| {
-        Error::Protocol(format!(
+        Error::Protocol(format_in!(
+            alloc,
             "distributed execution {}: lead heartbeat thread panicked",
             execution.0
         ))
@@ -891,19 +980,20 @@ fn heartbeat_during<T>(
             self.0.store(true, Ordering::Release);
         }
     }
+    let alloc = config.blobs.alloc;
     let finished = AtomicBool::new(false);
     let lost = AtomicBool::new(false);
-    std::thread::scope(|scope| {
+    scope(alloc, |s| {
         let (finished, lost) = (&finished, &lost);
-        let heartbeat = scope.spawn(move || {
-            let mut client = match Client::connect(&config.socket, random_id()?) {
+        let heartbeat = s.spawn(move || {
+            let mut client = match Client::connect(config.socket.as_str(), random_id()?, alloc) {
                 Ok(client) => client,
                 Err(error) => {
                     lost.store(true, Ordering::Release);
                     return Err(error);
                 }
             };
-            let bound = now_ms().saturating_add(config.deadline.as_millis() as u64);
+            let bound = now_ms().saturating_add(duration_ms(config.deadline));
             let mut next = now_ms();
             while !finished.load(Ordering::Acquire)
                 && !cancelled.load(Ordering::Acquire)
@@ -912,8 +1002,12 @@ fn heartbeat_during<T>(
                 if now_ms() >= next {
                     let command = Command::WorkerEvents(carrier::WorkerEvents {
                         content,
-                        executor: executor.to_owned(),
-                        request: WorkersEventsRequest { execution, attempt, events: Vec::new() },
+                        executor: WireString::from_str_in(executor, alloc),
+                        request: WorkersEventsRequest {
+                            execution,
+                            attempt,
+                            events: Vec::new_in(alloc),
+                        },
                     });
                     match client.call(command) {
                         Ok(Answer::WorkerEvents(answer)) if answer.verdict == 0 => {}
@@ -929,16 +1023,16 @@ fn heartbeat_during<T>(
                     }
                     next = now_ms().saturating_add(config.holder.heartbeat_ms);
                 }
-                std::thread::sleep(config.poll.min(Duration::from_millis(50)));
+                sleep(config.poll.min(Duration::from_millis(50)));
             }
             let _ = client.release();
             Ok::<(), Error>(())
-        });
+        })?;
         let end = End(finished);
         let result = complete(lost);
         drop(end);
         let observed = heartbeat.join();
-        completion_with_heartbeat(execution, result, observed)
+        completion_with_heartbeat(execution, result, observed, alloc)
     })
 }
 
@@ -953,14 +1047,15 @@ fn leave(client: &mut Client, binding: &Binding) {
 }
 
 /// Why the execution ended with nothing committed: its terminal for this subscription.
-fn ended(client: &mut Client, binding: &Binding) -> Error {
+fn ended(client: &mut Client, binding: &Binding, alloc: WireAlloc) -> Error {
     match client.call(Command::Terminal(binding.subscription.clone())) {
         Ok(Answer::Terminal(carrier::Terminal { value: Some(value), .. })) => {
             Error::Ended(value.termination)
         }
-        Ok(other) => {
-            Error::Protocol(format!("the execution ended and its terminal says {other:?}"))
-        }
+        Ok(other) => Error::Protocol(format_in!(
+            alloc,
+            "the execution ended and its terminal says {other:?}"
+        )),
         Err(error) => error,
     }
 }
@@ -972,10 +1067,11 @@ fn committed(
     client: &mut Client,
     content: blaze_wire::JobContent,
     execution: ExecutionId,
+    alloc: WireAlloc,
 ) -> Result<carrier::CommittedPacks, Error> {
-    match answer(client, Command::Packs(carrier::Packs { content, execution }), "packs")? {
+    match answer(client, Command::Packs(carrier::Packs { content, execution }), "packs", alloc)? {
         Answer::Packs(packs) => Ok(packs),
-        other => Err(Error::Protocol(format!("packs answered {other:?}"))),
+        other => Err(Error::Protocol(format_in!(alloc, "packs answered {other:?}"))),
     }
 }
 
@@ -994,18 +1090,20 @@ fn hold(
     cancelled: &AtomicBool,
     arrived: &mut Arrived,
 ) -> Result<StopWhy, Error> {
+    let alloc = config.blobs.alloc;
     let content = binding.subscription.content;
     let mut holder = Holder::new(
         executor,
         execution,
         attempt,
-        root_set(unit),
-        Set::new(Vec::new()),
-        BTreeSet::new(),
+        root_set(unit, alloc),
+        Set::new(Vec::new_in(alloc)),
+        BTreeSet::new_in(alloc),
         config.holder.clone(),
+        alloc,
     );
-    let mut client = Client::connect(&config.socket, random_id()?)?;
-    let mut watcher = Client::connect(&config.socket, random_id()?)?;
+    let mut client = Client::connect(config.socket.as_str(), random_id()?, alloc)?;
+    let mut watcher = Client::connect(config.socket.as_str(), random_id()?, alloc)?;
     let leave = AtomicBool::new(false);
     let working = AtomicBool::new(true);
     let driver = DriverConfig {
@@ -1013,7 +1111,7 @@ fn hold(
         // legitimately receive Ended after the survivor finishes, which is not the
         // stale-attempt refusal this acceptance probe is intended to demonstrate.
         result_gate: if lead {
-            crate::result_gate::ResultGate::from_env(gate_timeout)?
+            crate::result_gate::ResultGate::from_env(gate_timeout, alloc)?
         } else {
             None
         },
@@ -1026,18 +1124,18 @@ fn hold(
         compiled: 0,
         stored: 0,
         grants: 0,
-        compiled_keys: Vec::new(),
+        compiled_keys: Vec::new_in(alloc),
     };
-    let stopped = std::thread::scope(|scope| {
+    let stopped = scope(alloc, |s| {
         let (leave, working) = (&leave, &working);
-        let watching = scope.spawn(move || {
+        let watching = s.spawn(move || {
             let mut waited = config.poll;
             while working.load(Ordering::Acquire) {
                 if cancelled.load(Ordering::Acquire) {
                     leave.store(true, Ordering::Release);
                     break;
                 }
-                match committed(&mut watcher, content, execution) {
+                match committed(&mut watcher, content, execution, alloc) {
                     Ok(carrier::CommittedPacks { packs: Some(_) }) => {
                         leave.store(true, Ordering::Release);
                         break;
@@ -1046,14 +1144,14 @@ fn hold(
                     // The holder's own calls say what this is; its heartbeat ends it.
                     Err(_) => {}
                 }
-                std::thread::sleep(waited);
-                waited = (waited * 2).min(POLL_MOST);
+                sleep(waited);
+                waited = waited.saturating_mul(2).min(POLL_MOST);
             }
             let _ = watcher.release();
-        });
+        })?;
         let stopped = run_holder_until(
             &mut client,
-            &config.socket,
+            config.socket.as_str(),
             &mut holder,
             content,
             executor,
@@ -1066,9 +1164,9 @@ fn hold(
         let _ = watching.join();
         stopped
     })?;
-    arrived.compiled_here += batches.compiled;
-    arrived.stored_here += batches.stored;
-    arrived.grants += batches.grants;
+    arrived.compiled_here = arrived.compiled_here.saturating_add(batches.compiled);
+    arrived.stored_here = arrived.stored_here.saturating_add(batches.stored);
+    arrived.grants = arrived.grants.saturating_add(batches.grants);
     arrived.compiled_keys.extend(batches.compiled_keys);
     let _ = client.release();
     Ok(stopped)
@@ -1082,31 +1180,35 @@ fn verdict(
     executor: &str,
     attempt: Attempt,
     outcome: Outcome,
+    alloc: WireAlloc,
 ) -> Result<(), Error> {
+    let mut event_list = Vec::with_capacity_in(1, alloc);
+    event_list.push(JobEvent::Done(DoneEvent { outcome, counters: Vec::new_in(alloc) }));
     let events = Command::WorkerEvents(carrier::WorkerEvents {
         content,
-        executor: executor.to_owned(),
-        request: WorkersEventsRequest {
-            execution,
-            attempt,
-            events: vec![JobEvent::Done(DoneEvent { outcome, counters: Vec::new() })],
-        },
+        executor: WireString::from_str_in(executor, alloc),
+        request: WorkersEventsRequest { execution, attempt, events: event_list },
     });
-    match answer(client, events, "reporting the unit's compiler verdict")? {
+    match answer(client, events, "reporting the unit's compiler verdict", alloc)? {
         Answer::WorkerEvents(_) => Ok(()),
-        other => Err(Error::Protocol(format!("the final verdict answered {other:?}"))),
+        other => Err(Error::Protocol(format_in!(alloc, "the final verdict answered {other:?}"))),
     }
 }
 
-fn deliver(client: &mut Client, binding: &Binding, packs: &[PackRef]) -> Result<(), Error> {
+fn deliver(
+    client: &mut Client,
+    binding: &Binding,
+    packs: &[PackRef],
+    alloc: WireAlloc,
+) -> Result<(), Error> {
     let command = Command::DeliverPublication(carrier::DeliverPublication {
         content: binding.subscription.content,
         execution: binding.subscription.execution,
-        packs: packs.to_vec_in(Global),
+        packs: Vec::from_slice_in(packs, alloc),
     });
     match client.call(command)? {
         Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => {
-            Err(ended(client, binding))
+            Err(ended(client, binding, alloc))
         }
         Answer::Ack(_) => match client.call(Command::Terminal(binding.subscription.clone()))? {
             Answer::Terminal(carrier::Terminal { value: Some(value), .. })
@@ -1117,11 +1219,12 @@ fn deliver(client: &mut Client, binding: &Binding, packs: &[PackRef]) -> Result<
             Answer::Terminal(carrier::Terminal { value: Some(value), .. }) => {
                 Err(Error::Ended(value.termination))
             }
-            other => Err(Error::Protocol(format!(
+            other => Err(Error::Protocol(format_in!(
+                alloc,
                 "publication delivery has no terminal verdict: {other:?}"
             ))),
         },
-        other => Err(Error::Protocol(format!("publication delivery answered {other:?}"))),
+        other => Err(Error::Protocol(format_in!(alloc, "publication delivery answered {other:?}"))),
     }
 }
 
@@ -1131,11 +1234,12 @@ fn retire_owned(
     execution: ExecutionId,
     executor: &str,
     claimant: Digest,
+    alloc: WireAlloc,
 ) -> Result<(), Error> {
     for _ in 0..MAX_ATTEMPTS {
         let lookup = Command::OwnedAssignment(carrier::OwnedAssignment {
             content,
-            executor: executor.to_owned(),
+            executor: WireString::from_str_in(executor, alloc),
             execution,
             claimant,
         });
@@ -1147,17 +1251,24 @@ fn retire_owned(
             {
                 return Ok(());
             }
-            other => return Err(Error::Protocol(format!("owned assignment answered {other:?}"))),
+            other => {
+                return Err(Error::Protocol(format_in!(
+                    alloc,
+                    "owned assignment answered {other:?}"
+                )));
+            }
         };
         let request = Command::RetireAssignment(carrier::RetireAssignment {
             content,
-            executor: executor.to_owned(),
+            executor: WireString::from_str_in(executor, alloc),
             execution,
             attempt,
             claimant,
         });
         match client.call(request)? {
-            Answer::Ack(_) => return acknowledge(client, content, execution, executor, attempt),
+            Answer::Ack(_) => {
+                return acknowledge(client, content, execution, executor, attempt, alloc);
+            }
             Answer::Error(error) if Refusal::of(&error) == Some(Refusal::AttemptMoved) => {
                 // A promotion raced the read. Query the same owned slot again; an old
                 // token never becomes authority over the replacement by itself.
@@ -1171,11 +1282,17 @@ fn retire_owned(
                 return Ok(());
             }
             other => {
-                return Err(Error::Protocol(format!("assignment retirement answered {other:?}")));
+                return Err(Error::Protocol(format_in!(
+                    alloc,
+                    "assignment retirement answered {other:?}"
+                )));
             }
         }
     }
-    Err(Error::Protocol("owned assignment exceeded its reassignment bound during cleanup".to_owned()))
+    Err(Error::Protocol(WireString::from_str_in(
+        "owned assignment exceeded its reassignment bound during cleanup",
+        alloc,
+    )))
 }
 
 fn acknowledge(
@@ -1184,10 +1301,11 @@ fn acknowledge(
     execution: ExecutionId,
     executor: &str,
     attempt: Attempt,
+    alloc: WireAlloc,
 ) -> Result<(), Error> {
     let ack = Command::KillAck(carrier::KillAck {
         content,
-        executor: executor.to_owned(),
+        executor: WireString::from_str_in(executor, alloc),
         execution,
         attempt,
         alive: true,
@@ -1198,7 +1316,7 @@ fn acknowledge(
         // was retired or replaced; it must not free a live/newer assignment.
         Answer::KillAck(_) => Ok(()),
         Answer::Error(error) if Refusal::of(&error) == Some(Refusal::NoExecution) => Ok(()),
-        other => Err(Error::Protocol(format!("kill acknowledgment answered {other:?}"))),
+        other => Err(Error::Protocol(format_in!(alloc, "kill acknowledgment answered {other:?}"))),
     }
 }
 
@@ -1206,26 +1324,45 @@ fn acknowledge(
 mod tests {
     use super::*;
     use crate::pack::test_alloc::{Counted, Counts};
-    use hegel::generators as gs;
+    use crate::sys::{Errno, IoError};
+    use blaze_rng::SplitMix64;
+
+    fn test_alloc() -> WireAlloc {
+        blaze_own::testing::heap().shared()
+    }
 
     #[test]
     fn imported_pack_storage_uses_the_callers_allocator() {
+        let base_alloc = test_alloc();
         let value = |key, bytes: &[u8]| Value {
-            key: [key; 32], kind: key, bytes: bytes.to_vec_in(Global),
+            key: [key; 32],
+            kind: key,
+            bytes: Vec::from_slice_in(bytes, base_alloc),
         };
+        let mut p0_vals = Vec::new_in(base_alloc);
+        p0_vals.push(value(1, b"one"));
+        let mut p1_vals = Vec::new_in(base_alloc);
+        p1_vals.push(value(1, b"one"));
+        p1_vals.push(value(2, b"two"));
         let packs = [
-            Pack::of(vec![value(1, b"one")], Global).unwrap(),
-            Pack::of(vec![value(1, b"one"), value(2, b"two")], Global).unwrap(),
+            Pack::of(p0_vals, base_alloc).unwrap(),
+            Pack::of(p1_vals, base_alloc).unwrap(),
         ];
         let references = [packs[0].reference.clone(), packs[1].reference.clone()];
         let counts = Counts::default();
         let alloc = Counted(&counts);
         let values = import_using(
             &references,
-            |digest| Ok(packs.iter().find(|pack| &pack.reference.pack == digest)
-                .map(|pack| pack.bytes.to_vec_in(&alloc))),
+            |digest| {
+                Ok(packs
+                    .iter()
+                    .find(|pack| &pack.reference.pack == digest)
+                    .map(|pack| Vec::from_slice_in(pack.bytes.as_slice(), &alloc)))
+            },
             &alloc,
-        ).unwrap();
+            base_alloc,
+        )
+        .unwrap();
         assert_eq!(values.len(), 2, "an identical value in two packs is retained only once");
         assert!(
             counts.allocations.get() - counts.deallocations.get() > values.len(),
@@ -1233,17 +1370,23 @@ mod tests {
         );
         for (key, (kind, bytes)) in &values {
             assert_eq!(*kind, key[0]);
-            assert!(std::ptr::eq(bytes.allocator().0, &counts));
+            assert!(core::ptr::eq(bytes.allocator().0, &counts));
         }
         assert_eq!(values[&[1; 32]].1.as_slice(), b"one");
         assert_eq!(values[&[2; 32]].1.as_slice(), b"two");
         let before = counts.allocations.get();
         let control = import_using(
             &references,
-            |digest| Ok(packs.iter().find(|pack| &pack.reference.pack == digest)
-                .map(|pack| pack.bytes.to_vec_in(Global))),
-            Global,
-        ).unwrap();
+            |digest| {
+                Ok(packs
+                    .iter()
+                    .find(|pack| &pack.reference.pack == digest)
+                    .map(|pack| Vec::from_slice_in(pack.bytes.as_slice(), base_alloc)))
+            },
+            base_alloc,
+            base_alloc,
+        )
+        .unwrap();
         assert_eq!(control.len(), values.len());
         for (key, (kind, bytes)) in &control {
             assert_eq!(*kind, values[key].0);
@@ -1257,10 +1400,16 @@ mod tests {
         broken[1].keys = [9; 32];
         let refused = import_using(
             &broken,
-            |digest| Ok(packs.iter().find(|pack| &pack.reference.pack == digest)
-                .map(|pack| pack.bytes.to_vec_in(&alloc))),
+            |digest| {
+                Ok(packs
+                    .iter()
+                    .find(|pack| &pack.reference.pack == digest)
+                    .map(|pack| Vec::from_slice_in(pack.bytes.as_slice(), &alloc)))
+            },
             &alloc,
-        ).unwrap_err();
+            base_alloc,
+        )
+        .unwrap_err();
         assert!(matches!(refused, Error::Committed(_)));
         assert_eq!(counts.allocations.get(), counts.deallocations.get());
 
@@ -1270,7 +1419,9 @@ mod tests {
         ] {
             // Each pack is valid by itself. The refusal must come from combining
             // different values under one key, after the first pack allocated its map.
-            let conflicting = Pack::of(vec![duplicate], Global).unwrap();
+            let mut dup_vals = Vec::new_in(base_alloc);
+            dup_vals.push(duplicate);
+            let conflicting = Pack::of(dup_vals, base_alloc).unwrap();
             let references = [packs[0].reference.clone(), conflicting.reference.clone()];
             let before = counts.allocations.get();
             let refused = import_using(
@@ -1282,20 +1433,25 @@ mod tests {
                         assert_eq!(digest, &conflicting.reference.pack);
                         &conflicting.bytes
                     };
-                    Ok(Some(source.to_vec_in(&alloc)))
+                    Ok(Some(Vec::from_slice_in(source.as_slice(), &alloc)))
                 },
                 &alloc,
-            ).unwrap_err();
+                base_alloc,
+            )
+            .unwrap_err();
+            let key_hex = format_in!(base_alloc, "{}", hex(&[1; 32]));
+            let pack_hex = format_in!(base_alloc, "{}", hex(&conflicting.reference.pack));
             assert!(
                 matches!(&refused, Error::Committed(why)
                     if why.contains("two values under the key")
-                        && why.contains(&hex(&[1; 32]).to_string())
-                        && why.contains(&hex(&conflicting.reference.pack).to_string())),
+                        && why.contains(key_hex.as_str())
+                        && why.contains(pack_hex.as_str())),
                 "conflicting {changed}: {refused}"
             );
             assert!(counts.allocations.get() > before, "the import must allocate caller storage");
             assert_eq!(
-                counts.allocations.get(), counts.deallocations.get(),
+                counts.allocations.get(),
+                counts.deallocations.get(),
                 "a conflicting {changed} must release every imported payload and map node"
             );
         }
@@ -1304,51 +1460,63 @@ mod tests {
     /// The invariant: a final compiler refusal retains its diagnostic and remains terminal
     /// under every local policy despite a concurrent heartbeat failure; a successful tail
     /// cannot hide a failed or panicking heartbeat worker.
-    #[hegel::test(test_cases = 64)]
-    fn a_failed_heartbeat_cannot_publish_a_successful_tail(tc: hegel::TestCase) {
-        let completion = tc.draw(gs::integers::<u8>()) % 3;
-        let heartbeat_kind = tc.draw(gs::integers::<u8>()) % 3;
-        let completed = match completion {
-            0 => Ok(7),
-            1 => Err(Error::Committed("the native pack was corrupt".to_owned())),
-            _ => Err(Error::Refused("the compiler's tail failed".to_owned())),
-        };
-        let heartbeat: std::thread::Result<Result<(), Error>> = match heartbeat_kind {
-            0 => Ok(Ok(())),
-            1 => Ok(Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                "the heartbeat carrier disconnected",
-            )))),
-            _ => Err(Box::new("planted heartbeat panic")),
-        };
-        let observed = completion_with_heartbeat(ExecutionId(9), completed, heartbeat);
-        match (completion, heartbeat_kind, observed) {
-            (0, 0, Ok(7)) => {}
-            (0, 1, Err(Error::Io(_))) => {}
-            (0, 2, Err(Error::Protocol(why))) if why.contains("heartbeat thread panicked") => {}
-            (1, _, Err(Error::Committed(_))) => {}
-            (2, _, Err(Error::Refused(why))) if why.contains("compiler's tail failed") => {
-                for policy in [LocalPolicy::Never, LocalPolicy::Fallback] {
-                    assert!(matches!(
-                        decide(&policy, Error::Refused(why.clone())),
-                        Err(Error::Refused(retained)) if retained == why
-                    ));
+    #[test]
+    fn a_failed_heartbeat_cannot_publish_a_successful_tail() {
+        let alloc = test_alloc();
+        let mut rng = SplitMix64::new(0x4845_4152_5442_4541);
+        for _ in 0..64 {
+            let completion = rng.next_u64() % 3;
+            let heartbeat_kind = rng.next_u64() % 3;
+            let completed = match completion {
+                0 => Ok(7),
+                1 => Err(Error::Committed(WireString::from_str_in(
+                    "the native pack was corrupt",
+                    alloc,
+                ))),
+                _ => Err(Error::Refused(WireString::from_str_in(
+                    "the compiler's tail failed",
+                    alloc,
+                ))),
+            };
+            let heartbeat: Result<Result<(), Error>, ThreadFailed> = match heartbeat_kind {
+                0 => Ok(Ok(())),
+                1 => Ok(Err(Error::Io(IoError::with_message(
+                    Errno::ConnRefused,
+                    WireString::from_str_in("the heartbeat carrier disconnected", alloc),
+                )))),
+                _ => Err(ThreadFailed),
+            };
+            let observed = completion_with_heartbeat(ExecutionId(9), completed, heartbeat, alloc);
+            match (completion, heartbeat_kind, observed) {
+                (0, 0, Ok(7)) => {}
+                (0, 1, Err(Error::Io(_))) => {}
+                (0, 2, Err(Error::Protocol(why))) if why.contains("heartbeat thread panicked") => {}
+                (1, _, Err(Error::Committed(_))) => {}
+                (2, _, Err(Error::Refused(why))) if why.contains("compiler's tail failed") => {
+                    for policy in [LocalPolicy::Never, LocalPolicy::Fallback] {
+                        assert!(matches!(
+                            decide(&policy, Error::Refused(why.clone()), alloc),
+                            Err(Error::Refused(retained)) if retained == why
+                        ));
+                    }
+                }
+                other => {
+                    panic!("a result lost its cause or heartbeat failure became success: {other:?}")
                 }
             }
-            other => panic!("a result lost its cause or heartbeat failure became success: {other:?}"),
         }
     }
 
     #[test]
     fn the_oracle_catches_a_dropped_heartbeat_failure() {
-        let failed = Ok(Err(Error::Io(std::io::Error::from(
-            std::io::ErrorKind::ConnectionRefused,
-        ))));
+        let alloc = test_alloc();
+        let failed = Ok(Err(Error::Io(IoError::from_errno(Errno::ConnRefused))));
         let rejects_failed_heartbeat = |result| matches!(result, Err(Error::Io(_)));
         assert!(rejects_failed_heartbeat(completion_with_heartbeat(
             ExecutionId(2),
             Ok(1),
             failed,
+            alloc,
         )));
         // Plant the original unchecked join, which returned the successful tail alone.
         assert!(!rejects_failed_heartbeat(Ok(1)));
@@ -1356,64 +1524,85 @@ mod tests {
 
     #[test]
     fn the_oracle_catches_a_compiler_refusal_reclassified_as_transport_loss() {
+        let alloc = test_alloc();
         let why = "fixture::tail: conflicting output under one immutable key";
-        let refuses_rebuild = |failure| decide(&LocalPolicy::Fallback, failure).is_err();
-        assert!(refuses_rebuild(Error::Refused(why.to_owned())));
+        let refuses_rebuild = |failure| decide(&LocalPolicy::Fallback, failure, alloc).is_err();
+        assert!(refuses_rebuild(Error::Refused(WireString::from_str_in(why, alloc))));
         // Plant the previous classification of the exact same compiler diagnostic.
-        assert!(!refuses_rebuild(Error::Protocol(why.to_owned())));
+        assert!(!refuses_rebuild(Error::Protocol(WireString::from_str_in(why, alloc))));
     }
 
     #[test]
     fn errors_after_publication_cannot_rebuild_an_immutable_unit() {
-        let unit = Unit { spec: [0x71; 32], names: Vec::new() }; // alloc: immutable unit fixture
+        let alloc = test_alloc();
+        let unit = Unit { spec: [0x71; 32], names: Vec::new_in(alloc) };
+        let spec_hex = format_in!(alloc, "{}", hex(&unit.spec));
         for error in [
-            Error::Io(std::io::ErrorKind::ConnectionReset.into()),
-            Error::Protocol("delivery was refused".to_owned()),
+            Error::Io(IoError::from_errno(Errno::ConnReset)),
+            Error::Protocol(WireString::from_str_in("delivery was refused", alloc)),
         ] {
             // A prior Protocol/Io error would have triggered Fallback despite
             // the coordinator having accepted this unit's immutable manifest.
-            let refused = after_publication(&unit, Err::<(), _>(error)).unwrap_err();
+            let refused = after_publication(&unit, Err::<(), _>(error), alloc).unwrap_err();
             assert!(matches!(
                 &refused,
-                Error::Committed(why) if why.contains(&hex(&unit.spec).to_string())
+                Error::Committed(why) if why.contains(spec_hex.as_str())
                     && why.contains("already accepted")
             ));
-            assert!(matches!(decide(&LocalPolicy::Fallback, refused), Err(Error::Committed(_))));
+            assert!(matches!(
+                decide(&LocalPolicy::Fallback, refused, alloc),
+                Err(Error::Committed(_))
+            ));
         }
-        let already_committed =
-            after_publication(&unit, Err::<(), _>(Error::Committed("bad pack".to_owned())))
-                .unwrap_err();
+        let already_committed = after_publication(
+            &unit,
+            Err::<(), _>(Error::Committed(WireString::from_str_in("bad pack", alloc))),
+            alloc,
+        )
+        .unwrap_err();
         assert!(matches!(
             already_committed,
-            Error::Committed(why) if why == "bad pack"
+            Error::Committed(why) if why.as_str() == "bad pack"
         ));
-        let cancelled =
-            after_publication(&unit, Err::<(), _>(Error::Cancelled("caller stopped".to_owned())))
-                .unwrap_err();
-        assert!(matches!(cancelled, Error::Cancelled(_)));
-        assert_eq!(after_publication(&unit, Ok(42)).unwrap(), 42);
-        // Control: the old classification would have permitted this rebuild.
-        assert!(decide(
-            &LocalPolicy::Fallback,
-            Error::Protocol("delivery was refused".to_owned()),
+        let cancelled = after_publication(
+            &unit,
+            Err::<(), _>(Error::Cancelled(WireString::from_str_in("caller stopped", alloc))),
+            alloc,
         )
-        .is_ok());
+        .unwrap_err();
+        assert!(matches!(cancelled, Error::Cancelled(_)));
+        assert_eq!(after_publication(&unit, Ok(42), alloc).unwrap(), 42);
+        // Control: the old classification would have permitted this rebuild.
+        assert!(
+            decide(
+                &LocalPolicy::Fallback,
+                Error::Protocol(WireString::from_str_in("delivery was refused", alloc)),
+                alloc,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn caller_cancellation_cannot_trigger_local_recompilation() {
-        let unit = Unit { spec: [0x42; 32], names: Vec::new() }; // alloc: cancellation fixture
+        let alloc = test_alloc();
+        let unit = Unit { spec: [0x42; 32], names: Vec::new_in(alloc) };
+        let spec_hex = format_in!(alloc, "{}", hex(&unit.spec));
         let cancelled = AtomicBool::new(false);
-        assert!(ensure_not_cancelled(&unit, &cancelled).is_ok());
+        assert!(ensure_not_cancelled(&unit, &cancelled, alloc).is_ok());
         cancelled.store(true, Ordering::Release);
-        let refused = ensure_not_cancelled(&unit, &cancelled).unwrap_err();
-        assert!(matches!(&refused, Error::Cancelled(why) if why.contains(&hex(&unit.spec).to_string())));
-        assert!(matches!(decide(&LocalPolicy::Fallback, refused), Err(Error::Cancelled(_))));
+        let refused = ensure_not_cancelled(&unit, &cancelled, alloc).unwrap_err();
+        assert!(matches!(&refused, Error::Cancelled(why) if why.contains(spec_hex.as_str())));
+        assert!(matches!(
+            decide(&LocalPolicy::Fallback, refused, alloc),
+            Err(Error::Cancelled(_))
+        ));
     }
 
     #[test]
     fn published_pack_list_requires_exact_sorted_unique_records() {
-        let unit = Unit { spec: [0x33; 32], names: Vec::new() }; // alloc: test fixture
+        let alloc = test_alloc();
+        let unit = Unit { spec: [0x33; 32], names: Vec::new_in(alloc) };
         let first = PackRef {
             pack: [0x11; 32],
             size: 10,
@@ -1422,22 +1611,26 @@ mod tests {
             format: blaze_wire::DIST_PACK_FORMAT,
         };
         let second = PackRef { pack: [0x22; 32], ..first.clone() };
-        let canonical = list_of(&[first.clone(), second.clone()], Global);
-        assert!(published_packs(&unit, &canonical, Global).is_ok());
-        assert!(published_packs(&unit, b"", Global).is_ok(), "an empty unit is canonical");
+        let canonical = list_of(&[first.clone(), second.clone()], alloc);
+        assert!(published_packs(&unit, &canonical, alloc, alloc).is_ok());
+        assert!(published_packs(&unit, b"", alloc, alloc).is_ok(), "an empty unit is canonical");
 
+        let mut with_extra = Vec::from_slice_in(canonical.as_slice(), alloc);
+        with_extra.extend_from_slice(b"extra\n");
+        let mut with_nl = Vec::from_slice_in(canonical.as_slice(), alloc);
+        with_nl.extend_from_slice(b"\n");
         let noncanonical = [
-            canonical[..canonical.len() - 1].to_vec(),
-            [canonical.as_slice(), b"extra\n"].concat(),
-            [canonical.as_slice(), b"\n"].concat(),
-            list_of(&[second, first.clone()], Global),
-            list_of(&[first.clone(), first], Global),
-            b"not-a-pack\n".to_vec(),
-            vec![0xff],
-        ]; // alloc: corrupted manifest fixtures
+            Vec::from_slice_in(&canonical[..canonical.len() - 1], alloc),
+            with_extra,
+            with_nl,
+            list_of(&[second, first.clone()], alloc),
+            list_of(&[first.clone(), first], alloc),
+            Vec::from_slice_in(b"not-a-pack\n", alloc),
+            Vec::from_slice_in(&[0xff], alloc),
+        ];
         for bytes in noncanonical {
             assert!(
-                matches!(published_packs(&unit, &bytes, Global), Err(Error::Committed(_))),
+                matches!(published_packs(&unit, &bytes, alloc, alloc), Err(Error::Committed(_))),
                 "a damaged published manifest must be refused, not rebuilt"
             );
         }
@@ -1445,6 +1638,7 @@ mod tests {
 
     #[test]
     fn a_committed_pack_missing_or_corrupt_must_not_rebuild_even_with_fallback() {
+        let alloc = test_alloc();
         let reference = PackRef {
             pack: [0x22; 32],
             size: 10,
@@ -1452,32 +1646,52 @@ mod tests {
             packed: None,
             format: blaze_wire::DIST_PACK_FORMAT,
         };
-        let missing = import_using::<Global, Global>(&[reference.clone()], |name| {
-            assert_eq!(*name, reference.pack);
-            Ok(None)
-        }, Global)
+        let pack_hex = format_in!(alloc, "{}", hex(&reference.pack));
+        let missing = import_using::<WireAlloc, WireAlloc>(
+            &[reference.clone()],
+            |name| {
+                assert_eq!(*name, reference.pack);
+                Ok(None)
+            },
+            alloc,
+            alloc,
+        )
         .unwrap_err();
-        assert!(matches!(&missing, Error::Committed(why) if why.contains(&hex(&reference.pack).to_string())));
-        assert!(matches!(decide(&LocalPolicy::Fallback, missing), Err(Error::Committed(_))));
+        assert!(matches!(&missing, Error::Committed(why) if why.contains(pack_hex.as_str())));
+        assert!(matches!(decide(&LocalPolicy::Fallback, missing, alloc), Err(Error::Committed(_))));
 
         for error in [
-            Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
-            Error::Protocol("GET returned 500".to_owned()),
+            Error::Io(IoError::from_errno(Errno::TimedOut)),
+            Error::Protocol(WireString::from_str_in("GET returned 500", alloc)),
         ] {
             let mut error = Some(error);
-            let failed =
-                import_using::<Global, Global>(&[reference.clone()], |_| Err(error.take().unwrap()), Global).unwrap_err();
-            assert!(matches!(decide(&LocalPolicy::Fallback, failed), Err(Error::Committed(_))));
+            let failed = import_using::<WireAlloc, WireAlloc>(
+                &[reference.clone()],
+                |_| Err(error.take().unwrap()),
+                alloc,
+                alloc,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                decide(&LocalPolicy::Fallback, failed, alloc),
+                Err(Error::Committed(_))
+            ));
         }
 
-        let corrupt = import_using::<Global, Global>(&[reference], |_| {
-            Ok(Some(b"bad pack".to_vec())) // alloc: deliberately corrupt committed pack fixture
-        }, Global)
+        let corrupt = import_using::<WireAlloc, WireAlloc>(
+            &[reference],
+            |_| Ok(Some(Vec::from_slice_in(b"bad pack", alloc))),
+            alloc,
+            alloc,
+        )
         .unwrap_err();
-        assert!(matches!(decide(&LocalPolicy::Fallback, corrupt), Err(Error::Committed(_))));
+        assert!(matches!(decide(&LocalPolicy::Fallback, corrupt, alloc), Err(Error::Committed(_))));
 
-        let unit = Unit { spec: [0x33; 32], names: Vec::new() }; // alloc: test fixture
-        let malformed = published_packs(&unit, b"not a pack", Global).unwrap_err();
-        assert!(matches!(decide(&LocalPolicy::Fallback, malformed), Err(Error::Committed(_))));
+        let unit = Unit { spec: [0x33; 32], names: Vec::new_in(alloc) };
+        let malformed = published_packs(&unit, b"not a pack", alloc, alloc).unwrap_err();
+        assert!(matches!(
+            decide(&LocalPolicy::Fallback, malformed, alloc),
+            Err(Error::Committed(_))
+        ));
     }
 }

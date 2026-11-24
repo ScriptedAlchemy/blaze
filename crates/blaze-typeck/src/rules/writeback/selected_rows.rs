@@ -334,63 +334,102 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         ty: PTy,
         norm_depth: u32,
     ) -> Result<PTy, CheckError> {
-        if norm_depth >= 8 {
-            return Ok(ty);
+        struct NormFrame<'a> {
+            orig_ty: PTy,
+            node: PNode,
+            kids: Vec<PTy, Alloc<'a>>,
+            next_kid: usize,
+            changed: bool,
+            depth: u32,
         }
         let alloc = self.alloc;
-        let node = ex.out.view().node(ty)?;
-        let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
-        ex.out.view().children_of(node, &mut kids)?;
-        let mut changed = false;
-        for kid in kids.iter_mut() {
-            let n = self.normalize_portable(ex, rows, inert, seen, out, nest, e, depth, *kid, norm_depth + 1)?;
-            if self.reads.stopped() {
-                return Ok(ty);
+        let mut stack: Vec<NormFrame<'a>, Alloc<'a>> = Vec::new_in(alloc);
+        let mut cur_ty = ty;
+        let mut cur_depth = norm_depth;
+        'eval: loop {
+            let mut result = cur_ty;
+            if cur_depth < 8 {
+                let node = ex.out.view().node(cur_ty)?;
+                let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+                ex.out.view().children_of(node, &mut kids)?;
+                if let Some(&first) = kids.first() {
+                    let next_depth = cur_depth + 1;
+                    stack.push(NormFrame {
+                        orig_ty: cur_ty,
+                        node,
+                        kids,
+                        next_kid: 0,
+                        changed: false,
+                        depth: cur_depth,
+                    });
+                    cur_ty = first;
+                    cur_depth = next_depth;
+                    continue 'eval;
+                }
             }
-            if n != *kid {
-                *kid = n;
-                changed = true;
+            'finish: loop {
+                if cur_depth < 8
+                    && let PNode::Alias { trait_: at, name: an, args: al } = ex.out.view().node(result)?
+                {
+                    let mut aps: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+                    aps.extend_from_slice(ex.out.view().list(al)?);
+                    let selected = self.select_row(ex, rows, inert, &aps, (at, al, Some(an)), e)?;
+                    if self.reads.stopped() {
+                        return Ok(ty);
+                    }
+                    if seen.insert((e, at, Some(an), al), ()).is_none() {
+                        if out.len() >= MOST_PROJECTED {
+                            return Err(CheckError::Limit(Limit::Solver));
+                        }
+                        out.push(Projected { expr: e, at: 0, trait_: at, name: Some(an), args: al, global_env: rows.env.global, selected });
+                        if matches!(selected, Selected::Impl { .. }) && depth < MOST_ROW_NESTING {
+                            nest.push((out.len() - 1, depth + 1));
+                        }
+                    }
+                    if let Selected::Impl { imp, args: imp_args } = selected {
+                        let hdr = match self.reads.impl_header(imp) {
+                            Ok(h) => h,
+                            Err(Stop::Need(_)) if self.reads.stopped() => return Ok(ty),
+                            Err(Stop::Need(_)) => None,
+                            Err(Stop::Error(err)) => return Err(err),
+                        };
+                        if let Some(h) = hdr
+                            && let Some(&(_, val_ty)) = h.assoc_types.iter().find(|&&(n, _)| n == an)
+                        {
+                            let mut ia: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+                            ia.extend_from_slice(ex.out.view().list(imp_args)?);
+                            if let Ok(ia_len) = u32::try_from(ia.len())
+                                && params_in_bounds(h.types, &[val_ty], ia_len, alloc)?
+                            {
+                                cur_ty = subst_into(h.types, val_ty, &ia, &mut ex.out, alloc)?;
+                                cur_depth += 1;
+                                continue 'eval;
+                            }
+                        }
+                    }
+                }
+                let Some(mut frame) = stack.pop() else {
+                    return Ok(result);
+                };
+                if let Some(slot) = frame.kids.get_mut(frame.next_kid)
+                    && result != *slot
+                {
+                    *slot = result;
+                    frame.changed = true;
+                }
+                frame.next_kid += 1;
+                if let Some(&next) = frame.kids.get(frame.next_kid) {
+                    let next_depth = frame.depth + 1;
+                    stack.push(frame);
+                    cur_ty = next;
+                    cur_depth = next_depth;
+                    continue 'eval;
+                }
+                result = if frame.changed { rebuild_in(&mut ex.out, frame.node, &frame.kids)? } else { frame.orig_ty };
+                cur_depth = frame.depth;
+                continue 'finish;
             }
         }
-        let cur = if changed { rebuild_in(&mut ex.out, node, &kids)? } else { ty };
-        let PNode::Alias { trait_: at, name: an, args: al } = ex.out.view().node(cur)? else {
-            return Ok(cur);
-        };
-        let mut aps: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
-        aps.extend_from_slice(ex.out.view().list(al)?);
-        let selected = self.select_row(ex, rows, inert, &aps, (at, al, Some(an)), e)?;
-        if self.reads.stopped() {
-            return Ok(cur);
-        }
-        if seen.insert((e, at, Some(an), al), ()).is_none() {
-            if out.len() >= MOST_PROJECTED {
-                return Err(CheckError::Limit(Limit::Solver));
-            }
-            out.push(Projected { expr: e, at: 0, trait_: at, name: Some(an), args: al, global_env: rows.env.global, selected });
-            if matches!(selected, Selected::Impl { .. }) && depth < MOST_ROW_NESTING {
-                nest.push((out.len() - 1, depth + 1));
-            }
-        }
-        let Selected::Impl { imp, args: imp_args } = selected else {
-            return Ok(cur);
-        };
-        let hdr = match self.reads.impl_header(imp) {
-            Ok(h) => h,
-            Err(Stop::Need(_)) if self.reads.stopped() => return Ok(cur),
-            Err(Stop::Need(_)) => None,
-            Err(Stop::Error(err)) => return Err(err),
-        };
-        let Some(h) = hdr else { return Ok(cur) };
-        let Some(&(_, val_ty)) = h.assoc_types.iter().find(|&&(n, _)| n == an) else {
-            return Ok(cur);
-        };
-        let mut ia: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
-        ia.extend_from_slice(ex.out.view().list(imp_args)?);
-        if !params_in_bounds(h.types, &[val_ty], ia.len() as u32, alloc)? {
-            return Ok(cur);
-        }
-        let sub = subst_into(h.types, val_ty, &ia, &mut ex.out, alloc)?;
-        self.normalize_portable(ex, rows, inert, seen, out, nest, e, depth, sub, norm_depth + 1)
     }
 
     /// How the row `key` (`(trait, [Self, trait args..], name)`, its arguments `ps` in

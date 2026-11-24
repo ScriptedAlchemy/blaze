@@ -403,9 +403,7 @@ pub fn skip_slow_tests() -> bool {
     if should_skip {
         eprintln!("ignoring slow test");
     } else {
-        let target = target_dir();
-        fs::create_dir_all(&target).unwrap();
-        fs::write(target.join(".slow_tests_cookie"), ".").unwrap();
+        write_creating_parent(target_dir().join(".slow_tests_cookie").as_std_path(), ".");
     }
     should_skip
 }
@@ -525,11 +523,15 @@ pub fn try_ensure_file_contents(file: &Path, contents: &str) -> Result<(), ()> {
     if is_ci() {
         eprintln!("    NOTE: run `cargo test` locally and commit the updated files\n");
     }
-    if let Some(parent) = file.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(file, contents).unwrap();
+    write_creating_parent(file, contents);
     Err(())
+}
+
+fn write_creating_parent(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(path, contents).unwrap();
 }
 
 fn normalize_newlines(s: &str) -> String {

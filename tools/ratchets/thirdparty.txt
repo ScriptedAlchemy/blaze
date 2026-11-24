@@ -9,7 +9,6 @@
 (reached)	205
 (with tests)	274
 blaze-cas	libc
-blaze-check	libc
 blaze-core	libc
 blaze-http	bytes
 blaze-http	quinn-proto

@@ -54,7 +54,7 @@ impl Descriptors {
         let now = self.clock;
         let entry = self.entries.iter_mut().find(|it| it.name == *name && it.cache == cache)?;
         entry.used = now;
-        Some(entry.orphan.clone()) // clone: a refcount
+        Some(entry.orphan.as_ref().map(Clone::clone))
     }
 
     /// `name` opened through `cache` and kept, the least recently read closed where the table

@@ -6,11 +6,10 @@
 //! the same [`ItemResult`], and the checker can hold an accepted result to what the lead's front
 //! end says it must be.
 
-use std::collections::{BTreeMap, BTreeSet};
-
+use blaze_own::{BTreeMap, BTreeSet, Vec};
 use blaze_wire::{
     Digest, EntryKey, EntryRef, Found, ItemKey, ItemOutcome, ItemResult, RootSet, Set, Why,
-    WorkKey, WorkName,
+    WireAlloc, WireString, WireVec, WorkKey, WorkName,
 };
 
 use super::Rng;
@@ -25,9 +24,9 @@ pub struct Item {
     /// Its outcome.
     pub outcome: ItemOutcome,
     /// What its code names: each callee's name and the tuple this call site holds for it.
-    pub calls: Vec<Found>,
+    pub calls: WireVec<Found>,
     /// Requests of its code with no stable name: ordinal and reason.
-    pub unnamed: Vec<(u32, String)>,
+    pub unnamed: WireVec<(u32, WireString)>,
 }
 
 impl Item {
@@ -69,7 +68,7 @@ pub enum Divergence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrontEnd {
     /// Its sorted roots.
-    pub roots: Vec<Item>,
+    pub roots: WireVec<Item>,
     /// Its root set.
     pub rootset: RootSet,
     /// Its code's difference: 0 for the lead's code.
@@ -79,89 +78,94 @@ pub struct FrontEnd {
 /// The program.
 #[derive(Clone, Debug)]
 pub struct Program {
+    alloc: WireAlloc,
     /// The lead's front end: the truth an accepted result is held to.
     pub lead: FrontEnd,
     /// Generic instances and on-demand functions, by name.
-    pub instances: BTreeMap<WorkName, Item>,
+    pub instances: BTreeMap<WorkName, Item, WireAlloc>,
     /// The names every executor's pre-index resolves: the on-demand ones.
-    pub index: BTreeSet<WorkName>,
+    pub index: BTreeSet<WorkName, WireAlloc>,
     /// The names the lead's daemon rejects.
-    pub rejected: BTreeSet<WorkName>,
+    pub rejected: BTreeSet<WorkName, WireAlloc>,
     spec: Digest,
     index_digest: Digest,
     inputs: Digest,
     tie: Option<usize>,
 }
 
-fn name(rng: &mut Rng, units: &[Digest]) -> (WorkName, WorkKey) {
+fn name(rng: &mut Rng, units: &[Digest], alloc: WireAlloc) -> (WorkName, WorkKey) {
+    let unit = units.get(rng.below_usize(units.len())).copied().unwrap_or([0; 32]);
     let key = WorkKey::Item(ItemKey {
-        unit: units[rng.below(units.len() as u64) as usize],
+        unit,
         stable: rng.digest(),
         env: if rng.chance(700_000) { [0; 32] } else { rng.digest() },
     });
-    (WorkName::of(&key, std::alloc::Global), key)
+    (WorkName::of(&key, alloc), key)
 }
 
-fn outcome(rng: &mut Rng, name: &WorkName, tuple: &Digest) -> ItemOutcome {
+fn outcome(rng: &mut Rng, name: &WorkName, tuple: &Digest, alloc: WireAlloc) -> ItemOutcome {
     let mut entry = [0u8; 32];
     for (i, b) in entry.iter_mut().enumerate() {
-        *b = name.0[i] ^ tuple[(i + 7) % 32];
+        let left = name.0.get(i).copied().unwrap_or(0);
+        let right = tuple.get((i + 7) % 32).copied().unwrap_or(0);
+        *b = left ^ right;
     }
     match rng.below(100) {
         0..=74 => ItemOutcome::Exported(EntryRef { entry: EntryKey(entry) }),
         75..=82 => ItemOutcome::FromStore(EntryRef { entry: EntryKey(entry) }),
-        83..=89 => ItemOutcome::Failed(Why { why: "a CodegenError".to_owned() }),
-        _ => ItemOutcome::Local(Why { why: "not exportable".to_owned() }),
+        83..=89 => {
+            ItemOutcome::Failed(Why { why: WireString::from_str_in("a CodegenError", alloc) })
+        }
+        _ => ItemOutcome::Local(Why { why: WireString::from_str_in("not exportable", alloc) }),
     }
 }
 
 impl Program {
     /// A program drawn from `rng`. With `conflicts`, some call sites hold another tuple for
     /// their callee than the others do: an identity the work key does not tell apart.
-    pub fn generate(rng: &mut Rng, conflicts: bool) -> Program {
+    pub fn generate(rng: &mut Rng, conflicts: bool, alloc: WireAlloc) -> Program {
         let units = [rng.digest(), rng.digest()];
-        let n_instances = rng.range(0, 48) as usize;
-        let mut instances: Vec<Item> = (0..n_instances)
-            .map(|_| {
-                let (name, _) = name(rng, &units);
-                let tuple = rng.digest();
-                Item {
-                    name,
-                    tuple,
-                    outcome: outcome(rng, &name, &tuple),
-                    calls: Vec::new(),
-                    unnamed: Vec::new(),
-                }
-            })
-            .collect();
-        let n_roots = rng.range(1, 40) as usize;
-        let mut roots: Vec<Item> = (0..n_roots)
-            .map(|_| {
-                let (name, _) = name(rng, &units);
-                let tuple = rng.digest();
-                Item {
-                    name,
-                    tuple,
-                    outcome: outcome(rng, &name, &tuple),
-                    calls: Vec::new(),
-                    unnamed: Vec::new(),
-                }
-            })
-            .collect();
+        let n_instances = rng.range_usize(0, 48);
+        let mut instances = Vec::with_capacity_in(n_instances, alloc);
+        for _ in 0..n_instances {
+            let (name, _) = name(rng, &units, alloc);
+            let tuple = rng.digest();
+            instances.push(Item {
+                name,
+                tuple,
+                outcome: outcome(rng, &name, &tuple, alloc),
+                calls: Vec::new_in(alloc),
+                unnamed: Vec::new_in(alloc),
+            });
+        }
+        let n_roots = rng.range_usize(1, 40);
+        let mut roots = Vec::with_capacity_in(n_roots + 1, alloc);
+        for _ in 0..n_roots {
+            let (name, _) = name(rng, &units, alloc);
+            let tuple = rng.digest();
+            roots.push(Item {
+                name,
+                tuple,
+                outcome: outcome(rng, &name, &tuple, alloc),
+                calls: Vec::new_in(alloc),
+                unnamed: Vec::new_in(alloc),
+            });
+        }
         // A tied pair: one work key, two requests the key does not tell apart, distinct roots.
-        if rng.chance(400_000) {
-            let twin = roots[0].name;
+        if rng.chance(400_000)
+            && let Some(first) = roots.first()
+        {
+            let twin = first.name;
             let tuple = rng.digest();
             roots.push(Item {
                 name: twin,
                 tuple,
-                outcome: outcome(rng, &twin, &tuple),
-                calls: Vec::new(),
-                unnamed: Vec::new(),
+                outcome: outcome(rng, &twin, &tuple, alloc),
+                calls: Vec::new_in(alloc),
+                unnamed: Vec::new_in(alloc),
             });
         }
-        let true_tuples: Vec<(WorkName, Digest)> =
-            instances.iter().map(|i| (i.name, i.tuple)).collect();
+        let true_tuples = Vec::from_iter_in(instances.iter().map(|i| (i.name, i.tuple)), alloc);
         let wire = |rng: &mut Rng, item: &mut Item, most: u64| {
             if matches!(item.outcome, ItemOutcome::FromStore(_) | ItemOutcome::Failed(_)) {
                 // Neither compiled nor followed: it names nothing.
@@ -169,14 +173,20 @@ impl Program {
             }
             if !true_tuples.is_empty() {
                 for _ in 0..rng.range(0, most) {
-                    let (callee, tuple) = true_tuples[rng.below(true_tuples.len() as u64) as usize];
-                    let tuple = if conflicts && rng.chance(40_000) { rng.digest() } else { tuple };
-                    item.calls.push(Found { name: callee, tuple });
+                    if let Some(&(callee, tuple)) = true_tuples.get(rng.below_usize(true_tuples.len()))
+                    {
+                        let tuple =
+                            if conflicts && rng.chance(40_000) { rng.digest() } else { tuple };
+                        item.calls.push(Found { name: callee, tuple });
+                    }
                 }
             }
             if rng.chance(80_000) {
-                for ordinal in 0..rng.range(1, 2) as u32 {
-                    item.unnamed.push((ordinal, "a const argument with no stable name".to_owned()));
+                for ordinal in 0..rng.range_u32(1, 2) {
+                    item.unnamed.push((
+                        ordinal,
+                        WireString::from_str_in("a const argument with no stable name", alloc),
+                    ));
                 }
             }
         };
@@ -186,23 +196,39 @@ impl Program {
         for item in &mut instances {
             wire(rng, item, 2);
         }
-        roots.sort_by(|a, b| (a.name, a.tuple).cmp(&(b.name, b.tuple)));
-        let tie = roots.windows(2).position(|w| w[0].name == w[1].name);
-        let index: BTreeSet<WorkName> =
-            instances.iter().filter(|_| rng.chance(300_000)).map(|i| i.name).collect();
-        let rejected: BTreeSet<WorkName> =
-            instances.iter().filter(|_| rng.chance(40_000)).map(|i| i.name).collect();
+        roots.sort_unstable_by(|a, b| (a.name, a.tuple).cmp(&(b.name, b.tuple)));
+        let tie = roots.windows(2).position(|w| matches!(w, [a, b] if a.name == b.name));
+        let mut index = BTreeSet::new_in(alloc);
+        for item in &instances {
+            if rng.chance(300_000) {
+                index.insert(item.name);
+            }
+        }
+        let mut rejected = BTreeSet::new_in(alloc);
+        for item in &instances {
+            if rng.chance(40_000) {
+                rejected.insert(item.name);
+            }
+        }
         let spec = rng.digest();
         let index_digest = blaze_wire::digest_of_encoded_name(
             "PreIndex",
-            &blaze_wire::encode(&Set::new(index.iter().copied().collect()), std::alloc::Global),
+            &blaze_wire::encode(&Set::new(Vec::from_iter_in(index.iter().copied(), alloc)), alloc),
         );
         let inputs = rng.digest();
-        let lead =
-            FrontEnd { rootset: rootset(spec, &roots, index_digest, inputs), roots, salt: 0 };
+        let lead = FrontEnd {
+            rootset: rootset(spec, &roots, index_digest, inputs, alloc),
+            roots,
+            salt: 0,
+        };
+        let mut instance_map = BTreeMap::new_in(alloc);
+        for item in instances {
+            instance_map.insert(item.name, item);
+        }
         Program {
+            alloc,
             lead,
-            instances: instances.into_iter().map(|i| (i.name, i)).collect(),
+            instances: instance_map,
             index,
             rejected,
             spec,
@@ -219,32 +245,47 @@ impl Program {
         let mut inputs = self.inputs;
         let mut salt = 0;
         match (divergence, self.tie) {
-            (Divergence::SwappedTie, Some(at)) => roots.swap(at, at + 1),
+            (Divergence::SwappedTie, Some(at)) => {
+                if at + 1 < roots.len() {
+                    roots.swap(at, at + 1);
+                }
+            }
             (Divergence::SwappedTie, None) | (Divergence::OtherRoot, _) => {
-                let at = rng.below(roots.len() as u64) as usize;
-                roots[at].name = WorkName(rng.digest());
-                roots[at].outcome = ItemOutcome::Local(Why { why: "another function".to_owned() });
-                roots.sort_by(|a, b| (a.name, a.tuple).cmp(&(b.name, b.tuple)));
+                let at = rng.below_usize(roots.len());
+                if let Some(root) = roots.get_mut(at) {
+                    root.name = WorkName(rng.digest());
+                    root.outcome = ItemOutcome::Local(Why {
+                        why: WireString::from_str_in("another function", self.alloc),
+                    });
+                }
+                roots.sort_unstable_by(|a, b| (a.name, a.tuple).cmp(&(b.name, b.tuple)));
             }
             (Divergence::Impure, _) => {
                 inputs = rng.digest();
                 salt = rng.next_u64() | 1;
             }
         }
-        FrontEnd { rootset: rootset(self.spec, &roots, self.index_digest, inputs), roots, salt }
+        FrontEnd {
+            rootset: rootset(self.spec, &roots, self.index_digest, inputs, self.alloc),
+            roots,
+            salt,
+        }
     }
 }
 
 /// The root set of a sorted root list: the digest of its `(WorkName, tuple)` pairs.
-fn rootset(spec: Digest, roots: &[Item], index: Digest, inputs: Digest) -> RootSet {
-    let pairs: Vec<(WorkName, Digest)> = roots.iter().map(|r| (r.name, r.tuple)).collect();
+fn rootset(
+    spec: Digest,
+    roots: &[Item],
+    index: Digest,
+    inputs: Digest,
+    alloc: WireAlloc,
+) -> RootSet {
+    let pairs = Vec::from_iter_in(roots.iter().map(|r| (r.name, r.tuple)), alloc);
     RootSet {
         spec,
-        roots: blaze_wire::digest_of_encoded_name(
-            "RootList",
-            &blaze_wire::encode(&pairs, std::alloc::Global),
-        ),
-        count: roots.len() as u64,
+        roots: blaze_wire::digest_of_encoded_name("RootList", &blaze_wire::encode(&pairs, alloc)),
+        count: u64::try_from(roots.len()).unwrap_or(u64::MAX),
         index,
         inputs,
     }

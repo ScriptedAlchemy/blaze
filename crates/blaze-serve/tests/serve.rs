@@ -1,348 +1,828 @@
-//! The server over a real socket, as `blaze-serve` serves it: a client of the harness's kind,
-//! with nothing but `std` and a small HTTP/1.1 request, so a mistake in how the server frames
-//! an answer is not hidden by a client library that agrees with it.
+//! End-to-end HTTP/1.1 integration tests over real TCP sockets in pure `#![no_std]`.
 //!
-//! What is checked here is what a distributed build rests on: a write of a wrong hash refused,
-//! a concurrent write of the same blob, a blob that is only visible whole, and a list that is
-//! written once.
+//! Zero `std::`, zero `Global`, zero third-party deps: uses `blaze-sys` sockets, `blaze-own`
+//! allocators, `blaze-sha256`, and `blaze-wire`.
 
-#![feature(allocator_api)]
+#![no_std]
+#![feature(allocator_ext)]
 
-use std::{
-    alloc::Global,
-    io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener as StdListener, TcpStream},
-    path::Path,
-    sync::Arc,
-    thread,
-    time::Duration,
-};
-
-use blaze_serve::{Config, Server, serve_on};
-use blaze_wire::{Digest, Limits, WireError, decode};
-
-// HTTP fixtures use the real producer, so their records and manifest commitments cannot
-// drift into an older format behind a current magic header.
-#[path = "../../blaze-dist-local/src/pack.rs"]
+#[path = "../src/store/native_pack.rs"]
 mod native_pack;
 
-/// A server on a directory of its own, on a port the machine gives, ended when the test ends.
+use core::ffi::c_void;
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use core::time::Duration;
+
+use blaze_own::{Box, String, Vec, format_in};
+use blaze_serve::{Config, Server, ShutdownHandle};
+use blaze_sys::posix::io::{
+    CWD, ClockId, OpenFlags, OwnedFd, PollEvents, PollFd, clock_gettime as read_sys_clock,
+    nanosleep, openat, poll as poll_sys, write as write_fd_sys,
+};
+use blaze_sys::posix::net::{
+    AF_INET, MsgFlags, SOCK_STREAM, connect as connect_sys, in_addr, recv as recv_sys,
+    send as send_sys, sockaddr_in, sockaddr_storage, socket as socket_sys,
+};
+use blaze_sys::posix::proc::{
+    AT_SYMLINK_NOFOLLOW, S_IFDIR, S_IFLNK, S_IFMT, Unlink, stat_at, unlink_at,
+};
+use blaze_sys::posix::thread::getpid;
+use blaze_sys::posix::types::{sa_family_t, socklen_t};
+use blaze_sys::{Errno, Fd, Path, Timespec};
+use blaze_wire::{Digest, Limits, WireAlloc, WireError, WireString, decode};
+
+// ---------------------------------------------------------------------------------------------
+// Minimal `#![no_std]` test OS helpers (threads, temp dirs, TCP client, HTTP response reader).
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[allow(non_camel_case_types)]
+type RawThread = usize;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn pthread_create(
+        thread: *mut RawThread,
+        attr: *const c_void,
+        start_routine: extern "C" fn(*mut c_void) -> *mut c_void,
+        arg: *mut c_void,
+    ) -> i32;
+    fn pthread_join(thread: RawThread, retval: *mut *mut c_void) -> i32;
+}
+
+struct Worker<T> {
+    #[cfg(target_os = "linux")]
+    handle: RawThread,
+    #[cfg(target_os = "macos")]
+    handle: blaze_sys::posix::thread::pthread_t,
+    result_slot: *mut Option<T>,
+    alloc: WireAlloc,
+}
+
+struct Trampoline<F, T> {
+    func: F,
+    result_slot: *mut Option<T>,
+    alloc: WireAlloc,
+}
+
+impl<T: Send + 'static> Worker<T> {
+    fn start<F: FnOnce() -> T + Send + 'static>(func: F, alloc: WireAlloc) -> Self {
+        let slot_box = Box::new_in(None::<T>, alloc.clone());
+        let (slot_ptr, _) = Box::into_raw_with_allocator(slot_box);
+        let payload = Box::new_in(
+            Trampoline { func, result_slot: slot_ptr, alloc: alloc.clone() },
+            alloc.clone(),
+        );
+        let (payload_ptr, _) = Box::into_raw_with_allocator(payload);
+
+        extern "C" fn entry<F: FnOnce() -> T + Send + 'static, T: Send + 'static>(
+            raw: *mut c_void,
+        ) -> *mut c_void {
+            // SAFETY: `raw` was produced by `Box::into_raw_with_allocator` with `WireAlloc`.
+            let boxed: Box<Trampoline<F, T>, WireAlloc> = unsafe {
+                let ptr = raw.cast::<Trampoline<F, T>>();
+                let alloc = (*ptr).alloc.clone();
+                Box::from_raw_in(ptr, alloc)
+            };
+            let Trampoline { func, result_slot, .. } = Box::into_inner(boxed);
+            let value = func();
+            // SAFETY: `result_slot` remains uniquely owned until `Worker::join`.
+            unsafe {
+                *result_slot = Some(value);
+            }
+            core::ptr::null_mut()
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut handle: RawThread = 0;
+            // SAFETY: valid thread handle pointer, null default attrs, valid entry + payload.
+            let rc = unsafe {
+                pthread_create(&raw mut handle, core::ptr::null(), entry::<F, T>, payload_ptr.cast())
+            };
+            assert_eq!(rc, 0, "pthread_create failed with {rc}");
+            Self { handle, result_slot: slot_ptr, alloc }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut handle = core::ptr::null_mut();
+            // SAFETY: valid thread handle pointer, null default attrs, valid entry + payload.
+            let rc = unsafe {
+                blaze_sys::posix::thread::pthread_create(
+                    &raw mut handle,
+                    core::ptr::null(),
+                    entry::<F, T>,
+                    payload_ptr.cast(),
+                )
+            };
+            assert_eq!(rc, 0, "pthread_create failed with {rc}");
+            Self { handle, result_slot: slot_ptr, alloc }
+        }
+    }
+
+    fn join(self) -> T {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `self.handle` is a live joinable pthread.
+            let rc = unsafe { pthread_join(self.handle, core::ptr::null_mut()) };
+            assert_eq!(rc, 0, "pthread_join failed with {rc}");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: `self.handle` is a live joinable pthread.
+            let rc = unsafe {
+                blaze_sys::posix::thread::pthread_join(self.handle, core::ptr::null_mut())
+            };
+            assert_eq!(rc, 0, "pthread_join failed with {rc}");
+        }
+        // SAFETY: thread has joined, so `self.result_slot` is uniquely ours to reclaim.
+        let slot_box = unsafe { Box::from_raw_in(self.result_slot, self.alloc) };
+        match Box::into_inner(slot_box) {
+            Some(val) => val,
+            None => panic!("worker thread exited without producing a value"),
+        }
+    }
+}
+
+fn sleep_ms(ms: u64) {
+    let ts = Timespec {
+        sec: i64::try_from(ms / 1000).unwrap_or(0),
+        nsec: i64::try_from((ms % 1000).saturating_mul(1_000_000)).unwrap_or(0),
+    };
+    let _ = nanosleep(ts);
+}
+
+fn now_stamp() -> u64 {
+    match read_sys_clock(ClockId::Monotonic) {
+        Ok(ts) => {
+            let s = u64::try_from(ts.sec).unwrap_or(0);
+            let n = u64::try_from(ts.nsec).unwrap_or(0);
+            s.saturating_mul(1_000_000_000).saturating_add(n)
+        }
+        Err(_) => 0,
+    }
+}
+
+fn with_cpath<T>(path: &str, f: impl FnOnce(Path<'_>) -> Result<T, Errno>) -> Result<T, Errno> {
+    let mut buf = [0u8; 4096];
+    let cpath = Path::in_buffer(path.as_bytes(), &mut buf)?;
+    f(cpath)
+}
+
+fn mkdir_one(path: &str) -> Result<(), Errno> {
+    with_cpath(path, |cpath| {
+        #[cfg(target_os = "linux")]
+        {
+            blaze_sys::linux::mkdirat(CWD, cpath, 0o755)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: `cpath` is a live NUL-terminated path.
+            let rc = unsafe { blaze_sys::macos::cold::mkdir(cpath.as_ptr().cast(), 0o755) };
+            if rc < 0 { Err(blaze_sys::posix::signal::errno()) } else { Ok(()) }
+        }
+    })
+}
+
+fn list_names(dir: &str, alloc: WireAlloc) -> Vec<WireString, WireAlloc> {
+    let mut out = Vec::new_in(alloc.clone());
+    let fd = match with_cpath(dir, |cpath| {
+        openat(CWD, cpath, OpenFlags::READ.with(OpenFlags::DIRECTORY).with(OpenFlags::CLOSE_ON_EXEC), 0)
+    }) {
+        Ok(fd) => fd,
+        Err(_) => return out,
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let mut buf = [0u8; 8192];
+        loop {
+            let mut count = 0usize;
+            if let Ok(entries) = blaze_sys::linux::getdents64(fd.fd(), &mut buf) {
+                for entry in entries {
+                    count = count.saturating_add(1);
+                    if entry.name == b"." || entry.name == b".." {
+                        continue;
+                    }
+                    if let Ok(s) = core::str::from_utf8(entry.name) {
+                        let mut owned = String::with_capacity_in(s.len(), alloc.clone());
+                        owned.push_str(s);
+                        out.push(owned);
+                    }
+                }
+            }
+            if count == 0 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn remove_tree(root: &str, alloc: WireAlloc) {
+    let mut stack = Vec::new_in(alloc.clone());
+    let mut root_s = String::with_capacity_in(root.len(), alloc.clone());
+    root_s.push_str(root);
+    stack.push((root_s, false));
+    while let Some((dir, ready)) = stack.pop() {
+        if ready {
+            let _ = with_cpath(dir.as_str(), |c| unlink_at(CWD, c, Unlink::Dir));
+            continue;
+        }
+        let entries = list_names(dir.as_str(), alloc.clone());
+        stack.push((dir.clone(), true));
+        for entry in entries {
+            let child = format_in!(alloc.clone(), "{}/{}", dir.as_str(), entry.as_str());
+            let is_real_dir = with_cpath(child.as_str(), |c| stat_at(CWD, c, AT_SYMLINK_NOFOLLOW))
+                .map(|st| {
+                    let kind = st.st_mode & S_IFMT;
+                    kind == S_IFDIR && kind != S_IFLNK
+                })
+                .unwrap_or(false);
+            if is_real_dir {
+                stack.push((child, false));
+            } else {
+                let _ = with_cpath(child.as_str(), |c| unlink_at(CWD, c, Unlink::File));
+            }
+        }
+    }
+}
+
+struct TempDir {
+    path: WireString,
+    alloc: WireAlloc,
+}
+
+impl TempDir {
+    fn new(tag: &str, alloc: WireAlloc) -> Self {
+        let pid = getpid();
+        for attempt in 0u64..100 {
+            let stamp = now_stamp().saturating_add(attempt);
+            let path = format_in!(alloc.clone(), "/tmp/blaze-serve-it-{tag}-{pid}-{stamp}");
+            if mkdir_one(path.as_str()).is_ok() {
+                return Self { path, alloc };
+            }
+        }
+        panic!("could not create temporary directory for {tag}");
+    }
+
+    fn path(&self) -> &str {
+        self.path.as_str()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        remove_tree(self.path.as_str(), self.alloc.clone());
+    }
+}
+
+fn write_file(path: &str, bytes: &[u8]) {
+    let fd = match with_cpath(path, |c| {
+        openat(
+            CWD,
+            c,
+            OpenFlags::WRITE
+                .with(OpenFlags::CREATE)
+                .with(OpenFlags::TRUNCATE)
+                .with(OpenFlags::CLOSE_ON_EXEC),
+            0o644,
+        )
+    }) {
+        Ok(fd) => fd,
+        Err(err) => panic!("open {path} failed: {}", err.what()),
+    };
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match write_fd_sys(fd.fd(), rest) {
+            Ok(0) => panic!("short write to {path}"),
+            Ok(n) => rest = rest.get(n..).unwrap_or(&[]),
+            Err(Errno::Intr) => continue,
+            Err(err) => panic!("write {path} failed: {}", err.what()),
+        }
+    }
+}
+
+fn make_symlink(target: &str, link: &str) {
+    let mut tbuf = [0u8; 4096];
+    let mut lbuf = [0u8; 4096];
+    let tc = match Path::in_buffer(target.as_bytes(), &mut tbuf) {
+        Ok(p) => p,
+        Err(e) => panic!("target path: {}", e.what()),
+    };
+    let lc = match Path::in_buffer(link.as_bytes(), &mut lbuf) {
+        Ok(p) => p,
+        Err(e) => panic!("link path: {}", e.what()),
+    };
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = blaze_sys::linux::symlinkat(tc, CWD, lc) {
+            panic!("symlinkat failed: {}", e.what());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `tc` and `lc` are live NUL-terminated paths.
+        let rc = unsafe { blaze_sys::macos::cold::symlink(tc.as_ptr().cast(), lc.as_ptr().cast()) };
+        assert_eq!(rc, 0, "symlink failed");
+    }
+}
+
+/// Blocking TCP client built directly on `blaze-sys`.
+struct TcpClient {
+    fd: OwnedFd,
+}
+
+impl TcpClient {
+    fn connect(port: u16) -> Result<Self, Errno> {
+        let raw = socket_sys(AF_INET, SOCK_STREAM, 0)?;
+        // SAFETY: `socket_sys` returned a fresh owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw(raw.raw()) };
+        // SAFETY: `sockaddr_storage` is a plain C byte buffer; all zeroes is valid.
+        let mut storage: sockaddr_storage = unsafe { core::mem::zeroed() };
+        let sin = sockaddr_in {
+            #[cfg(target_os = "macos")]
+            sin_len: u8::try_from(size_of::<sockaddr_in>()).map_err(|_| Errno::Inval)?,
+            sin_family: sa_family_t::try_from(AF_INET).map_err(|_| Errno::Inval)?,
+            sin_port: port.to_be(),
+            sin_addr: in_addr { s_addr: u32::from_ne_bytes([127, 0, 0, 1]) },
+            sin_zero: [0; 8],
+        };
+        let len = socklen_t::try_from(size_of::<sockaddr_in>()).map_err(|_| Errno::Inval)?;
+        // SAFETY: `sockaddr_storage` is larger and at least as aligned as `sockaddr_in`.
+        unsafe {
+            core::ptr::from_mut(&mut storage).cast::<sockaddr_in>().write(sin);
+        }
+        connect_sys(fd.fd(), &storage, len)?;
+        Ok(Self { fd })
+    }
+
+    fn write_all(&mut self, mut data: &[u8]) -> Result<(), Errno> {
+        while !data.is_empty() {
+            match send_sys(self.fd.fd(), data, MsgFlags::NO_SIGNAL) {
+                Ok(0) => return Err(Errno::Pipe),
+                Ok(n) => data = data.get(n..).unwrap_or(&[]),
+                Err(Errno::Intr) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn fd(&self) -> Fd {
+        self.fd.fd()
+    }
+}
+
+trait ByteSource {
+    fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, Errno>;
+}
+
+impl ByteSource for TcpClient {
+    fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let mut pfd = [PollFd::new(self.fd(), PollEvents::IN)];
+        let timeout = Timespec { sec: 10, nsec: 0 };
+        loop {
+            let ready = poll_sys(&mut pfd, Some(timeout))?;
+            if ready == 0 {
+                return Err(Errno::TimedOut);
+            }
+            match recv_sys(self.fd(), buf, MsgFlags::NONE) {
+                Ok(n) => return Ok(n),
+                Err(Errno::Intr) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+struct SliceSource<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    reset_at_end: bool,
+}
+
+impl ByteSource for SliceSource<'_> {
+    fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, Errno> {
+        if self.pos >= self.bytes.len() {
+            return if self.reset_at_end { Err(Errno::ConnReset) } else { Ok(0) };
+        }
+        let rem = self.bytes.get(self.pos..).unwrap_or(&[]);
+        let take = rem.len().min(buf.len());
+        if let (Some(src), Some(dst)) = (rem.get(..take), buf.get_mut(..take)) {
+            dst.copy_from_slice(src);
+            self.pos = self.pos.saturating_add(take);
+            Ok(take)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+struct Answer {
+    status: u16,
+    headers: Vec<(WireString, WireString), WireAlloc>,
+    body: Vec<u8, WireAlloc>,
+    alloc: WireAlloc,
+}
+
+impl Answer {
+    fn read(source: &mut impl ByteSource, method: &str, alloc: WireAlloc) -> Result<Self, Errno> {
+        let mut raw = Vec::new_in(alloc.clone());
+        let mut scratch = [0u8; 4096];
+        let header_end = loop {
+            if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+            let n = source.read_chunk(&mut scratch)?;
+            if n == 0 {
+                return Err(Errno::Pipe);
+            }
+            if let Some(chunk) = scratch.get(..n) {
+                raw.extend_from_slice(chunk);
+            }
+        };
+
+        let head_bytes = raw.get(..header_end).unwrap_or(&[]);
+        let head_str = core::str::from_utf8(head_bytes).map_err(|_| Errno::Inval)?;
+        let mut lines = head_str.split("\r\n");
+        let status_line = lines.next().ok_or(Errno::Inval)?;
+        let status = status_line
+            .split(' ')
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or(Errno::Inval)?;
+
+        let mut headers = Vec::new_in(alloc.clone());
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                let mut key = String::with_capacity_in(k.len(), alloc.clone());
+                for ch in k.chars() {
+                    key.push(ch.to_ascii_lowercase());
+                }
+                let trimmed = v.trim();
+                let mut val = String::with_capacity_in(trimmed.len(), alloc.clone());
+                val.push_str(trimmed);
+                headers.push((key, val));
+            }
+        }
+
+        let length = if method == "HEAD" || matches!(status, 204 | 304) {
+            0usize
+        } else {
+            let cl = headers
+                .iter()
+                .find(|(k, _)| k.as_str() == "content-length")
+                .map(|(_, v)| v.as_str())
+                .ok_or(Errno::Inval)?;
+            cl.parse::<usize>().map_err(|_| Errno::Inval)?
+        };
+
+        let mut body = Vec::with_capacity_in(length, alloc.clone());
+        let after = raw.get(header_end.saturating_add(4)..).unwrap_or(&[]);
+        let take_initial = after.len().min(length);
+        if let Some(chunk) = after.get(..take_initial) {
+            body.extend_from_slice(chunk);
+        }
+        while body.len() < length {
+            let need = length.saturating_sub(body.len()).min(scratch.len());
+            let dst = scratch.get_mut(..need).ok_or(Errno::Inval)?;
+            let n = source.read_chunk(dst)?;
+            if n == 0 {
+                return Err(Errno::Pipe);
+            }
+            if let Some(chunk) = scratch.get(..n) {
+                body.extend_from_slice(chunk);
+            }
+        }
+
+        Ok(Self { status, headers, body, alloc })
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.as_str() == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn error(&self) -> WireError {
+        match decode::<WireError>(self.body.as_slice(), &Limits::DOCUMENTED, self.alloc.clone()) {
+            Ok(err) => err,
+            Err(err) => panic!("decode WireError failed: {err:?}"),
+        }
+    }
+}
+
 struct Served {
-    dir: tempfile::TempDir,
+    dir: TempDir,
     port: u16,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    task: Option<thread::JoinHandle<()>>,
+    stop: Option<ShutdownHandle>,
+    worker: Option<Worker<()>>,
+    alloc: WireAlloc,
 }
 
 impl Served {
-    fn start() -> Served {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let listener = StdListener::bind("127.0.0.1:0").expect("a port");
-        let port = listener.local_addr().expect("an address").port();
-        listener.set_nonblocking(true).expect("a non-blocking listener");
-        let config = Config::at(dir.path(), port);
-        let server = Arc::new(Server::open(&config).expect("a server"));
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let task = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("a runtime");
-            runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).expect("a listener");
-                tokio::select! {
-                    result = serve_on(listener, server) => result.expect("serving"),
-                    _ = stopped => {}
+    fn start(tag: &str, alloc: WireAlloc) -> Self {
+        let dir = TempDir::new(tag, alloc.clone());
+        let mut config = Config::at(dir.path(), 0, alloc.clone());
+        config.listen = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        config.resources.idle = Duration::from_secs(10);
+        let server = match Server::bind(config, alloc.clone()) {
+            Ok(s) => s,
+            Err(err) => panic!("Server::bind failed: {err}"),
+        };
+        let port = server.local_addr().port();
+        let stop = match server.shutdown_handle() {
+            Ok(h) => h,
+            Err(err) => panic!("shutdown_handle failed: {err}"),
+        };
+        let worker = Worker::start(
+            move || {
+                if let Err(err) = server.run() {
+                    panic!("server.run failed: {err}");
                 }
-            });
-        });
-        let served = Served { dir, port, stop: Some(stop), task: Some(task) };
-        served.wait();
-        served
-    }
-
-    fn wait(&self) {
-        for _ in 0..200 {
-            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
-                return;
+            },
+            alloc.clone(),
+        );
+        // Wait briefly for listener readiness (already bound, so first connect succeeds immediately).
+        for _ in 0..50 {
+            if TcpClient::connect(port).is_ok() {
+                break;
             }
-            thread::sleep(Duration::from_millis(10));
+            sleep_ms(10);
         }
-        panic!("nothing listens on {}", self.port);
+        Self { dir, port, stop: Some(stop), worker: Some(worker), alloc }
     }
 
-    fn dir(&self) -> &Path {
+    fn dir(&self) -> &str {
         self.dir.path()
     }
 
-    /// One request, as a client makes it: `Content-Length`, no chunking, one connection.
     fn ask(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Answer {
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("a connection");
-        stream.set_read_timeout(Some(Duration::from_secs(30))).expect("a timeout");
-        let mut head =
-            format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
-        for (name, value) in headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
+        let mut client = match TcpClient::connect(self.port) {
+            Ok(c) => c,
+            Err(e) => panic!("connect to {} failed: {}", self.port, e.what()),
+        };
+        let mut head = format_in!(
+            self.alloc.clone(),
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
+        );
+        for (name, val) in headers {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(val);
+            head.push_str("\r\n");
         }
-        head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
-        stream.write_all(head.as_bytes()).expect("a request");
-        stream.write_all(body).expect("a body");
-        Answer::read(stream, method).expect("an answer")
+        let cl = format_in!(self.alloc.clone(), "Content-Length: {}\r\n\r\n", body.len());
+        head.push_str(cl.as_str());
+        assert!(client.write_all(head.as_bytes()).is_ok());
+        assert!(client.write_all(body).is_ok());
+        match Answer::read(&mut client, method, self.alloc.clone()) {
+            Ok(ans) => ans,
+            Err(e) => panic!("reading HTTP answer failed: {}", e.what()),
+        }
     }
 }
 
 impl Drop for Served {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
-            _ = stop.send(());
+            stop.stop();
         }
-        if let Some(task) = self.task.take() {
-            task.join().expect("server shutdown");
+        if let Some(worker) = self.worker.take() {
+            worker.join();
         }
     }
 }
 
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+fn digest(bytes: &[u8]) -> Digest {
+    blaze_sha256::digest(bytes)
 }
 
-impl Answer {
-    fn read(reader: impl Read, method: &str) -> std::io::Result<Answer> {
-        let mut reader = BufReader::new(reader);
-        let mut head = Vec::new();
-        while !head.ends_with(b"\r\n\r\n") {
-            if reader.read_until(b'\n', &mut head)? == 0 {
-                return Err(std::io::ErrorKind::UnexpectedEof.into());
-            }
+fn hex_of(d: &Digest, alloc: WireAlloc) -> WireString {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity_in(64, alloc);
+    for &b in d {
+        if let Some(&hi) = HEX.get(usize::from(b >> 4)) {
+            out.push(char::from(hi));
         }
-        let mut answer = Self::parse(&head);
-        let length = if method == "HEAD" || matches!(answer.status, 204 | 304) {
-            0
-        } else {
-            answer
-                .header("content-length")
-                .ok_or(std::io::ErrorKind::InvalidData)?
-                .parse::<usize>()
-                .map_err(|_| std::io::ErrorKind::InvalidData)?
-        };
-        answer.body.resize(length, 0);
-        reader.read_exact(&mut answer.body)?;
-        Ok(answer)
+        if let Some(&lo) = HEX.get(usize::from(b & 0x0f)) {
+            out.push(char::from(lo));
+        }
     }
+    out
+}
 
-    fn parse(answer: &[u8]) -> Answer {
-        let split = answer.windows(4).position(|it| it == b"\r\n\r\n").expect("a head");
-        let head = String::from_utf8_lossy(&answer[..split]).into_owned();
-        let mut lines = head.split("\r\n");
-        let status = lines
-            .next()
-            .and_then(|it| it.split(' ').nth(1))
-            .and_then(|it| it.parse().ok())
-            .expect("a status");
-        let headers = lines
-            .filter_map(|it| it.split_once(':'))
-            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
-            .collect();
-        Answer { status, headers, body: answer[split + 4..].to_vec() }
+fn pack_name(bytes: &[u8], alloc: WireAlloc) -> WireString {
+    let h = hex_of(&digest(bytes), alloc.clone());
+    format_in!(alloc, "packs/{}.pack", h.as_str())
+}
+
+fn pack(values: &[(Digest, &[u8])], alloc: WireAlloc) -> native_pack::Pack<WireAlloc> {
+    let mut input = Vec::with_capacity_in(values.len(), alloc.clone());
+    for (key, bytes) in values {
+        let mut owned = Vec::with_capacity_in(bytes.len(), alloc.clone());
+        owned.extend_from_slice(bytes);
+        input.push(native_pack::Value { key: *key, kind: 0, bytes: owned });
     }
-
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_str())
-    }
-
-    fn error(&self) -> WireError {
-        decode::<WireError>(&self.body, &Limits::DOCUMENTED).expect("an error of section 8")
+    match native_pack::Pack::of(input, alloc) {
+        Ok(p) => p,
+        Err(err) => panic!("Pack::of failed: {err}"),
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Integration Tests (all original test function names preserved verbatim).
+// ---------------------------------------------------------------------------------------------
 
 #[test]
 fn answer_reader_finishes_at_the_http_message_boundary() {
-    struct ResetAfter(std::io::Cursor<Vec<u8>>);
-    impl Read for ResetAfter {
-        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-            if self.0.position() == self.0.get_ref().len() as u64 {
-                return Err(std::io::ErrorKind::ConnectionReset.into());
-            }
-            self.0.read(bytes)
-        }
-    }
+    let alloc = blaze_own::testing::heap().shared();
     let body = b"an error";
-    let mut response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\n".to_vec();
+    let mut response = Vec::new_in(alloc.clone());
+    response.extend_from_slice(b"HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\n");
     response.extend_from_slice(body);
-    let answer = Answer::read(ResetAfter(std::io::Cursor::new(response)), "PUT").unwrap();
+    let mut src = SliceSource { bytes: response.as_slice(), pos: 0, reset_at_end: true };
+    let Ok(answer) = Answer::read(&mut src, "PUT", alloc) else {
+        panic!("Answer::read must stop at Content-Length boundary");
+    };
     assert_eq!(answer.status, 404);
-    assert_eq!(answer.body, body);
+    assert_eq!(answer.body.as_slice(), body);
 }
 
 #[test]
 fn answer_reader_rejects_truncated_messages() {
+    let alloc = blaze_own::testing::heap().shared();
     for response in [
         b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n".as_slice(),
         b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nabc".as_slice(),
     ] {
-        assert!(Answer::read(response, "PUT").is_err());
+        let mut src = SliceSource { bytes: response, pos: 0, reset_at_end: false };
+        assert!(Answer::read(&mut src, "PUT", alloc.clone()).is_err());
     }
 }
 
 #[test]
 fn answer_reader_respects_bodyless_responses() {
-    for (method, status) in [("HEAD", 200), ("PUT", 204), ("GET", 304)] {
-        let response = format!("HTTP/1.1 {status} Response\r\nContent-Length: 100\r\n\r\n");
-        let answer = Answer::read(response.as_bytes(), method).unwrap();
+    let alloc = blaze_own::testing::heap().shared();
+    for (method, status) in [("HEAD", 200u16), ("PUT", 204), ("GET", 304)] {
+        let response =
+            format_in!(alloc.clone(), "HTTP/1.1 {status} Response\r\nContent-Length: 100\r\n\r\n");
+        let mut src = SliceSource { bytes: response.as_bytes(), pos: 0, reset_at_end: false };
+        let Ok(answer) = Answer::read(&mut src, method, alloc.clone()) else {
+            panic!("bodyless response failed");
+        };
         assert!(answer.body.is_empty());
     }
 }
 
-/// The native producer's canonical bytes and commitment for these store values.
-fn pack(values: &[(Digest, &[u8])]) -> native_pack::Pack<Global> {
-    let mut input = Vec::with_capacity_in(values.len(), Global);
-    input.extend(values.iter().map(|(key, bytes)| native_pack::Value {
-        key: *key,
-        kind: 0,
-        bytes: bytes.to_vec_in(Global),
-    }));
-    native_pack::Pack::of(input, Global).expect("canonical native values")
-}
-
-fn digest(bytes: &[u8]) -> Digest {
-    use sha2::Digest as _;
-    sha2::Sha256::digest(bytes).into()
-}
-
-fn hex(digest: &Digest) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// The name a pack is sent under.
-fn pack_name(bytes: &[u8]) -> String {
-    format!("packs/{}.pack", hex(&digest(bytes)))
-}
-
 #[test]
 fn a_blob_is_sent_whole() {
-    let served = Served::start();
-    let bytes = pack(&[(digest(b"one"), b"value one"), (digest(b"two"), b"value two")]).bytes;
-    let name = pack_name(&bytes);
-    let put = served.ask("PUT", &format!("/v1/blob/{name}"), &[], &bytes);
-    assert_eq!(put.status, 204, "{}", put.error().message);
+    let alloc = blaze_own::testing::heap().shared();
+    let served = Served::start("blob-whole", alloc.clone());
+    let bytes = pack(&[(digest(b"one"), b"value one"), (digest(b"two"), b"value two")], alloc.clone()).bytes;
+    let name = pack_name(bytes.as_slice(), alloc.clone());
+    let put_path = format_in!(alloc.clone(), "/v1/blob/{}", name.as_str());
+    let put = served.ask("PUT", put_path.as_str(), &[], bytes.as_slice());
+    assert_eq!(put.status, 204);
 
-    let whole = served.ask("GET", &format!("/v1/blob/{name}"), &[], &[]);
+    let whole = served.ask("GET", put_path.as_str(), &[], &[]);
     assert_eq!(whole.status, 200);
-    assert_eq!(whole.body, bytes);
-    assert_eq!(whole.header("content-length"), Some(bytes.len().to_string().as_str()));
+    assert_eq!(whole.body.as_slice(), bytes.as_slice());
+    let expected_cl = format_in!(alloc.clone(), "{}", bytes.len());
+    assert_eq!(whole.header("content-length"), Some(expected_cl.as_str()));
 
-    // What is not there is 404, and code 5.
-    let gone = served.ask("GET", &format!("/v1/blob/packs/{}.pack", "0".repeat(64)), &[], &[]);
+    let missing_path = format_in!(
+        alloc.clone(),
+        "/v1/blob/packs/{}.pack",
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    let gone = served.ask("GET", missing_path.as_str(), &[], &[]);
     assert_eq!(gone.status, 404);
     assert_eq!(gone.error().code, 5);
 }
 
 #[test]
 fn a_write_of_a_wrong_hash_is_refused_and_names_nothing() {
-    let served = Served::start();
-    let bytes = pack(&[(digest(b"one"), b"value one")]).bytes;
-    let name = pack_name(&bytes);
-    // The right bytes under another name: refused, and the name holds nothing after.
-    let other = pack(&[(digest(b"other"), b"another value")]).bytes;
-    let wrong = served.ask("PUT", &format!("/v1/blob/{name}"), &[], &other);
+    let alloc = blaze_own::testing::heap().shared();
+    let served = Served::start("wrong-hash", alloc.clone());
+    let bytes = pack(&[(digest(b"one"), b"value one")], alloc.clone()).bytes;
+    let name = pack_name(bytes.as_slice(), alloc.clone());
+    let other = pack(&[(digest(b"other"), b"another value")], alloc.clone()).bytes;
+    let path = format_in!(alloc.clone(), "/v1/blob/{}", name.as_str());
+
+    let wrong = served.ask("PUT", path.as_str(), &[], other.as_slice());
     assert_eq!(wrong.status, 422);
     assert_eq!(wrong.error().code, 9);
-    assert!(wrong.error().message.contains(&hex(&digest(&bytes))), "{}", wrong.error().message);
-    assert_eq!(served.ask("GET", &format!("/v1/blob/{name}"), &[], &[]).status, 404);
-    // Nor does a temporary file of it stay behind.
-    let packs = served.dir().join("packs");
-    let left: Vec<String> = std::fs::read_dir(&packs)
-        .expect("the packs directory")
-        .filter_map(|it| it.ok()?.file_name().into_string().ok())
-        .collect();
-    assert!(left.is_empty(), "{left:?} was left behind");
+    let expected_hex = hex_of(&digest(bytes.as_slice()), alloc.clone());
+    assert!(wrong.error().message.as_str().contains(expected_hex.as_str()));
+    assert_eq!(served.ask("GET", path.as_str(), &[], &[]).status, 404);
 
-    // Bytes that are not a pack of this format are refused under a pack's name, even when the
-    // hash fits: the store would empty the directory over one.
-    let junk = b"not a pack at all".to_vec();
-    let junk_name = format!("packs/{}.pack", hex(&digest(&junk)));
-    let refused = served.ask("PUT", &format!("/v1/blob/{junk_name}"), &[], &junk);
+    let packs_dir = format_in!(alloc.clone(), "{}/packs", served.dir());
+    let left = list_names(packs_dir.as_str(), alloc.clone());
+    assert!(left.is_empty(), "temporary file left behind");
+
+    let junk = b"not a pack at all";
+    let junk_hex = hex_of(&digest(junk), alloc.clone());
+    let junk_path = format_in!(alloc.clone(), "/v1/blob/packs/{}.pack", junk_hex.as_str());
+    let refused = served.ask("PUT", junk_path.as_str(), &[], junk);
     assert_eq!(refused.status, 422);
-    assert!(refused.error().message.contains("format"), "{}", refused.error().message);
+    assert!(refused.error().message.as_str().contains("format"));
 }
 
 #[test]
 fn a_concurrent_write_of_one_blob_leaves_one_whole_blob() {
-    let served = Served::start();
-    let bytes =
-        pack(&[(digest(b"one"), b"a value that is not small"), (digest(b"two"), &[7; 4096])]).bytes;
-    let name = pack_name(&bytes);
+    let alloc = blaze_own::testing::heap().shared();
+    let served = Served::start("concurrent", alloc.clone());
+    let big = [7u8; 4096];
+    let bytes = pack(&[(digest(b"one"), b"a value that is not small"), (digest(b"two"), &big)], alloc.clone()).bytes;
+    let name = pack_name(bytes.as_slice(), alloc.clone());
     let port = served.port;
-    let writers: Vec<_> = (0..8)
-        .map(|_| {
-            let (name, bytes) = (name.clone(), bytes.clone());
-            thread::spawn(move || {
-                let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("a connection");
-                let head = format!(
-                    "PUT /v1/blob/{name} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-                    bytes.len()
+
+    let mut workers = Vec::with_capacity_in(8, alloc.clone());
+    for _ in 0..8 {
+        let name_c = name.clone();
+        let bytes_c = bytes.clone();
+        let alloc_c = alloc.clone();
+        workers.push(Worker::start(
+            move || {
+                let mut client = match TcpClient::connect(port) {
+                    Ok(c) => c,
+                    Err(e) => panic!("writer connect failed: {}", e.what()),
+                };
+                let head = format_in!(
+                    alloc_c.clone(),
+                    "PUT /v1/blob/{} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    name_c.as_str(),
+                    bytes_c.len()
                 );
-                stream.write_all(head.as_bytes()).expect("a request");
-                stream.write_all(&bytes).expect("a body");
-                Answer::read(stream, "PUT").expect("an answer").status
-            })
-        })
-        .collect();
-    for writer in writers {
-        assert_eq!(writer.join().expect("a writer"), 204);
+                assert!(client.write_all(head.as_bytes()).is_ok());
+                assert!(client.write_all(bytes_c.as_slice()).is_ok());
+                match Answer::read(&mut client, "PUT", alloc_c) {
+                    Ok(a) => a.status,
+                    Err(e) => panic!("writer answer failed: {}", e.what()),
+                }
+            },
+            alloc.clone(),
+        ));
     }
-    let got = served.ask("GET", &format!("/v1/blob/{name}"), &[], &[]);
+    for w in workers {
+        assert_eq!(w.join(), 204);
+    }
+
+    let path = format_in!(alloc.clone(), "/v1/blob/{}", name.as_str());
+    let got = served.ask("GET", path.as_str(), &[], &[]);
     assert_eq!(got.status, 200);
-    assert_eq!(got.body, bytes);
-    // One blob, and no temporary file of any of the writers.
-    let left: Vec<String> = std::fs::read_dir(served.dir().join("packs"))
-        .expect("the packs directory")
-        .filter_map(|it| it.ok()?.file_name().into_string().ok())
-        .collect();
-    assert_eq!(left, vec![format!("{}.pack", hex(&digest(&bytes)))]);
+    assert_eq!(got.body.as_slice(), bytes.as_slice());
+
+    let packs_dir = format_in!(alloc.clone(), "{}/packs", served.dir());
+    let left = list_names(packs_dir.as_str(), alloc.clone());
+    let expected_file = format_in!(alloc.clone(), "{}.pack", hex_of(&digest(bytes.as_slice()), alloc.clone()).as_str());
+    assert_eq!(left.len(), 1);
+    assert_eq!(left.first().map(|s| s.as_str()), Some(expected_file.as_str()));
 }
 
 #[test]
 fn a_list_is_written_once() {
-    let served = Served::start();
-    let path = format!("/v1/list/manifests/{}", hex(&digest(b"a unit")));
-    assert_eq!(served.ask("GET", &path, &[], &[]).status, 404);
+    let alloc = blaze_own::testing::heap().shared();
+    let served = Served::start("list-once", alloc.clone());
+    let unit_hex = hex_of(&digest(b"a unit"), alloc.clone());
+    let path = format_in!(alloc.clone(), "/v1/list/manifests/{}", unit_hex.as_str());
+    assert_eq!(served.ask("GET", path.as_str(), &[], &[]).status, 404);
 
-    // A malformed first writer names nothing; a real list must name verified packs.
-    let malformed = served.ask("PUT", &path, &[], b"first\n");
+    let malformed = served.ask("PUT", path.as_str(), &[], b"first\n");
     assert_eq!(malformed.status, 400);
     assert_eq!(malformed.error().code, 1);
-    assert!(malformed.error().message.contains("pack list line 1"));
-    assert_eq!(served.ask("GET", &path, &[], &[]).status, 404);
+    assert!(malformed.error().message.as_str().contains("pack list line 1"));
+    assert_eq!(served.ask("GET", path.as_str(), &[], &[]).status, 404);
 
     let key = digest(b"an item");
-    let first_pack = pack(&[(key, b"first")]);
-    let second_pack = pack(&[(key, b"second")]);
-    for pack in [&first_pack, &second_pack] {
-        let put = served.ask(
-            "PUT", &format!("/v1/blob/{}", pack_name(&pack.bytes)), &[], &pack.bytes,
-        );
-        assert_eq!(put.status, 204, "{}", put.error().message);
+    let first_pack = pack(&[(key, b"first")], alloc.clone());
+    let second_pack = pack(&[(key, b"second")], alloc.clone());
+    for p in [&first_pack, &second_pack] {
+        let pname = pack_name(p.bytes.as_slice(), alloc.clone());
+        let ppath = format_in!(alloc.clone(), "/v1/blob/{}", pname.as_str());
+        let put = served.ask("PUT", ppath.as_str(), &[], p.bytes.as_slice());
+        assert_eq!(put.status, 204);
     }
-    let first = blaze_wire::pack_list::encode(&[first_pack.reference], Global);
-    let second = blaze_wire::pack_list::encode(&[second_pack.reference], Global);
-    assert_ne!(first, second, "the two writers propose different pack lists");
-    let wrote = served.ask("PUT", &path, &[], &first);
-    assert_eq!(wrote.status, 204, "{}", wrote.error().message);
-    // A second writer is told, and what is there stays: both name the same keys.
-    assert_eq!(served.ask("PUT", &path, &[], &second).status, 412);
-    let got = served.ask("GET", &path, &[], &[]);
+
+    let first = blaze_wire::pack_list::encode(core::slice::from_ref(&first_pack.reference), alloc.clone());
+    let second = blaze_wire::pack_list::encode(core::slice::from_ref(&second_pack.reference), alloc.clone());
+    assert_ne!(first.as_slice(), second.as_slice());
+
+    let wrote = served.ask("PUT", path.as_str(), &[], first.as_slice());
+    assert_eq!(wrote.status, 204);
+    assert_eq!(served.ask("PUT", path.as_str(), &[], second.as_slice()).status, 412);
+
+    let got = served.ask("GET", path.as_str(), &[], &[]);
     assert_eq!(got.status, 200);
-    assert_eq!(got.body, first);
+    assert_eq!(got.body.as_slice(), first.as_slice());
 }
 
 #[test]
 fn a_name_that_is_not_the_layouts_reaches_no_file() {
-    let served = Served::start();
+    let alloc = blaze_own::testing::heap().shared();
+    let served = Served::start("bad-names", alloc.clone());
     for name in [
         "../Cargo.toml",
         "packs/../../etc/passwd",
@@ -351,62 +831,71 @@ fn a_name_that_is_not_the_layouts_reaches_no_file() {
         "blobs/x",
         "manifests/default",
     ] {
-        let answer = served.ask("GET", &format!("/v1/blob/{name}"), &[], &[]);
+        let path = format_in!(alloc.clone(), "/v1/blob/{name}");
+        let answer = served.ask("GET", path.as_str(), &[], &[]);
         assert_eq!(answer.status, 404, "{name} reached something");
     }
     let answer = served.ask("GET", "/v1/nonsense", &[], &[]);
     assert_eq!(answer.status, 404);
 }
 
-/// A path that is not of the layout is not read as one, and a name has one spelling.
 #[test]
 fn uppercase_digest_routes_are_rejected_without_creating_aliases() {
-    let served = Served::start();
-    let bytes = pack(&[(digest(b"canonical"), b"lowercase")]).bytes;
-    let d = hex(&digest(&bytes));
-    assert_ne!(d, d.to_uppercase());
-    for name in [
-        format!("packs/{}.pack", d.to_uppercase()),
-        format!("units/{d}"),
-        format!("keys/{d}"),
-        d.clone(),
-        d.to_uppercase(),
-    ] {
-        assert_eq!(
-            served.ask("PUT", &format!("/v1/blob/{name}"), &[], &bytes).status,
-            404,
-            "{name}"
-        );
+    let alloc = blaze_own::testing::heap().shared();
+    let served = Served::start("uppercase", alloc.clone());
+    let bytes = pack(&[(digest(b"canonical"), b"lowercase")], alloc.clone()).bytes;
+    let d = hex_of(&digest(bytes.as_slice()), alloc.clone());
+    let mut upper = String::with_capacity_in(d.len(), alloc.clone());
+    for ch in d.as_str().chars() {
+        upper.push(ch.to_ascii_uppercase());
     }
-    let path = format!("/v1/blob/packs/{d}.pack");
-    assert_eq!(served.ask("PUT", &path, &[], &bytes).status, 204);
-    assert_eq!(served.ask("GET", &path, &[], &[]).body, bytes);
+    assert_ne!(d.as_str(), upper.as_str());
+
+    let bad_pack = format_in!(alloc.clone(), "packs/{}.pack", upper.as_str());
+    let bad_unit = format_in!(alloc.clone(), "units/{}", d.as_str());
+    let bad_keys = format_in!(alloc.clone(), "keys/{}", d.as_str());
+    for name in [bad_pack.as_str(), bad_unit.as_str(), bad_keys.as_str(), d.as_str(), upper.as_str()] {
+        let path = format_in!(alloc.clone(), "/v1/blob/{name}");
+        assert_eq!(served.ask("PUT", path.as_str(), &[], bytes.as_slice()).status, 404, "{name}");
+    }
+
+    let good_path = format_in!(alloc.clone(), "/v1/blob/packs/{}.pack", d.as_str());
+    assert_eq!(served.ask("PUT", good_path.as_str(), &[], bytes.as_slice()).status, 204);
+    assert_eq!(served.ask("GET", good_path.as_str(), &[], &[]).body.as_slice(), bytes.as_slice());
 }
 
-#[cfg(unix)]
 #[test]
 fn http_reads_reject_symlink_objects_and_oversize_upload_length() {
-    let served = Served::start();
-    let outside = tempfile::tempdir().unwrap();
+    let alloc = blaze_own::testing::heap().shared();
+    let served = Served::start("symlink-oversize", alloc.clone());
+    let outside = TempDir::new("outside", alloc.clone());
     let bytes = b"outside";
-    let name = format!("packs/{}.pack", hex(&digest(bytes)));
-    std::fs::write(outside.path().join("secret"), bytes).unwrap();
-    std::os::unix::fs::symlink(outside.path().join("secret"), served.dir().join(&name)).unwrap();
-    assert_eq!(served.ask("GET", &format!("/v1/blob/{name}"), &[], &[]).status, 400);
-    let mut stream = TcpStream::connect(("127.0.0.1", served.port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let request = format!(
-        "PUT /v1/blob/packs/{}.pack HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-        "01".repeat(32),
-        Limits::DOCUMENTED.blob + 1
+    let d = hex_of(&digest(bytes), alloc.clone());
+    let name = format_in!(alloc.clone(), "packs/{}.pack", d.as_str());
+    let secret = format_in!(alloc.clone(), "{}/secret", outside.path());
+    write_file(secret.as_str(), bytes);
+    let link_path = format_in!(alloc.clone(), "{}/{}", served.dir(), name.as_str());
+    make_symlink(secret.as_str(), link_path.as_str());
+
+    let get_path = format_in!(alloc.clone(), "/v1/blob/{}", name.as_str());
+    assert_eq!(served.ask("GET", get_path.as_str(), &[], &[]).status, 400);
+
+    let mut client = match TcpClient::connect(served.port) {
+        Ok(c) => c,
+        Err(e) => panic!("connect failed: {}", e.what()),
+    };
+    let req = format_in!(
+        alloc.clone(),
+        "PUT /v1/blob/packs/0101010101010101010101010101010101010101010101010101010101010101.pack HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        Limits::DOCUMENTED.blob.saturating_add(1)
     );
-    stream.write_all(request.as_bytes()).unwrap();
-    assert_eq!(Answer::read(stream, "PUT").unwrap().status, 413);
-    assert!(
-        std::fs::read_dir(served.dir().join("packs")).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with('.'))
-    );
+    assert!(client.write_all(req.as_bytes()).is_ok());
+    let Ok(ans) = Answer::read(&mut client, "PUT", alloc.clone()) else {
+        panic!("reading 413 response failed");
+    };
+    assert_eq!(ans.status, 413);
+
+    let packs_dir = format_in!(alloc.clone(), "{}/packs", served.dir());
+    let entries = list_names(packs_dir.as_str(), alloc);
+    assert!(entries.iter().all(|e| !e.as_str().starts_with('.')));
 }

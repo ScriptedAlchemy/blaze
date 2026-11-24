@@ -24,9 +24,27 @@ impl Rng {
         if n == 0 { 0 } else { self.next_u64() % n }
     }
 
+    /// An index below `n`, or 0 when `n` is 0.
+    pub fn below_usize(&mut self, n: usize) -> usize {
+        let bound = u64::try_from(n).unwrap_or(u64::MAX);
+        usize::try_from(self.below(bound)).unwrap_or(0)
+    }
+
     /// A number in `lo..=hi`.
     pub fn range(&mut self, lo: u64, hi: u64) -> u64 {
         lo + self.below(hi - lo + 1)
+    }
+
+    /// A `usize` in `lo..=hi`.
+    pub fn range_usize(&mut self, lo: usize, hi: usize) -> usize {
+        let lo_u64 = u64::try_from(lo).unwrap_or(0);
+        let hi_u64 = u64::try_from(hi).unwrap_or(lo_u64);
+        usize::try_from(self.range(lo_u64, hi_u64)).unwrap_or(lo)
+    }
+
+    /// A `u32` in `lo..=hi`.
+    pub fn range_u32(&mut self, lo: u32, hi: u32) -> u32 {
+        u32::try_from(self.range(u64::from(lo), u64::from(hi))).unwrap_or(lo)
     }
 
     /// True `per_million` times in a million.

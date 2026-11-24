@@ -6,6 +6,16 @@ use blaze_own::Vec;
 use core::alloc::Allocator;
 use core::fmt;
 
+#[inline]
+fn to_usize(n: u32) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+#[inline]
+fn to_u32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 macro_rules! ids {
     ($($(#[$m:meta])* $name:ident = $tag:literal;)*) => {$(
         $(#[$m])*
@@ -13,7 +23,7 @@ macro_rules! ids {
         pub struct $name(pub u32);
         impl $name {
             pub fn index(self) -> usize {
-                self.0 as usize
+                to_usize(self.0)
             }
         }
         impl fmt::Display for $name {
@@ -57,7 +67,7 @@ impl Point {
         self.0 % 2 == 1
     }
     pub fn index(self) -> usize {
-        self.0 as usize
+        to_usize(self.0)
     }
 }
 
@@ -302,7 +312,7 @@ impl<A: Allocator> Flow<A> {
     }
 
     pub fn ops(&self, o: Ops) -> &[Operand] {
-        &self.operands[o.start as usize..o.end as usize]
+        &self.operands[to_usize(o.start)..to_usize(o.end)]
     }
 
     /// The prefix of `p` at `depth` (0 is the local's place).
@@ -347,7 +357,7 @@ impl<A: Allocator> Flow<A> {
         match self.stmt(s).kind {
             StmtKind::Goto(b) => f(Stmt(self.blocks[b.index()].start)),
             StmtKind::Switch { targets, .. } => {
-                for b in &self.succ[targets.start as usize..targets.end as usize] {
+                for b in &self.succ[to_usize(targets.start)..to_usize(targets.end)] {
                     f(Stmt(self.blocks[b.index()].start));
                 }
             }
@@ -367,7 +377,7 @@ impl<A: Allocator> Flow<A> {
             StmtKind::Goto(b) => (idx == 0).then(|| Stmt(self.blocks[b.index()].start)),
             StmtKind::Switch { targets, .. } => {
                 let i = targets.start + idx;
-                (i < targets.end).then(|| Stmt(self.blocks[self.succ[i as usize].index()].start))
+                (i < targets.end).then(|| Stmt(self.blocks[self.succ[to_usize(i)].index()].start))
             }
             StmtKind::Suspend { resume, cancel } => match idx {
                 0 => Some(Stmt(self.blocks[resume.index()].start)),
@@ -567,7 +577,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
     }
 
     pub fn local(&self, l: u32) -> Place {
-        self.flow.local_places[l as usize]
+        self.flow.local_places[to_usize(l)]
     }
 
     /// The projection that made `p` from its parent; `None` for a local's own place (or a
@@ -583,7 +593,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
         self.flow.places.push(PlaceRow { local: l, parent: None, proj: None, depth: 0, of_drop_type: false, of_slice: false, of_shared_ref: false });
         self.first_child.push(NO_CHILD);
         self.next_sibling.push(NO_CHILD);
-        self.flow.local_places.push(Place(self.flow.places.len() as u32 - 1));
+        self.flow.local_places.push(Place(to_u32(self.flow.places.len() - 1)));
         l
     }
 

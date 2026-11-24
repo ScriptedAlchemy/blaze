@@ -42,7 +42,7 @@ struct Wall(Instant);
 
 impl Clock for Wall {
     fn now_ns(&self) -> u64 {
-        self.0.elapsed().as_nanos() as u64
+        u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 }
 
@@ -192,7 +192,7 @@ fn main() {
             sink += floor_one(c, alloc);
         }
         std::hint::black_box(sink);
-        floor_ns = floor_ns.min(t.elapsed().as_nanos() as u64);
+        floor_ns = floor_ns.min(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
     }
     let mut check_ns = u64::MAX;
     for _ in 0..5 {
@@ -200,7 +200,7 @@ fn main() {
         for i in 0..BODIES {
             std::hint::black_box(check_one(&f, i, alloc));
         }
-        check_ns = check_ns.min(t.elapsed().as_nanos() as u64);
+        check_ns = check_ns.min(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
     }
     let per_s = |ns: u64| BODIES as f64 / (ns as f64 / 1e9);
     println!(
@@ -250,18 +250,22 @@ fn main() {
             wasted_ns as f64 / total_ns.max(1) as f64,
             if r <= R_THRESHOLD { "within" } else { "over" },
         );
-        let mut idx: Vec<usize> = (0..BODIES).collect();
-        idx.sort_by_key(|&i| std::cmp::Reverse(all[i].wasted_steps));
-        let top: u64 = idx.iter().take(BODIES / 10).map(|&i| all[i].wasted_steps).sum();
-        let show: Vec<String> = idx
+        let mut ranked: Vec<(usize, &Restarts, usize)> = all
+            .iter()
+            .zip(&f.bodies)
+            .enumerate()
+            .map(|(i, (r, (b, _, _)))| (i, r, b.exprs.len()))
+            .collect();
+        ranked.sort_by_key(|&(_, r, _)| std::cmp::Reverse(r.wasted_steps));
+        let top: u64 = ranked.iter().take(BODIES / 10).map(|&(_, r, _)| r.wasted_steps).sum();
+        let show: Vec<String> = ranked
             .iter()
             .take(4)
-            .map(|&i| {
+            .map(|&(i, r, expr_len)| {
                 format!(
-                    "body{i} ({} exprs, {} entries, {} wasted steps)",
-                    f.bodies[i].0.exprs.len(),
-                    all[i].entries,
-                    all[i].wasted_steps
+                    "body{i} ({expr_len} exprs, {} entries, {} wasted steps)",
+                    r.entries,
+                    r.wasted_steps
                 )
             })
             .collect();

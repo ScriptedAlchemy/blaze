@@ -282,14 +282,18 @@ mod tests {
     use super::{Home, Homes, named_home};
     use crate::{ArenaId, Gid};
 
+    fn boxed<T>(value: T) -> Box<T, Global> {
+        Box::new_in(value, Global)
+    }
+
     /// The invariant: a box is homed by what it holds (the control: a box of plain data names
     /// no arena, so it is homed in the session arena the snapshot holds, `home_of`).
     #[test]
     fn a_box_is_homed_by_what_it_holds() {
         let id = Gid::in_arena(ArenaId::new(3, 2), 9);
-        assert_eq!(named_home(&Box::new_in(id, Global)), Some(id.arena()));
-        assert_eq!(named_home(&Box::new_in(Some(id), Global)), Some(id.arena()));
-        assert_eq!(named_home(&Box::new_in(7_u32, Global)), None);
+        assert_eq!(named_home(&boxed(id)), Some(id.arena()));
+        assert_eq!(named_home(&boxed(Some(id))), Some(id.arena()));
+        assert_eq!(named_home(&boxed(7_u32)), None);
     }
 
     #[test]
@@ -304,8 +308,8 @@ mod tests {
 
         let id = Gid::in_arena(ArenaId::new(3, 2), 9);
         let expected = Some(id.arena());
-        assert_eq!(named_home(&Box::new_in(id, Global)), expected);
-        let lost = Box::new_in(MissingTraversal(id), Global);
+        assert_eq!(named_home(&boxed(id)), expected);
+        let lost = boxed(MissingTraversal(id));
         assert_eq!(lost.0, id, "the plant keeps the same arena-bearing contents");
         assert_ne!(named_home(&lost), expected, "the oracle must reject an omitted traversal");
         assert_eq!(named_home(&lost), None);

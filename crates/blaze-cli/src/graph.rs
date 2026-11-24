@@ -249,6 +249,23 @@ impl Parts {
     }
 }
 
+/// The feature selection passed from the command line (`-F`/`--features`, `--all-features`,
+/// `--no-default-features`) into the unit graph's [`Ask`] and the answer root key (rule 21).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FeatureAsk<'a> {
+    pub features: &'a [&'a str],
+    pub all_features: bool,
+    pub no_default_features: bool,
+}
+
+impl<'a> FeatureAsk<'a> {
+    pub const DEFAULT: Self = Self { features: &[], all_features: false, no_default_features: false };
+
+    pub fn is_default(&self) -> bool {
+        self.features.is_empty() && !self.all_features && !self.no_default_features
+    }
+}
+
 /// The job's inputs and what its entries mapped, for the command.
 pub struct Graph<'f> {
     /// The job's source (`unit_graph_task::source`), handed in `Start`.
@@ -267,10 +284,21 @@ impl<'f> Graph<'f> {
     /// [`Graph::new`] for the targets [`target_of`] made: what of their rustflags blaze does not
     /// apply is said on the graph's record, never dropped (rule 3). Under no `--target` the host
     /// takes the target's flags, so the target's are said.
-    pub fn of(parts: Parts, lockfile: &Lockfile<'f>, workspace_read: ContentId, target: Targeted, host: Targeted, tests: bool, heap: &'static blaze_own::Heap, frame: &'f Frame) -> Graph<'f> {
+    #[expect(clippy::too_many_arguments, reason = "unit-graph job edge: each argument one distinct input")]
+    pub fn of(
+        parts: Parts,
+        lockfile: &Lockfile<'f>,
+        workspace_read: ContentId,
+        target: Targeted,
+        host: Targeted,
+        features: FeatureAsk<'_>,
+        tests: bool,
+        heap: &'static blaze_own::Heap,
+        frame: &'f Frame,
+    ) -> Graph<'f> {
         let told = RustflagsTold(&target.flags);
         let told = told.any().then(|| held_str(bstd::mem::format_in!(frame, "{told}").as_str(), frame));
-        let mut graph = Graph::new(parts, lockfile, workspace_read, target.desc, host.desc, tests, heap, frame);
+        let mut graph = Graph::new(parts, lockfile, workspace_read, target.desc, host.desc, features, tests, heap, frame);
         graph.told = told;
         graph
     }
@@ -278,10 +306,33 @@ impl<'f> Graph<'f> {
     /// The job of `parts` over `lockfile`, for `target` and, for the host's units (build
     /// scripts), `host` (both from [`target_of`], each asked for its unit's kind); `workspace_read`
     /// is the units' source.
-    pub fn new(parts: Parts, lockfile: &Lockfile<'f>, workspace_read: ContentId, target: TargetDesc<'static>, host: TargetDesc<'static>, tests: bool, heap: &'static blaze_own::Heap, frame: &'f Frame) -> Graph<'f> {
+    #[expect(clippy::too_many_arguments, reason = "unit-graph job edge: each argument one distinct input")]
+    pub fn new(
+        parts: Parts,
+        lockfile: &Lockfile<'f>,
+        workspace_read: ContentId,
+        target: TargetDesc<'static>,
+        host: TargetDesc<'static>,
+        features: FeatureAsk<'_>,
+        tests: bool,
+        heap: &'static blaze_own::Heap,
+        frame: &'f Frame,
+    ) -> Graph<'f> {
         let mut roots = Vec::with_capacity_in(parts.members.len(), heap.alloc());
         roots.extend(parts.members.iter().map(|(id, _)| *id));
-        let ask = Ask { roots, features: Vec::new_in(heap.alloc()), all_features: false, no_default_features: false, tests };
+        let mut ask_features = Vec::new_in(heap.alloc());
+        for raw in features.features.iter() {
+            for item in raw.split(|c: char| c == ',' || c.is_ascii_whitespace()).filter(|item| !item.is_empty()) {
+                ask_features.push(blaze_unit_graph::Text::from_str_in(item, heap.alloc()));
+            }
+        }
+        let ask = Ask {
+            roots,
+            features: ask_features,
+            all_features: features.all_features,
+            no_default_features: features.no_default_features,
+            tests,
+        };
         let members: &'f [(LockId, Package<'static>)] = std::boxed::Box::leak(std::boxed::Box::new_in(parts.members, frame));
         let path_packages: &'f [(LockId, Package<'static>)] = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(parts.path_packages, frame));
         let target: &'f TargetDesc<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(target, frame));

@@ -549,6 +549,38 @@ fn required_features_skip_a_test_example_or_bench_and_say_so() {
     }
 }
 
+/// `required-features` may name a feature of a normal or build dependency (`dep/extra`,
+/// `hostdep/extra`), checked on that dependency's resolved feature side.
+#[test]
+fn required_features_follow_normal_and_build_dependencies() {
+    let world = [
+        pkg("app")
+            .member()
+            .build()
+            .dep(dep("dep"))
+            .dep(dep("hostdep").build().features(&["extra"]))
+            .bin("app")
+            .bin_requiring("needs", &["dep/extra"])
+            .bin_requiring("host-needs", &["hostdep/extra"]),
+        pkg("dep").feature("extra", &[]),
+        pkg("hostdep").feature("extra", &[]),
+    ];
+    let graph = solve(&world, &opts(Resolver::V2)).unwrap_or_else(|e| panic!("{e}"));
+    let bins: StdVec<StdString> = lines(&graph).into_iter().filter(|l| l.contains(" bin:")).collect();
+    assert!(bins.iter().any(|l| l.contains("bin:app ")), "{bins:?}");
+    assert!(bins.iter().any(|l| l.contains("bin:host-needs ")), "build-dep feature enabled: {bins:?}");
+    assert!(!bins.iter().any(|l| l.contains("bin:needs ")), "target-dep feature off: {bins:?}");
+    assert_eq!(graph.left_out.len(), 1);
+    assert_eq!((graph.left_out[0].kind, graph.left_out[0].name.as_str()), (LeftOutKind::Bin, "needs"));
+    assert_eq!(graph.left_out[0].off.iter().map(|f| f.as_str()).collect::<StdVec<_>>(), vec!["dep/extra"]);
+
+    let on = Opts { features: vec!["dep/extra".to_owned()], ..opts(Resolver::V2) };
+    let graph = solve(&world, &on).unwrap_or_else(|e| panic!("{e}"));
+    let bins: StdVec<StdString> = lines(&graph).into_iter().filter(|l| l.contains(" bin:")).collect();
+    assert!(bins.iter().any(|l| l.contains("bin:needs ")), "dep/extra enabled: {bins:?}");
+    assert!(graph.left_out.is_empty(), "{:?}", graph.left_out);
+}
+
 /// Rule 1: `x?/f` does not turn `x` on; when `x` is on for another reason, `f` follows.
 #[test]
 fn weak_feature_waits_for_its_dependency() {

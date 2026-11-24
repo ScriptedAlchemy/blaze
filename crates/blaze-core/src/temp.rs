@@ -155,6 +155,11 @@ mod tests {
         !path.exists()
     }
 
+    fn populate(dir: &TempDir) {
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/c"), b"x").unwrap();
+    }
+
     /// The invariant: a `TempDir` is a new empty directory of its own, and is gone, with what
     /// it held, once dropped.
     #[test]
@@ -164,8 +169,7 @@ mod tests {
         assert_ne!(first.path(), second.path());
         assert!(first.path().is_dir());
         assert_eq!(std::fs::read_dir(first.path()).unwrap().count(), 0);
-        std::fs::create_dir_all(first.join("a/b")).unwrap();
-        std::fs::write(first.join("a/b/c"), b"x").unwrap();
+        populate(&first);
         let path = first.path().to_path_buf();
         drop(first);
         assert!(directory_removed(&path), "{} outlived its TempDir", path.display());
@@ -174,13 +178,12 @@ mod tests {
 
     #[test]
     fn the_oracle_catches_a_temp_directory_whose_drop_does_not_run() {
-        let held = std::mem::ManuallyDrop::new(TempDir::for_test("blaze-core-temp-control-"));
-        std::fs::create_dir_all(held.join("a/b")).unwrap();
-        std::fs::write(held.join("a/b/c"), b"x").unwrap();
+        let held = core::mem::ManuallyDrop::new(TempDir::for_test("blaze-core-temp-control-"));
+        populate(&held);
         let path = held.path().to_path_buf();
         // The planted bug removes the destructor, so its files survive the supposed drop.
         assert!(!directory_removed(&path), "the oracle missed a retained directory");
-        drop(std::mem::ManuallyDrop::into_inner(held));
+        drop(core::mem::ManuallyDrop::into_inner(held));
         assert!(directory_removed(&path), "the control cleans up through the real destructor");
     }
 }

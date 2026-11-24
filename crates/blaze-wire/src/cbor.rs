@@ -16,8 +16,17 @@
 //! which the bytes-only validator cannot tell apart from any other array, so a lookup's schema
 //! field holds its own collection to that limit ([`Reader::lookup`]).
 
-use std::alloc::{Allocator, Global};
-use std::fmt;
+use core::alloc::Allocator;
+use core::cmp::Ordering;
+use core::fmt;
+use core::hash::{Hash, Hasher};
+use core::mem;
+use core::ops::{Deref, DerefMut};
+use core::slice;
+
+use blaze_own::{String, Vec};
+
+use crate::{WireAlloc, WireVec};
 
 /// The deepest nesting a message may have, counting every item and not only containers.
 ///
@@ -99,21 +108,9 @@ impl<A: Allocator + Clone> Encoder<A> {
     }
 
     /// An encoder that writes onto the end of `out`, for a prefix and then one value.
-    ///
-    /// The bytes are in `out` once the returned [`Appender`] is dropped, so a caller writes a
-    /// prefix, encodes one value, and has the two as one buffer:
-    ///
-    /// ```
-    /// let mut out = b"prefix".to_vec();
-    /// {
-    ///     let mut e = blaze_wire::Encoder::new_into(&mut out);
-    ///     e.uint(1);
-    /// }
-    /// assert_eq!(out, b"prefix\x01");
-    /// ```
     pub fn new_into(out: &mut Vec<u8, A>) -> Appender<'_, A> {
         let empty = Vec::new_in(out.allocator().clone());
-        Appender { encoder: Encoder { out: std::mem::replace(out, empty) }, back: out }
+        Appender { encoder: Encoder { out: mem::replace(out, empty) }, back: out }
     }
 
     /// The bytes written so far.
@@ -129,17 +126,19 @@ impl<A: Allocator + Clone> Encoder<A> {
     /// The major type and argument as one head, in the shortest form that holds the argument.
     fn head(&mut self, major: u8, arg: u64) {
         let major = major << 5;
-        if arg < 24 {
-            self.out.push(major | arg as u8);
-        } else if arg <= u8::MAX as u64 {
-            self.out.push(major | 24);
-            self.out.push(arg as u8);
-        } else if arg <= u16::MAX as u64 {
+        if let Ok(small) = u8::try_from(arg) {
+            if small < 24 {
+                self.out.push(major | small);
+            } else {
+                self.out.push(major | 24);
+                self.out.push(small);
+            }
+        } else if let Ok(v) = u16::try_from(arg) {
             self.out.push(major | 25);
-            self.out.extend_from_slice(&(arg as u16).to_be_bytes());
-        } else if arg <= u32::MAX as u64 {
+            self.out.extend_from_slice(&v.to_be_bytes());
+        } else if let Ok(v) = u32::try_from(arg) {
             self.out.push(major | 26);
-            self.out.extend_from_slice(&(arg as u32).to_be_bytes());
+            self.out.extend_from_slice(&v.to_be_bytes());
         } else {
             self.out.push(major | 27);
             self.out.extend_from_slice(&arg.to_be_bytes());
@@ -153,24 +152,24 @@ impl<A: Allocator + Clone> Encoder<A> {
 
     /// A byte string.
     pub fn bytes(&mut self, b: &[u8]) {
-        self.head(2, b.len() as u64);
+        self.head(2, u64::try_from(b.len()).unwrap_or(u64::MAX));
         self.out.extend_from_slice(b);
     }
 
     /// A text string.
     pub fn text(&mut self, s: &str) {
-        self.head(3, s.len() as u64);
+        self.head(3, u64::try_from(s.len()).unwrap_or(u64::MAX));
         self.out.extend_from_slice(s.as_bytes());
     }
 
     /// An array of `len` items, which the caller then writes.
     pub fn array(&mut self, len: usize) {
-        self.head(4, len as u64);
+        self.head(4, u64::try_from(len).unwrap_or(u64::MAX));
     }
 
     /// A map of `len` pairs, which the caller then writes.
     pub fn map(&mut self, len: usize) {
-        self.head(5, len as u64);
+        self.head(5, u64::try_from(len).unwrap_or(u64::MAX));
     }
 
     /// `false` or `true`.
@@ -193,22 +192,12 @@ impl<A: Allocator + Clone> Encoder<A> {
 
 /// An [`Encoder`] that writes onto the end of a caller's buffer, which it returns the bytes to
 /// when it is dropped.
-///
-/// It dereferences to [`Encoder`], so a value encodes into it the same way:
-///
-/// ```
-/// let mut out = b"blaze/Attempt/v1\0".to_vec();
-/// let mut e = blaze_wire::Encoder::new_into(&mut out);
-/// blaze_wire::Attempt(24).encode(&mut e);
-/// drop(e);
-/// assert_eq!(out.last(), Some(&24));
-/// ```
 pub struct Appender<'a, A: Allocator + Clone> {
     encoder: Encoder<A>,
     back: &'a mut Vec<u8, A>,
 }
 
-impl<A: Allocator + Clone> std::ops::Deref for Appender<'_, A> {
+impl<A: Allocator + Clone> Deref for Appender<'_, A> {
     type Target = Encoder<A>;
 
     fn deref(&self) -> &Encoder<A> {
@@ -216,7 +205,7 @@ impl<A: Allocator + Clone> std::ops::Deref for Appender<'_, A> {
     }
 }
 
-impl<A: Allocator + Clone> std::ops::DerefMut for Appender<'_, A> {
+impl<A: Allocator + Clone> DerefMut for Appender<'_, A> {
     fn deref_mut(&mut self) -> &mut Encoder<A> {
         &mut self.encoder
     }
@@ -226,9 +215,11 @@ impl<A: Allocator + Clone> Drop for Appender<'_, A> {
     fn drop(&mut self) {
         // The caller cannot access `back` while this borrow is live. Its placeholder has the
         // same allocator and no storage; swap returns the original buffer without allocating.
-        std::mem::swap(&mut self.encoder.out, self.back);
+        mem::swap(&mut self.encoder.out, self.back);
     }
 }
+
+const MAX_STACK: usize = 33;
 
 /// Reads canonical CBOR, refusing what is not.
 pub struct Reader<'a> {
@@ -236,7 +227,9 @@ pub struct Reader<'a> {
     pos: usize,
     limits: Limits,
     depth: u32,
-    maps: Vec<MapState>,
+    maps: [MapState; MAX_STACK],
+    map_depth: usize,
+    alloc: Option<WireAlloc>,
     /// The limit of the one collection whose header is read next, when a lookup's field set it
     /// with [`Reader::lookup`]. It applies to that collection only, so a lookup's answer is held
     /// to [`Limits::lookup_items`] at its top and each entry to [`Limits::batch_items`] inside.
@@ -249,17 +242,41 @@ struct MapState {
     seen: u128,
 }
 
+impl MapState {
+    const EMPTY: MapState = MapState { remaining: 0, seen: 0 };
+}
+
 impl<'a> Reader<'a> {
-    /// A reader over `input` that holds every message to `limits`.
-    pub fn new(input: &'a [u8], limits: &Limits) -> Reader<'a> {
+    /// A reader over `input` that holds every message to `limits` and owns decoded values in `alloc`.
+    pub fn new(input: &'a [u8], limits: &Limits, alloc: WireAlloc) -> Reader<'a> {
         Reader {
             input,
             pos: 0,
             limits: *limits,
             depth: 0,
-            maps: Vec::new(),
+            maps: [MapState::EMPTY; MAX_STACK],
+            map_depth: 0,
+            alloc: Some(alloc),
             next_collection_limit: None,
         }
+    }
+
+    fn for_validate(input: &'a [u8], limits: &Limits) -> Reader<'a> {
+        Reader {
+            input,
+            pos: 0,
+            limits: *limits,
+            depth: 0,
+            maps: [MapState::EMPTY; MAX_STACK],
+            map_depth: 0,
+            alloc: None,
+            next_collection_limit: None,
+        }
+    }
+
+    /// The allocator decoded owned values are placed in.
+    pub fn alloc(&self) -> Result<WireAlloc, Error> {
+        self.alloc.ok_or_else(|| self.err(ErrorKind::UnexpectedType { expected: "a decoding allocator" }))
     }
 
     /// Where in the input the reader is.
@@ -269,12 +286,6 @@ impl<'a> Reader<'a> {
 
     /// Reads one value whose first array or map is held to [`Limits::lookup_items`] rather than
     /// [`Limits::batch_items`], which is a lookup's collection limit.
-    ///
-    /// The bytes-only validator cannot tell a lookup's array from a batch's, so a lookup's field
-    /// reads through this and [`decode`] refuses a lookup with more items than the limit it
-    /// answers. The limit applies to the one collection the field's value starts with, and a
-    /// scalar clears it: anything inside that collection is a batch's, held to
-    /// [`Limits::batch_items`].
     pub fn lookup<T: Wire>(&mut self) -> Result<T, Error> {
         let saved = self.next_collection_limit;
         self.next_collection_limit = Some(u64::from(self.limits.lookup_items));
@@ -326,24 +337,33 @@ impl<'a> Reader<'a> {
                 v
             }
             25 => {
-                let b = self.take(2)?;
-                let v = u64::from(u16::from_be_bytes([b[0], b[1]]));
+                let b: [u8; 2] = self
+                    .take(2)?
+                    .try_into()
+                    .map_err(|_| self.err_at(ErrorKind::Truncated, at))?;
+                let v = u64::from(u16::from_be_bytes(b));
                 if v <= u64::from(u8::MAX) {
                     return Err(self.err_at(ErrorKind::NonShortestHead, at));
                 }
                 v
             }
             26 => {
-                let b = self.take(4)?;
-                let v = u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+                let b: [u8; 4] = self
+                    .take(4)?
+                    .try_into()
+                    .map_err(|_| self.err_at(ErrorKind::Truncated, at))?;
+                let v = u64::from(u32::from_be_bytes(b));
                 if v <= u64::from(u16::MAX) {
                     return Err(self.err_at(ErrorKind::NonShortestHead, at));
                 }
                 v
             }
             27 => {
-                let b = self.take(8)?;
-                let v = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                let b: [u8; 8] = self
+                    .take(8)?
+                    .try_into()
+                    .map_err(|_| self.err_at(ErrorKind::Truncated, at))?;
+                let v = u64::from_be_bytes(b);
                 if v <= u64::from(u32::MAX) {
                     return Err(self.err_at(ErrorKind::NonShortestHead, at));
                 }
@@ -351,16 +371,13 @@ impl<'a> Reader<'a> {
             }
             28..=30 => return Err(self.err_at(ErrorKind::ReservedAdditional(ai), at)),
             31 => return Err(self.err_at(ErrorKind::IndefiniteLength, at)),
-            _ => unreachable!("the additional information is five bits"),
+            other => return Err(self.err_at(ErrorKind::ReservedAdditional(other), at)),
         };
         Ok(Some(value))
     }
 
     /// A length, held to `limit` for the kind of item `what` names, or to the lookup limit when a
     /// lookup's field asked for it ([`Reader::lookup`]) and this is that collection.
-    ///
-    /// Only an array or a map is a collection, so only those take the pending limit; a byte or
-    /// text string is a scalar and clears it, as [`Reader::scalar`] does.
     fn length(&mut self, major: u8, what: &'static str, limit: u64) -> Result<u64, Error> {
         let at = self.pos;
         let limit = if major == 4 || major == 5 {
@@ -379,10 +396,6 @@ impl<'a> Reader<'a> {
 
     /// A scalar item's level: it sits one deeper than the containers already entered, so a
     /// scalar inside [`MAX_DEPTH`] containers is past the deepest item a message may have.
-    ///
-    /// The validator counts every item, containers and scalars alike, and this is the reader's
-    /// half of the same rule: a container enters and leaves, a scalar is checked against the
-    /// containers around it, so both refuse an item at level [`MAX_DEPTH`] + 1.
     fn scalar(&mut self) -> Result<(), Error> {
         // A scalar is no collection, so a lookup's pending collection limit ends here.
         self.next_collection_limit = None;
@@ -395,7 +408,7 @@ impl<'a> Reader<'a> {
     /// An unsigned integer, in the shortest form.
     pub fn uint(&mut self) -> Result<u64, Error> {
         self.scalar()?;
-        Ok(self.argument(0)?.expect("an integer has an argument"))
+        self.argument(0)?.ok_or_else(|| self.err(ErrorKind::IndefiniteLength))
     }
 
     /// An unsigned integer used as a map key, which a schema type compares with its field number.
@@ -414,12 +427,13 @@ impl<'a> Reader<'a> {
         let len = self.length(2, "byte string", self.limits.blob)?;
         self.take(len)
     }
+
     /// A byte string of exactly `n` bytes.
     pub fn bytes_of(&mut self, n: usize) -> Result<&'a [u8], Error> {
         self.scalar()?;
         let at = self.pos;
         let len = self.length(2, "byte string", self.limits.blob)?;
-        if len != n as u64 {
+        if u64::try_from(n).ok() != Some(len) {
             return Err(self
                 .err_at(ErrorKind::UnexpectedType { expected: "a byte string of its length" }, at));
         }
@@ -449,7 +463,7 @@ impl<'a> Reader<'a> {
         let at = self.pos;
         let len = self.length(3, "text string", limit)?;
         let bytes = self.take(len)?;
-        std::str::from_utf8(bytes).map_err(|_| self.err_at(ErrorKind::BadUtf8, at))
+        core::str::from_utf8(bytes).map_err(|_| self.err_at(ErrorKind::BadUtf8, at))
     }
 
     /// Whether the next item is `null`.
@@ -461,7 +475,7 @@ impl<'a> Reader<'a> {
     pub fn array_start(&mut self, n: usize) -> Result<(), Error> {
         let at = self.pos;
         let len = self.length(4, "array", u64::from(self.limits.batch_items))?;
-        if len != n as u64 {
+        if u64::try_from(n).ok() != Some(len) {
             return Err(
                 self.err_at(ErrorKind::UnexpectedType { expected: "an array of its length" }, at)
             );
@@ -492,7 +506,11 @@ impl<'a> Reader<'a> {
     pub fn map_start(&mut self) -> Result<(), Error> {
         let len = self.length(5, "map", u64::from(self.limits.batch_items))?;
         self.enter()?;
-        self.maps.push(MapState { remaining: len, seen: 0 });
+        let at = self.pos;
+        let slot =
+            self.maps.get_mut(self.map_depth).ok_or(Error { kind: ErrorKind::TooDeep, at })?;
+        *slot = MapState { remaining: len, seen: 0 };
+        self.map_depth += 1;
         Ok(())
     }
 
@@ -501,10 +519,10 @@ impl<'a> Reader<'a> {
     /// one over for [`Reader::map_end`] to name.
     pub fn field(&mut self, want: u64) -> Result<(), Error> {
         let at = self.pos;
-        let state = *self.maps.last().ok_or_else(|| {
-            self.err(ErrorKind::UnexpectedType { expected: "a field inside a map" })
-        })?;
-        if state.remaining == 0 {
+        let top = self.map_depth.checked_sub(1).and_then(|i| self.maps.get(i).copied()).ok_or_else(
+            || self.err(ErrorKind::UnexpectedType { expected: "a field inside a map" }),
+        )?;
+        if top.remaining == 0 {
             return Err(self.err_at(ErrorKind::MissingKey(want), at));
         }
         let key = self.key()?;
@@ -517,15 +535,15 @@ impl<'a> Reader<'a> {
         }
         // A smaller key than the one the schema wants is one it has already read (a duplicate) or
         // one it never reads (out of order).
-        if key < 128 && state.seen & (1u128 << key) != 0 {
+        if key < 128 && top.seen & (1u128 << key) != 0 {
             return Err(self.err_at(ErrorKind::DuplicateKey(key), at));
         }
         Err(self.err_at(ErrorKind::UnsortedKeys, at))
     }
 
     fn mark(&mut self, key: u64) {
-        if let Some(state) = self.maps.last_mut() {
-            state.remaining -= 1;
+        if let Some(state) = self.map_depth.checked_sub(1).and_then(|i| self.maps.get_mut(i)) {
+            state.remaining = state.remaining.saturating_sub(1);
             if key < 128 {
                 state.seen |= 1u128 << key;
             }
@@ -536,10 +554,16 @@ impl<'a> Reader<'a> {
     /// a key the schema does not have is named.
     pub fn map_end(&mut self) -> Result<(), Error> {
         let at = self.pos;
+        let idx = self
+            .map_depth
+            .checked_sub(1)
+            .ok_or_else(|| self.err(ErrorKind::UnexpectedType { expected: "the end of a map" }))?;
         let state = self
             .maps
-            .pop()
+            .get(idx)
+            .copied()
             .ok_or_else(|| self.err(ErrorKind::UnexpectedType { expected: "the end of a map" }))?;
+        self.map_depth = idx;
         self.depth = self.depth.saturating_sub(1);
         if state.remaining > 0 {
             let key = self.key()?;
@@ -567,83 +591,138 @@ impl<'a> Reader<'a> {
 
     /// Walks one item, checking every rule of section 4.2 that the bytes alone decide.
     fn walk(&mut self) -> Result<(), Error> {
-        self.enter()?;
-        let at = self.pos;
-        let ib = self.byte()?;
-        // Every arm reads the head again with `argument` or `length`, which are where the shortest
-        // form and the definite length are checked, so the position goes back to the head.
-        self.pos = at;
-        match ib >> 5 {
-            0 | 1 => {
-                self.argument(ib >> 5)?;
-            }
-            2 => {
-                let len = self.length(2, "byte string", self.limits.blob)?;
-                self.take(len)?;
-            }
-            3 => {
-                let len = self.length(3, "text string", u64::from(self.limits.string))?;
-                let bytes = self.take(len)?;
-                std::str::from_utf8(bytes).map_err(|_| self.err_at(ErrorKind::BadUtf8, at))?;
-            }
-            4 => {
-                let len = self.length(4, "array", u64::from(self.limits.batch_items))?;
-                for _ in 0..len {
-                    self.walk()?;
+        #[derive(Clone, Copy)]
+        enum Frame {
+            Array { remaining: u64 },
+            MapKey { remaining: u64, previous: Option<(usize, usize)> },
+            MapVal { remaining: u64, previous: Option<(usize, usize)>, key_at: usize },
+        }
+        let mut stack: [Option<Frame>; MAX_STACK] = [None; MAX_STACK];
+        let mut sp: usize = 0;
+
+        'item: loop {
+            self.enter()?;
+            let at = self.pos;
+            let ib = self.byte()?;
+            // Every arm reads the head again with `argument` or `length`, which are where the
+            // shortest form and the definite length are checked, so the position goes back to the head.
+            self.pos = at;
+            match ib >> 5 {
+                0 | 1 => {
+                    self.argument(ib >> 5)?;
                 }
-            }
-            5 => {
-                let len = self.length(5, "map", u64::from(self.limits.batch_items))?;
-                let mut previous: Option<(usize, usize)> = None;
-                for _ in 0..len {
-                    let key_at = self.pos;
-                    self.walk()?;
-                    let key_end = self.pos;
-                    if let Some((start, end)) = previous {
-                        let before = &self.input[start..end];
-                        let this = &self.input[key_at..key_end];
-                        match this.cmp(before) {
-                            std::cmp::Ordering::Greater => {}
-                            std::cmp::Ordering::Equal => {
-                                return Err(self.err_at(ErrorKind::DuplicateKey(0), key_at));
-                            }
-                            std::cmp::Ordering::Less => {
-                                return Err(self.err_at(ErrorKind::UnsortedKeys, key_at));
+                2 => {
+                    let len = self.length(2, "byte string", self.limits.blob)?;
+                    self.take(len)?;
+                }
+                3 => {
+                    let len = self.length(3, "text string", u64::from(self.limits.string))?;
+                    let bytes = self.take(len)?;
+                    core::str::from_utf8(bytes).map_err(|_| self.err_at(ErrorKind::BadUtf8, at))?;
+                }
+                4 => {
+                    let len = self.length(4, "array", u64::from(self.limits.batch_items))?;
+                    if len > 0 {
+                        let Some(slot) = stack.get_mut(sp) else {
+                            return Err(self.err_at(ErrorKind::TooDeep, at));
+                        };
+                        *slot = Some(Frame::Array { remaining: len - 1 });
+                        sp += 1;
+                        continue 'item;
+                    }
+                }
+                5 => {
+                    let len = self.length(5, "map", u64::from(self.limits.batch_items))?;
+                    if len > 0 {
+                        let Some(slot) = stack.get_mut(sp) else {
+                            return Err(self.err_at(ErrorKind::TooDeep, at));
+                        };
+                        *slot = Some(Frame::MapVal { remaining: len - 1, previous: None, key_at: self.pos });
+                        sp += 1;
+                        continue 'item;
+                    }
+                }
+                6 => return Err(self.err_at(ErrorKind::Tag, at)),
+                _ => {
+                    // A simple value's head is the whole item, or its first byte of two: the
+                    // position stays past the head the check above read.
+                    self.pos = at + 1;
+                    match ib & 0x1f {
+                        0..=23 => {}
+                        24 => {
+                            let value = self.byte()?;
+                            if value < 32 {
+                                return Err(self.err_at(ErrorKind::ReservedSimpleValue(value), at));
                             }
                         }
+                        25..=27 => return Err(self.err_at(ErrorKind::Float, at)),
+                        28..=30 => {
+                            return Err(self.err_at(ErrorKind::ReservedAdditional(ib & 0x1f), at));
+                        }
+                        31 => return Err(self.err_at(ErrorKind::IndefiniteLength, at)),
+                        other => return Err(self.err_at(ErrorKind::ReservedAdditional(other), at)),
                     }
-                    previous = Some((key_at, key_end));
-                    self.walk()?;
                 }
             }
-            6 => return Err(self.err_at(ErrorKind::Tag, at)),
-            _ => {
-                // A simple value's head is the whole item, or its first byte of two: the position
-                // stays past the head the check above read.
-                self.pos = at + 1;
-                match ib & 0x1f {
-                    // 0 to 23: the head is the item.
-                    0..=23 => {}
-                    // RFC 8949 section 3.3: a two-byte simple value whose second byte is below 32
-                    // is not well-formed, and every such form has a one-byte form (0 to 23) or a
-                    // reserved number (24 to 31).
-                    24 => {
-                        let value = self.byte()?;
-                        if value < 32 {
-                            return Err(self.err_at(ErrorKind::ReservedSimpleValue(value), at));
+            self.depth = self.depth.saturating_sub(1);
+
+            loop {
+                if sp == 0 {
+                    return Ok(());
+                }
+                let Some(frame) = stack.get_mut(sp - 1).and_then(Option::take) else {
+                    return Ok(());
+                };
+                match frame {
+                    Frame::Array { remaining } => {
+                        if remaining > 0 {
+                            if let Some(slot) = stack.get_mut(sp - 1) {
+                                *slot = Some(Frame::Array { remaining: remaining - 1 });
+                            }
+                            continue 'item;
                         }
+                        sp -= 1;
+                        self.depth = self.depth.saturating_sub(1);
                     }
-                    25..=27 => return Err(self.err_at(ErrorKind::Float, at)),
-                    28..=30 => {
-                        return Err(self.err_at(ErrorKind::ReservedAdditional(ib & 0x1f), at));
+                    Frame::MapVal { remaining, previous, key_at } => {
+                        let key_end = self.pos;
+                        if let Some((start, end)) = previous {
+                            let before = self
+                                .input
+                                .get(start..end)
+                                .ok_or_else(|| self.err_at(ErrorKind::Truncated, start))?;
+                            let this = self
+                                .input
+                                .get(key_at..key_end)
+                                .ok_or_else(|| self.err_at(ErrorKind::Truncated, key_at))?;
+                            match this.cmp(before) {
+                                Ordering::Greater => {}
+                                Ordering::Equal => {
+                                    return Err(self.err_at(ErrorKind::DuplicateKey(0), key_at));
+                                }
+                                Ordering::Less => {
+                                    return Err(self.err_at(ErrorKind::UnsortedKeys, key_at));
+                                }
+                            }
+                        }
+                        if let Some(slot) = stack.get_mut(sp - 1) {
+                            *slot = Some(Frame::MapKey { remaining, previous: Some((key_at, key_end)) });
+                        }
+                        continue 'item;
                     }
-                    31 => return Err(self.err_at(ErrorKind::IndefiniteLength, at)),
-                    _ => unreachable!("the additional information is five bits"),
+                    Frame::MapKey { remaining, previous } => {
+                        if remaining > 0 {
+                            if let Some(slot) = stack.get_mut(sp - 1) {
+                                *slot = Some(Frame::MapVal { remaining: remaining - 1, previous, key_at: self.pos });
+                            }
+                            continue 'item;
+                        }
+                        sp -= 1;
+                        self.depth = self.depth.saturating_sub(1);
+                    }
                 }
             }
         }
-        self.depth = self.depth.saturating_sub(1);
-        Ok(())
     }
 }
 
@@ -761,7 +840,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 fn major_name(major: u8) -> &'static str {
     match major {
@@ -781,41 +860,32 @@ fn major_name(major: u8) -> &'static str {
 /// This is the check of the bytes alone: heads, lengths, order, duplicates, floats, tags, depth
 /// and size. Whether a key is one the schema has is a decoder's to say; [`validate_as`] does both.
 pub fn validate(bytes: &[u8], limits: &Limits) -> Result<(), Error> {
-    if bytes.len() as u64 > u64::from(limits.request) {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if len > u64::from(limits.request) {
         return Err(Error {
             kind: ErrorKind::OversizeItem {
                 what: "message",
-                len: bytes.len() as u64,
+                len,
                 limit: u64::from(limits.request),
             },
             at: 0,
         });
     }
-    let mut r = Reader::new(bytes, limits);
+    let mut r = Reader::for_validate(bytes, limits);
     r.walk()?;
     r.finish()
 }
 
 /// Checks the bytes and then reads them as `T`, so a key the type does not have is refused too.
-///
-/// This is [`decode`]: a bounded structural pass, then each field's schema-specific budgets.
-/// Logical paths use the message budget; ordinary strings keep [`Limits::string`].
-pub fn validate_as<T: Wire>(bytes: &[u8], limits: &Limits) -> Result<T, Error> {
-    decode(bytes, limits)
+pub fn validate_as<T: Wire>(bytes: &[u8], limits: &Limits, alloc: WireAlloc) -> Result<T, Error> {
+    decode(bytes, limits, alloc)
 }
 
 /// Reads one value of `T` from canonical CBOR, after the validator's pass over the same bytes.
-///
-/// Message size, depth and canonical form are checked before schema decoding. The structural
-/// pass allows text within the message budget, because it cannot identify SourcePath.
-/// The typed pass applies ordinary string and logical path budgets independently.
-pub fn decode<T: Wire>(bytes: &[u8], limits: &Limits) -> Result<T, Error> {
-    // The structural pass cannot know which text is a logical path. Bound it by
-    // request bytes; typed fields then enforce their own budgets. Bytes-only
-    // validate keeps the ordinary text-string budget.
+pub fn decode<T: Wire>(bytes: &[u8], limits: &Limits, alloc: WireAlloc) -> Result<T, Error> {
     let structural = Limits { string: limits.request, ..*limits };
     validate(bytes, &structural)?;
-    let mut r = Reader::new(bytes, limits);
+    let mut r = Reader::new(bytes, limits, alloc);
     let value = T::decode(&mut r)?;
     r.finish()?;
     Ok(value)
@@ -888,13 +958,18 @@ impl<const N: usize> Wire for [u8; N] {
     }
 }
 
-impl Wire for String {
+impl<B: Allocator> Wire for String<B>
+where
+    B: From<WireAlloc>,
+{
     fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
         e.text(self);
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
-        Ok(r.text()?.to_owned())
+        let alloc = r.alloc()?;
+        let text = r.text()?;
+        Ok(String::from_str_in(text, B::from(alloc)))
     }
 }
 
@@ -917,7 +992,7 @@ impl<T: Wire> Wire for Option<T> {
     }
 }
 
-impl<T: Wire> Wire for Vec<T> {
+impl<T: Wire> Wire for WireVec<T> {
     fn encode<A: Allocator + Clone>(&self, e: &mut Encoder<A>) {
         e.array(self.len());
         for v in self {
@@ -926,8 +1001,9 @@ impl<T: Wire> Wire for Vec<T> {
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
+        let alloc = r.alloc()?;
         let len = r.array()?;
-        let mut out = Vec::with_capacity(usize::try_from(len).unwrap_or(0).min(1024));
+        let mut out = Vec::with_capacity_in(usize::try_from(len).unwrap_or(0).min(1024), alloc);
         for _ in 0..len {
             out.push(T::decode(r)?);
         }
@@ -972,19 +1048,13 @@ impl<A: Wire, B: Wire, C: Wire> Wire for (A, B, C) {
 
 /// The keys of a map, held in ascending order of their encoded bytes and without duplicates.
 #[derive(Clone)]
-pub struct Set<T, A: Allocator + Clone = Global> {
+pub struct Set<T, A: Allocator + Clone = WireAlloc> {
     items: Vec<T, A>,
 }
 
 impl<T: fmt::Debug, A: Allocator + Clone> fmt::Debug for Set<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Set").field("items", &self.items).finish()
-    }
-}
-
-impl<T> Default for Set<T> {
-    fn default() -> Self {
-        Self { items: Vec::new_in(Global) }
     }
 }
 
@@ -997,20 +1067,27 @@ impl<T: PartialEq, A: Allocator + Clone, B: Allocator + Clone> PartialEq<Set<T, 
 impl<T: Eq, A: Allocator + Clone> Eq for Set<T, A> {}
 
 impl<T: PartialOrd, A: Allocator + Clone, B: Allocator + Clone> PartialOrd<Set<T, B>> for Set<T, A> {
-    fn partial_cmp(&self, other: &Set<T, B>) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Set<T, B>) -> Option<Ordering> {
         self.items.as_slice().partial_cmp(other.items.as_slice())
     }
 }
 
 impl<T: Ord, A: Allocator + Clone> Ord for Set<T, A> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         self.items.as_slice().cmp(other.items.as_slice())
     }
 }
 
-impl<T: std::hash::Hash, A: Allocator + Clone> std::hash::Hash for Set<T, A> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(self.items.as_slice(), state);
+impl<T: Hash, A: Allocator + Clone> Hash for Set<T, A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Hash::hash(self.items.as_slice(), state);
+    }
+}
+
+impl<T, A: Allocator + Clone> Set<T, A> {
+    /// An empty set in `alloc`.
+    pub fn empty_in(alloc: A) -> Set<T, A> {
+        Set { items: Vec::new_in(alloc) }
     }
 }
 
@@ -1021,25 +1098,34 @@ impl<T: Wire, A: Allocator + Clone> Set<T, A> {
     pub fn new(mut items: Vec<T, A>) -> Set<T, A> {
         let alloc = items.allocator().clone();
         let mut keyed = Vec::with_capacity_in(items.len(), alloc.clone());
-        keyed.extend(items.iter().enumerate().map(|(i, item)| (Encoder::of(item, alloc.clone()), i)));
-        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (i, item) in items.iter().enumerate() {
+            keyed.push((Encoder::of(item, alloc.clone()), i));
+        }
+        keyed.sort_unstable_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()).then_with(|| a.1.cmp(&b.1)));
 
         let mut destination = Vec::with_capacity_in(items.len(), alloc);
         destination.resize(items.len(), 0);
         for (to, (_, from)) in keyed.iter().enumerate() {
-            destination[*from] = to;
+            if let Some(slot) = destination.get_mut(*from) {
+                *slot = to;
+            }
         }
         for at in 0..items.len() {
-            // Each swap settles one item at its destination, so the whole permutation takes at most len - 1 swaps.
-            while destination[at] != at {
-                let to = destination[at];
+            while let Some(&to) = destination.get(at) {
+                if to == at {
+                    break;
+                }
                 items.swap(at, to);
                 destination.swap(at, to);
             }
         }
-        let mut at = 0;
+        let mut at = 0usize;
         items.retain(|_| {
-            let unique = at == 0 || keyed[at - 1].0 != keyed[at].0;
+            let unique = at == 0
+                || keyed
+                    .get(at - 1)
+                    .zip(keyed.get(at))
+                    .is_some_and(|(prev, curr)| prev.0.as_slice() != curr.0.as_slice());
             at += 1;
             unique
         });
@@ -1067,20 +1153,19 @@ impl<T: Wire, A: Allocator + Clone> Set<T, A> {
     }
 
     /// The items, in their canonical order.
-    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+    pub fn iter(&self) -> slice::Iter<'_, T> {
         self.items.iter()
     }
 
-    /// Writes the canonical array using the encoder's allocator for its temporary keys. This is also available for
-    /// a set whose storage uses a non-global allocator; protocol decoding owns the default storage.
+    /// Writes the canonical array using the encoder's allocator for its temporary keys.
     pub fn encode<B: Allocator + Clone>(&self, e: &mut Encoder<B>) {
-        // A user-defined Wire value may have interior mutability. Canonicalize its current bytes, then write those
-        // exact bytes rather than asking the value to encode a second time after its sort key was computed.
         let alloc = e.allocator().clone();
         let mut keyed = Vec::with_capacity_in(self.items.len(), alloc.clone());
-        keyed.extend(self.items.iter().map(|item| Encoder::of(item, alloc.clone())));
-        keyed.sort_unstable();
-        keyed.dedup();
+        for item in &self.items {
+            keyed.push(Encoder::of(item, alloc.clone()));
+        }
+        keyed.sort_unstable_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        keyed.dedup_by(|a, b| a.as_slice() == b.as_slice());
         e.array(keyed.len());
         for bytes in keyed {
             e.out.extend_from_slice(&bytes);
@@ -1089,22 +1174,30 @@ impl<T: Wire, A: Allocator + Clone> Set<T, A> {
 }
 
 impl<T: Wire> Set<T> {
+    /// Collects an iterator into a canonical set stored in `alloc`.
+    pub fn from_iter_in<I: IntoIterator<Item = T>>(iter: I, alloc: WireAlloc) -> Set<T> {
+        let mut items = Vec::new_in(alloc);
+        items.extend(iter);
+        Set::new(items)
+    }
+
     /// The items of an array whose header is already read, in their canonical order.
     fn items_of(r: &mut Reader<'_>, len: u64) -> Result<Set<T>, Error> {
-        let mut items = Vec::with_capacity_in(usize::try_from(len).unwrap_or(0).min(1024), Global);
-        let mut previous: Option<Vec<u8>> = None;
+        let alloc = r.alloc()?;
+        let mut items = Vec::with_capacity_in(usize::try_from(len).unwrap_or(0).min(1024), alloc);
+        let mut previous: Option<WireVec<u8>> = None;
         for _ in 0..len {
             let at = r.position();
             let item = T::decode(r)?;
-            let bytes = Encoder::of(&item, Global);
+            let bytes = Encoder::of(&item, alloc);
             if let Some(before) = &previous {
-                match bytes.cmp(before) {
-                    std::cmp::Ordering::Greater => {}
-                    std::cmp::Ordering::Equal => {
+                match bytes.as_slice().cmp(before.as_slice()) {
+                    Ordering::Greater => {}
+                    Ordering::Equal => {
                         r.array_finish();
                         return Err(r.err_at(ErrorKind::DuplicateItem, at));
                     }
-                    std::cmp::Ordering::Less => {
+                    Ordering::Less => {
                         r.array_finish();
                         return Err(r.err_at(ErrorKind::UnsortedSet, at));
                     }
@@ -1115,14 +1208,6 @@ impl<T: Wire> Set<T> {
         }
         r.array_finish();
         Ok(Set { items })
-    }
-}
-
-impl<T: Wire> FromIterator<T> for Set<T> {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Set<T> {
-        let mut items = Vec::new_in(Global);
-        items.extend(iter);
-        Set::new(items)
     }
 }
 
@@ -1138,21 +1223,21 @@ impl<T: Wire> Wire for Set<T> {
 }
 
 /// Bytes that are not a `Vec`'s array: a byte string, as a blob, a hash or a program's output is.
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Bytes {
     /// The bytes.
-    pub bytes: Vec<u8>,
+    pub bytes: WireVec<u8>,
 }
 
-impl From<Vec<u8>> for Bytes {
-    fn from(bytes: Vec<u8>) -> Bytes {
+impl From<WireVec<u8>> for Bytes {
+    fn from(bytes: WireVec<u8>) -> Bytes {
         Bytes { bytes }
     }
 }
 
 impl crate::vectors::Sample for Bytes {
-    fn sample(g: &mut crate::vectors::Gen) -> Self {
-        Bytes { bytes: g.bytes(Global) }
+    fn sample(g: &mut crate::vectors::Gen, alloc: WireAlloc) -> Self {
+        Bytes { bytes: g.bytes(alloc) }
     }
 }
 
@@ -1162,24 +1247,20 @@ impl Wire for Bytes {
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
-        Ok(Bytes { bytes: r.bytes()?.to_vec() })
+        let alloc = r.alloc()?;
+        let slice = r.bytes()?;
+        let mut bytes = Vec::with_capacity_in(slice.len(), alloc);
+        bytes.extend_from_slice(slice);
+        Ok(Bytes { bytes })
     }
 }
 
 /// A schema type's struct: a map of the given field numbers, every key present, ascending.
-///
-/// The keys are literals in ascending order; the decoder reads them in that order, so a missing,
-/// repeated, out-of-order or unknown key is refused by name.
-///
-/// A `lookup [0, 1]` clause after the name holds those fields' collections to
-/// [`Limits::lookup_items`] rather than [`Limits::batch_items`]: a lookup's collection is 4,096
-/// items and a batch's is 65,536, and the bytes-only validator cannot tell one array from the
-/// other, so a lookup's schema holds its own field to the smaller number.
 #[macro_export]
 macro_rules! wire_struct {
     (
         $(#[$meta:meta])*
-        $name:ident { $(validate $validator:path,)? $(sample $repair:path,)? $(lookup [$($lookup:literal),* $(,)?],)? $($key:literal => $field:ident : $ty:ty),* $(,)? }
+        $name:ident { $(validate $validator:path,)? $(sample $repair:path,)? $(lookup ($($lookup:literal),* $(,)?),)? $($key:literal => $field:ident : $ty:ty),* $(,)? }
     ) => {
         $(#[$meta])*
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1191,8 +1272,8 @@ macro_rules! wire_struct {
         }
 
         impl $crate::Wire for $name {
-            fn encode<__Alloc: ::std::alloc::Allocator + Clone>(&self, e: &mut $crate::Encoder<__Alloc>) {
-                e.map($crate::wire_struct!(@count $($field),*));
+            fn encode<__Alloc: ::core::alloc::Allocator + Clone>(&self, e: &mut $crate::Encoder<__Alloc>) {
+                e.map(<[()]>::len(&[$({ let _ = stringify!($field); () }),*]));
                 $(
                     e.uint($key);
                     $crate::Wire::encode(&self.$field, e);
@@ -1200,9 +1281,6 @@ macro_rules! wire_struct {
             }
 
             fn decode(r: &mut $crate::Reader<'_>) -> Result<Self, $crate::Error> {
-                // The keys whose collections are a lookup's rather than a batch's, as the
-                // struct's `lookup` clause lists them. The slice is built once, so the per-field
-                // repetition below only names `$key`.
                 let lookup: &[u64] = &[$($($lookup),*)?];
                 r.map_start()?;
                 $(
@@ -1225,45 +1303,38 @@ macro_rules! wire_struct {
         }
 
         impl $crate::vectors::Sample for $name {
-            fn sample(g: &mut $crate::vectors::Gen) -> Self {
+            fn sample(g: &mut $crate::vectors::Gen, alloc: $crate::WireAlloc) -> Self {
                 #[allow(unused_mut)]
                 let mut value = $name {
-                    $($field: $crate::vectors::Sample::sample(g)),*
+                    $($field: $crate::vectors::Sample::sample(g, alloc)),*
                 };
                 $($repair(&mut value);)?
                 value
             }
         }
     };
-    (@count $($field:ident),*) => {
-        <[()]>::len(&[$($crate::wire_struct!(@one $field)),*])
-    };
-    (@one $field:ident) => { () };
 }
 
 /// A schema type's enum: the two-element array `[discriminant, payload]`, the payload the payload
 /// type's own map (or a unit variant's `null`).
-///
-/// The macro accumulates the enum's items in a token list, because a macro call is not an item
-/// inside an `enum` body, and writes the three walks (discriminant, encode, decode) as statements.
 #[macro_export]
 macro_rules! wire_enum {
     (
         $(#[$meta:meta])*
         $name:ident { $($variants:tt)* }
     ) => {
-        $crate::wire_enum!(@declare $name { $($variants)* } [ $($variants)* ] {} $(#[$meta])*);
+        wire_enum!(@declare $name { $($variants)* } [ $($variants)* ] {} $(#[$meta])*);
     };
 
     (@declare $name:ident { $($orig:tt)* } [ $variant:ident => $disc:literal ($ty:ty), $($rest:tt)* ] { $($done:tt)* } $(#[$meta:meta])*) => {
-        $crate::wire_enum!(@declare $name { $($orig)* } [ $($rest)* ] {
+        wire_enum!(@declare $name { $($orig)* } [ $($rest)* ] {
             $($done)*
             #[allow(missing_docs)]
             $variant($ty),
         } $(#[$meta])*);
     };
     (@declare $name:ident { $($orig:tt)* } [ $variant:ident => $disc:literal, $($rest:tt)* ] { $($done:tt)* } $(#[$meta:meta])*) => {
-        $crate::wire_enum!(@declare $name { $($orig)* } [ $($rest)* ] {
+        wire_enum!(@declare $name { $($orig)* } [ $($rest)* ] {
             $($done)*
             #[allow(missing_docs)]
             $variant,
@@ -1279,22 +1350,20 @@ macro_rules! wire_enum {
         impl $name {
             /// The integer of the variant's comment in docs/distributed.md.
             pub fn discriminant(&self) -> u64 {
-                $crate::wire_enum!(@disc self, $name, $($orig)*);
-                unreachable!("every variant has a discriminant")
+                wire_enum!(@disc self, $name, [ $($orig)* ] {})
             }
         }
 
         impl $crate::Wire for $name {
-            fn encode<__Alloc: ::std::alloc::Allocator + Clone>(&self, e: &mut $crate::Encoder<__Alloc>) {
+            fn encode<__Alloc: ::core::alloc::Allocator + Clone>(&self, e: &mut $crate::Encoder<__Alloc>) {
                 e.array(2);
-                $crate::wire_enum!(@write self, e, $name, $($orig)*);
-                unreachable!("every variant is written")
+                wire_enum!(@write self, e, $name, [ $($orig)* ] {})
             }
 
             fn decode(r: &mut $crate::Reader<'_>) -> Result<Self, $crate::Error> {
                 r.array_start(2)?;
                 let disc = r.uint()?;
-                $crate::wire_enum!(@read r, disc, $name, $($orig)*);
+                wire_enum!(@read r, disc, $name, $($orig)*);
                 let at = r.position();
                 Err($crate::Error { kind: $crate::ErrorKind::UnknownKey(disc), at })
             }
@@ -1305,70 +1374,86 @@ macro_rules! wire_enum {
         }
 
         impl $crate::vectors::Sample for $name {
-            #[allow(unused_assignments)]
-            fn sample(g: &mut $crate::vectors::Gen) -> Self {
-                let mut pick = g.below($crate::wire_enum!(@count $($orig)*) as u64);
-                $crate::wire_enum!(@sample g, pick, $name, $($orig)*);
-                unreachable!("every variant is sampled")
+            #[allow(unused_assignments, unused_variables)]
+            fn sample(g: &mut $crate::vectors::Gen, alloc: $crate::WireAlloc) -> Self {
+                let mut pick = g.below(wire_enum!(@count $($orig)*));
+                wire_enum!(@sample g, alloc, pick, $name, $($orig)*)
             }
         }
     };
 
-    (@sample $g:ident, $pick:ident, $name:ident, $variant:ident => $disc:literal ($ty:ty), $($rest:tt)*) => {
-        if $pick == 0 {
-            return $name::$variant($crate::vectors::Sample::sample($g));
-        }
-        $pick -= 1;
-        $crate::wire_enum!(@sample $g, $pick, $name, $($rest)*);
+    (@sample $g:ident, $alloc:ident, $pick:ident, $name:ident, $variant:ident => $disc:literal ($ty:ty),) => {
+        $name::$variant($crate::vectors::Sample::sample($g, $alloc))
     };
-    (@sample $g:ident, $pick:ident, $name:ident, $variant:ident => $disc:literal, $($rest:tt)*) => {
-        if $pick == 0 {
-            return $name::$variant;
-        }
-        $pick -= 1;
-        $crate::wire_enum!(@sample $g, $pick, $name, $($rest)*);
+    (@sample $g:ident, $alloc:ident, $pick:ident, $name:ident, $variant:ident => $disc:literal,) => {
+        $name::$variant
     };
-    (@sample $g:ident, $pick:ident, $name:ident,) => {};
+    (@sample $g:ident, $alloc:ident, $pick:ident, $name:ident, $variant:ident => $disc:literal ($ty:ty), $($rest:tt)+) => {
+        if $pick == 0 {
+            $name::$variant($crate::vectors::Sample::sample($g, $alloc))
+        } else {
+            $pick -= 1;
+            wire_enum!(@sample $g, $alloc, $pick, $name, $($rest)+)
+        }
+    };
+    (@sample $g:ident, $alloc:ident, $pick:ident, $name:ident, $variant:ident => $disc:literal, $($rest:tt)+) => {
+        if $pick == 0 {
+            $name::$variant
+        } else {
+            $pick -= 1;
+            wire_enum!(@sample $g, $alloc, $pick, $name, $($rest)+)
+        }
+    };
 
     (@count $variant:ident => $disc:literal ($ty:ty), $($rest:tt)*) => {
-        1 + $crate::wire_enum!(@count $($rest)*)
+        1u64 + wire_enum!(@count $($rest)*)
     };
     (@count $variant:ident => $disc:literal, $($rest:tt)*) => {
-        1 + $crate::wire_enum!(@count $($rest)*)
+        1u64 + wire_enum!(@count $($rest)*)
     };
-    (@count) => { 0 };
+    (@count) => { 0u64 };
 
-    (@disc $this:ident, $name:ident, $variant:ident => $disc:literal ($ty:ty), $($rest:tt)*) => {
-        if let $name::$variant(..) = $this {
-            return $disc;
-        }
-        $crate::wire_enum!(@disc $this, $name, $($rest)*);
+    (@disc $this:ident, $name:ident, [ $variant:ident => $disc:literal ($ty:ty), $($rest:tt)* ] { $($arms:tt)* }) => {
+        wire_enum!(@disc $this, $name, [ $($rest)* ] {
+            $($arms)*
+            $name::$variant(..) => $disc,
+        })
     };
-    (@disc $this:ident, $name:ident, $variant:ident => $disc:literal, $($rest:tt)*) => {
-        if matches!($this, $name::$variant) {
-            return $disc;
-        }
-        $crate::wire_enum!(@disc $this, $name, $($rest)*);
+    (@disc $this:ident, $name:ident, [ $variant:ident => $disc:literal, $($rest:tt)* ] { $($arms:tt)* }) => {
+        wire_enum!(@disc $this, $name, [ $($rest)* ] {
+            $($arms)*
+            $name::$variant => $disc,
+        })
     };
-    (@disc $this:ident, $name:ident,) => {};
+    (@disc $this:ident, $name:ident, [] { $($arms:tt)* }) => {
+        match $this {
+            $($arms)*
+        }
+    };
 
-    (@write $this:ident, $e:ident, $name:ident, $variant:ident => $disc:literal ($ty:ty), $($rest:tt)*) => {
-        if let $name::$variant(payload) = $this {
-            $e.uint($disc);
-            $crate::Wire::encode(payload, $e);
-            return;
-        }
-        $crate::wire_enum!(@write $this, $e, $name, $($rest)*);
+    (@write $this:ident, $e:ident, $name:ident, [ $variant:ident => $disc:literal ($ty:ty), $($rest:tt)* ] { $($arms:tt)* }) => {
+        wire_enum!(@write $this, $e, $name, [ $($rest)* ] {
+            $($arms)*
+            $name::$variant(payload) => {
+                $e.uint($disc);
+                $crate::Wire::encode(payload, $e);
+            }
+        })
     };
-    (@write $this:ident, $e:ident, $name:ident, $variant:ident => $disc:literal, $($rest:tt)*) => {
-        if matches!($this, $name::$variant) {
-            $e.uint($disc);
-            $e.null();
-            return;
-        }
-        $crate::wire_enum!(@write $this, $e, $name, $($rest)*);
+    (@write $this:ident, $e:ident, $name:ident, [ $variant:ident => $disc:literal, $($rest:tt)* ] { $($arms:tt)* }) => {
+        wire_enum!(@write $this, $e, $name, [ $($rest)* ] {
+            $($arms)*
+            $name::$variant => {
+                $e.uint($disc);
+                $e.null();
+            }
+        })
     };
-    (@write $this:ident, $e:ident, $name:ident,) => {};
+    (@write $this:ident, $e:ident, $name:ident, [] { $($arms:tt)* }) => {
+        match $this {
+            $($arms)*
+        }
+    };
 
     (@read $r:ident, $disc:ident, $name:ident, $variant:ident => $discriminant:literal ($ty:ty), $($rest:tt)*) => {
         if $disc == $discriminant {
@@ -1376,7 +1461,7 @@ macro_rules! wire_enum {
             $r.array_end()?;
             return Ok(value);
         }
-        $crate::wire_enum!(@read $r, $disc, $name, $($rest)*);
+        wire_enum!(@read $r, $disc, $name, $($rest)*);
     };
     (@read $r:ident, $disc:ident, $name:ident, $variant:ident => $discriminant:literal, $($rest:tt)*) => {
         if $disc == $discriminant {
@@ -1384,7 +1469,7 @@ macro_rules! wire_enum {
             $r.array_end()?;
             return Ok($name::$variant);
         }
-        $crate::wire_enum!(@read $r, $disc, $name, $($rest)*);
+        wire_enum!(@read $r, $disc, $name, $($rest)*);
     };
     (@read $r:ident, $disc:ident, $name:ident,) => {};
 }

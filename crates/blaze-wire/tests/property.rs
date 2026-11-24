@@ -1,13 +1,16 @@
 //! A property over random bytes: whatever the validator accepts is canonical, which a test checks
-//! by reading it as a value and writing that value again. A byte string the validator took but the
-//! encoder would not write is exactly the class of bug the validator exists to refuse, so this is
-//! the test that keeps the two halves of the crate in step.
-//!
-//! The bytes are made two ways: from a random value of a random type with bytes flipped, inserted
-//! and dropped, and from scratch out of the CBOR heads the schema uses.
+//! by reading it as a value and writing that value again.
 
+#![no_std]
+#![feature(allocator_api)]
+
+use blaze_own::Vec;
 use blaze_wire::vectors::{Entry, Gen, every};
-use blaze_wire::{Limits, validate};
+use blaze_wire::{Limits, WireAlloc, validate};
+
+fn heap() -> WireAlloc {
+    blaze_own::testing::heap().shared()
+}
 
 fn limits() -> Limits {
     Limits::DOCUMENTED
@@ -17,26 +20,26 @@ fn limits() -> Limits {
 /// or read back as a value whose encoding is the bytes themselves.
 #[test]
 fn bytes_the_validator_accepts_are_canonical() {
+    let alloc = heap();
     let entries: [Entry; 43] = every();
     let mut g = Gen::new(0x5eed);
     let mut accepted = 0u64;
     let mut refused = 0u64;
     for round in 0..4_000u64 {
-        let entry = &entries[(g.below(entries.len() as u64)) as usize];
-        let mut bytes = (entry.vector)(g.below(64) + 1).cbor;
-        // One or two changes: a flipped byte, a dropped byte, an inserted byte.
+        let entry = &entries[usize::try_from(g.below(u64::try_from(entries.len()).unwrap())).unwrap()];
+        let mut bytes = (entry.vector)(g.below(64) + 1, alloc).cbor;
         for _ in 0..=g.below(2) {
             if bytes.is_empty() {
-                bytes.push(g.next_u64() as u8);
+                bytes.push(u8::try_from(g.next_u64() & 0xff).unwrap());
                 continue;
             }
-            let at = g.below(bytes.len() as u64) as usize;
+            let at = usize::try_from(g.below(u64::try_from(bytes.len()).unwrap())).unwrap();
             match g.below(3) {
                 0 => bytes[at] ^= 1 << g.below(8),
                 1 => {
                     bytes.remove(at);
                 }
-                _ => bytes.insert(at, g.next_u64() as u8),
+                _ => bytes.insert(at, u8::try_from(g.next_u64() & 0xff).unwrap()),
             }
         }
         if validate(&bytes, &limits()).is_err() {
@@ -44,12 +47,10 @@ fn bytes_the_validator_accepts_are_canonical() {
             continue;
         }
         accepted += 1;
-        // The bytes are canonical, so reading them as the type and writing that value gives the
-        // same bytes. A type whose value the bytes are not is refused by the schema, which is
-        // another offence the validator's bytes pass did not see.
-        if let Ok(again) = (entry.reencode)(&bytes) {
+        if let Ok(again) = (entry.reencode)(&bytes, alloc) {
             assert_eq!(
-                again, bytes,
+                again.as_slice(),
+                bytes.as_slice(),
                 "{round}: {}: the validator took bytes the encoder would not write: {bytes:02x?}",
                 entry.name
             );
@@ -63,30 +64,30 @@ fn bytes_the_validator_accepts_are_canonical() {
 /// client that encodes wrong would send.
 #[test]
 fn random_heads_are_refused_or_canonical() {
+    let alloc = heap();
     let mut g = Gen::new(0xc0ffee);
     let mut accepted = 0u64;
     for _ in 0..4_000 {
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::new_in(alloc);
         let len = g.below(6) + 1;
         for _ in 0..len {
-            bytes.push(g.next_u64() as u8);
+            bytes.push(u8::try_from(g.next_u64() & 0xff).unwrap());
         }
         if validate(&bytes, &limits()).is_ok() {
             accepted += 1;
         }
     }
-    // Random bytes are almost never one canonical item, but some are (a small integer, a short
-    // string), so the count is small and not zero.
     assert!(accepted < 4_000, "every random string was accepted, so the validator checks nothing");
 }
 
 /// Every type's own bytes are accepted by the type-aware check, which is the strictest form.
 #[test]
 fn every_types_bytes_pass_the_strictest_check() {
+    let alloc = heap();
     let mut checked = 0;
     for entry in every() {
         for seed in 1..=8u64 {
-            let bytes = (entry.vector)(seed).cbor;
+            let bytes = (entry.vector)(seed, alloc).cbor;
             if let Err(e) = validate(&bytes, &limits()) {
                 panic!("{}: {e}", entry.name);
             }

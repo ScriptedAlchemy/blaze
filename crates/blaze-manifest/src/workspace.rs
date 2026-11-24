@@ -220,17 +220,17 @@ impl<'c, F: Files> Workspace<'c, F> {
     ) -> Result<Workspace<'c, F>, ManifestError> {
         // `has_root`: on Windows the daemon names `C:\a` as `/C:/a`, which has no prefix.
         if !manifest_path.has_root() {
-            return Err(WorkspaceError::NotAbsolute { manifest: manifest_path.to_owned() }.into());
+            return Err(WorkspaceError::NotAbsolute { manifest: PathBuf::from(manifest_path) }.into());
         }
         #[cfg(windows)]
-        let manifest_path = ctx.files().canonicalize(manifest_path).map_err(|error| {
-            ManifestError::Canonicalize { path: manifest_path.to_owned(), error }
+        let current_manifest = ctx.files().canonicalize(manifest_path).map_err(|error| {
+            ManifestError::Canonicalize { path: PathBuf::from(manifest_path), error }
         })?;
-        #[cfg(windows)]
-        let manifest_path = manifest_path.as_path();
+        #[cfg(not(windows))]
+        let current_manifest = PathBuf::from(manifest_path);
         let mut ws = Workspace {
             ctx,
-            current_manifest: manifest_path.to_owned(),
+            current_manifest: PathBuf::new(),
             packages: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             root_manifest: None,
             target_dir: None,
@@ -242,7 +242,8 @@ impl<'c, F: Files> Workspace<'c, F> {
             custom_metadata: None,
             warnings: Vec::new(),
         };
-        ws.root_manifest = ws.find_root(manifest_path)?;
+        ws.root_manifest = ws.find_root(&current_manifest)?;
+        ws.current_manifest = current_manifest;
         ws.target_dir = ctx.config.target_dir()?;
         ws.build_dir = ctx.config.build_dir(ws.root_manifest())?;
         ws.custom_metadata = ws.load_workspace_config()?.and_then(|cfg| cfg.custom_metadata);
@@ -467,7 +468,7 @@ impl<'c, F: Files> Workspace<'c, F> {
             for (path, default_member_glob) in default {
                 let manifest_path =
                     normalize_member_path(self.ctx.files(), &path.join("Cargo.toml"), self.root());
-                let normalized_path = manifest_path.parent().unwrap();
+                let normalized_path = manifest_path.parent().unwrap_or(manifest_path.as_path());
                 if !self.member_set.contains(&manifest_path) {
                     let exclude = members_paths.iter().any(|(m, _)| m == normalized_path)
                         && workspace_config.is_excluded(&normalized_path);
@@ -721,10 +722,11 @@ impl<'c, F: Files> Workspace<'c, F> {
 mod windows_member_path_tests {
     use super::*;
     use crate::{Config, metadata::export_no_deps};
+    use std::{borrow::Cow, io};
 
     #[test]
     fn path_dependencies_and_member_lookups_share_the_workspace_identity() {
-        let scratch = stdx::tempfile::NamedTempDir::new("blaze-member-identity-").unwrap();
+        let scratch = blaze_core::temp::TempDir::for_test("blaze-member-identity-");
         let root = scratch.path().join("workspace");
         for (path, contents) in [
             ("Cargo.toml", "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n"),
@@ -773,16 +775,16 @@ mod windows_member_path_tests {
     fn alias_reconciliation_uses_the_supplied_files_reader() {
         struct View;
         impl Files for View {
-            fn read(&self, _: &Path) -> std::io::Result<std::borrow::Cow<'_, [u8]>> {
+            fn read(&self, _: &Path) -> io::Result<Cow<'_, [u8]>> {
                 panic!("identity must not read file bytes")
             }
             fn kind(&self, _: &Path) -> Option<crate::files::FileKind> {
                 panic!("the view owns canonicalization")
             }
-            fn list(&self, _: &Path) -> std::io::Result<Vec<(String, bool)>> {
+            fn list(&self, _: &Path) -> io::Result<Vec<(String, bool)>> {
                 panic!("identity must not list directories")
             }
-            fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
                 assert_eq!(path, Path::new(r"C:\workspace\member\Cargo.toml"));
                 Ok(PathBuf::from("/C:/workspace/member/Cargo.toml"))
             }

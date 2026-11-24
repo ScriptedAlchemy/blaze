@@ -1,1129 +1,1374 @@
-//! The HTTP/1.1 side: the calls over `hyper`, and the answers they get.
+//! Non-blocking HTTP/1.1 cache server over `blaze-sys` (`poll` + non-blocking TCP).
 //!
-//! One connection is one task. A message is read whole, held to [`Limits::request`] and
-//! refused by the validator when it is not canonical CBOR; a `PUT` of a blob is streamed to a
-//! temporary file as it arrives, so a blob larger than the memory of the machine is still
-//! taken, and nothing of it is named until it is checked against its name.
-//!
-//! Every answer that is not a success is a [`WireError`] in CBOR, with the status of
-//! its code's class. A blob's bytes are not CBOR; the bytes of a list are the list's own text.
+//! Single-threaded event loop with bounded concurrency (`Resources::connections`), bounded
+//! header/body limits (`Limits`), per-request idle timeouts, write-progress stall detection
+//! (`progress::WriteProgress`), periodic unleased temporary-file sweeps, and graceful shutdown
+//! through a wakeup pipe.
 
-use std::{
-    alloc::{Allocator, AllocatorClone, Global},
-    convert::Infallible,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
+pub(crate) mod progress;
+pub(crate) mod publication;
+
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use core::time::Duration;
+
+use blaze_own::{Arc, String, Vec, format_in};
+use blaze_wire::{Digest, Limits, WireAlloc, WireString};
+
+use self::progress::WriteProgress;
+use self::publication::Temporary;
+use crate::blob::{Kind, ObjectName, hex_in, parse_digest};
+use crate::error::{Error, ServeError, reason_phrase_for};
+use crate::store::Store;
+use crate::sys::{
+    Errno, Fd, OwnedFd, PollEvents, PollFd, SysError, SystemClock, TcpServer,
+    configure_peer_socket, dup_cloexec, duration_to_nanos, duration_to_timespec, poll_fds,
+    pread_some, read_some, recv_nonblocking, send_nonblocking, shutdown_write, wakeup_pipe,
+    write_fd_best_effort,
 };
 
-use blaze_wire::{ErrorCode, Limits, encode};
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
-use hyper::{
-    Method, Request as HttpRequest, Response as HttpResponse, StatusCode,
-    body::{Frame, Incoming},
-    header::{self, HeaderName, HeaderValue},
-    server::conn::http1,
-    service::service_fn,
-};
-use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    sync::Semaphore,
-};
+/// Maximum HTTP request header block size (`16 KiB`).
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 
-use crate::blob::{ObjectName, hex};
-use crate::error::{ConnectionError, Error, ServeError, failed};
-use crate::store::{Store, temporary};
+/// Maximum length of a single chunk-size or trailer line in chunked transfer encoding.
+const MAX_CHUNK_LINE_BYTES: usize = 1024;
 
-mod progress;
-mod publication;
+/// Maximum number of trailer headers in a chunked request body.
+const MAX_TRAILER_LINES: usize = 32;
 
-use publication::Temporary;
+/// Streaming buffer size for `GET /v1/blob/...` responses (`64 KiB`).
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
-/// The bytes of one read of a file that is sent.
-const CHUNK: usize = 1 << 16;
+/// Receive scratch buffer size per read call (`16 KiB`).
+const RECV_BUF_BYTES: usize = 16 * 1024;
 
-/// What the server is told when it starts.
-#[derive(Clone, Debug)]
-pub struct Config {
-    /// The directory that holds `packs/` and `manifests/`.
-    pub dir: PathBuf,
-    /// Where it listens. `127.0.0.1:PORT` unless the operator says otherwise.
-    pub listen: SocketAddr,
-    /// Request and connection liveness policy, not a compile-worker memory limit.
-    pub resources: Resources,
-    /// The most bytes a blob or a request may be.
-    pub limits: Limits,
-}
+/// Backoff duration after transient `accept` errors (`100 ms`).
+const ACCEPT_BACKOFF_NS: u64 = 100_000_000;
 
-/// Resource leases for network peers.
-#[derive(Clone, Debug)]
+/// Operational resource limits for a [`Server`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Resources {
-    /// Longest pause between request-body frames or while reading request headers.
+    /// Maximum time a request or stalled write may go without making progress.
     pub idle: Duration,
-    /// Concurrent accepted connections.
+    /// Maximum simultaneous live TCP connections.
     pub connections: usize,
-    /// Interval between sweeps of abandoned staging files.
+    /// Interval between background sweeps of stale `.tmp` files.
     pub sweep_every: Duration,
-    /// Age after which an unlocked staging file can be removed.
+    /// Minimum age before an unleased `.tmp` file is swept.
     pub temporary_age: Duration,
 }
 
-impl Default for Resources {
-    fn default() -> Self {
-        Self {
-            idle: Duration::from_secs(30),
-            connections: 256,
-            sweep_every: Duration::from_secs(60),
-            temporary_age: Duration::from_secs(3600),
-        }
-    }
+impl Resources {
+    /// Documented production defaults.
+    pub const DOCUMENTED: Self = Self {
+        idle: Duration::from_secs(30),
+        connections: 256,
+        sweep_every: Duration::from_secs(300),
+        temporary_age: Duration::from_secs(3600),
+    };
+}
+
+/// Complete configuration for starting a [`Server`].
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// Directory holding `packs/` and `manifests/`.
+    pub store: WireString,
+    /// TCP socket address to bind.
+    pub listen: SocketAddr,
+    /// Wire and blob byte limits.
+    pub limits: Limits,
+    /// Connection, idle, and sweep limits.
+    pub resources: Resources,
 }
 
 impl Config {
-    /// A server on `dir`, listening on `127.0.0.1:port`.
-    pub fn at(dir: impl Into<PathBuf>, port: u16) -> Config {
-        Config {
-            dir: dir.into(),
-            listen: SocketAddr::from(([127, 0, 0, 1], port)),
-            resources: Resources::default(),
+    /// Builds a loopback configuration serving `dir` on `127.0.0.1:port` with documented limits.
+    pub fn at(dir: &str, port: u16, alloc: WireAlloc) -> Self {
+        let mut store = String::with_capacity_in(dir.len(), alloc);
+        store.push_str(dir);
+        Self {
+            store,
+            listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
             limits: Limits::DOCUMENTED,
+            resources: Resources::DOCUMENTED,
         }
     }
 }
 
-/// A running server's state, shared by its connections.
+/// Handle capable of stopping a running [`Server::run`] loop cleanly from another thread.
+pub struct ShutdownHandle {
+    wake_write: OwnedFd,
+}
+
+impl ShutdownHandle {
+    /// Signals the server loop to exit promptly.
+    pub fn stop(&self) {
+        write_fd_best_effort(self.wake_write.fd(), b"x");
+    }
+}
+
+/// Bound HTTP/1.1 cache server ready to execute [`Server::run`].
 pub struct Server {
-    store: Arc<Store>,
-    limits: Limits,
+    store: Arc<Store, WireAlloc>,
+    listener: TcpServer,
+    wake_read: OwnedFd,
+    wake_write: OwnedFd,
     resources: Resources,
-    #[cfg(test)]
-    accept_errors: std::sync::Mutex<std::collections::VecDeque<std::io::Error>>,
+    alloc: WireAlloc,
+    clock: SystemClock,
 }
 
 impl Server {
-    /// The server on `config.dir`.
-    pub fn open(config: &Config) -> Result<Server, Error> {
-        if config.resources.idle.is_zero()
-            || config.resources.connections == 0
-            || config.resources.sweep_every.is_zero()
-            || config.limits.request == 0
-            || config.limits.batch_items == 0
-        {
-            return Err(Error::malformed(format_args!(
-                "server resource leases and wire limits must be positive"
-            )));
-        }
-        let limits = config.limits;
-        let ceiling = Limits::DOCUMENTED;
-        if limits.request > ceiling.request || limits.blob < 32 || limits.blob > ceiling.blob {
-            return Err(Error::malformed(format_args!("unsupported server wire limits")));
-        }
-        let store = Store::open(&config.dir)?;
-        Ok(Server {
-            store: Arc::new(store),
-            limits: config.limits,
-            resources: config.resources.clone(),
-            #[cfg(test)]
-            accept_errors: std::sync::Mutex::new(std::collections::VecDeque::new()),
+    /// Opens the store and binds the TCP listener described by `config`.
+    pub fn bind(config: Config, alloc: WireAlloc) -> Result<Self, ServeError> {
+        let store = Store::open(config.store.as_str(), config.limits, alloc.clone())
+            .map_err(ServeError::Store)?;
+        let store = Arc::new_in(store, alloc.clone());
+        Self::bind_on(store, config.listen, config.resources, alloc)
+    }
+
+    /// Binds a TCP listener serving an already-open `store`.
+    pub fn bind_on(
+        store: Arc<Store, WireAlloc>,
+        listen: SocketAddr,
+        resources: Resources,
+        alloc: WireAlloc,
+    ) -> Result<Self, ServeError> {
+        let listener = TcpServer::bind_addr(listen)
+            .map_err(|e| ServeError::Listen { address: listen, source: SysError(e) })?;
+        let (wake_read, wake_write) =
+            wakeup_pipe().map_err(|e| ServeError::Pipe { source: SysError(e) })?;
+        Ok(Self {
+            store,
+            listener,
+            wake_read,
+            wake_write,
+            resources,
+            alloc,
+            clock: SystemClock,
         })
     }
 
-    /// The directory it serves.
-    pub fn store(&self) -> &Store {
+    /// Resolved local socket address (with concrete port if bound to port 0).
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.listener.local_addr()
+    }
+
+    /// The underlying [`Store`].
+    pub fn store(&self) -> &Arc<Store, WireAlloc> {
         &self.store
     }
 
-    async fn disk<T: Send + 'static>(
-        &self,
-        work: impl FnOnce(&Store) -> Result<T, Error> + Send + 'static,
-    ) -> Result<T, Error> {
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || work(&store))
-            .await
-            .map_err(|e| failed("cache filesystem work", e))?
+    /// Creates a [`ShutdownHandle`] that stops this server's [`Server::run`] loop.
+    pub fn shutdown_handle(&self) -> Result<ShutdownHandle, ServeError> {
+        let dup = dup_cloexec(self.wake_write.fd())
+            .map_err(|e| ServeError::Pipe { source: SysError(e) })?;
+        Ok(ShutdownHandle { wake_write: dup })
     }
 
-    /// One request, answered. This is what a connection calls.
-    pub async fn answer(&self, request: HttpRequest<Incoming>) -> HttpResponse<Body> {
-        let (parts, body) = request.into_parts();
-        let path = parts.uri.path().to_owned();
-        let answered = self.route(&parts.method, &path, &parts.headers, body).await;
-        match answered {
-            Ok(answer) => answer,
-            Err(error) => error_answer(error),
-        }
-    }
+    /// Runs the non-blocking HTTP/1.1 `poll()` loop until stopped via [`ShutdownHandle::stop`].
+    pub fn run(self) -> Result<(), ServeError> {
+        let idle_ns = duration_to_nanos(self.resources.idle);
+        let sweep_every_ns = duration_to_nanos(self.resources.sweep_every);
+        let mut next_sweep_ns = self
+            .clock
+            .monotonic_nanos()
+            .unwrap_or(0)
+            .saturating_add(sweep_every_ns);
+        let mut accept_backoff_until_ns: Option<u64> = None;
+        let max_conns = self.resources.connections.max(1);
 
-    async fn route(
-        &self,
-        method: &Method,
-        path: &str,
-        headers: &hyper::HeaderMap,
-        body: Incoming,
-    ) -> Result<HttpResponse<Body>, Error> {
-        if path == "/" {
-            return Ok(text(StatusCode::OK, "blaze-serve\n"));
-        }
-        let Some((endpoint, name)) = path.strip_prefix("/v1/").and_then(|it| it.split_once('/'))
-        else {
-            return Err(Error::not_found(format_args!("{path} is not a call of this server")));
-        };
-        match endpoint {
-            "blob" => self.blob(method, name, headers, body).await,
-            "list" => self.list(method, name, headers, body).await,
-            _ => Err(Error::not_found(format_args!("{path} is not a call of this server"))),
-        }
-    }
+        let mut conns: Vec<Conn, WireAlloc> = Vec::with_capacity_in(max_conns.min(64), self.alloc.clone());
+        let mut polls: Vec<PollFd, WireAlloc> = Vec::with_capacity_in(max_conns.min(64).saturating_add(2), self.alloc.clone());
 
-    async fn blob(
-        &self,
-        method: &Method,
-        name: &str,
-        headers: &hyper::HeaderMap,
-        body: Incoming,
-    ) -> Result<HttpResponse<Body>, Error> {
-        let object = ObjectName::parse(name)
-            .ok_or_else(|| Error::not_found(format_args!("`{name}` is not an object of this cache")))?;
-        if !object.is_blob() {
-            return Err(Error::not_found(format_args!("`{name}` is a list, not a blob")));
-        }
-        match *method {
-            Method::GET => {
-                let owned = object.name.clone();
-                let opened = self.disk(move |store| store.open_blob(&owned)).await?;
-                let Some((file, len)) = opened else {
-                    return Err(Error::not_found(format_args!("{name} is not here")));
-                };
-                Ok(HttpResponse::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/octet-stream")
-                    .header(header::CONTENT_LENGTH, len.to_string())
-                    .header(header::ETAG, format!("\"{}\"", hex(&object.digest)))
-                    .body(file_body(tokio::fs::File::from_std(file), len))?)
+        loop {
+            let now_ns = self.clock.monotonic_nanos().unwrap_or(0);
+
+            if now_ns >= next_sweep_ns {
+                let _ = self.store.sweep_temporaries(self.resources.temporary_age);
+                next_sweep_ns = now_ns.saturating_add(sweep_every_ns);
             }
-            Method::PUT => {
-                let written = self.put_blob(&object, headers, body).await?;
-                let mut answer = empty(StatusCode::NO_CONTENT);
-                let said = if written { "written" } else { "already there" };
-                if let Ok(value) = HeaderValue::from_str(&format!("{name}: {said}")) {
-                    answer.headers_mut().insert(HeaderName::from_static("x-blaze-blob"), value);
+
+            if let Some(until) = accept_backoff_until_ns {
+                if now_ns >= until {
+                    accept_backoff_until_ns = None;
                 }
-                Ok(answer)
             }
-            _ => Err(method_not_allowed(method, "GET, PUT")),
-        }
-    }
 
-    /// A blob is streamed to a temporary file as it arrives, then checked against its name and
-    /// renamed. Nothing is named that is not what its name says, or that was cut short.
-    async fn put_blob(
-        &self,
-        object: &ObjectName,
-        headers: &hyper::HeaderMap,
-        mut body: Incoming,
-    ) -> Result<bool, Error> {
-        if let Some(len) = content_length(headers)
-            && len > self.limits.blob
-        {
-            return Err(Error::too_large(format_args!(
-                "{len} bytes is more than the {} a blob may be",
-                self.limits.blob
-            )));
-        }
-        let name = object.name.clone();
-        let to = self.disk(move |store| store.checked_path(&name)).await?;
-        let partial = temporary(&to);
-        // Creation returns both the file and its cleanup owner from the blocking task. If
-        // this await is cancelled, dropping that task's result still removes its own file.
-        let (file, cleanup) = tokio::task::spawn_blocking(move || Temporary::create(partial))
-            .await
-            .map_err(|e| failed("creating an upload staging file", e))?
-            .map_err(|e| failed(&format!("writing {}", object.name), e))?;
-        let mut file = tokio::fs::File::from_std(file);
-        let mut taken = 0u64;
-        while let Some(frame) = tokio::time::timeout(self.resources.idle, body.frame())
-            .await
-            .map_err(|_| {
-                Error::new(ErrorCode::Refused, format_args!("upload body idle deadline expired"))
-            })?
-        {
-            let frame =
-                frame.map_err(|e| Error::malformed(format_args!("the body of a PUT broke: {e}")))?;
-            let Some(data) = frame.into_data().ok() else { continue };
-            taken += data.len() as u64;
-            if taken > self.limits.blob {
-                drop(file);
-                return Err(Error::too_large(format_args!(
-                    "a blob of more than the {} bytes the server takes",
-                    self.limits.blob
-                )));
-            }
-            file.write_all(&data)
-                .await
-                .map_err(|e| failed(&format!("writing {}", object.name), e))?;
-        }
-        file.flush().await.map_err(|e| failed(&format!("writing {}", object.name), e))?;
-        drop(file);
-        // Verification owns cleanup until it finishes, even if the HTTP request goes away.
-        let store = self.store.clone();
-        let name = object.name.clone();
-        cleanup
-            .blocking(move |partial| store.put_blob_from(&name, partial))
-            .await
-            .map_err(|e| failed("verifying a blob", e))?
-    }
+            // Build poll set: [0] = shutdown wakeup pipe, optional [1] = listener, then active conns.
+            polls.clear();
+            polls.push(PollFd::new(self.wake_read.fd(), PollEvents::IN));
 
-    /// `GET`, `HEAD`, `PUT`, `DELETE /v1/list/<name>`: a manifest or a project's units.
-    /// A unit's list is immutable by default. An exact If-Match permits repair only when
-    /// the current list has an absent pack and every replacement pack verifies.
-    async fn list(
-        &self,
-        method: &Method,
-        name: &str,
-        headers: &hyper::HeaderMap,
-        body: Incoming,
-    ) -> Result<HttpResponse<Body>, Error> {
-        let object = ObjectName::parse(name)
-            .ok_or_else(|| Error::not_found(format_args!("`{name}` is not an object of this cache")))?;
-        if object.is_blob() {
-            return Err(Error::not_found(format_args!("`{name}` is a blob, not a list")));
-        }
-        let owned = object.name.clone();
-        match *method {
-            Method::GET => {
-                let most = u64::from(self.limits.request);
-                let read = self.disk(move |store| store.read_small(&owned, most, Global)).await?;
-                let Some(bytes) = read else {
-                    return Err(Error::not_found(format_args!("{name} is not here")));
-                };
-                Ok(HttpResponse::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                    .header(header::CONTENT_LENGTH, bytes.len().to_string())
-                    .body(full(Bytes::from(bytes)))?)
+            let listening = conns.len() < max_conns && accept_backoff_until_ns.is_none();
+            if listening {
+                polls.push(PollFd::new(self.listener.fd(), PollEvents::IN));
             }
-            Method::PUT => {
-                let bytes = self.read_whole(headers, body, Global).await?;
-                let expected = manifest_match(headers)?;
-                let wrote = self
-                    .disk(move |store| match expected {
-                        Some(expected) => store.repair_list(&owned, &expected, &bytes),
-                        None => store.put_list(&owned, &bytes),
-                    })
-                    .await?;
-                Ok(empty(if wrote {
-                    StatusCode::NO_CONTENT
+            let conn_base = polls.len();
+            for conn in &conns {
+                polls.push(PollFd::new(conn.fd.fd(), conn.interest()));
+            }
+
+            // Compute nearest deadline across sweep, accept backoff, and all active connections.
+            let mut next_deadline_ns = next_sweep_ns;
+            if let Some(until) = accept_backoff_until_ns {
+                next_deadline_ns = next_deadline_ns.min(until);
+            }
+            for conn in &conns {
+                if let Some(d) = conn.deadline_ns() {
+                    next_deadline_ns = next_deadline_ns.min(d);
+                }
+            }
+            let wait_ns = next_deadline_ns.saturating_sub(now_ns);
+            let timeout = duration_to_timespec(Duration::from_nanos(wait_ns));
+
+            let ready = poll_fds(polls.as_mut_slice(), Some(timeout))
+                .map_err(|e| ServeError::Loop { source: SysError(e) })?;
+
+            let now_ns = self.clock.monotonic_nanos().unwrap_or(0);
+
+            // Check shutdown pipe first.
+            if let Some(wake_pfd) = polls.first() {
+                if wake_pfd.found().contains(PollEvents::IN)
+                    || wake_pfd.found().contains(PollEvents::HUP)
+                {
+                    let mut drain = [0u8; 32];
+                    let _ = read_some(self.wake_read.fd(), &mut drain);
+                    break;
+                }
+            }
+
+            // Accept new connections if listener is ready and capacity allows.
+            if ready > 0 && listening {
+                if let Some(listen_pfd) = polls.get(1) {
+                    if listen_pfd.found().contains(PollEvents::IN) {
+                        while conns.len() < max_conns {
+                            match self.listener.accept_one() {
+                                Ok(peer_fd) => {
+                                    configure_peer_socket(peer_fd.fd());
+                                    conns.push(Conn::new(
+                                        peer_fd,
+                                        now_ns,
+                                        idle_ns,
+                                        self.alloc.clone(),
+                                    ));
+                                }
+                                Err(Errno::Again | Errno::Intr) => break,
+                                Err(err) if is_transient_accept_error(err) => {
+                                    accept_backoff_until_ns =
+                                        Some(now_ns.saturating_add(ACCEPT_BACKOFF_NS));
+                                    break;
+                                }
+                                Err(err) => {
+                                    return Err(ServeError::Loop { source: SysError(err) });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Drive active connections in reverse so swap-remove never shifts unvisited poll indices.
+            let mut idx = polls.len().saturating_sub(conn_base);
+            while idx > 0 {
+                idx = idx.saturating_sub(1);
+                let revents = polls
+                    .get(conn_base.saturating_add(idx))
+                    .map_or(PollEvents::NONE, PollFd::found);
+                let keep = if let Some(conn) = conns.get_mut(idx) {
+                    conn.step(&self.store, revents, now_ns, idle_ns)
                 } else {
-                    StatusCode::PRECONDITION_FAILED
-                }))
+                    false
+                };
+                if !keep {
+                    let _ = conns.remove_swap(idx);
+                }
             }
-            _ => Err(method_not_allowed(method, "GET, PUT")),
         }
-    }
-
-    async fn read_whole<A: Allocator>(
-        &self,
-        headers: &hyper::HeaderMap,
-        mut body: Incoming,
-        alloc: A,
-    ) -> Result<Vec<u8, A>, Error> {
-        if let Some(len) = content_length(headers)
-            && len > u64::from(self.limits.request)
-        {
-            return Err(Error::too_large(format_args!(
-                "{len} bytes is more than the {} a request may be",
-                self.limits.request
-            )));
-        }
-        let mut bytes = Vec::new_in(alloc);
-        while let Some(frame) = tokio::time::timeout(self.resources.idle, body.frame())
-            .await
-            .map_err(|_| {
-                Error::new(ErrorCode::Refused, format_args!("request body idle deadline expired"))
-            })?
-        {
-            let frame = frame.map_err(|e| Error::malformed(format_args!("the body broke: {e}")))?;
-            let Ok(data) = frame.into_data() else { continue };
-            if bytes.len().saturating_add(data.len()) > self.limits.request as usize {
-                return Err(Error::too_large(format_args!("the request exceeds the advertised limit")));
-            }
-            bytes.extend_from_slice(&data);
-        }
-        Ok(bytes)
+        Ok(())
     }
 }
 
-/// Serves `config` until the process ends: one task a connection.
-pub async fn serve(config: Config) -> Result<(), ServeError> {
-    let setup = config.clone();
-    let opened = tokio::task::spawn_blocking(move || Server::open(&setup)).await
-        .map_err(|source| ServeError::StoreTask { directory: config.dir.clone(), source })?
-        .map_err(|source| ServeError::Store { directory: config.dir.clone(), source })?;
-    let server = Arc::new_in(opened, Global);
-    let listener = TcpListener::bind(config.listen)
-        .await
-        .map_err(|source| ServeError::Listen { address: config.listen, source })?;
-    let local = listener.local_addr().map_err(ServeError::ListenerAddress)?;
-    println!(
-        "blaze-serve: serving {} on http://{local}, routes /v1, codec {}, no authentication",
-        server.store().dir().display(),
+/// Convenience wrapper: binds `config` and runs the server until stopped or fatally errored.
+pub fn serve(config: Config, alloc: WireAlloc) -> Result<(), ServeError> {
+    let server = Server::bind(config, alloc.clone())?;
+    let banner = format_in!(
+        alloc,
+        "blaze-serve: serving {} on http://{}, routes /v1, codec {}, no authentication\n",
+        server.store().root(),
+        server.local_addr(),
         blaze_wire::VERSION
     );
-    tokio::select! {
-        done = serve_on(listener, server) => done,
-        signal = tokio::signal::ctrl_c() => signal.map_err(ServeError::Signal),
-    }
+    write_fd_best_effort(Fd::new(1), banner.as_bytes());
+    server.run()
 }
 
-/// Serves the connections of `listener` with `server`, until the listener fails. A test uses
-/// this with a listener of its own, so the port is one the machine gives.
-pub async fn serve_on<A: AllocatorClone + Send + Sync + 'static>(
-    listener: TcpListener,
-    server: Arc<Server, A>,
+/// Convenience wrapper: binds `listen` over an existing `store` and runs the server.
+pub fn serve_on(
+    store: Arc<Store, WireAlloc>,
+    listen: SocketAddr,
+    resources: Resources,
+    alloc: WireAlloc,
 ) -> Result<(), ServeError> {
-    let address = listener.local_addr().map_err(ServeError::ListenerAddress)?;
-    let permits = Arc::new_in(Semaphore::new(server.resources.connections), Global);
-    let mut connections = tokio::task::JoinSet::new();
-    let mut sweep = tokio::time::interval(server.resources.sweep_every);
-    loop {
-        tokio::select! {
-            _ = sweep.tick() => {
-                let age = server.resources.temporary_age;
-                if let Err(error) = server.disk(move |store| store.sweep_temporaries(age)).await {
-                    eprintln!("blaze-serve: staging janitor failed: {error}; service continues");
+    let server = Server::bind_on(store, listen, resources, alloc)?;
+    server.run()
+}
+
+fn is_transient_accept_error(err: Errno) -> bool {
+    matches!(
+        err,
+        Errno::ConnAborted
+            | Errno::ConnReset
+            | Errno::NoMem
+            | Errno::MFile
+            | Errno::NFile
+            | Errno::NoBufs
+            | Errno::NetDown
+            | Errno::Proto
+            | Errno::NoProtoOpt
+            | Errno::HostDown
+            | Errno::NoNet
+            | Errno::HostUnreach
+            | Errno::OpNotSupp
+            | Errno::NetUnreach
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-Connection HTTP/1.1 State Machine
+// ---------------------------------------------------------------------------------------------
+
+struct Conn {
+    fd: OwnedFd,
+    alloc: WireAlloc,
+    in_buf: Vec<u8, WireAlloc>,
+    in_pos: usize,
+    keep_alive: bool,
+    state: ConnState,
+}
+
+enum ConnState {
+    ReadingHeaders {
+        deadline_ns: u64,
+    },
+    ReadingBlobBody {
+        name: ObjectName,
+        temp: Temporary,
+        framing: BodyFraming,
+        deadline_ns: u64,
+    },
+    ReadingListBody {
+        name: ObjectName,
+        expected: Option<Digest>,
+        body: Vec<u8, WireAlloc>,
+        framing: BodyFraming,
+        deadline_ns: u64,
+    },
+    Writing {
+        out_buf: Vec<u8, WireAlloc>,
+        out_pos: usize,
+        file: Option<FileTail>,
+        progress: WriteProgress,
+    },
+}
+
+struct FileTail {
+    fd: OwnedFd,
+    offset: u64,
+    remaining: u64,
+}
+
+#[derive(Debug)]
+enum BodyFraming {
+    Fixed { remaining: u64 },
+    Chunked(ChunkedState),
+}
+
+#[derive(Debug)]
+enum ChunkedState {
+    SizeLine,
+    Data { remaining: u64 },
+    DataCr,
+    DataLf,
+    Trailers { lines: usize },
+    Done,
+}
+
+struct ParsedRequest<'a> {
+    method: &'a str,
+    target: &'a str,
+    keep_alive: bool,
+    framing: BodyFraming,
+    if_match: Option<Digest>,
+    expect_continue: bool,
+}
+
+impl Conn {
+    fn new(fd: OwnedFd, now_ns: u64, idle_ns: u64, alloc: WireAlloc) -> Self {
+        Self {
+            fd,
+            in_buf: Vec::new_in(alloc.clone()),
+            in_pos: 0,
+            keep_alive: true,
+            state: ConnState::ReadingHeaders { deadline_ns: now_ns.saturating_add(idle_ns) },
+            alloc,
+        }
+    }
+
+    fn interest(&self) -> PollEvents {
+        match &self.state {
+            ConnState::ReadingHeaders { .. }
+            | ConnState::ReadingBlobBody { .. }
+            | ConnState::ReadingListBody { .. } => PollEvents::IN,
+            ConnState::Writing { .. } => PollEvents::OUT,
+        }
+    }
+
+    fn deadline_ns(&self) -> Option<u64> {
+        match &self.state {
+            ConnState::ReadingHeaders { deadline_ns }
+            | ConnState::ReadingBlobBody { deadline_ns, .. }
+            | ConnState::ReadingListBody { deadline_ns, .. } => Some(*deadline_ns),
+            ConnState::Writing { progress, .. } => progress.deadline_ns(),
+        }
+    }
+
+    /// Advances the connection; returns `false` when the connection should be closed and dropped.
+    fn step(&mut self, store: &Store, revents: PollEvents, now_ns: u64, idle_ns: u64) -> bool {
+        if revents.contains(PollEvents::ERR) || revents.contains(PollEvents::NVAL) {
+            return false;
+        }
+
+        // Loop boundedly so pipelined input or immediate transitions complete in one poll turn.
+        for _ in 0..8 {
+            match &mut self.state {
+                ConnState::ReadingHeaders { deadline_ns } => {
+                    if now_ns >= *deadline_ns {
+                        return false;
+                    }
+                    if revents.contains(PollEvents::IN) || revents.contains(PollEvents::HUP) {
+                        match self.recv_more(now_ns, idle_ns) {
+                            RecvOutcome::Bytes(n) if n > 0 => {
+                                if let ConnState::ReadingHeaders { deadline_ns } = &mut self.state {
+                                    *deadline_ns = now_ns.saturating_add(idle_ns);
+                                }
+                            }
+                            RecvOutcome::Bytes(_) | RecvOutcome::WouldBlock => {}
+                            RecvOutcome::Eof => {
+                                if self.unread().is_empty() {
+                                    return false;
+                                }
+                            }
+                            RecvOutcome::Closed => return false,
+                        }
+                    }
+                    if !self.try_parse_headers(store, now_ns, idle_ns) {
+                        if revents.contains(PollEvents::HUP) && self.unread().is_empty() {
+                            return false;
+                        }
+                        return true;
+                    }
                 }
-            }
-            Some(_) = connections.join_next(), if !connections.is_empty() => {}
-            accepted = accept(&listener, &server), if permits.available_permits() != 0 => {
-                let (stream, _) = match accepted {
-                    Ok(accepted) => accepted,
-                    Err(error) if retry_accept(&error) => {
-                        eprintln!("blaze-serve: accept failed: {error}; retrying");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                ConnState::ReadingBlobBody { deadline_ns, .. } => {
+                    if now_ns >= *deadline_ns {
+                        self.keep_alive = false;
+                        self.queue_error(
+                            Error::new_static(
+                                crate::error::ErrorCode::Malformed,
+                                "timed out waiting for pack upload body",
+                            ),
+                            408,
+                            idle_ns,
+                        );
                         continue;
                     }
-                    Err(source) => return Err(ServeError::Accept { address, source }),
+                    let mut got_eof = false;
+                    if revents.contains(PollEvents::IN) || revents.contains(PollEvents::HUP) {
+                        match self.recv_more(now_ns, idle_ns) {
+                            RecvOutcome::Bytes(n) if n > 0 => {
+                                if let ConnState::ReadingBlobBody { deadline_ns, .. } = &mut self.state {
+                                    *deadline_ns = now_ns.saturating_add(idle_ns);
+                                }
+                            }
+                            RecvOutcome::Bytes(_) | RecvOutcome::WouldBlock => {}
+                            RecvOutcome::Eof => got_eof = true,
+                            RecvOutcome::Closed => return false,
+                        }
+                    }
+                    if !self.pump_blob_body(store, got_eof, idle_ns) {
+                        return !got_eof;
+                    }
+                }
+                ConnState::ReadingListBody { deadline_ns, .. } => {
+                    if now_ns >= *deadline_ns {
+                        self.keep_alive = false;
+                        self.queue_error(
+                            Error::new_static(
+                                crate::error::ErrorCode::Malformed,
+                                "timed out waiting for manifest upload body",
+                            ),
+                            408,
+                            idle_ns,
+                        );
+                        continue;
+                    }
+                    let mut got_eof = false;
+                    if revents.contains(PollEvents::IN) || revents.contains(PollEvents::HUP) {
+                        match self.recv_more(now_ns, idle_ns) {
+                            RecvOutcome::Bytes(n) if n > 0 => {
+                                if let ConnState::ReadingListBody { deadline_ns, .. } = &mut self.state {
+                                    *deadline_ns = now_ns.saturating_add(idle_ns);
+                                }
+                            }
+                            RecvOutcome::Bytes(_) | RecvOutcome::WouldBlock => {}
+                            RecvOutcome::Eof => got_eof = true,
+                            RecvOutcome::Closed => return false,
+                        }
+                    }
+                    if !self.pump_list_body(store, got_eof, idle_ns) {
+                        return !got_eof;
+                    }
+                }
+                ConnState::Writing { .. } => {
+                    return self.pump_write(now_ns, idle_ns);
+                }
+            }
+        }
+        true
+    }
+
+    fn unread(&self) -> &[u8] {
+        self.in_buf.get(self.in_pos..).unwrap_or(&[])
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.in_pos = self.in_pos.saturating_add(n).min(self.in_buf.len());
+        if self.in_pos == self.in_buf.len() {
+            self.in_buf.clear();
+            self.in_pos = 0;
+        } else if self.in_pos >= 8192 {
+            let remaining = self.in_buf.len().saturating_sub(self.in_pos);
+            self.in_buf.copy_within(self.in_pos.., 0);
+            self.in_buf.truncate(remaining);
+            self.in_pos = 0;
+        }
+    }
+
+    fn recv_more(&mut self, _now_ns: u64, _idle_ns: u64) -> RecvOutcome {
+        let mut scratch = [0u8; RECV_BUF_BYTES];
+        let mut total = 0usize;
+        for _ in 0..4 {
+            match recv_nonblocking(self.fd.fd(), &mut scratch) {
+                Ok(0) => return if total > 0 { RecvOutcome::Bytes(total) } else { RecvOutcome::Eof },
+                Ok(n) => {
+                    if let Some(chunk) = scratch.get(..n) {
+                        self.in_buf.extend_from_slice(chunk);
+                    }
+                    total = total.saturating_add(n);
+                    if n < scratch.len() || self.in_buf.len() >= STREAM_CHUNK_BYTES {
+                        break;
+                    }
+                }
+                Err(Errno::Again) => {
+                    return if total > 0 {
+                        RecvOutcome::Bytes(total)
+                    } else {
+                        RecvOutcome::WouldBlock
+                    };
+                }
+                Err(Errno::Intr) => continue,
+                Err(_) => return RecvOutcome::Closed,
+            }
+        }
+        RecvOutcome::Bytes(total)
+    }
+
+    /// Parses headers if `\r\n\r\n` has arrived; returns `true` if state transitioned.
+    fn try_parse_headers(&mut self, store: &Store, now_ns: u64, idle_ns: u64) -> bool {
+        let unread = self.unread();
+        let Some(end) = find_header_end(unread) else {
+            if unread.len() > MAX_HEADER_BYTES {
+                self.keep_alive = false;
+                self.queue_error(Error::malformed("HTTP headers exceed 16 KiB limit"), 400, idle_ns);
+                return true;
+            }
+            return false;
+        };
+        if end > MAX_HEADER_BYTES {
+            self.keep_alive = false;
+            self.queue_error(Error::malformed("HTTP headers exceed 16 KiB limit"), 400, idle_ns);
+            return true;
+        }
+
+        // Copy header slice into a small local buffer so we can consume `in_buf` cleanly.
+        let mut hdr_copy = Vec::with_capacity_in(end, self.alloc.clone());
+        if let Some(slice) = unread.get(..end) {
+            hdr_copy.extend_from_slice(slice);
+        }
+        self.consume(end.saturating_add(4));
+
+        let parsed = match parse_request_headers(hdr_copy.as_slice()) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                self.keep_alive = false;
+                let status = err.status_code();
+                self.queue_error(err, status, idle_ns);
+                return true;
+            }
+        };
+
+        self.keep_alive = parsed.keep_alive;
+        let path = parsed.target.split('?').next().unwrap_or(parsed.target);
+
+        if path == "/" {
+            self.queue_inline_response(200, "text/plain; charset=utf-8", b"blaze-serve\n", None, idle_ns);
+            return true;
+        }
+
+        if let Some(raw_name) = path.strip_prefix("/v1/blob/") {
+            match parsed.method {
+                "GET" => {
+                    let name = match ObjectName::parse_kind(raw_name, Kind::Pack) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            let err = Error::not_found_owned(format_in!(
+                                self.alloc.clone(),
+                                "invalid pack route {raw_name}"
+                            ));
+                            self.queue_error(err, 404, idle_ns);
+                            return true;
+                        }
+                    };
+                    match store.open_blob(&name) {
+                        Ok(Some((fd, len))) => {
+                            let etag = hex_in(name.digest(), self.alloc.clone());
+                            let etag_hdr = format_in!(self.alloc.clone(), "etag: \"{}\"\r\n", etag.as_str());
+                            self.queue_file_response(
+                                200,
+                                "application/octet-stream",
+                                len,
+                                etag_hdr.as_str(),
+                                fd,
+                                idle_ns,
+                            );
+                        }
+                        Ok(None) => {
+                            let err = Error::not_found_owned(format_in!(
+                                self.alloc.clone(),
+                                "no such blob {raw_name}"
+                            ));
+                            let st = err.status_code();
+                            self.queue_error(err, st, idle_ns);
+                        }
+                        Err(err) => {
+                            let st = err.status_code();
+                            self.queue_error(err, st, idle_ns);
+                        }
+                    }
+                    return true;
+                }
+                "PUT" => {
+                    let name = match ObjectName::parse_kind(raw_name, Kind::Pack) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            self.keep_alive = false;
+                            let err = Error::not_found_owned(format_in!(
+                                self.alloc.clone(),
+                                "invalid pack route {raw_name}"
+                            ));
+                            self.queue_error(err, 404, idle_ns);
+                            return true;
+                        }
+                    };
+                    if let BodyFraming::Fixed { remaining } = parsed.framing {
+                        if remaining > store.limits().blob {
+                            self.keep_alive = false;
+                            let err = Error::too_large_owned(format_in!(
+                                self.alloc.clone(),
+                                "pack content-length {} exceeds {}-byte limit",
+                                remaining,
+                                store.limits().blob
+                            ));
+                            let st = err.status_code();
+                            self.queue_error(err, st, idle_ns);
+                            return true;
+                        }
+                    }
+                    let temp = match Temporary::open(store, &name) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            self.keep_alive = false;
+                            let st = e.status_code();
+                            self.queue_error(e, st, idle_ns);
+                            return true;
+                        }
+                    };
+                    if parsed.expect_continue {
+                        let _ = send_nonblocking(self.fd.fd(), b"HTTP/1.1 100 Continue\r\n\r\n");
+                    }
+                    self.state = ConnState::ReadingBlobBody {
+                        name,
+                        temp,
+                        framing: parsed.framing,
+                        deadline_ns: now_ns.saturating_add(idle_ns),
+                    };
+                    return true;
+                }
+                _ => {
+                    self.keep_alive = false;
+                    self.queue_error(
+                        Error::malformed("blob route supports GET and PUT only"),
+                        400,
+                        idle_ns,
+                    );
+                    return true;
+                }
+            }
+        }
+
+        if let Some(raw_name) = path.strip_prefix("/v1/list/") {
+            match parsed.method {
+                "GET" => {
+                    let name = match ObjectName::parse_kind(raw_name, Kind::Manifest) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            let err = Error::not_found_owned(format_in!(
+                                self.alloc.clone(),
+                                "invalid manifest route {raw_name}"
+                            ));
+                            self.queue_error(err, 404, idle_ns);
+                            return true;
+                        }
+                    };
+                    match store.read_small(&name, u64::from(store.limits().request), self.alloc.clone()) {
+                        Ok(Some(bytes)) => {
+                            self.queue_inline_response(
+                                200,
+                                "text/plain; charset=utf-8",
+                                bytes.as_slice(),
+                                None,
+                                idle_ns,
+                            );
+                        }
+                        Ok(None) => {
+                            let err = Error::not_found_owned(format_in!(
+                                self.alloc.clone(),
+                                "no such manifest {raw_name}"
+                            ));
+                            let st = err.status_code();
+                            self.queue_error(err, st, idle_ns);
+                        }
+                        Err(err) => {
+                            let st = err.status_code();
+                            self.queue_error(err, st, idle_ns);
+                        }
+                    }
+                    return true;
+                }
+                "PUT" => {
+                    let name = match ObjectName::parse_kind(raw_name, Kind::Manifest) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            self.keep_alive = false;
+                            let err = Error::not_found_owned(format_in!(
+                                self.alloc.clone(),
+                                "invalid manifest route {raw_name}"
+                            ));
+                            self.queue_error(err, 404, idle_ns);
+                            return true;
+                        }
+                    };
+                    if let BodyFraming::Fixed { remaining } = parsed.framing {
+                        let req_cap = u64::from(store.limits().request);
+                        if remaining > req_cap {
+                            self.keep_alive = false;
+                            let err = Error::too_large_owned(format_in!(
+                                self.alloc.clone(),
+                                "manifest content-length {} exceeds {}-byte limit",
+                                remaining,
+                                req_cap
+                            ));
+                            let st = err.status_code();
+                            self.queue_error(err, st, idle_ns);
+                            return true;
+                        }
+                    }
+                    if parsed.expect_continue {
+                        let _ = send_nonblocking(self.fd.fd(), b"HTTP/1.1 100 Continue\r\n\r\n");
+                    }
+                    self.state = ConnState::ReadingListBody {
+                        name,
+                        expected: parsed.if_match,
+                        body: Vec::new_in(self.alloc.clone()),
+                        framing: parsed.framing,
+                        deadline_ns: now_ns.saturating_add(idle_ns),
+                    };
+                    return true;
+                }
+                _ => {
+                    self.keep_alive = false;
+                    self.queue_error(
+                        Error::malformed("list route supports GET and PUT only"),
+                        400,
+                        idle_ns,
+                    );
+                    return true;
+                }
+            }
+        }
+
+        let err = Error::not_found_owned(format_in!(self.alloc.clone(), "unknown route {path}"));
+        let st = err.status_code();
+        self.queue_error(err, st, idle_ns);
+        true
+    }
+
+    fn pump_blob_body(&mut self, store: &Store, got_eof: bool, idle_ns: u64) -> bool {
+        let blob_limit = store.limits().blob;
+        let alloc = self.alloc.clone();
+        let outcome = {
+            let ConnState::ReadingBlobBody { temp, framing, .. } = &mut self.state else {
+                return false;
+            };
+            let unread = self.in_buf.get(self.in_pos..).unwrap_or(&[]);
+            let mut consumed = 0usize;
+            let res = drain_body(unread, &mut consumed, framing, |chunk| {
+                temp.write_chunk(chunk, blob_limit)
+            });
+            (consumed, res)
+        };
+        let (consumed, res) = outcome;
+        if consumed > 0 {
+            self.consume(consumed);
+        }
+        match res {
+            Ok(BodyStep::NeedMore) => {
+                if got_eof {
+                    // Client disconnected mid-body; dropping state unlinks Temporary.
+                    self.keep_alive = false;
+                    self.queue_error(
+                        Error::malformed("unexpected EOF inside pack upload body"),
+                        400,
+                        idle_ns,
+                    );
+                    return true;
+                }
+                false
+            }
+            Ok(BodyStep::Complete) => {
+                let placeholder = ConnState::ReadingHeaders { deadline_ns: 0 };
+                let prev = core::mem::replace(&mut self.state, placeholder);
+                let ConnState::ReadingBlobBody { name, temp, .. } = prev else {
+                    return false;
                 };
-                let permit = permits.clone().acquire_owned().await.map_err(ServeError::Capacity)?;
-                let server = server.clone();
-                connections.spawn(async move {
-                    let _permit = permit;
-                    _ = connection(stream, server).await;
-                });
+                match temp.publish(store, &name) {
+                    Ok(wrote) => {
+                        let name_s = name.as_string_in(alloc.clone());
+                        let verb = if wrote { "written" } else { "already there" };
+                        let hdr = format_in!(
+                            alloc,
+                            "x-blaze-blob: {}: {}\r\n",
+                            name_s.as_str(),
+                            verb
+                        );
+                        self.queue_empty_response(204, Some(hdr.as_str()), idle_ns);
+                    }
+                    Err(err) => {
+                        let st = err.status_code();
+                        self.queue_error(err, st, idle_ns);
+                    }
+                }
+                true
+            }
+            Err(err) => {
+                self.keep_alive = false;
+                let st = err.status_code();
+                self.queue_error(err, st, idle_ns);
+                true
             }
         }
     }
-}
 
-async fn accept(
-    listener: &TcpListener,
-    _server: &Server,
-) -> std::io::Result<(TcpStream, SocketAddr)> {
-    #[cfg(test)]
-    if let Some(error) = _server.accept_errors.lock().unwrap().pop_front() {
-        return Err(error);
-    }
-    listener.accept().await
-}
-
-async fn connection<A: AllocatorClone + Send + Sync + 'static>(
-    stream: TcpStream,
-    server: Arc<Server, A>,
-) -> Result<(), ConnectionError> {
-    let idle = server.resources.idle;
-    let peer = stream.peer_addr().map_err(ConnectionError::PeerAddress)?;
-    let socket = socket2::SockRef::from(&stream);
-    socket.set_tcp_keepalive(
-        &socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(30))
-            .with_interval(Duration::from_secs(10)),
-    ).map_err(|source| ConnectionError::Keepalive { peer, source })?;
-    let io = TokioIo::new(progress::ProgressIo::new(stream, idle));
-    let service = service_fn(move |request| {
-        let server = server.clone();
-        async move { Ok::<_, Infallible>(server.answer(request).await) }
-    });
-    http1::Builder::new()
-        .timer(TokioTimer::new())
-        .header_read_timeout(idle)
-        .serve_connection(io, service)
-        .await.map_err(|source| ConnectionError::Http { peer, source })?;
-    Ok(())
-}
-
-fn retry_accept(error: &std::io::Error) -> bool {
-    use std::io::ErrorKind;
-    matches!(
-        error.kind(),
-        ErrorKind::Interrupted
-            | ErrorKind::WouldBlock
-            | ErrorKind::ConnectionAborted
-            | ErrorKind::ConnectionReset
-            | ErrorKind::OutOfMemory
-    ) || {
-        #[cfg(unix)]
-        {
-            let resource =
-                matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS));
-            #[cfg(target_os = "linux")]
-            let pending_network = matches!(
-                error.raw_os_error(),
-                Some(
-                    libc::ENETDOWN
-                        | libc::EPROTO
-                        | libc::ENOPROTOOPT
-                        | libc::EHOSTDOWN
-                        | libc::ENONET
-                        | libc::EHOSTUNREACH
-                        | libc::EOPNOTSUPP
-                        | libc::ENETUNREACH
-                )
-            );
-            #[cfg(not(target_os = "linux"))]
-            let pending_network = false;
-            resource || pending_network
+    fn pump_list_body(&mut self, store: &Store, got_eof: bool, idle_ns: u64) -> bool {
+        let req_limit = u64::from(store.limits().request);
+        let alloc = self.alloc.clone();
+        let outcome = {
+            let ConnState::ReadingListBody { body, framing, .. } = &mut self.state else {
+                return false;
+            };
+            let unread = self.in_buf.get(self.in_pos..).unwrap_or(&[]);
+            let mut consumed = 0usize;
+            let res = drain_body(unread, &mut consumed, framing, |chunk| {
+                let next_len = u64::try_from(body.len().saturating_add(chunk.len()))
+                    .unwrap_or(u64::MAX);
+                if next_len > req_limit {
+                    return Err(Error::too_large_owned(format_in!(
+                        alloc.clone(),
+                        "manifest body exceeds {req_limit}-byte limit"
+                    )));
+                }
+                body.extend_from_slice(chunk);
+                Ok(())
+            });
+            (consumed, res)
+        };
+        let (consumed, res) = outcome;
+        if consumed > 0 {
+            self.consume(consumed);
         }
-        #[cfg(not(unix))]
-        {
-            false
-        }
-    }
-}
-
-/// The body of every answer: bytes, or a file streamed from it, or nothing.
-pub type Body = BoxBody<Bytes, std::io::Error>;
-
-fn full(bytes: Bytes) -> Body {
-    Full::new(bytes).map_err(|never| match never {}).boxed()
-}
-
-fn empty_body() -> Body {
-    Full::new(Bytes::new()).map_err(|never| match never {}).boxed()
-}
-
-/// `count` bytes of `file` from where it is, as they are read: a blob is not held in memory.
-fn file_body(file: tokio::fs::File, count: u64) -> Body {
-    let chunks = futures_util::stream::unfold((file, count), |(mut file, left)| async move {
-        if left == 0 {
-            return None;
-        }
-        let mut buffer = vec![0; CHUNK.min(left as usize)];
-        match file.read(&mut buffer).await {
-            Ok(0) => {
-                Some((Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)), (file, 0)))
+        match res {
+            Ok(BodyStep::NeedMore) => {
+                if got_eof {
+                    self.keep_alive = false;
+                    self.queue_error(
+                        Error::malformed("unexpected EOF inside manifest upload body"),
+                        400,
+                        idle_ns,
+                    );
+                    return true;
+                }
+                false
             }
-            Ok(read) => {
-                buffer.truncate(read);
-                Some((Ok(Frame::data(Bytes::from(buffer))), (file, left - read as u64)))
+            Ok(BodyStep::Complete) => {
+                let placeholder = ConnState::ReadingHeaders { deadline_ns: 0 };
+                let prev = core::mem::replace(&mut self.state, placeholder);
+                let ConnState::ReadingListBody { name, expected, body, .. } = prev else {
+                    return false;
+                };
+                match store.repair_list(&name, expected, body.as_slice()) {
+                    Ok(true) => self.queue_empty_response(204, None, idle_ns),
+                    Ok(false) => self.queue_empty_response(412, None, idle_ns),
+                    Err(err) => {
+                        let st = err.status_code();
+                        self.queue_error(err, st, idle_ns);
+                    }
+                }
+                true
             }
-            Err(e) => Some((Err(e), (file, 0))),
+            Err(err) => {
+                self.keep_alive = false;
+                let st = err.status_code();
+                self.queue_error(err, st, idle_ns);
+                true
+            }
         }
-    });
-    BodyExt::boxed(StreamBody::new(chunks))
-}
-
-fn text(status: StatusCode, text: &'static str) -> HttpResponse<Body> {
-    HttpResponse::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(full(Bytes::from_static(text.as_bytes())))
-        .expect("a text answer")
-}
-
-fn empty(status: StatusCode) -> HttpResponse<Body> {
-    HttpResponse::builder().status(status).body(empty_body()).expect("an empty answer")
-}
-
-fn error_answer(error: Error) -> HttpResponse<Body> {
-    let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let retry_after_ms = error.retry_after_ms;
-    let mut answer = HttpResponse::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/cbor")
-        .body(full(Bytes::from(encode(&error.into_wire(), Global))))
-        .expect("an error answer");
-    if let Some(ms) = retry_after_ms
-        && let Ok(value) = HeaderValue::from_str(&ms.div_ceil(1000).to_string())
-    {
-        answer.headers_mut().insert(header::RETRY_AFTER, value);
     }
-    answer
-}
 
-fn method_not_allowed(method: &Method, allowed: &str) -> Error {
-    Error::malformed(format_args!("{method} is not how this call is made: {allowed}"))
-}
+    fn pump_write(&mut self, now_ns: u64, idle_ns: u64) -> bool {
+        let ConnState::Writing { out_buf, out_pos, file, progress } = &mut self.state else {
+            return true;
+        };
+        if progress.is_expired(now_ns) {
+            return false;
+        }
+        for _ in 0..8 {
+            if *out_pos >= out_buf.len() {
+                out_buf.clear();
+                *out_pos = 0;
+                if let Some(tail) = file {
+                    if tail.remaining > 0 {
+                        let want = usize::try_from(
+                            tail.remaining.min(u64::try_from(STREAM_CHUNK_BYTES).unwrap_or(65536)),
+                        )
+                        .unwrap_or(STREAM_CHUNK_BYTES);
+                        out_buf.resize(want, 0);
+                        match pread_some(tail.fd.fd(), out_buf.as_mut_slice(), tail.offset) {
+                            Ok(0) => return false,
+                            Ok(n) => {
+                                out_buf.truncate(n);
+                                let n_u64 = u64::try_from(n).unwrap_or(0);
+                                tail.offset = tail.offset.saturating_add(n_u64);
+                                tail.remaining = tail.remaining.saturating_sub(n_u64);
+                            }
+                            Err(_) => return false,
+                        }
+                    } else {
+                        *file = None;
+                    }
+                }
+            }
 
-/// Only one quoted, lowercase SHA256 is a conditional repair token. Wildcards, weak
-/// tags, lists and repeated headers must not turn an immutable PUT into a broad overwrite.
-fn manifest_match(headers: &hyper::HeaderMap) -> Result<Option<blaze_wire::Digest>, Error> {
-    let mut values = headers.get_all(header::IF_MATCH).iter();
-    let Some(value) = values.next() else { return Ok(None) };
-    if values.next().is_some() {
-        return Err(Error::malformed(format_args!(
-            "manifest repair takes exactly one If-Match header"
-        )));
+            if *out_pos >= out_buf.len() && file.is_none() {
+                // Entire response sent!
+                if self.keep_alive {
+                    self.state = ConnState::ReadingHeaders {
+                        deadline_ns: now_ns.saturating_add(idle_ns),
+                    };
+                    return true;
+                }
+                let _ = shutdown_write(self.fd.fd());
+                return false;
+            }
+
+            let pending = out_buf.get(*out_pos..).unwrap_or(&[]);
+            match send_nonblocking(self.fd.fd(), pending) {
+                Ok(0) => return false,
+                Ok(wrote) => {
+                    *out_pos = out_pos.saturating_add(wrote);
+                    progress.on_written(wrote);
+                }
+                Err(Errno::Again) => {
+                    progress.on_stalled(now_ns);
+                    return !progress.is_expired(now_ns);
+                }
+                Err(Errno::Intr) => continue,
+                Err(_) => return false,
+            }
+        }
+        true
     }
-    let text = value.to_str().map_err(|_| Error::malformed(format_args!("If-Match is not text")))?;
-    let digest = text
+
+    fn queue_inline_response(
+        &mut self,
+        status: u16,
+        content_type: &str,
+        body: &[u8],
+        extra_headers: Option<&str>,
+        idle_ns: u64,
+    ) {
+        let conn_hdr = if self.keep_alive { "keep-alive" } else { "close" };
+        let extra = extra_headers.unwrap_or("");
+        let head = format_in!(
+            self.alloc.clone(),
+            "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\n{}connection: {}\r\n\r\n",
+            status,
+            reason_phrase_for(status),
+            content_type,
+            body.len(),
+            extra,
+            conn_hdr
+        );
+        let mut out = Vec::with_capacity_in(head.len().saturating_add(body.len()), self.alloc.clone());
+        out.extend_from_slice(head.as_bytes());
+        out.extend_from_slice(body);
+        self.state = ConnState::Writing {
+            out_buf: out,
+            out_pos: 0,
+            file: None,
+            progress: WriteProgress::new(idle_ns),
+        };
+    }
+
+    fn queue_empty_response(&mut self, status: u16, extra_headers: Option<&str>, idle_ns: u64) {
+        let conn_hdr = if self.keep_alive { "keep-alive" } else { "close" };
+        let extra = extra_headers.unwrap_or("");
+        let head = format_in!(
+            self.alloc.clone(),
+            "HTTP/1.1 {} {}\r\ncontent-length: 0\r\n{}connection: {}\r\n\r\n",
+            status,
+            reason_phrase_for(status),
+            extra,
+            conn_hdr
+        );
+        let mut out = Vec::with_capacity_in(head.len(), self.alloc.clone());
+        out.extend_from_slice(head.as_bytes());
+        self.state = ConnState::Writing {
+            out_buf: out,
+            out_pos: 0,
+            file: None,
+            progress: WriteProgress::new(idle_ns),
+        };
+    }
+
+    fn queue_file_response(
+        &mut self,
+        status: u16,
+        content_type: &str,
+        len: u64,
+        extra_headers: &str,
+        fd: OwnedFd,
+        idle_ns: u64,
+    ) {
+        let conn_hdr = if self.keep_alive { "keep-alive" } else { "close" };
+        let head = format_in!(
+            self.alloc.clone(),
+            "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\n{}connection: {}\r\n\r\n",
+            status,
+            reason_phrase_for(status),
+            content_type,
+            len,
+            extra_headers,
+            conn_hdr
+        );
+        let mut out = Vec::with_capacity_in(head.len(), self.alloc.clone());
+        out.extend_from_slice(head.as_bytes());
+        self.state = ConnState::Writing {
+            out_buf: out,
+            out_pos: 0,
+            file: Some(FileTail { fd, offset: 0, remaining: len }),
+            progress: WriteProgress::new(idle_ns),
+        };
+    }
+
+    fn queue_error(&mut self, error: Error, status: u16, idle_ns: u64) {
+        let retry_hdr = error.retry_after_ms.map(|ms| {
+            let secs = ms.div_ceil(1000).max(1);
+            format_in!(self.alloc.clone(), "retry-after: {secs}\r\n")
+        });
+        let wire = error.into_wire(self.alloc.clone());
+        let encoded = blaze_wire::encode(&wire, self.alloc.clone());
+        self.queue_inline_response(
+            status,
+            "application/cbor",
+            encoded.as_slice(),
+            retry_hdr.as_ref().map(|s| s.as_str()),
+            idle_ns,
+        );
+    }
+}
+
+enum RecvOutcome {
+    Bytes(usize),
+    WouldBlock,
+    Eof,
+    Closed,
+}
+
+enum BodyStep {
+    NeedMore,
+    Complete,
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
+}
+
+fn parse_request_headers(raw: &[u8]) -> Result<ParsedRequest<'_>, Error> {
+    let text = core::str::from_utf8(raw)
+        .map_err(|_| Error::malformed("HTTP headers must be valid UTF-8"))?;
+    let mut lines = text.split("\r\n");
+    let req_line = lines.next().ok_or_else(|| Error::malformed("empty HTTP request line"))?;
+    let mut parts = req_line.split(' ');
+    let method = parts.next().ok_or_else(|| Error::malformed("missing HTTP method"))?;
+    let target = parts.next().ok_or_else(|| Error::malformed("missing HTTP request target"))?;
+    let version = parts.next().ok_or_else(|| Error::malformed("missing HTTP version"))?;
+    if parts.next().is_some() {
+        return Err(Error::malformed("extra tokens in HTTP request line"));
+    }
+    let mut keep_alive = match version {
+        "HTTP/1.1" => true,
+        "HTTP/1.0" => false,
+        _ => return Err(Error::malformed("unsupported HTTP version")),
+    };
+
+    let mut content_length: Option<u64> = None;
+    let mut is_chunked = false;
+    let mut if_match: Option<Digest> = None;
+    let mut saw_if_match = false;
+    let mut expect_continue = false;
+
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, val)) = line.split_once(':') else {
+            return Err(Error::malformed("malformed HTTP header line"));
+        };
+        let name = name.trim();
+        let val = val.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            let parsed = val
+                .parse::<u64>()
+                .map_err(|_| Error::malformed("invalid Content-Length header"))?;
+            if let Some(prev) = content_length {
+                if prev != parsed {
+                    return Err(Error::malformed("conflicting Content-Length headers"));
+                }
+            }
+            content_length = Some(parsed);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if val.eq_ignore_ascii_case("chunked") {
+                is_chunked = true;
+            } else {
+                return Err(Error::malformed("unsupported Transfer-Encoding"));
+            }
+        } else if name.eq_ignore_ascii_case("connection") {
+            if val.eq_ignore_ascii_case("close") {
+                keep_alive = false;
+            } else if val.eq_ignore_ascii_case("keep-alive") {
+                keep_alive = true;
+            }
+        } else if name.eq_ignore_ascii_case("if-match") {
+            if saw_if_match {
+                return Err(Error::malformed("multiple If-Match headers are refused"));
+            }
+            saw_if_match = true;
+            if_match = Some(parse_if_match(val)?);
+        } else if name.eq_ignore_ascii_case("expect") {
+            if val.eq_ignore_ascii_case("100-continue") {
+                expect_continue = true;
+            }
+        }
+    }
+
+    if is_chunked && content_length.is_some() {
+        return Err(Error::malformed("both Content-Length and Transfer-Encoding given"));
+    }
+    let framing = if is_chunked {
+        BodyFraming::Chunked(ChunkedState::SizeLine)
+    } else {
+        BodyFraming::Fixed { remaining: content_length.unwrap_or(0) }
+    };
+
+    Ok(ParsedRequest { method, target, keep_alive, framing, if_match, expect_continue })
+}
+
+fn parse_if_match(val: &str) -> Result<Digest, Error> {
+    let inner = val
         .strip_prefix('"')
-        .and_then(|text| text.strip_suffix('"'))
-        .filter(|text| text.len() == 64)
-        .and_then(|text| ObjectName::parse(&format!("manifests/{text}")))
-        .ok_or_else(|| {
-            Error::malformed(format_args!(
-                "manifest repair If-Match must be one quoted lowercase SHA256"
-            ))
-        })?;
-    Ok(Some(digest.digest))
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or_else(|| Error::malformed("If-Match must be a single quoted 64-hex SHA-256"))?;
+    parse_digest(inner)
 }
 
-fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
-    headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|it| it.to_str().ok())
-        .and_then(|it| it.parse().ok())
+fn drain_body(
+    input: &[u8],
+    consumed: &mut usize,
+    framing: &mut BodyFraming,
+    mut on_chunk: impl FnMut(&[u8]) -> Result<(), Error>,
+) -> Result<BodyStep, Error> {
+    match framing {
+        BodyFraming::Fixed { remaining } => {
+            if *remaining == 0 {
+                return Ok(BodyStep::Complete);
+            }
+            let avail = input.get(*consumed..).unwrap_or(&[]);
+            if avail.is_empty() {
+                return Ok(BodyStep::NeedMore);
+            }
+            let take_u64 = (*remaining).min(u64::try_from(avail.len()).unwrap_or(u64::MAX));
+            let take = usize::try_from(take_u64).unwrap_or(avail.len());
+            if let Some(chunk) = avail.get(..take) {
+                on_chunk(chunk)?;
+                *consumed = consumed.saturating_add(take);
+                *remaining = remaining.saturating_sub(take_u64);
+            }
+            if *remaining == 0 {
+                Ok(BodyStep::Complete)
+            } else {
+                Ok(BodyStep::NeedMore)
+            }
+        }
+        BodyFraming::Chunked(state) => loop {
+            let avail = input.get(*consumed..).unwrap_or(&[]);
+            match state {
+                ChunkedState::SizeLine => {
+                    let Some(line_end) = find_crlf(avail) else {
+                        if avail.len() > MAX_CHUNK_LINE_BYTES {
+                            return Err(Error::malformed("chunk size line too long"));
+                        }
+                        return Ok(BodyStep::NeedMore);
+                    };
+                    let line_bytes = avail.get(..line_end).unwrap_or(&[]);
+                    let line = core::str::from_utf8(line_bytes)
+                        .map_err(|_| Error::malformed("non-UTF-8 chunk size"))?;
+                    let hex_part = line.split(';').next().unwrap_or("").trim();
+                    if hex_part.is_empty() {
+                        return Err(Error::malformed("empty chunk size"));
+                    }
+                    let size = u64::from_str_radix(hex_part, 16)
+                        .map_err(|_| Error::malformed("invalid hex chunk size"))?;
+                    *consumed = consumed.saturating_add(line_end.saturating_add(2));
+                    if size == 0 {
+                        *state = ChunkedState::Trailers { lines: 0 };
+                    } else {
+                        *state = ChunkedState::Data { remaining: size };
+                    }
+                }
+                ChunkedState::Data { remaining } => {
+                    if avail.is_empty() {
+                        return Ok(BodyStep::NeedMore);
+                    }
+                    let take_u64 = (*remaining).min(u64::try_from(avail.len()).unwrap_or(u64::MAX));
+                    let take = usize::try_from(take_u64).unwrap_or(avail.len());
+                    if let Some(chunk) = avail.get(..take) {
+                        on_chunk(chunk)?;
+                        *consumed = consumed.saturating_add(take);
+                        *remaining = remaining.saturating_sub(take_u64);
+                    }
+                    if *remaining == 0 {
+                        *state = ChunkedState::DataCr;
+                    }
+                }
+                ChunkedState::DataCr => {
+                    let Some(&b) = avail.first() else {
+                        return Ok(BodyStep::NeedMore);
+                    };
+                    if b != b'\r' {
+                        return Err(Error::malformed("expected CR after chunk data"));
+                    }
+                    *consumed = consumed.saturating_add(1);
+                    *state = ChunkedState::DataLf;
+                }
+                ChunkedState::DataLf => {
+                    let Some(&b) = avail.first() else {
+                        return Ok(BodyStep::NeedMore);
+                    };
+                    if b != b'\n' {
+                        return Err(Error::malformed("expected LF after chunk data"));
+                    }
+                    *consumed = consumed.saturating_add(1);
+                    *state = ChunkedState::SizeLine;
+                }
+                ChunkedState::Trailers { lines } => {
+                    let Some(line_end) = find_crlf(avail) else {
+                        if avail.len() > MAX_CHUNK_LINE_BYTES {
+                            return Err(Error::malformed("chunk trailer line too long"));
+                        }
+                        return Ok(BodyStep::NeedMore);
+                    };
+                    *consumed = consumed.saturating_add(line_end.saturating_add(2));
+                    if line_end == 0 {
+                        *state = ChunkedState::Done;
+                        return Ok(BodyStep::Complete);
+                    }
+                    *lines = lines.saturating_add(1);
+                    if *lines > MAX_TRAILER_LINES {
+                        return Err(Error::malformed("too many chunk trailer lines"));
+                    }
+                }
+                ChunkedState::Done => return Ok(BodyStep::Complete),
+            }
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn consuming_error_answers_preserves_http_and_wire_failures() {
-        for (code, status) in [
-            (ErrorCode::Malformed, 400),
-            (ErrorCode::Version, 400),
-            (ErrorCode::Unauthenticated, 401),
-            (ErrorCode::NotAllowed, 403),
-            (ErrorCode::NotFound, 404),
-            (ErrorCode::Conflict, 409),
-            (ErrorCode::TooLarge, 413),
-            (ErrorCode::Busy, 429),
-            (ErrorCode::Refused, 422),
-            (ErrorCode::Internal, 500),
+    #[test]
+    fn if_match_parser_requires_exact_quoted_lowercase_sha256() {
+        let valid = "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"";
+        assert!(parse_if_match(valid).is_ok());
+
+        for bad in [
+            "*",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "W/\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"",
+            "\"0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef\"",
+            "\"short\"",
+            "",
         ] {
-            for retry_after_ms in [None, Some(0), Some(1), Some(1001)] {
-                let mut error = Error::new(code, format_args!("pack {}: exact refusal", 17));
-                error.retry_after_ms = retry_after_ms;
-                let response = error_answer(error);
-                assert_eq!(response.status().as_u16(), status);
-                assert_eq!(response.headers()[header::CONTENT_TYPE], "application/cbor");
-                let retry_header = response.headers().get(header::RETRY_AFTER);
-                match retry_after_ms {
-                    Some(ms) => {
-                        assert_eq!(
-                            retry_header.unwrap().to_str().unwrap(),
-                            ms.div_ceil(1000).to_string()
-                        );
-                    }
-                    None => assert!(retry_header.is_none()),
-                }
-                let body = response.into_body().collect().await.unwrap().to_bytes();
-                let wire: blaze_wire::WireError =
-                    blaze_wire::decode(&body, &Limits::DOCUMENTED).unwrap();
-                assert_eq!(wire.code(), Some(code));
-                assert_eq!(wire.message, "pack 17: exact refusal");
-                assert_eq!(wire.retry_after_ms, retry_after_ms);
-            }
+            assert!(parse_if_match(bad).is_err(), "expected refusal for {bad:?}");
         }
     }
 
-    struct Running {
-        _dir: tempfile::TempDir,
-        server: Arc<Server>,
-        port: u16,
-        task: tokio::task::JoinHandle<Result<(), ServeError>>,
-    }
-
-    impl Running {
-        async fn start() -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            Self::with_config(dir, |config| config).await
-        }
-
-        async fn with_config(
-            dir: tempfile::TempDir,
-            change: impl FnOnce(Config) -> Config,
-        ) -> Self {
-            let server = Arc::new(Server::open(&change(Config::at(dir.path(), 0))).unwrap());
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let task = tokio::spawn(serve_on(listener, server.clone()));
-            Self { _dir: dir, server, port, task }
-        }
-
-        async fn request(
-            &self,
-            method: &str,
-            path: &str,
-            headers: &str,
-            bytes: &[u8],
-        ) -> (u16, String, Vec<u8>) {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-
-            let mut stream = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
-            let head = format!(
-                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n",
-                bytes.len()
-            );
-            stream.write_all(head.as_bytes()).await.unwrap();
-            stream.write_all(bytes).await.unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                // A rejected upload can close with unread request bytes and reset TCP on
-                // macOS. HTTP completion is its message framing, not a subsequent TCP EOF.
-                let mut reader = BufReader::new(stream);
-                let mut head = String::new();
-                while !head.ends_with("\r\n\r\n") {
-                    assert_ne!(reader.read_line(&mut head).await.unwrap(), 0, "truncated headers");
-                }
-                let head = head.trim_end_matches("\r\n").to_lowercase();
-                let status = head.split_whitespace().nth(1).unwrap().parse::<u16>().unwrap();
-                let length = if method == "HEAD" || matches!(status, 204 | 304) {
-                    0
-                } else {
-                    head.lines()
-                        .find_map(|line| line.strip_prefix("content-length:"))
-                        .expect("the test server frames responses with Content-Length")
-                        .trim()
-                        .parse::<u64>()
-                        .unwrap()
-                };
-                let mut body = Vec::new();
-                let read = reader.take(length).read_to_end(&mut body).await.unwrap();
-                assert_eq!(read as u64, length, "truncated response body");
-                (status, head, body)
-            })
-            .await
-            .unwrap()
-        }
-    }
-
-    #[tokio::test]
-    async fn a_bind_failure_retains_the_address_and_os_error() {
-        use std::error::Error as _;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let mut config = Config::at(directory.path(), address.port());
-        config.listen = address;
-        let error = serve(config).await.unwrap_err();
-        assert!(error.source().is_some());
-        match error {
-            ServeError::Listen { address: refused, source } => {
-                assert_eq!(refused, address);
-                assert_eq!(source.kind(), std::io::ErrorKind::AddrInUse);
-            }
-            other => panic!("the occupied address was not the refusal: {other}"),
-        }
-    }
-
-    impl Drop for Running {
-        fn drop(&mut self) {
-            self.task.abort();
-        }
-    }
-
-    /// Bytes the server takes as a pack, with the digest that names them.
-    fn pack(rest: &[u8]) -> (Vec<u8>, String) {
-        let mut bytes = blaze_wire::DIST_PACK_MAGIC.to_vec();
-        bytes.extend_from_slice(&[1; 32]);
-        bytes.push(0);
-        bytes.extend_from_slice(&(rest.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(rest);
-        let name = {
-            use sha2::Digest as _;
-            let digest: blaze_wire::Digest = sha2::Sha256::digest(&bytes).into();
-            hex(&digest).to_string()
-        };
-        (bytes, name)
-    }
-
-    #[tokio::test]
-    async fn an_idle_upload_times_out_without_blocking_a_healthy_client() {
-        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
-            config.resources.idle = Duration::from_millis(200);
-            config
-        })
-        .await;
-        let (_, digest) = pack(b"complete");
-        let name = format!("packs/{digest}.pack");
-        let mut idle = TcpStream::connect(("127.0.0.1", run.port)).await.unwrap();
-        idle.write_all(
-            format!(
-                "PUT /v1/blob/{name} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\ncut"
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-        let directory = run.server.store().dir().join("packs");
-        for _ in 0..100 {
-            if std::fs::read_dir(&directory).unwrap().count() != 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
-        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while std::fs::read_dir(&directory).unwrap().count() != 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(run.server.store().open_blob(&name).unwrap().is_none());
-        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
-    }
-
-    #[tokio::test]
-    async fn periodic_sweeps_remove_only_unlocked_abandoned_staging_files() {
-        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
-            config.resources.sweep_every = Duration::from_millis(20);
-            config.resources.temporary_age = Duration::ZERO;
-            config
-        })
-        .await;
-        let abandoned = run.server.store().dir().join("packs/.abandoned.123-456-1.tmp");
-        std::fs::write(&abandoned, b"cut").unwrap();
-        let path = run.server.store().dir().join("packs/.active.123-456-2.tmp");
-        let (file, owner) = Temporary::create(path.clone()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while abandoned.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await
-            }
-        })
-        .await
-        .unwrap();
-        assert!(path.exists());
-        drop(file);
-        assert!(path.exists(), "the cleanup lease retains the staging lock");
-        drop(owner);
-        assert!(!path.exists());
-        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
-    }
-
-    #[tokio::test]
-    async fn restarting_a_server_keeps_fresh_stale_files_hidden_until_periodic_cleanup() {
-        let dir = tempfile::tempdir().unwrap();
-        let server = Server::open(&Config::at(dir.path(), 0)).unwrap();
-        let stale = server.store().dir().join("manifests/.default.123-456-3.tmp");
-        std::fs::write(&stale, b"incomplete").unwrap();
-        drop(server);
-        let _run = Running::with_config(dir, |mut config| {
-            config.resources.sweep_every = Duration::from_millis(20);
-            config.resources.temporary_age = Duration::ZERO;
-            config
-        })
-        .await;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while stale.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await
-            }
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_connection_slot_is_released_when_idle_headers_expire() {
-        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
-            config.resources.connections = 1;
-            config.resources.idle = Duration::from_millis(100);
-            config
-        })
-        .await;
-        let mut stalled = TcpStream::connect(("127.0.0.1", run.port)).await.unwrap();
-        stalled.write_all(b"PUT /v1/blob/").await.unwrap();
-        let mut bytes = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(2), stalled.read_to_end(&mut bytes))
-            .await
-            .unwrap();
-        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
-    }
-
-    #[tokio::test]
-    async fn stalled_response_releases_its_connection_permit() {
-        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
-            config.resources.connections = 1;
-            config.resources.idle = Duration::from_millis(200);
-            config
-        })
-        .await;
-        let bytes = vec![b'x'; 16 << 20];
-        let (bytes, digest) = pack(&bytes);
-        let name = format!("packs/{digest}.pack");
-        run.server.store().put_blob(&name, &bytes).unwrap();
-        let mut stalled = TcpStream::connect(("127.0.0.1", run.port)).await.unwrap();
-        socket2::SockRef::from(&stalled).set_recv_buffer_size(4096).unwrap();
-        stalled
-            .write_all(
-                format!("GET /v1/blob/{name} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
-            )
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // With one permit, this response cannot arrive until the blocked writer expires.
-        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
-        assert!(run.server.store().open_blob(&name).unwrap().is_some());
-        drop(stalled);
-    }
-
-    #[tokio::test]
-    async fn transient_accept_errors_and_bad_janitor_entries_leave_service_usable() {
-        let dir = tempfile::tempdir().unwrap();
-        let run = Running::with_config(dir, |mut config| {
-            config.resources.sweep_every = Duration::from_millis(20);
-            config.resources.temporary_age = Duration::ZERO;
-            config
-        })
-        .await;
-        run.server.accept_errors.lock().unwrap().push_back(std::io::ErrorKind::Interrupted.into());
-        #[cfg(unix)]
-        run.server
-            .accept_errors
-            .lock()
-            .unwrap()
-            .push_back(std::io::Error::from_raw_os_error(libc::EMFILE));
-        #[cfg(target_os = "linux")]
-        {
-            let mut errors = run.server.accept_errors.lock().unwrap();
-            errors.push_back(std::io::Error::from_raw_os_error(libc::EPROTO));
-            errors.push_back(std::io::Error::from_raw_os_error(libc::ENETUNREACH));
-        }
-        let stale_dir = run.server.store().dir().join("packs/.bad.123-456-1.tmp");
-        std::fs::create_dir(&stale_dir).unwrap();
-        let abandoned = run.server.store().dir().join("packs/.abandoned.123-456-2.tmp");
-        std::fs::write(&abandoned, b"leftover").unwrap();
-        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while abandoned.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await
-            }
-        })
-        .await
-        .unwrap();
-        assert!(stale_dir.is_dir());
-        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
-        assert!(run.server.accept_errors.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn malformed_and_traversing_object_paths_are_not_published() {
-        let run = Running::start().await;
-        for name in ["%", "%2", "%GG", "%ff", "%00", "a%2Fb", "a%5Cb", "%2e%2e", "default"] {
-            let (status, _, _) = run
-                .request("PUT", &format!("/v1/list/manifests/{name}"), "", b"must not appear\n")
-                .await;
-            assert_eq!(status, 404, "{name}: {status}");
-        }
-        assert_eq!(
-            std::fs::read_dir(run.server.store().dir().join("manifests")).unwrap().count(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn http_put_get_and_wrong_digest() {
-        let run = Running::start().await;
-        let (bytes, name) = pack(b"0123456789");
-        let path = format!("/v1/blob/packs/{name}.pack");
-        assert_eq!(run.request("PUT", &path, "", &bytes).await.0, 204);
-        let (status, head, body) = run.request("GET", &path, "", &[]).await;
-        assert_eq!((status, body), (200, bytes.clone()));
-        assert!(head.contains(&format!("etag: \"{name}\"")));
-        let wrong = format!("/v1/blob/packs/{}.pack", hex(&[1; 32]));
-        assert_eq!(run.request("PUT", &wrong, "", &bytes).await.0, 422);
-        assert_eq!(run.request("GET", &wrong, "", &[]).await.0, 404);
-        let (unframed, name) = (b"not a pack".to_vec(), hex(&[2; 32]));
-        let path = format!("/v1/blob/packs/{name}.pack");
-        assert_eq!(run.request("PUT", &path, "", &unframed).await.0, 422);
-        for gone in ["/v1/hello", "/v1/cache/missing", "/v1/objects?prefix=packs/"] {
-            assert_eq!(run.request("POST", gone, "", &[]).await.0, 404, "{gone}");
-        }
-        // A method no call is made with is the request's fault.
-        assert_eq!(
-            run.request("DELETE", &format!("/v1/blob/packs/{name}.pack"), "", &[]).await.0,
-            400
-        );
-    }
-
-    #[tokio::test]
-    async fn http_list_is_written_once_and_a_second_writer_is_told() {
-        let run = Running::start().await;
-        let path = format!("/v1/list/manifests/{}", hex(&[7; 32]));
-        let (first_bytes, first_name) = pack(b"first");
-        let (second_bytes, second_name) = pack(b"second");
-        for (bytes, name) in [(&first_bytes, &first_name), (&second_bytes, &second_name)] {
-            assert_eq!(
-                run.request("PUT", &format!("/v1/blob/packs/{name}.pack"), "", bytes).await.0,
-                204
-            );
-        }
-        let first = blaze_wire::pack_list::encode(&[manifest_ref(&first_bytes, &first_name)], Global);
-        let second = blaze_wire::pack_list::encode(&[manifest_ref(&second_bytes, &second_name)], Global);
-        let (a, b) = tokio::join!(
-            run.request("PUT", &path, "", &first),
-            run.request("PUT", &path, "", &second),
-        );
-        let mut statuses = [a.0, b.0];
-        statuses.sort();
-        assert_eq!(statuses, [204, 412]);
-        let (status, _, body) = run.request("GET", &path, "", &[]).await;
-        assert_eq!(status, 200);
-        assert!(body == first || body == second);
-        for path in [
-            "/v1/blob/packs/../key",
-            "/v1/list/manifests/../key",
-            "/v1/list/manifests/%2e%2e%2fkey",
-        ] {
-            assert_ne!(run.request("GET", path, "", &[]).await.0, 200, "{path}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_short_http_upload_is_not_published_and_leaves_no_temporary() {
-        let run = Running::start().await;
-        let (_, digest) = pack(b"complete");
-        let name = format!("packs/{digest}.pack");
-        let mut stream = TcpStream::connect(("127.0.0.1", run.port)).await.unwrap();
-        let request = format!(
-            "PUT /v1/blob/{name} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\ncut"
-        );
-        stream.write_all(request.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut out = Vec::new();
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_secs(2), stream.read_to_end(&mut out))
-                .await;
-        for _ in 0..100 {
-            if std::fs::read_dir(run.server.store().dir().join("packs")).unwrap().count() == 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(run.server.store().open_blob(&name).unwrap().is_none());
-        assert_eq!(std::fs::read_dir(run.server.store().dir().join("packs")).unwrap().count(), 0);
-    }
-
-    fn manifest_ref(bytes: &[u8], digest: &str) -> blaze_wire::PackRef {
-        blaze_wire::PackRef {
-            pack: ObjectName::parse(&format!("packs/{digest}.pack")).unwrap().digest,
-            size: bytes.len() as u64,
-            keys: blaze_wire::digest_of_encoded_name(
-                "blaze/dist-pack-keys",
-                &blaze_wire::encode(&vec![[1; 32]], Global),
-            ),
-            packed: None,
-            format: blaze_wire::DIST_PACK_FORMAT,
-        }
-    }
-
-    #[tokio::test]
-    async fn conditional_manifest_repair_requires_one_exact_token_and_verified_replacement() {
-        use sha2::{Digest as _, Sha256};
-        let run = Running::start().await;
-        let (a, aname) = pack(b"old pack");
-        let (b, bname) = pack(b"replacement pack");
-        let old = blaze_wire::pack_list::encode(&[manifest_ref(&a, &aname)], Global);
-        let new = blaze_wire::pack_list::encode(&[manifest_ref(&b, &bname)], Global);
-        let path = format!("/v1/list/manifests/{}", hex(&[8; 32]));
-        assert_eq!(
-            run.request("PUT", &format!("/v1/blob/packs/{aname}.pack"), "", &a).await.0,
-            204
-        );
-        assert_eq!(run.request("PUT", &path, "", &old).await.0, 204);
-        std::fs::remove_file(run.server.store().dir().join(format!("packs/{aname}.pack"))).unwrap();
-        let expected: blaze_wire::Digest = Sha256::digest(&old).into();
-        let tag = format!("\"{}\"", hex(&expected));
-        for value in [
-            "*".to_owned(),
-            format!("W/{tag}"),
-            format!("{tag}, {tag}"),
-            tag.trim_matches('"').to_owned(),
-            format!("\"{}\"", "AB".repeat(32)),
-        ] {
-            let header = format!("If-Match: {value}\r\n");
-            assert_eq!(run.request("PUT", &path, &header, &new).await.0, 400, "{value}");
-            assert_eq!(run.request("GET", &path, "", &[]).await.2, old);
-        }
-        let repeated = format!("If-Match: {tag}\r\nIf-Match: {tag}\r\n");
-        assert_eq!(run.request("PUT", &path, &repeated, &new).await.0, 400);
-        let wrong = format!("If-Match: \"{}\"\r\n", hex(&[0; 32]));
-        assert_eq!(run.request("PUT", &path, &wrong, &new).await.0, 412);
-        let header = format!("If-Match: {tag}\r\n");
-        assert_eq!(
-            run.request("PUT", &path, &header, &new).await.0,
-            422,
-            "an absent replacement pack is refused"
-        );
-        assert_eq!(
-            run.request("PUT", &format!("/v1/blob/packs/{bname}.pack"), "", &b).await.0,
-            204
-        );
-        let mut corrupt = b.clone();
-        *corrupt.last_mut().unwrap() ^= 1;
-        std::fs::write(run.server.store().dir().join(format!("packs/{bname}.pack")), corrupt)
-            .unwrap();
-        assert_eq!(
-            run.request("PUT", &path, &header, &new).await.0,
-            422,
-            "a corrupt replacement is refused"
-        );
-        assert_eq!(run.request("GET", &path, "", &[]).await.2, old);
-        assert_eq!(
-            run.request("PUT", &format!("/v1/blob/packs/{bname}.pack"), "", &b).await.0,
-            204
-        );
-        assert_eq!(run.request("PUT", &path, &header, &new).await.0, 204);
-        assert_eq!(run.request("GET", &path, "", &[]).await.2, new);
-        let current: blaze_wire::Digest = Sha256::digest(&new).into();
-        let valid = format!("If-Match: \"{}\"\r\n", hex(&current));
-        assert_eq!(
-            run.request("PUT", &path, &valid, &old).await.0,
-            412,
-            "a valid current manifest stays immutable"
-        );
-        assert_eq!(run.request("PUT", &path, "", b"ordinary immutable publication\n").await.0, 412);
-        assert_eq!(run.request("GET", &path, "", &[]).await.2, new);
-    }
-
-    #[tokio::test]
-    async fn competing_http_repairs_have_one_atomic_comparison_winner() {
-        use sha2::{Digest as _, Sha256};
-        let run = Running::start().await;
-        let (a, aname) = pack(b"absent old pack");
-        let (b, bname) = pack(b"first complete replacement");
-        let (c, cname) = pack(b"second complete replacement");
-        for (name, bytes) in [(&bname, &b), (&cname, &c)] {
-            assert_eq!(
-                run.request("PUT", &format!("/v1/blob/packs/{name}.pack"), "", bytes).await.0,
-                204
-            );
-        }
-        let old = blaze_wire::pack_list::encode(&[manifest_ref(&a, &aname)], Global);
-        let left = blaze_wire::pack_list::encode(&[manifest_ref(&b, &bname)], Global);
-        let right = blaze_wire::pack_list::encode(&[manifest_ref(&c, &cname)], Global);
-        let path = format!("/v1/list/manifests/{}", hex(&[9; 32]));
-        // Seed a preexisting list with a lost pack; the new PUT path rejects it.
-        std::fs::write(run.server.store().dir().join(format!("manifests/{}", hex(&[9; 32]))), &old)
-            .unwrap();
-        let expected: blaze_wire::Digest = Sha256::digest(&old).into();
-        let header = format!("If-Match: \"{}\"\r\n", hex(&expected));
-        let (a, b) = tokio::join!(
-            run.request("PUT", &path, &header, &left),
-            run.request("PUT", &path, &header, &right),
-        );
-        let mut statuses = [a.0, b.0];
-        statuses.sort();
-        assert_eq!(statuses, [204, 412]);
-        let visible = run.request("GET", &path, "", &[]).await.2;
-        assert!(visible == left || visible == right);
+    #[test]
+    fn chunked_decoder_handles_split_chunks_and_trailers() {
+        let alloc = blaze_own::testing::heap().shared();
+        let wire = b"5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nX-Trailer: ok\r\n\r\n";
+        let mut framing = BodyFraming::Chunked(ChunkedState::SizeLine);
+        let mut out = Vec::new_in(alloc);
+        let mut consumed = 0usize;
+        let done = drain_body(wire, &mut consumed, &mut framing, |chunk| {
+            out.extend_from_slice(chunk);
+            Ok(())
+        });
+        assert!(matches!(done, Ok(BodyStep::Complete)));
+        assert_eq!(consumed, wire.len());
+        assert_eq!(out.as_slice(), b"hello world");
     }
 }

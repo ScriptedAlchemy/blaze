@@ -19,6 +19,10 @@ pub mod work;
 
 pub use rng::Rng;
 
+use core::fmt::{self, Write as _};
+
+use blaze_wire::{WireAlloc, WireString};
+
 use crate::Millis;
 
 /// An invariant a run broke: which, when, and what the checker saw.
@@ -31,23 +35,25 @@ pub struct Violation {
     /// The simulated time it was found at.
     pub at: Millis,
     /// What was seen.
-    pub detail: String,
+    pub detail: WireString,
 }
 
 impl Violation {
-    fn new(seed: u64, at: Millis, invariant: &'static str, detail: std::fmt::Arguments<'_>) -> Self {
-        use std::alloc::Global;
-        use std::io::Write as _;
-
-        let mut bytes = Vec::new_in(Global);
-        bytes.write_fmt(detail).expect("formatting a simulation failure into its owned bytes");
-        let detail = String::from_utf8(bytes).expect("formatting produces UTF-8");
-        Self { seed, invariant, at, detail }
+    fn new(
+        seed: u64,
+        at: Millis,
+        invariant: &'static str,
+        detail: fmt::Arguments<'_>,
+        alloc: WireAlloc,
+    ) -> Self {
+        let mut text = WireString::new_in(alloc);
+        let _ = text.write_fmt(detail);
+        Self { seed, invariant, at, detail: text }
     }
 }
 
-impl std::fmt::Display for Violation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Violation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "seed {}: {} broken at {} ms: {}",

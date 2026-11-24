@@ -5,7 +5,7 @@
 //! attempt stops, a join that came before the lead tries again. So each refusal's message starts
 //! with a stable token and a colon, which [`Refusal::of`] reads back.
 
-use blaze_wire::{ErrorCode, WireError};
+use blaze_wire::{ErrorCode, WireAlloc, WireError, WireString};
 
 /// A refusal of a work or job call.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -30,7 +30,7 @@ pub enum Refusal {
     /// A batch's sequence number was used before with other content.
     SeqReused,
     /// The call does not follow the protocol's shape: what is wrong.
-    Malformed(String),
+    Malformed(WireString),
     /// Past a bound: the queue is full and the caller retries after the time given.
     Busy,
     /// No such subscriber.
@@ -79,7 +79,7 @@ impl Refusal {
 
     /// The error on the wire. `retry_after_ms` is set where waiting helps: a join before the
     /// lead's, and a full queue.
-    pub fn to_wire(&self, retry_after_ms: Option<u64>) -> WireError {
+    pub fn to_wire(&self, retry_after_ms: Option<u64>, alloc: WireAlloc) -> WireError {
         let text = match self {
             Refusal::NotJoined => "the holder has not joined this attempt",
             Refusal::NotYet => "the lead has not joined and the provisional root set differs",
@@ -95,7 +95,7 @@ impl Refusal {
             Refusal::NoSubscriber => "no such subscriber",
             Refusal::Superseded => "a newer source of this pull request replaced this one",
         };
-        let error = WireError::new(self.code(), format_args!("{}: {text}", self.token()));
+        let error = WireError::new(self.code(), format_args!("{}: {text}", self.token()), alloc);
         match retry_after_ms {
             Some(ms) => error.retry_after(ms),
             None => error,
@@ -105,7 +105,9 @@ impl Refusal {
     /// The refusal a wire error names, by its token; `None` for an error this crate did not
     /// write.
     pub fn of(error: &WireError) -> Option<Refusal> {
-        let (token, rest) = error.message.split_once(": ").unwrap_or((&error.message, ""));
+        let alloc = *error.message.allocator();
+        let (token, rest) =
+            error.message.as_str().split_once(": ").unwrap_or((error.message.as_str(), ""));
         Some(match token {
             "not-joined" => Refusal::NotJoined,
             "not-yet" => Refusal::NotYet,
@@ -116,7 +118,7 @@ impl Refusal {
             "no-execution" => Refusal::NoExecution,
             "not-holder" => Refusal::NotHolder,
             "seq-reused" => Refusal::SeqReused,
-            "malformed" => Refusal::Malformed(rest.to_owned()),
+            "malformed" => Refusal::Malformed(WireString::from_str_in(rest, alloc)),
             "busy" => Refusal::Busy,
             "no-subscriber" => Refusal::NoSubscriber,
             "superseded" => Refusal::Superseded,
@@ -127,10 +129,13 @@ impl Refusal {
 
 #[cfg(test)]
 mod tests {
+    use blaze_wire::WireString;
+
     use super::Refusal;
 
     #[test]
     fn every_refusal_reads_back() {
+        let alloc = blaze_own::testing::heap().shared();
         for refusal in [
             Refusal::NotJoined,
             Refusal::NotYet,
@@ -141,11 +146,11 @@ mod tests {
             Refusal::NoExecution,
             Refusal::NotHolder,
             Refusal::SeqReused,
-            Refusal::Malformed("items: 3 for 4 processed".into()),
+            Refusal::Malformed(WireString::from_str_in("items: 3 for 4 processed", alloc)),
             Refusal::Busy,
             Refusal::NoSubscriber,
         ] {
-            let wire = refusal.to_wire(Some(5));
+            let wire = refusal.to_wire(Some(5), alloc);
             assert_eq!(Refusal::of(&wire), Some(refusal.clone()), "{wire:?}");
             assert_eq!(wire.code(), Some(refusal.code()));
         }

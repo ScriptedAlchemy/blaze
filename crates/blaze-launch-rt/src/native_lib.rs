@@ -44,7 +44,7 @@ use blaze_sys::posix::thread::{self as dyld, RtldFlags};
 
 use crate::run_mode::{CName, Memory, RunModeError};
 
-mod args;
+pub(crate) mod args;
 #[cfg(target_os = "linux")]
 mod linux;
 pub use args::{ArgsError, ArgumentList, ProcessArgs, ProcessArgsOpts};

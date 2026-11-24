@@ -1936,35 +1936,66 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         visited: &mut [ItemKey; 16],
         vlen: &mut usize,
     ) -> Result<bool, Refused> {
-        if depth >= 8 || *vlen >= 16 || visited[..*vlen].contains(&seed_tr) {
-            return Ok(false);
+        let _ = want_tr;
+        #[derive(Clone, Copy)]
+        struct Frame<'c> {
+            tr: ItemKey,
+            self_: Side<'c>,
+            trait_: Side<'c>,
+            has_self: bool,
+            depth: u32,
         }
-        visited[*vlen] = seed_tr;
-        *vlen += 1;
-        let Some((tenv, views)) = self.trait_env_from_seed(seed_tr, seed_self, seed_trait, seed_has_self)? else {
-            return Ok(false);
-        };
-        for allow_alias in [false, true] {
-            for cv in views {
-                let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
-                if self.match_trait_clause(c, subject, trait_ref, has_subject, allow_alias)? {
-                    return Ok(true);
+        let mut stack: [Option<Frame<'c>>; 64] = [None; 64];
+        let mut sp: usize = 0;
+        if let Some(slot) = stack.get_mut(sp) {
+            *slot = Some(Frame { tr: seed_tr, self_: seed_self, trait_: seed_trait, has_self: seed_has_self, depth });
+            sp += 1;
+        }
+        while sp > 0 {
+            sp -= 1;
+            let Some(frame) = stack.get_mut(sp).and_then(Option::take) else {
+                continue;
+            };
+            if frame.depth >= 8 || *vlen >= 16 {
+                continue;
+            }
+            if visited.get(..*vlen).is_some_and(|seen| seen.contains(&frame.tr)) {
+                continue;
+            }
+            if let Some(slot) = visited.get_mut(*vlen) {
+                *slot = frame.tr;
+                *vlen += 1;
+            }
+            let Some((tenv, views)) = self.trait_env_from_seed(frame.tr, frame.self_, frame.trait_, frame.has_self)? else {
+                continue;
+            };
+            for allow_alias in [false, true] {
+                for cv in views {
+                    let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
+                    if self.match_trait_clause(c, subject, trait_ref, has_subject, allow_alias)? {
+                        return Ok(true);
+                    }
                 }
             }
-        }
-        for cv in views {
-            let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
-            if let Ok(PNode::ExTrait(ct, _)) = self.node(c)
-                && self.fits(c).is_ok()
-                && let Ok(c_own) = self.own(c)
-                && let Ok(ckids) = self.kids_of(c)
-                && ckids.len() > 0
-                && let Some((_, crest)) = c.slots.split(c_own)
-                && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
-                && self.erased_sides(c_self, subject)
-                && self.elaborate_for_trait(ct, c_self, c, true, want_tr, subject, trait_ref, has_subject, depth + 1, visited, vlen)?
-            {
-                return Ok(true);
+            let base = sp;
+            for cv in views {
+                let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
+                if let Ok(PNode::ExTrait(ct, _)) = self.node(c)
+                    && self.fits(c).is_ok()
+                    && let Ok(c_own) = self.own(c)
+                    && let Ok(ckids) = self.kids_of(c)
+                    && ckids.len() > 0
+                    && let Some((_, crest)) = c.slots.split(c_own)
+                    && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
+                    && self.erased_sides(c_self, subject)
+                    && let Some(slot) = stack.get_mut(sp)
+                {
+                    *slot = Some(Frame { tr: ct, self_: c_self, trait_: c, has_self: true, depth: frame.depth + 1 });
+                    sp += 1;
+                }
+            }
+            if let Some(pushed) = stack.get_mut(base..sp) {
+                pushed.reverse();
             }
         }
         Ok(false)
@@ -1986,35 +2017,65 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         visited: &mut [ItemKey; 16],
         vlen: &mut usize,
     ) -> Result<Option<Side<'c>>, Refused> {
-        if depth >= 8 || *vlen >= 16 || visited[..*vlen].contains(&seed_tr) {
-            return Ok(None);
+        #[derive(Clone, Copy)]
+        struct Frame<'c> {
+            tr: ItemKey,
+            self_: Side<'c>,
+            trait_: Side<'c>,
+            has_self: bool,
+            depth: u32,
         }
-        visited[*vlen] = seed_tr;
-        *vlen += 1;
-        let Some((tenv, views)) = self.trait_env_from_seed(seed_tr, seed_self, seed_trait, seed_has_self)? else {
-            return Ok(None);
-        };
-        for allow_alias in [false, true] {
-            for cv in views {
-                let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
-                if let Some(term) = self.match_proj_clause(c, want, want_arg_count, want_tr, want_name, allow_alias)? {
-                    return Ok(Some(term));
+        let mut stack: [Option<Frame<'c>>; 64] = [None; 64];
+        let mut sp: usize = 0;
+        if let Some(slot) = stack.get_mut(sp) {
+            *slot = Some(Frame { tr: seed_tr, self_: seed_self, trait_: seed_trait, has_self: seed_has_self, depth });
+            sp += 1;
+        }
+        while sp > 0 {
+            sp -= 1;
+            let Some(frame) = stack.get_mut(sp).and_then(Option::take) else {
+                continue;
+            };
+            if frame.depth >= 8 || *vlen >= 16 {
+                continue;
+            }
+            if visited.get(..*vlen).is_some_and(|seen| seen.contains(&frame.tr)) {
+                continue;
+            }
+            if let Some(slot) = visited.get_mut(*vlen) {
+                *slot = frame.tr;
+                *vlen += 1;
+            }
+            let Some((tenv, views)) = self.trait_env_from_seed(frame.tr, frame.self_, frame.trait_, frame.has_self)? else {
+                continue;
+            };
+            for allow_alias in [false, true] {
+                for cv in views {
+                    let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
+                    if let Some(term) = self.match_proj_clause(c, want, want_arg_count, want_tr, want_name, allow_alias)? {
+                        return Ok(Some(term));
+                    }
                 }
             }
-        }
-        for cv in views {
-            let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
-            if let Ok(PNode::ExTrait(ct, _)) = self.node(c)
-                && self.fits(c).is_ok()
-                && let Ok(c_own) = self.own(c)
-                && let Ok(ckids) = self.kids_of(c)
-                && ckids.len() > 0
-                && let Some((_, crest)) = c.slots.split(c_own)
-                && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
-                && self.erased_sides(c_self, subject)
-                && let Some(term) = self.elaborate_for_proj(ct, c_self, c, true, want, want_arg_count, subject, want_tr, want_name, depth + 1, visited, vlen)?
-            {
-                return Ok(Some(term));
+            let base = sp;
+            for cv in views {
+                let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
+                if let Ok(PNode::ExTrait(ct, _)) = self.node(c)
+                    && self.fits(c).is_ok()
+                    && let Ok(c_own) = self.own(c)
+                    && let Ok(ckids) = self.kids_of(c)
+                    && ckids.len() > 0
+                    && let Some((_, crest)) = c.slots.split(c_own)
+                    && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
+                    && self.erased_sides(c_self, subject)
+                    && let Some(slot) = stack.get_mut(sp)
+                {
+                    *slot = Some(Frame { tr: ct, self_: c_self, trait_: c, has_self: true, depth: frame.depth + 1 });
+                    sp += 1;
+                }
+            }
+            if let Some(pushed) = stack.get_mut(base..sp) {
+                pushed.reverse();
             }
         }
         Ok(None)

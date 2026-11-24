@@ -541,7 +541,7 @@ fn an_array_round_trips() {
 #[test]
 fn the_oracle_catches_a_value_encoded_in_the_wrong_byte_order() {
     let value = Owned::Integer(0x0102_0304_0506_0708);
-    let mut bytes = Vec::new();
+    let mut bytes = Default::default();
     codec::encode(value.as_ref(), &mut bytes).unwrap();
     assert_eq!(decoded_value(Storage::Integer, &bytes), value);
     // Keep the framing intact and plant the opposite byte order in the eight-byte integer.
@@ -553,8 +553,8 @@ fn the_oracle_catches_a_value_encoded_in_the_wrong_byte_order() {
 #[test]
 fn the_oracle_catches_an_array_that_drops_its_null_elements() {
     let items = [Owned::Integer(1), Owned::Null, Owned::Integer(2)];
-    let refs: Vec<ValueRef<'_>> = items.iter().map(Owned::as_ref).collect();
-    let mut bytes = Vec::new();
+    let refs = items.each_ref().map(Owned::as_ref);
+    let mut bytes = Default::default();
     codec::encode_array(Storage::Integer, &refs, &mut bytes).unwrap();
     assert_eq!(decoded_array(Storage::Integer, &bytes), items);
     let nonnull = [items[0].as_ref(), items[2].as_ref()];

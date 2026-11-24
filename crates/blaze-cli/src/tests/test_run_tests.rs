@@ -622,7 +622,7 @@ fn on_linux_every_run_is_refused_for_want_of_a_sandbox() {
     let g = Alloc::global();
     let mut scripts: AVec<'static, Script> = Vec::new_in(g);
     scripts.resize(3, Script::Pass);
-    let mut runner = Runner::new(SimZygote::new(&tape, scripts, None), &config(2).plan, Host::Linux, g);
+    let mut runner = Runner::new(SimZygote::new(&tape, scripts, None), &config(2).plan, Host::Unsupported, g);
     let driven = drive(&mut runner, 2, 3).expect("the request ends");
     assert_eq!(runner.zygotes().starts, 0, "no zygote starts without a sandbox");
     assert!(driven.stopped.is_none(), "{:?}", driven.stopped);

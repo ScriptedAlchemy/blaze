@@ -398,6 +398,7 @@ blaze_sim::kind_test! {
                 // SAFETY: between fork and exec the closure makes only system calls (prctl,
                 // prlimit64, landlock_restrict_self, seccomp) on memory the parent made before
                 // the fork; it allocates nothing and takes no lock.
+                #[expect(unsafe_code, reason = "pre_exec enters Linux Landlock/seccomp confinement before exec, with its SAFETY above")]
                 unsafe {
                     command.pre_exec(move || {
                         let confine = blaze_sys::linux::confine::ChildConfine { ruleset: blaze_sys::Fd::new(ruleset), filter: &filter, limits: &limits };

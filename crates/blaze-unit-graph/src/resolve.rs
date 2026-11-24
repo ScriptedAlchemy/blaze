@@ -560,13 +560,17 @@ impl<'l, 'a> Resolution<'l, 'a> {
             let mut named = false;
             let mut on = false;
             for (e, dep) in package.deps.iter().enumerate() {
-                let kind_counts = dep.kind == DepKind::Normal || (with_dev && dep.kind == DepKind::Dev);
+                let kind_counts = dep.kind == DepKind::Normal || dep.kind == DepKind::Build || (with_dev && dep.kind == DepKind::Dev);
                 if dep.key.as_str() != dep_key || !kind_counts {
                     continue;
                 }
                 named = true;
-                let (on_target, _) = self.holds[id.index()][e];
-                if !on_target || (dep.optional && !get(&st.active[n], e)) {
+                let (on_target, on_host) = self.holds[id.index()][e];
+                let applies = match dep.kind == DepKind::Build {
+                    true => on_host,
+                    false => on_target,
+                };
+                if !applies || (dep.optional && !get(&st.active[n], e)) {
                     continue;
                 }
                 let child_id = self.locked(id, package, e)?;

@@ -134,10 +134,8 @@ working setup procedure:
 | `BLAZE_DIST_PR`, `BLAZE_DIST_SOURCE` | Pull-request namespace and revision identity. |
 | `BLAZE_DIST_REPORT` | Per-unit JSON provenance used to prove where compiled and reused values came from. |
 
-The simulation tests have their own controls:
-`BLAZE_DIST_SEEDS` changes the seeds per invariant set (default 10,000), and
-`BLAZE_DIST_SEED` chooses one seed for the `replay` test. They are read only in
-`crates/blaze-dist/tests/sim.rs`, not by the coordinator or a compiler.
+The simulation tests in `crates/blaze-dist/tests/sim.rs` run 10,000 deterministic
+seeds per invariant set with `#![no_std]` and no environment reads.
 
 ## Wire format and calls
 

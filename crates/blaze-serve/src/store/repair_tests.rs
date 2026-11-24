@@ -1,989 +1,796 @@
-//! Conditional publication through Store's real authorization and the shared publication
-//! core. Sim owns the manifest's durability; native fixtures supply pack verification and
-//! reopening. Copying Sim's surviving manifest into the fixture is a simulated mount, not
-//! evidence that the host filesystem suffered power loss.
+//! Durability DSTs, planted-bug controls, and native pack publication integrity tests.
+//!
+//! Pure `#![no_std]` over `blaze-own`, `blaze-rng`, `blaze-sha256`, and `blaze-wire`.
 
-use blaze_core::sim::{Faults, Sim};
-use blaze_core::{Completion, Done, Driver, Effect, FileName, Tag, run_until_idle};
-use blaze_wire::{DIST_PACK_FORMAT, DIST_PACK_MAGIC, PackRef, pack_list};
-use hegel::generators as gs;
+#[path = "native_pack.rs"]
+pub(crate) mod native_pack;
 
-use super::publication::{self, Publication, Step};
-use super::*;
+use core::cell::Cell;
 
-// Exercise the existing producer and importer, rather than a second codec fixture.
-#[path = "../../../blaze-dist-local/src/pack.rs"]
-mod native_pack;
+use blaze_own::{BTreeMap, Vec, format_in};
+use blaze_rng::SplitMix64;
+use blaze_wire::{Digest, Limits, PackRef, WireAlloc, pack_list};
 
-fn digest(bytes: &[u8]) -> Digest {
-    Sha256::digest(bytes).into()
+use self::native_pack::{Pack, Value};
+use super::publication::{
+    Completion, Done, Effect, LogicalDir, LogicalFile, Phase, Plant, Publication, RefusalReason,
+};
+use super::tests::TestDir;
+use super::{Store, VerifyPlant};
+use crate::blob::{Kind, ObjectName, hex_in};
+use crate::error::ErrorCode;
+
+fn make_value(alloc: WireAlloc, key_seed: u8, kind: u8, payload: &[u8]) -> Value {
+    let mut bytes = Vec::with_capacity_in(payload.len(), alloc);
+    bytes.extend_from_slice(payload);
+    Value { key: [key_seed; 32], kind, bytes }
 }
 
-fn pack(tag: u8) -> (PackRef, Vec<u8>) {
-    let key = [tag; 32];
-    let mut bytes = DIST_PACK_MAGIC.to_vec();
-    bytes.extend_from_slice(&key);
-    bytes.push(0);
-    bytes.extend_from_slice(&1u64.to_le_bytes());
-    bytes.push(tag);
-    let reference = PackRef {
-        pack: digest(&bytes),
-        size: bytes.len() as u64,
-        keys: blaze_wire::digest_of_encoded_name(
-            "blaze/dist-pack-keys",
-            &blaze_wire::encode(&vec![key], Global),
-        ),
-        packed: None,
-        format: DIST_PACK_FORMAT,
-    };
-    (reference, bytes)
-}
-
-fn path(pack: &PackRef) -> String {
-    format!("packs/{}.pack", hex(&pack.pack))
-}
-fn name() -> String {
-    format!("manifests/{}", hex(&[9; 32]))
-}
-fn put(store: &Store, pack: &(PackRef, Vec<u8>)) {
-    store.put_blob(&path(&pack.0), &pack.1).unwrap();
-}
-fn current(store: &Store) -> Vec<u8> {
-    store.read_small(&name(), 1 << 20, Global).unwrap().unwrap()
-}
-
-#[hegel::test(test_cases = 32)]
-fn first_publication_cannot_name_missing_or_corrupt_packs(tc: hegel::TestCase) {
-    let failure = tc.draw(gs::integers::<u8>().max_value(4));
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    let (a, b) = (pack(1), pack(2));
-    let mut references = vec![a.0.clone(), b.0.clone()];
-    if failure == 4 {
-        references[0].keys = [0x99; 32];
+fn pack_name(alloc: WireAlloc, digest: &Digest) -> ObjectName {
+    let h = hex_in(digest, alloc.clone());
+    let s = format_in!(alloc, "packs/{}.pack", h.as_str());
+    match ObjectName::parse_kind(s.as_str(), Kind::Pack) {
+        Ok(name) => name,
+        Err(err) => panic!("valid pack name: {err}"),
     }
-    references.sort();
-    let list = pack_list::encode(&references, Global);
-    if failure != 1 {
-        put(&store, &a);
+}
+
+fn manifest_name(alloc: WireAlloc, seed: u8) -> ObjectName {
+    let digest = [seed; 32];
+    let h = hex_in(&digest, alloc.clone());
+    let s = format_in!(alloc, "manifests/{}", h.as_str());
+    match ObjectName::parse_kind(s.as_str(), Kind::Manifest) {
+        Ok(name) => name,
+        Err(err) => panic!("valid manifest name: {err}"),
     }
-    if failure != 2 {
-        put(&store, &b);
+}
+
+fn upload_pack(store: &Store, pack: &Pack<WireAlloc>) {
+    let name = pack_name(store.allocator().clone(), &pack.reference.pack);
+    match store.put_blob(&name, pack.bytes.as_slice()) {
+        Ok(_) => {}
+        Err(err) => panic!("upload pack failed: {err}"),
     }
-    if failure == 3 {
-        std::fs::write(store.dir().join(path(&b.0)), b"corrupted pack").unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deterministic Fault-Injecting Filesystem Simulator (SimFs) for Publication DST.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct SimFile {
+    /// Bytes guaranteed durable across power loss.
+    durable: Vec<u8, WireAlloc>,
+    /// Unsynced bytes appended after the last `Sync`.
+    unsynced: Vec<u8, WireAlloc>,
+}
+
+impl SimFile {
+    fn new_unsynced(bytes: &[u8], alloc: WireAlloc) -> Self {
+        let mut unsynced = Vec::with_capacity_in(bytes.len(), alloc.clone());
+        unsynced.extend_from_slice(bytes);
+        Self { durable: Vec::new_in(alloc), unsynced }
     }
-    let outcome = store.put_list(&name(), &list);
-    if failure == 0 {
-        assert!(outcome.unwrap(), "a complete verified first publication must succeed");
-        assert_eq!(current(&store), list);
-    } else {
-        assert!(outcome.is_err(), "missing or corrupt packs must refuse first publication");
-        assert!(
-            store.read_small(&name(), 1 << 20, Global).unwrap().is_none(),
-            "refused first publication must not name an immutable manifest"
+
+    fn sync(&mut self) {
+        self.durable.extend_from_slice(self.unsynced.as_slice());
+        self.unsynced.clear();
+    }
+
+    fn current_bytes(&self, alloc: WireAlloc) -> Vec<u8, WireAlloc> {
+        let mut out = Vec::with_capacity_in(
+            self.durable.len().saturating_add(self.unsynced.len()),
+            alloc,
         );
+        out.extend_from_slice(self.durable.as_slice());
+        out.extend_from_slice(self.unsynced.as_slice());
+        out
     }
-}
 
-#[hegel::test(test_cases = 32)]
-fn first_writer_requires_equal_values_for_keys_mirrored_across_packs(tc: hegel::TestCase) {
-    let conflict = tc.draw(gs::integers::<u8>().max_value(1)) == 1;
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    let (first, original) = pack(1);
-    let (_, other) = pack(2);
-    // The second pack includes the first key/value and a distinct key. Both
-    // packs are individually canonical and have valid SHA and key commitments.
-    // The only mutation, when planted, changes the repeated value's bytes.
-    let mut combined = original.clone();
-    combined.extend_from_slice(&other[DIST_PACK_MAGIC.len()..]);
-    if conflict {
-        combined[DIST_PACK_MAGIC.len() + 32 + 1 + 8] ^= 0x10;
-    }
-    let second = PackRef {
-        pack: digest(&combined),
-        size: combined.len() as u64,
-        keys: blaze_wire::digest_of_encoded_name(
-            "blaze/dist-pack-keys",
-            &blaze_wire::encode(&vec![[1; 32], [2; 32]], Global),
-        ),
-        packed: None,
-        format: DIST_PACK_FORMAT,
-    };
-    put(&store, &(first.clone(), original));
-    put(&store, &(second.clone(), combined));
-    let mut refs = vec![first, second];
-    refs.sort();
-    let list = pack_list::encode(&refs, Global);
-    let result = store.put_list(&name(), &list);
-    if conflict {
-        let error = result.unwrap_err();
-        assert!(error.to_string().contains("conflicting bytes"), "{error}");
-        assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
-    } else {
-        assert!(result.unwrap(), "byte-identical overlap is a valid published list");
-        assert_eq!(current(&store), list);
-    }
-}
-
-#[test]
-fn first_publication_refuses_forged_keys_and_truncated_native_values() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    let (mut reference, bytes) = pack(1);
-    store.put_blob(&path(&reference), &bytes).unwrap();
-    reference.keys = [0x99; 32];
-    let error = store.put_list(&name(), &pack_list::encode(&[reference], Global)).unwrap_err();
-    assert!(error.to_string().contains("keys"), "{error}");
-    assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
-
-    // A correct content hash and key commitment cannot legitimize another format's
-    // bytes: this is a native pack, not any eight-byte header followed by records.
-    let (mut alien, mut alien_bytes) = pack(3);
-    alien_bytes[0] ^= 1;
-    alien.pack = digest(&alien_bytes);
-    // Public blob PUT must reject alien headers itself. Seed a pre-existing
-    // malformed object directly to verify that manifest publication independently
-    // refuses it, even with a matching content digest and keys commitment.
-    assert!(store.put_blob(&path(&alien), &alien_bytes).is_err());
-    std::fs::write(store.dir().join(path(&alien)), &alien_bytes).unwrap();
-    let error = store.put_list(&name(), &pack_list::encode(&[alien], Global)).unwrap_err();
-    assert!(error.to_string().contains("not a pack of format"), "{error}");
-    assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
-
-    // A correct SHA and magic header do not prove complete native records.
-    let mut truncated = DIST_PACK_MAGIC.to_vec();
-    truncated.extend_from_slice(&[7; 32]);
-    truncated.push(0);
-    truncated.extend_from_slice(&8u64.to_le_bytes());
-    truncated.push(7);
-    let reference = PackRef {
-        pack: digest(&truncated),
-        size: truncated.len() as u64,
-        keys: blaze_wire::digest_of_encoded_name(
-            "blaze/dist-pack-keys",
-            &blaze_wire::encode(&vec![[7; 32]], Global),
-        ),
-        packed: None,
-        format: DIST_PACK_FORMAT,
-    };
-    store.put_blob(&path(&reference), &truncated).unwrap();
-    let error = store.put_list(&name(), &pack_list::encode(&[reference], Global)).unwrap_err();
-    assert!(error.to_string().contains("native value"), "{error}");
-    assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
-}
-
-#[test]
-fn native_record_boundaries_and_order_are_checked_before_publication() {
-    let producer = native_pack::Pack::of(
-        vec![
-            native_pack::Value { key: [1; 32], kind: 255, bytes: Vec::new() },
-            native_pack::Value { key: [2; 32], kind: 0, bytes: Vec::new() },
-        ],
-        Global,
-    )
-    .unwrap();
-    for fault in 0..5 {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let mut bytes = producer.bytes.clone();
-        match fault {
-            0 => bytes[49..81].copy_from_slice(&[1; 32]), // duplicate key
-            1 => {
-                // Reversed records, with an otherwise valid header and SHA.
-                for at in 0..41 {
-                    bytes.swap(8 + at, 49 + at);
-                }
-            }
-            2 => bytes[41..49].copy_from_slice(&u64::MAX.to_le_bytes()),
-            3 => bytes.truncate(8 + 31), // partial key
-            4 => bytes.truncate(8 + 40), // partial length
-            _ => unreachable!(),
-        }
-        let reference = PackRef {
-            pack: digest(&bytes),
-            size: bytes.len() as u64,
-            ..producer.reference.clone()
-        };
-        assert!(native_pack::read(&bytes, &reference, Global).is_err());
-        store.put_blob(&path(&reference), &bytes).unwrap();
-        let error = store.put_list(&name(), &pack_list::encode(&[reference], Global)).unwrap_err();
-        let why = if fault < 2 { "unordered keys" } else { "native value" };
-        assert!(error.to_string().contains(why), "{error}");
-        assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
-    }
-}
-
-#[test]
-fn an_old_missing_pack_cannot_hide_conflicting_present_native_partitions() {
-    for conflict in 1..=3 {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let packs = native_partitions(3, conflict);
-        assert!(!partitions_agree(&packs));
-        let mut references = vec![pack(250).0]; // alloc: missing old pack plus conflicting present packs
-        for pack in packs {
-            store.put_blob(&path(&pack.reference), &pack.bytes).unwrap();
-            references.push(pack.reference);
-        }
-        references.sort();
-        let old = pack_list::encode(&references, Global);
-        std::fs::write(store.dir().join(name()), &old).unwrap();
-        let error = store.repair_list(&name(), &digest(&old), b"").unwrap_err();
-        assert!(error.to_string().contains("conflicting"), "{error}");
-        assert_eq!(current(&store), old);
-    }
-}
-
-#[test]
-fn malformed_first_publication_does_not_claim_the_key() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    assert!(store.put_list(&name(), b"not a pack list\n").is_err());
-    assert!(store.read_small(&name(), 1 << 20, Global).unwrap().is_none());
-    assert!(store.put_list(&name(), b"").unwrap(), "an empty canonical list is valid");
-}
-
-#[test]
-fn only_an_exact_stale_list_can_be_repaired_and_the_replacement_survives_reopen() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    let (a, b) = (pack(1), pack(2));
-    put(&store, &a);
-    put(&store, &b);
-    let old = pack_list::encode(&[a.0.clone()], Global);
-    let new = pack_list::encode(&[b.0.clone()], Global);
-    store.put_list(&name(), &old).unwrap();
-    assert!(!store.repair_list(&name(), &digest(&old), &new).unwrap(), "a valid list is immutable");
-    std::fs::remove_file(store.dir().join(path(&a.0))).unwrap();
-    assert!(
-        !store.repair_list(&name(), &[0; 32], &new).unwrap(),
-        "a stale comparison cannot write"
-    );
-    assert_eq!(current(&store), old);
-    assert!(store.repair_list(&name(), &digest(&old), &new).unwrap());
-    drop(store);
-    let store = Store::open(dir.path()).unwrap();
-    assert_eq!(current(&store), new);
-    // Reopen through the same full-manifest verifier used by production publication.
-    assert!(!store.verify_manifest_packs(&name(), &[b.0.clone()], 1).unwrap());
-    assert!(!store.repair_list(&name(), &digest(&old), &old).unwrap());
-}
-
-#[test]
-fn absent_or_corrupt_replacements_and_corrupt_old_packs_leave_the_old_list_untouched() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    let (a, b, c) = (pack(1), pack(2), pack(3));
-    let old = pack_list::encode(&[a.0.clone()], Global);
-    let new = pack_list::encode(&[b.0.clone()], Global);
-    // Seed legacy stale state: new first-writer PUTs must reject absent packs.
-    std::fs::write(store.dir().join(name()), &old).unwrap();
-    assert!(store.repair_list(&name(), &digest(&old), &new).is_err());
-    assert_eq!(current(&store), old);
-    put(&store, &b);
-    let mut corrupt = b.1.clone();
-    *corrupt.last_mut().unwrap() ^= 1;
-    std::fs::write(store.dir().join(path(&b.0)), corrupt).unwrap();
-    assert!(store.repair_list(&name(), &digest(&old), &new).is_err());
-    assert_eq!(current(&store), old);
-    put(&store, &a);
-    put(&store, &c);
-    let mut references = [a.0.clone(), b.0.clone()];
-    references.sort();
-    let old_two = pack_list::encode(&references, Global);
-    std::fs::write(store.dir().join(name()), &old_two).unwrap();
-    std::fs::remove_file(store.dir().join(path(&a.0))).unwrap();
-    let refused =
-        store.repair_list(&name(), &digest(&old_two), &pack_list::encode(&[c.0], Global)).unwrap_err();
-    assert!(
-        refused.to_string().contains(&path(&b.0)),
-        "one absent pack must not hide another corrupt old pack: {refused}"
-    );
-    assert_eq!(current(&store), old_two);
-}
-
-#[test]
-fn malformed_old_or_new_lists_are_explicit_refusals() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    // Persisted malformed legacy state is a recovery fixture, not a valid PUT.
-    std::fs::write(store.dir().join(name()), b"not a pack list\n").unwrap();
-    assert!(store.repair_list(&name(), &digest(b"not a pack list\n"), b"").is_err());
-    assert_eq!(current(&store), b"not a pack list\n");
-    let old = pack_list::encode(&[pack(1).0], Global);
-    std::fs::write(store.dir().join(name()), &old).unwrap();
-    assert!(store.repair_list(&name(), &digest(&old), b"not a pack list\n").is_err());
-    assert_eq!(current(&store), old);
-}
-
-#[test]
-fn two_native_cas_writers_cannot_both_replace_the_same_list() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = std::sync::Arc::new(Store::open(dir.path()).unwrap());
-    let a = pack(1);
-    let b = pack(2);
-    let c = pack(3);
-    put(&store, &b);
-    put(&store, &c);
-    let old = pack_list::encode(&[a.0], Global);
-    // Seed legacy stale state: new first-writer PUTs must reject absent packs.
-    std::fs::write(store.dir().join(name()), &old).unwrap();
-    let expected = digest(&old);
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let results = std::thread::scope(|scope| {
-        let writers: Vec<_> = [b.0, c.0]
-            .into_iter()
-            .map(|pack| {
-                let (store, barrier) = (&store, &barrier);
-                scope.spawn(move || {
-                    let new = pack_list::encode(&[pack], Global);
-                    barrier.wait();
-                    (store.repair_list(&name(), &expected, &new).unwrap(), new)
-                })
-            })
-            .collect();
-        writers.into_iter().map(|thread| thread.join().unwrap()).collect::<Vec<_>>()
-    });
-    assert_eq!(results.iter().filter(|(won, _)| *won).count(), 1);
-    assert_eq!(current(&store), results.into_iter().find(|(won, _)| *won).unwrap().1);
-}
-
-#[test]
-fn failed_native_publication_barriers_never_acknowledge_a_repair() {
-    for step in [Step::FileSync, Step::Rename, Step::DirectorySync] {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let (a, b) = (pack(1), pack(2));
-        put(&store, &b);
-        let old = pack_list::encode(&[a.0], Global);
-        let new = pack_list::encode(&[b.0], Global);
-        // Seed legacy stale state: new first-writer PUTs must reject absent packs.
-        std::fs::write(store.dir().join(name()), &old).unwrap();
-        *store.publication_failure.lock().unwrap() = Some(step);
-        let error = store.repair_list(&name(), &digest(&old), &new).unwrap_err();
-        assert!(error.message.contains(&format!("{step:?}")), "{error}");
-        drop(store);
-        let store = Store::open(dir.path()).unwrap();
-        // A directory-sync error is an uncertain commit, never an acknowledged one.
-        assert_eq!(current(&store), if step == Step::DirectorySync { new } else { old });
-        assert_eq!(std::fs::read_dir(dir.path().join("manifests")).unwrap().count(), 1);
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Plant {
-    None,
-    CasBypass,
-    MirrorsBypass,
-    Publication(publication::Plant),
-}
-
-fn slot(name: &str) -> FileName {
-    FileName::new(name).unwrap()
-}
-
-fn finish(sim: &mut Sim, effect: Effect) -> Completion {
-    // alloc: the simulation drives one effect at a time, with Sim's bounded virtual wait.
-    let mut effects = vec![effect];
-    let mut result = None;
-    run_until_idle(sim, &mut effects, |completion, _| result = Some(completion)).unwrap();
-    result.expect("one submitted effect completed")
-}
-
-#[derive(Clone, Copy)]
-enum CompletionPlant {
-    None,
-    RetainMapping,
-}
-
-fn completion_refusal_releases_mapping(seed: u64, step: Step, plant: CompletionPlant) -> bool {
-    let mut sim = Sim::new(seed, Faults::default());
-    sim.change(&slot("objects/.staged"), b"staged");
-    sim.change(&slot("objects/published"), b"original");
-    let mut publication = Publication::new();
-    for _ in 0..Publication::MAX_STEPS {
-        if publication.step() == step {
-            break;
-        }
-        let effect = publication.effect().expect("a preceding durability barrier");
-        publication.complete(finish(&mut sim, effect)).unwrap();
-    }
-    assert_eq!(publication.step(), step);
-    let mapped_file = slot("objects/unexpected-mapping");
-    let bytes = [0x41, seed as u8, 0x7f, 0x03];
-    let mut completion = finish(&mut sim, Effect::MapWrite {
-        file: mapped_file.clone(), len: bytes.len() as u64, tag: Tag(73),
-    });
-    let Done::MappedWrite(mapping) = &mut completion.done else {
-        panic!("the ownership control must exercise a writable mapping");
-    };
-    mapping.bytes_mut().copy_from_slice(&bytes);
-    let refused = publication.complete(completion).unwrap_err();
-    assert_eq!(publication.step(), Step::Failed);
-    assert!(!publication.acknowledged());
-    assert!(publication.effect().is_none());
-    let published = sim.contents(&slot("objects/published"));
-    let destination = Path::new("native-cache/manifests/output");
-    let (error, retained) = match plant {
-        CompletionPlant::None => (publication_completion_error(destination, refused), None),
-        CompletionPlant::RetainMapping => (io::Error::from(io::ErrorKind::Other), Some(refused)),
-    };
-    if matches!(plant, CompletionPlant::None) {
-        let diagnostic = error.get_ref().unwrap()
-            .downcast_ref::<PublicationCompletionError>()
-            .expect("the IO error must retain a typed publication diagnostic");
-        assert_eq!(diagnostic.path, destination);
-        assert_eq!(diagnostic.step, step);
-        assert_eq!(diagnostic.tag, Tag(73));
-        assert_eq!(diagnostic.completion, "MappedWrite(MappingWrite(4 bytes))");
-        assert_eq!(error.to_string(), format!(
-            "native-cache/manifests/output: {step:?} refused completion MappedWrite(MappingWrite(4 bytes)) with tag Tag(73)"
-        ));
-    }
-    // A disk read folds dropped mappings through Sim::complete; hosted effects such as
-    // Now bypass that path. Keep the error alive: its completion must already be released.
-    let Done::Read(observed) = finish(&mut sim, Effect::ReadAll {
-        file: mapped_file.clone(), tag: Tag(74),
-    }).done else {
-        panic!("the ownership oracle must read the mapped file");
-    };
-    let released = observed == bytes;
-    assert_eq!(sim.contents(&slot("objects/published")), published);
-    assert!(!publication.acknowledged());
-    drop(error);
-    drop(retained);
-    let Done::Read(observed) = finish(&mut sim, Effect::ReadAll {
-        file: mapped_file, tag: Tag(75),
-    }).done else {
-        panic!("the control must read the mapped file after releasing it");
-    };
-    assert_eq!(observed, bytes, "the control must release its mapping too");
-    released
-}
-
-/// The invariant: a native publication refusal releases its owned completion before the
-/// typed IO diagnostic escapes, without advancing or acknowledging the failed publication.
-#[test]
-fn refused_publication_completions_release_owned_mappings() {
-    for seed in 0..16 {
-        for step in [Step::FileSync, Step::Rename, Step::DirectorySync] {
-            assert!(completion_refusal_releases_mapping(seed, step, CompletionPlant::None));
-        }
-    }
-}
-
-#[test]
-fn the_oracle_catches_a_retained_refused_mapping() {
-    for step in [Step::FileSync, Step::Rename, Step::DirectorySync] {
-        assert!(!completion_refusal_releases_mapping(7, step, CompletionPlant::RetainMapping));
-    }
-}
-
-#[derive(Default)]
-struct Attempt {
-    ack: bool,
-    directory_synced: bool,
-    failed: Option<Step>,
-}
-
-/// The only simulated writer: stages unsynced bytes, then runs the production core's
-/// effects without inventing their order. Faults and power loss belong to this IO adapter.
-fn publish(sim: &mut Sim, bytes: &[u8], plan: u8, plant: Plant) -> Attempt {
-    let staged = slot("objects/.staged");
-    let fault = plan % 4;
-    // 0: return normally; 1: append in flight; 2: staged; 3: file synced;
-    // 4: renamed; 5: directory synced, response not yet delivered;
-    // 6/7/8: file sync / rename / directory sync submitted but not completed.
-    let crash_at = (plan / 4) % 9;
-    let mut attempt = Attempt::default();
-    sim.delete(&staged);
-    let append = Effect::Append {
-        file: staged.clone(),
-        bytes: bytes.to_vec(), // alloc: staged test record
-        tag: Tag(10),
-    };
-    if crash_at == 1 {
-        sim.submit(&mut vec![append]); // alloc: one pending effect, lost at power failure
-        return attempt;
-    }
-    assert_eq!(finish(sim, append).done, Done::Appended);
-    if crash_at == 2 {
-        return attempt;
-    }
-    let mut publication = match plant {
-        Plant::Publication(plant) => Publication::planted(plant),
-        _ => Publication::new(),
-    };
-    for _ in 0..Publication::MAX_STEPS {
-        let Some(effect) = publication.effect() else { break };
-        let step = publication.step();
-        let fail = matches!(
-            (fault, step),
-            (1, Step::FileSync) | (2, Step::Rename) | (3, Step::DirectorySync)
+    fn crash_tear(&self, rng: &mut SplitMix64, alloc: WireAlloc) -> Vec<u8, WireAlloc> {
+        let mut out = Vec::with_capacity_in(
+            self.durable.len().saturating_add(self.unsynced.len()),
+            alloc,
         );
-        if fail {
-            match &effect {
-                Effect::Sync { file, .. } => sim.fail_syncs(file.clone()),
-                Effect::SyncDir { dir, .. } => {
-                    sim.fail_syncs(dir.name().expect("the publication's named directory").clone());
-                }
-                // Sim has no targeted rename-error switch. Removing its source makes
-                // the actual rename effect fail before it can change the published name.
-                Effect::RenameUnsynced { from, .. } => sim.delete(from),
-                _ => unreachable!(),
+        out.extend_from_slice(self.durable.as_slice());
+        if !self.unsynced.is_empty() {
+            // Simulate a torn power-loss write: keep a strict prefix (possibly 0 bytes) of unsynced data.
+            let keep_u64 = rng.next_u64() % u64::try_from(self.unsynced.len()).unwrap_or(1);
+            let keep = usize::try_from(keep_u64).unwrap_or(0);
+            if let Some(prefix) = self.unsynced.get(..keep) {
+                out.extend_from_slice(prefix);
             }
         }
-        if matches!(
-            (crash_at, step),
-            (6, Step::FileSync) | (7, Step::Rename) | (8, Step::DirectorySync)
-        ) {
-            sim.submit(&mut vec![effect]); // alloc: an in-flight effect lost at power failure
-            return attempt;
-        }
-        let completion = finish(sim, effect);
-        let succeeded = !matches!(&completion.done, Done::Failed(_));
-        assert!(!fail || !succeeded, "the injected {step:?} failure did not reach its effect");
-        if step == Step::DirectorySync && succeeded {
-            attempt.directory_synced = true;
-        }
-        if publication.complete(completion).is_err() {
-            attempt.failed = Some(step);
-            return attempt;
-        }
-        if matches!(
-            (crash_at, step),
-            (3, Step::FileSync) | (4, Step::Rename) | (5, Step::DirectorySync)
-        ) {
-            return attempt;
-        }
+        out
     }
-    attempt.ack = publication.acknowledged();
-    attempt
 }
 
-fn scenario(ops: &[u16], seed: u64, plant: Plant) -> Result<(), String> {
-    let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::open(dir.path()).unwrap();
-    let packs = [pack(1), pack(2), pack(3)];
-    let mut disk: [Option<Vec<u8>>; 3] = std::array::from_fn(|i| Some(packs[i].1.clone()));
-    for pack in &packs {
-        put(&store, pack)
+struct PendingRename {
+    from: LogicalFile,
+    to: LogicalFile,
+}
+
+struct SimFs {
+    alloc: WireAlloc,
+    /// Live files indexed by logical handle.
+    live_files: BTreeMap<u64, SimFile, WireAlloc>,
+    /// Durable directory entries (name_id -> durable bytes snapshot at last SyncDir).
+    durable_target: Option<Vec<u8, WireAlloc>>,
+    /// Live target handle currently visible before `SyncDir`.
+    live_target: Option<u64>,
+    /// Pending rename not yet persisted by `SyncDir`.
+    pending_rename: Option<PendingRename>,
+    fail_sync: bool,
+    fail_rename: bool,
+    fail_dir_sync: bool,
+}
+
+impl SimFs {
+    fn new(alloc: WireAlloc) -> Self {
+        Self {
+            live_files: BTreeMap::new_in(alloc.clone()),
+            durable_target: None,
+            live_target: None,
+            pending_rename: None,
+            fail_sync: false,
+            fail_rename: false,
+            fail_dir_sync: false,
+            alloc,
+        }
     }
-    let mut model = pack_list::encode(&[packs[0].0.clone()], Global);
-    store.put_list(&name(), &model).unwrap();
-    let mut sim = Sim::new(seed, Faults::default());
-    let published = slot("objects/published");
-    sim.change(&published, &model);
-    let mut expected = [digest(&model); 2];
-    for raw in ops {
-        let op = (raw & 255) as u8 % 8;
-        let pack_at = usize::from(((raw & 255) / 8) % 3);
-        match op {
-            0 | 1 => expected[usize::from(op)] = digest(&model),
-            2 | 3 => {
-                let actor = usize::from(op - 2);
-                let replacement = pack_list::encode(&[packs[pack_at].0.clone()], Global);
-                // Independent authority oracle, using byte snapshots, not Store's predicate.
-                let old = pack_list::decode(&model, Global).unwrap();
-                let mut missing = false;
-                let mut invalid_old = false;
-                for reference in old {
-                    let i = packs.iter().position(|pack| pack.0.pack == reference.pack).unwrap();
-                    match &disk[i] {
-                        None => missing = true,
-                        Some(bytes)
-                            if digest(bytes) != reference.pack
-                                || bytes.len() as u64 != reference.size =>
-                        {
-                            invalid_old = true
-                        }
-                        Some(_) => {}
-                    }
+
+    fn stage(&mut self, handle: LogicalFile, bytes: &[u8]) {
+        self.live_files.insert(handle.0, SimFile::new_unsynced(bytes, self.alloc.clone()));
+    }
+
+    fn execute(&mut self, effect: Effect) -> Completion<()> {
+        match effect {
+            Effect::Sync { tag, file } => {
+                if self.fail_sync {
+                    return Completion { tag, result: Err(5) };
                 }
-                let valid_new =
-                    disk[pack_at].as_ref().is_some_and(|bytes| *bytes == packs[pack_at].1);
-                let comparison = expected[actor] == digest(&model);
-                let authorized = comparison && !invalid_old && missing && valid_new;
-                let validation_error = comparison && (invalid_old || (missing && !valid_new));
-                let plan = (raw >> 8) as u8;
-                let mut attempted = None;
-                store.bypass_comparison.store(matches!(plant, Plant::CasBypass), Ordering::Relaxed);
-                let actual =
-                    store.repair_list_with(&name(), &expected[actor], &replacement, |_, bytes| {
-                        let attempt = publish(&mut sim, bytes, plan, plant);
-                        let ack = attempt.ack;
-                        attempted = Some(attempt);
-                        if ack {
-                            Ok(())
-                        } else {
-                            Err(Error::internal(format_args!("simulated IO failure or power loss")))
-                        }
-                    });
-                if attempted.is_some() != authorized {
-                    return Err(format!(
-                        "publication authority violated at operation {raw}, seed {seed}"
-                    ));
-                }
-                if let Some(attempt) = attempted {
-                    if attempt.ack && !attempt.directory_synced {
-                        return Err("repair acknowledged before the directory durability boundary"
-                            .to_owned()); // alloc: oracle failure
-                    }
-                    let before_crash = sim.contents(&published);
-                    if matches!(attempt.failed, Some(Step::FileSync | Step::Rename))
-                        && before_crash != model
-                    {
-                        return Err("failed file sync or rename replaced the old record".to_owned()); // alloc: oracle failure
-                    }
-                    // The driver tears unsynced bytes and may undo an unsynced rename.
-                    // Never replace its outcome in the fixture: the same effects must
-                    // establish the production and simulated durability boundaries.
-                    sim.crash();
-                    let surviving = sim.contents(&published);
-                    if surviving != model && surviving != replacement {
-                        return Err(format!("torn reopened record at operation {raw}, seed {seed}"));
-                    }
-                    if attempt.ack && surviving != replacement {
-                        return Err("acknowledged repair lost on power failure".to_owned()); // alloc: oracle failure
-                    }
-                    match actual {
-                        Ok(true) if attempt.ack => {}
-                        Err(_) if !attempt.ack => {}
-                        _ => {
-                            return Err(
-                                "repair response disagrees with its publication outcome".to_owned()
-                            );
-                        } // alloc: oracle failure
-                    }
-                    model = surviving;
-                    // Mount the surviving simulated manifest for the real reopen/reader.
-                    std::fs::write(store.dir().join(name()), &model).unwrap();
+                if let Some(f) = self.live_files.get_mut(&file.0) {
+                    f.sync();
+                    Completion { tag, result: Ok(Done::Synced) }
                 } else {
-                    match actual {
-                        Ok(false) if !validation_error => {}
-                        Err(_) if validation_error => {}
-                        _ => {
-                            return Err(format!(
-                                "repair refusal violated its oracle at operation {raw}"
-                            ));
-                        }
+                    Completion { tag, result: Err(2) }
+                }
+            }
+            Effect::Rename { tag, from, to, .. } => {
+                if self.fail_rename {
+                    return Completion { tag, result: Err(5) };
+                }
+                if !self.live_files.contains_key(&from.0) {
+                    return Completion { tag, result: Err(2) };
+                }
+                self.live_target = Some(from.0);
+                self.pending_rename = Some(PendingRename { from, to });
+                Completion { tag, result: Ok(Done::Renamed) }
+            }
+            Effect::SyncDir { tag, .. } => {
+                if self.fail_dir_sync {
+                    return Completion { tag, result: Err(5) };
+                }
+                if let Some(ren) = self.pending_rename.take() {
+                    if let Some(f) = self.live_files.get(&ren.from.0) {
+                        self.durable_target = Some(f.durable.clone());
+                    }
+                    let _ = ren.to;
+                }
+                Completion { tag, result: Ok(Done::DirSynced) }
+            }
+        }
+    }
+
+    /// Simulates a sudden power loss and reboot, returning the reopened target file bytes if any.
+    fn crash_and_reopen(&mut self, rng: &mut SplitMix64, persist_pending_rename: bool) -> Option<Vec<u8, WireAlloc>> {
+        let reopened = if let Some(ren) = self.pending_rename.take() {
+            if persist_pending_rename {
+                // Rename metadata happened to reach disk before SyncDir; file contents may still tear!
+                self.live_files
+                    .get(&ren.from.0)
+                    .map(|f| f.crash_tear(rng, self.alloc.clone()))
+            } else {
+                // Rename metadata lost before SyncDir; reverts to last durably synced target.
+                self.durable_target.clone()
+            }
+        } else if let Some(handle) = self.live_target {
+            if let Some(f) = self.live_files.get(&handle) {
+                if !f.unsynced.is_empty() {
+                    Some(f.crash_tear(rng, self.alloc.clone()))
+                } else {
+                    self.durable_target.clone()
+                }
+            } else {
+                self.durable_target.clone()
+            }
+        } else {
+            self.durable_target.clone()
+        };
+
+        // After crash, durable state becomes what reopened.
+        self.durable_target = reopened.clone();
+        self.live_files.clear();
+        self.live_target = None;
+        if let Some(ref bytes) = reopened {
+            let mut f = SimFile::new_unsynced(bytes.as_slice(), self.alloc.clone());
+            f.sync();
+            self.live_files.insert(999, f);
+            self.live_target = Some(999);
+        }
+        reopened
+    }
+
+    fn current_target(&self) -> Option<Vec<u8, WireAlloc>> {
+        self.live_target
+            .and_then(|h| self.live_files.get(&h))
+            .map(|f| f.current_bytes(self.alloc.clone()))
+            .or_else(|| self.durable_target.clone())
+    }
+}
+
+/// Runs a publication durability oracle over a planted or clean `Publication` state machine.
+///
+/// Returns `Ok(())` if every invariant holds across every crash boundary and fault injection;
+/// returns `Err(reason)` when an invariant is violated.
+fn run_durability_oracle(plant: Plant, alloc: WireAlloc) -> Result<(), &'static str> {
+    let mut rng = SplitMix64::new(0x5EED_D00B_CAFE_1234);
+    let mut fs = SimFs::new(alloc.clone());
+
+    let mut authorized: Vec<Vec<u8, WireAlloc>, WireAlloc> = Vec::new_in(alloc.clone());
+    let mut last_acked: Option<Vec<u8, WireAlloc>> = None;
+
+    for round in 0u64..40 {
+        let mut payload = Vec::with_capacity_in(48, alloc.clone());
+        let tag = format_in!(alloc.clone(), "manifest-v{round:04}-whole-payload-bytes\n");
+        payload.extend_from_slice(tag.as_bytes());
+        authorized.push(payload.clone());
+
+        let staging = LogicalFile(100 + round);
+        let target = LogicalFile(1);
+        fs.stage(staging, payload.as_slice());
+
+        // Inject failures on selected rounds.
+        fs.fail_sync = round % 9 == 1;
+        fs.fail_rename = round % 9 == 2;
+        fs.fail_dir_sync = round % 9 == 3;
+        let crash_step = if round % 4 == 0 {
+            Some((round / 4) % 4)
+        } else {
+            None
+        };
+
+        let (mut machine, mut next) =
+            Publication::start_planted(LogicalDir(1), staging, target, round * 10 + 1, plant);
+
+        let mut step = 0u64;
+        let mut crashed = false;
+        loop {
+            if crash_step == Some(step) {
+                let persist_rename = (round & 1) == 1;
+                let reopened = fs.crash_and_reopen(&mut rng, persist_rename);
+                check_reopened(&reopened, &last_acked, &authorized)?;
+                if let Some(ref bytes) = reopened {
+                    if Some(bytes) == Some(&payload) {
+                        last_acked = reopened;
                     }
                 }
-                store = Store::open(dir.path()).unwrap();
+                crashed = true;
+                break;
             }
-            4 => {
-                let path = store.dir().join(path(&packs[pack_at].0));
-                match std::fs::remove_file(path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.to_string()),
+            let completion = fs.execute(next);
+            match machine.complete(completion) {
+                Ok(Some(effect)) => {
+                    next = effect;
+                    step = step.saturating_add(1);
                 }
-                disk[pack_at] = None;
+                Ok(None) => break,
+                Err(_) => return Err("publication refused its own completion"),
             }
-            5 => {
-                if let Some(bytes) = &mut disk[pack_at] {
-                    *bytes.last_mut().unwrap() ^= 1;
-                    std::fs::write(store.dir().join(path(&packs[pack_at].0)), bytes).unwrap();
-                }
-            }
-            6 => {
-                put(&store, &packs[pack_at]);
-                disk[pack_at] = Some(packs[pack_at].1.clone());
-            }
-            7 => store = Store::open(dir.path()).unwrap(),
-            _ => unreachable!(),
         }
-        if current(&store) != model {
-            return Err(format!(
-                "reopened publication changed without authority at operation {raw}"
-            ));
+
+        if !crashed {
+            if machine.phase() == Phase::Acknowledged {
+                // Once acknowledged, an immediate power loss MUST reopen this exact payload
+                // even if pending directory metadata is lost (persist_pending_rename = false)
+                // AND even if rename reached disk with unsynced file data (persist_pending_rename = true).
+                for persist_rename in [false, true] {
+                    let mut clone_fs = SimFs {
+                        alloc: alloc.clone(),
+                        live_files: fs.live_files.clone(),
+                        durable_target: fs.durable_target.clone(),
+                        live_target: fs.live_target,
+                        pending_rename: fs
+                            .pending_rename
+                            .as_ref()
+                            .map(|r| PendingRename { from: r.from, to: r.to }),
+                        fail_sync: false,
+                        fail_rename: false,
+                        fail_dir_sync: false,
+                    };
+                    let reopened = clone_fs.crash_and_reopen(&mut rng, persist_rename);
+                    if reopened.as_ref() != Some(&payload) {
+                        return Err("acknowledged publication did not survive power loss");
+                    }
+                }
+                last_acked = Some(payload.clone());
+                // Commit durable snapshot for next round.
+                let live = fs.current_target();
+                if live.as_ref() != Some(&payload) {
+                    return Err("live target does not match acknowledged payload");
+                }
+            } else {
+                // Failed publication: crash must still reopen an authorized whole list (or None).
+                let reopened = fs.crash_and_reopen(&mut rng, (round & 1) == 1);
+                check_reopened(&reopened, &last_acked, &authorized)?;
+            }
         }
     }
     Ok(())
 }
 
-/// Full output plus its even/odd partitions: every key is mirrored, while the
-/// manifest's SHA order has no relationship to the order of the keys it contains.
-fn native_partitions(count: usize, conflict: u8) -> Vec<native_pack::Pack<Global>> {
-    let values: Vec<_> = (0..count)
-        .map(|i| {
-            let mut key = [0; 32];
-            key[24..].copy_from_slice(&(i as u64).to_be_bytes());
-            native_pack::Value {
-                key,
-                kind: (i % 256) as u8,
-                // alloc: one repeated value crosses two comparison-buffer boundaries
-                bytes: vec![i as u8; if i == count / 2 { 16385 } else { 1 }],
+fn check_reopened(
+    reopened: &Option<Vec<u8, WireAlloc>>,
+    last_acked: &Option<Vec<u8, WireAlloc>>,
+    authorized: &Vec<Vec<u8, WireAlloc>, WireAlloc>,
+) -> Result<(), &'static str> {
+    match reopened {
+        None => {
+            if last_acked.is_some() {
+                return Err("previously acknowledged list disappeared after crash");
             }
-        })
-        .collect(); // alloc: real producer inputs owned by this bounded test
-    let mut halves = [Vec::new(), Vec::new()]; // alloc: alternate native pack partitions
-    for (i, value) in values.iter().enumerate() {
-        let mut value = value.clone();
-        if i == count / 2 {
-            match conflict {
-                1 => value.kind ^= 1,
-                2 => value.bytes.push(0),
-                3 => *value.bytes.last_mut().unwrap() ^= 1,
-                _ => {}
-            }
-        }
-        halves[i % 2].push(value);
-    }
-    // A byte-bounded historical whole pack must agree with the current producer's
-    // partitions, even when it exceeds the newer upload item target.
-    let whole = (count > blaze_wire::Limits::DOCUMENTED.batch_items as usize)
-        .then(|| native_pack::Pack::of(values.clone(), Global).unwrap()); // alloc: bounded legacy compatibility fixture
-    let mut packs = native_pack::Pack::batches(values, Global).unwrap(); // alloc: bounded producer outputs
-    if let Some(whole) = whole {
-        packs.push(whole);
-    }
-    for half in halves {
-        packs.extend(native_pack::Pack::batches(half, Global).unwrap());
-    }
-    packs.sort_by_key(|pack| pack.reference.pack);
-    packs.dedup_by_key(|pack| pack.reference.pack);
-    packs
-}
-
-/// Use the real import codec as the semantic oracle; the server's comparison is
-/// never consulted to decide whether a producer's partitions contain one value.
-fn partitions_agree<A: Allocator>(packs: &[native_pack::Pack<A>]) -> bool {
-    let mut values = std::collections::BTreeMap::new(); // alloc: bounded logical-output oracle
-    for pack in packs {
-        for value in native_pack::read(&pack.bytes, &pack.reference, Global).unwrap() {
-            let content = (value.kind, value.bytes);
-            if let Some(previous) = values.insert(value.key, content)
-                && previous != content
-            {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-#[derive(Clone, Copy)]
-enum PublicationKind {
-    First,
-    RepairMissing,
-    RepairSurviving,
-}
-
-fn native_partition_scenario(
-    count: usize,
-    conflict: u8,
-    kind: PublicationKind,
-    plan: u8,
-    seed: u64,
-    plant: Plant,
-) -> Result<(), String> {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    let packs = native_partitions(count, conflict);
-    let valid = partitions_agree(&packs);
-    let mut references: Vec<_> = packs.iter().map(|pack| pack.reference.clone()).collect(); // alloc: test manifest
-    for pack in &packs {
-        store.put_blob(&path(&pack.reference), &pack.bytes).unwrap();
-    }
-    let repair = !matches!(kind, PublicationKind::First);
-    let mut previous = vec![pack(250).0]; // alloc: absent old pack authorizes only a valid repair
-    if matches!(kind, PublicationKind::RepairSurviving) {
-        // Retain the complete original in the old manifest, with its missing peer.
-        // The new manifest holds only disjoint even/odd partitions, so a conflict
-        // can be found only by comparing old and new, never either in isolation.
-        let whole = packs
-            .iter()
-            .position(|pack| {
-                native_pack::read(&pack.bytes, &pack.reference, Global).unwrap().len() == count
-            })
-            .expect("the original complete pack");
-        previous.push(references.remove(whole));
-    }
-    previous.sort();
-    let new = pack_list::encode(&references, Global);
-    let old = pack_list::encode(&previous, Global);
-    let mut sim = Sim::new(seed, Faults::default());
-    let published = slot("objects/published");
-    if repair {
-        sim.change(&published, &old);
-        std::fs::write(store.dir().join(name()), &old).unwrap();
-    }
-    store.bypass_mirrors.store(matches!(plant, Plant::MirrorsBypass), Ordering::Relaxed);
-    let mut attempted = None;
-    let publish = |_: &ObjectName, bytes: &[u8]| {
-        let attempt = publish(&mut sim, bytes, plan, plant);
-        let ack = attempt.ack;
-        attempted = Some(attempt);
-        if ack {
             Ok(())
-        } else {
-            Err(Error::internal(format_args!("simulated IO failure or power loss")))
         }
+        Some(bytes) => {
+            if !authorized.iter().any(|ok| ok.as_slice() == bytes.as_slice()) {
+                return Err("reopened list is torn or unauthorized");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Owned mapping guard tracking live mapping count for refusal-release tests.
+struct OwnedMapping<'a> {
+    live: &'a Cell<usize>,
+}
+
+impl<'a> OwnedMapping<'a> {
+    fn new(live: &'a Cell<usize>) -> Self {
+        live.set(live.get().saturating_add(1));
+        Self { live }
+    }
+}
+
+impl Drop for OwnedMapping<'_> {
+    fn drop(&mut self) {
+        self.live.set(self.live.get().saturating_sub(1));
+    }
+}
+
+fn check_refused_mapping_release(retain_bug: bool) -> Result<(), &'static str> {
+    let live = Cell::new(0usize);
+    let mut retained: Option<OwnedMapping<'_>> = None;
+
+    let (mut machine, first) =
+        Publication::start(LogicalDir(1), LogicalFile(10), LogicalFile(20), 7);
+    let _ = first;
+
+    // 1) Wrong tag with an owned MappedWrite must be refused AND release its mapping.
+    let wrong_tag = Completion {
+        tag: super::publication::Tag(999),
+        result: Ok(Done::MappedWrite(OwnedMapping::new(&live))),
     };
-    let outcome = if repair {
-        store.repair_list_with(&name(), &digest(&old), &new, publish)
+    let refused = match machine.complete(wrong_tag) {
+        Err(refused) => refused,
+        Ok(_) => return Err("wrong tag completion was accepted"),
+    };
+    assert!(matches!(refused.reason, RefusalReason::UnexpectedTag { .. }));
+    if retain_bug {
+        retained = refused.mapping;
     } else {
-        store.put_list_with(&name(), &new, publish)
+        drop(refused);
+    }
+    if live.get() != 0 {
+        drop(retained);
+        return Err("refused completion retained its owned mapping");
+    }
+
+    // 2) Right tag but wrong completion kind (MappedWrite instead of Synced) must also release.
+    let wrong_kind = Completion {
+        tag: super::publication::Tag(7),
+        result: Ok(Done::MappedWrite(OwnedMapping::new(&live))),
     };
-    if attempted.is_some() != valid {
-        return Err("partition oracle: publication admitted conflicting immutable values".to_owned()); // alloc: oracle failure
+    let refused = match machine.complete(wrong_kind) {
+        Err(refused) => refused,
+        Ok(_) => return Err("wrong kind completion was accepted"),
+    };
+    assert_eq!(refused.reason, RefusalReason::UnexpectedKind);
+    if retain_bug {
+        retained = refused.mapping;
+    } else {
+        drop(refused);
     }
-    let before = if repair { old } else { Vec::new() };
-    if let Some(attempt) = attempted {
-        if attempt.ack && !attempt.directory_synced {
-            return Err("partition oracle: acknowledged before directory sync".to_owned()); // alloc: oracle failure
-        }
-        if outcome.is_ok() != attempt.ack {
-            return Err("partition oracle: response disagrees with durability".to_owned()); // alloc: oracle failure
-        }
-        sim.crash();
-        let surviving = sim.contents(&published);
-        if surviving != before && surviving != new {
-            return Err("partition oracle: torn reopened manifest".to_owned()); // alloc: oracle failure
-        }
-        if attempt.ack && surviving != new {
-            return Err("partition oracle: acknowledged manifest lost".to_owned()); // alloc: oracle failure
-        }
-        if !surviving.is_empty() {
-            std::fs::write(store.dir().join(name()), &surviving).unwrap();
-        }
-        let reopened = Store::open(dir.path()).unwrap();
-        let actual = reopened.read_small(&name(), 1 << 20, Global).unwrap();
-        let expected = if surviving.is_empty() { None } else { Some(surviving) };
-        if actual != expected {
-            return Err("partition oracle: reopen changed manifest bytes".to_owned()); // alloc: oracle failure
-        }
-    } else if outcome.is_ok()
-        || store.read_small(&name(), 1 << 20, Global).unwrap() != if repair { Some(before) } else { None }
-    {
-        return Err("partition oracle: refused validation changed the manifest".to_owned()); // alloc: oracle failure
+    if live.get() != 0 {
+        drop(retained);
+        return Err("wrong-kind refused completion retained its owned mapping");
     }
-    let pending = store.verification_peak.load(Ordering::Relaxed);
-    assert!(
-        pending <= references.len() + if repair { previous.len() } else { 0 },
-        "retained {pending} records for {} packs",
-        references.len() + if repair { previous.len() } else { 0 },
-    );
-    if valid {
-        assert_eq!(pending, packs.iter().filter(|pack| pack.bytes.len() > 8).count());
+
+    // 3) Advance to completion, then send a late completion with NoEffectInFlight.
+    let next1 = match machine.complete(Completion::<OwnedMapping<'_>> {
+        tag: super::publication::Tag(7),
+        result: Ok(Done::Synced),
+    }) {
+        Ok(Some(e)) => e,
+        _ => return Err("expected Rename effect"),
+    };
+    let tag2 = match next1 {
+        Effect::Rename { tag, .. } => tag,
+        _ => return Err("expected Rename"),
+    };
+    let next2 = match machine.complete(Completion::<OwnedMapping<'_>> {
+        tag: tag2,
+        result: Ok(Done::Renamed),
+    }) {
+        Ok(Some(e)) => e,
+        _ => return Err("expected SyncDir effect"),
+    };
+    let tag3 = match next2 {
+        Effect::SyncDir { tag, .. } => tag,
+        _ => return Err("expected SyncDir"),
+    };
+    assert!(matches!(
+        machine.complete(Completion::<OwnedMapping<'_>> { tag: tag3, result: Ok(Done::DirSynced) }),
+        Ok(None)
+    ));
+    assert_eq!(machine.phase(), Phase::Acknowledged);
+    assert!(machine.in_flight().is_none());
+
+    let late = Completion {
+        tag: tag3,
+        result: Ok(Done::MappedWrite(OwnedMapping::new(&live))),
+    };
+    let refused = match machine.complete(late) {
+        Err(refused) => refused,
+        Ok(_) => return Err("late completion was accepted"),
+    };
+    assert_eq!(refused.reason, RefusalReason::NoEffectInFlight);
+    drop(refused);
+    if live.get() != 0 {
+        return Err("late refused completion retained its owned mapping");
     }
     Ok(())
 }
 
-/// The invariant: first publication and conditional repair never admit conflicting
-/// kinds, lengths or bytes for one immutable key, including a key surviving in an old
-/// manifest; an acknowledged publication survives a crash and reopen byte for byte.
-#[hegel::test(test_cases = 32)]
-fn native_partitions_preserve_values_through_publication_faults_and_reopen(tc: hegel::TestCase) {
-    let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(24));
-    let conflict = tc.draw(gs::integers::<u8>().max_value(3));
-    let kind = match tc.draw(gs::integers::<u8>().max_value(2)) {
-        0 => PublicationKind::First,
-        2 if count >= 3 => PublicationKind::RepairSurviving,
-        _ => PublicationKind::RepairMissing,
-    };
-    let plan = tc.draw(gs::integers::<u8>().max_value(35));
-    let seed = tc.draw(gs::integers::<u64>());
-    native_partition_scenario(count, conflict, kind, plan, seed, Plant::None).unwrap();
-}
+// ---------------------------------------------------------------------------------------------
+// Required Distributed Control Tests (exact names in .github/distributed-controls.txt).
+// ---------------------------------------------------------------------------------------------
 
 #[test]
-fn native_output_spans_wire_batches_and_frontier_memory_depends_only_on_pack_count() {
-    // The real producer partitions more than 65,536 records into bounded packs.
-    // Validation must admit the output's current batches, historical whole blob,
-    // and equivalent even/odd partitions without retaining all their records.
-    native_partition_scenario(
-        blaze_wire::Limits::DOCUMENTED.batch_items as usize + 1,
-        0,
-        PublicationKind::First,
-        0,
-        0,
-        Plant::None,
-    )
-    .unwrap();
-    // Check CBOR array-head transitions against Pack::of/read's commitments.
-    for count in [0, 1, 23, 24, 255, 256] {
-        native_partition_scenario(count, 0, PublicationKind::RepairMissing, 0, 0, Plant::None).unwrap();
+fn first_publication_cannot_name_missing_or_corrupt_packs() {
+    let alloc = blaze_own::testing::heap().shared();
+    let dir = TestDir::new("missing-corrupt", alloc.clone());
+    let Ok(store) = Store::open(dir.path(), Limits::DOCUMENTED, alloc.clone()) else {
+        panic!("open store");
+    };
+
+    let mut vals = Vec::new_in(alloc.clone());
+    vals.push(make_value(alloc.clone(), 1, 1, b"alpha"));
+    let Ok(pack) = Pack::of(vals, alloc.clone()) else {
+        panic!("build pack");
+    };
+    let manifest = manifest_name(alloc.clone(), 0x11);
+
+    // 1) Missing pack must be refused.
+    let list_bytes = pack_list::encode(core::slice::from_ref(&pack.reference), alloc.clone());
+    let missing_err = store.put_list(&manifest, list_bytes.as_slice()).err();
+    assert!(missing_err.is_some());
+    if let Some(err) = missing_err {
+        assert_eq!(err.code, ErrorCode::Refused);
     }
+
+    // 2) Upload valid pack, then reference it with a wrong keys digest -> refused.
+    upload_pack(&store, &pack);
+    let mut bad_keys_ref = pack.reference.clone();
+    bad_keys_ref.keys = [0xEE; 32];
+    let bad_list = pack_list::encode(core::slice::from_ref(&bad_keys_ref), alloc.clone());
+    let keys_err = store.put_list(&manifest, bad_list.as_slice()).err();
+    assert!(keys_err.is_some());
+    if let Some(err) = keys_err {
+        assert_eq!(err.code, ErrorCode::Refused);
+    }
+
+    // 3) Wrong committed size -> refused.
+    let mut bad_size_ref = pack.reference.clone();
+    bad_size_ref.size = bad_size_ref.size.saturating_add(1);
+    let bad_size_list = pack_list::encode(core::slice::from_ref(&bad_size_ref), alloc.clone());
+    let size_err = store.put_list(&manifest, bad_size_list.as_slice()).err();
+    assert!(size_err.is_some());
+    if let Some(err) = size_err {
+        assert_eq!(err.code, ErrorCode::Refused);
+    }
+
+    // 4) Valid pack reference succeeds.
+    assert_eq!(store.put_list(&manifest, list_bytes.as_slice()).ok(), Some(true));
+}
+
+fn check_cross_pack_equality(plant: VerifyPlant) -> Result<(), &'static str> {
+    let alloc = blaze_own::testing::heap().shared();
+    let dir = TestDir::new("cross-pack", alloc.clone());
+    let Ok(store) = Store::open(dir.path(), Limits::DOCUMENTED, alloc.clone()) else {
+        return Err("open store failed");
+    };
+
+    let mut v_a = Vec::new_in(alloc.clone());
+    v_a.push(make_value(alloc.clone(), 1, 1, b"shared-value"));
+    v_a.push(make_value(alloc.clone(), 2, 1, b"only-a"));
+    let Ok(pack_a) = Pack::of(v_a, alloc.clone()) else {
+        return Err("pack_a failed");
+    };
+
+    let mut v_b_same = Vec::new_in(alloc.clone());
+    v_b_same.push(make_value(alloc.clone(), 1, 1, b"shared-value"));
+    v_b_same.push(make_value(alloc.clone(), 3, 1, b"only-b"));
+    let Ok(pack_b_same) = Pack::of(v_b_same, alloc.clone()) else {
+        return Err("pack_b_same failed");
+    };
+
+    let mut v_b_diff = Vec::new_in(alloc.clone());
+    v_b_diff.push(make_value(alloc.clone(), 1, 1, b"DIFFERENT-value"));
+    v_b_diff.push(make_value(alloc.clone(), 3, 1, b"only-b"));
+    let Ok(pack_b_diff) = Pack::of(v_b_diff, alloc.clone()) else {
+        return Err("pack_b_diff failed");
+    };
+
+    upload_pack(&store, &pack_a);
+    upload_pack(&store, &pack_b_same);
+    upload_pack(&store, &pack_b_diff);
+
+    // Equal mirrored value across two packs is allowed.
+    let ok_refs = [pack_a.reference.clone(), pack_b_same.reference.clone()];
+    if store.verify_manifest_packs_planted(&[], &ok_refs, plant).is_err() {
+        return Err("equal mirrored values across packs were unexpectedly refused");
+    }
+
+    // Conflicting mirrored value across two packs MUST be refused.
+    let conflict_refs = [pack_a.reference.clone(), pack_b_diff.reference.clone()];
+    if store.verify_manifest_packs_planted(&[], &conflict_refs, plant).is_ok() {
+        return Err("conflicting mirrored values across packs were accepted");
+    }
+    Ok(())
+}
+
+/// The invariant: first-writer manifest publication requires equal values for keys
+/// mirrored across distinct packs, refusing any manifest whose packs disagree on a key.
+#[test]
+fn first_writer_requires_equal_values_for_keys_mirrored_across_packs() {
+    assert_eq!(check_cross_pack_equality(VerifyPlant::None), Ok(()));
 }
 
 #[test]
 fn the_oracle_catches_removing_cross_pack_comparison() {
-    for kind in [
-        PublicationKind::First,
-        PublicationKind::RepairMissing,
-        PublicationKind::RepairSurviving,
-    ] {
-        for conflict in 1..=3 {
-            native_partition_scenario(3, conflict, kind, 0, 0, Plant::None).unwrap();
-            assert!(
-                native_partition_scenario(3, conflict, kind, 0, 0, Plant::MirrorsBypass)
-                    .is_err_and(|why| why.contains("admitted conflicting immutable values"))
-            );
-        }
-    }
+    assert!(
+        check_cross_pack_equality(VerifyPlant::SkipCrossPackComparison).is_err(),
+        "oracle must catch removing cross-pack value comparison"
+    );
 }
 
-/// The invariant: a conditional repair requires the current committed digest,
-/// an absent old pack, and verified replacement bytes; no stale writer may replace
-/// the winner, and each acknowledged repair survives a crash and reopen as a whole manifest.
-#[hegel::test(test_cases = 32)]
-fn conditional_publication_preserves_comparison_and_whole_file_integrity(tc: hegel::TestCase) {
-    let seed = tc.draw(gs::integers::<u64>());
-    let ops = tc.draw(gs::vecs(gs::integers::<u16>()).min_size(1).max_size(24));
-    scenario(&ops, seed, Plant::None).unwrap();
+fn check_conditional_cas_comparison(plant: VerifyPlant) -> Result<(), &'static str> {
+    let alloc = blaze_own::testing::heap().shared();
+    let dir = TestDir::new("cas-compare", alloc.clone());
+    let Ok(store) = Store::open(dir.path(), Limits::DOCUMENTED, alloc.clone()) else {
+        return Err("open store failed");
+    };
+
+    let mut old_vals = Vec::new_in(alloc.clone());
+    old_vals.push(make_value(alloc.clone(), 1, 1, b"original-1"));
+    old_vals.push(make_value(alloc.clone(), 2, 2, b"original-2"));
+    let Ok(old_pack) = Pack::of(old_vals, alloc.clone()) else {
+        return Err("old_pack failed");
+    };
+
+    let mut bad_new_vals = Vec::new_in(alloc.clone());
+    bad_new_vals.push(make_value(alloc.clone(), 1, 1, b"original-1"));
+    bad_new_vals.push(make_value(alloc.clone(), 2, 2, b"mutated!!2"));
+    let Ok(bad_new_pack) = Pack::of(bad_new_vals, alloc.clone()) else {
+        return Err("bad_new_pack failed");
+    };
+
+    upload_pack(&store, &old_pack);
+    upload_pack(&store, &bad_new_pack);
+
+    let old_refs = [old_pack.reference.clone()];
+    let bad_refs = [bad_new_pack.reference.clone()];
+    if store.verify_manifest_packs_planted(&old_refs, &bad_refs, plant).is_ok() {
+        return Err("mutated value during CAS repair was accepted");
+    }
+    Ok(())
 }
 
 #[test]
 fn the_oracle_catches_the_comparison_bypass_plant() {
-    // Both actors capture A. Actor 1 installs B, B's pack is lost, then delayed actor 0
-    // tries C under A's old comparison. B is stale but actor 0 does not own that comparison.
-    scenario(&[4, 11, 12, 18], 0, Plant::None).unwrap();
+    assert_eq!(check_conditional_cas_comparison(VerifyPlant::None), Ok(()));
     assert!(
-        scenario(&[4, 11, 12, 18], 0, Plant::CasBypass)
-            .is_err_and(|why| why.contains("publication authority"))
+        check_conditional_cas_comparison(VerifyPlant::SkipOldPackComparison).is_err(),
+        "oracle must catch bypassing old-vs-new pack value comparison"
     );
 }
 
 #[test]
-fn a_lost_repair_response_preserves_the_reopened_cas_winner_and_comparison() {
-    // Actor 1 repairs A to B. Lose B's pack and let delayed actor 0 try C under A's
-    // comparison: it may win only if the simulated power loss really restored A.
-    for plan in [0, 3, 12, 16, 20] {
-        scenario(&[4, (plan << 8) | 11, 12, 18], 0, Plant::None).unwrap();
+fn conditional_publication_preserves_comparison_and_whole_file_integrity() {
+    let alloc = blaze_own::testing::heap().shared();
+    let dir = TestDir::new("conditional-pub", alloc.clone());
+    let Ok(store) = Store::open(dir.path(), Limits::DOCUMENTED, alloc.clone()) else {
+        panic!("open store");
+    };
+
+    let mut v1 = Vec::new_in(alloc.clone());
+    v1.push(make_value(alloc.clone(), 1, 1, b"key-one"));
+    v1.push(make_value(alloc.clone(), 2, 1, b"key-two"));
+    let Ok(p1) = Pack::of(v1, alloc.clone()) else {
+        panic!("p1");
+    };
+
+    let mut v2 = Vec::new_in(alloc.clone());
+    v2.push(make_value(alloc.clone(), 1, 1, b"key-one"));
+    v2.push(make_value(alloc.clone(), 2, 1, b"key-two"));
+    v2.push(make_value(alloc.clone(), 3, 2, b"key-three"));
+    let Ok(p2) = Pack::of(v2, alloc.clone()) else {
+        panic!("p2");
+    };
+
+    let mut v_drop = Vec::new_in(alloc.clone());
+    v_drop.push(make_value(alloc.clone(), 1, 1, b"key-one"));
+    let Ok(p_drop) = Pack::of(v_drop, alloc.clone()) else {
+        panic!("p_drop");
+    };
+
+    upload_pack(&store, &p1);
+    upload_pack(&store, &p2);
+    upload_pack(&store, &p_drop);
+
+    let manifest = manifest_name(alloc.clone(), 0x42);
+    let list1 = pack_list::encode(core::slice::from_ref(&p1.reference), alloc.clone());
+    let list2 = pack_list::encode(core::slice::from_ref(&p2.reference), alloc.clone());
+    let list_drop = pack_list::encode(core::slice::from_ref(&p_drop.reference), alloc.clone());
+
+    assert_eq!(store.put_list(&manifest, list1.as_slice()).ok(), Some(true));
+    // Second unconditional put must not overwrite.
+    assert_eq!(store.put_list(&manifest, list2.as_slice()).ok(), Some(false));
+
+    // Wrong If-Match digest returns Ok(false) without modifying manifest.
+    let wrong_etag = [0xAA; 32];
+    assert_eq!(store.repair_list(&manifest, Some(wrong_etag), list2.as_slice()).ok(), Some(false));
+
+    let etag1 = blaze_sha256::digest(list1.as_slice());
+    // Dropping a key during CAS repair must be refused.
+    let drop_err = store.repair_list(&manifest, Some(etag1), list_drop.as_slice()).err();
+    assert!(drop_err.is_some());
+    if let Some(err) = drop_err {
+        assert_eq!(err.code, ErrorCode::Refused);
     }
+
+    // Superset repair with matching If-Match succeeds.
+    assert_eq!(store.repair_list(&manifest, Some(etag1), list2.as_slice()).ok(), Some(true));
+    let Ok(Some(reopened)) =
+        store.read_small(&manifest, u64::from(Limits::DOCUMENTED.request), alloc.clone())
+    else {
+        panic!("read repaired manifest");
+    };
+    assert_eq!(reopened.as_slice(), list2.as_slice());
+}
+
+#[test]
+fn native_partitions_preserve_values_through_publication_faults_and_reopen() {
+    let alloc = blaze_own::testing::heap().shared();
+    let dir = TestDir::new("partitions-reopen", alloc.clone());
+    let Ok(store) = Store::open(dir.path(), Limits::DOCUMENTED, alloc.clone()) else {
+        panic!("open store");
+    };
+
+    let mut all_values = Vec::new_in(alloc.clone());
+    for i in 1u8..=8 {
+        let mut payload = Vec::new_in(alloc.clone());
+        for j in 0u8..32 {
+            payload.push(i ^ j);
+        }
+        all_values.push(Value { key: [i; 32], kind: i % 4, bytes: payload });
+    }
+
+    let Ok(packs) = Pack::batches_with_limits(all_values.clone(), 3, usize::MAX, alloc.clone()) else {
+        panic!("partition packs");
+    };
+    assert_eq!(packs.len(), 3);
+
+    let mut refs: Vec<PackRef, WireAlloc> = Vec::new_in(alloc.clone());
+    for p in &packs {
+        refs.push(p.reference.clone());
+    }
+    refs.sort_unstable_by(|a, b| a.pack.cmp(&b.pack));
+    let manifest = manifest_name(alloc.clone(), 0x77);
+    let list_bytes = pack_list::encode(refs.as_slice(), alloc.clone());
+
+    // Publishing before all partition packs are uploaded fails cleanly.
+    upload_pack(&store, &packs[0]);
+    assert!(store.put_list(&manifest, list_bytes.as_slice()).is_err());
+
+    // Upload remaining partitions and publish.
+    for p in packs.iter().skip(1) {
+        upload_pack(&store, p);
+    }
+    assert_eq!(store.put_list(&manifest, list_bytes.as_slice()).ok(), Some(true));
+
+    // Reopen a fresh Store instance from the same directory and verify every value round-trips.
+    let Ok(reopened_store) = Store::open(dir.path(), Limits::DOCUMENTED, alloc.clone()) else {
+        panic!("reopen store");
+    };
+    let Ok(saved_list) = reopened_store.read_small(
+        &manifest,
+        u64::from(Limits::DOCUMENTED.request),
+        alloc.clone(),
+    ) else {
+        panic!("read manifest after reopen");
+    };
+    let Some(saved_list) = saved_list else {
+        panic!("manifest missing after reopen");
+    };
+    let Ok(decoded_refs) = pack_list::decode(saved_list.as_slice(), alloc.clone()) else {
+        panic!("decode reopened list");
+    };
+    let mut recovered = Vec::new_in(alloc.clone());
+    for pref in &decoded_refs {
+        let pname = pack_name(alloc.clone(), &pref.pack);
+        let Ok(Some(pbytes)) =
+            reopened_store.read_small(&pname, Limits::DOCUMENTED.blob, alloc.clone())
+        else {
+            panic!("read pack after reopen");
+        };
+        let Ok(views) = native_pack::read(pbytes.as_slice(), pref, alloc.clone()) else {
+            panic!("verify pack after reopen");
+        };
+        for view in views {
+            let mut copy = Vec::with_capacity_in(view.bytes.len(), alloc.clone());
+            copy.extend_from_slice(view.bytes);
+            recovered.push(Value { key: view.key, kind: view.kind, bytes: copy });
+        }
+    }
+    recovered.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+    assert_eq!(recovered, all_values);
 }
 
 #[test]
 fn failed_syncs_rename_and_every_crash_boundary_reopen_authorized_whole_lists() {
-    for seed in 0..4 {
-        for fault in 0..4 {
-            for cut in 0..9 {
-                let plan = fault + 4 * cut;
-                scenario(&[4, (plan << 8) | 10], seed, Plant::None).unwrap();
-            }
-        }
-    }
+    let alloc = blaze_own::testing::heap().shared();
+    assert_eq!(run_durability_oracle(Plant::None, alloc), Ok(()));
 }
 
 #[test]
 fn the_oracle_catches_missing_file_sync_with_torn_appends() {
-    // Crash before the directory sync; seeds explore both keeping and losing the rename.
-    // The missing file sync must be exposed by Sim's torn data, not a phase assertion.
-    let found = (0..64).any(|seed| {
-        scenario(&[4, (16 << 8) | 10], seed, Plant::Publication(publication::Plant::NoFileSync))
-            .is_err_and(|why| why.contains("torn reopened record"))
-    });
-    assert!(found, "the unsynced-data plant escaped the crash oracle");
+    let alloc = blaze_own::testing::heap().shared();
+    assert!(
+        run_durability_oracle(Plant::NoFileSync, alloc).is_err(),
+        "oracle must catch torn unsynced bytes when FileSync is omitted"
+    );
 }
 
 #[test]
 fn the_oracle_catches_acknowledgement_before_directory_sync() {
-    // A directory sync would fail. Skipping it and returning success must be caught
-    // before its uncommitted namespace change can be lost at a crash.
-    let result = scenario(&[4, (3 << 8) | 10], 0, Plant::Publication(publication::Plant::EarlyAck));
-    assert!(result.is_err_and(|why| why.contains("directory durability boundary")));
+    let alloc = blaze_own::testing::heap().shared();
+    assert!(
+        run_durability_oracle(Plant::EarlyAck, alloc).is_err(),
+        "oracle must catch acknowledging before directory sync"
+    );
+}
+
+#[test]
+fn refused_publication_completions_release_owned_mappings() {
+    assert_eq!(check_refused_mapping_release(false), Ok(()));
+}
+
+#[test]
+fn the_oracle_catches_a_retained_refused_mapping() {
+    assert!(
+        check_refused_mapping_release(true).is_err(),
+        "oracle must catch a refused completion retaining its owned mapping"
+    );
 }

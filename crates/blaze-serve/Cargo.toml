@@ -14,27 +14,14 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-blaze-core.workspace = true
+blaze-own = { workspace = true, features = ["std"] }
+blaze-sha256.workspace = true
+blaze-sys.workspace = true
 blaze-wire.workspace = true
-anyhow.workspace = true
-sha2.workspace = true
-# The retained HTTP/1.1 server keeps its transport features explicit.
-hyper = { workspace = true, default-features = false, features = ["server", "http1"] }
-hyper-util = { workspace = true, default-features = false, features = ["server", "http1", "tokio"] }
-futures-util = { workspace = true, default-features = false, features = ["std"] }
-http-body-util.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "fs", "io-util", "signal", "sync", "time", "macros"] }
-bytes.workspace = true
-# Already in the lockfile; configures transport liveness rather than job policy.
-socket2.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
-tempfile.workspace = true
-crc32fast.workspace = true
+blaze-own = { workspace = true, features = ["testing"] }
+blaze-rng.workspace = true
 
 [lints]
 workspace = true

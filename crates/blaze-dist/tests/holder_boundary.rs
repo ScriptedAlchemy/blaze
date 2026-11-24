@@ -1,19 +1,23 @@
 //! The compiler is not allowed to run or publish work outside its exact lease.
-#![feature(allocator_api)]
 
-use std::alloc::Global;
-use std::collections::BTreeSet;
+#![no_std]
+#![allow(missing_docs)]
 
 use blaze_dist::Ranges;
 use blaze_dist::holder::{Call, Compiled, Effect, Event, Holder, HolderConfig, Reply, StopWhy};
+use blaze_own::{BTreeSet, Vec, vec_in};
 use blaze_wire::{
     Attempt, EntryKey, EntryRef, ExecutionId, Found, Grant, ItemOutcome, ItemResult, Lease,
-    RootSet, Set, WorkJoinAnswer, WorkLeaseAnswer, WorkName,
+    RootSet, Set, WireAlloc, WireString, WireVec, WorkJoinAnswer, WorkLeaseAnswer, WorkName,
 };
 
 const FIRST: WorkName = WorkName([1; 32]);
 const SECOND: WorkName = WorkName([2; 32]);
 const FOUND: WorkName = WorkName([3; 32]);
+
+fn heap() -> WireAlloc {
+    blaze_own::testing::heap().shared()
+}
 
 fn sent(effects: &[Effect]) -> u64 {
     effects
@@ -25,7 +29,7 @@ fn sent(effects: &[Effect]) -> u64 {
         .expect("expected a coordinator request")
 }
 
-fn ready(index: BTreeSet<WorkName>) -> (Holder<Global>, u64) {
+fn ready(index: BTreeSet<WorkName, WireAlloc>, alloc: WireAlloc) -> (Holder<WireAlloc>, u64) {
     let roots =
         RootSet { spec: [1; 32], roots: [2; 32], count: 2, index: [3; 32], inputs: [4; 32] };
     let mut holder = Holder::new(
@@ -33,11 +37,12 @@ fn ready(index: BTreeSet<WorkName>) -> (Holder<Global>, u64) {
         ExecutionId(1),
         Attempt(1),
         roots.clone(),
-        Set::new(Vec::new()),
+        Set::empty_in(alloc),
         index,
         HolderConfig::default(),
+        alloc,
     );
-    let mut out = Vec::new();
+    let mut out = Vec::new_in(alloc);
     holder.step(0, Event::Loaded, &mut out);
     let id = sent(&out);
     out.clear();
@@ -49,12 +54,12 @@ fn ready(index: BTreeSet<WorkName>) -> (Holder<Global>, u64) {
     (holder, sent(&out))
 }
 
-fn grant(roots: Vec<(u64, u64)>, names: Vec<WorkName>) -> Grant {
+fn grant(roots: WireVec<(u64, u64)>, names: WireVec<WorkName>, alloc: WireAlloc) -> Grant {
     Grant {
         lease: Lease {
             execution: ExecutionId(1),
             attempt: Attempt(1),
-            holder: "worker".into(),
+            holder: WireString::from_str_in("worker", alloc),
             generation: 1,
         },
         roots: Set::new(roots),
@@ -62,14 +67,22 @@ fn grant(roots: Vec<(u64, u64)>, names: Vec<WorkName>) -> Grant {
     }
 }
 
-fn compiling(roots: Vec<(u64, u64)>, names: Vec<WorkName>) -> Holder<Global> {
-    let (mut holder, id) = ready(names.iter().copied().collect());
-    let mut out = Vec::new();
+fn compiling(
+    roots: WireVec<(u64, u64)>,
+    names: WireVec<WorkName>,
+    alloc: WireAlloc,
+) -> Holder<WireAlloc> {
+    let mut index = BTreeSet::new_in(alloc);
+    for name in names.iter().copied() {
+        index.insert(name);
+    }
+    let (mut holder, id) = ready(index, alloc);
+    let mut out = Vec::new_in(alloc);
     holder.step(
         2,
         Event::Reply {
             id,
-            reply: Reply::Lease(Ok(WorkLeaseAnswer { grant: Some(grant(roots, names)) })),
+            reply: Reply::Lease(Ok(WorkLeaseAnswer { grant: Some(grant(roots, names, alloc)) })),
         },
         &mut out,
     );
@@ -77,62 +90,71 @@ fn compiling(roots: Vec<(u64, u64)>, names: Vec<WorkName>) -> Holder<Global> {
     holder
 }
 
-fn item(name: WorkName) -> ItemResult {
+fn item(name: WorkName, alloc: WireAlloc) -> ItemResult {
     ItemResult {
         name,
         outcome: ItemOutcome::Exported(EntryRef { entry: EntryKey([9; 32]) }),
-        found: Set::new(vec![Found { name: FOUND, tuple: [7; 32] }]),
-        unnamed: Set::new(Vec::new()),
+        found: Set::new(vec_in![alloc; Found { name: FOUND, tuple: [7; 32] }]),
+        unnamed: Set::empty_in(alloc),
     }
 }
 
-fn batch(roots: Vec<ItemResult>, names: Vec<ItemResult>) -> Compiled {
+fn batch(roots: WireVec<ItemResult>, names: WireVec<ItemResult>, alloc: WireAlloc) -> Compiled {
     Compiled {
         generation: 1,
         roots,
         names,
-        packs: Vec::new(),
-        returned_roots: Ranges::new(),
-        returned_names: Vec::new(),
+        packs: Vec::new_in(alloc),
+        returned_roots: Ranges::new(alloc),
+        returned_names: Vec::new_in(alloc),
     }
 }
 
-fn refuses_batch(holder: &mut Holder<Global>, compiled: Compiled) {
-    let retained: BTreeSet<_> = compiled
-        .roots
-        .iter()
-        .chain(&compiled.names)
-        .flat_map(|item| item.found.iter().map(|found| found.name))
-        .collect();
-    let mut out = Vec::new();
+fn refuses_batch(holder: &mut Holder<WireAlloc>, compiled: Compiled, alloc: WireAlloc) {
+    let mut retained = BTreeSet::new_in(alloc);
+    for item in compiled.roots.iter().chain(&compiled.names) {
+        for found in item.found.iter() {
+            retained.insert(found.name);
+        }
+    }
+    let mut out = Vec::new_in(alloc);
     holder.step(3, Event::Compiled(compiled), &mut out);
     assert!(holder.is_stopped(), "a malformed compiler batch cannot be reported as a valid prefix");
     assert!(out.iter().any(|effect| matches!(effect, Effect::Stop(StopWhy::Protocol(_)))));
     assert!(!out.iter().any(|effect| matches!(effect, Effect::Send { call: Call::Result(_), .. })));
-    let released: BTreeSet<_> = out
-        .iter()
-        .flat_map(|effect| match effect {
-            Effect::Release(names) => names.as_slice(),
-            _ => &[],
-        })
-        .copied()
-        .collect();
+    let mut released = BTreeSet::new_in(alloc);
+    for effect in &out {
+        if let Effect::Release(names) = effect {
+            for name in names.as_slice() {
+                released.insert(*name);
+            }
+        }
+    }
     assert!(
-        retained.is_subset(&released),
+        retained.iter().all(|name| released.contains(name)),
         "refused batches must release compiler-retained discoveries"
     );
 }
 
 #[test]
 fn malformed_and_out_of_bounds_root_grants_never_reach_the_compiler() {
-    for ranges in [vec![(0, 3)], vec![(2, 3)], vec![(1, 0)], vec![(0, 0)], vec![(0, 2), (1, 2)]] {
-        let (mut holder, id) = ready(BTreeSet::new());
-        let mut out = Vec::new();
+    let alloc = heap();
+    for ranges in [
+        vec_in![alloc; (0, 3)],
+        vec_in![alloc; (2, 3)],
+        vec_in![alloc; (1, 0)],
+        vec_in![alloc; (0, 0)],
+        vec_in![alloc; (0, 2), (1, 2)],
+    ] {
+        let (mut holder, id) = ready(BTreeSet::new_in(alloc), alloc);
+        let mut out = Vec::new_in(alloc);
         holder.step(
             2,
             Event::Reply {
                 id,
-                reply: Reply::Lease(Ok(WorkLeaseAnswer { grant: Some(grant(ranges, Vec::new())) })),
+                reply: Reply::Lease(Ok(WorkLeaseAnswer {
+                    grant: Some(grant(ranges, Vec::new_in(alloc), alloc)),
+                })),
             },
             &mut out,
         );
@@ -143,52 +165,73 @@ fn malformed_and_out_of_bounds_root_grants_never_reach_the_compiler() {
 
 #[test]
 fn surplus_named_results_are_not_silently_discarded() {
-    let mut holder = compiling(vec![(0, 1)], Vec::new());
-    refuses_batch(&mut holder, batch(vec![item(FIRST)], vec![item(SECOND)]));
+    let alloc = heap();
+    let mut holder = compiling(vec_in![alloc; (0, 1)], Vec::new_in(alloc), alloc);
+    refuses_batch(
+        &mut holder,
+        batch(vec_in![alloc; item(FIRST, alloc)], vec_in![alloc; item(SECOND, alloc)], alloc),
+        alloc,
+    );
 }
 
 #[test]
 fn every_unreturned_root_requires_exactly_one_result() {
-    for roots in [vec![], vec![item(FIRST), item(SECOND), item(FIRST)]] {
-        let mut holder = compiling(vec![(0, 2)], Vec::new());
-        refuses_batch(&mut holder, batch(roots, Vec::new()));
+    let alloc = heap();
+    for roots in [
+        Vec::new_in(alloc),
+        vec_in![alloc; item(FIRST, alloc), item(SECOND, alloc), item(FIRST, alloc)],
+    ] {
+        let mut holder = compiling(vec_in![alloc; (0, 2)], Vec::new_in(alloc), alloc);
+        refuses_batch(&mut holder, batch(roots, Vec::new_in(alloc), alloc), alloc);
     }
 }
 
 #[test]
 fn results_must_follow_the_granted_name_order() {
-    let mut holder = compiling(Vec::new(), vec![FIRST, SECOND]);
-    refuses_batch(&mut holder, batch(Vec::new(), vec![item(SECOND), item(FIRST)]));
+    let alloc = heap();
+    let mut holder = compiling(Vec::new_in(alloc), vec_in![alloc; FIRST, SECOND], alloc);
+    refuses_batch(
+        &mut holder,
+        batch(Vec::new_in(alloc), vec_in![alloc; item(SECOND, alloc), item(FIRST, alloc)], alloc),
+        alloc,
+    );
 }
 
 #[test]
 fn returned_work_must_belong_to_this_compile_plan() {
-    let mut holder = compiling(vec![(0, 1)], Vec::new());
-    let mut compiled = batch(vec![item(FIRST)], Vec::new());
+    let alloc = heap();
+    let mut holder = compiling(vec_in![alloc; (0, 1)], Vec::new_in(alloc), alloc);
+    let mut compiled = batch(vec_in![alloc; item(FIRST, alloc)], Vec::new_in(alloc), alloc);
     compiled.returned_roots.insert(1, 2);
-    refuses_batch(&mut holder, compiled);
+    refuses_batch(&mut holder, compiled, alloc);
 
-    let mut holder = compiling(Vec::new(), vec![FIRST]);
-    let mut compiled = batch(Vec::new(), vec![item(FIRST)]);
+    let mut holder = compiling(Vec::new_in(alloc), vec_in![alloc; FIRST], alloc);
+    let mut compiled = batch(Vec::new_in(alloc), vec_in![alloc; item(FIRST, alloc)], alloc);
     compiled.returned_names.push(SECOND);
-    refuses_batch(&mut holder, compiled);
+    refuses_batch(&mut holder, compiled, alloc);
 }
 
 #[test]
 fn duplicate_returns_do_not_hide_a_missing_result() {
-    let mut holder = compiling(Vec::new(), vec![FIRST, SECOND]);
-    let mut compiled = batch(Vec::new(), vec![item(SECOND)]);
-    compiled.returned_names = vec![FIRST, FIRST];
-    refuses_batch(&mut holder, compiled);
+    let alloc = heap();
+    let mut holder = compiling(Vec::new_in(alloc), vec_in![alloc; FIRST, SECOND], alloc);
+    let mut compiled = batch(Vec::new_in(alloc), vec_in![alloc; item(SECOND, alloc)], alloc);
+    compiled.returned_names = vec_in![alloc; FIRST, FIRST];
+    refuses_batch(&mut holder, compiled, alloc);
 }
 
 #[test]
 fn a_valid_partial_batch_preserves_exact_returned_work() {
-    let mut holder = compiling(vec![(0, 2)], vec![FIRST, SECOND]);
-    let mut compiled = batch(vec![item(WorkName([4; 32]))], vec![item(SECOND)]);
+    let alloc = heap();
+    let mut holder = compiling(vec_in![alloc; (0, 2)], vec_in![alloc; FIRST, SECOND], alloc);
+    let mut compiled = batch(
+        vec_in![alloc; item(WorkName([4; 32]), alloc)],
+        vec_in![alloc; item(SECOND, alloc)],
+        alloc,
+    );
     compiled.returned_roots.insert(1, 2);
     compiled.returned_names.push(FIRST);
-    let mut out = Vec::new();
+    let mut out = Vec::new_in(alloc);
     holder.step(3, Event::Compiled(compiled), &mut out);
     assert!(!holder.is_stopped());
     let result = out
@@ -200,6 +243,6 @@ fn a_valid_partial_batch_preserves_exact_returned_work() {
         .unwrap();
     assert_eq!(result.items.len(), 2);
     assert_eq!(result.items[1].name, SECOND);
-    assert_eq!(result.returned_roots, Set::new(vec![(1, 2)]));
-    assert_eq!(result.returned_names, Set::new(vec![FIRST]));
+    assert_eq!(result.returned_roots, Set::new(vec_in![alloc; (1, 2)]));
+    assert_eq!(result.returned_names, Set::new(vec_in![alloc; FIRST]));
 }

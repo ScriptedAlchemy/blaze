@@ -11,22 +11,6 @@ use blaze_manifest::metadata::{export_no_deps, root_manifest};
 use blaze_manifest::{Config, Context, ManifestError, Workspace};
 use serde::Serialize;
 
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let name = entry.file_name();
-        if name == "expected.json" || name == "fixture.json" {
-            continue;
-        }
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &to.join(&name));
-        } else {
-            std::fs::copy(entry.path(), to.join(&name)).unwrap();
-        }
-    }
-}
-
 /// The error as cargo prints it, blank lines dropped as they were when `expected.json` was recorded.
 fn error_text(err: &ManifestError, cwd: &Path) -> String {
     if let Some(diagnostic) = err.diagnostic() {
@@ -38,7 +22,7 @@ fn error_text(err: &ManifestError, cwd: &Path) -> String {
             .collect::<Vec<_>>()
             .join("\n");
     }
-    let mut lines = Vec::new();
+    let mut lines = vec![];
     for (i, cause) in err.chain().enumerate() {
         if i == 0 {
             let text = format!("error: {cause}");
@@ -56,7 +40,7 @@ fn error_text(err: &ManifestError, cwd: &Path) -> String {
 /// What blaze-manifest prints for the fixture, in the form of `expected.json`.
 fn read(fixture: &Path, scratch: &Path) -> String {
     let root = scratch.join(fixture.file_name().unwrap());
-    copy_dir(fixture, &root);
+    fixture_paths::copy_dir(fixture, &root, &["expected.json", "fixture.json"]);
     let root = fixture_paths::canonicalize(&root);
     let home = scratch.join("cargo-home");
     std::fs::create_dir_all(&home).unwrap();

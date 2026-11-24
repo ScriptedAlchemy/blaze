@@ -46,31 +46,36 @@ fn io(sim: &mut Sim, effect: Effect) -> Done {
 }
 
 /// The same transition and SQEs as Uring::wrote/path_sqes. Only kernel execution is replaced.
-fn simulate(case: Case, plant: Plant) -> Result<(), String> {
+fn simulate(case: Case, plant: Plant) -> Result<(), &'static str> {
     let mut sim = Sim::new(case.seed, Faults::default());
     let mut rng = Rng::new(case.seed ^ 0xc10e);
     let (temp, target) = (name("placed/temporary"), name("placed/value"));
     let old: &[u8] = b"the old output";
     sim.change(&target, old);
-    let bytes: Vec<u8> = (0..case.len).map(|n| n as u8 ^ 0xa5).collect();
+    let mut buf = [0u8; 128];
+    for (n, b) in buf[..case.len].iter_mut().enumerate() {
+        *b = n as u8 ^ 0xa5;
+    }
+    let bytes = &buf[..case.len];
     let mut hot = Hot::new(Tag(1), Kind::Write, 0);
     let mut cold = Cold { slots: [0, 1], ..Cold::EMPTY };
     let (mut ops, mut synced, mut injected) = (0, false, false);
     let names = [c"temporary".as_ptr().cast(), c"value".as_ptr().cast(), c"placed".as_ptr().cast()];
     for _ in 0..1024 {
         let mut sqes = [Sqe::default(); LINKS];
-        let mut n = whole::sqes(&hot, &cold, &bytes, names, |n| n as u64, &mut sqes);
+        let mut n = whole::sqes(&hot, &cold, bytes, names, |n| n as u64, &mut sqes);
         // Plant the old missing gate: publish in the write's chain, before its count is known.
         // The suffix itself comes from the production commit SQE builder, not a second writer.
         if matches!(plant, Plant::EarlyPublication) && matches!(hot.phase, OPENING | OPENED) {
             sqes[n - 1].flags |= SQE_IO_LINK;
             let mut commit = [Sqe::default(); LINKS];
             let committing = Hot { phase: COMMITTING, ..hot };
-            let more = whole::sqes(&committing, &cold, &bytes, names, |n| n as u64, &mut commit);
+            let more = whole::sqes(&committing, &cold, bytes, names, |n| n as u64, &mut commit);
             sqes[n..n + more].copy_from_slice(&commit[..more]);
             n += more;
         }
-        let mut completions = Vec::new();
+        let mut completions = [(0usize, 0i32); LINKS];
+        let mut completed = 0;
         let mut cancelled = false;
         for sqe in &sqes[..n] {
             let link = sqe.user_data as usize;
@@ -136,7 +141,7 @@ fn simulate(case: Case, plant: Plant) -> Result<(), String> {
                         // the output was written and synced. Namespace durability follows.
                         if !synced || sim.contents(&temp) != bytes {
                             return Err(
-                                "rename published before all bytes were written and synced".into()
+                                "rename published before all bytes were written and synced",
                             );
                         }
                         assert_eq!(
@@ -181,11 +186,12 @@ fn simulate(case: Case, plant: Plant) -> Result<(), String> {
             cancelled |= sqe.flags & SQE_IO_LINK != 0
                 && (res < 0
                     || (sqe.opcode == OP_WRITE && res < sqe.len.min(case.import_limit) as i32));
-            completions.push((link, res));
+            completions[completed] = (link, res);
+            completed += 1;
             ops += 1;
             let visible = sim.contents(&target);
             if visible != old && visible != bytes {
-                return Err("the canonical name contains a partial output".into());
+                return Err("the canonical name contains a partial output");
             }
             if ops == case.crash_after {
                 sim.crash();
@@ -193,31 +199,31 @@ fn simulate(case: Case, plant: Plant) -> Result<(), String> {
                 return if visible == old || visible == bytes {
                     Ok(())
                 } else {
-                    Err("a crash exposed partial canonical bytes".into())
+                    Err("a crash exposed partial canonical bytes")
                 };
             }
         }
-        rng.shuffle(&mut completions);
+        rng.shuffle(&mut completions[..completed]);
         let mut results = [0; LINKS];
-        for (link, res) in completions {
+        for &(link, res) in &completions[..completed] {
             results[link] = res;
         }
         match whole::advance(&mut hot, &mut cold, bytes.len(), results) {
             Step::Again => {}
             Step::Ends(Some(Done::Written)) => {
                 if injected {
-                    return Err("an injected error was reported as success".into());
+                    return Err("an injected error was reported as success");
                 }
                 sim.crash();
                 return if sim.contents(&target) == bytes && !sim.exists(&temp) {
                     Ok(())
                 } else {
-                    Err("success did not leave exactly the durable output".into())
+                    Err("success did not leave exactly the durable output")
                 };
             }
             Step::Ends(Some(Done::Failed(_))) if injected => {
                 if sim.exists(&temp) {
-                    return Err("failure did not clean its live temporary name".into());
+                    return Err("failure did not clean its live temporary name");
                 }
                 sim.crash();
                 let visible = sim.contents(&target);
@@ -226,13 +232,13 @@ fn simulate(case: Case, plant: Plant) -> Result<(), String> {
                 return if visible == old || visible == bytes {
                     Ok(())
                 } else {
-                    Err("failure exposed partial canonical bytes after a crash".into())
+                    Err("failure exposed partial canonical bytes after a crash")
                 };
             }
-            _ => return Err(format!("unexpected write outcome in phase {}", hot.phase)),
+            _ => return Err("unexpected write outcome"),
         }
     }
-    Err("whole-file write exceeded its positive-progress bound".into())
+    Err("whole-file write exceeded its positive-progress bound")
 }
 
 #[test]
@@ -275,7 +281,7 @@ fn whole_write_oracle_catches_publication_linked_to_a_clamped_write() {
     assert_eq!(simulate(case, Plant::None), Ok(()));
     assert_eq!(
         simulate(case, Plant::EarlyPublication),
-        Err("rename published before all bytes were written and synced".into())
+        Err("rename published before all bytes were written and synced")
     );
     for fault in
         [Fault::None, Fault::Write, Fault::Zero, Fault::FileSync, Fault::Rename, Fault::DirSync]

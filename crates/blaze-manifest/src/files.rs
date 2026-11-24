@@ -4,6 +4,7 @@
 //! made, so readers take it as a type parameter, never as a trait object.
 
 use std::borrow::Cow;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::error::ManifestError;
@@ -12,7 +13,7 @@ use crate::schema::TomlManifest;
 pub trait Files {
     /// The bytes of the file at `path`: borrowed where the files are kept already (a view's,
     /// in the database), owned where they had to be read (the disk).
-    fn read(&self, path: &Path) -> std::io::Result<Cow<'_, [u8]>>;
+    fn read(&self, path: &Path) -> io::Result<Cow<'_, [u8]>>;
     /// The manifest at `path` parsed, as [`crate::manifest::read_manifest`] reads it, with its
     /// errors: one that can't be read, isn't UTF-8 or isn't TOML of a manifest names `path`.
     /// A `Files` that keeps manifests parsed answers from them, so nothing parses one twice.
@@ -27,10 +28,10 @@ pub trait Files {
     /// The names in a directory, sorted, each with whether it is a directory (a link to one is
     /// not, as cargo's target discovery reads `DirEntry::file_type`). Names that are not UTF-8
     /// are left out: no reader here matches them.
-    fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool)>>;
+    fn list(&self, path: &Path) -> io::Result<Vec<(String, bool)>>;
     /// The path with every link resolved, as `std::fs::canonicalize`; an error when nothing is
     /// there.
-    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf>;
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
 
     fn exists(&self, path: &Path) -> bool {
         self.kind(path).is_some()
@@ -58,7 +59,7 @@ pub enum FileKind {
 pub struct Disk;
 
 impl Files for Disk {
-    fn read(&self, path: &Path) -> std::io::Result<Cow<'_, [u8]>> {
+    fn read(&self, path: &Path) -> io::Result<Cow<'_, [u8]>> {
         // alloc: the file's bytes, read from the disk
         std::fs::read(path).map(Cow::Owned)
     }
@@ -74,7 +75,7 @@ impl Files for Disk {
         })
     }
 
-    fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool)>> {
+    fn list(&self, path: &Path) -> io::Result<Vec<(String, bool)>> {
         let mut names = Vec::new();
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
@@ -85,14 +86,14 @@ impl Files for Disk {
         Ok(names)
     }
 
-    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         #[cfg(windows)]
         if path.to_str().is_some_and(|text| {
             matches!(text.as_bytes(), [b'/', drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
         }) {
             let native = blaze_source::file_url(path)
                 .and_then(|url| url.to_file_path())
-                .map_err(|()| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!(
+                .map_err(|()| io::Error::new(io::ErrorKind::InvalidInput, format!(
                     "`{}` is not a native Windows drive path", path.display()
                 )))?;
             return native.canonicalize();
@@ -425,7 +426,7 @@ mod windows_disk_path_tests {
 
     #[test]
     fn rooted_drive_paths_canonicalize_through_the_disk_adapter() {
-        let scratch = stdx::tempfile::NamedTempDir::new("blaze-drive-path-").unwrap();
+        let scratch = blaze_core::temp::TempDir::for_test("blaze-drive-path-");
         let ordinary = blaze_source::file_url(scratch.path()).unwrap().to_file_path().unwrap();
         let rooted = blaze_source::SourceId::for_path(&ordinary).unwrap().local_path().unwrap();
         assert_eq!(Disk.canonicalize(&rooted).unwrap(), scratch.path());

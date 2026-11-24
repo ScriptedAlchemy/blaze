@@ -1,12 +1,13 @@
 //! Serialized routing, retry journal and retention for the local IO driver.
 
-use std::alloc::{Allocator, Global};
-use std::collections::{BTreeMap, BTreeSet};
+use core::alloc::Allocator;
 
 use blaze_dist::Refusal;
 use blaze_dist::jobs::{AssignmentToken, Effect, ExecState, Execution, Jobs};
+use blaze_own::{BTreeMap, BTreeSet, Vec};
 use blaze_wire::{
-    Ack, Digest, ErrorCode, ExecutionId, JobRequest, Limits, WireError, decode, encode,
+    Ack, Digest, ErrorCode, ExecutionId, JobRequest, Limits, WireAlloc, WireError, WireString,
+    WireVec, decode, encode,
 };
 
 use crate::protocol::*;
@@ -79,7 +80,7 @@ struct Session {
     /// Immutable ceiling, including the initial admission wait and bounded work/cleanup.
     maximum_expires: u64,
     /// Only executions verified by a successful request, bounded by max_executions.
-    executions: BTreeSet<ExecutionId>,
+    executions: BTreeSet<ExecutionId, WireAlloc>,
     next: u64,
     /// The last request answered, its exact bytes and its answer's. A client has one request
     /// outstanding at a time, so this is the only one it can retry: a session that polls for
@@ -91,8 +92,8 @@ struct Session {
 
 struct Answered {
     sequence: u64,
-    request: Vec<u8>,
-    reply: Vec<u8>,
+    request: WireVec<u8>,
+    reply: WireVec<u8>,
 }
 
 /// Single-owner facade. A reactor owns it; no locks around individual core transitions.
@@ -104,23 +105,24 @@ pub struct Coordinator {
     jobs: Jobs,
     /// Live sessions only. Expiry removes the entry, so its capacity returns. A label is
     /// never issued twice, so nothing has to be remembered to refuse a revival.
-    sessions: BTreeMap<Digest, Session>,
+    sessions: BTreeMap<Digest, Session, WireAlloc>,
     /// Monotonic label counter. Labels are not capabilities: they only need to be unique
     /// within this daemon, and the epoch check carries the authority.
     issued: u64,
-    ended: BTreeMap<ExecutionId, u64>,
-    work_bytes: BTreeMap<ExecutionId, usize>,
-    units: BTreeMap<ExecutionId, Digest>,
+    ended: BTreeMap<ExecutionId, u64, WireAlloc>,
+    work_bytes: BTreeMap<ExecutionId, usize, WireAlloc>,
+    units: BTreeMap<ExecutionId, Digest, WireAlloc>,
     last_now: u64,
+    alloc: WireAlloc,
 }
 
-fn error(code: ErrorCode, text: &str) -> WireError {
-    WireError::new(code, format_args!("{text}"))
+fn error(code: ErrorCode, text: &str, alloc: WireAlloc) -> WireError {
+    WireError::new(code, format_args!("{text}"), alloc)
 }
 
 /// A claimant label alone carries no authority. Its owned session is part of the core identity.
 fn owned_claimant(session: &Digest, label: &Digest) -> Digest {
-    let mut bytes = [0; 64];
+    let mut bytes = [0u8; 64];
     bytes[..32].copy_from_slice(session);
     bytes[32..].copy_from_slice(label);
     blaze_wire::digest_of_encoded_name("blaze/local-claim-owner", &bytes)
@@ -152,18 +154,19 @@ impl Coordinator {
     /// Own the actual core registry. The caller sets admission/builders, not worker messages.
     /// The registry's ids are seeded from this daemon's epoch, so a restarted daemon
     /// never reissues an execution id a surviving executor's lease still names.
-    pub fn new(mut jobs: Jobs, config: Config, epoch: Digest) -> Self {
+    pub fn new(mut jobs: Jobs, config: Config, epoch: Digest, alloc: WireAlloc) -> Self {
         jobs.seed_ids(&epoch);
         Self {
             jobs,
             config,
             epoch,
-            sessions: BTreeMap::new(),
+            sessions: BTreeMap::new_in(alloc),
             issued: 0,
-            ended: BTreeMap::new(),
-            work_bytes: BTreeMap::new(),
-            units: BTreeMap::new(),
+            ended: BTreeMap::new_in(alloc),
+            work_bytes: BTreeMap::new_in(alloc),
+            units: BTreeMap::new_in(alloc),
             last_now: 0,
+            alloc,
         }
     }
 
@@ -183,18 +186,26 @@ impl Coordinator {
     }
 
     fn execution_ceiling(&self, execution: &Execution) -> Result<u64, WireError> {
-        let queued = execution.stages().first().expect("execution starts Queued").1;
+        let queued = execution
+            .stages()
+            .first()
+            .ok_or_else(|| error(ErrorCode::Malformed, "execution-missing-queued-stage", self.alloc))?
+            .1;
         queued
             .checked_add(self.config.max_execution_ms)
-            .ok_or_else(|| error(ErrorCode::Malformed, "execution-deadline-limit"))
+            .ok_or_else(|| error(ErrorCode::Malformed, "execution-deadline-limit", self.alloc))
     }
 
     fn session_work_limit(&self, session: Digest, ceiling: u64) -> Result<(), WireError> {
         let bound = ceiling
             .checked_add(self.config.owner_cleanup_ms)
-            .ok_or_else(|| error(ErrorCode::Conflict, "session-work-lifetime-limit"))?;
-        if bound > self.sessions[&session].maximum_expires {
-            return Err(error(ErrorCode::Conflict, "session-work-lifetime-limit"));
+            .ok_or_else(|| error(ErrorCode::Conflict, "session-work-lifetime-limit", self.alloc))?;
+        let live = self
+            .sessions
+            .get(&session)
+            .ok_or_else(|| error(ErrorCode::NotFound, "session-expired", self.alloc))?;
+        if bound > live.maximum_expires {
+            return Err(error(ErrorCode::Conflict, "session-work-lifetime-limit", self.alloc));
         }
         Ok(())
     }
@@ -274,13 +285,11 @@ impl Coordinator {
     ) -> Vec<(ExecutionId, Effect), A> {
         let now = self.now(now);
         let mut attached = Vec::new_in(alloc.clone());
-        attached.extend(
-            self.jobs.executions().flat_map(|e| {
-                e.subscribers()
-                    .filter(|s| s.state == blaze_dist::jobs::SubscriberState::Attached)
-                    .map(move |s| (e.id, s.id))
-            }),
-        );
+        attached.extend(self.jobs.executions().flat_map(|e| {
+            e.subscribers()
+                .filter(|s| s.state == blaze_dist::jobs::SubscriberState::Attached)
+                .map(move |s| (e.id, s.id))
+        }));
         let mut effects = Vec::new_in(alloc);
         for (execution, subscriber) in attached {
             let _ = self.jobs.unsubscribe(now, execution, subscriber, &mut effects);
@@ -297,19 +306,23 @@ impl Coordinator {
             || hello.codec != blaze_wire::VERSION
             || hello.terminal != blaze_wire::job_terminal_v2::VERSION
         {
-            return Err(error(ErrorCode::Conflict, "version-mismatch"));
+            return Err(error(ErrorCode::Conflict, "version-mismatch", self.alloc));
         }
         match (&hello.epoch, &hello.resume) {
             (None, None) => self.create(now, hello),
             (Some(epoch), Some(session)) => {
                 if *epoch != self.epoch {
-                    return Err(error(ErrorCode::Conflict, "daemon-moved"));
+                    return Err(error(ErrorCode::Conflict, "daemon-moved", self.alloc));
                 }
-                let live =
-                    self.sessions.get(session).filter(|s| now <= s.expires).ok_or_else(|| {
+                let live = self
+                    .sessions
+                    .get(session)
+                    .filter(|s| now <= s.expires)
+                    .ok_or_else(|| {
                         error(
                             ErrorCode::NotFound,
                             "session-expired: resume names no live lifetime of this daemon",
+                            self.alloc,
                         )
                     })?;
                 Ok(self.welcome(now, *session, live, false))
@@ -317,6 +330,7 @@ impl Coordinator {
             _ => Err(error(
                 ErrorCode::Malformed,
                 "hello-shape: creation names no epoch/resume, resume names both",
+                self.alloc,
             )),
         }
     }
@@ -329,41 +343,44 @@ impl Coordinator {
         self.sessions.retain(|_, session| now <= session.expires);
         let existing =
             self.sessions.iter().find(|(_, s)| s.nonce == hello.nonce).map(|(session, _)| *session);
-        if let Some(session) = existing {
-            let live = &self.sessions[&session];
+        if let Some(session) = existing
+            && let Some(live) = self.sessions.get(&session)
+        {
             return Ok(self.welcome(now, session, live, false));
         }
         if self.sessions.len() >= self.config.max_sessions {
-            return Err(error(ErrorCode::Busy, "session-capacity: live sessions are full"));
+            return Err(error(
+                ErrorCode::Busy,
+                "session-capacity: live sessions are full",
+                self.alloc,
+            ));
         }
         // A label is never issued twice. Exhausting the counter is a typed capacity
         // refusal, never a wrap that would reissue an old identity.
         let counter = self
             .issued
             .checked_add(1)
-            .ok_or_else(|| error(ErrorCode::Busy, "session-label-exhausted"))?;
+            .ok_or_else(|| error(ErrorCode::Busy, "session-label-exhausted", self.alloc))?;
         let expires = now
             .checked_add(self.config.session_ms)
-            .ok_or_else(|| error(ErrorCode::Busy, "session-lifetime-overflow"))?;
+            .ok_or_else(|| error(ErrorCode::Busy, "session-lifetime-overflow", self.alloc))?;
         let maximum_expires = expires
             .checked_add(self.config.max_execution_ms)
             .and_then(|bound| bound.checked_add(self.config.owner_cleanup_ms))
-            .ok_or_else(|| error(ErrorCode::Busy, "session-lifetime-overflow"))?;
+            .ok_or_else(|| error(ErrorCode::Busy, "session-lifetime-overflow", self.alloc))?;
         let session = self.label(counter);
-        self.sessions.insert(
-            session,
-            Session {
-                expires,
-                maximum_expires,
-                executions: BTreeSet::new(),
-                next: 1,
-                last: None,
-                nonce: hello.nonce,
-            },
-        );
+        let entry = Session {
+            expires,
+            maximum_expires,
+            executions: BTreeSet::new_in(self.alloc),
+            next: 1,
+            last: None,
+            nonce: hello.nonce,
+        };
+        let welcome = self.welcome(now, session, &entry, true);
+        self.sessions.insert(session, entry);
         self.issued = counter;
-        let live = &self.sessions[&session];
-        Ok(self.welcome(now, session, live, true))
+        Ok(welcome)
     }
 
     fn welcome(&self, now: u64, session: Digest, live: &Session, created: bool) -> LocalWelcome {
@@ -392,23 +409,29 @@ impl Coordinator {
     ) -> Result<(Vec<u8, A>, Vec<(ExecutionId, Effect), A>), WireError> {
         let now = self.now(now);
         if request.epoch != self.epoch {
-            return Err(error(ErrorCode::Conflict, "daemon-moved"));
+            return Err(error(ErrorCode::Conflict, "daemon-moved", self.alloc));
         }
-        let raw = encode(&ClientFrame::Request(request.clone()), Global);
+        let raw = encode(&ClientFrame::Request(request.clone()), self.alloc);
         let session = self
             .sessions
             .get(&request.session)
             .filter(|s| now <= s.expires)
-            .ok_or_else(|| error(ErrorCode::NotFound, "session-expired"))?;
+            .ok_or_else(|| error(ErrorCode::NotFound, "session-expired", self.alloc))?;
         if request.sequence != session.next {
             // Only the last answer is kept: an earlier sequence is no request of a client that
             // waits for each answer before its next, and is refused like one out of order.
             return match &session.last {
-                Some(last) if last.sequence == request.sequence => match last.request == raw {
-                    true => Ok((last.reply.to_vec_in(alloc.clone()), Vec::new_in(alloc))),
-                    false => Err(error(ErrorCode::Malformed, "sequence-reused")),
-                },
-                _ => Err(error(ErrorCode::Conflict, "request-out-of-order")),
+                Some(last) if last.sequence == request.sequence => {
+                    if last.request == raw {
+                        Ok((
+                            Vec::from_slice_in(last.reply.as_slice(), alloc.clone()),
+                            Vec::new_in(alloc),
+                        ))
+                    } else {
+                        Err(error(ErrorCode::Malformed, "sequence-reused", self.alloc))
+                    }
+                }
+                _ => Err(error(ErrorCode::Conflict, "request-out-of-order", self.alloc)),
             };
         }
         // Apply deadlines before route-level retention checks. An expired execution is
@@ -426,11 +449,9 @@ impl Coordinator {
             _ => referenced_execution(&request.command).map(|(id, _)| id),
         };
         if let Some(execution) = execution {
-            self.sessions
-                .get_mut(&request.session)
-                .expect("validated session")
-                .executions
-                .insert(execution);
+            if let Some(session) = self.sessions.get_mut(&request.session) {
+                session.executions.insert(execution);
+            }
             self.refresh_work_sessions(now);
         }
         let mut reply = encode(
@@ -442,7 +463,8 @@ impl Coordinator {
             }),
             alloc,
         );
-        if reply.len() > self.config.max_frame as usize {
+        let max_frame = usize::try_from(self.config.max_frame).unwrap_or(usize::MAX);
+        if reply.len() > max_frame {
             // Keep the already-observed transition journaled if a future response variant
             // breaks its structural bound; never transmit an oversize frame or retry it.
             reply = encode(
@@ -450,19 +472,26 @@ impl Coordinator {
                     epoch: self.epoch,
                     session: request.session,
                     sequence: request.sequence,
-                    answer: Answer::Error(error(ErrorCode::Busy, "response-frame-capacity")),
+                    answer: Answer::Error(error(
+                        ErrorCode::Busy,
+                        "response-frame-capacity",
+                        self.alloc,
+                    )),
                 }),
                 reply.allocator().clone(),
             );
         }
         // Responses are bounded structurally by event pagination and request limits.
         // The server configuration is validated to leave room for all non-event answers.
-        let session = self.sessions.get_mut(&request.session).expect("validated session");
-        session.next += 1;
+        let session = self
+            .sessions
+            .get_mut(&request.session)
+            .ok_or_else(|| error(ErrorCode::NotFound, "session-expired", self.alloc))?;
+        session.next = session.next.saturating_add(1);
         session.last = Some(Answered {
             sequence: request.sequence,
             request: raw,
-            reply: reply.to_vec_in(Global),
+            reply: Vec::from_slice_in(reply.as_slice(), self.alloc),
         });
         // A release is terminal: its answer is journaled above, then the lifetime and its
         // journal are removed. Capacity and memory return at once, and nothing is kept to
@@ -475,10 +504,12 @@ impl Coordinator {
     }
 
     fn subscription(&self, s: &Subscription) -> Result<Binding, WireError> {
-        let e =
-            self.jobs.execution(s.execution).ok_or_else(|| Refusal::NoExecution.to_wire(None))?;
+        let e = self
+            .jobs
+            .execution(s.execution)
+            .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?;
         if e.content != s.content || !e.subscribers().any(|sub| sub.id == s.subscriber) {
-            return Err(Refusal::NoSubscriber.to_wire(None));
+            return Err(Refusal::NoSubscriber.to_wire(None, self.alloc));
         }
         // Ended subscribers resume their immutable terminal attempt, even if the
         // shared execution moved to a replacement lead for its remaining subscribers.
@@ -489,7 +520,7 @@ impl Coordinator {
 
     fn binding(&self, b: &Binding) -> Result<(), WireError> {
         if self.subscription(&b.subscription)?.attempt != b.attempt {
-            return Err(Refusal::AttemptMoved.to_wire(None));
+            return Err(Refusal::AttemptMoved.to_wire(None, self.alloc));
         }
         Ok(())
     }
@@ -500,12 +531,15 @@ impl Coordinator {
         execution: ExecutionId,
         attempt: blaze_wire::Attempt,
     ) -> Result<(), WireError> {
-        let e = self.jobs.execution(execution).ok_or_else(|| Refusal::NoExecution.to_wire(None))?;
+        let e = self
+            .jobs
+            .execution(execution)
+            .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?;
         if e.content != content {
-            return Err(Refusal::NoExecution.to_wire(None));
+            return Err(Refusal::NoExecution.to_wire(None, self.alloc));
         }
         if e.attempt() != attempt {
-            return Err(Refusal::AttemptMoved.to_wire(None));
+            return Err(Refusal::AttemptMoved.to_wire(None, self.alloc));
         }
         Ok(())
     }
@@ -522,19 +556,19 @@ impl Coordinator {
                 .jobs
                 .execution(id)
                 .filter(|e| e.content == content)
-                .ok_or_else(|| Refusal::NoExecution.to_wire(None))?;
+                .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?;
             let ceiling = self.execution_ceiling(execution)?;
             if execution.deadline().is_some_and(|deadline| deadline > ceiling) {
-                return Err(error(ErrorCode::Malformed, "execution-deadline-limit"));
+                return Err(error(ErrorCode::Malformed, "execution-deadline-limit", self.alloc));
             }
             self.session_work_limit(session, ceiling)?;
         }
         match command {
             Command::Submit(s) => {
-                let req: JobRequest = decode(&s.request.bytes, &Limits::DOCUMENTED)
-                    .map_err(|_| error(ErrorCode::Malformed, "submission-codec"))?;
-                if submission(&req, s.need.clone()).content != s.content {
-                    return Err(error(ErrorCode::Conflict, "content-mismatch"));
+                let req: JobRequest = decode(&s.request.bytes, &Limits::DOCUMENTED, self.alloc)
+                    .map_err(|_| error(ErrorCode::Malformed, "submission-codec", self.alloc))?;
+                if submission(&req, s.need.clone(), self.alloc).content != s.content {
+                    return Err(error(ErrorCode::Conflict, "content-mismatch", self.alloc));
                 }
                 let running = self
                     .jobs
@@ -544,85 +578,122 @@ impl Coordinator {
                     Some(execution) => self.execution_ceiling(execution)?,
                     None => now
                         .checked_add(self.config.max_execution_ms)
-                        .ok_or_else(|| error(ErrorCode::Malformed, "execution-deadline-limit"))?,
+                        .ok_or_else(|| {
+                            error(ErrorCode::Malformed, "execution-deadline-limit", self.alloc)
+                        })?,
                 };
                 if req.deadline_ms > ceiling {
-                    return Err(error(ErrorCode::Malformed, "execution-deadline-limit"));
+                    return Err(error(
+                        ErrorCode::Malformed,
+                        "execution-deadline-limit",
+                        self.alloc,
+                    ));
                 }
                 self.session_work_limit(session, ceiling)?;
                 // An equal live job adds an interest to the existing execution. A retained
                 // terminal instead creates a new execution with its own subscriber budget.
-                if running.is_none() && self.jobs.executions().count() >= self.config.max_executions
+                if running.is_none()
+                    && self.jobs.executions().count() >= self.config.max_executions
                 {
-                    return Err(error(ErrorCode::Busy, "execution-retention-capacity"));
+                    return Err(error(
+                        ErrorCode::Busy,
+                        "execution-retention-capacity",
+                        self.alloc,
+                    ));
                 }
                 if running.is_some_and(|e| e.subscribers().count() >= self.config.max_subscribers) {
-                    return Err(error(ErrorCode::Busy, "subscriber-retention-capacity"));
+                    return Err(error(
+                        ErrorCode::Busy,
+                        "subscriber-retention-capacity",
+                        self.alloc,
+                    ));
                 }
                 let a = self
                     .jobs
                     .submit(now, &req, s.need.clone(), out)
-                    .map_err(|(r, retry)| r.to_wire(retry))?;
+                    .map_err(|(r, retry)| r.to_wire(retry, self.alloc))?;
                 self.units.insert(a.execution, req.unit);
                 self.jobs.tick(now, out);
+                let attempt = self
+                    .jobs
+                    .execution(a.execution)
+                    .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?
+                    .attempt();
                 Ok(Answer::Binding(Binding {
                     subscription: Subscription {
                         content: a.content,
                         execution: a.execution,
                         subscriber: a.subscriber,
                     },
-                    attempt: self.jobs.execution(a.execution).expect("submitted").attempt(),
+                    attempt,
                 }))
             }
             Command::Subscribe(s) => {
-                let execution = self.jobs.execution(s.execution).expect("preflight bound");
-                if s.deadline_ms > self.execution_ceiling(execution)? {
-                    return Err(error(ErrorCode::Malformed, "execution-deadline-limit"));
-                }
-                if self
+                let execution = self
                     .jobs
                     .execution(s.execution)
-                    .is_some_and(|e| e.subscribers().count() >= self.config.max_subscribers)
-                {
-                    return Err(error(ErrorCode::Busy, "subscriber-retention-capacity"));
+                    .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?;
+                if s.deadline_ms > self.execution_ceiling(execution)? {
+                    return Err(error(
+                        ErrorCode::Malformed,
+                        "execution-deadline-limit",
+                        self.alloc,
+                    ));
+                }
+                if execution.subscribers().count() >= self.config.max_subscribers {
+                    return Err(error(
+                        ErrorCode::Busy,
+                        "subscriber-retention-capacity",
+                        self.alloc,
+                    ));
                 }
                 let a = self
                     .jobs
                     .subscribe(now, s.execution, s.content, s.deadline_ms, s.policy.clone(), out)
-                    .map_err(|r| r.to_wire(None))?;
+                    .map_err(|r| r.to_wire(None, self.alloc))?;
+                let attempt = self
+                    .jobs
+                    .execution(a.execution)
+                    .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?
+                    .attempt();
                 Ok(Answer::Binding(Binding {
                     subscription: Subscription {
                         content: a.content,
                         execution: a.execution,
                         subscriber: a.subscriber,
                     },
-                    attempt: self.jobs.execution(a.execution).expect("subscribed").attempt(),
+                    attempt,
                 }))
             }
             Command::Resume(s) => Ok(Answer::Binding(self.subscription(s)?)),
             Command::Events(r) => {
                 self.binding(&r.binding)?;
                 if r.limit == 0 || r.limit > 256 {
-                    return Err(error(ErrorCode::Malformed, "event-page-limit"));
+                    return Err(error(ErrorCode::Malformed, "event-page-limit", self.alloc));
                 }
                 let events = self
                     .jobs
                     .execution(r.binding.subscription.execution)
-                    .expect("bound")
+                    .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?
                     .events(r.from);
-                let mut page =
-                    EventPage { binding: r.binding.clone(), events: Vec::new(), next: r.from };
-                for event in events.iter().take(r.limit as usize) {
+                let mut page = EventPage {
+                    binding: r.binding.clone(),
+                    events: Vec::new_in(self.alloc),
+                    next: r.from,
+                };
+                let limit = usize::try_from(r.limit).unwrap_or(usize::MAX);
+                let max_frame = usize::try_from(self.config.max_frame).unwrap_or(usize::MAX);
+                for event in events.iter().take(limit) {
                     page.events.push(event.clone());
                     // Leave framing/response envelope headroom, never split a CBOR event.
-                    if encode(&page, Global).len() + 256 > self.config.max_frame as usize {
+                    if encode(&page, self.alloc).len().saturating_add(256) > max_frame {
                         page.events.pop();
                         break;
                     }
                     page.next = event.sequence;
                 }
                 if !events.is_empty() && page.events.is_empty() {
-                    return Err(error(ErrorCode::Busy, "event-too-large"));
+                    return Err(error(ErrorCode::Busy, "event-too-large", self.alloc));
                 }
                 Ok(Answer::Events(page))
             }
@@ -630,18 +701,18 @@ impl Coordinator {
                 self.binding(b)?;
                 self.jobs
                     .unsubscribe(now, b.subscription.execution, b.subscription.subscriber, out)
-                    .map_err(|r| r.to_wire(None))?;
+                    .map_err(|r| r.to_wire(None, self.alloc))?;
                 Ok(Answer::Ack(Ack {}))
             }
             Command::Join(r) => {
                 self.work(r.content, r.request.execution, r.request.attempt)?;
                 if r.request.roots.count > self.config.max_roots {
-                    return Err(error(ErrorCode::Busy, "root-capacity"));
+                    return Err(error(ErrorCode::Busy, "root-capacity", self.alloc));
                 }
                 Ok(Answer::Join(
                     self.jobs
-                        .join(now, &r.executor, &r.request, out)
-                        .map_err(|r| r.to_wire(None))?,
+                        .join(now, r.executor.as_str(), &r.request, out)
+                        .map_err(|r| r.to_wire(None, self.alloc))?,
                 ))
             }
             Command::Lease(r) => {
@@ -652,60 +723,66 @@ impl Coordinator {
                     .and_then(|e| e.work())
                     .is_some_and(|w| w.counters().grants >= self.config.max_grants)
                 {
-                    return Err(error(ErrorCode::Busy, "grant-retention-capacity"));
+                    return Err(error(ErrorCode::Busy, "grant-retention-capacity", self.alloc));
                 }
                 Ok(Answer::Lease(
                     self.jobs
-                        .lease(now, &r.executor, &r.request, out)
-                        .map_err(|r| r.to_wire(None))?,
+                        .lease(now, r.executor.as_str(), &r.request, out)
+                        .map_err(|r| r.to_wire(None, self.alloc))?,
                 ))
             }
             Command::Result(r) => {
                 self.work(r.content, r.request.lease.execution, r.request.lease.attempt)?;
                 if r.request.items.iter().map(|item| item.found.len()).sum::<usize>() > 4096 {
-                    return Err(error(ErrorCode::Busy, "discovery-frame-capacity"));
+                    return Err(error(ErrorCode::Busy, "discovery-frame-capacity", self.alloc));
                 }
-                let bytes = encode(&r.request, Global).len();
+                let bytes = encode(&r.request, self.alloc).len();
                 let held = self.work_bytes.get(&r.request.lease.execution).copied().unwrap_or(0);
                 if held.saturating_add(bytes) > self.config.work_bytes {
-                    return Err(error(ErrorCode::Busy, "work-retention-capacity"));
+                    return Err(error(ErrorCode::Busy, "work-retention-capacity", self.alloc));
                 }
                 let answer = self
                     .jobs
-                    .result(now, &r.executor, &r.request, out)
-                    .map_err(|r| r.to_wire(None))?;
-                self.work_bytes.insert(r.request.lease.execution, held + bytes);
+                    .result(now, r.executor.as_str(), &r.request, out)
+                    .map_err(|r| r.to_wire(None, self.alloc))?;
+                self.work_bytes.insert(r.request.lease.execution, held.saturating_add(bytes));
                 Ok(Answer::Result(answer))
             }
             Command::WorkerEvents(r) => {
                 self.work(r.content, r.request.execution, r.request.attempt)?;
-                let e = self.jobs.execution(r.request.execution).expect("bound");
+                let e = self
+                    .jobs
+                    .execution(r.request.execution)
+                    .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?;
                 if e.events(0).len().saturating_add(r.request.events.len()).saturating_add(4)
                     > self.config.max_events
                 {
-                    return Err(error(ErrorCode::Busy, "event-retention-capacity"));
+                    return Err(error(ErrorCode::Busy, "event-retention-capacity", self.alloc));
                 }
-                let held: usize = e.events(0).iter().map(|event| encode(event, Global).len()).sum();
-                if held.saturating_add(encode(&r.request, Global).len()).saturating_add(1024)
+                let held: usize =
+                    e.events(0).iter().map(|event| encode(event, self.alloc).len()).sum();
+                if held
+                    .saturating_add(encode(&r.request, self.alloc).len())
+                    .saturating_add(1024)
                     > self.config.event_bytes
                 {
-                    return Err(error(ErrorCode::Busy, "event-byte-capacity"));
+                    return Err(error(ErrorCode::Busy, "event-byte-capacity", self.alloc));
                 }
                 Ok(Answer::WorkerEvents(
                     self.jobs
-                        .worker_events(now, &r.executor, &r.request, out)
-                        .map_err(|r| r.to_wire(None))?,
+                        .worker_events(now, r.executor.as_str(), &r.request, out)
+                        .map_err(|r| r.to_wire(None, self.alloc))?,
                 ))
             }
             Command::KillAck(r) => {
                 // Old-attempt stop acknowledgments are necessary; Jobs checks the exact
                 // pending token, not the current execution attempt.
                 if self.jobs.execution(r.execution).is_none_or(|e| e.content != r.content) {
-                    return Err(Refusal::NoExecution.to_wire(None));
+                    return Err(Refusal::NoExecution.to_wire(None, self.alloc));
                 }
                 let accepted = self.jobs.killed(
                     now,
-                    &r.executor,
+                    r.executor.as_str(),
                     AssignmentToken { execution: r.execution, attempt: r.attempt },
                     r.alive,
                 );
@@ -713,31 +790,31 @@ impl Coordinator {
             }
             Command::RetireAssignment(r) => {
                 if self.jobs.execution(r.execution).is_none_or(|e| e.content != r.content) {
-                    return Err(Refusal::NoExecution.to_wire(None));
+                    return Err(Refusal::NoExecution.to_wire(None, self.alloc));
                 }
                 self.jobs
                     .retire(
                         now,
-                        &r.executor,
+                        r.executor.as_str(),
                         AssignmentToken { execution: r.execution, attempt: r.attempt },
                         owned_claimant(&session, &r.claimant),
                         out,
                     )
-                    .map_err(|r| r.to_wire(None))?;
+                    .map_err(|r| r.to_wire(None, self.alloc))?;
                 Ok(Answer::Ack(Ack {}))
             }
             Command::OwnedAssignment(r) => {
                 if self.jobs.execution(r.execution).is_none_or(|e| e.content != r.content) {
-                    return Err(Refusal::NoExecution.to_wire(None));
+                    return Err(Refusal::NoExecution.to_wire(None, self.alloc));
                 }
                 let assignment = self
                     .jobs
                     .owned_assignment(
-                        &r.executor,
+                        r.executor.as_str(),
                         r.execution,
                         owned_claimant(&session, &r.claimant),
                     )
-                    .map_err(|r| r.to_wire(None))?;
+                    .map_err(|r| r.to_wire(None, self.alloc))?;
                 Ok(Answer::OwnedAssignment(OwnedAssignmentAnswer { attempt: assignment.attempt }))
             }
             Command::Terminal(s) => {
@@ -749,14 +826,22 @@ impl Coordinator {
             }
             Command::Claim(c) => {
                 if self.jobs.execution(c.execution).is_none_or(|e| e.content != c.content) {
-                    return Err(Refusal::NoExecution.to_wire(None));
+                    return Err(Refusal::NoExecution.to_wire(None, self.alloc));
                 }
+                let alloc = self.alloc;
                 let claimed = self
                     .jobs
                     .claim(now, c.execution, owned_claimant(&session, &c.claimant), out)
-                    .map(|claimed| claimed.map(|(executor, attempt)| (executor.to_owned(), attempt)))
-                    .map_err(|r| r.to_wire(None))?;
-                let e = self.jobs.execution(c.execution).expect("claimed");
+                    .map(|claimed| {
+                        claimed.map(|(executor, attempt)| {
+                            (WireString::from_str_in(executor, alloc), attempt)
+                        })
+                    })
+                    .map_err(|r| r.to_wire(None, self.alloc))?;
+                let e = self
+                    .jobs
+                    .execution(c.execution)
+                    .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?;
                 let lead = claimed.as_ref().is_some_and(|(who, _)| e.lead() == Some(who.as_str()));
                 Ok(Answer::Claimed(match claimed {
                     Some((executor, attempt)) => {
@@ -767,36 +852,50 @@ impl Coordinator {
             }
             Command::Packs(p) => {
                 if self.jobs.execution(p.execution).is_none_or(|e| e.content != p.content) {
-                    return Err(Refusal::NoExecution.to_wire(None));
+                    return Err(Refusal::NoExecution.to_wire(None, self.alloc));
                 }
-                let packs = self.jobs.committed_packs(p.execution).map_err(|r| r.to_wire(None))?;
+                let alloc = self.alloc;
+                let packs = self
+                    .jobs
+                    .committed_packs(p.execution)
+                    .map_err(|r| r.to_wire(None, self.alloc))?;
                 Ok(Answer::Packs(CommittedPacks {
-                    packs: packs.map(|packs| packs.cloned().collect()),
+                    packs: packs.map(|packs| {
+                        let mut out = Vec::new_in(alloc);
+                        out.extend(packs.cloned());
+                        out
+                    }),
                 }))
             }
             Command::CommitPublication(p) => {
                 self.work(p.content, p.execution, p.attempt)?;
-                if encode(&p.packs, Global).len() > self.config.work_bytes {
-                    return Err(error(ErrorCode::Busy, "publication-retention-capacity"));
+                if encode(&p.packs, self.alloc).len() > self.config.work_bytes {
+                    return Err(error(
+                        ErrorCode::Busy,
+                        "publication-retention-capacity",
+                        self.alloc,
+                    ));
                 }
                 self.jobs
-                    .commit_publication(now, p.execution, &p.executor, p.attempt, &p.packs, out)
-                    .map_err(|r| r.to_wire(None))?;
+                    .commit_publication(
+                        now,
+                        p.execution,
+                        p.executor.as_str(),
+                        p.attempt,
+                        &p.packs,
+                        out,
+                    )
+                    .map_err(|r| r.to_wire(None, self.alloc))?;
+                let execution = self
+                    .jobs
+                    .execution(p.execution)
+                    .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?;
                 Ok(Answer::Publication(Publication {
-                    packs: self
-                        .jobs
-                        .execution(p.execution)
-                        .and_then(|e| e.publication())
-                        .map(|packs| packs.to_vec()),
-                    attempt: self
-                        .jobs
-                        .execution(p.execution)
-                        .expect("committed execution")
-                        .attempt(),
-                    accepted_attempt: self
-                        .jobs
-                        .execution(p.execution)
-                        .and_then(|e| e.publication_attempt()),
+                    packs: execution
+                        .publication()
+                        .map(|packs| Vec::from_slice_in(packs, self.alloc)),
+                    attempt: execution.attempt(),
+                    accepted_attempt: execution.publication_attempt(),
                 }))
             }
             Command::Publication(p) => {
@@ -804,20 +903,22 @@ impl Coordinator {
                     .jobs
                     .execution(p.execution)
                     .filter(|e| e.content == p.content)
-                    .ok_or_else(|| Refusal::NoExecution.to_wire(None))?;
+                    .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?;
                 Ok(Answer::Publication(Publication {
-                    packs: execution.publication().map(|packs| packs.to_vec()),
+                    packs: execution
+                        .publication()
+                        .map(|packs| Vec::from_slice_in(packs, self.alloc)),
                     attempt: execution.attempt(),
                     accepted_attempt: execution.publication_attempt(),
                 }))
             }
             Command::DeliverPublication(p) => {
                 if self.jobs.execution(p.execution).is_none_or(|e| e.content != p.content) {
-                    return Err(Refusal::NoExecution.to_wire(None));
+                    return Err(Refusal::NoExecution.to_wire(None, self.alloc));
                 }
                 self.jobs
                     .deliver_publication(now, p.execution, &p.packs, out)
-                    .map_err(|r| r.to_wire(None))?;
+                    .map_err(|r| r.to_wire(None, self.alloc))?;
                 Ok(Answer::Ack(Ack {}))
             }
             Command::Release(_) => Ok(Answer::Ack(Ack {})),
@@ -834,17 +935,26 @@ mod tests {
     use blaze_dist::admission::{Admission, AdmissionConfig};
     use blaze_dist::jobs::ExecutionConfig;
 
+    fn test_alloc() -> WireAlloc {
+        blaze_own::testing::heap().shared()
+    }
+
     fn coordinator(config: Config) -> Coordinator {
-        let jobs =
-            Jobs::new(Admission::new(AdmissionConfig::default()), ExecutionConfig::default());
-        Coordinator::new(jobs, config, [7; 32])
+        let alloc = test_alloc();
+        let jobs = Jobs::new(
+            Admission::new(AdmissionConfig::default(), alloc),
+            ExecutionConfig::default(),
+            alloc,
+        );
+        Coordinator::new(jobs, config, [7; 32], alloc)
     }
 
     #[test]
     fn expired_work_cannot_bypass_execution_retention_by_resubmitting_the_same_content() {
+        let alloc = test_alloc();
         let mut c = coordinator(Config { max_executions: 1, ..Config::default() });
         let welcome = c.hello(0, &hello([1; 32])).unwrap();
-        let mut job: JobRequest = blaze_wire::Sample::sample(&mut blaze_wire::Gen::new(7));
+        let mut job: JobRequest = blaze_wire::Sample::sample(&mut blaze_wire::Gen::new(7), alloc);
         job.namespace = blaze_wire::Namespace::Main;
         job.deadline_ms = 10;
         let request = |sequence, job: &JobRequest| Request {
@@ -854,23 +964,24 @@ mod tests {
             command: Command::Submit(submission(
                 job,
                 blaze_wire::Reservation { memory: 1, cpus: 1, disk: 1 },
+                alloc,
             )),
         };
-        let (first, _) = c.request(0, &request(1, &job), Global).unwrap();
+        let (first, _) = c.request(0, &request(1, &job), alloc).unwrap();
         let ServerFrame::Response(Response { answer: Answer::Binding(first), .. }) =
-            decode(&first, &Limits::DOCUMENTED).unwrap()
+            decode(&first, &Limits::DOCUMENTED, alloc).unwrap()
         else {
             panic!("first job was not submitted")
         };
         job.deadline_ms = 100;
-        let (second, effects) = c.request(11, &request(2, &job), Global).unwrap();
+        let (second, effects) = c.request(11, &request(2, &job), alloc).unwrap();
         let ServerFrame::Response(Response { answer: Answer::Error(error), .. }) =
-            decode(&second, &Limits::DOCUMENTED).unwrap()
+            decode(&second, &Limits::DOCUMENTED, alloc).unwrap()
         else {
             panic!("expired execution was revived or retention was exceeded")
         };
         assert_eq!(error.code(), Some(ErrorCode::Busy));
-        assert_eq!(error.message, "execution-retention-capacity");
+        assert_eq!(error.message.as_str(), "execution-retention-capacity");
         assert!(effects.iter().any(|(id, effect)| *id == first.subscription.execution
             && matches!(
                 effect,
@@ -918,6 +1029,7 @@ mod tests {
     /// map cannot grow with the number of clients served.
     #[test]
     fn release_returns_capacity_without_retaining_a_tombstone() {
+        let alloc = test_alloc();
         let mut c = coordinator(Config { max_sessions: 2, ..Config::default() });
         let a = c.hello(0, &hello([3; 32])).unwrap();
         let b = c.hello(0, &hello([4; 32])).unwrap();
@@ -931,7 +1043,7 @@ mod tests {
             sequence: 1,
             command: Command::Release(Release {}),
         };
-        let (_, effects) = c.request(0, &request, Global).unwrap();
+        let (_, effects) = c.request(0, &request, alloc).unwrap();
         assert!(effects.is_empty());
         assert_eq!(c.sessions.len(), 1);
         assert!(!c.sessions.contains_key(&a.session));
@@ -945,9 +1057,10 @@ mod tests {
     /// gets again byte for byte, while an earlier sequence is refused and reaches no core.
     #[test]
     fn a_session_keeps_only_its_last_answer() {
+        let alloc = test_alloc();
         let mut c = coordinator(Config::default());
         let welcome = c.hello(0, &hello([8; 32])).unwrap();
-        let mut job: JobRequest = blaze_wire::Sample::sample(&mut blaze_wire::Gen::new(9));
+        let mut job: JobRequest = blaze_wire::Sample::sample(&mut blaze_wire::Gen::new(9), alloc);
         job.namespace = blaze_wire::Namespace::Main;
         job.deadline_ms = 1_000;
         let submit = Request {
@@ -957,11 +1070,12 @@ mod tests {
             command: Command::Submit(submission(
                 &job,
                 blaze_wire::Reservation { memory: 1, cpus: 1, disk: 1 },
+                alloc,
             )),
         };
-        let (bound, _) = c.request(0, &submit, Global).unwrap();
+        let (bound, _) = c.request(0, &submit, alloc).unwrap();
         let ServerFrame::Response(Response { answer: Answer::Binding(binding), .. }) =
-            decode(&bound, &Limits::DOCUMENTED).unwrap()
+            decode(&bound, &Limits::DOCUMENTED, alloc).unwrap()
         else {
             panic!("the job was not submitted")
         };
@@ -971,17 +1085,17 @@ mod tests {
             sequence,
             command: Command::Terminal(binding.subscription.clone()),
         };
-        let mut last = Vec::new();
+        let mut last = Vec::new_in(alloc);
         for sequence in 2..=5_000 {
-            (last, _) = c.request(0, &poll(sequence), Global).unwrap();
+            (last, _) = c.request(0, &poll(sequence), alloc).unwrap();
         }
         let session = &c.sessions[&welcome.session];
         assert_eq!(session.next, 5_001);
         assert_eq!(session.last.as_ref().map(|it| it.sequence), Some(5_000));
-        assert_eq!(c.request(0, &poll(5_000), Global).unwrap().0, last);
+        assert_eq!(c.request(0, &poll(5_000), alloc).unwrap().0, last);
         let reused = Request { command: Command::Release(Release {}), ..poll(5_000) };
-        assert_eq!(c.request(0, &reused, Global).unwrap_err().message, "sequence-reused");
-        let retired = c.request(0, &submit, Global).unwrap_err();
+        assert_eq!(c.request(0, &reused, alloc).unwrap_err().message.as_str(), "sequence-reused");
+        let retired = c.request(0, &submit, alloc).unwrap_err();
         assert_eq!(retired.code(), Some(ErrorCode::Conflict));
         assert_eq!(c.jobs.executions().count(), 1);
     }

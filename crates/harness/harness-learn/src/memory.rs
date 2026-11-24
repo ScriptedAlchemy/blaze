@@ -137,10 +137,13 @@ impl Progress {
     /// A lesson's mastery, 0 to 1: the mean strength of its checks (a check never answered counts as 0). A lesson whose
     /// steps are not written yet has none.
     pub fn lesson_mastery<A: Allocator>(&self, course: &str, lesson: &Lesson, alloc: A) -> f32 {
+        self.lesson_mastery_in(course, lesson, &mut Vec::new_in(alloc))
+    }
+
+    fn lesson_mastery_in<A: Allocator>(&self, course: &str, lesson: &Lesson, key: &mut Vec<u8, A>) -> f32 {
         let (mut sum, mut n) = (0.0, 0);
-        let mut key = Vec::new_in(alloc);
         for id in lesson.checks() {
-            sum += self.checks.get(check_key(course, &lesson.id, id, &mut key)).map_or(0.0, Memory::strength);
+            sum += self.checks.get(check_key(course, &lesson.id, id, key)).map_or(0.0, Memory::strength);
             n += 1;
         }
         if n == 0 { 0.0 } else { sum / n as f32 }
@@ -152,11 +155,11 @@ impl Progress {
         if course.lessons.is_empty() {
             return 0.0;
         }
-        let mut key = Vec::new_in(alloc.clone());
+        let mut key = Vec::new_in(alloc);
         let total: f32 = course
             .lessons
             .iter()
-            .map(|l| if self.finished_in(&course.id, &l.id, &mut key) { 0.5 + 0.5 * self.lesson_mastery(&course.id, l, alloc.clone()) } else { 0.0 })
+            .map(|l| if self.finished_in(&course.id, &l.id, &mut key) { 0.5 + 0.5 * self.lesson_mastery_in(&course.id, l, &mut key) } else { 0.0 })
             .sum();
         total / course.lessons.len() as f32
     }

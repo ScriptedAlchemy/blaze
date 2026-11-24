@@ -11,17 +11,18 @@
 //! Effect buffers belong to the caller. Routing through an execution or its work set uses
 //! the same allocator for temporary effect logs, so a driver's task allocator owns them all.
 
-use std::alloc::{Allocator, Global};
-use std::collections::{BTreeMap, BTreeSet};
+use core::alloc::Allocator;
 
+use blaze_own::{BTreeMap, BTreeSet, String, Vec};
 use blaze_wire::job_terminal_v2::{
     SubscriberTerminalV2, TerminationReasonV2, TerminationV2, VERSION as TERMINAL_VERSION,
 };
 use blaze_wire::{
     AssignedEvent, Attempt, BatchResult, Digest, DoneEvent, EventItem, ExecutionId, JobAnswer,
     JobContent, JobContentInput, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome, PackRef,
-    Reservation, Stage, StageEvent, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
-    WorkLeaseRequest, WorkResultAnswer, WorkersEventsAnswer, WorkersEventsRequest,
+    Reservation, Stage, StageEvent, WireAlloc, WireString, WireVec, WorkJoinAnswer,
+    WorkJoinRequest, WorkLeaseAnswer, WorkLeaseRequest, WorkResultAnswer, WorkersEventsAnswer,
+    WorkersEventsRequest,
 };
 
 use crate::admission::{Admission, Waiting};
@@ -142,7 +143,7 @@ pub enum Effect {
     /// Stop an executor's process group: the agent kills it.
     Kill {
         /// The executor to stop.
-        executor: String,
+        executor: WireString,
         /// Stop only this assignment, never a newer one on the same executor.
         assignment: AssignmentToken,
     },
@@ -163,7 +164,7 @@ pub enum Effect {
     /// attempt: the agent starts its holder, which joins under `assignment.attempt`.
     HelperAssigned {
         /// The executor to start.
-        executor: String,
+        executor: WireString,
         /// The attempt it helps.
         assignment: AssignmentToken,
     },
@@ -172,6 +173,7 @@ pub enum Effect {
 /// One execution of a `JobContent`.
 #[derive(Clone, Debug)]
 pub struct Execution {
+    alloc: WireAlloc,
     config: ExecutionConfig,
     /// The server's id of it.
     pub id: ExecutionId,
@@ -180,30 +182,31 @@ pub struct Execution {
     /// Its namespace.
     pub namespace: Namespace,
     attempt: Attempt,
-    lead: Option<String>,
-    helpers: BTreeSet<String>,
+    lead: Option<WireString>,
+    helpers: BTreeSet<WireString, WireAlloc>,
     lead_heard: Millis,
-    heard: BTreeMap<String, Millis>,
+    heard: BTreeMap<WireString, Millis, WireAlloc>,
     losses: u32,
     /// Slots unavailable to this execution after loss or voluntary retirement.
-    lost: BTreeSet<String>,
+    lost: BTreeSet<WireString, WireAlloc>,
     work: Option<WorkSet>,
-    subscribers: BTreeMap<u64, Subscriber>,
-    events: Vec<EventItem>,
-    stages: Vec<(Stage, Millis)>,
+    subscribers: BTreeMap<u64, Subscriber, WireAlloc>,
+    events: WireVec<EventItem>,
+    stages: WireVec<(Stage, Millis)>,
     compiled: Option<(Attempt, u64)>,
     /// The full manifest accepted while its publisher held the current lead attempt. It is
     /// immutable across retries and lead replacement; copying it to a cache is delivery.
-    publication: Option<Vec<PackRef>>,
+    publication: Option<WireVec<PackRef>>,
     publication_attempt: Option<Attempt>,
     publication_delivered: bool,
-    terminals: BTreeMap<u64, SubscriberTerminalV2>,
+    terminals: BTreeMap<u64, SubscriberTerminalV2, WireAlloc>,
     refused: bool,
     state: ExecState,
 }
 
 impl Execution {
     /// A queued execution with its first subscriber.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         now: Millis,
         id: ExecutionId,
@@ -211,29 +214,33 @@ impl Execution {
         namespace: Namespace,
         first: Subscriber,
         config: ExecutionConfig,
+        alloc: WireAlloc,
         out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Execution {
+        let mut subscribers = BTreeMap::new_in(alloc);
+        subscribers.insert(first.id, first);
         let mut execution = Execution {
+            alloc,
             config,
             id,
             content,
             namespace,
             attempt: Attempt(1),
             lead: None,
-            helpers: BTreeSet::new(),
+            helpers: BTreeSet::new_in(alloc),
             lead_heard: now,
-            heard: BTreeMap::new(),
+            heard: BTreeMap::new_in(alloc),
             losses: 0,
-            lost: BTreeSet::new(),
+            lost: BTreeSet::new_in(alloc),
             work: None,
-            subscribers: BTreeMap::from([(first.id, first)]),
-            events: Vec::new(),
-            stages: Vec::new(),
+            subscribers,
+            events: Vec::new_in(alloc),
+            stages: Vec::new_in(alloc),
             compiled: None,
             publication: None,
             publication_attempt: None,
             publication_delivered: false,
-            terminals: BTreeMap::new(),
+            terminals: BTreeMap::new_in(alloc),
             refused: false,
             state: ExecState::Queued,
         };
@@ -268,7 +275,7 @@ impl Execution {
 
     /// The executors of the current attempt.
     pub fn executors(&self) -> impl Iterator<Item = &str> {
-        self.lead.iter().map(String::as_str).chain(self.helpers.iter().map(String::as_str))
+        self.lead.iter().map(WireString::as_str).chain(self.helpers.iter().map(WireString::as_str))
     }
 
     /// How many times its lead was lost.
@@ -374,20 +381,34 @@ impl Execution {
         if self.lead.is_some() || self.work.is_some() {
             self.attempt = Attempt(self.attempt.0 + 1);
         }
-        for old in self.executors().map(str::to_owned).collect::<Vec<_>>() {
-            if old != lead && !helpers.contains(&old.as_str()) {
+        let existing = Vec::from_iter_in(
+            self.executors().map(|name| WireString::from_str_in(name, self.alloc)),
+            self.alloc,
+        );
+        for old in existing {
+            if old.as_str() != lead && !helpers.contains(&old.as_str()) {
                 out.push(Effect::Kill { executor: old, assignment: previous });
             }
         }
-        self.lead = Some(lead.to_owned());
-        self.helpers = helpers.iter().copied().filter(|h| *h != lead).map(str::to_owned).collect();
+        self.lead = Some(WireString::from_str_in(lead, self.alloc));
+        self.helpers.clear();
+        for &helper in helpers {
+            if helper != lead {
+                self.helpers.insert(WireString::from_str_in(helper, self.alloc));
+            }
+        }
         self.lead_heard = now;
-        self.heard.insert(lead.to_owned(), now);
+        self.heard.insert(WireString::from_str_in(lead, self.alloc), now);
         let mut log = Vec::new_in(out.allocator().clone());
         match &mut self.work {
             None => {
-                self.work =
-                    Some(WorkSet::new(self.id, self.attempt, lead, self.config.work.clone()));
+                self.work = Some(WorkSet::new(
+                    self.id,
+                    self.attempt,
+                    lead,
+                    self.config.work.clone(),
+                    self.alloc,
+                ));
             }
             Some(work) => work.new_attempt(self.attempt, lead, &mut log),
         }
@@ -395,7 +416,10 @@ impl Execution {
         self.state = ExecState::Running;
         self.stage(now, Stage::Assigned, out);
         self.push(
-            JobEvent::Assigned(AssignedEvent { executor: lead.to_owned(), attempt: self.attempt }),
+            JobEvent::Assigned(AssignedEvent {
+                executor: WireString::from_str_in(lead, self.alloc),
+                attempt: self.attempt,
+            }),
             out,
         );
         Ok(())
@@ -412,7 +436,7 @@ impl Execution {
             return Err(Refusal::NotHolder);
         }
         if self.lead.as_deref() != Some(executor) {
-            self.helpers.insert(executor.to_owned());
+            self.helpers.insert(WireString::from_str_in(executor, self.alloc));
         }
         // Reserving an executor does not mean the worker has started or is alive.
         // Only an accepted work call or heartbeat makes it eligible as a recently
@@ -450,8 +474,11 @@ impl Execution {
             self.lose_lead(now, out);
         } else {
             self.helpers.remove(from);
-            self.lost.insert(from.to_owned());
-            out.push(Effect::Kill { executor: from.to_owned(), assignment: self.assignment() });
+            self.lost.insert(WireString::from_str_in(from, self.alloc));
+            out.push(Effect::Kill {
+                executor: WireString::from_str_in(from, self.alloc),
+                assignment: self.assignment(),
+            });
             self.after_work(now, out);
         }
         Ok(())
@@ -475,9 +502,12 @@ impl Execution {
         }
         self.member(from)?;
         if self.config.completion == CompletionMode::NoCompileWork {
-            return Err(Refusal::Malformed("work call in no-compile-work execution".to_owned()));
+            return Err(Refusal::Malformed(WireString::from_str_in(
+                "work call in no-compile-work execution",
+                self.alloc,
+            )));
         }
-        self.heard.insert(from.to_owned(), now);
+        self.heard.insert(WireString::from_str_in(from, self.alloc), now);
         let work = self.work.as_mut().ok_or(Refusal::NotJoined)?;
         let mut log = Vec::new_in(out.allocator().clone());
         let answer = call(work, &mut log);
@@ -551,7 +581,7 @@ impl Execution {
             self.end(now, Outcome::Cancelled, EndWhy::Deadline, out);
             return Ok(WorkersEventsAnswer::CANCEL);
         }
-        self.heard.insert(from.to_owned(), now);
+        self.heard.insert(WireString::from_str_in(from, self.alloc), now);
         if lead {
             self.lead_heard = now;
         }
@@ -627,28 +657,42 @@ impl Execution {
             self.end(now, Outcome::Refused, EndWhy::Reported, out);
             return Err(Refusal::Ended);
         }
-        if packs.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(Refusal::Malformed("publication packs are not canonical".to_owned()));
+        if packs.windows(2).any(|pair| matches!(pair, [a, b] if a >= b)) {
+            return Err(Refusal::Malformed(WireString::from_str_in(
+                "publication packs are not canonical",
+                self.alloc,
+            )));
         }
         if let Some(committed) = &self.publication {
-            return if committed == packs {
+            return if committed.as_slice() == packs {
                 Ok(())
             } else {
-                Err(Refusal::Malformed("publication changed after its commit".to_owned()))
+                Err(Refusal::Malformed(WireString::from_str_in(
+                    "publication changed after its commit",
+                    self.alloc,
+                )))
             };
         }
         if !self.work_ready() {
-            return Err(Refusal::Malformed("publication before work completion".to_owned()));
+            return Err(Refusal::Malformed(WireString::from_str_in(
+                "publication before work completion",
+                self.alloc,
+            )));
         }
-        if self.work.as_ref().is_some_and(|work| {
-            work.report().packs.iter().any(|pack| packs.binary_search(pack).is_err())
-        }) {
-            return Err(Refusal::Malformed("publication omits committed work".to_owned()));
+        if self
+            .work
+            .as_ref()
+            .is_some_and(|work| work.packs().any(|pack| packs.binary_search(pack).is_err()))
+        {
+            return Err(Refusal::Malformed(WireString::from_str_in(
+                "publication omits committed work",
+                self.alloc,
+            )));
         }
-        self.publication = Some(packs.to_vec_in(Global));
+        self.publication = Some(Vec::from_slice_in(packs, self.alloc));
         self.publication_attempt = Some(attempt);
         self.lead_heard = now;
-        self.heard.insert(from.to_owned(), now);
+        self.heard.insert(WireString::from_str_in(from, self.alloc), now);
         self.stage(now, Stage::Published, out);
         Ok(())
     }
@@ -664,7 +708,10 @@ impl Execution {
     ) -> Result<(), Refusal> {
         self.tick(now, out);
         if self.publication.as_deref() != Some(packs) {
-            return Err(Refusal::Malformed("delivery names no accepted publication".to_owned()));
+            return Err(Refusal::Malformed(WireString::from_str_in(
+                "delivery names no accepted publication",
+                self.alloc,
+            )));
         }
         match &self.state {
             ExecState::Ended(_) if self.publication_delivered => return Ok(()),
@@ -698,7 +745,7 @@ impl Execution {
     /// `GET /v1/jobs/<execution>/events?from=N`: the items after sequence `from`.
     pub fn events(&self, from: u64) -> &[EventItem] {
         let start = usize::try_from(from).unwrap_or(usize::MAX).min(self.events.len());
-        &self.events[start..]
+        self.events.get(start..).unwrap_or(&[])
     }
 
     /// Ends what has run out of time: subscribers past their deadline, the execution past the
@@ -729,8 +776,8 @@ impl Execution {
 
     /// Both heartbeat expiry and owned retirement use the same bounded reassignment rule.
     fn lose_lead(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator + Clone>) {
-        let lost = self.lead.take().expect("lead");
-        self.lost.insert(lost.clone());
+        let Some(lost) = self.lead.take() else { return };
+        self.lost.insert(WireString::from_str_in(lost.as_str(), self.alloc));
         out.push(Effect::Kill { executor: lost, assignment: self.assignment() });
         self.losses += 1;
         if self.losses >= MAX_ATTEMPTS {
@@ -791,12 +838,18 @@ impl Execution {
 
     /// Detaches subscribers whose own deadlines have passed, once, before either a timer or
     /// a final result can report an outcome to them.
-    fn expire_subscribers(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator + Clone>) -> bool {
-        let late: Vec<u64> =
-            self.attached().filter(|s| now > s.deadline_ms).map(|s| s.id).collect();
+    fn expire_subscribers(
+        &mut self,
+        now: Millis,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
+    ) -> bool {
+        let late = Vec::from_iter_in(
+            self.attached().filter(|s| now > s.deadline_ms).map(|s| s.id),
+            self.alloc,
+        );
         let expired = !late.is_empty();
         for id in late {
-            let subscriber = self.subscribers.get_mut(&id).expect("attached");
+            let Some(subscriber) = self.subscribers.get_mut(&id) else { continue };
             subscriber.state = SubscriberState::TimedOut;
             let terminal = SubscriberTerminalV2 {
                 execution: self.id,
@@ -826,7 +879,11 @@ impl Execution {
         why: EndWhy,
         out: &mut Vec<Effect, impl Allocator + Clone>,
     ) {
-        for executor in self.executors().map(str::to_owned).collect::<Vec<_>>() {
+        let executors = Vec::from_iter_in(
+            self.executors().map(|name| WireString::from_str_in(name, self.alloc)),
+            self.alloc,
+        );
+        for executor in executors {
             out.push(Effect::Kill { executor, assignment: self.assignment() });
         }
         for subscriber in self.subscribers.values_mut() {
@@ -858,7 +915,10 @@ impl Execution {
             }
         }
         self.stage(now, Stage::Done, out);
-        self.push(JobEvent::Done(DoneEvent { outcome, counters: Vec::new() }), out);
+        self.push(
+            JobEvent::Done(DoneEvent { outcome, counters: Vec::new_in(self.alloc) }),
+            out,
+        );
     }
 
     fn stage(&mut self, now: Millis, stage: Stage, out: &mut Vec<Effect, impl Allocator + Clone>) {
@@ -867,8 +927,8 @@ impl Execution {
     }
 
     fn push(&mut self, event: JobEvent, out: &mut Vec<Effect, impl Allocator + Clone>) {
-        let item =
-            EventItem { sequence: self.events.len() as u64 + 1, attempt: self.attempt, event };
+        let sequence = u64::try_from(self.events.len()).unwrap_or(u64::MAX).saturating_add(1);
+        let item = EventItem { sequence, attempt: self.attempt, event };
         self.events.push(item.clone());
         out.push(Effect::Event(item));
     }
@@ -893,9 +953,13 @@ pub enum LocalAction {
 /// Unknown versions or inconsistent outcome/reason pairs are refused, never guessed from
 /// the v1 stream. `NoLead` is delivered as `Lost` in both v1 and v2, with its explicit reason
 /// retained in v2 rather than guessed from that outcome.
-pub fn local_action(policy: &LocalPolicy, remote: &TerminationV2) -> Result<LocalAction, Refusal> {
+pub fn local_action(
+    policy: &LocalPolicy,
+    remote: &TerminationV2,
+    alloc: WireAlloc,
+) -> Result<LocalAction, Refusal> {
     if !remote.is_valid() {
-        return Err(Refusal::Malformed("invalid terminal contract".to_owned()));
+        return Err(Refusal::Malformed(WireString::from_str_in("invalid terminal contract", alloc)));
     }
     let verdict = remote.reason == TerminationReasonV2::Reported;
     Ok(match policy {
@@ -919,13 +983,14 @@ pub fn local_action(policy: &LocalPolicy, remote: &TerminationV2) -> Result<Loca
 /// The server's executions: one per running `JobContent`, admitted in admission's order.
 #[derive(Clone, Debug)]
 pub struct Jobs {
+    alloc: WireAlloc,
     config: ExecutionConfig,
     admission: Admission,
-    executions: BTreeMap<ExecutionId, Execution>,
-    running: BTreeMap<JobContent, ExecutionId>,
-    platforms: BTreeMap<ExecutionId, (Digest, Reservation)>,
-    pr_jobs: BTreeMap<u64, PrJobs>,
-    assignments: BTreeMap<String, Assignment>,
+    executions: BTreeMap<ExecutionId, Execution, WireAlloc>,
+    running: BTreeMap<JobContent, ExecutionId, WireAlloc>,
+    platforms: BTreeMap<ExecutionId, (Digest, Reservation), WireAlloc>,
+    pr_jobs: BTreeMap<u64, PrJobs, WireAlloc>,
+    assignments: BTreeMap<WireString, Assignment, WireAlloc>,
     next_execution: u64,
     next_subscriber: u64,
 }
@@ -936,22 +1001,23 @@ struct PrJobs {
     source: Digest,
     /// The sources it replaced: a unit of one of them is refused. A build is many jobs, so
     /// two revisions' builds overlap, and the older one's next unit is not a newer push.
-    superseded: BTreeSet<Digest>,
+    superseded: BTreeSet<Digest, WireAlloc>,
     /// Live executions of this pull request, including older revisions kept by subscribers.
-    executions: BTreeMap<ExecutionId, Digest>,
+    executions: BTreeMap<ExecutionId, Digest, WireAlloc>,
 }
 
 impl Jobs {
     /// No execution yet, over `admission`'s machines.
-    pub fn new(admission: Admission, config: ExecutionConfig) -> Jobs {
+    pub fn new(admission: Admission, config: ExecutionConfig, alloc: WireAlloc) -> Jobs {
         Jobs {
+            alloc,
             config,
             admission,
-            executions: BTreeMap::new(),
-            running: BTreeMap::new(),
-            platforms: BTreeMap::new(),
-            pr_jobs: BTreeMap::new(),
-            assignments: BTreeMap::new(),
+            executions: BTreeMap::new_in(alloc),
+            running: BTreeMap::new_in(alloc),
+            platforms: BTreeMap::new_in(alloc),
+            pr_jobs: BTreeMap::new_in(alloc),
+            assignments: BTreeMap::new_in(alloc),
             next_execution: 1,
             next_subscriber: 1,
         }
@@ -962,8 +1028,12 @@ impl Jobs {
     /// `BatchResult` of the old daemon then meets `NoExecution`, not a live lease of a
     /// resubmitted job. Ids only ever move forward from the seed.
     pub fn seed_ids(&mut self, epoch: &Digest) {
-        let executions = u64::from_be_bytes(epoch[..8].try_into().expect("digest")) % (1 << 62);
-        let subscribers = u64::from_be_bytes(epoch[8..16].try_into().expect("digest")) % (1 << 62);
+        let Some((first, rest)) = epoch.split_at_checked(8) else { return };
+        let Some((second, _)) = rest.split_at_checked(8) else { return };
+        let Ok(first_bytes) = <[u8; 8]>::try_from(first) else { return };
+        let Ok(second_bytes) = <[u8; 8]>::try_from(second) else { return };
+        let executions = u64::from_be_bytes(first_bytes) % (1 << 62);
+        let subscribers = u64::from_be_bytes(second_bytes) % (1 << 62);
         self.next_execution = self.next_execution.max(executions + 1);
         self.next_subscriber = self.next_subscriber.max(subscribers + 1);
     }
@@ -1120,18 +1190,17 @@ impl Jobs {
         }) {
             return Ok(Some((executor, token.attempt)));
         }
-        let free = e
-            .executors()
-            .find(|executor| {
-                self.assignments.get(*executor).is_some_and(|assignment| {
-                    assignment.token == token
-                        && !assignment.stopping
-                        && assignment.claimant.is_none()
-                })
-            });
-        Ok(free.map(|executor| {
-            self.assignments.get_mut(executor).expect("assigned").claimant = Some(claimant);
-            (executor, token.attempt)
+        let free = e.executors().find(|executor| {
+            self.assignments.get(*executor).is_some_and(|assignment| {
+                assignment.token == token
+                    && !assignment.stopping
+                    && assignment.claimant.is_none()
+            })
+        });
+        Ok(free.and_then(|executor| {
+            let assignment = self.assignments.get_mut(executor)?;
+            assignment.claimant = Some(claimant);
+            Some((executor, token.attempt))
         }))
     }
 
@@ -1216,7 +1285,7 @@ impl Jobs {
                 platform: req.platform,
                 namespace: req.namespace.clone(),
             },
-            out.allocator(),
+            out.allocator().clone(),
         );
         let subscriber = Subscriber {
             id: self.next_subscriber,
@@ -1225,11 +1294,8 @@ impl Jobs {
             state: SubscriberState::Attached,
         };
         if let Some(&id) = self.running.get(&content) {
-            self.executions
-                .get_mut(&id)
-                .expect("running")
-                .subscribe(subscriber)
-                .map_err(|r| (r, None))?;
+            let execution = self.executions.get_mut(&id).ok_or((Refusal::NoExecution, None))?;
+            execution.subscribe(subscriber).map_err(|r| (r, None))?;
             self.next_subscriber += 1;
             self.pr_submitted(now, req, id, out);
             return Ok(JobAnswer { content, execution: id, subscriber: self.next_subscriber - 1 });
@@ -1253,6 +1319,7 @@ impl Jobs {
             req.namespace.clone(),
             subscriber.clone(),
             self.config.clone(),
+            self.alloc,
             &mut log,
         );
         out.extend(log.into_iter().map(|e| (id, e)));
@@ -1271,10 +1338,11 @@ impl Jobs {
         out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) {
         let Namespace::Pr(pr) = &req.namespace else { return };
+        let alloc = self.alloc;
         let jobs = self.pr_jobs.entry(pr.n).or_insert_with(|| PrJobs {
             source: req.source,
-            superseded: BTreeSet::new(),
-            executions: BTreeMap::new(),
+            superseded: BTreeSet::new_in(alloc),
+            executions: BTreeMap::new_in(alloc),
         });
         // A joined execution is the source's that last asked for it: its older subscriber may
         // leave, and that must not make it look like an obsolete job of the older revision.
@@ -1284,19 +1352,24 @@ impl Jobs {
         }
         jobs.superseded.insert(jobs.source);
         jobs.source = req.source;
-        let previous: Vec<_> = jobs
-            .executions
-            .iter()
-            .filter(|(_, source)| **source != req.source)
-            .map(|(&id, _)| id)
-            .collect();
+        let previous = Vec::from_iter_in(
+            jobs.executions
+                .iter()
+                .filter(|(_, source)| **source != req.source)
+                .map(|(&id, _)| id),
+            self.alloc,
+        );
         for previous in previous {
-            if let Some(old) = self.executions.get(&previous)
-                && !matches!(old.state(), ExecState::Ended(_))
-                && old.attached().count() == 1
-            {
-                let only = old.attached().next().expect("one").id;
-                let _ = self.unsubscribe(now, previous, only, out);
+            let only_id = self.executions.get(&previous).and_then(|old| {
+                if matches!(old.state(), ExecState::Ended(_)) {
+                    return None;
+                }
+                let mut attached = old.attached();
+                let only = attached.next()?;
+                attached.next().is_none().then_some(only.id)
+            });
+            if let Some(only_id) = only_id {
+                let _ = self.unsubscribe(now, previous, only_id, out);
             }
         }
     }
@@ -1403,10 +1476,14 @@ impl Jobs {
     }
 
     /// Time passed: executions' deadlines and lead losses, reassignments, then admission.
-    pub fn tick(&mut self, now: Millis, out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>) {
-        let ids: Vec<ExecutionId> = self.executions.keys().copied().collect();
+    pub fn tick(
+        &mut self,
+        now: Millis,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
+    ) {
+        let ids = Vec::from_iter_in(self.executions.keys().copied(), self.alloc);
         for id in ids {
-            let e = self.executions.get_mut(&id).expect("present");
+            let Some(e) = self.executions.get_mut(&id) else { continue };
             if matches!(e.state(), ExecState::Ended(_)) {
                 continue;
             }
@@ -1415,12 +1492,14 @@ impl Jobs {
             self.after(now, id, log, out);
         }
         for admitted in self.admission.admit(now, out.allocator().clone()) {
-            let e = self.executions.get_mut(&admitted.execution).expect("queued");
+            let Some(e) = self.executions.get_mut(&admitted.execution) else { continue };
             let mut log = Vec::new_in(out.allocator().clone());
             e.admitted(now, &mut log);
             if e.assign(now, &admitted.executor, &[], &mut log).is_ok() {
-                self.assignments
-                    .insert(Box::clone_from_ref_in(admitted.executor.as_ref(), Global).into_string(), Assignment::new(e.assignment()));
+                self.assignments.insert(
+                    WireString::from_str_in(admitted.executor.as_ref(), self.alloc),
+                    Assignment::new(e.assignment()),
+                );
             }
             self.after(now, admitted.execution, log, out);
         }
@@ -1445,48 +1524,52 @@ impl Jobs {
         // then has no lead at all). One per tick keeps spares reaching builds
         // admitted moments later, and over ticks an alone build still gathers
         // every idle executor.
-        let mut ids: Vec<(usize, ExecutionId)> = self
-            .executions
-            .values()
-            .filter(|e| {
-                matches!(e.state(), ExecState::Running)
-                    && e.config.completion != CompletionMode::NoCompileWork
-                    && e.lead().is_some()
-                    && e.work().is_some_and(|w| !w.is_done())
-            })
-            .map(|e| (e.executors().count(), e.id))
-            .collect();
-        ids.sort();
+        let mut ids = Vec::from_iter_in(
+            self.executions
+                .values()
+                .filter(|e| {
+                    matches!(e.state(), ExecState::Running)
+                        && e.config.completion != CompletionMode::NoCompileWork
+                        && e.lead().is_some()
+                        && e.work().is_some_and(|w| !w.is_done())
+                })
+                .map(|e| (e.executors().count(), e.id)),
+            self.alloc,
+        );
+        ids.sort_unstable();
         for (_, id) in ids {
             let Some((platform, need)) = self.platforms.get(&id).cloned() else { continue };
             if self.admission.waiting(&platform) > 0 {
                 continue;
             }
-            let e = &self.executions[&id];
+            let Some(e) = self.executions.get(&id) else { continue };
             if e.work().is_none_or(|w| w.is_done()) {
                 continue;
             }
             let namespace = e.namespace.clone();
             let mut except = Vec::new_in(out.allocator().clone());
-            except.extend(e.executors().chain(e.lost.iter().map(String::as_str)));
+            except.extend(e.executors().chain(e.lost.iter().map(WireString::as_str)));
             let Some(helper) = self.admission.idle_for(&namespace, &platform, &need, &except)
             else {
                 continue;
             };
-            let helper = Box::clone_from_ref_in(helper, Global).into_string();
+            let helper = WireString::from_str_in(helper, self.alloc);
             drop(except);
-            let e = self.executions.get_mut(&id).expect("present");
-            let Ok(attempt) = e.add_helper(now, &helper) else { continue };
+            let Some(e) = self.executions.get_mut(&id) else { continue };
+            let Ok(attempt) = e.add_helper(now, helper.as_str()) else { continue };
             let assignment = e.assignment();
-            self.admission.take(&helper, id, attempt);
-            self.assignments.insert(helper.clone(), Assignment::new(assignment));
+            self.admission.take(helper.as_str(), id, attempt);
+            self.assignments.insert(
+                WireString::from_str_in(helper.as_str(), self.alloc),
+                Assignment::new(assignment),
+            );
             out.push((id, Effect::HelperAssigned { executor: helper, assignment }));
         }
     }
 
     fn track_stop(&mut self, effect: &Effect) {
         if let Effect::Kill { executor, assignment } = effect
-            && let Some(held) = self.assignments.get_mut(executor)
+            && let Some(held) = self.assignments.get_mut(executor.as_str())
             && held.token == *assignment
         {
             held.stopping = true;
@@ -1502,7 +1585,8 @@ impl Jobs {
         {
             held.token = assignment;
         } else {
-            self.assignments.insert(executor.to_owned(), Assignment::new(assignment));
+            self.assignments
+                .insert(WireString::from_str_in(executor, self.alloc), Assignment::new(assignment));
         }
     }
 
@@ -1515,10 +1599,16 @@ impl Jobs {
     ) {
         for effect in log {
             if effect == Effect::NeedLead {
-                let e = &self.executions[&id];
+                let Some(e) = self.executions.get(&id) else {
+                    out.push((id, effect));
+                    continue;
+                };
+                let Some((platform, need)) = self.platforms.get(&id).cloned() else {
+                    out.push((id, effect));
+                    continue;
+                };
                 let mut except = Vec::new_in(out.allocator().clone());
-                except.extend(e.lost.iter().map(String::as_str));
-                let (platform, need) = self.platforms[&id].clone();
+                except.extend(e.lost.iter().map(WireString::as_str));
                 let namespace = e.namespace.clone();
                 // Helpers heard from inside the lead-loss window keep helping under the
                 // new attempt, and one of them leads first: it already holds this
@@ -1527,42 +1617,54 @@ impl Jobs {
                 // helper cannot be taken over while its owner might still be running;
                 // prefer an idle replacement over that unavailable reservation.
                 let mut heard = Vec::new_in(out.allocator().clone());
-                heard.extend(e.heard_recently(now).map(|name| Box::clone_from_ref_in(name, out.allocator().clone())));
+                heard.extend(
+                    e.heard_recently(now)
+                        .map(|name| String::from_str_in(name, out.allocator().clone())),
+                );
                 for helper in e.executors() {
                     if Some(helper) != e.lead()
-                        && !except.contains(&helper)
-                        && !heard.iter().any(|candidate| candidate.as_ref() == helper)
+                        && except.scan_for(&helper).is_none()
+                        && !heard.iter().any(|candidate| candidate.as_str() == helper)
                         && self
                             .assignments
                             .get(helper)
                             .is_some_and(|assignment| assignment.claimant.is_none())
                     {
-                        heard.push(Box::clone_from_ref_in(helper, out.allocator().clone()));
+                        heard.push(String::from_str_in(helper, out.allocator().clone()));
                     }
                 }
                 let lead = heard
                     .first()
-                    .cloned()
-                    .or_else(|| self.admission.idle_for(&namespace, &platform, &need, &except)
-                        .map(|name| Box::clone_from_ref_in(name, out.allocator().clone())));
+                    .map(|name| String::from_str_in(name.as_str(), out.allocator().clone()))
+                    .or_else(|| {
+                        self.admission
+                            .idle_for(&namespace, &platform, &need, &except)
+                            .map(|name| String::from_str_in(name, out.allocator().clone()))
+                    });
                 drop(except);
                 let mut more = Vec::new_in(out.allocator().clone());
-                let e = self.executions.get_mut(&id).expect("present");
-                match lead {
-                    Some(lead) => {
-                        let mut helpers = Vec::new_in(out.allocator().clone());
-                        helpers.extend(heard.iter().map(|name| name.as_ref()).filter(|h| *h != lead.as_ref()));
-                        if e.assign(now, &lead, &helpers, &mut more).is_ok() {
-                            let assignment = e.assignment();
-                            self.admission.take(&lead, id, e.attempt());
-                            self.track_reassignment(&lead, assignment);
-                            for helper in helpers {
-                                self.admission.take(helper, id, assignment.attempt);
-                                self.track_reassignment(helper, assignment);
+                if let Some(e) = self.executions.get_mut(&id) {
+                    match lead {
+                        Some(lead) => {
+                            let mut helpers = Vec::new_in(out.allocator().clone());
+                            helpers.extend(
+                                heard
+                                    .iter()
+                                    .map(String::as_str)
+                                    .filter(|h| *h != lead.as_str()),
+                            );
+                            if e.assign(now, lead.as_str(), &helpers, &mut more).is_ok() {
+                                let assignment = e.assignment();
+                                self.admission.take(lead.as_str(), id, e.attempt());
+                                self.track_reassignment(lead.as_str(), assignment);
+                                for helper in helpers {
+                                    self.admission.take(helper, id, assignment.attempt);
+                                    self.track_reassignment(helper, assignment);
+                                }
                             }
                         }
+                        None => e.end(now, Outcome::Lost, EndWhy::NoLead, &mut more),
                     }
-                    None => e.end(now, Outcome::Lost, EndWhy::NoLead, &mut more),
                 }
                 out.push((id, effect));
                 for effect in more {
@@ -1574,7 +1676,7 @@ impl Jobs {
             self.track_stop(&effect);
             out.push((id, effect));
         }
-        let e = &self.executions[&id];
+        let Some(e) = self.executions.get(&id) else { return };
         if let ExecState::Ended(_) = e.state() {
             if self.running.get(&e.content) == Some(&id) {
                 self.running.remove(&e.content);
@@ -1597,9 +1699,11 @@ impl Jobs {
 
 #[cfg(test)]
 mod retention_tests {
+    use blaze_own::Vec;
+    use blaze_wire::PrNamespace;
+
     use super::*;
     use crate::admission::AdmissionConfig;
-    use blaze_wire::PrNamespace;
 
     fn request(pr: u64, source: u8) -> JobRequest {
         JobRequest {
@@ -1614,26 +1718,30 @@ mod retention_tests {
 
     #[test]
     fn ending_pr_executions_releases_the_source_index_and_preserves_live_siblings() {
-        let mut jobs =
-            Jobs::new(Admission::new(AdmissionConfig::default()), ExecutionConfig::default());
+        let alloc = blaze_own::testing::heap().shared();
+        let mut jobs = Jobs::new(
+            Admission::new(AdmissionConfig::default(), alloc),
+            ExecutionConfig::default(),
+            alloc,
+        );
         let need = Reservation { memory: 4, cpus: 4, disk: 4 };
         for pr in 1..=128 {
-            let mut effects = Vec::new();
+            let mut effects = Vec::new_in(alloc);
             let first = jobs.submit(0, &request(pr, 1), need.clone(), &mut effects).unwrap();
             let mut other_platform = request(pr, 1);
             other_platform.platform = [3; 32];
             let sibling = jobs.submit(0, &other_platform, need.clone(), &mut effects).unwrap();
             jobs.unsubscribe(1, first.execution, first.subscriber, &mut effects).unwrap();
-            assert_eq!(jobs.pr_jobs[&pr].executions.len(), 1);
-            assert!(jobs.pr_jobs[&pr].executions.contains_key(&sibling.execution));
+            assert_eq!(jobs.pr_jobs.get(&pr).unwrap().executions.len(), 1);
+            assert!(jobs.pr_jobs.get(&pr).unwrap().executions.contains_key(&sibling.execution));
 
             let next = jobs.submit(2, &request(pr, 2), need.clone(), &mut effects).unwrap();
             assert_eq!(
                 jobs.execution(sibling.execution).unwrap().state(),
                 ExecState::Ended(Outcome::Cancelled)
             );
-            assert_eq!(jobs.pr_jobs[&pr].executions.len(), 1);
-            assert!(jobs.pr_jobs[&pr].executions.contains_key(&next.execution));
+            assert_eq!(jobs.pr_jobs.get(&pr).unwrap().executions.len(), 1);
+            assert!(jobs.pr_jobs.get(&pr).unwrap().executions.contains_key(&next.execution));
             jobs.unsubscribe(3, next.execution, next.subscriber, &mut effects).unwrap();
             for execution in [first.execution, sibling.execution, next.execution] {
                 assert!(jobs.forget_terminal(execution));

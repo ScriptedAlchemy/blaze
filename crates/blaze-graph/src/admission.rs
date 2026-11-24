@@ -141,7 +141,7 @@ pub fn run_as<R>(kind: TaskKind, f: impl FnOnce() -> R) -> (R, TaskSpent) {
     let ((out, heap), frames) = blaze_mem::frame::measure(|| {
         crate::arena::measured(|| blaze_mem::frame::task(tag, |_| f()))
     });
-    (out, TaskSpent { peak: heap.peak + frames as u64, heap })
+    (out, TaskSpent { peak: heap.peak + u64::try_from(frames).unwrap_or(u64::MAX), heap })
 }
 
 /// What a task spent ([`run_as`]).

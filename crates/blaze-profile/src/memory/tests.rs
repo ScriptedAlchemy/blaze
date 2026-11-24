@@ -178,11 +178,7 @@ fn answer_difference(ours: &[Batch], theirs: &[Batch]) -> Option<&'static str> {
 #[test]
 fn the_oracle_catches_a_memory_answer_that_loses_a_double_bit_or_column() {
     let batch = |name: &'static str, value: f64| {
-        let column = Column::options([Some(value), None], Global);
-        let fields =
-            blaze_own::Vec::from_iter_in([Field::new(name, column.ty(), true)], Global);
-        let columns = blaze_own::Vec::from_iter_in([column], Global);
-        vec![Batch::try_new(fields, columns).unwrap()]
+        batches("memory_held", vec![(name, doubles([Some(value), None]))]).unwrap()
     };
     let value = f64::from_bits(1.0_f64.to_bits() + 1);
     let expected = batch("gib", value);

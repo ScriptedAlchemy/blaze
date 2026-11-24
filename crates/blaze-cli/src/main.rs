@@ -428,6 +428,12 @@ struct Flags<'a> {
     /// (`bodies`). Step 4: `bodies` runs the whole-crate differential inside `--names-oracle`
     /// (engine_names.rs `NamesOracle::Blocks`); the engine's records stay `modules`.
     block_scopes: blaze_scope::surface::BlockScopes,
+    /// `-F` / `--features`: comma- or whitespace-separated feature lists (empty when none passed).
+    features: &'a [&'a str],
+    /// `--all-features`: enable every feature of the selected workspace roots.
+    all_features: bool,
+    /// `--no-default-features`: do not enable `default` on the selected workspace roots.
+    no_default_features: bool,
 }
 
 impl<'a> Flags<'a> {
@@ -451,15 +457,26 @@ impl<'a> Flags<'a> {
             names_oracle: engine_names::NamesOracle::Off,
             driver: engine_ready_edit::Driver::Auto,
             block_scopes: blaze_scope::surface::BlockScopes::Modules,
+            features: &[],
+            all_features: false,
+            no_default_features: false,
+        }
+    }
+
+    pub(crate) fn feature_ask(&self) -> crate::graph::FeatureAsk<'a> {
+        crate::graph::FeatureAsk {
+            features: self.features,
+            all_features: self.all_features,
+            no_default_features: self.no_default_features,
         }
     }
 }
 
 fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
-    parse_flags(args, |_| {})
+    parse_flags_with(args, |_| {}, |_| {})
 }
 
-fn parse_flags<'a>(args: &'a Args, mut package: impl FnMut(&'a str)) -> Result<Flags<'a>, CliError> {
+fn parse_flags_with<'a>(args: &'a Args, mut package: impl FnMut(&'a str), mut feature: impl FnMut(&'a str)) -> Result<Flags<'a>, CliError> {
     let mut flags = Flags::empty();
     let mut at = 2;
     while let Some(arg) = args.get(at) {
@@ -473,7 +490,7 @@ fn parse_flags<'a>(args: &'a Args, mut package: impl FnMut(&'a str)) -> Result<F
         }
         let mut value = || {
             at += 1;
-            args.get(at - 1).ok_or(CliError::Usage("--color, --origin, --origin-key, --grant, --workers, -p, --bin and -o each take a value"))
+            args.get(at - 1).ok_or(CliError::Usage("--color, --origin, --origin-key, --grant, --workers, -p, --bin, -F/--features and -o each take a value"))
         };
         let selected = match arg {
             "-p" | "--package" => Some(value()?),
@@ -484,7 +501,17 @@ fn parse_flags<'a>(args: &'a Args, mut package: impl FnMut(&'a str)) -> Result<F
             flags.select.package = Some(name);
             continue;
         }
+        let feat = match arg {
+            "-F" | "--features" => Some(value()?),
+            _ => arg.strip_prefix("--features="),
+        };
+        if let Some(list) = feat {
+            feature(list);
+            continue;
+        }
         match arg {
+            "--all-features" => flags.all_features = true,
+            "--no-default-features" => flags.no_default_features = true,
             "--view" => flags.view = Some(View::parse(value()?).ok_or(CliError::Usage("--view is person, agent or json"))?),
             _ if arg.starts_with("--view=") => flags.view = Some(View::parse(&arg["--view=".len()..]).ok_or(CliError::Usage("--view is person, agent or json"))?),
             // Every word after `--fix` up to the next flag is a selector: an id or a prefix of
@@ -1745,5 +1772,36 @@ mod tests {
         let open_check = args_of(&["blaze", "check", "--open"]);
         let parsed_check = flags(&open_check).expect("check flags parse before command check");
         assert!(matches!(check_command::refuse_not_taken(&parsed_check), Err(CliError::Usage(_))));
+    }
+
+    /// `-F`/`--features`, `--all-features`, and `--no-default-features` parse across forms and
+    /// produce distinct answer-root names from the default request (rule 21).
+    #[test]
+    fn feature_flags_parse_and_separate_answer_roots() {
+        let args_of = |words: &[&str]| {
+            let mut world = SimWorld::new(1, Limits::USUAL);
+            world.args = words.iter().map(|&s| s.into()).collect();
+            Io::simulated(world).need_args().expect("args")
+        };
+        let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+        let raw = args_of(&["blaze", "run", "-F", "dep/extra,other", "--features=more", "--all-features", "--no-default-features", "--bin", "needs"]);
+        let mut feats = blaze_own::Vec::new_in(&frame);
+        let mut parsed = parse_flags_with(&raw, |_| {}, |f| feats.push(f)).expect("feature flags parse");
+        parsed.features = feats.as_slice();
+        assert_eq!(parsed.features, ["dep/extra,other", "more"]);
+        assert!(parsed.all_features);
+        assert!(parsed.no_default_features);
+        assert_eq!(parsed.select.bin, Some("needs"));
+
+        let default_root = engine_answer::root_name("ws", &frame);
+        let featured_root = engine_answer::root_name_for("ws", parsed.feature_ask(), &frame);
+        let reordered = crate::graph::FeatureAsk {
+            features: &["more other", "dep/extra"],
+            all_features: true,
+            no_default_features: true,
+        };
+        let same_root = engine_answer::root_name_for("ws", reordered, &frame);
+        assert_ne!(default_root.as_str(), featured_root.as_str());
+        assert_eq!(featured_root.as_str(), same_root.as_str());
     }
 }

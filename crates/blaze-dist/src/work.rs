@@ -15,13 +15,16 @@
 //! The machine has no clock, IO or threads of its own: every call takes `now`, answers with a
 //! wire type or a [`Refusal`], and appends what happened to `out`, the log a driver keeps.
 
-use std::alloc::{Allocator, AllocatorClone};
-use std::collections::{BTreeMap, BTreeSet};
+use core::alloc::Allocator;
+use core::fmt;
+use core::mem;
 
+use blaze_own::{BTreeMap, BTreeSet, Vec, format_in};
 use blaze_wire::{
     Attempt, BatchResult, Digest, EdgeKey, EntryKey, ExecutionId, Found, Grant, ItemOutcome,
-    ItemResult, Lease, PackRef, RootSet, Set, Why, WorkJoinAnswer, WorkJoinRequest, WorkKey,
-    WorkLeaseAnswer, WorkLeaseRequest, WorkName, WorkResultAnswer, WorkersEventsAnswer,
+    ItemResult, Lease, PackRef, RootSet, Set, Why, WireAlloc, WireString, WireVec, WorkJoinAnswer,
+    WorkJoinRequest, WorkKey, WorkLeaseAnswer, WorkLeaseRequest, WorkName, WorkResultAnswer,
+    WorkersEventsAnswer,
 };
 
 use crate::{Millis, Ranges, Refusal};
@@ -77,7 +80,7 @@ impl Default for WorkConfig {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Commit {
     /// The holder whose result it was.
-    pub holder: String,
+    pub holder: WireString,
     /// The lease generation it was committed under.
     pub generation: u64,
     /// The holder's batch number.
@@ -101,7 +104,7 @@ pub enum TailWhy {
     /// It was outstanding when the lead was lost: findings of a dead attempt are invalid.
     LeadLost,
     /// A request with no stable name: a terminal `WorkKey::Edge` of its parent, with the reason.
-    Unnamed(String),
+    Unnamed(WireString),
     /// A root item answered `Lost`: a holder resolves roots by index, so it is not one the
     /// protocol makes, and unknown is `Local`.
     LostRoot,
@@ -193,7 +196,7 @@ pub enum Effect {
     /// An executor's root set differs from the lead's: a determinism bug, with both digests.
     RootsDisagree {
         /// The executor.
-        holder: String,
+        holder: WireString,
         /// The lead's.
         lead: RootSet,
         /// The executor's.
@@ -202,13 +205,13 @@ pub enum Effect {
     /// A grant was made under a new lease generation.
     Granted {
         /// Its holder.
-        holder: String,
+        holder: WireString,
         /// The new generation.
         generation: u64,
         /// The root indexes it holds.
         roots: Ranges,
         /// The names it holds, in set order.
-        names: Vec<WorkName>,
+        names: WireVec<WorkName>,
     },
     /// A batch's result was committed.
     Committed {
@@ -225,14 +228,14 @@ pub enum Effect {
     /// A call was refused.
     Refused {
         /// Who called.
-        holder: String,
+        holder: WireString,
         /// Why.
         refusal: Refusal,
     },
     /// A lease ended without its result: its generation is dead.
     Fenced {
         /// Its holder.
-        holder: String,
+        holder: WireString,
         /// Its generation.
         generation: u64,
         /// Why.
@@ -241,7 +244,7 @@ pub enum Effect {
     /// A holder was dropped: its findings are no longer counted on.
     HolderLost {
         /// The holder.
-        holder: String,
+        holder: WireString,
         /// Why.
         why: FenceWhy,
     },
@@ -310,13 +313,13 @@ pub struct Report {
     /// The root epoch: how many times the work set started again on the lead's root list.
     pub epoch: u64,
     /// Each root index's end, or `None` while it is outstanding.
-    pub roots: Vec<Option<Terminal>>,
+    pub roots: WireVec<Option<Terminal>>,
     /// Each name's first tuple and end.
-    pub names: BTreeMap<WorkName, (Digest, Option<Terminal>)>,
+    pub names: BTreeMap<WorkName, (Digest, Option<Terminal>), WireAlloc>,
     /// Each edge's parent, ordinal and end.
-    pub edges: BTreeMap<WorkName, (WorkName, u32, Terminal)>,
+    pub edges: BTreeMap<WorkName, (WorkName, u32, Terminal), WireAlloc>,
     /// The packs of committed results.
-    pub packs: BTreeSet<PackRef>,
+    pub packs: BTreeSet<PackRef, WireAlloc>,
     /// Whether the compile phase is done.
     pub done: bool,
 }
@@ -343,9 +346,9 @@ struct NameSlot {
     /// The first finder's tuple: a finder with another makes the name a conflict.
     tuple: Digest,
     /// Holders that reported it with this tuple and still hold their finding.
-    finders: BTreeSet<String>,
+    finders: BTreeSet<WireString, WireAlloc>,
     /// The first finder, granted it first while it holds it.
-    prefer: Option<String>,
+    prefer: Option<WireString>,
     revoked: u32,
     state: Slot,
 }
@@ -354,7 +357,7 @@ struct NameSlot {
 struct EdgeSlot {
     parent: WorkName,
     ordinal: u32,
-    why: String,
+    why: WireString,
 }
 
 #[derive(Clone, Debug)]
@@ -363,14 +366,14 @@ struct HolderSlot {
     heard: Millis,
     lease: Option<u64>,
     /// The names it is a finder of, this attempt.
-    findings: BTreeSet<WorkName>,
+    findings: BTreeSet<WorkName, WireAlloc>,
 }
 
 #[derive(Clone, Debug)]
 struct Issued {
-    holder: String,
+    holder: WireString,
     roots: Ranges,
-    names: Vec<WorkName>,
+    names: WireVec<WorkName>,
     granted_at: Millis,
     live: bool,
     grant: Grant,
@@ -387,59 +390,67 @@ enum Phase {
 /// The work set of one execution.
 #[derive(Clone, Debug)]
 pub struct WorkSet {
+    alloc: WireAlloc,
     config: WorkConfig,
     execution: ExecutionId,
     attempt: Attempt,
-    lead: String,
+    lead: WireString,
     phase: Phase,
     fixed: Option<RootSet>,
     provisional: Option<RootSet>,
     epoch: u64,
-    rejected: BTreeSet<WorkName>,
-    roots: Vec<RootSlot>,
+    rejected: BTreeSet<WorkName, WireAlloc>,
+    roots: WireVec<RootSlot>,
     pool: Ranges,
-    names: BTreeMap<WorkName, NameSlot>,
-    waiting: BTreeSet<WorkName>,
-    edges: BTreeMap<WorkName, EdgeSlot>,
-    holders: BTreeMap<String, HolderSlot>,
+    names: BTreeMap<WorkName, NameSlot, WireAlloc>,
+    waiting: BTreeSet<WorkName, WireAlloc>,
+    edges: BTreeMap<WorkName, EdgeSlot, WireAlloc>,
+    holders: BTreeMap<WireString, HolderSlot, WireAlloc>,
     /// Executors refused this attempt for a root set that differs from the lead's.
-    refused: BTreeMap<String, RootSet>,
-    leases: BTreeMap<u64, Issued>,
-    live: BTreeSet<u64>,
+    refused: BTreeMap<WireString, RootSet, WireAlloc>,
+    leases: BTreeMap<u64, Issued, WireAlloc>,
+    live: BTreeSet<u64, WireAlloc>,
     next_generation: u64,
-    replies: BTreeMap<(String, u64, u64), (Digest, WorkResultAnswer)>,
+    replies: BTreeMap<(WireString, u64, u64), (Digest, WorkResultAnswer), WireAlloc>,
     /// Committed batches' times from grant to commit, sorted, for the median.
-    batch_ms: Vec<u64>,
-    packs: BTreeSet<PackRef>,
+    batch_ms: WireVec<u64>,
+    packs: BTreeSet<PackRef, WireAlloc>,
     counters: Counters,
 }
 
 impl WorkSet {
     /// The work set of `execution` at `attempt`, whose lead is `lead`.
-    pub fn new(execution: ExecutionId, attempt: Attempt, lead: &str, config: WorkConfig) -> Self {
+    pub fn new(
+        execution: ExecutionId,
+        attempt: Attempt,
+        lead: &str,
+        config: WorkConfig,
+        alloc: WireAlloc,
+    ) -> Self {
         WorkSet {
+            alloc,
             config,
             execution,
             attempt,
-            lead: lead.to_owned(),
+            lead: WireString::from_str_in(lead, alloc),
             phase: Phase::Open,
             fixed: None,
             provisional: None,
             epoch: 0,
-            rejected: BTreeSet::new(),
-            roots: Vec::new(),
-            pool: Ranges::new(),
-            names: BTreeMap::new(),
-            waiting: BTreeSet::new(),
-            edges: BTreeMap::new(),
-            holders: BTreeMap::new(),
-            refused: BTreeMap::new(),
-            leases: BTreeMap::new(),
-            live: BTreeSet::new(),
+            rejected: BTreeSet::new_in(alloc),
+            roots: Vec::new_in(alloc),
+            pool: Ranges::new(alloc),
+            names: BTreeMap::new_in(alloc),
+            waiting: BTreeSet::new_in(alloc),
+            edges: BTreeMap::new_in(alloc),
+            holders: BTreeMap::new_in(alloc),
+            refused: BTreeMap::new_in(alloc),
+            leases: BTreeMap::new_in(alloc),
+            live: BTreeSet::new_in(alloc),
             next_generation: 1,
-            replies: BTreeMap::new(),
-            batch_ms: Vec::new(),
-            packs: BTreeSet::new(),
+            replies: BTreeMap::new_in(alloc),
+            batch_ms: Vec::new_in(alloc),
+            packs: BTreeSet::new_in(alloc),
             counters: Counters::default(),
         }
     }
@@ -451,7 +462,7 @@ impl WorkSet {
 
     /// The current attempt's lead.
     pub fn lead(&self) -> &str {
-        &self.lead
+        self.lead.as_str()
     }
 
     /// Whether the compile phase is done: every root, name and edge terminal, no lease live.
@@ -471,7 +482,7 @@ impl WorkSet {
 
     /// Whether this attempt's lead has joined with its own root set.
     pub fn lead_joined(&self) -> bool {
-        self.holders.contains_key(&self.lead)
+        self.holders.contains_key(self.lead.as_str())
     }
 
     /// How the execution ended, if it ended before its compile phase was done.
@@ -494,7 +505,8 @@ impl WorkSet {
         }
         let heard = self.holders.values().map(|h| h.heard + self.config.lease_ms + 1);
         let timeout = self.progress_timeout();
-        let progress = self.live.iter().map(|g| self.leases[g].granted_at + timeout + 1);
+        let progress =
+            self.live.iter().filter_map(|g| self.leases.get(g).map(|l| l.granted_at + timeout + 1));
         heard.chain(progress).min()
     }
 
@@ -509,7 +521,10 @@ impl WorkSet {
         self.tick(now, out);
         let answer = self.join_inner(now, from, req, out);
         if let Err(refusal) = &answer {
-            out.push(Effect::Refused { holder: from.to_owned(), refusal: refusal.clone() });
+            out.push(Effect::Refused {
+                holder: WireString::from_str_in(from, self.alloc),
+                refusal: refusal.clone(),
+            });
         }
         answer
     }
@@ -531,22 +546,24 @@ impl WorkSet {
             return Err(Refusal::AttemptMoved);
         }
         if req.roots.count > self.config.max_roots {
-            return Err(Refusal::Malformed(format!(
+            return Err(Refusal::Malformed(format_in!(
+                self.alloc,
                 "a root set of {} roots, past {}",
-                req.roots.count, self.config.max_roots
+                req.roots.count,
+                self.config.max_roots
             )));
         }
         if let Some(holder) = self.holders.get_mut(from) {
             // A join sent again is answered again.
             if holder.roots == req.roots {
                 holder.heard = now;
-                return Ok(self.join_answer());
+                return Ok(self.join_answer(&req.roots));
             }
             // A front end that changed under findings held is a new process: a source change
             // is a new execution, not a reload, so what it held is dropped.
             self.lose(from, FenceWhy::RootsDisagree, out);
         }
-        if from == self.lead {
+        if from == self.lead.as_str() {
             self.join_lead(req, out);
         } else {
             if self.refused.contains_key(from) {
@@ -556,11 +573,12 @@ impl WorkSet {
                 (Some(fixed), _) if *fixed != req.roots => {
                     self.counters.root_disagreements += 1;
                     out.push(Effect::RootsDisagree {
-                        holder: from.to_owned(),
+                        holder: WireString::from_str_in(from, self.alloc),
                         lead: fixed.clone(),
                         other: req.roots.clone(),
                     });
-                    self.refused.insert(from.to_owned(), req.roots.clone());
+                    self.refused
+                        .insert(WireString::from_str_in(from, self.alloc), req.roots.clone());
                     return Err(Refusal::FrontEndDiffers);
                 }
                 (Some(_), _) => {}
@@ -577,20 +595,21 @@ impl WorkSet {
             }
         }
         self.holders.insert(
-            from.to_owned(),
+            WireString::from_str_in(from, self.alloc),
             HolderSlot {
                 roots: req.roots.clone(),
                 heard: now,
                 lease: None,
-                findings: BTreeSet::new(),
+                findings: BTreeSet::new_in(self.alloc),
             },
         );
-        Ok(self.join_answer())
+        Ok(self.join_answer(&req.roots))
     }
 
     /// The lead's join: its root set is the execution's, whatever the work set held.
     fn join_lead(&mut self, req: &WorkJoinRequest, out: &mut Vec<Effect, impl Allocator>) {
-        self.rejected = req.rejected.iter().copied().collect();
+        self.rejected.clear();
+        self.rejected.extend(req.rejected.iter().copied());
         let held = self.fixed.clone().or_else(|| self.provisional.clone());
         match held {
             Some(held) if held == req.roots => {
@@ -627,21 +646,25 @@ impl WorkSet {
     /// set is fenced and refused, what was committed under it is dropped, and the difference
     /// is counted as a determinism bug.
     fn reset(&mut self, roots: &RootSet, out: &mut Vec<Effect, impl Allocator>) {
-        let holders: Vec<String> = self.holders.keys().cloned().collect();
-        for holder in holders {
-            let theirs = self.holders[&holder].roots.clone();
-            if holder != self.lead {
+        let holders = Vec::from_iter_in(
+            self.holders.iter().map(|(id, slot)| {
+                (WireString::from_str_in(id.as_str(), self.alloc), slot.roots.clone())
+            }),
+            self.alloc,
+        );
+        for (holder, theirs) in holders {
+            if holder.as_str() != self.lead.as_str() {
                 self.counters.root_disagreements += 1;
                 out.push(Effect::RootsDisagree {
-                    holder: holder.clone(),
+                    holder: WireString::from_str_in(holder.as_str(), self.alloc),
                     lead: roots.clone(),
                     other: theirs.clone(),
                 });
-                self.refused.insert(holder.clone(), theirs);
+                self.refused.insert(WireString::from_str_in(holder.as_str(), self.alloc), theirs);
             }
-            self.lose(&holder, FenceWhy::RootsDisagree, out);
+            self.lose(holder.as_str(), FenceWhy::RootsDisagree, out);
         }
-        let live: Vec<u64> = self.live.iter().copied().collect();
+        let live = Vec::from_iter_in(self.live.iter().copied(), self.alloc);
         for generation in live {
             self.fence(generation, FenceWhy::RootsDisagree, out);
         }
@@ -662,13 +685,21 @@ impl WorkSet {
     }
 
     fn start_roots(&mut self, count: u64) {
-        let len = usize::try_from(count).expect("bounded by max_roots");
-        self.roots = vec![RootSlot { revoked: 0, state: Slot::Waiting }; len];
-        self.pool = Ranges::full(count);
+        let len = usize::try_from(count).unwrap_or(0);
+        let mut roots = Vec::with_capacity_in(len, self.alloc);
+        for _ in 0..len {
+            roots.push(RootSlot { revoked: 0, state: Slot::Waiting });
+        }
+        self.roots = roots;
+        self.pool = Ranges::full(count, self.alloc);
     }
 
-    fn join_answer(&self) -> WorkJoinAnswer {
-        let roots = self.fixed.clone().or_else(|| self.provisional.clone()).expect("joined");
+    fn join_answer(&self, fallback: &RootSet) -> WorkJoinAnswer {
+        let roots = self
+            .fixed
+            .clone()
+            .or_else(|| self.provisional.clone())
+            .unwrap_or_else(|| fallback.clone());
         WorkJoinAnswer { roots, fixed: self.fixed.is_some() }
     }
 
@@ -684,7 +715,10 @@ impl WorkSet {
         self.tick(now, out);
         let answer = self.lease_inner(now, from, req, out);
         if let Err(refusal) = &answer {
-            out.push(Effect::Refused { holder: from.to_owned(), refusal: refusal.clone() });
+            out.push(Effect::Refused {
+                holder: WireString::from_str_in(from, self.alloc),
+                refusal: refusal.clone(),
+            });
         }
         answer
     }
@@ -711,7 +745,9 @@ impl WorkSet {
         holder.heard = now;
         if let Some(generation) = holder.lease {
             // A lease asked for again, or by a request the network repeated: the same grant.
-            return Ok(WorkLeaseAnswer { grant: Some(self.leases[&generation].grant.clone()) });
+            return Ok(WorkLeaseAnswer {
+                grant: self.leases.get(&generation).map(|l| l.grant.clone()),
+            });
         }
         if self.phase == Phase::Done {
             return Ok(WorkLeaseAnswer { grant: None });
@@ -725,19 +761,23 @@ impl WorkSet {
         holder: &str,
         out: &mut Vec<Effect, impl Allocator>,
     ) -> Option<Grant> {
+        let holder_slot = self.holders.get(holder)?;
         // Names come before roots, so a finder compiles what it found while its database holds
         // it. A name goes to its first finder while that one holds it, else to any finder.
-        let names: Vec<WorkName> = self.holders[holder]
-            .findings
-            .iter()
-            .filter(|name| self.waiting.contains(*name))
-            .filter(|name| {
-                let slot = &self.names[*name];
-                slot.prefer.is_none() || slot.prefer.as_deref() == Some(holder)
-            })
-            .take(self.config.grant_names)
-            .copied()
-            .collect();
+        let names = Vec::from_iter_in(
+            holder_slot
+                .findings
+                .iter()
+                .filter(|name| self.waiting.contains(*name))
+                .filter(|name| {
+                    self.names.get(*name).is_some_and(|slot| {
+                        slot.prefer.is_none() || slot.prefer.as_deref() == Some(holder)
+                    })
+                })
+                .take(self.config.grant_names)
+                .copied(),
+            self.alloc,
+        );
         let roots = self.pool.take_front(self.config.grant_roots);
         if names.is_empty() && roots.is_empty() {
             return None;
@@ -745,18 +785,24 @@ impl WorkSet {
         let generation = self.next_generation;
         self.next_generation += 1;
         for index in roots.indexes() {
-            self.roots[index as usize].state = Slot::Held(generation);
+            if let Ok(idx) = usize::try_from(index)
+                && let Some(slot) = self.roots.get_mut(idx)
+            {
+                slot.state = Slot::Held(generation);
+            }
         }
         for name in &names {
             self.waiting.remove(name);
-            self.names.get_mut(name).expect("waiting").state = Slot::Held(generation);
+            if let Some(slot) = self.names.get_mut(name) {
+                slot.state = Slot::Held(generation);
+            }
         }
         let names = Set::new(names);
         let grant = Grant {
             lease: Lease {
                 execution: self.execution,
                 attempt: self.attempt,
-                holder: holder.to_owned(),
+                holder: WireString::from_str_in(holder, self.alloc),
                 generation,
             },
             roots: roots.to_wire(),
@@ -765,19 +811,21 @@ impl WorkSet {
         self.leases.insert(
             generation,
             Issued {
-                holder: holder.to_owned(),
+                holder: WireString::from_str_in(holder, self.alloc),
                 roots: roots.clone(),
-                names: names.iter().copied().collect(),
+                names: Vec::from_iter_in(names.iter().copied(), self.alloc),
                 granted_at: now,
                 live: true,
                 grant: grant.clone(),
             },
         );
         self.live.insert(generation);
-        self.holders.get_mut(holder).expect("joined").lease = Some(generation);
+        if let Some(slot) = self.holders.get_mut(holder) {
+            slot.lease = Some(generation);
+        }
         self.counters.grants += 1;
         out.push(Effect::Granted {
-            holder: holder.to_owned(),
+            holder: WireString::from_str_in(holder, self.alloc),
             generation,
             roots,
             names: names.into_vec(),
@@ -797,7 +845,10 @@ impl WorkSet {
         self.tick(now, out);
         let answer = self.result_inner(now, from, req, out);
         if let Err(refusal) = &answer {
-            out.push(Effect::Refused { holder: from.to_owned(), refusal: refusal.clone() });
+            out.push(Effect::Refused {
+                holder: WireString::from_str_in(from, self.alloc),
+                refusal: refusal.clone(),
+            });
         }
         answer
     }
@@ -812,16 +863,20 @@ impl WorkSet {
         if req.lease.execution != self.execution {
             return Err(Refusal::NoExecution);
         }
-        if req.lease.holder != from {
+        if req.lease.holder.as_str() != from {
             return Err(Refusal::NotHolder);
         }
         if req.lease.attempt != self.attempt {
             return Err(Refusal::AttemptMoved);
         }
         let generation = req.lease.generation;
-        let by = Commit { holder: from.to_owned(), generation, seq: req.seq };
-        let key = (from.to_owned(), generation, req.seq);
-        let digest = blaze_wire::digest_of(req, out.allocator());
+        let by = Commit {
+            holder: WireString::from_str_in(from, self.alloc),
+            generation,
+            seq: req.seq,
+        };
+        let key = (WireString::from_str_in(from, self.alloc), generation, req.seq);
+        let digest = blaze_wire::digest_of(req, out.allocator().clone());
         // A result committed in this attempt gets the same answer after its lease ended.
         // An earlier attempt must not replay or keep a newly joined holder alive.
         if let Some((committed, answer)) = self.replies.get(&key) {
@@ -841,40 +896,61 @@ impl WorkSet {
         }
         // The fence: only the holder's live lease commits. A result of a dead generation is
         // refused whole, `found` and `unnamed` included, so it registers no names.
-        let live = self.holders.get(from).and_then(|h| h.lease) == Some(generation)
-            && self.leases.get(&generation).is_some_and(|issued| issued.live);
-        if !live {
+        let Some(issued) = self.leases.get(&generation).filter(|issued| issued.live).cloned()
+        else {
+            self.counters.dead_leases += 1;
+            return Err(Refusal::DeadLease);
+        };
+        if self.holders.get(from).and_then(|h| h.lease) != Some(generation) {
             self.counters.dead_leases += 1;
             return Err(Refusal::DeadLease);
         }
         if let Some(holder) = self.holders.get_mut(from) {
             holder.heard = now;
         }
-        let issued = self.leases[&generation].clone();
         let alloc = out.allocator().clone();
         let (processed_roots, processed_names, returned_roots, returned_names) =
-            match shape(&issued, req, &alloc) {
+            match shape(&issued, req, &alloc, self.alloc) {
                 Ok(shape) => shape,
                 Err(what) => {
                     self.counters.malformed += 1;
                     self.fence(generation, FenceWhy::Malformed, out);
                     self.check_done(out);
-                    return Err(Refusal::Malformed(what.to_string()));
+                    return Err(Refusal::Malformed(format_in!(self.alloc, "{what}")));
                 }
             };
-        let roots_done = processed_roots.len() as usize;
+        let Ok(roots_done) = usize::try_from(processed_roots.len()) else {
+            self.counters.malformed += 1;
+            self.fence(generation, FenceWhy::Malformed, out);
+            self.check_done(out);
+            return Err(Refusal::Malformed(WireString::from_str_in(
+                "root count past address size",
+                self.alloc,
+            )));
+        };
+        let Some((root_items, name_items)) = req.items.split_at_checked(roots_done) else {
+            self.counters.malformed += 1;
+            self.fence(generation, FenceWhy::Malformed, out);
+            self.check_done(out);
+            return Err(Refusal::Malformed(WireString::from_str_in(
+                "items shorter than processed roots",
+                self.alloc,
+            )));
+        };
         let mut granted = BTreeSet::new_in(&alloc);
         let mut conflicts = BTreeSet::new_in(&alloc);
-        for (item, index) in req.items[..roots_done].iter().zip(processed_roots.indexes()) {
+        for (item, index) in root_items.iter().zip(processed_roots.indexes()) {
             let terminal = match &item.outcome {
                 ItemOutcome::Lost(_) => Terminal::Tail(TailWhy::LostRoot),
                 _ => self.committed(item, &by),
             };
-            if let Some(slot) = self.roots.get_mut(index as usize) {
+            if let Ok(idx) = usize::try_from(index)
+                && let Some(slot) = self.roots.get_mut(idx)
+            {
                 slot.state = Slot::Done(terminal);
             }
         }
-        for (item, name) in req.items[roots_done..].iter().zip(&processed_names) {
+        for (item, name) in name_items.iter().zip(&processed_names) {
             self.commit_name(from, item, *name, &by, &mut conflicts, out);
         }
         for item in &req.items {
@@ -884,12 +960,12 @@ impl WorkSet {
             for (ordinal, why) in item.unnamed.iter() {
                 let edge = WorkName::of(
                     &WorkKey::Edge(EdgeKey { parent: item.name, ordinal: *ordinal }),
-                    out.allocator(),
+                    out.allocator().clone(),
                 );
                 self.edges.entry(edge).or_insert(EdgeSlot {
                     parent: item.name,
                     ordinal: *ordinal,
-                    why: why.clone(),
+                    why: WireString::from_str_in(why.as_str(), self.alloc),
                 });
             }
             for found in item.found.iter() {
@@ -898,7 +974,9 @@ impl WorkSet {
         }
         for (start, end) in returned_roots.iter() {
             for index in start..end {
-                if let Some(slot) = self.roots.get_mut(index as usize) {
+                if let Ok(idx) = usize::try_from(index)
+                    && let Some(slot) = self.roots.get_mut(idx)
+                {
                     slot.state = Slot::Waiting;
                 }
             }
@@ -914,22 +992,26 @@ impl WorkSet {
             }
         }
         self.packs.extend(req.packs.iter().cloned());
-        let issued = self.leases.get_mut(&generation).expect("live");
-        issued.live = false;
+        let granted_at = if let Some(lease) = self.leases.get_mut(&generation) {
+            lease.live = false;
+            lease.granted_at
+        } else {
+            issued.granted_at
+        };
         self.live.remove(&generation);
         if let Some(holder) = self.holders.get_mut(from)
             && holder.lease == Some(generation)
         {
             holder.lease = None;
         }
-        let took = now.saturating_sub(issued.granted_at);
+        let took = now.saturating_sub(granted_at);
         let at = self.batch_ms.partition_point(|&ms| ms <= took);
-        self.batch_ms.insert(at, took);
+        self.batch_ms.insert_shift(at, took);
         self.counters.commits += 1;
         out.push(Effect::Committed { by, epoch: self.epoch });
         let answer = WorkResultAnswer {
-            granted: Set::new(granted.into_iter().collect()),
-            conflicts: Set::new(conflicts.into_iter().collect()),
+            granted: Set::new(Vec::from_iter_in(granted.into_iter(), self.alloc)),
+            conflicts: Set::new(Vec::from_iter_in(conflicts.into_iter(), self.alloc)),
         };
         self.replies.insert(key, (digest, answer.clone()));
         self.check_done(out);
@@ -942,7 +1024,7 @@ impl WorkSet {
             ItemOutcome::Exported(_) | ItemOutcome::FromStore(_) if !item.unnamed.is_empty() => {
                 // Its entry could not name its callee: the lead compiles it.
                 self.counters.unnamed_forced_local += 1;
-                ItemOutcome::Local(Why { why: UNNAMED_REQUEST.to_owned() })
+                ItemOutcome::Local(Why { why: WireString::from_str_in(UNNAMED_REQUEST, self.alloc) })
             }
             outcome => outcome.clone(),
         };
@@ -955,7 +1037,7 @@ impl WorkSet {
         item: &ItemResult,
         name: WorkName,
         by: &Commit,
-        conflicts: &mut BTreeSet<WorkName, impl AllocatorClone>,
+        conflicts: &mut BTreeSet<WorkName, impl Allocator>,
         out: &mut Vec<Effect, impl Allocator>,
     ) {
         let Some(state) = self.names.get(&name).map(|slot| slot.state.clone()) else { return };
@@ -978,10 +1060,11 @@ impl WorkSet {
         let terminal = match &item.outcome {
             ItemOutcome::Lost(why) => {
                 self.drop_finder(from, name);
-                let slot = &self.names[&name];
-                if why.why == LOST_FINDING {
+                let no_finders =
+                    self.names.get(&name).is_none_or(|slot| slot.finders.is_empty());
+                if why.why.as_str() == LOST_FINDING {
                     self.counters.lost_findings += 1;
-                    if slot.finders.is_empty() {
+                    if no_finders {
                         Slot::Done(Terminal::Tail(TailWhy::NoFinder))
                     } else {
                         self.waiting.insert(name);
@@ -997,7 +1080,9 @@ impl WorkSet {
             }
             _ => Slot::Done(self.committed(item, by)),
         };
-        self.names.get_mut(&name).expect("held").state = terminal;
+        if let Some(slot) = self.names.get_mut(&name) {
+            slot.state = terminal;
+        }
     }
 
     /// A name an item found: a new one is granted to its finder, an equal one adds a finder,
@@ -1006,8 +1091,8 @@ impl WorkSet {
         &mut self,
         from: &str,
         found: &Found,
-        granted: &mut BTreeSet<WorkName, impl AllocatorClone>,
-        conflicts: &mut BTreeSet<WorkName, impl AllocatorClone>,
+        granted: &mut BTreeSet<WorkName, impl Allocator>,
+        conflicts: &mut BTreeSet<WorkName, impl Allocator>,
         out: &mut Vec<Effect, impl Allocator>,
     ) {
         let name = found.name;
@@ -1023,14 +1108,16 @@ impl WorkSet {
                 }
                 Slot::Waiting
             };
-            let finders =
-                if rejected { BTreeSet::new() } else { BTreeSet::from([from.to_owned()]) };
+            let mut finders = BTreeSet::new_in(self.alloc);
+            if !rejected {
+                finders.insert(WireString::from_str_in(from, self.alloc));
+            }
             self.names.insert(
                 name,
                 NameSlot {
                     tuple: found.tuple,
                     finders,
-                    prefer: (!rejected).then(|| from.to_owned()),
+                    prefer: (!rejected).then(|| WireString::from_str_in(from, self.alloc)),
                     revoked: 0,
                     state,
                 },
@@ -1039,7 +1126,7 @@ impl WorkSet {
         };
         if slot.tuple == found.tuple {
             if !matches!(slot.state, Slot::Done(_)) {
-                slot.finders.insert(from.to_owned());
+                slot.finders.insert(WireString::from_str_in(from, self.alloc));
                 if let Some(holder) = self.holders.get_mut(from) {
                     holder.findings.insert(name);
                 }
@@ -1065,10 +1152,11 @@ impl WorkSet {
 
     /// `holder` no longer holds its finding of `name`.
     fn drop_finder(&mut self, holder: &str, name: WorkName) {
-        let slot = self.names.get_mut(&name).expect("registered");
-        slot.finders.remove(holder);
-        if slot.prefer.as_deref() == Some(holder) {
-            slot.prefer = None;
+        if let Some(slot) = self.names.get_mut(&name) {
+            slot.finders.remove(holder);
+            if slot.prefer.as_deref() == Some(holder) {
+                slot.prefer = None;
+            }
         }
         if let Some(h) = self.holders.get_mut(holder) {
             h.findings.remove(&name);
@@ -1092,7 +1180,7 @@ impl WorkSet {
         if let Some(holder) = self.holders.get_mut(from) {
             holder.heard = now;
         }
-        if self.phase == Phase::Done && from != self.lead {
+        if self.phase == Phase::Done && from != self.lead.as_str() {
             return WorkersEventsAnswer::CANCEL;
         }
         WorkersEventsAnswer::CONTINUE
@@ -1105,25 +1193,27 @@ impl WorkSet {
         if self.phase != Phase::Open {
             return;
         }
-        let silent: Vec<String> = self
-            .holders
-            .iter()
-            .filter(|(_, h)| now > h.heard + self.config.lease_ms)
-            .map(|(id, _)| id.clone())
-            .collect();
+        let silent = Vec::from_iter_in(
+            self.holders
+                .iter()
+                .filter(|(_, h)| now > h.heard + self.config.lease_ms)
+                .map(|(id, _)| WireString::from_str_in(id.as_str(), self.alloc)),
+            self.alloc,
+        );
         for holder in silent {
-            self.lose(&holder, FenceWhy::Expired, out);
+            self.lose(holder.as_str(), FenceWhy::Expired, out);
         }
         let timeout = self.progress_timeout();
-        let hung: Vec<String> = self
-            .live
-            .iter()
-            .map(|g| &self.leases[g])
-            .filter(|issued| now > issued.granted_at + timeout)
-            .map(|issued| issued.holder.clone())
-            .collect();
+        let hung = Vec::from_iter_in(
+            self.live
+                .iter()
+                .filter_map(|g| self.leases.get(g))
+                .filter(|issued| now > issued.granted_at + timeout)
+                .map(|issued| WireString::from_str_in(issued.holder.as_str(), self.alloc)),
+            self.alloc,
+        );
         for holder in hung {
-            self.lose(&holder, FenceWhy::Hung, out);
+            self.lose(holder.as_str(), FenceWhy::Hung, out);
         }
         self.check_done(out);
     }
@@ -1146,7 +1236,7 @@ impl WorkSet {
         if let Some(generation) = slot.lease {
             self.fence(generation, why, out);
         }
-        let slot = self.holders.remove(holder).expect("present");
+        let Some(slot) = self.holders.remove(holder) else { return };
         for name in slot.findings {
             let Some(n) = self.names.get_mut(&name) else { continue };
             n.finders.remove(holder);
@@ -1159,7 +1249,10 @@ impl WorkSet {
             }
         }
         self.counters.holders_lost += 1;
-        out.push(Effect::HolderLost { holder: holder.to_owned(), why });
+        out.push(Effect::HolderLost {
+            holder: WireString::from_str_in(holder, self.alloc),
+            why,
+        });
     }
 
     /// The owned assignment is retiring. Revoke its work before its reservation can be released.
@@ -1179,7 +1272,7 @@ impl WorkSet {
         issued.live = false;
         let issued = issued.clone();
         self.live.remove(&generation);
-        if let Some(h) = self.holders.get_mut(&issued.holder)
+        if let Some(h) = self.holders.get_mut(issued.holder.as_str())
             && h.lease == Some(generation)
         {
             h.lease = None;
@@ -1187,10 +1280,15 @@ impl WorkSet {
         if why.counts() {
             self.counters.revocations += 1;
         }
-        out.push(Effect::Fenced { holder: issued.holder.clone(), generation, why });
+        out.push(Effect::Fenced {
+            holder: WireString::from_str_in(issued.holder.as_str(), self.alloc),
+            generation,
+            why,
+        });
         let bound = self.config.revocations_to_tail;
         for index in issued.roots.indexes() {
-            let slot = &mut self.roots[index as usize];
+            let Ok(idx) = usize::try_from(index) else { continue };
+            let Some(slot) = self.roots.get_mut(idx) else { continue };
             if slot.state != Slot::Held(generation) {
                 continue;
             }
@@ -1205,11 +1303,11 @@ impl WorkSet {
             }
         }
         for name in &issued.names {
-            if self.names[name].state != Slot::Held(generation) {
+            if self.names.get(name).is_none_or(|slot| slot.state != Slot::Held(generation)) {
                 continue;
             }
-            self.drop_finder(&issued.holder, *name);
-            let slot = self.names.get_mut(name).expect("held");
+            self.drop_finder(issued.holder.as_str(), *name);
+            let Some(slot) = self.names.get_mut(name) else { continue };
             if why.counts() {
                 slot.revoked += 1;
             }
@@ -1242,17 +1340,18 @@ impl WorkSet {
             }
         }
         self.waiting.clear();
-        let live: Vec<u64> = self.live.iter().copied().collect();
+        let live = Vec::from_iter_in(self.live.iter().copied(), self.alloc);
         for generation in live {
             self.fence(generation, FenceWhy::AttemptMoved, out);
         }
-        for holder in std::mem::take(&mut self.holders).into_keys() {
+        let old_holders = mem::replace(&mut self.holders, BTreeMap::new_in(self.alloc));
+        for (holder, _) in old_holders {
             self.counters.holders_lost += 1;
             out.push(Effect::HolderLost { holder, why: FenceWhy::AttemptMoved });
         }
         self.refused.clear();
         self.attempt = attempt;
-        self.lead = lead.to_owned();
+        self.lead = WireString::from_str_in(lead, self.alloc);
         self.check_done(out);
     }
 
@@ -1263,7 +1362,7 @@ impl WorkSet {
         if self.phase != Phase::Open {
             return;
         }
-        let live: Vec<u64> = self.live.iter().copied().collect();
+        let live = Vec::from_iter_in(self.live.iter().copied(), self.alloc);
         for generation in live {
             self.fence(generation, FenceWhy::Ended, out);
         }
@@ -1296,7 +1395,9 @@ impl WorkSet {
     ) -> Vec<WorkName, A> {
         let mut committed = Vec::new_in(alloc.clone());
         let Some(issued) = self.leases.get(&request.lease.generation) else { return committed };
-        let Ok((roots, names, _, _)) = shape(issued, request, &alloc) else { return committed };
+        let Ok((roots, names, _, _)) = shape(issued, request, &alloc, self.alloc) else {
+            return committed;
+        };
         let accepted = |slot: &Slot, item: &ItemResult| {
             matches!(slot,
             Slot::Done(Terminal::Committed { outcome, by })
@@ -1304,19 +1405,25 @@ impl WorkSet {
                     && *outcome == item.outcome && by.holder == request.lease.holder
                     && by.generation == request.lease.generation && by.seq == request.seq)
         };
-        let root_count = roots.len() as usize;
-        committed.extend(roots
-            .indexes()
-            .zip(&request.items[..root_count])
-            .filter_map(|(index, item)| {
-                self.roots
-                    .get(index as usize)
-                    .filter(|slot| accepted(&slot.state, item))
-                    .map(|_| item.name)
-            })
-            .chain(names.iter().zip(&request.items[root_count..]).filter_map(|(name, item)| {
-                self.names.get(name).filter(|slot| accepted(&slot.state, item)).map(|_| item.name)
-            })));
+        let Ok(root_count) = usize::try_from(roots.len()) else { return committed };
+        let Some((root_slice, name_slice)) = request.items.split_at_checked(root_count) else {
+            return committed;
+        };
+        committed.extend(
+            roots
+                .indexes()
+                .zip(root_slice)
+                .filter_map(|(index, item)| {
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(|idx| self.roots.get(idx))
+                        .filter(|slot| accepted(&slot.state, item))
+                        .map(|_| item.name)
+                })
+                .chain(names.iter().zip(name_slice).filter_map(|(name, item)| {
+                    self.names.get(name).filter(|slot| accepted(&slot.state, item)).map(|_| item.name)
+                })),
+        );
         committed
     }
 
@@ -1326,18 +1433,30 @@ impl WorkSet {
             Slot::Done(t) => Some(t.clone()),
             _ => None,
         };
+        let mut names = BTreeMap::new_in(self.alloc);
+        for (n, s) in &self.names {
+            names.insert(*n, (s.tuple, terminal(&s.state)));
+        }
+        let mut edges = BTreeMap::new_in(self.alloc);
+        for (e, s) in &self.edges {
+            edges.insert(
+                *e,
+                (
+                    s.parent,
+                    s.ordinal,
+                    Terminal::Tail(TailWhy::Unnamed(WireString::from_str_in(
+                        s.why.as_str(),
+                        self.alloc,
+                    ))),
+                ),
+            );
+        }
         Report {
             fixed: self.fixed.clone(),
             epoch: self.epoch,
-            roots: self.roots.iter().map(|r| terminal(&r.state)).collect(),
-            names: self.names.iter().map(|(n, s)| (*n, (s.tuple, terminal(&s.state)))).collect(),
-            edges: self
-                .edges
-                .iter()
-                .map(|(e, s)| {
-                    (*e, (s.parent, s.ordinal, Terminal::Tail(TailWhy::Unnamed(s.why.clone()))))
-                })
-                .collect(),
+            roots: Vec::from_iter_in(self.roots.iter().map(|r| terminal(&r.state)), self.alloc),
+            names,
+            edges,
             packs: self.packs.clone(),
             done: self.phase == Phase::Done,
         }
@@ -1356,45 +1475,52 @@ enum ShapeError {
     NameOrder,
 }
 
-impl std::fmt::Display for ShapeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ShapeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RootRanges => f.write_str("returned roots overlap or are empty"),
             Self::UngrantedRoots => f.write_str("returned roots that were not granted"),
             Self::UngrantedNames => f.write_str("returned names that were not granted"),
-            Self::ItemCount { actual, processed } => write!(f, "{actual} items for {processed} processed"),
+            Self::ItemCount { actual, processed } => {
+                write!(f, "{actual} items for {processed} processed")
+            }
             Self::NameOrder => f.write_str("name items out of the grant's order"),
         }
     }
 }
 
-impl std::error::Error for ShapeError {}
+impl core::error::Error for ShapeError {}
 
 #[allow(clippy::type_complexity)]
-fn shape<A: AllocatorClone>(
+fn shape<A: Allocator + Clone>(
     issued: &Issued,
     req: &BatchResult,
     alloc: A,
+    wire_alloc: WireAlloc,
 ) -> Result<(Ranges, Vec<WorkName, A>, Ranges, BTreeSet<WorkName, A>), ShapeError> {
-    let returned_roots = Ranges::from_wire(&req.returned_roots)
-        .ok_or(ShapeError::RootRanges)?;
+    let returned_roots =
+        Ranges::from_wire(&req.returned_roots, wire_alloc).ok_or(ShapeError::RootRanges)?;
     if !issued.roots.contains_all(&returned_roots) {
         return Err(ShapeError::UngrantedRoots);
     }
     let mut returned_names = BTreeSet::new_in(alloc.clone());
     returned_names.extend(req.returned_names.iter().copied());
-    if !returned_names.iter().all(|n| issued.names.contains(n)) {
+    if !returned_names.iter().all(|n| issued.names.scan_for(n).is_some()) {
         return Err(ShapeError::UngrantedNames);
     }
     let processed_roots = issued.roots.minus(&returned_roots);
     let mut processed_names = Vec::new_in(alloc);
     processed_names.extend(issued.names.iter().filter(|n| !returned_names.contains(n)).copied());
-    let want = processed_roots.len() as usize + processed_names.len();
+    let roots_done = usize::try_from(processed_roots.len()).map_err(|_| ShapeError::RootRanges)?;
+    let want = roots_done.saturating_add(processed_names.len());
     if req.items.len() != want {
         return Err(ShapeError::ItemCount { actual: req.items.len(), processed: want });
     }
-    let roots_done = processed_roots.len() as usize;
-    for (item, name) in req.items[roots_done..].iter().zip(&processed_names) {
+    let name_items = req.items.get(roots_done..).ok_or(ShapeError::ItemCount {
+        actual: req.items.len(),
+        processed: want,
+    })?;
+    for (item, name) in name_items.iter().zip(&processed_names) {
         if item.name != *name {
             return Err(ShapeError::NameOrder);
         }

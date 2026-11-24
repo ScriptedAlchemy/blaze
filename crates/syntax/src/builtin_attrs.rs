@@ -739,11 +739,18 @@ blaze_phf::phf_table! {
 mod tests {
     use super::{INERT_ATTRIBUTES, find, is_built_in};
 
-    fn lookup_problem(lookup: impl Fn(&str) -> Option<usize>) -> Option<String> {
+    #[derive(Debug, PartialEq, Eq)]
+    enum LookupProblem {
+        WrongRow(&'static str, usize),
+        NearDisagrees,
+        UnexpectedHit(&'static str),
+    }
+
+    fn lookup_problem(lookup: impl Fn(&str) -> Option<usize>) -> Option<LookupProblem> {
         for (at, attr) in INERT_ATTRIBUTES.iter().enumerate() {
             let name = attr.name;
             if lookup(name) != Some(at) {
-                return Some(format!("{name} was not found at its row {at}"));
+                return Some(LookupProblem::WrongRow(name, at));
             }
             for near in [
                 format!("{name}_"),
@@ -754,13 +761,13 @@ mod tests {
             ] {
                 let by_text = INERT_ATTRIBUTES.iter().position(|it| it.name == near);
                 if lookup(&near) != by_text {
-                    return Some(format!("{near} disagrees with its row {by_text:?}"));
+                    return Some(LookupProblem::NearDisagrees);
                 }
             }
         }
         for other in ["", "derive", "macro_rules", "not_an_attribute", "test", "rustfmt"] {
             if lookup(other).is_some() {
-                return Some(format!("{other} has no row but was found"));
+                return Some(LookupProblem::UnexpectedHit(other));
             }
         }
         None
@@ -783,7 +790,7 @@ mod tests {
         // The lookup still recognizes every name, but points to the next attribute's data.
         let problem = lookup_problem(|name| find(name).map(|at| (at + 1) % INERT_ATTRIBUTES.len()))
             .expect("the oracle missed a shifted row");
-        assert!(problem.contains("was not found at its row"), "{problem}");
+        assert!(matches!(problem, LookupProblem::WrongRow(..)), "{problem:?}");
     }
 
     /// rustc's own names are built in whether or not the table has them; a path is not.

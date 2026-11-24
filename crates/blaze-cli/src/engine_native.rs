@@ -832,15 +832,24 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
         return Ok(None);
     }
     // Collect every Rust C export (unmangled name -> fn symbol), sorted by name for `native_merge`.
+    // Only exports actually referenced by `image.words` become mandatory `run_roots` items
+    // (matching `send_of` and `ExportNative::items`'s contract; unused `compiler_builtins`
+    // exports are never forced into the executable root set).
     let mut exports: AVec<'s, blaze_export::CExport<'s>> = Vec::new_in(alloc);
     let mut items: AVec<'s, blaze_id::ItemKey> = Vec::new_in(alloc);
+    let strip_underscore = matches!(prepared.platform, blaze_native::Platform::MacosArm64);
     for table in tables.iter() {
         for export in table.exports.iter() {
             let checker = blaze_ladder::front2::keys::checker_of(export.item);
             let symbol = blaze_ladder::symbols::fn_symbol(checker, blaze_typeck::List::EMPTY, blaze_typeck::PTys::EMPTY, alloc)
                 .map_err(|why| NativeError::Send { words: held(bstd::mem::format_in!(out_frame, "export `{}` symbol: {why:?}", export.name).as_str(), ask) })?;
-            exports.push(blaze_export::CExport { name: export.name.as_bytes(), symbol });
-            if items.scan_for(&export.item).is_none() {
+            let name = export.name.as_bytes();
+            exports.push(blaze_export::CExport { name, symbol });
+            let needed_by_word = image.words.iter().any(|word| {
+                let unmangled = if strip_underscore { word.strip_prefix(b"_") } else { Some(*word) };
+                unmangled == Some(name)
+            });
+            if needed_by_word && items.scan_for(&export.item).is_none() {
                 items.push(export.item);
             }
         }

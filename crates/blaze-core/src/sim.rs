@@ -4346,14 +4346,14 @@ mod tests {
                     }
                     Fault::Held | Fault::Released => {
                         sim.submit(&mut vec![sync]);
-                        let mut completed = Vec::new();
+                        let mut completed = Default::default();
                         sim.advance(Duration::from_secs(1));
                         sim.poll(&mut completed, Deadline::PASSED);
                         assert!(completed.is_empty());
                         assert_eq!(sim.held_syncs(), 1);
                         if matches!(fault, Fault::Released) {
                             sim.release_held(Duration::ZERO);
-                            assert_eq!(ran(&mut sim, Vec::new())[&Tag(2)], Done::Synced);
+                            assert_eq!(ran(&mut sim, Default::default())[&Tag(2)], Done::Synced);
                         }
                     }
                 }

@@ -1,8 +1,12 @@
 //! The native full-manifest format shared by the agent and the cache server: exactly
 //! `<pack sha256> <byte length> <keys digest>\n` per pack, with an empty list valid.
 
-use std::alloc::Allocator;
-use std::io::Write as _;
+use core::alloc::Allocator;
+use core::fmt::{self, Write as _};
+use core::num::ParseIntError;
+use core::str::Utf8Error;
+
+use blaze_own::Vec;
 
 use crate::{DIST_PACK_FORMAT, DIST_PACK_MAGIC, Digest, Limits, PackRef};
 
@@ -12,7 +16,7 @@ pub enum DecodeErrorKind {
     /// The entire manifest exceeds the advertised wire limit.
     RequestLimit,
     /// A manifest's bytes are not UTF-8.
-    Utf8(std::str::Utf8Error),
+    Utf8(Utf8Error),
     /// The final record has no line terminator.
     LineTerminator,
     /// A record exceeds the maximum lengths of its three fields.
@@ -26,7 +30,7 @@ pub enum DecodeErrorKind {
     /// The byte length is not a canonical unsigned decimal.
     LengthSyntax,
     /// A decimal byte length exceeds its wire representation.
-    LengthOverflow(std::num::ParseIntError),
+    LengthOverflow(ParseIntError),
     /// A pack cannot contain even its header.
     ShortPack,
     /// The keys digest field is absent.
@@ -50,8 +54,8 @@ pub struct DecodeError {
     pub kind: DecodeErrorKind,
 }
 
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(line) = self.line {
             write!(f, "pack list line {line}: ")?;
         } else {
@@ -77,8 +81,8 @@ impl std::fmt::Display for DecodeError {
     }
 }
 
-impl std::error::Error for DecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match &self.kind {
             DecodeErrorKind::Utf8(source) => Some(source),
             DecodeErrorKind::LengthOverflow(source) => Some(source),
@@ -87,19 +91,28 @@ impl std::error::Error for DecodeError {
     }
 }
 
+struct VecWriter<'a, A: Allocator>(&'a mut Vec<u8, A>);
+
+impl<A: Allocator> fmt::Write for VecWriter<'_, A> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+}
+
 /// Render the native list, whose references use the current raw pack format. Order is kept:
 /// callers canonicalize their set before its attempt-owned commit.
 pub fn encode<A: Allocator>(packs: &[PackRef], alloc: A) -> Vec<u8, A> {
     let mut out = Vec::new_in(alloc);
+    let mut writer = VecWriter(&mut out);
     for pack in packs {
-        writeln!(
-            out,
+        let _ = writeln!(
+            writer,
             "{} {} {}",
             crate::json::hex(&pack.pack),
             pack.size,
             crate::json::hex(&pack.keys)
-        )
-        .expect("writing bytes to a vector");
+        );
     }
     out
 }
@@ -112,7 +125,8 @@ fn digest(text: &str) -> Option<Digest> {
         return None;
     }
     for (at, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[at * 2..at * 2 + 2], 16).ok()?;
+        let pair = text.get(at * 2..at * 2 + 2)?;
+        *byte = u8::from_str_radix(pair, 16).ok()?;
     }
     Some(out)
 }
@@ -123,16 +137,17 @@ pub fn decode<A: Allocator>(bytes: &[u8], alloc: A) -> Result<Vec<PackRef, A>, D
     if bytes.is_empty() {
         return Ok(Vec::new_in(alloc));
     }
-    if bytes.len() > Limits::DOCUMENTED.request as usize {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > u64::from(Limits::DOCUMENTED.request) {
         return Err(DecodeError { line: None, kind: DecodeErrorKind::RequestLimit });
     }
-    let text = std::str::from_utf8(bytes)
+    let text = core::str::from_utf8(bytes)
         .map_err(|source| DecodeError { line: None, kind: DecodeErrorKind::Utf8(source) })?;
     if !text.is_empty() && !text.ends_with('\n') {
         return Err(DecodeError { line: None, kind: DecodeErrorKind::LineTerminator });
     }
     let mut packs = Vec::new_in(alloc);
     let mut previous = None;
+    let min_pack = u64::try_from(DIST_PACK_MAGIC.len()).unwrap_or(0);
     for (at, line) in text.split_terminator('\n').enumerate() {
         let bad = |kind| DecodeError { line: Some(at + 1), kind };
         if line.len() > 151 {
@@ -148,9 +163,9 @@ pub fn decode<A: Allocator>(bytes: &[u8], alloc: A) -> Result<Vec<PackRef, A>, D
         {
             return Err(bad(DecodeErrorKind::LengthSyntax));
         }
-        let size: u64 = length.parse()
-            .map_err(|source| bad(DecodeErrorKind::LengthOverflow(source)))?;
-        if size < DIST_PACK_MAGIC.len() as u64 {
+        let size: u64 =
+            length.parse().map_err(|source| bad(DecodeErrorKind::LengthOverflow(source)))?;
+        if size < min_pack {
             return Err(bad(DecodeErrorKind::ShortPack));
         }
         let keys = digest(fields.next().ok_or_else(|| bad(DecodeErrorKind::MissingKeys))?)
@@ -172,26 +187,36 @@ pub fn decode<A: Allocator>(bytes: &[u8], alloc: A) -> Result<Vec<PackRef, A>, D
 
 #[cfg(test)]
 mod tests {
+    use core::error::Error as _;
+
+    use blaze_own::{String, format_in};
+
     use super::*;
-    use std::alloc::Global;
-    use std::error::Error as _;
 
     #[test]
     fn refusals_retain_the_record_and_the_parsing_cause() {
-        let invalid_utf8 = decode(&[0xff], Global).unwrap_err();
+        let alloc = blaze_own::testing::heap().shared();
+        let invalid_utf8 = decode(&[0xff], alloc).unwrap_err();
         assert_eq!(invalid_utf8.line, None);
         assert!(matches!(invalid_utf8.kind, DecodeErrorKind::Utf8(_)));
         assert!(invalid_utf8.source().is_some());
 
-        let first = format!("{} 80 {}\n", "ab".repeat(32), "cd".repeat(32));
-        let repeated = decode(format!("{first}{first}").as_bytes(), Global).unwrap_err();
+        let mut ab = String::with_capacity_in(64, alloc);
+        let mut cd = String::with_capacity_in(64, alloc);
+        for _ in 0..32 {
+            ab.push_str("ab");
+            cd.push_str("cd");
+        }
+        let first = format_in!(alloc, "{ab} 80 {cd}\n");
+        let two = format_in!(alloc, "{first}{first}");
+        let repeated = decode(two.as_bytes(), alloc).unwrap_err();
         assert_eq!(repeated.line, Some(2));
         assert_eq!(repeated.kind, DecodeErrorKind::DuplicatePack);
-        let overflow = decode(first.replace(" 80 ", " 18446744073709551616 ").as_bytes(), Global)
-            .unwrap_err();
+        let big = format_in!(alloc, "{ab} 18446744073709551616 {cd}\n");
+        let overflow = decode(big.as_bytes(), alloc).unwrap_err();
         assert_eq!(overflow.line, Some(1));
         assert!(matches!(overflow.kind, DecodeErrorKind::LengthOverflow(_)));
         assert!(overflow.source().is_some());
-        assert!(decode(first.as_bytes(), Global).is_ok());
+        assert!(decode(first.as_bytes(), alloc).is_ok());
     }
 }

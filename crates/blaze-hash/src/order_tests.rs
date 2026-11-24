@@ -36,11 +36,12 @@ unsafe impl Allocator for Counted<'_> {
     }
 }
 
-fn contents_agree(map: &IndexMap<u8, u32, Global>, model: &[(u8, u32)]) -> Result<(), String> {
-    // alloc: what the map iterates, to compare with the model
-    let held: Vec<(u8, u32)> = map.iter().map(|(&key, &value)| (key, value)).collect();
-    if held != model {
-        return Err(format!("the map iterates {held:?}, the model {model:?}"));
+fn contents_agree<A: Allocator + Clone>(
+    map: &IndexMap<u8, u32, A>,
+    model: &[(u8, u32)],
+) -> Result<(), String> {
+    if !map.iter().map(|(&key, &value)| (key, value)).eq(model.iter().copied()) {
+        return Err(format!("the map iterates {map:?}, the model {model:?}"));
     }
     for (at, &(key, value)) in model.iter().enumerate() {
         if map.get_full(&key) != Some((at, &key, &value)) || map.get_index(at) != Some((&key, &value)) {

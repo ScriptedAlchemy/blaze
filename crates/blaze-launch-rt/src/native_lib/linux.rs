@@ -5,6 +5,7 @@
 use core::ffi::{c_int, c_void};
 
 use blaze_launch::wire::RecordId;
+use libc::{Elf64_Half, PT_TLS, dl_iterate_phdr, dl_phdr_info};
 
 use super::{NativeError, ThreadData};
 
@@ -15,10 +16,10 @@ struct Find {
     tls: Option<ThreadData>,
 }
 
-unsafe extern "C" fn visit(info: *mut libc::dl_phdr_info, size: usize, data: *mut c_void) -> c_int {
+unsafe extern "C" fn visit(info: *mut dl_phdr_info, size: usize, data: *mut c_void) -> c_int {
     // The four original dl_phdr_info fields, present since this API was introduced. Later
     // libc versions append fields; none is read here.
-    if size < core::mem::offset_of!(libc::dl_phdr_info, dlpi_phnum) + size_of::<libc::Elf64_Half>() {
+    if size < core::mem::offset_of!(dl_phdr_info, dlpi_phnum) + size_of::<Elf64_Half>() {
         return 0;
     }
     // SAFETY: data is our live Find. Read only the checked prefix through raw field pointers:
@@ -37,7 +38,7 @@ unsafe extern "C" fn visit(info: *mut libc::dl_phdr_info, size: usize, data: *mu
     for index in 0..usize::from(count) {
         // SAFETY: ld.so's counted program-header array is readable throughout this callback.
         let header = unsafe { &*headers.add(index) };
-        if header.p_type == libc::PT_TLS {
+        if header.p_type == PT_TLS {
             if find.tls.is_some() || header.p_vaddr.checked_add(header.p_memsz).is_none() {
                 find.malformed = true;
                 return 1;
@@ -53,7 +54,7 @@ pub(super) fn thread_data(record: RecordId, base: u64) -> Result<Option<ThreadDa
     // SAFETY: the callback keeps no loader pointer and writes only this stack local; ld.so
     // calls it synchronously. The native_so writer's first PT_LOAD has vaddr 0, so dladdr's
     // image base is this object's dlpi_addr (its load bias).
-    unsafe { libc::dl_iterate_phdr(Some(visit), (&raw mut find).cast()) };
+    unsafe { dl_iterate_phdr(Some(visit), (&raw mut find).cast()) };
     if !find.found {
         return Err(NativeError::Layout { record, what: "ld.so listed no image at the descriptor's base" });
     }

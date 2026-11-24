@@ -8,9 +8,9 @@
 //! atomics as cells of the world threads share (`lean/Blaze/Atomic.lean`).
 
 #[cfg(not(test))]
-pub use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
+pub use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 
 #[cfg(test)]
 pub use crate::world::threads::scheduled::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 
-pub use std::sync::atomic::Ordering;
+pub use core::sync::atomic::Ordering;

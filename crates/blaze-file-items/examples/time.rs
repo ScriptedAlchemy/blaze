@@ -39,8 +39,20 @@ fn cpu() -> f64 {
     time.seconds as f64 + time.nanoseconds as f64 * 1e-9
 }
 
-/// The machine's one-minute load average, as text.
-fn load() -> std::string::String {
+/// The machine's one-minute load average, formatted on demand.
+struct Load(Option<f64>);
+
+impl core::fmt::Display for Load {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(v) => write!(f, "{v:.1}"),
+            None => f.write_str("unknown"),
+        }
+    }
+}
+
+/// The machine's one-minute load average.
+fn load() -> Load {
     unsafe extern "C" {
         fn getloadavg(averages: *mut f64, count: i32) -> i32;
     }
@@ -48,10 +60,7 @@ fn load() -> std::string::String {
     // SAFETY: `getloadavg` (macOS and Linux libc, which std links) writes at most `count`
     // doubles to `averages`, which holds three.
     let got = unsafe { getloadavg(averages.as_mut_ptr(), 3) };
-    match got {
-        1.. => format!("{:.1}", averages[0]),
-        _ => std::string::String::from("unknown"),
-    }
+    Load((got >= 1).then_some(averages[0]))
 }
 
 fn main() {
@@ -116,7 +125,7 @@ fn main() {
     }
     // `outline` over everything, best of five, with the machine's load average when the best
     // round ended.
-    let mut best = (f64::MAX, std::string::String::new());
+    let mut best = (f64::MAX, Load(None));
     let (mut best_cpu, mut count) = (f64::MAX, 0usize);
     for _ in 0..5 {
         let (start, start_cpu) = (Instant::now(), cpu());

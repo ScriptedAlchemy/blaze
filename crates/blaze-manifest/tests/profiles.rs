@@ -14,30 +14,13 @@ mod fixture_paths;
 
 use std::path::Path;
 
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let name = entry.file_name();
-        if name == "expected.json" || name == "case.json" {
-            continue;
-        }
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &to.join(&name));
-        } else {
-            std::fs::copy(entry.path(), to.join(&name)).unwrap();
-        }
-    }
-}
-
 /// The error of `stderr`, as `expected.json` records it.
 fn error_text(stderr: &str) -> String {
-    let lines: Vec<&str> = stderr.lines().collect();
-    let start = lines.iter().position(|l| l.starts_with("error")).unwrap_or(lines.len());
-    lines[start..]
-        .iter()
+    stderr
+        .lines()
+        .skip_while(|l| !l.starts_with("error"))
         .filter(|l| !l.trim().is_empty())
-        .map(|l| l.trim_end())
+        .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -59,7 +42,7 @@ fn strings(value: &serde_json::Value) -> Vec<String> {
 fn check(fixture: &Path, scratch: &Path) -> (usize, Vec<String>) {
     let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
     let root = scratch.join(&name);
-    copy_dir(fixture, &root);
+    fixture_paths::copy_dir(fixture, &root, &["expected.json", "case.json"]);
     let root = fixture_paths::canonicalize(&root);
     let home = scratch.join("cargo-home");
     std::fs::create_dir_all(&home).unwrap();

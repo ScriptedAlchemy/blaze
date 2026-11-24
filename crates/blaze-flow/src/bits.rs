@@ -31,27 +31,35 @@ impl<A: Allocator> Bits<A> {
     }
 
     pub fn get(&self, r: usize, c: usize) -> bool {
-        self.data[r * self.words + c / 64] >> (c % 64) & 1 == 1
+        self.data.get(r * self.words + c / 64).is_some_and(|&w| (w >> (c % 64)) & 1 == 1)
     }
 
     /// Sets the bit; says whether it was clear.
     pub fn set(&mut self, r: usize, c: usize) -> bool {
-        let w = &mut self.data[r * self.words + c / 64];
+        let Some(w) = self.data.get_mut(r * self.words + c / 64) else {
+            return false;
+        };
         let was = *w;
         *w |= 1 << (c % 64);
         *w != was
     }
 
     pub fn clear(&mut self, r: usize, c: usize) {
-        self.data[r * self.words + c / 64] &= !(1 << (c % 64));
+        if let Some(w) = self.data.get_mut(r * self.words + c / 64) {
+            *w &= !(1 << (c % 64));
+        }
     }
 
     /// Row `dst` |= row `src`; says whether `dst` grew.
     pub fn union_rows(&mut self, dst: usize, src: usize) -> bool {
         let mut grew = false;
         for i in 0..self.words {
-            let s = self.data[src * self.words + i];
-            let d = &mut self.data[dst * self.words + i];
+            let Some(&s) = self.data.get(src * self.words + i) else {
+                break;
+            };
+            let Some(d) = self.data.get_mut(dst * self.words + i) else {
+                break;
+            };
             let was = *d;
             *d |= s;
             grew |= *d != was;
@@ -83,14 +91,16 @@ pub fn intersect_into(dst: &mut [u64], src: &[u64]) -> bool {
 }
 
 pub fn test(row: &[u64], c: usize) -> bool {
-    row[c / 64] >> (c % 64) & 1 == 1
+    row.get(c / 64).is_some_and(|&w| (w >> (c % 64)) & 1 == 1)
 }
 
 pub fn put(row: &mut [u64], c: usize, on: bool) {
-    if on {
-        row[c / 64] |= 1 << (c % 64);
-    } else {
-        row[c / 64] &= !(1 << (c % 64));
+    if let Some(w) = row.get_mut(c / 64) {
+        if on {
+            *w |= 1 << (c % 64);
+        } else {
+            *w &= !(1 << (c % 64));
+        }
     }
 }
 
@@ -131,7 +141,9 @@ impl<A: Allocator + Copy> BitWorklist<A> {
     #[inline]
     pub(crate) fn push(&mut self, mut index: usize) {
         for &start in &self.levels {
-            let word = &mut self.bits[start + index / 64];
+            let Some(word) = self.bits.get_mut(start + index / 64) else {
+                break;
+            };
             let was = *word;
             *word |= 1u64 << (index % 64);
             if was != 0 {
@@ -148,15 +160,22 @@ impl<A: Allocator + Copy> BitWorklist<A> {
         }
         let mut index = 0usize;
         for &start in self.levels.iter().rev() {
-            let word = self.bits[start + index];
+            let Some(&word) = self.bits.get(start + index) else {
+                return None;
+            };
             if word == 0 {
                 return None;
             }
-            index = index * 64 + word.trailing_zeros() as usize;
+            let Ok(tz) = usize::try_from(word.trailing_zeros()) else {
+                return None;
+            };
+            index = index * 64 + tz;
         }
         let rank = index;
         for &start in &self.levels {
-            let word = &mut self.bits[start + index / 64];
+            let Some(word) = self.bits.get_mut(start + index / 64) else {
+                break;
+            };
             *word &= !(1u64 << (index % 64));
             if *word != 0 {
                 break;

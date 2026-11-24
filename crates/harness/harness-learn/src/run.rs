@@ -242,8 +242,7 @@ impl Run {
             Step::Read { .. } => true,
             Step::Choice { answer, .. } => self.picked == Some(*answer),
             Step::Fill { answer, accept, .. } => {
-                let typed = plain(&self.typed);
-                std::iter::once(answer).chain(accept).any(|a| plain(a).eq(typed.clone()))
+                std::iter::once(answer).chain(accept).any(|a| plain(a).eq(plain(&self.typed)))
             }
             Step::Order { .. } => self.order.iter().enumerate().all(|(i, &x)| i == x),
         }

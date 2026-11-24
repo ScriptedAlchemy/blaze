@@ -149,12 +149,8 @@ fn whole_f32(tape: &Tape, label: &'static str) -> f32 {
 
 /// How many times the second float kind halves its whole number: from 1 to `fraction_bits`
 /// (the float's fraction width), so the result keeps every bit of a small numerator.
-#[expect(
-    blaze::as_cast,
-    reason = "a draw below a fraction width (52 or 23) made into the `i32` exponent `powi` takes; every such value fits"
-)]
 fn halvings(tape: &Tape, fraction_bits: u32, label: &'static str) -> i32 {
-    1 + tape.below(u64::from(fraction_bits), label) as i32
+    1 + i32::try_from(tape.below(u64::from(fraction_bits), label)).unwrap_or(i32::MAX)
 }
 
 /// Where a float lies for `f64_finite` and `f32_finite`: finite, or past one end of the finite

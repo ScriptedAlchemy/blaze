@@ -10,11 +10,11 @@
 //! beside the old one only if both fit; otherwise the old one
 //! drains first. Past `Q` waiting jobs a platform answers `busy`.
 
-use std::alloc::{Allocator, Global};
-use std::collections::{BTreeMap, VecDeque};
-use std::io::Write as _;
+use core::alloc::Allocator;
+use core::fmt;
 
-use blaze_wire::{Attempt, Digest, ExecutionId, Namespace, Reservation};
+use blaze_own::{BTreeMap, Box, String, Vec, VecDeque, format_in};
+use blaze_wire::{Attempt, Digest, ExecutionId, Namespace, Reservation, WireAlloc, WireString};
 
 use crate::{Millis, Refusal};
 
@@ -29,13 +29,17 @@ pub struct CapacityExceeded<'a> {
     pub capacity: &'a Reservation,
 }
 
-impl std::fmt::Display for CapacityExceeded<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "machine {} holds {:?}, past its capacity {:?}", self.machine, self.used, self.capacity)
+impl fmt::Display for CapacityExceeded<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "machine {} holds {:?}, past its capacity {:?}",
+            self.machine, self.used, self.capacity
+        )
     }
 }
 
-impl std::error::Error for CapacityExceeded<'_> {}
+impl core::error::Error for CapacityExceeded<'_> {}
 
 /// Admission's bounds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,9 +107,9 @@ pub enum ExecutorPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutorSlot {
     /// Its id.
-    pub id: String,
+    pub id: WireString,
     /// The machine it runs on.
-    pub machine: String,
+    pub machine: WireString,
     /// The namespace that created the slot, for lifecycle bookkeeping, not an access boundary.
     pub namespace: Namespace,
     /// What it holds on its machine.
@@ -134,18 +138,19 @@ pub struct Admitted<A: Allocator> {
 
 impl<A: Allocator + Clone> Clone for Admitted<A> {
     fn clone(&self) -> Self {
+        let alloc = Box::allocator(&self.executor).clone();
         Self {
             execution: self.execution,
             namespace: self.namespace.clone(),
             platform: self.platform,
-            executor: self.executor.clone(),
+            executor: box_str(&self.executor, alloc),
             created: self.created,
         }
     }
 }
 
-impl<A: Allocator> std::fmt::Debug for Admitted<A> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<A: Allocator> fmt::Debug for Admitted<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Admitted")
             .field("execution", &self.execution)
             .field("namespace", &self.namespace)
@@ -168,15 +173,19 @@ impl<A: Allocator, B: Allocator> PartialEq<Admitted<B>> for Admitted<A> {
 
 impl<A: Allocator> Eq for Admitted<A> {}
 
-#[derive(Clone, Debug)]
-struct Queue {
-    main: VecDeque<Waiting>,
-    pr: VecDeque<Waiting>,
+fn box_str<A: Allocator>(text: &str, alloc: A) -> Box<str, A> {
+    String::from_str_in(text, alloc).into_boxed_str()
 }
 
-impl Default for Queue {
-    fn default() -> Self {
-        Self { main: VecDeque::new_in(Global), pr: VecDeque::new_in(Global) }
+#[derive(Clone, Debug)]
+struct Queue {
+    main: VecDeque<Waiting, WireAlloc>,
+    pr: VecDeque<Waiting, WireAlloc>,
+}
+
+impl Queue {
+    fn new(alloc: WireAlloc) -> Self {
+        Self { main: VecDeque::new_in(alloc), pr: VecDeque::new_in(alloc) }
     }
 }
 
@@ -189,12 +198,13 @@ struct Machine {
 /// Admission over a fleet's machines.
 #[derive(Clone, Debug)]
 pub struct Admission {
+    alloc: WireAlloc,
     config: AdmissionConfig,
-    machines: BTreeMap<String, Machine>,
-    executors: BTreeMap<String, ExecutorSlot>,
-    queues: BTreeMap<Digest, Queue>,
+    machines: BTreeMap<WireString, Machine, WireAlloc>,
+    executors: BTreeMap<WireString, ExecutorSlot, WireAlloc>,
+    queues: BTreeMap<Digest, Queue, WireAlloc>,
     /// Rebuilds that wait for their old builder to drain: the old one and the new reservation.
-    rebuilds: BTreeMap<String, Reservation>,
+    rebuilds: BTreeMap<WireString, Reservation, WireAlloc>,
     next_executor: u64,
 }
 
@@ -211,20 +221,22 @@ fn covers(held: &Reservation, need: &Reservation) -> bool {
 
 impl Admission {
     /// No machine yet.
-    pub fn new(config: AdmissionConfig) -> Admission {
+    pub fn new(config: AdmissionConfig, alloc: WireAlloc) -> Admission {
         Admission {
+            alloc,
             config,
-            machines: BTreeMap::new_in(Global),
-            executors: BTreeMap::new_in(Global),
-            queues: BTreeMap::new_in(Global),
-            rebuilds: BTreeMap::new_in(Global),
+            machines: BTreeMap::new_in(alloc),
+            executors: BTreeMap::new_in(alloc),
+            queues: BTreeMap::new_in(alloc),
+            rebuilds: BTreeMap::new_in(alloc),
             next_executor: 1,
         }
     }
 
     /// A machine and its declared capacity.
     pub fn add_machine(&mut self, name: &str, platform: Digest, capacity: Reservation) {
-        self.machines.insert(Box::clone_from_ref_in(name, Global).into_string(), Machine { platform, capacity });
+        self.machines
+            .insert(WireString::from_str_in(name, self.alloc), Machine { platform, capacity });
     }
 
     /// The capacity of a machine.
@@ -241,7 +253,7 @@ impl Admission {
     pub fn used(&self, machine: &str) -> Reservation {
         let mut used = Reservation { memory: 0, cpus: 0, disk: 0 };
         for e in self.executors.values() {
-            if e.machine == machine && e.phase != ExecutorPhase::Stopped {
+            if e.machine.as_str() == machine && e.phase != ExecutorPhase::Stopped {
                 used.memory += e.reservation.memory;
                 used.cpus += e.reservation.cpus;
                 used.disk += e.reservation.disk;
@@ -252,7 +264,7 @@ impl Admission {
 
     /// The machines' names.
     pub fn machines(&self) -> impl Iterator<Item = &str> {
-        self.machines.keys().map(String::as_str)
+        self.machines.keys().map(WireString::as_str)
     }
 
     /// The executors.
@@ -281,23 +293,22 @@ impl Admission {
         if !fits(&self.used(machine), &reservation, &m.capacity) {
             return None;
         }
-        let mut bytes = Vec::new_in(Global);
-        write!(&mut bytes, "exec:{}", self.next_executor).expect("writing an executor name to a vector");
-        let id = String::from_utf8(bytes).expect("executor names contain only ASCII");
+        let id = format_in!(self.alloc, "exec:{}", self.next_executor);
         self.next_executor += 1;
-        let slot = self.executors
-            .entry(Box::clone_from_ref_in(id.as_str(), Global).into_string())
-            .insert_entry(ExecutorSlot {
-                id,
-                machine: Box::clone_from_ref_in(machine, Global).into_string(),
+        let key = WireString::from_str_in(id.as_str(), self.alloc);
+        self.executors.insert(
+            key,
+            ExecutorSlot {
+                id: WireString::from_str_in(id.as_str(), self.alloc),
+                machine: WireString::from_str_in(machine, self.alloc),
                 namespace,
                 reservation,
                 busy: None,
                 phase: ExecutorPhase::Ready,
                 idle_since: now,
-            })
-            .into_mut();
-        Some(slot.id.as_str())
+            },
+        );
+        self.executors.get(id.as_str()).map(|slot| slot.id.as_str())
     }
 
     /// A builder on `machine`, as the operator starts one: only if it fits. Its returned
@@ -309,14 +320,14 @@ impl Admission {
         reservation: Reservation,
         alloc: A,
     ) -> Option<Box<str, A>> {
-        self.create(now, machine, Namespace::Main, reservation)
-            .map(|id| Box::clone_from_ref_in(id, alloc))
+        self.create(now, machine, Namespace::Main, reservation).map(|id| box_str(id, alloc))
     }
 
     /// Queues a job, or answers `busy` past `Q`.
     pub fn enqueue(&mut self, waiting: Waiting) -> Result<(), (Refusal, u64)> {
         let class = Class::of(&waiting.namespace);
-        let queue = self.queues.entry(waiting.platform).or_default();
+        let alloc = self.alloc;
+        let queue = self.queues.entry(waiting.platform).or_insert_with(|| Queue::new(alloc));
         if queue.main.len() + queue.pr.len() >= self.config.queue_limit {
             return Err((Refusal::Busy, self.config.busy_retry_ms));
         }
@@ -332,7 +343,7 @@ impl Admission {
         for queue in self.queues.values_mut() {
             for list in [&mut queue.main, &mut queue.pr] {
                 if let Some(at) = list.iter().position(|w| w.execution == execution) {
-                    list.remove(at);
+                    list.remove_shift(at);
                     return true;
                 }
             }
@@ -346,7 +357,7 @@ impl Admission {
     pub fn admit<A: Allocator + Clone>(&mut self, now: Millis, alloc: A) -> Vec<Admitted<A>, A> {
         // A rebuild that waits for room tries again whenever admission runs.
         let mut rebuilds = Vec::new_in(alloc.clone());
-        rebuilds.extend(self.rebuilds.keys().map(|old| Box::clone_from_ref_in(old.as_str(), alloc.clone())));
+        rebuilds.extend(self.rebuilds.keys().map(|old| box_str(old.as_str(), alloc.clone())));
         for old in rebuilds {
             self.start_rebuild(now, &old);
         }
@@ -355,19 +366,23 @@ impl Admission {
         platforms.extend(self.queues.keys().copied());
         for platform in platforms {
             loop {
-                let queue = &self.queues[&platform];
+                let Some(queue) = self.queues.get(&platform) else { break };
                 let head = match queue.main.front().or(queue.pr.front()) {
                     Some(head) => head.clone(),
                     None => break,
                 };
-                let Some((executor, created)) = self.place(now, &head, alloc.clone()) else { break };
-                let queue = self.queues.get_mut(&platform).expect("platform");
-                match Class::of(&head.namespace) {
-                    Class::Main => queue.main.pop_front(),
-                    Class::Pr => queue.pr.pop_front(),
+                let Some((executor, created)) = self.place(now, &head, alloc.clone()) else {
+                    break;
                 };
-                self.executors.get_mut(executor.as_ref()).expect("placed").busy =
-                    Some((head.execution, Attempt(1)));
+                if let Some(queue) = self.queues.get_mut(&platform) {
+                    match Class::of(&head.namespace) {
+                        Class::Main => queue.main.pop_front(),
+                        Class::Pr => queue.pr.pop_front(),
+                    };
+                }
+                if let Some(slot) = self.executors.get_mut(executor.as_ref()) {
+                    slot.busy = Some((head.execution, Attempt(1)));
+                }
                 admitted.push(Admitted {
                     execution: head.execution,
                     namespace: head.namespace,
@@ -382,7 +397,12 @@ impl Admission {
 
     /// An executor for `job`: an idle one of its lifecycle namespace on its platform, or, for a pull
     /// request, a new one where its reservation fits.
-    fn place<A: Allocator + Clone>(&mut self, now: Millis, job: &Waiting, alloc: A) -> Option<(Box<str, A>, bool)> {
+    fn place<A: Allocator + Clone>(
+        &mut self,
+        now: Millis,
+        job: &Waiting,
+        alloc: A,
+    ) -> Option<(Box<str, A>, bool)> {
         // An idle executor runs it only within what it reserved: a job never runs past its
         // executor's share of the machine.
         let idle = self.executors.values().find(|e| {
@@ -390,23 +410,28 @@ impl Admission {
                 && e.busy.is_none()
                 && e.namespace == job.namespace
                 && covers(&e.reservation, &job.need)
-                && self.machines.get(&e.machine).is_some_and(|m| m.platform == job.platform)
+                && self.machines.get(e.machine.as_str()).is_some_and(|m| m.platform == job.platform)
         });
         if let Some(e) = idle {
-            return Some((Box::clone_from_ref_in(e.id.as_str(), alloc), false));
+            return Some((box_str(e.id.as_str(), alloc), false));
         }
         if job.namespace == Namespace::Main {
             // Persistent builders are started by the operator, never on demand for a job.
             return None;
         }
         let mut machines = Vec::new_in(alloc.clone());
-        machines.extend(self.machines.iter()
-            .filter(|(_, m)| m.platform == job.platform)
-            .map(|(name, _)| Box::clone_from_ref_in(name.as_str(), alloc.clone())));
+        machines.extend(
+            self.machines
+                .iter()
+                .filter(|(_, m)| m.platform == job.platform)
+                .map(|(name, _)| box_str(name.as_str(), alloc.clone())),
+        );
         machines
             .iter()
-            .find_map(|machine| self.create(now, machine, job.namespace.clone(), job.need.clone())
-                .map(|id| Box::clone_from_ref_in(id, alloc.clone())))
+            .find_map(|machine| {
+                self.create(now, machine, job.namespace.clone(), job.need.clone())
+                    .map(|id| box_str(id, alloc.clone()))
+            })
             .map(|id| (id, true))
     }
 
@@ -427,7 +452,10 @@ impl Admission {
                     && e.namespace == *namespace
                     && covers(&e.reservation, need)
                     && !except.contains(&e.id.as_str())
-                    && self.machines.get(&e.machine).is_some_and(|m| m.platform == *platform)
+                    && self
+                        .machines
+                        .get(e.machine.as_str())
+                        .is_some_and(|m| m.platform == *platform)
             })
             .map(|e| e.id.as_str())
     }
@@ -471,14 +499,18 @@ impl Admission {
 
     /// The pull request closed: its executors are destroyed. Answers the ones that were busy,
     /// whose jobs end, with the result and its names held in `alloc`.
-    pub fn close_pr<A: Allocator + Clone>(&mut self, n: u64, alloc: A) -> Vec<(Box<str, A>, Option<(ExecutionId, Attempt)>), A> {
+    pub fn close_pr<A: Allocator + Clone>(
+        &mut self,
+        n: u64,
+        alloc: A,
+    ) -> Vec<(Box<str, A>, Option<(ExecutionId, Attempt)>), A> {
         let mut gone = Vec::new_in(alloc.clone());
         for e in self.executors.values_mut() {
             if e.namespace == Namespace::Pr(blaze_wire::PrNamespace { n })
                 && e.phase != ExecutorPhase::Stopped
             {
                 e.phase = ExecutorPhase::Stopped;
-                gone.push((Box::clone_from_ref_in(e.id.as_str(), alloc.clone()), e.busy.take()));
+                gone.push((box_str(e.id.as_str(), alloc.clone()), e.busy.take()));
             }
         }
         gone
@@ -495,7 +527,7 @@ impl Admission {
                 && now > e.idle_since + bound
             {
                 e.phase = ExecutorPhase::Stopped;
-                gone.push(Box::clone_from_ref_in(e.id.as_str(), alloc.clone()));
+                gone.push(box_str(e.id.as_str(), alloc.clone()));
             }
         }
         gone
@@ -516,23 +548,31 @@ impl Admission {
         if e.namespace != Namespace::Main || e.phase != ExecutorPhase::Ready {
             return None;
         }
-        let machine = Box::clone_from_ref_in(e.machine.as_str(), alloc.clone());
+        let machine = box_str(e.machine.as_str(), alloc.clone());
         if let Some(id) = self.create(now, &machine, Namespace::Main, reservation.clone()) {
-            let id = Box::clone_from_ref_in(id, alloc);
-            let old = self.executors.get_mut(builder).expect("present");
-            if old.busy.is_some() {
-                old.phase = ExecutorPhase::Draining;
-            } else {
-                old.phase = ExecutorPhase::Stopped;
+            let id = box_str(id, alloc);
+            if let Some(old) = self.executors.get_mut(builder) {
+                if old.busy.is_some() {
+                    old.phase = ExecutorPhase::Draining;
+                } else {
+                    old.phase = ExecutorPhase::Stopped;
+                }
             }
             return Some(id);
         }
-        self.rebuilds.insert(Box::clone_from_ref_in(builder, Global).into_string(), reservation);
-        let old = self.executors.get_mut(builder).expect("present");
-        if old.busy.is_some() {
-            old.phase = ExecutorPhase::Draining;
+        self.rebuilds.insert(WireString::from_str_in(builder, self.alloc), reservation);
+        let busy = if let Some(old) = self.executors.get_mut(builder) {
+            if old.busy.is_some() {
+                old.phase = ExecutorPhase::Draining;
+                true
+            } else {
+                old.phase = ExecutorPhase::Stopped;
+                false
+            }
         } else {
-            old.phase = ExecutorPhase::Stopped;
+            true
+        };
+        if !busy {
             self.start_rebuild(now, builder);
         }
         None
@@ -541,14 +581,15 @@ impl Admission {
     fn start_rebuild(&mut self, now: Millis, old: &str) {
         // Once a rebuild chose draining, finish that lifecycle before replacing it.
         // Room freed by another executor must not restart a still-busy old builder.
-        if self.executors.get(old).is_none_or(|e| e.phase != ExecutorPhase::Stopped) {
+        let Some(slot) = self.executors.get(old) else { return };
+        if slot.phase != ExecutorPhase::Stopped {
             return;
         }
+        let machine = WireString::from_str_in(slot.machine.as_str(), self.alloc);
         let Some(reservation) = self.rebuilds.remove(old) else { return };
-        let machine = Box::clone_from_ref_in(self.executors[old].machine.as_str(), Global);
-        if self.create(now, &machine, Namespace::Main, reservation.clone()).is_none() {
+        if self.create(now, machine.as_str(), Namespace::Main, reservation.clone()).is_none() {
             // Still does not fit beside what runs there: it waits for the next stop.
-            self.rebuilds.insert(Box::clone_from_ref_in(old, Global).into_string(), reservation);
+            self.rebuilds.insert(WireString::from_str_in(old, self.alloc), reservation);
         }
     }
 
@@ -556,9 +597,13 @@ impl Admission {
     pub fn check(&self) -> Result<(), CapacityExceeded<'_>> {
         let zero = Reservation { memory: 0, cpus: 0, disk: 0 };
         for (name, machine) in &self.machines {
-            let used = self.used(name);
+            let used = self.used(name.as_str());
             if !fits(&zero, &used, &machine.capacity) {
-                return Err(CapacityExceeded { machine: name, used, capacity: &machine.capacity });
+                return Err(CapacityExceeded {
+                    machine: name.as_str(),
+                    used,
+                    capacity: &machine.capacity,
+                });
             }
         }
         Ok(())

@@ -97,22 +97,27 @@ mod whole {
                 let mut n = 0;
                 if hot.phase == OPENING {
                     sqes[0] = open(parent, DIR, 0, dir, SQE_IO_LINK, ud(0));
-                    let flags = (OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE).bits() as i32;
+                    let flags = (OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE).bits().cast_signed();
                     sqes[1] = open(temp, flags, 0o644, temporary, SQE_IO_LINK, ud(1));
                     n = 2;
                 }
-                let done = hot.done as usize;
+                let done = usize::try_from(hot.done).unwrap_or(bytes.len());
                 // Linux can import less than SQE.len (MAX_RW_COUNT) and still run the
                 // linked suffix. Publish only after completions account for every byte.
                 sqes[n] = Sqe {
                     off: hot.done,
                     addr: bytes[done..].as_ptr() as u64,
-                    len: (bytes.len() - done).min(u32::MAX as usize) as u32,
+                    len: u32::try_from(bytes.len() - done).unwrap_or(u32::MAX),
                     ..on_slot(OP_WRITE, temporary, 0, ud(2))
                 };
                 n + 1
             }
         }
+    }
+
+    /// Low 32 bits of `at` hold the failed syscall's positive errno.
+    pub(super) fn unpack_errno(at: u64) -> i32 {
+        u32::try_from(at & u64::from(u32::MAX)).unwrap_or(u32::MAX).cast_signed()
     }
 
     /// Called only after every CQE of this phase arrived, and its opens succeeded.
@@ -123,18 +128,22 @@ mod whole {
         results: [i32; LINKS],
     ) -> Step {
         if hot.phase == UNLINKING {
-            return Step::Ends(failed(-(cold.at as i32)));
+            return Step::Ends(failed(-unpack_errno(cold.at)));
         }
+        let len = u64::try_from(len).unwrap_or(u64::MAX);
         let failure = if hot.phase == COMMITTING {
-            (3..5).find_map(|link| (results[link] < 0).then_some((link, results[link])))
+            (3_u32..5).find_map(|link| {
+                let res = results[usize::try_from(link).unwrap_or(0)];
+                (res < 0).then_some((link, res))
+            })
         } else {
             let wrote = results[2];
             match wrote {
-                res if res < 0 => Some((2, res)),
-                0 if hot.done < len as u64 => Some((2, -i32::from(Errno::Io.raw()))),
+                res if res < 0 => Some((2_u32, res)),
+                0 if hot.done < len => Some((2_u32, -i32::from(Errno::Io.raw()))),
                 _ => {
-                    hot.done += wrote as u64;
-                    hot.phase = if hot.done < len as u64 { OPENED } else { COMMITTING };
+                    hot.done += u64::from(wrote.cast_unsigned());
+                    hot.phase = if hot.done < len { OPENED } else { COMMITTING };
                     return Step::Again;
                 }
             }
@@ -142,7 +151,7 @@ mod whole {
         if let Some((link, res)) = failure {
             hot.phase = UNLINKING;
             // Keep the original failure across cleanup: low half errno, high half link.
-            cold.at = u64::from(res.unsigned_abs()) | (link as u64) << 32;
+            cold.at = u64::from(res.unsigned_abs()) | (u64::from(link) << 32);
             return Step::Again;
         }
         if results[5] < 0 {
@@ -1147,7 +1156,7 @@ impl Uring {
                 4 => "renaming temporary",
                 _ => unreachable!("a whole-file write's failed link"),
             };
-            return self.failed_on(id, what, 0, -(at as u32 as i32));
+            return self.failed_on(id, what, 0, -whole::unpack_errno(at));
         }
         if hot.phase == OPENING {
             let dir = results[0];

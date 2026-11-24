@@ -22,7 +22,7 @@ fn class(w: &World, g: &mut G, ty: PTy) -> Result<Class, CAbiError> {
 }
 
 fn locs(args: &[Class], variadic_from: Option<usize>, platform: Platform) -> Vec<ArgLoc> {
-    let mut out = Vec::new_in(Global);
+    let mut out = Default::default();
     assign(args, variadic_from, platform, &mut out).expect("assigns");
     out
 }
@@ -64,7 +64,7 @@ fn classes_follow_the_fundamental_types_and_homogeneous_aggregates() {
     let arr5 = g.array(f64_, 5);
     let slice = g.n(PNode::Slice(u8_));
     let wide = g.r(slice);
-    let cases: Vec<(PTy, Class)> = vec![
+    let cases = [
         (i16_, Class::Int { size: 2, signed: true }),
         (i128_, Class::Int { size: 16, signed: true }),
         (u128_, Class::Int { size: 16, signed: false }),
@@ -107,7 +107,8 @@ fn the_ninth_integer_is_stacked_by_each_platform_rule() {
     let mut args = vec![I64; 8];
     args.extend([Class::Int { size: 1, signed: false }, Class::Int { size: 4, signed: false }]);
     let generic = locs(&args, None, Platform::Aapcs);
-    assert_eq!(&generic[..8], &(0..8).map(|i| gpr(i, 1)).collect::<Vec<_>>()[..]);
+    let expected_gprs: [ArgLoc; 8] = core::array::from_fn(|i| gpr(i as u8, 1));
+    assert_eq!(&generic[..8], &expected_gprs);
     assert_eq!(&generic[8..], &[stack(0, 8), stack(8, 8)]);
     let apple = locs(&args, None, Platform::Apple);
     assert_eq!(&apple[8..], &[

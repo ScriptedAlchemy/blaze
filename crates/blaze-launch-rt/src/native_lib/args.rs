@@ -13,6 +13,17 @@ unsafe extern "C" {
     static mut environ: *mut *mut c_char;
 }
 
+/// Replaces libc's `environ` pointer on Linux.
+///
+/// # Safety
+/// The process must be single-threaded (or synchronized against all `getenv`/`setenv` readers)
+/// and `table` with all its strings must remain valid for as long as libc may read `environ`.
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn set_environ(table: *mut *mut c_char) {
+    // SAFETY: caller upholds the single-threaded / lifetime contract above.
+    unsafe { environ = table };
+}
+
 /// Which C string list could not be prepared.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArgumentList {

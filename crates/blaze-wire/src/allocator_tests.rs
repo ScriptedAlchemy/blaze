@@ -1,34 +1,67 @@
 //! Real codec outputs belong to the allocator their caller chose.
 
-use std::alloc::{AllocError, Allocator, Global, Layout};
-use std::cell::Cell;
-use std::ptr::NonNull;
+use core::alloc::{AllocError, Allocator, Layout};
+use core::cell::Cell;
+use core::cmp::Ordering;
+use core::hash::{Hash, Hasher};
+use core::ptr::{self, NonNull};
+
+use blaze_own::{String, Vec};
 
 use crate::{
     Attempt, DIST_PACK_FORMAT, Encoder, ExecutionId, Grant, Lease, Limits, PackRef, PrNamespace,
-    Set, Wire, WorkName, decode, digest_input, digest_of, encode, pack_list,
+    Set, Wire, WireAlloc, WireString, WorkName, decode, digest_input, digest_of, encode, pack_list,
 };
 
-#[derive(Clone, Copy)]
-struct Counted<'a>(&'a Cell<usize>);
+fn heap() -> WireAlloc {
+    blaze_own::testing::heap().shared()
+}
 
-// SAFETY: this forwards every block and layout unchanged to Global; every clone has the
-// same allocation behavior and may deallocate blocks returned by any other clone.
+#[derive(Clone, Copy)]
+struct Counted<'a> {
+    base: WireAlloc,
+    count: &'a Cell<usize>,
+}
+
+// SAFETY: this forwards every block and layout unchanged to `base`; every clone shares the
+// same backing allocator and may deallocate blocks returned by any other clone.
 unsafe impl Allocator for Counted<'_> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let allocation = Global.allocate(layout)?;
-        self.0.set(self.0.get() + 1);
+        let allocation = self.base.allocate(layout)?;
+        self.count.set(self.count.get() + 1);
         Ok(allocation)
     }
 
     unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
-        // SAFETY: all pointers returned by this allocator came from Global with this layout.
-        unsafe { Global.deallocate(pointer, layout) };
+        // SAFETY: all pointers returned by this allocator came from `base` with this layout.
+        unsafe { self.base.deallocate(pointer, layout) };
+    }
+}
+
+struct FnvHasher(u64);
+
+impl FnvHasher {
+    fn new() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+}
+
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
     }
 }
 
 #[test]
 fn pack_lists_use_the_callers_allocator() {
+    let base = heap();
     let packs = [PackRef {
         pack: [0xab; 32],
         size: 80,
@@ -37,51 +70,49 @@ fn pack_lists_use_the_callers_allocator() {
         format: DIST_PACK_FORMAT,
     }];
     let encoded_allocations = Cell::new(0);
-    let encoded = pack_list::encode(&packs, Counted(&encoded_allocations));
+    let counted_enc = Counted { base, count: &encoded_allocations };
+    let encoded = pack_list::encode(&packs, counted_enc);
     assert!(encoded_allocations.get() > 0);
-    assert_eq!(encoded.as_slice(), pack_list::encode(&packs, Global).as_slice());
+    assert_eq!(encoded.as_slice(), pack_list::encode(&packs, base).as_slice());
 
     let decoded_allocations = Cell::new(0);
-    let decoded = pack_list::decode(&encoded, Counted(&decoded_allocations)).unwrap();
+    let counted_dec = Counted { base, count: &decoded_allocations };
+    let decoded = pack_list::decode(&encoded, counted_dec).unwrap();
     assert_eq!(decoded.as_slice(), packs.as_slice());
     assert_eq!(decoded_allocations.get(), 1, "one output allocation, no ordering index");
 
-    // Control: the same real decoder with a different allocator yields the same references
-    // while making no allocation through the monitored allocator.
     decoded_allocations.set(0);
-    let control = pack_list::decode(&encoded, Global).unwrap();
+    let control = pack_list::decode(&encoded, base).unwrap();
     assert_eq!(decoded.as_slice(), control.as_slice());
     assert_eq!(decoded_allocations.get(), 0);
 }
 
 #[test]
 fn nested_schema_encoding_and_digest_scratch_use_the_callers_allocator() {
+    let base = heap();
     let value = Grant {
         lease: Lease {
             execution: ExecutionId(3),
             attempt: Attempt(1),
-            holder: "holder".into(),
+            holder: WireString::from_str_in("holder", base),
             generation: 3,
         },
-        roots: [(24, 2), (1, 2)].into_iter().collect(),
-        names: [WorkName([9; 32]), WorkName([2; 32])].into_iter().collect(),
+        roots: Set::from_iter_in([(24, 2), (1, 2)], base),
+        names: Set::from_iter_in([WorkName([9; 32]), WorkName([2; 32])], base),
     };
     let allocations = Cell::new(0);
-    let encoded = encode(&value, Counted(&allocations));
+    let counted = Counted { base, count: &allocations };
+    let encoded = encode(&value, counted);
     assert!(allocations.get() > 0);
-    assert!(std::ptr::eq(encoded.allocator().0, &allocations));
-    assert_eq!(decode::<Grant>(&encoded, &Limits::DOCUMENTED).unwrap(), value);
+    assert!(ptr::eq(encoded.allocator().count, &allocations));
+    assert_eq!(decode::<Grant>(&encoded, &Limits::DOCUMENTED, base).unwrap(), value);
 
-    // Control: the same schema through the default allocator must write the same bytes and
-    // leave the monitored allocator untouched.
     allocations.set(0);
-    let control = encode(&value, Global);
+    let control = encode(&value, base);
     assert_eq!(encoded.as_slice(), control.as_slice());
     assert_eq!(allocations.get(), 0);
 
-    // The output is already large enough: any allocation during this encode is nested set
-    // scratch. A codec that propagates the allocator only to its outer buffer fails here.
-    let mut preallocated = Vec::with_capacity_in(control.len(), Counted(&allocations));
+    let mut preallocated = Vec::with_capacity_in(control.len(), counted);
     let pointer = preallocated.as_ptr();
     allocations.set(0);
     value.encode(&mut Encoder::new_into(&mut preallocated));
@@ -90,22 +121,24 @@ fn nested_schema_encoding_and_digest_scratch_use_the_callers_allocator() {
     assert_eq!(preallocated.as_slice(), control.as_slice());
 
     allocations.set(0);
-    let digest = digest_of(&value, Counted(&allocations));
+    let digest = digest_of(&value, counted);
     assert!(allocations.get() > 0);
     allocations.set(0);
-    assert_eq!(digest, digest_of(&value, Global));
+    assert_eq!(digest, digest_of(&value, base));
     assert_eq!(allocations.get(), 0);
 
-    let preimage = digest_input(&value, Counted(&allocations));
+    let preimage = digest_input(&value, counted);
     assert!(allocations.get() > 0);
-    assert!(std::ptr::eq(preimage.allocator().0, &allocations));
-    assert_eq!(preimage.as_slice(), digest_input(&value, Global).as_slice());
+    assert!(ptr::eq(preimage.allocator().count, &allocations));
+    assert_eq!(preimage.as_slice(), digest_input(&value, base).as_slice());
 }
 
 #[test]
 fn appending_keeps_the_callers_buffer_and_allocator_without_allocating() {
+    let base = heap();
     let allocations = Cell::new(0);
-    let mut bytes = Vec::with_capacity_in(64, Counted(&allocations));
+    let counted = Counted { base, count: &allocations };
+    let mut bytes = Vec::with_capacity_in(64, counted);
     bytes.extend_from_slice(b"prefix");
     let pointer = bytes.as_ptr();
     let capacity = bytes.capacity();
@@ -114,21 +147,25 @@ fn appending_keeps_the_callers_buffer_and_allocator_without_allocating() {
     {
         let mut appender = Encoder::new_into(&mut bytes);
         PrNamespace { n: 24 }.encode(&mut appender);
-        assert!(std::ptr::eq(appender.allocator().0, &allocations));
+        assert!(ptr::eq(appender.allocator().count, &allocations));
     }
 
     assert_eq!(bytes.as_slice(), b"prefix\xa1\x00\x18\x18");
     assert_eq!(bytes.as_ptr(), pointer);
     assert_eq!(bytes.capacity(), capacity);
-    assert!(std::ptr::eq(bytes.allocator().0, &allocations));
+    assert!(ptr::eq(bytes.allocator().count, &allocations));
     assert_eq!(allocations.get(), 0, "neither the temporary swap nor the append needs storage");
 }
 
 #[test]
 fn sets_keep_their_storage_and_take_encoding_scratch_from_the_output_allocator() {
+    let base = heap();
     let storage_allocations = Cell::new(0);
-    let mut items = Vec::with_capacity_in(8, Counted(&storage_allocations));
-    items.extend(["aa".to_owned(), "b".to_owned(), "aa".to_owned(), "a".to_owned()]);
+    let storage = Counted { base, count: &storage_allocations };
+    let mut items = Vec::with_capacity_in(8, storage);
+    for text in ["aa", "b", "aa", "a"] {
+        items.push(String::from_str_in(text, base));
+    }
     let pointer = items.as_ptr();
     let capacity = items.capacity();
     let first_duplicate = items[0].as_ptr();
@@ -136,33 +173,36 @@ fn sets_keep_their_storage_and_take_encoding_scratch_from_the_output_allocator()
 
     let set = Set::new(items);
     assert!(storage_allocations.get() > 0, "canonicalization uses the input allocator");
-    assert_eq!(set.as_slice(), ["a", "b", "aa"], "encoded order differs from lexical order");
+    assert_eq!(set.as_slice()[0].as_str(), "a");
+    assert_eq!(set.as_slice()[1].as_str(), "b");
+    assert_eq!(set.as_slice()[2].as_str(), "aa");
     assert_eq!(set.as_slice()[2].as_ptr(), first_duplicate, "equal encodings keep the first item");
-    let control: Set<String> = ["a", "b", "aa"].into_iter().map(str::to_owned).collect();
-    // Counted deliberately has no comparison, formatting or hashing traits: those properties
-    // belong to the items, independently of where the set keeps them.
+
+    let control: Set<WireString> =
+        Set::from_iter_in(["a", "b", "aa"].into_iter().map(|s| String::from_str_in(s, base)), base);
     assert_eq!(set, control);
-    assert_eq!(set.partial_cmp(&control), Some(std::cmp::Ordering::Equal));
-    assert_eq!(set.cmp(&set), std::cmp::Ordering::Equal);
-    let mut actual_hash = std::hash::DefaultHasher::new();
-    let mut control_hash = std::hash::DefaultHasher::new();
-    std::hash::Hash::hash(&set, &mut actual_hash);
-    std::hash::Hash::hash(&control, &mut control_hash);
-    assert_eq!(std::hash::Hasher::finish(&actual_hash), std::hash::Hasher::finish(&control_hash));
+    assert_eq!(set.partial_cmp(&control), Some(Ordering::Equal));
+    assert_eq!(set.cmp(&set), Ordering::Equal);
+    let mut actual_hash = FnvHasher::new();
+    let mut control_hash = FnvHasher::new();
+    Hash::hash(&set, &mut actual_hash);
+    Hash::hash(&control, &mut control_hash);
+    assert_eq!(actual_hash.finish(), control_hash.finish());
 
     let output_allocations = Cell::new(0);
-    let mut encoded = Vec::with_capacity_in(64, Counted(&output_allocations));
+    let output = Counted { base, count: &output_allocations };
+    let mut encoded = Vec::with_capacity_in(64, output);
     storage_allocations.set(0);
     output_allocations.set(0);
     set.encode(&mut Encoder::new_into(&mut encoded));
     assert_eq!(storage_allocations.get(), 0, "encoding must not allocate in the set's storage");
     assert!(output_allocations.get() > 0, "canonical encoding keys belong to the output allocator");
-    assert_eq!(encoded.as_slice(), encode(&control, Global).as_slice());
+    assert_eq!(encoded.as_slice(), encode(&control, base).as_slice());
 
     let items = set.into_vec();
     assert_eq!(items.as_ptr(), pointer);
     assert_eq!(items.capacity(), capacity);
-    assert!(std::ptr::eq(items.allocator().0, &storage_allocations));
+    assert!(ptr::eq(items.allocator().count, &storage_allocations));
 }
 
 #[test]
@@ -186,19 +226,16 @@ fn set_encoding_writes_each_canonical_sort_key_once() {
         }
     }
 
-    let mut values = Vec::with_capacity_in(2, Global);
-    values.extend([
-        Changing { values: Cell::new((1, 9)), calls: Cell::new(0) },
-        Changing { values: Cell::new((2, 0)), calls: Cell::new(0) },
-    ]);
+    let base = heap();
+    let mut values = Vec::with_capacity_in(2, base);
+    values.push(Changing { values: Cell::new((1, 9)), calls: Cell::new(0) });
+    values.push(Changing { values: Cell::new((2, 0)), calls: Cell::new(0) });
     let set = Set::new(values);
     assert!(set.iter().all(|item| item.calls.get() == 1));
 
-    // Construction saw [1, 2]; the next snapshots are [9, 0]. Reencoding the items after
-    // sorting those snapshots would emit [2, 1], which is not a canonical set.
-    let bytes = encode(&set, Global);
-    assert_eq!(bytes, [0x82, 0, 9]);
+    let bytes = encode(&set, base);
+    assert_eq!(bytes.as_slice(), [0x82, 0, 9]);
     assert!(set.iter().all(|item| item.calls.get() == 2));
-    assert_eq!(decode::<Set<u64>>(&bytes, &Limits::DOCUMENTED).unwrap().as_slice(), &[0, 9]);
-    assert!(decode::<Set<u64>>(&[0x82, 2, 1], &Limits::DOCUMENTED).is_err());
+    assert_eq!(decode::<Set<u64>>(&bytes, &Limits::DOCUMENTED, base).unwrap().as_slice(), &[0, 9]);
+    assert!(decode::<Set<u64>>(&[0x82, 2, 1], &Limits::DOCUMENTED, base).is_err());
 }

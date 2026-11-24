@@ -11,13 +11,15 @@
 //! compile threads (D0's `compile_ahead` batch), and [`Event::Compiled`] brings back what they
 //! did.
 
-use std::alloc::{Allocator, AllocatorClone, Global};
-use std::collections::{BTreeMap, BTreeSet};
+use core::alloc::Allocator;
+use core::mem;
 
+use blaze_own::{BTreeMap, BTreeSet, Vec, format_in};
 use blaze_wire::{
     Attempt, BatchResult, Digest, ErrorCode, ExecutionId, Grant, ItemOutcome, ItemResult, PackRef,
-    RootSet, Set, Why, WireError, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
-    WorkLeaseRequest, WorkName, WorkResultAnswer, WorkersEventsAnswer, WorkersEventsRequest,
+    RootSet, Set, Why, WireAlloc, WireError, WireString, WireVec, WorkJoinAnswer, WorkJoinRequest,
+    WorkLeaseAnswer, WorkLeaseRequest, WorkName, WorkResultAnswer, WorkersEventsAnswer,
+    WorkersEventsRequest,
 };
 
 use crate::work::{LOST_FINDING, UNKNOWN_NAME};
@@ -80,7 +82,7 @@ pub struct Plan {
     pub seq: u64,
     /// The granted names the holder resolves, through a finding or its pre-index, in the
     /// grant's set order. The others are answered `Lost` by the holder.
-    pub compile: Vec<WorkName>,
+    pub compile: WireVec<WorkName>,
 }
 
 /// What the compile threads did with a [`Plan`]: a batch, exported, sealed and uploaded.
@@ -89,15 +91,15 @@ pub struct Compiled {
     /// The lease generation of the plan's grant.
     pub generation: u64,
     /// One item per processed root, in ascending index order.
-    pub roots: Vec<ItemResult>,
+    pub roots: WireVec<ItemResult>,
     /// One item per processed name of the plan's `compile`, in its order.
-    pub names: Vec<ItemResult>,
+    pub names: WireVec<ItemResult>,
     /// The packs the batch's entries were sealed into, uploaded.
-    pub packs: Vec<PackRef>,
+    pub packs: WireVec<PackRef>,
     /// Granted roots the batch did not get to (u7's budget).
     pub returned_roots: Ranges,
     /// Names of the plan's `compile` the batch did not get to.
-    pub returned_names: Vec<WorkName>,
+    pub returned_names: WireVec<WorkName>,
 }
 
 /// What a holder's driver compiles its plans with: the executor's batch
@@ -108,7 +110,7 @@ pub struct Compiled {
 /// is not). A compile failure is the driver's to surface, named.
 pub trait BatchCompiler {
     /// The compiler's own failure type; the carrier renders it only at its message boundary.
-    type Error: std::error::Error;
+    type Error: core::error::Error;
 
     /// Compile one granted batch whole, its entries sealed and uploaded.
     fn compile(&mut self, plan: &Plan) -> Result<Compiled, Self::Error>;
@@ -128,7 +130,7 @@ pub enum StopWhy {
     /// The execution ended.
     Ended,
     /// An answer the protocol does not give a correct holder: a bug, named.
-    Protocol(String),
+    Protocol(WireString),
 }
 
 /// What the holder asks its driver to do.
@@ -144,7 +146,7 @@ pub enum Effect {
     /// Compile a batch; [`Event::Compiled`] brings it back.
     Compile(Plan),
     /// Findings the compiler need no longer retain.
-    Release(Vec<WorkName>),
+    Release(WireVec<WorkName>),
     /// The holder left the execution.
     Stop(StopWhy),
 }
@@ -173,7 +175,7 @@ enum Phase {
     Joining,
     Idle { until: Millis, then_join: bool },
     Leasing,
-    Compiling { grant: Grant, lost: BTreeMap<WorkName, ItemResult> },
+    Compiling { grant: Grant, lost: BTreeMap<WorkName, ItemResult, WireAlloc> },
     Reporting { result: BatchResult, root_items: usize },
     Stopped,
 }
@@ -187,16 +189,17 @@ struct Outstanding {
 
 /// One executor's part in one execution.
 #[derive(Clone, Debug)]
-pub struct Holder<A: AllocatorClone> {
+pub struct Holder<A: Allocator> {
+    alloc: WireAlloc,
     config: HolderConfig,
-    id: String,
+    id: WireString,
     execution: ExecutionId,
     attempt: Attempt,
     roots: RootSet,
-    rejected: BTreeSet<WorkName>,
+    rejected: BTreeSet<WorkName, WireAlloc>,
     index: BTreeSet<WorkName, A>,
-    findings: BTreeMap<WorkName, Digest>,
-    lost: BTreeSet<WorkName>,
+    findings: BTreeMap<WorkName, Digest, WireAlloc>,
+    lost: BTreeSet<WorkName, WireAlloc>,
     phase: Phase,
     seq: u64,
     next_id: u64,
@@ -205,10 +208,11 @@ pub struct Holder<A: AllocatorClone> {
     next_beat: Millis,
 }
 
-impl<A: AllocatorClone> Holder<A> {
+impl<A: Allocator> Holder<A> {
     /// The holder `id` of `execution` at `attempt`, with the root set its front end computed,
     /// the names its daemon rejects, and its pre-index: the names it resolves with no finding.
     /// The pre-index keeps its existing storage and allocator for the holder's lifetime.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: &str,
         execution: ExecutionId,
@@ -217,19 +221,21 @@ impl<A: AllocatorClone> Holder<A> {
         rejected: Set<WorkName>,
         index: BTreeSet<WorkName, A>,
         config: HolderConfig,
+        alloc: WireAlloc,
     ) -> Holder<A> {
-        let mut rejected_names = BTreeSet::new_in(Global);
+        let mut rejected_names = BTreeSet::new_in(alloc);
         rejected_names.extend(rejected.into_vec());
         Holder {
+            alloc,
             config,
-            id: Box::clone_from_ref_in(id, Global).into_string(),
+            id: WireString::from_str_in(id, alloc),
             execution,
             attempt,
             roots,
             rejected: rejected_names,
             index,
-            findings: BTreeMap::new_in(Global),
-            lost: BTreeSet::new_in(Global),
+            findings: BTreeMap::new_in(alloc),
+            lost: BTreeSet::new_in(alloc),
             phase: Phase::Loading,
             seq: 0,
             next_id: 1,
@@ -241,7 +247,7 @@ impl<A: AllocatorClone> Holder<A> {
 
     /// The holder's id.
     pub fn id(&self) -> &str {
-        &self.id
+        self.id.as_str()
     }
 
     /// Whether it left the execution.
@@ -345,7 +351,7 @@ impl<A: AllocatorClone> Holder<A> {
             let call = Call::Events(WorkersEventsRequest {
                 execution: self.execution,
                 attempt: self.attempt,
-                events: Vec::new(),
+                events: Vec::new_in(self.alloc),
             });
             out.push(Effect::Send { id, call });
         }
@@ -368,7 +374,7 @@ impl<A: AllocatorClone> Holder<A> {
     }
 
     fn reply(&mut self, now: Millis, reply: Reply, out: &mut Vec<Effect, impl Allocator>) {
-        match (std::mem::replace(&mut self.phase, Phase::Leasing), reply) {
+        match (mem::replace(&mut self.phase, Phase::Leasing), reply) {
             (Phase::Joining, Reply::Join(Ok(answer))) => {
                 if answer.roots != self.roots {
                     return self.stop(StopWhy::FrontEndDiffers, out);
@@ -409,12 +415,14 @@ impl<A: AllocatorClone> Holder<A> {
             }
             (Phase::Reporting { result, .. }, Reply::Result(Err(error))) => {
                 // Refused whole: nothing it found was registered.
-                let found: Vec<WorkName> = result
-                    .items
-                    .iter()
-                    .flat_map(|item| item.found.iter().map(|f| f.name))
-                    .filter(|name| !self.findings.contains_key(name))
-                    .collect();
+                let found = Vec::from_iter_in(
+                    result
+                        .items
+                        .iter()
+                        .flat_map(|item| item.found.iter().map(|f| f.name))
+                        .filter(|name| !self.findings.contains_key(name)),
+                    self.alloc,
+                );
                 if !found.is_empty() {
                     out.push(Effect::Release(found));
                 }
@@ -425,7 +433,10 @@ impl<A: AllocatorClone> Holder<A> {
             }
             (phase, reply) => {
                 self.phase = phase;
-                self.stop(StopWhy::Protocol(format!("{reply:?} in {:?}", self.phase)), out);
+                self.stop(
+                    StopWhy::Protocol(format_in!(self.alloc, "{reply:?} in {:?}", self.phase)),
+                    out,
+                );
             }
         }
     }
@@ -444,7 +455,7 @@ impl<A: AllocatorClone> Holder<A> {
             Some(Refusal::AttemptMoved) => StopWhy::AttemptMoved,
             Some(Refusal::Ended | Refusal::NoExecution) => StopWhy::Ended,
             Some(Refusal::FrontEndDiffers) => StopWhy::FrontEndDiffers,
-            _ => StopWhy::Protocol(error.message.clone()),
+            _ => StopWhy::Protocol(WireString::from_str_in(error.message.as_str(), self.alloc)),
         };
         self.stop(why, out);
     }
@@ -452,7 +463,7 @@ impl<A: AllocatorClone> Holder<A> {
     /// The coordinator dropped this holder: what it found is no longer counted on, so it is
     /// released, and the holder joins as new.
     fn rejoin(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator>) {
-        let held: Vec<WorkName> = self.findings.keys().copied().collect();
+        let held = Vec::from_iter_in(self.findings.keys().copied(), self.alloc);
         if !held.is_empty() {
             out.push(Effect::Release(held));
         }
@@ -466,18 +477,26 @@ impl<A: AllocatorClone> Holder<A> {
             || grant.lease.attempt != self.attempt
             || grant.lease.execution != self.execution
         {
-            return self
-                .stop(StopWhy::Protocol(format!("a grant of another lease: {grant:?}")), out);
+            return self.stop(
+                StopWhy::Protocol(format_in!(self.alloc, "a grant of another lease: {grant:?}")),
+                out,
+            );
         }
         // Validate before handing indexes to a compiler. The wire set is sorted,
         // but sorting alone does not exclude reversed, overlapping or foreign roots.
-        let valid_roots = Ranges::from_wire(&grant.roots)
+        let valid_roots = Ranges::from_wire(&grant.roots, self.alloc)
             .is_some_and(|ranges| ranges.iter().all(|(_, end)| end <= self.roots.count));
         if !valid_roots {
-            return self.stop(StopWhy::Protocol("invalid granted root ranges".into()), out);
+            return self.stop(
+                StopWhy::Protocol(WireString::from_str_in(
+                    "invalid granted root ranges",
+                    self.alloc,
+                )),
+                out,
+            );
         }
-        let mut compile = Vec::new();
-        let mut lost = BTreeMap::new();
+        let mut compile = Vec::new_in(self.alloc);
+        let mut lost = BTreeMap::new_in(self.alloc);
         for name in grant.names.iter() {
             let why = if self.findings.contains_key(name) || self.index.contains(name) {
                 compile.push(*name);
@@ -492,9 +511,11 @@ impl<A: AllocatorClone> Holder<A> {
                 *name,
                 ItemResult {
                     name: *name,
-                    outcome: ItemOutcome::Lost(Why { why: why.to_owned() }),
-                    found: Set::new(Vec::new()),
-                    unnamed: Set::new(Vec::new()),
+                    outcome: ItemOutcome::Lost(Why {
+                        why: WireString::from_str_in(why, self.alloc),
+                    }),
+                    found: Set::empty_in(self.alloc),
+                    unnamed: Set::empty_in(self.alloc),
                 },
             );
         }
@@ -508,8 +529,25 @@ impl<A: AllocatorClone> Holder<A> {
             return;
         }
         let (grant, lost) = (grant.clone(), lost.clone());
-        let returned: BTreeSet<WorkName> = batch.returned_names.iter().copied().collect();
-        let granted_roots = Ranges::from_wire(&grant.roots).expect("validated root ranges");
+        let mut returned = BTreeSet::new_in(self.alloc);
+        returned.extend(batch.returned_names.iter().copied());
+        let Some(granted_roots) = Ranges::from_wire(&grant.roots, self.alloc) else {
+            self.release(
+                batch
+                    .roots
+                    .iter()
+                    .chain(&batch.names)
+                    .flat_map(|item| item.found.iter().map(|found| found.name)),
+                out,
+            );
+            return self.stop(
+                StopWhy::Protocol(WireString::from_str_in(
+                    "invalid granted root ranges",
+                    self.alloc,
+                )),
+                out,
+            );
+        };
         let valid_returns = returned.len() == batch.returned_names.len()
             && returned.iter().all(|name| {
                 !lost.contains_key(name) && grant.names.iter().any(|granted| granted == name)
@@ -518,7 +556,8 @@ impl<A: AllocatorClone> Holder<A> {
         let expected_names =
             grant.names.iter().filter(|name| !lost.contains_key(name) && !returned.contains(name));
         let valid_items = valid_returns
-            && batch.roots.len() as u64 == granted_roots.len() - batch.returned_roots.len()
+            && u64::try_from(batch.roots.len()).ok()
+                == granted_roots.len().checked_sub(batch.returned_roots.len())
             && batch.names.iter().map(|item| &item.name).eq(expected_names);
         if !valid_items {
             // An extra result used to disappear in the zip below. It may carry
@@ -532,8 +571,13 @@ impl<A: AllocatorClone> Holder<A> {
                     .flat_map(|item| item.found.iter().map(|found| found.name)),
                 out,
             );
-            return self
-                .stop(StopWhy::Protocol("compiler batch does not cover its grant".into()), out);
+            return self.stop(
+                StopWhy::Protocol(WireString::from_str_in(
+                    "compiler batch does not cover its grant",
+                    self.alloc,
+                )),
+                out,
+            );
         }
         let mut compiled = batch.names.into_iter();
         let root_items = batch.roots.len();
@@ -571,7 +615,8 @@ impl<A: AllocatorClone> Holder<A> {
         answer: &WorkResultAnswer,
         out: &mut Vec<Effect, impl Allocator>,
     ) {
-        let conflicts: BTreeSet<WorkName> = answer.conflicts.iter().copied().collect();
+        let mut conflicts = BTreeSet::new_in(self.alloc);
+        conflicts.extend(answer.conflicts.iter().copied());
         let mut release = conflicts.clone();
         for item in &result.items {
             for found in item.found.iter() {
@@ -584,7 +629,9 @@ impl<A: AllocatorClone> Holder<A> {
                 }
             }
         }
-        release.extend(result.items[root_items..].iter().map(|item| item.name));
+        if let Some(named_items) = result.items.get(root_items..) {
+            release.extend(named_items.iter().map(|item| item.name));
+        }
         self.release(release, out);
     }
 
@@ -594,7 +641,7 @@ impl<A: AllocatorClone> Holder<A> {
             execution: self.execution,
             attempt: self.attempt,
             roots: self.roots.clone(),
-            rejected: Set::new(self.rejected.iter().copied().collect()),
+            rejected: Set::new(Vec::from_iter_in(self.rejected.iter().copied(), self.alloc)),
         });
         self.send(now, call, out);
     }
@@ -619,7 +666,8 @@ impl<A: AllocatorClone> Holder<A> {
     }
 
     fn stop(&mut self, why: StopWhy, out: &mut Vec<Effect, impl Allocator>) {
-        let mut held: BTreeSet<WorkName> = self.findings.keys().copied().collect();
+        let mut held = BTreeSet::new_in(self.alloc);
+        held.extend(self.findings.keys().copied());
         if let Phase::Reporting { result, .. } = &self.phase {
             held.extend(result.items.iter().flat_map(|item| item.found.iter().map(|f| f.name)));
         }
@@ -635,13 +683,14 @@ impl<A: AllocatorClone> Holder<A> {
         names: impl IntoIterator<Item = WorkName>,
         out: &mut Vec<Effect, impl Allocator>,
     ) {
-        let names: BTreeSet<WorkName> = names.into_iter().collect();
-        for name in &names {
+        let mut set = BTreeSet::new_in(self.alloc);
+        set.extend(names);
+        for name in &set {
             self.findings.remove(name);
             self.lost.remove(name);
         }
-        if !names.is_empty() {
-            out.push(Effect::Release(names.into_iter().collect()));
+        if !set.is_empty() {
+            out.push(Effect::Release(Vec::from_iter_in(set.into_iter(), self.alloc)));
         }
     }
 }

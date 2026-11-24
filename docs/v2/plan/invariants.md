@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-372 invariants, 45 refinements, 12 reference models.
-By level: 293 tested, 108 simulated, 1 model-checked, 15 proved.
+370 invariants, 45 refinements, 12 reference models.
+By level: 293 tested, 106 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -180,7 +180,7 @@ By level: 293 tested, 108 simulated, 1 model-checked, 15 proved.
 
 ### blaze-dist
 
-- **`every_success_has_one_immutable_full_manifest`** *tested* (`crates/blaze-dist/src/jobs/publication_tests.rs`): a published-work execution reports success only after full output is uploaded, its immutable manifest is accepted unchanged, and delivery to subscribers completes; a later attempt cannot replace the accepted record and a later worker verdict cannot supersede it.
+- **`every_success_has_one_immutable_full_manifest`** *simulated* (`crates/blaze-dist/src/jobs/publication_tests.rs`): a published-work execution reports success only after full output is uploaded, its immutable manifest is accepted unchanged, and delivery to subscribers completes; a later attempt cannot replace the accepted record and a later worker verdict cannot supersede it.
   Controls: `an_early_done_plant`, `a_late_worker_verdict_plant`.
 - **`retirement_preserves_survivors_and_exact_assignment_ownership`** *simulated* (`crates/blaze-dist/src/jobs/retirement_tests.rs`): retiring an owned assignment fences its work without ending another subscriber or releasing capacity before its exact stop acknowledgment; stale retirement, unowned retirement and stale acknowledgments cannot affect a replacement assignment.
   Controls: `leaving_without_retirement`, `release_without_a_pending_stop`, `a_stale_retirement_of_the_replacement_lead`, `a_stale_acknowledgment_of_a_reused_slot`, `an_unowned_retirement`, `retired_work_kept_under_its_old_lease`, `promotion_erasing_the_continuing_owner`, `cleanup_using_only_the_last_observed_attempt`, `a_stale_claimed_helper_misclassified_as_unclaimed`.
@@ -518,12 +518,8 @@ By level: 293 tested, 108 simulated, 1 model-checked, 15 proved.
 
 ### blaze-serve
 
-- **`refused_publication_completions_release_owned_mappings`** *simulated* (`crates/blaze-serve/src/store/repair_tests.rs`): a native publication refusal releases its owned completion before the typed IO diagnostic escapes, without advancing or acknowledging the failed publication.
-  Controls: `a_retained_refused_mapping`, `removing_cross_pack_comparison`, `the_comparison_bypass_plant`, `missing_file_sync_with_torn_appends`, `acknowledgement_before_directory_sync`.
-- **`native_partitions_preserve_values_through_publication_faults_and_reopen`** *simulated* (`crates/blaze-serve/src/store/repair_tests.rs`): first publication and conditional repair never admit conflicting kinds, lengths or bytes for one immutable key, including a key surviving in an old manifest; an acknowledged publication survives a crash and reopen byte for byte.
-  Controls: `a_retained_refused_mapping`, `removing_cross_pack_comparison`, `the_comparison_bypass_plant`, `missing_file_sync_with_torn_appends`, `acknowledgement_before_directory_sync`.
-- **`conditional_publication_preserves_comparison_and_whole_file_integrity`** *simulated* (`crates/blaze-serve/src/store/repair_tests.rs`): a conditional repair requires the current committed digest, an absent old pack, and verified replacement bytes; no stale writer may replace the winner, and each acknowledged repair survives a crash and reopen as a whole manifest.
-  Controls: `a_retained_refused_mapping`, `removing_cross_pack_comparison`, `the_comparison_bypass_plant`, `missing_file_sync_with_torn_appends`, `acknowledgement_before_directory_sync`.
+- **`first_writer_requires_equal_values_for_keys_mirrored_across_packs`** *tested* (`crates/blaze-serve/src/store/repair_tests.rs`): first-writer manifest publication requires equal values for keys mirrored across distinct packs, refusing any manifest whose packs disagree on a key.
+  Controls: `removing_cross_pack_comparison`, `the_comparison_bypass_plant`, `missing_file_sync_with_torn_appends`, `acknowledgement_before_directory_sync`, `a_retained_refused_mapping`.
 
 ### blaze-sim
 
@@ -1116,7 +1112,7 @@ Every promise of a doc comment or an effect attribute and how it is held
 `Evidence:` or `Unverified:`, an effect attribute, a `# Safety` obligation, a proved contract.
 A checked attribute and an obligation are counted, not listed.
 
-4204 claims. By level: 31 none, 4 unverified, 386 obligation, 3743 checked, 0 tested, 2 simulated, 0 model-checked, 38 proved.
+4207 claims. By level: 31 none, 4 unverified, 387 obligation, 3745 checked, 0 tested, 2 simulated, 0 model-checked, 38 proved.
 
 ### Totals
 
@@ -1139,7 +1135,7 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-int | 0 | 0 | 0 | 17 | 0 | 0 | 0 | 0 |
 | blaze-kit | 5 | 0 | 7 | 0 | 0 | 0 | 0 | 0 |
 | blaze-ladder | 1 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
-| blaze-launch-rt | 0 | 0 | 23 | 0 | 0 | 0 | 0 | 0 |
+| blaze-launch-rt | 0 | 0 | 24 | 0 | 0 | 0 | 0 | 0 |
 | blaze-lex | 0 | 0 | 2 | 0 | 0 | 0 | 0 | 0 |
 | blaze-malloc | 0 | 0 | 27 | 0 | 0 | 0 | 0 | 0 |
 | blaze-mem | 0 | 0 | 26 | 0 | 0 | 0 | 0 | 0 |
@@ -1159,7 +1155,7 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-std | 0 | 0 | 19 | 1271 | 0 | 0 | 0 | 0 |
 | blaze-store-check | 0 | 0 | 8 | 0 | 0 | 0 | 0 | 0 |
 | blaze-surface | 0 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
-| blaze-sys | 0 | 4 | 86 | 1511 | 0 | 0 | 0 | 0 |
+| blaze-sys | 0 | 4 | 86 | 1513 | 0 | 0 | 0 | 0 |
 | blaze-text | 0 | 0 | 5 | 0 | 0 | 0 | 0 | 0 |
 | blaze-trace | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
 | blaze-url | 0 | 0 | 0 | 58 | 0 | 0 | 0 | 0 |

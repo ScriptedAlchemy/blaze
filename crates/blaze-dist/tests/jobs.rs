@@ -1,21 +1,27 @@
 //! Lifecycle boundaries that must hold independently of the randomized load.
 
-#![feature(allocator_api)]
+#![no_std]
+#![allow(missing_docs)]
 
-use std::alloc::Global;
 use blaze_dist::admission::{Admission, AdmissionConfig};
 use blaze_dist::jobs::{
     AssignmentToken, Effect, ExecState, Execution, ExecutionConfig, Jobs, Subscriber,
     SubscriberState,
 };
 use blaze_dist::work::EndWhy;
+use blaze_own::{Vec, vec_in};
 use blaze_wire::{
     Attempt, BatchResult, Digest, DoneEvent, ExecutionId, ItemOutcome, ItemResult, JobContent,
     JobEvent, JobRequest, LocalPolicy, Namespace, Outcome, PrNamespace, RefusedEvent, Reservation,
-    RootSet, Set, Why, WorkJoinRequest, WorkLeaseRequest, WorkName, WorkersEventsRequest,
+    RootSet, Set, Why, WireAlloc, WireString, WorkJoinRequest, WorkLeaseRequest, WorkName,
+    WorkersEventsRequest,
 };
 
-fn execution() -> Execution {
+fn heap() -> WireAlloc {
+    blaze_own::testing::heap().shared()
+}
+
+fn execution(alloc: WireAlloc) -> Execution {
     let mut e = Execution::new(
         0,
         ExecutionId(1),
@@ -23,9 +29,10 @@ fn execution() -> Execution {
         Namespace::Main,
         subscriber(1, 100_000),
         ExecutionConfig::default(),
-        &mut Vec::new(),
+        alloc,
+        &mut Vec::new_in(alloc),
     );
-    e.assign(0, "lead", &["helper"], &mut Vec::new()).unwrap();
+    e.assign(0, "lead", &["helper"], &mut Vec::new_in(alloc)).unwrap();
     e
 }
 
@@ -35,7 +42,7 @@ fn subscriber(id: u64, deadline_ms: u64) -> Subscriber {
 
 // Deadline/verdict tests explicitly establish zero authoritative work. This is not
 // permission to infer cache-only success from a worker Done or an empty unit.
-fn complete_empty_work(e: &mut Execution, now: u64) {
+fn complete_empty_work(e: &mut Execution, now: u64, alloc: WireAlloc) {
     let request = blaze_wire::WorkJoinRequest {
         execution: e.id,
         attempt: e.attempt(),
@@ -46,17 +53,18 @@ fn complete_empty_work(e: &mut Execution, now: u64) {
             index: [3; 32],
             inputs: [4; 32],
         },
-        rejected: Set::new(Vec::new()),
+        rejected: Set::empty_in(alloc),
     };
-    let lead = e.lead().unwrap().to_owned();
-    e.join(now, &lead, &request, &mut Vec::new()).unwrap();
+    let lead = WireString::from_str_in(e.lead().unwrap(), alloc);
+    e.join(now, lead.as_str(), &request, &mut Vec::new_in(alloc)).unwrap();
 }
 
 #[test]
 fn a_subscribers_timeout_does_not_cancel_another_subscriber() {
-    let mut e = execution();
+    let alloc = heap();
+    let mut e = execution(alloc);
     e.subscribe(subscriber(2, 10)).unwrap();
-    let mut effects = Vec::new();
+    let mut effects = Vec::new_in(alloc);
     e.tick(11, &mut effects);
     assert_eq!(e.state(), ExecState::Running);
     assert!(effects.iter().any(|effect| matches!(
@@ -70,98 +78,115 @@ fn a_subscribers_timeout_does_not_cancel_another_subscriber() {
 
 #[test]
 fn a_reassigned_execution_refuses_the_old_attempts_events() {
-    let mut e = execution();
-    let mut effects = Vec::new();
+    let alloc = heap();
+    let mut e = execution(alloc);
+    let mut effects = Vec::new_in(alloc);
     e.assign(1, "helper", &[], &mut effects).unwrap();
     assert_eq!(e.attempt(), Attempt(2));
-    assert!(effects.contains(&Effect::Kill {
-        executor: "lead".to_owned(),
+    assert!(effects.scan_for(&Effect::Kill {
+        executor: WireString::from_str_in("lead", alloc),
         assignment: AssignmentToken { execution: e.id, attempt: Attempt(1) }
-    }));
-    let request = WorkersEventsRequest { execution: e.id, attempt: Attempt(1), events: Vec::new() };
+    }).is_some());
+    let request = WorkersEventsRequest {
+        execution: e.id,
+        attempt: Attempt(1),
+        events: Vec::new_in(alloc),
+    };
     assert_eq!(
-        e.worker_events(2, "lead", &request, &mut Vec::new()),
+        e.worker_events(2, "lead", &request, &mut Vec::new_in(alloc)),
         Err(blaze_dist::Refusal::AttemptMoved),
     );
 }
 
 #[test]
 fn a_refusal_never_turns_into_a_passed_result() {
-    let mut e = execution();
-    complete_empty_work(&mut e, 0);
+    let alloc = heap();
+    let mut e = execution(alloc);
+    complete_empty_work(&mut e, 0, alloc);
     let request = WorkersEventsRequest {
         execution: e.id,
         attempt: e.attempt(),
-        events: vec![
+        events: vec_in![
+            alloc;
             JobEvent::Refused(RefusedEvent {
-                function: "function".to_owned(),
-                why: "cannot compile".to_owned(),
+                function: WireString::from_str_in("function", alloc),
+                why: WireString::from_str_in("cannot compile", alloc),
             }),
-            JobEvent::Done(DoneEvent { outcome: Outcome::Passed, counters: Vec::new() }),
+            JobEvent::Done(DoneEvent { outcome: Outcome::Passed, counters: Vec::new_in(alloc) }),
         ],
     };
-    e.worker_events(1, "lead", &request, &mut Vec::new()).unwrap();
+    e.worker_events(1, "lead", &request, &mut Vec::new_in(alloc)).unwrap();
     assert_eq!(e.state(), ExecState::Ended(Outcome::Refused));
-    let verdicts: Vec<_> = e
-        .events(0)
-        .iter()
-        .filter_map(|item| match &item.event {
+    let verdicts = Vec::from_iter_in(
+        e.events(0).iter().filter_map(|item| match &item.event {
             JobEvent::Done(done) => Some(done.outcome.clone()),
             _ => None,
-        })
-        .collect();
-    assert_eq!(verdicts, vec![Outcome::Refused]);
+        }),
+        alloc,
+    );
+    assert_eq!(verdicts.as_slice(), &[Outcome::Refused]);
 }
 
 #[test]
 fn reassignment_does_not_erase_an_executions_refusal() {
-    let mut e = execution();
+    let alloc = heap();
+    let mut e = execution(alloc);
     let refused = WorkersEventsRequest {
         execution: e.id,
         attempt: e.attempt(),
-        events: vec![JobEvent::Refused(RefusedEvent {
-            function: "function".to_owned(),
-            why: "cannot compile".to_owned(),
-        })],
+        events: vec_in![
+            alloc;
+            JobEvent::Refused(RefusedEvent {
+                function: WireString::from_str_in("function", alloc),
+                why: WireString::from_str_in("cannot compile", alloc),
+            })
+        ],
     };
-    e.worker_events(1, "lead", &refused, &mut Vec::new()).unwrap();
-    e.assign(2, "helper", &[], &mut Vec::new()).unwrap();
-    complete_empty_work(&mut e, 2);
+    e.worker_events(1, "lead", &refused, &mut Vec::new_in(alloc)).unwrap();
+    e.assign(2, "helper", &[], &mut Vec::new_in(alloc)).unwrap();
+    complete_empty_work(&mut e, 2, alloc);
     let done = WorkersEventsRequest {
         execution: e.id,
         attempt: e.attempt(),
-        events: vec![JobEvent::Done(DoneEvent { outcome: Outcome::Passed, counters: Vec::new() })],
+        events: vec_in![
+            alloc;
+            JobEvent::Done(DoneEvent { outcome: Outcome::Passed, counters: Vec::new_in(alloc) })
+        ],
     };
-    e.worker_events(3, "helper", &done, &mut Vec::new()).unwrap();
+    e.worker_events(3, "helper", &done, &mut Vec::new_in(alloc)).unwrap();
     assert_eq!(e.state(), ExecState::Ended(Outcome::Refused));
 }
 
 #[test]
 fn review_completion_respects_each_subscribers_deadline_without_a_tick() {
+    let alloc = heap();
     for now in [10, 11] {
-        let mut e = execution();
-        complete_empty_work(&mut e, 0);
+        let mut e = execution(alloc);
+        complete_empty_work(&mut e, 0, alloc);
         e.subscribe(subscriber(2, 10)).unwrap();
         let done = WorkersEventsRequest {
             execution: e.id,
             attempt: e.attempt(),
-            events: vec![JobEvent::Done(DoneEvent {
-                outcome: Outcome::Passed,
-                counters: Vec::new(),
-            })],
+            events: vec_in![
+                alloc;
+                JobEvent::Done(DoneEvent {
+                    outcome: Outcome::Passed,
+                    counters: Vec::new_in(alloc),
+                })
+            ],
         };
-        let mut effects = Vec::new();
+        let mut effects = Vec::new_in(alloc);
         e.worker_events(now, "lead", &done, &mut effects).unwrap();
         assert_eq!(e.state(), ExecState::Ended(Outcome::Passed));
         let expected = if now > 10 { Outcome::TimedOut } else { Outcome::Passed };
-        let ended: Vec<_> = effects
-            .iter()
-            .filter_map(|effect| match effect {
+        let ended = Vec::from_iter_in(
+            effects.iter().filter_map(|effect| match effect {
                 Effect::SubscriberEnded { subscriber: 2, outcome, .. } => Some(outcome),
                 _ => None,
-            })
-            .collect();
-        assert_eq!(ended, vec![&expected]);
+            }),
+            alloc,
+        );
+        assert_eq!(ended.as_slice(), &[&expected]);
         assert!(effects.iter().any(|effect| matches!(
             effect,
             Effect::SubscriberEnded { subscriber: 1, outcome: Outcome::Passed, .. }
@@ -171,13 +196,17 @@ fn review_completion_respects_each_subscribers_deadline_without_a_tick() {
 
 #[test]
 fn review_completion_after_the_last_deadline_cannot_publish_success() {
-    let mut e = execution();
+    let alloc = heap();
+    let mut e = execution(alloc);
     let done = WorkersEventsRequest {
         execution: e.id,
         attempt: e.attempt(),
-        events: vec![JobEvent::Done(DoneEvent { outcome: Outcome::Passed, counters: Vec::new() })],
+        events: vec_in![
+            alloc;
+            JobEvent::Done(DoneEvent { outcome: Outcome::Passed, counters: Vec::new_in(alloc) })
+        ],
     };
-    let mut effects = Vec::new();
+    let mut effects = Vec::new_in(alloc);
     e.worker_events(100_001, "lead", &done, &mut effects).unwrap();
     assert_eq!(e.state(), ExecState::Ended(Outcome::Cancelled));
     assert_eq!(e.work().unwrap().ended(), Some(EndWhy::Deadline));
@@ -208,16 +237,17 @@ fn request(source: u8) -> JobRequest {
 
 #[test]
 fn resubmission_cannot_revive_an_execution_past_its_last_deadline() {
+    let alloc = heap();
     for running in [false, true] {
-        let (mut jobs, _) = registry();
+        let (mut jobs, _) = registry(alloc);
         let mut req = request(1);
         req.deadline_ms = 10;
-        let first = jobs.submit(0, &req, reservation(), &mut Vec::new()).unwrap();
+        let first = jobs.submit(0, &req, reservation(), &mut Vec::new_in(alloc)).unwrap();
         if running {
-            jobs.tick(0, &mut Vec::new());
+            jobs.tick(0, &mut Vec::new_in(alloc));
         }
         req.deadline_ms = 100;
-        let mut effects = Vec::new();
+        let mut effects = Vec::new_in(alloc);
         let second = jobs.submit(11, &req, reservation(), &mut effects).unwrap();
         assert_ne!(second.execution, first.execution);
         assert_eq!(
@@ -236,14 +266,15 @@ fn resubmission_cannot_revive_an_execution_past_its_last_deadline() {
 
 #[test]
 fn resubmission_still_coalesces_when_an_existing_subscriber_is_live() {
-    let (mut jobs, _) = registry();
+    let alloc = heap();
+    let (mut jobs, _) = registry(alloc);
     let mut req = request(1);
     req.deadline_ms = 10;
-    let first = jobs.submit(0, &req, reservation(), &mut Vec::new()).unwrap();
+    let first = jobs.submit(0, &req, reservation(), &mut Vec::new_in(alloc)).unwrap();
     req.deadline_ms = 100;
-    let live = jobs.submit(1, &req, reservation(), &mut Vec::new()).unwrap();
+    let live = jobs.submit(1, &req, reservation(), &mut Vec::new_in(alloc)).unwrap();
     req.deadline_ms = 200;
-    let next = jobs.submit(11, &req, reservation(), &mut Vec::new()).unwrap();
+    let next = jobs.submit(11, &req, reservation(), &mut Vec::new_in(alloc)).unwrap();
     assert_eq!(first.execution, live.execution);
     assert_eq!(next.execution, live.execution);
     assert_eq!(
@@ -256,18 +287,22 @@ fn resubmission_still_coalesces_when_an_existing_subscriber_is_live() {
 
 #[test]
 fn review_a_late_kill_ack_cannot_release_a_new_execution() {
+    let alloc = heap();
     for alive in [true, false] {
-        let mut admission = Admission::new(AdmissionConfig::default());
+        let mut admission = Admission::new(AdmissionConfig::default(), alloc);
         admission.add_machine("machine", [1; 32], reservation());
-        let builder = admission.add_builder(0, "machine", reservation(), Global).unwrap().into_string();
-        let mut jobs = Jobs::new(admission, ExecutionConfig::default());
-        let mut effects = Vec::new();
+        let builder = WireString::from_str_in(
+            &admission.add_builder(0, "machine", reservation(), alloc).unwrap(),
+            alloc,
+        );
+        let mut jobs = Jobs::new(admission, ExecutionConfig::default(), alloc);
+        let mut effects = Vec::new_in(alloc);
         let first = jobs.submit(0, &request(1), reservation(), &mut effects).unwrap();
         jobs.tick(0, &mut effects);
         jobs.unsubscribe(1, first.execution, first.subscriber, &mut effects).unwrap();
         jobs.killed(
             1,
-            &builder,
+            builder.as_str(),
             AssignmentToken { execution: first.execution, attempt: Attempt(1) },
             true,
         );
@@ -278,12 +313,12 @@ fn review_a_late_kill_ack_cannot_release_a_new_execution() {
         // A duplicated or reordered acknowledgement belongs to the first assignment.
         jobs.killed(
             3,
-            &builder,
+            builder.as_str(),
             AssignmentToken { execution: first.execution, attempt: Attempt(1) },
             alive,
         );
         assert_eq!(
-            jobs.admission_view().executor(&builder).unwrap().busy,
+            jobs.admission_view().executor(builder.as_str()).unwrap().busy,
             Some((second.execution, Attempt(1))),
         );
 
@@ -296,9 +331,10 @@ fn review_a_late_kill_ack_cannot_release_a_new_execution() {
 
 #[test]
 fn review_pr_supersession_follows_source_and_preserves_shared_executions() {
-    let admission = Admission::new(AdmissionConfig::default());
-    let mut jobs = Jobs::new(admission, ExecutionConfig::default());
-    let mut effects = Vec::new();
+    let alloc = heap();
+    let admission = Admission::new(AdmissionConfig::default(), alloc);
+    let mut jobs = Jobs::new(admission, ExecutionConfig::default(), alloc);
+    let mut effects = Vec::new_in(alloc);
     let mut linux = request(1);
     linux.namespace = Namespace::Pr(PrNamespace { n: 7 });
     let mut macos = linux.clone();
@@ -345,8 +381,9 @@ fn review_pr_supersession_follows_source_and_preserves_shared_executions() {
 
 #[test]
 fn review_a_replacement_lead_gets_its_own_compiled_event() {
+    let alloc = heap();
     for changed in [false, true] {
-        let mut e = execution();
+        let mut e = execution(alloc);
         let roots = blaze_wire::RootSet {
             spec: [1; 32],
             roots: [2; 32],
@@ -358,15 +395,18 @@ fn review_a_replacement_lead_gets_its_own_compiled_event() {
             execution: e.id,
             attempt: e.attempt(),
             roots: roots.clone(),
-            rejected: Set::new(Vec::new()),
+            rejected: Set::empty_in(alloc),
         };
-        e.join(0, "lead", &first, &mut Vec::new()).unwrap();
+        e.join(0, "lead", &first, &mut Vec::new_in(alloc)).unwrap();
         assert!(e.work().unwrap().is_done());
-        e.tick(15_001, &mut Vec::new());
-        e.assign(15_002, "helper", &[], &mut Vec::new()).unwrap();
-        let heartbeat =
-            WorkersEventsRequest { execution: e.id, attempt: e.attempt(), events: Vec::new() };
-        let mut effects = Vec::new();
+        e.tick(15_001, &mut Vec::new_in(alloc));
+        e.assign(15_002, "helper", &[], &mut Vec::new_in(alloc)).unwrap();
+        let heartbeat = WorkersEventsRequest {
+            execution: e.id,
+            attempt: e.attempt(),
+            events: Vec::new_in(alloc),
+        };
+        let mut effects = Vec::new_in(alloc);
         e.worker_events(15_002, "helper", &heartbeat, &mut effects).unwrap();
         assert!(!effects.iter().any(|effect| matches!(
             effect,
@@ -386,58 +426,67 @@ fn review_a_replacement_lead_gets_its_own_compiled_event() {
             } else {
                 roots
             },
-            rejected: Set::new(Vec::new()),
+            rejected: Set::empty_in(alloc),
         };
-        e.join(15_003, "helper", &next, &mut Vec::new()).unwrap();
+        e.join(15_003, "helper", &next, &mut Vec::new_in(alloc)).unwrap();
         if changed {
             assert!(!e.work().unwrap().is_done());
             let request = blaze_wire::WorkLeaseRequest { execution: e.id, attempt: e.attempt() };
-            let grant =
-                e.lease(15_004, "helper", &request, &mut Vec::new()).unwrap().grant.unwrap();
+            let grant = e
+                .lease(15_004, "helper", &request, &mut Vec::new_in(alloc))
+                .unwrap()
+                .grant
+                .unwrap();
             let result = blaze_wire::BatchResult {
                 lease: grant.lease,
                 seq: 1,
-                items: vec![blaze_wire::ItemResult {
-                    name: blaze_wire::WorkName([7; 32]),
-                    outcome: blaze_wire::ItemOutcome::Local(blaze_wire::Why {
-                        why: "lead tail".to_owned(),
-                    }),
-                    found: Set::new(Vec::new()),
-                    unnamed: Set::new(Vec::new()),
-                }],
-                packs: Vec::new(),
-                returned_roots: Set::new(Vec::new()),
-                returned_names: Set::new(Vec::new()),
+                items: vec_in![
+                    alloc;
+                    blaze_wire::ItemResult {
+                        name: blaze_wire::WorkName([7; 32]),
+                        outcome: blaze_wire::ItemOutcome::Local(blaze_wire::Why {
+                            why: WireString::from_str_in("lead tail", alloc),
+                        }),
+                        found: Set::empty_in(alloc),
+                        unnamed: Set::empty_in(alloc),
+                    }
+                ],
+                packs: Vec::new_in(alloc),
+                returned_roots: Set::empty_in(alloc),
+                returned_names: Set::empty_in(alloc),
             };
-            e.result(15_005, "helper", &result, &mut Vec::new()).unwrap();
+            e.result(15_005, "helper", &result, &mut Vec::new_in(alloc)).unwrap();
         }
         assert!(e.work().unwrap().is_done());
         // Replaying the join must not duplicate this attempt's completion notification.
-        e.join(15_006, "helper", &next, &mut Vec::new()).unwrap();
-        let compiled: Vec<_> = e
-            .events(0)
-            .iter()
-            .filter_map(|item| match &item.event {
+        e.join(15_006, "helper", &next, &mut Vec::new_in(alloc)).unwrap();
+        let compiled = Vec::from_iter_in(
+            e.events(0).iter().filter_map(|item| match &item.event {
                 JobEvent::Stage(stage) if stage.stage == blaze_wire::Stage::Compiled => {
                     Some(item.attempt)
                 }
                 _ => None,
-            })
-            .collect();
-        assert_eq!(compiled, vec![Attempt(1), Attempt(2)]);
+            }),
+            alloc,
+        );
+        assert_eq!(compiled.as_slice(), &[Attempt(1), Attempt(2)]);
     }
 }
 
-fn done(e: &Execution) -> WorkersEventsRequest {
+fn done(e: &Execution, alloc: WireAlloc) -> WorkersEventsRequest {
     WorkersEventsRequest {
         execution: e.id,
         attempt: e.attempt(),
-        events: vec![JobEvent::Done(DoneEvent { outcome: Outcome::Passed, counters: Vec::new() })],
+        events: vec_in![
+            alloc;
+            JobEvent::Done(DoneEvent { outcome: Outcome::Passed, counters: Vec::new_in(alloc) })
+        ],
     }
 }
 
 #[test]
 fn completion_and_timer_order_preserve_each_subscribers_deadline() {
+    let alloc = heap();
     for timer_first in [false, true] {
         for last in [false, true] {
             for now in [10, 11] {
@@ -448,41 +497,49 @@ fn completion_and_timer_order_preserve_each_subscribers_deadline() {
                     Namespace::Main,
                     subscriber(1, 10),
                     ExecutionConfig::default(),
-                    &mut Vec::new(),
+                    alloc,
+                    &mut Vec::new_in(alloc),
                 );
                 if !last {
                     let mut b = subscriber(2, 100);
                     b.policy = LocalPolicy::Fallback;
                     e.subscribe(b).unwrap();
                 }
-                e.assign(0, "lead", &[], &mut Vec::new()).unwrap();
-                complete_empty_work(&mut e, 0);
-                let request = done(&e);
-                let mut out = Vec::new();
+                e.assign(0, "lead", &[], &mut Vec::new_in(alloc)).unwrap();
+                complete_empty_work(&mut e, 0, alloc);
+                let request = done(&e, alloc);
+                let mut out = Vec::new_in(alloc);
                 if timer_first {
                     e.tick(now, &mut out);
                 }
                 e.worker_events(now, "lead", &request, &mut out).unwrap();
                 e.tick(now, &mut out);
                 e.worker_events(now + 1, "lead", &request, &mut out).unwrap();
-                let outcomes: Vec<_> = out
-                    .iter()
-                    .filter_map(|fx| match fx {
+                let outcomes = Vec::from_iter_in(
+                    out.iter().filter_map(|fx| match fx {
                         Effect::SubscriberEnded { subscriber, outcome, policy, .. } => {
                             Some((*subscriber, outcome.clone(), policy.clone()))
                         }
                         _ => None,
-                    })
-                    .collect();
-                let mut expected = vec![(
-                    1,
-                    if now > 10 { Outcome::TimedOut } else { Outcome::Passed },
-                    LocalPolicy::Never,
-                )];
+                    }),
+                    alloc,
+                );
+                let mut expected = vec_in![
+                    alloc;
+                    (
+                        1,
+                        if now > 10 { Outcome::TimedOut } else { Outcome::Passed },
+                        LocalPolicy::Never,
+                    )
+                ];
                 if !last {
                     expected.push((2, Outcome::Passed, LocalPolicy::Fallback));
                 }
-                assert_eq!(outcomes, expected, "timer_first={timer_first}, last={last}, now={now}");
+                assert_eq!(
+                    outcomes.as_slice(),
+                    expected.as_slice(),
+                    "timer_first={timer_first}, last={last}, now={now}"
+                );
                 assert_eq!(
                     e.state(),
                     ExecState::Ended(if last && now > 10 {
@@ -500,18 +557,19 @@ fn completion_and_timer_order_preserve_each_subscribers_deadline() {
     }
 }
 
-fn registry() -> (blaze_dist::jobs::Jobs, String) {
-    let mut a = blaze_dist::admission::Admission::new(Default::default());
+fn registry(alloc: WireAlloc) -> (blaze_dist::jobs::Jobs, WireString) {
+    let mut a = blaze_dist::admission::Admission::new(Default::default(), alloc);
     a.add_machine("machine", [1; 32], reservation());
-    let slot = a.add_builder(0, "machine", reservation(), Global).unwrap().into_string();
-    (blaze_dist::jobs::Jobs::new(a, Default::default()), slot)
+    let slot =
+        WireString::from_str_in(&a.add_builder(0, "machine", reservation(), alloc).unwrap(), alloc);
+    (blaze_dist::jobs::Jobs::new(a, Default::default(), alloc), slot)
 }
 
-fn submit(jobs: &mut blaze_dist::jobs::Jobs, tag: u64) -> ExecutionId {
+fn submit(jobs: &mut blaze_dist::jobs::Jobs, tag: u64, alloc: WireAlloc) -> ExecutionId {
     jobs.submit(
         0,
         &blaze_wire::JobRequest {
-            unit: [tag as u8; 32],
+            unit: [u8::try_from(tag & 0xff).unwrap(); 32],
             platform: [1; 32],
             namespace: Namespace::Main,
             source: [0; 32],
@@ -519,7 +577,7 @@ fn submit(jobs: &mut blaze_dist::jobs::Jobs, tag: u64) -> ExecutionId {
             local: LocalPolicy::Never,
         },
         reservation(),
-        &mut Vec::new(),
+        &mut Vec::new_in(alloc),
     )
     .unwrap()
     .execution
@@ -528,57 +586,67 @@ fn submit(jobs: &mut blaze_dist::jobs::Jobs, tag: u64) -> ExecutionId {
 #[test]
 fn a_duplicate_kill_ack_cannot_release_a_new_assignment_or_its_draining_slot() {
     use blaze_dist::admission::ExecutorPhase;
+    let alloc = heap();
     for draining in [false, true] {
         for alive in [false, true] {
-            let (mut jobs, slot) = registry();
-            let a = submit(&mut jobs, 1);
-            jobs.tick(0, &mut Vec::new());
+            let (mut jobs, slot) = registry(alloc);
+            let a = submit(&mut jobs, 1, alloc);
+            jobs.tick(0, &mut Vec::new_in(alloc));
             // This assignment-stop test needs a final verdict, not successful compile
             // coverage. A reported build failure is a legitimate terminal verdict.
-            let mut request = done(jobs.execution(a).unwrap());
-            request.events =
-                vec![JobEvent::Done(DoneEvent { outcome: Outcome::Failed, counters: Vec::new() })];
-            let mut out = Vec::new();
-            jobs.worker_events(1, &slot, &request, &mut out).unwrap();
+            let mut request = done(jobs.execution(a).unwrap(), alloc);
+            request.events = vec_in![
+                alloc;
+                JobEvent::Done(DoneEvent { outcome: Outcome::Failed, counters: Vec::new_in(alloc) })
+            ];
+            let mut out = Vec::new_in(alloc);
+            jobs.worker_events(1, slot.as_str(), &request, &mut out).unwrap();
             let token = out
                 .iter()
                 .find_map(|(_, fx)| match fx {
-                    Effect::Kill { executor, assignment } if executor == &slot => Some(*assignment),
+                    Effect::Kill { executor, assignment } if executor.as_str() == slot.as_str() => {
+                        Some(*assignment)
+                    }
                     _ => None,
                 })
                 .unwrap();
-            jobs.killed(2, &slot, token, true);
-            jobs.killed(2, &slot, token, true); // duplicate before reuse is inert too
-            let b = submit(&mut jobs, 2);
-            jobs.tick(3, &mut Vec::new());
-            assert_eq!(jobs.admission_view().executor(&slot).unwrap().busy, Some((b, Attempt(1))));
+            jobs.killed(2, slot.as_str(), token, true);
+            jobs.killed(2, slot.as_str(), token, true); // duplicate before reuse is inert too
+            let b = submit(&mut jobs, 2, alloc);
+            jobs.tick(3, &mut Vec::new_in(alloc));
+            assert_eq!(
+                jobs.admission_view().executor(slot.as_str()).unwrap().busy,
+                Some((b, Attempt(1)))
+            );
             if draining {
-                assert!(jobs.admission().rebuild(4, &slot, reservation(), Global).is_none());
+                assert!(jobs.admission().rebuild(4, slot.as_str(), reservation(), alloc).is_none());
             }
-            let before = jobs.admission_view().executor(&slot).unwrap().clone();
-            jobs.killed(5, &slot, token, alive);
+            let before = jobs.admission_view().executor(slot.as_str()).unwrap().clone();
+            jobs.killed(5, slot.as_str(), token, alive);
             // Even the current token cannot acknowledge a stop that has not been requested.
-            jobs.killed(5, &slot, jobs.execution(b).unwrap().assignment(), true);
-            assert_eq!(jobs.admission_view().executor(&slot), Some(&before));
-            let c = submit(&mut jobs, 3);
-            jobs.tick(6, &mut Vec::new());
+            jobs.killed(5, slot.as_str(), jobs.execution(b).unwrap().assignment(), true);
+            assert_eq!(jobs.admission_view().executor(slot.as_str()), Some(&before));
+            let c = submit(&mut jobs, 3, alloc);
+            jobs.tick(6, &mut Vec::new_in(alloc));
             assert_eq!(jobs.execution(c).unwrap().state(), ExecState::Queued);
             assert_eq!(jobs.admission_view().executors().count(), 1);
             assert_eq!(
                 before.phase,
                 if draining { ExecutorPhase::Draining } else { ExecutorPhase::Ready }
             );
-            let mut request = done(jobs.execution(b).unwrap());
-            request.events =
-                vec![JobEvent::Done(DoneEvent { outcome: Outcome::Failed, counters: Vec::new() })];
+            let mut request = done(jobs.execution(b).unwrap(), alloc);
+            request.events = vec_in![
+                alloc;
+                JobEvent::Done(DoneEvent { outcome: Outcome::Failed, counters: Vec::new_in(alloc) })
+            ];
             let b_token = jobs.execution(b).unwrap().assignment();
-            jobs.worker_events(7, &slot, &request, &mut Vec::new()).unwrap();
-            jobs.killed(8, &slot, b_token, true);
-            jobs.tick(9, &mut Vec::new());
+            jobs.worker_events(7, slot.as_str(), &request, &mut Vec::new_in(alloc)).unwrap();
+            jobs.killed(8, slot.as_str(), b_token, true);
+            jobs.tick(9, &mut Vec::new_in(alloc));
             assert_eq!(jobs.execution(c).unwrap().state(), ExecState::Running);
             if draining {
                 assert_eq!(
-                    jobs.admission_view().executor(&slot).unwrap().phase,
+                    jobs.admission_view().executor(slot.as_str()).unwrap().phase,
                     ExecutorPhase::Stopped
                 );
                 assert_ne!(jobs.execution(c).unwrap().lead(), Some(slot.as_str()));
@@ -589,7 +657,7 @@ fn a_duplicate_kill_ack_cannot_release_a_new_assignment_or_its_draining_slot() {
 
 #[test]
 fn promoted_permanently_stalled_helper_is_cancelled_at_deadline_without_coverage() {
-    use blaze_wire::{BatchResult, RootSet, Set, WorkJoinRequest, WorkLeaseRequest};
+    let alloc = heap();
     let mut config = ExecutionConfig::default();
     config.heartbeat_ms = 5;
     config.work.progress_first_ms = 10;
@@ -600,23 +668,27 @@ fn promoted_permanently_stalled_helper_is_cancelled_at_deadline_without_coverage
         Namespace::Main,
         subscriber(1, 50),
         config,
-        &mut Vec::new(),
+        alloc,
+        &mut Vec::new_in(alloc),
     );
-    e.assign(0, "lead", &["stuck", "healthy"], &mut Vec::new()).unwrap();
+    e.assign(0, "lead", &["stuck", "healthy"], &mut Vec::new_in(alloc)).unwrap();
     let roots =
         RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
     let heartbeat = |e: &Execution| WorkersEventsRequest {
         execution: e.id,
         attempt: e.attempt(),
-        events: Vec::new(),
+        events: Vec::new_in(alloc),
     };
     // The original lead disappears. The helper keeps heartbeating and is promoted.
-    e.worker_events(16, "stuck", &heartbeat(&e), &mut Vec::new()).unwrap();
+    e.worker_events(16, "stuck", &heartbeat(&e), &mut Vec::new_in(alloc)).unwrap();
     let old = e.assignment();
-    let mut out = Vec::new();
+    let mut out = Vec::new_in(alloc);
     e.tick(16, &mut out);
-    assert!(out.contains(&Effect::Kill { executor: "lead".to_owned(), assignment: old }));
-    assert!(out.contains(&Effect::NeedLead));
+    assert!(out.scan_for(&Effect::Kill {
+        executor: WireString::from_str_in("lead", alloc),
+        assignment: old
+    }).is_some());
+    assert!(out.scan_for(&Effect::NeedLead).is_some());
     e.assign(16, "stuck", &["healthy"], &mut out).unwrap();
     e.join(
         16,
@@ -625,7 +697,7 @@ fn promoted_permanently_stalled_helper_is_cancelled_at_deadline_without_coverage
             execution: e.id,
             attempt: e.attempt(),
             roots,
-            rejected: Set::new(Vec::new()),
+            rejected: Set::empty_in(alloc),
         },
         &mut out,
     )
@@ -646,10 +718,10 @@ fn promoted_permanently_stalled_helper_is_cancelled_at_deadline_without_coverage
     let late = BatchResult {
         lease: grant.lease,
         seq: 1,
-        items: Vec::new(),
-        packs: Vec::new(),
+        items: Vec::new_in(alloc),
+        packs: Vec::new_in(alloc),
         returned_roots: grant.roots,
-        returned_names: Set::new(Vec::new()),
+        returned_names: Set::empty_in(alloc),
     };
     assert_eq!(e.result(50, "stuck", &late, &mut out), Err(blaze_dist::Refusal::DeadLease));
     let current = e.assignment();
@@ -657,8 +729,14 @@ fn promoted_permanently_stalled_helper_is_cancelled_at_deadline_without_coverage
     assert_eq!(e.state(), ExecState::Ended(Outcome::Cancelled));
     assert_eq!(e.work().unwrap().ended(), Some(EndWhy::Deadline));
     assert!(!e.work().unwrap().is_done());
-    assert!(out.contains(&Effect::Kill { executor: "stuck".to_owned(), assignment: current }));
-    assert!(out.contains(&Effect::Kill { executor: "healthy".to_owned(), assignment: current }));
+    assert!(out.scan_for(&Effect::Kill {
+        executor: WireString::from_str_in("stuck", alloc),
+        assignment: current
+    }).is_some());
+    assert!(out.scan_for(&Effect::Kill {
+        executor: WireString::from_str_in("healthy", alloc),
+        assignment: current
+    }).is_some());
     assert!(!out.iter().any(|fx| matches!(fx, Effect::Work(blaze_dist::work::Effect::Done))));
     assert_eq!(e.result(52, "stuck", &late, &mut out), Err(blaze_dist::Refusal::Ended));
 }
@@ -669,28 +747,35 @@ fn promoted_permanently_stalled_helper_is_cancelled_at_deadline_without_coverage
 /// second worker's join, so no build could ever split.
 #[test]
 fn an_idle_builder_is_assigned_as_a_helper_and_both_workers_lease() {
-    let mut admission = Admission::new(AdmissionConfig::default());
+    let alloc = heap();
+    let mut admission = Admission::new(AdmissionConfig::default(), alloc);
     admission.add_machine("machine", [1; 32], Reservation { memory: 16, cpus: 16, disk: 16 });
-    let lead = admission.add_builder(0, "machine", reservation(), Global).unwrap().into_string();
-    let helper = admission.add_builder(0, "machine", reservation(), Global).unwrap().into_string();
+    let lead = WireString::from_str_in(
+        &admission.add_builder(0, "machine", reservation(), alloc).unwrap(),
+        alloc,
+    );
+    let helper = WireString::from_str_in(
+        &admission.add_builder(0, "machine", reservation(), alloc).unwrap(),
+        alloc,
+    );
     let config = ExecutionConfig {
         work: blaze_dist::work::WorkConfig { grant_roots: 1, ..Default::default() },
         ..Default::default()
     };
-    let mut jobs = Jobs::new(admission, config);
-    let mut out = Vec::new();
+    let mut jobs = Jobs::new(admission, config, alloc);
+    let mut out = Vec::new_in(alloc);
     let id = jobs.submit(0, &request(7), reservation(), &mut out).unwrap().execution;
     out.clear();
     jobs.tick(0, &mut out);
-    let assigned: Vec<_> = out
-        .iter()
-        .filter_map(|(_, effect)| match effect {
+    let assigned = Vec::from_iter_in(
+        out.iter().filter_map(|(_, effect)| match effect {
             Effect::HelperAssigned { executor, assignment } => {
                 Some((executor.clone(), *assignment))
             }
             _ => None,
-        })
-        .collect();
+        }),
+        alloc,
+    );
     assert_eq!(assigned.len(), 1, "{out:?}");
     assert_eq!(assigned[0].0, helper);
     assert_eq!(assigned[0].1.execution, id);
@@ -708,42 +793,47 @@ fn an_idle_builder_is_assigned_as_a_helper_and_both_workers_lease() {
                 execution: id,
                 attempt,
                 roots: roots.clone(),
-                rejected: Set::new(Vec::new()),
+                rejected: Set::empty_in(alloc),
             },
-            &mut Vec::new(),
+            &mut Vec::new_in(alloc),
         )
         .unwrap()
     };
-    join(&mut jobs, &lead);
-    join(&mut jobs, &helper);
+    join(&mut jobs, lead.as_str());
+    join(&mut jobs, helper.as_str());
     let lease = |jobs: &mut Jobs, who: &str| {
-        jobs.lease(0, who, &WorkLeaseRequest { execution: id, attempt }, &mut Vec::new())
+        jobs.lease(0, who, &WorkLeaseRequest { execution: id, attempt }, &mut Vec::new_in(alloc))
             .unwrap()
             .grant
             .unwrap()
     };
-    let first = lease(&mut jobs, &lead);
-    let second = lease(&mut jobs, &helper);
-    assert_eq!(first.roots.iter().copied().collect::<Vec<_>>(), vec![(0, 1)]);
-    assert_eq!(second.roots.iter().copied().collect::<Vec<_>>(), vec![(1, 2)]);
-    for (who, grant, tag) in [(&lead, &first, 9u8), (&helper, &second, 10u8)] {
+    let first = lease(&mut jobs, lead.as_str());
+    let second = lease(&mut jobs, helper.as_str());
+    assert_eq!(first.roots.as_slice(), &[(0, 1)]);
+    assert_eq!(second.roots.as_slice(), &[(1, 2)]);
+    for (who, grant, tag) in [(lead.as_str(), &first, 9u8), (helper.as_str(), &second, 10u8)] {
         jobs.result(
             0,
             who,
             &BatchResult {
                 lease: grant.lease.clone(),
                 seq: 1,
-                items: vec![ItemResult {
-                    name: WorkName([tag; 32]),
-                    outcome: ItemOutcome::Local(Why { why: "fixture".to_owned() }),
-                    found: Set::new(Vec::new()),
-                    unnamed: Set::new(Vec::new()),
-                }],
-                packs: Vec::new(),
-                returned_roots: Set::new(Vec::new()),
-                returned_names: Set::new(Vec::new()),
+                items: vec_in![
+                    alloc;
+                    ItemResult {
+                        name: WorkName([tag; 32]),
+                        outcome: ItemOutcome::Local(Why {
+                            why: WireString::from_str_in("fixture", alloc),
+                        }),
+                        found: Set::empty_in(alloc),
+                        unnamed: Set::empty_in(alloc),
+                    }
+                ],
+                packs: Vec::new_in(alloc),
+                returned_roots: Set::empty_in(alloc),
+                returned_names: Set::empty_in(alloc),
             },
-            &mut Vec::new(),
+            &mut Vec::new_in(alloc),
         )
         .unwrap();
     }
@@ -755,10 +845,11 @@ fn an_idle_builder_is_assigned_as_a_helper_and_both_workers_lease() {
 /// resubmitted job the id a surviving executor's lease still names.
 #[test]
 fn seeded_ids_differ_between_daemon_epochs() {
+    let alloc = heap();
     let first_id = |epoch: Digest| {
-        let (mut jobs, _) = registry();
+        let (mut jobs, _) = registry(alloc);
         jobs.seed_ids(&epoch);
-        submit(&mut jobs, 1)
+        submit(&mut jobs, 1, alloc)
     };
     assert_eq!(first_id([9; 32]), first_id([9; 32]));
     assert_ne!(first_id([9; 32]), first_id([7; 32]));
@@ -770,29 +861,30 @@ fn seeded_ids_differ_between_daemon_epochs() {
 /// An eager inner loop used to give both spare builders to the first build.
 #[test]
 fn idle_helpers_are_shared_round_robin_between_running_builds() {
-    let mut admission = Admission::new(AdmissionConfig::default());
+    let alloc = heap();
+    let mut admission = Admission::new(AdmissionConfig::default(), alloc);
     admission.add_machine("machine", [1; 32], Reservation { memory: 32, cpus: 32, disk: 32 });
     for _ in 0..4 {
-        admission.add_builder(0, "machine", reservation(), Global).unwrap();
+        admission.add_builder(0, "machine", reservation(), alloc).unwrap();
     }
-    let mut jobs = Jobs::new(admission, ExecutionConfig::default());
+    let mut jobs = Jobs::new(admission, ExecutionConfig::default(), alloc);
     // Every effect counts, submits included: a submit ticks admission before
     // it enqueues, so the first build's helper is assigned inside the second
     // submit, not in the tick below.
-    let mut out = Vec::new();
+    let mut out = Vec::new_in(alloc);
     let a = jobs.submit(0, &request(7), reservation(), &mut out).unwrap().execution;
     let b = jobs.submit(0, &request(8), reservation(), &mut out).unwrap().execution;
     assert_ne!(a, b);
     jobs.tick(0, &mut out);
     assert_eq!(jobs.execution(a).unwrap().state(), ExecState::Running);
     assert_eq!(jobs.execution(b).unwrap().state(), ExecState::Running);
-    let helpers: Vec<_> = out
-        .iter()
-        .filter_map(|(execution, effect)| match effect {
+    let helpers = Vec::from_iter_in(
+        out.iter().filter_map(|(execution, effect)| match effect {
             Effect::HelperAssigned { executor, .. } => Some((*execution, executor.as_str())),
             _ => None,
-        })
-        .collect();
+        }),
+        alloc,
+    );
     assert_eq!(helpers.len(), 2, "{out:?}");
     assert_eq!(helpers.iter().filter(|(id, _)| *id == a).count(), 1, "{out:?}");
     assert_eq!(helpers.iter().filter(|(id, _)| *id == b).count(), 1, "{out:?}");
@@ -804,34 +896,39 @@ fn idle_helpers_are_shared_round_robin_between_running_builds() {
 /// otherwise a just-assigned but silent worker can be promoted on lead loss.
 #[test]
 fn assigning_an_unstarted_helper_does_not_forge_liveness() {
-    let mut e = execution();
-    let heartbeat =
-        WorkersEventsRequest { execution: e.id, attempt: e.attempt(), events: Vec::new() };
-    e.worker_events(9, "helper", &heartbeat, &mut Vec::new()).unwrap();
+    let alloc = heap();
+    let mut e = execution(alloc);
+    let heartbeat = WorkersEventsRequest {
+        execution: e.id,
+        attempt: e.attempt(),
+        events: Vec::new_in(alloc),
+    };
+    e.worker_events(9, "helper", &heartbeat, &mut Vec::new_in(alloc)).unwrap();
     e.add_helper(10, "silent").unwrap();
-    let recently_heard: Vec<&str> = e.heard_recently(11).collect();
-    assert!(recently_heard.contains(&"helper"), "{recently_heard:?}");
-    assert!(!recently_heard.contains(&"silent"), "{recently_heard:?}");
+    let recently_heard = Vec::from_iter_in(e.heard_recently(11), alloc);
+    assert!(recently_heard.scan_for(&"helper").is_some(), "{recently_heard:?}");
+    assert!(recently_heard.scan_for(&"silent").is_none(), "{recently_heard:?}");
 
-    e.worker_events(12, "silent", &heartbeat, &mut Vec::new()).unwrap();
+    e.worker_events(12, "silent", &heartbeat, &mut Vec::new_in(alloc)).unwrap();
     assert!(e.heard_recently(13).any(|executor| executor == "silent"));
 }
 
 mod claim {
-    use std::alloc::Global;
-
     use blaze_dist::admission::{Admission, AdmissionConfig};
     use blaze_dist::jobs::{ExecutionConfig, Jobs};
-    use blaze_wire::{JobRequest, LocalPolicy, Namespace, Reservation};
+    use blaze_own::Vec;
+    use blaze_wire::{JobRequest, LocalPolicy, Namespace, Reservation, WireAlloc, WireString};
 
-    fn started(executors: u32) -> (Jobs, blaze_wire::ExecutionId) {
+    use super::heap;
+
+    fn started(executors: u32, alloc: WireAlloc) -> (Jobs, blaze_wire::ExecutionId) {
         let need = Reservation { memory: 1, cpus: 1, disk: 1 };
-        let mut admission = Admission::new(AdmissionConfig::default());
+        let mut admission = Admission::new(AdmissionConfig::default(), alloc);
         admission.add_machine("machine", [1; 32], Reservation { memory: 64, cpus: 64, disk: 64 });
         for _ in 0..executors {
-            admission.add_builder(0, "machine", need.clone(), Global).unwrap();
+            admission.add_builder(0, "machine", need.clone(), alloc).unwrap();
         }
-        let mut jobs = Jobs::new(admission, ExecutionConfig::default());
+        let mut jobs = Jobs::new(admission, ExecutionConfig::default(), alloc);
         let request = JobRequest {
             unit: [9; 32],
             platform: [1; 32],
@@ -840,18 +937,20 @@ mod claim {
             deadline_ms: 3_600_000,
             local: LocalPolicy::Never,
         };
-        let mut out = Vec::new();
+        let mut out = Vec::new_in(alloc);
         let answer = jobs.submit(0, &request, need, &mut out).unwrap();
         (jobs, answer.execution)
     }
 
     #[test]
     fn an_executor_is_claimed_once_and_again_by_its_claimant() {
-        let (mut jobs, id) = started(1);
-        let mut out = Vec::new();
+        let alloc = heap();
+        let (mut jobs, id) = started(1, alloc);
+        let mut out = Vec::new_in(alloc);
         let (first, attempt, storage) = {
-            let (executor, attempt) = jobs.claim(1, id, [1; 32], &mut out).unwrap().expect("the lead");
-            (executor.to_owned(), attempt, executor.as_ptr())
+            let (executor, attempt) =
+                jobs.claim(1, id, [1; 32], &mut out).unwrap().expect("the lead");
+            (WireString::from_str_in(executor, alloc), attempt, executor.as_ptr())
         };
         assert_eq!(jobs.execution(id).unwrap().lead().unwrap().as_ptr(), storage);
         assert_eq!(jobs.claim(2, id, [1; 32], &mut out).unwrap(), Some((first.as_str(), attempt)));
@@ -860,19 +959,24 @@ mod claim {
 
     #[test]
     fn a_second_claimant_gets_a_helper_when_there_is_one() {
-        let (mut jobs, id) = started(2);
-        let mut out = Vec::new();
-        let first = jobs.claim(1, id, [1; 32], &mut out).unwrap().expect("the lead").0.to_owned();
+        let alloc = heap();
+        let (mut jobs, id) = started(2, alloc);
+        let mut out = Vec::new_in(alloc);
+        let first = WireString::from_str_in(
+            jobs.claim(1, id, [1; 32], &mut out).unwrap().expect("the lead").0,
+            alloc,
+        );
         let second = jobs.claim(2, id, [2; 32], &mut out).unwrap();
         // A helper is offered per tick, and only once the execution has its work set.
         if let Some(second) = second {
-            assert_ne!(first, second.0, "one claimant per executor");
+            assert_ne!(first.as_str(), second.0, "one claimant per executor");
         }
     }
 
     #[test]
     fn work_unfinished_has_no_committed_packs() {
-        let (jobs, id) = started(1);
+        let alloc = heap();
+        let (jobs, id) = started(1, alloc);
         assert!(jobs.committed_packs(id).unwrap().is_none());
     }
 }

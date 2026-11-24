@@ -296,8 +296,44 @@ const fn cut(text: &'static str, from: usize, to: usize) -> &'static str {
     }
 }
 
+enum CatalogueError {
+    MissingSays,
+    MissingSql,
+    RepeatedName,
+    UndeclaredName,
+    MissingSection,
+}
+
+impl CatalogueError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::MissingSays => {
+                "a view's `-- name:` line in sql/examples.sql is not followed by its `-- says:` line"
+            }
+            Self::MissingSql => "a view's `-- says:` line in sql/examples.sql has no SQL line after it",
+            Self::RepeatedName => "sql/examples.sql repeats a `-- name:` section of VIEWS",
+            Self::UndeclaredName => {
+                "sql/examples.sql has a `-- name:` section with no declaration in VIEWS"
+            }
+            Self::MissingSection => {
+                "sql/examples.sql has no `-- name:` section for a view of VIEWS"
+            }
+        }
+    }
+}
+
 /// Fill each declaration from one pass over the sections, checking the catalogue at compile time.
-const fn catalogue<const N: usize>(file: &'static str, mut views: [View; N]) -> [View; N] {
+const fn catalogue<const N: usize>(file: &'static str, views: [View; N]) -> [View; N] {
+    match build_catalogue(file, views) {
+        Ok(views) => views,
+        Err(why) => panic!("{}", why.message()),
+    }
+}
+
+const fn build_catalogue<const N: usize>(
+    file: &'static str,
+    mut views: [View; N],
+) -> Result<[View; N], CatalogueError> {
     let bytes = file.as_bytes();
     let mut found = [false; N];
     let mut at = line_starting(bytes, NAME, 0);
@@ -306,13 +342,11 @@ const fn catalogue<const N: usize>(file: &'static str, mut views: [View; N]) -> 
         let end = line_end(bytes, named);
         let says = end + 1;
         if !starts(bytes, says, SAYS) {
-            panic!(
-                "a view's `-- name:` line in sql/examples.sql is not followed by its `-- says:` line"
-            );
+            return Err(CatalogueError::MissingSays);
         }
         let says_end = line_end(bytes, says);
         if says_end == bytes.len() {
-            panic!("a view's `-- says:` line in sql/examples.sql has no SQL line after it");
+            return Err(CatalogueError::MissingSql);
         }
         let sql = says_end + 1;
         let next = line_starting(bytes, NAME, sql);
@@ -320,33 +354,38 @@ const fn catalogue<const N: usize>(file: &'static str, mut views: [View; N]) -> 
         while sql_end > sql && bytes[sql_end - 1].is_ascii_whitespace() {
             sql_end -= 1;
         }
-        let mut i = 0;
-        while i < N {
-            let name = views[i].name;
-            if end - named == name.len() && starts(bytes, named, name.as_bytes()) {
-                if found[i] {
-                    panic!("sql/examples.sql repeats a `-- name:` section of VIEWS");
+        let mut matched = false;
+        let mut rest_views = views.as_mut_slice();
+        let mut rest_found = found.as_mut_slice();
+        while let (Some((view, next_views)), Some((seen, next_found))) =
+            (rest_views.split_first_mut(), rest_found.split_first_mut())
+        {
+            if end - named == view.name.len() && starts(bytes, named, view.name.as_bytes()) {
+                if *seen {
+                    return Err(CatalogueError::RepeatedName);
                 }
-                found[i] = true;
-                views[i].title = cut(file, says + SAYS.len(), says_end);
-                views[i].sql = cut(file, sql, sql_end);
+                *seen = true;
+                view.title = cut(file, says + SAYS.len(), says_end);
+                view.sql = cut(file, sql, sql_end);
+                matched = true;
                 break;
             }
-            i += 1;
+            rest_views = next_views;
+            rest_found = next_found;
         }
-        if i == N {
-            panic!("sql/examples.sql has a `-- name:` section with no declaration in VIEWS");
+        if !matched {
+            return Err(CatalogueError::UndeclaredName);
         }
         at = next;
     }
-    let mut i = 0;
-    while i < N {
-        if !found[i] {
-            panic!("sql/examples.sql has no `-- name:` section for a view of VIEWS");
+    let mut rest_found = found.as_slice();
+    while let Some((seen, next_found)) = rest_found.split_first() {
+        if !*seen {
+            return Err(CatalogueError::MissingSection);
         }
-        i += 1;
+        rest_found = next_found;
     }
-    views
+    Ok(views)
 }
 
 #[derive(Debug, PartialEq)]
@@ -701,6 +740,7 @@ pub fn args_schema(view: &View) -> Value {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::panic::catch_unwind;
 
     use serde_json::json;
 
@@ -796,8 +836,7 @@ mod tests {
                 "repeats a `-- name:` section",
             ),
         ] {
-            let error = std::panic::catch_unwind(|| catalogue(file, [view("wanted", &[])]))
-                .expect_err(file);
+            let error = catch_unwind(|| catalogue(file, [view("wanted", &[])])).expect_err(file);
             let message = error
                 .downcast_ref::<&str>()
                 .copied()
@@ -809,7 +848,7 @@ mod tests {
     #[test]
     fn cut_refuses_either_boundary_inside_a_utf8_character() {
         for (from, to) in [(1, 2), (0, 1)] {
-            let error = std::panic::catch_unwind(|| cut("é", from, to));
+            let error = catch_unwind(|| cut("é", from, to));
             assert!(error.is_err(), "cut {from}..{to} inside é must fail UTF-8 validation");
         }
     }
@@ -1091,7 +1130,7 @@ mod tests {
                 let name = if quoted {
                     at += 1;
                     let mut part = at;
-                    let mut name = String::new();
+                    let mut name = "".to_owned();
                     loop {
                         assert!(at < bytes.len(), "unterminated quoted identifier: {sql}");
                         if bytes[at] != b'"' {
@@ -1207,16 +1246,15 @@ mod tests {
 
     #[test]
     fn the_check_finds_a_misspelled_column() {
-        let mut known = BTreeSet::new();
-        known.extend(["spans".to_owned(), "dur_ns".to_owned()]);
-        let caught = std::panic::catch_unwind(|| check("bad", "SELECT dur_sn FROM spans", &known));
+        let known = ["spans", "dur_ns"].into_iter().map(str::to_owned).collect();
+        let caught = catch_unwind(|| check("bad", "SELECT dur_sn FROM spans", &known));
         assert!(caught.is_err());
         check("good", "SELECT dur_ns AS ms FROM spans WHERE ms > 1", &known);
     }
 
     #[test]
     fn the_check_resolves_aliases_and_still_refuses_unknown_columns_and_functions() {
-        let known = BTreeSet::from(["spans".to_owned(), "dur_ns".to_owned(), "crate".to_owned()]);
+        let known = ["spans", "dur_ns", "crate"].into_iter().map(str::to_owned).collect();
         for sql in [
             "SELECT r.dur_ns, h.dur_ns FROM (SELECT dur_ns FROM spans) r \
              ASOF JOIN (SELECT dur_ns FROM spans) h ON r.dur_ns >= h.dur_ns",
@@ -1236,7 +1274,7 @@ mod tests {
             r#"SELECT "dur_ns FROM spans"#,
         ] {
             assert!(
-                std::panic::catch_unwind(|| check("bad", sql, &known)).is_err(),
+                catch_unwind(|| check("bad", sql, &known)).is_err(),
                 "the schema check accepted {sql}"
             );
         }

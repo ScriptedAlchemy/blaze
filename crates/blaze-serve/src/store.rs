@@ -1,1083 +1,1379 @@
-//! The directory the server serves.
+//! On-disk cache store for content-addressed packs (`packs/<sha256>.pack`) and unit pack lists
+//! (`manifests/<unit-key>`).
 //!
-//! Every pack is checked before it becomes visible, so a name only ever holds what it says:
-//! `packs/<d>.pack` is a sealed pack whose bytes hash to `<d>`.
-//!
-//! A write goes to `.<name>.<pid>-<nanos>.tmp` in the same directory, is synced, renamed, and
-//! the directory synced, as the store writes its own files, so a partially written blob never
-//! appears: a reader sees all of it or none.
+//! Every write goes through a locked, dot-prefixed temporary file, verified against its name and
+//! format, and published through the sans-IO [`publication::Publication`] state machine (`fsync`
+//! file -> `rename` -> `fsync` directory). Every manifest publication checks that all referenced
+//! packs exist, match their committed digest/size/keys, agree on any shared key's value, and (on
+//! conditional CAS repair) preserve every key of the superseded manifest.
 
-use std::{
-    alloc::{Allocator, Global},
-    cmp::Reverse,
-    collections::BinaryHeap,
-    fs::File,
-    io::{self, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
+pub(crate) mod publication;
+
+#[cfg(test)]
+mod repair_tests;
+
+use core::alloc::Allocator;
+use core::cmp::Ordering as CmpOrdering;
+use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
+
+use blaze_own::{Heap4, Vec, format_in};
+use blaze_sha256::Sha256;
+use blaze_wire::{
+    DIST_PACK_FORMAT, DIST_PACK_MAGIC, Digest, Limits, PackRef, WireAlloc, WireString, is_dist_pack,
+    pack_list,
 };
 
-use blaze_wire::Digest;
-use sha2::{Digest as _, Sha256};
+use crate::blob::{Kind, ObjectName, hex_bytes, hex_in};
+use crate::error::Error;
+use crate::sys::{
+    Errno, Fd, OwnedFd, PublicationGate, ReadExactError, SysError, SystemClock, canonical_path,
+    create_dir_all, current_pid, dup_cloexec, fstat_len, fsync_fd, join_path, list_dir, lstat_info,
+    open_create_new, open_dir, open_read, pread_exact, pread_some, rename_path, try_flock_exclusive,
+    unlink_path, write_all_fd,
+};
+use publication::{Completion, Done, Effect, LogicalDir, LogicalFile, Phase, Publication};
 
-use crate::blob::{ObjectName, hex};
-use crate::error::{Error, failed};
+/// Buffer size for streaming pack verification (`64 KiB`).
+const SCAN_BUF_LEN: usize = 64 * 1024;
 
-mod publication;
+/// Buffer size for streaming value comparison across packs (`8 KiB`).
+const COMPARE_BUF_LEN: usize = 8 * 1024;
 
-/// The native boundary keeps the refusal's diagnostic, not the completion's owned IO.
-#[derive(Debug)]
-struct PublicationCompletionError {
-    path: PathBuf,
-    step: publication::Step,
-    tag: blaze_core::Tag,
-    completion: String,
-}
+/// Maximum time to wait on the in-process manifest publication gate (`30 s`).
+const GATE_DEADLINE_MS: u64 = 30_000;
 
-impl std::fmt::Display for PublicationCompletionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}: {:?} refused completion {} with tag {:?}",
-            self.path.display(), self.step, self.completion, self.tag,
-        )
-    }
-}
+/// Maximum attempts to create a unique staging file name.
+const MAX_TEMP_ATTEMPTS: usize = 16;
 
-impl std::error::Error for PublicationCompletionError {}
-
-fn publication_completion_error(
-    to: &Path,
-    refused: publication::RefusedCompletion,
-) -> io::Error {
-    let publication::RefusedCompletion { step, tag, done } = refused;
-    // A refused completion can own a writable mapping. Release it on the driver thread,
-    // before placing this Send + Sync diagnostic in an io::Error; the sans-IO core
-    // returns ownership unchanged. Done has no separate completion-description type.
-    let error = PublicationCompletionError {
-        path: to.to_owned(),
-        step,
-        tag,
-        completion: format!("{done:?}"),
-    };
-    drop(done);
-    io::Error::other(error)
-}
-
-/// One native record's header; ordering starts with its key for the merge frontier.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct NativeEntry {
-    key: Digest,
-    kind: u8,
-    length: u64,
-    offset: u64,
-}
-
-/// A native scan's fixed read buffer. Small values are skipped inside it; a larger
-/// value seeks past the unread tail, so the scan never retains values or keys.
-struct NativeScan<R> {
-    reader: R,
-    bytes: [u8; 8192],
-    at: usize,
-    end: usize,
-}
-
-impl<R: Read + Seek> NativeScan<R> {
-    fn new(reader: R) -> Self {
-        Self { reader, bytes: [0; 8192], at: 0, end: 0 }
-    }
-
-    fn skip(&mut self, count: u64) -> io::Result<()> {
-        let buffered = self.end - self.at;
-        if count <= buffered as u64 {
-            self.at += count as usize;
-        } else {
-            let beyond = i64::try_from(count - buffered as u64)
-                .map_err(|_| io::ErrorKind::InvalidInput)?;
-            self.reader.seek(SeekFrom::Current(beyond))?;
-            self.at = 0;
-            self.end = 0;
-        }
-        Ok(())
-    }
-
-    fn rewind(&mut self, offset: u64) -> io::Result<()> {
-        self.reader.seek(SeekFrom::Start(offset))?;
-        self.at = 0;
-        self.end = 0;
-        Ok(())
-    }
-}
-
-impl<R: Read> Read for NativeScan<R> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
-        }
-        if self.at == self.end {
-            self.end = self.reader.read(&mut self.bytes)?;
-            self.at = 0;
-        }
-        let n = out.len().min(self.end - self.at);
-        out[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
-        self.at += n;
-        Ok(n)
-    }
-}
-
-fn native_refusal(name: &str, why: &str) -> Error {
-    Error::new(blaze_wire::ErrorCode::Refused, format_args!("{name}: {why}"))
-}
-
-/// Read just a header. Validate the end before any skip or value comparison, so even
-/// u64::MAX lengths cannot overflow or seek past the verified file's boundary.
-fn native_entry(
-    reader: &mut impl Read,
-    name: &str,
-    offset: u64,
-    size: u64,
-) -> Result<Option<NativeEntry>, Error> {
-    if offset == size {
-        return Ok(None);
-    }
-    let mut header = [0; 41];
-    reader.read_exact(&mut header)
-        .map_err(|e| native_refusal(name, &format!("ends inside a native value header: {e}")))?;
-    let length = u64::from_le_bytes(header[33..].try_into().expect("eight length bytes"));
-    let value_offset = offset
-        .checked_add(header.len() as u64)
-        .ok_or_else(|| native_refusal(name, "native value offset overflows u64"))?;
-    if length > size.saturating_sub(value_offset) || value_offset > size {
-        return Err(native_refusal(name, "ends inside a native value"));
-    }
-    Ok(Some(NativeEntry {
-        key: header[..32].try_into().expect("32 key bytes"),
-        kind: header[32],
-        length,
-        offset: value_offset,
-    }))
-}
-
-fn native_keys_hasher(count: usize) -> Sha256 {
-    let mut hash = Sha256::new();
-    // The wire v5 digest domain, followed by the same array head and byte strings
-    // Pack::of hashes. Streaming avoids allocating a CBOR array proportional to keys.
-    write!(Unhashed(&mut hash), "blaze/blaze/dist-pack-keys/v{}\0", blaze_wire::VERSION)
-        .expect("the hashing writer cannot fail");
-    let count = count as u64;
-    match count {
-        0..=23 => hash.update([0x80 | count as u8]),
-        24..=0xff => hash.update([0x98, count as u8]),
-        0x100..=0xffff => {
-            hash.update([0x99]);
-            hash.update((count as u16).to_be_bytes());
-        }
-        0x1_0000..=0xffff_ffff => {
-            hash.update([0x9a]);
-            hash.update((count as u32).to_be_bytes());
-        }
-        _ => {
-            hash.update([0x9b]);
-            hash.update(count.to_be_bytes());
-        }
-    }
-    hash
-}
-
-/// The directory, shared by every connection.
+/// On-disk store rooted at a directory holding `packs/` and `manifests/`.
 pub struct Store {
-    dir: PathBuf,
-    /// Serializes publication's comparison, validation and atomic rename. Ordinary lists
-    /// are immutable; a conditional repair may replace only an exactly matched stale list.
-    publication: Mutex<()>,
-    #[cfg(test)]
-    publication_failure: Mutex<Option<publication::Step>>,
-    #[cfg(test)]
-    bypass_comparison: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
-    bypass_mirrors: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
-    verification_peak: std::sync::atomic::AtomicUsize,
+    root: WireString,
+    limits: Limits,
+    alloc: WireAlloc,
+    clock: SystemClock,
+    next_tmp: AtomicU64,
+    publication: PublicationGate,
+}
+
+/// A newly created, exclusively `flock`-leased temporary staging file.
+pub(crate) struct StagedTemp {
+    pub(crate) path: WireString,
+    pub(crate) fd: OwnedFd,
+    pub(crate) dir_path: WireString,
+}
+
+/// Planted verification bug for DST oracle testing only.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum VerifyPlant {
+    None,
+    SkipCrossPackComparison,
+    SkipOldPackComparison,
 }
 
 impl Store {
-    /// The directory `dir`. A directory that is not there is made, so that the server can be
-    /// pointed at a new one.
-    pub fn open(dir: &Path) -> Result<Store, Error> {
-        for sub in ["packs", "manifests"] {
-            let at = dir.join(sub);
-            std::fs::create_dir_all(&at)
-                .map_err(|e| failed(&format!("making {}", at.display()), e))?;
-            if std::fs::symlink_metadata(&at)?.file_type().is_symlink() {
-                return Err(Error::malformed(format_args!(
-                    "{} is a symlink, not a cache directory",
-                    at.display()
-                )));
-            }
-        }
-        let store = Store {
-            dir: dir.canonicalize()?,
-            publication: Mutex::new(()),
-            #[cfg(test)]
-            publication_failure: Mutex::new(None),
-            #[cfg(test)]
-            bypass_comparison: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            bypass_mirrors: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            verification_peak: std::sync::atomic::AtomicUsize::new(0),
+    /// Opens or initializes a store at `root` under `limits`, using `alloc` for internal buffers.
+    ///
+    /// Refuses symlinks at `root`, `root/packs`, and `root/manifests`.
+    pub fn open(root: &str, limits: Limits, alloc: WireAlloc) -> Result<Self, Error> {
+        ensure_real_directory(root, alloc.clone())?;
+        let canonical = canonical_path(root, alloc.clone())
+            .map_err(|e| Error::store_io(alloc.clone(), "canonicalize", root, e))?;
+        let packs_dir = join_path(canonical.as_str(), Kind::Pack.directory(), alloc.clone());
+        let manifests_dir = join_path(canonical.as_str(), Kind::Manifest.directory(), alloc.clone());
+        ensure_real_directory(packs_dir.as_str(), alloc.clone())?;
+        ensure_real_directory(manifests_dir.as_str(), alloc.clone())?;
+        Ok(Self {
+            root: canonical,
+            limits,
+            alloc,
+            clock: SystemClock,
+            next_tmp: AtomicU64::new(1),
+            publication: PublicationGate::new(),
+        })
+    }
+
+    /// Canonical path of the store root.
+    pub fn root(&self) -> &str {
+        self.root.as_str()
+    }
+
+    /// Active wire and blob limits.
+    pub const fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    /// Allocator used by the store for owned buffers and error messages.
+    pub fn allocator(&self) -> &WireAlloc {
+        &self.alloc
+    }
+
+    /// Absolute path on disk for `name`.
+    pub(crate) fn object_path(&self, name: &ObjectName) -> WireString {
+        let rel = name.as_string_in(self.alloc.clone());
+        join_path(self.root.as_str(), rel.as_str(), self.alloc.clone())
+    }
+
+    /// Absolute path of the kind's directory (`<root>/packs` or `<root>/manifests`).
+    pub(crate) fn kind_dir(&self, kind: Kind) -> WireString {
+        join_path(self.root.as_str(), kind.directory(), self.alloc.clone())
+    }
+
+    /// Opens an existing object read-only, returning its descriptor and byte length.
+    ///
+    /// Returns `Ok(None)` if the object does not exist; refuses symlinks or non-regular files.
+    pub fn open_blob(&self, name: &ObjectName) -> Result<Option<(OwnedFd, u64)>, Error> {
+        let path = self.object_path(name);
+        let meta = match lstat_info(path.as_str()) {
+            Ok(meta) => meta,
+            Err(Errno::NoEnt) => return Ok(None),
+            Err(err) => return Err(Error::store_io(self.alloc.clone(), "stat", path.as_str(), err)),
         };
-        store.sweep_temporaries(std::time::Duration::from_secs(3600))?;
-        Ok(store)
-    }
-
-    /// The directory it serves.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    pub(crate) fn checked_path(&self, name: &str) -> Result<PathBuf, Error> {
-        Ok(self.object(name)?.path(&self.dir))
-    }
-
-    /// The object under `name`, or `None` when nothing is there.
-    pub fn open_blob(&self, name: &str) -> Result<Option<(File, u64)>, Error> {
-        let object = self.object(name)?;
-        match File::open(object.path(&self.dir)) {
-            Ok(file) => {
-                let len = file.metadata().map_err(|e| failed(&format!("reading {name}"), e))?.len();
-                Ok(Some((file, len)))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(failed(&format!("opening {name}"), e)),
+        if meta.is_symlink || !meta.is_file {
+            return Err(Error::malformed_owned(format_in!(
+                self.alloc.clone(),
+                "store object {} is not a regular file",
+                path.as_str()
+            )));
         }
+        let fd = match open_read(path.as_str()) {
+            Ok(fd) => fd,
+            Err(Errno::NoEnt) => return Ok(None),
+            Err(err) => return Err(Error::store_io(self.alloc.clone(), "open", path.as_str(), err)),
+        };
+        let len = fstat_len(fd.fd())
+            .map_err(|e| Error::store_io(self.alloc.clone(), "fstat", path.as_str(), e))?;
+        Ok(Some((fd, len)))
     }
 
-    /// The bytes of a small object, when it is at most `most`.
+    /// Reads a whole object into `alloc` provided its size does not exceed `cap`.
     pub fn read_small<A: Allocator>(
         &self,
-        name: &str,
-        most: u64,
+        name: &ObjectName,
+        cap: u64,
         alloc: A,
     ) -> Result<Option<Vec<u8, A>>, Error> {
-        let Some((file, _)) = self.open_blob(name)? else { return Ok(None) };
-        let mut bytes = Vec::new_in(alloc);
-        std::io::copy(&mut file.take(most.saturating_add(1)), &mut bytes)?;
-        if bytes.len() as u64 > most {
-            return Err(Error::too_large(format_args!(
-                "`{name}` is longer than the {most} bytes that are taken of it: {}",
-                bytes.len()
-            )));
-        }
-        Ok(Some(bytes))
-    }
-
-    /// Writes a blob `name` with `bytes`, after checking that they are what the name says, and
-    /// says whether the name was new.
-    pub fn put_blob(&self, name: &str, bytes: &[u8]) -> Result<bool, Error> {
-        let object = self.object(name)?;
-        if !object.is_blob() {
-            return Err(Error::malformed(format_args!("{name} is a list, not a blob")));
-        }
-        self.verify(&object, bytes)?;
-        let _gate = self.publication.lock().unwrap_or_else(|e| e.into_inner());
-        let existed = object.path(&self.dir).exists();
-        self.write_whole(&object, bytes)?;
-        Ok(!existed)
-    }
-
-    /// Writes a blob from a temporary file the caller filled, which is renamed into place:
-    /// the way a blob too large to hold is written. The bytes are read back and checked
-    /// first, and nothing is named when the check fails.
-    pub fn put_blob_from(&self, name: &str, from: &Path) -> Result<bool, Error> {
-        let object = self.object(name)?;
-        if !object.is_blob() {
-            return Err(Error::malformed(format_args!("{name} is a list, not a blob")));
-        }
-        self.verify_file(&object, from)?;
-        let _gate = self.publication.lock().unwrap_or_else(|e| e.into_inner());
-        let to = object.path(&self.dir);
-        let existed = to.exists();
-        let file = File::options()
-            .write(true)
-            .open(from)
-            .map_err(|e| failed(&format!("writing {name}"), e))?;
-        self.name_file_whole(&file, from, &to).map_err(|e| failed(&format!("naming {name}"), e))?;
-        Ok(!existed)
-    }
-
-    /// Writes the list `name`, if nothing is there. `false` is another writer having written
-    /// first: a list is written once.
-    pub fn put_list(&self, name: &str, bytes: &[u8]) -> Result<bool, Error> {
-        self.put_list_with(name, bytes, |object, bytes| self.write_whole(object, bytes))
-    }
-
-    // The simulation supplies publication IO, keeping the real first-writer predicate.
-    fn put_list_with(
-        &self,
-        name: &str,
-        bytes: &[u8],
-        publish: impl FnOnce(&ObjectName, &[u8]) -> Result<(), Error>,
-    ) -> Result<bool, Error> {
-        if bytes.len() > blaze_wire::Limits::DOCUMENTED.request as usize {
-            return Err(Error::too_large(format_args!("the list exceeds the request limit")));
-        }
-        let object = self.object(name)?;
-        if object.is_blob() {
-            return Err(Error::malformed(format_args!("{name} is a blob, not a list")));
-        }
-        // The look and the write are one step: the gate is held across both.
-        let _gate = self.publication.lock().unwrap_or_else(|e| e.into_inner());
-        if object.path(&self.dir).exists() {
-            return Ok(false);
-        }
-        // A first writer must not publish a missing, corrupt or noncanonical
-        // pack list. Keep validation under the same publication lock as the
-        // atomic name, so concurrent PUTs cannot change the verified packs.
-        let packs = blaze_wire::pack_list::decode(bytes, Global)
-            .map_err(|why| Error::malformed(format_args!("the new {name}: {why}")))?;
-        self.verify_manifest_packs(name, &packs, packs.len())?;
-        publish(&object, bytes)?;
-        Ok(true)
-    }
-
-    /// Repair an exactly matched manifest only when at least one of its packs is absent.
-    /// Existing corrupt packs and malformed lists are refused. Every replacement pack is
-    /// verified before the existing atomic writer is entered, under the publication gate.
-    /// False is a missing/different current list or a list whose packs are all still valid.
-    pub fn repair_list(&self, name: &str, expected: &Digest, bytes: &[u8]) -> Result<bool, Error> {
-        self.repair_list_with(name, expected, bytes, |object, bytes| {
-            self.write_whole(object, bytes)
-        })
-    }
-
-    // Keep authorization and the publication gate shared with the simulation's IO adapter.
-    fn repair_list_with(
-        &self,
-        name: &str,
-        expected: &Digest,
-        bytes: &[u8],
-        publish: impl FnOnce(&ObjectName, &[u8]) -> Result<(), Error>,
-    ) -> Result<bool, Error> {
-        if bytes.len() > blaze_wire::Limits::DOCUMENTED.request as usize {
-            return Err(Error::too_large(format_args!(
-                "the replacement list exceeds the request limit"
-            )));
-        }
-        let object = self.object(name)?;
-        if object.is_blob() {
-            return Err(Error::malformed(format_args!("{name} is a blob, not a manifest")));
-        }
-        let _gate = self.publication.lock().unwrap_or_else(|error| error.into_inner());
-        let Some(current) =
-            self.read_small(name, u64::from(blaze_wire::Limits::DOCUMENTED.request), Global)?
-        else {
-            return Ok(false);
-        };
-        let same = <Digest>::from(Sha256::digest(&current)) == *expected;
-        #[cfg(test)]
-        let same = same || self.bypass_comparison.load(Ordering::Relaxed);
-        if !same {
-            return Ok(false);
-        }
-        let old = blaze_wire::pack_list::decode(&current, Global)
-            .map_err(|why| Error::malformed(format_args!("the current {name}: {why}")))?;
-        // Inspect every present old pack, even when another is missing: a
-        // conflicting immutable key is not a repairable cache miss.
-        let missing = self.verify_manifest_packs(name, &old, 0)?;
-        if !missing {
-            return Ok(false);
-        }
-        let mut replacement = blaze_wire::pack_list::decode(bytes, Global)
-            .map_err(|why| Error::malformed(format_args!("the replacement {name}: {why}")))?;
-        let required = replacement.len();
-        // A missing pack does not release the immutable keys in surviving old packs.
-        // Compare both manifests together: validating each in isolation would permit a
-        // repair to replace an old verified value with conflicting new bytes.
-        replacement.extend(old);
-        self.verify_manifest_packs(name, &replacement, required)?;
-        publish(&object, bytes)?;
-        Ok(true)
-    }
-
-    /// Validate each native pack, then merge its ordered records to compare equal keys.
-    /// The first `required` packs must exist; later packs may be absent. Conditional
-    /// repair compares the replacement and surviving old packs in this one frontier.
-    /// The request limit bounds the frontier to one record per manifest line, independent
-    /// of the number of keys in a unit. Only two files and fixed byte buffers are live.
-    /// Work is linear in pack bytes plus O(records * log(packs)) frontier operations.
-    /// Reopened content names remain stable under the caller's publication gate: every
-    /// Store blob replacement takes that gate, and the janitor only removes temporaries.
-    fn verify_manifest_packs(
-        &self,
-        name: &str,
-        packs: &[blaze_wire::PackRef],
-        required: usize,
-    ) -> Result<bool, Error> {
-        // The frontier lives for this bounded verification of one manifest.
-        let mut frontier = BinaryHeap::new_in(Global);
-        let mut missing = false;
-        for (at, pack) in packs.iter().enumerate() {
-            if !self.verify_pack(pack)? {
-                if at < required {
-                    return Err(Error::new(
-                        blaze_wire::ErrorCode::Refused,
-                        format_args!("{name} names absent pack {}", hex(&pack.pack)),
-                    ));
-                }
-                missing = true;
-            } else if let Some(entry) = self.native_entry_at(pack, 8)? {
-                frontier.push(Reverse((entry, at)));
-            }
-        }
-        #[cfg(test)]
-        self.verification_peak.fetch_max(frontier.len(), Ordering::Relaxed);
-        let mut previous: Option<(NativeEntry, usize)> = None;
-        while let Some(Reverse((entry, at))) = frontier.pop() {
-            if let Some((prior, prior_at)) = previous
-                && prior.key == entry.key
-            {
-                self.compare_native_values(&packs[prior_at], prior, &packs[at], entry)?;
-            }
-            previous = Some((entry, at));
-            if let Some(next) = self.native_entry_at(&packs[at], entry.offset + entry.length)? {
-                frontier.push(Reverse((next, at)));
-            }
-        }
-        Ok(missing)
-    }
-
-    /// True is a whole present native pack; false is absence. CBOR's batch limit
-    /// bounds wire arrays, not the opaque records in a native blob (Pack::of has no
-    /// such cap). Count ordered records first, then hash their CBOR encoding without
-    /// retaining keys or values. The blob byte limit bounds both scans.
-    fn verify_pack(&self, pack: &blaze_wire::PackRef) -> Result<bool, Error> {
-        let name = format!("packs/{}.pack", hex(&pack.pack));
-        let object = self.object(&name)?;
-        let Some((mut file, size)) = self.open_blob(&name)? else { return Ok(false) };
-        if size != pack.size || size > blaze_wire::Limits::DOCUMENTED.blob {
-            return Err(native_refusal(
-                &name,
-                &format!(
-                    "has {size} bytes, its list names {}; the wire blob limit is {}",
-                    pack.size,
-                    blaze_wire::Limits::DOCUMENTED.blob,
-                ),
-            ));
-        }
-        self.verify_reader(&object, &mut file)?;
-        file.seek(SeekFrom::Start(8)).map_err(|e| failed(&format!("rewinding {name}"), e))?;
-        let mut reader = NativeScan::new(file);
-        let mut count = 0;
-        let mut previous = None;
-        let mut offset = 8;
-        while let Some(entry) = native_entry(&mut reader, &name, offset, size)? {
-            if previous.is_some_and(|key| key >= entry.key) {
-                return Err(native_refusal(&name, "native entries have duplicate or unordered keys"));
-            }
-            previous = Some(entry.key);
-            count += 1;
-            offset = entry.offset + entry.length;
-            reader.skip(entry.length)
-                .map_err(|e| failed(&format!("skipping a value in {name}"), e))?;
-        }
-        reader.rewind(8).map_err(|e| failed(&format!("rewinding {name}"), e))?;
-        let mut hash = native_keys_hasher(count);
-        offset = 8;
-        while let Some(entry) = native_entry(&mut reader, &name, offset, size)? {
-            // A Digest is a CBOR byte string of 32 bytes, not an array of integers.
-            hash.update([0x58, 32]);
-            hash.update(entry.key);
-            offset = entry.offset + entry.length;
-            reader.skip(entry.length)
-                .map_err(|e| failed(&format!("skipping a value in {name}"), e))?;
-        }
-        if Digest::from(hash.finalize()) != pack.keys {
-            return Err(native_refusal(
-                &name,
-                "native keys differ from the immutable list commitment",
-            ));
-        }
-        Ok(true)
-    }
-
-    fn native_entry_at(
-        &self,
-        pack: &blaze_wire::PackRef,
-        offset: u64,
-    ) -> Result<Option<NativeEntry>, Error> {
-        if offset == pack.size {
+        let Some((fd, len)) = self.open_blob(name)? else {
             return Ok(None);
-        }
-        let name = format!("packs/{}.pack", hex(&pack.pack));
-        let mut file = self.verified_pack_file(&name)?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| failed(&format!("locating a record in {name}"), e))?;
-        native_entry(&mut file, &name, offset, pack.size)
-    }
-
-    fn verified_pack_file(&self, name: &str) -> Result<File, Error> {
-        self.open_blob(name)?.map(|(file, _)| file).ok_or_else(|| {
-            native_refusal(name, "previously verified pack vanished under the publication gate")
-        })
-    }
-
-    fn compare_native_values(
-        &self,
-        prior_pack: &blaze_wire::PackRef,
-        prior: NativeEntry,
-        pack: &blaze_wire::PackRef,
-        entry: NativeEntry,
-    ) -> Result<(), Error> {
-        #[cfg(test)]
-        if self.bypass_mirrors.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let name = format!("packs/{}.pack", hex(&pack.pack));
-        let conflict = |why| {
-            native_refusal(
-                &name,
-                &format!(
-                    "immutable key {} has conflicting {why} across packs {} and {}",
-                    hex(&entry.key),
-                    hex(&prior_pack.pack),
-                    hex(&pack.pack),
-                ),
-            )
         };
-        if prior.kind != entry.kind || prior.length != entry.length {
-            return Err(conflict("kinds or lengths"));
+        if len > cap {
+            let obj_name = name.as_string_in(self.alloc.clone());
+            return Err(Error::too_large_owned(format_in!(
+                self.alloc.clone(),
+                "{} is {} bytes, over limit {}",
+                obj_name.as_str(),
+                len,
+                cap
+            )));
         }
-        let prior_name = format!("packs/{}.pack", hex(&prior_pack.pack));
-        let mut old = self.verified_pack_file(&prior_name)?;
-        let mut new = self.verified_pack_file(&name)?;
-        old.seek(SeekFrom::Start(prior.offset))
-            .map_err(|e| failed(&format!("locating a value in {prior_name}"), e))?;
-        new.seek(SeekFrom::Start(entry.offset))
-            .map_err(|e| failed(&format!("locating a value in {name}"), e))?;
-        let mut old_bytes = [0; 8192];
-        let mut new_bytes = [0; 8192];
-        let mut remaining = entry.length;
-        while remaining > 0 {
-            let chunk = remaining.min(old_bytes.len() as u64) as usize;
-            old.read_exact(&mut old_bytes[..chunk])
-                .map_err(|e| failed(&format!("reading a value in {prior_name}"), e))?;
-            new.read_exact(&mut new_bytes[..chunk])
-                .map_err(|e| failed(&format!("reading a value in {name}"), e))?;
-            if old_bytes[..chunk] != new_bytes[..chunk] {
-                return Err(conflict("bytes"));
+        let initial_cap = usize::try_from(len).unwrap_or(0);
+        let mut out = Vec::with_capacity_in(initial_cap, alloc);
+        let mut buf = [0u8; 8192];
+        let mut offset = 0u64;
+        loop {
+            let n = pread_some(fd.fd(), &mut buf, offset).map_err(|e| {
+                let p = self.object_path(name);
+                Error::store_io(self.alloc.clone(), "read", p.as_str(), e)
+            })?;
+            if n == 0 {
+                break;
             }
-            remaining -= chunk as u64;
+            let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
+            let next_offset = offset.saturating_add(n_u64);
+            if next_offset > cap {
+                let obj_name = name.as_string_in(self.alloc.clone());
+                return Err(Error::too_large_owned(format_in!(
+                    self.alloc.clone(),
+                    "{} grew past limit {}",
+                    obj_name.as_str(),
+                    cap
+                )));
+            }
+            if let Some(chunk) = buf.get(..n) {
+                out.extend_from_slice(chunk);
+            }
+            offset = next_offset;
         }
-        Ok(())
+        Ok(Some(out))
     }
 
-    /// Removes the temporary files of writes that were stopped, once they are older than the
-    /// hour a remote's collection gives an object: a write that is in flight when this runs is
-    /// younger than that, and no request is in flight when the store is opened.
-    pub(crate) fn sweep_temporaries(&self, older_than: std::time::Duration) -> Result<(), Error> {
-        for sub in ["", "packs", "manifests"] {
-            let at = if sub.is_empty() { self.dir.clone() } else { self.dir.join(sub) };
-            let entries = match std::fs::read_dir(&at) {
-                Ok(entries) => entries,
-                Err(error) => {
-                    eprintln!("blaze-serve: janitor cannot list {}: {error}", at.display());
-                    continue;
-                }
-            };
-            for entry in entries.flatten() {
-                let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
-                let temporary = name.strip_suffix(".tmp").is_some_and(|name| {
-                    name.rsplit_once('.').is_some_and(|(_, stamp)| {
-                        let parts: Vec<_> = stamp.split('-').collect();
-                        matches!(parts.len(), 2 | 3)
-                            && parts.iter().all(|it| {
-                                !it.is_empty() && it.bytes().all(|byte| byte.is_ascii_digit())
-                            })
-                    })
-                });
-                if !temporary {
-                    continue;
-                }
-                // Project names may themselves end in a numeric .tmp suffix. Published
-                // objects are never staging files, even when the suffix looks like one.
-                // Current dot-prefixed and excluded legacy staging names still qualify.
-                if !sub.is_empty() && ObjectName::parse(&format!("{sub}/{name}")).is_some() {
-                    continue;
-                }
-                if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                    continue;
-                }
-                let old = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|it| it.modified().ok())
-                    .and_then(|it| it.elapsed().ok())
-                    .is_some_and(|it| it > older_than);
-                if old {
-                    let file = match File::options().read(true).write(true).open(entry.path()) {
-                        Ok(file) => file,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(error) => {
-                            eprintln!(
-                                "blaze-serve: janitor cannot open {}: {error}; left untouched",
-                                entry.path().display()
-                            );
+    /// Creates a uniquely named, `flock`-leased temporary file in `name.kind()`'s directory.
+    pub(crate) fn stage_temporary(&self, name: &ObjectName) -> Result<StagedTemp, Error> {
+        let dir_path = self.kind_dir(name.kind());
+        let file_name = name.file_name_in(self.alloc.clone());
+        let pid = current_pid();
+        let now_ns = self.clock.monotonic_nanos().unwrap_or(0);
+        for _ in 0..MAX_TEMP_ATTEMPTS {
+            let seq = self.next_tmp.fetch_add(1, Ordering::Relaxed);
+            let tmp_name = format_in!(
+                self.alloc.clone(),
+                ".{}.{}-{}-{}.tmp",
+                file_name.as_str(),
+                pid,
+                now_ns,
+                seq
+            );
+            let path = join_path(dir_path.as_str(), tmp_name.as_str(), self.alloc.clone());
+            match open_create_new(path.as_str(), true) {
+                Ok(fd) => {
+                    match try_flock_exclusive(fd.fd()) {
+                        Ok(true) => return Ok(StagedTemp { path, fd, dir_path }),
+                        Ok(false) => {
+                            let _ = unlink_path(path.as_str());
                             continue;
                         }
-                    };
-                    match file.try_lock() {
-                        Ok(()) => {
-                            if let Err(error) = std::fs::remove_file(entry.path())
-                                && error.kind() != std::io::ErrorKind::NotFound
-                            {
-                                eprintln!(
-                                    "blaze-serve: janitor cannot remove {}: {error}",
-                                    entry.path().display()
-                                );
-                            }
-                        }
-                        Err(std::fs::TryLockError::WouldBlock) => {}
-                        Err(std::fs::TryLockError::Error(error)) => {
-                            eprintln!(
-                                "blaze-serve: janitor cannot lock {}: {error}; left untouched",
-                                entry.path().display()
-                            );
+                        Err(err) => {
+                            let _ = unlink_path(path.as_str());
+                            return Err(Error::store_io(
+                                self.alloc.clone(),
+                                "flock",
+                                path.as_str(),
+                                err,
+                            ));
                         }
                     }
                 }
+                Err(Errno::Exist) => continue,
+                Err(err) => {
+                    return Err(Error::store_io(
+                        self.alloc.clone(),
+                        "create temp",
+                        path.as_str(),
+                        err,
+                    ));
+                }
             }
         }
-        Ok(())
+        Err(Error::internal("exhausted unique temporary names"))
     }
 
-    /// Checks that `bytes` are the pack `object`'s name says.
-    pub fn verify(&self, object: &ObjectName, bytes: &[u8]) -> Result<(), Error> {
-        self.verify_reader(object, std::io::Cursor::new(bytes))
+    /// Stores a whole pack from memory, checking magic, blob limit and SHA-256 against `name`.
+    ///
+    /// Returns `Ok(true)` if newly written, `Ok(false)` if already present.
+    pub fn put_blob(&self, name: &ObjectName, body: &[u8]) -> Result<bool, Error> {
+        if name.kind() != Kind::Pack {
+            return Err(Error::malformed("put_blob only writes packs/<sha256>.pack"));
+        }
+        let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        if len > self.limits.blob {
+            return Err(Error::too_large_owned(format_in!(
+                self.alloc.clone(),
+                "pack is {} bytes, over limit {}",
+                len,
+                self.limits.blob
+            )));
+        }
+        if !is_dist_pack(body) {
+            return Err(Error::refused("pack is not of the distributed pack format"));
+        }
+        let got = blaze_sha256::digest(body);
+        if &got != name.digest() {
+            let want_hex = hex_in(name.digest(), self.alloc.clone());
+            let got_hex = hex_in(&got, self.alloc.clone());
+            return Err(Error::refused_owned(format_in!(
+                self.alloc.clone(),
+                "pack digest mismatch: name {}, body {}",
+                want_hex.as_str(),
+                got_hex.as_str()
+            )));
+        }
+        let dst = self.object_path(name);
+        if self.existing_regular_file(dst.as_str())? {
+            return Ok(false);
+        }
+        self.write_whole(name, body)?;
+        Ok(true)
     }
 
-    fn verify_file(&self, object: &ObjectName, from: &Path) -> Result<(), Error> {
-        let file = File::open(from)
-            .map_err(|e| failed(&format!("reading what was sent for {}", object.name), e))?;
-        self.verify_reader(object, file)
+    /// Finalizes a streamed pack from a staged temporary file.
+    ///
+    /// Takes ownership of `temp_fd` and unlinks `temp_path` on any refusal or if the blob already
+    /// exists. Returns `Ok(true)` if newly published, `Ok(false)` if already present.
+    pub(crate) fn put_blob_from(
+        &self,
+        name: &ObjectName,
+        temp_path: &str,
+        temp_fd: OwnedFd,
+        dir_path: &str,
+        len: u64,
+        got_digest: Digest,
+        starts_with_magic: bool,
+    ) -> Result<bool, Error> {
+        if name.kind() != Kind::Pack {
+            let _ = unlink_path(temp_path);
+            return Err(Error::malformed("put_blob only writes packs/<sha256>.pack"));
+        }
+        if len > self.limits.blob {
+            let _ = unlink_path(temp_path);
+            return Err(Error::too_large_owned(format_in!(
+                self.alloc.clone(),
+                "pack is {} bytes, over limit {}",
+                len,
+                self.limits.blob
+            )));
+        }
+        if !starts_with_magic {
+            let _ = unlink_path(temp_path);
+            return Err(Error::refused("pack is not of the distributed pack format"));
+        }
+        if &got_digest != name.digest() {
+            let _ = unlink_path(temp_path);
+            let want_hex = hex_in(name.digest(), self.alloc.clone());
+            let got_hex = hex_in(&got_digest, self.alloc.clone());
+            return Err(Error::refused_owned(format_in!(
+                self.alloc.clone(),
+                "pack digest mismatch: name {}, body {}",
+                want_hex.as_str(),
+                got_hex.as_str()
+            )));
+        }
+        let dst = self.object_path(name);
+        if self.existing_regular_file(dst.as_str())? {
+            let _ = unlink_path(temp_path);
+            return Ok(false);
+        }
+        self.name_file_whole(temp_path, temp_fd, dst.as_str(), dir_path)?;
+        Ok(true)
     }
 
-    fn verify_reader(&self, object: &ObjectName, mut reader: impl Read) -> Result<(), Error> {
-        let mut hash = Sha256::new();
-        let mut start = [0; 8];
-        reader.read_exact(&mut start).map_err(|e| {
-            Error::new(
-                blaze_wire::ErrorCode::Refused,
-                format_args!("{} has no pack header: {e}", object.name),
-            )
+    /// Publishes a manifest under first-writer semantics (no `If-Match`).
+    ///
+    /// Returns `Ok(true)` if written, `Ok(false)` if a manifest already existed.
+    pub fn put_list(&self, name: &ObjectName, body: &[u8]) -> Result<bool, Error> {
+        self.repair_list(name, None, body)
+    }
+
+    /// Publishes or conditionally replaces a manifest (`If-Match` = `expected`).
+    ///
+    /// - When `expected` is `None`: refuses to overwrite an existing manifest (`Ok(false)`).
+    /// - When `expected` is `Some(digest)`: requires the existing manifest's SHA-256 to match
+    ///   `digest` (`Ok(false)` on mismatch or absence) and requires every key from the existing
+    ///   manifest's packs to remain present with equal kind and bytes in the new packs.
+    pub fn repair_list(
+        &self,
+        name: &ObjectName,
+        expected: Option<Digest>,
+        body: &[u8],
+    ) -> Result<bool, Error> {
+        if name.kind() != Kind::Manifest {
+            return Err(Error::malformed("manifest route only writes manifests/<sha256>"));
+        }
+        let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        let req_cap = u64::from(self.limits.request);
+        if body_len > req_cap {
+            return Err(Error::too_large_owned(format_in!(
+                self.alloc.clone(),
+                "manifest is {} bytes, over limit {}",
+                body_len,
+                req_cap
+            )));
+        }
+        let new_packs = pack_list::decode(body, self.alloc.clone()).map_err(|err| {
+            Error::malformed_owned(format_in!(
+                self.alloc.clone(),
+                "malformed manifest pack list: {err}"
+            ))
         })?;
-        if !blaze_wire::is_dist_pack(&start) {
-            return Err(Error::new(
-                blaze_wire::ErrorCode::Refused,
-                format_args!(
-                    "{} is not a pack of format {}",
-                    object.name,
-                    blaze_wire::DIST_PACK_FORMAT
-                ),
-            ));
-        }
-        hash.update(start);
-        std::io::copy(&mut reader, &mut Unhashed(&mut hash)).map_err(|e| {
-            Error::new(
-                blaze_wire::ErrorCode::Refused,
-                format_args!("{} does not read: {e}", object.name),
-            )
+
+        let _guard = self.publication.acquire(self.clock, GATE_DEADLINE_MS).map_err(|err| {
+            Error::internal_owned(format_in!(
+                self.alloc.clone(),
+                "acquiring publication gate: {}",
+                SysError(err)
+            ))
         })?;
-        let got: Digest = hash.finalize().into();
-        if got != object.digest {
-            return Err(wrong(&object.name, &got, &object.digest));
-        }
-        Ok(())
+
+        let existing = self.read_small(name, req_cap, self.alloc.clone())?;
+        let old_packs = match (expected, existing) {
+            (None, Some(_)) => return Ok(false),
+            (None, None) => Vec::new_in(self.alloc.clone()),
+            (Some(_), None) => return Ok(false),
+            (Some(want), Some(current)) => {
+                if blaze_sha256::digest(current.as_slice()) != want {
+                    return Ok(false);
+                }
+                pack_list::decode(current.as_slice(), self.alloc.clone()).map_err(|err| {
+                    Error::internal_owned(format_in!(
+                        self.alloc.clone(),
+                        "existing manifest on disk is malformed: {err}"
+                    ))
+                })?
+            }
+        };
+
+        self.verify_manifest_packs(old_packs.as_slice(), new_packs.as_slice())?;
+        self.write_whole(name, body)?;
+        Ok(true)
     }
 
-    /// Writes `bytes` under the object's name, whole or not at all.
-    fn write_whole(&self, object: &ObjectName, bytes: &[u8]) -> Result<(), Error> {
-        let to = object.path(&self.dir);
-        let partial = temporary(&to);
-        let write = (|| -> std::io::Result<()> {
-            let mut file = File::options().write(true).create_new(true).open(&partial)?;
-            file.try_lock().map_err(std::io::Error::from)?;
-            file.write_all(bytes)?;
-            self.name_file_whole(&file, &partial, &to)
-        })();
-        if let Err(e) = write {
-            _ = std::fs::remove_file(&partial);
-            return Err(failed(&format!("writing {}", object.name), e));
-        }
-        Ok(())
-    }
-
-    /// Drive the publication core on the original handle and paths. In particular, do not
-    /// reopen the staged file by name or substitute a driver that changes Windows rename
-    /// semantics, creates directories, or syncs an ancestor instead of the original parent.
-    fn name_file_whole(&self, file: &File, from: &Path, to: &Path) -> std::io::Result<()> {
-        use blaze_core::{Completion, Done, Effect};
-        use publication::{Publication, Step};
-
-        let mut publication = Publication::new();
-        for _ in 0..Publication::MAX_STEPS {
-            let Some(effect) = publication.effect() else { break };
-            let tag = effect.tag();
-            let step = publication.step();
+    /// Verifies that every pack in `old_packs` and `new_packs` exists, passes integrity checks,
+    /// has consistent values for any duplicated keys, and preserves every old key in `new_packs`.
+    pub(crate) fn verify_manifest_packs(
+        &self,
+        old_packs: &[PackRef],
+        new_packs: &[PackRef],
+    ) -> Result<(), Error> {
+        verify_manifest_packs_impl(
+            self,
+            old_packs,
+            new_packs,
             #[cfg(test)]
-            if *self.publication_failure.lock().unwrap() == Some(step) {
-                return Err(std::io::Error::other(format!(
-                    "{}: injected {step:?} failure",
-                    to.display()
+            VerifyPlant::None,
+        )
+    }
+
+    /// Test-only entrypoint allowing planted verification bugs for the DST oracle.
+    #[cfg(test)]
+    pub(crate) fn verify_manifest_packs_planted(
+        &self,
+        old_packs: &[PackRef],
+        new_packs: &[PackRef],
+        plant: VerifyPlant,
+    ) -> Result<(), Error> {
+        verify_manifest_packs_impl(self, old_packs, new_packs, plant)
+    }
+
+    /// Deletes stale unleased `.tmp` files older than `older_than` from `packs/` and `manifests/`.
+    pub fn sweep_temporaries(&self, older_than: Duration) -> Result<usize, Error> {
+        let now = self.clock.realtime().map_err(|e| {
+            Error::internal_owned(format_in!(self.alloc.clone(), "read wall clock: {}", SysError(e)))
+        })?;
+        let now_ns = timespec_signed_nanos(now.sec, now.nsec);
+        let cutoff_ns = i128::try_from(older_than.as_nanos()).unwrap_or(i128::MAX);
+        let mut removed = 0usize;
+
+        for kind in [Kind::Pack, Kind::Manifest] {
+            let dir = self.kind_dir(kind);
+            let entries = match list_dir(dir.as_str(), self.alloc.clone()) {
+                Ok(entries) => entries,
+                Err(Errno::NoEnt) => continue,
+                Err(err) => {
+                    return Err(Error::store_io(self.alloc.clone(), "list dir", dir.as_str(), err));
+                }
+            };
+            for entry in &entries {
+                let name = entry.name.as_str();
+                if !name.starts_with('.') || !name.ends_with(".tmp") {
+                    continue;
+                }
+                let path = join_path(dir.as_str(), name, self.alloc.clone());
+                let meta = match lstat_info(path.as_str()) {
+                    Ok(meta) => meta,
+                    Err(Errno::NoEnt) => continue,
+                    Err(_) => continue,
+                };
+                if !meta.is_file || meta.is_symlink {
+                    continue;
+                }
+                let mtime_ns = timespec_signed_nanos(meta.mtime_sec, meta.mtime_nsec);
+                let age_ns = now_ns.saturating_sub(mtime_ns);
+                if age_ns < cutoff_ns {
+                    continue;
+                }
+                let fd = match open_read(path.as_str()) {
+                    Ok(fd) => fd,
+                    Err(_) => continue,
+                };
+                match try_flock_exclusive(fd.fd()) {
+                    Ok(true) => {
+                        if unlink_path(path.as_str()).is_ok() {
+                            removed = removed.saturating_add(1);
+                        }
+                    }
+                    Ok(false) | Err(_) => {}
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    fn existing_regular_file(&self, path: &str) -> Result<bool, Error> {
+        match lstat_info(path) {
+            Ok(meta) => {
+                if meta.is_symlink || !meta.is_file {
+                    return Err(Error::internal_owned(format_in!(
+                        self.alloc.clone(),
+                        "store path {path} is not a regular file"
+                    )));
+                }
+                Ok(true)
+            }
+            Err(Errno::NoEnt) => Ok(false),
+            Err(err) => Err(Error::store_io(self.alloc.clone(), "stat", path, err)),
+        }
+    }
+
+    fn write_whole(&self, name: &ObjectName, body: &[u8]) -> Result<(), Error> {
+        let staged = self.stage_temporary(name)?;
+        if let Err(err) = write_all_fd(staged.fd.fd(), body) {
+            let _ = unlink_path(staged.path.as_str());
+            return Err(Error::store_io(self.alloc.clone(), "write", staged.path.as_str(), err));
+        }
+        let dst = self.object_path(name);
+        self.name_file_whole(staged.path.as_str(), staged.fd, dst.as_str(), staged.dir_path.as_str())
+    }
+
+    /// Drives the sans-IO [`Publication`] state machine (`Sync` -> `Rename` -> `SyncDir`).
+    fn name_file_whole(
+        &self,
+        temp_path: &str,
+        temp_fd: OwnedFd,
+        dst_path: &str,
+        dir_path: &str,
+    ) -> Result<(), Error> {
+        let (mut machine, mut next) =
+            Publication::start(LogicalDir(1), LogicalFile(1), LogicalFile(2), 1);
+        loop {
+            let completion = match next {
+                Effect::Sync { tag, .. } => match fsync_fd(temp_fd.fd()) {
+                    Ok(()) => Completion { tag, result: Ok(Done::<()>::Synced) },
+                    Err(err) => {
+                        let _ = unlink_path(temp_path);
+                        return Err(Error::store_io(self.alloc.clone(), "fsync", temp_path, err));
+                    }
+                },
+                Effect::Rename { tag, .. } => match rename_path(temp_path, dst_path) {
+                    Ok(()) => Completion { tag, result: Ok(Done::<()>::Renamed) },
+                    Err(err) => {
+                        let _ = unlink_path(temp_path);
+                        return Err(Error::store_io(self.alloc.clone(), "rename", dst_path, err));
+                    }
+                },
+                Effect::SyncDir { tag, .. } => {
+                    let dir_fd = open_dir(dir_path).map_err(|err| {
+                        Error::store_io(self.alloc.clone(), "open dir", dir_path, err)
+                    })?;
+                    match fsync_fd(dir_fd.fd()) {
+                        Ok(()) => Completion { tag, result: Ok(Done::<()>::DirSynced) },
+                        Err(err) => {
+                            return Err(Error::store_io(
+                                self.alloc.clone(),
+                                "fsync dir",
+                                dir_path,
+                                err,
+                            ));
+                        }
+                    }
+                }
+            };
+            match machine.complete(completion) {
+                Ok(Some(effect)) => next = effect,
+                Ok(None) => {
+                    if machine.phase() == Phase::Acknowledged {
+                        return Ok(());
+                    }
+                    return Err(Error::internal("publication finished without acknowledgement"));
+                }
+                Err(_) => return Err(Error::internal("publication refused its own completion")),
+            }
+        }
+    }
+
+    fn open_and_verify_pack(&self, pack_ref: &PackRef) -> Result<OwnedFd, Error> {
+        let h = hex_bytes(&pack_ref.pack);
+        let h_str = core::str::from_utf8(&h).unwrap_or("");
+        let name_str = format_in!(self.alloc.clone(), "packs/{h_str}.pack");
+        let obj = ObjectName::parse_kind(name_str.as_str(), Kind::Pack)?;
+        let Some((fd, actual_len)) = self.open_blob(&obj)? else {
+            return Err(Error::refused_owned(format_in!(
+                self.alloc.clone(),
+                "manifest names missing pack {}",
+                name_str.as_str()
+            )));
+        };
+        verify_pack_fd(fd.fd(), actual_len, pack_ref, name_str.as_str(), self.alloc.clone())?;
+        Ok(fd)
+    }
+}
+
+/// Ensures `path` exists as a real (non-symlink) directory, creating missing directories as needed.
+fn ensure_real_directory(path: &str, alloc: WireAlloc) -> Result<(), Error> {
+    match lstat_info(path) {
+        Ok(meta) => {
+            if meta.is_symlink {
+                return Err(Error::internal_owned(format_in!(
+                    alloc,
+                    "store directory {path} must not be a symlink"
                 )));
             }
-            // The core uses logical file slots so native paths need no UTF-8 conversion.
-            // RenameUnsynced reports the atomic namespace change; SyncDir separately
-            // makes it durable, as the simulation's same effects do.
-            let result = match (step, effect) {
-                (Step::FileSync, Effect::Sync { .. }) => file.sync_all().map(|()| Done::Synced),
-                (Step::Rename, Effect::RenameUnsynced { .. }) => {
-                    std::fs::rename(from, to).map(|()| Done::Renamed)
-                }
-                (Step::DirectorySync, Effect::SyncDir { .. }) => to
-                    .parent()
-                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))
-                    .and_then(|parent| File::open(parent)?.sync_all())
-                    .map(|()| Done::Synced),
-                _ => return Err(std::io::Error::other("invalid cache publication effect")),
-            };
-            let done = result.map_err(|error| {
-                std::io::Error::new(error.kind(), format!("{}: {step:?}: {error}", to.display()))
-            })?;
-            publication.complete(Completion { tag, done })
-                .map_err(|refused| publication_completion_error(to, refused))?;
-        }
-        if publication.acknowledged() {
+            if !meta.is_dir {
+                return Err(Error::internal_owned(format_in!(
+                    alloc,
+                    "store path {path} is not a directory"
+                )));
+            }
             Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "{}: cache publication exhausted its effect bound",
-                to.display()
-            )))
         }
+        Err(Errno::NoEnt) => {
+            create_dir_all(path).map_err(|e| Error::store_io(alloc.clone(), "mkdir", path, e))?;
+            let meta = lstat_info(path)
+                .map_err(|e| Error::store_io(alloc.clone(), "stat", path, e))?;
+            if meta.is_symlink || !meta.is_dir {
+                return Err(Error::internal_owned(format_in!(
+                    alloc,
+                    "store directory {path} must be a real directory"
+                )));
+            }
+            Ok(())
+        }
+        Err(err) => Err(Error::store_io(alloc, "stat", path, err)),
+    }
+}
+
+fn timespec_signed_nanos(sec: i64, nsec: i64) -> i128 {
+    i128::from(sec).saturating_mul(1_000_000_000).saturating_add(i128::from(nsec))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Streaming native pack verification & multi-pack key-value merge check.
+// ---------------------------------------------------------------------------------------------
+
+/// Header of a single record inside a native pack, along with its byte offset in the pack file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RecordMeta {
+    pub(crate) key: Digest,
+    pub(crate) kind: u8,
+    pub(crate) value_offset: u64,
+    pub(crate) value_len: u64,
+}
+
+/// Buffered forward scanner over a native pack file descriptor using explicit `pread` offsets.
+///
+/// Never loads values into memory when skipping; advances from its logical file position so
+/// skips across buffer boundaries are exact.
+pub(crate) struct PackScanner {
+    fd: OwnedFd,
+    file_len: u64,
+    logical_pos: u64,
+    buf_start: u64,
+    buf_filled: usize,
+    buf: Vec<u8, WireAlloc>,
+}
+
+impl PackScanner {
+    /// Opens a scanner at byte 0 with a `buf_len`-byte read window.
+    pub(crate) fn new(fd: OwnedFd, file_len: u64, buf_len: usize, alloc: WireAlloc) -> Self {
+        let cap = buf_len.max(64);
+        let mut buf = Vec::with_capacity_in(cap, alloc);
+        buf.resize(cap, 0);
+        Self { fd, file_len, logical_pos: 0, buf_start: 0, buf_filled: 0, buf }
     }
 
-    fn object(&self, name: &str) -> Result<ObjectName, Error> {
-        let object = ObjectName::parse(name)
-            .ok_or_else(|| Error::not_found(format_args!("`{name}` is not an object of this cache")))?;
-        let at = object.path(&self.dir);
-        for path in [at.parent().expect("an object has a directory"), at.as_path()] {
-            match std::fs::symlink_metadata(path) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    return Err(Error::malformed(format_args!("a cache object cannot be a symlink")));
+    /// Logical position in the file.
+    pub(crate) const fn pos(&self) -> u64 {
+        self.logical_pos
+    }
+
+    /// Underlying file descriptor.
+    pub(crate) fn fd(&self) -> Fd {
+        self.fd.fd()
+    }
+
+    /// Reads exact `dst.len()` bytes from the current logical position.
+    pub(crate) fn read_exact(&mut self, dst: &mut [u8]) -> Result<(), ReadExactError> {
+        let mut filled = 0usize;
+        while filled < dst.len() {
+            let avail = self.buffered_slice();
+            if !avail.is_empty() {
+                let take = avail.len().min(dst.len().saturating_sub(filled));
+                if let (Some(src), Some(out)) =
+                    (avail.get(..take), dst.get_mut(filled..filled.saturating_add(take)))
+                {
+                    out.copy_from_slice(src);
+                    let take_u64 = u64::try_from(take).unwrap_or(0);
+                    self.logical_pos = self.logical_pos.saturating_add(take_u64);
+                    filled = filled.saturating_add(take);
+                    continue;
                 }
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+            }
+            if !self.refill().map_err(ReadExactError::Os)? {
+                return Err(ReadExactError::UnexpectedEof);
             }
         }
-        Ok(object)
-    }
-}
-
-/// A writer that hashes what it is given and keeps none of it.
-struct Unhashed<'a>(&'a mut Sha256);
-
-impl Write for Unhashed<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.update(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// Feeds `len` bytes starting at `self.logical_pos` into `hasher` and advances `logical_pos`.
+    pub(crate) fn hash_bytes(&mut self, mut len: u64, hasher: &mut Sha256) -> Result<(), ReadExactError> {
+        while len > 0 {
+            let avail = self.buffered_slice();
+            if !avail.is_empty() {
+                let take_u64 = len.min(u64::try_from(avail.len()).unwrap_or(u64::MAX));
+                let take = usize::try_from(take_u64).unwrap_or(avail.len());
+                if let Some(chunk) = avail.get(..take) {
+                    hasher.update(chunk);
+                }
+                self.logical_pos = self.logical_pos.saturating_add(take_u64);
+                len = len.saturating_sub(take_u64);
+                continue;
+            }
+            if !self.refill().map_err(ReadExactError::Os)? {
+                return Err(ReadExactError::UnexpectedEof);
+            }
+        }
+        Ok(())
+    }
+
+    /// Advances the logical position by `len` bytes without reading them from disk.
+    pub(crate) fn skip(&mut self, len: u64) -> Result<(), ReadExactError> {
+        let Some(next) = self.logical_pos.checked_add(len) else {
+            return Err(ReadExactError::UnexpectedEof);
+        };
+        if next > self.file_len {
+            return Err(ReadExactError::UnexpectedEof);
+        }
+        self.logical_pos = next;
+        Ok(())
+    }
+
+    /// Reads the next native record header (`key[32] || kind[1] || len[8]`) and skips its payload,
+    /// returning `Ok(None)` cleanly at exact EOF.
+    pub(crate) fn next_record(&mut self) -> Result<Option<RecordMeta>, ReadExactError> {
+        if self.logical_pos >= self.file_len {
+            return Ok(None);
+        }
+        let mut header = [0u8; 41];
+        self.read_exact(&mut header)?;
+        let Some((key, rest)) = header.split_first_chunk::<32>() else {
+            return Err(ReadExactError::UnexpectedEof);
+        };
+        let Some((&kind, len_bytes)) = rest.split_first() else {
+            return Err(ReadExactError::UnexpectedEof);
+        };
+        let Some(len_arr) = len_bytes.first_chunk::<8>() else {
+            return Err(ReadExactError::UnexpectedEof);
+        };
+        let value_len = u64::from_le_bytes(*len_arr);
+        let value_offset = self.logical_pos;
+        self.skip(value_len)?;
+        Ok(Some(RecordMeta { key: *key, kind, value_offset, value_len }))
+    }
+
+    fn buffered_slice(&self) -> &[u8] {
+        let buf_end = self
+            .buf_start
+            .saturating_add(u64::try_from(self.buf_filled).unwrap_or(0));
+        if self.logical_pos < self.buf_start || self.logical_pos >= buf_end {
+            return &[];
+        }
+        let rel = usize::try_from(self.logical_pos.saturating_sub(self.buf_start)).unwrap_or(0);
+        self.buf.get(rel..self.buf_filled).unwrap_or(&[])
+    }
+
+    fn refill(&mut self) -> Result<bool, Errno> {
+        if self.logical_pos >= self.file_len {
+            self.buf_start = self.logical_pos;
+            self.buf_filled = 0;
+            return Ok(false);
+        }
+        let n = pread_some(self.fd.fd(), self.buf.as_mut_slice(), self.logical_pos)?;
+        self.buf_start = self.logical_pos;
+        self.buf_filled = n;
+        Ok(n > 0)
+    }
 }
 
-fn wrong(name: &str, got: &Digest, want: &Digest) -> Error {
-    Error::new(
-        blaze_wire::ErrorCode::Refused,
-        format_args!("{name} is named by {}, and the bytes sent hash to {}", hex(want), hex(got)),
-    )
+/// Encodes the CBOR definite-length array header for `count` items into `out`, returning the slice.
+pub(crate) fn encode_cbor_array_header(count: u64, out: &mut [u8; 9]) -> &[u8] {
+    encode_cbor_uint_header(4 << 5, count, out)
 }
 
-/// A dot-prefixed temporary name, excluded from every kind of object in the layout.
-pub(crate) fn temporary(to: &Path) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |it| it.as_nanos());
-    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-    let name = to.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
-    to.with_file_name(format!(".{name}.{}-{nanos}-{sequence}.tmp", std::process::id()))
+/// Encodes the CBOR definite-length byte-string header for `len` bytes into `out`.
+pub(crate) fn encode_cbor_bytes_header(len: u64, out: &mut [u8; 9]) -> &[u8] {
+    encode_cbor_uint_header(2 << 5, len, out)
+}
+
+fn encode_cbor_uint_header(major: u8, n: u64, out: &mut [u8; 9]) -> &[u8] {
+    if n < 24 {
+        let low = u8::try_from(n).unwrap_or(0);
+        out[0] = major | low;
+        out.get(..1).unwrap_or(&[])
+    } else if let Ok(v) = u8::try_from(n) {
+        out[0] = major | 24;
+        out[1] = v;
+        out.get(..2).unwrap_or(&[])
+    } else if let Ok(v) = u16::try_from(n) {
+        out[0] = major | 25;
+        let b = v.to_be_bytes();
+        out[1] = b[0];
+        out[2] = b[1];
+        out.get(..3).unwrap_or(&[])
+    } else if let Ok(v) = u32::try_from(n) {
+        out[0] = major | 26;
+        let b = v.to_be_bytes();
+        out[1] = b[0];
+        out[2] = b[1];
+        out[3] = b[2];
+        out[4] = b[3];
+        out.get(..5).unwrap_or(&[])
+    } else {
+        out[0] = major | 27;
+        let b = n.to_be_bytes();
+        out[1] = b[0];
+        out[2] = b[1];
+        out[3] = b[2];
+        out[4] = b[3];
+        out[5] = b[4];
+        out[6] = b[5];
+        out[7] = b[6];
+        out[8] = b[7];
+        out.as_slice()
+    }
+}
+
+/// Streaming two-pass verification of a native pack file descriptor against `expected`.
+///
+/// Pass 1 verifies size, magic header, strictly ascending keys, record boundaries, exact EOF,
+/// and whole-pack SHA-256 while counting keys. Pass 2 computes the streaming CBOR key-array
+/// digest (`blaze/dist-pack-keys`) with O(1) memory and checks it against `expected.keys`.
+pub(crate) fn verify_pack_fd(
+    fd: Fd,
+    actual_len: u64,
+    expected: &PackRef,
+    label: &str,
+    alloc: WireAlloc,
+) -> Result<(), Error> {
+    if expected.format != DIST_PACK_FORMAT {
+        return Err(Error::refused_owned(format_in!(
+            alloc,
+            "pack {label} has unsupported format {}",
+            expected.format
+        )));
+    }
+    if expected.size > Limits::DOCUMENTED.blob {
+        return Err(Error::refused_owned(format_in!(
+            alloc,
+            "pack {label} exceeds documented blob limit"
+        )));
+    }
+    if actual_len != expected.size {
+        return Err(Error::refused_owned(format_in!(
+            alloc,
+            "pack {label} is {} bytes on disk, committed as {}",
+            actual_len,
+            expected.size
+        )));
+    }
+    let dup1 = dup_cloexec(fd)
+        .map_err(|e| Error::store_io(alloc.clone(), "dup", label, e))?;
+    let mut scan = PackScanner::new(dup1, actual_len, SCAN_BUF_LEN, alloc.clone());
+    let mut pack_hasher = Sha256::new();
+
+    let mut magic = [0u8; 8];
+    scan.read_exact(&mut magic).map_err(|_| {
+        Error::refused_owned(format_in!(alloc.clone(), "pack {label} is shorter than magic header"))
+    })?;
+    if magic != DIST_PACK_MAGIC {
+        return Err(Error::refused_owned(format_in!(
+            alloc,
+            "pack {label} has invalid DIST_PACK_MAGIC"
+        )));
+    }
+    pack_hasher.update(&magic);
+
+    let mut prev_key: Option<Digest> = None;
+    let mut key_count = 0u64;
+    while scan.pos() < actual_len {
+        let mut header = [0u8; 41];
+        scan.read_exact(&mut header).map_err(|_| {
+            Error::refused_owned(format_in!(
+                alloc.clone(),
+                "pack {label} truncated in record header"
+            ))
+        })?;
+        pack_hasher.update(&header);
+        let Some((key, rest)) = header.split_first_chunk::<32>() else {
+            return Err(Error::refused("truncated record key"));
+        };
+        let Some((_, len_bytes)) = rest.split_first() else {
+            return Err(Error::refused("truncated record kind"));
+        };
+        let Some(len_arr) = len_bytes.first_chunk::<8>() else {
+            return Err(Error::refused("truncated record length"));
+        };
+        let value_len = u64::from_le_bytes(*len_arr);
+        if let Some(prev) = prev_key {
+            if *key <= prev {
+                return Err(Error::refused_owned(format_in!(
+                    alloc,
+                    "pack {label} keys are not strictly sorted"
+                )));
+            }
+        }
+        prev_key = Some(*key);
+        key_count = key_count.saturating_add(1);
+        scan.hash_bytes(value_len, &mut pack_hasher).map_err(|_| {
+            Error::refused_owned(format_in!(
+                alloc.clone(),
+                "pack {label} truncated in record value"
+            ))
+        })?;
+    }
+
+    let got_pack = pack_hasher.finish();
+    if got_pack != expected.pack {
+        return Err(Error::refused_owned(format_in!(
+            alloc,
+            "pack {label} digest mismatch"
+        )));
+    }
+
+    // Pass 2: stream keys into domain-separated CBOR array digest without buffering all keys.
+    let dup2 = dup_cloexec(fd)
+        .map_err(|e| Error::store_io(alloc.clone(), "dup", label, e))?;
+    let mut key_scan = PackScanner::new(dup2, actual_len, SCAN_BUF_LEN, alloc.clone());
+    key_scan.skip(u64::try_from(DIST_PACK_MAGIC.len()).unwrap_or(8)).map_err(|_| {
+        Error::refused_owned(format_in!(alloc.clone(), "pack {label} magic skip failed"))
+    })?;
+
+    let mut keys_hasher = Sha256::new();
+    keys_hasher.update(b"blaze/blaze/dist-pack-keys/v5\0");
+    let mut hdr_buf = [0u8; 9];
+    keys_hasher.update(encode_cbor_array_header(key_count, &mut hdr_buf));
+    let mut bytes_hdr_buf = [0u8; 9];
+    let key_bstr_hdr = encode_cbor_bytes_header(32, &mut bytes_hdr_buf);
+
+    let mut seen = 0u64;
+    while let Some(rec) = key_scan.next_record().map_err(|_| {
+        Error::refused_owned(format_in!(alloc.clone(), "pack {label} key pass failed"))
+    })? {
+        keys_hasher.update(key_bstr_hdr);
+        keys_hasher.update(&rec.key);
+        seen = seen.saturating_add(1);
+    }
+    if seen != key_count || keys_hasher.finish() != expected.keys {
+        return Err(Error::refused_owned(format_in!(
+            alloc,
+            "pack {label} keys digest does not match commitment"
+        )));
+    }
+    Ok(())
+}
+
+/// Which side of a manifest publication a pack cursor belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Side {
+    Old,
+    New,
+}
+
+struct OpenPack {
+    side: Side,
+    scanner: PackScanner,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct FrontierEntry {
+    key: Digest,
+    side: Side,
+    pack_idx: usize,
+    record: RecordMeta,
+}
+
+impl Ord for FrontierEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.key
+            .cmp(&other.key)
+            .then_with(|| self.side.cmp(&other.side))
+            .then_with(|| self.pack_idx.cmp(&other.pack_idx))
+    }
+}
+
+impl PartialOrd for FrontierEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn verify_manifest_packs_impl(
+    store: &Store,
+    old_packs: &[PackRef],
+    new_packs: &[PackRef],
+    #[cfg(test)] plant: VerifyPlant,
+) -> Result<(), Error> {
+    let total = old_packs.len().saturating_add(new_packs.len());
+    let mut open_packs = Vec::with_capacity_in(total, store.alloc.clone());
+    let mut frontier = Heap4::with_capacity_in(total, store.alloc.clone());
+
+    for pack_ref in old_packs {
+        let fd = store.open_and_verify_pack(pack_ref)?;
+        let mut scanner = PackScanner::new(fd, pack_ref.size, SCAN_BUF_LEN, store.alloc.clone());
+        scanner
+            .skip(u64::try_from(DIST_PACK_MAGIC.len()).unwrap_or(8))
+            .map_err(|_| Error::refused("old pack header skip failed"))?;
+        let idx = open_packs.len();
+        if let Some(record) = scanner
+            .next_record()
+            .map_err(|_| Error::refused("old pack record scan failed"))?
+        {
+            frontier.push(FrontierEntry { key: record.key, side: Side::Old, pack_idx: idx, record });
+        }
+        open_packs.push(OpenPack { side: Side::Old, scanner });
+    }
+
+    for pack_ref in new_packs {
+        let fd = store.open_and_verify_pack(pack_ref)?;
+        let mut scanner = PackScanner::new(fd, pack_ref.size, SCAN_BUF_LEN, store.alloc.clone());
+        scanner
+            .skip(u64::try_from(DIST_PACK_MAGIC.len()).unwrap_or(8))
+            .map_err(|_| Error::refused("new pack header skip failed"))?;
+        let idx = open_packs.len();
+        if let Some(record) = scanner
+            .next_record()
+            .map_err(|_| Error::refused("new pack record scan failed"))?
+        {
+            frontier.push(FrontierEntry { key: record.key, side: Side::New, pack_idx: idx, record });
+        }
+        open_packs.push(OpenPack { side: Side::New, scanner });
+    }
+
+    let mut group = Vec::new_in(store.alloc.clone());
+    while let Some(first) = frontier.pop() {
+        let current_key = first.key;
+        group.clear();
+        group.push(first);
+        while let Some(peek) = frontier.peek() {
+            if peek.key != current_key {
+                break;
+            }
+            if let Some(item) = frontier.pop() {
+                group.push(item);
+            }
+        }
+
+        let mut saw_old = false;
+        let mut saw_new = false;
+        let mut canonical_entry: Option<FrontierEntry> = None;
+
+        for &entry in group.as_slice() {
+            match entry.side {
+                Side::Old => saw_old = true,
+                Side::New => saw_new = true,
+            }
+            if let Some(canon) = canonical_entry {
+                #[cfg(test)]
+                let skip = (plant == VerifyPlant::SkipCrossPackComparison
+                    && canon.side == Side::New
+                    && entry.side == Side::New)
+                    || (plant == VerifyPlant::SkipOldPackComparison
+                        && canon.side == Side::Old
+                        && entry.side == Side::New);
+                #[cfg(not(test))]
+                let skip = false;
+
+                if !skip {
+                    if canon.record.kind != entry.record.kind
+                        || canon.record.value_len != entry.record.value_len
+                    {
+                        let key_hex = hex_in(&current_key, store.alloc.clone());
+                        return Err(Error::refused_owned(format_in!(
+                            store.alloc.clone(),
+                            "conflicting value metadata for key {}",
+                            key_hex.as_str()
+                        )));
+                    }
+                    let (Some(pack_a), Some(pack_b)) =
+                        (open_packs.get(canon.pack_idx), open_packs.get(entry.pack_idx))
+                    else {
+                        return Err(Error::internal("pack cursor index out of range"));
+                    };
+                    let equal = compare_native_values(
+                        pack_a.scanner.fd(),
+                        canon.record.value_offset,
+                        pack_b.scanner.fd(),
+                        entry.record.value_offset,
+                        canon.record.value_len,
+                        store.alloc.clone(),
+                    )?;
+                    if !equal {
+                        let key_hex = hex_in(&current_key, store.alloc.clone());
+                        return Err(Error::refused_owned(format_in!(
+                            store.alloc.clone(),
+                            "conflicting value bytes for key {}",
+                            key_hex.as_str()
+                        )));
+                    }
+                }
+            } else {
+                canonical_entry = Some(entry);
+            }
+        }
+
+        if saw_old && !saw_new {
+            let key_hex = hex_in(&current_key, store.alloc.clone());
+            return Err(Error::refused_owned(format_in!(
+                store.alloc.clone(),
+                "replacement manifest dropped key {}",
+                key_hex.as_str()
+            )));
+        }
+
+        // Advance every pack that contributed to `current_key`.
+        for &entry in group.as_slice() {
+            if let Some(pack) = open_packs.get_mut(entry.pack_idx) {
+                if let Some(next_rec) = pack
+                    .scanner
+                    .next_record()
+                    .map_err(|_| Error::refused("pack advance failed"))?
+                {
+                    frontier.push(FrontierEntry {
+                        key: next_rec.key,
+                        side: pack.side,
+                        pack_idx: entry.pack_idx,
+                        record: next_rec,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compares `len` bytes from `(fd_a, off_a)` and `(fd_b, off_b)` in bounded `8 KiB` chunks.
+fn compare_native_values(
+    fd_a: Fd,
+    mut off_a: u64,
+    fd_b: Fd,
+    mut off_b: u64,
+    mut remaining: u64,
+    alloc: WireAlloc,
+) -> Result<bool, Error> {
+    let mut buf_a = [0u8; COMPARE_BUF_LEN];
+    let mut buf_b = [0u8; COMPARE_BUF_LEN];
+    while remaining > 0 {
+        let step_u64 = remaining.min(u64::try_from(COMPARE_BUF_LEN).unwrap_or(8192));
+        let step = usize::try_from(step_u64).unwrap_or(COMPARE_BUF_LEN);
+        let (Some(slice_a), Some(slice_b)) = (buf_a.get_mut(..step), buf_b.get_mut(..step)) else {
+            return Err(Error::internal("compare buffer slice failed"));
+        };
+        pread_exact(fd_a, slice_a, off_a).map_err(|_| {
+            Error::refused_owned(format_in!(alloc.clone(), "failed reading value for comparison"))
+        })?;
+        pread_exact(fd_b, slice_b, off_b).map_err(|_| {
+            Error::refused_owned(format_in!(alloc.clone(), "failed reading value for comparison"))
+        })?;
+        if slice_a != slice_b {
+            return Ok(false);
+        }
+        off_a = off_a.saturating_add(step_u64);
+        off_b = off_b.saturating_add(step_u64);
+        remaining = remaining.saturating_sub(step_u64);
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use core::alloc::{AllocError, Allocator, Layout};
+    use core::cell::Cell;
+    use core::ptr::NonNull;
 
-    use std::alloc::{AllocError, Layout};
-    use std::cell::Cell;
-    use std::ptr::NonNull;
+    use blaze_own::{String, Vec, format_in};
+    use blaze_wire::{DIST_PACK_MAGIC, Limits, WireAlloc, digest_of_encoded_name};
+
+    use super::*;
+    use crate::blob::{Kind, ObjectName, hex_in};
+    use crate::error::ErrorCode;
+    use crate::sys::{
+        create_dir_all, current_pid, join_path, list_dir, lstat_info, open_create_new, open_read,
+        remove_empty_dir, unlink_path, write_all_fd,
+    };
+
+    /// Test-only RAII temp directory rooted under `/tmp` with recursive cleanup on drop.
+    pub(crate) struct TestDir {
+        path: WireString,
+        alloc: WireAlloc,
+    }
+
+    impl TestDir {
+        pub(crate) fn new(tag: &str, alloc: WireAlloc) -> Self {
+            let pid = current_pid();
+            let stamp = SystemClock.monotonic_nanos().unwrap_or(0);
+            let path = format_in!(alloc.clone(), "/tmp/blaze-serve-{tag}-{pid}-{stamp}");
+            assert!(create_dir_all(path.as_str()).is_ok(), "create temp dir {}", path.as_str());
+            Self { path, alloc }
+        }
+
+        pub(crate) fn path(&self) -> &str {
+            self.path.as_str()
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            remove_tree_iterative(self.path.as_str(), self.alloc.clone());
+        }
+    }
+
+    pub(crate) fn remove_tree_iterative(root: &str, alloc: WireAlloc) {
+        let mut stack = Vec::new_in(alloc.clone());
+        let mut root_s = String::with_capacity_in(root.len(), alloc.clone());
+        root_s.push_str(root);
+        stack.push((root_s, false));
+        while let Some((dir, ready)) = stack.pop() {
+            if ready {
+                let _ = remove_empty_dir(dir.as_str());
+                continue;
+            }
+            let Ok(entries) = list_dir(dir.as_str(), alloc.clone()) else {
+                let _ = unlink_path(dir.as_str());
+                continue;
+            };
+            stack.push((dir.clone(), true));
+            for entry in entries {
+                let child = join_path(dir.as_str(), entry.name.as_str(), alloc.clone());
+                let is_real_dir = lstat_info(child.as_str())
+                    .map(|m| m.is_dir && !m.is_symlink)
+                    .unwrap_or(false);
+                if is_real_dir {
+                    stack.push((child, false));
+                } else {
+                    let _ = unlink_path(child.as_str());
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Counts {
+        allocations: Cell<usize>,
+        deallocations: Cell<usize>,
+    }
 
     #[derive(Clone, Copy)]
-    struct Counted<'a>(&'a Cell<usize>);
+    struct Counted<'a> {
+        counts: &'a Counts,
+        inner: WireAlloc,
+    }
 
-    // SAFETY: allocations and deallocations forward the same pointer and layout to Global.
     unsafe impl Allocator for Counted<'_> {
         fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-            let block = Global.allocate(layout)?;
-            self.0.set(self.0.get() + 1);
-            Ok(block)
+            let ptr = self.inner.allocate(layout)?;
+            self.counts.allocations.set(self.counts.allocations.get().saturating_add(1));
+            Ok(ptr)
         }
 
-        unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
-            // SAFETY: every block produced here came from Global with this layout.
-            unsafe { Global.deallocate(pointer, layout) };
-        }
-    }
-
-    fn scratch() -> tempfile::TempDir {
-        tempfile::tempdir().expect("a temporary directory")
-    }
-
-    #[test]
-    fn native_scan_crosses_buffer_edges_and_skips_from_the_logical_position() {
-        let bytes: Vec<u8> = (0..25_000).map(|i| (i % 251) as u8).collect();
-        let mut scan = NativeScan::new(io::Cursor::new(&bytes));
-        let mut header = [0; 41];
-        scan.read_exact(&mut header).unwrap();
-        assert_eq!(header, bytes[..41]);
-
-        scan.skip(8192 - 41 - 17).unwrap();
-        scan.read_exact(&mut header).unwrap();
-        assert_eq!(header, bytes[8175..8216], "a header straddles the refill");
-
-        scan.skip(10_000).unwrap();
-        scan.read_exact(&mut header).unwrap();
-        assert_eq!(header, bytes[18_216..18_257], "a seek discounts the unread buffered tail");
-
-        scan.rewind(8).unwrap();
-        assert_eq!(scan.read(&mut []).unwrap(), 0);
-        scan.read_exact(&mut header).unwrap();
-        assert_eq!(header, bytes[8..49], "the second pass discards the old buffer");
-        scan.skip((bytes.len() - 49) as u64).unwrap();
-        assert_eq!(scan.read(&mut header).unwrap(), 0);
-        assert_eq!(scan.skip(u64::MAX).unwrap_err().kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn native_key_digest_headers_match_the_wire_at_every_length_boundary() {
-        for count in [0, 1, 23, 24, 0xff, 0x100, 0xffff, 0x1_0000, 0xffff_ffff, 0x1_0000_0000, u64::MAX] {
-            let Ok(count) = usize::try_from(count) else { continue };
-            let mut encoded = blaze_wire::Encoder::new(Global);
-            encoded.array(count);
-            let expected = blaze_wire::digest_of_encoded_name("blaze/dist-pack-keys", &encoded.into_bytes());
-            let actual: Digest = native_keys_hasher(count).finalize().into();
-            assert_eq!(actual, expected, "array length {count}");
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            self.counts.deallocations.set(self.counts.deallocations.get().saturating_add(1));
+            // SAFETY: delegates to the same `inner` allocator.
+            unsafe { self.inner.deallocate(ptr, layout) };
         }
     }
 
     #[test]
     fn bounded_object_reads_use_the_callers_allocator_and_preserve_size_refusals() {
-        let dir = scratch();
-        let store = Store::open(dir.path()).unwrap();
-        let bytes = pack(&[([1; 32], b"a complete value")]);
-        let name = format!("packs/{}.pack", hex(&digest(&bytes)));
-        store.put_blob(&name, &bytes).unwrap();
+        let alloc = blaze_own::testing::heap().shared();
+        let dir = TestDir::new("bounded-read", alloc.clone());
+        let Ok(store) = Store::open(dir.path(), Limits::DOCUMENTED, alloc.clone()) else {
+            panic!("open store failed");
+        };
 
-        let allocations = Cell::new(0);
-        let read = store
-            .read_small(&name, bytes.len() as u64, Counted(&allocations))
-            .unwrap()
-            .unwrap();
-        assert_eq!(read.as_slice(), bytes.as_slice());
-        assert!(allocations.get() > 0, "the caller owns the returned buffer");
-        assert!(std::ptr::eq(read.allocator().0, &allocations));
+        let mut pack_bytes = Vec::new_in(alloc.clone());
+        pack_bytes.extend_from_slice(&DIST_PACK_MAGIC);
+        pack_bytes.extend_from_slice(b"payload-for-bounded-read");
+        let digest = blaze_sha256::digest(pack_bytes.as_slice());
+        let name_str = format_in!(alloc.clone(), "packs/{}.pack", hex_in(&digest, alloc.clone()).as_str());
+        let Ok(name) = ObjectName::parse_kind(name_str.as_str(), Kind::Pack) else {
+            panic!("parse name failed");
+        };
+        assert_eq!(store.put_blob(&name, pack_bytes.as_slice()).ok(), Some(true));
 
-        // The same real reader with another allocator returns the same bytes without using ours.
-        allocations.set(0);
-        let control = store.read_small(&name, bytes.len() as u64, Global).unwrap().unwrap();
-        assert_eq!(control.as_slice(), read.as_slice());
-        assert_eq!(allocations.get(), 0);
-        for most in [0, bytes.len() as u64 - 1] {
-            let error = store.read_small(&name, most, Counted(&allocations)).unwrap_err();
-            assert_eq!(error.code, blaze_wire::ErrorCode::TooLarge);
-            assert!(error.message.contains(&name), "{error}");
+        let counts = Counts::default();
+        let counted = Counted { counts: &counts, inner: alloc.clone() };
+        let Ok(Some(got)) = store.read_small(&name, u64::try_from(pack_bytes.len()).unwrap_or(0), counted) else {
+            panic!("read_small failed");
+        };
+        assert!(core::ptr::eq(got.allocator().counts, &counts));
+        assert_eq!(got.as_slice(), pack_bytes.as_slice());
+        drop(got);
+        assert_eq!(counts.allocations.get(), counts.deallocations.get());
+
+        // Cap below file size must refuse with TooLarge.
+        let err = store
+            .read_small(&name, u64::try_from(pack_bytes.len().saturating_sub(1)).unwrap_or(0), counted)
+            .err();
+        assert!(err.is_some());
+        if let Some(err) = err {
+            assert_eq!(err.code, ErrorCode::TooLarge);
         }
-        assert_eq!(std::fs::read(store.dir().join(&name)).unwrap(), bytes);
-        let absent = format!("packs/{}.pack", hex(&[0; 32]));
-        allocations.set(0);
-        assert!(store.read_small(&absent, 0, Counted(&allocations)).unwrap().is_none());
-        assert_eq!(allocations.get(), 0, "a missing object needs no output buffer");
     }
 
     #[test]
-    fn sweeping_staging_files_preserves_published_objects() {
-        let dir = scratch();
-        let store = Store::open(dir.path()).unwrap();
-        let name = format!("manifests/{}", hex(&[1; 32]));
-        // Legacy persisted names remain janitor fixtures, not valid new PUTs.
-        std::fs::write(store.dir().join(&name), b"published\n").unwrap();
-        let published = store.dir().join(&name);
-        let stale = temporary(&published);
-        std::fs::write(&stale, b"abandoned\n").unwrap();
-        for path in [&published, &stale] {
-            File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
-                .unwrap();
+    fn native_scan_crosses_buffer_edges_and_skips_from_the_logical_position() {
+        let alloc = blaze_own::testing::heap().shared();
+        let dir = TestDir::new("scan-edges", alloc.clone());
+        let file_path = join_path(dir.path(), "edge.pack", alloc.clone());
+
+        let mut raw = Vec::new_in(alloc.clone());
+        raw.extend_from_slice(&DIST_PACK_MAGIC);
+        for i in 0u8..6 {
+            let key = [i.saturating_add(1); 32];
+            let payload_len = usize::from(i).saturating_mul(29).saturating_add(17);
+            raw.extend_from_slice(&key);
+            raw.push(i);
+            let len_u64 = u64::try_from(payload_len).unwrap_or(0);
+            raw.extend_from_slice(&len_u64.to_le_bytes());
+            for j in 0..payload_len {
+                let b = u8::try_from(j % 251).unwrap_or(0) ^ i;
+                raw.push(b);
+            }
         }
-        store.sweep_temporaries(std::time::Duration::from_secs(3600)).unwrap();
-        assert_eq!(store.read_small(&name, 100, Global).unwrap(), Some(b"published\n".to_vec()));
-        assert!(!stale.exists(), "abandoned hidden staging file was not swept");
-    }
+        let Ok(fd) = open_create_new(file_path.as_str(), true) else {
+            panic!("create edge pack");
+        };
+        assert!(write_all_fd(fd.fd(), raw.as_slice()).is_ok());
+        drop(fd);
 
-    #[cfg(unix)]
-    #[test]
-    fn an_unreadable_stale_file_is_left_untouched_without_failing_the_sweep() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = scratch();
-        let store = Store::open(dir.path()).unwrap();
-        let path = store.dir().join("packs/.foreign.123-456-1.tmp");
-        std::fs::write(&path, b"foreign leftover").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let unreadable = File::open(&path).is_err();
-        let result = store.sweep_temporaries(std::time::Duration::ZERO);
-        if unreadable {
-            assert!(path.exists());
+        // Use the minimum buffer window (64 bytes) so every record crosses buffer boundaries.
+        let Ok(rfd) = open_read(file_path.as_str()) else {
+            panic!("open edge pack");
+        };
+        let file_len = u64::try_from(raw.len()).unwrap_or(0);
+        let mut scan = PackScanner::new(rfd, file_len, 64, alloc.clone());
+        let mut magic = [0u8; 8];
+        assert!(scan.read_exact(&mut magic).is_ok());
+        assert_eq!(magic, DIST_PACK_MAGIC);
+
+        let mut seen = 0u8;
+        while let Ok(Some(rec)) = scan.next_record() {
+            assert_eq!(rec.key, [seen.saturating_add(1); 32]);
+            assert_eq!(rec.kind, seen);
+            let expected_len = u64::from(seen).saturating_mul(29).saturating_add(17);
+            assert_eq!(rec.value_len, expected_len);
+            seen = seen.saturating_add(1);
         }
-        if path.exists() {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(seen, 6);
+        assert_eq!(scan.pos(), file_len);
+    }
+
+    #[test]
+    fn native_key_digest_headers_match_the_wire_at_every_length_boundary() {
+        let alloc = blaze_own::testing::heap().shared();
+        for count in [0usize, 1, 23, 24, 25, 255, 256, 257] {
+            let mut keys = Vec::with_capacity_in(count, alloc.clone());
+            for i in 0..count {
+                let mut k = [0u8; 32];
+                let idx = u64::try_from(i).unwrap_or(0).to_be_bytes();
+                if let Some(tail) = k.get_mut(24..32) {
+                    tail.copy_from_slice(&idx);
+                }
+                keys.push(k);
+            }
+            let wire_encoded = blaze_wire::encode(&keys, alloc.clone());
+            let expected = digest_of_encoded_name("blaze/dist-pack-keys", wire_encoded.as_slice());
+
+            let mut hasher = Sha256::new();
+            hasher.update(b"blaze/blaze/dist-pack-keys/v5\0");
+            let mut arr_hdr = [0u8; 9];
+            hasher.update(encode_cbor_array_header(u64::try_from(count).unwrap_or(0), &mut arr_hdr));
+            let mut b_hdr = [0u8; 9];
+            let key_hdr = encode_cbor_bytes_header(32, &mut b_hdr);
+            for k in &keys {
+                hasher.update(key_hdr);
+                hasher.update(k);
+            }
+            assert_eq!(hasher.finish(), expected, "key digest mismatch at length {count}");
         }
-        assert!(result.is_ok());
-    }
-
-    /// A native pack of sorted keys and opaque values, as the distributed agent emits.
-    fn pack(values: &[(Digest, &[u8])]) -> Vec<u8> {
-        let mut out = blaze_wire::DIST_PACK_MAGIC.to_vec();
-        for (key, value) in values {
-            out.extend_from_slice(key);
-            out.push(0);
-            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
-            out.extend_from_slice(value);
-        }
-        out
-    }
-
-    fn digest(bytes: &[u8]) -> Digest {
-        Sha256::digest(bytes).into()
-    }
-
-    #[test]
-    fn a_pack_is_checked_against_its_name_and_a_wrong_one_is_not_named() {
-        let dir = scratch();
-        let store = Store::open(dir.path()).expect("a store");
-        let bytes = pack(&[([1; 32], b"a value")]);
-        let name = format!("packs/{}.pack", hex(&digest(&bytes)));
-        assert!(store.put_blob(&name, &bytes).expect("a write"));
-        assert!(store.open_blob(&name).expect("a lookup").is_some());
-
-        let other = pack(&[([2; 32], b"another value")]);
-        let refused = store.put_blob(&format!("packs/{}.pack", hex(&digest(&bytes))), &other);
-        assert!(refused.is_err());
-        assert_eq!(
-            store
-                .open_blob(&format!("packs/{}.pack", hex(&digest(&bytes))))
-                .expect("a lookup")
-                .map(|(_, len)| len),
-            Some(bytes.len() as u64)
-        );
-        // A name the layout does not have is not a name.
-        assert!(store.put_blob("packs/../x.pack", &bytes).is_err());
-    }
-
-    #[test]
-    fn a_concurrent_write_of_one_blob_leaves_one_whole_blob() {
-        let dir = scratch();
-        let store = std::sync::Arc::new(Store::open(dir.path()).expect("a store"));
-        let bytes = pack(&[([5; 32], b"a value that is not small"), ([6; 32], &[9; 4096])]);
-        let name = format!("packs/{}.pack", hex(&digest(&bytes)));
-        let writers: Vec<_> = (0..8)
-            .map(|_| {
-                let (store, name, bytes) = (store.clone(), name.clone(), bytes.clone());
-                std::thread::spawn(move || store.put_blob(&name, &bytes))
-            })
-            .collect();
-        for writer in writers {
-            writer.join().expect("a writer").expect("a write");
-        }
-        assert_eq!(store.read_small(&name, 1 << 20, Global).expect("a read"), Some(bytes));
-        // One file under the name, and no temporary file of any of the writers.
-        let left: Vec<String> = std::fs::read_dir(dir.path().join("packs"))
-            .expect("the packs directory")
-            .filter_map(|it| it.ok()?.file_name().into_string().ok())
-            .collect();
-        assert_eq!(left.len(), 1, "{left:?}");
-    }
-
-    #[test]
-    fn a_list_is_written_once() {
-        let dir = scratch();
-        let store = Store::open(dir.path()).expect("a store");
-        let name = &format!("manifests/{}", hex(&[1; 32]));
-        let bytes = pack(&[([1; 32], b"first")]);
-        let digest = digest(&bytes);
-        store.put_blob(&format!("packs/{}.pack", hex(&digest)), &bytes).unwrap();
-        let first = blaze_wire::pack_list::encode(
-            &[blaze_wire::PackRef {
-                pack: digest,
-                size: bytes.len() as u64,
-                keys: blaze_wire::digest_of_encoded_name(
-                    "blaze/dist-pack-keys",
-                    &blaze_wire::encode(&vec![[1; 32]], Global),
-                ),
-                packed: None,
-                format: blaze_wire::DIST_PACK_FORMAT,
-            }],
-            Global,
-        );
-        assert!(store.put_list(name, &first).expect("a write"));
-        assert!(!store.put_list(name, b"").expect("a second write"));
-        assert_eq!(store.read_small(name, 1000, Global).unwrap().unwrap(), first);
-    }
-
-    #[test]
-    fn a_file_is_checked_as_it_streams_and_a_wrong_one_is_not_named() {
-        let dir = scratch();
-        let store = Store::open(dir.path()).expect("a store");
-        let bytes = pack(&[([3; 32], b"a value")]);
-        let right = dir.path().join("right");
-        std::fs::write(&right, &bytes).unwrap();
-        let name = format!("packs/{}.pack", hex(&digest(&bytes)));
-        assert!(store.put_blob_from(&name, &right).unwrap());
-        let wrong = dir.path().join("wrong");
-        std::fs::write(&wrong, &bytes).unwrap();
-        let other = format!("packs/{}.pack", hex(&[9; 32]));
-        assert!(store.put_blob_from(&other, &wrong).is_err());
-        assert!(store.open_blob(&other).unwrap().is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlinks_are_not_cache_objects() {
-        let dir = scratch();
-        let store = Store::open(dir.path()).unwrap();
-        let outside = scratch();
-        let name = format!("packs/{}.pack", hex(&digest(b"outside")));
-        std::fs::write(outside.path().join("secret"), b"outside").unwrap();
-        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join(&name)).unwrap();
-        assert!(store.open_blob(&name).is_err());
-        assert!(store.put_blob(&name, b"outside").is_err());
-        std::fs::remove_dir(dir.path().join("manifests")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), dir.path().join("manifests")).unwrap();
-        assert!(Store::open(dir.path()).is_err());
     }
 }
-
-#[cfg(test)]
-mod repair_tests;

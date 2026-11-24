@@ -21,12 +21,15 @@
 //!   worker-supplied `Stage` events are outside this check;
 //! - **progress**: every execution ends.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::alloc::Global;
+use core::alloc::Allocator;
+use core::fmt;
+use core::mem;
 
+use blaze_own::{BTreeMap, BTreeSet, Vec, VecDeque, format_in, vec_in};
 use blaze_wire::{
     Attempt, Digest, DoneEvent, ExecutionId, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome,
-    PrNamespace, RefusedEvent, Reservation, Stage, WorkersEventsRequest,
+    PrNamespace, RefusedEvent, Reservation, Stage, WireAlloc, WireString, WireVec,
+    WorkersEventsRequest,
 };
 
 use super::{Rng, Violation};
@@ -48,7 +51,7 @@ pub struct Summary {
     /// Executions reassigned after a lead was lost.
     pub reassigned: u64,
     /// Outcomes, by `Outcome`'s discriminant.
-    pub outcomes: BTreeMap<u64, u64>,
+    pub outcomes: BTreeMap<u64, u64, WireAlloc>,
 }
 
 const STEP_MS: Millis = 1_000;
@@ -56,7 +59,7 @@ const HEARTBEAT_MS: Millis = 5_000;
 
 #[derive(Clone, Debug)]
 struct Lead {
-    executor: String,
+    executor: WireString,
     attempt: Attempt,
     finish_at: Millis,
     dead: bool,
@@ -66,60 +69,70 @@ struct Lead {
 }
 
 struct World {
+    alloc: WireAlloc,
     seed: u64,
     rng: Rng,
     now: Millis,
     jobs: Jobs,
-    specs: Vec<SimUnit>,
+    specs: WireVec<SimUnit>,
     queue_limit: usize,
     /// The checker's own queue: per platform and class, the executions waiting, in order.
-    shadow: BTreeMap<(Digest, Class), VecDeque<ExecutionId>>,
-    meta: BTreeMap<ExecutionId, (Digest, Namespace, Reservation)>,
-    subscribers: BTreeMap<u64, (ExecutionId, u64)>,
-    ended_subs: BTreeSet<u64>,
-    left: BTreeSet<u64>,
-    leads: BTreeMap<ExecutionId, Lead>,
-    late: Vec<(ExecutionId, String, Attempt)>,
-    kills: Vec<(Millis, String, jobs::AssignmentToken, bool)>,
-    live: BTreeMap<String, jobs::AssignmentToken>,
-    dead: BTreeSet<String>,
+    shadow: BTreeMap<(Digest, Class), VecDeque<ExecutionId, WireAlloc>, WireAlloc>,
+    meta: BTreeMap<ExecutionId, (Digest, Namespace, Reservation), WireAlloc>,
+    subscribers: BTreeMap<u64, (ExecutionId, u64), WireAlloc>,
+    ended_subs: BTreeSet<u64, WireAlloc>,
+    left: BTreeSet<u64, WireAlloc>,
+    leads: BTreeMap<ExecutionId, Lead, WireAlloc>,
+    late: WireVec<(ExecutionId, WireString, Attempt)>,
+    kills: WireVec<(Millis, WireString, jobs::AssignmentToken, bool)>,
+    live: BTreeMap<WireString, jobs::AssignmentToken, WireAlloc>,
+    dead: BTreeSet<WireString, WireAlloc>,
     summary: Summary,
 }
 
 impl World {
-    fn violation(&self, invariant: &'static str, detail: std::fmt::Arguments<'_>) -> Violation {
-        Violation::new(self.seed, self.now, invariant, detail)
+    fn violation(&self, invariant: &'static str, detail: fmt::Arguments<'_>) -> Violation {
+        Violation::new(self.seed, self.now, invariant, detail, self.alloc)
     }
 
-    fn new(seed: u64) -> World {
+    fn new(seed: u64, alloc: WireAlloc) -> World {
         let mut rng = Rng::new(seed ^ 0x5EED_0F_10B5);
-        let queue_limit = rng.range(2, 8) as usize;
+        let queue_limit = rng.range_usize(2, 8);
         let mut admission =
-            Admission::new(AdmissionConfig { queue_limit, ..AdmissionConfig::default() });
-        let platforms: Vec<Digest> = (0..rng.range(1, 2)).map(|_| rng.digest()).collect();
+            Admission::new(AdmissionConfig { queue_limit, ..AdmissionConfig::default() }, alloc);
+        let platform_count = rng.range_usize(1, 2);
+        let mut platforms = Vec::with_capacity_in(platform_count, alloc);
+        for _ in 0..platform_count {
+            platforms.push(rng.digest());
+        }
         for (p, platform) in platforms.iter().enumerate() {
             for m in 0..rng.range(1, 3) {
-                let name = format!("m{p}.{m}");
+                let name = format_in!(alloc, "m{p}.{m}");
                 let capacity = Reservation {
                     memory: rng.range(16, 96),
-                    cpus: rng.range(8, 48) as u32,
+                    cpus: rng.range_u32(8, 48),
                     disk: rng.range(100, 600),
                 };
-                admission.add_machine(&name, *platform, capacity);
+                admission.add_machine(name.as_str(), *platform, capacity);
                 for _ in 0..rng.range(0, 2) {
                     let r = Reservation {
                         memory: rng.range(8, 24),
-                        cpus: rng.range(4, 16) as u32,
+                        cpus: rng.range_u32(4, 16),
                         disk: rng.range(20, 80),
                     };
-                    let _ = admission.add_builder(0, &name, r, Global);
+                    let _ = admission.add_builder(0, name.as_str(), r, alloc);
                 }
             }
         }
-        let specs = (0..rng.range(2, 6))
-            .map(|i| spec(platforms[i as usize % platforms.len()], i))
-            .collect();
+        let spec_count = rng.range(2, 6);
+        let mut specs = Vec::new_in(alloc);
+        for i in 0..spec_count {
+            let idx = usize::try_from(i).unwrap_or(0) % platforms.len().max(1);
+            let platform = platforms.get(idx).copied().unwrap_or([0; 32]);
+            specs.push(spec(platform, i));
+        }
         World {
+            alloc,
             seed,
             rng,
             now: 0,
@@ -131,26 +144,27 @@ impl World {
                     completion: jobs::CompletionMode::NoCompileWork,
                     ..ExecutionConfig::default()
                 },
+                alloc,
             ),
             specs,
             queue_limit,
-            shadow: BTreeMap::new(),
-            meta: BTreeMap::new(),
-            subscribers: BTreeMap::new(),
-            ended_subs: BTreeSet::new(),
-            left: BTreeSet::new(),
-            leads: BTreeMap::new(),
-            late: Vec::new(),
-            kills: Vec::new(),
-            live: BTreeMap::new(),
-            dead: BTreeSet::new(),
+            shadow: BTreeMap::new_in(alloc),
+            meta: BTreeMap::new_in(alloc),
+            subscribers: BTreeMap::new_in(alloc),
+            ended_subs: BTreeSet::new_in(alloc),
+            left: BTreeSet::new_in(alloc),
+            leads: BTreeMap::new_in(alloc),
+            late: Vec::new_in(alloc),
+            kills: Vec::new_in(alloc),
+            live: BTreeMap::new_in(alloc),
+            dead: BTreeSet::new_in(alloc),
             summary: Summary {
                 seed,
                 executions: 0,
                 busy: 0,
                 joined: 0,
                 reassigned: 0,
-                outcomes: BTreeMap::new(),
+                outcomes: BTreeMap::new_in(alloc),
             },
         }
     }
@@ -164,11 +178,13 @@ impl World {
             }
             self.leads()?;
             self.agents();
-            let mut out = Vec::new();
+            let mut out = Vec::new_in(self.alloc);
             self.jobs.tick(self.now, &mut out);
             self.effects(out)?;
             self.check_assignments()?;
-            self.jobs.admission_view().check()
+            self.jobs
+                .admission_view()
+                .check()
                 .map_err(|error| self.violation("capacity", format_args!("{error}")))?;
             self.assignments()?;
             if self.now >= horizon
@@ -187,7 +203,7 @@ impl World {
                     format_args!("execution {:?} never ended: {:?}", e.id, e.state()),
                 ));
             }
-            stages(e, self.seed, self.now)?;
+            stages(e, self.seed, self.now, self.alloc)?;
         }
         Ok(self.summary)
     }
@@ -196,26 +212,25 @@ impl World {
         match self.rng.below(100) {
             0..=11 => self.submit(),
             12..=14 => {
-                let attached: Vec<u64> = self
-                    .subscribers
-                    .keys()
-                    .filter(|s| !self.left.contains(s) && !self.ended_subs.contains(s))
-                    .copied()
-                    .collect();
-                if let Some(&s) =
-                    attached.get(self.rng.below(attached.len().max(1) as u64) as usize)
-                {
+                let attached = Vec::from_iter_in(
+                    self.subscribers
+                        .keys()
+                        .filter(|s| !self.left.contains(s) && !self.ended_subs.contains(s))
+                        .copied(),
+                    self.alloc,
+                );
+                if let Some(&s) = attached.get(self.rng.below_usize(attached.len().max(1))) {
                     self.unsubscribe(s)?;
                 }
                 Ok(())
             }
             15 => {
                 let n = self.rng.range(1, 4);
-                let gone = self.jobs.admission().close_pr(n, Global);
+                let gone = self.jobs.admission().close_pr(n, self.alloc);
                 for (executor, busy) in gone {
-                    let executor = executor.into_string();
-                    self.dead.insert(executor.clone());
-                    self.live.remove(&executor);
+                    let executor = WireString::from_str_in(&executor, self.alloc);
+                    self.dead.insert(WireString::from_str_in(executor.as_str(), self.alloc));
+                    self.live.remove(executor.as_str());
                     if let Some((execution, _)) = busy
                         && let Some(lead) = self.leads.get_mut(&execution)
                         && lead.executor == executor
@@ -227,78 +242,89 @@ impl World {
             }
             16..=17 => {
                 // A lead dies, or stalls and comes back with its old attempt's events.
-                let running: Vec<ExecutionId> = self.leads.keys().copied().collect();
-                if let Some(&id) = running.get(self.rng.below(running.len().max(1) as u64) as usize)
-                {
+                let running = Vec::from_iter_in(self.leads.keys().copied(), self.alloc);
+                if let Some(&id) = running.get(self.rng.below_usize(running.len().max(1))) {
                     let stall = self.rng.chance(500_000);
                     let until = self.now + self.rng.range(10_000, 60_000);
-                    let lead = self.leads.get_mut(&id).expect("running");
-                    if stall {
-                        lead.stall_until = until;
-                    } else {
-                        lead.dead = true;
+                    if let Some(lead) = self.leads.get_mut(&id) {
+                        if stall {
+                            lead.stall_until = until;
+                        } else {
+                            lead.dead = true;
+                        }
                     }
                 }
                 Ok(())
             }
             18 => {
-                let builders: Vec<String> = self
-                    .jobs
-                    .admission_view()
-                    .executors()
-                    .filter(|e| e.namespace == Namespace::Main)
-                    .map(|e| e.id.clone())
-                    .collect();
-                if let Some(b) = builders.get(self.rng.below(builders.len().max(1) as u64) as usize)
-                {
+                let builders = Vec::from_iter_in(
+                    self.jobs
+                        .admission_view()
+                        .executors()
+                        .filter(|e| e.namespace == Namespace::Main)
+                        .map(|e| WireString::from_str_in(e.id.as_str(), self.alloc)),
+                    self.alloc,
+                );
+                if let Some(b) = builders.get(self.rng.below_usize(builders.len().max(1))) {
                     let r = Reservation {
                         memory: self.rng.range(8, 32),
-                        cpus: self.rng.range(4, 16) as u32,
+                        cpus: self.rng.range_u32(4, 16),
                         disk: self.rng.range(20, 80),
                     };
-                    let _ = self.jobs.admission().rebuild(self.now, b, r, Global);
+                    let _ = self.jobs.admission().rebuild(self.now, b.as_str(), r, self.alloc);
                 }
                 Ok(())
             }
             19 => {
-                let gone = self.jobs.admission().reap(self.now, Global);
-                self.dead.extend(gone.into_iter().map(|name| name.into_string()));
+                let gone = self.jobs.admission().reap(self.now, self.alloc);
+                for name in gone {
+                    self.dead.insert(WireString::from_str_in(&name, self.alloc));
+                }
                 Ok(())
             }
             20 => {
                 // Invalid ingress, including a valid prefix followed by a forged stage.
                 // Check the public stream, not only the private stage bookkeeping.
-                let running: Vec<ExecutionId> = self
-                    .leads
-                    .iter()
-                    .filter_map(|(id, lead)| {
+                let running = Vec::from_iter_in(
+                    self.leads.iter().filter_map(|(id, lead)| {
                         self.jobs
                             .execution(*id)
                             .filter(|e| {
                                 e.state() == ExecState::Running && e.attempt() == lead.attempt
                             })
                             .map(|_| *id)
-                    })
-                    .collect();
-                if let Some(&id) = running.get(self.rng.below(running.len().max(1) as u64) as usize)
-                {
-                    let lead = self.leads[&id].clone();
-                    let before = self.jobs.execution(id).unwrap().events(0).to_vec();
+                    }),
+                    self.alloc,
+                );
+                if let Some(&id) = running.get(self.rng.below_usize(running.len().max(1))) {
+                    let Some(lead) = self.leads.get(&id).cloned() else { return Ok(()) };
+                    let Some(before) = self
+                        .jobs
+                        .execution(id)
+                        .map(|e| Vec::from_slice_in(e.events(0), self.alloc))
+                    else {
+                        return Ok(());
+                    };
                     let req = WorkersEventsRequest {
                         execution: id,
                         attempt: lead.attempt,
-                        events: vec![
-                            JobEvent::Output(blaze_wire::OutputEvent { stream: 1, bytes: vec![1] }),
+                        events: vec_in![
+                            self.alloc;
+                            JobEvent::Output(blaze_wire::OutputEvent {
+                                stream: 1,
+                                bytes: vec_in![self.alloc; 1],
+                            }),
                             JobEvent::Stage(blaze_wire::StageEvent {
                                 stage: Stage::Compiled,
                                 at_ms: 0,
                             }),
                         ],
                     };
-                    let mut out = Vec::new();
-                    let answer = self.jobs.worker_events(self.now, &lead.executor, &req, &mut out);
-                    let after = self.jobs.execution(id).unwrap().events(0);
-                    if answer.is_ok() || !out.is_empty() || after != before {
+                    let mut out = Vec::new_in(self.alloc);
+                    let answer =
+                        self.jobs.worker_events(self.now, lead.executor.as_str(), &req, &mut out);
+                    let after = self.jobs.execution(id).map_or(&[][..], |e| e.events(0));
+                    if answer.is_ok() || !out.is_empty() || after != before.as_slice() {
                         return Err(self.violation(
                             "ingress",
                             format_args!("forged stage batch changed public stream"),
@@ -312,7 +338,9 @@ impl World {
     }
 
     fn submit(&mut self) -> Result<(), Violation> {
-        let spec = self.specs[self.rng.below(self.specs.len() as u64) as usize].clone();
+        let Some(&spec) = self.specs.get(self.rng.below_usize(self.specs.len())) else {
+            return Ok(());
+        };
         let namespace = if self.rng.chance(350_000) {
             Namespace::Main
         } else {
@@ -332,24 +360,33 @@ impl World {
         };
         let need = Reservation {
             memory: self.rng.range(4, 32),
-            cpus: self.rng.range(2, 16) as u32,
+            cpus: self.rng.range_u32(2, 16),
             disk: self.rng.range(10, 100),
         };
         let platform = spec.platform;
         let class = Class::of(&namespace);
-        let mut out = Vec::new();
+        let mut out = Vec::new_in(self.alloc);
         let answer = self.jobs.submit(self.now, &req, need.clone(), &mut out);
         // Submission advances timers before coalescing or queueing. Apply those existing
         // executions' events to the shadow before checking admission at this instant.
         // A new execution's first event starts the submission itself, which is checked below.
         let first_new =
             out.iter().position(|(id, _)| !self.meta.contains_key(id)).unwrap_or(out.len());
-        let submitted = out.split_off(first_new);
-        self.effects(out)?;
+        let mut prior = Vec::with_capacity_in(first_new, self.alloc);
+        let mut submitted = Vec::with_capacity_in(out.len().saturating_sub(first_new), self.alloc);
+        for (idx, item) in out.into_iter().enumerate() {
+            if idx < first_new {
+                prior.push(item);
+            } else {
+                submitted.push(item);
+            }
+        }
+        self.effects(prior)?;
         let waiting: usize = [Class::Main, Class::Pr]
             .iter()
             .map(|c| self.shadow.get(&(platform, *c)).map_or(0, VecDeque::len))
             .sum();
+        let alloc = self.alloc;
         let running: Option<ExecutionId> = self
             .jobs
             .executions()
@@ -363,7 +400,7 @@ impl World {
                                 platform: spec.platform,
                                 namespace: namespace.clone(),
                             },
-                            Global,
+                            alloc,
                         )
             })
             .map(|e| e.id);
@@ -395,7 +432,7 @@ impl World {
                         self.meta.insert(answer.execution, (platform, namespace, need));
                         self.shadow
                             .entry((platform, class))
-                            .or_default()
+                            .or_insert_with(|| VecDeque::new_in(alloc))
                             .push_back(answer.execution);
                     }
                 }
@@ -419,12 +456,12 @@ impl World {
     }
 
     fn unsubscribe(&mut self, s: u64) -> Result<(), Violation> {
-        let (execution, _) = self.subscribers[&s];
+        let Some(&(execution, _)) = self.subscribers.get(&s) else { return Ok(()) };
         self.left.insert(s);
-        let mut out = Vec::new();
+        let mut out = Vec::new_in(self.alloc);
         let _ = self.jobs.unsubscribe(self.now, execution, s, &mut out);
         self.effects(out)?;
-        let e = self.jobs.execution(execution).expect("known");
+        let Some(e) = self.jobs.execution(execution) else { return Ok(()) };
         let attached = e.subscribers().any(|x| x.state == jobs::SubscriberState::Attached);
         if !attached && !matches!(e.state(), ExecState::Ended(_)) {
             return Err(
@@ -436,27 +473,33 @@ impl World {
 
     /// The leads of running executions: heartbeats, and the end of the job.
     fn leads(&mut self) -> Result<(), Violation> {
-        let ids: Vec<ExecutionId> = self.leads.keys().copied().collect();
+        let ids = Vec::from_iter_in(self.leads.keys().copied(), self.alloc);
         for id in ids {
-            let lead = self.leads[&id].clone();
+            let Some(lead) = self.leads.get(&id).cloned() else { continue };
             if lead.dead || self.now < lead.stall_until || self.now < lead.next_beat {
                 continue;
             }
-            let mut events = Vec::new();
+            let mut events = Vec::new_in(self.alloc);
             if self.now >= lead.finish_at {
                 if lead.refuse {
                     events.push(JobEvent::Refused(RefusedEvent {
-                        function: "a build script blaze cannot run".to_owned(),
-                        why: "it needs rustc".to_owned(),
+                        function: WireString::from_str_in(
+                            "a build script blaze cannot run",
+                            self.alloc,
+                        ),
+                        why: WireString::from_str_in("it needs rustc", self.alloc),
                     }));
                 }
                 let outcome =
                     if self.rng.chance(800_000) { Outcome::Passed } else { Outcome::Failed };
-                events.push(JobEvent::Done(DoneEvent { outcome, counters: Vec::new() }));
+                events.push(JobEvent::Done(DoneEvent {
+                    outcome,
+                    counters: Vec::new_in(self.alloc),
+                }));
             }
             let req = WorkersEventsRequest { execution: id, attempt: lead.attempt, events };
-            let mut out = Vec::new();
-            let answer = self.jobs.worker_events(self.now, &lead.executor, &req, &mut out);
+            let mut out = Vec::new_in(self.alloc);
+            let answer = self.jobs.worker_events(self.now, lead.executor.as_str(), &req, &mut out);
             let current = self.jobs.execution(id).map(|e| e.attempt());
             if current != Some(lead.attempt) && answer != Err(Refusal::AttemptMoved) {
                 let ended = self
@@ -476,10 +519,12 @@ impl World {
             self.effects(out)?;
         }
         // Late events of dead attempts, sent again: every one refused.
-        for (id, executor, attempt) in std::mem::take(&mut self.late) {
-            let req = WorkersEventsRequest { execution: id, attempt, events: Vec::new() };
-            let mut out = Vec::new();
-            let answer = self.jobs.worker_events(self.now, &executor, &req, &mut out);
+        let late = mem::replace(&mut self.late, Vec::new_in(self.alloc));
+        for (id, executor, attempt) in late {
+            let req =
+                WorkersEventsRequest { execution: id, attempt, events: Vec::new_in(self.alloc) };
+            let mut out = Vec::new_in(self.alloc);
+            let answer = self.jobs.worker_events(self.now, executor.as_str(), &req, &mut out);
             let ended =
                 self.jobs.execution(id).is_some_and(|e| matches!(e.state(), ExecState::Ended(_)));
             if !ended && answer != Err(Refusal::AttemptMoved) {
@@ -497,29 +542,39 @@ impl World {
     /// assignment, so replay after the executor starts another job cannot free that job.
     fn agents(&mut self) {
         let now = self.now;
-        let (due, later): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.kills).into_iter().partition(|(at, ..)| *at <= now);
+        let kills = mem::replace(&mut self.kills, Vec::new_in(self.alloc));
+        let mut due = Vec::new_in(self.alloc);
+        let mut later = Vec::new_in(self.alloc);
+        for item in kills {
+            if item.0 <= now {
+                due.push(item);
+            } else {
+                later.push(item);
+            }
+        }
         self.kills = later;
         for (_, executor, assignment, alive) in due {
             // The simulated agent stops only the named assignment. Delayed duplicates
             // cannot stop the newer process occupying this slot.
-            if self.live.get(&executor) == Some(&assignment) {
-                self.live.remove(&executor);
+            if self.live.get(executor.as_str()) == Some(&assignment) {
+                self.live.remove(executor.as_str());
             }
-            self.jobs.killed(now, &executor, assignment, alive);
+            self.jobs.killed(now, executor.as_str(), assignment, alive);
         }
     }
 
     fn check_assignments(&self) -> Result<(), Violation> {
         for (executor, assignment) in &self.live {
-            let slot = self.jobs.admission_view().executor(executor);
+            let slot = self.jobs.admission_view().executor(executor.as_str());
             if !slot.is_some_and(|s| {
                 s.busy == Some((assignment.execution, assignment.attempt))
                     && s.phase != crate::admission::ExecutorPhase::Stopped
             }) {
                 return Err(self.violation(
                     "assignment",
-                    format_args!("live assignment {assignment:?} lost its slot {executor}: {slot:?}"),
+                    format_args!(
+                        "live assignment {assignment:?} lost its slot {executor}: {slot:?}"
+                    ),
                 ));
             }
         }
@@ -528,7 +583,7 @@ impl World {
 
     fn effects(
         &mut self,
-        out: Vec<(ExecutionId, jobs::Effect), impl std::alloc::Allocator>,
+        out: Vec<(ExecutionId, jobs::Effect), impl Allocator>,
     ) -> Result<(), Violation> {
         for (id, effect) in out {
             match effect {
@@ -538,11 +593,16 @@ impl World {
                         && lead.executor == executor
                         && lead.dead
                     {
-                        self.dead.insert(executor.clone());
+                        self.dead.insert(WireString::from_str_in(executor.as_str(), self.alloc));
                     }
                     let at = self.now + self.rng.range(0, 10_000);
-                    let alive = !self.dead.contains(&executor);
-                    self.kills.push((at, executor.clone(), assignment, alive));
+                    let alive = !self.dead.contains(executor.as_str());
+                    self.kills.push((
+                        at,
+                        WireString::from_str_in(executor.as_str(), self.alloc),
+                        assignment,
+                        alive,
+                    ));
                     // A second acknowledgment can arrive after the slot has been reused.
                     let duplicate_at = at + self.rng.range(1_000, 60_000);
                     self.kills.push((duplicate_at, executor, assignment, alive));
@@ -552,7 +612,7 @@ impl World {
                         || terminal.subscriber != subscriber
                         || terminal.termination.outcome != outcome
                         || !terminal.termination.is_valid()
-                        || jobs::local_action(&policy, &terminal.termination).is_err()
+                        || jobs::local_action(&policy, &terminal.termination, self.alloc).is_err()
                         || self.jobs.execution(id).and_then(|e| e.terminal(subscriber))
                             != Some(&terminal)
                     {
@@ -573,7 +633,12 @@ impl World {
                             format_args!("subscriber {subscriber} ended twice"),
                         ));
                     }
-                    let (_, deadline) = self.subscribers[&subscriber];
+                    let Some(&(_, deadline)) = self.subscribers.get(&subscriber) else {
+                        return Err(self.violation(
+                            "subscribers",
+                            format_args!("unknown subscriber {subscriber} ended"),
+                        ));
+                    };
                     if outcome == Outcome::TimedOut && self.now <= deadline {
                         return Err(self.violation(
                             "subscribers",
@@ -583,7 +648,9 @@ impl World {
                     if self.now > deadline && outcome != Outcome::TimedOut {
                         return Err(self.violation(
                             "subscribers",
-                            format_args!("subscriber {subscriber} got {outcome:?} past its deadline"),
+                            format_args!(
+                                "subscriber {subscriber} got {outcome:?} past its deadline"
+                            ),
                         ));
                     }
                 }
@@ -608,11 +675,15 @@ impl World {
         event: &JobEvent,
         attempt: Attempt,
     ) -> Result<(), Violation> {
-        let (platform, namespace, need) = self.meta.get(&id).cloned().expect("submitted");
+        let Some((platform, namespace, need)) = self.meta.get(&id).cloned() else {
+            return Err(self.violation("order", format_args!("event for unsubmitted {id:?}")));
+        };
+        let alloc = self.alloc;
         match event {
             JobEvent::Stage(stage) if stage.stage == Stage::Admitted => {
                 let class = Class::of(&namespace);
-                let queue = self.shadow.entry((platform, class)).or_default();
+                let queue =
+                    self.shadow.entry((platform, class)).or_insert_with(|| VecDeque::new_in(alloc));
                 if queue.front() != Some(&id) {
                     let first = queue.front().copied();
                     return Err(self.violation(
@@ -633,7 +704,10 @@ impl World {
             }
             JobEvent::Assigned(assigned) => {
                 let token = jobs::AssignmentToken { execution: id, attempt: assigned.attempt };
-                if let Some(old) = self.live.insert(assigned.executor.clone(), token) {
+                if let Some(old) = self
+                    .live
+                    .insert(WireString::from_str_in(assigned.executor.as_str(), alloc), token)
+                {
                     return Err(self.violation(
                         "assignment",
                         format_args!(
@@ -642,10 +716,12 @@ impl World {
                         ),
                     ));
                 }
-                let executor = self.jobs.admission_view().executor(&assigned.executor).cloned();
+                let executor =
+                    self.jobs.admission_view().executor(assigned.executor.as_str()).cloned();
                 match executor {
                     Some(e)
-                        if self.jobs.admission_view().platform(&e.machine) == Some(platform)
+                        if self.jobs.admission_view().platform(e.machine.as_str())
+                            == Some(platform)
                             && e.namespace == namespace
                             && e.busy == Some((id, attempt))
                             && e.reservation.memory >= need.memory
@@ -674,7 +750,7 @@ impl World {
                 self.leads.insert(
                     id,
                     Lead {
-                        executor: assigned.executor.clone(),
+                        executor: WireString::from_str_in(assigned.executor.as_str(), alloc),
                         attempt,
                         finish_at,
                         dead: false,
@@ -685,7 +761,9 @@ impl World {
                 );
             }
             JobEvent::Done(done) => {
-                let e = self.jobs.execution(id).expect("known");
+                let Some(e) = self.jobs.execution(id) else {
+                    return Err(self.violation("progress", format_args!("unknown execution {id:?}")));
+                };
                 if e.losses() >= 2 && done.outcome != Outcome::Lost {
                     return Err(self.violation(
                         "attempts",
@@ -697,13 +775,15 @@ impl World {
                     && done.outcome == Outcome::Passed
                     && lead.finish_at <= self.now
                 {
-                    return Err(self
-                        .violation("subscribers", format_args!("{id:?} ended Passed after a refusal")));
+                    return Err(self.violation(
+                        "subscribers",
+                        format_args!("{id:?} ended Passed after a refusal"),
+                    ));
                 }
                 for queue in self.shadow.values_mut() {
                     queue.retain(|x| *x != id);
                 }
-                *self.summary.outcomes.entry(done.outcome.discriminant()).or_default() += 1;
+                *self.summary.outcomes.entry(done.outcome.discriminant()).or_insert(0) += 1;
             }
             _ => {}
         }
@@ -712,7 +792,7 @@ impl World {
 
     /// Capacity sums alone cannot detect two executions sharing one executor reservation.
     fn assignments(&self) -> Result<(), Violation> {
-        let mut owners = BTreeMap::new();
+        let mut owners = BTreeMap::new_in(self.alloc);
         for execution in self.jobs.executions() {
             if execution.state() != ExecState::Running {
                 continue;
@@ -743,21 +823,20 @@ impl World {
 }
 
 /// Stage timestamps go forward, each stage after the one before it.
-fn stages(e: &jobs::Execution, seed: u64, now: Millis) -> Result<(), Violation> {
-    let public: Vec<_> = e
-        .events(0)
-        .iter()
-        .filter_map(|item| match &item.event {
+fn stages(e: &jobs::Execution, seed: u64, now: Millis, alloc: WireAlloc) -> Result<(), Violation> {
+    let public = Vec::from_iter_in(
+        e.events(0).iter().filter_map(|item| match &item.event {
             JobEvent::Stage(s) => Some((s.stage.clone(), s.at_ms)),
             _ => None,
-        })
-        .collect();
-    if public != e.stages() {
+        }),
+        alloc,
+    );
+    if public.as_slice() != e.stages() {
         return Err(Violation {
             seed,
             invariant: "stages",
             at: now,
-            detail: format!("{:?}: public stages bypass coordinator bookkeeping", e.id),
+            detail: format_in!(alloc, "{:?}: public stages bypass coordinator bookkeeping", e.id),
         });
     }
     let mut last: Option<(u64, Millis)> = None;
@@ -770,7 +849,7 @@ fn stages(e: &jobs::Execution, seed: u64, now: Millis) -> Result<(), Violation> 
                 seed,
                 invariant: "stages",
                 at: now,
-                detail: format!("{:?}: stage {stage:?} at {at} after {r} at {t}", e.id),
+                detail: format_in!(alloc, "{:?}: stage {stage:?} at {at} after {r} at {t}", e.id),
             });
         }
         last = Some((rank, *at));
@@ -786,10 +865,11 @@ struct SimUnit {
 }
 
 fn spec(platform: Digest, i: u64) -> SimUnit {
-    SimUnit { unit: [i as u8; 32], platform }
+    let [tag, ..] = i.to_le_bytes();
+    SimUnit { unit: [tag; 32], platform }
 }
 
 /// Runs the jobs simulation of `seed`.
-pub fn run(seed: u64) -> Result<Summary, Violation> {
-    World::new(seed).run()
+pub fn run(seed: u64, alloc: WireAlloc) -> Result<Summary, Violation> {
+    World::new(seed, alloc).run()
 }

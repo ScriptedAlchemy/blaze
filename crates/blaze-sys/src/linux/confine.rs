@@ -222,23 +222,70 @@ pub fn build(filter: Filter, out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilte
     &out[..at]
 }
 
+/// Seccomp filter for a sandboxed test process on Linux: refuses every kernel/namespace/trace
+/// door in [`deny::EPERM`] (except `socket`, which is restricted to `AF_UNIX`, `AF_INET`, and
+/// `AF_INET6` so tests can exercise loopback TCP and Unix sockets under their Landlock `TMPDIR`
+/// while refusing raw, netlink, packet, and other socket families).
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn build_test(out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilter] {
+    const AF_UNIX: u32 = 1;
+    const AF_INET: u32 = 2;
+    const AF_INET6: u32 = 10;
+    let mut at = 0;
+    let mut put = |instruction: SockFilter| {
+        if let Some(slot) = out.get_mut(at) {
+            *slot = instruction;
+            at += 1;
+        }
+    };
+    put(stmt(LD_W_ABS, DATA_ARCH));
+    put(jump(JEQ_K, AUDIT_ARCH, 1, 0));
+    put(stmt(RET_K, RET_KILL_PROCESS));
+    put(stmt(LD_W_ABS, DATA_NR));
+    if let Some(bit) = deny::X32_BIT {
+        put(jump(JGE_K, bit, 0, 1));
+        put(stmt(RET_K, RET_KILL_PROCESS));
+    }
+    // `deny::EPERM` starts with `socket`; every later entry is refused unconditionally.
+    if let Some((&socket_nr, rest)) = deny::EPERM.split_first() {
+        for &nr in rest {
+            put(jump(JEQ_K, nr, 0, 1));
+            put(stmt(RET_K, RET_ERRNO | EPERM));
+        }
+        put(jump(JEQ_K, socket_nr, 0, 5));
+        put(stmt(LD_W_ABS, DATA_ARG0));
+        put(jump(JEQ_K, AF_UNIX, 3, 0));
+        put(jump(JEQ_K, AF_INET, 2, 0));
+        put(jump(JEQ_K, AF_INET6, 1, 0));
+        put(stmt(RET_K, RET_ERRNO | EPERM));
+    }
+    put(stmt(RET_K, RET_ALLOW));
+    out.get(..at).unwrap_or(out.as_slice())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Filter, MOST_FILTER, RET_ALLOW, SockFilter, build};
+    use super::{Filter, MOST_FILTER, RET_ALLOW, SockFilter, build, build_test};
+
+    fn check_well_formed(filter: &[SockFilter]) {
+        let last = filter.last().copied().expect("a filter");
+        assert_eq!((last.code, last.k), (0x06, RET_ALLOW));
+        for (at, instruction) in filter.iter().enumerate() {
+            if instruction.code & 0x07 == 0x05 {
+                assert!(at + 1 + usize::from(instruction.jt.max(instruction.jf)) < filter.len(), "jump at {at} leaves the filter");
+            }
+        }
+    }
 
     /// The filter ends in its allow, fits its cap both ways, and every jump lands inside it.
     #[test]
     fn the_filter_is_well_formed_with_and_without_processes() {
         for processes in [false, true] {
             let mut out = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
-            let filter = build(Filter { processes }, &mut out);
-            let last = filter.last().copied().expect("a filter");
-            assert_eq!((last.code, last.k), (0x06, RET_ALLOW));
-            for (at, instruction) in filter.iter().enumerate() {
-                if instruction.code & 0x07 == 0x05 {
-                    assert!(at + 1 + usize::from(instruction.jt.max(instruction.jf)) < filter.len(), "jump at {at} leaves the filter");
-                }
-            }
+            check_well_formed(build(Filter { processes }, &mut out));
         }
+        let mut out = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
+        check_well_formed(build_test(&mut out));
     }
 }

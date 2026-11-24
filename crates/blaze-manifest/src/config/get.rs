@@ -490,19 +490,21 @@ mod env_quoting_tests {
             ),
             (&["--merged", "no"][..], Some("# CARGO_BUILD_RUSTFLAGS='x y'"), ""),
         ] {
-            let args: Vec<String> = ["-Zunstable-options", "config", "get", "build"]
-                .into_iter()
-                .chain(flags.iter().copied())
-                .map(str::to_owned)
-                .collect();
+            let mut args = vec![
+                "-Zunstable-options".to_owned(),
+                "config".to_owned(),
+                "get".to_owned(),
+                "build".to_owned(),
+            ];
+            args.extend(flags.iter().map(|flag| (*flag).to_owned()));
             let (code, output) = main(root, env.clone(), &args);
             assert_eq!(code, 0, "{args:?}: {}", output.stderr);
-            let annotations: Vec<_> = output
+            let mut annotations = output
                 .stdout
                 .lines()
-                .filter(|line| line.starts_with("# CARGO_BUILD_RUSTFLAGS="))
-                .collect();
-            assert_eq!(annotations, stdout_annotation.into_iter().collect::<Vec<_>>(), "{args:?}");
+                .filter(|line| line.starts_with("# CARGO_BUILD_RUSTFLAGS="));
+            assert_eq!(annotations.next(), stdout_annotation, "{args:?}");
+            assert_eq!(annotations.next(), None, "{args:?}");
             assert_eq!(output.stderr, stderr, "{args:?}");
         }
     }

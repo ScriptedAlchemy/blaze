@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use blaze_lower::{Cfg, CfgAnswer, Lowered};
-use blaze_own::Alloc;
+use blaze_own::{Alloc, Vec};
 use blaze_surface::{Edition, ItemDetail};
 
 const EDITION: Edition = Edition::E2024;
@@ -108,7 +108,7 @@ impl Tally {
         }
     }
 
-    fn print(&self, title: &str) {
+    fn print(&self, title: &str, alloc: Alloc<'_>) {
         println!("### {title}\n");
         println!(
             "{} files ({} the outline refuses), {} items ({} turned off by `cfg`, not counted), {} pass every stage ({}%); {} fns, {} pass ({}%)\n",
@@ -122,7 +122,7 @@ impl Tally {
             self.clean_fns,
             (self.clean_fns * 100).checked_div(self.fns).unwrap_or(0),
         );
-        let mut rows: Vec<(&(Stage, String), &Cause)> = self.causes.iter().collect();
+        let mut rows = Vec::from_iter_in(self.causes.iter(), alloc);
         rows.sort_by(|a, b| b.1.first.cmp(&a.1.first).then(b.1.all.cmp(&a.1.all)).then(a.0.cmp(b.0)));
         println!("| stage | cause | items it refuses first | occurrences | first at |");
         println!("|---|---|---|---|---|");
@@ -134,13 +134,15 @@ impl Tally {
 }
 
 /// Every `.rs` file under `root`, sorted.
-fn rust_files(root: &Path) -> Vec<PathBuf> {
+fn rust_files<'a>(root: &Path, alloc: Alloc<'a>) -> Vec<PathBuf, Alloc<'a>> {
+    let mut out = Vec::new_in(alloc);
     if root.is_file() {
-        return vec![root.to_path_buf()];
+        out.push(root.to_path_buf());
+        return out;
     }
     let src = root.join("src");
-    let mut todo = vec![if src.is_dir() { src } else { root.to_path_buf() }];
-    let mut out = Vec::new();
+    let mut todo = Vec::new_in(alloc);
+    todo.push(if src.is_dir() { src } else { root.to_path_buf() });
     while let Some(at) = todo.pop() {
         let Ok(entries) = std::fs::read_dir(&at) else {
             eprintln!("census: cannot read {}", at.display());
@@ -161,26 +163,26 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
 
 /// `path:line:col` of byte `at` of `text`.
 fn place(path: &str, text: &str, at: u32) -> String {
-    let before = text.get(..at as usize).unwrap_or(text);
+    let before = usize::try_from(at).ok().and_then(|i| text.get(..i)).unwrap_or(text);
     let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
     let col = before.len() - before.rfind('\n').map_or(0, |i| i + 1) + 1;
     format!("{path}:{line}:{col}")
 }
 
 /// What one stage refused of an item: each cause and its byte in the file.
-enum Seen {
+enum Seen<'a> {
     Clean,
     CfgOut,
-    Refused(Vec<(String, u32)>),
+    Refused(Vec<(String, u32), Alloc<'a>>),
 }
 
 /// The causes in one lowering: what it did not lower, and what it diagnosed.
-fn seen(lowered: &Lowered<'_, '_>, item_start: u32) -> Seen {
+fn seen<'a>(lowered: &Lowered<'_, '_>, item_start: u32, alloc: Alloc<'a>) -> Seen<'a> {
     let view = lowered.view();
     if view.cfg_out() {
         return Seen::CfgOut;
     }
-    let mut out = Vec::new();
+    let mut out = Vec::new_in(alloc);
     for u in view.unhandled() {
         let kind = blaze_file_items::syntax_kind(u.syntax);
         let name = blaze_ladder::refusal::syntax_name(kind).unwrap_or("an unnamed construct");
@@ -205,7 +207,7 @@ fn seen(lowered: &Lowered<'_, '_>, item_start: u32) -> Seen {
 
 fn tally(root: &Path, alloc: Alloc<'_>) -> Tally {
     let mut t = Tally::default();
-    for path in rust_files(root) {
+    for path in rust_files(root, alloc) {
         let shown = path.display().to_string();
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -233,7 +235,7 @@ fn tally(root: &Path, alloc: Alloc<'_>) -> Tally {
                 _ => continue,
             };
             let start = item.range.start;
-            let mut refused: Vec<(Stage, String, u32)> = Vec::new();
+            let mut refused = Vec::new_in(alloc);
             if !errors.is_empty() {
                 refused.push((Stage::Outline, "a syntax error".to_string(), start));
             } else if matches!(item.detail, ItemDetail::MacroCall { .. }) {
@@ -254,7 +256,7 @@ fn tally(root: &Path, alloc: Alloc<'_>) -> Tally {
                             continue;
                         }
                     };
-                    match seen(&lowered, start) {
+                    match seen(&lowered, start, alloc) {
                         Seen::Clean => {}
                         Seen::CfgOut => off = true,
                         Seen::Refused(causes) => refused.extend(causes.into_iter().map(|(c, at)| (stage, c, at))),
@@ -348,8 +350,8 @@ fn split_top<'t>(text: &'t str, sep: &str) -> Option<(&'t str, &'t str)> {
 }
 
 /// The list's program side: each function and the side (crate) it was measured in.
-fn wanted(list: &str) -> Vec<Wanted> {
-    let mut out = Vec::new();
+fn wanted<'a>(list: &str, alloc: Alloc<'a>) -> Vec<Wanted, Alloc<'a>> {
+    let mut out = Vec::new_in(alloc);
     let mut side = None;
     for line in list.lines() {
         if let Some(h) = line.strip_prefix("== ") {
@@ -362,8 +364,7 @@ fn wanted(list: &str) -> Vec<Wanted> {
             continue;
         }
         let Some(side) = side else { continue };
-        let words: Vec<&str> = line.split_whitespace().collect();
-        if words.len() < 2 {
+        if line.split_whitespace().take(2).count() < 2 {
             continue;
         }
         // `count [kinds] name`; the name is the last column, which may hold spaces (`as`).
@@ -373,27 +374,26 @@ fn wanted(list: &str) -> Vec<Wanted> {
             _ => rest.trim(),
         }
         .to_string();
-        let mut w = Wanted { side, name: name.clone(), self_ty: None, trait_: None, module: None, fn_name: String::new() };
-        if let Some(inner) = name.strip_prefix('<') {
+        let (self_ty, trait_, module, fn_name) = if let Some(inner) = name.strip_prefix('<') {
             // `<Self as Trait>::f` or `<Self>::f`: the closing `>` before the last `::`.
             let (head, f) = name.rsplit_once(">::").unwrap_or((&name, ""));
             let head = head.strip_prefix('<').unwrap_or(inner);
-            match split_top(head, " as ") {
+            let (self_ty, trait_) = match split_top(head, " as ") {
                 Some((s, t)) => {
-                    w.self_ty = Some(norm(s));
                     let t = strip_generics(t);
-                    w.trait_ = Some(t.rsplit("::").next().unwrap_or(t).to_string());
+                    (Some(norm(s)), Some(t.rsplit("::").next().unwrap_or(t).to_string()))
                 }
-                None => w.self_ty = Some(norm(head)),
-            }
-            w.fn_name = strip_generics(f).trim_end_matches("::").to_string();
+                None => (Some(norm(head)), None),
+            };
+            (self_ty, trait_, None, strip_generics(f).trim_end_matches("::").to_string())
         } else {
             let base = strip_generics(&name).trim_end_matches("::");
-            let mut segs: Vec<&str> = base.split("::").collect();
-            w.fn_name = segs.pop().unwrap_or("").to_string();
-            w.module = segs.last().map(|s| s.to_string());
-        }
-        out.push(w);
+            let mut segs: Vec<&str, _> = Vec::from_iter_in(base.split("::"), alloc);
+            let fn_name = segs.pop().unwrap_or("").to_string();
+            let module = segs.last().map(|s| s.to_string());
+            (None, None, module, fn_name)
+        };
+        out.push(Wanted { side, name, self_ty, trait_, module, fn_name });
     }
     out
 }
@@ -438,7 +438,7 @@ fn first_refusal(shown: &str, text: &str, item: &blaze_surface::Item, outline_ok
         let Ok(lowered) = lowered else {
             return Some(("lowering", "a `cfg` this census does not answer".to_string(), place(shown, text, start)));
         };
-        if let Seen::Refused(mut causes) = seen(&lowered, start) {
+        if let Seen::Refused(mut causes) = seen(&lowered, start, alloc) {
             causes.sort_by_key(|c| c.1);
             let (cause, at) = causes.swap_remove(0);
             let stage = if cause.contains("macro call") { "expansion" } else { "lowering" };
@@ -454,16 +454,16 @@ fn functions(list: &Path, roots: &[String], alloc: Alloc<'_>) {
         eprintln!("census: cannot read {}", list.display());
         std::process::exit(2);
     };
-    let wanted = wanted(&list);
-    let mut files = Vec::new();
+    let wanted = wanted(&list, alloc);
+    let mut files = Vec::new_in(alloc);
     for root in roots {
-        for path in rust_files(Path::new(root)) {
+        for path in rust_files(Path::new(root), alloc) {
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
             files.push((path.display().to_string(), text));
         }
     }
-    let outlines: Vec<_> = files.iter().map(|(_, text)| blaze_file_items::outline(text, EDITION, alloc)).collect();
-    let mut found: Vec<Found> = Vec::new();
+    let outlines: Vec<_, _> = Vec::from_iter_in(files.iter().map(|(_, text)| blaze_file_items::outline(text, EDITION, alloc)), alloc);
+    let mut found: Vec<Found, _> = Vec::new_in(alloc);
     for w in &wanted {
         let mut hit = None;
         if w.name.starts_with("core::ptr::drop_glue") {
@@ -477,7 +477,10 @@ fn functions(list: &Path, roots: &[String], alloc: Alloc<'_>) {
             let ok = outline.errors().is_empty();
             for item in items {
                 // An item's name and signature ranges are relative to the item's start.
-                let own = |of: &blaze_surface::Item, r: blaze_surface::Range| of.range.of(text).get(r.start as usize..r.end as usize);
+                let own = |of: &blaze_surface::Item, r: blaze_surface::Range| {
+                    let (Ok(s), Ok(e)) = (usize::try_from(r.start), usize::try_from(r.end)) else { return None };
+                    of.range.of(text).get(s..e)
+                };
                 if !matches!(item.detail, ItemDetail::Fn { .. }) || item.name.and_then(|r| own(item, r)) != Some(w.fn_name.as_str()) {
                     continue;
                 }
@@ -531,7 +534,7 @@ fn functions(list: &Path, roots: &[String], alloc: Alloc<'_>) {
     for f in &found {
         *by.entry((f.stage, f.cause.as_str())).or_default() += 1;
     }
-    let mut rows: Vec<_> = by.into_iter().collect();
+    let mut rows: Vec<_, _> = Vec::from_iter_in(by, alloc);
     rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     println!("\n| stage | cause | functions |\n|---|---|---|");
     for ((stage, cause), n) in rows {
@@ -540,16 +543,16 @@ fn functions(list: &Path, roots: &[String], alloc: Alloc<'_>) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        eprintln!("usage: census <crate dir or .rs file>... | census --fns <list> <crate dir or .rs file>...");
-        std::process::exit(2);
-    }
     // The program's one allocator, made here at its top and handed down: a frame, whose memory
     // comes from the OS (no global heap).
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).unwrap_or_else(|e| panic!("census: the frame: {e}"));
     let erased = blaze_own::Erased::new(&frame);
     let alloc = erased.handle();
+    let args = Vec::from_iter_in(std::env::args().skip(1), alloc);
+    if args.is_empty() {
+        eprintln!("usage: census <crate dir or .rs file>... | census --fns <list> <crate dir or .rs file>...");
+        std::process::exit(2);
+    }
     if args[0] == "--fns" && args.len() > 2 {
         functions(Path::new(&args[1]), &args[2..], alloc);
         return;
@@ -557,10 +560,10 @@ fn main() {
     let mut all = Tally::default();
     for a in &args {
         let t = tally(Path::new(a), alloc);
-        t.print(a);
+        t.print(a, alloc);
         all.add(&t);
     }
     if args.len() > 1 {
-        all.print("all of the above");
+        all.print("all of the above", alloc);
     }
 }

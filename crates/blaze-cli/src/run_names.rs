@@ -521,6 +521,9 @@ pub(crate) enum RunNamesError {
     Store(std::boxed::Box<CliError, Global>),
     /// The `UnitGraph` record holds no crate list: its world could not be made (its finding says why).
     WorldNotMade,
+    /// The picked binary target was skipped by the unit graph because its `required-features`
+    /// were not all enabled.
+    RequiredFeatures { target: blaze_own::AString<'static>, package: blaze_own::AString<'static>, features: blaze_own::AString<'static> },
     /// No member crate of a `Bin` unit has its root at `root`, the picked program's crate root
     /// (run_package.rs `Program::root`; [`program_row`]).
     NoProgramCrate { root: std::boxed::Box<str> },
@@ -556,6 +559,9 @@ impl fmt::Display for RunNamesError {
             RunNamesError::NoGraph => write!(f, "the answer holds no `UnitGraph` row (no lock file matched), so the program's crates are not known ({at})"),
             RunNamesError::Store(error) => write!(f, "the program's names records: {error}"),
             RunNamesError::WorldNotMade => write!(f, "the `UnitGraph` record holds no crate list: the crates' world could not be made (its finding says why; {at})"),
+            RunNamesError::RequiredFeatures { target, package, features } => {
+                write!(f, "target `{}` in package `{}` requires the features: {}", target.as_str(), package.as_str(), features.as_str())
+            }
             RunNamesError::NoProgramCrate { root } => write!(f, "no binary unit's member crate has its root at `{root}`, the program `blaze run` starts ({at})"),
             RunNamesError::TwoProgramCrates { root, first, second } => write!(f, "two binary units' crates, `{first}` and `{second}`, have their root at `{root}` ({at})"),
             RunNamesError::NoMemberAt { at: place } => write!(f, "the crate list has no member crate at place {place} ({at})"),
@@ -694,23 +700,25 @@ pub(crate) fn program_row<'f, 'm>(
     answered: &dyn Answered,
     store: &mut dyn Store<'m>,
     facts: &mut crate::work::Facts<'f, impl crate::sweep::Stamps>,
-    program_root: &str,
+    picked: &crate::run_package::Program<'_>,
     heap: &'static blaze_own::Heap,
     frame: &'f Frame,
 ) -> Result<usize, RunNamesError> {
     let _cx = cx.span("run names: the program's unit");
+    let program_root = picked.root;
     let graph = answered.graph().ok_or(RunNamesError::NoGraph)?;
     let list = facts.bodies.list(cx, store, &graph, frame).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
     let mapping = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
     let decoded;
-    let units = match facts.names.as_ref().and_then(|names| names.made()) {
-        Some(made) => &made.graph().units,
+    let unit_graph = match facts.names.as_ref().and_then(|names| names.made()) {
+        Some(made) => made.graph(),
         None => {
             let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
             decoded = blaze_unit_graph::record::decode(bytes.unit_graph(graph.name).map_err(stored)?.graph, heap.alloc()).map_err(RunNamesError::TestGraph)?;
-            &decoded.graph.units
+            &decoded.graph
         }
     };
+    let units = &unit_graph.units;
     if mapping.len() != units.len() * 4 {
         return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
     }
@@ -731,7 +739,31 @@ pub(crate) fn program_row<'f, 'm>(
             _ => owner = Some(at),
         }
     }
-    owner.ok_or_else(|| RunNamesError::NoProgramCrate { root: std::boxed::Box::from(program_root) })
+    if let Some(at) = owner {
+        return Ok(at);
+    }
+    if let Some(left) = unit_graph.left_out.iter().find(|left| {
+        left.kind == blaze_unit_graph::LeftOutKind::Bin
+            && left.package_name.as_str() == picked.package
+            && left.name.as_str() == picked.bin
+    }) {
+        let alloc = heap.alloc();
+        let mut features = blaze_own::AString::new_in(alloc);
+        for (i, feat) in left.off.iter().enumerate() {
+            if i > 0 {
+                features.push_str(", ");
+            }
+            features.push('`');
+            features.push_str(feat.as_str());
+            features.push('`');
+        }
+        return Err(RunNamesError::RequiredFeatures {
+            target: blaze_own::AString::from_str_in(left.name.as_str(), alloc),
+            package: blaze_own::AString::from_str_in(left.package_name.as_str(), alloc),
+            features,
+        });
+    }
+    Err(RunNamesError::NoProgramCrate { root: std::boxed::Box::from(program_root) })
 }
 
 fn test_map(

@@ -17,6 +17,7 @@
 //! and splits the time between the world's answers, hashing them and the rest; each pass prints
 //! the sums. Fills per round (the records front2 makes between rounds) are not counted.
 
+use core::fmt::Write as _;
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
@@ -131,24 +132,25 @@ struct Mono(Instant);
 
 impl Clock for Mono {
     fn now_ns(&self) -> u64 {
-        self.0.elapsed().as_nanos() as u64
+        u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 }
 
 /// The counters of `recs` summed: rounds, questions by kind, conversions, and where the
 /// check's time went.
-fn tally_lines(label: &str, recs: &[&Rec], out: &mut String) {
+fn tally_lines(label: &str, recs: &[&Rec], out: &mut impl core::fmt::Write) {
     let mut t = Tally::default();
     for r in recs {
         t.add(&r.tally);
     }
-    let rounds: Vec<u64> = recs.iter().map(|r| r.tally.checks).collect();
     let mut hist = [0usize; 6];
-    for &n in &rounds {
-        hist[(n.max(1) as usize - 1).min(5)] += 1;
+    for r in recs {
+        let idx = usize::try_from(r.tally.checks.max(1) - 1).unwrap_or(5).min(5);
+        hist[idx] += 1;
     }
-    out.push_str(&format!(
-        "{label} rounds: {} checks for {} bodies; bodies by rounds 1:{} 2:{} 3:{} 4:{} 5:{} 6+:{}\n",
+    let _ = writeln!(
+        out,
+        "{label} rounds: {} checks for {} bodies; bodies by rounds 1:{} 2:{} 3:{} 4:{} 5:{} 6+:{}",
         t.checks,
         recs.len(),
         hist[0],
@@ -157,15 +159,15 @@ fn tally_lines(label: &str, recs: &[&Rec], out: &mut String) {
         hist[3],
         hist[4],
         hist[5]
-    ));
-    out.push_str(&format!("{label} speculative needs dropped {} (fills past a hole that could not be made)\n", t.dropped));
+    );
+    let _ = writeln!(out, "{label} speculative needs dropped {} (fills past a hole that could not be made)", t.dropped);
     let mut late = String::new();
     for (i, name) in QUESTION_KINDS.iter().enumerate() {
         if t.late_holes[i] > 0 {
             late.push_str(&format!(" {name} {};", t.late_holes[i]));
         }
     }
-    out.push_str(&format!("{label} holes met by second and later runs (what makes a third round):{late}\n"));
+    let _ = writeln!(out, "{label} holes met by second and later runs (what makes a third round):{late}");
     let mut asks = String::new();
     let mut total = 0;
     for (i, name) in QUESTION_KINDS.iter().enumerate() {
@@ -174,26 +176,29 @@ fn tally_lines(label: &str, recs: &[&Rec], out: &mut String) {
             asks.push_str(&format!(" {name} {};", t.asks[i]));
         }
     }
-    out.push_str(&format!("{label} questions: {total} ({} missing), {:.1} per check:{asks}\n", t.missing, total as f64 / t.checks.max(1) as f64));
-    out.push_str(&format!(
-        "{label} table conversions {}: entries converted {}; entries reached {}; entries offered {} ({:.0} per conversion)\n",
+    let _ = writeln!(out, "{label} questions: {total} ({} missing), {:.1} per check:{asks}", t.missing, total as f64 / t.checks.max(1) as f64);
+    let _ = writeln!(
+        out,
+        "{label} table conversions {}: entries converted {}; entries reached {}; entries offered {} ({:.0} per conversion)",
         t.conversions,
         t.entries_converted,
         t.entries_reached,
         t.entries_offered,
         t.entries_offered as f64 / t.conversions.max(1) as f64
-    ));
-    out.push_str(&format!(
-        "{label} time in checks {}: world answers {}, hashing answers {}, the rest (walk, solver, conversions) {}; of all, facts fills (their asks included) {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "{label} time in checks {}: world answers {}, hashing answers {}, the rest (walk, solver, conversions) {}; of all, facts fills (their asks included) {}",
         ms(t.check_ns),
         ms(t.world_ns),
         ms(t.hash_ns),
         ms(t.check_ns.saturating_sub(t.world_ns + t.hash_ns)),
         ms(t.convert_ns)
-    ));
+    );
     let s = t.solve;
-    out.push_str(&format!(
-        "{label} solver: {} calls in {} ({:.1} us each), {} repeated after a fact fill; frames {} ({:.1} per call); cache hits {}; ground fast path {}; impl candidates {} ({:.2} per frame); cycle reruns {}\n",
+    let _ = writeln!(
+        out,
+        "{label} solver: {} calls in {} ({:.1} us each), {} repeated after a fact fill; frames {} ({:.1} per call); cache hits {}; ground fast path {}; impl candidates {} ({:.2} per frame); cycle reruns {}",
         s.calls,
         ms(s.ns),
         s.ns as f64 / 1000.0 / s.calls.max(1) as f64,
@@ -205,44 +210,65 @@ fn tally_lines(label: &str, recs: &[&Rec], out: &mut String) {
         s.stats.candidates,
         s.stats.candidates as f64 / s.stats.frames.max(1) as f64,
         s.stats.reruns
-    ));
-    out.push_str(&format!(
-        "{label} checker phases: walk and rules (all less world answers, hashing, solver calls and fact fills; a fill's asks are taken off twice, so a lower bound) {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "{label} checker phases: walk and rules (all less world answers, hashing, solver calls and fact fills; a fill's asks are taken off twice, so a lower bound) {}",
         ms(t.check_ns.saturating_sub(t.world_ns + t.hash_ns + s.ns + t.convert_ns))
-    ));
+    );
 }
 
 fn heads_of(s: &Store<'_>) -> usize {
     s.adts.len() + s.impls.len() + s.fns.len() + s.maps.traits.len()
 }
 
-fn kinds(s: &Store<'_>) -> String {
-    format!(
-        "adts {}, impls {}, fns {}, traits {}, trait members {}, preds {}, generics {}, aliases {}, ctors {}, fn gaps {}, table nodes {}",
-        s.adts.len(),
-        s.impls.len(),
-        s.fns.len(),
-        s.maps.traits.len(),
-        s.trait_defs.len(),
-        s.preds.len(),
-        s.maps.generics.len(),
-        s.maps.aliases.len(),
-        s.ctors.len(),
-        s.fn_gaps.len(),
-        s.tys.len()
-    )
+fn kinds<'a, 'b>(s: &'a Store<'b>) -> impl core::fmt::Display + use<'a, 'b> {
+    struct Show<'a, 'b>(&'a Store<'b>);
+    impl core::fmt::Display for Show<'_, '_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let s = self.0;
+            write!(
+                f,
+                "adts {}, impls {}, fns {}, traits {}, trait members {}, preds {}, generics {}, aliases {}, ctors {}, fn gaps {}, table nodes {}",
+                s.adts.len(),
+                s.impls.len(),
+                s.fns.len(),
+                s.maps.traits.len(),
+                s.trait_defs.len(),
+                s.preds.len(),
+                s.maps.generics.len(),
+                s.maps.aliases.len(),
+                s.ctors.len(),
+                s.fn_gaps.len(),
+                s.tys.len()
+            )
+        }
+    }
+    Show(s)
 }
 
 fn ns(t: Instant) -> u64 {
-    t.elapsed().as_nanos() as u64
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn ms(n: u64) -> String {
-    format!("{:.1} ms", n as f64 / 1e6)
+fn ms(n: u64) -> impl core::fmt::Display {
+    struct Show(u64);
+    impl core::fmt::Display for Show {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "{:.1} ms", self.0 as f64 / 1e6)
+        }
+    }
+    Show(n)
 }
 
-fn us(n: u64) -> String {
-    format!("{:.1} us", n as f64 / 1e3)
+fn us(n: u64) -> impl core::fmt::Display {
+    struct Show(u64);
+    impl core::fmt::Display for Show {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "{:.1} us", self.0 as f64 / 1e3)
+        }
+    }
+    Show(n)
 }
 
 fn rate(count: usize, total_ns: u64) -> f64 {
@@ -278,19 +304,20 @@ fn pct(sorted: &[u64], p: f64) -> u64 {
     sorted[i.clamp(1, sorted.len()) - 1]
 }
 
-fn dist(label: &str, mut v: Vec<u64>) -> String {
+fn write_dist(out: &mut impl core::fmt::Write, label: &str, v: &mut [u64]) {
     v.sort_unstable();
     let sum: u64 = v.iter().sum();
-    format!(
+    let _ = writeln!(
+        out,
         "{label}: n {}, total {}, mean {}, p50 {}, p90 {}, p99 {}, max {}",
         v.len(),
         ms(sum),
-        us(if v.is_empty() { 0 } else { sum / v.len() as u64 }),
-        us(pct(&v, 50.0)),
-        us(pct(&v, 90.0)),
-        us(pct(&v, 99.0)),
-        us(pct(&v, 100.0))
-    )
+        us(if v.is_empty() { 0 } else { sum / u64::try_from(v.len()).unwrap_or(u64::MAX) }),
+        us(pct(v, 50.0)),
+        us(pct(v, 90.0)),
+        us(pct(v, 99.0)),
+        us(pct(v, 100.0))
+    );
 }
 
 fn make<'n>(r: &mut Records<'_, 'n>, w: Want) -> bool {
@@ -389,35 +416,39 @@ fn one<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, st: &mut St<'n>, prepar
     rec
 }
 
-fn outcome_line(label: &str, recs: &[Rec]) -> String {
-    let mut s = format!("{label} outcomes:");
+fn write_outcome_line(out: &mut impl core::fmt::Write, label: &str, recs: &[Rec]) {
+    let _ = write!(out, "{label} outcomes:");
     for (o, name) in OUTCOMES {
-        s.push_str(&format!(" {name} {};", recs.iter().filter(|r| r.outcome == o).count()));
+        let _ = write!(out, " {name} {};", recs.iter().filter(|r| r.outcome == o).count());
     }
-    s
+    let _ = writeln!(out);
 }
 
 /// One pass's lines: totals and rates of lowering and checking (bodies = those lowered).
-fn pass_lines(label: &str, recs: &[Rec], out: &mut String) {
+fn pass_lines(label: &str, recs: &[Rec], out: &mut impl core::fmt::Write) {
     let lowered: Vec<&Rec> = recs.iter().filter(|r| !matches!(r.outcome, Outcome::ContainerFail | Outcome::NoBody)).collect();
     let checked: Vec<&Rec> = recs.iter().filter(|r| matches!(r.outcome, Outcome::Clean | Outcome::CheckFail)).collect();
     let cont: u64 = recs.iter().map(|r| r.container_ns).sum();
     let low: u64 = lowered.iter().map(|r| r.lower_ns).sum();
     let chk: u64 = checked.iter().map(|r| r.check_ns).sum();
-    out.push_str(&format!("{}\n", outcome_line(label, recs)));
-    out.push_str(&format!("{label} container heads: {}\n", ms(cont)));
-    out.push_str(&format!("{label} lower: {} bodies in {}: {:.0} bodies/s\n", lowered.len(), ms(low), rate(lowered.len(), low)));
-    out.push_str(&format!("{label} check: {} bodies in {}: {:.0} bodies/s (floor {FLOOR_BODIES_PER_S:.0}/s: ratio {:.1}x)\n", checked.len(), ms(chk), rate(checked.len(), chk), FLOOR_BODIES_PER_S / rate(checked.len(), chk).max(1e-9)));
-    out.push_str(&format!("{}\n", dist(&format!("{label} check per body"), checked.iter().map(|r| r.check_ns).collect())));
-    out.push_str(&format!("{}\n", dist(&format!("{label} check per clean body"), checked.iter().filter(|r| r.outcome == Outcome::Clean).map(|r| r.check_ns).collect())));
-    out.push_str(&format!("{}\n", dist(&format!("{label} lower per body"), lowered.iter().map(|r| r.lower_ns).collect())));
+    write_outcome_line(out, label, recs);
+    let _ = writeln!(out, "{label} container heads: {}", ms(cont));
+    let _ = writeln!(out, "{label} lower: {} bodies in {}: {:.0} bodies/s", lowered.len(), ms(low), rate(lowered.len(), low));
+    let _ = writeln!(out, "{label} check: {} bodies in {}: {:.0} bodies/s (floor {FLOOR_BODIES_PER_S:.0}/s: ratio {:.1}x)", checked.len(), ms(chk), rate(checked.len(), chk), FLOOR_BODIES_PER_S / rate(checked.len(), chk).max(1e-9));
+    let mut check_ns: Vec<u64> = checked.iter().map(|r| r.check_ns).collect();
+    write_dist(out, &format!("{label} check per body"), &mut check_ns);
+    let mut clean_ns: Vec<u64> = checked.iter().filter(|r| r.outcome == Outcome::Clean).map(|r| r.check_ns).collect();
+    write_dist(out, &format!("{label} check per clean body"), &mut clean_ns);
+    let mut lower_ns: Vec<u64> = lowered.iter().map(|r| r.lower_ns).collect();
+    write_dist(out, &format!("{label} lower per body"), &mut lower_ns);
     tally_lines(label, &checked, out);
     let grew = recs.iter().filter(|r| r.heads_made > 0).count();
-    out.push_str(&format!(
-        "{label} records made: heads {} by {grew} bodies, table nodes {}\n",
+    let _ = writeln!(
+        out,
+        "{label} records made: heads {} by {grew} bodies, table nodes {}",
         recs.iter().map(|r| r.heads_made).sum::<usize>(),
         recs.iter().map(|r| r.nodes_made).sum::<usize>()
-    ));
+    );
 }
 
 fn main() {

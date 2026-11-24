@@ -800,8 +800,11 @@ pub fn devtools(view: u64, message: &[u8]) {
                         Ok(Some(msg)) => h.to_app(&AppDown::Message { view, msg }),
                         Ok(None) => {}
                         Err(e) => {
-                            let url = h.pages.get(&view).and_then(|p| p.ui.as_ref()).map(|u| u.url.clone()).unwrap_or_default();
-                            h.app_error(None, format!("UI view {view} ({url}): {e}"));
+                            let msg = {
+                                let url = h.pages.get(&view).and_then(|p| p.ui.as_ref()).map(|u| u.url.as_str()).unwrap_or_default();
+                                format!("UI view {view} ({url}): {e}")
+                            };
+                            h.app_error(None, msg);
                         }
                     }
                     return None;
@@ -920,8 +923,8 @@ fn binding_call(message: &[u8]) -> Result<Option<String>, BindingError> {
 /// `OnBeforeClose`: the view is gone. Everyone hears why; its pending requests and waiters are answered.
 pub fn closed(view: u64) {
     let after = with("a view closing", |h| {
-        let page = h.pages.remove(&view)?;
-        let why = page.closing.clone().unwrap_or_else(|| "the page closed itself".to_owned());
+        let mut page = h.pages.remove(&view)?;
+        let why = page.closing.take().unwrap_or_else(|| "the page closed itself".to_owned());
         for a in h.cdp.forget_view(view) {
             if let Asker::Conn { conn, id } = a {
                 h.to_conn(conn, &KernelDown::Cdp { view, message: cdp_error(&id, &format!("view {view} closed before answering: {why}")) });
@@ -1337,11 +1340,14 @@ pub fn ui_post(view: u64, msg: &str) -> Result<(Frame, String), UiPostError> {
     let b = with("a post to a UI view", |h| {
         let p = h.pages.get(&view).ok_or(UiPostError::MissingView { view })?;
         let ui = p.ui.as_ref().ok_or_else(|| UiPostError::NotUi { view, url: p.info.url.clone() })?;
+        let url = ui.url.clone();
         if let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(msg) {
-            return Err(UiPostError::Json { view, url: ui.url.clone(), source: e });
+            return Err(UiPostError::Json { view, url, source: e });
         }
-        let b = p.browser.clone().ok_or_else(|| UiPostError::MissingBrowser { view, url: ui.url.clone() })?;
-        Ok((b, ui.url.clone()))
+        let Some(b) = p.browser.clone() else {
+            return Err(UiPostError::MissingBrowser { view, url });
+        };
+        Ok((b, url))
     })
     .unwrap_or(Err(UiPostError::HostStopped { view }))?;
     let (b, url) = b;

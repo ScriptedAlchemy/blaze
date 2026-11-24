@@ -42,7 +42,7 @@ blaze-engine	0	0	0	14
 blaze-expand	32	0	0	38
 blaze-export	12	0	0	0
 blaze-fetch	52	0	7	40
-blaze-file-items	64	0	4	72
+blaze-file-items	61	0	4	69
 blaze-flow	0	0	1	0
 blaze-fmt	223	1	0	1050
 blaze-format	13	0	0	11
@@ -63,9 +63,9 @@ blaze-inproc-rt	0	1	0	0
 blaze-json	0	0	2	0
 blaze-keyed	0	0	13	291
 blaze-kit	12	0	13	30
-blaze-ladder	309	1	2	1727
+blaze-ladder	308	1	2	1718
 blaze-launch	0	0	15	58
-blaze-launch-rt	92	1	1	159
+blaze-launch-rt	90	1	1	158
 blaze-launcher	60	1	0	13
 blaze-lex	14	0	0	16
 blaze-lint	17	0	0	31
@@ -73,7 +73,7 @@ blaze-lint-defs	0	0	3	16
 blaze-lir	0	0	31	135
 blaze-lower	17	0	0	15
 blaze-malloc	4	0	3	20
-blaze-manifest	151	1	0	775
+blaze-manifest	143	1	0	775
 blaze-math	0	0	0	1
 blaze-mem	48	1	5	39
 blaze-memchr	2	0	1	4
@@ -85,7 +85,7 @@ blaze-pack	0	0	10	86
 blaze-parquet	0	0	2	0
 blaze-pg	0	0	7	39
 blaze-proc-macro	513	1	0	1013
-blaze-profile	349	1	17	1546
+blaze-profile	349	1	17	1545
 blaze-protocol	27	1	1	157
 blaze-queue	1	0	5	0
 blaze-radix	2	1	1	23
@@ -98,7 +98,7 @@ blaze-resolve	103	1	0	326
 blaze-run	2	0	0	1
 blaze-scope	126	0	0	381
 blaze-screen	0	0	11	132
-blaze-script	127	1	0	330
+blaze-script	125	1	0	327
 blaze-semver	0	0	4	0
 blaze-sim	31	1	0	132
 blaze-solve	25	0	0	219
@@ -139,4 +139,4 @@ stdx	62	1	0	58
 syntax	702	1	1	236
 syntax-tree	42	1	1	117
 target-features	0	0	3	7
-test-utils	20	1	0	80
+test-utils	18	1	0	80

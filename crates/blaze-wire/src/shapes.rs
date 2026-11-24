@@ -5,9 +5,10 @@
 //! digest is its inner value: a byte string of 32 bytes. A `Vec` marked **set** in the doc is a
 //! [`Set`], sorted by the bytes of each item's encoding and without duplicates.
 
+use core::alloc::Allocator;
+
 use crate::cbor::Wire;
-use crate::{Digest, Named, Set};
-use crate::{wire_enum, wire_struct};
+use crate::{Digest, Named, Set, WireAlloc, WireString, WireVec};
 
 wire_enum! {
     /// Where a local build looks before it compiles.
@@ -93,7 +94,7 @@ wire_struct! {
     Lease {
         0 => execution: ExecutionId,
         1 => attempt: Attempt,
-        2 => holder: String,
+        2 => holder: WireString,
         3 => generation: u64,
     }
 }
@@ -128,7 +129,7 @@ wire_struct! {
 wire_struct! {
     /// The fields of `ItemOutcome::Failed`, `Local` and `Lost`.
     Why {
-        0 => why: String,
+        0 => why: WireString,
     }
 }
 
@@ -138,7 +139,7 @@ wire_struct! {
         0 => name: WorkName,
         1 => outcome: ItemOutcome,
         2 => found: Set<Found>,
-        3 => unnamed: Set<(u32, String)>,
+        3 => unnamed: Set<(u32, WireString)>,
     }
 }
 
@@ -147,8 +148,8 @@ wire_struct! {
     BatchResult {
         0 => lease: Lease,
         1 => seq: u64,
-        2 => items: Vec<ItemResult>,
-        3 => packs: Vec<PackRef>,
+        2 => items: WireVec<ItemResult>,
+        3 => packs: WireVec<PackRef>,
         4 => returned_roots: Set<(u64, u64)>,
         5 => returned_names: Set<WorkName>,
     }
@@ -201,7 +202,7 @@ wire_struct! {
 wire_struct! {
     /// The fields of `JobEvent::Assigned`.
     AssignedEvent {
-        0 => executor: String,
+        0 => executor: WireString,
         1 => attempt: Attempt,
     }
 }
@@ -209,8 +210,8 @@ wire_struct! {
 wire_struct! {
     /// The fields of `JobEvent::Refused`.
     RefusedEvent {
-        0 => function: String,
-        1 => why: String,
+        0 => function: WireString,
+        1 => why: WireString,
     }
 }
 
@@ -218,7 +219,7 @@ wire_struct! {
     /// The fields of `JobEvent::Output`.
     OutputEvent {
         0 => stream: u8,
-        1 => bytes: Vec<u8>,
+        1 => bytes: WireVec<u8>,
     }
 }
 
@@ -226,7 +227,7 @@ wire_struct! {
     /// The fields of `JobEvent::Done`.
     DoneEvent {
         0 => outcome: Outcome,
-        1 => counters: Vec<(String, u64)>,
+        1 => counters: WireVec<(WireString, u64)>,
     }
 }
 
@@ -251,9 +252,6 @@ wire_struct! {
     }
 }
 
-// The digest newtypes. Each is its inner value, a 32-byte string, and each names the type its
-// digest is taken of, so the domain separation covers the name as well as the bytes.
-
 macro_rules! digest_newtype {
     ($(#[$meta:meta])* $name:ident => $input:ty) => {
         $(#[$meta])*
@@ -261,7 +259,7 @@ macro_rules! digest_newtype {
         pub struct $name(pub Digest);
 
         impl Wire for $name {
-            fn encode<A: std::alloc::Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
+            fn encode<A: Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
                 e.bytes(&self.0);
             }
 
@@ -278,14 +276,14 @@ macro_rules! digest_newtype {
 
         impl $name {
             /// The digest of one input value, under this type's domain separation.
-            pub fn of<A: std::alloc::Allocator + Clone>(value: &$input, alloc: A) -> $name {
+            pub fn of<A: Allocator + Clone>(value: &$input, alloc: A) -> $name {
                 $name(crate::digest_of_encoded::<Self>(&crate::encode(value, alloc)))
             }
         }
 
         impl crate::vectors::Sample for $name {
-            fn sample(g: &mut crate::vectors::Gen) -> Self {
-                $name(<[u8; 32]>::sample(g))
+            fn sample(g: &mut crate::vectors::Gen, alloc: WireAlloc) -> Self {
+                $name(<[u8; 32]>::sample(g, alloc))
             }
         }
     };
@@ -298,7 +296,7 @@ macro_rules! digest_newtype {
 pub struct EntryKey(pub Digest);
 
 impl Wire for EntryKey {
-    fn encode<A: std::alloc::Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
         e.bytes(&self.0);
     }
 
@@ -314,8 +312,8 @@ impl Named for EntryKey {
 }
 
 impl crate::vectors::Sample for EntryKey {
-    fn sample(g: &mut crate::vectors::Gen) -> Self {
-        EntryKey(<[u8; 32]>::sample(g))
+    fn sample(g: &mut crate::vectors::Gen, alloc: WireAlloc) -> Self {
+        EntryKey(<[u8; 32]>::sample(g, alloc))
     }
 }
 
@@ -335,7 +333,7 @@ digest_newtype! {
 pub struct ExecutionId(pub u64);
 
 impl Wire for ExecutionId {
-    fn encode<A: std::alloc::Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
         e.uint(self.0);
     }
 
@@ -349,8 +347,8 @@ impl Named for ExecutionId {
 }
 
 impl crate::vectors::Sample for ExecutionId {
-    fn sample(g: &mut crate::vectors::Gen) -> Self {
-        ExecutionId(u64::sample(g))
+    fn sample(g: &mut crate::vectors::Gen, alloc: WireAlloc) -> Self {
+        ExecutionId(u64::sample(g, alloc))
     }
 }
 
@@ -359,7 +357,7 @@ impl crate::vectors::Sample for ExecutionId {
 pub struct Attempt(pub u32);
 
 impl Wire for Attempt {
-    fn encode<A: std::alloc::Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
+    fn encode<A: Allocator + Clone>(&self, e: &mut crate::Encoder<A>) {
         e.uint(u64::from(self.0));
     }
 
@@ -378,7 +376,7 @@ impl Named for Attempt {
 }
 
 impl crate::vectors::Sample for Attempt {
-    fn sample(g: &mut crate::vectors::Gen) -> Self {
-        Attempt(u32::sample(g))
+    fn sample(g: &mut crate::vectors::Gen, alloc: WireAlloc) -> Self {
+        Attempt(u32::sample(g, alloc))
     }
 }

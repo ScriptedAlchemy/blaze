@@ -1,40 +1,34 @@
-//! blaze's cache server: what the executors of a distributed build share, over HTTP/1.1.
+//! `blaze-serve`: blaze's HTTP/1.1 cache server for content-addressed packs and unit pack lists.
 //!
-//! A unit's executors put the packs of what they compiled here before they report it, so a
-//! committed result's bytes exist, and a unit that linked names its packs in a list, so a later
-//! build of the same unit takes them and schedules nothing ([docs/distributed.md](../../docs/distributed.md)).
+//! Pure `#![no_std]` driver over `blaze-sys`, `blaze-own`, `blaze-sha256`, and `blaze-wire`.
 //!
-//! | Call | Request | Answer |
-//! |---|---|---|
-//! | `GET`, `PUT /v1/blob/packs/<sha256>.pack` | bytes | bytes |
-//! | `GET`, `PUT /v1/list/manifests/<sha256>` | text | text |
-//!
-//! A pack's name is the SHA-256 of its bytes, and a pack is checked against its name before it
-//! becomes visible, so a name only ever holds what it says. A list's name is its unit's digest;
-//! a list is written once, and a second writer's `PUT` answers 412. Conditional repair uses
-//! one exact quoted SHA256 `If-Match`, and can replace only a matched list whose pack is
-//! absent after every replacement pack verifies; a valid or corrupt old list is never erased.
-//!
-//! # What it does not do
-//!
-//! No authentication: it listens on `127.0.0.1` unless told otherwise, so a shared one belongs
-//! behind what authenticates its clients. No collection: its directory grows until it is removed.
-//!
-//! # On disk
-//!
-//! A blob is written under a temporary name, synced, renamed and its directory synced, so a
-//! partially written one never appears under its name.
+//! Routes:
+//! - `GET /` — health banner (`"blaze-serve\n"`)
+//! - `GET /v1/blob/packs/<sha256>.pack` — stream a pack (`200`, `ETag: "<sha256>"`)
+//! - `PUT /v1/blob/packs/<sha256>.pack` — verify `DIST_PACK_MAGIC` and SHA-256, publish (`204`)
+//! - `GET /v1/list/manifests/<sha256>` — read a unit's pack list (`200`)
+//! - `PUT /v1/list/manifests/<sha256>` — verify packs and publish (optional `If-Match` CAS; `204` / `412`)
 
+#![no_std]
 #![deny(missing_docs)]
-#![feature(allocator_api, register_tool, custom_inner_attributes)]
+#![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::driver]
+#![deny(blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 
 mod blob;
 mod error;
 mod server;
 mod store;
+mod sys;
 
 pub use blob::{Kind, ObjectName};
-pub use error::{Error, ErrorCode, ServeError};
-pub use server::{Body, Config, Resources, Server, serve, serve_on};
+pub use error::{Error, ErrorCode, ErrorMessage, ServeError};
+pub use server::{Config, Resources, Server, ShutdownHandle, serve, serve_on};
 pub use store::Store;
+pub use sys::{SysError, process_args};
+
+/// Writes `bytes` to standard error (`fd 2`) without pulling in `std::io`.
+pub fn write_stderr(bytes: &[u8]) {
+    sys::write_fd_best_effort(sys::Fd::STDERR, bytes);
+}

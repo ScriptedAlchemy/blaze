@@ -216,8 +216,10 @@ pub(crate) fn command(
     command: Command,
 ) -> Result<Status, CliError> {
     let mut packages = blaze_own::Vec::new_in(cx.frame());
+    let mut features = blaze_own::Vec::new_in(cx.frame());
     // `-p` picks from the engine's unit graph for `run` and `test` alike (R3).
-    let flags = crate::parse_flags(args, |name| packages.push(name))?;
+    let mut flags = crate::parse_flags_with(args, |name| packages.push(name), |feat| features.push(feat))?;
+    flags.features = features.as_slice();
     if flags.fix.is_some() {
         return Err(CliError::Usage("--fix is `blaze check`'s"));
     }
@@ -336,7 +338,7 @@ pub(crate) fn run_program(
     // the program's crate is its `Bin` unit's, found through that map (`program_row`).
     let mut facts = start_facts(&standing, launch.fs, phases, lints);
     let answered = run_names::FromEngine { graph: standing.graph, names: standing.names };
-    let at = run_names::program_row(cx, root, &answered, &mut *standing.store, &mut facts, picked.root, heap, frame).map_err(CliError::RunNames)?;
+    let at = run_names::program_row(cx, root, &answered, &mut *standing.store, &mut facts, &picked, heap, frame).map_err(CliError::RunNames)?;
     let owner = run_names::Owner::At(at);
     let found = run_names::found_answered(cx, &answered, owner, &mut *standing.store, &mut facts.bodies, &mut read, heap, frame).map_err(CliError::RunNames)?;
     let program_found = found.program().ok_or(CliError::Start(StartError::NoProgram))?;

@@ -14,8 +14,11 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-serde_json.workspace = true
-sha2.workspace = true
+blaze-own.workspace = true
+blaze-sha256.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

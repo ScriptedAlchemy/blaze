@@ -143,24 +143,29 @@ fn definitions(texts: &[String]) -> (&'static [(&'static str, Prepared<'static>)
         for call in found.iter() {
             let Some(name_at) = call.name else { continue };
             let inner = call.inner();
-            let Ok(body) = stream.copy_in(inner.start as usize..inner.end as usize, Alloc::global()) else { continue };
+            let (Ok(start), Ok(end)) = (usize::try_from(inner.start), usize::try_from(inner.end)) else { continue };
+            let Ok(body) = stream.copy_in(start..end, Alloc::global()) else { continue };
             let def = match call.kind {
                 NestedKind::MacroRules => MacroDefinition::rules(body, def_at()),
                 NestedKind::Macro2 => {
                     let params = match call.params {
                         None => None,
-                        Some(p) => match stream.copy_in(p.start as usize + 1..p.end as usize - 1, Alloc::global()) {
-                            Ok(params) => Some(params),
-                            Err(_) => continue,
-                        },
+                        Some(p) => {
+                            let (Ok(ps), Ok(pe)) = (usize::try_from(p.start), usize::try_from(p.end)) else { continue };
+                            match stream.copy_in(ps + 1..pe - 1, Alloc::global()) {
+                                Ok(params) => Some(params),
+                                Err(_) => continue,
+                            }
+                        }
                     };
                     MacroDefinition::macro2(params, body, def_at())
                 }
                 _ => continue,
             };
             let def: &'static MacroDefinition<'static> = Box::leak(Box::new(def));
+            let Ok(name_idx) = usize::try_from(name_at) else { continue };
             match prepare(def) {
-                Ok(prepared) => defs.push((stream.text_at(name_at as usize), prepared)),
+                Ok(prepared) => defs.push((stream.text_at(name_idx), prepared)),
                 Err(_) => refused += 1,
             }
         }

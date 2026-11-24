@@ -1,20 +1,21 @@
 //! The doc's types and the crate's agree: every `struct` and `enum` "Data shapes" and "The calls"
 //! name is a type here, and every type here is one the doc names.
-//!
-//! This is the check that a type the doc adds is not silently missing from the crate, and that the
-//! crate does not invent a type the doc does not have.
 
-use std::collections::BTreeSet;
+#![no_std]
+#![feature(allocator_api)]
 
-/// The doc, read from the workspace the crate is in.
-fn doc() -> String {
-    let path = format!("{}/../../docs/distributed.md", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("no {path}: {e}"))
+use blaze_own::{SortedSet, String, Vec};
+use blaze_wire::WireAlloc;
+
+const DOC: &str = include_str!("../../../docs/distributed.md");
+
+fn heap() -> WireAlloc {
+    blaze_own::testing::heap().shared()
 }
 
 /// The `struct` and `enum` names of `text`, as the code blocks write them.
-fn names_in(text: &str) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
+fn names_in(text: &str, alloc: WireAlloc) -> SortedSet<String<WireAlloc>, WireAlloc> {
+    let mut names = SortedSet::new_in(alloc);
     for line in text.lines() {
         let line = line.trim_start();
         let rest = line
@@ -25,8 +26,10 @@ fn names_in(text: &str) -> BTreeSet<String> {
             .or_else(|| line.strip_prefix("struct "))
             .or_else(|| line.strip_prefix("enum "));
         if let Some(rest) = rest {
-            let name: String =
-                rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            let mut name = String::new_in(alloc);
+            for c in rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_') {
+                name.push(c);
+            }
             if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_alphabetic()) {
                 names.insert(name);
             }
@@ -36,33 +39,41 @@ fn names_in(text: &str) -> BTreeSet<String> {
 }
 
 /// The doc's two sections, as the ranges the shapes are in.
-fn shape_sections() -> String {
-    let doc = doc();
-    let start = doc.find("## Data shapes").expect("the doc has no \"Data shapes\"");
-    let end = doc
+fn shape_sections() -> &'static str {
+    let start = DOC.find("## Data shapes").expect("the doc has no \"Data shapes\"");
+    let end = DOC
         .find("## Tests and the remaining acceptance boundary")
         .expect("no end of the doc's shapes");
-    doc[start..end].to_owned()
+    &DOC[start..end]
 }
 
 #[test]
 fn every_type_the_doc_names_is_in_the_crate() {
-    let documented = names_in(&shape_sections());
-    let in_crate: BTreeSet<String> =
-        blaze_wire::vectors::every().iter().map(|entry| entry.name.to_owned()).collect();
+    let alloc = heap();
+    let documented = names_in(shape_sections(), alloc);
+    let mut in_crate = SortedSet::new_in(alloc);
+    for entry in blaze_wire::vectors::every() {
+        in_crate.insert(String::from_str_in(entry.name, alloc));
+    }
     assert!(documented.len() >= 40, "the doc's shapes were read as {} types", documented.len());
-    let missing: Vec<&String> = documented.difference(&in_crate).collect();
+    let mut missing = Vec::new_in(alloc);
+    for name in documented.iter() {
+        if !in_crate.contains(name) {
+            missing.push(name);
+        }
+    }
     assert!(missing.is_empty(), "the doc names types the crate does not have: {missing:?}");
 }
 
 #[test]
 fn every_type_the_crate_has_is_in_the_doc() {
-    let documented = names_in(&shape_sections());
-    let in_crate: BTreeSet<String> =
-        blaze_wire::vectors::every().iter().map(|entry| entry.name.to_owned()).collect();
-    let invented: Vec<&String> = in_crate.difference(&documented).collect();
-    // Each enum payload must be documented and present in the crate as its own type too.
-    let payloads: BTreeSet<&str> = [
+    let alloc = heap();
+    let documented = names_in(shape_sections(), alloc);
+    let mut in_crate = SortedSet::new_in(alloc);
+    for entry in blaze_wire::vectors::every() {
+        in_crate.insert(String::from_str_in(entry.name, alloc));
+    }
+    let payloads = [
         "PrNamespace",
         "ItemKey",
         "EdgeKey",
@@ -73,17 +84,18 @@ fn every_type_the_crate_has_is_in_the_doc() {
         "RefusedEvent",
         "OutputEvent",
         "DoneEvent",
-    ]
-    .into_iter()
-    .collect();
-    let invented: Vec<&&String> =
-        invented.iter().filter(|name| !payloads.contains(name.as_str())).collect();
+    ];
+    let mut invented = Vec::new_in(alloc);
+    for name in in_crate.iter() {
+        if !documented.contains(name) && !payloads.contains(&name.as_str()) {
+            invented.push(name);
+        }
+    }
     assert!(invented.is_empty(), "the crate has types the doc does not name: {invented:?}");
 }
 
 #[test]
 fn the_payload_structs_are_the_ones_the_doc_names() {
-    let doc = doc();
     for name in [
         "PrNamespace",
         "ItemKey",
@@ -96,7 +108,7 @@ fn the_payload_structs_are_the_ones_the_doc_names() {
         "OutputEvent",
         "DoneEvent",
     ] {
-        assert!(doc.contains(name), "the doc does not name the payload struct {name}");
+        assert!(DOC.contains(name), "the doc does not name the payload struct {name}");
         assert!(
             blaze_wire::vectors::every().iter().any(|entry| entry.name == name),
             "the crate has no payload struct {name}"

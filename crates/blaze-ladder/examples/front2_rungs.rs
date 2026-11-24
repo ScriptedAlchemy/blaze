@@ -122,7 +122,7 @@ fn write_all(fd: i32, bytes: &[u8]) -> bool {
 }
 
 /// Reads what `fd` (non-blocking) holds now into `text`; true at end of file.
-fn drain(fd: i32, text: &mut Vec<u8>) -> bool {
+fn drain<A: core::alloc::Allocator>(fd: i32, text: &mut Vec<u8, A>) -> bool {
     let mut buf = [0u8; 4096];
     loop {
         // SAFETY: `fd` is the open read end of the pipe; `buf` is a live array of that length.

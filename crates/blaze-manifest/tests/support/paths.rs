@@ -1,6 +1,23 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+
+pub fn copy_dir(from: &Path, to: &Path, skip: &[&str]) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if skip.iter().any(|it| name == *it) {
+            continue;
+        }
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &to.join(&name), skip);
+        } else {
+            fs::copy(entry.path(), to.join(&name)).unwrap();
+        }
+    }
+}
 
 /// Resolve the fixture's native identity, then use the source layer's ordinary path spelling
 /// on Windows so its verbatim prefix does not leak into the fixture's environment values.
@@ -20,7 +37,9 @@ pub fn normalize(text: &str, root: &Path, home: &Path) -> String {
 pub fn normalize_path(text: &str, path: &Path, marker: &str) -> String {
     let text = normalize_native(text, path.to_str().unwrap(), marker);
     let url = url::Url::from_file_path(path).unwrap().to_string();
-    normalize_prefix(&text, url.strip_prefix("file://").unwrap(), marker, None)
+    let mut out = "".to_owned();
+    push_normalized_prefix(&mut out, &text, url.strip_prefix("file://").unwrap(), marker, None);
+    out
 }
 
 fn normalize_native(text: &str, native: &str, marker: &str) -> String {
@@ -44,36 +63,46 @@ fn normalize_native(text: &str, native: &str, marker: &str) -> String {
     }
     // Strip the whole verbatim root before its shorter drive/UNC spelling can
     // match inside it and leave a dangling prefix in the normalized JSON.
-    spellings.sort_by_key(|path| std::cmp::Reverse(path.len()));
+    spellings.sort_by_key(|path| core::cmp::Reverse(path.len()));
     let mut text = text.to_owned();
+    let mut out = "".to_owned();
     for path in spellings {
         text = text.replace(&format!("'{path}'"), marker);
         let escaped = serde_json::to_string(&path).unwrap();
         let escaped = &escaped[1..escaped.len() - 1];
         let windows = path.contains('\\');
-        text = normalize_prefix(&text, escaped, marker, windows.then_some("\\\\"));
-        text = normalize_prefix(&text, &path, marker, windows.then_some("\\"));
+        out.clear();
+        push_normalized_prefix(&mut out, &text, escaped, marker, windows.then_some("\\\\"));
+        core::mem::swap(&mut text, &mut out);
+        out.clear();
+        push_normalized_prefix(&mut out, &text, &path, marker, windows.then_some("\\"));
+        core::mem::swap(&mut text, &mut out);
     }
     text
 }
 
-fn normalize_prefix(text: &str, prefix: &str, marker: &str, separator: Option<&str>) -> String {
-    let mut normalized = String::new();
+fn push_normalized_prefix(
+    normalized: &mut impl core::fmt::Write,
+    text: &str,
+    prefix: &str,
+    marker: &str,
+    separator: Option<&str>,
+) {
     let mut rest = text;
     while let Some((before, after)) = rest.split_once(prefix) {
-        normalized.push_str(before);
-        normalized.push_str(marker);
+        normalized.write_str(before).unwrap();
+        normalized.write_str(marker).unwrap();
         let mut suffix = after;
         loop {
             if let Some(tail) = separator.and_then(|sep| suffix.strip_prefix(sep)) {
-                normalized.push('/');
+                normalized.write_char('/').unwrap();
                 suffix = tail;
             } else if let Some(c) = suffix
                 .chars()
                 .next()
                 .filter(|c| c.is_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
             {
-                normalized.push(c);
+                normalized.write_char(c).unwrap();
                 suffix = &suffix[c.len_utf8()..];
             } else {
                 break;
@@ -81,22 +110,7 @@ fn normalize_prefix(text: &str, prefix: &str, marker: &str, separator: Option<&s
         }
         rest = suffix;
     }
-    normalized.push_str(rest);
-    normalized
-}
-
-/// Fixture paths use portable slash-delimited components. Emit native paths,
-/// including on Windows, without altering file URLs or diagnostic text.
-fn native_fixture_path(text: &str, marker: &str, root: &Path) -> Option<String> {
-    let suffix = text.strip_prefix(marker)?;
-    if (!suffix.is_empty() && !suffix.starts_with('/')) || suffix.chars().any(char::is_whitespace) {
-        return None;
-    }
-    let mut path = root.to_path_buf();
-    for component in suffix.split('/').filter(|part| !part.is_empty()) {
-        path.push(component);
-    }
-    Some(path.to_string_lossy().into_owned())
+    normalized.write_str(rest).unwrap();
 }
 
 pub fn expand(value: &mut Value, root: &Path, home: &Path) {
@@ -107,8 +121,20 @@ pub fn expand(value: &mut Value, root: &Path, home: &Path) {
                     &format!("file://{marker}"),
                     url::Url::from_file_path(path).unwrap().as_str(),
                 );
-                *text = native_fixture_path(&expanded_url, marker, path)
-                    .unwrap_or_else(|| expanded_url.replace(marker, path.to_str().unwrap()));
+                let native = expanded_url.strip_prefix(marker).and_then(|suffix| {
+                    if (!suffix.is_empty() && !suffix.starts_with('/'))
+                        || suffix.chars().any(char::is_whitespace)
+                    {
+                        return None;
+                    }
+                    let mut out = path.to_path_buf();
+                    for component in suffix.split('/').filter(|part| !part.is_empty()) {
+                        out.push(component);
+                    }
+                    Some(out.to_string_lossy().into_owned())
+                });
+                *text =
+                    native.unwrap_or_else(|| expanded_url.replace(marker, path.to_str().unwrap()));
             }
         }
         Value::Array(values) => values.iter_mut().for_each(|v| expand(v, root, home)),
@@ -119,7 +145,7 @@ pub fn expand(value: &mut Value, root: &Path, home: &Path) {
 
 #[test]
 fn fixture_paths_preserve_unrelated_escapes_and_json() {
-    let dir = std::env::temp_dir().join("fixture-paths");
+    let dir = Path::new(if cfg!(windows) { r"C:\fixture-paths" } else { "/fixture-paths" });
     let home = dir.join("home");
     let root = dir.join("root");
     let path = root.join("src/lib.rs");
@@ -139,7 +165,11 @@ fn fixture_paths_preserve_unrelated_escapes_and_json() {
 
 #[test]
 fn fixture_expansion_uses_native_components_and_preserves_urls_and_diagnostics() {
-    let dir = std::env::temp_dir().join("fixture-native-components");
+    let dir = Path::new(if cfg!(windows) {
+        r"C:\fixture-native-components"
+    } else {
+        "/fixture-native-components"
+    });
     let home = dir.join("home");
     let root = dir.join("root");
     let mut value = serde_json::json!({

@@ -96,7 +96,7 @@ mod tests {
                 if temporary {
                     // Plant the allocating implementation while keeping the resulting text
                     // and the destination's capacity exactly the same.
-                    buf.push_str(&std::hint::black_box(std::format!("{n}-")));
+                    buf.push_str(&core::hint::black_box(format!("{n}-")));
                 } else {
                     format_into!(&mut buf, "{n}-");
                 }

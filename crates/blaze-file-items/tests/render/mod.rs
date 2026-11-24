@@ -68,7 +68,7 @@ pub fn lexes_back(text: &str, edition: Edition, written: &[(u32, u32, u32)]) -> 
     let lexed = LexedStr::new(edition, text);
     let (mut at, mut same) = (0, true);
     lexed.each_input_token(edition, &mut Joiner::new(), |word, bytes, _| {
-        let token = (word & !JOINT, bytes.start as u32, bytes.end as u32);
+        let token = (word & !JOINT, u32::try_from(bytes.start).unwrap_or(u32::MAX), u32::try_from(bytes.end).unwrap_or(u32::MAX));
         same &= written.get(at) == Some(&token);
         at += 1;
     });

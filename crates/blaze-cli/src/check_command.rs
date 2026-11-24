@@ -55,10 +55,12 @@ pub(crate) fn run(
     heap: &'static blaze_own::Heap,
     spawn_daemon: bool,
 ) -> Result<Status, CliError> {
-    let flags = crate::flags(args)?;
+    let mut features = blaze_own::Vec::new_in(cx.frame());
+    let mut flags = crate::parse_flags_with(args, |_| {}, |feat| features.push(feat))?;
+    flags.features = features.as_slice();
     refuse_not_taken(&flags)?;
     let status = crate::engine_check::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap)?;
-    if spawn_daemon && !cx.is_simulated() && !flags.dir.is_some_and(crate::single_file::is_script_arg) {
+    if spawn_daemon && flags.feature_ask().is_default() && !cx.is_simulated() && !flags.dir.is_some_and(crate::single_file::is_script_arg) {
         let frame = cx.frame();
         if let Ok(checkout) = crate::checkout::checkout(flags.dir, frame)
             && let Ok(located) = crate::run_package::locate(cx, fs, &checkout, frame)

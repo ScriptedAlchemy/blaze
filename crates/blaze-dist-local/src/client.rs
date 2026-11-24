@@ -1,47 +1,49 @@
 //! Blocking CLI/client IO over the carrier's nonblocking server. A lost response leaves the
 //! exact pending request available for retry, including after reconnect.
 
-use std::alloc::Global;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use core::time::Duration;
 
-use blaze_core::wait::{Clock, Deadline, Monotonic};
-use blaze_wire::{Digest, Limits, decode, encode};
+use blaze_own::{Vec, format_in};
+use blaze_wire::{Digest, Limits, WireAlloc, WireString, decode, encode};
 
 use crate::Error;
 use crate::protocol::*;
 use crate::server::frame;
+use crate::sys::{SystemClock, UnixStream};
 
-#[expect(unsafe_code, reason = "owned nonblocking Unix connect and checked sockaddr, no raw waits")]
 mod socket;
 
 /// Local client with immutable retry state. Session labels are lifetime identities, not capabilities.
 pub struct Client {
     stream: UnixStream,
-    socket: PathBuf,
+    socket: WireString,
     /// Clock, versions, epoch and bounds from the most recent handshake. Verified job
     /// traffic can extend expiry; reconnect refreshes expires_ms without changing identity.
     pub welcome: LocalWelcome,
     next: u64,
     pending: Option<Request>,
+    alloc: WireAlloc,
 }
 
 #[expect(
     clippy::needless_pass_by_value,
     reason = "a hello is sent once; its one caller gives it up"
 )]
-fn connect(path: &Path, hello: LocalHello) -> Result<(UnixStream, LocalWelcome), Error> {
-    let clock = Monotonic::new();
-    let deadline = Deadline::after(clock.now(), Duration::from_secs(5));
-    let mut stream = socket::connect_until(path, deadline, &clock)?;
+fn connect(
+    path: &str,
+    hello: LocalHello,
+    alloc: WireAlloc,
+) -> Result<(UnixStream, LocalWelcome), Error> {
+    let clock = SystemClock;
+    let now = clock.monotonic_nanos()?;
+    let deadline = socket::ConnectDeadline::after(now, Duration::from_secs(5));
+    let mut stream = socket::connect_until(path, deadline, &clock, alloc)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    stream.write_all(&frame(&encode(&ClientFrame::Hello(hello.clone()), Global), Global))?;
-    let response = read(&mut stream, 1 << 20)?;
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(hello.clone()), alloc), alloc))?;
+    let response = read(&mut stream, 1 << 20, alloc)?;
     let ServerFrame::Welcome(welcome) = response else {
-        return Err(Error::Protocol(format!("hello refused: {response:?}")));
+        return Err(Error::Protocol(format_in!(alloc, "hello refused: {response:?}")));
     };
     let resumes = hello.resume.is_some();
     if welcome.transport != hello.transport
@@ -54,54 +56,64 @@ fn connect(path: &Path, hello: LocalHello) -> Result<(UnixStream, LocalWelcome),
         || (resumes && (welcome.created || Some(welcome.session) != hello.resume))
         || hello.epoch.is_some_and(|epoch| epoch != welcome.epoch)
     {
-        return Err(Error::Protocol("welcome-binding/version".to_owned()));
+        return Err(Error::Protocol(WireString::from_str_in("welcome-binding/version", alloc)));
     }
     Ok((stream, welcome))
 }
 
-fn read(stream: &mut UnixStream, max_frame: u32) -> Result<ServerFrame, Error> {
+fn read(stream: &mut UnixStream, max_frame: u32, alloc: WireAlloc) -> Result<ServerFrame, Error> {
     let mut header = [0; 4];
     stream.read_exact(&mut header)?;
     let size = u32::from_be_bytes(header);
     if size == 0 || size > max_frame {
-        return Err(Error::Protocol("response-size".to_owned()));
+        return Err(Error::Protocol(WireString::from_str_in("response-size", alloc)));
     }
-    let mut body = vec![0; size as usize];
+    let body_len = usize::try_from(size)
+        .map_err(|_| Error::Protocol(WireString::from_str_in("response-size", alloc)))?;
+    let mut body = Vec::with_capacity_in(body_len, alloc);
+    body.resize(body_len, 0);
     stream.read_exact(&mut body)?;
-    decode(&body, &Limits::DOCUMENTED)
-        .map_err(|e| Error::Protocol(format!("response-codec: {e:?}")))
+    decode(&body, &Limits::DOCUMENTED, alloc)
+        .map_err(|e| Error::Protocol(format_in!(alloc, "response-codec: {e:?}")))
 }
 
 impl Client {
+    /// Allocator owned by this client.
+    pub(crate) const fn alloc(&self) -> WireAlloc {
+        self.alloc
+    }
+
     /// Create a new daemon-issued lifetime. `nonce` only makes a retried creation
     /// idempotent while that lifetime is live; it is not a capability or an authority.
-    pub fn connect(path: &Path, nonce: Digest) -> Result<Self, Error> {
-        let (stream, welcome) = connect(path, hello(nonce))?;
+    pub fn connect(path: &str, nonce: Digest, alloc: WireAlloc) -> Result<Self, Error> {
+        let (stream, welcome) = connect(path, hello(nonce), alloc)?;
         Ok(Self {
             next: welcome.next_request,
             welcome,
             stream,
-            socket: path.to_owned(),
+            socket: WireString::from_str_in(path, alloc),
             pending: None,
+            alloc,
         })
     }
 
     /// Resume this same lifetime and epoch. A pending request is never changed, skipped or
     /// carried into a new lifetime: an expired lifetime refuses this and the caller decides
     /// explicitly whether to create a fresh one and re-issue its work.
-    pub fn reconnect(&mut self, path: &Path) -> Result<(), Error> {
-        let (stream, welcome) = connect(path, resume(self.welcome.session, self.welcome.epoch))?;
+    pub fn reconnect(&mut self, path: &str) -> Result<(), Error> {
+        let (stream, welcome) =
+            connect(path, resume(self.welcome.session, self.welcome.epoch), self.alloc)?;
         if let Some(pending) = &self.pending {
             if welcome.next_request != pending.sequence
-                && welcome.next_request != pending.sequence + 1
+                && welcome.next_request != pending.sequence.saturating_add(1)
             {
-                return Err(Error::Protocol("resume-request-gap".to_owned()));
+                return Err(Error::Protocol(WireString::from_str_in("resume-request-gap", self.alloc)));
             }
         } else if welcome.next_request != self.next {
-            return Err(Error::Protocol("resume-request-gap".to_owned()));
+            return Err(Error::Protocol(WireString::from_str_in("resume-request-gap", self.alloc)));
         }
         self.stream = stream;
-        self.socket = path.to_owned();
+        self.socket = WireString::from_str_in(path, self.alloc);
         self.welcome = welcome;
         Ok(())
     }
@@ -111,7 +123,10 @@ impl Client {
     /// can be resumed afterwards; a pending request is refused rather than migrated.
     pub fn release(&mut self) -> Result<(), Error> {
         if self.pending.is_some() {
-            return Err(Error::Protocol("pending-request: it is never migrated".to_owned()));
+            return Err(Error::Protocol(WireString::from_str_in(
+                "pending-request: it is never migrated",
+                self.alloc,
+            )));
         }
         self.call(Command::Release(Release {}))?;
         Ok(())
@@ -122,7 +137,10 @@ impl Client {
     /// Protocol refusal or genuine lifetime expiry never creates a replacement session.
     pub fn call(&mut self, command: Command) -> Result<Answer, Error> {
         if self.pending.is_some() {
-            return Err(Error::Protocol("retry pending request first".to_owned()));
+            return Err(Error::Protocol(WireString::from_str_in(
+                "retry pending request first",
+                self.alloc,
+            )));
         }
         self.pending = Some(Request {
             epoch: self.welcome.epoch,
@@ -133,7 +151,7 @@ impl Client {
         match self.retry() {
             Err(Error::Io(_)) => {
                 let socket = self.socket.clone();
-                self.reconnect(&socket)?;
+                self.reconnect(socket.as_str())?;
                 self.retry()
             }
             answer => answer,
@@ -145,30 +163,31 @@ impl Client {
         let pending = self
             .pending
             .as_ref()
-            .ok_or_else(|| Error::Protocol("no pending request".to_owned()))?;
-        let bytes = encode(&ClientFrame::Request(pending.clone()), Global);
-        if bytes.len() > self.welcome.max_frame as usize {
-            return Err(Error::Protocol("request-size".to_owned()));
+            .ok_or_else(|| Error::Protocol(WireString::from_str_in("no pending request", self.alloc)))?;
+        let bytes = encode(&ClientFrame::Request(pending.clone()), self.alloc);
+        let max_frame = usize::try_from(self.welcome.max_frame).unwrap_or(usize::MAX);
+        if bytes.len() > max_frame {
+            return Err(Error::Protocol(WireString::from_str_in("request-size", self.alloc)));
         }
-        self.stream.write_all(&frame(&bytes, Global))?;
-        let response = read(&mut self.stream, self.welcome.max_frame)?;
+        self.stream.write_all(&frame(&bytes, self.alloc))?;
+        let response = read(&mut self.stream, self.welcome.max_frame, self.alloc)?;
         let ServerFrame::Response(response) = response else {
-            return Err(Error::Protocol(format!("request refused: {response:?}")));
+            return Err(Error::Protocol(format_in!(self.alloc, "request refused: {response:?}")));
         };
         if response.epoch != pending.epoch
             || response.session != pending.session
             || response.sequence != pending.sequence
         {
-            return Err(Error::Protocol("response-binding".to_owned()));
+            return Err(Error::Protocol(WireString::from_str_in("response-binding", self.alloc)));
         }
-        validate_answer(&pending.command, &response.answer)?;
-        self.next += 1;
+        validate_answer(&pending.command, &response.answer, self.alloc)?;
+        self.next = self.next.saturating_add(1);
         self.pending = None;
         Ok(response.answer)
     }
 }
 
-fn validate_answer(command: &Command, answer: &Answer) -> Result<(), Error> {
+fn validate_answer(command: &Command, answer: &Answer, alloc: WireAlloc) -> Result<(), Error> {
     let matched = match (command, answer) {
         (_, Answer::Error(_)) => true,
         (Command::Release(_), Answer::Ack(_)) => true,
@@ -178,9 +197,12 @@ fn validate_answer(command: &Command, answer: &Answer) -> Result<(), Error> {
         }
         (Command::Resume(s), Answer::Binding(b)) => b.subscription == *s,
         (Command::Events(r), Answer::Events(page)) => {
+            let limit = usize::try_from(r.limit).unwrap_or(usize::MAX);
             page.binding == r.binding
-                && page.events.len() <= r.limit as usize
-                && page.events.windows(2).all(|w| w[0].sequence < w[1].sequence)
+                && page.events.len() <= limit
+                && page.events.windows(2).all(|w| {
+                    matches!(w, [a, b] if a.sequence < b.sequence)
+                })
                 && page.events.first().is_none_or(|e| e.sequence > r.from)
                 && page.next == page.events.last().map_or(r.from, |e| e.sequence)
         }
@@ -211,5 +233,9 @@ fn validate_answer(command: &Command, answer: &Answer) -> Result<(), Error> {
         }
         _ => false,
     };
-    if matched { Ok(()) } else { Err(Error::Protocol("answer-command-binding".to_owned())) }
+    if matched {
+        Ok(())
+    } else {
+        Err(Error::Protocol(WireString::from_str_in("answer-command-binding", alloc)))
+    }
 }

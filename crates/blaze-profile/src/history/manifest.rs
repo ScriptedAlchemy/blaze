@@ -608,11 +608,8 @@ impl Manifest {
         for (table, files) in &manifest.tables {
             let known = schema::TABLES.iter().any(|it| it.name == table.as_str());
             for (file, entry) in files {
-                if entry.version == 0 {
-                    // clone: an error
-                    return Err(ManifestError::Entry { table: table.clone(), file: file.clone() });
-                }
-                let fits = table_of(file) == Some(table.as_str())
+                let fits = entry.version != 0
+                    && table_of(file) == Some(table.as_str())
                     && !file.starts_with('.')
                     && !file.contains(['/', '\\'])
                     && (!known || listable(file).is_some());

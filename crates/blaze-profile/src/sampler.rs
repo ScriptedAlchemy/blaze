@@ -137,8 +137,8 @@ enum State {
     Off(Unsampled),
 }
 
-impl std::fmt::Display for State {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for State {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NotStarted => {
                 f.write_str("off: not started in this process (`blaze serve` starts it)")

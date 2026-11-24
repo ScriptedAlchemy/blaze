@@ -2,10 +2,10 @@
 //! there): parsed into cargo's own schema, `workspace = true` fields and dependencies
 //! inherited, targets discovered, dependencies and features checked.
 
-use std::cell::RefCell;
+use core::cell::RefCell;
+use core::fmt;
 use std::collections::BTreeMap;
-use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 
 use blaze_data::Value;
 use blaze_hash::{FixedState, Map, MapOpts};
@@ -304,7 +304,7 @@ pub(crate) fn resolve_relative_path(
         Some(path) => match path.to_str() {
             Some(text) if matches!(label, "readme" | "license-file") => {
                 // Inherited package metadata uses portable separators on every host.
-                Ok(text.replace(std::path::MAIN_SEPARATOR, "/"))
+                Ok(text.replace(MAIN_SEPARATOR, "/"))
             }
             Some(text) => Ok(text.to_owned()),
             None => Err(InvalidManifest::NotUtf8Path { label: label.to_owned(), path }.into()),
@@ -1779,27 +1779,31 @@ supported tools: {}",
 
 #[cfg(test)]
 mod inherited_path_tests {
-    use super::resolve_relative_path;
+    use super::{Path, resolve_relative_path};
 
     #[test]
     fn inherited_manifest_paths_keep_portable_separators() {
-        let root = std::env::temp_dir().join("blaze-inherited-path-test");
+        let root = Path::new(if cfg!(windows) {
+            r"C:\blaze-inherited-path-test"
+        } else {
+            "/blaze-inherited-path-test"
+        });
         let member = root.join("member");
         for (label, path, expected) in [
             ("readme", "docs/README.md", "../docs/README.md"),
             ("license-file", "legal/LICENSE.txt", "../legal/LICENSE.txt"),
         ] {
-            assert_eq!(resolve_relative_path(label, &root, &member, path).unwrap(), expected);
+            assert_eq!(resolve_relative_path(label, root, &member, path).unwrap(), expected);
         }
     }
 
     #[cfg(unix)]
     #[test]
     fn a_literal_backslash_in_an_inherited_unix_filename_is_kept() {
-        let root = std::env::temp_dir().join("blaze-inherited-path-test");
+        let root = Path::new("/blaze-inherited-path-test");
         let member = root.join("member");
         assert_eq!(
-            resolve_relative_path("readme", &root, &member, r"docs\README.md").unwrap(),
+            resolve_relative_path("readme", root, &member, r"docs\README.md").unwrap(),
             r"../docs\README.md"
         );
     }

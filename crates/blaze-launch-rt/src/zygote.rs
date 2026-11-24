@@ -798,13 +798,8 @@ fn environment<'a>(
         *libc::_NSGetEnviron() = table;
     }
     #[cfg(target_os = "linux")]
-    {
-        unsafe extern "C" {
-            static mut environ: *mut *mut c_char;
-        }
-        // SAFETY: as above.
-        unsafe { environ = table };
-    }
+    // SAFETY: as above.
+    unsafe { crate::native_lib::args::set_environ(table) };
     None
 }
 

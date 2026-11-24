@@ -13,7 +13,7 @@ blaze-cad	1
 blaze-cad-field	1
 blaze-cert	21
 blaze-check	1
-blaze-cli	3
+blaze-cli	2
 blaze-columns	1
 blaze-core	3
 blaze-deflate	1

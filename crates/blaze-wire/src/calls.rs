@@ -4,12 +4,12 @@
 //! Every request and answer is a map with every field present, its keys the numbers
 //! `docs/distributed.md` gives in ascending order.
 
+use core::alloc::Allocator;
+use core::fmt::{self, Write as _};
+
 use crate::cbor::Wire;
 use crate::shapes::*;
-use crate::wire_struct;
-use crate::{Digest, Named};
-use std::alloc::{Allocator, Global};
-use std::io::Write as _;
+use crate::{Digest, Named, WireAlloc, WireString, WireVec};
 
 /// The answer of every call that has nothing to say: `{}`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -32,17 +32,13 @@ impl Named for Ack {
 }
 
 impl crate::vectors::Sample for Ack {
-    fn sample(_g: &mut crate::vectors::Gen) -> Self {
+    fn sample(_g: &mut crate::vectors::Gen, _alloc: WireAlloc) -> Self {
         Ack {}
     }
 }
 
 wire_struct! {
-    /// A job: one unit of a build on one platform. Fields 0 to 2 are its content, what equal
-    /// jobs share an execution by. `unit` is what the unit's walk computed from its sources,
-    /// settings and toolchain (`blaze_codegen::driver::WorkSet::digest`). `source` says which
-    /// build of a pull request this is: a newer one supersedes the older one's executions that
-    /// nothing else waits for. Fields 3 to 5 are the subscriber's.
+    /// A job: one unit of a build on one platform.
     JobRequest {
         0 => unit: Digest,
         1 => platform: Digest,
@@ -117,7 +113,7 @@ wire_struct! {
     WorkersEventsRequest {
         0 => execution: ExecutionId,
         1 => attempt: Attempt,
-        2 => events: Vec<JobEvent>,
+        2 => events: WireVec<JobEvent>,
     }
 }
 
@@ -139,19 +135,19 @@ wire_struct! {
     /// The one shape an error takes on every call.
     WireError {
         0 => code: u8,
-        1 => message: String,
+        1 => message: WireString,
         2 => retry_after_ms: Option<u64>,
     }
 }
 
 impl WireError {
     /// The error of one code, with its message.
-    pub fn new(code: ErrorCode, message: std::fmt::Arguments<'_>) -> WireError {
-        let mut bytes = Vec::new_in(Global);
-        bytes.write_fmt(message).expect("formatting a wire error into Vec cannot fail");
+    pub fn new(code: ErrorCode, message: fmt::Arguments<'_>, alloc: WireAlloc) -> WireError {
+        let mut out = WireString::new_in(alloc);
+        let _ = out.write_fmt(message);
         WireError {
-            code: code as u8,
-            message: String::from_utf8(bytes).expect("formatting a wire error writes UTF-8"),
+            code: code.as_u8(),
+            message: out,
             retry_after_ms: None,
         }
     }
@@ -194,6 +190,22 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// The wire byte for this code.
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            ErrorCode::Malformed => 1,
+            ErrorCode::Version => 2,
+            ErrorCode::Unauthenticated => 3,
+            ErrorCode::NotAllowed => 4,
+            ErrorCode::NotFound => 5,
+            ErrorCode::Conflict => 6,
+            ErrorCode::TooLarge => 7,
+            ErrorCode::Busy => 8,
+            ErrorCode::Refused => 9,
+            ErrorCode::Internal => 10,
+        }
+    }
+
     /// The code of a byte, when it is one this schema names.
     pub fn from_u8(code: u8) -> Option<ErrorCode> {
         Some(match code {

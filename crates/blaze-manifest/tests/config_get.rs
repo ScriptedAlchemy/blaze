@@ -6,32 +6,17 @@
 #[path = "support/paths.rs"]
 mod fixture_paths;
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use blaze_manifest::config::get::main as config_main;
 
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let name = entry.file_name();
-        if name == "expected.json" || name == "case.json" {
-            continue;
-        }
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &to.join(&name));
-        } else {
-            std::fs::copy(entry.path(), to.join(&name)).unwrap();
-        }
-    }
-}
-
 /// The differences between what blaze-manifest prints for each run of the case and what cargo did.
 fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
     let root = scratch.join(fixture.file_name().unwrap());
-    copy_dir(fixture, &root);
+    fixture_paths::copy_dir(fixture, &root, &["expected.json", "case.json"]);
     let root = fixture_paths::canonicalize(&root);
-    let case: serde_json::Value = match std::fs::read_to_string(fixture.join("case.json")) {
+    let case: serde_json::Value = match fs::read_to_string(fixture.join("case.json")) {
         Ok(text) => serde_json::from_str(&text).unwrap(),
         Err(_) => serde_json::json!({}),
     };
@@ -39,7 +24,7 @@ fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
         Some(home) => root.join(home),
         None => {
             let home = scratch.join("cargo-home");
-            std::fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&home).unwrap();
             home.canonicalize().unwrap()
         }
     };
@@ -56,19 +41,13 @@ fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
     }
     let cwd = root.join(case["cwd"].as_str().unwrap_or(""));
     let normalize = |text: String| fixture_paths::normalize(&text, &root, &home);
-    let expected: Vec<serde_json::Value> =
-        serde_json::from_str(&std::fs::read_to_string(fixture.join("expected.json")).unwrap())
+    let expected: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fixture.join("expected.json")).unwrap())
             .unwrap();
-    let mut failed = Vec::new();
-    for run in &expected {
-        let args: Vec<String> = run["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|a| a.as_str().unwrap().to_owned())
-            .collect();
+    let mut failed = vec![];
+    for run in expected.as_array().unwrap() {
         let mut full = vec!["-Zunstable-options".to_owned(), "config".to_owned(), "get".to_owned()];
-        full.extend(args.iter().cloned());
+        full.extend(run["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_owned()));
         let (code, output) = config_main(&cwd, env.clone(), &full);
         let got = [
             ("code", code.to_string()),
@@ -84,7 +63,7 @@ fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
                 failed.push(format!(
                     "{} `config get {}`: {stream}: blaze\n{text}\ncargo\n{want}",
                     fixture.file_name().unwrap().to_string_lossy(),
-                    args.join(" ")
+                    full[3..].join(" ")
                 ));
                 break;
             }
@@ -98,9 +77,9 @@ fn config_fixtures_read_as_cargo_reads_them() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/config-fixtures");
     let scratch = blaze_core::temp::TempDir::for_test("blaze-manifest-config-");
     let mut names: Vec<_> =
-        std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
     names.sort();
-    let mut failed = Vec::new();
+    let mut failed = vec![];
     for name in &names {
         failed.extend(check(&dir.join(name), scratch.path()));
     }

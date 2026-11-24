@@ -104,8 +104,8 @@ struct Body {
 
 impl Body {
     /// Its function references as [`InstanceNames`] borrows them.
-    fn callees(&self) -> Vec<Callee<'_>, Global> {
-        let mut out = Vec::with_capacity_in(self.funcs.len(), Global);
+    fn callees<A: core::alloc::Allocator>(&self, alloc: A) -> Vec<Callee<'_>, A> {
+        let mut out = Vec::with_capacity_in(self.funcs.len(), alloc);
         out.extend(self.funcs.iter().map(|c| match c {
             Owned::Symbol(s) => Callee::Symbol(*s),
             Owned::C(name) => Callee::C(name),
@@ -209,8 +209,7 @@ impl Classes {
     }
 
     /// Most bodies first, then by name.
-    fn print(&self, out: &mut String, title: &str) {
-        use std::fmt::Write as _;
+    fn print(&self, out: &mut impl core::fmt::Write, title: &str) {
         let _ = writeln!(out, "{title}: {} bodies in {} classes", self.total(), self.0.len());
         let mut rows: Vec<(&String, &Class), Global> = Vec::with_capacity_in(self.0.len(), Global);
         rows.extend(self.0.iter());
@@ -285,21 +284,27 @@ struct Tally {
 }
 
 /// `a / b` to three places, in integers.
-fn ratio(a: u64, b: u64) -> String {
-    match b {
-        0 => "-".to_string(),
-        _ => {
-            let milli = a * 1000 / b;
-            format!("{}.{:03}", milli / 1000, milli % 1000)
+fn ratio(a: u64, b: u64) -> impl core::fmt::Display {
+    struct Show(u64, u64);
+    impl core::fmt::Display for Show {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self.1 {
+                0 => f.write_str("-"),
+                b => {
+                    let milli = self.0 * 1000 / b;
+                    write!(f, "{}.{:03}", milli / 1000, milli % 1000)
+                }
+            }
         }
     }
+    Show(a, b)
 }
 
 fn tally(bodies: &[Body], references: &[Reference], inline: bool, fast: &Fast<'_>, machine: Machine, alloc: Alloc<'_>) -> Tally {
     let index = Index::new(bodies);
     let mut t = Tally::default();
     for (body, reference) in bodies.iter().zip(references) {
-        let callees = body.callees();
+        let callees = body.callees(Global);
         let names = InstanceNames { funcs: &callees, statics: &body.statics, c_statics: &[], vtables: &body.vtables, tls: &body.tls };
         let simplified = if inline {
             let stage = catch_unwind(AssertUnwindSafe(|| {
@@ -356,7 +361,7 @@ fn tally(bodies: &[Body], references: &[Reference], inline: bool, fast: &Fast<'_
     t
 }
 
-fn print_tally(out: &mut String, t: &Tally, heading: &str, reached: usize, built: usize, references: &Classes, inline: bool) {
+fn print_tally(out: &mut impl core::fmt::Write, t: &Tally, heading: &str, reached: usize, built: usize, references: &Classes, inline: bool) {
     use std::fmt::Write as _;
     let _ = writeln!(out, "## {heading}\n");
     let reference_emitted = built - references.total();
@@ -452,7 +457,7 @@ fn census(heap: &'static blaze_own::Heap) -> Result<i32, CensusError> {
     let mut reference_refused = Classes::default();
     let mut references: Vec<Reference, Global> = Vec::with_capacity_in(bodies.len(), Global);
     for body in bodies.iter() {
-        let callees = body.callees();
+        let callees = body.callees(Global);
         let names = InstanceNames { funcs: &callees, statics: &body.statics, c_statics: &[], vtables: &body.vtables, tls: &body.tls };
         let made = catch_unwind(AssertUnwindSafe(|| {
             emit_record_measured(body.func.verified(), &names, &RoutinePlaces::NONE, isa, &[], alloc).map(|(record, insts, _called)| (u64::from(insts), record.code.len() as u64))

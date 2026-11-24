@@ -26,7 +26,7 @@ blaze-body-flow	6	1	0	7	0	0	0	0	0	0
 blaze-body-lower	13	0	0	24	0	0	0	0	0	0
 blaze-borrow	3	0	0	5	0	0	0	0	0	0
 blaze-bstd-convert	13	0	0	9	8	0	0	0	0	0
-blaze-build	139	2	2	439	0	0	6	3	0	0
+blaze-build	139	2	2	438	0	0	6	3	0	0
 blaze-build-script	132	0	0	111	3	0	0	0	0	0
 blaze-bytes	9	0	0	20	0	0	1	0	0	0
 blaze-c	2	0	0	0	0	0	0	0	0	0
@@ -48,7 +48,7 @@ blaze-comptime	2	0	0	26	0	0	0	0	0	0
 blaze-comptime-sys	2	0	0	15	0	0	0	0	0	0
 blaze-cond	1	0	0	0	0	0	0	0	0	0
 blaze-consteval	85	0	0	14	0	0	0	0	0	0
-blaze-core	693	0	3	967	402	103	34	5	0	0
+blaze-core	690	0	3	967	402	103	34	5	0	0
 blaze-cunit	2	0	0	0	0	0	0	0	0	0
 blaze-data	3	0	0	1	0	0	1	0	0	0
 blaze-dbsp	1	0	0	43	0	0	0	0	0	0
@@ -61,8 +61,8 @@ blaze-expand	40	8	0	78	0	0	0	0	0	0
 blaze-export	28	5	0	6	12	6	0	1	0	0
 blaze-fetch	89	0	0	90	0	0	0	0	0	0
 blaze-file-items	48	5	0	81	6	0	0	0	0	0
-blaze-flow	30	0	1	46	0	1	0	0	0	0
-blaze-flow-lower	310	0	0	85	2	0	0	0	0	0
+blaze-flow	27	0	1	46	0	1	0	0	0	0
+blaze-flow-lower	276	0	0	77	2	0	0	0	0	0
 blaze-fmt	5	1	0	16	2	0	0	0	0	0
 blaze-format	6	0	0	46	0	0	0	0	0	0
 blaze-format-core	15	0	0	45	0	0	0	0	0	0
@@ -83,9 +83,9 @@ blaze-int	4	0	0	1	0	0	0	0	0	0
 blaze-json	3	0	0	0	0	0	1	0	0	0
 blaze-keyed	6	0	1	124	0	0	0	0	0	0
 blaze-kit	2	0	0	0	0	0	0	0	0	0
-blaze-ladder	739	286	0	2325	62	53	8	251	0	86
+blaze-ladder	735	285	0	2315	62	53	8	250	0	86
 blaze-launch	19	0	0	158	0	0	0	0	0	1
-blaze-launch-rt	114	2	0	100	7	7	18	1	0	0
+blaze-launch-rt	114	2	0	99	7	5	17	1	0	0
 blaze-launcher	20	1	0	17	8	0	0	1	0	0
 blaze-lex	13	0	0	21	2	0	1	0	0	0
 blaze-lint	6	0	0	2	0	0	0	0	0	0
@@ -94,7 +94,7 @@ blaze-lir	23	0	2	105	0	0	0	0	0	0
 blaze-lower	175	2	0	163	0	0	4	0	0	0
 blaze-macro-run	2	0	0	3	0	0	0	0	0	0
 blaze-malloc	9	7	5	41	0	4	12	0	0	1
-blaze-manifest	98	6	0	164	43	0	0	0	0	0
+blaze-manifest	96	6	0	163	38	0	0	0	0	0
 blaze-math	1	0	0	0	0	0	0	0	0	0
 blaze-mem	67	3	6	201	3	3	37	0	0	0
 blaze-memchr	2	0	0	7	0	0	0	0	0	0
@@ -110,7 +110,7 @@ blaze-pg	9	0	2	140	0	0	0	0	0	0
 blaze-phf	5	0	0	9	0	0	0	0	0	1
 blaze-proc-macro	261	3	0	269	154	1	2	12	0	1
 blaze-producers	8	0	0	0	0	0	0	0	0	0
-blaze-profile	197	0	0	443	19	35	47	15	0	3
+blaze-profile	196	0	0	443	19	35	47	15	0	3
 blaze-protocol	23	0	0	116	10	0	0	0	0	2
 blaze-queue	2	0	0	26	0	0	4	0	0	0
 blaze-radix	10	0	0	30	0	0	1	0	0	0

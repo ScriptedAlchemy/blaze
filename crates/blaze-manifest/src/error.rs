@@ -4,7 +4,8 @@
 //! what an outer step was doing is a [`Context`] around its cause, printed as cargo prints a
 //! chain (`{:#}` joins it with `: `, `diagnostic::rendered` under `Caused by:`).
 
-use std::fmt;
+use core::fmt;
+use std::io;
 use std::path::PathBuf;
 
 use crate::config::error::ConfigError;
@@ -23,9 +24,9 @@ use crate::workspace::WorkspaceError;
 #[derive(Debug)]
 pub enum ManifestError {
     /// A file that could not be read.
-    Read { path: PathBuf, error: std::io::Error },
+    Read { path: PathBuf, error: io::Error },
     /// A file whose native filesystem identity could not be resolved.
-    Canonicalize { path: PathBuf, error: std::io::Error },
+    Canonicalize { path: PathBuf, error: io::Error },
     /// A manifest that is not UTF-8.
     NotUtf8 { path: PathBuf },
     /// A manifest that is no TOML or does not fit the schema, with the span cargo marks.

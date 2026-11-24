@@ -357,7 +357,9 @@ pub(crate) fn check_in_daemon<'d>(
     sdk_override: Option<blaze_apple_sdk::Sdk<'_>>,
     daemon: &mut DaemonCheckCtx<'d>,
 ) -> Result<Status, CliError> {
-    let flags = crate::flags(args)?;
+    let mut features = blaze_own::Vec::new_in(cx.frame());
+    let mut flags = crate::parse_flags_with(args, |_| {}, |feat| features.push(feat))?;
+    flags.features = features.as_slice();
     crate::check_command::refuse_not_taken(&flags)?;
     let request = request_frame()?;
     let located = crate::run_package::Located {
@@ -597,7 +599,9 @@ fn serve(
     heap: &'static blaze_own::Heap,
     why: Option<&str>,
 ) -> Result<Status, CliError> {
-    let flags = crate::flags(args)?;
+    let mut features = blaze_own::Vec::new_in(cx.frame());
+    let mut flags = crate::parse_flags_with(args, |_| {}, |feat| features.push(feat))?;
+    flags.features = features.as_slice();
     let request = request_frame()?;
     edge(cx, fs, env, net, host, out, err, phases, heap, &flags, why, &request, |edge, phases| {
         let Edge { root, opts, mut shown, err, caps, view, shown_root, frame, .. } = edge;
@@ -872,6 +876,7 @@ fn edge_at<'l, R>(
         names_oracle: flags.names_oracle,
         driver: flags.driver,
         ready_plant: crate::engine_ready_edit::CommitPlant::None,
+        features: flags.feature_ask(),
     };
     // `requests` is `&'static` (the handlers' one board), so the guard moves into the edge.
     let edge = Edge {
@@ -1105,7 +1110,7 @@ fn check_and_open<R>(
         let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
         let request_mem = crate::engine_phase_mem::RequestMem::new()?;
         let alloc = request_mem.shared();
-        let answer_root = crate::engine_answer::root_name(place.checkout, frame);
+        let answer_root = crate::engine_answer::root_name_for(place.checkout, flags.feature_ask(), frame);
         let pointer = match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {
             Some(Ok(pointer)) => Some(pointer),
             Some(Err(why)) if require_graph => return Err(EngineCheckError::StartNoAnswer { why: Some(why) }.into()),
@@ -1336,6 +1341,8 @@ pub(crate) struct Opts<'f> {
     /// The ready commit's planted bug (engine_ready_edit.rs `CommitPlant`, rule 23): the
     /// command's is `None`; the world test plants a dropped cause to see its oracle catch it.
     pub(crate) ready_plant: crate::engine_ready_edit::CommitPlant,
+    /// Feature selection passed into the unit graph and the answer root key (rule 21).
+    pub(crate) features: crate::graph::FeatureAsk<'f>,
 }
 
 /// The most one request's frame takes: its blocks are taken as it is used (blaze-mem
@@ -1579,7 +1586,7 @@ fn checking<'f, 'd>(
 ) -> Result<BoxedChecked, CliError> {
     #[cfg(test)]
     stack_probe::at("checking");
-    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant } = opts;
+    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, features } = opts;
     // The oracle compares every crate's names, so every crate is entered: no stored answer read.
     let fresh = fresh || names_oracle.on();
     let began = phases.now();
@@ -1612,7 +1619,7 @@ fn checking<'f, 'd>(
     phases.mark_cx(cx, "store open", frame);
     // 0. The stored answer (engine_answer.rs): its pointer, then the sweep of what it read.
     // Nothing moved, nothing owed and no findings kept: the certificate, from the pointer alone.
-    let answer_root = crate::engine_answer::root_name(place.checkout, frame);
+    let answer_root = crate::engine_answer::root_name_for(place.checkout, features, frame);
     let view_slot = crate::engine_lines::ViewSlot::load(&opened.lent, answer_root.as_str(), fresh, shown, &tools, frame)?;
     // The pointer and the last request's lines, in a frame of their own ([`own_frame`]).
     let (mut unreadable, pointer, last_lines, other_checkout) = own_frame(|| -> Result<_, CliError> {
@@ -2037,7 +2044,7 @@ fn checking<'f, 'd>(
                 let host = crate::graph::target_of(cx, &env, &laid_here.rustflags, program, &blaze_unit_graph::UnitKind::BuildScript, frame)?;
                 // PHASE-MEM-DEBT(Units): the unit graph on the process heap (graph.rs `Graph::of`,
                 // `heap: &'static Heap`): the request's; the graph is a record (`discover` puts it).
-                laid_here.graph = Some(crate::graph::Graph::of(parts, lockfile, units, target, host, true, heap, frame));
+                laid_here.graph = Some(crate::graph::Graph::of(parts, lockfile, units, target, host, features, true, heap, frame));
             }
             phases.mark_cx(cx, "plan (the graph's inputs: the profile's panic, the target's and the host's cfg)", frame);
             let mut discovered = {

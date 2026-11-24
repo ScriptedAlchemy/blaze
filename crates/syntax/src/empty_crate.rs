@@ -20,8 +20,8 @@ pub enum Refusal {
     Item(TextRange),
 }
 
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Syntax(source) => write!(f, "source syntax error at {:?}: {source}", source.range()),
             Self::Token { kind, range } => write!(f, "unchecked source token {kind:?} at {range:?}"),
@@ -31,8 +31,8 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-impl std::error::Error for Refusal {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for Refusal {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Syntax(source) => Some(source),
             _ => None,
@@ -67,17 +67,20 @@ pub fn check(text: &str, edition: Edition) -> Result<EmptyCrate, Refusal> {
                 SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::SHEBANG => {}
                 kind => return Err(Refusal::Token { kind, range: token.text_range() }),
             },
-            NodeOrToken::Node(node) => match ast::AnyAttr::cast(node.clone()) {
-                Some(ast::AnyAttr::Attr(attr))
-                    if attr.kind().is_inner()
-                        && attr.as_simple_atom().as_deref() == Some("no_std") =>
-                {
-                    result.no_std = true;
+            NodeOrToken::Node(node) => {
+                let range = node.text_range();
+                match ast::AnyAttr::cast(node) {
+                    Some(ast::AnyAttr::Attr(attr))
+                        if attr.kind().is_inner()
+                            && attr.as_simple_atom().as_deref() == Some("no_std") =>
+                    {
+                        result.no_std = true;
+                    }
+                    Some(ast::AnyAttr::DocComment(doc)) if doc.kind().is_inner() => {}
+                    Some(_) => return Err(Refusal::Attribute(range)),
+                    None => return Err(Refusal::Item(range)),
                 }
-                Some(ast::AnyAttr::DocComment(doc)) if doc.kind().is_inner() => {}
-                Some(_) => return Err(Refusal::Attribute(node.text_range())),
-                None => return Err(Refusal::Item(node.text_range())),
-            },
+            }
         }
     }
     Ok(result)

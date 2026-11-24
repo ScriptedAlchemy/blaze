@@ -14,13 +14,13 @@
 //! Verified execution bindings also retain their carrier lifetime through bounded work and
 //! cleanup; this does not revive an expired session or permit cross-session request replay.
 
+use blaze_own::Vec;
 use blaze_wire::job_terminal_v2::SubscriberTerminalV2;
-use std::alloc::Global;
 use blaze_wire::{
     Ack, Attempt, BatchResult, Bytes, Digest, EventItem, ExecutionId, JobContent, LocalPolicy,
-    PackRef, Reservation, Set, WireError, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
-    WorkLeaseRequest, WorkResultAnswer, WorkersEventsAnswer, WorkersEventsRequest, wire_enum,
-    wire_struct,
+    PackRef, Reservation, Set, WireAlloc, WireError, WireString, WireVec, WorkJoinAnswer,
+    WorkJoinRequest, WorkLeaseAnswer, WorkLeaseRequest, WorkResultAnswer, WorkersEventsAnswer,
+    WorkersEventsRequest, wire_enum, wire_struct,
 };
 
 /// Carrier protocol version; not blaze-wire's global codec version.
@@ -104,7 +104,7 @@ wire_struct! {
     /// Work sender id and content, checked against the named execution and attempt.
     Join {
         0 => content: JobContent,
-        1 => executor: String,
+        1 => executor: WireString,
         2 => request: WorkJoinRequest,
     }
 }
@@ -112,7 +112,7 @@ wire_struct! {
     /// A lease request from an assigned executor.
     Lease {
         0 => content: JobContent,
-        1 => executor: String,
+        1 => executor: WireString,
         2 => request: WorkLeaseRequest,
     }
 }
@@ -120,7 +120,7 @@ wire_struct! {
     /// A batch result, with content and sender binding outside its wire lease.
     BatchSubmission {
         0 => content: JobContent,
-        1 => executor: String,
+        1 => executor: WireString,
         2 => request: BatchResult,
     }
 }
@@ -128,7 +128,7 @@ wire_struct! {
     /// Worker heartbeat/stage/verdict events; the core enforces full-batch authority.
     WorkerEvents {
         0 => content: JobContent,
-        1 => executor: String,
+        1 => executor: WireString,
         2 => request: WorkersEventsRequest,
     }
 }
@@ -136,7 +136,7 @@ wire_struct! {
     /// Acknowledgment only of a delivered stop for this exact assignment.
     KillAck {
         0 => content: JobContent,
-        1 => executor: String,
+        1 => executor: WireString,
         2 => execution: ExecutionId,
         3 => attempt: Attempt,
         4 => alive: bool,
@@ -147,7 +147,7 @@ wire_struct! {
     /// This cannot claim a fresh slot or follow it into another execution.
     OwnedAssignment {
         0 => content: JobContent,
-        1 => executor: String,
+        1 => executor: WireString,
         2 => execution: ExecutionId,
         3 => claimant: Digest,
     }
@@ -163,7 +163,7 @@ wire_struct! {
     /// It emits a stop; only the separate KillAck releases the reservation.
     RetireAssignment {
         0 => content: JobContent,
-        1 => executor: String,
+        1 => executor: WireString,
         2 => execution: ExecutionId,
         3 => attempt: Attempt,
         4 => claimant: Digest,
@@ -207,7 +207,7 @@ wire_struct! {
 wire_struct! {
     /// The executor an agent runs, if one is assigned to it yet, and the attempt it serves.
     Claimed {
-        0 => executor: Option<String>,
+        0 => executor: Option<WireString>,
         1 => attempt: Attempt,
         2 => lead: bool,
     }
@@ -222,7 +222,7 @@ wire_struct! {
 wire_struct! {
     /// The packs of every committed result, or `None` while work is outstanding.
     CommittedPacks {
-        0 => packs: Option<Vec<PackRef>>,
+        0 => packs: Option<WireVec<PackRef>>,
     }
 }
 wire_struct! {
@@ -232,8 +232,8 @@ wire_struct! {
         0 => content: JobContent,
         1 => execution: ExecutionId,
         2 => attempt: Attempt,
-        3 => executor: String,
-        4 => packs: Vec<PackRef>,
+        3 => executor: WireString,
+        4 => packs: WireVec<PackRef>,
     }
 }
 wire_struct! {
@@ -242,13 +242,13 @@ wire_struct! {
     DeliverPublication {
         0 => content: JobContent,
         1 => execution: ExecutionId,
-        2 => packs: Vec<PackRef>,
+        2 => packs: WireVec<PackRef>,
     }
 }
 wire_struct! {
     /// The committed full manifest, or None while the lead still completes the unit.
     Publication {
-        0 => packs: Option<Vec<PackRef>>,
+        0 => packs: Option<WireVec<PackRef>>,
         1 => attempt: Attempt,
         2 => accepted_attempt: Option<Attempt>,
     }
@@ -270,7 +270,7 @@ wire_struct! {
     /// Paginated public stream; next is the last returned sequence (or the request cursor).
     EventPage {
         0 => binding: Binding,
-        1 => events: Vec<EventItem>,
+        1 => events: WireVec<EventItem>,
         2 => next: u64,
     }
 }
@@ -332,7 +332,11 @@ wire_enum! {
 }
 
 /// Exact opaque submission envelope from a request in this pinned codec.
-pub fn submission(request: &blaze_wire::JobRequest, need: Reservation) -> Submission {
+pub fn submission(
+    request: &blaze_wire::JobRequest,
+    need: Reservation,
+    alloc: WireAlloc,
+) -> Submission {
     Submission {
         content: JobContent::of(
             &blaze_wire::JobContentInput {
@@ -340,9 +344,9 @@ pub fn submission(request: &blaze_wire::JobRequest, need: Reservation) -> Submis
                 platform: request.platform,
                 namespace: request.namespace.clone(),
             },
-            Global,
+            alloc,
         ),
-        request: Bytes { bytes: blaze_wire::encode(request, Global) },
+        request: Bytes { bytes: blaze_wire::encode(request, alloc) },
         need,
     }
 }
@@ -365,6 +369,8 @@ pub fn resume(session: Digest, epoch: Digest) -> LocalHello {
 }
 
 /// Versions this implementation speaks, as a deterministic set for diagnostic rendering.
-pub fn versions() -> Set<u32> {
-    Set::new(vec![TRANSPORT_VERSION])
+pub fn versions(alloc: WireAlloc) -> Set<u32> {
+    let mut out = Vec::with_capacity_in(1, alloc);
+    out.push(TRANSPORT_VERSION);
+    Set::new(out)
 }

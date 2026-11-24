@@ -1,33 +1,32 @@
 //! Half-open ranges of indexes into the sorted roots, as a `Grant` and a `BatchResult` carry them.
 
-use std::collections::BTreeMap;
-
-use blaze_wire::Set;
+use blaze_own::{BTreeMap, Vec};
+use blaze_wire::{Set, WireAlloc};
 
 /// A set of root indexes, held as disjoint, non-adjacent half-open ranges in ascending order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ranges {
     /// Start to end of each range.
-    spans: BTreeMap<u64, u64>,
+    spans: BTreeMap<u64, u64, WireAlloc>,
 }
 
 impl Ranges {
     /// No index.
-    pub fn new() -> Ranges {
-        Ranges::default()
+    pub fn new(alloc: WireAlloc) -> Ranges {
+        Ranges { spans: BTreeMap::new_in(alloc) }
     }
 
     /// The indexes `0..n`.
-    pub fn full(n: u64) -> Ranges {
-        let mut out = Ranges::new();
+    pub fn full(n: u64, alloc: WireAlloc) -> Ranges {
+        let mut out = Ranges::new(alloc);
         out.insert(0, n);
         out
     }
 
     /// The ranges of a wire set, or `None` when one is empty or reversed or two overlap: a set
     /// the coordinator did not write.
-    pub fn from_wire(set: &Set<(u64, u64)>) -> Option<Ranges> {
-        let mut out = Ranges::new();
+    pub fn from_wire(set: &Set<(u64, u64)>, alloc: WireAlloc) -> Option<Ranges> {
+        let mut out = Ranges::new(alloc);
         for &(start, end) in set.iter() {
             if start >= end || out.intersects(start, end) {
                 return None;
@@ -39,7 +38,8 @@ impl Ranges {
 
     /// The ranges as the wire carries them: a set of `(start, end)`.
     pub fn to_wire(&self) -> Set<(u64, u64)> {
-        Set::new(self.iter().collect())
+        let alloc = *self.spans.allocator();
+        Set::new(Vec::from_iter_in(self.iter(), alloc))
     }
 
     /// How many indexes the ranges hold.
@@ -67,6 +67,7 @@ impl Ranges {
         if start >= end {
             return;
         }
+        let alloc = *self.spans.allocator();
         let (mut start, mut end) = (start, end);
         // A range that starts before `start` and reaches it merges.
         if let Some((&s, &e)) = self.spans.range(..=start).next_back()
@@ -77,8 +78,7 @@ impl Ranges {
             self.spans.remove(&s);
         }
         // Ranges that start inside `start..=end` merge.
-        let inside: Vec<(u64, u64)> =
-            self.spans.range(start..=end).map(|(&s, &e)| (s, e)).collect();
+        let inside = Vec::from_iter_in(self.spans.range(start..=end).map(|(&s, &e)| (s, e)), alloc);
         for (s, e) in inside {
             end = end.max(e);
             self.spans.remove(&s);
@@ -91,8 +91,11 @@ impl Ranges {
         if start >= end {
             return;
         }
-        let cut: Vec<(u64, u64)> =
-            self.spans.range(..end).filter(|&(_, &e)| e > start).map(|(&s, &e)| (s, e)).collect();
+        let alloc = *self.spans.allocator();
+        let cut = Vec::from_iter_in(
+            self.spans.range(..end).filter(|&(_, &e)| e > start).map(|(&s, &e)| (s, e)),
+            alloc,
+        );
         for (s, e) in cut {
             self.spans.remove(&s);
             if s < start {
@@ -137,7 +140,8 @@ impl Ranges {
 
     /// Takes up to `n` indexes from the front.
     pub fn take_front(&mut self, n: u64) -> Ranges {
-        let mut out = Ranges::new();
+        let alloc = *self.spans.allocator();
+        let mut out = Ranges::new(alloc);
         let mut left = n;
         while left > 0 {
             let Some((&start, &end)) = self.spans.iter().next() else { break };
@@ -152,30 +156,40 @@ impl Ranges {
 
 #[cfg(test)]
 mod tests {
+    use blaze_own::{Vec, vec_in};
+
     use super::Ranges;
 
     #[test]
     fn insert_merges_and_remove_splits() {
-        let mut r = Ranges::new();
+        let alloc = blaze_own::testing::heap().shared();
+        let mut r = Ranges::new(alloc);
         r.insert(5, 10);
         r.insert(0, 3);
         r.insert(3, 5);
-        assert_eq!(r.iter().collect::<Vec<_>>(), vec![(0, 10)]);
+        assert_eq!(Vec::from_iter_in(r.iter(), alloc).as_slice(), &[(0, 10)]);
         r.remove(2, 4);
-        assert_eq!(r.iter().collect::<Vec<_>>(), vec![(0, 2), (4, 10)]);
+        assert_eq!(Vec::from_iter_in(r.iter(), alloc).as_slice(), &[(0, 2), (4, 10)]);
         assert_eq!(r.len(), 8);
         assert!(r.covers(4, 10) && !r.covers(1, 5));
         assert!(r.intersects(1, 3) && !r.intersects(2, 4));
         let front = r.take_front(3);
-        assert_eq!(front.iter().collect::<Vec<_>>(), vec![(0, 2), (4, 5)]);
-        assert_eq!(r.iter().collect::<Vec<_>>(), vec![(5, 10)]);
+        assert_eq!(Vec::from_iter_in(front.iter(), alloc).as_slice(), &[(0, 2), (4, 5)]);
+        assert_eq!(Vec::from_iter_in(r.iter(), alloc).as_slice(), &[(5, 10)]);
     }
 
     #[test]
     fn wire_refuses_overlap_and_empty() {
-        let ok = blaze_wire::Set::new(vec![(0, 2), (2, 4)]);
-        assert_eq!(Ranges::from_wire(&ok).unwrap().iter().collect::<Vec<_>>(), vec![(0, 4)]);
-        assert!(Ranges::from_wire(&blaze_wire::Set::new(vec![(0, 3), (2, 4)])).is_none());
-        assert!(Ranges::from_wire(&blaze_wire::Set::new(vec![(3, 3)])).is_none());
+        let alloc = blaze_own::testing::heap().shared();
+        let ok = blaze_wire::Set::new(vec_in![alloc; (0, 2), (2, 4)]);
+        assert_eq!(
+            Vec::from_iter_in(Ranges::from_wire(&ok, alloc).unwrap().iter(), alloc).as_slice(),
+            &[(0, 4)]
+        );
+        assert!(
+            Ranges::from_wire(&blaze_wire::Set::new(vec_in![alloc; (0, 3), (2, 4)]), alloc)
+                .is_none()
+        );
+        assert!(Ranges::from_wire(&blaze_wire::Set::new(vec_in![alloc; (3, 3)]), alloc).is_none());
     }
 }

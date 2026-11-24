@@ -99,10 +99,10 @@ const PARKED: usize = 4 * BUFFER;
 #[cfg(test)]
 thread_local! {
     /// Counts fanotify starts so spare reuse is checked independently of process privilege.
-    static FANOTIFY_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FANOTIFY_STARTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     /// A test's: this thread's starts take fanotify as refused (`EPERM`), so a privileged run
     /// tests the inotify path too.
-    pub(crate) static FANOTIFY_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FANOTIFY_REFUSED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     /// A test's planted bug: nothing waits for a watch's start ([`looks_under`]'s callers), so
     /// a look asked after a watch may be answered before it is in place.
     pub(crate) static HOLDS_NOTHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

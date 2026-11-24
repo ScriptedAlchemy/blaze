@@ -454,35 +454,37 @@ impl<A: Allocator + Copy> Components<A> {
 #[cfg(test)]
 mod tests {
     use super::{Components, Meter, Origin};
-    use std::alloc::Global;
-    use std::vec::Vec;
+    use blaze_own::{Inline, Vec};
 
     #[test]
     fn point_components_close_across_words_and_split_at_the_next_point() {
+        let heap: Inline<524_288> = Inline::new();
         // Two disjoint long chains, a back edge in the first, and one branch into a
         // separate two-origin cycle. Subsets go down each chain. The back edge
         // makes three origins mutually reachable. The branch is one-way.
-        let mut edges: Vec<_> = (0..129)
-            .chain(132..195)
-            .map(|i| (Origin(i), Origin(i + 1)))
-            .collect();
+        let mut edges = Vec::from_iter_in(
+            (0..129)
+                .chain(132..195)
+                .map(|i| (Origin(i), Origin(i + 1))),
+            &heap,
+        );
         edges.extend([
             (Origin(66), Origin(64)),
             (Origin(2), Origin(130)),
             (Origin(130), Origin(131)),
             (Origin(131), Origin(130)),
         ]);
-        let mut graph = Components::new(Global);
+        let mut graph = Components::new(&heap);
         let mut meter = Meter::new(u64::MAX);
         assert!(graph.build(&edges, &mut meter).is_ok());
         assert!(graph.reach.is_empty());
-        let targets: Vec<_> = (0..196).map(Origin).collect();
+        let targets = Vec::from_iter_in((0..196).map(Origin), &heap);
         assert!(graph.index_targets(&[Origin(129), Origin(195)], &mut meter).is_ok());
         assert!(graph.reaches(Origin(0), Origin(129)));
         assert!(!graph.reaches(Origin(0), Origin(195)));
         assert!(graph.reach.len() <= graph.len());
         assert!(graph.index_targets(&targets, &mut meter).is_ok());
-        let mut expected = Vec::new();
+        let mut expected = Vec::new_in(&heap);
         for from in 0..196 {
             for into in 0..196 {
                 let reachable = from != into && (
@@ -497,7 +499,7 @@ mod tests {
                 }
             }
         }
-        let mut expanded = Vec::new();
+        let mut expanded = Vec::new_in(&heap);
         for &from in &targets {
             graph.for_each_target(from, &mut meter, |into| expanded.push((from, into))).unwrap();
         }
@@ -513,7 +515,7 @@ mod tests {
         for i in [0, 64, 66, 68, 131, 135, 195] {
             crate::bits::put(&mut live, i, true);
         }
-        let mut generators = blaze_own::Vec::new_in(Global);
+        let mut generators = Vec::new_in(&heap);
         assert!(graph.project(&live, &mut generators, &mut meter).is_ok());
         assert_eq!(generators.len(), 6);
         assert!(graph.build(&generators, &mut meter).is_ok());

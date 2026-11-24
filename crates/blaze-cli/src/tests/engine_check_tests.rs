@@ -60,6 +60,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         names_oracle: crate::engine_names::NamesOracle::Off,
         driver: crate::engine_ready_edit::Driver::Phases,
         ready_plant: crate::engine_ready_edit::CommitPlant::None,
+        features: crate::graph::FeatureAsk::DEFAULT,
     }
 }
 
