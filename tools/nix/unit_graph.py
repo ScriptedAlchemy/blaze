@@ -102,7 +102,15 @@ def cleanup_step(proc: subprocess.Popen) -> bool:
                 left = deadline - time.monotonic()
                 if left <= 0:
                     break
-                if not live_group(proc, left):
+                try:
+                    remaining = live_group(proc, left)
+                except subprocess.TimeoutExpired:
+                    # This census shares the signal's grace deadline. Spending the
+                    # remaining budget ends that wait, not cleanup: advance to SIGKILL
+                    # (or its final census) without losing the forced-cleanup evidence.
+                    # The initial and final censuses retain their own bounded errors.
+                    break
+                if not remaining:
                     break
                 time.sleep(min(0.025, max(0, deadline - time.monotonic())))
         remaining = live_group(proc, CLEANUP_SECONDS)

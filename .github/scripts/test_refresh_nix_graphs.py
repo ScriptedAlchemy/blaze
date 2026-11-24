@@ -202,6 +202,27 @@ class GraphProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assert_reaped()
 
     async def test_exited_launcher_cannot_leave_a_descendant_or_touch_another_group(self):
+        await self.exited_launcher_cleanup()
+
+    async def test_a_grace_census_timeout_escalates_without_losing_the_descendant_diagnosis(self):
+        live_group = graph.live_group
+        exhausted = []
+
+        def exhaust_grace(process, seconds):
+            # Only the wait-phase snapshot spends the remaining grace budget. Force that
+            # census to use it up; the initial and final ownership censuses still run.
+            if seconds < graph.CLEANUP_SECONDS and process.pid not in exhausted:
+                exhausted.append(process.pid)
+                raise subprocess.TimeoutExpired(["ps", "-A"], seconds)
+            return live_group(process, seconds)
+
+        with patch.object(graph, "live_group", side_effect=exhaust_grace), \
+                redirect_stderr(io.StringIO()) as diagnostics:
+            await self.exited_launcher_cleanup()
+        self.assertEqual(len(exhausted), 2, "both successful and failed launchers exhaust their TERM grace")
+        self.assertNotIn("cleanup failed", diagnostics.getvalue(), "grace exhaustion advances to SIGKILL and final verification")
+
+    async def exited_launcher_cleanup(self):
         unrelated = self.capture(self.command("import time; time.sleep(60)"), start_new_session=True)
         for status in (0, 23):
             with self.subTest(status=status):
@@ -235,6 +256,24 @@ class GraphProcessTests(unittest.IsolatedAsyncioTestCase):
         os.killpg(unrelated.pid, signal.SIGKILL)
         unrelated.wait(timeout=2)
         self.assert_reaped()
+
+    async def test_initial_and_final_census_timeouts_remain_cleanup_errors(self):
+        live_group = graph.live_group
+        for failed_call in (1, 2):
+            with self.subTest(failed_call=failed_call):
+                calls = []
+
+                def fail_census(process, seconds):
+                    calls.append(seconds)
+                    if len(calls) == failed_call:
+                        raise subprocess.TimeoutExpired(["ps", "-A"], seconds)
+                    return live_group(process, seconds)
+
+                with patch.object(graph, "live_group", side_effect=fail_census):
+                    with self.assertRaisesRegex(graph.StepError, "step 'census' cleanup failed:.*timed out"):
+                        await graph.run_step("census", self.command("pass"), 5, self.directory)
+                self.assertEqual(calls, [graph.CLEANUP_SECONDS] * failed_call)
+                self.assert_reaped()
 
     async def test_a_failed_group_observation_still_kills_and_reaps(self):
         with patch.object(graph, "live_group", side_effect=OSError("injected ps failure")), \

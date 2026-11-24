@@ -1,0 +1,14 @@
+{
+  "id": "nix-graph-grace-census-deadline-20261124",
+  "date": "2026-11-24",
+  "who": "GPT-6 Astra Pro, upstream repair lane",
+  "where": "tools/nix/unit_graph.py cleanup_step; .github/scripts/test_refresh_nix_graphs.py",
+  "what": "A successful launcher left a SIGTERM-resistant descendant, but the Nix control reported a ps observation timeout instead of the established surviving-descendant failure.",
+  "cost": "Gate run 45354438642 failed the Nix process controls after a grace-period census received only 0.002374796 seconds of its existing deadline.",
+  "cause": "The signal grace loop passed its remaining budget to ps and treated exhaustion of that budget as a cleanup error. The exception skipped normal escalation and discarded the forced-cleanup result even though the fallback killed the descendant.",
+  "class": "a bounded phase's exhausted observation is mistaken for failure of the enclosing cleanup",
+  "prevention": "A TimeoutExpired only inside the signal grace wait ends that phase and advances to SIGKILL or final verification. Initial and final censuses still have their own unchanged bounds and errors. Deterministic controls exhaust the grace census for both zero and nonzero launcher exits, retain the original exit and stderr, verify descendants stop and unrelated groups survive, and separately require initial/final census timeouts to remain failures.",
+  "workaround": "None; no timeout or assertion was loosened, and process-group ownership remains pinned through waitid/WNOWAIT until final reap.",
+  "fix": "The injected control reproduced the original failure before the source change; all 16 Nix refresh/process controls passed locally afterwards. Exact-tree hosted validation remains required.",
+  "state": "open"
+}
