@@ -29,6 +29,45 @@ use crate::error::{Error, failed};
 
 mod publication;
 
+/// The native boundary keeps the refusal's diagnostic, not the completion's owned IO.
+#[derive(Debug)]
+struct PublicationCompletionError {
+    path: PathBuf,
+    step: publication::Step,
+    tag: blaze_core::Tag,
+    completion: String,
+}
+
+impl std::fmt::Display for PublicationCompletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {:?} refused completion {} with tag {:?}",
+            self.path.display(), self.step, self.completion, self.tag,
+        )
+    }
+}
+
+impl std::error::Error for PublicationCompletionError {}
+
+fn publication_completion_error(
+    to: &Path,
+    refused: publication::RefusedCompletion,
+) -> io::Error {
+    let publication::RefusedCompletion { step, tag, done } = refused;
+    // A refused completion can own a writable mapping. Release it on the driver thread,
+    // before placing this Send + Sync diagnostic in an io::Error; the sans-IO core
+    // returns ownership unchanged. Done has no separate completion-description type.
+    let error = PublicationCompletionError {
+        path: to.to_owned(),
+        step,
+        tag,
+        completion: format!("{done:?}"),
+    };
+    drop(done);
+    io::Error::other(error)
+}
+
 /// One native record's header; ordering starts with its key for the merge frontier.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct NativeEntry {
@@ -714,7 +753,8 @@ impl Store {
             let done = result.map_err(|error| {
                 std::io::Error::new(error.kind(), format!("{}: {step:?}: {error}", to.display()))
             })?;
-            publication.complete(Completion { tag, done }).map_err(std::io::Error::other)?;
+            publication.complete(Completion { tag, done })
+                .map_err(|refused| publication_completion_error(to, refused))?;
         }
         if publication.acknowledged() {
             Ok(())

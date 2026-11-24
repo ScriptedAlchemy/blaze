@@ -392,6 +392,87 @@ fn finish(sim: &mut Sim, effect: Effect) -> Completion {
     result.expect("one submitted effect completed")
 }
 
+#[derive(Clone, Copy)]
+enum CompletionPlant {
+    None,
+    RetainMapping,
+}
+
+fn completion_refusal_releases_mapping(seed: u64, step: Step, plant: CompletionPlant) -> bool {
+    let mut sim = Sim::new(seed, Faults::default());
+    sim.change(&slot("objects/.staged"), b"staged");
+    sim.change(&slot("objects/published"), b"original");
+    let mut publication = Publication::new();
+    for _ in 0..Publication::MAX_STEPS {
+        if publication.step() == step {
+            break;
+        }
+        let effect = publication.effect().expect("a preceding durability barrier");
+        publication.complete(finish(&mut sim, effect)).unwrap();
+    }
+    assert_eq!(publication.step(), step);
+    let mapped_file = slot("objects/unexpected-mapping");
+    let bytes = [0x41, seed as u8, 0x7f, 0x03];
+    let mut completion = finish(&mut sim, Effect::MapWrite {
+        file: mapped_file.clone(), len: bytes.len() as u64, tag: Tag(73),
+    });
+    let Done::MappedWrite(mapping) = &mut completion.done else {
+        panic!("the ownership control must exercise a writable mapping");
+    };
+    mapping.bytes_mut().copy_from_slice(&bytes);
+    let refused = publication.complete(completion).unwrap_err();
+    assert_eq!(publication.step(), Step::Failed);
+    assert!(!publication.acknowledged());
+    assert!(publication.effect().is_none());
+    let published = sim.contents(&slot("objects/published"));
+    let destination = Path::new("native-cache/manifests/output");
+    let (error, retained) = match plant {
+        CompletionPlant::None => (publication_completion_error(destination, refused), None),
+        CompletionPlant::RetainMapping => (io::Error::from(io::ErrorKind::Other), Some(refused)),
+    };
+    if matches!(plant, CompletionPlant::None) {
+        let diagnostic = error.get_ref().unwrap()
+            .downcast_ref::<PublicationCompletionError>()
+            .expect("the IO error must retain a typed publication diagnostic");
+        assert_eq!(diagnostic.path, destination);
+        assert_eq!(diagnostic.step, step);
+        assert_eq!(diagnostic.tag, Tag(73));
+        assert_eq!(diagnostic.completion, "MappedWrite(MappingWrite(4 bytes))");
+        assert_eq!(error.to_string(), format!(
+            "native-cache/manifests/output: {step:?} refused completion MappedWrite(MappingWrite(4 bytes)) with tag Tag(73)"
+        ));
+    }
+    // An unrelated effect lets Sim collect a dropped mapping. Keep the error alive:
+    // ownership must already be released, without acknowledging any publication.
+    finish(&mut sim, Effect::Now { tag: Tag(74) });
+    let released = sim.contents(&mapped_file) == bytes;
+    assert_eq!(sim.contents(&slot("objects/published")), published);
+    assert!(!publication.acknowledged());
+    drop(error);
+    drop(retained);
+    finish(&mut sim, Effect::Now { tag: Tag(75) });
+    assert_eq!(sim.contents(&mapped_file), bytes, "the control must release its mapping too");
+    released
+}
+
+/// The invariant: a native publication refusal releases its owned completion before the
+/// typed IO diagnostic escapes, without advancing or acknowledging the failed publication.
+#[test]
+fn refused_publication_completions_release_owned_mappings() {
+    for seed in 0..16 {
+        for step in [Step::FileSync, Step::Rename, Step::DirectorySync] {
+            assert!(completion_refusal_releases_mapping(seed, step, CompletionPlant::None));
+        }
+    }
+}
+
+#[test]
+fn the_oracle_catches_a_retained_refused_mapping() {
+    for step in [Step::FileSync, Step::Rename, Step::DirectorySync] {
+        assert!(!completion_refusal_releases_mapping(7, step, CompletionPlant::RetainMapping));
+    }
+}
+
 #[derive(Default)]
 struct Attempt {
     ack: bool,
