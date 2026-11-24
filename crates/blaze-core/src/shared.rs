@@ -266,7 +266,7 @@ mod tests {
         crate::temp::TempDir::for_test(&format!("blaze-shared-{name}-"))
     }
 
-    /// Invariant: the first process stamps the header and zeros the rest, and a second
+    /// The invariant: the first process stamps the header and zeros the rest, and a second
     /// mapping of the file sees it and the first's writes.
     #[test]
     fn the_first_process_stamps_the_header_and_others_see_it() {
@@ -287,7 +287,7 @@ mod tests {
         assert_eq!(leftovers, 1, "the file made under a name of its own was left");
     }
 
-    /// Invariant: a file of another length is refused naming it, and left as it is.
+    /// The invariant: a file of another length is refused naming it, and left as it is.
     #[test]
     fn a_file_of_another_length_is_refused_and_left_whole() {
         let held = dir("length");
@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), [7u8; 10], "the file was changed");
     }
 
-    /// Invariant: a file of another identity (another magic or layout) is refused naming the
+    /// The invariant: a file of another identity (another magic or layout) is refused naming the
     /// word.
     #[test]
     fn a_file_of_another_identity_is_refused() {
@@ -330,7 +330,7 @@ mod tests {
         assert!(clock.now() >= wait);
     }
 
-    /// Invariant: a thread asleep on a word through one mapping is woken by a wake through
+    /// The invariant: a thread asleep on a word through one mapping is woken by a wake through
     /// another mapping of the file (as another process's is), the word unchanged, long before
     /// its deadline.
     #[test]

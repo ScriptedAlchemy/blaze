@@ -1,8 +1,14 @@
 ---
-status: current
-summary: blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's verdicts, how it is scored, what is left.
+status: record
+summary: Borrow-checker modes and historical scoring from the retired hir-ty pipeline; current code is in blaze-borrow and blaze-flow.
+date: 2026-11-15
 ---
 # The borrow checker
+
+This records the borrow checker before the old front end was retired. The current
+implementation is in [blaze-borrow](../crates/blaze-borrow/src/lib.rs) and
+[blaze-flow](../crates/blaze-flow/src/lib.rs). The modes, scores and remaining gaps below
+describe that historical implementation; they are not acceptance evidence for the current one.
 
 blaze has its own borrow checker (`crates/blaze-borrow` and `crates/blaze-flow`). It checks the body flow IR and is meant to give exactly rustc's
 verdict: the same errors, on the same lines, and none where rustc gives none. At its last

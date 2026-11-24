@@ -318,7 +318,7 @@ In blaze, because both halves of the difference are blaze's:
    review").
 2. **Compare the lines cargo reads.** `directives()` keeps the lines that, as text and trimmed,
    start with `cargo:` (`cargo::` too), which is where cargo's `BuildOutput::parse` starts (and
-   [`blaze-build-script`'s `output::parse`](../../crates/blaze-build-script/src/output.rs)). What the script
+   [`blaze-build-script`'s `output::parse`](https://github.com/ScriptedAlchemy/blaze/blob/2177d456a3d790a1c2b5e4e574fcd97bdf3c835e/crates/blaze-build-script/src/output.rs)). What the script
    or a tool it runs says besides is the script's own. `rerun_into` and `same_run` compare those, in order.
    What the script wrote into `OUT_DIR` is still compared whole (`tree_digest`, which is `digest_of`
    of the first version, made to read links and failures as "After review" says), so a script

@@ -146,7 +146,7 @@ generic function, closure, coroutine, or shim. Its entry contains machine code, 
 data, unwind information, and optional debug information. Entries are sealed into packs.
 Cargo units describe configuration and dependency relationships; they are not the smallest
 compiled artifact. See cached.rs, Entry, and
-[stable.rs](../crates/hir-ty-codegen/stable.rs), StableNames::instance.
+[stable.rs](https://github.com/ScriptedAlchemy/blaze/blob/2177d456a3d790a1c2b5e4e574fcd97bdf3c835e/crates/hir-ty-codegen/stable.rs), StableNames::instance.
 
 Persistent invalidation is nevertheless conservative at the crate dependency-closure boundary.
 StableNames::spell_crate prefixes owned names with a ContentId. In

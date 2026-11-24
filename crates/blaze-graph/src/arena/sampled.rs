@@ -224,7 +224,7 @@ mod tests {
         found
     }
 
-    /// Invariant: a sample is in the table from its put to its block's free, follows the
+    /// The invariant: a sample is in the table from its put to its block's free, follows the
     /// block through a move, and stays through a realloc that failed or moved nothing. One
     /// test, since the table is the process's: each case uses addresses of its own.
     #[test]
