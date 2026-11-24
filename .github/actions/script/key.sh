@@ -26,7 +26,7 @@ else
   status=$?
   [ "$status" = 1 ] || die "cannot read sparse checkout configuration"
 fi
-for need in .github/blaze-version harness/toolchain Cargo.toml Cargo.lock blaze.lock .cargo/config.toml scripts/Cargo.toml; do
+for need in .github/blaze-version pins/toolchain Cargo.toml Cargo.lock blaze.lock .cargo/config.toml scripts/Cargo.toml; do
   [ -f "$need" ] && [ ! -L "$need" ] || die "missing or symlinked input $need"
 done
 command -v bun >/dev/null || die "Bun 1.4.5 is required to parse Cargo manifests"
@@ -42,7 +42,7 @@ awk -v locals="$work/locals" -f "$here/lock.awk" Cargo.lock > "$work/closure"
 # cannot substitute for a missing declared package. The helper also records ancestors
 # that supply workspace inputs, whether tracked by git or ignored.
 bun "$here/packages.mjs" "$work/locals" "$work/used-manifests" > "$work/directories"
-printf '%s\n' .github/actions/script >> "$work/directories"
+printf '%s\n' .github/actions/script pins >> "$work/directories"
 sort -u "$work/directories" > "$work/sorted-directories"
 : > "$work/files"
 cat "$work/used-manifests" >> "$work/files"
@@ -59,7 +59,7 @@ while IFS= read -r dir; do
     printf '%s\n' "$file" >> "$work/files"
   done < "$work/tree"
 done < "$work/sorted-directories"
-printf '%s\n' .github/blaze-version harness/toolchain Cargo.toml blaze.lock .cargo/config.toml >> "$work/files"
+printf '%s\n' .github/blaze-version pins/toolchain Cargo.toml blaze.lock .cargo/config.toml >> "$work/files"
 sort -u "$work/files" > "$work/sorted-files"
 {
   printf 'host %s %s\n' "$(uname -s)" "$(uname -m)"

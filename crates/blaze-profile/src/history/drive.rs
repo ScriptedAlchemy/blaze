@@ -17,11 +17,10 @@ use std::{
     time::Duration,
 };
 
-use arrow_array::RecordBatch;
 use blaze_core::{Completion, Driver, Effect, FileName, wait::Deadline};
 
 use super::{
-    BuildRow, HistoryError, Outcome as BuildOutcome, Writer, arrow_error, builds,
+    BuildRow, HistoryError, Outcome as BuildOutcome, Writer, builds,
     compact::Name,
     files::{CrashRead, CrashRow, Dead, Files, Host, Outcome, Placed, Recovery, Wait},
     manifest::{Entry, Manifest},
@@ -29,6 +28,7 @@ use super::{
 };
 use crate::{
     batches::{self, Process},
+    columns::Batch,
     crash::{self, CrashError},
     flight::postmortem,
     schema::{self, Table},
@@ -83,8 +83,9 @@ impl Live {
         // Each read holds the postmortem's names until it drops: one at a time.
         let recovered =
             found.read(listed.map(|it| it.flushed)).map_err(HistoryError::Postmortem)?;
-        let files = recovered_files(&self.dir, &self.writer, seq, &recovered)?;
-        Ok(Recovery::Files { nonce: recovered.nonce, files })
+        let nonce = recovered.nonce;
+        let files = recovered_files(&self.dir, &self.writer, seq, recovered)?;
+        Ok(Recovery::Files { nonce, files })
     }
 }
 
@@ -115,12 +116,15 @@ impl Host for Live {
         };
         match crash::read(path, bytes, &hash) {
             Ok(None) => CrashRead::Nothing,
-            Ok(Some(crash)) => CrashRead::Row(CrashRow {
-                pid: crash.pid,
-                t_ns: crash.t_ns,
-                row: crash.row(),
-                image: crash.image(),
-            }),
+            Ok(Some(crash)) => {
+                let image = crash.image();
+                CrashRead::Row(CrashRow {
+                    pid: crash.pid,
+                    t_ns: crash.t_ns,
+                    row: crash.row(),
+                    image,
+                })
+            }
             Err(refused) => CrashRead::Refused(refused),
         }
     }
@@ -141,24 +145,23 @@ fn recovered_files(
     dir: &Path,
     writer: &Writer,
     seq: u64,
-    recovered: &postmortem::Recovered,
+    recovered: postmortem::Recovered,
 ) -> Result<Vec<Placed>, HistoryError> {
     let process = Process { pid: recovered.pid, name: &recovered.process, commit: None };
     let read = &recovered.read;
+    let last_ns = recovered.last_ns;
+    let blaze = &recovered.blaze;
     // alloc: a row a build the dead daemon was running, once a postmortem
     let crashed: Vec<BuildRow> = recovered
         .builds
-        .iter()
+        .into_iter()
         .map(|build| BuildRow {
             build_id: build.build_id,
-            // clone: a build's texts, once a postmortem
-            commit: build.commit.clone(),
-            // clone: as above
-            workspace: build.workspace.clone(),
-            // clone: as above
-            command: build.command.clone(),
+            commit: build.commit,
+            workspace: build.workspace,
+            command: build.command,
             started_ns: build.started_ns,
-            dur_ns: Some(recovered.last_ns.max(build.started_ns) - build.started_ns),
+            dur_ns: Some(last_ns.max(build.started_ns) - build.started_ns),
             started_unix_ns: build.started_unix_ns,
             outcome: BuildOutcome::Crashed,
             hits: None,
@@ -166,37 +169,37 @@ fn recovered_files(
             joined: None,
             tree: None,
             // clone: a hash, once a build
-            blaze: (!recovered.blaze.is_empty()).then(|| recovered.blaze.clone()),
+            blaze: (!blaze.is_empty()).then(|| blaze.clone()),
             client_ns: None,
             daemon_cpu_ns: None,
         })
         .collect();
-    let tables: [(&'static Table, RecordBatch); 7] = [
+    let tables: [(&'static Table, Batch); 7] = [
         (
             &schema::SPANS,
-            batches::spans(&read.spans, process).map_err(arrow_error(&schema::SPANS))?,
+            batches::spans(&read.spans, process).map_err(HistoryError::Batch)?,
         ),
         (
             &schema::COUNTERS,
-            batches::counters(&read.counters, process).map_err(arrow_error(&schema::COUNTERS))?,
+            batches::counters(&read.counters, process).map_err(HistoryError::Batch)?,
         ),
-        (&schema::BUILDS, builds(&crashed, &[], recovered.pid).map_err(arrow_error(&schema::BUILDS))?),
+        (&schema::BUILDS, builds(&crashed, &[], recovered.pid).map_err(HistoryError::Batch)?),
         (
             &schema::SWITCHES,
-            batches::switches(&read.switches, process).map_err(arrow_error(&schema::SWITCHES))?,
+            batches::switches(&read.switches, process).map_err(HistoryError::Batch)?,
         ),
         (
             &schema::EVENTS,
-            batches::events(&read.events, process).map_err(arrow_error(&schema::EVENTS))?,
+            batches::events(&read.events, process).map_err(HistoryError::Batch)?,
         ),
         (
             &schema::EVENT_FIELDS,
             batches::event_fields(&read.fields, process)
-                .map_err(arrow_error(&schema::EVENT_FIELDS))?,
+                .map_err(HistoryError::Batch)?,
         ),
         (
             &schema::FOLDED,
-            batches::folded(&read.folds, process).map_err(arrow_error(&schema::FOLDED))?,
+            batches::folded(&read.folds, process).map_err(HistoryError::Batch)?,
         ),
     ];
     let build = read.highest_build().max(crashed.iter().map(|it| it.build_id).max().unwrap_or(0));
@@ -221,7 +224,7 @@ fn recovered_files(
 impl Entry {
     /// The entry of a file of `table` this process writes with the rows of `parts`: its pid,
     /// and the boot its clock counts from.
-    pub fn of_batches(table: &schema::Table, parts: &[RecordBatch]) -> Entry {
+    pub fn of_batches(table: &schema::Table, parts: &[Batch]) -> Entry {
         Entry::of_rows(table, parts, std::process::id(), crate::clock::boot())
     }
 }
@@ -278,19 +281,19 @@ fn waiting_on(wait: Wait) -> &'static str {
 
 /// The span naming the wait `wait` of the history `dir` (every-wait-says-what); `None` for the
 /// waits on its plain reads and writes, which the job's own span covers.
-fn span_of(wait: Wait, dir: &Path) -> Option<tracing::span::EnteredSpan> {
+fn span_of(wait: Wait, dir: &Path) -> Option<blaze_trace::span::EnteredSpan> {
     match wait {
         Wait::ManifestLock => Some(
-            tracing::info_span!(
+            blaze_trace::info_span!(
                 target: "blaze",
                 "waits on the profile history's manifest lock",
                 dir = %dir.display()
             )
             .entered(),
         ),
-        Wait::Sync => Some(tracing::info_span!(target: "blaze", "profile fsync").entered()),
-        Wait::Merge => Some(tracing::info_span!(target: "blaze", "profile merge").entered()),
-        Wait::Reap => Some(tracing::info_span!(target: "blaze", "profile reap").entered()),
+        Wait::Sync => Some(blaze_trace::info_span!(target: "blaze", "profile fsync").entered()),
+        Wait::Merge => Some(blaze_trace::info_span!(target: "blaze", "profile merge").entered()),
+        Wait::Reap => Some(blaze_trace::info_span!(target: "blaze", "profile reap").entered()),
         Wait::Files | Wait::Nothing => None,
     }
 }
@@ -311,7 +314,7 @@ pub(crate) fn run<H: Host>(
     let mut done: Vec<Completion> = Vec::new();
     // The span open over the polls of one wait, and the wait it names.
     let mut spanned = Wait::Nothing;
-    let mut span: Option<tracing::span::EnteredSpan> = None;
+    let mut span: Option<blaze_trace::span::EnteredSpan> = None;
     let mut progressed = driver.now();
     loop {
         files.effects(&mut effects);
@@ -374,7 +377,7 @@ impl<H: Host> Core<H> {
             doing: "starting the IO driver of the profile history under",
             error,
         })?;
-        let files = Files::new(host, root, name, super::all_properties());
+        let files = Files::new(host, root, name);
         // alloc: a path, once a core
         Ok(Core { files, driver, dir: dir.to_owned() })
     }
@@ -491,7 +494,7 @@ pub fn recover_dead(dir: &Path) -> Result<usize, HistoryError> {
 /// is refused, naming it. The bytes written.
 pub(crate) fn write_listed(
     dir: &Path,
-    files: &[(&Path, &'static Table, &[RecordBatch])],
+    files: &[(&Path, &'static Table, &[Batch])],
 ) -> Result<u64, HistoryError> {
     std::fs::create_dir_all(dir).map_err(super::io_error(dir, "making the directory"))?;
     let writer = Writer::new();
@@ -540,10 +543,10 @@ pub(crate) fn list_written(dir: &Path) {
             continue;
         }
         let path = dir.join(&name);
-        let bytes = bytes::Bytes::from(std::fs::read(&path).unwrap());
+        let bytes = std::fs::read(&path).unwrap();
         let entry = Entry::of_footer(&path, &bytes, Some(schema::VERSION)).unwrap();
         std::fs::remove_file(&path).unwrap();
-        placed.push(Placed { file: name, bytes: bytes.to_vec(), entry });
+        placed.push(Placed { file: name, bytes, entry });
     }
     let mut core = Core::new(Live::new(dir), dir).unwrap();
     match core.job(|it| it.write_listed(placed)).unwrap() {

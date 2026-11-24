@@ -1,24 +1,11 @@
-"""report.py: the one shape of a v2 proof script's result.
+"""report.py: the retained shape of an objective acceptance result.
 
-A script makes a `Report`, adds an `Outcome` for each thing it checked, and ends with
-`finish()`, which writes the result to the script's `out` (JSON) and exits:
+A script makes a Report, adds an Outcome for each check, and calls finish(), which writes
+the JSON result and exits. Failed, erroneous, unmeasured and empty runs all fail. The
+objective ledger consumes this schema; a report is evidence only for the checks it ran.
 
-    pass        what was checked holds
-    fail        it does not: a finding about the compiler (a wrong program, a stale result,
-                a budget missed, a build that is not byte for byte the same)
-    unmeasured  the engine has no answer to it (`engine.Unmeasurable`): a failure, as blaze
-                has to measure everything
-    error       the harness could not check it (`engine.Failed`: a command that timed out,
-                an answer of the engine it could not read)
-
-The exit status is 1 when anything failed or erred, or the engine is v2 and anything was
-unmeasured; else 0. `proof.py` reads the results of every script into one report.
-
-The file:
-
-    {"script": "oracle.py", "engine": {...}, "host": {...}, "commit": "...", "started": "...",
-     "ended": "...", "outcomes": [{"name", "verdict", "detail", "numbers"}], "counts": {...},
-     "extra": {...}}
+The engine descriptor records the requested client and backends. It starts no compiler
+and supplies no execution driver. Source and binary identity remain the caller's checks.
 """
 
 import json
@@ -33,10 +20,35 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal, NoReturn
 
-from engine import ROOT, EngineSpec, Failed, Unmeasurable
-
+ROOT = Path(__file__).resolve().parents[2]
+type Kind = Literal["v2"]
+type Backend = Literal["cranelift", "llvm"]
+type DevBackend = Literal["default", "stencil", "cranelift"]
+DEV_BACKENDS: tuple[DevBackend, ...] = ("default", "stencil", "cranelift")
 type Verdict = Literal["pass", "fail", "unmeasured", "error"]
 type Number = int | float | str | bool | None
+
+
+class Unmeasurable(Exception):
+    """The requested check has no measured answer."""
+
+
+class Failed(Exception):
+    """The harness could not complete or interpret a check."""
+
+
+@dataclass(frozen=True)
+class EngineSpec:
+    """The existing report descriptor, independent of the deleted daemon driver."""
+
+    kind: Kind
+    blaze: str
+    backend: Backend = "cranelift"
+    dev_backend: DevBackend = "default"
+
+    def __post_init__(self) -> None:
+        if self.dev_backend not in DEV_BACKENDS:
+            raise Failed(f"engine.dev_backend: one of {', '.join(DEV_BACKENDS)}, not {self.dev_backend!r}")
 
 
 @dataclass(frozen=True)
@@ -48,13 +60,13 @@ class Outcome:
 
 
 def commit() -> str | None:
-    ran = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
+    ran = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                         capture_output=True, text=True, check=False, timeout=30)
     return ran.stdout.strip() or None
 
 
 def host() -> dict[str, Number]:
     """What the run was on."""
-    # Linux only: elsewhere `os` has no `sched_getaffinity`.
     affinity: Callable[[int], set[int]] | None = getattr(os, "sched_getaffinity", None)
     cores = len(affinity(0)) if affinity is not None else os.cpu_count()
     memory_gib: float | None = None
@@ -64,10 +76,11 @@ def host() -> dict[str, Number]:
         memory_gib = round(kb / 2**20, 1)
     except (OSError, StopIteration, ValueError):
         if sys.platform == "darwin":
-            out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout.strip()
+            out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                                 text=True, check=False, timeout=30).stdout.strip()
             memory_gib = round(int(out) / 2**30, 1) if out.isdigit() else None
-    return dict(os=platform.system(), arch=platform.machine(), kernel=platform.release(), cores=cores,
-                machine_cores=os.cpu_count(), memory_gib=memory_gib, name=os.environ.get("BLAZE_BENCH_MACHINE"))
+    return {"os": platform.system(), "arch": platform.machine(), "kernel": platform.release(), "cores": cores,
+            "machine_cores": os.cpu_count(), "memory_gib": memory_gib, "name": os.environ.get("BLAZE_BENCH_MACHINE")}
 
 
 def now() -> str:
@@ -91,8 +104,7 @@ class Report:
         return outcome
 
     def guarded[T](self, name: str, fn: Callable[[], T]) -> T | None:
-        """`fn()`, or None with an outcome for `name` when it could not be done: unmeasured for
-        an engine without the answer, error for the harness or an interface v2 lacks."""
+        """Record an unmeasured or erroneous check; neither can make the report pass."""
         try:
             return fn()
         except Unmeasurable as e:
@@ -106,15 +118,13 @@ class Report:
         return [o for o in self.outcomes if o.verdict in bad]
 
     def finish(self) -> NoReturn:
-        # A script that checked nothing has not passed (agents.json A39, vacuous success): an
-        # empty selection, a corpus that was not found or a loop over no case ends here with no
-        # outcome, which is an error of the harness and exit status 1, never a silent 0.
+        # Empty selections and loops over no case are errors, never successful evidence.
         if not self.outcomes:
             self.add("checked nothing", "error", f"{self.script} ended with no outcome: nothing it was asked to check ran")
         counts = Counter(o.verdict for o in self.outcomes)
-        result = dict(script=self.script, engine=asdict(self.engine), host=host(), commit=commit(),
-                      started=self.started, ended=now(), outcomes=[asdict(o) for o in self.outcomes],
-                      counts=dict(counts), extra=self.extra)
+        result = {"script": self.script, "engine": asdict(self.engine), "host": host(), "commit": commit(),
+                  "started": self.started, "ended": now(), "outcomes": [asdict(o) for o in self.outcomes],
+                  "counts": dict(counts), "extra": self.extra}
         if self.out:
             self.out.parent.mkdir(parents=True, exist_ok=True)
             self.out.write_text(json.dumps(result, indent=1) + "\n")

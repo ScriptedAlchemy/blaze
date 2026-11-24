@@ -20,13 +20,15 @@ from exec_observer import Failed, Input, load
 
 def command(given: Input, args: tuple[str, ...], log: Path, seconds: int) -> int:
     environment = dict(os.environ)
+    environment["HOME"] = given.home
     environment["BLAZE_HOME"] = given.home
     environment["BLAZE_CACHE"] = str(Path(given.home) / "v2" / "store")
-    with log.open("xb") as output:
+    # Keep machine-readable stdout intact; diagnostic stderr remains a separate full artifact.
+    with log.open("xb") as output, log.with_suffix(".stderr").open("xb") as errors:
         try:
-            return subprocess.run([given.blaze, "--ignore-pin", *args], cwd=given.cwd,
+            return subprocess.run([given.blaze, *args], cwd=given.cwd,
                                   env=environment, stdin=subprocess.DEVNULL, stdout=output,
-                                  stderr=subprocess.STDOUT, timeout=seconds, check=False).returncode
+                                  stderr=errors, timeout=seconds, check=False).returncode
         except subprocess.TimeoutExpired:
             return 124
         except OSError as error:

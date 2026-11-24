@@ -1,6 +1,13 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+
+/// Resolve the fixture's native identity, then use the source layer's ordinary path spelling
+/// on Windows so its verbatim prefix does not leak into the fixture's environment values.
+pub fn canonicalize(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap();
+    blaze_source::file_url(&path).unwrap().to_file_path().unwrap()
+}
 
 pub fn normalize(text: &str, root: &Path, home: &Path) -> String {
     let mut text = text.to_owned();

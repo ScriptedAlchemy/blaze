@@ -114,10 +114,7 @@ impl ResolveBehavior {
             "1" => Ok(ResolveBehavior::V1),
             "2" => Ok(ResolveBehavior::V2),
             "3" => Ok(ResolveBehavior::V3),
-            s => anyhow::bail!(
-                "`resolver` setting `{}` is not valid, valid options are \"1\", \"2\" or \"3\"",
-                s
-            ),
+            s => Err(crate::ResolveError::ResolverSetting { value: s.to_owned() }),
         }
     }
 
@@ -141,6 +138,9 @@ pub struct ResolveOpts {
     /// Set of features requested on the command-line.
     pub features: RequestedFeatures,
 }
+
+impl blaze_own::Share for ResolveOpts {}
+impl blaze_own::LocalShare for ResolveOpts {}
 
 impl ResolveOpts {
     /// Creates a `ResolveOpts` that resolves everything.
@@ -190,8 +190,8 @@ pub enum SemverCompatibility {
     Patch(u64),
 }
 
-impl From<&semver::Version> for SemverCompatibility {
-    fn from(ver: &semver::Version) -> Self {
+impl From<&crate::Version> for SemverCompatibility {
+    fn from(ver: &crate::Version) -> Self {
         if let Some(m) = NonZeroU64::new(ver.major) {
             return SemverCompatibility::Major(m);
         }
@@ -311,7 +311,7 @@ pub(super) type DepInfo = (Dependency, Rc<[Summary]>, FeaturesSet);
 /// We maintain a list of conflicts for error reporting as well as backtracking
 /// purposes. Each reason here is why candidates may be rejected or why we may
 /// fail to resolve a dependency.
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub enum ConflictReason {
     /// There was a semver conflict, for example we tried to activate a package
     /// 1.0.2 but 1.1.0 was already activated (aka a compatible semver version
@@ -392,3 +392,6 @@ impl<T> Clone for RcVecIter<T> {
         RcVecIter { vec: Rc::clone(&self.vec), offset: self.offset }
     }
 }
+
+impl<T> blaze_own::Share for RcVecIter<T> {}
+impl<T> blaze_own::LocalShare for RcVecIter<T> {}

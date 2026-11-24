@@ -17,12 +17,12 @@
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
         };
-        # The one toolchain blaze is pinned to: the dated nightly in harness/toolchain
+        # The one toolchain blaze is pinned to: the dated nightly in pins/toolchain
         # (`nightly-YYYY-MM-DD`, moved by harness/toolchain_bump.py, which also moves the
         # rust-overlay input to one that has it). rust-src is for rust-analyzer in an editor of
         # this repository; blaze reads none of it (its standard library is library/,
         # docs/toolchain.md).
-        pin = pkgs.lib.removePrefix "nightly-" (pkgs.lib.fileContents ./harness/toolchain);
+        pin = pkgs.lib.removePrefix "nightly-" (pkgs.lib.fileContents ./pins/toolchain);
         rust = pkgs.rust-bin.nightly.${pin}.default.override {
           extensions = [ "rust-src" ];
         };
@@ -33,15 +33,15 @@
         };
         # The one LLVM the `llvm` feature builds against, for every build of it: the dev shells
         # here, CI (`.#llvm`, .github/actions/toolchain), the flake's `dist` and the release.
-        # crates/hir-ty-codegen/llvm.json pins it: LLVM 23.1.4, built for each target by
+        # pins/llvm.json pins it: LLVM 23.1.4, built for each target by
         # .github/scripts/llvm.py (the llvm workflow) and fetched here by its sha256. Its static libraries, headers, llvm-config,
         # llvm-dwarfdump and llvm-pdbutil; LLVM_SYS_231_PREFIX names it, and
         # vendor/llvm-sys links it statically, and its build script (pin.rs) refuses any other. Its tools were
         # built on Ubuntu 22.04 with the C++ runtime linked in: on Linux they are pointed at the
         # store's libc.
-        llvmPin = builtins.fromJSON (builtins.readFile ./crates/hir-ty-codegen/llvm.json);
+        llvmPin = builtins.fromJSON (builtins.readFile ./pins/llvm.json);
         llvm =
-          let pin = llvmPin.targets.${triple} or (throw "crates/hir-ty-codegen/llvm.json has no LLVM for ${triple}: run the llvm workflow");
+          let pin = llvmPin.targets.${triple} or (throw "pins/llvm.json has no LLVM for ${triple}: run the llvm workflow");
           in pkgs.stdenv.mkDerivation {
             pname = "blaze-llvm";
             inherit (llvmPin) version;
@@ -110,47 +110,40 @@
         src = self;
         # The one version, from the workspace's Cargo.toml.
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
-        # The one build of blaze, the release workflow's recipe (.github/scripts/build_release.py):
-        # the `dist` profile optimized with the profile tools/pgo/profiles.json pins for this system,
-        # fetched by its sha256. The binaries run each other from next to themselves, unwrapped.
-        # `--nix`: they load nixpkgs' glibc, so the release's floor of RHEL 9's glibc is not theirs
-        # (build_release.py checks that instead; release.yaml keeps the floor).
+        # The current source CLI and its required sibling executables, built by the pinned
+        # Cargo toolchain as release.yaml does. The canonical toolchain shelf is a separate
+        # source-bound input; this package build does not establish fresh-home acceptance.
         triple = {
           x86_64-linux = "x86_64-unknown-linux-gnu";
           aarch64-linux = "aarch64-unknown-linux-gnu";
           aarch64-darwin = "aarch64-apple-darwin";
         }.${system};
-        pgo = builtins.fromJSON (builtins.readFile ./tools/pgo/profiles.json);
-        pgoProfile =
-          let pin = pgo.targets.${triple} or (throw "tools/pgo/profiles.json has no profile for ${triple}: run the pgo workflow");
-          in pkgs.fetchurl { url = "${pgo.release}/${pin.name}"; inherit (pin) sha256; };
-        dist = rustPlatform.buildRustPackage (llvmEnv // {
+        dist = rustPlatform.buildRustPackage {
           pname = "blaze-dist";
           inherit version src;
-          # `blaze-engine --version` names the commit (a dirty tree has none of its own).
+          # A dirty checkout has no named source commit of its own.
           BLAZE_GIT_SHA = self.shortRev or self.dirtyShortRev or "";
           cargoLock.lockFile = ./Cargo.lock;
-          # otool: build_release.py checks that no binary loads libLLVM.
-          nativeBuildInputs = [ pkgs.python3 ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.cctools ];
           doCheck = false;
-          # cargo-auditable wraps rustc for the workspace's crates, which changes their symbols:
-          # the profile would find none of them.
+          # Keep this source recipe's compiler invocation identical to the release build.
           auditable = false;
           buildPhase = ''
             runHook preBuild
-            python3 -I .github/scripts/build_release.py --target ${triple} --profdata ${pgoProfile} --out shipped --nix
+            cargo build --release --locked --offline --target ${triple} --bins -p blaze-cli -p blaze-launcher
             runHook postBuild
           '';
           installPhase = ''
             runHook preInstall
             mkdir -p $out/bin $out/share/blaze
-            cp shipped/* $out/bin/
+            for binary in blaze blaze-launcher blaze-fact-shim; do
+              install -m 755 target/${triple}/release/$binary $out/bin/$binary
+            done
             # The standard library's source, which blaze finds above its programs
             # (crates/blaze-cargo/src/toolchain/library.rs).
             cp -r library $out/share/blaze/library
             runHook postInstall
           '';
-        });
+        };
         # `nix run .#duckdb`: the DuckDB `blaze debug sql`, `blaze explain` and the explorer run,
         # nixpkgs' at the locked rev, parquet built in, so nothing downloads. Pinned: a nixpkgs
         # bump that changes it stops here, a visible change.
@@ -190,22 +183,16 @@
 
         # One derivation per cargo unit (tools/nix/units.nix, tools/nix/units/*.json from tools/nix/unit_graph.py):
         # editing blaze's own source rebuilds only blaze, never the crates it depends on. The
-        # demo's window is built this way; `daemon-units` is blaze built this way, `release`
-        # without PGO, for working on the flake: what ships is `dist`.
+        # demo's window is built this way.
         units = json: import ./tools/nix/units.nix {
           inherit pkgs rust guiLibs json;
           repo = ./.;
           gitSha = self.shortRev or self.dirtyShortRev or "";
         };
-        daemonUnits = units ./tools/nix/units/daemon.json;
-        lifeUnits = units ./tools/nix/units/life.json;
-        # blaze's binaries run each other from next to themselves, found by
-        # their own path: the binaries are copied together, not wrapped or linked. The toolchain
-        # has to be on PATH (the launcher puts it there).
-        daemon-units = pkgs.runCommand "blaze-units" { } ''
-          mkdir -p $out/bin
-          cp -L ${daemonUnits.bins}/bin/* $out/bin/
-        '';
+        lifeUnits =
+          if builtins.pathExists ./crates/blaze-api/Cargo.toml
+          then units ./tools/nix/units/life.json
+          else throw "the retained Nix life demo requires the removed blaze-api/live protocol; port its source CLI bridge before claiming live-demo acceptance";
         life-bin = pkgs.runCommand "blaze-life-bin" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
           mkdir -p $out/bin
           makeWrapper ${builtins.head lifeUnits.roots}/bin/life $out/bin/life \
@@ -217,7 +204,7 @@
         # with), with the root manifest their `workspace = true` fields come from, copied to a
         # writable directory at run time; its crates.io dependencies are vendored from Cargo.lock
         # so that needs no network.
-        lifeSource = pkgs.lib.fileset.toSource {
+        lifeSource = if builtins.pathExists ./crates/blaze-api/Cargo.toml then pkgs.lib.fileset.toSource {
           root = ./.;
           fileset = pkgs.lib.fileset.unions [
             ./Cargo.toml
@@ -229,7 +216,6 @@
             ./crates/blaze-format
             ./crates/blaze-graph
             ./crates/blaze-ids
-            ./crates/blaze-image
             ./crates/blaze-inproc
             ./crates/blaze-inproc-rt
             ./library/blaze_inproc_rt
@@ -243,12 +229,11 @@
             ./crates/blaze-reclaim
             ./crates/blaze-rng
             ./crates/blaze-sha256
-            ./crates/blaze-vfs
             ./crates/intern
             ./crates/stdx
             ./vendor/blake3-servil
           ];
-        };
+        } else throw "the retained Nix life source needs its removed blaze-api/live dependencies and a current source CLI bridge";
         lifeVendor = pkgs.rustPlatform.importCargoLock { lockFile = ./demo/life/Cargo.lock; };
         # `nix run github:indexable-inc/blaze#life`: the Game of Life window. On macOS on AArch64 the
         # daemon builds the copy and edits to it show up live; elsewhere the prebuilt window runs.
@@ -265,7 +250,7 @@
           # `blaze build` works. `#blaze` names it too.
           default = daemon;
           blaze = daemon;
-          inherit dist daemon run life daemon-units life-bin duckdb;
+          inherit dist daemon run life life-bin duckdb;
           # The pinned LLVM: its tools (llvm-dwarfdump), which CI puts on PATH where the harnesses
           # read debug info, and the prefix a build of the `llvm` feature links.
           inherit llvm;
@@ -289,11 +274,11 @@
         };
         # `nix develop`: the pinned LLVM (LLVM_SYS_231_PREFIX, its tools on PATH) and a C
         # toolchain with libstdc++.a, so `cargo build -p blaze-engine` links it in. Rust is
-        # rustup at the pinned nightly: plain `cargo` is harness/toolchain's and `cargo +<toolchain>` works.
+        # rustup at the pinned nightly: plain `cargo` is pins/toolchain's and `cargo +<toolchain>` works.
         devShells.default = pkgs.mkShell (llvmEnv // {
           packages = scripts.packages ++ [ pkgs.rustup llvm pkgs.unixtools.ps ];
           inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
-          RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
+          RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./pins/toolchain;
           # The pinned DuckDB that `blaze slow`, `blaze debug sql` and `blaze explain` run (blaze
           # never looks for one on PATH), as the installed `blaze` wrapper sets it.
           BLAZE_DUCKDB = "${duckdb}/bin/duckdb";
@@ -313,7 +298,7 @@
         devShells.wasm = pkgs.mkShell (llvmEnv // {
           packages = scripts.packages ++ [ pkgs.rustup llvm pkgs.wasmtime pkgs.wasm-tools pkgs.wasm-bindgen-cli ];
           inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
-          RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
+          RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./pins/toolchain;
           hardeningDisable = [ "all" ];
         });
         devShells.bench = pkgs.mkShell bench;

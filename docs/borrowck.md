@@ -1,40 +1,28 @@
 ---
 status: current
-summary: The retained borrow checker (hir-ty-borrowck): its rules, historical rustc comparisons and scoring harness; compiler integration is parked while the item layer is replaced.
+summary: blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's verdicts, how it is scored, what is left.
 ---
 # The borrow checker
 
-The borrow checker and its front-end dependencies are [parked](v2/plan/parked.md) while
-the item layer is replaced. This page describes the retained implementation and earlier
-measurements; they do not establish that the current source-built compiler can check a
-program. The daemon that previously scheduled unit checks was removed by upstream commit
-`8e87a017ff` on 2026-11-15.
-
-The retained borrow checker is the crate `hir-ty-borrowck` in the front end
-(`crates/hir-ty-borrowck`, next to `hir-ty`). It checks the MIR `hir-ty-mir`
-lowers (from rust-analyzer's lowering), the same MIR the code generator compiles, and it is meant to give exactly rustc's
+blaze has its own borrow checker (`crates/blaze-borrow` and `crates/blaze-flow`). It checks the body flow IR and is meant to give exactly rustc's
 verdict: the same errors, on the same lines, and none where rustc gives none. At its last
 scoring it gave rustc's verdict on 99.8% of the rustc borrow-check tests in scope, and on
 every one rustc accepts; how they were scored and what is left is below.
 
-Its front-end diagnostics entry point remains in `crates/hir/src/diagnostics.rs`.
-The deleted daemon ran each unit's check beside codegen and reported its findings through
-`blaze check`. A borrow-check error failed that build (below); the replacement command
-layer still needs that integration. The checker also misses some errors rustc gives
-(What is left, below).
+It runs as part of the front end's diagnostics, in each unit's check, and `blaze check` reports what it finds. A build it finds a borrow-check error in fails (below), but the
+checker still misses some errors rustc gives (What is left, below).
 
 ## Refusing builds
 
-In the daemon-based implementation, a build with a borrow-check error failed with the file,
-line and error, as one with a type error did: the unit's check failed, so what its codegen
-made was dropped. No cargo or rustc was asked. This was the integration's contract; the
-parked checker alone does not demonstrate it for the new command layer.
+A build with a borrow-check error fails, with the file, line and error, as one with a type
+error does: the unit's check failed, so what its codegen made is dropped. Nothing else runs;
+no cargo or rustc is asked.
 
-The earlier corpus runs reported no error on a test rustc accepted, nor on ripgrep, fd, bat,
-hyperfine, just, axum, nushell, helix or biome. Those results are evidence for that corpus,
-not a proof that every refusal matches rustc. A borrow-check error blaze reports where
-rustc reports none is a bug. The checker misses some errors rustc gives (it accepts code
-rustc rejects, listed below), so those checks alone cannot reject all such programs.
+This is safe because the checker reports nothing on any test rustc accepts, nor on ripgrep,
+fd, bat, hyperfine, just, axum, nushell, helix or biome: a refused build is one rustc refuses too. A
+borrow-check error blaze reports where rustc reports none is a bug. What it does not do: it
+misses some errors rustc gives (it accepts code rustc rejects, listed below), so code with
+such an error still builds.
 
 ## Modes
 
@@ -47,7 +35,7 @@ rustc rejects, listed below), so those checks alone cannot reject all such progr
 - `polonius-flow`: an opt-in extension that only ever accepts more than `polonius`. A body
   `polonius` accepts gets exactly that result, at no extra cost. A body it rejects is checked
   again, and this time each loan's scope is narrowed to where datalog (legacy) Polonius's
-  naive rules (`crates/hir-ty-borrowck/src/flow.rs`) also find it live. Those rules kill a
+  naive rules (`crates/blaze-flow/src/loans.rs`) also find it live. Those rules kill a
   loan when its path is overwritten and propagate subsets along the control flow. A universal
   region error is dropped only when those rules find no failing pair. This accepts the cases
   in section 2.5 of the research that the alpha rejects and legacy
@@ -535,9 +523,9 @@ is queued. At 68be5dec all 22 applications checked
 clean; at 47793534 nushell (53, E0716 in its tests), ruff (19, E0716 and "lifetime may not live
 long enough") and rust-analyzer (1, E0515) got errors rustc does not give.
 
-Three checks hold `polonius-flow` to "accepts more, never less":
+The earlier `polonius-flow` validation combined three checks of "accepts more, never less":
 
-- `harness/v2/frontend/borrowck_flow.py` runs the 46 tests with a Polonius revision that are
+- The [historical Python runner](https://github.com/ScriptedAlchemy/blaze/blob/845de2dc3e1df8d5e30d4d2554b455d445385fb1/harness/v2/frontend/borrowck_flow.py) ran the 46 tests with a Polonius revision that are
   vendored in `fed1eb428d:docs/upstream/borrowck/rust-lang-rust/tests-ui` in both modes. It fails on any
   of the following:
   - `polonius-flow` rejects something `polonius` accepts.
@@ -548,6 +536,12 @@ Three checks hold `polonius-flow` to "accepts more, never less":
   Where it has errors, `polonius-flow`'s errors must be a subset of them.
 - `flow_tests` holds std-free versions of the targets, which must be accepted, and of the tests
   every Polonius rejects, which must stay rejected.
+
+The Python runner and its frontend command driver were retired after their daemon helpers
+were removed. The frontend fixtures and borrow-check corpus remain available. Current native
+checks live in `crates/blaze-borrow/src/tests.rs`, `crates/blaze-flow/src/tests.rs` and the
+other test modules beside them. The scores above remain historical until the corresponding
+corpus has been run against the current compiler.
 
 ## What is left
 
@@ -694,8 +688,8 @@ missed rather than errors made up:
 
 ## What it costs
 
-The deleted v2 daemon ran a unit's check beside codegen, so a check added to a build's
-critical path when it took longer than codegen. The numbers below are v1's,
+In v1 a unit's check ran beside its codegen, so
+it added to a build only when it takes longer than the codegen. The numbers below are v1's,
 whose daemon checked the edited files on a thread of their own beside the build.
 For an edit of the corpus's largest file, the check went from a median of 40 ms with the
 checker off to 52-74 ms with it on, while the build took 250-400 ms. A cold check of all of
@@ -835,6 +829,4 @@ is 0.3 ms now. Nothing else moves.
 
 ## Debugging
 
-- `BLAZE_BORROWCK_DEBUG=1` prints each body's locals, universal regions, constraints and
-  loans; `BLAZE_BORROWCK_DEBUG=<function>` only those of that function and its closures,
-  which a project needs.
+Inspect borrow-check flow and loan diagnostics via `crates/blaze-borrow` and `crates/blaze-flow` unit tests (`blaze test -p blaze-borrow -p blaze-flow`).

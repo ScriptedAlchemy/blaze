@@ -54,24 +54,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, io,
     path::Path,
+    sync::Arc,
     time::Duration,
 };
 
-use arrow_array::{
-    RecordBatch,
-    cast::AsArray,
-    types::{Int64Type, UInt64Type},
-};
-use parquet::file::{
-    metadata::{ParquetMetaData, ParquetMetaDataReader},
-    statistics::Statistics,
-};
 use blaze_report::{say, say::Code};
-use bytes::Bytes;
 use serde_derive::{Deserialize, Serialize};
 
-use super::{HistoryError, compact::Name, merge, retire::Retired};
-use crate::{perf, schema};
+use super::{HistoryError, compact::Name, retire::Retired};
+use crate::{columns::Batch, perf, schema};
 
 /// The manifest's file in the history's directory.
 pub const FILE: &str = "manifest.json";
@@ -198,7 +189,7 @@ impl Entry {
     /// writes with the rows of `parts` (the driver's [`Entry::of_batches`] says this process's).
     pub(crate) fn of_rows(
         table: &schema::Table,
-        parts: &[RecordBatch],
+        parts: &[Batch],
         pid: u32,
         boot: Option<&str>,
     ) -> Entry {
@@ -214,7 +205,7 @@ impl Entry {
         for part in parts {
             entry.rows += part.num_rows() as u64;
             if let Some(at) = table.column("build_id")
-                && let Some(ids) = part.column(at).as_primitive_opt::<UInt64Type>()
+                && let Some(ids) = part.column(at).u64s()
             {
                 for id in ids.iter().flatten() {
                     entry.builds = Some(widen(entry.builds, id, id));
@@ -222,7 +213,7 @@ impl Entry {
             }
             for name in INSTANTS {
                 let Some(at) = table.column(name) else { continue };
-                let Some(times) = part.column(at).as_primitive_opt::<Int64Type>() else { continue };
+                let Some(times) = part.column(at).i64s() else { continue };
                 for t in times.iter().flatten() {
                     entry.t_ns = Some(widen(entry.t_ns, t, t));
                 }
@@ -238,10 +229,10 @@ impl Entry {
     /// `version` given is [`ManifestError::Unversioned`].
     pub(crate) fn of_footer(
         path: &Path,
-        bytes: &Bytes,
+        bytes: &[u8],
         version: Option<u32>,
     ) -> Result<Entry, HistoryError> {
-        let metadata = ParquetMetaDataReader::new().parse_and_finish(bytes).map_err(|error| {
+        let file = blaze_parquet::File::open(bytes, std::alloc::Global).map_err(|error| {
             HistoryError::Io {
                 // alloc: an error
                 path: path.to_owned(),
@@ -252,56 +243,46 @@ impl Entry {
         // alloc: an error
         let unversioned =
             || HistoryError::Manifest { path: path.to_owned(), why: ManifestError::Unversioned };
-        let version = match footer_version(&metadata) {
+        let version = match file.value("blaze.schema").and_then(|it| it.parse().ok()) {
             Some(it) => it,
             None => version.ok_or_else(unversioned)?,
         };
         let mut entry = Entry {
             version,
-            rows: u64::try_from(metadata.file_metadata().num_rows()).unwrap_or(0),
+            rows: u64::try_from(file.num_rows()).unwrap_or(0),
             builds: None,
             t_ns: None,
             boot: None,
             pid: None,
         };
-        let schema = metadata.file_metadata().schema_descr();
-        let column = |name: &str| {
-            (0..schema.num_columns()).find(|&at| schema.column(at).path().string() == name)
+        // The range of column `at` in row group `group`: `None` when every row there is null,
+        // `[MIN, MAX]` (of `T`) when the footer does not bound it.
+        let range = |group: usize, at: usize| -> Option<Option<(i128, i128)>> {
+            let rows = file.group_rows(group);
+            match file.int_stats(group, at) {
+                Some(stats) if stats.nulls == Some(rows) => None,
+                Some(stats) => Some(stats.range),
+                None => Some(None),
+            }
         };
-        for group in metadata.row_groups() {
-            if group.num_rows() == 0 {
+        for group in 0..file.row_groups() {
+            if file.group_rows(group) == 0 {
                 continue;
             }
-            if let Some(at) = column("build_id") {
-                entry.builds = match group.column(at).statistics() {
-                    Some(Statistics::Int64(it))
-                        if it.null_count_opt() == Some(group.num_rows() as u64) =>
-                    {
-                        entry.builds
-                    }
-                    // A `UBIGINT`, stored as INT64: build ids are far below 2^63.
-                    Some(Statistics::Int64(it)) => match (it.min_opt(), it.max_opt()) {
-                        (Some(&low), Some(&high)) => {
-                            Some(widen(entry.builds, low as u64, high as u64))
-                        }
-                        _ => Some([0, u64::MAX]),
-                    },
-                    _ => Some([0, u64::MAX]),
+            if let Some(at) = file.column("build_id")
+                && let Some(range) = range(group, at)
+            {
+                entry.builds = match range.and_then(|(low, high)| Some((u64::try_from(low).ok()?, u64::try_from(high).ok()?))) {
+                    Some((low, high)) => Some(widen(entry.builds, low, high)),
+                    None => Some([0, u64::MAX]),
                 };
             }
             for name in INSTANTS {
-                let Some(at) = column(name) else { continue };
-                entry.t_ns = match group.column(at).statistics() {
-                    Some(Statistics::Int64(it))
-                        if it.null_count_opt() == Some(group.num_rows() as u64) =>
-                    {
-                        entry.t_ns
-                    }
-                    Some(Statistics::Int64(it)) => match (it.min_opt(), it.max_opt()) {
-                        (Some(&low), Some(&high)) => Some(widen(entry.t_ns, low, high)),
-                        _ => Some([i64::MIN, i64::MAX]),
-                    },
-                    _ => Some([i64::MIN, i64::MAX]),
+                let Some(at) = file.column(name) else { continue };
+                let Some(range) = range(group, at) else { continue };
+                entry.t_ns = match range.and_then(|(low, high)| Some((i64::try_from(low).ok()?, i64::try_from(high).ok()?))) {
+                    Some((low, high)) => Some(widen(entry.t_ns, low, high)),
+                    None => Some([i64::MIN, i64::MAX]),
                 };
             }
         }
@@ -342,36 +323,6 @@ fn widen<T: Ord + Copy>(range: Option<[T; 2]>, low: T, high: T) -> [T; 2] {
         Some([a, b]) => [a.min(low), b.max(high)],
         None => [low, high],
     }
-}
-
-/// The `blaze.schema` a file's footer says: a key of its own, or one of its Arrow schema's.
-fn footer_version(metadata: &ParquetMetaData) -> Option<u32> {
-    let file = metadata.file_metadata();
-    let own = file.key_value_metadata().into_iter().flatten().find(|it| it.key == "blaze.schema");
-    if let Some(value) = own.and_then(|it| it.value.as_deref()) {
-        return value.parse().ok();
-    }
-    let pairs = file.key_value_metadata()?;
-    let encoded = pairs.iter().find(|it| it.key == "ARROW:schema")?.value.as_deref()?;
-    arrow_schema_version(encoded)
-}
-
-/// The `blaze.schema` key of the Arrow schema a Parquet footer encodes (`ARROW:schema`: base64
-/// of an IPC schema message, after a continuation marker and length when it has one, as
-/// parquet's `get_arrow_schema_from_metadata` reads it), read from the flatbuffer in place: no
-/// `Schema` is built, whose metadata map would draw a hasher's random state, which a sans-IO
-/// core does not read.
-fn arrow_schema_version(encoded: &str) -> Option<u32> {
-    use base64::Engine as _;
-    // alloc: the footer's encoded schema, decoded once a file read
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
-    let message = match bytes.get(..4) {
-        Some([0xff, 0xff, 0xff, 0xff]) if bytes.len() > 8 => &bytes[8..],
-        _ => &bytes[..],
-    };
-    let schema = arrow_ipc::root_as_message(message).ok()?.header_as_schema()?;
-    let pair = schema.custom_metadata()?.iter().find(|it| it.key() == Some("blaze.schema"))?;
-    pair.value()?.parse().ok()
 }
 
 /// Which files a reader reads.
@@ -790,15 +741,23 @@ pub(crate) fn adopt(
         names.iter().enumerate().filter_map(|(at, it)| Some((at, Name::parse(it)?))).collect();
     // alloc: once a history is adopted
     let named: Vec<Name> = parsed.iter().map(|it| it.1).collect();
+    // A sorted array searched by halves, not a tree: `superseded` is ascending and `parsed`
+    // keeps `names`' order, so the positions stay ascending. `gone` lives only in this call: a
+    // frame of its own, freed when it returns.
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Profile).expect("an adoption's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     // alloc: once a history is adopted
-    let gone: BTreeSet<usize> =
-        super::compact::superseded(&named).into_iter().map(|at| parsed[at].0).collect();
+    let mut gone = super::compact::superseded(&named, alloc);
+    for at in gone.iter_mut() {
+        *at = parsed[*at].0;
+    }
     let mut manifest = Manifest::new();
     manifest.retired = retired;
     // alloc: once a history is adopted
     let mut superseded = Vec::new();
     for (at, name) in names.into_iter().enumerate() {
-        if gone.contains(&at) {
+        if gone.binary_search(&at).is_ok() {
             superseded.push(name);
             continue;
         }
@@ -808,7 +767,7 @@ pub(crate) fn adopt(
         let Some(mapping) = footers.remove(&name) else {
             unreachable!("a mapping of each file adopted")
         };
-        let entry = Entry::of_footer(&dir.join(&name), &merge::bytes_of(mapping), None)?;
+        let entry = Entry::of_footer(&dir.join(&name), mapping.bytes(), None)?;
         manifest
             .insert(&name, entry)
             .map_err(|why| HistoryError::Manifest { path: dir.join(FILE), why })?;
@@ -857,13 +816,44 @@ fn legacy_retired(path: &Path, bytes: &[u8]) -> Result<Retired, HistoryError> {
     Ok(retired)
 }
 
+/// A shared handle to a [`Manifest`] (`Arc` inside): commits and snapshots share it in O(1)
+/// instead of deep-cloning the whole file table, and [`Held`] mutates copy-on-write.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SharedManifest(Arc<Manifest>);
+
+impl Clone for SharedManifest {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl blaze_own::Share for SharedManifest {}
+
+impl core::ops::Deref for SharedManifest {
+    type Target = Manifest;
+
+    fn deref(&self) -> &Manifest {
+        &self.0
+    }
+}
+
+impl SharedManifest {
+    pub(crate) fn new(manifest: Manifest) -> Self {
+        Self(Arc::new(manifest))
+    }
+
+    fn make_mut(&mut self) -> &mut Manifest {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 /// The manifest of a history as a writer read it under its lock ([`LOCK`], taken and let go of
 /// by the history's core, [`super::files`]): changed in memory, then committed by the core,
 /// which writes it only when it changed ([`Held::changed`]).
 pub(crate) struct Held {
-    manifest: Manifest,
+    manifest: SharedManifest,
     /// The manifest as its file holds it: a commit writes only a change.
-    written: Manifest,
+    written: SharedManifest,
     /// Made from the files of a directory with none: the commit that writes it deletes
     /// [`LEGACY_RETIRED`] after.
     adopting: bool,
@@ -872,8 +862,9 @@ pub(crate) struct Held {
 impl Held {
     /// The manifest read from its file.
     pub(crate) fn read(manifest: Manifest) -> Held {
-        // clone: the manifest, once a hold
-        Held { written: manifest.clone(), manifest, adopting: false }
+        use blaze_own::Share;
+        let manifest = SharedManifest::new(manifest);
+        Held { written: manifest.share(), manifest, adopting: false }
     }
 
     /// The manifest a directory with none makes ([`adopt`]): written at the next commit, so the
@@ -881,16 +872,26 @@ impl Held {
     pub(crate) fn adopted(manifest: Manifest) -> Held {
         let mut written = Manifest::new();
         written.format = 0;
-        Held { manifest, written, adopting: true }
+        Held {
+            manifest: SharedManifest::new(manifest),
+            written: SharedManifest::new(written),
+            adopting: true,
+        }
     }
 
     pub(crate) fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 
+    pub(crate) fn shared(&self) -> SharedManifest {
+        use blaze_own::Share;
+        self.manifest.share()
+    }
+
     /// Whether the manifest differs from what its file holds.
     pub(crate) fn changed(&self) -> bool {
-        self.manifest != self.written
+        !Arc::ptr_eq(&self.manifest.0, &self.written.0)
+            && *self.manifest != *self.written
     }
 
     /// The manifest's bytes, as its file holds them once committed.
@@ -905,42 +906,43 @@ impl Held {
 
     /// The core renamed the manifest's bytes into place: its file holds it.
     pub(crate) fn committed(&mut self) {
-        // clone: the manifest, once a commit
-        self.written = self.manifest.clone();
+        use blaze_own::Share;
+        self.written = self.manifest.share();
         self.adopting = false;
     }
 
     /// Lists the file `name` of the history's directory, with its entry.
     pub(crate) fn add(&mut self, name: &str, entry: Entry) -> Result<(), ManifestError> {
-        self.manifest.insert(name, entry)
+        self.manifest.make_mut().insert(name, entry)
     }
 
     /// Unlists each of `names` and retires it ([`Manifest::retire`]): deleted once no pin holds
     /// it ([`Held::reaped`]).
     pub(crate) fn retire<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
-        self.manifest.retire(names);
+        self.manifest.make_mut().retire(names);
     }
 
     /// Forgets the retired files at `at` (positions in [`Retired::files`], ascending), deleted.
     pub(crate) fn reaped(&mut self, at: &[usize]) {
-        self.manifest.retired.reaped(at);
+        self.manifest.make_mut().retired.reaped(at);
     }
 
     pub(crate) fn flush_committed(&mut self, seq: u64) {
-        self.manifest.flush_committed(seq);
+        self.manifest.make_mut().flush_committed(seq);
     }
 
     /// Notes that this commit's trim retired builds up to `through`: kept as the highest any
     /// trim retired, with the flush this manifest says is the last committed.
     pub(crate) fn capped_builds(&mut self, through: u64) {
-        let through = self.manifest.capped.map_or(through, |it| it.through.max(through));
-        self.manifest.capped = Some(CappedBuilds { through, flush: self.manifest.flushed });
+        let m = self.manifest.make_mut();
+        let through = m.capped.map_or(through, |it| it.through.max(through));
+        m.capped = Some(CappedBuilds { through, flush: m.flushed });
     }
 
     /// Notes that this commit holds the rows of flush `seq` of the process `pid` whose
     /// flight recorder mapping has `nonce`: a postmortem of it reads past that flush's marks.
     pub(crate) fn recorder_flushed(&mut self, pid: u32, nonce: u64, seq: u64) {
-        let recorders = &mut self.manifest.consumed.recorders;
+        let recorders = &mut self.manifest.make_mut().consumed.recorders;
         match recorders.get_mut(&pid) {
             Some(it) if it.nonce == nonce => it.flushed = it.flushed.max(seq),
             Some(_) | None => _ = recorders.insert(pid, Recorder { nonce, flushed: seq, recovered: false }),
@@ -951,19 +953,23 @@ impl Held {
     /// with `nonce`: the next to find it deletes it unread.
     pub(crate) fn recorder_recovered(&mut self, pid: u32, nonce: u64) {
         let flushed = self.manifest.recorder(pid, nonce).map_or(0, |it| it.flushed);
-        self.manifest.consumed.recorders.insert(pid, Recorder { nonce, flushed, recovered: true });
+        self.manifest
+            .make_mut()
+            .consumed
+            .recorders
+            .insert(pid, Recorder { nonce, flushed, recovered: true });
     }
 
     /// Notes that this commit holds the `panics` rows of the crash records `ids` (each its
     /// process and the instant of its signal).
     pub(crate) fn crashes_written(&mut self, ids: impl IntoIterator<Item = (u32, i64)>) {
-        self.manifest.consumed.crashes.extend(ids);
+        self.manifest.make_mut().consumed.crashes.extend(ids);
     }
 
     /// Forgets what was consumed of a mapping or crash record whose file `gone` says is no
     /// longer in the history's directory: nothing can read it again.
     pub(crate) fn prune_consumed(&mut self, gone: impl Fn(&str) -> bool) {
-        let consumed = &mut self.manifest.consumed;
+        let consumed = &mut self.manifest.make_mut().consumed;
         consumed.recorders.retain(|&pid, _| !gone(&crate::flight::postmortem::file_name(pid)));
         consumed.crashes.retain(|&(pid, _)| !gone(&crate::crash::file_name(pid)));
     }

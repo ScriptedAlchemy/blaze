@@ -1,8 +1,14 @@
 ---
-status: current
-summary: The retained lint definitions and workspace-level parser, their current limits after the old runner's removal, and the rules referenced by surviving code.
+status: record
+summary: The fork's lint definitions and workspace-level parser before the remaining V1 crates were removed; current lint work lives in blaze-lint and blaze-lint-defs.
+date: 2026-11-21
 ---
 # Lint definitions and the replacement runner
+
+This is the pre-integration account. The later upstream deletion removed `hir-lint-levels`
+and the old workspace parser described here. Current implementations are in
+`crates/blaze-lint` and `crates/blaze-lint-defs`; this record does not describe their
+present feature coverage.
 
 The old `blaze-lints` runner, its passes and baselines, and the compiler daemon were deleted
 in the upstream rewrite on 2026-11-15. The CLI and the front-end level resolver remain

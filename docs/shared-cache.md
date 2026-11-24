@@ -1,22 +1,21 @@
 ---
 status: current
-summary: The retained blaze-remote library's signed segment cache, its configuration and command interface, and the parked CLI boundary.
+summary: The blaze-remote library's signed segment cache, its configuration and handler interface, and its boundary with the current compiler.
 ---
 # The signed shared cache
 
 `crates/blaze-remote` implements an object-bucket cache of the plain store's segments,
 signed statements, index shards, roots and bundles. This library remains in the active
 workspace. Its settings and command handlers are implemented; the compiler and CLI that
-previously called them are [parked](v2/plan/parked.md#waiting-on-a-command-line-without-the-daemon).
+previously called them were [deleted](v2/plan/parked.md).
 The command spellings below describe the retained handler interface, not a claim that a
 compiler built from this checkout can already run them. A bootstrap release has its own
 interface and must not be assumed to implement this one.
 
 The implementation is in [settings.rs](../crates/blaze-remote/src/settings.rs),
 [cmd.rs](../crates/blaze-remote/src/cmd.rs) and
-[http.rs](../crates/blaze-remote/src/http.rs). The retained dispatch is
-`crates/blaze-cargo/src/cli/cache.rs`; it still obtains the settings directory through the
-removed daemon layer. Library callers supply that directory explicitly as `root`.
+[http.rs](../crates/blaze-remote/src/http.rs). The old `blaze-cargo` dispatch was removed
+with its daemon. Library callers supply the settings directory explicitly as `root`.
 
 This cache uses signed plain segments in an S3-compatible bucket. The distributed protocol's
 standalone pack server is documented in [distributed.md](distributed.md). The older gateway
@@ -89,8 +88,8 @@ then public. Without `trusted_writer`, every record it writes is local and canno
 An organisation is opt-in through `org` in `store.json`; naming it permits reads, not writes.
 A trusted writer can also write public and its configured organisation namespace.
 
-The cache handlers operate on the plain segment store. Its configuration can explicitly
-select `"form": "plain"`; the store's default form when no file exists is packs. `status`
+The cache handlers operate on the plain segment store. The old pack store was removed;
+a legacy `store.json` containing `"form"` is refused. `status`
 prints which namespaces the store reads and writes, whether remote contact is configured,
 and where settings came from. It makes no bucket connection and prints no secret value.
 
@@ -121,6 +120,6 @@ one implementation in `crates/blaze-remote/src/trust.rs` and the plain store.
 `crates/blaze-remote/src/tests.rs` contains simulated bucket faults, concurrent pushes,
 namespace separation, trust refusals, bundle round trips, no-contact configuration checks
 and the trusted-writer refusal. These library tests exercise the implemented cache. They
-do not establish that the parked compiler automatically reads or fills it, or that a
+do not establish that the current compiler automatically reads or fills it, or that a
 particular live bucket honours conditional writes. That deployment still needs its own
 end-to-end evidence.

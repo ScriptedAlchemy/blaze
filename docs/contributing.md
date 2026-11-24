@@ -4,12 +4,6 @@ summary: How to build, test and change blaze: AI use, where new code goes, rules
 ---
 # Contributing
 
-The current tree is rebuilding its item and command layers. The old daemon was removed
-on 2026-11-15, and the compiler crates listed in [parked crates](v2/plan/parked.md) are
-excluded from the active workspace until their dependencies are replaced. The compiler
-build and end-to-end harness recipes below describe the required acceptance path; they
-are not evidence that this checkout currently produces a working compiler.
-
 ## AI use
 
 This code was written largely with AI assistance under human direction. The same is true
@@ -51,8 +45,8 @@ one level down:
 
 The crates to know first:
 
-    crates/blaze-engine/       the old `blaze` program and pinning, parked during the replacement
-    crates/blaze-cargo/        retained CLI and sandbox code, parked; its daemon was removed
+    crates/blaze-engine/       the program `blaze`: what runs before blaze's cargo, and pinning
+    crates/blaze-cargo/        blaze's cargo: the client (`cli`), the daemon (`serve`), the sandbox
     crates/hir-ty-codegen/    the code generator: MIR to Cranelift IR, the producers
     crates/blaze-cas/        the content-addressed store of everything blaze keeps, which knows nothing about Rust
     crates/blaze-fuzz/       made-up and damaged inputs for the tests of what reads the store
@@ -67,9 +61,8 @@ The crates to know first:
     crates/rustc_abi/         rustc's layout crate at the pinned nightly's commit
     vendor/source.rev         the commit of the old development branch this tree last took from
 
-`crates/hir-ty-codegen` is the code generator, a crate of its own over `hir-ty`'s MIR: what
-it uses of `hir-ty` is public there. Its root is `mod.rs`, the file it was compiled from when
-it was a module of `hir-ty`. The front end's crates depend on none of blaze's machinery
+`crates/blaze-emit` and `crates/blaze-build` form the code generator over `crates/blaze-body`
+and `crates/blaze-lir`. The front end's crates depend on none of blaze's machinery
 (the code generator, the store, the daemon).
 
 ## rust-analyzer
@@ -83,7 +76,7 @@ names. Edit them, build and test from the root, and commit like any other file. 
 builds:
 
     git clone https://github.com/indexable-inc/blaze && cd blaze
-    cargo +"$(cat harness/toolchain)" build -p blaze-engine --release   # cargo +nightly-2026-10-27
+    cargo +"$(cat pins/toolchain)" build -p blaze-engine --release   # cargo +nightly-2026-10-27
 
 That is stage 0, `blaze 0.0.0-dev`. The root `Cargo.toml` pins a release of blaze
 (`[workspace.metadata.blaze] version`) for everyone who runs a released `blaze` here, and a
@@ -135,6 +128,29 @@ type aliases of such a `Result`, equal its row in
 held to none; a change over its row is refused with the new sites named
 (`scripts/src/bin/untyped.rs`).
 
+blaze depends on no third-party crate in the end: every crate depends only on crates of this
+workspace, and a new crate starts at none (`docs/v2/plan/design/bottom.md`, "Also decided on
+2026-11-15"). The gate holds the way there by crate: each workspace crate's third-party packages
+in its normal and build dependencies, in its dev-dependencies only, and in the closure they reach
+through the workspace's manifests and `Cargo.lock` equal its row in
+`tools/ratchets/third-party.txt`, which only shrinks, and a crate with no row is held to none. A
+fork under `vendor/` counts as third-party unless its manifest says
+`[package.metadata.blaze] ours = true`. A change over its row is refused with the new packages and
+the manifest lines they came in by (`scripts/src/bin/thirdparty.rs`); `docs/v2/plan/third-party.md`
+says what replaces each.
+
+blaze's own code uses no `std` and no `alloc` in the end: a crate is `#![no_std]` on `core`, takes
+its collections from blaze-own and blaze-hash, and is passed its allocator (the same decision; rule
+nothing-ambient). The gate holds the way there by crate, outside test code: the lines naming
+`std` and those naming `alloc` as a path's first segment, 1 when the crate's root lacks
+`#![no_std]`, and the lines naming a `std` or `alloc` collection (`Vec`, `Box`, `String`, `Rc`,
+`Arc`, the `BTree*`, `VecDeque`, `BinaryHeap`, `HashMap`, `HashSet`) written bare and not imported
+from blaze-own, blaze-mem or blaze-hash, or under `std::`/`alloc::`, equal its row in
+`tools/ratchets/std-alloc.txt`, which only shrinks; a crate with no row is held to 0 in every
+column. It reads the text, resolving no names: a rename, `vec!`, `format!` and a prelude use of
+`alloc` with no path are missed, and its usage lists the rest
+(`scripts/src/bin/ambient.rs`); blaze's lints are the definition once blaze checks its own crates.
+
 blaze's machinery stays out of the front end, in crates of its own: the code generator's backends, object and debug-info
 writing, the linker, the daemon and its socket, the cargo drop-in, the store and the remote,
 the sandbox, and the harnesses. A change there is one ordinary
@@ -155,37 +171,40 @@ with blaze's changes made in place. That branch and its history are kept as
 
 ## The toolchain
 
-blaze supports one toolchain, the latest nightly, pinned by date in `harness/toolchain`
+blaze supports one toolchain, the latest nightly, pinned by date in `pins/toolchain`
 (`nightly-2026-10-27`, which says `rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`). Stable
 Rust is not a separate target: what a stable release builds, the nightly builds. blaze
 itself is built with that nightly by blaze, which brings it (`blaze toolchain`): no rustup, and
 no `cargo` or `rustc` of it is run. The pin is written in that
 one file; everything else reads it or is written from it:
 
-- `crates/blaze-cargo/src/toolchain/pins.txt` (by `harness/toolchain_pins.py '{"write": true}'`): the
+- `pins/rust.txt` (by `harness/toolchain_pins.py '{"write": true}'`): the
   sha256 and size of each file blaze downloads as its own toolchain, the nightly's `rustc -V`
   line and its rust-lang/rust commit. A rustc is taken for the pinned one by that whole line,
   since every nightly of a release has the same number.
 - What mirrors rustc, all from that commit: `crates/rustc_abi` (rustc's `compiler/rustc_abi`),
-  `crates/blaze-macro-eval` (blaze's proc-macro server, which speaks the pinned
+  `crates/blaze-proc-macro` (blaze's proc-macro runner, which speaks the pinned
   `library/proc_macro` bridge's protocol by hand and checks it at load), the answers to rustc's
-  questions (`crates/blaze-units/src/stdlib/rustc.json`), and the code written by hand to agree with rustc:
+  questions (`pins/answers/rustc.json`), and the code written by hand to agree with rustc:
   the Rust ABI in the code generator, `vtable.rs`, `type_id.rs`, symbol names (v0) in
   `symbols.rs`, the intrinsics and lang items, the test harness's call into libtest.
-- `site/install.sh`'s `TOOLCHAIN`, the flake (`rust-bin.nightly.<date>`, for the dev shells and the
+- Rust reads every pinned fact from `crates/blaze-pins` (constants parsed at compile time from
+  `pins/`, [pins/README.md](../pins/README.md)) and Python from `harness/toolchain_pins.py`; no
+  copy of a pinned value is kept anywhere else.
+- `site/install.sh` (which names `pins/toolchain` and lets blaze fetch it), the flake (`rust-bin.nightly.<date>`, for the dev shells and the
   bench nightly alike) and `Cargo.toml`'s `rust-version`.
 
 ### Moving to a newer nightly
 
 The daily workflow does this every day and opens the pull request
-([toolchain.md, "The daily bump"](toolchain.md#the-daily-bump)); by hand it is for fixing what
+([toolchain.md, "Moving the pin"](toolchain.md#moving-the-pin)); by hand it is for fixing what
 a nightly breaks, on the bump's branch `toolchain/bump`, or for trying a nightly:
 
     uv run --frozen python harness/toolchain_bump.py '{}'                      # the newest nightly blaze can use
     uv run --frozen python harness/toolchain_bump.py '{"date": "2026-11-02"}'  # or a given one
 
 picks the nightly (the newest of the last two weeks whose manifest has every component blaze
-needs on every host it ships for, or the date given), writes `harness/toolchain` and
+needs on every host it ships for, or the date given), writes `pins/toolchain` and
 `pins.txt`, re-vendors `crates/rustc_abi` from rust-lang/rust at the new commit, merges that
 nightly's standard library into `library/` (`harness/library.py merge`: upstream's changes applied three-way, so blaze's own changes to it
 are kept; a conflict stops it and names the files), moves the pin where else it is written (`site/install.sh`, the
@@ -253,7 +272,7 @@ files are, what they hold, the DuckDB queries that answer each question and the 
   you did not run. CI's merge gate is the build and the unit tests on Linux AArch64 (on ix runners), and
   `blaze check --workspace` with the released blaze on Linux AArch64 and macOS, with astlog's
   rules after it (`tools/astlog/README.md`), and the lint baselines held by the blaze the
-  change builds ([cargo.md](cargo.md#lints)); every
+  change builds ([v2/plan/design/lint.md](v2/plan/design/lint.md)); every
   harness on every platform, Windows too, and the slow ones (`norustc.py`, the store,
   `blaze_cli.py` on real projects) run in the release train on
   main after the merge, and a red train opens or adds to the issue "Release train is red",
@@ -322,10 +341,9 @@ tests on `blaze_core::sim::Sim` and their oracles, and testing a causal claim. C
 crash-recovering, billing and data-deleting code is proven by a deterministic simulation test,
 not by a code review (rule `dst-not-review`).
 
-An incremental-build bug gets a revision test ([harness.md](harness.md#revision-tests)): a
-directory under `crates/blaze-engine/tests/revisions/cases/` with the project, the edit and what
-must be made again, run in process under seeds (`cargo test -p hir-ty-codegen --lib --
-edits::revisions`) and against a real daemon (`cargo test -p blaze-engine --test revisions`).
+An incremental-build bug gets a regression test ([harness.md](harness.md#adding-a-test)): a
+test in `crates/blaze-cli/tests/` or `crates/blaze-engine` with the project, the edit and what
+must be made again.
 
 ## Documents
 
@@ -379,14 +397,14 @@ main with all the others, so:
 
 Main moves only through pull requests: nobody pushes to it or merges into it by hand. Nothing
 merges, by `land.py` or by an admin, until a release blaze built from the exact merge commit (the
-branch merged into the main it joins) has run the hello-world smoke on blaze-vm (a cold run, a
+branch merged into the main it joins) has run the hello-world smoke on the Mac or build VM (a cold run, a
 no-op, a body edit and a comment edit, each under a timeout, each counted only with exit 0 and the
-program's own line) and the result is quoted in the pull request; a compile check is not evidence
+program's own line, then `blaze check` and `blaze test` with one executed passing assertion) and the result is quoted in the pull request; a compile check is not evidence
 that the binary runs (rule `proof-before-merge`; the `landing` skill has the steps). To make the
-quote, merge origin/main into the branch, build a release blaze of that commit on blaze-vm and run
-`blaze run -q -p scripts --bin smoke -- '{"blaze": "<that blaze>", "work": "<an empty directory>"}' > smoke.txt`
+quote, merge origin/main into the branch, build the release `blaze-cli` and `blaze-launcher` of that commit in the same target directory and run
+`cargo +$(cat pins/toolchain) run --locked -q -p scripts --bin smoke -- '{"blaze": "<that blaze>", "work": "<an empty directory>"}' > smoke.txt`
 (`scripts/src/bin/smoke.rs`; it exits 0 only for `verdict ok`). The quote, the block in smoke.txt
-whose first line is `blaze-smoke 1`, goes in the pull request's body, and `land.py` puts it there
+whose first line is `blaze-smoke 2`, goes in the pull request's body, and `land.py` puts it there
 from the file you give it. `land.py` refuses to open, resume or merge a pull request whose quote
 does not name its head's exact tree, clean, with verdict ok, or whose head no longer contains
 main; no flag skips this, and an admin merge needs the quote too. Once the branch's work is
@@ -400,7 +418,7 @@ quote in its body, and starts the waiting that merges it. The pull request's own
 Linux x86-64 and the released blaze's `blaze check --workspace` on Linux x86-64 and macOS, with
 astlog's rules after it, and the lint baselines ([harness.md](harness.md#ci)); a failure there ends `land.py`
 with the check's link. The gate also holds the budget smoke's guards with the blaze the change
-built ([harness.md](harness.md#the-smokes-guards)): what a warm no-op build, a comment edit and a
+built ([harness.md](harness.md#ci)): what a warm no-op build, a comment edit and a
 body edit of two small fixtures may cost, and that blaze runs inside its build-script sandbox. A
 merge that goes around the gate goes around them: on 2026-11-10, with 4 of the last 300 gate
 runs green and merges going around it, every build had been lowering its program anew for days.
@@ -422,26 +440,18 @@ remove the worktree and the local branch
 
 `blaze build --release` is the build to work with: the harnesses, the gate and CI use it, and
 it rebuilds quickly after a change. What users get is one other build: the `dist` profile,
-built by the stage-0 blaze `.github/blaze-version` names, through
-`.github/scripts/build_release.py` (one JSON input, `{"target": ..., "out": ...}`). The release
-workflow and install.yaml run that script; blaze builds blaze, never cargo or rustc. `dist`'s
+built by the stage-0 blaze `.github/blaze-version` names. The release
+workflow and install.yaml build it; blaze builds blaze, never cargo or rustc. `dist`'s
 `lto = "thin"` and `codegen-units = 1` are what blaze's release codegen does anyway (one LLVM unit
 per function with ThinLTO's summaries and imports across the program, [v2-codegen.md](v2/plan/design/codegen.md)).
 reports/RELEASE-BUILD.md has the numbers of the older cargo build.
 
-PGO is off: releases build with `"pgo": "off"`. The `pgo` workflow trains profiles with
-`tools/pgo/pgo.py`, which builds blaze instrumented with the stage-0 blaze, and `"pgo": "pinned"`
-builds with the profile `tools/pgo/profiles.json` pins, only one trained on blaze's own build
-(`"builder": "blaze"`). The old daemon refused `-C profile-generate` because its linker
-wrote no profile sections; that code path was removed with the daemon. The retained command
-implementation selects `Pgo::None` (`crates/blaze-command/src/run.rs`), and the compiler
-integration remains parked. The pinned profiles are from cargo's build, which the release
-script refuses: they are not evidence of PGO support in the replacement compiler.
+PGO is off: releases build with `"pgo": "off"`. Neither PGO training nor pinned PGO profiles work yet: blaze refuses `-C profile-generate`, since its linker writes no profile sections (`crates/blaze-code`), and the profiles pinned earlier were cargo's.
 
 ## LLVM
 
 blaze builds against one LLVM, 23.1.4 with our fixes, built by blaze for each target it ships on
-and pinned by its commit, version and per-target sha256 in `crates/hir-ty-codegen/llvm.json`.
+and pinned by its commit, version and per-target sha256 in `pins/llvm.json`.
 Every native build of blaze links it (blaze-engine's default `native` feature, through
 hir-ty-codegen's `llvm`): std and every opt-level 2/3 unit are LLVM's, and `blaze-stencil`'s
 build script has it make the stencils. Only the seed (`--no-default-features --features seed`)
@@ -458,7 +468,7 @@ The variable blaze sets wins over one your shell has (`nix develop` still sets i
 flake's `blaze-llvm`, the same bytes), so a build always links what the pin names. A stage 0
 older than the table (`.github/blaze-version` before this change) ignores it and still needs the
 variable, with the archive somewhere its sandbox lets llvm-sys search, below `/usr/local/lib`
-(`crates/blaze-cargo/src/directives.rs`, `SYSTEM`), as CI's merge gate does
+(`crates/blaze-build-script`), as CI's merge gate does
 (`.github/actions/blaze`):
 
     sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$USER" /usr/local/lib/blaze-llvm
@@ -492,25 +502,18 @@ bitcode, and the Linux ones need zlib, zstd and libxml2.
 
 ### The stencil pin
 
-`crates/blaze-stencil/stencils.json` pins the stencil libraries the way `llvm.json` pins LLVM:
+The stencil pin file (`stencils.json` in the stencil generator crate, when enabled) pins the stencil libraries the way `llvm.json` pins LLVM:
 each library's file and its id, the BLAKE3 hash of its bytes with the id field zeroed.
-`blaze-stencil`'s build script checks every library it includes against the pin. It checks that
+The build script checks every library it includes against the pin: it checks that
 the library hashes to the id in its header, and that this id is the pinned one:
 
-- A build with LLVM (every native one: hir-ty-codegen's `llvm` turns on blaze-stencil's
-  `llvm-stencils`) makes the libraries and writes their
-  pin beside them, as `stencils.json` in blaze-stencil's `OUT_DIR`. When that differs from the
-  tree's pin, the build stops and names each id. When a change to the generator (`gen/`,
-  `src/shape.rs`, `src/enc.rs`, `src/table/format.rs`, LLVM) changes what it makes, pin the
-  result in the same change with the command the error prints:
-
-      cp <blaze-stencil's OUT_DIR>/stencils.json crates/blaze-stencil/stencils.json && cp <blaze-stencil's OUT_DIR>/*.stencils crates/blaze-stencil/prebuilt/
-
-  The libraries themselves are committed in `crates/blaze-stencil/prebuilt/` (about 570 KB
-  each), and the build also stops when what it made differs from them. If nothing the
+- A build with LLVM makes the libraries and writes their
+  pin beside them, as `stencils.json` in `OUT_DIR`. When that differs from the
+  tree's pin, the build stops and names each id.
+  If nothing the
   generator reads changed, the output isn't deterministic, which is a bug (rule 25).
 - The seed profile (`blaze-engine --no-default-features --features seed`) has no LLVM. It
-  includes the committed libraries in `crates/blaze-stencil/prebuilt/`; no variable points
+  uses the prebuilt stencil libraries; no variable points
   elsewhere. A library whose bytes aren't the pinned ones is refused, and the error names the
   file, the pinned id and the file's own id.
 

@@ -2,7 +2,9 @@
 //! parsed is the same bytes; text written by hand is any function the grammar spells, which
 //! the verifier then judges (`parse` checks the text, not what it means).
 
-use std::{alloc::Global, fmt};
+use alloc::{borrow::ToOwned, string::String, string::ToString, vec::Vec};
+use core::fmt;
+use alloc::alloc::Global;
 
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
@@ -10,9 +12,9 @@ use blaze_ids::ContentId;
 use crate::{
     flags::{self, AtomicRmw, FloatCond, IntCond},
     func::{
-        AsmOperandKind, AsmOperandRec, AsmPieceRec, AsmRec, BlockKind, CompoundRec, Conv, DataRec,
-        DataRelocRec, Ext, FnAttrs, Func, Head, Inline, InlinedRec, IntrinsicRec, MemAttrsRec, NONE,
-        ParamFactsRec, ParamKind, ParamRec, RangeRec, RefKind, RefRec, SigRec, SlotKind, SlotRec,
+        AsmOperandKind, AsmOperandRec, AsmPieceRec, AsmRec, BlockKind, CompoundRec, Conv, DataPositionRec,
+        DataRec, DataRelocRec, Ext, FnAttrs, Func, Head, Inline, InlinedRec, IntrinsicRec, MemAttrsRec, NONE,
+        ParamFactsRec, ParamKind, ParamRec, PositionField, RangeRec, RefKind, RefRec, SigRec, SlotKind, SlotRec,
         VarRec,
     },
     op::{Field, Layout, Op},
@@ -36,9 +38,9 @@ impl fmt::Display for ParseError {
     }
 }
 
-impl std::error::Error for ParseError {}
+impl core::error::Error for ParseError {}
 
-type Result<T> = std::result::Result<T, ParseError>;
+type Result<T> = core::result::Result<T, ParseError>;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Tok<'a> {
@@ -181,7 +183,7 @@ impl<'t, 'a> Line<'t, 'a> {
         Err(self.err("a quoted string"))
     }
 
-    fn number<T: std::str::FromStr>(&mut self, what: &'static str) -> Result<T> {
+    fn number<T: core::str::FromStr>(&mut self, what: &'static str) -> Result<T> {
         let at = self.at;
         let word = self.word(what)?;
         word.parse().map_err(|_| {
@@ -540,7 +542,7 @@ fn table(keyword: &str, line: &mut Line<'_, '_>, func: &mut Func<Global>) -> Res
             })?;
             let place = match kind {
                 RefKind::Data => line.id("d", "a data row")?,
-                RefKind::Func | RefKind::Static | RefKind::Tls => line.number("a place")?,
+                RefKind::Func | RefKind::Static | RefKind::Tls | RefKind::Vtable => line.number("a place")?,
             };
             func.refs.push(RefRec { place, kind: kind as u32 });
         }
@@ -571,12 +573,31 @@ fn table(keyword: &str, line: &mut Line<'_, '_>, func: &mut Func<Global>) -> Res
                 func.data_relocs.push(DataRelocRec { addend, offset, target });
                 Ok(())
             })?;
+            let positions_first = func.data_positions.len() as u32;
+            if line.is_keyword("positions") {
+                line.at += 1;
+                line.list('[', ']', |line| {
+                    let offset = line.number("a source position's offset")?;
+                    let field = line.word("a source position's field")?;
+                    let field = PositionField::from_name(field).ok_or_else(|| {
+                        line.at -= 1;
+                        line.err("a source position's field (`line` or `col`)")
+                    })?;
+                    let words = line.hex_words(4)?;
+                    let item = words.iter().rev().fold(0u128, |it, &word| (it << 32) | u128::from(word));
+                    let site = line.number("a source position's site")?;
+                    func.data_positions.push(DataPositionRec { item: item.to_le_bytes(), offset, site, field: field as u32 });
+                    Ok(())
+                })?;
+            }
             func.datas.push(DataRec {
                 bytes_first,
                 bytes_len: func.data_bytes.len() as u32 - bytes_first,
                 relocs_first,
                 relocs_len: func.data_relocs.len() as u32 - relocs_first,
                 align,
+                positions_first,
+                positions_len: func.data_positions.len() as u32 - positions_first,
             });
         }
         "intrinsic" => {

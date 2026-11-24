@@ -6,7 +6,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::span::Span;
-use thiserror::Error;
 
 use crate::FormatReport;
 use crate::config::{Config, IndentStyle};
@@ -31,7 +30,7 @@ impl<T: Rewrite> Rewrite for Box<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MacroErrorKind {
     ParseFailure,
     ReplaceMacroVariable,
@@ -48,21 +47,40 @@ impl std::fmt::Display for MacroErrorKind {
     }
 }
 
-#[derive(Clone, Error, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum RewriteError {
-    #[error("Formatting was skipped due to skip attribute or out of file range.")]
     SkipFormatting,
 
-    #[error("It exceeds the required width of {configured_width} for the span: {span:?}")]
     ExceedsMaxWidth { configured_width: usize, span: Span },
 
-    #[error("Failed to format given macro{} at: {span:?}", kind)]
     MacroFailure { kind: MacroErrorKind, span: Span },
 
     /// Format failure that does not fit to above categories.
-    #[error("An unknown error occurred during formatting.")]
     Unknown,
 }
+
+impl std::fmt::Display for RewriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RewriteError::SkipFormatting => {
+                f.write_str("Formatting was skipped due to skip attribute or out of file range.")
+            }
+            RewriteError::ExceedsMaxWidth {
+                configured_width,
+                span,
+            } => write!(
+                f,
+                "It exceeds the required width of {configured_width} for the span: {span:?}"
+            ),
+            RewriteError::MacroFailure { kind, span } => {
+                write!(f, "Failed to format given macro{kind} at: {span:?}")
+            }
+            RewriteError::Unknown => f.write_str("An unknown error occurred during formatting."),
+        }
+    }
+}
+
+impl core::error::Error for RewriteError {}
 
 pub(crate) struct ExceedsMaxWidthError {
     pub configured_width: usize,
@@ -168,7 +186,7 @@ impl<'a> RewriteContext<'a> {
         let is_nested_macro_context = self.inside_macro.replace(true);
         InsideMacroGuard {
             is_nested_macro_context,
-            inside_macro_ref: self.inside_macro.clone(),
+            inside_macro_ref: Rc::clone(&self.inside_macro),
         }
     }
 

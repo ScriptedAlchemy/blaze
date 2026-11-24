@@ -442,6 +442,19 @@ ops! {
     /// then its inputs. Its outputs are a value of the block it falls through to, whose one
     /// predecessor it is.
     AsmBr = "asm_br": Layout::Extra(&[Field::Asm, Field::Block, Field::Blocks, Field::Values]), Any, None, None, Yes;
+
+    // Coroutines (decision D73; docs/v2/plan/design/coroutines.md). Both exist only between
+    // the builder and the coroutine pass (`crate::coroutine::split`), whose two outputs hold
+    // neither: no backend takes one. They are last so every other operation keeps its byte.
+    /// A suspension point of a coroutine body: its number, the block the next poll goes on
+    /// at, the block the state's drop goes on at when the state is dropped parked here, then
+    /// what this poll returns (the function's returns: the builder's `Poll::Pending`). Neither
+    /// block has parameters. In the body it is a two-way edge: the next poll's arguments
+    /// replace every entry parameter but the state pointer.
+    Suspend = "suspend": Layout::Extra(&[Field::Imm, Field::Block, Field::Block, Field::Values]), None, None, None, Yes;
+    /// The end of a cancel path (a `suspend`'s second block and what follows it): where the
+    /// state's drop glue returns.
+    Cancelled = "cancelled": NONE, None, None, None, Yes;
 }
 
 /// A code of the operation table: its name, layout, result, flags, attributes and end, so a
@@ -546,7 +559,7 @@ impl<'a> Operands<'a> {
     pub(crate) fn of(view: View<'a>, inst: usize) -> Operands<'a> {
         let words: &'a [u32] = match view.op(inst).info().layout {
             Layout::None => &[],
-            Layout::Data(_) => std::slice::from_ref(&view.data[inst]),
+            Layout::Data(_) => core::slice::from_ref(&view.data[inst]),
             Layout::Extra(_) => &view.extra[view.data[inst] as usize..],
         };
         Operands { words, at: 0, tys: view.tys, ty: Ty(view.tys[inst]) }
@@ -791,6 +804,113 @@ pub enum WalkError<E> {
     NoScrutinee,
     /// What the visitor refused.
     Visit(E),
+}
+
+/// Sink for [`rewrite_fields`]: appends an instruction's rewritten `extra` operands.
+pub(crate) trait RewriteSink {
+    type Error;
+
+    fn put_value(&mut self, value: u32);
+    fn put_block(&mut self, block: u32);
+    fn put_slot(&mut self, slot: u32) -> Result<(), Self::Error>;
+    fn push_word(&mut self, word: u32);
+    fn push_words(&mut self, words: &[u32]);
+}
+
+/// Appends the operands `fields` from `words` to `sink`, rewriting each value, block and slot.
+/// The mirror of [`walk`] (which hands no list's count), on a verified function.
+pub(crate) fn rewrite_fields<S: RewriteSink>(
+    words: &[u32],
+    fields: &[Field],
+    ty: Ty,
+    tys: &[u16],
+    sink: &mut S,
+) -> Result<(), S::Error> {
+    let mut at = 0;
+    let mut scrutinee = None;
+    for &field in fields {
+        match field {
+            Field::Value => {
+                scrutinee = Some(words[at]);
+                sink.put_value(words[at]);
+                at += 1;
+            }
+            Field::Block => {
+                sink.put_block(words[at]);
+                at += 1;
+            }
+            Field::Slot => {
+                sink.put_slot(words[at])?;
+                at += 1;
+            }
+            Field::Imm
+            | Field::Offset
+            | Field::IntCond
+            | Field::FloatCond
+            | Field::Rmw
+            | Field::Ref
+            | Field::Sig
+            | Field::Intrinsic
+            | Field::Asm => {
+                sink.push_word(words[at]);
+                at += 1;
+            }
+            Field::Target => at = rewrite_target(words, at, sink),
+            Field::Values => {
+                let count = words[at];
+                sink.push_word(count);
+                at += 1;
+                for _ in 0..count {
+                    sink.put_value(words[at]);
+                    at += 1;
+                }
+            }
+            Field::Blocks => {
+                let count = words[at];
+                sink.push_word(count);
+                at += 1;
+                for _ in 0..count {
+                    sink.put_block(words[at]);
+                    at += 1;
+                }
+            }
+            Field::Mask => {
+                let n = words[at] as usize;
+                sink.push_words(&words[at..at + 1 + n]);
+                at += 1 + n;
+            }
+            Field::Const => {
+                let n = ty.const_words() as usize;
+                sink.push_words(&words[at..at + n]);
+                at += n;
+            }
+            Field::Cases => {
+                let width = scrutinee.map_or(0, |it: u32| Ty(tys[it as usize]).const_words()) as usize;
+                let count = words[at];
+                sink.push_word(count);
+                at += 1;
+                for _ in 0..count {
+                    sink.push_words(&words[at..at + width]);
+                    at += width;
+                    at = rewrite_target(words, at, sink);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Appends the target at `words[at..]` (a block, a count, the arguments); where its words end.
+fn rewrite_target(words: &[u32], mut at: usize, sink: &mut impl RewriteSink) -> usize {
+    sink.put_block(words[at]);
+    let count = words[at + 1];
+    sink.push_word(count);
+    at += 2;
+    for _ in 0..count {
+        sink.put_value(words[at]);
+        at += 1;
+    }
+    at
 }
 
 #[cfg(test)]

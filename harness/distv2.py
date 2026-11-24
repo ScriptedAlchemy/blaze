@@ -133,9 +133,33 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def host_triple(blaze: str, env: dict, timeout: int) -> str:
-    out = subprocess.run([blaze, "--ignore-pin", "toolchain", "--json"], env=env, capture_output=True, text=True, check=True, timeout=timeout)
-    return json.loads(out.stdout)["host"]
+def host_triple(blaze: str, env: dict, timeout: int, evidence_dir: Path) -> str:
+    """Probe the selected CLI's retained worker protocol before giving it acceptance credit.
+
+    The current source CLI has `run`, `check` and `export`, but has not yet connected those
+    commands to the retained coordinator/cache protocol. A successful version or hello is
+    not evidence of that connection. Keep the real protocol oracle below, and retain the
+    exact capability reply when this bridge is absent.
+    """
+    argv = [blaze, "toolchain", "--json"]
+    out = subprocess.run(argv, env=env, capture_output=True, text=True,
+                         check=False, timeout=timeout, stdin=subprocess.DEVNULL)
+    (evidence_dir / "worker-protocol-probe.json").write_text(json.dumps({
+        "argv": argv, "returncode": out.returncode, "stdout": out.stdout, "stderr": out.stderr,
+    }, indent=2) + "\n")
+    try:
+        reply = json.loads(out.stdout)
+        host = reply.get("host") if isinstance(reply, dict) else None
+    except json.JSONDecodeError:
+        host = None
+    if out.returncode != 0 or not isinstance(host, str) or not host or any(c.isspace() for c in host):
+        raise Failed(
+            "source CLI lacks the distributed worker protocol bridge: `blaze toolchain --json` "
+            "must return a host before the serve/build/status protocol can run. The current "
+            "run/check/export compiler must connect to blaze-dist-local and blaze-serve; "
+            "no two-worker, cross-PR, fencing, recovery or final-artifact acceptance was run. "
+            f"Probe exit {out.returncode}; see {evidence_dir / 'worker-protocol-probe.json'}")
+    return host
 
 
 def source_state(repository: Path, timeout: int) -> tuple[str, str, bytes]:
@@ -284,7 +308,7 @@ class Run:
             raise Failed("the cache server did not listen")
 
     def start_coordinator(self) -> None:
-        triple = host_triple(self.given.blaze, self.env("solo", False), self.given.command_timeout)
+        triple = self.host
         log = open(self.root / "logs" / "coordinator.log", "a")
         self.socket.unlink(missing_ok=True)
         coordinator = subprocess.Popen(
@@ -313,7 +337,7 @@ class Run:
             gate_env["BLAZE_DIST_TEST_RESULT_GATE"] = str(result_gate.resolve())
         # Status is only for this run's private home, never a shared daemon.
         log = open(self.root / "logs" / f"{home}.daemon.log", "a")
-        args = [self.given.blaze, "--ignore-pin", "serve"]
+        args = [self.given.blaze, "serve"]
         if self.given.stall_bound is not None:
             args += ["--stall-bound", str(self.given.stall_bound)]
         with log:
@@ -327,7 +351,7 @@ class Run:
         self.sequence += 1
         log = open(self.root / "logs" / f"{home}.{self.sequence}.log", "w")
         process = subprocess.Popen(
-            [self.given.blaze, "--ignore-pin", "build", *self.given.args],
+            [self.given.blaze, "build", *self.given.args],
             cwd=project or self.project,
             env={**self.env(home, dist, **extra), "CARGO_TARGET_DIR": str(self.target(home, project))},
             stdout=log,
@@ -425,7 +449,7 @@ class Run:
 
 def daemon_pid(run: Run, home: str) -> int | None:
     out = subprocess.run(
-        [run.given.blaze, "--ignore-pin", "status", "--json"], cwd=run.project, env=run.env(home, False), capture_output=True, text=True, timeout=run.given.command_timeout
+        [run.given.blaze, "status", "--json"], cwd=run.project, env=run.env(home, False), capture_output=True, text=True, timeout=run.given.command_timeout
     )
     try:
         return (json.loads(out.stdout).get("daemon") or {}).get("pid")
@@ -618,6 +642,7 @@ def main(given: Input) -> None:
         resource_env = run.env("solo", False)
         check(all(resource_env.get(name, "").strip() for name in ("BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB")),
               "root supplied explicit per-daemon core and memory hints before starting children")
+        run.host = host_triple(given.blaze, resource_env, given.command_timeout, run.root / "logs")
         run.start_services()
         code, text = run.build("solo", dist=False)
         check(code == 0, f"solo builds: {text[-400:] if code else ''}")

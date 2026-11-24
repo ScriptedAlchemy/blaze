@@ -5,13 +5,13 @@
 //!
 //! Native IO maps the logical slots to the caller's original handle and paths. Sim maps
 //! them to its files; staging uses Append, whose unsynced bytes can tear, never Write (an
-//! already durable whole-file replacement). Sim's completed rename keeps the namespace
-//! change even without a directory sync: the test explicitly explores losing that change.
+//! already durable whole-file replacement). RenameUnsynced changes the name without
+//! committing it; SyncDir is the separate durability boundary on both drivers.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use blaze_core::{Completion, Done, Effect, FileName, Tag};
+use blaze_core::{Completion, DirName, Done, Effect, FileName, Tag};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
@@ -54,7 +54,7 @@ pub(super) struct Publication {
     step: Step,
     staged: FileName,
     published: FileName,
-    directory: FileName,
+    directory: DirName,
     #[cfg(test)]
     plant: Plant,
 }
@@ -67,7 +67,7 @@ impl Publication {
             step: Step::FileSync,
             staged: FileName::new("objects/.staged").expect("a fixed logical name"),
             published: FileName::new("objects/published").expect("a fixed logical name"),
-            directory: FileName::new("objects").expect("a fixed logical name"),
+            directory: DirName::Named(FileName::new("objects").expect("a fixed logical name")),
             #[cfg(test)]
             plant: Plant::None,
         }
@@ -94,12 +94,12 @@ impl Publication {
     pub(super) fn effect(&self) -> Option<Effect> {
         Some(match self.step {
             Step::FileSync => Effect::Sync { file: self.staged.clone(), tag: Tag(0) },
-            Step::Rename => Effect::Rename {
+            Step::Rename => Effect::RenameUnsynced {
                 from: self.staged.clone(),
                 to: self.published.clone(),
                 tag: Tag(1),
             },
-            Step::DirectorySync => Effect::Sync { file: self.directory.clone(), tag: Tag(2) },
+            Step::DirectorySync => Effect::SyncDir { dir: self.directory.clone(), tag: Tag(2) },
             Step::Acknowledged | Step::Failed => return None,
         })
     }

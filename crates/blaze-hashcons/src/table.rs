@@ -1,4 +1,4 @@
-//! The interner (docs/v2/plan/design/concurrency.md): [`blaze_ids::shard_count`] shards, each
+//! The interner (docs/v2/plan/design/concurrency.md): [`blaze_ids::Shards`] shards, each
 //! an append-only arena of nodes in chunks that never move and one open-addressed table from
 //! fingerprint bits to the node's place in the arena.
 //!
@@ -13,19 +13,13 @@
 //! - An [`Idx`] is the node's place in its shard's arena shifted past the shard bits, ored with
 //!   the shard: an index to a node is arithmetic and two acquire loads.
 
-use std::{
-    any::type_name,
-    fmt, hash,
-    ops::Deref,
-    ptr,
-    sync::{
-        OnceLock,
-        atomic::{AtomicU32, Ordering},
-    },
-};
+use alloc::{boxed::Box, vec::Vec};
+use core::{any::type_name, fmt, hash, ops::Deref, ptr, sync::atomic::AtomicU32, sync::atomic::Ordering};
+use alloc::alloc::Global;
 
 use blaze_ids::{ContentId, Fingerprint, Hasher, Idx, Interner};
 use blaze_mem::swiss::Index;
+use blaze_swiss::sync::Once as OnceLock;
 
 use crate::{Consed, content_of};
 
@@ -72,7 +66,7 @@ struct Shard<T> {
     len: AtomicU32,
     /// The shard's nodes by their fingerprint's bits 64..128: a find is one control word and
     /// one slot, then the node's fingerprint compared only on a tag match.
-    index: Index,
+    index: Index<Global>,
     nodes: [OnceLock<Chunk<T>>; CHUNKS],
 }
 
@@ -103,8 +97,8 @@ impl<T> Shard<T> {
         Shard {
             lock: ShardLock::new(),
             len: AtomicU32::new(0),
-            index: Index::new(),
-            nodes: std::array::from_fn(|_| OnceLock::new()),
+            index: Index::new_in(Global),
+            nodes: core::array::from_fn(|_| OnceLock::new()),
         }
     }
 
@@ -139,7 +133,7 @@ pub struct HashCons<T> {
 
 impl<T: Consed> HashCons<T> {
     pub fn new() -> HashCons<T> {
-        let count = blaze_ids::shard_count();
+        let count = blaze_ids::Shards::for_this_machine().count();
         debug_assert!(count.is_power_of_two() && count >= 4);
         HashCons {
             shards: (0..count).map(|_| Shard::new()).collect(),
@@ -154,6 +148,24 @@ impl<T: Consed> HashCons<T> {
     pub fn intern(&self, value: T) -> Interned<'_, T> {
         let content = content_of(&value);
         self.intern_content(content, value)
+    }
+
+    /// [`HashCons::intern`] of each of `values`, as one batch: every content ID computed and
+    /// its shard's index group prefetched first, then each interned in order, so on indexes
+    /// larger than the cache the groups' misses overlap. Equal values in one batch get one
+    /// handle, as one `intern` after another would give them.
+    pub fn intern_many<const N: usize>(&self, values: [T; N]) -> [Interned<'_, T>; N] {
+        let contents = values.each_ref().map(|value| content_of(value));
+        for content in &contents {
+            let key = Key::of(content, self.mask);
+            self.shards[key.shard].index.prefetch(key.hash);
+        }
+        let mut at = 0;
+        values.map(|value| {
+            let content = contents[at];
+            at += 1;
+            self.intern_content(content, value)
+        })
     }
 
     /// [`HashCons::intern`] of a value whose content ID the caller has just computed with

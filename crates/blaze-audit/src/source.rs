@@ -19,12 +19,13 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::Global;
-use std::fmt;
+use alloc::{borrow::ToOwned, string::String, string::ToString, vec::Vec};
+use alloc::alloc::Global;
+use core::fmt;
 
 use blaze_fetch::{Algo, Digest};
 
-use crate::cargo_lock::{Lock, Source};
+use blaze_manifest::lock::{Checksum, Lock, LockSource as Source};
 use crate::pins::{SourcePins, is_commit};
 use crate::policy::Settings;
 use crate::{UNPINNED_PATH, WEAK_SOURCE_PIN};
@@ -169,7 +170,7 @@ pub enum Pinned {
 /// Every source of `lock` and every outside path dependency, checked: the refusals, and the
 /// git trees and paths it passed, each sorted.
 pub fn check(
-    lock: &Lock,
+    lock: &Lock<'_>,
     outside: &[OutsidePath],
     pins: &SourcePins,
     settings: &Settings,
@@ -177,23 +178,27 @@ pub fn check(
 ) -> (Vec<PinRefused, Global>, Vec<Pinned, Global>) {
     let mut refused = Vec::new_in(Global);
     let mut passed = Vec::new_in(Global);
-    for package in &lock.packages {
+    for package in lock.packages.iter() {
+        let name = package.name.as_str();
         match &package.source {
             Source::Path => {}
-            Source::Registry { url, checksum } => {
-                let strong = checksum.as_deref().is_some_and(|it| {
-                    it.len() == 64 && it.bytes().all(|b| b.is_ascii_hexdigit())
-                });
+            Source::Registry { .. } => {
+                let strong = match &package.checksum {
+                    Checksum::Sha256(it) => it.len() == 64 && it.bytes().all(|b| b.is_ascii_hexdigit()),
+                    Checksum::Absent => false,
+                };
                 if !strong {
                     refused.push(PinRefused::NoChecksum {
-                        package: package.name.clone(),
+                        package: name.to_owned(),
                         version: package.version.to_string(),
-                        registry: url.clone(),
+                        // The registry as `Cargo.lock` names it: its `source`, prefix and all.
+                        registry: package.source_text.as_str().to_owned(),
                     });
                 }
             }
             Source::Git { url, commit, .. } => {
-                let recorded = match require_git(pins, &package.name, url, commit) {
+                let (url, commit) = (&url.as_str().to_owned(), &commit.as_str().to_owned());
+                let recorded = match require_git(pins, name, url, commit) {
                     Ok(it) => it,
                     Err(why) => {
                         refused.push(why);
@@ -201,7 +206,7 @@ pub fn check(
                     }
                 };
                 let pinned = |verified| Pinned::Git {
-                    package: package.name.clone(),
+                    package: name.to_owned(),
                     url: url.clone(),
                     commit: commit.clone(),
                     tree: recorded.clone(),
@@ -209,12 +214,12 @@ pub fn check(
                 };
                 match trees.tree(url, commit, recorded.algo()) {
                     Ok(None) => passed.push(pinned(false)),
-                    Ok(Some(found)) => match verify_git(recorded, &found, &package.name, url, commit) {
+                    Ok(Some(found)) => match verify_git(recorded, &found, name, url, commit) {
                         Ok(()) => passed.push(pinned(true)),
                         Err(why) => refused.push(why),
                     },
                     Err(why) => refused.push(PinRefused::Tree {
-                        package: package.name.clone(),
+                        package: name.to_owned(),
                         url: url.clone(),
                         commit: commit.clone(),
                         why,

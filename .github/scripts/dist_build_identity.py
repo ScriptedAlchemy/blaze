@@ -4,9 +4,9 @@
 One typed JSON input, inline, a file, or stdin (`-`):
     {"command": "seal" | "verify", "binaries": "/path/to/bin", "services": false}
 
-The build job seals the Blaze pair before uploading it. The acceptance job verifies
-that handoff before running either program; after that Blaze builds the coordinator
-and cache server, `services: true` seals and verifies all four programs. This records
+The build job seals the source CLI, launcher and fact shim before uploading them. The acceptance
+job verifies that handoff before running either program; `services: true` also binds
+the coordinator and cache server built from the same source tree. This records
 build provenance, not a successful distributed run.
 """
 from __future__ import annotations
@@ -65,7 +65,7 @@ def source() -> dict[str, str]:
 
 
 def binaries(directory: Path, services: bool) -> dict[str, str]:
-    names = ["blaze", "blaze-engine"]
+    names = ["blaze", "blaze-launcher", "blaze-fact-shim"]
     if services:
         names += ["blaze-dist-local", "blaze-serve"]
     suffix = ".exe" if sys.platform == "win32" else ""
@@ -81,13 +81,13 @@ def binaries(directory: Path, services: bool) -> dict[str, str]:
 
 
 def identity(directory: Path, services: bool) -> dict[str, object]:
-    return {"schema": 1, "source": source(), "binaries": binaries(directory, services)}
+    return {"schema": 2, "source": source(), "binaries": binaries(directory, services)}
 
 
 def verify(record: object, actual: dict[str, object]) -> None:
     if not isinstance(record, dict) or set(record) != {"schema", "source", "binaries"}:
         raise Refused("build identity must contain exactly schema, source and binaries")
-    if type(record["schema"]) is not int or record["schema"] != 1:
+    if type(record["schema"]) is not int or record["schema"] != 2:
         raise Refused("build identity has an unsupported schema")
     if record["source"] != actual["source"]:
         raise Refused(f"build source {record['source']!r} differs from checkout {actual['source']!r}")

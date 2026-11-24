@@ -146,67 +146,20 @@ class RunnerLabels(unittest.TestCase):
             "on: schedule\njobs:\n  test:\n    uses: ./.github/workflows/platform.yaml\n"
             "    with:\n      os: ix\n"))
 
-    def test_benchmark_platforms_are_hosted(self):
-        import runpy
-        from pathlib import Path
-        platforms = runpy.run_path(str(Path(HERE).parents[1] / "harness/benchplatforms.py"))
-        for platform in platforms["PLATFORMS"]:
-            self.assertRegex(platform["label"], check.HOSTED)
-            self.assertNotIn("labels", platform)
-        self.assertEqual(platforms["registered"]({}), [])
-        self.assertEqual(len(platforms["registered"]({"BENCH_RUNNER": "true"})), 1)
-        self.assertEqual(len(platforms["registered"]({
-            "BENCH_RUNNERS": "linux-x86-64,linux-aarch64,macos-arm64"})), 3)
-
-    def test_repository_runtime_runner_sources(self):
-        # The nonliteral runners the policy checker trusts: caller os inputs,
-        # or the one benchmark table checked above. A new source needs a test.
+    def test_repository_runtime_runner_sources_are_literal_hosted_matrices(self):
         from pathlib import Path
         for path in Path(WORKFLOWS).glob("*.yaml"):
             workflow = check.read(path.read_text())
             for job_id, job in workflow["jobs"].items():
                 runs = job.get("runs-on", "")
                 expression = check.EXPRESSION.fullmatch(runs) if isinstance(runs, str) else None
-                if not expression:
-                    continue
-                reference = check.MATRIX_REF.fullmatch(expression.group(1).strip())
-                if reference and check._matrix_values(job, reference.group(1)):
-                    continue
-                if path.name in ("blaze-platform.yaml", "bench.yaml"):
-                    self.assertEqual(runs, "${{ inputs.os }}", (path, job_id))
-                    os_input = workflow["on"]["workflow_call"]["inputs"]["os"]
-                    self.assertEqual(os_input["type"], "string")
-                    self.assertEqual(os_input["required"], "true")
-                else:
-                    self.assertIn((path.name, job_id), (
-                        ("bench-readme.yaml", "bench"), ("bench-bun.yaml", "bench"),
-                        ("bench-counts.yaml", "counts")))
-                    self.assertEqual(runs, "${{ matrix.label }}")
-                    self.assertEqual(job["strategy"]["matrix"],
-                                     "${{ fromJSON(needs.platforms.outputs.matrix) }}")
-                    self.assertIn("python3 harness/benchplatforms.py matrix", path.read_text())
-
-    def test_source_benchmark_runner_has_a_hosted_entry_point(self):
-        # The reusable benchmark inherits the platform's already checked os. A manual run
-        # has the one original hosted ARM64 choice, never a free-form private runner label.
-        from pathlib import Path
-        workflows = {path.name: check.read(path.read_text())
-                     for path in Path(WORKFLOWS).glob("*.yaml")}
-        bench = workflows["bench.yaml"]
-        self.assertEqual(set(bench["on"]), {"workflow_call", "workflow_dispatch"})
-        manual = bench["on"]["workflow_dispatch"]["inputs"]["os"]
-        self.assertEqual(manual["type"], "choice")
-        self.assertEqual(manual["options"], ["ubuntu-24.04-arm"])
-        self.assertEqual(manual["default"], "ubuntu-24.04-arm")
-        self.assertEqual(manual["required"], "true")
-        callers = []
-        for name, workflow in workflows.items():
-            for job_id, job in workflow["jobs"].items():
-                if job.get("uses") == "./.github/workflows/bench.yaml":
-                    callers.append((name, job_id))
-                    self.assertEqual(job["with"]["os"], "${{ inputs.os }}")
-                    self.assertEqual(job["needs"], "build")
-        self.assertEqual(callers, [("blaze-platform.yaml", "microbench")])
+                if expression:
+                    reference = check.MATRIX_REF.fullmatch(expression.group(1).strip())
+                    self.assertIsNotNone(reference, (path.name, job_id, runs))
+                    values = check._matrix_values(job, reference.group(1))
+                    self.assertTrue(values, (path.name, job_id))
+                    for value in values:
+                        self.assertRegex(value, check.HOSTED)
 
     def test_this_repository(self):
         paths = sorted(glob.glob(os.path.join(WORKFLOWS, "*.yaml")))

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """A commit of one lane's work out of a checkout several lanes write in (how-to H12): whole
 files that are the lane's alone, and, from files other lanes also have uncommitted lines in,
 only the hunks whose added lines match the lane's pattern. Made in an index of its own on top
@@ -6,7 +5,7 @@ of `base`, so no branch moves, nothing is staged in the checkout and no other la
 taken. Input: one JSON value
 
     {"repo": "/Volumes/Projects/blaze-int-1112", "base": "origin/int-1112", "message": "...",
-     "whole": ["crates/x/src/mine.rs", "docs/contributing.md"],
+     "whole": ["crates/x/src/mine.rs", "docs/README.md"],
      "hunks": {"crates/x/src/shared.rs": "ahead|Ahead"},
      "push": "onsave-1112"}
 
@@ -18,9 +17,14 @@ Why not `git commit -- <file>`: it commits the file as the checkout has it, with
 lane's half-written hunk (row onsave-1112-1). Why the hunks are renumbered: a hunk with no
 context is placed by its line in the new file, which the hunks left out had shifted. A kept
 hunk that removes a line is refused: say which lines are yours by adding them."""
-import json, os, re, subprocess, sys, tempfile
+import os
+import re
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass, field
-from typing import cast
+
+from typed_input import fail, parse
 
 
 @dataclass(frozen=True)
@@ -29,51 +33,20 @@ class Input:
     base: str
     message: str
     whole: tuple[str, ...] = ()
-    hunks: dict[str, str] = field(default_factory=dict[str, str])
+    hunks: dict[str, str] = field(default_factory=lambda: dict[str, str]())
     push: str | None = None
 
 
-def read_input() -> Input:
-    value: object = json.loads(sys.argv[1])
-    if not isinstance(value, dict):
-        sys.exit("lane_commit.py: the input is one JSON object")
-    raw = cast(dict[str, object], value)
-    assert set(raw) <= set(Input.__dataclass_fields__), sorted(raw)
-    strings: dict[str, str] = {}
-    for name in ("repo", "base", "message"):
-        string = raw.get(name)
-        if not isinstance(string, str):
-            sys.exit(f"lane_commit.py: {name} is a required string")
-        strings[name] = string
-    whole_value = raw.get("whole", [])
-    if not isinstance(whole_value, list):
-        sys.exit("lane_commit.py: whole is a list of file names")
-    whole: list[str] = []
-    for path in cast(list[object], whole_value):
-        if not isinstance(path, str):
-            sys.exit("lane_commit.py: whole is a list of file names")
-        whole.append(path)
-    hunks_value = raw.get("hunks", {})
-    if not isinstance(hunks_value, dict):
-        sys.exit("lane_commit.py: hunks is an object of file names to patterns")
-    hunks: dict[str, str] = {}
-    for path, pattern in cast(dict[str, object], hunks_value).items():
-        if not isinstance(pattern, str):
-            sys.exit(f"lane_commit.py: hunks.{path} is a string pattern")
-        hunks[path] = pattern
-    push = raw.get("push")
-    if push is not None and not isinstance(push, str):
-        sys.exit("lane_commit.py: push is a string or null")
-    return Input(strings["repo"], strings["base"], strings["message"], tuple(whole), hunks, push)
-
-
 def main() -> None:
-    ask = read_input()
+    if len(sys.argv) != 2:
+        fail("lane_commit.py", "takes one JSON value (inline, a file, or -)")
+    ask = parse(Input, sys.argv[1], "lane_commit.py")
     with tempfile.TemporaryDirectory() as tmp:
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
 
         def git(*args: str, stdin: str | None = None) -> str:
-            done = subprocess.run(["git", "-C", ask.repo, *args], input=stdin, capture_output=True, text=True, env=env)
+            done = subprocess.run(["git", "-C", ask.repo, *args], input=stdin, capture_output=True,
+                                  text=True, env=env, check=False, timeout=120)
             if done.returncode != 0:
                 sys.exit(f"lane_commit.py: git {' '.join(args)}: {done.stderr.strip()}")
             return done.stdout
@@ -90,7 +63,7 @@ def main() -> None:
                 lines = hunk.splitlines(keepends=True)
                 if not any(mine.search(line) for line in lines[1:] if line.startswith("+")):
                     continue
-                at = re.match(r"@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@(.*)", lines[0], re.S)
+                at = re.match(r"@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@(.*)", lines[0], re.DOTALL)
                 if at is None or at.group(2) != "0":
                     sys.exit(f"lane_commit.py: {path}: a hunk matching `{pattern}` removes lines, so whose it is cannot be told:\n{hunk}")
                 old, count = int(at.group(1)), int(at.group(3) or 1)
@@ -105,4 +78,5 @@ def main() -> None:
         print(commit)
 
 
-main()
+if __name__ == "__main__":
+    main()

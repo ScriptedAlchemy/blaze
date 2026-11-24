@@ -4,7 +4,7 @@ use std::ops::Deref;
 
 use crate::ast::{self, FnRetTy, Mutability, Term};
 use crate::span::{BytePos, Pos, Span, symbol::kw};
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::comment::{combine_strs_with_missing_comments, contains_comment};
 use crate::config::lists::*;
@@ -358,7 +358,7 @@ fn format_function_type(
         Shape::legacy(budget, offset)
     };
 
-    let is_inputs_empty = inputs.len() == 0;
+    let is_inputs_empty = inputs.is_empty();
     let list_lo = context.snippet_provider.span_after(span, "(");
     let (list_str, tactic) = if is_inputs_empty {
         let tactic = get_tactics(&[], &output, shape);

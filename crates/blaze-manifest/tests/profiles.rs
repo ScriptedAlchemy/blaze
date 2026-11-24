@@ -60,7 +60,7 @@ fn check(fixture: &Path, scratch: &Path) -> (usize, Vec<String>) {
     let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
     let root = scratch.join(&name);
     copy_dir(fixture, &root);
-    let root = dunce::canonicalize(root).unwrap();
+    let root = fixture_paths::canonicalize(&root);
     let home = scratch.join("cargo-home");
     std::fs::create_dir_all(&home).unwrap();
     let home = home.canonicalize().unwrap();

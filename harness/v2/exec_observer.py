@@ -8,9 +8,10 @@ One JSON object (inline, a path, or `-`), compatible with Python 3.10:
     stop_seconds          positive bound for the selected Blaze's stop (60)
     reap_seconds          positive bound after stop for every descendant to exit (30)
     tracer                absolute strace executable (/usr/bin/strace)
+    shelf                 optional absolute canonical shelf to copy into the new HOME
 
-The client and its sibling engine are SHA-256 bound before and after the run. The
-helper inserts --ignore-pin, uses a new private BLAZE_HOME/store, and runs stop in
+The source CLI, launcher and fact shim are SHA-256 bound before and after the run. The
+helper uses a new private BLAZE_HOME/store, and runs stop in
 the traced tree even when a command fails. HOME and the sandbox are unchanged.
 
 Linux strace 6.8's launch-only -ff and --kill-on-exit use kernel fork/clone/exec
@@ -30,6 +31,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -76,6 +78,7 @@ class Input:
     stop_seconds: int = 60
     reap_seconds: int = 30
     tracer: str = "/usr/bin/strace"
+    shelf: str | None = None
 
 
 def mapping(value: object, names: set[str], where: str) -> dict[str, object]:
@@ -142,6 +145,7 @@ def load(value: str) -> Input:
         stop_seconds=seconds(given.get("stop_seconds", 60), "stop_seconds"),
         reap_seconds=seconds(given.get("reap_seconds", 30), "reap_seconds"),
         tracer=path_value(given.get("tracer", "/usr/bin/strace"), "tracer"),
+        shelf=path_value(given["shelf"], "shelf") if given.get("shelf") is not None else None,
     )
 
 
@@ -163,8 +167,8 @@ def digest(path: Path) -> str:
 
 def compiler_identity(blaze: Path) -> dict[str, str]:
     if blaze.name != "blaze":
-        raise Failed(f"selected client {blaze} must be named blaze beside blaze-engine")
-    return {name: digest(blaze.with_name(name)) for name in ("blaze", "blaze-engine")}
+        raise Failed(f"selected CLI {blaze} must be named blaze beside blaze-launcher and blaze-fact-shim")
+    return {name: digest(blaze.with_name(name)) for name in ("blaze", "blaze-launcher", "blaze-fact-shim")}
 
 
 def unhex(quoted: str) -> str:
@@ -442,6 +446,12 @@ def observe(given: Input) -> int:
     given = replace(given, blaze=str(blaze), tracer=str(tracer), cwd=str(cwd), home=str(home), out=str(out))
     out.mkdir(mode=0o700)
     home.mkdir(mode=0o700)
+    if given.shelf is not None:
+        shelf = Path(given.shelf).resolve(strict=True)
+        if not shelf.is_dir() or not any(shelf.iterdir()) or any(path.is_symlink() for path in shelf.rglob("*")):
+            raise Failed("the source observer shelf must be a nonempty directory without symlinks")
+        (home / ".blaze/v2").mkdir(parents=True)
+        shutil.copytree(shelf, home / ".blaze/v2/toolchain")
     config = out / "input.json"
     config.write_text(json.dumps(asdict(given), indent=2) + "\n", encoding="utf-8")
     python = str(Path(sys.executable).resolve(strict=True))

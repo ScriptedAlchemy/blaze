@@ -1,8 +1,8 @@
 """distributed.py: D11's real native remote-cache acceptance, in both build profiles.
 
 One typed JSON object (inline, a file, or `-`):
-    blaze                  the source-built client, beside blaze-engine, blaze-dist-local,
-                           blaze-serve and their services=true blaze-build.json seal
+    blaze                  the source-built client, beside blaze-launcher, blaze-fact-shim,
+                           blaze-dist-local, blaze-serve and their services=true seal
     out                    a new ledger report path on a reflink filesystem
     cores, daemon_memory_gb required positive integer per-daemon resource hints; the D11
                            check supplies 2 cores and 6 GiB, as the existing CI lane does
@@ -10,7 +10,7 @@ One typed JSON object (inline, a file, or `-`):
     command_timeout        seconds for status, stop and running an artifact (60)
     stall_bound            optional daemon loop-stall bound, in seconds
 
-The existing build-identity verifier binds all four programs to the current clean source.
+The existing build-identity verifier binds all five programs to the current clean source.
 This adapter never builds or seals them. Evidence stays beside out in <out>.distv2, with a
 fresh dev and release scratch directory. Reusing out/evidence or a volume that cannot prove
 shared clone blocks is an error; pass the Rust ledger a new work directory on the prepared volume.
@@ -20,6 +20,8 @@ every cold-cache, publication and fault oracle; release also requires real LLVM 
 work from two holders. There is no profile filter, fault opt-out, or second receipt policy.
 These checks cover native distributed-cache reuse. D11's signed global-cache integration
 and off-critical-path latency/overlap evidence remain missing in the objective ledger.
+The current source CLI must also supply the distributed compiler bridge: the retained
+acceptance harness refuses its missing capabilities before starting either profile.
 """
 
 import contextlib
@@ -37,7 +39,7 @@ ROOT = HERE.parents[1]
 sys.path[:0] = [str(HERE), str(HERE.parent), str(ROOT / ".github/scripts")]
 import clone_out
 import report
-from engine import EngineSpec
+from report import EngineSpec
 from typed_input import fail, parse
 
 # The CI helper lives outside the Python workspace's import roots; its runtime import
@@ -124,7 +126,7 @@ def accept(name: str, given: Any, directory: Path, initial: object, log: Path) -
             returned: object = distv2.main(given)
             if returned is not None:
                 raise ValueError(f"distv2.main returned {returned!r} instead of completing its checks")
-        except (SystemExit, Exception) as why:
+        except (SystemExit, Exception) as why:  # noqa: BLE001 - every failed acceptance must become a failed report row
             traceback.print_exc()
             errors.append(f"{name} acceptance: {why}")
         finally:
@@ -133,7 +135,7 @@ def accept(name: str, given: Any, directory: Path, initial: object, log: Path) -
             signal.signal(signal.SIGTERM, previous_handler)
             try:
                 verified_build(directory, initial)
-            except (SystemExit, Exception) as why:
+            except (SystemExit, Exception) as why:  # noqa: BLE001 - cleanup must record every identity-verification failure
                 traceback.print_exc()
                 errors.append(f"identity after {name} cleanup: {why}")
     return errors
@@ -163,7 +165,7 @@ def main(given: Input) -> None:
         profiles: list[tuple[str, Any]] = [
             (name, profile_input(given, blaze, evidence, name)) for name in ("dev", "release")
         ]
-    except (SystemExit, Exception) as why:
+    except (SystemExit, Exception) as why:  # noqa: BLE001 - prerequisite exceptions are reported as errors, never passes
         rep.add("distributed-prerequisites", "error", str(why))
         rep.finish()
 

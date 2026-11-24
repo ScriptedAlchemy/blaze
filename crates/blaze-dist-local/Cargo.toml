@@ -14,11 +14,11 @@ doctest = false
 
 [dependencies]
 blaze-core.workspace = true
-blaze-dist = { path = "../blaze-dist" }
+blaze-dist.workspace = true
 blaze-mem.workspace = true
 blaze-wire.workspace = true
 libc.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

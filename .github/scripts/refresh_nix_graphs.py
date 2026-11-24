@@ -20,7 +20,7 @@ import tomllib
 from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[2]
-FILES = ("demo/life/Cargo.lock", "tools/nix/units/daemon.json", "tools/nix/units/life.json")
+FILES = ("demo/life/Cargo.lock", "tools/nix/units/life.json")
 SYSTEMS = {"x86_64-linux", "aarch64-linux", "aarch64-darwin", "x86_64-darwin"}
 Run = Callable[[list[str], Path], bytes]
 
@@ -45,7 +45,7 @@ def run(command: list[str], cwd: Path) -> bytes:
 
 
 def checked_graphs(work: Path) -> None:
-    for project, directory in (("daemon", work), ("life", work / "demo/life")):
+    for project, directory in (("life", work / "demo/life"),):
         graph = json.loads((work / f"tools/nix/units/{project}.json").read_text())
         if graph.get("version") != 4 or set(graph.get("systems", {})) != SYSTEMS:
             raise ValueError(f"{project}: incomplete generated platform graph")
@@ -76,7 +76,7 @@ def refresh(root: Path, request: Request, execute: Run = run) -> None:
             # rejects git+file flakes without revCount there. Supply the shell
             # from the checkout, with its pins identical to this source tree,
             # while executing all metadata operations in the isolated worktree.
-            for name in ("flake.nix", "flake.lock", "harness/toolchain"):
+            for name in ("flake.nix", "flake.lock", "pins/toolchain"):
                 if (root / name).read_bytes() != (work / name).read_bytes():
                     raise ValueError(f"{name}: checkout differs from the source tree")
             execute([

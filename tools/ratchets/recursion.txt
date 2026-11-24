@@ -1,0 +1,43 @@
+# The functions that call themselves directly, outside test code, by crate (its directory
+# under crates/), read from the syntax (mutual recursion is out of its reach). Only shrinks; a
+# crate with no row is held to 0, and the new layer's crates are held to 0 whatever it says
+# (AGENTS.md bounded-progress). Written by scripts/src/bin/recursion.rs (`{"command":
+# "write"}`), checked in CI.
+# crate	functions
+blaze-bench	1
+blaze-blake3	2
+blaze-bstd-convert	5
+blaze-build-script	3
+blaze-c	4
+blaze-cad	1
+blaze-cad-field	1
+blaze-cert	21
+blaze-check	1
+blaze-cli	3
+blaze-columns	1
+blaze-core	3
+blaze-deflate	1
+blaze-fmt	35
+blaze-glob	1
+blaze-graph	1
+blaze-hash	2
+blaze-ids	1
+blaze-launch	1
+blaze-launcher	1
+blaze-manifest	9
+blaze-memo-macros	1
+blaze-parquet	1
+blaze-proc-macro	1
+blaze-protocol	1
+blaze-real	2
+blaze-rel	15
+blaze-report	1
+blaze-script	8
+blaze-sql	4
+blaze-squeeze	1
+blaze-std	5
+gpu	5
+ix-prof	2
+parser	4
+stdx	4
+test-utils	1

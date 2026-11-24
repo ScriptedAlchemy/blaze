@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""CI refuses wrong build identities and incomplete distributed acceptance.
+"""Hold the real CI shell to exact source identities and complete acceptance receipts.
 
-The small executables below are identity fixtures and shell command doubles. The protocol
-shell uses the real kernel observer and strace; real Blaze acceptance belongs to the dependent job.
+Executable fixtures only test the harness and refusal paths; real compiler acceptance is
+owned by the required hosted source and production jobs.
 """
 import contextlib
 import copy
-import hashlib
 import importlib.util
 import io
 import json
@@ -15,9 +14,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
-import tarfile
 import tempfile
-import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -25,58 +22,8 @@ import dist_build_identity as identity
 
 ROOT = Path(__file__).resolve().parents[2]
 MAIN = ROOT / ".github/workflows/blaze.yaml"
-PLATFORM = ROOT / ".github/workflows/blaze-platform.yaml"
+CONTROLS = (ROOT / ".github/distributed-controls.txt").read_text().splitlines()
 PASSED = "distv2: every check passed\n"
-PROTOCOL_STEP = "distributed protocol and carrier tests with Stage 1"
-RELEASE_STEP = "daemon release and scheduler controls with Stage 1"
-PROTOCOL_ACCEPTED_STEP = "protocol tests completed with unchanged Stage 1 and source"
-EXECUTION_SCOPE = "linux-launched-descendants-through-blaze-stop"
-RELEASE_CONTROLS = (
-    "worker_release_keeps_the_loop_responsive_and_publication_fenced",
-    "parked_successors_allow_release_with_one_work_slot",
-    "cancellation_at_each_handoff_boundary_retires_the_build",
-    "release_failure_and_panic_preserve_the_cause_and_keep_serving",
-    "refused_release_uses_one_accounted_discard",
-    "orphaned_worker_result_is_discarded_after_job_removal",
-    "late_write_requires_another_final_release",
-    "completion_preserves_later_pressure_finished_crates_and_end",
-    "final_release_policy_requires_completion_after_every_late_write",
-    "parking_an_unposted_task_after_cancel_or_failure_settles_without_a_token",
-    "pending_history_uses_the_completed_handoff_outcome",
-    "the_oracle_catches_inline_release",
-    "the_oracle_catches_a_held_successor_grant",
-    "the_oracle_catches_a_late_result_dropped_on_the_loop",
-    "the_oracle_catches_keep_after_an_older_final_release",
-    "the_oracle_catches_completion_erasing_later_pressure",
-    "the_oracle_catches_completion_erasing_later_finished_crates",
-    "the_oracle_catches_completion_erasing_a_later_end",
-    "the_oracle_catches_reusing_a_final_plan_before_a_late_write",
-    "the_oracle_catches_history_before_handoff_failure",
-)
-BUNDLE_MODELS = (
-    "overlapping_downloads_wait_for_shared_fetches_and_keep_their_outcomes",
-    "readable_bundle_values_keep_their_pending_durability_fence",
-    "verified_manifests_keep_immutable_bindings_and_refuse_conflicts_atomically",
-    "bundle_values_keep_their_manifest_bindings_across_local_and_shared_sources",
-)
-BUNDLE_CONTROLS = (
-    "the_oracle_catches_a_download_ignoring_an_existing_fetch",
-    "the_oracle_catches_a_shared_completion_consumed_by_one_download",
-    "the_oracle_catches_a_readable_value_without_its_durability_fence",
-    "the_oracle_catches_waiting_for_a_value_published_during_fetch_scheduling",
-    "the_oracle_catches_a_lost_manifest_binding",
-    "the_oracle_catches_a_partly_applied_conflicting_manifest",
-    "the_oracle_catches_a_readable_value_from_another_manifest_record",
-    "the_oracle_catches_a_racing_value_from_another_manifest_record",
-    "the_oracle_catches_a_shared_fetch_from_another_manifest_record",
-    "the_oracle_catches_an_old_fetch_outcome_delivered_after_a_new_manifest",
-)
-BUNDLE_CASES = BUNDLE_MODELS + BUNDLE_CONTROLS
-STANDARD_CONTROLS = (
-    "the_oracle_catches_a_main_without_its_output_capability",
-    "the_oracle_catches_a_line_written_without_its_newline",
-)
-
 
 def shell_step(workflow: Path, name: str) -> str:
     """Exercise the shell CI runs, so removing a safeguard changes the test's result."""
@@ -140,7 +87,7 @@ class BuildIdentityTests(unittest.TestCase):
         self.git("commit", "-qm", "source fixture")
         suffix = ".exe" if sys.platform == "win32" else ""
         self.programs = {}
-        for stem in ("blaze", "blaze-engine", "blaze-dist-local", "blaze-serve"):
+        for stem in ("blaze", "blaze-launcher", "blaze-fact-shim", "blaze-dist-local", "blaze-serve"):
             program = self.bin / (stem + suffix)
             raw = f"executable identity fixture for {stem}\n".encode()
             program.write_bytes(raw)
@@ -218,733 +165,171 @@ class BuildIdentityTests(unittest.TestCase):
 
 
 class AcceptanceGateTests(unittest.TestCase):
-    def run_shell(self, workflow, step, env):
-        return subprocess.run(
-            [*shell_command(workflow, step), "-c", shell_step(workflow, step)],
-            cwd=ROOT, env={**os.environ, **env}, text=True, capture_output=True, timeout=30)
+    def run_shell(self, name, env):
+        return subprocess.run([*shell_command(MAIN, name), "-c", shell_step(MAIN, name)],
+                              cwd=ROOT, env={**os.environ, **env}, text=True,
+                              capture_output=True, timeout=30)
 
-    def test_partial_library_feedback_is_independent_of_bootstrap_and_tier(self):
-        source = MAIN.read_text()
+    def needs(self, tier="gate"):
+        jobs = {name: {"result":"success", "outputs":{}} for name in
+                ("changes","scripts","workflows","lean","cargo","distributed-core",
+                 "source-compiler","production-acceptance")}
+        jobs["changes"]["outputs"]["tier"] = tier
+        jobs["source-compiler"]["outputs"]["source_smoke"] = "true"
+        jobs["production-acceptance"]["outputs"] = {
+            name:"true" for name in ("distributed_acceptance","forkfixes_acceptance","protocol_tests")}
+        if tier == "none":
+            for name in ("cargo","source-compiler","production-acceptance"):
+                jobs[name] = {"result":"skipped", "outputs":{}}
+        return jobs
 
-        def require_independent(text):
-            job = text.split("  distributed-core:\n", 1)[1].split("\n  cross-probe:", 1)[0]
-            header = job.split("    steps:\n", 1)[0].splitlines()
-            self.assertEqual([line for line in header if line.startswith("    needs:")],
-                             ["    needs: [workflows]"])
-            self.assertFalse(any(line.startswith("    if:") for line in header))
-            workflow_header = text.split("  workflows:\n", 1)[1].split("    steps:\n", 1)[0]
-            self.assertFalse(any(line.startswith(("    needs:", "    if:"))
-                                 for line in workflow_header.splitlines()))
+    def test_aggregate_requires_actual_jobs_and_each_real_receipt(self):
+        for tier in ("none","gate","warm"):
+            base = self.needs(tier)
+            self.assertEqual(self.run_shell("every required check passed", {"NEEDS":json.dumps(base)}).returncode, 0)
+            for job, value in base.items():
+                if value["result"] != "success":
+                    continue
+                for outcome in (None, "", "skipped", "failure", "cancelled"):
+                    with self.subTest(tier=tier, job=job, outcome=outcome):
+                        changed = copy.deepcopy(base)
+                        if outcome is None:
+                            del changed[job]
+                        else:
+                            changed[job]["result"] = outcome
+                        done = self.run_shell("every required check passed", {"NEEDS":json.dumps(changed)})
+                        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+        for job in ("source-compiler", "production-acceptance"):
+            for name in self.needs()[job]["outputs"]:
+                for value in (None, "", "false", True):
+                    changed = self.needs()
+                    changed[job]["outputs"][name] = value
+                    self.assertNotEqual(self.run_shell("every required check passed", {"NEEDS":json.dumps(changed)}).returncode, 0)
 
-        require_independent(source)
-        header = "    name: distributed library controls with pinned Cargo (partial)\n    needs: [workflows]\n"
-        self.assertEqual(source.count(header), 1)
-        for name, replacement in (
-            ("waits for changes", header.replace("[workflows]", "[changes, workflows]")),
-            ("waits for scripts", header.replace("[workflows]", "[scripts, workflows]")),
-            ("filters a tier", header + "    if: needs.changes.outputs.tier != 'none'\n"),
-        ):
-            with self.subTest(regression=name), self.assertRaises(AssertionError):
-                require_independent(source.replace(header, replacement))
-
-        ci_header = source.split("  ci:\n", 1)[1].split("    steps:\n", 1)[0]
-        self.assertIn(
-            "    needs: [changes, scripts, workflows, lean, distributed-core, linux-6-8, linux-arm64, macos, workspace-check]\n",
-            ci_header,
-        )
-
-    def test_aggregate_requires_real_acceptance_for_every_code_tier(self):
-        base = {"changes": {"result": "success", "outputs": {"tier": "gate"}},
-                "scripts": {"result": "success", "outputs": {}},
-                "workflows": {"result": "success"},
-                "lean": {"result": "success"},
-                "linux-6-8": {"result": "success"},
-                "workspace-check": {"result": "success"},
-                "distributed-core": {"result": "success"},
-                "macos": {"result": "skipped"},
-                "linux-arm64": {"result": "success", "outputs": {
-                    "distributed_acceptance": "true", "forkfixes_acceptance": "true",
-                    "protocol_tests": "true"}}}
-        cases = [("gate passes", base, True)]
-        warm = copy.deepcopy(base)
-        warm["changes"]["outputs"]["tier"] = "warm"
-        warm["macos"]["result"] = "success"
-        cases.append(("warm passes", warm, True))
-        missing_warm_macos = copy.deepcopy(warm)
-        missing_warm_macos["macos"]["result"] = "skipped"
-        cases.append(("warm with skipped macOS", missing_warm_macos, False))
-        docs = copy.deepcopy(base)
-        docs["changes"]["outputs"]["tier"] = "none"
-        docs["linux-arm64"] = {"result": "skipped", "outputs": {}}
-        docs["linux-6-8"]["result"] = "skipped"
-        docs["workspace-check"]["result"] = "skipped"
-        cases.append(("docs need no build", docs, True))
-        # The independent partial library check can succeed while bootstrap is blocked.
-        # It supplies no compiler or acceptance receipt and cannot waive either gate.
-        for fixture in (base, warm, docs):
-            tier = fixture["changes"]["outputs"]["tier"]
-            for job in ("changes", "scripts"):
-                for result in (None, "", "failure", "cancelled", "skipped"):
-                    changed = copy.deepcopy(fixture)
-                    if result is None:
-                        del changed[job]
-                    else:
-                        changed[job]["result"] = result
-                    cases.append((f"{tier} partial library success with {job} {result!r}", changed, False))
-        # Lean runs for every change, including docs: a missing or skipped proof job
-        # cannot stand for success even when the code-tier jobs do not apply.
-        for fixture in (base, warm, docs):
-            tier = fixture["changes"]["outputs"]["tier"]
-            for result in (None, "", "failure", "cancelled", "skipped"):
-                changed = copy.deepcopy(fixture)
-                if result is None:
-                    del changed["lean"]
-                else:
-                    changed["lean"]["result"] = result
-                cases.append((f"{tier} with lean {result!r}", changed, False))
-        for receipt in ("distributed_acceptance", "forkfixes_acceptance", "protocol_tests"):
-            for value in (None, "", "false"):
-                changed = copy.deepcopy(base)
-                outputs = changed["linux-arm64"]["outputs"]
-                if value is None:
-                    del outputs[receipt]
-                else:
-                    outputs[receipt] = value
-                cases.append((f"missing acceptance {receipt}={value!r}", changed, False))
-        for job, result in (("linux-arm64", "skipped"), ("linux-arm64", "cancelled"),
-                            ("scripts", "failure"), ("scripts", "cancelled"), ("scripts", "skipped"),
-                            ("workflows", "skipped"), ("linux-6-8", "skipped"),
-                            ("workspace-check", "skipped"), ("distributed-core", "skipped"),
-                            ("distributed-core", "failure"), ("changes", "skipped")):
-            changed = copy.deepcopy(base)
-            changed[job]["result"] = result
-            cases.append((f"{job} {result}", changed, False))
-        for name, needs, wanted in cases:
-            with self.subTest(name=name):
-                done = self.run_shell(MAIN, "every required check passed", {"NEEDS": json.dumps(needs)})
-                self.assertEqual(done.returncode == 0, wanted, done.stdout + done.stderr)
-
-    def shell_fixture(self, root, *, code=0, failure_harness=None):
-        evidence = root / "dist-evidence"
-        evidence.mkdir()
-        (root / "blaze-fs").mkdir()
+    def fixture(self, root):
         commands = root / "commands"
         commands.mkdir()
         python = commands / "python3"
-        harness_double = ""
-        if failure_harness is not None:
-            # The old tee/exit controls explicitly double their expensive harness. No
-            # other script, especially the execution observer, may silently be stubbed.
-            harness_double = (f"  {shlex.quote(failure_harness)})\n"
-                              f"    printf '%s\\n' 'distv2: every check passed'; exit {code} ;;\n")
         python.write_text(
-            "#!/bin/sh\n"
-            'case "$1" in\n'
-            "  harness/v2/exec_observer.py)\n"
-            "    shift\n"
-            f"    exec {shlex.quote(sys.executable)} {shlex.quote(str(ROOT / 'harness/v2/exec_observer.py'))} \"$@\" ;;\n"
-            "  .github/scripts/dist_build_identity.py)\n"
-            '    cat > "$RUNNER_TEMP/identity-input.json"\n'
-            f"    exit {code} ;;\n"
-            + harness_double
-            + '  *) printf \'unexpected Python command: %s\\n\' "$1" >&2; exit 97 ;;\n'
-            "esac\n")
+            "#!/bin/sh\ncase \"$1\" in\n"
+            " .github/scripts/dist_build_identity.py) exit \"${IDENTITY_EXIT:-0}\" ;;\n"
+            " harness/blaze_cli.py) printf '%s\\n' \"${SMOKE_SAYS:-source CLI: every check passed}\"; exit \"${SMOKE_EXIT:-0}\" ;;\n"
+            f" *) exec {shlex.quote(sys.executable)} \"$@\" ;;\nesac\n")
         python.chmod(0o700)
-        return evidence, {"RUNNER_TEMP": str(root), "GITHUB_OUTPUT": str(root / "output"),
-                          "GITHUB_WORKSPACE": str(ROOT),
-                          "PATH": str(commands) + os.pathsep + os.environ["PATH"]}
+        (root / "dist-evidence").mkdir()
+        (root / "source-evidence").mkdir()
+        return {"RUNNER_TEMP":str(root), "GITHUB_OUTPUT":str(root / "output"),
+                "GITHUB_WORKSPACE":str(ROOT), "PATH":str(commands) + os.pathsep + os.environ["PATH"]}
 
-    def protocol_fixture(self, root, *, test_code=0, release_code=0, stop_code=0,
-                         reported=RELEASE_CONTROLS, bundle_reported=BUNDLE_CASES):
-        _, env = self.shell_fixture(root)
-        evidence = root / "protocol-evidence"
-        evidence.mkdir()
-        binaries = root / "protocol-binaries"
-        binaries.mkdir()
-        blaze = binaries / "blaze"
-        blaze.write_text(
-            "#!/bin/sh\n"
-            '[ "$1" = --ignore-pin ] || exit 91\n'
-            'case "$2" in\n'
-            '  stop) name=stop ;;\n'
-            '  test) case " $* " in *" -p blaze-cargo "*) name=release ;; *) name=tests ;; esac ;;\n'
-            '  *) exit 92 ;;\n'
-            'esac\n'
-            'printf \'%s\\n\' "$name" >> "$RUNNER_TEMP/protocol-evidence/execution-order.txt"\n'
-            'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/protocol-evidence/$name-invocation.txt"\n'
-            'printf \'%s\\n\' "$BLAZE_TESTS" > "$RUNNER_TEMP/protocol-evidence/$name-mode.txt"\n'
-            'printf \'%s\\n\' "$BLAZE_HOME" "$BLAZE_CACHE" > "$RUNNER_TEMP/protocol-evidence/$name-home.txt"\n'
-            'if [ "$name" = stop ]; then printf \'%s\\n\' "shutdown fixture"; exit "$STOP_EXIT"; fi\n'
-            '"$RUNNER_TEMP/protocol-binaries/blaze-engine" "$name" || exit $?\n'
-            'if [ "$name" = tests ]; then cat "$PROTOCOL_OUTPUT"; exit "$PROTOCOL_EXIT"; fi\n'
-            'cat "$RELEASE_OUTPUT"\nexit "$RELEASE_EXIT"\n')
-        blaze.chmod(0o700)
-        engine = binaries / "blaze-engine"
-        engine.write_text(
-            "#!/bin/sh\n"
-            'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/protocol-evidence/engine-$1-invocation.txt"\n'
-            "exit 0\n")
-        engine.chmod(0o700)
-        # The seed succeeds deliberately. Selecting it must still fail the identity,
-        # invocation and trace assertions; B0 cannot compile these integration targets.
-        seed = root / "commands/blaze"
-        seed.write_text(
-            "#!/bin/sh\n"
-            'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/wrong-path-seed-used"\n'
-            "printf '%s\\n' 'seed used instead of Stage 1'\nexit 0\n")
-        seed.chmod(0o700)
-        protocol_output = root / "test-output.txt"
-        protocol_output.write_text(f"protocol test fixture exit {test_code}\n"
-                                   + "".join(f"test tests::download::{name} ... ok\n" for name in bundle_reported)
-                                   + "".join(f"test stdlib::tests::{name} ... ok\n" for name in STANDARD_CONTROLS))
-        release_output = root / "release-output.txt"
-        release_output.write_text(f"running {len(reported)} tests\n"
-                                  + "".join(f"test serve::tests::release::{name} ... ok\n" for name in reported))
-        # Read the actual executing step, not the later release-log validation step.
-        header = PLATFORM.read_text().split(f"      - name: {PROTOCOL_STEP}\n", 1)[1].split("        run: |\n", 1)[0]
-        mode = [line.split(":", 1)[1].strip().strip("\"'") for line in header.splitlines()
-                if line.startswith("          BLAZE_TESTS:")]
-        self.assertEqual(mode, ["verify"])
-        env.update(BLAZE_TESTS=mode[0], PROTOCOL_OUTPUT=str(protocol_output), PROTOCOL_EXIT=str(test_code),
-                   RELEASE_OUTPUT=str(release_output), RELEASE_EXIT=str(release_code), STOP_EXIT=str(stop_code),
-                   BLAZE_HOME=str(root / "inherited-home"), BLAZE_CACHE=str(root / "inherited-cache"))
-        return evidence, binaries, env
+    def test_partial_library_checks_are_independent_and_cover_every_active_target(self):
+        text = MAIN.read_text()
+        header = text.split("  distributed-core:\n",1)[1].split("    steps:\n",1)[0]
+        self.assertIn("    needs: [workflows]\n", header)
+        self.assertNotIn("    if:", header)
+        body = shell_step(MAIN,"distributed library models and planted controls with pinned Cargo")
+        self.assertIn("--all-targets", body)
+        self.assertIn("--no-fail-fast", body)
+        for name in ("blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"):
+            self.assertIn("-p " + name, body)
+        self.assertIn("done < .github/distributed-controls.txt", body)
+        self.assertGreater(len(CONTROLS), 70)
+        self.assertEqual(len(CONTROLS),len(set(CONTROLS)))
+        self.assertIn("--workspace --exclude blaze-std --all-targets",text)
 
-    def assert_protocol_evidence(self, root, *, test_code=0, release_code=0, stop_code=0):
-        evidence = root / "protocol-evidence"
-        binaries = root / "protocol-binaries"
-        commands = [("tests", test_code)] + ([("release", release_code)] if test_code == 0 else [])
-        expected_code = test_code or release_code or stop_code
-        receipt = json.loads((evidence / "exec/result.json").read_text())
-        self.assertEqual(receipt["schema"], 1)
-        self.assertEqual(receipt["scope"], EXECUTION_SCOPE)
-        self.assertIs(receipt["passed"], expected_code == 0)
-        self.assertEqual(receipt["returncode"], expected_code)
-        self.assertEqual(receipt["compiler"], {
-            name: hashlib.sha256((binaries / name).read_bytes()).hexdigest() for name in ("blaze", "blaze-engine")})
-        supervisor = json.loads((evidence / "exec/supervisor.json").read_text())
-        self.assertEqual(supervisor["commands"], [{"name": name, "returncode": code} for name, code in commands])
-        self.assertEqual(supervisor["stop"], stop_code)
-        self.assertIs(supervisor["complete"], True)
-        executions = [entry["path"] for entry in receipt["trace"]["executions"] if entry["succeeded"]]
-        self.assertEqual(executions.count(str(binaries / "blaze")), len(commands) + 1)
-        self.assertEqual(executions.count(str(binaries / "blaze-engine")), len(commands))
-        self.assertFalse((root / "wrong-path-seed-used").exists())
-        order = [name for name, _ in commands] + ["stop"]
-        self.assertEqual((evidence / "execution-order.txt").read_text().splitlines(), order)
-        for name in order:
-            self.assertEqual((evidence / f"{name}-home.txt").read_text().splitlines(),
-                             [str(root / "blaze-fs/protocol-tests"), str(root / "blaze-fs/protocol-tests/v2/store")])
-            self.assertEqual((evidence / f"{name}-mode.txt").read_text(), "verify\n")
-        self.assertEqual((evidence / "stop-invocation.txt").read_text().splitlines(),
-                         [str(binaries / "blaze"), "--ignore-pin", "stop"])
+    def test_native_controls_must_execute_and_pipeline_failure_is_not_hidden_by_tee(self):
+        for omit, code in ((None,0),(CONTROLS[0],0),(CONTROLS[-1],0),(None,23),("all",0)):
+            with self.subTest(omit=omit,code=code), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);env=self.fixture(root)
+                reported=[] if omit == "all" else [name for name in CONTROLS if name != omit]
+                log=root/"tests.txt"
+                log.write_text("".join(f"test tests::{name} ... ok\n" for name in reported))
+                for name in ("cargo","rustc"):
+                    program=root/"commands"/name
+                    program.write_text('#!/bin/sh\nif [ "$2" = test ]; then cat "$NATIVE_LOG"; exit "$NATIVE_EXIT"; fi\nexit 0\n')
+                    program.chmod(0o700)
+                done=self.run_shell("distributed library models and planted controls with pinned Cargo",
+                                    {**env,"NATIVE_LOG":str(log),"NATIVE_EXIT":str(code)})
+                self.assertEqual(done.returncode == 0, omit is None and code == 0, done.stdout+done.stderr)
 
-    def test_missing_or_non_fault_run_cannot_issue_an_acceptance_receipt(self):
-        for dev, release, wanted in ((PASSED, PASSED, True), (None, PASSED, False),
-                                     (PASSED, None, False),
-                                     (PASSED, "distv2: non-fault checks passed; fault acceptance NOT RUN\n", False)):
-            with self.subTest(dev=dev, release=release), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                evidence, env = self.shell_fixture(root)
-                for profile, text in (("dev", dev), ("release", release)):
-                    if text is not None:
-                        (evidence / f"{profile}.log").write_text(text)
-                done = self.run_shell(PLATFORM, "both complete fault runs used unchanged binaries and source", env)
-                self.assertEqual(done.returncode == 0, wanted, done.stdout + done.stderr)
-                output = root / "output"
+    def test_source_smoke_failure_or_absent_completion_cannot_issue_receipt(self):
+        for code, said, identity_code in ((0,"source CLI: every check passed",0),
+                                          (23,"source CLI: every check passed",0),
+                                          (0,"cold only passed",0),
+                                          (0,"source CLI: every check passed",7)):
+            with self.subTest(code=code,said=said,identity=identity_code), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);env=self.fixture(root)
+                done=self.run_shell("cold warm edited and exported hello with the source CLI",
+                                    {**env,"SMOKE_EXIT":str(code),"SMOKE_SAYS":said,"IDENTITY_EXIT":str(identity_code)})
+                wanted=code == 0 and identity_code == 0 and said == "source CLI: every check passed"
+                self.assertEqual(done.returncode == 0,wanted,done.stdout+done.stderr)
+                output=root/"output"
                 self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if wanted else "")
 
-    def test_partial_cargo_library_feedback_requires_every_model_and_control(self):
-        models = [
-            "retirement_preserves_survivors_and_exact_assignment_ownership",
-            "cancellation_cleans_a_promotion_the_worker_has_not_observed",
-            "stale_claimed_helpers_do_not_block_available_replacements",
-            "execution_bindings_retain_cleanup_without_sliding_replay_or_expiry",
-            "every_success_has_one_immutable_full_manifest",
-            "an_accepted_refusal_cannot_publish_success_after_reassignment",
-            "a_late_worker_verdict_cannot_rewrite_an_accepted_manifest",
-            "a_failed_heartbeat_cannot_publish_a_successful_tail",
-            "virtual_clock_and_actor_order_preserve_the_captured_results_authority",
-            "first_publication_cannot_name_missing_or_corrupt_packs",
-            "first_writer_requires_equal_values_for_keys_mirrored_across_packs",
-            "native_partitions_preserve_values_through_publication_faults_and_reopen",
-            "conditional_publication_preserves_comparison_and_whole_file_integrity",
-            "failed_syncs_rename_and_every_crash_boundary_reopen_authorized_whole_lists",
-        ]
-        controls = [
-            "the_oracle_catches_leaving_without_retirement",
-            "the_oracle_catches_release_without_a_pending_stop",
-            "the_oracle_catches_a_stale_retirement_of_the_replacement_lead",
-            "the_oracle_catches_a_stale_acknowledgment_of_a_reused_slot",
-            "the_oracle_catches_an_unowned_retirement",
-            "the_oracle_catches_retired_work_kept_under_its_old_lease",
-            "the_oracle_catches_promotion_erasing_the_continuing_owner",
-            "the_oracle_catches_cleanup_using_only_the_last_observed_attempt",
-            "the_oracle_catches_a_stale_claimed_helper_misclassified_as_unclaimed",
-            "the_oracle_catches_a_missing_verified_execution_binding",
-            "the_oracle_catches_a_sliding_session_ceiling",
-            "the_oracle_catches_a_lost_reply_with_changed_replay_identity",
-            "the_oracle_catches_different_bytes_reusing_a_replay_identity",
-            "the_oracle_catches_an_early_done_plant",
-            "the_oracle_catches_a_late_worker_verdict_plant",
-            "the_oracle_catches_a_dropped_heartbeat_failure",
-            "the_oracle_catches_a_compiler_refusal_reclassified_as_transport_loss",
-            "the_identity_oracle_catches_reissuing_the_captured_result_under_a_new_lease",
-            "the_oracle_catches_removing_cross_pack_comparison",
-            "the_oracle_catches_the_comparison_bypass_plant",
-            "the_oracle_catches_missing_file_sync_with_torn_appends",
-            "the_oracle_catches_acknowledgement_before_directory_sync",
-        ]
-        transport_cases = [
-            "fragmented_replies_preserve_body_boundaries_and_committed_refusals",
-            "http_bodies_keep_the_callers_allocation_through_decoding",
-            "coordinator_outputs_and_replays_use_the_callers_allocator",
-            "admission_names_and_scratch_use_the_callers_allocator",
-            "holder_keeps_the_callers_index_storage",
-            "simulation_trace_writes_directly_into_the_callers_buffer",
-            "agent::tests::imported_pack_storage_uses_the_callers_allocator",
-            "pack::tests::packs_and_record_views_use_the_callers_allocator",
-            "store::repair_tests::native_pack::tests::packs_and_record_views_use_the_callers_allocator",
-            "server::tests::effect_sink_moves_one_batch_from_the_callers_allocator",
-            "server::tests::framing_uses_the_callers_allocator_without_changing_the_body",
-            "telemetry::tests::evidence_keeps_wire_json_escaping_and_the_callers_allocator",
-            "telemetry::tests::digest_evidence_matches_the_previous_hex_string_fields",
-            "committed_reply_bounds_follow_the_native_wire_contract",
-            "an_http_reply_must_end_at_its_declared_body_boundary",
-            "an_interrupted_committed_get_cannot_authorize_local_recompilation",
-            "a_lost_publication_reply_cannot_authorize_local_recompilation",
-            "a_first_writer_conflict_must_compare_the_immutable_manifest",
-            "bounded_packs_keep_every_key_and_refuse_conflicts_across_boundaries",
-            "errors_after_publication_cannot_rebuild_an_immutable_unit",
-        ]
-        allocator_cases = [
-            "nested_effect_logs_use_the_callers_allocator",
-            "holder_effects_use_the_callers_allocator",
-            "committed_names_use_the_callers_allocator_and_exact_result_identity",
-            "pack_lists_use_the_callers_allocator",
-            "nested_schema_encoding_and_digest_scratch_use_the_callers_allocator",
-            "appending_keeps_the_callers_buffer_and_allocator_without_allocating",
-            "sets_keep_their_storage_and_take_encoding_scratch_from_the_output_allocator",
-            "set_encoding_writes_each_canonical_sort_key_once",
-            "rendering_uses_the_destination_and_reports_its_capacity",
-            "native_scan_crosses_buffer_edges_and_skips_from_the_logical_position",
-            "native_key_digest_headers_match_the_wire_at_every_length_boundary",
-            "bounded_object_reads_use_the_callers_allocator_and_preserve_size_refusals",
-        ]
-        integration_cases = [
-            "every_type_round_trips_byte_identically",
-            "every_type_has_a_golden_file",
-            "golden_vectors_match",
-            "bytes_the_validator_accepts_are_canonical",
-            "every_digest_input_is_the_encoding_the_golden_digest_uses",
-            "the_native_three_field_layout_round_trips_including_empty",
-            "malformed_lists_never_become_empty_cache_entries",
-            "fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries",
-            "two_agents_split_a_unit_and_both_get_all_of_it",
-            "a_unit_published_by_one_pull_request_is_taken_by_another",
-            "a_final_compiler_or_output_refusal_cannot_fall_back",
-            "a_tail_conflicting_with_committed_values_is_refused_before_publication",
-        ]
-        names = models + controls + transport_cases + allocator_cases + integration_cases
-        # Read the actual job's literal setting, so removing verification from the workflow
-        # cannot be hidden by this shell fixture supplying its own unrelated default.
-        job = MAIN.read_text().split("  distributed-core:\n", 1)[1].split("\n  cross-probe:", 1)[0]
-        self.assertIn("name: distributed library controls with pinned Cargo (partial)", job)
-        self.assertIn("uses: ./.github/actions/toolchain", job)
-        self.assertIn("uses: ./.github/actions/locked-memory", job)
-        self.assertLess(job.index("uses: ./.github/actions/locked-memory"),
-                        job.index("uses: ./.github/actions/toolchain"))
-        header = job.split("    steps:\n", 1)[0]
-        mode = [line.split(":", 1)[1].strip().strip("\"'") for line in header.splitlines()
-                if line.startswith("      BLAZE_TESTS:")]
-        self.assertEqual(mode, ["verify"])
-        cases = [("complete", names, 0, 0), ("zero tests", [], 0, 1)]
-        # Each missing line is the only fault; all remaining cases still report success.
-        cases += [(f"missing model {name}", [item for item in names if item != name], 0, 1)
-                  for name in models]
-        cases += [(f"missing control {name}", [item for item in names if item != name], 0, 1)
-                  for name in controls]
-        cases += [(f"missing transport case {name}", [item for item in names if item != name], 0, 1)
-                  for name in transport_cases]
-        cases += [(f"missing allocator case {name}", [item for item in names if item != name], 0, 1)
-                  for name in allocator_cases]
-        cases += [(f"missing integration case {name}", [item for item in names if item != name], 0, 1)
-                  for name in integration_cases]
-        cases.append(("compiler failed after success lines", names, 23, 23))
-        toolchain = (ROOT / "harness/toolchain").read_text().strip()
-        for label, reported, code, expected in cases:
-            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                commands = root / "commands"
-                commands.mkdir()
-                cargo = commands / "cargo"
-                cargo.write_text(
-                    "#!/bin/sh\n"
-                    'if [ "$2" = --version ]; then printf \'%s\\n\' \'cargo fixture\'; exit 0; fi\n'
-                    'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/core-evidence/invocation.txt"\n'
-                    'printf \'%s\\n\' "$BLAZE_TESTS" > "$RUNNER_TEMP/core-evidence/mode.txt"\n'
-                    'cat "$CORE_OUTPUT"\nexit "$CORE_EXIT"\n')
-                cargo.chmod(0o700)
-                rustc = commands / "rustc"
-                rustc.write_text(
-                    "#!/bin/sh\n"
-                    'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/core-evidence/rustc-invocation.txt"\n'
-                    'printf \'%s\\n\' \'rustc fixture\'\n')
-                rustc.chmod(0o700)
-                output = f"running {len(reported)} tests\n"
-                output += "".join(f"test {'' if name in integration_cases else 'fixture::'}{name} ... ok\n"
-                                  for name in reported)
-                output += f"test result: ok. {len(reported)} passed; 0 failed; 0 ignored\n"
-                transcript = root / "test-output.txt"
-                transcript.write_text(output)
-                env = {"RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(ROOT),
-                       "PATH": str(commands) + os.pathsep + os.environ["PATH"],
-                       "BLAZE_TESTS": mode[0], "CORE_OUTPUT": str(transcript), "CORE_EXIT": str(code)}
-                done = self.run_shell(MAIN, "distributed library models and planted controls with pinned Cargo", env)
-                self.assertEqual(done.returncode, expected, done.stdout + done.stderr)
-                evidence = root / "core-evidence"
-                invocation = (evidence / "invocation.txt").read_text().splitlines()
-                self.assertEqual(invocation, [str(cargo), f"+{toolchain}", "test", "--release", "--locked",
-                                              "--all-targets", "-p", "blaze-dist", "-p", "blaze-dist-local",
-                                              "-p", "blaze-wire", "-p", "blaze-serve", "--no-fail-fast"])
-                self.assertEqual((evidence / "mode.txt").read_text(), "verify\n")
-                self.assertEqual((evidence / "tests.log").read_text(), output)
-                self.assertEqual((evidence / "toolchain-pin.txt").read_bytes(),
-                                 (ROOT / "harness/toolchain").read_bytes())
-                self.assertEqual((evidence / "cargo-version.txt").read_text(), "cargo fixture\n")
-                self.assertEqual((evidence / "rustc-version.txt").read_text(), "rustc fixture\n")
-                self.assertEqual((evidence / "rustc-invocation.txt").read_text().splitlines(),
-                                 [str(rustc), f"+{toolchain}", "--version", "--verbose"])
-                if expected == 1:
-                    missing = next(name for name in names if name not in reported)
-                    self.assertIn("missing executed library control: " + missing, done.stdout)
-
-    def test_harness_core_feedback_requires_real_tests_and_preserves_failures(self):
-        names = [
-            "ui::tests::a_file_page_is_its_own_file",
-            "ui::tests::an_http_page_is_its_scheme_host_and_port",
-            "ui::tests::other_schemes_and_broken_urls_are_refused",
-            "keys::tests::the_table",
-            "keys::tests::down_up_and_chars",
-            "cdp_ids::tests::two_connections_with_the_same_ids_get_their_own_answers",
-            "cdp_ids::tests::events_orphans_and_forgetting",
-            "cdp_ids::tests::refuses_what_is_not_a_request_and_crossed_answers",
-            "cdp_ids::tests::ids_wrap_and_skip_pending",
-            "cdp_ids::dst::every_cdp_answer_reaches_only_its_asker_once_and_every_live_request_is_answered",
-            "cdp_ids::dst::seeded_plans_pass",
-            "cdp_ids::dst::the_oracle_catches_a_dropped_connections_ids_freed_at_once",
-            "completion::tests::completion_tracks_sessions_through_navigation_and_disappearance",
-            "completion::tests::the_oracle_catches_focus_based_completion",
-            "fileview::tests::the_cited_part_is_marked",
-            "fileview::tests::rendering_escapes_unicode_and_preserves_writer_failures",
-            "intent::tests::a_topic_borrows_the_original_bytes_after_a_unicode_greeting",
-            "memory::tests::sorted_reviews_and_key_scratch_use_the_callers_allocator",
-            "tutor::tests::a_prompt_writes_into_fixed_storage_and_reports_a_full_sink",
-            "run::tests::streamed_answers_match_unicode_lowercase_and_whitespace_normalization",
-            "run::tests::an_order_reuses_its_buffer_when_a_missed_check_returns",
-        ]
-        cases = [("complete", names, 0, 0, None), ("zero tests", [], 0, 1, None),
-                 ("compiler failed after success lines", names, 23, 23, None)]
-        cases += [(f"missing {name}", [item for item in names if item != name], 0, 1, None)
-                  for name in names]
-        cases += [(f"changed pin {field}", names, 0, 1, field)
-                  for field in ("name", "version", "source", "checksum")]
-        cases.append(("metadata failure", names, 0, 23, "metadata"))
-        toolchain = (ROOT / "harness/toolchain").read_text().strip()
-        seed = tomllib.loads((ROOT / "crates/harness/Cargo.lock").read_text())
-        pinned = next(package for package in seed["package"] if package["name"] == "serde")
-        for label, reported, code, expected, mutation in cases:
-            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                commands = root / "commands"
-                commands.mkdir()
-                cargo = commands / "cargo"
-                cargo.write_text(
-                    "#!/bin/sh\n"
-                    'if [ "$2" = metadata ]; then\n'
-                    '  printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/core-evidence/metadata-invocation.txt"\n'
-                    '  cp "${7%/*}/Cargo.lock" "$RUNNER_TEMP/core-evidence/input.Cargo.lock"\n'
-                    '  cp "$CORE_LOCK" "${7%/*}/Cargo.lock"\n'
-                    '  printf \'%s\\n\' "{}"\n'
-                    '  exit "$METADATA_EXIT"\n'
-                    'fi\n'
-                    'printf \'%s\\n\' "$0" "$@" > "$RUNNER_TEMP/core-evidence/invocation.txt"\n'
-                    'cat "$CORE_OUTPUT"\nexit "$CORE_EXIT"\n')
-                cargo.chmod(0o700)
-                dependency = {field: pinned[field] for field in ("name", "version", "source", "checksum")}
-                if mutation in dependency:
-                    dependency[mutation] = "changed-unpinned-value"
-                normalized = root / "normalized.lock"
-                if mutation in dependency:
-                    normalized.write_text(
-                        'version = 4\n\n[[package]]\nname = "blaze-harness-core-ci"\nversion = "0.1.0"\n\n'
-                        '[[package]]\n' + "".join(f"{key} = {json.dumps(value)}\n" for key, value in dependency.items()))
-                else:
-                    normalized.write_bytes((ROOT / ".github/fixtures/harness-core/Cargo.lock").read_bytes())
-                transcript = root / "test-output.txt"
-                output = "".join(f"test {name} ... ok\n" for name in reported)
-                transcript.write_text(output)
-                env = {"RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(ROOT),
-                       "PATH": str(commands) + os.pathsep + os.environ["PATH"],
-                       "CORE_OUTPUT": str(transcript), "CORE_EXIT": str(code),
-                       "CORE_LOCK": str(normalized), "METADATA_EXIT": "23" if mutation == "metadata" else "0"}
-                done = self.run_shell(MAIN, "harness pure cores with the pinned Rust toolchain", env)
-                self.assertEqual(done.returncode, expected, done.stdout + done.stderr)
-                evidence = root / "core-evidence"
-                metadata = (evidence / "metadata-invocation.txt").read_text().splitlines()
-                manifest = metadata[-1]
-                self.assertEqual(metadata, [str(cargo), f"+{toolchain}", "metadata", "--locked", "--format-version", "1",
-                                            "--manifest-path", manifest])
-                self.assertEqual((evidence / "input.Cargo.lock").read_bytes(),
-                                 (ROOT / ".github/fixtures/harness-core/Cargo.lock").read_bytes())
-                self.assertTrue(Path(manifest).is_relative_to(root))
-                self.assertEqual((Path(manifest).parent / "../../../crates").resolve(), ROOT / "crates")
-                if mutation:
-                    self.assertFalse((evidence / "invocation.txt").exists(), "unpinned metadata cannot compile")
-                    if mutation != "metadata":
-                        self.assertIn("dependency is outside the pinned lock", done.stdout + done.stderr)
-                    continue
-                self.assertEqual((evidence / "invocation.txt").read_text().splitlines(),
-                                 [str(cargo), f"+{toolchain}", "test", "--release", "--locked",
-                                  "--all-targets", "--manifest-path", manifest])
-                self.assertEqual((evidence / "harness-core.Cargo.lock").read_bytes(), normalized.read_bytes())
-                self.assertEqual((evidence / "harness-core-tests.log").read_text(), output)
-                if expected == 1:
-                    missing = next(name for name in names if name not in reported)
-                    self.assertIn("missing executed harness-core control: " + missing, done.stdout)
-
-    def test_tee_preserves_a_harness_failure_even_with_a_success_line(self):
-        for step in ("dev two-worker, cold-cache, cross-PR and fault acceptance",
-                     "release and folded-group two-worker and fault acceptance"):
-            with self.subTest(step=step), tempfile.TemporaryDirectory() as directory:
-                _, env = self.shell_fixture(Path(directory), code=23, failure_harness="harness/distv2.py")
-                done = self.run_shell(PLATFORM, step, env)
-                self.assertEqual(done.returncode, 23, done.stdout + done.stderr)
-
-    def test_protocol_handoff_verifies_stage1_before_retaining_its_provenance(self):
-        for code in (0, 23):
-            with self.subTest(identity_exit=code), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                _, env = self.shell_fixture(root, code=code)
-                binaries = root / "protocol-binaries"
-                binaries.mkdir()
-                manifest = root / identity.MANIFEST
-                manifest.write_text('{"identity": "Stage 1 handoff fixture"}\n')
-                with tarfile.open(binaries / "blaze.tar", "w") as archive:
-                    archive.add(manifest, arcname=identity.MANIFEST)
-                done = self.run_shell(PLATFORM, "verify the protocol test Stage 1 handoff", env)
-                self.assertEqual(done.returncode, code, done.stdout + done.stderr)
-                self.assertEqual(json.loads((root / "identity-input.json").read_text()),
-                                 {"command": "verify", "binaries": str(binaries)})
-                retained = root / "protocol-evidence/stage1-build.json"
-                self.assertEqual(retained.exists(), code == 0)
-                if code == 0:
-                    self.assertEqual(retained.read_bytes(), manifest.read_bytes())
-
-    def test_protocol_tests_use_stage1_for_all_targets_and_preserve_failure(self):
-        for test_code, release_code, stop_code in ((0, 0, 0), (23, 0, 0), (0, 24, 0),
-                                                   (0, 0, 25), (23, 0, 25), (0, 24, 25)):
-            with self.subTest(test_exit=test_code, release_exit=release_code,
-                              stop_exit=stop_code), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                evidence, binaries, env = self.protocol_fixture(
-                    root, test_code=test_code, release_code=release_code, stop_code=stop_code)
-                done = self.run_shell(PLATFORM, PROTOCOL_STEP, env)
-                self.assertEqual(done.returncode, test_code or release_code or stop_code, done.stdout + done.stderr)
-                self.assert_protocol_evidence(root, test_code=test_code, release_code=release_code, stop_code=stop_code)
-                # Exact argv preserves every lib/integration target and permits no
-                # positional filter, --test selection, --no-run or skipped package.
-                self.assertEqual((evidence / "tests-invocation.txt").read_text().splitlines(),
-                                 [str(binaries / "blaze"), "--ignore-pin", "test", "--release", "--locked",
-                                  "-p", "blaze-wire", "-p", "blaze-dist", "-p", "blaze-dist-local",
-                                  "-p", "blaze-serve", "-p", "blaze-global", "-p", "blaze-graph",
-                                  "-p", "blaze-std",
-                                  "--lib", "--tests", "--no-fail-fast"])
-                self.assertIn(f"protocol test fixture exit {test_code}", (evidence / "exec/tests.log").read_text())
-                if test_code:
-                    self.assertFalse((evidence / "exec/release.log").exists())
-                    self.assertFalse((evidence / "release-invocation.txt").exists())
-                else:
-                    self.assertEqual((evidence / "release-invocation.txt").read_text().splitlines(),
-                                     [str(binaries / "blaze"), "--ignore-pin", "test", "--release", "--locked", "--lib",
-                                      "-p", "blaze-cargo", "--no-fail-fast", "--", "serve::"])
-                    self.assertEqual((evidence / "exec/release.log").read_bytes(), Path(env["RELEASE_OUTPUT"]).read_bytes())
-
-    def test_protocol_receipt_requires_completed_logs_kernel_evidence_and_unchanged_stage1(self):
-        receipt = {"schema": 1, "scope": EXECUTION_SCOPE, "passed": True, "returncode": 0}
-        valid = json.dumps(receipt)
-        cases = [("success", "test output\n", "success", "release output\n", valid, 0, True),
-                 ("success", "test output\n", "success", "release output\n", valid, 23, False),
-                 ("success", None, "success", "release output\n", valid, 0, False),
-                 ("success", "", "success", "release output\n", valid, 0, False),
-                 ("success", "test output\n", "success", None, valid, 0, False),
-                 ("success", "test output\n", "success", "", valid, 0, False)]
-        cases += [(outcome, "test output\n", "success", "release output\n", valid, 0, False)
-                  for outcome in ("", "failure", "cancelled", "skipped")]
-        cases += [("success", "test output\n", outcome, "release output\n", valid, 0, False)
-                  for outcome in ("", "failure", "cancelled", "skipped")]
-        invalid_receipts = [None, "", "{", "null", "[]", "{}"]
-        for name, values in (("schema", (None, True, 2, "1")),
-                             ("scope", (None, "", "client-only")),
-                             ("passed", (None, False, 1, "true")),
-                             ("returncode", (None, True, 23, "0"))):
-            omitted = dict(receipt)
-            omitted.pop(name)
-            invalid_receipts.append(json.dumps(omitted))
-            for value in values:
-                invalid_receipts.append(json.dumps({**receipt, name: value}))
-        cases += [("success", "test output\n", "success", "release output\n", raw, 0, False)
-                  for raw in invalid_receipts]
-        for outcome, log, release_outcome, release_log, raw, code, wanted in cases:
-            with self.subTest(outcome=outcome, log=log, release=release_outcome,
-                              release_log=release_log, receipt=raw,
-                              identity_exit=code), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                _, env = self.shell_fixture(root, code=code)
-                env["PROTOCOL_TEST_OUTCOME"] = outcome
-                env["RELEASE_TEST_OUTCOME"] = release_outcome
-                evidence = root / "protocol-evidence/exec"
-                evidence.mkdir(parents=True)
-                if log is not None:
-                    (evidence / "tests.log").write_text(log)
-                if release_log is not None:
-                    (evidence / "release.log").write_text(release_log)
-                if raw is not None:
-                    (evidence / "result.json").write_text(raw)
-                done = self.run_shell(PLATFORM, PROTOCOL_ACCEPTED_STEP, env)
-                self.assertEqual(done.returncode == 0, wanted, done.stdout + done.stderr)
-                output = root / "output"
-                self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if wanted else "")
-                if outcome == "success" and log and release_outcome == "success" and release_log and raw == valid:
-                    self.assertEqual(json.loads((root / "identity-input.json").read_text()),
-                                     {"command": "verify", "binaries": str(root / "protocol-binaries")})
-                else:
-                    self.assertFalse((root / "identity-input.json").exists())
-
-    def test_daemon_release_receipt_requires_stage1_and_every_executed_control(self):
-        cases = [("complete", RELEASE_CONTROLS, 0, 0), ("zero tests", (), 0, 1)]
-        cases += [(f"missing {name}", [item for item in RELEASE_CONTROLS if item != name], 0, 1)
-                  for name in RELEASE_CONTROLS]
-        cases.append(("compiler failed after success lines", RELEASE_CONTROLS, 23, 0))
-        for label, reported, code, expected in cases:
-            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                evidence, binaries, env = self.protocol_fixture(root, release_code=code, reported=reported)
-                protocol = self.run_shell(PLATFORM, PROTOCOL_STEP, env)
-                self.assertEqual(protocol.returncode, code, protocol.stdout + protocol.stderr)
-                done = self.run_shell(PLATFORM, RELEASE_STEP, env)
-                self.assertEqual(done.returncode, expected, done.stdout + done.stderr)
-                # The line check must not launch another compiler outside the trace.
-                self.assert_protocol_evidence(root, release_code=code)
-                self.assertEqual((evidence / "release-invocation.txt").read_text().splitlines(),
-                                 [str(binaries / "blaze"), "--ignore-pin", "test", "--release", "--locked", "--lib",
-                                  "-p", "blaze-cargo", "--no-fail-fast", "--", "serve::"])
-                self.assertEqual((evidence / "exec/release.log").read_bytes(), Path(env["RELEASE_OUTPUT"]).read_bytes())
-                if expected == 1:
-                    missing = next(name for name in RELEASE_CONTROLS if name not in reported)
-                    self.assertIn("missing executed daemon release control: " + missing, done.stdout)
-                # Success lines cannot rescue a failed compiler or an incomplete set.
-                env.update(PROTOCOL_TEST_OUTCOME="success" if protocol.returncode == 0 else "failure",
-                           RELEASE_TEST_OUTCOME="success" if done.returncode == 0 else "failure")
-                accepted = self.run_shell(PLATFORM, PROTOCOL_ACCEPTED_STEP, env)
-                wanted = code == 0 and expected == 0
-                self.assertEqual(accepted.returncode == 0, wanted, accepted.stdout + accepted.stderr)
-                output = root / "output"
+    def test_every_full_fault_profile_and_unchanged_source_is_required(self):
+        for dev,release,identity_code in ((PASSED,PASSED,0),(None,PASSED,0),
+                                          (PASSED,"distv2: non-fault checks passed\n",0),
+                                          (PASSED,PASSED,9)):
+            with self.subTest(dev=dev,release=release,identity=identity_code), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);env=self.fixture(root)
+                for name,value in (("dev",dev),("release",release)):
+                    if value is not None:
+                        (root/f"dist-evidence/{name}.log").write_text(value)
+                done=self.run_shell("both complete fault runs used unchanged binaries and source",{**env,"IDENTITY_EXIT":str(identity_code)})
+                wanted=dev == release == PASSED and identity_code == 0
+                self.assertEqual(done.returncode == 0,wanted,done.stdout+done.stderr)
+                output=root/"output"
                 self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if wanted else "")
 
-    def test_standard_library_controls_require_stage1_instead_of_a_cargo_claim(self):
-        self.assertNotIn("-p blaze-std", shell_step(MAIN, "remaining active V2 library controls"))
-        for missing in (None, *STANDARD_CONTROLS):
-            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                evidence = root / "protocol-evidence/exec"
-                evidence.mkdir(parents=True)
-                (evidence / "release.log").write_text(
-                    "".join(f"test serve::tests::{name} ... ok\n" for name in RELEASE_CONTROLS))
-                (evidence / "tests.log").write_text(
-                    "".join(f"test tests::{name} ... ok\n"
-                            for name in (*BUNDLE_CASES, *STANDARD_CONTROLS) if name != missing))
-                checked = self.run_shell(PLATFORM, RELEASE_STEP, {"RUNNER_TEMP": str(root)})
-                self.assertEqual(checked.returncode, 1 if missing else 0, checked.stdout + checked.stderr)
-                if missing:
-                    self.assertIn("missing executed Blaze standard-library control: " + missing, checked.stdout)
+    def test_source_protocol_needs_all_causal_cases_actual_execution_and_shutdown(self):
+        packages=["blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"]
+        for plant in (None,"missing-control","reused","filtered","not-built","empty-package",
+                      "failed-test","bad-stop","lost-trace","changed-binary"):
+            with self.subTest(plant=plant), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);env=self.fixture(root)
+                out=root/"dist-evidence/exec";out.mkdir()
+                (out/"result.json").write_text(json.dumps({"schema":1,"passed":plant != "lost-trace",
+                    "returncode":0,"scope":"linux-launched-descendants-through-blaze-stop"}))
+                (out/"supervisor.json").write_text(json.dumps({"complete":True,"stop":7 if plant == "bad-stop" else 0,
+                    "commands":[{"name":name,"returncode":0} for name in packages]}))
+                for at,package in enumerate(packages):
+                    names=CONTROLS[at::len(packages)]
+                    if at == 0 and plant == "missing-control": names=names[1:]
+                    if at == 0 and plant == "empty-package": names=[]
+                    tests=[{"event":"test","path":"tests::"+name,"outcome":"passed","ran_because":"run_all","failure":None,"basis":None} for name in names]
+                    summary={"event":"summary","result":"ok","ran":len(names),"passed":len(names),"failed":0,
+                             "reused":0,"filtered_out":0,"flaky":0}
+                    if at == 0:
+                        if plant == "reused": tests[0]["ran_because"]="reused"
+                        elif plant == "filtered": summary["filtered_out"]=1
+                        elif plant == "not-built": summary["not_built"]=1
+                        elif plant == "failed-test": tests[0]["outcome"]="failed"
+                    (out/(package+".log")).write_text("\n".join(json.dumps(row) for row in [*tests,summary])+"\n")
+                done=self.run_shell("complete source protocol receipt with unchanged executables",
+                                    {**env,"IDENTITY_EXIT":"9" if plant == "changed-binary" else "0"})
+                self.assertEqual(done.returncode == 0,plant is None,done.stdout+done.stderr)
+                output=root/"output"
+                self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if plant is None else "")
 
-    def test_protocol_receipt_requires_every_bundle_model_and_control_under_stage1(self):
-        cases = [("complete", BUNDLE_CASES, 0), ("zero bundle tests", (), 1)]
-        cases += [(f"missing {name}", [item for item in BUNDLE_CASES if item != name], 1)
-                  for name in BUNDLE_CASES]
-        for label, reported, expected in cases:
-            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                evidence, _, env = self.protocol_fixture(root, bundle_reported=reported)
-                protocol = self.run_shell(PLATFORM, PROTOCOL_STEP, env)
-                self.assertEqual(protocol.returncode, 0, protocol.stdout + protocol.stderr)
-                checked = self.run_shell(PLATFORM, RELEASE_STEP, env)
-                self.assertEqual(checked.returncode, expected, checked.stdout + checked.stderr)
-                self.assert_protocol_evidence(root)
-                self.assertEqual((evidence / "exec/tests.log").read_bytes(), Path(env["PROTOCOL_OUTPUT"]).read_bytes())
-                if expected:
-                    missing = next(name for name in BUNDLE_CASES if name not in reported)
-                    self.assertIn("missing executed bundle control: " + missing, checked.stdout)
-                env.update(PROTOCOL_TEST_OUTCOME="success",
-                           RELEASE_TEST_OUTCOME="success" if checked.returncode == 0 else "failure")
-                accepted = self.run_shell(PLATFORM, PROTOCOL_ACCEPTED_STEP, env)
-                self.assertEqual(accepted.returncode == 0, expected == 0, accepted.stdout + accepted.stderr)
-                output = root / "output"
-                self.assertEqual(output.read_text() if output.exists() else "",
-                                 "accepted=true\n" if expected == 0 else "")
 
-    def test_fork_migration_harness_failure_reaches_ci(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _, env = self.shell_fixture(root, code=23, failure_harness="harness/forkfixes.py")
-            (root / "forkfixes-evidence").mkdir()
-            done = self.run_shell(PLATFORM, "every fork migration fixture with Stage 1", env)
-            self.assertEqual(done.returncode, 23, done.stdout + done.stderr)
-
-    def test_ci_generated_inputs_keep_explicit_lock_policy_in_child_environment(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            evidence, env = self.shell_fixture(root)
-            binaries = root / "dist-binaries"
-            binaries.mkdir()
-            (binaries / "blaze-build.json").write_text("{}\n")
-            services = root / "blaze-fs/dist-service-build/release"
-            services.mkdir(parents=True)
-            for name in ("blaze-dist-local", "blaze-serve"):
-                (services / name).write_text("identity fixture; never executed\n")
-            # Run the real input-generation shell, with only its identity command doubled.
-            done = self.run_shell(PLATFORM, "bind the four acceptance programs to the same source", env)
-            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-
-            spec = importlib.util.spec_from_file_location("distv2_ci_input", ROOT / "harness/distv2.py")
-            self.assertIsNotNone(spec)
-            self.assertIsNotNone(spec.loader)
-            harness = importlib.util.module_from_spec(spec)
-            with patch.object(sys, "path", [str(ROOT / "harness"), *sys.path]), patch.dict(sys.modules), \
-                    patch.dict(os.environ, {"CI": "true", "BLAZE_LOCK": "locked"}):
-                sys.modules[spec.name] = harness
-                spec.loader.exec_module(harness)
-                for profile in ("dev", "release"):
-                    with self.subTest(profile=profile):
-                        generated = evidence / f"{profile}-input.json"
-                        given = harness.load(str(generated))
-                        # Environment construction only: no constructor socket, daemon or build.
-                        run = object.__new__(harness.Run)
-                        run.given = given
-                        run.root = Path(given.scratch)
-                        run.root.mkdir()
-                        run.socket, run.port = root / "unused.sock", 1
-                        for distributed in (False, True):
-                            child = run.env("solo" if not distributed else "a", distributed)
-                            self.assertEqual(child["CI"], "true")
-                            self.assertEqual(child.get("BLAZE_LOCK"), "write")
-                        # Removing the explicit input loses the lock setting despite CI and
-                        # an inherited BLAZE_LOCK. This is why setting only the job env fails.
-                        without_policy = json.loads(generated.read_text())
-                        without_policy["env"].pop("BLAZE_LOCK")
-                        run.given = harness.load(json.dumps(without_policy))
-                        self.assertNotIn("BLAZE_LOCK", run.env("solo", False))
+class WorkerBridgeTests(unittest.TestCase):
+    def test_real_capability_reply_decides_whether_worker_acceptance_can_start(self):
+        sys.path.insert(0,str(ROOT/"harness"))
+        spec=importlib.util.spec_from_file_location("worker_acceptance",ROOT/"harness/distv2.py")
+        worker=importlib.util.module_from_spec(spec);sys.modules[spec.name]=worker;spec.loader.exec_module(worker)
+        for code,stdout,works in ((0,'{"host":"aarch64-unknown-linux-gnu"}',True),
+                                  (0,"Rust nightly-2026-11-11\n",False),
+                                  (1,"unknown command",False),(0,'{"host":null}',False),
+                                  (0,'{"host":"bad host"}',False)):
+            with self.subTest(stdout=stdout),tempfile.TemporaryDirectory() as directory:
+                out=Path(directory)
+                with patch.object(worker.subprocess,"run",return_value=subprocess.CompletedProcess([],code,stdout,"")) as invoke:
+                    if works:
+                        self.assertEqual(worker.host_triple("/source/blaze",{},5,out),"aarch64-unknown-linux-gnu")
+                    else:
+                        with self.assertRaisesRegex(worker.Failed,"distributed worker protocol bridge"):
+                            worker.host_triple("/source/blaze",{},5,out)
+                self.assertEqual(invoke.call_args.args[0],["/source/blaze","toolchain","--json"])
+                self.assertEqual(json.loads((out/"worker-protocol-probe.json").read_text())["stdout"],stdout)
 
 
 if __name__ == "__main__":

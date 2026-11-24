@@ -525,7 +525,7 @@ fn a_value_round_trips() {
     });
 }
 
-/// The refinement: decoding what `encode_array` wrote gives the elements back, nulls included.
+/// Refinement: decoding what `encode_array` wrote gives the elements back, nulls included.
 #[test]
 fn an_array_round_trips() {
     blaze_sim::check(blaze_sim::Config::cases(100), |tape| {

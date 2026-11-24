@@ -7,22 +7,36 @@
 //! because both of those sit below `blaze-ids` (`blaze-core` stays below `blake3`, and
 //! `blaze-ids` checks its lock-free code with `blaze-check`).
 
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+// The core module is marked `#![blaze::sans_io]`, not the crate root: a tool attribute on the
+// crate root makes `#[macro_export]` macros macro-expanded, which rustc forbids naming by
+// `$crate::` path (agents/annoyances/crate-root-tool-attribute-hides-macros.json).
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 #![forbid(unsafe_code)]
 
-/// The Weyl increment, `2^64 / φ` rounded to odd.
-pub const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+// The tests' growable buffers and `catch_unwind`: `core` has neither.
+#[cfg(test)]
+extern crate std;
 
-/// SplitMix64's finalizer: a bijection on `u64` that spreads every input bit over the output.
-#[inline]
-pub const fn mix(z: u64) -> u64 {
-    let z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    let z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
+mod rng {
+    #![blaze::sans_io]
 
-/// One SplitMix64 stream: its state is the seed plus `GAMMA` once per draw.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SplitMix64(u64);
+    /// The Weyl increment, `2^64 / φ` rounded to odd.
+    pub const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    /// SplitMix64's finalizer: a bijection on `u64` that spreads every input bit over the output.
+    #[inline]
+    pub const fn mix(z: u64) -> u64 {
+        let z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// One SplitMix64 stream: its state is the seed plus `GAMMA` once per draw.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SplitMix64(u64);
 
 impl SplitMix64 {
     pub const fn new(seed: u64) -> SplitMix64 {
@@ -61,7 +75,7 @@ impl SplitMix64 {
 
     /// In `start..end`, or `start` when the range is empty.
     #[inline]
-    pub fn range(&mut self, range: std::ops::Range<u64>) -> u64 {
+    pub fn range(&mut self, range: core::ops::Range<u64>) -> u64 {
         range.start + self.below(range.end.saturating_sub(range.start))
     }
 
@@ -128,6 +142,9 @@ impl SplitMix64 {
         open.iter().enumerate().filter(|(_, it)| **it).nth(at).map(|(arm, _)| arm)
     }
 }
+}
+
+pub use rng::{GAMMA, SplitMix64, mix};
 
 /// One of the arms, evaluated, drawn from `rng` (a [`SplitMix64`]): each arm whose condition
 /// holds is as likely as the others. `if cond => arm` gives an arm a condition; an arm without
@@ -136,6 +153,12 @@ impl SplitMix64 {
 /// The list is all the bookkeeping: no count beside it and no number on an arm, so two
 /// changes that each add an arm merge without renumbering. It panics, naming itself, when no
 /// condition holds.
+///
+/// It is for other crates: its rules call each other through `$crate::choose!`, which rustc
+/// refuses where the call is inside blaze-rng (`macro_expanded_macro_exports_accessed_by_absolute_paths`:
+/// the crate-root `#![blaze::sans_io]` makes the crate's exported macros count as
+/// macro-expanded; annoyance crate-root-tool-attribute-hides-macros), and the recursion cannot go, since one matcher cannot tell an `if` arm from an `if`
+/// expression. Its test is tests/choose.rs.
 #[macro_export]
 macro_rules! choose {
     // Each arm in turn moves to the lists of conditions and arms; one rule per form, since a
@@ -169,6 +192,8 @@ macro_rules! choose {
 
 #[cfg(test)]
 mod tests {
+    use std::{vec, vec::Vec};
+
     use blaze_sim::Config;
 
     use super::*;
@@ -244,21 +269,8 @@ mod tests {
         assert_eq!(rng.pick(&[9]), Some(&9));
     }
 
-    /// Each open arm about as often as the others, a closed one never, and nothing to take is
-    /// a panic.
-    #[test]
-    fn choose_takes_open_arms_evenly() {
-        let mut rng = SplitMix64::new(11);
-        let mut taken = [0u32; 4];
-        for _ in 0..12_000 {
-            let arm: usize = choose!(rng; 0, if false => 1, 2, 3);
-            taken[arm] += 1;
-        }
-        assert_eq!(taken[1], 0, "{taken:?}");
-        assert!(taken.iter().all(|&n| n == 0 || (3600..4400).contains(&n)), "{taken:?}");
-        let none = std::panic::catch_unwind(|| choose!(SplitMix64::new(0); if false => 0u8));
-        assert!(none.is_err());
-    }
+    // `choose!`'s test is tests/choose.rs: an exported macro that calls itself through
+    // `$crate::choose!` is refused inside its own crate (see the macro).
 
     #[test]
     fn shuffle_permutes() {

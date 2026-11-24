@@ -14,7 +14,7 @@
 //! Cost: a small allocation is a bump in the local block (about 2 ns); a block refill is one
 //! compare-and-swap on the arena; a chunk refill is one pop from the cache.
 
-use std::{
+use core::{
     alloc::{AllocError, Allocator, Layout},
     cell::Cell,
     mem::{ManuallyDrop, MaybeUninit},
@@ -252,8 +252,8 @@ impl Drop for Arena {
     }
 }
 
-impl std::fmt::Debug for Arena {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Arena {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Arena")
             .field("tag", &self.tag)
             .field("held", &self.held())
@@ -418,6 +418,10 @@ impl<'a> ArenaLocal<'a> {
         ptr.as_ptr() as usize - self.block.get() as usize
     }
 }
+
+// SAFETY: `ArenaLocal` bump-allocates from its parent `Arena`, whose chunks are reclaimed in bulk
+// when the arena resets or drops; forgetting a handle never leaks memory past the arena.
+unsafe impl blaze_own::BumpAlloc for ArenaLocal<'_> {}
 
 // SAFETY: blocks come from the local's own block or from blocks and regions the arena hands
 // out once each, disjoint and committed. Each stays valid until the arena resets or drops, both

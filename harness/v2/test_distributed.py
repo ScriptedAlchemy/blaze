@@ -10,6 +10,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from collections.abc import Callable
@@ -36,7 +37,7 @@ class DistributedLedgerTests(unittest.TestCase):
         source = patch.object(d.identity, "source", side_effect=current_source)
         source.start()
         self.addCleanup(source.stop)
-        for name in ("blaze", "blaze-engine", "blaze-dist-local", "blaze-serve"):
+        for name in ("blaze", "blaze-launcher", "blaze-fact-shim", "blaze-dist-local", "blaze-serve"):
             path = self.bin / name
             path.write_text(f"synthetic {name}; never executed\n")
             path.chmod(0o700)
@@ -62,6 +63,13 @@ class DistributedLedgerTests(unittest.TestCase):
             d.main(given)
         self.assertEqual(ended.exception.code, code)
         return json.loads(Path(given.out).read_text())
+
+    def probe_reply(self) -> subprocess.CompletedProcess[str]:
+        # The real capability parser must run before the deliberately failed build.
+        # Only the subprocess result is supplied: no synthetic program is executable proof.
+        return subprocess.CompletedProcess(
+            [str(self.bin / "blaze"), "toolchain", "--json"], 0,
+            json.dumps({"host": "fixture-only-unknown-linux-gnu"}), "")
 
     def test_complete_profiles_reuse_the_sealed_programs_and_separate_fresh_scratch(self) -> None:
         seen: list[Any] = []
@@ -92,7 +100,7 @@ class DistributedLedgerTests(unittest.TestCase):
         self.assertEqual([(it["name"], it["verdict"]) for it in result["outcomes"]],
                          [("distv2-dev", "pass"), ("distv2-release", "pass")])
         self.assertEqual(set(result["extra"]["build_identity"]["binaries"]),
-                         {"blaze", "blaze-engine", "blaze-dist-local", "blaze-serve"})
+                         {"blaze", "blaze-launcher", "blaze-fact-shim", "blaze-dist-local", "blaze-serve"})
         self.assertEqual(json.loads((evidence / "build-identity.json").read_text()),
                          result["extra"]["build_identity"])
 
@@ -125,7 +133,7 @@ class DistributedLedgerTests(unittest.TestCase):
         self.assertEqual((child["BLAZE_CORES"], child["BLAZE_DAEMON_MEMORY_GB"]), ("2", "6"))
 
     def test_each_sealed_program_and_the_services_manifest_are_required_before_acceptance(self) -> None:
-        for name in ("blaze", "blaze-engine", "blaze-dist-local", "blaze-serve"):
+        for name in ("blaze", "blaze-launcher", "blaze-fact-shim", "blaze-dist-local", "blaze-serve"):
             with self.subTest(name=name):
                 path = self.bin / name
                 original = path.read_bytes()
@@ -154,12 +162,12 @@ class DistributedLedgerTests(unittest.TestCase):
         acceptance.assert_not_called()
         self.assertIn("source checkout has changes", result["outcomes"][0]["detail"])
 
-    def test_resealing_changed_engine_bytes_between_profiles_cannot_change_this_runs_identity(self) -> None:
-        def replace_engine(_given: object) -> None:
-            (self.bin / "blaze-engine").write_text("different engine, still never executed\n")
+    def test_resealing_changed_launcher_bytes_between_profiles_cannot_change_this_runs_identity(self) -> None:
+        def replace_launcher(_given: object) -> None:
+            (self.bin / "blaze-launcher").write_text("different launcher, still never executed\n")
             self.seal()  # The current manifest is internally valid, but is a different build.
 
-        with patch.object(d.distv2, "main", side_effect=replace_engine) as acceptance:
+        with patch.object(d.distv2, "main", side_effect=replace_launcher) as acceptance:
             result = self.invoke()
         self.assertEqual(acceptance.call_count, 1)
         self.assertEqual(result["counts"], {"fail": 1, "error": 1})
@@ -221,12 +229,18 @@ class DistributedLedgerTests(unittest.TestCase):
 
         with patch.object(d.distv2, "free_port", return_value=1), \
                 patch.object(d.distv2, "source_state", return_value=(self.source["commit"], self.source["tree"], b"")), \
+                patch.object(d.distv2.subprocess, "run", return_value=self.probe_reply()) as probe, \
                 patch.object(d.distv2.Run, "start_services", return_value=None), \
                 patch.object(d.distv2.Run, "build", return_value=(23, "controlled build failure")) as build, \
                 patch.object(d.distv2.Run, "stop", new=stop):
             result = self.invoke()
+        probe.assert_called_once()
+        self.assertEqual(probe.call_args.args[0], self.probe_reply().args)
         self.assertEqual(build.call_count, 1)
         self.assertEqual(stopped, [Path(self.given.out + ".distv2") / "dev"])
+        observed = json.loads((stopped[0] / "logs/worker-protocol-probe.json").read_text())
+        self.assertEqual(observed, {"argv": self.probe_reply().args, "returncode": 0,
+                                    "stdout": self.probe_reply().stdout, "stderr": ""})
         self.assertEqual(result["counts"], {"fail": 1, "error": 1})
         self.assertIn("solo builds: controlled build failure", result["outcomes"][0]["detail"])
         log = Path(result["outcomes"][0]["numbers"]["log"]).read_text()
@@ -237,15 +251,18 @@ class DistributedLedgerTests(unittest.TestCase):
 
         def stop(run: Any) -> None:
             original_stop(run)
-            (self.bin / "blaze-engine").write_text("changed during cleanup; never executed\n")
+            (self.bin / "blaze-fact-shim").write_text("changed during cleanup; never executed\n")
             raise d.distv2.Failed("controlled owned-process cleanup failure")
 
         with patch.object(d.distv2, "free_port", return_value=1), \
                 patch.object(d.distv2, "source_state", return_value=(self.source["commit"], self.source["tree"], b"")), \
+                patch.object(d.distv2.subprocess, "run", return_value=self.probe_reply()) as probe, \
                 patch.object(d.distv2.Run, "start_services", return_value=None), \
-                patch.object(d.distv2.Run, "build", return_value=(23, "controlled build failure")), \
+                patch.object(d.distv2.Run, "build", return_value=(23, "controlled build failure")) as build, \
                 patch.object(d.distv2.Run, "stop", new=stop):
             result = self.invoke()
+        probe.assert_called_once()
+        self.assertEqual(build.call_count, 1)
         self.assertEqual(result["counts"], {"fail": 1, "error": 1})
         detail = result["outcomes"][0]["detail"]
         self.assertIn("controlled owned-process cleanup failure", detail)

@@ -20,7 +20,7 @@ use crate::ast::token::{Delimiter, Token, TokenKind};
 use crate::ast::tokenstream::{TokenStream, TokenStreamIter, TokenTree};
 use crate::ast_pretty as pprust;
 use crate::span::{BytePos, DUMMY_SP, Ident, Pos, Span, Symbol};
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::comment::{
     CharClasses, FindUncommented, FullCodeCharKind, LineClasses, contains_comment,
@@ -448,7 +448,7 @@ pub(crate) fn rewrite_macro_def(
         return snippet;
     }
 
-    let ts = def.body.tokens.clone();
+    let ts = blaze_own::Share::share(&def.body.tokens);
     let mut parser = MacroParser::new(ts.iter());
     let parsed_def = match parser.parse() {
         Some(def) => def,
@@ -481,7 +481,7 @@ pub(crate) fn rewrite_macro_def(
         shape
     };
 
-    if parsed_def.branches.len() == 0 {
+    if parsed_def.branches.is_empty() {
         let lo = context.snippet_provider.span_before(span, "{");
         result += " ";
         result += &rewrite_empty_macro_def_body(context, span.with_lo(lo), shape)?;
@@ -845,9 +845,8 @@ impl MacroArgParser {
             "".to_owned()
         };
         self.result.push(ParsedMacroArg {
-            kind: MacroArgKind::Separator(self.buf.clone(), prefix),
+            kind: MacroArgKind::Separator(core::mem::take(&mut self.buf), prefix),
         });
-        self.buf.clear();
     }
 
     fn add_other(&mut self) {
@@ -857,9 +856,8 @@ impl MacroArgParser {
             "".to_owned()
         };
         self.result.push(ParsedMacroArg {
-            kind: MacroArgKind::Other(self.buf.clone(), prefix),
+            kind: MacroArgKind::Other(core::mem::take(&mut self.buf), prefix),
         });
-        self.buf.clear();
     }
 
     fn add_meta_variable(&mut self, iter: &mut TokenStreamIter<'_>) -> Option<()> {
@@ -872,10 +870,9 @@ impl MacroArgParser {
                 _,
             )) => {
                 self.result.push(ParsedMacroArg {
-                    kind: MacroArgKind::MetaVariable(name, self.buf.clone()),
+                    kind: MacroArgKind::MetaVariable(name, core::mem::take(&mut self.buf)),
                 });
 
-                self.buf.clear();
                 self.is_meta_var = false;
                 Some(())
             }

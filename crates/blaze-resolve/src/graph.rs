@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::hash::Hash;
 
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use std::alloc::Global;
 
 use crate::persistent;
@@ -66,32 +66,35 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
         N: Hash,
     {
         let mut ret = Vec::with_capacity(self.nodes.len());
-        let mut marks = HashSet::with_capacity_in(self.nodes.len(), Global);
+        let alloc = Global;
+        let mut marks =
+            Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(self.nodes.len()) });
+        let mut stack = blaze_own::Vec::new_in(alloc);
 
         for node in self.nodes.keys() {
-            self.sort_inner_visit(node, &mut ret, &mut marks);
+            if !marks.insert(node) {
+                continue;
+            }
+            let children = self.nodes.get(node).map(persistent::OrdMap::keys);
+            stack.push((node, children));
+            while let Some(top) = stack.last_mut() {
+                match top.1.as_mut().and_then(Iterator::next) {
+                    Some(child) => {
+                        if marks.insert(child) {
+                            let child_iter = self.nodes.get(child).map(persistent::OrdMap::keys);
+                            stack.push((child, child_iter));
+                        }
+                    }
+                    None => {
+                        if let Some((cur, _)) = stack.pop() {
+                            ret.push(cur.clone());
+                        }
+                    }
+                }
+            }
         }
 
         ret
-    }
-
-    fn sort_inner_visit<'a>(
-        &'a self,
-        node: &'a N,
-        dst: &mut Vec<N>,
-        marks: &mut HashSet<&'a N, Global>,
-    ) where
-        N: Hash,
-    {
-        if !marks.insert(node) {
-            return;
-        }
-
-        for child in self.nodes[node].keys() {
-            self.sort_inner_visit(child, dst, marks);
-        }
-
-        dst.push(node.clone());
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &N> {
@@ -108,7 +111,7 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
         N: Hash,
     {
         let mut stack = vec![from];
-        let mut seen = HashSet::new_in(Global);
+        let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         seen.insert(from);
         while let Some(iter) = stack.pop().and_then(|p| self.nodes.get(p)) {
             for p in iter.keys() {

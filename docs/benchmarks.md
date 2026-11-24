@@ -1,24 +1,22 @@
 ---
-status: current
-summary: Blaze benchmark measurement and regression checks, with historical Cargo comparisons kept under their original labels.
+status: record
+summary: blaze v1's benchmarks against cargo on three platforms (edit, memory, disk, runtime), measured by harness/bench.py, deleted with the daemon on 2026-11-15.
+date: 2026-10-25
 ---
 # Benchmarks
 
-How long an edit takes to build under Blaze, how much memory and disk it uses, and how fast the
-programs it builds run. Schema 2 compares Blaze with its own stored measurements; the older
-Cargo comparison tables retain their historical labels. The platforms are macOS arm64,
-Linux aarch64 and Linux x86-64, measuring real projects at pinned commits, with results written
-back here and to the README. A platform's numbers compare with each other
+How long an edit takes to build under blaze, how much memory and disk it uses, and how fast the
+programs it builds run, against cargo. Each table is a matrix over three platforms, macOS arm64,
+Linux aarch64 and Linux x86-64, each measured on a dedicated machine of its own, on real
+projects at pinned commits, against plain cargo on the same machine, and written back here (and
+the README's numbers with them) by a bot commit. A platform's numbers compare with each other
 and with its own history, not with another platform's: the machines differ in more than their
 architecture. The rest of this page says how, so that anyone can check it or run it again.
 
-The unversioned comparison results are blaze v1's, measured from 2026-10-20 to 2026-10-25,
-before v2 replaced v1 on 2026-10-30. Each table names the commit and format it measured.
-`harness/bench.py` now writes schema 2: Blaze measurements only, using the selected source-built
-executable with `--ignore-pin`, its SHA-256 checked before and after the run. It picks the
-backend by profile (`cranelift` is dev, `llvm` is release); no new Cargo speed baseline is run.
-Historical JSON and its Cargo fields retain their original meaning. New runs compare their
-Blaze metrics with stored Blaze metrics and fail when required evidence disappears
+Every number on this page is blaze v1's: each table names the commit it measured, all from
+2026-10-20 to 2026-10-25, before v2 replaced v1 on 2026-10-30. No run of v2 has been published.
+`harness/bench.py` now picks the backend as v2 does, by the profile (`cranelift` is the dev
+profile, `llvm` the release profile on both sides), but has not run against v2 yet
 ([harness.md](harness.md#timing)). Where this page says what the daemon does (hands an edit to
 cargo, builds cold with cargo, leaves crates to rustc), it says what v1 did; v2 never hands a
 build to cargo or rustc. v2's targets are in [v2/plan/goals/targets.md](v2/plan/objectives.md),
@@ -334,12 +332,11 @@ Measured by v1's runbench.py on each platform's benchmark machine, the last resu
 ## Over time
 
 `harness/benchcharts.py` draws these from `docs/benchmarks/history` (below) into the same section
-of the README and this page, each run of a workflow that appends to the history (bench-readme
-and bench-counts) right after it appends, and the workflow commits them with the
+of the README and this page, each run of a workflow that appends to the history (bench-readme,
+bench-counts and live-latency) right after it appends, and the workflow commits them with the
 history. A platform's trend draws only the runs of the machine of its last run, as the check
 compares them; a chart with fewer than two such runs is a line saying so. Regressions are not
-marked on them yet: the history does not record what the check found. The removed live-latency
-workflow also used this publisher; its stored history remains part of the historical charts.
+marked on them yet: the history does not record what the check found.
 
 <!-- benchtrend:start -->
 How blaze's own numbers move from run to run, each platform on its own benchmark machine: the instructions each merge to main retires, how long an edit takes and how soon a live edit runs, from [the history](benchmarks/history) ([how it is kept](#history-and-regressions)). Every workflow that adds to the history draws these again and commits them with it.
@@ -351,44 +348,48 @@ Not drawn until there are two runs on one machine: macOS arm64 instructions per 
 
 ## What is measured
 
-`harness/bench.py` copies each project's pinned checkout, selects one source-built Blaze by
-absolute path, and measures each requested profile in its own target directory, home and
-store. Dependency fetching belongs to the selected Blaze. The active benchmark does not run
-an alternate compiler, Cargo setup or Cargo runtime reference.
+`harness/bench.py` copies each project's pinned checkout and builds it two ways side by side:
+`blaze build` (the daemon) and plain `cargo build` into a target directory of its own.
+Both build the same source after every edit, one after the other, so they see the same machine
+state.
 
-| Phase | What happens under Blaze |
-|---|---|
-| Cold | Build from an empty target, home and store, repeated `cold_runs` times. The first build is the daemon's own. |
-| Cold, warm store | Build another copy of the same source with a fresh target and daemon, using the store the first checkout filled. |
-| Nothing changed | Build again without an edit. |
-| Function, widely used function, signature, generic function, new function, struct field | Apply each edit listed in `PROJECTS`, build it, undo it and build again, `runs` times. Each existing image must be retained and spliced; a new image may have its first link. |
-| Tests | With `tests:true`, run each declared project suite, including an empty argument list, before edits, after an edit and its reversal, and with no change. Each requested profile is measured. The project's own test verdict decides correctness. |
-| Runtime | Run the program Blaze built for a declared workload, after two warmups. Every invocation must exit successfully. |
+| Phase | What happens | blaze | cargo |
+|---|---|---|---|
+| Cold | build from an empty target directory and an empty blaze store; crates are already downloaded | the build returns (under v1, cargo built the first time) and then the daemon loads the workspace in the background; both are reported | `cargo build` |
+| Cold, warm store | after everything else, `--cold-runs` times: a second copy of the project with an empty target directory and a daemon of its own, but the store the measured copy filled with its cold build and edits (as a second checkout of the same project, or a teammate's store, would have) | build and daemon ready, as cold | |
+| Nothing changed | build again with no edit | | |
+| Edit a function | one statement is added to a function in the main crate | | incremental |
+| Edit a widely used function | one statement in a function many places call: in a library crate of the workspace when there is one (ripgrep's `grep-matcher`, axum's `axum-core`, nushell's `nu-path`, bat's library), otherwise in a module the rest of the crate uses (fd, hyperfine, just) | | incremental |
+| Change a signature | a method gets another parameter and every caller passes it | | incremental |
+| Edit a generic function | a statement in a generic function used at many types (ripgrep and nushell) | | incremental |
+| Add a function | a new function in the main crate, called from the function of "Edit a function" | | incremental |
+| Add a struct field | a struct gets one more field (`_bench_edit: ()`) and every place that builds it sets it; in a library crate where there is one (nushell's `nu-protocol::Alias`, built in `nu-parser`) | | incremental |
+| Tests | (`--tests`) the project's test suite, or the crates of it named in `PROJECTS`, after the edits: `blaze test` and `cargo test`, run twice each, the second timed; every test has to pass under blaze by its own verdict (cargo is only timed) | | |
+| Runtime | (ripgrep) the program blaze linked, cargo's debug build and cargo's release build run the same search over the toolchain's own library source | | |
 
-The edits do not change observable output. The first run after each kind of edit must match
-the cold program's exit status, stdout and stderr. A failed build, program, test verdict or
-splice check is retained in the result and the command exits 3. Publication and history
-append refuse these failures, missing measurements and an unverified compiler identity.
+The edits do not change what the program does. After the first edit of each kind the program
+blaze linked is run and has to print what the program of blaze's cold build printed (exit
+status, stdout and stderr); in the runtime phase each of the three programs has to exit 0. cargo
+is the speed baseline, not the answer (2026-10-30: no harness compares blaze's output with
+cargo's). A run in which a program is wrong is not published (`benchreport.py` refuses it and the workflow fails).
 
-Schema 2 keeps each phase's wall time, samples, compiled work, daemon and splice verdict,
-Blaze memory, available instructions and cycles, and the target/store/home disk use. It keeps
-test-edit and runtime timings separately. It emits no `cargo_s`, Cargo memory or alternate
-setup fields. The old `harness/bench-baseline.json` remains an unversioned historical result:
-comparison reads its Blaze fields without changing or relabeling its Cargo numbers. A missing
-previously measured Blaze field or phase fails comparison; time differences at or below
-50 ms do not count. The required promotion speed check also needs a stored Blaze baseline.
+Each edit is made and taken back `--runs` times (5 in CI). The summary tables show the median of
+the edits; the results below also show the fastest and slowest run of each side, and the raw JSON keeps
+every sample, the time of taking each edit back, who built each step (the daemon, or cargo and
+why), whether the daemon spliced the change into the program or linked it again, how many
+functions it compiled, the memory of both sides (below) and the daemon's own timeline of each
+build.
+Cold is `--cold-runs` runs of each (5 in CI), each with a new target directory, home and store;
+the store size after it is kept too.
 
-In the historical tables, `(c)` identifies a v1 Cargo fallback. Schema 2 refuses a successful
-build without a native daemon verdict. Historical Cargo ratio charts stay separate from the
-Blaze history charts that consume new runs.
+An edit v1's daemon handed to cargo (a fallback) was measured once, marked `(c)` in the tables,
+and shows about cargo's time. v2 has no such fallback: what it can't build stops with an error.
 
 ## Memory and disk
 
-Schema 2 measures Blaze's process and daemon memory, the daemon between edits, and its target,
-store and home on disk. Its runtime workload records the Blaze program's peak and binary size.
-The following two-sided definitions describe the historical measurements already published
-here. Their Cargo columns remain historical. [The summary](#how-much-memory-and-disk-it-takes)
-is at the top of this page; [the results](#results) have all of it.
+Every build in the table is also measured for memory, on both sides, and so is the disk each
+side leaves behind. [The summary](#how-much-memory-and-disk-it-takes) is at the top of this page;
+[the results](#results) have all of it.
 
 | Number | blaze | cargo |
 |---|---|---|
@@ -401,8 +402,7 @@ is at the top of this page; [the results](#results) have all of it.
 
 v1's runbench.py (runtime parity) added the peak of each program while it runs, the size of
 each binary, and the peak of each build: `cargo build --release` against blaze's whole-program
-LLVM build. That separate whole-program comparison remains historical; schema 2 times only
-the selected Blaze program for each declared runtime workload.
+LLVM build. v2 has no runtime bench yet.
 
 **How.** One helper, `harness/memory.py`, measures all of it, and every harness that reports
 memory uses it. It combines two readings:
@@ -486,7 +486,7 @@ builds it in a few minutes on the same machine. Its build needs `nix develop .#b
 ## Fairness
 
 - Same machine, same source, same moment: the two builds alternate after every edit.
-- Same toolchain on both sides: the pinned nightly (`harness/toolchain`, `nightly-2026-10-25`;
+- Same toolchain on both sides: the pinned nightly (`pins/toolchain`, `nightly-2026-10-25`;
   the runs dated before 2026-10-25 were on Rust 1.99.0), from the flake's
   `devShells.bench`, which also pins LLVM 23 for the LLVM tier.
 - Cargo is warm and incremental: the dev profile's default (`CARGO_INCREMENTAL` unset).
@@ -507,15 +507,15 @@ summary tables) and LLVM (`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`, `BAC
 `harness/bench.py`). v2 refuses those variables and picks the backend from the profile's
 `opt-level` (0 and 1 Cranelift, the rest LLVM; `crates/blaze-codegen/src/plan.rs`), so a v2
 tier is a profile: `bench.py`'s `BACKENDS` gives the release profile's `--release` for `llvm`. Both
-are measured with the one executable named by the typed input's `blaze` field, which links LLVM as every native blaze does. A new tier
+are measured with one blaze (`BLAZE_BIN`), which links LLVM as every native blaze does. A new tier
 is one more entry in `BACKENDS` in `harness/bench.py`; the report makes a table for every
 backend in the result.
 
 ## The fastest setups
 
-These are historical v1 Cargo comparisons. The old harness's setups built each step again
-into separate target directories on the same source. Schema 2 does not execute these setups
-and refuses the removed setup inputs:
+With `--setups` (all of them in the nightly run, `--setups-on ripgrep,nushell`), every step plain
+cargo builds is built again by each of the fastest ways to build Rust there already are, each
+into a target directory of its own, right after plain cargo, on the same source:
 
 | Setup | What it is |
 |---|---|
@@ -530,7 +530,7 @@ and refuses the removed setup inputs:
 The flags go in through `--config target.'cfg(all())'.rustflags`, which cargo adds to each
 project's own (helix sets `--cfg tokio_unstable` there; `RUSTFLAGS` would replace it).
 `-Zshare-generics` is not a column: it is already on in every debug build. The nightly is
-`harness/toolchain`'s, `rust-bin.nightly.<date>` with `rustc-codegen-cranelift-preview`, from
+`pins/toolchain`'s, `rust-bin.nightly.<date>` with `rustc-codegen-cranelift-preview`, from
 the flake (`BLAZE_NIGHTLY`; `rust-bin.nightly."2026-10-09"` in the runs before 2026-10-25). A setup that cannot build a project is reported as failed and not timed
 after that.
 
@@ -576,30 +576,44 @@ patch, today Linux.
 
 ## The machines
 
-Every result records its machine and platform: the name given by the typed `machine` field,
+Every result records its machine and platform: the name it was given (`BLAZE_BENCH_MACHINE`),
 the CPU, the cores the run could use (it may be pinned with `taskset`) and the machine's total,
 memory, OS, kernel, rustc, C compiler, linker, LLVM version and the load average when it
-started (below and in the JSON). The platforms, their runners' label and how a result is
+started (below and in the JSON). The platforms, their runners' labels and how a result is
 filed are `harness/benchplatforms.py`.
 
-This fork uses GitHub-hosted runners for optional benchmark jobs:
+Each platform is meant to run on a dedicated machine that runs nothing else, registered as a
+self-hosted GitHub Actions runner. A shared runner is no use: GitHub's hosted macOS arm64 runner
+(`macos-15`) is a 3-core VM with 7 GB of memory, less than nushell's daemon holds, with
+neighbours that move the numbers. The three:
 
-| Platform | Runner label |
-|---|---|
-| Linux x86-64 | `ubuntu-24.04` |
-| Linux aarch64 | `ubuntu-24.04-arm` |
-| macOS arm64 | `macos-15` |
+| Platform | Runner labels | Machine | Why |
+|---|---|---|---|
+| Linux x86-64 | `self-hosted, linux, x64, bench-x86` | `dev-aws-bench-x86` (i-01666717f0de39201, us-west-2a), resized to m8a.4xlarge: 16 AMD EPYC 9R45 (Zen 5) cores, one thread per core, 64 GiB | already launched for it, on demand, ttl a year, tagged `ix-dev-purpose=blaze-bench`; launched as a c8a.4xlarge (32 GiB), too little for nushell's daemon (15 GB) beside cargo |
+| Linux aarch64 | `self-hosted, linux, ARM64, bench-arm64` | a new `dev-aws-bench-arm64`, m8g.4xlarge: 16 Graviton4 (Neoverse V2) cores, 64 GiB, on demand | the same core count and memory as the x86 machine; a cloud VM is not bare metal, but its cores are not shared with other tenants |
+| macOS arm64 | `self-hosted, macOS, ARM64, bench-macos` | a Mac mini M4 Pro (14 cores, 64 GB) kept for it, plugged in, not sleeping (`sudo pmset -a sleep 0`), or an EC2 mac-m4pro.metal host if it has to be in AWS | bare metal, and the only way to measure macOS: a MacBook in use is busy with other work |
 
-Select platforms with the repository variable `BENCH_RUNNERS`, using the comma-separated
-slugs `linux-x86-64,linux-aarch64,macos-arm64`. An unset variable leaves these optional
-jobs disabled. `BENCH_RUNNER=true` retains the legacy Linux x86-64 selection.
+`harness/benchrunner.sh PLATFORM MACHINE` sets a runner up: it checks the platform is the
+machine's, installs the runner in `~/actions-runner`, registers it with the platform's labels and
+runs it at boot (on Linux as user `andrew` from a user systemd unit,
+`blaze-bench-runner.service`, lingering; on macOS as the runner's launchd service), and its
+`.env` names the machine for the results. It needs Nix with flakes on the machine:
 
-Hosted timings can vary with contention and have less memory than the historical
-dedicated machines. Keep each result's machine metadata; do not treat a change of
-host as evidence of a compiler regression or improvement.
+```
+scp harness/benchrunner.sh HOST:
+gh api -X POST repos/indexable-inc/blaze/actions/runners/registration-token --jq .token \
+  | ssh HOST bash benchrunner.sh linux-aarch64 "'AWS m8g.4xlarge (dev-aws-bench-arm64)'"
+```
 
-Historical numbers were measured by hand with the same harness, pinned to 16
-cores with `taskset`. The edits: on 2026-10-22, Linux x86-64 on `dev-aws-8` (a c7a.48xlarge, AMD EPYC 9R14, idle and
+Then name the platform in the repository variable `BENCH_RUNNERS`, comma-separated, which turns
+its jobs on: `gh variable set BENCH_RUNNERS -R indexable-inc/blaze -b linux-x86-64,linux-aarch64,macos-arm64`.
+A platform it does not name is skipped by every run rather than left waiting for a runner that
+is not there, and the tables keep its last numbers, under their machine, date and commit.
+(`BENCH_RUNNER=true`, from before there were platforms, still means Linux x86-64.)
+
+Until the runners exist the numbers are measured by hand with the same harness, pinned to 16
+cores with `taskset` so that cargo and the daemon have the 16 cores of the machines above. The
+edits: on 2026-10-22, Linux x86-64 on `dev-aws-8` (a c7a.48xlarge, AMD EPYC 9R14, idle and
 claimed for the run) and Linux aarch64 on a c8g.16xlarge (Graviton4, Neoverse-V2) launched for
 it; macOS arm64's are the MacBook Pro (M5 Max) run of 2026-10-21, made while it was busy with
 other work (its load average is under the tables), so its times are noisier than the others'. The
@@ -625,9 +639,9 @@ stored one of the same platform (`docs/benchmarks/<platform>.json`, e.g. `linux-
 README's numbers and this page's tables from the newest stored result of every platform, only
 when:
 
-- a median Blaze time in any phase moved by more than 10% and more than 50 ms,
-- the measurement schema changed (historical comparison to schema 2),
-- a Blaze peak moved by more than 10% and 100 MB,
+- a median of either side, in any phase, moved by more than 10% and more than 50 ms,
+- a step the daemon built is now built by cargo, or the other way round,
+- a peak of either side moved by more than 10% and 100 MB,
 - a project or backend was added or removed, or
 - the stored run is more than 24 hours old (so the commit the tables name stays within a day
   of main).
@@ -635,15 +649,15 @@ when:
 It then draws [the trends](#over-time) again (`harness/benchcharts.py`, after the history below is
 appended) and commits those files to main as `github-actions[bot]` with `[skip ci]` in the
 message (so the commit starts no other workflow), once for every platform, rebasing onto main if
-main moved during the run (`.github/scripts/bench_commit.py`, which bench-counts.yaml uses
-too, as the removed live-latency workflow did). bench-readme and bench-counts each draw
-every trend, so both running at once can conflict in the trend charts and sections: a
+main moved during the run (`.github/scripts/bench_commit.py`, which bench-counts.yaml
+commits through too). bench-readme and bench-counts each draw
+every trend, so the two running at once can conflict in the trend charts and sections: a
 conflict only there is settled by drawing them again from the merged history, and one anywhere
 else stops the commit with the files named. It pushes with the secret `BLAZE_BOT_TOKEN`, a repository admin's token, which
 the ruleset on main lets past its required check; the job's own `GITHUB_TOKEN` is refused
 ([harness.md](harness.md#ci)). `bench-bun.yaml` does the same for bun, nightly, on the same runners: bun takes
 hours, so it has a workflow and a stored result of its own (`docs/benchmarks/bun-<platform>.json`
-and the historical `runtime-bun-<platform>.json`, selected by the publisher's `name:"bun"` field), but it is a project like
+and `runtime-bun-<platform>.json`, written by `benchreport.py --name bun`), but it is a project like
 the others in the tables and charts and in their geometric means. Each table folds a
 platform's bun result into that platform's own (`benchreport.py`'s `stored_all`), whichever
 workflow wrote last, and a footnote names bun's machine, commit and date; its every number is
@@ -683,38 +697,38 @@ shows.
 
 ### The stress corpus and the per-merge run
 
-`bench.py` with `stress:true` adds the crates of `harness/stress-corpus/manifest.json` (`{"version": 1,
+`bench.py --stress` adds the crates of `harness/stress-corpus/manifest.json` (`{"version": 1,
 "crates": [{"name", "path", "what"}]}`, paths relative to `harness/stress-corpus`): small crates,
 each a shape that is hard for a compiler. Each is copied out as a workspace of its own and built
 from nothing (no target directory, an empty home and store, no daemon) by `blaze check` and then
-`blaze build`, `runs` times each, until the daemon is ready and quiet: wall time, blaze's
+`blaze build`, `--runs` times each, until the daemon is ready and quiet: wall time, blaze's
 peak memory and the counts. They are in the result under `stress` (and `stress_gap` when the
 manifest is not in the tree), and in a history line as `stress:<crate>/<backend>`.
 
 `.github/workflows/bench-counts.yaml` runs on every push to main that touches code, on the same
 dedicated machines as bench-readme (one run at a time, a newer push replacing the waiting one):
 the stress corpus with fd and hyperfine, the dev profile, three runs. It appends a line per
-platform to `docs/benchmarks/history/<platform>-merge.jsonl` (`benchhistory.py` action `build`,
-suite `merge`; the site does not chart those yet, [the trends](#over-time) do), checks it as below, writes
+platform to `docs/benchmarks/history/<platform>-merge.jsonl` (`benchhistory.py build --suite
+merge`; the site does not chart those yet, [the trends](#over-time) do), checks it as below, writes
 the summary to the run's summary, draws the trends again, commits the history and the trends to
 main with `[skip ci]` and fails on a regression.
 
 ## History and regressions
 
 Every run of the workflow appends one line per platform to
-`docs/benchmarks/history/<platform>.jsonl` (`harness/benchhistory.py`, action `build`), whether or not the
+`docs/benchmarks/history/<platform>.jsonl` (`harness/benchhistory.py build`), whether or not the
 tables changed: the medians, spreads, who built each step, memory and store size of each project
 and phase, the platform, the machine and the run's link. The site's
 [/bench](https://ix.dev/blaze/bench) page charts those files, a platform and machine at a time,
 and the workflow starts the site's deploy after it commits.
 
-`benchhistory.py` action `check` then compares the new line with the median of the last seven from the
+`benchhistory.py check` then compares the new line with the median of the last seven from the
 same machine with the same cores. A number regressed when it is above that median by more than
 its noise band and by more than a floor, and improved when it is below it by as much.
-Instructions are the primary signal: their band is 1% (`instructions_noise`) or three times
+Instructions are the primary signal: their band is 1% (`--instructions-noise`) or three times
 the spread the history shows (1.4826 times the median absolute deviation), whichever is larger,
 with a floor of 1M instructions. Every other number is secondary and keeps the band it had: 10%
-(`noise`) or three times the spread, with floors of 50 ms for times, 100 MB for memory and
+(`--noise`) or three times the spread, with floors of 50 ms for times, 100 MB for memory and
 50 MB for the store and disk. Either band is doubled with fewer than three earlier runs. A wall
 time past its band fails the check as before, since a step can get slower without retiring more
 instructions (a lock, a lost core). The report starts with a summary in rustc-perf's form: for
@@ -722,60 +736,44 @@ instructions, wall time and peak memory, how many numbers regressed and how many
 their band and the geometric mean of their change, and over every number compared, below the
 band too, how many went up and down and the geometric mean of all the changes. Memory checked is
 blaze's: its peak in each phase, what the daemon holds after each phase, once ready and at the
-end of the run, and its disk. Historical Cargo memory is never compared as Blaze memory. A missing
-previously measured Blaze field or phase fails; losing the daemon verdict fails regardless of time.
-On a regression the workflow opens an issue
+end of the run, and its disk; cargo's memory is charted, not checked. A step the daemon built that cargo
+builds now is a regression whatever its time. On a regression the workflow opens an issue
 labelled `bench-regression` with a table of what moved (or comments on the one already open),
 writes the table to the run's summary and fails.
 
-Live edits were checked the same way by the former `live-latency.yaml` workflow, which is
-absent from the current tree along with the old live implementation. It ran nightly on a
-GitHub macOS arm64 runner (`macos-15`), timed edits of four live programs through `blaze build`,
-appended one line for all of them to `docs/benchmarks/history/macos-arm64-live.jsonl`, and
-checked each program and mode's p50 and p90 (floor 1 ms) before publishing the trends.
-That history and [the old live design](live.md#latency-under-typing) remain available;
-they do not establish current live-edit support or an active latency gate.
-
 ## Run it yourself
 
-Build the selected compiler with the pinned Blaze as [contributing.md](contributing.md)
-describes. Use that source-built executable and the pinned LLVM, with a fresh work directory
-on the supported filesystem. On Linux the work, home, cache and store must use the verified
-reflink volume; on macOS keep the work path short enough for the daemon's socket. A benchmark
-refuses a nonempty work directory. Ripgrep's workload searches this checkout's `library/`.
+As v1 was measured (against v2 this stops where [the top of the page](#benchmarks) says), on any of the platforms with Nix (or with the pinned nightly of `pins/toolchain`, the pinned LLVM 23 and Python 3 installed; ripgrep's run searches blaze's `library/`, not a rust-src):
 
-```sh
-uv run --frozen --no-dev python harness/bench.py '{"action":"run","blaze":"/absolute/source-built/blaze-engine","work":"/fresh/bench","out":"/results/bench.json","projects":["ripgrep","fd"],"runs":5,"cold_runs":5,"tests":true,"machine":"my-benchmark-machine"}'
-uv run --frozen --no-dev python harness/bench.py '{"action":"compare","baseline":"OLD.json","result":"/results/bench.json","threshold":25}'
-uv run --frozen --no-dev python harness/benchreport.py '{"action":"publish","result":"/results/bench.json","check":true}'
+```
+nix develop .#bench
+cargo build -p blaze-engine --release
+python3 harness/bench.py ripgrep fd --runs 5 --out /tmp/bench.json   # any of the projects
+python3 harness/benchreport.py /tmp/bench.json --check               # what would change
 ```
 
-Each script accepts one JSON object inline, from a file, or from standard input with `-`.
-`backends:["cranelift"]` selects dev only; the default includes release too. `sources` chooses
-the clone cache (default `~/blaze-projects`), and `stress:true` adds the stress corpus. With an
-empty project list and `stress:true`, only the stress corpus runs. The old `setups` and
-`reference` options are refused. The corpus application named `cargo` remains a real project
-compiled by Blaze.
-
-`benchreport.py` publishes with `{"action":"publish","result":"RESULT.json"}` or regenerates
-stored tables with `{"action":"render"}`. `benchhistory.py` appends a valid result with
-`{"action":"build","result":"RESULT.json","history":"HISTORY.jsonl"}` and checks it with
-`{"action":"check","history":"HISTORY.jsonl","report":"regressions.md"}`. New history rows
-retain schema 2 and the compiler identity; historical Cargo fields are never reused as Blaze
-measurements. The `machine`, `commit` and `run_url` benchmark fields supply provenance explicitly.
+`--backend cranelift` measures one tier. `--cold-runs 5` repeats the cold builds, `--setups
+all --setups-on ripgrep,nushell` adds the setups above, `--tests` the test suites, and
+`--reference DIR` puts cargo's target directories outside the work directory.
+Projects are cloned once into `BLAZE_PROJECTS`
+(default `~/blaze-projects`). The whole CI set (seven projects, both tiers, five runs) took 38
+minutes on 16 Zen 5 cores, plus the build of blaze. It needs about 20 GB of memory (nushell)
+and 30 GB of disk.
+`python3 harness/bench.py --compare OLD.json NEW.json` lists what got slower or holds more
+memory. On macOS give `--work` a short directory (`--work /tmp/bench`): the daemon's socket
+path has to fit in 104 bytes, which a work directory under `$TMPDIR` does not leave room for.
+`python3 harness/benchreport.py RESULT` publishes a run as its platform's (the machine it ran
+on): `BLAZE_BENCH_MACHINE` names that machine in the tables, and `taskset -c 0-15` before
+`python3` gives it the 16 cores of the benchmark machines. `benchreport.py --render` writes
+every table and chart again from the stored results.
 
 ## Caveats
 
-- Live edits (the patch applied to a running program) work on macOS on Apple silicon only and are
-  measured there by `harness/live_latency.py`, one edit at a time through `blaze build` (its
-  per-keystroke modes wait on a `blaze_api::client` port): [live.md](live.md#latency-under-typing)
-  has the numbers once measured on a MacBook, and
-  `history/macos-arm64-live.jsonl` the runs.
 - One machine, one OS. The numbers on a laptop will differ; the ratios are what carries over.
 - Cold is the least precise number here: five runs at most, each minutes long on the large
   projects.
-- The historical setup comparisons measured ripgrep and nushell only; schema 2 runs none of
-  those Cargo setups.
+- The setups compared are measured on ripgrep and nushell only (`--setups-on`): seven more
+  builds of every step on every project would make the nightly run too long for one machine.
 - An edit is a small, fixed change. A larger change (many functions, a new type) costs more.
 - axum's output is not checked (it is a server); its build is.
 - ripgrep's runtime is one short workload (tens of milliseconds, over 16 threads), so it says more

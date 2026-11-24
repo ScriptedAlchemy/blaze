@@ -18,6 +18,13 @@ enum Fault {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum Plant {
+    None,
+    EarlyPublication,
+    NoDirSync,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Case {
     seed: u64,
     len: usize,
@@ -39,7 +46,7 @@ fn io(sim: &mut Sim, effect: Effect) -> Done {
 }
 
 /// The same transition and SQEs as Uring::wrote/path_sqes. Only kernel execution is replaced.
-fn simulate(case: Case, plant: bool) -> Result<(), String> {
+fn simulate(case: Case, plant: Plant) -> Result<(), String> {
     let mut sim = Sim::new(case.seed, Faults::default());
     let mut rng = Rng::new(case.seed ^ 0xc10e);
     let (temp, target) = (name("placed/temporary"), name("placed/value"));
@@ -55,7 +62,7 @@ fn simulate(case: Case, plant: bool) -> Result<(), String> {
         let mut n = whole::sqes(&hot, &cold, &bytes, names, |n| n as u64, &mut sqes);
         // Plant the old missing gate: publish in the write's chain, before its count is known.
         // The suffix itself comes from the production commit SQE builder, not a second writer.
-        if plant && matches!(hot.phase, OPENING | OPENED) {
+        if matches!(plant, Plant::EarlyPublication) && matches!(hot.phase, OPENING | OPENED) {
             sqes[n - 1].flags |= SQE_IO_LINK;
             let mut commit = [Sqe::default(); LINKS];
             let committing = Hot { phase: COMMITTING, ..hot };
@@ -88,13 +95,13 @@ fn simulate(case: Case, plant: bool) -> Result<(), String> {
                         assert_eq!(
                             io(
                                 &mut sim,
-                                Effect::Write {
+                                Effect::Truncate {
                                     file: temp.clone(),
-                                    bytes: Vec::new(),
+                                    len: 0,
                                     tag: Tag(1),
                                 }
                             ),
-                            Done::Written
+                            Done::Truncated
                         );
                         0
                     }
@@ -125,8 +132,8 @@ fn simulate(case: Case, plant: bool) -> Result<(), String> {
                         0
                     }
                     OP_RENAMEAT => {
-                        // Publication's invariant, checked BEFORE Sim's completed-rename
-                        // durability can hide a missing sync or an early publication.
+                        // A canonical name may become visible only after every byte of
+                        // the output was written and synced. Namespace durability follows.
                         if !synced || sim.contents(&temp) != bytes {
                             return Err(
                                 "rename published before all bytes were written and synced".into()
@@ -135,7 +142,7 @@ fn simulate(case: Case, plant: bool) -> Result<(), String> {
                         assert_eq!(
                             io(
                                 &mut sim,
-                                Effect::Rename {
+                                Effect::RenameUnsynced {
                                     from: temp.clone(),
                                     to: target.clone(),
                                     tag: Tag(1),
@@ -145,7 +152,20 @@ fn simulate(case: Case, plant: bool) -> Result<(), String> {
                         );
                         0
                     }
-                    OP_FSYNC => 0, // Sim makes a completed rename durable; model dir errors above.
+                    OP_FSYNC => {
+                        // The planted bug reports a completed syscall without committing
+                        // the rename. Only Sim's actual SyncDir makes that name durable.
+                        if !matches!(plant, Plant::NoDirSync) {
+                            assert_eq!(
+                                io(
+                                    &mut sim,
+                                    Effect::SyncDir { dir: name("placed").into(), tag: Tag(1) }
+                                ),
+                                Done::Synced
+                            );
+                        }
+                        0
+                    }
                     OP_UNLINKAT => {
                         assert_eq!(
                             io(&mut sim, Effect::Remove { file: temp.clone(), tag: Tag(1) }),
@@ -196,12 +216,17 @@ fn simulate(case: Case, plant: bool) -> Result<(), String> {
                 };
             }
             Step::Ends(Some(Done::Failed(_))) if injected => {
+                if sim.exists(&temp) {
+                    return Err("failure did not clean its live temporary name".into());
+                }
                 sim.crash();
                 let visible = sim.contents(&target);
-                return if !sim.exists(&temp) && (visible == old || visible == bytes) {
+                // Cleanup has no directory sync after a refused commit. A crash may
+                // restore its temporary name; it must never tear the canonical output.
+                return if visible == old || visible == bytes {
                     Ok(())
                 } else {
-                    Err("failure left temporary or partial canonical bytes".into())
+                    Err("failure exposed partial canonical bytes after a crash".into())
                 };
             }
             _ => return Err(format!("unexpected write outcome in phase {}", hot.phase)),
@@ -233,7 +258,7 @@ fn whole_write_publication_survives_import_limits_faults_and_crashes() {
                 .unwrap(),
             crash_after: tape.int_in(0..=64, "crash after"),
         };
-        assert_eq!(simulate(case, false), Ok(()), "{case:?}");
+        assert_eq!(simulate(case, Plant::None), Ok(()), "{case:?}");
     });
 }
 
@@ -247,19 +272,41 @@ fn whole_write_oracle_catches_publication_linked_to_a_clamped_write() {
         fault: Fault::None,
         crash_after: 0,
     };
-    assert_eq!(simulate(case, false), Ok(()));
+    assert_eq!(simulate(case, Plant::None), Ok(()));
     assert_eq!(
-        simulate(case, true),
+        simulate(case, Plant::EarlyPublication),
         Err("rename published before all bytes were written and synced".into())
     );
     for fault in
         [Fault::None, Fault::Write, Fault::Zero, Fault::FileSync, Fault::Rename, Fault::DirSync]
     {
-        assert_eq!(simulate(Case { fault, ..case }, false), Ok(()), "{fault:?}");
+        assert_eq!(simulate(Case { fault, ..case }, Plant::None), Ok(()), "{fault:?}");
     }
     for crash_after in 1..=7 {
-        assert_eq!(simulate(Case { crash_after, ..case }, false), Ok(()), "crash {crash_after}");
+        assert_eq!(simulate(Case { crash_after, ..case }, Plant::None), Ok(()), "crash {crash_after}");
     }
+}
+
+#[test]
+fn whole_write_oracle_catches_a_missing_directory_sync() {
+    let mut caught = false;
+    for seed in 0..64 {
+        let case = Case {
+            seed,
+            len: 43,
+            import_limit: 32,
+            short: false,
+            fault: Fault::None,
+            crash_after: 0,
+        };
+        assert_eq!(simulate(case, Plant::None), Ok(()), "seed {seed}");
+        match simulate(case, Plant::NoDirSync) {
+            Ok(()) => {}
+            Err(why) if why == "success did not leave exactly the durable output" => caught = true,
+            other => panic!("seed {seed}: unexpected missing-sync outcome {other:?}"),
+        }
+    }
+    assert!(caught, "the crash oracle missed an acknowledged write without a directory sync");
 }
 
 #[test]

@@ -12,15 +12,15 @@ failures it can return, the way `#[blaze::may(..)]` says exactly which effects i
 ```rust
 #![blaze::error_unions]
 
-fn main(cx: &Cx, io: Io) -> Result<(), Missing | FsError> {
-    let fs = io.need_fs()?;                      // Missing
+fn main(cx: &Cx, fs: Fs, out: Out) -> Result<(), OutError | FsError> {
     let data = fs.open_dir(cx, path!("data"))?;  // FsError
+    out.line(cx, "opened data")?;                // OutError
     ..
 }
 
-match main(cx, io) {
+match main(cx, fs, out) {
     Ok(()) => {}
-    Err(Missing { capability }) => ..,
+    Err(OutError { stream, .. }) => ..,
     Err(FsError { kind: FsKind::NotFound, path, .. }) => ..,
     Err(e @ FsError { .. }) => report(e),        // e: FsError
 }
@@ -70,10 +70,17 @@ A signature's set is a positive list, as an effect list is: what it leaves out c
 - **Too much is advice**, not built: a member of a private function's set that no `?`, `Err` or
   return of its body can produce (`blaze::unneeded_member`, `warn`, with the fix that takes it
   off), as `unneeded_effect` does for a word. A `pub` function may reserve a member.
-- **Inferred sets** (Zig's `!T`), not built: a private function writes `Result<T, _>` and the set
-  is the union of what its body returns. It needs the set as an inference result the signature
-  reads, which is the cycle Zig also has for recursion; the border rule of the edition (infer
-  inside, declare at `pub`) is where it goes.
+- **Inferred return types and error sets (`Result<T, _>`, `-> _`, `-> Option<_>`):** any function
+  with a body (both private and `pub`) may write `_` placeholders in its return type — including
+  `Result<T, _>` (where every `Err(...)` and `?` error in the body is collected into a single
+  canonical error union, a single type, or `!` when infallible) as well as general return-type
+  holes like `-> _`, `-> Option<_>`, and `-> (_, u32)`. Call chains between `_`-returning
+  functions are resolved on demand via an iterative worklist in `front2` (`Store::inferred_outputs`),
+  while bodyless declarations (`extern fn`, required trait methods) and recursive `_`-inference
+  cycles are rejected cleanly with `E0391` asking for an explicit return/error type. Explicit
+  `Result<T, E1 | E2>` remains supported for stable public contracts and pure
+  `Heads`-only incremental caching, and `Store::inferred_return_type` / `Store::inferred_error_set`
+  expose the finalized types for `blaze inspect` inlay hints.
 
 ## Matching
 
@@ -94,11 +101,32 @@ covered, a member left out is the witness, written `FsError { .. }` or `Stopped:
 covered twice is unreachable), MIR lowering (a discriminant test, then the variant's field),
 the match tree and closure capture analysis.
 
-Not built: the typed binding of the edition page, `Err(e: FsError)` and `_: Stopped`, which
-binds or tests a member whole without naming its fields or variants (today `e @ FsError { .. }`
-for a struct; an enum member whole has no pattern). It is sugar for the same adjustment and
-needs a pattern form in the parser and `hir-def`. Narrowing the rest of a set after an arm
-(`E is not FsError`) waits for pattern types.
+**v2 compiler representation (`blaze-ty::union_ty`, `blaze-typeck`, `blaze-build`, `blaze-lower`, `parser`):**
+- `UNION_TYPE` lowers directly to `TypeRef::Union(List)` in `blaze-lower`, and to first-class
+  `PNode::Union(List)` / `TyView::Union(TyList)` across `blaze-typeck`, `blaze-body`,
+  `blaze-borrow`, `blaze-flow-lower`, `blaze-facts`, and `blaze-ladder`, with real tagged-sum
+  layout (`u8`/`u16` local discriminant + aligned payload, transparent for 1 member, uninhabited
+  ZST for 0 members) in `blaze-build/src/layout.rs`.
+- **Canonical result & error-union syntax:** `Result<Row, FsError | Stopped>` and `Result<Row, _>`
+  use standard Rust generic syntax with zero `!` macro/never-type ambiguity (including structural
+  record error members like `Result<Row, { code: u32 }>`).
+- `blaze-ty::union_ty::UnionTy` supports arbitrary arity (>12 members, `u8` tag up to 256 members,
+  `u16` beyond) with niche-reuse layout computation.
+- **Generic unions (`ParametricUnionTy`):** `fn with_timeout<T, E>(...) -> Result<T, E | Timeout>`
+  normalizes, flattens nested unions, strips `!`, and deduplicates identical members at
+  monomorphization time.
+- **Typed binding patterns:** `Err(e: FsError)` and `Err(_: Stopped)` parse natively under
+  `#![blaze::error_unions]` in `match` arms and nested pattern delimiters (`tuple`, `tuple_struct`,
+  `slice`, `paren`) without affecting `let x: T`, `fn(x: T)`, or closure parameter ascriptions.
+- **Multi-member residual narrowing (`narrow_remove_many`):** matching `FsError` and `ParseError`
+  out of `FsError | ParseError | Timeout | Stopped` narrows the fallback arm `Err(other)` to
+  `Timeout | Stopped`, detecting redundant arms and allowing direct `?` / `return Err(other)`
+  widening.
+- **General `_` return-type & error-set inference (`Checked::inferred_output`, `Store::inferred_outputs`):**
+  supports `Result<T, _>` (accumulating `Err(..)` / `?` / nested unions into the canonical union)
+  as well as `-> _`, `-> Option<_>`, and `-> (_, u32)` on any function with a body, resolved in
+  demand order across call chains with cycle detection (`E0391`) and queryable for `blaze inspect`
+  inlay hints (`Store::inferred_return_type`, `Store::inferred_error_set`).
 
 ## Representation and cost
 
@@ -161,8 +189,7 @@ that open the root.
 | `KvError { under: FsError }` | stays: it adds the key and the operation to the file's error, which is context, not a sum; its `under` follows `FsError`, so `Kv`'s nine functions (kv.rs 230 to 314) return `KvError \| Stopped` | |
 | `TaskWhy::OutOfMemory(Stopped)` | `Scope::spawn`'s reserve failure is the `Stopped` it is: `Task::join` returns `TaskError \| Stopped` | `task.rs` 221, 322 |
 
-Stay as they are: `Io::need_*` (`Missing`, a set of one, which is what makes `main` above
-work), the name types' errors (`PathError`, `UrlError`, `KeyError`, `NameError`,
+Stay as they are: `Io::need_*` (`Missing`, a set of one), the name types' errors (`PathError`, `UrlError`, `KeyError`, `NameError`,
 `HostPortError`, `VarNameError`, `HeaderError`), `ImageError`, `VideoError`, `MuxError`, and
 `TaskWhy::Failed(String)`: a task's own error `E` as a member needs a set over a type
 parameter, which is refused.

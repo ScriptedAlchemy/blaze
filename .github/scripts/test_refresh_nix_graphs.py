@@ -284,8 +284,8 @@ class RefreshTests(unittest.TestCase):
         (self.root / "untouched").write_text("original\n")
         (self.root / "flake.nix").write_text("{}\n")
         (self.root / "flake.lock").write_text("{}\n")
-        (self.root / "harness").mkdir()
-        (self.root / "harness/toolchain").write_text("nightly-2026-10-27\n")
+        (self.root / "pins").mkdir()
+        (self.root / "pins/toolchain").write_text("nightly-2026-10-27\n")
         self.graphs(self.root)
         self.git("add", ".")
         self.git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
@@ -295,7 +295,7 @@ class RefreshTests(unittest.TestCase):
         return refresh.run(["git", *args], self.root)
 
     def graphs(self, work):
-        for project, directory in (("daemon", work), ("life", work / "demo/life")):
+        for project, directory in (("life", work / "demo/life"),):
             graph = {
                 "version": 4,
                 "manifest": tomllib.loads((directory / "Cargo.toml").read_text()),
@@ -323,7 +323,7 @@ class RefreshTests(unittest.TestCase):
 
     def test_export_is_bound_to_committed_source_and_leaves_checkout_untouched(self):
         # The ordinary graph check may have already changed a generated file before failing.
-        original = self.root / "tools/nix/units/daemon.json"
+        original = self.root / "tools/nix/units/life.json"
         original.write_text("dirty output from failed gate\n")
         before = self.git("diff", "--binary")
         refresh.refresh(self.root, refresh.Request(self.out), self.metadata)
@@ -340,7 +340,7 @@ class RefreshTests(unittest.TestCase):
         for name, digest in receipt["files"].items():
             self.assertEqual(hashlib.sha256((self.out / name).read_bytes()).hexdigest(), digest)
         self.assertIn(b"demo/life/Cargo.lock", (self.out / "refresh.patch").read_bytes())
-        self.assertNotIn("dirty output", (self.out / "tools/nix/units/daemon.json").read_text())
+        self.assertNotIn("dirty output", (self.out / "tools/nix/units/life.json").read_text())
         refresh.checked_graphs(self.out_with_manifests())
 
     def out_with_manifests(self):
@@ -375,8 +375,8 @@ class RefreshTests(unittest.TestCase):
                 self.assertEqual(self.git("diff"), b"")
 
     def test_changed_shell_pin_refuses_metadata_export(self):
-        (self.root / "harness/toolchain").write_text("nightly-2026-10-28\n")
-        with self.assertRaisesRegex(ValueError, "harness/toolchain: checkout differs"):
+        (self.root / "pins/toolchain").write_text("nightly-2026-10-28\n")
+        with self.assertRaisesRegex(ValueError, "pins/toolchain: checkout differs"):
             refresh.refresh(self.root, refresh.Request(self.out), self.metadata)
         self.assertFalse(self.out.exists())
         self.assertEqual(self.git("worktree", "list", "--porcelain").count(b"worktree "), 1)

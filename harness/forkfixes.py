@@ -76,9 +76,7 @@ def provenance(given: Input) -> dict:
         files[name] = sha256(path) if path.is_file() else None
     encoded = json.dumps(files, sort_keys=True).encode()
     binaries = [Path(given.blaze).resolve(strict=True)]
-    engine = binaries[0].with_name("blaze-engine")
-    if engine.is_file():
-        binaries.append(engine)
+    binaries.extend(binaries[0].with_name(name) for name in ("blaze-launcher", "blaze-fact-shim"))
     # Include this lane's fixtures even when the compiler came from a separate frozen tree.
     harness = [Path(__file__).resolve(), HERE / "storelib.py",
                *sorted((HERE / "forkfixes").glob("*.py")),
@@ -209,7 +207,7 @@ class Daemon:
         return env_for(self.scratch, self.home)
 
     def status(self, log: Path, timeout: float = 10) -> int | None:
-        result = command([self.given.blaze, "--ignore-pin", "status", "--json"], self.scratch, self.env, log, timeout)
+        result = command([self.given.blaze, "status", "--json"], self.scratch, self.env, log, timeout)
         if result["returncode"] != 0:
             raise Failed(f"daemon status exited {result['returncode']}: {log}.*")
         status = blaze_status_of(log.with_suffix(".stdout").read_text())
@@ -218,7 +216,7 @@ class Daemon:
     def start(self) -> None:
         self.generation += 1
         log = self.scratch / "logs" / f"daemon-{self.generation}"
-        argv = [self.given.blaze, "--ignore-pin", "serve"]
+        argv = [self.given.blaze, "serve"]
         if self.given.stall_bound is not None:
             argv += ["--stall-bound", str(self.given.stall_bound)]
         with log.with_suffix(".log").open("w") as out:
@@ -250,7 +248,7 @@ class Daemon:
         if self.process is None:
             return
         try:
-            result = command([self.given.blaze, "--ignore-pin", "stop"], self.scratch, self.env,
+            result = command([self.given.blaze, "stop"], self.scratch, self.env,
                              self.scratch / "logs" / f"stop-{self.generation}", 60)
             if result["returncode"] != 0:
                 raise Failed(f"blaze stop exited {result['returncode']}")
@@ -301,7 +299,7 @@ def run_case(daemon: Daemon, case: dict) -> tuple[bool, str]:
                 env.pop(name, None)
             else:
                 env[name] = value
-        argv = [given.blaze, "--ignore-pin", "test" if "test" in step else "build", "--target-dir", str(target),
+        argv = [given.blaze, "test" if "test" in step else "build", "--target-dir", str(target),
                 "--message-format=json", *(["--reached"] if "test" in step else []), *step.get("args", ())]
         result = command(argv, root, env, log, given.timeout)
         daemon.check(log.with_name(f"{index}-after"))

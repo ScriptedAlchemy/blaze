@@ -1,24 +1,9 @@
-# The repository's scripts (scripts/src/bin/<name>.rs, docs/v2/plan/design/scripts.md), built,
-# as BLAZE_SCRIPTS: a step runs one as `"$BLAZE_SCRIPTS/<name>" '<json>'`. The binaries are kept
-# in the Actions cache under key.sh's source/manifest/lock key (its header names the inputs),
-# so a hit runs no blaze and costs the key's hashing and the restore: seconds,
-# requiring a complete checkout so every local dependency source is present. A miss
-# installs the release .github/blaze-version names (./.github/actions/blaze)
-# unless that blaze is already on PATH, builds them with it (build.sh) and saves them: they are
-# blaze's output alone, never cargo's (AGENTS.md blaze-builds-blaze). A restored entry that is
-# not what build.sh made is an error (check.sh), never rebuilt in place. `local.sh CACHE` runs
-# these steps outside Actions. The cached directory (~1.4 GB) is mostly zeros, the patch room
-# blaze-link writes into every dev executable (build.sh's header; ledger D44), which the cache's
-# zstd compresses away; it stays so until the linker stops writing the room.
 name: script
-description: the repository's built scripts, from the Actions cache or built by the pinned blaze
+description: the repository scripts built with the pinned Cargo toolchain and a complete source key
 inputs:
   job:
-    description: the job whose blaze store a miss builds in (./.github/actions/blaze's `job`)
+    description: the job requesting the source-keyed scripts
     required: true
-  memory-gb:
-    description: explicit daemon budget for an owned user scope on a miss (empty keeps the caller's existing lifecycle)
-    default: ""
 runs:
   using: composite
   steps:
@@ -39,54 +24,19 @@ runs:
     - if: steps.restore.outputs.cache-hit == 'true'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/check.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'
-    # A miss: the release, unless a step before installed it. key.sh requires the full tree.
+    # key.sh already required the full checkout: source closure is part of the cache identity.
+    # A miss installs the pinned Rust toolchain unless a step before installed it.
     - id: need
       if: steps.restore.outputs.cache-hit != 'true'
       shell: bash
       run: |
-        have=$(blaze-engine --version 2>/dev/null | awk '$1 == "blaze" { print $2 }' || true)
-        echo "install=$([ "$have" = "$(cat .github/blaze-version)" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+        tc=$(cat pins/toolchain)
+        echo "install=$(cargo +"$tc" --version >/dev/null 2>&1 && echo false || echo true)" >> "$GITHUB_OUTPUT"
     - if: steps.need.outputs.install == 'true'
-      uses: ./.github/actions/blaze
-      with:
-        job: ${{ inputs.job }}
-        # The pinned release places even script and compiled std outputs by cloning blocks.
-        # Hosted Linux's ext4 needs the same proven filesystem as the compiler build jobs.
-        reflink: ${{ runner.os == 'Linux' }}
-    - name: build missing scripts
-      if: steps.restore.outputs.cache-hit != 'true'
+      uses: ./.github/actions/toolchain
+    - if: steps.restore.outputs.cache-hit != 'true'
       shell: bash
-      env:
-        SCOPE_MEMORY_GB: ${{ inputs.memory-gb }}
-        SCRIPT_DIR: ${{ steps.key.outputs.dir }}
-        SCRIPT_KEY: ${{ steps.key.outputs.key }}
-      run: |
-        if [ -z "$SCOPE_MEMORY_GB" ]; then
-          exec "$GITHUB_ACTION_PATH/build.sh" "$SCRIPT_DIR" "$SCRIPT_KEY"
-        fi
-        # The workspace caller's cache miss must not start an unowned daemon before
-        # its later scope. Build the same binaries/argv under the same proved cap,
-        # then stop/reap that scope's daemon before returning to the cache action.
-        evidence=$(mktemp -d "$RUNNER_TEMP/workspace-script-scope.XXXXXX")
-        echo "BLAZE_SCRIPT_SCOPE_EVIDENCE=$evidence" >> "$GITHUB_ENV"
-        python3 - "$evidence" <<'PY' | python3 .github/scripts/seed_preflight.py -
-        import json, os, pathlib, shutil, sys, uuid
-        evidence = pathlib.Path(sys.argv[1])
-        print(json.dumps({"blaze": shutil.which("blaze"), "log": str(evidence / "serve.log"),
-                          "scope": {"unit": f"blaze-workspace-{uuid.uuid4().hex}.scope",
-                                    "memory_gb": os.environ["SCOPE_MEMORY_GB"],
-                                    "command": [str(pathlib.Path(os.environ["GITHUB_ACTION_PATH"]) / "build.sh"),
-                                                os.environ["SCRIPT_DIR"], os.environ["SCRIPT_KEY"]],
-                                    "seconds": 4500}}))
-        PY
-    - name: retain scoped script bootstrap proof
-      if: always() && env.BLAZE_SCRIPT_SCOPE_EVIDENCE != ''
-      uses: actions/upload-artifact@v7
-      with:
-        name: workspace-script-scope-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ env.BLAZE_SCRIPT_SCOPE_EVIDENCE }}
-        if-no-files-found: error
-        retention-days: 14
+      run: '"$GITHUB_ACTION_PATH/build.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'
     - if: steps.restore.outputs.cache-hit != 'true'
       uses: actions/cache/save@v6
       with:

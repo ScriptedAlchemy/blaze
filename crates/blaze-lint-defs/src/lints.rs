@@ -72,7 +72,7 @@ pub(super) const BLAZE: &[Lint] = &[
     l(
         "blaze::implicit_allocator",
         Allow,
-        "detects a type that leaves its allocator to the default `Global`, or a global-heap type that takes none",
+        "detects a heap reached for instead of handed down: `Alloc::global()` or `Heap::process()`, an allocating call that names no allocator (`Vec::new()`, `vec!`, `format!`, `.to_string()`), a type that leaves its allocator to the default `Global`, or a global-heap type that takes none",
     )
     .externally_loaded(),
     l("blaze::fixed_key_lookup", Allow, "detects a lookup of keys known at compile time made at run time instead of by a perfect hash")
@@ -85,7 +85,17 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::default_policy", Allow, "detects `impl Default`, `#[derive(Default)]` or a `new()` that takes nothing on a type with a field marked `#[blaze::policy]`, a cost or a guarantee its maker decides")
         .externally_loaded(),
-    l("blaze::sans_io_core", Allow, "detects a function of a `#![blaze::sans_io]` core that reaches the wall clock or IO")
+    // A core is a crate or module whose top says `#![blaze::sans_io]` (D170 C5): its logic, a
+    // state machine that returns what to do. Its driver says `#![blaze::driver]` at its top: the
+    // thin code that holds the handles and does the IO the core asks for, in straight-line
+    // calls; the driver is the one place a sans-IO crate's IO is. blaze-lint's `sans-io-core`
+    // rule finds what this names, in the files its driver marks as a core (`RootMarks`).
+    l("blaze::sans_io_core", Allow, "detects, in a `#![blaze::sans_io]` crate or module, a path to the file system, the network, a process, the OS, the environment or a thread, a print, a blocking wait (`recv`, `join`, `lock`, `wait`, `block_on`) or a wall-clock read: what a core returns as its machine's output for its `#![blaze::driver]` to do")
+        .externally_loaded(),
+    // D179: state shared between workers is published, gathered or claimed; a lock is the named
+    // exception, `#[blaze::lock_exception(tried = "..", why = "..")]` on what constructs it.
+    // blaze-lint's `lock-without-reason` rule finds a construction without one.
+    l("blaze::lock_without_reason", Allow, "detects a lock constructed in shipped code (`Lock::new`, `Lock::unrecorded`, `Lock::probed`, `ReadLock::new`, `ReadLock::unrecorded`, `RwLock::new`, `RankedLock::new`, `SharedMap::new_in`) where no `#[blaze::lock_exception(tried = \"published\"|\"gathered\"|\"claimed\", why = \"..\")]` says which D179 shape it could not be, and a `lock_exception` that does not say both")
         .externally_loaded(),
     l("blaze::key_ignores_field", Allow, "detects a hand-written key (`Hash`, `PartialEq`, `Ord` or a key builder) that leaves a field out unnamed")
         .externally_loaded(),
@@ -222,7 +232,17 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::unmarked_nonblocking", Allow, "detects a function the effects walk proves never blocks the thread that lacks `#[blaze::nonblocking]`, which callers could rely on")
         .externally_loaded(),
-    l("blaze::mut_ref", Allow, "detects a unique reference spelled `&mut` or `ref mut` in a crate that says `#![blaze::uniq]`, which spells it `&uniq` and `ref uniq`")
+    l("blaze::mut_ref", Allow, "deprecates unique references spelled `&mut` or `ref mut` in favor of `&uniq` and `ref uniq` (with mechanical auto-fix)")
+        .externally_loaded(),
+    l("blaze::mut_for_uniq_borrow", Allow, "detects `let mut x = ..;` when `x` is never reassigned and only borrowed uniquely (`&uniq x` / `&mut x`); under Blaze's edition `let x` permits `&uniq x` directly and `mut` is reserved for local rebinding")
+        .externally_loaded(),
+    l("blaze::magic_slice_len", Warn, "detects hardcoded magic slice range lengths (`bytes.get(0..3) == Some(..)`, `bytes.get(at..at + 2)`, `&x[..7] == b\"..\"`, `starts_with` followed by hardcoded advance) and suggests deriving the length via `strip_prefix`, `starts_with`, `.len()`, `size_of::<T>()`, or a named `const`")
+        .externally_loaded(),
+    l("blaze::bool_as_int", Warn, "detects boolean-to-integer `as` casts (`(a == b) as u32`, `x.is_some() as usize`) and mechanically auto-fixes them to infallible `T::from(..)` conversions")
+        .externally_loaded(),
+    l("blaze::manual_slice_idioms", Warn, "detects manual length/index slice patterns (`x.len() == 0` / `x.len() > 0` auto-fixed to `is_empty()`, `for i in 0..xs.len() { xs[i] }` index loops, and `.find(..)` followed by manual slice splitting instead of `split_once`)")
+        .externally_loaded(),
+    l("blaze::test_ambient_leak", Warn, "detects `Alloc::global()` and `#[cfg(test)] extern crate std;` in test code, which violate Blaze's test-world allocator and `#![no_std]` test ratchets")
         .externally_loaded(),
     l("blaze::undeclared_effect", Deny, "detects a function that may panic, allocate from the global heap, block the thread or not return (`diverge`), through any call, where its `#[blaze::expect(..)]`, its trait method's, the default of a module around it or `#![blaze::effects]` does not allow it; and an impl's method that lists an effect its trait's method does not; a list that is not one; and the deleted `#[blaze::may(..)]`, respelled `#[blaze::expect(..)]`")
         .externally_loaded(),
@@ -288,7 +308,7 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::narrowed_len", Allow, "detects a length narrowed to a smaller integer type by `try_from` or `try_into` with an `expect` or `unwrap`, which panics on a large input instead of refusing it with a typed error")
         .externally_loaded(),
-    l("blaze::process_static", Allow, "detects a `static` or `thread_local!` key holding a growable collection beneath a lock or a cell, or a concurrent collection: state that grows for the process's life with no owner to drop it")
+    l("blaze::process_static", Allow, "detects a `thread_local!`, a `static mut`, or a `static` whose type holds interior state (a cell, a lock, an atomic, a once or lazy value): state the process keeps with no owner (D170 C3); the three statics C3 and D173 allow (the foreign heap, the profile ring, the signal handler) are rows of blaze-lint's `ALLOWED_STATICS`, by crate and name, the one table the sansio gate reads too")
         .externally_loaded(),
     l("blaze::loop_turn_effects", Deny, "detects a `#[blaze::bounded_turn]` function, a loop thread's turn, that may block the thread, do IO, sync a file to the disk or take a lock, through any call")
         .externally_loaded(),
@@ -316,7 +336,7 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::detached_thread", Allow, "detects a `thread::spawn` or `thread::Builder::spawn` whose `JoinHandle` is dropped or never named, so nobody joins the thread")
         .externally_loaded(),
-    l("blaze::unbounded_channel", Allow, "detects a channel made with no bound (`mpsc::channel`, `crossbeam_channel::unbounded`, tokio's `unbounded_channel`, `flume::unbounded`), which a fast sender grows until memory runs out")
+    l("blaze::unbounded_channel", Allow, "detects a channel made with no bound (`mpsc::channel`, `blaze_core::chan::unbounded`, tokio's `unbounded_channel`, `flume::unbounded`), which a fast sender grows until memory runs out")
         .externally_loaded(),
     l("blaze::transmute", Allow, "detects `std::mem::transmute` and `transmute_copy`, which check nothing but the sizes, and writes std's safe function where one exists for the pair")
         .externally_loaded(),
@@ -403,8 +423,7 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::swappable_parameters", Allow, "detects two adjacent parameters of one primitive or string type")
         .externally_loaded(),
-    // How hard code is to hold in one's head: each measure over its bound (docs/lints.md,
-    // "Complexity"), an existing item held at its value.
+    // How hard code is to hold in one's head: each measure over its bound, an existing item held at its value.
     l("blaze::function_weight", Allow, "detects a function whose cognitive complexity is over its bound")
         .externally_loaded(),
     l("blaze::path_count", Allow, "detects a function with more acyclic paths through it, loops taken once, than its bound")
@@ -463,7 +482,7 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::comment_claims", Allow, "detects a body comment claiming what nothing checks (`cannot overflow`, `unreachable`, `can't be None`)")
         .externally_loaded(),
-    // Duplicated code and copy-paste mistakes, by the shape of code (docs/lints.md, Duplicates).
+    // Duplicated code and copy-paste mistakes, by the shape of code.
     l("blaze::same_fn", Allow, "detects two functions with the same body and signature up to the names of their locals")
         .externally_loaded(),
     l("blaze::same_impl_fn", Allow, "detects one method body written in several impls, which a default method or blanket impl would hold once")
@@ -558,4 +577,10 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
+    // Raw std/third-party synchronization primitives, checked by blaze-lint's `raw-sync` rule.
+    l("blaze::raw_sync", Allow, "detects raw synchronization primitives (`std::sync::{Mutex, RwLock, Condvar, Barrier}`, `parking_lot::{Mutex, RwLock, Condvar}`, `dashmap::DashMap`, `mpsc::{channel, sync_channel}`) where blaze's named locks or bounded channels belong")
+        .externally_loaded(),
+    // Anonymous tuple return types with unnamed state (`(Option<T>, bool)`, `(A, B, C)`), checked by blaze-lint's `anon-tuple-return` rule.
+    l("blaze::anon_tuple_return", Allow, "detects a function returning an anonymous tuple carrying unnamed state (e.g. `(Option<T>, bool)`, `(T, bool)`, or 3+ elements) where a named struct should name each field")
+        .externally_loaded(),
 ];

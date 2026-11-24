@@ -127,6 +127,11 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::unmarked_noalloc",
             "blaze::unmarked_nonblocking",
             "blaze::mut_ref",
+            "blaze::magic_slice_len",
+            "blaze::bool_as_int",
+            "blaze::manual_slice_idioms",
+            "blaze::test_ambient_leak",
+            "blaze::mut_for_uniq_borrow",
             // Code written the way the edition wants it (docs/v2/plan/design/facts.md).
             "blaze::program_lifetime",
         ],
@@ -165,6 +170,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::many_bools",
             "blaze::default_policy",
             "blaze::sans_io_core",
+            "blaze::lock_without_reason",
             "blaze::key_ignores_field",
             "blaze::wildcard_arm",
             "blaze::large_move",
@@ -300,6 +306,8 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::registry_spread",
             "blaze::same_behaviour",
             "blaze::workspace_unsafe",
+            "blaze::raw_sync",
+            "blaze::anon_tuple_return",
         ],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in

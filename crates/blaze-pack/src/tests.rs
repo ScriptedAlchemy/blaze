@@ -29,7 +29,7 @@ fn imported(model: &mut Model, manifest: &Manifest, body: &mut Cut) -> Result<im
 
 // ---- the manifest
 
-/// The invariant: one selection has one manifest, whatever order its records were found in.
+/// Invariant: one selection has one manifest, whatever order its records were found in.
 /// The control: the same records written in another order are bytes a reader refuses.
 #[test]
 fn exporting_one_selection_twice_gives_identical_bytes() {
@@ -154,7 +154,7 @@ fn a_manifest_that_is_not_the_packs_is_refused_before_it_is_read() {
     assert!(matches!(Manifest::named(&pack, &flipped, &TestHashes), Err(Refused::Manifest { .. })));
 }
 
-/// The invariant: a span index says where each span's frame is and never asks for more than
+/// Invariant: a span index says where each span's frame is and never asks for more than
 /// its bounds; one with another number of frames than its body has spans, a span or a frame
 /// past its bound, is refused as it is read.
 #[test]
@@ -182,7 +182,7 @@ fn a_span_index_round_trips_and_is_bounded() {
 
 // ---- the import
 
-/// The invariant: an export imported into an empty store leaves, under every key of the
+/// Invariant: an export imported into an empty store leaves, under every key of the
 /// manifest, the origin's bytes, and a build then misses none of them. A second import puts
 /// nothing: a record already present is not written again.
 #[test]
@@ -226,7 +226,7 @@ fn flipped(seed: u64, plant: bool) -> (u64, Result<import::Summary, Refused>, Id
     (model.violations, done, manifest.records()[hit as usize].key)
 }
 
-/// The invariant: no record whose bytes are not the manifest's is ever put, and the import
+/// Invariant: no record whose bytes are not the manifest's is ever put, and the import
 /// stops naming the record the flipped byte is in. The control puts unchecked: the oracle
 /// (the model checks every put against the manifest) must see it.
 #[test]
@@ -245,7 +245,7 @@ fn the_oracle_catches_unchecked_flipped_pack_bytes() {
     assert_eq!(caught, SEEDS, "the control put flipped bytes and the oracle saw {caught} of {SEEDS}");
 }
 
-/// The invariant: a body that ends early stops the import naming the record it ends in,
+/// Invariant: a body that ends early stops the import naming the record it ends in,
 /// nothing unchecked is put, and the same import with the whole body then completes.
 #[test]
 fn a_truncated_transfer_is_refused_and_a_second_import_completes() {
@@ -315,7 +315,7 @@ fn crashed_at_every_step(seed: u64, plant: bool) -> u64 {
     violations
 }
 
-/// The invariant: through a crash at any step no unchecked record is ever visible, nothing
+/// Invariant: through a crash at any step no unchecked record is ever visible, nothing
 /// is durable without its pin, and the import run again completes with the origin's bytes.
 /// The control puts unchecked over a flipped body.
 #[test]
@@ -347,7 +347,7 @@ fn collected_after_import(seed: u64, pin: bool) -> usize {
     model.missing(&manifest)
 }
 
-/// The invariant: what an import made visible is pinned by the same commit, so a collection
+/// Invariant: what an import made visible is pinned by the same commit, so a collection
 /// of everything unrooted between the import and the first build takes none of it and the
 /// build makes 0 units. The control imports without the pin: the collection takes them all.
 #[test]
@@ -467,7 +467,7 @@ fn fetched(seed: u64, count: usize, sources: &[Does], plant: bool) -> Fetched {
     out
 }
 
-/// The invariant: nothing is kept that is not the record's bytes; a source that lies ends
+/// Invariant: nothing is kept that is not the record's bytes; a source that lies ends
 /// the fetch naming it and the key, with nothing of the lie kept. The control keeps
 /// unchecked: the oracle (each kept record against the origin) must see it.
 #[test]
@@ -490,7 +490,7 @@ fn the_oracle_catches_a_lying_sources_bytes_kept_unchecked() {
     assert_eq!(caught, SEEDS, "the control kept lies and the oracle saw {caught} of {SEEDS}");
 }
 
-/// The invariant: a source that fails or never answers is dropped once, said once, and what
+/// Invariant: a source that fails or never answers is dropped once, said once, and what
 /// it was asked comes from the sources left; the fetch ends within its bound.
 #[test]
 fn a_source_that_fails_or_stalls_is_dropped_once_and_the_rest_is_fetched() {
@@ -505,7 +505,7 @@ fn a_source_that_fails_or_stalls_is_dropped_once_and_the_rest_is_fetched() {
     }
 }
 
-/// The invariant: a record no source has is a miss, an outcome and not an error; with every
+/// Invariant: a record no source has is a miss, an outcome and not an error; with every
 /// source failing, everything is a miss.
 #[test]
 fn a_record_no_source_has_is_a_miss() {
@@ -544,7 +544,7 @@ impl Signatures for TestSignatures {
     }
 }
 
-/// The invariant: a head is taken only when a trusted key's signature over exactly its
+/// Invariant: a head is taken only when a trusted key's signature over exactly its
 /// fields verifies, or when it is unsigned and the user said so; a signature that fails is
 /// never read as an unsigned head.
 #[test]
@@ -592,7 +592,7 @@ fn a_head_is_taken_only_under_a_trusted_signature_or_the_users_word() {
     assert!(Head::decode(&bytes).is_err(), "bytes after a head were read");
 }
 
-/// The invariant: an endpoint answers a request only when a listed key signed exactly its
+/// Invariant: an endpoint answers a request only when a listed key signed exactly its
 /// path; no address, no unsigned request and no other key's signature reads anything.
 #[test]
 fn an_endpoint_answers_only_requests_a_listed_key_signed() {
@@ -681,7 +681,7 @@ fn a_batch_of_statements_round_trips_and_is_bounded() {
     assert!(peer::statements_of(&after).is_err());
 }
 
-/// The invariant: a statement is taken for a key only when it is about that key and a
+/// Invariant: a statement is taken for a key only when it is about that key and a
 /// trusted key signed exactly it.
 #[test]
 fn a_peers_statement_is_taken_only_about_its_key_under_a_trusted_signature() {
@@ -722,4 +722,29 @@ fn a_verified_record_carries_the_manifests_key_and_kind() {
     let mut into = Vec::new();
     cut.read(0, 4, &mut into).unwrap();
     assert_eq!(into, records[0].1[..4]);
+}
+
+#[test]
+fn spans_coalesce_ranges_merges_nearby_frames_and_respects_max_range() {
+    use crate::spans::{CoalescedRange, Spans};
+    // 6 spans of 1000 bytes each; compressed frame sizes = [100, 120, 80, 500, 90, 110].
+    let spans = Spans::new(1000, 6000, &[100, 120, 80, 500, 90, 110]).unwrap();
+    // Ask for bytes in spans 0, 2 (gap = frame 1 = 120 bytes <= 150), and span 5 (gap = frames 3+4 = 590 > 150).
+    let got = spans.coalesce_ranges(&[(10, 50), (2050, 20), (5010, 30), (15, 25)], 150, 1000);
+    assert_eq!(
+        got,
+        vec![
+            CoalescedRange { byte_start: 0, byte_len: 300, first_span: 0, end_span: 3 },
+            CoalescedRange { byte_start: 890, byte_len: 110, first_span: 5, end_span: 6 },
+        ]
+    );
+    // Respect max_range cap: cap = 250 splits span 2 from span 0 even though gap <= 150.
+    let split = spans.coalesce_ranges(&[(10, 50), (2050, 20)], 150, 250);
+    assert_eq!(
+        split,
+        vec![
+            CoalescedRange { byte_start: 0, byte_len: 100, first_span: 0, end_span: 1 },
+            CoalescedRange { byte_start: 220, byte_len: 80, first_span: 2, end_span: 3 },
+        ]
+    );
 }

@@ -1,37 +1,5 @@
-# blaze: the merge gate. What a pull request and each entry of the merge queue has to pass:
-# one build of blaze shared by the tests, distributed acceptance and microbenchmarks on Linux
-# AArch64, a build for Linux x86-64 cross-compiled there, and checks of the harness scripts.
-# The other harnesses on every platform run in the release train (train.yaml), which releases main when
-# it is green and opens an issue when it is not. What runs where, and how long it takes, is in
-# docs/harness.md ("CI").
-#
-#   pull request, merge queue: the unit tests and the build on Linux AArch64,
-#       `blaze check --workspace` and `blaze check --workspace --all-targets` (every crate's
-#       test targets type-check) with the release on Linux AArch64,
-#       real distributed library controls and source-built protocol/fault acceptance,
-#       `harness/imports.py` and `rustcsites` (scripts/), actionlint over the workflows. No `blaze fmt --check`: fmt.yaml
-#       formats main after each push instead.
-#   push to main: the build and the unit tests on Linux AArch64 and macOS, which
-#       write the caches every other run reads, and the same `blaze check --workspace`. One runs at a time: the next push waits, and a
-#       newer one replaces it, so each run ends and writes the caches as of its commit.
-#
-# A change runs the build and the unit tests only when it touches a file they read: the crates,
-# the vendored crates, astlog (tools/astlog), the workspace's manifest, lock file, cargo
-# config, .rustfmt.toml and .clippy.toml, the pinned nightly (harness/toolchain),
-# harness/unittests.py, harness/distv2.py and its fixtures/oracles, the flake, the release of blaze that builds blaze
-# (.github/blaze-version, site/install.sh), and these workflows and the actions they use; on a push
-# to main, also the smoke corpus (harness/smoke.py, harness/smoke/).
-# scripts/src/bin/gate_changes.rs has the list and why each path is on it. It names what is
-# code, so a new directory is not: any other change (documentation, the site, benches, the
-# other harnesses and workflows) runs the script, workflow and Lean checks plus partial
-# distributed library feedback, and a list of files that cannot be had counts as code.
-# `ci` is the one check that says whether everything that ran passed: it
-# is the check branch rules and the merge queue require. The queue tests each pull request
-# merged onto main and whatever is ahead of it, and main moves only to what it tested.
-#
-# Main's #69/#71 policy: GitHub-hosted runners only. Linux remains AArch64; native
-# Linux x86-64 coverage is an outstanding gap. The workflows job checks runner labels
-# for pull requests and merge-group entries; no private-runner snapshot is restored.
+# Source CI on GitHub-hosted ARM64. The source CLI and retained distributed protocol
+# have separate required receipts; a native library pass grants neither receipt.
 name: blaze
 on:
   push:
@@ -55,9 +23,14 @@ concurrency:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 env:
   # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
   BLAZE_CORES: all
+  CARGO_BUILD_JOBS: "2"
 
 jobs:
   # Which tier runs: `gate` for a pull request and the merge queue, `warm` for a push to main
@@ -67,49 +40,16 @@ jobs:
   changes:
     name: changes
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 12
+    # Full-source cache hits reuse the pinned-Cargo scripts. A miss builds that exact closure.
+    timeout-minutes: 30
     outputs:
       tier: ${{ steps.files.outputs.tier }}
     steps:
-      # The script key hashes its complete local dependency closure, including vendor sources.
-      # Materialize it before keying; an incomplete checkout cannot produce a cache key.
+      # The cache key proves the entire local source closure; sparse checkouts are refused.
       - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - id: bootstrap
-        uses: ./.github/actions/script
+      - uses: ./.github/actions/script
         with:
           job: changes
-      # A locked bootstrap failure stays a failure. Ask the exact installed release for its
-      # proposed lockfiles in a complete, disposable snapshot, never in the build's checkout.
-      - name: diagnose bootstrap lockfiles in an isolated snapshot
-        if: failure() && steps.bootstrap.outcome == 'failure'
-        timeout-minutes: 4
-        run: |
-          set -euo pipefail
-          blaze_bin=$(command -v blaze)
-          snapshot=$(mktemp -d "$RUNNER_TEMP/blaze-lock.XXXXXX")
-          trap 'rm -rf "$snapshot"' EXIT
-          evidence="$RUNNER_TEMP/blaze-lock-evidence"
-          mkdir -p "$evidence"
-          git rev-parse HEAD > "$evidence/commit.txt"
-          blaze-engine --version > "$evidence/version.txt"
-          timeout 30s git archive HEAD | timeout 30s tar -x -C "$snapshot"
-          (cd "$snapshot" && timeout --kill-after=10s 120s "$blaze_bin" lock -p scripts --bins) \
-            2>&1 | tee "$evidence/resolve.log"
-          cp "$snapshot/Cargo.lock" "$evidence/Cargo.lock"
-          if [ -f "$snapshot/blaze.lock" ]; then cp "$snapshot/blaze.lock" "$evidence/blaze.lock"; fi
-          diff_status=0
-          diff -u Cargo.lock "$evidence/Cargo.lock" > "$evidence/Cargo.lock.diff" || diff_status=$?
-          cat "$evidence/Cargo.lock.diff"
-          [ "$diff_status" -le 1 ]
-      - name: keep bootstrap lockfile diagnosis
-        if: failure() && steps.bootstrap.outcome == 'failure'
-        uses: actions/upload-artifact@v7
-        with:
-          name: bootstrap-lock-diagnosis
-          path: ${{ runner.temp }}/blaze-lock-evidence/
-          if-no-files-found: warn
       - id: files
         env:
           GH_TOKEN: ${{ github.token }}
@@ -124,268 +64,93 @@ jobs:
   scripts:
     name: harness imports, rustc sites
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
+    # The required script checks include cache, lifecycle, source-identity and oracle controls.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.4.5"
-      - name: script cache key closure and refusal controls
-        run: timeout 60s bun .github/actions/script/test-key.mjs
       - uses: ./.github/actions/toolchain
-      - name: kernel execution tracing for the observer controls
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends strace
       # The repository's Python workspace (pyproject.toml, uv.lock): its scripts lint and type-check.
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (hosted runner is arm64)
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu
           enable-cache: false
-      - name: standard library source digest
-        run: uv run --frozen python harness/library.py check '{}'
-      - run: uv run --frozen ruff check
-      - run: uv run --frozen pyright
-      # Some scripts ask rustc for the host when imported: after the toolchain is installed. In
-      # the workspace's Python, which has its helpers (tools/typed-input) for the scripts that use them.
-      - run: uv run --frozen python harness/imports.py
-      # This is only the distributed acceptance oracle's planted-bug selfcheck,
-      # NOT the real two-daemon execution required for V2 acceptance.
-      - name: distributed acceptance oracle negative controls
-        run: uv run --frozen python harness/distv2/selfcheck.py
-      - name: distributed build identity and CI acceptance regressions
-        run: uv run --frozen python -m unittest discover --start-directory .github/scripts --pattern 'test_distributed_ci.py'
-      - name: selected Blaze CLI and generated fixture regressions
-        run: uv run --frozen python -m unittest discover --start-directory .github/scripts --pattern 'test_blaze_cli.py'
-      - name: native Bun preparation regressions
-        run: python3 -I .github/scripts/test_bunprep.py
-      - name: Blaze benchmark evidence and history regressions
-        run: uv run --frozen --no-dev python -I -m unittest discover -s harness -p 'test_bench.py'
-      - name: benchmark workflow caller regressions
-        run: uv run --frozen --no-dev python -I .github/scripts/test_benchmark_ci.py
-      - name: rival compiler selection and evidence regressions
-        run: uv run --frozen python .github/scripts/test_rival.py
-      - name: release speed evidence regressions
-        run: python3 -I .github/scripts/test_promote_speed.py
-      - name: release smoke provenance and compiler selection regressions
-        run: python3 -I .github/scripts/test_promote_smoke.py
-      - name: kernel process observation and loss controls
-        run: uv run --frozen python -m unittest discover --start-directory harness/v2 --pattern 'test_exec_observer.py'
-      - name: distributed objective adapter regressions
-        run: uv run --frozen python harness/v2/test_distributed.py
-      - name: bounded seed readiness and shutdown regressions
-        run: python3 -I -B .github/scripts/test_seed_preflight.py
-      - name: fork migration oracle and CI acceptance regressions
-        run: |
-          uv run --frozen python -m unittest discover --start-directory harness/forkfixes --pattern 'test_*.py'
-          uv run --frozen python -m unittest discover --start-directory .github/scripts --pattern 'test_forkfixes_ci.py'
-      # The list of tests that may fail holds together and is as its recorder writes it, and the
-      # comparison and the recording do what they say on made-up results.
-      - run: uv run --frozen python harness/failures.py selftest
-      # A row or a test run counts only with proof that it ran (harness/v2/ran.py): each rule
-      # beside the planted bug it refuses, and the count of checks the self-test expects of itself.
-      - run: uv run --frozen python harness/v2/ran.py selftest
-      # library/DIGEST is the digest of library/ as it is (a stale one stops every fresh home).
-      - run: uv run --frozen python harness/library.py check '{}'
-      # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates.
-      - run: bun install --frozen-lockfile --cwd site
-      # Use the same bun runtime as the rule generator.
-      - run: bun site/node_modules/.bin/tsc -p tools/agents
-      - run: bun tools/agents/rules.ts --check
-      # The repository's Rust scripts (scripts/, docs/v2/plan/design/scripts.md), built by the
-      # release .github/blaze-version names, never by the blaze this tree builds: a tree whose
-      # compiler does not build must still be checked (the stage-0 rule). From the Actions cache
-      # when their inputs are unchanged (./.github/actions/script). No LLVM: the scripts link none.
-      - id: bootstrap
-        uses: ./.github/actions/script
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.5"
+      - uses: ./.github/actions/apt
+        with:
+          packages: strace
+      # Cargo with pins/toolchain builds the canonical scripts independently of Blaze.
+      - uses: ./.github/actions/script
         with:
           job: scripts
-      # Independent checks still run after another check fails, once their tools exist.
-      # Each failure keeps the job failed; a failed bootstrap or cancellation runs none.
-      # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
-      # their index (scripts/src/bin/docs.rs). And no Python file is added: tools/python-allowed.txt
-      # lists the ones left and only shrinks (docs/v2/plan/design/scripts.md).
-      - name: documentation contracts and index
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        run: |
-          "$BLAZE_SCRIPTS/docs" selftest
-          "$BLAZE_SCRIPTS/docs" check
-      # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md,
-      # scripts/src/bin/rustcsites.rs).
-      - name: compiler invocation sites
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        run: '"$BLAZE_SCRIPTS/rustcsites"'
-      # The objectives ledger's rows are well formed and its table is current (scripts/src/bin/ledger.rs).
-      - name: objective ledger controls and index
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        run: |
-          "$BLAZE_SCRIPTS/ledger" selftest
-          "$BLAZE_SCRIPTS/ledger" '{"command": "check"}'
-      # The budget harness's own parts hold: which rows an input selects, the daemon home's layout
-      # against the daemon's rule, the smoke's edit on the fixture (harness/v2/budgets.py). Its
-      # smoke, against the blaze a change builds, is blaze-platform.yaml's profile-gate job.
-      - name: budget harness controls
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        run: uv run --frozen python harness/v2/budgets.py selftest
-      # The smoke's guards (harness/v2/guards.py): each finding a bound is for, in miniature, is
-      # refused by its bound and the fixed state passes; the known list reads; a result with a
-      # guard missing is refused. And which packages a change touches (scripts/src/bin/changed.rs).
-      - name: guard and changed-package controls
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        run: |
-          uv run --frozen python harness/v2/guards.py selftest
-          "$BLAZE_SCRIPTS/changed" selftest
-      # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them
-      # (scripts/src/bin/invariants.rs).
-      - name: invariant controls and index
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        run: |
-          "$BLAZE_SCRIPTS/invariants" selftest
-          "$BLAZE_SCRIPTS/invariants" '{"command": "check"}'
-      # The Lean proofs, as far as no Lean is needed (harness/v2/lean_gate.py): the list of
-      # theorems (lean/theorems.json) names statements that are there, no source says `sorry`,
-      # `native_decide`, `axiom` or `partial def`, lean/analysis's manifest is checked in at the
-      # pinned Mathlib, and docs/v2/plan/proofs.md is current. The `lean` job builds them.
-      - name: Lean source controls
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        run: |
-          uv run --frozen python harness/v2/lean_gate.py selftest
-          uv run --frozen python harness/v2/lean_gate.py '{"command": "sources"}'
-      # blaze's registry of rustc's lints (crates/blaze-lint-defs/src/rustc.rs) is the one written
-      # from rustc's source at the commit library/UPSTREAM pins, unedited: a toolchain bump that
-      # does not write it again fails here (scripts/src/bin/lint_table.rs).
-      - name: rustc lint table
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        run: |
-          "$BLAZE_SCRIPTS/lint_table" selftest
-          "$BLAZE_SCRIPTS/lint_table" '{"command": "check"}'
-      # Each hash domain in crates/ is written once outside tests, and is under a cache of
-      # docs/v2/plan/design/caches.md with the grain of its key; each hasher that is not BLAKE3
-      # has its class there (scripts/src/bin/domains.rs).
-      - name: hash domains
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        run: |
-          "$BLAZE_SCRIPTS/domains" '{"root": "."}'
-      # What is left of the global heap only goes down (AGENTS.md bump-allocate): per crate,
-      # outside tests, the `// alloc:` lines left to convert, the `expect`s of
-      # `blaze::implicit_allocator`, the lines naming `Global` and the function signatures that
-      # fix the caller's allocator (`blaze::unwritten_allocator`'s rule, read from the text) equal their crate's row of
-      # tools/ratchets/alloc-sites.txt, a crate with no row is held to 0, and no
-      # row is above the base's (`global` may rise while `// alloc:` lines are left); a crate
-      # over its row has its new sites named from the base's diff (scripts/src/bin/allocs.rs). It needs no compiler, where the lints need a blaze that
-      # checks the workspace. Against the base itself: the checkout is shallow.
-      - name: global-heap allocations only go down
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+      # The gate: every row of tools/gate.txt, the one list `just lint` runs too, through the one
+      # runner (scripts/src/bin/gate.rs), which first checks that this job runs no check beside it
+      # (each step but this one is a `uses:` or a row of its CI_ONLY_STEPS). The Python and bun
+      # checks, the docs, the ledger and the ratchets are its rows, each with its timeout; a ratchet
+      # row is held to the base's rows too. Against the base itself: the checkout is shallow.
+      - name: the gate (tools/gate.txt, as `just lint`)
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
-          "$BLAZE_SCRIPTS/allocs" selftest
           if [ -n "$BASE" ]; then
             git fetch -q --depth=1 origin "$BASE"
-            "$BLAZE_SCRIPTS/allocs" "{\"command\": \"check\", \"base\": \"$BASE\"}"
+            "$BLAZE_SCRIPTS/gate" "{\"command\": \"run\", \"scripts\": \"$BLAZE_SCRIPTS\", \"base\": \"$BASE\"}"
           else
             echo "no base to compare with (a run by hand): each crate is held to its row only"
-            "$BLAZE_SCRIPTS/allocs" '{"command": "check"}'
-          fi
-      # Untyped errors only go down (AGENTS.md errors-name-the-thing): per crate, outside tests,
-      # the function signatures whose error is a `String`, a `&str`, a `Box<dyn Error>` or
-      # `anyhow`'s (`blaze::untyped_error`'s rule, read from the text), and the type aliases of
-      # such a `Result`, equal their crate's row of tools/ratchets/untyped-errors.txt,
-      # a crate with no row is held to 0, and no row is above the base's; a crate over its row
-      # has its new sites named from the base's diff (scripts/src/bin/untyped.rs). It needs no
-      # compiler, where the lint needs a blaze that checks the workspace. Against the base
-      # itself: the checkout is shallow.
-      - name: untyped errors only go down
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-        run: |
-          "$BLAZE_SCRIPTS/untyped" selftest
-          if [ -n "$BASE" ]; then
-            git fetch -q --depth=1 origin "$BASE"
-            "$BLAZE_SCRIPTS/untyped" "{\"command\": \"check\", \"base\": \"$BASE\"}"
-          else
-            echo "no base to compare with (a run by hand): each crate is held to its row only"
-            "$BLAZE_SCRIPTS/untyped" '{"command": "check"}'
-          fi
-      # Every SCHEMA/LAYOUT/FORMAT/MAGIC/VERSION constant under crates/ has a row of
-      # scripts/layouts.txt, and a persisted one whose value changed against the base names its
-      # crate's test of the previous layout (rule persisted-state-round-trips;
-      # scripts/src/bin/layouts.rs).
-      - name: a changed persisted layout has a previous-layout test
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-        run: |
-          "$BLAZE_SCRIPTS/layouts" selftest
-          if [ -n "$BASE" ]; then
-            git fetch -q --depth=1 origin "$BASE"
-            "$BLAZE_SCRIPTS/layouts" "{\"command\": \"check\", \"base\": \"$BASE\"}"
-          else
-            echo "no base to compare with (a run by hand): the list is checked, no value is compared"
-            "$BLAZE_SCRIPTS/layouts" '{"command": "check"}'
+            "$BLAZE_SCRIPTS/gate" "{\"command\": \"run\", \"scripts\": \"$BLAZE_SCRIPTS\"}"
           fi
       # A change of blaze-profile's schema version lands only once ix.dev/explore reads it
-      # (.github/scripts/explore_page.py; release.yaml checks every release too).
+      # (.github/scripts/explore_page.py).
       - name: ix.dev/explore reads a new profile schema
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
         run: |
           git fetch -q --depth=1 origin main
           version() { grep -E '^pub const VERSION: u32' "$@"; }
           if [ "$(git show FETCH_HEAD:crates/blaze-profile/src/schema.rs | version)" != "$(version crates/blaze-profile/src/schema.rs)" ]; then
             uv run --frozen python .github/scripts/explore_page.py '{}'
           fi
-      # Keep the native scanners' exact rows for a failing gate. They write only an isolated
-      # snapshot; the checked lists and the preceding failures remain unchanged.
-      - name: record current allocation and error counts
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
-        shell: bash
-        timeout-minutes: 3
+
+      - name: export canonical gate inventories for review
+        if: always() && env.BLAZE_SCRIPTS != ''
         run: |
-          ratchet_snapshot=$(mktemp -d "$RUNNER_TEMP/blaze-ratchet-snapshot.XXXXXX")
-          mkdir -p "$RUNNER_TEMP/ratchet-evidence"
-          git archive HEAD | tar -x -C "$ratchet_snapshot"
-          # The invariant inventory enumerates tracked paths. Register the archived files in
-          # the isolated snapshot, including files whose current ignore rules would hide them.
-          git -C "$ratchet_snapshot" init -q
-          git -C "$ratchet_snapshot" add -f .
-          cp "$BLAZE_SCRIPTS/KEY" "$RUNNER_TEMP/ratchet-evidence/validator-key.txt"
-          git rev-parse HEAD > "$RUNNER_TEMP/ratchet-evidence/source-head.txt"
-          # A failed scanner still leaves its diagnostic and any output it wrote. Removing
-          # the old lists first prevents a failed write from being archived as fresh counts.
-          rm "$ratchet_snapshot/tools/ratchets/alloc-sites.txt" \
-            "$ratchet_snapshot/tools/ratchets/untyped-errors.txt" \
-            "$ratchet_snapshot/docs/v2/plan/invariants.md"
+          set -euo pipefail
+          out="$RUNNER_TEMP/gate-inventory"
+          mkdir -p "$out/before" "$out/generated"
+          files=(docs/README.md docs/v2/plan/invariants.md docs/v2/plan/objectives.json docs/v2/plan/objectives.md tools/python-allowed.txt tools/ratchets/alloc-sites.txt tools/ratchets/untyped-errors.txt)
+          git rev-parse HEAD HEAD^{tree} > "$out/source.txt"
+          git status --porcelain --untracked-files=all > "$out/status.txt"
+          git diff HEAD --binary > "$out/source.patch"
+          for file in "${files[@]}"; do cp --parents --preserve=mode,timestamps "$file" "$out/before/"; done
+          restore() {
+            for file in "${files[@]}"; do cp --preserve=mode,timestamps "$out/before/$file" "$file"; done
+          }
+          trap restore EXIT
           failed=0
-          for scanner in allocs untyped invariants; do
-            if "$BLAZE_SCRIPTS/$scanner" "{\"command\": \"write\", \"root\": \"$ratchet_snapshot\"}" \
-                2>&1 | tee "$RUNNER_TEMP/ratchet-evidence/$scanner.log"; then
-              status=0
-            else
-              status=$?
-              failed=1
-            fi
-            printf '%s\t%s\n' "$scanner" "$status" >> "$RUNNER_TEMP/ratchet-evidence/validator-status.tsv"
-          done
-          for output in tools/ratchets/alloc-sites.txt tools/ratchets/untyped-errors.txt docs/v2/plan/invariants.md; do
-            if [ -f "$ratchet_snapshot/$output" ]; then
-              cp "$ratchet_snapshot/$output" "$RUNNER_TEMP/ratchet-evidence/"
-            else
-              echo "::error::native scanner produced no $output"
-              failed=1
-            fi
-          done
-          exit "$failed"
-      - name: keep native ratchet counts
-        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+          timeout -k 10 120 "$BLAZE_SCRIPTS/invariants" '{"command":"claims"}' > "$out/claims.json" 2> "$out/claims.stderr" || failed=1
+          timeout -k 10 120 "$BLAZE_SCRIPTS/allocs" '{"command":"findings"}' > "$out/alloc-findings.json" 2> "$out/alloc-findings.stderr" || failed=1
+          timeout -k 10 120 "$BLAZE_SCRIPTS/untyped" '{"command":"findings"}' > "$out/untyped-findings.json" 2> "$out/untyped-findings.stderr" || failed=1
+          timeout -k 10 120 "$BLAZE_SCRIPTS/docs" write > "$out/docs.log" 2>&1 || failed=1
+          timeout -k 10 120 "$BLAZE_SCRIPTS/invariants" '{"command":"write"}' > "$out/invariants.log" 2>&1 || failed=1
+          timeout -k 10 120 "$BLAZE_SCRIPTS/ledger" '{"command":"write"}' > "$out/ledger.log" 2>&1 || failed=1
+          timeout -k 10 120 "$BLAZE_SCRIPTS/allocs" '{"command":"write"}' > "$out/alloc-counts.log" 2>&1 || failed=1
+          timeout -k 10 120 "$BLAZE_SCRIPTS/untyped" '{"command":"write"}' > "$out/untyped-counts.log" 2>&1 || failed=1
+          for file in "${files[@]}"; do cp --parents "$file" "$out/generated/"; done
+          git diff HEAD --binary > "$out/generated.patch"
+          restore
+          trap - EXIT
+          for file in "${files[@]}"; do cmp "$out/before/$file" "$file"; done
+          if [ "$failed" != 0 ]; then
+            echo '::error::one or more canonical diagnostic generators failed; original required checks and source are unchanged; inspect gate-inventory logs'
+            exit 1
+          fi
+      - name: keep canonical gate inventories
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: native-ratchet-counts
-          path: ${{ runner.temp }}/ratchet-evidence/
-          if-no-files-found: error
+          name: gate-inventory
+          path: ${{ runner.temp }}/gate-inventory
+          if-no-files-found: warn
 
   # The Lean proofs hold (rule verified-compiler; harness/v2/lean_gate.py, docs/v2/plan/proofs.md):
   # with the Lean lean/lean-toolchain pins, `lake build` of lean/ (core Lean: the semantics of
@@ -406,7 +171,7 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu
           enable-cache: false
       - uses: actions/cache@v6
         with:
@@ -442,8 +207,8 @@ jobs:
           uv run --frozen python harness/v2/lean_gate.py '{"command": "check"}'
 
   # Every workflow parses and holds together (actionlint): a workflow whose YAML does not parse
-  # fails on push with no jobs and says so nowhere (release.yaml, promote.yaml and yank.yaml after
-  # #1691, an unquoted `: ` in a `run:` line). The local actions (.github/actions/*/action.yml) are
+  # fails on push with no jobs and says so nowhere (three release workflows after #1691, an
+  # unquoted `: ` in a `run:` line). The local actions (.github/actions/*/action.yml) are
   # parsed where a workflow uses them. actionlint's own checks only: its shellcheck and pyflakes
   # passes are off. What it is told to ignore is in .github/actionlint.yaml.
   workflows:
@@ -453,20 +218,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          persist-credentials: false
           sparse-checkout: |
             .github
             tools/typed-input
-            harness
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-      - name: GitHub-hosted runner policy
-        env:
-          PYTHONPATH: tools/typed-input/src
-        run: |
-          python3 .github/scripts/check_runner_labels.py '{}'
-          python3 -m unittest discover --start-directory .github/scripts --pattern 'test_check_runner_labels.py'
       # The release binary, checked by its sha256 (rhysd/actionlint's checksums.txt).
       - name: actionlint 1.7.12
         run: |
@@ -480,71 +234,84 @@ jobs:
           echo "$sum  $tgz" | sha256sum -c -
           tar -xzf "$tgz" -C "$RUNNER_TEMP" actionlint
       - run: '"$RUNNER_TEMP/actionlint" -color -shellcheck= -pyflakes='
+      - name: GitHub-hosted runner policy
+        env:
+          PYTHONPATH: tools/typed-input/src
+        run: |
+          timeout 60 python3 .github/scripts/check_runner_labels.py '{}'
+          timeout 60 python3 -m unittest discover -s .github/scripts -p test_check_runner_labels.py
 
-  # Native Linux x86-64 coverage remains outstanding. This job cross-compiles on
-  # hosted AArch64 with cross gcc/glibc and qemu-user for the target llvm-config;
-  # the resulting binaries are checked as ELF and never run. It remains outside
-  # ci's needs until a successful run establishes the cross path.
-  # llvm-sys is built twice: for the target (hir-ty-codegen, through blaze-engine) and for the
-  # host (a build-dependency of blaze-stencil's build script, which runs here). blaze gives each
-  # run of its build script the LLVM llvm.json pins for that run's target (a pinned native input,
-  # Cargo.toml's `[workspace.metadata.blaze.native.llvm]`, set over the shell's
-  # LLVM_SYS_231_PREFIX), so the job fetches and names none. The C and C++ compilers are named
-  # for the target only: cc-rs (and llvm-sys's libstdc++.a, which it asks cc-rs's compiler for)
-  # takes CC_<target>/CXX_<target> before plain CC/CXX, so the host copy keeps the runner's own
-  # gcc. A plain CXX here would give the host copy x86-64 libstdc++.a and objects.
-  linux-x64-cross:
-    name: linux x64 (cross-compiled, not run)
-    needs: [changes, scripts, workflows]
+
+  # The buildable workspace (every crate but those parked, docs/v2/plan/parked.md, and
+  # blaze-std, its own world) type-checks with its test targets, and its unit tests pass, with
+  # cargo and the pinned nightly (pins/toolchain): cargo builds blaze in the dev loop until
+  # blaze builds blaze again (AGENTS.md rule blaze-builds-blaze). No LLVM: no buildable crate
+  # links it. Each hosted job starts from its checked-out source and the pinned toolchain.
+  cargo:
+    name: cargo check and test, linux arm64
+    needs: changes
     if: needs.changes.outputs.tier != 'none'
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 150
-    env:
-      # Keep the complete B0 bootstrap's reader wave below the previous swap-heavy run.
-      BLAZE_CORES: "2"
-      BLAZE_DAEMON_MEMORY_GB: "6"
-      # Read by blaze's daemon when it starts (blaze-link's C driver, cc-rs in build scripts), so
-      # set for the whole job. For the target alone: no plain CC or CXX (see above).
-      CC_x86_64_unknown_linux_gnu: x86_64-linux-gnu-gcc
-      CXX_x86_64_unknown_linux_gnu: x86_64-linux-gnu-g++
-      # The x86-64 llvm-config's own libraries, for qemu-user.
-      QEMU_LD_PREFIX: /usr/x86_64-linux-gnu
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/locked-memory
+      - uses: ./.github/actions/reflink
+      # llvm-tools and the two other targets for blaze-sys's imports step below: core and
+      # compiler_builtins come precompiled with each target, so nothing builds a standard library.
+      - uses: ./.github/actions/toolchain
         with:
-          persist-credentials: false
-      - name: x86-64 cross gcc and glibc, qemu-user
-        uses: ./.github/actions/apt
-        with:
-          packages: gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libc6-dev-amd64-cross qemu-user-static binfmt-support
-      - name: qemu-user runs x86-64 programs
+          components: llvm-tools
+          targets: x86_64-unknown-linux-gnu aarch64-apple-darwin
+      - name: short same-filesystem home for all workspace tests
         run: |
-          sudo systemctl restart systemd-binfmt || sudo update-binfmts --enable qemu-x86_64
-          test -e /proc/sys/fs/binfmt_misc/qemu-x86_64 || { echo "::error::binfmt_misc has no qemu-x86_64 entry: the x86-64 llvm-config cannot run"; exit 1; }
-      - id: blaze
-        uses: ./.github/actions/blaze
+          mkdir "$RUNNER_TEMP/blaze-fs/workspace-home"
+          test_home=$(mktemp -d /tmp/bc.XXXXXX)
+          timeout 10 sudo mount --bind "$RUNNER_TEMP/blaze-fs/workspace-home" "$test_home"
+          # ci_test puts TMPDIR beneath HOME so its source shelf hardlinks stay on one device.
+          # Retained native durability tests require the same verified reflink filesystem.
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+          echo "HOME=$test_home" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/script
         with:
-          job: cross-x86_64
-          reflink: "true"
-      - run: blaze build --release --locked -p blaze-engine --target x86_64-unknown-linux-gnu --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
-        # Retain the query-key panic's stack from this build; harnesses keep their usual
-        # RUST_BACKTRACE=0 output contract.
-        env:
-          RUST_BACKTRACE: '1'
-      - name: an x86-64 ELF, not run
+          job: cargo
+      - uses: ./.github/actions/toolchain-shelf
+        id: shelf
+      - name: cargo check --workspace --exclude blaze-std --all-targets
+        if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
+        run: timeout -k 30 3600 cargo +"$(cat pins/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short
+      - name: cargo test --workspace --exclude blaze-std
+        if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
         run: |
-          for bin in blaze-engine blaze; do
-            f="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/x86_64-unknown-linux-gnu/release/$bin"
-            [ -x "$f" ] || { echo "::error::the cross build made no executable $f"; exit 1; }
-            file "$f" | tee /dev/stderr | grep -q 'ELF 64-bit LSB .*x86-64' || { echo "::error::$f is not an x86-64 ELF"; exit 1; }
+          timeout -k 30 5400 "$BLAZE_SCRIPTS/ci_test" '{"exclude": ["blaze-std"]}'
+      # D180: blaze-sys's compiled objects reference no C-library symbol on Linux (both
+      # architectures), and on macOS only the libSystem symbols of
+      # tools/ratchets/blaze-sys-libsystem.txt (scripts/src/bin/sys_imports.rs). Its lib alone,
+      # no_std: an rlib per target (nothing links, so the Mac target builds here too).
+      - name: blaze-sys imports, per target
+        run: |
+          tc="$(cat pins/toolchain)"
+          sysroot="$(rustc +"$tc" --print sysroot)"
+          nm="$sysroot/lib/rustlib/aarch64-unknown-linux-gnu/bin/llvm-nm"
+          for triple in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+            timeout -k 30 600 cargo +"$tc" build --locked -p blaze-sys --lib --target "$triple" --target-dir target/sys-imports
+            builtins=$(echo "$sysroot/lib/rustlib/$triple/lib/"libcompiler_builtins-*.rlib)
+            case "$triple" in
+              *-linux-*) extra='' ; os=linux ;;
+              *) extra=', "ratchet": "tools/ratchets/blaze-sys-libsystem.txt"' ; os=macos ;;
+            esac
+            timeout -k 30 120 "$BLAZE_SCRIPTS/sys_imports" "{\"command\": \"check\", \"target\": \"$os\", \"objects\": [\"target/sys-imports/$triple/debug/libblaze_sys.rlib\"], \"builtins\": \"$builtins\", \"nm\": \"$nm\"$extra}"
           done
-      # Why the daemon ended, when it did (the client does not say).
-      - if: failure() || cancelled()
-        uses: ./.github/actions/daemon-log
+      - name: keep workspace shelf verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: workspace-toolchain-evidence
+          path: ${{ runner.temp }}/toolchain-cut
+          if-no-files-found: warn
 
-  # Partial library feedback on the pinned Rust toolchain. Upstream parks blaze-global
-  # and removes the old memory-admission API; full compiler acceptance remains in Stage 1.
-  # Run after workflow validation on every trigger, even if changes or scripts cannot bootstrap.
+
   distributed-core:
     name: distributed library controls with pinned Cargo (partial)
     needs: [workflows]
@@ -595,98 +362,16 @@ jobs:
         timeout-minutes: 75
         run: |
           mkdir -p "$RUNNER_TEMP/core-evidence"
-          toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
-          cp "$GITHUB_WORKSPACE/harness/toolchain" "$RUNNER_TEMP/core-evidence/toolchain-pin.txt"
+          toolchain="$(cat "$GITHUB_WORKSPACE/pins/toolchain")"
+          cp "$GITHUB_WORKSPACE/pins/toolchain" "$RUNNER_TEMP/core-evidence/toolchain-pin.txt"
           cargo "+$toolchain" --version --verbose > "$RUNNER_TEMP/core-evidence/cargo-version.txt"
           rustc "+$toolchain" --version --verbose > "$RUNNER_TEMP/core-evidence/rustc-version.txt"
-          cargo "+$toolchain" test --release --locked --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve --no-fail-fast \
+          timeout -k 30 4200 cargo "+$toolchain" test --release --locked --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve --no-fail-fast \
             2>&1 | tee "$RUNNER_TEMP/core-evidence/tests.log"
-          cases=(
-            retirement_preserves_survivors_and_exact_assignment_ownership
-            cancellation_cleans_a_promotion_the_worker_has_not_observed
-            stale_claimed_helpers_do_not_block_available_replacements
-            execution_bindings_retain_cleanup_without_sliding_replay_or_expiry
-            every_success_has_one_immutable_full_manifest
-            an_accepted_refusal_cannot_publish_success_after_reassignment
-            a_late_worker_verdict_cannot_rewrite_an_accepted_manifest
-            a_failed_heartbeat_cannot_publish_a_successful_tail
-            virtual_clock_and_actor_order_preserve_the_captured_results_authority
-            first_publication_cannot_name_missing_or_corrupt_packs
-            first_writer_requires_equal_values_for_keys_mirrored_across_packs
-            native_partitions_preserve_values_through_publication_faults_and_reopen
-            conditional_publication_preserves_comparison_and_whole_file_integrity
-            failed_syncs_rename_and_every_crash_boundary_reopen_authorized_whole_lists
-            the_oracle_catches_leaving_without_retirement
-            the_oracle_catches_release_without_a_pending_stop
-            the_oracle_catches_a_stale_retirement_of_the_replacement_lead
-            the_oracle_catches_a_stale_acknowledgment_of_a_reused_slot
-            the_oracle_catches_an_unowned_retirement
-            the_oracle_catches_retired_work_kept_under_its_old_lease
-            the_oracle_catches_promotion_erasing_the_continuing_owner
-            the_oracle_catches_cleanup_using_only_the_last_observed_attempt
-            the_oracle_catches_a_stale_claimed_helper_misclassified_as_unclaimed
-            the_oracle_catches_a_missing_verified_execution_binding
-            the_oracle_catches_a_sliding_session_ceiling
-            the_oracle_catches_a_lost_reply_with_changed_replay_identity
-            the_oracle_catches_different_bytes_reusing_a_replay_identity
-            the_oracle_catches_an_early_done_plant
-            the_oracle_catches_a_late_worker_verdict_plant
-            the_oracle_catches_a_dropped_heartbeat_failure
-            the_oracle_catches_a_compiler_refusal_reclassified_as_transport_loss
-            the_identity_oracle_catches_reissuing_the_captured_result_under_a_new_lease
-            the_oracle_catches_removing_cross_pack_comparison
-            the_oracle_catches_the_comparison_bypass_plant
-            the_oracle_catches_missing_file_sync_with_torn_appends
-            the_oracle_catches_acknowledgement_before_directory_sync
-            fragmented_replies_preserve_body_boundaries_and_committed_refusals
-            http_bodies_keep_the_callers_allocation_through_decoding
-            coordinator_outputs_and_replays_use_the_callers_allocator
-            admission_names_and_scratch_use_the_callers_allocator
-            holder_keeps_the_callers_index_storage
-            simulation_trace_writes_directly_into_the_callers_buffer
-            agent::tests::imported_pack_storage_uses_the_callers_allocator
-            pack::tests::packs_and_record_views_use_the_callers_allocator
-            store::repair_tests::native_pack::tests::packs_and_record_views_use_the_callers_allocator
-            server::tests::effect_sink_moves_one_batch_from_the_callers_allocator
-            server::tests::framing_uses_the_callers_allocator_without_changing_the_body
-            telemetry::tests::evidence_keeps_wire_json_escaping_and_the_callers_allocator
-            telemetry::tests::digest_evidence_matches_the_previous_hex_string_fields
-            committed_reply_bounds_follow_the_native_wire_contract
-            an_http_reply_must_end_at_its_declared_body_boundary
-            an_interrupted_committed_get_cannot_authorize_local_recompilation
-            a_lost_publication_reply_cannot_authorize_local_recompilation
-            a_first_writer_conflict_must_compare_the_immutable_manifest
-            bounded_packs_keep_every_key_and_refuse_conflicts_across_boundaries
-            errors_after_publication_cannot_rebuild_an_immutable_unit
-            nested_effect_logs_use_the_callers_allocator
-            holder_effects_use_the_callers_allocator
-            committed_names_use_the_callers_allocator_and_exact_result_identity
-            pack_lists_use_the_callers_allocator
-            nested_schema_encoding_and_digest_scratch_use_the_callers_allocator
-            appending_keeps_the_callers_buffer_and_allocator_without_allocating
-            sets_keep_their_storage_and_take_encoding_scratch_from_the_output_allocator
-            set_encoding_writes_each_canonical_sort_key_once
-            rendering_uses_the_destination_and_reports_its_capacity
-            native_scan_crosses_buffer_edges_and_skips_from_the_logical_position
-            native_key_digest_headers_match_the_wire_at_every_length_boundary
-            bounded_object_reads_use_the_callers_allocator_and_preserve_size_refusals
-            every_type_round_trips_byte_identically
-            every_type_has_a_golden_file
-            golden_vectors_match
-            bytes_the_validator_accepts_are_canonical
-            every_digest_input_is_the_encoding_the_golden_digest_uses
-            the_native_three_field_layout_round_trips_including_empty
-            malformed_lists_never_become_empty_cache_entries
-            fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries
-            two_agents_split_a_unit_and_both_get_all_of_it
-            a_unit_published_by_one_pull_request_is_taken_by_another
-            a_final_compiler_or_output_refusal_cannot_fall_back
-            a_tail_conflicting_with_committed_values_is_refused_before_publication
-          )
-          for case_name in "${cases[@]}"; do
+          while IFS= read -r case_name; do
             grep -Eq "^test ([[:alnum:]_]+::)*$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \
               || { echo "::error::missing executed library control: $case_name"; exit 1; }
-          done
+          done < .github/distributed-controls.txt
       - name: distributed library binaries and integration targets compile
         id: retained-all-targets
         if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
@@ -694,478 +379,229 @@ jobs:
         timeout-minutes: 20
         run: |
           mkdir -p "$RUNNER_TEMP/core-evidence"
-          toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
-          cargo "+$toolchain" check --release --locked --keep-going --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve \
+          toolchain="$(cat "$GITHUB_WORKSPACE/pins/toolchain")"
+          timeout -k 30 1100 cargo "+$toolchain" check --release --locked --keep-going --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve \
             2>&1 | tee "$RUNNER_TEMP/core-evidence/all-targets.log"
-      - name: keep retained library failures before the remaining tests
-        if: ${{ !cancelled() && (steps.retained-tests.outcome == 'failure' || steps.retained-all-targets.outcome == 'failure') }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: retained-library-errors
-          path: |
-            ${{ runner.temp }}/core-evidence/tests.log
-            ${{ runner.temp }}/core-evidence/all-targets.log
-            ${{ runner.temp }}/core-evidence/toolchain-pin.txt
-          if-no-files-found: error
-      - name: active V2 library invariants and their planted controls
-        id: active-tests
-        if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
-        shell: bash
-        timeout-minutes: 30
-        run: |
-          mkdir -p "$RUNNER_TEMP/core-evidence"
-          toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
-          cargo "+$toolchain" test --release --locked --lib --no-fail-fast \
-            -p blaze-core -p blaze-cas -p blaze-hashcons -p blaze-http -p blaze-kernel \
-            -p blaze-launch-rt -p blaze-profile -p blaze-solo -p blaze-vfs -p const-ast \
-            -p blaze-pack -p blaze-unitkey -p blaze-record -p blaze-manifest -p syntax \
-            2>&1 | tee "$RUNNER_TEMP/core-evidence/active-tests.log"
-          cases=(
-            account::tests::every_input_of_the_tree_has_a_writer
-            account::tests::snapshot_text_policy_and_published_bodies_have_their_writers
-            flight::tests::a_recorded_pool_run_accounts_for_every_jobs_wall_time_and_its_critical_path_spans_the_build
-            uring::tests::a_large_tcp_send_goes_from_the_askers_pages
-            sampler::tests::every_sampler_starter_observes_the_first_outcome
-            sampler::tests::a_busy_thread_is_sampled_and_named
-            sampler::linux::tests::a_sample_inside_a_span_names_it
-            tests::the_views_are_syntax_asts
-            tests::an_outline_has_the_arrays_of_a_full_parse
-            tests::every_item_rebuilt_is_the_parsers
-            tests::self_hosting_parsing
-            the_oracle_catches_a_census_omitting_unflushed_records
-            the_oracle_catches_a_head_skipping_records_committed_during_rebuild
-            the_oracle_catches_a_root_leaving_out_its_sealed_set
-            the_oracle_catches_a_collector_ignoring_a_kept_roots_listing
-            the_oracle_catches_a_sync_opening_a_sealed_file_for_write
-            the_oracle_catches_a_content_hash_omitting_part_of_the_value
-            the_oracle_catches_an_ack_told_at_sent
-            the_oracle_catches_a_read_left_out
-            the_oracle_catches_a_hit_admitted_without_postings
-            the_oracle_catches_a_posting_written_at_the_next_carry
-            the_oracle_catches_an_absence_left_out_of_the_change_set
-            the_oracle_catches_a_root_kept_without_its_repair
-            the_oracle_catches_a_session_opened_without_its_postings
-            the_oracle_catches_a_parent_repaired_before_its_child
-            the_oracle_catches_a_session_that_outlives_its_pin
-            the_oracle_catches_a_parent_recording_its_childs_reads_but_one
-            the_oracle_catches_a_cutoff_by_the_childs_identity_alone
-            the_oracle_catches_a_valued_read_that_went_taken_as_what_it_saw
-            the_oracle_catches_a_valued_kind_that_reads_no_posting_back
-            the_oracle_catches_a_kind_with_no_difference_said_clean
-            the_oracle_catches_a_value_kept_from_the_first_posting
-            the_oracle_catches_a_first_need_join_not_remembered
-            the_oracle_catches_unchecked_flipped_pack_bytes
-            the_oracle_catches_unverified_records_published_across_a_crash
-            the_oracle_catches_an_import_without_its_pin
-            the_oracle_catches_a_lying_sources_bytes_kept_unchecked
-            the_oracle_catches_a_restart_counted_as_progress
-            the_oracle_catches_a_read_left_out_of_the_list
-            the_oracle_catches_an_answer_keyed_without_a_read
-            the_oracle_catches_each_planted_commit_bug
-            the_oracle_catches_repeated_siblings_without_distinct_ids
-            the_oracle_catches_unread_macro_call_tokens_and_paths
-            the_oracle_catches_unread_macro_definition_bodies
-            the_oracle_catches_a_column_omitting_its_persisted_names
-            the_oracle_catches_an_image_copying_its_files_bytes
-            the_oracle_catches_a_rebuilt_size_off_by_one
-            the_oracle_catches_a_rename_before_the_prewarm_ends
-            the_oracle_catches_a_home_also_kept_in_its_pack
-            the_oracle_catches_a_part_read_from_the_next_byte
-            the_oracle_catches_a_home_override_ignored
-            the_oracle_catches_a_shared_wait_with_no_wake
-            the_oracle_catches_a_temp_directory_whose_drop_does_not_run
-            the_oracle_catches_a_table_edit_that_keeps_the_old_part
-            the_oracle_catches_an_absence_not_posted
-            the_oracle_catches_a_removed_key_the_comparison_missed
-            the_oracle_catches_a_part_digested_as_another
-            the_oracle_catches_a_maintainer_that_forgets_a_deletion_under_verify
-            the_oracle_catches_a_maintainer_that_forgets_a_deletion_with_verify_off
-            the_oracle_catches_a_memory_answer_that_loses_a_double_bit_or_column
-            the_oracle_catches_a_split_seen_record_that_vouches_for_its_root_too_soon
-            the_oracle_catches_relisting_only_changed_files_parents
-            the_oracle_catches_an_attribute_lookup_with_shifted_rows
-          )
-          for case_name in "${cases[@]}"; do
-            grep -Eq "^test ([[:alnum:]_]+::)*$case_name( - should panic)? \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/active-tests.log" \
-              || { echo "::error::missing executed V2 invariant control: $case_name"; exit 1; }
-          done
-          # This control exists independently in the kernel and the record store.
-          [ "$(grep -Ec '^test ([[:alnum:]_]+::)*the_oracle_catches_a_negative_read_dropped \.\.\. ok[[:space:]]*$' "$RUNNER_TEMP/core-evidence/active-tests.log")" -eq 2 ] \
-            || { echo '::error::both negative-read controls must execute'; exit 1; }
-      - name: keep active V2 library failures before the remaining tests
-        if: ${{ !cancelled() && steps.active-tests.outcome == 'failure' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: active-v2-library-errors
-          path: |
-            ${{ runner.temp }}/core-evidence/active-tests.log
-            ${{ runner.temp }}/core-evidence/toolchain-pin.txt
-            ${{ runner.temp }}/core-evidence/cargo-version.txt
-            ${{ runner.temp }}/core-evidence/rustc-version.txt
-          if-no-files-found: error
-      - name: remaining active V2 library controls
-        id: remaining-active-tests
-        if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
-        shell: bash
-        timeout-minutes: 20
-        run: |
-          mkdir -p "$RUNNER_TEMP/core-evidence"
-          toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
-          cargo "+$toolchain" test --release --locked --lib --no-fail-fast \
-            -p blaze-graph -p blaze-hash -p blaze-host -p blaze-mem -p blaze-memo \
-            -p blaze-pg -p blaze-remote -p blaze-screen -p span \
-            2>&1 | tee "$RUNNER_TEMP/core-evidence/remaining-active-tests.log"
-          cases=(
-            the_oracle_catches_a_sample_whose_free_is_not_reported
-            the_oracle_catches_a_parked_stack_without_the_give_back
-            the_oracle_catches_a_deep_suspend_that_does_not_count_its_stack
-            the_oracle_catches_swap_removing_when_order_must_shift
-            the_oracle_catches_hash_bucket_order_used_for_insertion_order
-            the_oracle_catches_task_order_in_a_record_payload
-            the_oracle_catches_formatting_through_a_temporary_buffer
-            the_oracle_catches_a_retained_flight_released_too_soon
-            the_oracle_catches_a_box_whose_arena_id_was_erased
-            the_oracle_catches_a_value_encoded_in_the_wrong_byte_order
-            the_oracle_catches_an_array_that_drops_its_null_elements
-            the_oracle_catches_ticket_expiry_checked_against_an_old_clock
-            the_oracle_catches_cached_passes_reported_as_tests_run
-            the_oracle_catches_a_context_read_in_another_arena_without_translation
-          )
-          for case_name in "${cases[@]}"; do
-            grep -Eq "^test ([[:alnum:]_]+::)*$case_name( - should panic)? \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/remaining-active-tests.log" \
-              || { echo "::error::missing executed active library control: $case_name"; exit 1; }
-          done
-      - name: keep remaining library failures before the integration tests
-        if: ${{ !cancelled() && steps.remaining-active-tests.outcome == 'failure' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: remaining-v2-library-errors
-          path: |
-            ${{ runner.temp }}/core-evidence/remaining-active-tests.log
-            ${{ runner.temp }}/core-evidence/toolchain-pin.txt
-            ${{ runner.temp }}/core-evidence/cargo-version.txt
-            ${{ runner.temp }}/core-evidence/rustc-version.txt
-          if-no-files-found: error
-      - name: memo invariant integration controls
-        if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
-        shell: bash
-        timeout-minutes: 20
-        run: |
-          mkdir -p "$RUNNER_TEMP/core-evidence"
-          toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
-          cargo "+$toolchain" test --release --locked -p blaze-memo --test additions --test resident --test sim --no-fail-fast \
-            2>&1 | tee "$RUNNER_TEMP/core-evidence/memo-tests.log"
-          for case_name in the_oracle_catches_a_bitwise_copy_dropped_twice_and_a_leak the_oracle_catches_keep_owned_missing_its_drop_list resident_refines_the_reference every_interleaving_answers_as_the_evaluator a_reader_of_a_carried_table_looks_up_only_live_ids; do
-            grep -Eq "^test $case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/memo-tests.log" \
-              || { echo "::error::missing executed memo control: $case_name"; exit 1; }
-          done
-      - name: persisted compiler function-key format controls
-        if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
-        shell: bash
-        timeout-minutes: 15
-        run: |
-          mkdir -p "$RUNNER_TEMP/core-evidence"
-          toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
-          cargo "+$toolchain" test --release --locked -p blaze-ids --test cached_code \
-            2>&1 | tee "$RUNNER_TEMP/core-evidence/fncache-tests.log"
-          for case_name in a_previous_format_has_a_different_cached_code_key the_oracle_catches_a_format_left_out_of_the_key every_compilation_input_changes_the_cached_code_key; do
-            grep -Eq "^test key::tests::$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/fncache-tests.log" \
-              || { echo "::error::missing executed function-key control: $case_name"; exit 1; }
-          done
-      - name: harness pure cores with the pinned Rust toolchain
-        if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
-        shell: bash
-        timeout-minutes: 15
-        run: |
-          mkdir -p "$RUNNER_TEMP/core-evidence"
-          toolchain="$(cat "$GITHUB_WORKSPACE/harness/toolchain")"
-          # The adapter's feature closure is locked to the application's exact pins.
-          # Metadata does not compile or update the lock. Source modules are read through
-          # the repository symlink; none is copied or rewritten.
-          harness_snapshot=$(mktemp -d "$RUNNER_TEMP/blaze-harness-core.XXXXXX")
-          mkdir -p "$harness_snapshot/.github/fixtures"
-          cp -a .github/fixtures/harness-core "$harness_snapshot/.github/fixtures/"
-          ln -s "$GITHUB_WORKSPACE/crates" "$harness_snapshot/crates"
-          ln -s "$GITHUB_WORKSPACE/Cargo.toml" "$harness_snapshot/Cargo.toml"
-          manifest="$harness_snapshot/.github/fixtures/harness-core/Cargo.toml"
-          git rev-parse HEAD > "$RUNNER_TEMP/core-evidence/harness-core-source-head.txt"
-          metadata_status=0
-          timeout --kill-after=10s 120s cargo "+$toolchain" metadata --locked --format-version 1 \
-            --manifest-path "$manifest" > "$RUNNER_TEMP/core-evidence/harness-core-metadata.json" \
-            2> "$RUNNER_TEMP/core-evidence/harness-core-metadata.log" || metadata_status=$?
-          cat "$RUNNER_TEMP/core-evidence/harness-core-metadata.log"
-          cp "$(dirname "$manifest")/Cargo.lock" "$RUNNER_TEMP/core-evidence/harness-core.Cargo.lock"
-          [ "$metadata_status" -eq 0 ] || exit "$metadata_status"
-          python3 - "$(jq -cn --arg seed "$GITHUB_WORKSPACE/crates/harness/Cargo.lock" \
-            --arg actual "$RUNNER_TEMP/core-evidence/harness-core.Cargo.lock" '{seed: $seed, actual: $actual}')" <<'PY'
-          from dataclasses import dataclass
-          import json
-          from pathlib import Path
-          import sys
-          import tomllib
-
-          @dataclass(frozen=True)
-          class Input:
-              seed: str
-              actual: str
-
-          asked = Input(**json.loads(sys.argv[1]))
-          seed = tomllib.loads(Path(asked.seed).read_text())
-          actual = tomllib.loads(Path(asked.actual).read_text())
-          fields = ("name", "version", "source", "checksum")
-          identities = {tuple(package.get(field) for field in fields) for package in seed["package"]}
-          adapter = ("blaze-harness-core-ci", "0.1.0", None, None)
-          identities.add(adapter)
-          resolved = [tuple(package.get(field) for field in fields) for package in actual["package"]]
-          if actual["version"] != seed["version"] or resolved.count(adapter) != 1:
-              raise SystemExit("::error::the harness adapter has no exact root and lock format")
-          for package in resolved:
-              if package not in identities:
-                  raise SystemExit(f"::error::harness adapter dependency is outside the pinned lock: {package}")
-          print(f"harness-core: {len(resolved)} exact package identities retained from the application lock")
-          PY
-          cmp .github/fixtures/harness-core/Cargo.toml "$manifest"
-          cmp .github/fixtures/harness-core/lib.rs "$(dirname "$manifest")/lib.rs"
-          cmp .github/fixtures/harness-core/Cargo.lock "$(dirname "$manifest")/Cargo.lock"
-          timeout --kill-after=10s 600s cargo "+$toolchain" test --release --locked --all-targets \
-            --manifest-path "$manifest" \
-            2>&1 | tee "$RUNNER_TEMP/core-evidence/harness-core-tests.log"
-          cases=(
-            ui::tests::a_file_page_is_its_own_file
-            ui::tests::an_http_page_is_its_scheme_host_and_port
-            ui::tests::other_schemes_and_broken_urls_are_refused
-            keys::tests::the_table
-            keys::tests::down_up_and_chars
-            cdp_ids::tests::two_connections_with_the_same_ids_get_their_own_answers
-            cdp_ids::tests::events_orphans_and_forgetting
-            cdp_ids::tests::refuses_what_is_not_a_request_and_crossed_answers
-            cdp_ids::tests::ids_wrap_and_skip_pending
-            cdp_ids::dst::every_cdp_answer_reaches_only_its_asker_once_and_every_live_request_is_answered
-            cdp_ids::dst::seeded_plans_pass
-            cdp_ids::dst::the_oracle_catches_a_dropped_connections_ids_freed_at_once
-            completion::tests::completion_tracks_sessions_through_navigation_and_disappearance
-            completion::tests::the_oracle_catches_focus_based_completion
-            fileview::tests::the_cited_part_is_marked
-            fileview::tests::rendering_escapes_unicode_and_preserves_writer_failures
-            intent::tests::a_topic_borrows_the_original_bytes_after_a_unicode_greeting
-            memory::tests::sorted_reviews_and_key_scratch_use_the_callers_allocator
-            tutor::tests::a_prompt_writes_into_fixed_storage_and_reports_a_full_sink
-            run::tests::streamed_answers_match_unicode_lowercase_and_whitespace_normalization
-            run::tests::an_order_reuses_its_buffer_when_a_missed_check_returns
-          )
-          for case_name in "${cases[@]}"; do
-            grep -Eq "^test $case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/harness-core-tests.log" \
-              || { echo "::error::missing executed harness-core control: $case_name"; exit 1; }
-          done
-      - uses: actions/upload-artifact@v7
+      - name: keep all retained library evidence
         if: always()
+        uses: actions/upload-artifact@v7
         with:
-          name: distributed-core-cargo-partial
-          path: ${{ runner.temp }}/core-evidence/
+          name: distributed-core-evidence
+          path: ${{ runner.temp }}/core-evidence
           if-no-files-found: warn
 
-  # The gate's build and unit tests on hosted AArch64 (blaze-platform.yaml).
-  # What blaze cross-builds is run (ledger row X1, docs/v2/plan/design/toolchain-c.md "Cross
-  # compilation"): the probe (harness/v2/cross/probe: hello, threads, a file, TCP loopback, a
-  # panic with a backtrace) is built for each Linux glibc triple with nothing of the machine (no
-  # cross gcc, no CC_*: `scripts --bin cross` builds under `env -i` with an empty PATH), the
-  # AArch64 one is run here and the x86-64 one under qemu-user with Debian's x86-64 glibc to load
-  # (libc6-amd64-cross and libgcc-s1-amd64-cross are what it runs against, not what it is built
-  # with). Not part of `ci` until it has been green on main: it needs no secret, and its runner
-  # label is a new one of the same pool as the job above.
-  cross-probe:
-    name: cross-built, run (linux x64 under qemu-user, linux arm64)
-    needs: changes
+  source-compiler:
+    name: source CLI, real hello and exact build identity
+    needs: [changes, workflows]
     if: needs.changes.outputs.tier != 'none'
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-      - name: qemu-user and an x86-64 glibc to run against
-        uses: ./.github/actions/apt
-        with:
-          packages: qemu-user-static libc6-amd64-cross libgcc-s1-amd64-cross
-      - id: blaze
-        uses: ./.github/actions/blaze
-        with:
-          job: cross-probe
-      - run: blaze build --release --locked -p blaze-engine -p blaze-thin
-      - name: build the probe for each triple with nothing of the machine, and run it
-        run: |
-          mkdir -p "$RUNNER_TEMP/cross-bin"
-          cp target/release/blaze-thin "$RUNNER_TEMP/cross-bin/blaze"
-          cp target/release/blaze-engine "$RUNNER_TEMP/cross-bin/blaze-engine"
-          blaze run -q -p scripts --bin cross -- "$(cat <<JSON
-          {"command": "check",
-           "engine": {"kind": "v2", "blaze": "$RUNNER_TEMP/cross-bin/blaze"},
-           "out": "$RUNNER_TEMP/cross.json",
-           "triples": ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"],
-           "run": {"aarch64-unknown-linux-gnu": [],
-                   "x86_64-unknown-linux-gnu": ["qemu-x86_64-static", "-L", "/usr/x86_64-linux-gnu"]}}
-          JSON
-          )"
-      - if: failure()
-        uses: ./.github/actions/daemon-log
-
-  # The gate builds and tests on hosted AArch64 (blaze-platform.yaml).
-  linux-arm64:
-    name: linux arm64
-    needs: [changes, scripts, workflows]
-    if: needs.changes.outputs.tier != 'none'
-    uses: ./.github/workflows/blaze-platform.yaml
-    # For main's push of blaze's store (the cache-writer environment's secrets).
-    secrets: inherit
-    with:
-      platform: linux-arm64
-      os: ubuntu-24.04-arm
-      tier: ${{ needs.changes.outputs.tier }}
-      smoke: true
-      microbench: true
-
-  # The daemon this change builds starts on Linux 6.8: GitHub's hosted ubuntu-22.04 runners
-  # boot Ubuntu's linux-azure 6.8 (6.8.0-1070-azure in November 2026), the release's Linux
-  # builds run there. linux-azure 6.8.0-1063 and later invert
-  # io_uring's check of a provided buffer ring's reserved words (blaze-core's
-  # `ReservedCheck`), which stopped every daemon start of v0.20261105.3's release. The
-  # binary is the linux-arm64 build's, linked against Ubuntu 24.04's glibc,
-  # so it runs in an ubuntu:24.04 container, which shares the host's kernel; Docker's default
-  # seccomp profile refuses io_uring, so the container's is off.
-  linux-6-8:
-    name: daemon starts on Linux 6.8 (hosted ubuntu-22.04-arm)
-    needs: [changes, linux-arm64]
-    if: needs.changes.outputs.tier != 'none'
-    runs-on: ubuntu-22.04-arm
-    timeout-minutes: 10
-    container:
-      image: ubuntu:24.04
-      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
-    env:
-      # As in `docker run`: the runner's /github/home belongs to its own user.
-      HOME: /root
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: blaze-linux-arm64
-      - name: blaze serve listens, blaze status sees it, blaze stop ends it
-        run: |
-          tar -xf blaze.tar && uname -r
-          ./blaze serve > serve.log 2>&1 & serve=$!
-          for _ in $(seq 120); do
-            ./blaze status | grep -qvx "no daemon is running" && break
-            kill -0 "$serve" 2>/dev/null || { cat serve.log; echo "::error::blaze serve ended before it listened on Linux $(uname -r)"; exit 1; }
-            sleep 0.5
-          done
-          ./blaze status | grep -qvx "no daemon is running" || { cat serve.log; echo "::error::blaze serve did not listen within 60 s on Linux $(uname -r)"; exit 1; }
-          ./blaze stop && wait "$serve"
-
-  macos:
-    name: macos arm64
-    needs: [changes, scripts, workflows]
-    if: needs.changes.outputs.tier == 'warm'
-    uses: ./.github/workflows/blaze-platform.yaml
-    # For main's push of blaze's store (the cache-writer environment's secrets).
-    secrets: inherit
-    with:
-      platform: macos-arm64
-      os: macos-latest
-      tier: warm
-
-  # The released blaze checks the workspace on hosted AArch64. A macOS workspace
-  # check remains outstanding; macos above runs builds and tests only on main.
-  workspace-check:
-    name: blaze check --workspace, linux arm64
-    needs: [changes, scripts, workflows]
-    if: needs.changes.outputs.tier != 'none'
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
-    env:
-      BLAZE_CORES: "2"
-      BLAZE_DAEMON_MEMORY_GB: "6"
+    timeout-minutes: 150
+    outputs:
+      source_smoke: ${{ steps.smoke.outputs.accepted }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/blaze
-        with:
-          job: check
-          llvm: true
-          reflink: "true"
+      - uses: ./.github/actions/locked-memory
+      - uses: ./.github/actions/reflink
+      - uses: ./.github/actions/toolchain
       - uses: ./.github/actions/script
         with:
-          job: check
-          memory-gb: ${{ env.BLAZE_DAEMON_MEMORY_GB }}
-      # The configured six-GiB budget needs its own accounting scope: the pinned release
-      # otherwise subtracts the hosted agent's cached files from that daemon budget.
-      # The setup preflight has stopped its owned daemon. This supervisor refuses any
-      # other daemon, proves the user scope/cap, and owns serve through all checks below.
-      - name: workspace compiler checks in an owned bounded user scope
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          job: source-compiler
+      - name: build the source CLI and retained services
         run: |
-          set -euo pipefail
-          evidence=$(mktemp -d "$RUNNER_TEMP/workspace-scope.XXXXXX")
-          echo "BLAZE_WORKSPACE_SCOPE_EVIDENCE=$evidence" >> "$GITHUB_ENV"
-          cat > "$evidence/check.sh" <<'SH'
-          set -euo pipefail
-          # A shallow checkout needs the base before the optional narrow check.
-          # Returning here leaves the complete workspace checks below mandatory.
-          changed_packages() {
-            if [ -z "$BASE" ] || ! git fetch -q --depth=1 origin "$BASE"; then
-              echo "no base to compare with: the workspace check below is the check"; return
-            fi
-            args=$("$BLAZE_SCRIPTS/changed" "{\"base\": \"$BASE\", \"direct\": true, \"print\": \"args\"}")
-            if [ -z "$args" ] || [ "$args" = --workspace ]; then
-              echo "nothing narrower than the workspace to check first: ${args:-no package changed}"; return
-            fi
-            echo "blaze check $args --lib --tests"
-            # shellcheck disable=SC2086
-            blaze check $args --lib --tests --message-format short --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
-          }
-          # TODO(stage 0 with --deny): add `--deny blaze::todo` once the pin takes it.
-          echo '::group::blaze check of the packages this change touches'
-          changed_packages
-          echo '::endgroup::'
-          echo '::group::blaze check --workspace'
-          blaze check --workspace --message-format short --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
-          echo '::endgroup::'
-          echo '::group::blaze check --workspace --all-targets (the test targets compile)'
-          blaze check --workspace --all-targets --message-format short --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
-          echo '::endgroup::'
-          echo '::group::astlog build and rules'
-          blaze build -p astlog --target-dir "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
-          astlog="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/debug/astlog"
-          [ -x "$astlog" ] || { echo "::error::the build made no executable $astlog"; exit 1; }
-          jq -n --arg astlog "$astlog" \
-            '{astlog: $astlog, rules: "tools/astlog/rules", paths: ["crates", "tools"], exclude: ["crates/harness"]}' \
-            > "$RUNNER_TEMP/astlog.json"
-          PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py "$RUNNER_TEMP/astlog.json"
-          echo '::endgroup::'
-          SH
-          python3 - "$evidence" <<'PY' | python3 .github/scripts/seed_preflight.py -
-          import json, os, pathlib, shutil, sys, uuid
-          evidence = pathlib.Path(sys.argv[1])
-          print(json.dumps({"blaze": shutil.which("blaze"), "log": str(evidence / "serve.log"),
-                            "scope": {"unit": f"blaze-workspace-{uuid.uuid4().hex}.scope",
-                                      "memory_gb": os.environ["BLAZE_DAEMON_MEMORY_GB"],
-                                      "command": [shutil.which("bash"), "-e", "-o", "pipefail",
-                                                  str(evidence / "check.sh")],
-                                      "seconds": 4500}}))
-          PY
-      - name: retain workspace scope and daemon proof
-        if: always() && env.BLAZE_WORKSPACE_SCOPE_EVIDENCE != ''
+          mkdir -p "$RUNNER_TEMP/source-evidence"
+          tc="$(cat pins/toolchain)"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/source-evidence/source.txt"
+          cp pins/toolchain "$RUNNER_TEMP/source-evidence/toolchain-pin.txt"
+          timeout -k 30 5400 cargo +"$tc" build --release --locked --bins -p blaze-cli -p blaze-launcher -p blaze-dist-local -p blaze-serve \
+            2>&1 | tee "$RUNNER_TEMP/source-evidence/build.log"
+          mkdir "$RUNNER_TEMP/source-binaries"
+          for binary in blaze blaze-launcher blaze-fact-shim blaze-dist-local blaze-serve; do
+            install -m 755 "$CARGO_TARGET_DIR/release/$binary" "$RUNNER_TEMP/source-binaries/$binary"
+          done
+          python3 .github/scripts/dist_build_identity.py "{\"command\":\"seal\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+      - uses: ./.github/actions/toolchain-shelf
+      - name: cold warm edited and exported hello with the source CLI
+        id: smoke
+        timeout-minutes: 45
+        run: |
+          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+          timeout -k 30 2400 python3 harness/blaze_cli.py "{\"blaze\":\"$RUNNER_TEMP/source-binaries/blaze\",\"scratch\":\"$RUNNER_TEMP/blaze-fs/source-smoke\",\"shelf\":\"$HOME/.blaze/v2/toolchain\",\"timeout\":900}" \
+            2>&1 | tee "$RUNNER_TEMP/source-evidence/smoke.log"
+          grep -Fxq 'source CLI: every check passed' "$RUNNER_TEMP/source-evidence/smoke.log"
+          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+          echo 'accepted=true' >> "$GITHUB_OUTPUT"
+      - name: package the exact source binaries and toolchain
+        run: |
+          tar -czf "$RUNNER_TEMP/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries" .
+          tar -czf "$RUNNER_TEMP/source-toolchain.tar.gz" -C "$HOME/.blaze/v2" toolchain
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source-compiler
+          path: |
+            ${{ runner.temp }}/source-binaries.tar.gz
+            ${{ runner.temp }}/source-toolchain.tar.gz
+          if-no-files-found: error
+      - name: keep source compiler and shelf evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: workspace-scope-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.BLAZE_WORKSPACE_SCOPE_EVIDENCE }}
-          if-no-files-found: error
-          retention-days: 14
-      # A timed-out check is cancelled, so failure() alone loses its daemon evidence.
-      - if: failure() || cancelled()
-        uses: ./.github/actions/daemon-log
+          name: source-compiler-evidence
+          path: |
+            ${{ runner.temp }}/source-evidence
+            ${{ runner.temp }}/toolchain-cut
+            ${{ runner.temp }}/source-binaries/blaze-build.json
+            ${{ runner.temp }}/blaze-fs/source-smoke/*.json
+          if-no-files-found: warn
+      - name: retain canonical shelf bytes when the committed pin is stale
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: source-toolchain-diagnosis
+          path: ~/.blaze/v2/toolchain
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  production-acceptance:
+    name: source compiler distributed and migration acceptance
+    needs: [changes, workflows, source-compiler]
+    if: needs.changes.outputs.tier != 'none'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 330
+    env:
+      BLAZE_CORES: "2"
+      BLAZE_DAEMON_MEMORY_GB: "2"
+      BLAZE_TESTS: verify
+    outputs:
+      distributed_acceptance: ${{ steps.distributed.outputs.accepted }}
+      forkfixes_acceptance: ${{ steps.forkfixes.outputs.accepted }}
+      protocol_tests: ${{ steps.protocol.outputs.accepted }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/locked-memory
+      - uses: ./.github/actions/reflink
+      - uses: ./.github/actions/apt
+        with:
+          packages: strace
+      - name: user namespaces for source test sandboxes
+        run: |
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            timeout 10 sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - uses: actions/download-artifact@v8
+        with:
+          name: source-compiler
+          path: ${{ runner.temp }}/source-package
+      - name: verify the source compiler handoff
+        run: |
+          mkdir "$RUNNER_TEMP/source-binaries"
+          tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries"
+          mkdir -p "$HOME/.blaze/v2" "$RUNNER_TEMP/dist-evidence"
+          tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$HOME/.blaze/v2"
+          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+      # The real source CLI must implement the retained worker protocol. distv2 probes it,
+      # preserves the exact reply and names the missing bridge before any acceptance credit.
+      # Version metadata, a hello or Cargo's native protocol tests cannot satisfy this gate.
+      - name: full distributed worker and fault acceptance
+        timeout-minutes: 240
+        run: |
+          for profile in dev release; do
+            jq -n --arg bin "$RUNNER_TEMP/source-binaries" --arg scratch "$RUNNER_TEMP/blaze-fs/dist-$profile" --arg profile "$profile" \
+              '{blaze:($bin+"/blaze"),dist_local:($bin+"/blaze-dist-local"),serve:($bin+"/blaze-serve"),scratch:$scratch,faults:true,cores:2,daemon_memory_gb:2,timeout:1800,command_timeout:60,stall_bound:300,args:(if $profile=="release" then ["--release"] else [] end),profile:(if $profile=="release" then "release" else "debug" end),release_fold:($profile=="release")}' \
+              > "$RUNNER_TEMP/dist-evidence/$profile-input.json"
+            python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+            status=0
+            timeout -k 30 7200 python3 harness/distv2.py "$RUNNER_TEMP/dist-evidence/$profile-input.json" \
+              2>&1 | tee "$RUNNER_TEMP/dist-evidence/$profile.log" || status=$?
+            python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+            [ "$status" = 0 ] || exit "$status"
+          done
+      - name: both complete fault runs used unchanged binaries and source
+        id: distributed
+        run: |
+          for profile in dev release; do
+            grep -Fxq 'distv2: every check passed' "$RUNNER_TEMP/dist-evidence/$profile.log" \
+              || { echo "::error::missing full $profile distributed fault acceptance"; exit 1; }
+          done
+          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+          echo 'accepted=true' >> "$GITHUB_OUTPUT"
+      - name: every retained compiler migration fixture
+        id: forkfixes
+        timeout-minutes: 60
+        run: |
+          scratch="$RUNNER_TEMP/blaze-fs/forkfixes"
+          timeout -k 30 3300 python3 harness/forkfixes.py "{\"blaze\":\"$RUNNER_TEMP/source-binaries/blaze\",\"scratch\":\"$scratch\",\"source\":\"$GITHUB_WORKSPACE\",\"timeout\":900,\"stall_bound\":300}" \
+            2>&1 | tee "$RUNNER_TEMP/dist-evidence/forkfixes.log"
+          python3 .github/scripts/forkfixes_acceptance.py "{\"scratch\":\"$scratch\"}"
+          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+          echo 'accepted=true' >> "$GITHUB_OUTPUT"
+      - name: source protocol tests and complete execution observation
+        timeout-minutes: 60
+        run: |
+          jq -n --arg blaze "$RUNNER_TEMP/source-binaries/blaze" --arg cwd "$GITHUB_WORKSPACE" --arg home "$RUNNER_TEMP/blaze-fs/protocol-home" --arg out "$RUNNER_TEMP/dist-evidence/exec" --arg shelf "$HOME/.blaze/v2/toolchain" \
+            '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:3300,commands:(["blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"] | map({name:.,args:["test","-p",.,"--view","json","--","--run-all","--format","json"]}))}' \
+            > "$RUNNER_TEMP/dist-evidence/exec-input.json"
+          timeout -k 30 3500 python3 harness/v2/exec_observer.py "$RUNNER_TEMP/dist-evidence/exec-input.json"
+      - name: complete source protocol receipt with unchanged executables
+        id: protocol
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          out = Path(os.environ["RUNNER_TEMP"]) / "dist-evidence/exec"
+          result = json.loads((out / "result.json").read_text())
+          supervisor = json.loads((out / "supervisor.json").read_text())
+          packages = ["blaze-dist", "blaze-dist-local", "blaze-wire", "blaze-serve"]
+          if (result.get("schema") != 1 or result.get("passed") is not True or result.get("returncode") != 0
+                  or result.get("scope") != "linux-launched-descendants-through-blaze-stop"
+                  or supervisor.get("complete") is not True or supervisor.get("stop") != 0
+                  or supervisor.get("commands") != [{"name":name,"returncode":0} for name in packages]):
+              raise SystemExit("missing complete source protocol execution and shutdown evidence")
+          passed = []
+          for package in packages:
+              rows = [json.loads(line) for line in (out / (package + ".log")).read_text().splitlines() if line.strip()]
+              summaries = [row for row in rows if row.get("event") == "summary"]
+              tests = [row for row in rows if row.get("event") == "test"]
+              if len(summaries) != 1:
+                  raise SystemExit(f"{package}: no one source test summary")
+              summary = summaries[0]
+              ran = summary.get("ran")
+              if (summary.get("result") != "ok" or type(ran) is not int or ran <= 0
+                      or summary.get("passed") != ran or len(tests) != ran
+                      or any(summary.get(key, 0) != 0 for key in ("failed","reused","filtered_out","flaky","not_built"))
+                      or any(row.get("outcome") != "passed" or row.get("ran_because") != "run_all"
+                             or row.get("failure") is not None or row.get("basis") is not None for row in tests)):
+                  raise SystemExit(f"{package}: source tests did not all execute and pass")
+              passed.extend(row["path"] for row in tests)
+          required = Path(".github/distributed-controls.txt").read_text().splitlines()
+          missing = [name for name in required if not any(path == name or path.endswith("::" + name) for path in passed)]
+          if not required or missing:
+              raise SystemExit(f"missing executed source protocol controls: {missing}")
+          PY
+          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+          echo 'accepted=true' >> "$GITHUB_OUTPUT"
+      - name: keep production acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: production-acceptance-evidence
+          path: |
+            ${{ runner.temp }}/dist-evidence
+            ${{ runner.temp }}/source-binaries/blaze-build.json
+            ${{ runner.temp }}/blaze-fs/dist-*/provenance.json
+            ${{ runner.temp }}/blaze-fs/dist-*/source.patch
+            ${{ runner.temp }}/blaze-fs/dist-*/logs
+            ${{ runner.temp }}/blaze-fs/dist-*/final-artifacts.json
+            ${{ runner.temp }}/blaze-fs/forkfixes/*.json
+            ${{ runner.temp }}/blaze-fs/forkfixes/logs
+          if-no-files-found: warn
 
   ci:
     name: ci
-    needs: [changes, scripts, workflows, lean, distributed-core, linux-6-8, linux-arm64, macos, workspace-check]
+    needs: [changes, scripts, workflows, lean, cargo, distributed-core, source-compiler, production-acceptance]
     if: always()
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
@@ -1173,49 +609,28 @@ jobs:
       - name: every required check passed
         env:
           NEEDS: ${{ toJSON(needs) }}
-          TIER: ${{ needs.changes.outputs.tier }}
         run: |
-          echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
-          echo "$NEEDS" | jq -e 'all(.[]; .result != "failure" and .result != "cancelled")' > /dev/null \
-            || { echo "::error::a required check failed or was cancelled"; exit 1; }
-          # Every applicable job must succeed; skipped code-tier checks and absent receipts
-          # cannot stand for runtime acceptance. Mac runs only on warm/main.
-          echo "$NEEDS" | jq -e '
-            .changes.result == "success" and
-            .scripts.result == "success" and
-            .workflows.result == "success" and
-            .lean.result == "success" and
-            (.changes.outputs.tier == "none" or
-              ((.changes.outputs.tier == "gate" or .changes.outputs.tier == "warm") and
-               .["linux-arm64"].result == "success" and
-               .["distributed-core"].result == "success" and
-               .["linux-6-8"].result == "success" and
-               .["workspace-check"].result == "success" and
-               (.changes.outputs.tier != "warm" or .macos.result == "success") and
-               .["linux-arm64"].outputs.protocol_tests == "true" and
-               .["linux-arm64"].outputs.distributed_acceptance == "true" and
-               .["linux-arm64"].outputs.forkfixes_acceptance == "true"))
-          ' > /dev/null || { echo "::error::required checks or protocol, distributed, or fork migration acceptance are incomplete"; exit 1; }
-      # The budget smoke's guards ran and held (harness/v2/guards.py, `held`): a tier that builds
-      # blaze has the smoke's result, with an outcome that passed for every bound of every step
-      # of both fixtures and for the sandbox's probe. A job that was skipped passes the step
-      # above; a smoke that did not run, or dropped a guard, fails this one. A gate run that
-      # did not run the smoke is red (docs/harness.md, "The smoke's guards").
-      - if: needs.changes.outputs.tier != 'none'
-        uses: actions/checkout@v7
-      - if: needs.changes.outputs.tier != 'none'
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-        with:
-          version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
-          enable-cache: false
-      - if: needs.changes.outputs.tier != 'none'
-        continue-on-error: true
-        uses: actions/download-artifact@v8
-        with:
-          name: budgets-smoke-linux-arm64
-          path: ${{ runner.temp }}/budgets-smoke
-      - name: the budget smoke's guards ran and held
-        if: needs.changes.outputs.tier != 'none'
-        run: |
-          uv run --frozen --no-dev python harness/v2/guards.py "{\"command\": \"held\", \"result\": \"$RUNNER_TEMP/budgets-smoke/budgets-smoke.json\"}"
+          python3 - <<'PY'
+          import json, os
+          needs = json.loads(os.environ["NEEDS"])
+          tier = needs.get("changes", {}).get("outputs", {}).get("tier")
+          if tier not in ("none", "gate", "warm"):
+              raise SystemExit(f"unknown acceptance tier: {tier!r}")
+          required = ["changes", "scripts", "workflows", "lean", "distributed-core"]
+          if tier != "none":
+              required += ["cargo", "source-compiler", "production-acceptance"]
+          missing = [job for job in required if needs.get(job, {}).get("result") != "success"]
+          failed = [job for job, value in needs.items() if value.get("result") in ("failure", "cancelled")]
+          if missing or failed:
+              raise SystemExit(f"required jobs did not succeed: {missing}; failures/cancellations: {failed}")
+          if tier != "none":
+              receipts = [("source-compiler", "source_smoke"),
+                          ("production-acceptance", "distributed_acceptance"),
+                          ("production-acceptance", "forkfixes_acceptance"),
+                          ("production-acceptance", "protocol_tests")]
+              missing = [f"{job}.{name}" for job, name in receipts
+                         if needs[job].get("outputs", {}).get(name) != "true"]
+              if missing:
+                  raise SystemExit(f"required acceptance evidence is absent: {missing}")
+          print(f"tier {tier}: every required check and acceptance receipt passed")
+          PY

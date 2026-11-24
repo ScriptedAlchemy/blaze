@@ -43,11 +43,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use anyhow::bail;
-use cargo_platform::Platform;
+use crate::platform::Platform;
 
 use super::types::{FeaturesSet, ResolveBehavior};
-use super::{CargoResult, HashMap, HashSet};
+use super::{CargoResult, FixedState, Map, MapOpts, Set, SetOpts};
 use crate::dependency::{DepKind, Dependency};
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
@@ -78,7 +77,7 @@ pub enum CompileKind {
 pub type PackageFeaturesKey = (PackageId, FeaturesFor);
 /// Map of activated features.
 // BTreeSet: grown while resolving and read in order by every `activated_features` call.
-pub type ActivateMap = HashMap<PackageFeaturesKey, BTreeSet<InternedString>, Global>;
+pub type ActivateMap = Map<PackageFeaturesKey, BTreeSet<InternedString>, FixedState, Global>;
 
 /// Set of all activated features for all packages in the resolve graph.
 pub struct ResolvedFeatures {
@@ -207,6 +206,9 @@ pub enum RequestedFeatures {
     },
 }
 
+impl blaze_own::Share for RequestedFeatures {}
+impl blaze_own::LocalShare for RequestedFeatures {}
+
 /// Features specified on the command-line.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct CliFeatures {
@@ -217,6 +219,9 @@ pub struct CliFeatures {
     /// Inverse of `--no-default-features` flag.
     pub uses_default_features: bool,
 }
+
+impl blaze_own::Share for CliFeatures {}
+impl blaze_own::LocalShare for CliFeatures {}
 
 impl CliFeatures {
     /// Creates a new `CliFeatures` from the given command-line flags.
@@ -232,11 +237,13 @@ impl CliFeatures {
                 // Maybe call validate_feature_name here once it is an error?
                 FeatureValue::Feature(_) => {}
                 FeatureValue::Dep { .. } => {
-                    bail!("feature `{}` is not allowed to use explicit `dep:` syntax", feature);
+                    let feature = *feature;
+                    return Err(crate::ResolveError::CliDepSyntax { feature });
                 }
                 FeatureValue::DepFeature { dep_feature, .. } => {
                     if dep_feature.contains('/') {
-                        bail!("multiple slashes in feature `{}` is not allowed", feature);
+                        let feature = *feature;
+                        return Err(crate::ResolveError::CliSlashes { feature });
                     }
                 }
             }
@@ -386,7 +393,7 @@ pub struct FeatureResolver<'a, T> {
     activated_dependencies: ActivateMap,
     /// Keeps track of which packages have had its dependencies processed.
     /// Used to avoid cycles, and to speed up processing.
-    processed_deps: HashSet<PackageFeaturesKey, Global>,
+    processed_deps: Set<PackageFeaturesKey, FixedState, Global>,
     /// If this is `true`, then a non-default `feature_key` needs to be tracked while
     /// traversing the graph.
     ///
@@ -404,7 +411,29 @@ pub struct FeatureResolver<'a, T> {
     /// dependency will trigger the addition of new features. The value is the
     /// set of features to activate.
     deferred_weak_dependencies:
-        HashMap<(PackageId, FeaturesFor, InternedString), HashSet<InternedString, Global>, Global>,
+        Map<(PackageId, FeaturesFor, InternedString), Set<InternedString, FixedState, Global>, FixedState, Global>,
+}
+
+enum FeatureWork<'a> {
+    /// Activate a package's non-optional dependencies after its initial features are activated.
+    ProcessDeps(PackageId, FeaturesFor),
+    /// Activate a package with features from a dependency declaration.
+    ActivateDepPkg(PackageId, FeaturesFor, &'a Dependency),
+    /// Activate a single `FeatureValue` on `(pkg_id, fk)`.
+    ActivateFv(PackageId, FeaturesFor, FeatureValue),
+    /// Activate a single feature directly (`activate_rec`).
+    ActivateRec(PackageId, FeaturesFor, InternedString),
+    /// Activate a single `(dep_pkg_id, dep, dep_fk)` match for `dep_name/dep_feature`.
+    ActivateDepFeatureEntry {
+        pkg_id: PackageId,
+        fk: FeaturesFor,
+        dep_pkg_id: PackageId,
+        dep: &'a Dependency,
+        dep_fk: FeaturesFor,
+        dep_name: InternedString,
+        dep_feature: InternedString,
+        weak: bool,
+    },
 }
 
 impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
@@ -421,19 +450,20 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
         opts: FeatureOpts,
     ) -> CargoResult<ResolvedFeatures> {
         let track_for_host = opts.decouple_host_deps || opts.ignore_inactive_targets;
+        let alloc = Global;
         let mut r = FeatureResolver {
             targets,
             requested_targets,
             resolve,
             opts,
-            activated_features: HashMap::new_in(Global),
-            activated_dependencies: HashMap::new_in(Global),
-            processed_deps: HashSet::new_in(Global),
+            activated_features: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            activated_dependencies: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            processed_deps: Set::new(SetOpts { hasher: FixedState, alloc, capacity: None }),
             track_for_host,
-            deferred_weak_dependencies: HashMap::new_in(Global),
+            deferred_weak_dependencies: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
         };
-        r.do_resolve(member_features)?;
-        tracing::debug!("features={:#?}", r.activated_features);
+        r.do_resolve(member_features, alloc)?;
+        blaze_trace::debug!("features={:#?}", r.activated_features);
         Ok(ResolvedFeatures {
             activated_features: r.activated_features,
             activated_dependencies: r.activated_dependencies,
@@ -442,7 +472,12 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
     }
 
     /// Performs the process of resolving all features for the resolve graph.
-    fn do_resolve(&mut self, member_features: &[(&Summary, CliFeatures)]) -> CargoResult<()> {
+    fn do_resolve<A: core::alloc::Allocator>(
+        &mut self,
+        member_features: &[(&Summary, CliFeatures)],
+        alloc: A,
+    ) -> CargoResult<()> {
+        let mut work = blaze_own::Vec::new_in(alloc);
         for (member, cli_features) in member_features {
             let fvs = self.fvs_from_requested(member.package_id(), cli_features);
             let fk = if self.track_for_host && self.has_any_proc_macro(member.package_id()) {
@@ -453,215 +488,234 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
                 // `--workspace`), this forces feature unification with normal
                 // dependencies. This is part of the bigger problem where
                 // features depend on which packages are built.
-                self.activate_pkg(member.package_id(), FeaturesFor::default(), &fvs)?;
+                self.activate_pkg(member.package_id(), FeaturesFor::default(), &fvs, &mut work)?;
                 FeaturesFor::HostDep
             } else {
                 FeaturesFor::default()
             };
-            self.activate_pkg(member.package_id(), fk, &fvs)?;
+            self.activate_pkg(member.package_id(), fk, &fvs, &mut work)?;
         }
         Ok(())
     }
 
-    /// Activates [`FeatureValue`]s on the given package.
-    ///
-    /// This is the main entrance into the recursion of feature activation
-    /// for a package.
-    fn activate_pkg(
+    /// Activates [`FeatureValue`]s on the given package and drains the resulting
+    /// feature-activation worklist iteratively in DFS order.
+    fn activate_pkg<A: core::alloc::Allocator>(
         &mut self,
         pkg_id: PackageId,
         fk: FeaturesFor,
         fvs: &[FeatureValue],
+        work: &mut blaze_own::Vec<FeatureWork<'a>, A>,
     ) -> CargoResult<()> {
-        tracing::trace!("activate_pkg {} {}", pkg_id.name(), fk);
+        blaze_trace::trace!("activate_pkg {} {}", pkg_id.name(), fk);
         // Add an empty entry to ensure everything is covered. This is intended for
         // finding bugs where the resolver missed something it should have visited.
         // Remove this in the future if `activated_features` uses an empty default.
         self.activated_features.entry((pkg_id, fk.apply_opts(&self.opts))).or_default();
-        for fv in fvs {
-            self.activate_fv(pkg_id, fk, fv)?;
+        work.push(FeatureWork::ProcessDeps(pkg_id, fk));
+        for &fv in fvs.iter().rev() {
+            work.push(FeatureWork::ActivateFv(pkg_id, fk, fv));
         }
-        if !self.processed_deps.insert((pkg_id, fk)) {
-            // Already processed dependencies. There's no need to process them
-            // again. This is primarily to avoid cycles, but also helps speed
-            // things up.
-            //
-            // This is safe because if another package comes along and adds a
-            // feature on this package, it will immediately add it (in
-            // `activate_fv`), and recurse as necessary right then and there.
-            // For example, consider we've already processed our dependencies,
-            // and another package comes along and enables one of our optional
-            // dependencies, it will do so immediately in the
-            // `FeatureValue::DepFeature` branch, and then immediately
-            // recurse into that optional dependency. This also holds true for
-            // features that enable other features.
-            return Ok(());
-        }
-        for (dep_pkg_id, deps) in self.deps(pkg_id, fk)? {
-            for (dep, dep_fk) in deps {
-                if dep.is_optional() {
-                    // Optional dependencies are enabled in `activate_fv` when
-                    // a feature enables it.
-                    continue;
-                }
-                // Recurse into the dependency.
-                let fvs = self.fvs_from_dependency(dep_pkg_id, dep);
-                self.activate_pkg(dep_pkg_id, dep_fk, &fvs)?;
-            }
-        }
-        Ok(())
-    }
 
-    /// Activate a single `FeatureValue` for a package.
-    fn activate_fv(
-        &mut self,
-        pkg_id: PackageId,
-        fk: FeaturesFor,
-        fv: &FeatureValue,
-    ) -> CargoResult<()> {
-        tracing::trace!("activate_fv {} {} {}", pkg_id.name(), fk, fv);
-        match fv {
-            FeatureValue::Feature(f) => {
-                self.activate_rec(pkg_id, fk, *f)?;
-            }
-            FeatureValue::Dep { dep_name } => {
-                self.activate_dependency(pkg_id, fk, *dep_name)?;
-            }
-            FeatureValue::DepFeature { dep_name, dep_feature, weak } => {
-                self.activate_dep_feature(pkg_id, fk, *dep_name, *dep_feature, *weak)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Activate the given feature for the given package, and then recursively
-    /// activate any other features that feature enables.
-    fn activate_rec(
-        &mut self,
-        pkg_id: PackageId,
-        fk: FeaturesFor,
-        feature_to_enable: InternedString,
-    ) -> CargoResult<()> {
-        tracing::trace!("activate_rec {} {} feat={}", pkg_id.name(), fk, feature_to_enable);
-        let enabled =
-            self.activated_features.entry((pkg_id, fk.apply_opts(&self.opts))).or_default();
-        if !enabled.insert(feature_to_enable) {
-            // Already enabled.
-            return Ok(());
-        }
-        let summary = self.resolve.summary(pkg_id);
-        let feature_map = summary.features();
-        let Some(fvs) = feature_map.get(&feature_to_enable) else {
-            // TODO: this should only happen for optional dependencies.
-            // Other cases should be validated by Summary's `build_feature_map`.
-            // Figure out some way to validate this assumption.
-            tracing::debug!("pkg {:?} does not define feature {}", pkg_id, feature_to_enable);
-            return Ok(());
-        };
-        for fv in fvs {
-            self.activate_fv(pkg_id, fk, fv)?;
-        }
-        Ok(())
-    }
-
-    /// Activate a dependency (`dep:dep_name` syntax).
-    fn activate_dependency(
-        &mut self,
-        pkg_id: PackageId,
-        fk: FeaturesFor,
-        dep_name: InternedString,
-    ) -> CargoResult<()> {
-        // Mark this dependency as activated.
-        let save_decoupled = fk.apply_opts(&self.opts);
-        self.activated_dependencies.entry((pkg_id, save_decoupled)).or_default().insert(dep_name);
-        // Check for any deferred features.
-        let to_enable = self.deferred_weak_dependencies.remove(&(pkg_id, fk, dep_name));
-        // Activate the optional dep.
-        for (dep_pkg_id, deps) in self.deps(pkg_id, fk)? {
-            for (dep, dep_fk) in deps {
-                if dep.name_in_toml() != dep_name {
-                    continue;
-                }
-                if let Some(to_enable) = &to_enable {
-                    for dep_feature in to_enable {
-                        tracing::trace!(
-                            "activate deferred {} {} -> {}/{}",
-                            pkg_id.name(),
-                            fk,
-                            dep_name,
-                            dep_feature
-                        );
-                        let fv = FeatureValue::new(*dep_feature);
-                        self.activate_fv(dep_pkg_id, dep_fk, &fv)?;
+        while let Some(item) = work.pop() {
+            match item {
+                FeatureWork::ActivateDepPkg(dep_pkg_id, dep_fk, dep) => {
+                    blaze_trace::trace!("activate_pkg {} {}", dep_pkg_id.name(), dep_fk);
+                    self.activated_features
+                        .entry((dep_pkg_id, dep_fk.apply_opts(&self.opts)))
+                        .or_default();
+                    let dep_fvs = self.fvs_from_dependency(dep_pkg_id, dep);
+                    work.push(FeatureWork::ProcessDeps(dep_pkg_id, dep_fk));
+                    for fv in dep_fvs.into_iter().rev() {
+                        work.push(FeatureWork::ActivateFv(dep_pkg_id, dep_fk, fv));
                     }
                 }
-                let fvs = self.fvs_from_dependency(dep_pkg_id, dep);
-                self.activate_pkg(dep_pkg_id, dep_fk, &fvs)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Activate a feature within a dependency (`dep_name/feat_name` syntax).
-    fn activate_dep_feature(
-        &mut self,
-        pkg_id: PackageId,
-        fk: FeaturesFor,
-        dep_name: InternedString,
-        dep_feature: InternedString,
-        weak: bool,
-    ) -> CargoResult<()> {
-        for (dep_pkg_id, deps) in self.deps(pkg_id, fk)? {
-            for (dep, dep_fk) in deps {
-                if dep.name_in_toml() != dep_name {
-                    continue;
-                }
-                if dep.is_optional() {
-                    let save_for_host = fk.apply_opts(&self.opts);
-                    if weak
-                        && !self
-                            .activated_dependencies
-                            .get(&(pkg_id, save_for_host))
-                            .map(|deps| deps.contains(&dep_name))
-                            .unwrap_or(false)
-                    {
-                        // This is weak, but not yet activated. Defer in case
-                        // something comes along later and enables it.
-                        tracing::trace!(
-                            "deferring feature {} {} -> {}/{}",
-                            pkg_id.name(),
-                            fk,
-                            dep_name,
-                            dep_feature
-                        );
-                        self.deferred_weak_dependencies
-                            .entry((pkg_id, fk, dep_name))
-                            .or_default()
-                            .insert(dep_feature);
+                FeatureWork::ProcessDeps(pkg_id, fk) => {
+                    if !self.processed_deps.insert((pkg_id, fk)) {
+                        // Already processed dependencies. There's no need to process them
+                        // again. This is primarily to avoid cycles, but also helps speed
+                        // things up.
+                        //
+                        // This is safe because if another package comes along and adds a
+                        // feature on this package, it will immediately add it (in
+                        // `ActivateFv`), and expand as necessary right then and there.
                         continue;
                     }
-
-                    // Activate the dependency on self.
-                    let fv = FeatureValue::Dep { dep_name };
-                    self.activate_fv(pkg_id, fk, &fv)?;
-                    if !weak {
-                        // The old behavior before weak dependencies were
-                        // added is to also enables a feature of the same
-                        // name.
-                        //
-                        // Don't enable if the implicit optional dependency
-                        // feature wasn't created due to `dep:` hiding.
-                        // See rust-lang/cargo#10788 and rust-lang/cargo#12130
-                        let summary = self.resolve.summary(pkg_id);
-                        let feature_map = summary.features();
-                        if feature_map.contains_key(&dep_name) {
-                            self.activate_rec(pkg_id, fk, dep_name)?;
+                    let deps_list = self.deps(pkg_id, fk)?;
+                    for (dep_pkg_id, deps) in deps_list.into_iter().rev() {
+                        for (dep, dep_fk) in deps.into_iter().rev() {
+                            if dep.is_optional() {
+                                // Optional dependencies are enabled in `ActivateFv` when
+                                // a feature enables it.
+                                continue;
+                            }
+                            work.push(FeatureWork::ActivateDepPkg(dep_pkg_id, dep_fk, dep));
                         }
                     }
                 }
-                // Activate the feature on the dependency.
-                let fv = FeatureValue::new(dep_feature);
-                self.activate_fv(dep_pkg_id, dep_fk, &fv)?;
+                FeatureWork::ActivateFv(pkg_id, fk, fv) => {
+                    blaze_trace::trace!("activate_fv {} {} {}", pkg_id.name(), fk, fv);
+                    match fv {
+                        FeatureValue::Feature(f) => {
+                            work.push(FeatureWork::ActivateRec(pkg_id, fk, f));
+                        }
+                        FeatureValue::Dep { dep_name } => {
+                            // Mark this dependency as activated.
+                            let save_decoupled = fk.apply_opts(&self.opts);
+                            self.activated_dependencies
+                                .entry((pkg_id, save_decoupled))
+                                .or_default()
+                                .insert(dep_name);
+                            // Check for any deferred features.
+                            let to_enable =
+                                self.deferred_weak_dependencies.remove(&(pkg_id, fk, dep_name));
+                            // Activate the optional dep.
+                            let deps_list = self.deps(pkg_id, fk)?;
+                            for (dep_pkg_id, deps) in deps_list.into_iter().rev() {
+                                for (dep, dep_fk) in deps.into_iter().rev() {
+                                    if dep.name_in_toml() != dep_name {
+                                        continue;
+                                    }
+                                    work.push(FeatureWork::ActivateDepPkg(dep_pkg_id, dep_fk, dep));
+                                    if let Some(to_enable) = &to_enable {
+                                        for dep_feature in to_enable {
+                                            blaze_trace::trace!(
+                                                "activate deferred {} {} -> {}/{}",
+                                                pkg_id.name(),
+                                                fk,
+                                                dep_name,
+                                                dep_feature
+                                            );
+                                            work.push(FeatureWork::ActivateFv(
+                                                dep_pkg_id,
+                                                dep_fk,
+                                                FeatureValue::new(*dep_feature),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        FeatureValue::DepFeature { dep_name, dep_feature, weak } => {
+                            let deps_list = self.deps(pkg_id, fk)?;
+                            for (dep_pkg_id, deps) in deps_list.into_iter().rev() {
+                                for (dep, dep_fk) in deps.into_iter().rev() {
+                                    if dep.name_in_toml() != dep_name {
+                                        continue;
+                                    }
+                                    work.push(FeatureWork::ActivateDepFeatureEntry {
+                                        pkg_id,
+                                        fk,
+                                        dep_pkg_id,
+                                        dep,
+                                        dep_fk,
+                                        dep_name,
+                                        dep_feature,
+                                        weak,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                FeatureWork::ActivateRec(pkg_id, fk, feature_to_enable) => {
+                    blaze_trace::trace!(
+                        "activate_rec {} {} feat={}",
+                        pkg_id.name(),
+                        fk,
+                        feature_to_enable
+                    );
+                    let enabled = self
+                        .activated_features
+                        .entry((pkg_id, fk.apply_opts(&self.opts)))
+                        .or_default();
+                    if !enabled.insert(feature_to_enable) {
+                        // Already enabled.
+                        continue;
+                    }
+                    let summary = self.resolve.summary(pkg_id);
+                    let feature_map = summary.features();
+                    let Some(fvs) = feature_map.get(&feature_to_enable) else {
+                        // TODO: this should only happen for optional dependencies.
+                        // Other cases should be validated by Summary's `build_feature_map`.
+                        // Figure out some way to validate this assumption.
+                        blaze_trace::debug!(
+                            "pkg {:?} does not define feature {}",
+                            pkg_id,
+                            feature_to_enable
+                        );
+                        continue;
+                    };
+                    for &fv in fvs.iter().rev() {
+                        work.push(FeatureWork::ActivateFv(pkg_id, fk, fv));
+                    }
+                }
+                FeatureWork::ActivateDepFeatureEntry {
+                    pkg_id,
+                    fk,
+                    dep_pkg_id,
+                    dep,
+                    dep_fk,
+                    dep_name,
+                    dep_feature,
+                    weak,
+                } => {
+                    if dep.is_optional() {
+                        let save_for_host = fk.apply_opts(&self.opts);
+                        if weak
+                            && !self
+                                .activated_dependencies
+                                .get(&(pkg_id, save_for_host))
+                                .map(|deps| deps.contains(&dep_name))
+                                .unwrap_or(false)
+                        {
+                            // This is weak, but not yet activated. Defer in case
+                            // something comes along later and enables it.
+                            blaze_trace::trace!(
+                                "deferring feature {} {} -> {}/{}",
+                                pkg_id.name(),
+                                fk,
+                                dep_name,
+                                dep_feature
+                            );
+                            self.deferred_weak_dependencies
+                                .entry((pkg_id, fk, dep_name))
+                                .or_default()
+                                .insert(dep_feature);
+                            continue;
+                        }
+                    }
+                    // Push in reverse execution order:
+                    // 1. Activate the dependency on self (if optional).
+                    // 2. Enable the implicit feature of the same name (if optional and !weak).
+                    // 3. Activate the feature on the dependency.
+                    work.push(FeatureWork::ActivateFv(
+                        dep_pkg_id,
+                        dep_fk,
+                        FeatureValue::new(dep_feature),
+                    ));
+                    if dep.is_optional() {
+                        if !weak {
+                            // The old behavior before weak dependencies were
+                            // added is to also enables a feature of the same
+                            // name.
+                            //
+                            // Don't enable if the implicit optional dependency
+                            // feature wasn't created due to `dep:` hiding.
+                            // See rust-lang/cargo#10788 and rust-lang/cargo#12130
+                            let summary = self.resolve.summary(pkg_id);
+                            let feature_map = summary.features();
+                            if feature_map.contains_key(&dep_name) {
+                                work.push(FeatureWork::ActivateRec(pkg_id, fk, dep_name));
+                            }
+                        }
+                        work.push(FeatureWork::ActivateFv(
+                            pkg_id,
+                            fk,
+                            FeatureValue::Dep { dep_name },
+                        ));
+                    }
+                }
             }
         }
         Ok(())

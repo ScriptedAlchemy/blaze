@@ -30,7 +30,7 @@ fn copy_dir(from: &Path, to: &Path) {
 fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
     let root = scratch.join(fixture.file_name().unwrap());
     copy_dir(fixture, &root);
-    let root = dunce::canonicalize(root).unwrap();
+    let root = fixture_paths::canonicalize(&root);
     let case: serde_json::Value = match std::fs::read_to_string(fixture.join("case.json")) {
         Ok(text) => serde_json::from_str(&text).unwrap(),
         Err(_) => serde_json::json!({}),

@@ -1,6 +1,6 @@
 ---
 name: compiler-correctness
-description: "What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's query crates (blaze-query, derived from salsa), keys that cover every input and are computed from text before the work, checks done once with a proof type later code takes, positions item-relative in every key and record, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. A cache of a function's results keyed by code identity, and what the store holds, are the `memory-and-data` skill. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox."
+description: "What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's crates (hir-ty and its checkers, asking for items through `Items` and `Source`), keys that cover every input and are computed from text before the work, checks done once with a proof type later code takes, positions item-relative in every key and record, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. A cache of a function's results keyed by code identity, and what the store holds, are the `memory-and-data` skill. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox."
 ---
 
 # Compiler correctness
@@ -117,13 +117,12 @@ ordered by construction; a test builds twice and compares bytes.
 ## semantics-in-front-end (rule 31)
 
 Language semantics (MIR building and passes, borrow checking, const eval, layout, code-identity
-hashes) go in the front end's crates in `crates/` (`hir-ty`, `hir-def` and the rest, derived from
-rust-analyzer but no longer synced with it), whose queries run on blaze's own engine
-(`blaze_query::db`, crates/blaze-query: derived from salsa but not salsa; dense ids, in memory, one
-view at a time; what outlives a request is a record, `outputs-are-records`, never a row kept in the
-engine), in a crate of their own where possible. The target design (docs/v2/plan/design/target.md)
-replaces the engine's validity machinery with records keyed before the work; the language rules stay
-in these crates. Codegen, the store, the driver (the daemon today), cargo integration and the
+hashes) go in the front end's crates in `crates/` (`hir-ty` and its checkers, and the body and
+signature lowering of `hir-def`, derived from rust-analyzer but no longer synced with it), in a
+crate of their own where possible. Since 2026-11-15 they are parked while the item layer under them
+is rebuilt (docs/v2/plan/design/bottom.md): the type checker asks for items only through the traits
+`Items` and `Source`, every answer a record keyed from text before the work (`outputs-are-records`);
+the language rules stay in these crates. Codegen, the store, the driver, cargo integration and the
 runtime stay outside the front end.
 
 See [docs/contributing.md#where-new-code-goes](../../../docs/contributing.md#where-new-code-goes).
@@ -167,16 +166,20 @@ See [docs/v2/plan/design/edition.md](../../../docs/v2/plan/design/edition.md).
 ## reflection-first (rule 56)
 
 A property that follows from the shape of a type or the body of a function (it holds no capability,
-it cannot own itself, every field is in its key, it is serializable) is written once as compile-time
-Rust over reflected code (docs/v2/plan/design/comptime.md) and stated as a trait with a blanket impl
-over what the reflection finds: it can ask the real question (does a shared, mutable pointer lead
-back to this type), is decided per instance, and its refusal names the field path. An auto trait can
-only say "every field has it" and fails with no reason; a proc macro is opaque to blaze
-(`blaze::proc_macro`); a check built into the compiler serves one property. Use those only where
-reflection is not the more powerful, and say why. When reflection cannot express what is needed (a
-bound that depends on a const expression, a body it cannot read, a type it cannot name), that is the
-work: extend reflection or the language with the smallest general primitive (`own-the-language`,
-`library-over-language`), never ship the weaker approximation in its place.
+it cannot own itself, every field is in its key, it is serializable or live-patchable) is written
+once using Blaze compile-time reflection (`inline for (name, field) in v`, `inline for (name, field)
+in dst`, `zip_fields`, docs/v2/plan/design/comptime.md) and stated as a generic function or trait
+over what reflection finds: it can ask the real question (does a shared, mutable pointer lead back
+to this type), is decided per instance, and its refusal names the field path. Never reach for a Rust
+bridge macro (e.g. `reflect_struct!`) or `#[derive]` workaround in Blaze apps or demos just to
+compile with `rustc`: compile with `blaze` and use comptime reflection directly
+(`blaze-builds-blaze`). An auto trait can only say "every field has it" and fails with no reason; a
+proc macro is opaque to blaze (`blaze::proc_macro`); a check built into the compiler serves one
+property. Use those only where reflection is not the more powerful, and say why. When reflection
+cannot express what is needed (a bound that depends on a const expression, a body it cannot read, a
+type it cannot name), that is the work: extend reflection or the language with the smallest general
+primitive (`own-the-language`, `library-over-language`), never ship the weaker approximation in its
+place.
 
 See [docs/v2/plan/design/comptime.md](../../../docs/v2/plan/design/comptime.md).
 
@@ -271,7 +274,8 @@ duplicates across crates) run in the background on the command's snapshot, are c
 command and are never started by a file change (`act-on-snapshots`). Every reply says what is still
 pending. A project that is plain Rust adopts blaze's checks one step at a time (`step = "rust" |
 "suggest" | "edition" | "strict"` in `[workspace.metadata.blaze.lints]`), and `blaze::suggest` says
-where a blaze feature or a tighter type would pay. The crate is crates/blaze-findings; the design is
+where a blaze feature or a tighter type would pay. The lints are rebuilt this way on the new item
+layer, a short list first (docs/v2/plan/design/bottom.md); the design is
 docs/v2/plan/design/target.md, Findings.
 
 <!-- End of the generated rules. Hand-written notes follow. -->

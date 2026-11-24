@@ -145,10 +145,9 @@ import subprocess
 import sys
 import time
 
-assert sys.argv[1] == "--ignore-pin"
 home = Path(os.environ["BLAZE_HOME"])
 tools = Path(__file__).parent
-action = sys.argv[2]
+action = sys.argv[1]
 if action == "stop":
     if (home / "stop-fails").exists():
         sys.exit(7)
@@ -184,10 +183,10 @@ elif action in ("late", "leak"):
     assert os.read(read, 5) == b"ready"
     os.close(read)
 elif action == "drift":
-    with (tools / "blaze-engine").open("ab") as output:
+    with (tools / "blaze-fact-shim").open("ab") as output:
         output.write(b"changed")
 elif action == "swap-symlink":
-    link, target = Path(sys.argv[3]), Path(sys.argv[4])
+    link, target = Path(sys.argv[2]), Path(sys.argv[3])
     link.unlink()
     link.symlink_to(target)
 print("selected fake Blaze command completed")
@@ -203,7 +202,7 @@ class NativeObserverTests(unittest.TestCase):
         binary = self.root / "bin"
         binary.mkdir()
         python = str(Path(sys.executable).resolve())
-        for name in ("blaze", "blaze-engine"):
+        for name in ("blaze", "blaze-launcher", "blaze-fact-shim"):
             path = binary / name
             path.write_text(FAKE_BLAZE.replace("#!PYTHON", "#!" + python), encoding="utf-8")
             path.chmod(0o700)

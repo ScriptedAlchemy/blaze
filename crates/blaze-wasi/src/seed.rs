@@ -30,7 +30,9 @@
 //! has). The macro host does not, and its import check refuses the module.
 
 #[cfg(feature = "seed")]
-use std::marker::PhantomData;
+use alloc::{format, vec::Vec};
+#[cfg(feature = "seed")]
+use core::marker::PhantomData;
 
 #[cfg(feature = "seed")]
 use wasmtime::{
@@ -40,7 +42,7 @@ use wasmtime::{
 #[cfg(feature = "seed")]
 use crate::{
     Embed, Errno, Stop, W64,
-    calls::{Mem, answered},
+    layout::{Halt, Mem, answered},
 };
 
 /// The module the seed imports these calls from.
@@ -188,7 +190,7 @@ impl Fibers {
     /// Takes `fiber` out to run it.
     fn take(&mut self, fiber: u64) -> wasmtime::Result<Fiber> {
         let slot = self.slot("fiber_resume", fiber)?;
-        match std::mem::replace(slot, Slot::Running) {
+        match core::mem::replace(slot, Slot::Running) {
             Slot::Idle(it) => Ok(it),
             was => {
                 let why = if matches!(was, Slot::Running) {
@@ -222,7 +224,7 @@ impl Fibers {
     /// seed's entry returned, before its store is dropped. A fiber still suspended then is one
     /// the seed leaked (as blaze-graph leaks a fiber suspended mid-body).
     pub fn dispose_all<T: EmbedSeed>(store: &mut Store<T>) {
-        let slots = std::mem::take(&mut store.data_mut().fibers().slots);
+        let slots = core::mem::take(&mut store.data_mut().fibers().slots);
         for slot in slots {
             if let Slot::Idle(it) = slot {
                 store.guest_fiber_dispose(it.fiber);
@@ -337,7 +339,7 @@ fn fiber_resume<T: EmbedSeed>(c: &mut Caller<'_, T>, fiber: u64) -> wasmtime::Re
 #[cfg(feature = "seed")]
 fn fiber_drop<T: EmbedSeed>(c: &mut Caller<'_, T>, fiber: u64) -> wasmtime::Result<()> {
     let slot = c.data_mut().fibers().slot("fiber_drop", fiber)?;
-    match std::mem::replace(slot, Slot::Free) {
+    match core::mem::replace(slot, Slot::Free) {
         Slot::Running => {
             *slot = Slot::Running;
             // alloc: error path
@@ -357,21 +359,23 @@ fn fiber_drop<T: EmbedSeed>(c: &mut Caller<'_, T>, fiber: u64) -> wasmtime::Resu
 fn call<T: EmbedSeed, R>(
     caller: &mut Caller<'_, T>,
     name: &'static str,
-    f: impl FnOnce(&mut Mem<'_, W64>, &mut dyn Seed) -> Result<R, Stop>, // dyn: as `EmbedSeed::with_seed`
+    f: impl FnOnce(&mut Mem<'_, W64>, &mut dyn Seed) -> Result<R, Halt>, // dyn: as `EmbedSeed::with_seed`
 ) -> wasmtime::Result<R> {
-    T::with_seed(caller, |bytes, seed| f(&mut Mem { bytes, call: name, width: PhantomData }, seed))
+    T::with_seed(caller, |bytes, seed| {
+        f(&mut Mem { bytes, call: name, width: PhantomData }, seed).map_err(Stop::from)
+    })
 }
 
 /// The absolute path at `(ptr, len)`, or `EINVAL` for a relative one.
 #[cfg(feature = "seed")]
-fn path<'m>(mem: &'m Mem<'_, W64>, ptr: u64, len: u64) -> Result<Result<&'m [u8], Errno>, Stop> {
+fn path<'m>(mem: &'m Mem<'_, W64>, ptr: u64, len: u64) -> Result<Result<&'m [u8], Errno>, Halt> {
     let path = mem.get(ptr, len)?;
     Ok(if path.first() == Some(&b'/') { Ok(path) } else { Err(Errno::INVAL) })
 }
 
 /// The `errno` of a call that answers nothing.
 #[cfg(feature = "seed")]
-fn done(answer: Result<(), Errno>) -> Result<i32, Stop> {
+fn done(answer: Result<(), Errno>) -> Result<i32, Halt> {
     answered(answer, |()| Ok(()))
 }
 
@@ -381,7 +385,7 @@ pub fn link<T: EmbedSeed>(l: &mut Linker<T>) -> wasmtime::Result<()> {
     let m = MODULE;
     l.func_wrap(m, "abi_version", |_: Caller<'_, T>| VERSION as i32)?;
     l.func_wrap(m, "decommit", |mut c: Caller<'_, T>, ptr: u64, len: u64| {
-        call(&mut c, "decommit", |mem, seed| seed.decommit(mem.get_mut(ptr, len)?))
+        call(&mut c, "decommit", |mem, seed| Ok(seed.decommit(mem.get_mut(ptr, len)?)?))
     })?;
     l.func_wrap(m, "create_dir", |mut c: Caller<'_, T>, ptr: u64, len: u64| {
         call(&mut c, "create_dir", |mem, seed| {

@@ -139,3 +139,70 @@ fn const_static_without_a_brace_is_as_before() {
     let blocks = tree.iter().filter(|it| *it == "BLOCK_EXPR").count();
     assert_eq!(blocks, 1, "the function's body, no `const static` block: {tree:#?}");
 }
+
+#[test]
+fn inline_for_is_a_for_expr_with_an_inline_token() {
+    let inline = clean("fn f() { inline for x in r { g(x); } inline for (k, v) in &r { h(k, v); } 'a: inline for y in t { g(y); } }");
+    assert_eq!(inline.iter().filter(|it| *it == "FOR_EXPR").count(), 3, "{inline:#?}");
+    assert_eq!(inline.iter().filter(|it| *it == "INLINE_KW \"inline\"").count(), 3, "{inline:#?}");
+    assert!(has_run(&inline, &["INLINE_KW \"inline\"", "WHITESPACE \" \"", "FOR_KW \"for\""]), "{inline:#?}");
+}
+
+#[test]
+fn inline_identifier_has_zero_conflict_without_for() {
+    let tree = clean("#[inline] fn f() { let inline = 1; let y = inline + 2; }");
+    assert!(!tree.iter().any(|it| it == "FOR_EXPR"), "{tree:#?}");
+    assert!(!tree.iter().any(|it| it == "INLINE_KW \"inline\""), "{tree:#?}");
+    assert!(tree.iter().filter(|it| *it == "IDENT \"inline\"").count() >= 3, "{tree:#?}");
+}
+
+#[test]
+fn for_fields_where_predicate_parses_cleanly() {
+    let fn_tree = clean(
+        "fn to_json<T>(v: &T, out: &mut Buf) where for<F in fields(T)> F: FieldCodec + Copy {}",
+    );
+    assert!(
+        has_run(
+            &fn_tree,
+            &[
+                "WHERE_PRED",
+                "FOR_BINDER",
+                "FOR_KW \"for\"",
+                "L_ANGLE \"<\"",
+                "NAME",
+                "IDENT \"F\"",
+                "WHITESPACE \" \"",
+                "IN_KW \"in\"",
+                "WHITESPACE \" \"",
+                "IDENT \"fields\"",
+                "L_PAREN \"(\"",
+                "PATH_TYPE",
+            ]
+        ),
+        "{fn_tree:#?}"
+    );
+    assert!(has_run(&fn_tree, &["R_PAREN \")\"", "R_ANGLE \">\""]), "{fn_tree:#?}");
+
+    // Works across impl, trait, struct, enum, generic trait args, and compound container types.
+    for item in [
+        "impl<T> FieldCodec for T where for<F in fields(T)> F: FieldCodec {}",
+        "trait Encode<T> where for<F in fields(T)> F: FieldCodec<Buf> + Copy {}",
+        "struct Wrap<T> where for<F in fields(T)> F: Copy { inner: T }",
+        "enum Choice<T> where for<F in fields(Foo<T>)> F: Copy + Send { A(T) }",
+        "fn multi<T, U>() where T: Sized, for<F in fields(T)> F: FieldCodec + Copy, for<'a> U: Fn(&'a str) {}",
+    ] {
+        let tree = clean(item);
+        assert!(tree.iter().any(|it| it == "FOR_BINDER"), "{item}: {tree:#?}");
+        assert!(tree.iter().any(|it| it == "IN_KW \"in\""), "{item}: {tree:#?}");
+    }
+
+    // Malformed field-quantified binders recover cleanly with parse errors.
+    for bad in [
+        "fn f<T>() where for<F in fields()> F: Copy {}",
+        "fn f<T>() where for<F in > F: Copy {}",
+        "fn f<T>() where for<F in fields> F: Copy {}",
+    ] {
+        let (_, errors) = parse_lines(bad, Edition::CURRENT);
+        assert!(!errors.is_empty(), "expected parse error for `{bad}`");
+    }
+}

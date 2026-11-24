@@ -8,7 +8,7 @@ The input is one JSON object (inline, the path of a .json file, or `-` for stand
 unknown fields refused (rule scripts-take-typed-input):
 
     what    what the branch does; the pull request is "Merge <branch>: <what>"
-    smoke   the file holding the smoke quote (its first line `blaze-smoke 1`) that
+    smoke   the file holding the smoke quote (its first line `blaze-smoke 2`) that
             scripts/src/bin/smoke.rs printed for a release blaze built from this branch's head
     wait    follow the waiting until the merge (true); false leaves it running in the background
     follow  instead of landing: follow the waiting of this branch's pull request (true) or of
@@ -23,12 +23,12 @@ branch must contain origin/main (`git merge origin/main` first), so the merge co
 head's; the quote must name that tree, clean, with verdict ok (smoke.rs decides, land.py only asks
 it: `smoke '{"verify": ...}'`). It pushes the branch, opens its pull request (titled "Merge
 <branch>: <what it does>", which with " (#N)" is the merge commit's subject) or takes the one
-already open, and puts the quote in its body. The pull request's run is the merge gate, the build
-and the unit tests on Linux AArch64 (on ix runners). Once it passes, the waiting asks smoke.rs
+already open, and puts the quote in its body. The pull request's run is the merge gate
+(blaze.yaml's `ci`: the script checks, actionlint, the Lean proofs, and cargo check and the unit
+tests on Linux AArch64, on ix runners). Once it passes, the waiting asks smoke.rs
 again about the body's quote and the head GitHub has, checks that main has not moved past the
-head, and merges with a merge commit, as `git merge --no-ff` would, pinned to that head. Every
-harness runs after the merge, in the release train (train.yaml). land.py waits until then and
-exits 0 with the commit main is at, or exits 1 and says why the pull request did not merge (a
+head, and merges with a merge commit, as `git merge --no-ff` would, pinned to that head.
+land.py waits until then and exits 0 with the commit main is at, or exits 1 and says why the pull request did not merge (a
 check that failed, a conflict with main, main moved, the quote). GitHub deletes the branch on
 origin once it is merged. There is no flag around the smoke, and an admin merge is not an
 exception to it (rule 68).
@@ -40,6 +40,7 @@ waiting going. `{"follow": true}` (this branch's pull request) or `{"follow": N}
 again, and starts it again if it is gone; running land.py again on the same branch does too.
 """
 import dataclasses, json, os, signal, subprocess, sys, time
+from pathlib import Path
 
 REPO = "indexable-inc/blaze"
 POLL = 20
@@ -47,15 +48,15 @@ GIVE_UP = 3 * 3600
 # A `gh` call that fails this many times in a row (the network, GitHub) ends the waiting.
 TRIES = 15
 EXIT = "land.py exit "
-# How the quote is checked: smoke.rs's own `verify`, on the pinned release blaze, so the quote's
+# How the quote is checked: smoke.rs's own `verify`, built with the pinned toolchain, so the quote's
 # format is read in one place only.
-SMOKE = ["blaze", "run", "-q", "-p", "scripts", "--bin", "smoke", "--"]
+SMOKE = ["cargo", "+" + Path("pins/toolchain").read_text().strip(), "run", "--locked", "-q", "-p", "scripts", "--bin", "smoke", "--"]
 # The ceiling of one `smoke` verify, in seconds: a build of the scripts crate by the pinned
-# release when it is not built yet (minutes), then a check that reads one text in milliseconds.
+# toolchain when it is not built yet (minutes), then a check that reads one text in milliseconds.
 # Past it something is wrong, and the merge waits for it.
 VERIFY_TIMEOUT = 900
 # What makes the quote, said in every refusal.
-SMOKE_RUN = ("blaze run -q -p scripts --bin smoke -- "
+SMOKE_RUN = ("cargo +$(cat pins/toolchain) run --locked -q -p scripts --bin smoke -- "
              "'{\"blaze\": \"<a release blaze built from this head>\", \"work\": \"<an empty directory>\"}' > smoke.txt")
 # The pull request body's smoke section, which land.py replaces whole on each run.
 QUOTE_START, QUOTE_END = "<!-- smoke quote (land.py writes this) -->", "<!-- end of the smoke quote -->"
@@ -141,7 +142,7 @@ def refusal(why):
     return (f"land.py: refused: {why}\n"
             "  A merge carries the smoke quote of a release blaze built from its exact tree (rule proof-before-merge);\n"
             "  admin merges need the smoke quote too: rule 68. No flag skips it.\n"
-            f"  Run, on blaze-vm (how-to H-smoke-before-merge): {SMOKE_RUN}\n"
+            f"  Run on the Mac or build VM: {SMOKE_RUN}\n"
             "  then: python3 .github/scripts/land.py '{\"what\": \"...\", \"smoke\": \"smoke.txt\"}'")
 
 

@@ -22,8 +22,12 @@
 //! `declare_lint!`s, `register_builtins` and `register_internals`; `tests` holds their counts
 //! and hashes to rustc's.
 
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+
+extern crate alloc;
+use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
 mod index;
 mod lints;
 mod names;
@@ -32,10 +36,9 @@ pub mod ready;
 mod rustc;
 mod set;
 
-use std::sync::OnceLock;
+use blaze_swiss::sync::Once as OnceLock;
 
 use edition::Edition;
-use serde::{Deserialize, Serialize};
 
 use self::index::{
     ALL, BLAZE_END, BUILTIN_END, Entry, FIRST_GROUP, GROUP_COUNT, INTERNAL_END, INTERNAL_GROUP,
@@ -47,7 +50,7 @@ pub use self::{
 };
 
 /// A lint level, in rustc's order: where one is capped, the lower wins.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Level {
     Allow,
     Expect,
@@ -452,7 +455,7 @@ impl LintId {
 
     /// `&'static [&'static Lint]` of it alone.
     fn alone(self) -> &'static [&'static Lint] {
-        std::slice::from_ref(&REFS[usize::from(self.0)])
+        core::slice::from_ref(&REFS[usize::from(self.0)])
     }
 }
 

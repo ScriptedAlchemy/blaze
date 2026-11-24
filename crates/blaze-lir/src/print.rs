@@ -22,7 +22,8 @@
 //! `(values)`, `[blocks]` or `[lanes]`, an immediate in decimal, a constant as hex words
 //! from the most significant, and rows of the tables as `refN`, `sN`, `ssN`, `iN`, `aN`.
 
-use std::fmt::{self, Write as _};
+use alloc::string::String;
+use core::fmt;
 
 use crate::{
     flags::{AtomicRmw, FloatCond, IntCond, Shown},
@@ -74,7 +75,7 @@ pub(crate) fn quoted(text: &str, out: &mut impl fmt::Write) -> fmt::Result {
 }
 
 fn text<'a>(view: &View<'a>, first: u32, len: u32) -> &'a str {
-    std::str::from_utf8(view.asm_str(first, len)).unwrap_or("?")
+    core::str::from_utf8(view.asm_str(first, len)).unwrap_or("?")
 }
 
 fn hex(bytes: &[u8], out: &mut impl fmt::Write) -> fmt::Result {
@@ -116,7 +117,7 @@ fn header(view: &View<'_>, out: &mut impl fmt::Write) -> fmt::Result {
         out.write_str(inline.name())?;
     }
     out.write_str("] features ")?;
-    quoted(std::str::from_utf8(view.features).unwrap_or("?"), out)?;
+    quoted(core::str::from_utf8(view.features).unwrap_or("?"), out)?;
     out.write_char('\n')
 }
 
@@ -222,11 +223,26 @@ fn tables(view: &View<'_>, out: &mut impl fmt::Write) -> fmt::Result {
             }
             write!(out, "{} ref{} {}", reloc.offset, reloc.target, reloc.addend)?;
         }
-        out.write_str("]\n")?;
+        out.write_char(']')?;
+        // Written only when there are some, so a row without them prints as before positions
+        // existed.
+        let positions = view.data_positions_of(crate::func::DataId(r as u32));
+        if !positions.is_empty() {
+            out.write_str(" positions [")?;
+            for (i, position) in positions.iter().enumerate() {
+                if i > 0 {
+                    out.write_str(", ")?;
+                }
+                let field = crate::func::PositionField::from_word(position.field).map_or("?", crate::func::PositionField::name);
+                write!(out, "{} {field} 0x{:032x} {}", position.offset, position.item_key(), position.site)?;
+            }
+            out.write_char(']')?;
+        }
+        out.write_char('\n')?;
     }
     for (r, rec) in view.intrinsics.iter().enumerate() {
         write!(out, "intrinsic i{r} = ")?;
-        quoted(std::str::from_utf8(view.intrinsic_name(crate::func::IntrinsicId(r as u32))).unwrap_or("?"), out)?;
+        quoted(core::str::from_utf8(view.intrinsic_name(crate::func::IntrinsicId(r as u32))).unwrap_or("?"), out)?;
         writeln!(out, " s{}", rec.sig)?;
     }
     for (r, rec) in view.slots.iter().enumerate() {

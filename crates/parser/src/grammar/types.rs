@@ -34,36 +34,34 @@ pub(super) const TYPE_RECOVERY_SET: TokenSet = TokenSet::new(&[
     T![pub],
 ]);
 
-pub(crate) fn type_(p: &mut Parser<'_>) {
+pub(crate) fn type_<S: Sink>(p: &mut Parser<'_, S>) {
     type_or_union(p, true);
 }
 
-pub(super) fn type_no_bounds(p: &mut Parser<'_>) {
+pub(super) fn type_no_bounds<S: Sink>(p: &mut Parser<'_, S>) {
     type_or_union(p, false);
 }
 
-/// A type, or under `#![blaze::error_unions]` an error union `A | B | C` of types: the union
-/// binds loosest, so `&A | B` is a union of `&A` and `B`, and a member is never a union itself
-/// (write one in parentheses). Without the extension, or where Rust lets a `|` follow a type
-/// (a closure's parameters, after `as`: [`Parser::with_unions`]), this is the type alone and
-/// the parse is Rust's.
-fn type_or_union(p: &mut Parser<'_>, allow_bounds: bool) {
+/// A type, or under `#![blaze::error_unions]` an error union `A | B | C`.
+/// Without the extension, or where Rust lets a `|` follow a type (a closure's parameters, after
+/// `as`: [`Parser::with_unions`]), this is the type alone and the parse is Rust's.
+fn type_or_union<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
     if !p.unions() {
         type_with_bounds_cond(p, allow_bounds);
         return;
     }
     let m = p.start();
     p.with_unions(false, |p| type_with_bounds_cond(p, allow_bounds));
-    if !at_union_bar(p) {
-        m.abandon(p);
+    if at_union_bar(p) {
+        union_members(p, allow_bounds);
+        m.complete(p, UNION_TYPE);
         return;
     }
-    union_members(p, allow_bounds);
-    m.complete(p, UNION_TYPE);
+    m.abandon(p);
 }
 
 /// The `| B | C` of an error union, each member a type that is no union itself.
-fn union_members(p: &mut Parser<'_>, allow_bounds: bool) {
+fn union_members<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
     // blaze, under `#![blaze::error_unions]`: `type E = io::Error | ParseIntError;`
     while at_union_bar(p) {
         p.bump(T![|]);
@@ -73,31 +71,33 @@ fn union_members(p: &mut Parser<'_>, allow_bounds: bool) {
 
 /// The rest of an error union whose first member, `first`, a caller parsed itself (a generic
 /// argument that starts with a name is parsed there, to tell `Item = T` and `Item: Bound` from
-/// a type): `first | B | C` as one `UNION_TYPE`, or `first` where no union may be or none
-/// follows.
-pub(super) fn union_after(p: &mut Parser<'_>, first: CompletedMarker) -> CompletedMarker {
-    if !p.unions() || !at_union_bar(p) {
+/// a type): `first | B | C` as one `UNION_TYPE`, or `first` where no union may be or none follows.
+pub(super) fn union_after<S: Sink>(p: &mut Parser<'_, S>, first: CompletedMarker) -> CompletedMarker {
+    if !p.unions() {
         return first;
     }
-    let m = first.precede(p);
-    while at_union_bar(p) {
-        p.bump(T![|]);
-        p.with_unions(false, |p| type_with_bounds_cond(p, true));
+    if at_union_bar(p) {
+        let m = first.precede(p);
+        while at_union_bar(p) {
+            p.bump(T![|]);
+            p.with_unions(false, |p| type_with_bounds_cond(p, true));
+        }
+        return m.complete(p, UNION_TYPE);
     }
-    m.complete(p, UNION_TYPE)
+    first
 }
 
 /// Whether the parser is at the `|` between two members of an error union: a lone `|`, not
 /// the first of `||` or `|=`, that a crate with the extension wrote.
-fn at_union_bar(p: &Parser<'_>) -> bool {
+fn at_union_bar<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T![|]) && !p.at(T![||]) && !p.at(T![|=]) && p.union_bar_gate()
 }
 
-fn type_with_bounds_cond(p: &mut Parser<'_>, allow_bounds: bool) {
+fn type_with_bounds_cond<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
     stdx::ensure_sufficient_stack(|| type_with_bounds_cond_here(p, allow_bounds))
 }
 
-fn type_with_bounds_cond_here(p: &mut Parser<'_>, allow_bounds: bool) {
+fn type_with_bounds_cond_here<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
     match p.current() {
         T!['('] => paren_or_tuple_type(p),
         T![!] => never_type(p),
@@ -128,13 +128,14 @@ fn type_with_bounds_cond_here(p: &mut Parser<'_>, allow_bounds: bool) {
 }
 
 /// blaze, under `#![blaze::records]`: `fn open(opts: { create: bool = false, mode: u32 }) {}`
+/// and structural spread `type Actor = { ..Transform, hp: u32 = 100 };`.
 ///
 /// A record type: a field list where a type is expected, which is nowhere a type of Rust's
 /// (the arm after this one is its error). The list and its fields are a struct's nodes, but a
-/// record's field is a name, a `:`, a type and then a default (`= expr`, as
-/// `default_field_values` writes it) and nothing else: a visibility, an attribute or `unsafe`
-/// is an error here. hir-ty refuses a default outside a function parameter.
-fn record_type(p: &mut Parser<'_>) {
+/// record's field is either a spread (`..Type`, a `RECORD_FIELD` with no `NAME`) or a name, a
+/// `:`, a type and then an optional default (`= expr`, as `default_field_values` writes it) and
+/// nothing else: a visibility, an attribute or `unsafe` is an error here.
+fn record_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
     let m = p.start();
     let list = p.start();
@@ -144,20 +145,26 @@ fn record_type(p: &mut Parser<'_>) {
             error_block(p, "expected a record field: a name, `:` and a type");
             continue;
         }
-        if !p.at(IDENT) {
+        if p.at(T![..]) && !p.at(T![..=]) {
+            let field = p.start();
+            p.bump(T![..]);
+            type_(p);
+            field.complete(p, RECORD_FIELD);
+        } else if p.at(IDENT) {
+            let field = p.start();
+            name(p);
+            p.expect(T![:]);
+            type_(p);
+            if p.eat(T![=]) {
+                let default = p.start();
+                expressions::expr(p);
+                default.complete(p, CONST_ARG);
+            }
+            field.complete(p, RECORD_FIELD);
+        } else {
             p.err_and_bump("expected a record field: a name, `:` and a type");
             continue;
         }
-        let field = p.start();
-        name(p);
-        p.expect(T![:]);
-        type_(p);
-        if p.eat(T![=]) {
-            let default = p.start();
-            expressions::expr(p);
-            default.complete(p, CONST_ARG);
-        }
-        field.complete(p, RECORD_FIELD);
         if !p.at(T!['}']) {
             p.expect(T![,]);
         }
@@ -169,24 +176,24 @@ fn record_type(p: &mut Parser<'_>) {
 
 /// Whether the parser is at a record type (`#![blaze::records]`) where only a type can be,
 /// which [`TYPE_FIRST`] cannot say: a `{` starts a type only under the extension.
-pub(super) fn at_record_type(p: &Parser<'_>) -> bool {
+pub(super) fn at_record_type<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T!['{']) && p.records_gate()
 }
 
 /// Whether the parser is at a record type that is a generic argument (`Vec<{ a: u8 }>`,
-/// `#![blaze::records]`): a `{`, an identifier, a `:` and a token that is not a second `:`.
-/// Any other `{` in a generic argument list is Rust's const block (`Foo<{ N + 1 }>`, `Foo<{}>`),
-/// which never starts so; the empty record there is written `({})`. Four tokens, jointness
-/// unread, the bound of [`super::expressions::at_record_value`].
-pub(super) fn at_record_type_arg(p: &Parser<'_>) -> bool {
+/// `Vec<{ ..Base, a: u8 }>`, `#![blaze::records]`): a `{`, then either an identifier, a `:` and
+/// a token that is not a second `:`, or a `..` spread (not `..=`). Any other `{` in a generic
+/// argument list is Rust's const block (`Foo<{ N + 1 }>`, `Foo<{}>`), which never starts so;
+/// the empty record there is written `({})`. Four tokens, jointness unread, the bound of
+/// [`super::expressions::at_record_value`].
+pub(super) fn at_record_type_arg<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T!['{'])
         && p.records_gate()
-        && p.nth(1) == IDENT
-        && p.nth(2) == T![:]
-        && p.nth(3) != T![:]
+        && ((p.nth(1) == IDENT && p.nth(2) == T![:] && p.nth(3) != T![:])
+            || (p.nth_at(1, T![..]) && !p.nth_at(1, T![..=])))
 }
 
-pub(crate) fn is_dyn_weak(p: &Parser<'_>) -> bool {
+pub(crate) fn is_dyn_weak<S: Sink>(p: &Parser<'_, S>) -> bool {
     const WEAK_DYN_PATH_FIRST: TokenSet = TokenSet::new(&[
         IDENT,
         T![self],
@@ -205,7 +212,7 @@ pub(crate) fn is_dyn_weak(p: &Parser<'_>) -> bool {
     }
 }
 
-pub(super) fn ascription(p: &mut Parser<'_>) {
+pub(super) fn ascription<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T![:]));
     p.bump(T![:]);
     if p.at(T![=]) {
@@ -217,7 +224,7 @@ pub(super) fn ascription(p: &mut Parser<'_>) {
     type_(p);
 }
 
-fn paren_or_tuple_type(p: &mut Parser<'_>) {
+fn paren_or_tuple_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['(']));
     let m = p.start();
     p.bump(T!['(']);
@@ -254,14 +261,14 @@ fn paren_or_tuple_type(p: &mut Parser<'_>) {
 
 // test never_type
 // type Never = !;
-fn never_type(p: &mut Parser<'_>) {
+fn never_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T![!]));
     let m = p.start();
     p.bump(T![!]);
     m.complete(p, NEVER_TYPE);
 }
 
-fn ptr_type(p: &mut Parser<'_>) {
+fn ptr_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T![*]));
     let m = p.start();
     p.bump(T![*]);
@@ -285,7 +292,7 @@ fn ptr_type(p: &mut Parser<'_>) {
     m.complete(p, PTR_TYPE);
 }
 
-fn array_or_slice_type(p: &mut Parser<'_>) {
+fn array_or_slice_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['[']));
     let m = p.start();
     p.bump(T!['[']);
@@ -323,7 +330,7 @@ fn array_or_slice_type(p: &mut Parser<'_>) {
 // type A = &();
 // type B = &'static ();
 // type C = &mut ();
-fn ref_type(p: &mut Parser<'_>) {
+fn ref_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T![&]));
     let m = p.start();
     p.bump(T![&]);
@@ -340,7 +347,7 @@ fn ref_type(p: &mut Parser<'_>) {
 
 // test placeholder_type
 // type Placeholder = _;
-fn infer_type(p: &mut Parser<'_>) {
+fn infer_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T![_]));
     let m = p.start();
     p.bump(T![_]);
@@ -352,7 +359,7 @@ fn infer_type(p: &mut Parser<'_>) {
 // type B = unsafe fn();
 // type C = unsafe extern "C" fn();
 // type D = extern "C" fn ( u8 , ... ) -> u8;
-fn fn_ptr_type(p: &mut Parser<'_>) {
+fn fn_ptr_type<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     p.eat(T![unsafe]);
     if p.at(T![extern]) {
@@ -376,11 +383,32 @@ fn fn_ptr_type(p: &mut Parser<'_>) {
     m.complete(p, FN_PTR_TYPE);
 }
 
-pub(super) fn for_binder(p: &mut Parser<'_>) {
+pub(super) fn for_binder<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     p.bump(T![for]);
     if p.at(T![<]) {
-        generic_params::generic_param_list(p);
+        if p.nth_at(1, IDENT) && p.nth_at(2, T![in]) {
+            p.bump(T![<]);
+            name(p);
+            p.bump(T![in]);
+            if p.eat(IDENT) {
+                if p.eat(T!['(']) {
+                    type_(p);
+                    if !p.eat(T![')']) {
+                        p.error("expected `)`");
+                    }
+                } else {
+                    p.error("expected `(`");
+                }
+            } else {
+                p.error("expected `fields`");
+            }
+            if !p.eat(T![>]) {
+                p.error("expected `>`");
+            }
+        } else {
+            generic_params::generic_param_list(p);
+        }
     } else {
         p.error("expected `<`");
     }
@@ -391,7 +419,7 @@ pub(super) fn for_binder(p: &mut Parser<'_>) {
 // type A = for<'a> fn() -> ();
 // type B = for<'a> unsafe extern "C" fn(&'a ()) -> ();
 // type Obj = for<'a> PartialEq<&'a i32>;
-pub(super) fn for_type(p: &mut Parser<'_>, allow_bounds: bool) {
+pub(super) fn for_type<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
     assert!(p.at(T![for]));
     let m = p.start();
     for_binder(p);
@@ -422,7 +450,7 @@ pub(super) fn for_type(p: &mut Parser<'_>, allow_bounds: bool) {
 // type A = unsafe<'a> &'a ();
 // type B = unsafe<'a, 'b> &'a &'b ();
 // type C = unsafe<> u8;
-fn unsafe_binder_type(p: &mut Parser<'_>) {
+fn unsafe_binder_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T![unsafe]) && p.nth_at(1, T![<]));
     let m = p.start();
     p.bump(T![unsafe]);
@@ -433,7 +461,7 @@ fn unsafe_binder_type(p: &mut Parser<'_>) {
 
 // test impl_trait_type
 // type A = impl Iterator<Item=Foo<'a>> + 'a;
-fn impl_trait_type(p: &mut Parser<'_>) {
+fn impl_trait_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T![impl]));
     let m = p.start();
     p.bump(T![impl]);
@@ -443,7 +471,7 @@ fn impl_trait_type(p: &mut Parser<'_>) {
 
 // test dyn_trait_type
 // type A = dyn Iterator<Item=Foo<'a>> + 'a;
-fn dyn_trait_type(p: &mut Parser<'_>) {
+fn dyn_trait_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T![dyn]));
     let m = p.start();
     p.bump(T![dyn]);
@@ -460,7 +488,7 @@ fn dyn_trait_type(p: &mut Parser<'_>) {
 // type DynParen = dyn(Path);
 // type Path = dyn::Path;
 // type Generic = dyn<Path>;
-fn dyn_trait_type_weak(p: &mut Parser<'_>) {
+fn dyn_trait_type_weak<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at_contextual_kw(T![dyn]));
     let m = p.start();
     p.bump_remap(T![dyn]);
@@ -471,7 +499,7 @@ fn dyn_trait_type_weak(p: &mut Parser<'_>) {
 // test bare_dyn_types_with_leading_lifetime
 // type A = 'static + Trait;
 // type B = S<'static + Trait>;
-fn bare_dyn_trait_type(p: &mut Parser<'_>) {
+fn bare_dyn_trait_type<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     generic_params::bounds_without_colon(p);
     m.complete(p, DYN_TRAIT_TYPE);
@@ -480,7 +508,7 @@ fn bare_dyn_trait_type(p: &mut Parser<'_>) {
 // test macro_call_type
 // type A = foo!();
 // type B = crate::foo!();
-fn path_or_macro_type(p: &mut Parser<'_>, allow_bounds: bool) {
+fn path_or_macro_type<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
     assert!(paths::is_path_start(p));
     if p.at_contextual_kw(T![builtin]) && p.nth_at(1, T![#]) {
         pattern_type(p);
@@ -524,7 +552,7 @@ fn path_or_macro_type(p: &mut Parser<'_>, allow_bounds: bool) {
 // type B = ::Foo;
 // type C = self::Foo;
 // type D = super::Foo;
-pub(super) fn path_type_bounds(p: &mut Parser<'_>, allow_bounds: bool) {
+pub(super) fn path_type_bounds<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
     assert!(paths::is_path_start(p));
     let m = p.start();
     paths::type_path(p);
@@ -540,8 +568,8 @@ pub(super) fn path_type_bounds(p: &mut Parser<'_>, allow_bounds: bool) {
 
 /// This turns a parsed PATH_TYPE or FOR_TYPE optionally into a DYN_TRAIT_TYPE
 /// with a TYPE_BOUND_LIST
-pub(super) fn opt_type_bounds_as_dyn_trait_type(
-    p: &mut Parser<'_>,
+pub(super) fn opt_type_bounds_as_dyn_trait_type<S: Sink>(
+    p: &mut Parser<'_, S>,
     type_marker: CompletedMarker,
 ) -> CompletedMarker {
     assert!(matches!(type_marker.kind(), PATH_TYPE | FOR_TYPE | MACRO_TYPE));
@@ -580,7 +608,7 @@ pub(super) fn opt_type_bounds_as_dyn_trait_type(
 
 // test pattern_type_base
 // type P = builtin#pattern_type (*const u8 is !null);
-fn pattern_type(p: &mut Parser<'_>) {
+fn pattern_type<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     p.bump_remap(T![builtin]);
     p.bump(T![#]);

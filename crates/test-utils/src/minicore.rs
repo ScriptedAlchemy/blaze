@@ -1341,6 +1341,7 @@ pub mod ops {
             }
         }
 
+        // Each flag's impl whole, so the file itself parses (syntax's `self_hosting_parsing`).
         // region:!try_bodies
         impl<#[blaze::linear] T> FromResidual for Option<T> {
             fn from_residual(x: Option<Infallible>) -> Self {

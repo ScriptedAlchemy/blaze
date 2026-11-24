@@ -90,7 +90,8 @@ try {
   cpSync(action, join(base, ".github/actions/script"), { recursive: true });
   const fixture = {
     ".github/blaze-version": "0.test.1\n",
-    "harness/toolchain": "nightly-test\n",
+    "pins/toolchain": "nightly-test\n",
+    "pins/llvm.json": '{"revision":"fixture-one"}\n',
     ".cargo/config.toml": "[env]\nTEST_INPUT = \"one\"\n",
     "blaze.lock": "version = 1\n",
     "Cargo.toml": `[workspace]
@@ -206,6 +207,8 @@ version = "1.0.0"
   }
   changes("whole root workspace manifest", () => replace("Cargo.toml", 'registry-pkg = "1.0.0"', 'registry-pkg = "=1.0.0"'));
   changes("blaze lock input", () => write("blaze.lock", "version = 2\n"));
+  changes("pinned Cargo toolchain", () => write("pins/toolchain", "nightly-other\n"));
+  changes("pinned LLVM recipe", () => write("pins/llvm.json", '{"revision":"fixture-two"}\n'));
   changes("selected package manifest", () => write("crates/shared/Cargo.toml", read("crates/shared/Cargo.toml") + "# package input\n"));
   changes("ancestor workspace manifest", () => replace("nested/Cargo.toml", 'edition = "2024"', 'edition = "2021"'));
   check("literal identity still hashes ignored ancestor workspace", () => {
@@ -242,6 +245,7 @@ version = "1.0.0"
     symlinkSync("../real-deep", join(checkout, "nested/deep"));
   }, /symlinked input/);
   refuses("sparse checkout", () => { assert.equal(run("git", ["config", "core.sparseCheckout", "true"]).status, 0); }, /sparse checkout/);
+  refuses("missing pinned toolchain", () => rmSync(join(checkout, "pins/toolchain")), /missing or symlinked input pins\/toolchain/);
   refuses("failing hash command cannot print a key", () => mock("sha256sum", "exit 23"), /cannot hash source input/);
   refuses("wrong TOML runtime cannot use a fallback", () => mock("bun", "echo 0.0.0"), /Bun 1\.4\.5 is required/);
   refuses("unhashable dependency after valid closure blocks", () => replace("Cargo.lock", `checksum = "${"a".repeat(64)}"\n`, ""), /unhashable dependency registry-pkg/);

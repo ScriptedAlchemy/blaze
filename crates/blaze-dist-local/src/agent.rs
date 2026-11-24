@@ -398,8 +398,10 @@ const CANCELLED: &str = "the build was cancelled";
 /// A cancelled request is terminal even if the carrier or local policy permits a retry.
 fn ensure_not_cancelled(unit: &Unit, cancelled: &AtomicBool) -> Result<(), Error> {
     if cancelled.load(Ordering::Acquire) {
-        let reason = blaze_mem::format_in!(Global, "unit {}: {CANCELLED}", hex(&unit.spec))
-            .into_boxed_str().into_string();
+        let reason = blaze_mem::text::into_std_boxed_str(blaze_mem::format_in!(
+            Global, "unit {}: {CANCELLED}", hex(&unit.spec)
+        ))
+        .into_string();
         Err(Error::Cancelled(reason))
     } else {
         Ok(())

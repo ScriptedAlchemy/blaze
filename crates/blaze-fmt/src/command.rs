@@ -21,6 +21,8 @@ use blaze_manifest::features::Edition;
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::{Config, Context, Workspace};
 
+use crate::FmtError;
+
 /// Runs `blaze fmt` with `args`, the words after `fmt`, and returns its exit code.
 pub fn main(args: Vec<String>) -> i32 {
     if !names_files(&args) {
@@ -39,16 +41,16 @@ pub fn main(args: Vec<String>) -> i32 {
     // The words that are not files, then each edition's files: one rustfmt run per edition, as
     // cargo-fmt runs one per edition of the targets. The first failing run's code is the exit
     // code, and every run happens.
-    let rest: Vec<&String> = args // alloc: the command line without its files
+    let rest: Vec<&str> = args // alloc: the command line without its files
         .iter()
         .enumerate()
         .filter(|(at, _)| !is_file_at(&args, *at))
-        .map(|(_, it)| it)
+        .map(|(_, it)| it.as_str())
         .collect();
     let mut code = 0;
     for (edition, files) in groups {
         // alloc: one command line per edition
-        let mut words: Vec<String> = rest.iter().map(|it| (*it).clone()).collect();
+        let mut words: Vec<String> = rest.iter().map(|&it| it.to_owned()).collect();
         words.extend(files);
         if let Some(edition) = edition {
             words.extend(["--edition".to_owned(), edition.rust_syntax()]);
@@ -93,7 +95,7 @@ fn picks_edition(args: &[String]) -> bool {
 
 /// The files `args` name, grouped by the edition of the target or package each belongs to
 /// (`None`: in no package), in a fixed order.
-fn by_edition(args: &[String]) -> anyhow::Result<BTreeMap<Option<Edition>, Vec<String>>> {
+fn by_edition(args: &[String]) -> Result<BTreeMap<Option<Edition>, Vec<String>>, FmtError> {
     let mut packages = Packages::default();
     let mut groups: BTreeMap<Option<Edition>, Vec<String>> = BTreeMap::new();
     for file in files_of(args) {
@@ -122,7 +124,7 @@ impl Packages {
     /// The edition `file` is formatted with: its target's when it is a target's source, else its
     /// package's (the member whose directory holds it most closely); `None` when it is in no
     /// package, or does not exist (rustfmt then says so, as for any file it can't open).
-    fn edition_of(&mut self, file: &Path) -> anyhow::Result<Option<Edition>> {
+    fn edition_of(&mut self, file: &Path) -> Result<Option<Edition>, FmtError> {
         let Ok(file) = file.canonicalize() else {
             return Ok(None);
         };
@@ -148,28 +150,24 @@ impl Packages {
     }
 
     /// The members of the workspace `manifest` is in, each workspace read once.
-    fn members(&mut self, manifest: &Path) -> anyhow::Result<&[Member]> {
-        let root = match self.roots.get(manifest) {
-            Some(root) => root.clone(),
-            None => {
-                let (root, members) = read_members(manifest).map_err(|error| {
-                    anyhow::anyhow!(
-                        "reading the workspace of {} for the edition of the files in it: {error:#}",
-                        manifest.display()
-                    )
+    fn members(&mut self, manifest: &Path) -> Result<&[Member], FmtError> {
+        if !self.roots.contains_key(manifest) {
+            let (root, members) =
+                read_members(manifest).map_err(|error| FmtError::Workspace {
+                    manifest: manifest.to_owned(),
+                    error: Box::new(error),
                 })?;
-                self.roots.insert(manifest.to_owned(), root.clone());
-                self.read.entry(root.clone()).or_insert(members);
-                root
-            }
-        };
-        Ok(self.read[&root].as_slice())
+            self.read.entry(root.to_path_buf()).or_insert(members);
+            self.roots.insert(manifest.to_owned(), root);
+        }
+        let root = self.roots.get(manifest).map(PathBuf::as_path).unwrap_or(manifest);
+        Ok(self.read[root].as_slice())
     }
 }
 
 /// The root of the workspace `manifest` is in, and its members, as blaze-manifest reads them
 /// (what cargo-fmt reads from `cargo metadata --no-deps`).
-fn read_members(manifest: &Path) -> anyhow::Result<(PathBuf, Vec<Member>)> {
+fn read_members(manifest: &Path) -> Result<(PathBuf, Vec<Member>), FmtError> {
     let ctx = Context::new(Config::from_process()?);
     let ws = Workspace::new(&root_manifest(Some(manifest), &ctx)?, &ctx)?;
     let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());

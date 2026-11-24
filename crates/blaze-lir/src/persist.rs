@@ -12,14 +12,18 @@
 //! once measured (docs/v2/plan/design/lir.md, open question 3): this is the record that is kept
 //! then, and what the round-trip tests hold to its bytes now.
 
-use std::{alloc::Global, mem::offset_of};
+use alloc::vec::Vec;
+use core::mem::offset_of;
+use alloc::alloc::Global;
 
-use blaze_format::{FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer, open_as, schema_of};
+use blaze_format::{
+    FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer, WriterIn, open_as, schema_of,
+};
 
 use blaze_format::SpanRef;
 
 use crate::func::{
-    AsmOperandRec, AsmPieceRec, AsmRec, CompoundRec, DataRec, DataRelocRec, InlinedRec, IntrinsicRec,
+    AsmOperandRec, AsmPieceRec, AsmRec, CompoundRec, DataPositionRec, DataRec, DataRelocRec, InlinedRec, IntrinsicRec,
     MemAttrsRec, ParamFactsRec, ParamRec, RangeRec, RefRec, SigRec, SlotRec, VarRec,
 };
 use crate::{
@@ -40,7 +44,7 @@ macro_rules! root {
         }
 
         /// Writes `view`'s columns, then the root naming them; returns where the root is.
-        fn write_columns(view: &View<'_>, out: &mut Writer) -> u64 {
+        fn write_columns<P: WriterIn>(view: &View<'_>, out: &mut Writer<P>) -> u64 {
             $( let $name = Placed::push(out, view.$name); )*
             let at = out.next::<LirRoot>();
             let root = LirRoot {
@@ -87,8 +91,8 @@ pub enum ReadError {
     Structure(VerifyError),
 }
 
-impl std::fmt::Display for ReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ReadError::Format(error) => write!(f, "not a kept LIR: {error}"),
             ReadError::Structure(error) => write!(f, "a kept LIR that is not a function: {error}"),
@@ -96,16 +100,17 @@ impl std::fmt::Display for ReadError {
     }
 }
 
-impl std::error::Error for ReadError {}
+impl core::error::Error for ReadError {}
 
 /// `view` written into `out`, a writer of [`SCHEMA`]: where its root is.
-pub fn write(view: &View<'_>, out: &mut Writer) -> u64 {
+pub fn write<P: WriterIn>(view: &View<'_>, out: &mut Writer<P>) -> u64 {
     write_columns(view, out)
 }
 
 /// `view` as a buffer of its own.
 pub fn to_bytes(view: &View<'_>) -> Vec<u8> {
-    let mut out = Writer::new(SCHEMA);
+    // Compatibility (D170): the global heap until blaze-lir's conversion passes an allocator.
+    let mut out = Writer::on_the_global_heap_until_ported(SCHEMA);
     let root = write(view, &mut out);
     out.finish(root)
 }
@@ -124,7 +129,7 @@ impl Persist for Func<Global> {
     const SCHEMA: SchemaHash = SCHEMA;
     type Ref<'a> = View<'a>;
 
-    fn write(&self, out: &mut Writer) -> u64 {
+    fn write<P: WriterIn>(&self, out: &mut Writer<P>) -> u64 {
         write(&self.view(), out)
     }
 

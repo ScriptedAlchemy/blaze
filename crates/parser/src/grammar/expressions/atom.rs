@@ -29,7 +29,7 @@ pub(crate) const LITERAL_FIRST: TokenSet = TokenSet::new(&[
     C_STRING,
 ]);
 
-pub(crate) fn literal(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+pub(crate) fn literal<S: Sink>(p: &mut Parser<'_, S>) -> Option<CompletedMarker> {
     if !p.at_ts(LITERAL_FIRST) {
         return None;
     }
@@ -70,8 +70,8 @@ pub(super) const ATOM_EXPR_FIRST: TokenSet =
 pub(in crate::grammar) const EXPR_RECOVERY_SET: TokenSet =
     TokenSet::new(&[T!['}'], T![')'], T![']'], T![,]]);
 
-pub(super) fn atom_expr(
-    p: &mut Parser<'_>,
+pub(super) fn atom_expr<S: Sink>(
+    p: &mut Parser<'_, S>,
     r: Restrictions,
 ) -> Option<(CompletedMarker, BlockLike)> {
     if let Some(m) = literal(p) {
@@ -79,6 +79,9 @@ pub(super) fn atom_expr(
     }
     if p.at_contextual_kw(T![builtin]) && p.nth_at(1, T![#]) {
         return Some((builtin_expr(p)?, BlockLike::NotBlock));
+    }
+    if p.at_contextual_kw(T![inline]) && p.nth_at(1, T![for]) {
+        return Some((inline_for_expr(p, None), BlockLike::Block));
     }
     if paths::is_path_start(p) {
         return Some(path_expr(p, r));
@@ -203,7 +206,7 @@ pub(super) fn atom_expr(
 //     (1);
 //     (1,);
 // }
-fn tuple_expr(p: &mut Parser<'_>) -> CompletedMarker {
+fn tuple_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T!['(']));
     let m = p.start();
     p.expect(T!['(']);
@@ -248,7 +251,7 @@ fn tuple_expr(p: &mut Parser<'_>) -> CompletedMarker {
 //     builtin#offset_of(Foo, bar.baz.0);
 //     builtin#cfg(any(true, x = "y"));
 // }
-fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+fn builtin_expr<S: Sink>(p: &mut Parser<'_, S>) -> Option<CompletedMarker> {
     let m = p.start();
     p.bump_remap(T![builtin]);
     p.bump(T![#]);
@@ -365,7 +368,7 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
 //         tmp = out(reg) _,
 //     );
 // }
-pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedMarker> {
+pub(crate) fn parse_asm_expr<S: Sink>(p: &mut Parser<'_, S>, m: Marker) -> Option<CompletedMarker> {
     p.expect(T!['(']);
     if expr(p).is_none() && !p.at(T!['}']) {
         p.err_and_bump("expected asm template");
@@ -503,7 +506,7 @@ pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedM
     Some(m.complete(p, ASM_EXPR))
 }
 
-fn parse_options(p: &mut Parser<'_>) {
+fn parse_options<S: Sink>(p: &mut Parser<'_, S>) {
     p.expect(T!['(']);
 
     while !p.eat(T![')']) && !p.at(EOF) && !p.at(T!['}']) {
@@ -534,7 +537,7 @@ fn parse_options(p: &mut Parser<'_>) {
     }
 }
 
-fn parse_clobber_abi(p: &mut Parser<'_>) {
+fn parse_clobber_abi<S: Sink>(p: &mut Parser<'_, S>) {
     p.expect(T!['(']);
 
     while !p.eat(T![')']) && !p.at(EOF) && !p.at(T!['}']) {
@@ -550,7 +553,7 @@ fn parse_clobber_abi(p: &mut Parser<'_>) {
     }
 }
 
-fn parse_reg(p: &mut Parser<'_>) {
+fn parse_reg<S: Sink>(p: &mut Parser<'_, S>) {
     p.expect(T!['(']);
     if p.at_ts(PATH_NAME_REF_KINDS) {
         let m = p.start();
@@ -575,7 +578,7 @@ fn parse_reg(p: &mut Parser<'_>) {
 //     [1, 2,];
 //     [1; 2];
 // }
-fn array_expr(p: &mut Parser<'_>) -> CompletedMarker {
+fn array_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T!['[']));
     let m = p.start();
 
@@ -622,7 +625,7 @@ fn array_expr(p: &mut Parser<'_>) -> CompletedMarker {
 //     for<'a> || {};
 //     for<'a> move || {};
 // }
-fn closure_expr(p: &mut Parser<'_>) -> CompletedMarker {
+fn closure_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(match p.current() {
         T![const] | T![static] | T![async] | T![move] | T![|] => true,
         T![for] => p.nth(1) == T![<],
@@ -677,20 +680,39 @@ fn closure_expr(p: &mut Parser<'_>) -> CompletedMarker {
 //     if S {};
 //     if { true } { } else { };
 // }
-fn if_expr(p: &mut Parser<'_>) -> CompletedMarker {
+fn if_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![if]));
-    let m = p.start();
+    let outer = p.start();
     p.bump(T![if]);
     expr_no_struct(p);
     block_expr(p);
-    if p.eat(T![else]) {
-        if p.at(T![if]) {
-            if_expr(p);
-        } else {
-            block_expr(p);
-        }
+    if !p.eat(T![else]) {
+        return outer.complete(p, IF_EXPR);
     }
-    m.complete(p, IF_EXPR)
+    if !p.at(T![if]) {
+        block_expr(p);
+        return outer.complete(p, IF_EXPR);
+    }
+    blaze_mem::scratch::with_u32s(|markers| {
+        loop {
+            let m = p.start();
+            p.bump(T![if]);
+            expr_no_struct(p);
+            block_expr(p);
+            markers.push(m.into_raw());
+            if !p.eat(T![else]) {
+                break;
+            }
+            if !p.at(T![if]) {
+                block_expr(p);
+                break;
+            }
+        }
+        while let Some(raw) = markers.pop() {
+            Marker::from_raw(raw).complete(p, IF_EXPR);
+        }
+    });
+    outer.complete(p, IF_EXPR)
 }
 
 // test label
@@ -699,7 +721,7 @@ fn if_expr(p: &mut Parser<'_>) -> CompletedMarker {
 //     'b: while true {}
 //     'c: for x in () {}
 // }
-fn label(p: &mut Parser<'_>) {
+fn label<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(LIFETIME_IDENT) && p.nth(1) == T![:]);
     let m = p.start();
     lifetime(p);
@@ -709,12 +731,15 @@ fn label(p: &mut Parser<'_>) {
 
 /// A loop or block after a label (rustc's `parse_expr_labeled`); `None` after the error when
 /// neither follows.
-fn labeled_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+fn labeled_expr<S: Sink>(p: &mut Parser<'_, S>) -> Option<CompletedMarker> {
     let m = p.start();
     label(p);
     Some(match p.current() {
         T![loop] => loop_expr(p, Some(m)),
         T![for] => for_expr(p, Some(m)),
+        IDENT if p.at_contextual_kw(T![inline]) && p.nth_at(1, T![for]) => {
+            inline_for_expr(p, Some(m))
+        }
         T![while] => while_expr(p, Some(m)),
         // test labeled_block
         // fn f() { 'label: {}; }
@@ -738,7 +763,7 @@ fn labeled_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
 // fn foo() {
 //     loop {};
 // }
-fn loop_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
+fn loop_expr<S: Sink>(p: &mut Parser<'_, S>, m: Option<Marker>) -> CompletedMarker {
     assert!(p.at(T![loop]));
     let m = m.unwrap_or_else(|| p.start());
     p.bump(T![loop]);
@@ -753,7 +778,7 @@ fn loop_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
 //     while let Some(x) = it.next() {};
 //     while { true } {};
 // }
-fn while_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
+fn while_expr<S: Sink>(p: &mut Parser<'_, S>, m: Option<Marker>) -> CompletedMarker {
     assert!(p.at(T![while]));
     let m = m.unwrap_or_else(|| p.start());
     p.bump(T![while]);
@@ -763,11 +788,17 @@ fn while_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
     m.complete(p, WHILE_EXPR)
 }
 
+fn inline_for_expr<S: Sink>(p: &mut Parser<'_, S>, m: Option<Marker>) -> CompletedMarker {
+    let m = m.unwrap_or_else(|| p.start());
+    p.bump_remap(T![inline]);
+    for_expr(p, Some(m))
+}
+
 // test for_expr
 // fn foo() {
 //     for x in [] {};
 // }
-fn for_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
+fn for_expr<S: Sink>(p: &mut Parser<'_, S>, m: Option<Marker>) -> CompletedMarker {
     assert!(p.at(T![for]));
     let m = m.unwrap_or_else(|| p.start());
     p.bump(T![for]);
@@ -787,7 +818,7 @@ fn for_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
 //     if let Some(_) = None && true {}
 //     while 1 == 5 && (let None = None) {}
 // }
-fn let_expr(p: &mut Parser<'_>, r: Restrictions) -> CompletedMarker {
+fn let_expr<S: Sink>(p: &mut Parser<'_, S>, r: Restrictions) -> CompletedMarker {
     let m = p.start();
     p.bump(T![let]);
     patterns::pattern(p);
@@ -803,7 +834,7 @@ fn let_expr(p: &mut Parser<'_>, r: Restrictions) -> CompletedMarker {
 //     match { } { _ => () };
 //     match { S {} } {};
 // }
-fn match_expr(p: &mut Parser<'_>) -> CompletedMarker {
+fn match_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![match]));
     let m = p.start();
     p.bump(T![match]);
@@ -828,7 +859,7 @@ fn match_expr(p: &mut Parser<'_>) -> CompletedMarker {
 //         () if => (),
 //     }
 // }
-pub(crate) fn match_arm_list(p: &mut Parser<'_>) {
+pub(crate) fn match_arm_list<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
     let m = p.start();
     p.eat(T!['{']);
@@ -870,7 +901,7 @@ pub(crate) fn match_arm_list(p: &mut Parser<'_>) {
 //         | X => (),
 //     };
 // }
-fn match_arm(p: &mut Parser<'_>) {
+fn match_arm<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     // test match_arms_outer_attributes
     // fn foo() {
@@ -887,7 +918,7 @@ fn match_arm(p: &mut Parser<'_>) {
     // }
     attributes::outer_attrs(p);
 
-    patterns::pattern_top_r(p, TokenSet::new(&[T![=], T![if]]));
+    p.with_typed_pats(true, |p| patterns::pattern_top_r(p, TokenSet::new(&[T![=], T![if]])));
     if p.at(T![if]) {
         match_guard(p);
     }
@@ -922,7 +953,7 @@ fn match_arm(p: &mut Parser<'_>) {
 //         _ if let foo = bar => (),
 //     }
 // }
-fn match_guard(p: &mut Parser<'_>) -> CompletedMarker {
+fn match_guard<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![if]));
     let m = p.start();
     p.bump(T![if]);
@@ -945,7 +976,7 @@ fn match_guard(p: &mut Parser<'_>) -> CompletedMarker {
 // fn b() { let _ = 1; }
 // fn c() { 1; 2; }
 // fn d() { 1; 2 }
-pub(crate) fn block_expr(p: &mut Parser<'_>) {
+pub(crate) fn block_expr<S: Sink>(p: &mut Parser<'_, S>) {
     if !p.at(T!['{']) {
         p.error("expected a block");
         return;
@@ -957,7 +988,7 @@ pub(crate) fn block_expr(p: &mut Parser<'_>) {
 
 /// `const { .. }` where the grammar asks for one outside an expression: a where clause's
 /// const condition. The same `BLOCK_EXPR` an expression's `const { .. }` is.
-pub(crate) fn const_block(p: &mut Parser<'_>) {
+pub(crate) fn const_block<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T![const]) && p.nth_at(1, T!['{']));
     let m = p.start();
     p.bump(T![const]);
@@ -965,7 +996,7 @@ pub(crate) fn const_block(p: &mut Parser<'_>) {
     m.complete(p, BLOCK_EXPR);
 }
 
-fn stmt_list(p: &mut Parser<'_>) -> CompletedMarker {
+fn stmt_list<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T!['{']));
     let m = p.start();
     p.bump(T!['{']);
@@ -979,7 +1010,7 @@ fn stmt_list(p: &mut Parser<'_>) -> CompletedMarker {
 //     return;
 //     return 92;
 // }
-fn return_expr(p: &mut Parser<'_>) -> CompletedMarker {
+fn return_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![return]));
     let m = p.start();
     p.bump(T![return]);
@@ -997,7 +1028,7 @@ fn return_expr(p: &mut Parser<'_>) -> CompletedMarker {
 // fn foo() {
 //     become foo();
 // }
-fn become_expr(p: &mut Parser<'_>) -> CompletedMarker {
+fn become_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![become]));
     let m = p.start();
     p.bump(T![become]);
@@ -1010,7 +1041,7 @@ fn become_expr(p: &mut Parser<'_>) -> CompletedMarker {
 //     yield;
 //     yield 1;
 // }
-fn yield_expr(p: &mut Parser<'_>) -> CompletedMarker {
+fn yield_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![yield]));
     let m = p.start();
     p.bump(T![yield]);
@@ -1025,7 +1056,7 @@ fn yield_expr(p: &mut Parser<'_>) -> CompletedMarker {
 //     do yeet;
 //     do yeet 1
 // }
-fn yeet_expr(p: &mut Parser<'_>) -> CompletedMarker {
+fn yeet_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![do]));
     assert!(p.nth_at_contextual_kw(1, T![yeet]));
     let m = p.start();
@@ -1044,7 +1075,7 @@ fn yeet_expr(p: &mut Parser<'_>) -> CompletedMarker {
 //         continue 'l;
 //     }
 // }
-fn continue_expr(p: &mut Parser<'_>) -> CompletedMarker {
+fn continue_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![continue]));
     let m = p.start();
     p.bump(T![continue]);
@@ -1063,7 +1094,7 @@ fn continue_expr(p: &mut Parser<'_>) -> CompletedMarker {
 //         break 'l 92;
 //     }
 // }
-fn break_expr(p: &mut Parser<'_>, r: Restrictions) -> CompletedMarker {
+fn break_expr<S: Sink>(p: &mut Parser<'_, S>, r: Restrictions) -> CompletedMarker {
     assert!(p.at(T![break]));
     let m = p.start();
     p.bump(T![break]);
@@ -1098,7 +1129,7 @@ fn break_expr(p: &mut Parser<'_>, r: Restrictions) -> CompletedMarker {
 //     let _ = try {};
 //     let _ = try bikeshed T<U> {};
 // }
-fn try_block_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
+fn try_block_expr<S: Sink>(p: &mut Parser<'_, S>, m: Option<Marker>) -> CompletedMarker {
     assert!(p.at(T![try]));
     let m = m.unwrap_or_else(|| p.start());
     let try_modifier = p.start();

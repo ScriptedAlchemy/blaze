@@ -697,14 +697,14 @@ impl Store {
                 )));
             }
             // The core uses logical file slots so native paths need no UTF-8 conversion.
-            // Rename here reports the atomic namespace change; the core separately asks
-            // for its durability barrier. Native's general Rename already bundles both.
+            // RenameUnsynced reports the atomic namespace change; SyncDir separately
+            // makes it durable, as the simulation's same effects do.
             let result = match (step, effect) {
                 (Step::FileSync, Effect::Sync { .. }) => file.sync_all().map(|()| Done::Synced),
-                (Step::Rename, Effect::Rename { .. }) => {
+                (Step::Rename, Effect::RenameUnsynced { .. }) => {
                     std::fs::rename(from, to).map(|()| Done::Renamed)
                 }
-                (Step::DirectorySync, Effect::Sync { .. }) => to
+                (Step::DirectorySync, Effect::SyncDir { .. }) => to
                     .parent()
                     .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))
                     .and_then(|parent| File::open(parent)?.sync_all())

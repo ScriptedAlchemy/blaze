@@ -148,10 +148,92 @@ impl fmt::Display for NotAllowed {
 
 impl core::error::Error for NotAllowed {}
 
+/// A world's environment: what an [`Env`] reads. A native world's is a view over the
+/// process's start block, where the kernel left it, scanned when a variable is asked for and
+/// never sorted or copied (std.md, "What a program pays for at start"); a run spec's or a
+/// simulated world's is owned text. Either way only variables whose name and value are UTF-8
+/// are in it: one that is not reads as unset (a stated gap until `Env` holds bytes).
+#[derive(Clone)] // clone: a refcount, or a `&'static`
+pub struct Vars(Source);
+
+#[derive(Clone)]
+enum Source {
+    /// `NAME=value` entries, as the process was started with them ([`crate::rt::block`]).
+    Process(&'static [&'static core::ffi::CStr]),
+    Given(Arc<[(String, String)]>),
+    Owned(
+        blaze_own::Arc<
+            blaze_own::Vec<
+                (blaze_own::String<blaze_own::SharedAlloc<'static>>, blaze_own::String<blaze_own::SharedAlloc<'static>>),
+                blaze_own::SharedAlloc<'static>,
+            >,
+            blaze_own::SharedAlloc<'static>,
+        >,
+    ),
+}
+
+impl Vars {
+    /// An environment of owned text: a run spec's, or a test's.
+    pub fn given(vars: alloc::vec::Vec<(String, String)>) -> Vars {
+        // alloc: once per world, its environment.
+        Vars(Source::Given(vars.into()))
+    }
+
+    /// An environment built from borrowed `(key, value)` slices in an explicit shared allocator
+    /// (e.g. a resident daemon request).
+    pub fn from_pairs_in(vars: &[(&str, &str)], alloc: blaze_own::SharedAlloc<'static>) -> Vars {
+        let mut owned = blaze_own::Vec::with_capacity_in(vars.len(), alloc);
+        for &(k, v) in vars {
+            owned.push((blaze_own::String::from_str_in(k, alloc), blaze_own::String::from_str_in(v, alloc)));
+        }
+        Vars(Source::Owned(blaze_own::Arc::new_in(owned, alloc)))
+    }
+
+    /// The process's own, borrowed from its start block.
+    pub(crate) fn process(block: &'static crate::rt::block::Block) -> Vars {
+        Vars(Source::Process(&block.env))
+    }
+
+    /// The first value of `name`, as the C library's `getenv` finds it.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
+        self.each().find(|(it, _)| *it == name).map(|(_, value)| value)
+    }
+
+    /// Each variable, in the world's order.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn each(&self) -> impl Iterator<Item = (&str, &str)> {
+        let (process, given, owned) = match &self.0 {
+            Source::Process(entries) => (Some(entries.iter().filter_map(|entry| split(entry.to_bytes()))), None, None),
+            Source::Given(vars) => (None, Some(vars.iter().map(|(name, value)| (name.as_str(), value.as_str()))), None),
+            Source::Owned(vars) => (None, None, Some(vars.iter().map(|(name, value)| (name.as_str(), value.as_str())))),
+        };
+        process.into_iter().flatten().chain(given.into_iter().flatten()).chain(owned.into_iter().flatten())
+    }
+}
+
+/// Names only: a value may be a secret.
+impl fmt::Debug for Vars {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.each().map(|(name, _)| name)).finish()
+    }
+}
+
+/// `NAME=value` as its two halves, when there is a `=` and both are UTF-8.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
+fn split(entry: &[u8]) -> Option<(&str, &str)> {
+    let at = entry.iter().position(|byte| *byte == b'=')?;
+    Some((core::str::from_utf8(&entry[..at]).ok()?, core::str::from_utf8(&entry[at + 1..]).ok()?))
+}
+
 /// The variables a holder may read.
 #[derive(Clone)]
 pub struct Env {
-    vars: Arc<[(String, String)]>,
+    vars: Vars,
     /// The names it may read; `None` for every one.
     allowed: Option<Arc<[VarName]>>,
     plant: Plant,
@@ -161,8 +243,17 @@ impl Env {
     #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    pub(crate) fn new(vars: Arc<[(String, String)]>, plant: Plant) -> Env {
+    pub(crate) fn new(vars: Vars, plant: Plant) -> Env {
         Env { vars, allowed: None, plant }
+    }
+
+    /// Wraps [`Vars`] as an unrestricted [`Env`] capability (e.g. a resident daemon serving a
+    /// client request's environment without mutating process state).
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn from_vars(vars: Vars) -> Env {
+        Env { vars, allowed: None, plant: Plant::None }
     }
 
     /// The variable `name`: its value, `None` when it is not set, or [`NotAllowed`] when
@@ -175,7 +266,7 @@ impl Env {
             // clone: an error's name of its variable, a refcount.
             return Err(NotAllowed { name: name.clone() });
         }
-        Ok(self.vars.iter().find(|(it, _)| it.as_str() == name.as_str()).map(|(_, value)| value.as_str()))
+        Ok(self.vars.get(name.as_str()))
     }
 
     /// Whether this may read `name`, set or not.
@@ -195,11 +286,12 @@ impl Env {
     pub fn only(&self, names: &[VarName]) -> Env {
         let kept = names.iter().filter(|name| match self.plant {
             Plant::EnvOnlyReplaces => true,
-            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => self.may_read(name),
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => self.may_read(name),
         });
         // alloc: once per narrowing, the names kept (each a refcount).
         let allowed: Arc<[VarName]> = kept.cloned().collect();
-        Env { vars: Arc::clone(&self.vars), allowed: Some(allowed), plant: self.plant }
+        // clone: the world's environment, a refcount or a `&'static`.
+        Env { vars: self.vars.clone(), allowed: Some(allowed), plant: self.plant }
     }
 
     /// Each variable this may read that is set, in the world's order.
@@ -207,10 +299,7 @@ impl Env {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn each(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.vars
-            .iter()
-            .filter(|(name, _)| self.may_read_str(name))
-            .map(|(name, value)| (name.as_str(), value.as_str()))
+        self.vars.each().filter(|(name, _)| self.may_read_str(name))
     }
 }
 

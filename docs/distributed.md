@@ -1,15 +1,17 @@
 ---
 status: current
-summary: The retained distributed protocol, coordinator, pack cache and test controls; compiler integration awaits the replacement command and item layers.
+summary: The retained distributed protocol, coordinator, pack cache and test controls; compiler integration awaits callbacks into the current compiler.
 ---
 # Distributed protocol and cache
 
 The fork retains the distributed state machines, Unix transport, agent library and
 standalone pack server. They are in the active workspace and can be exercised without a
 compiler. The old compiler daemon and its distributed bridge were deleted by the upstream
-rewrite. A current-tree compiler must be connected to the replacement item and command
-layers before distributed compilation works end to end. The
-[parked-crate status](v2/plan/parked.md#distributed-fork-integration) records that boundary.
+rewrite. The `blaze` executable is now built by `blaze-cli`; `blaze-engine` is now a library
+for the new execution engine. Neither restores the removed distributed bridge. The
+retained services need compiler callbacks on the current item and command layers before
+distributed compilation works end to end. The [deletion record](v2/plan/parked.md)
+describes which old implementations were removed.
 
 This page describes the surviving implementation. The
 [publication design](v2/plan/design/distributed-publication.md),
@@ -101,7 +103,7 @@ identity through `agent::Config`, rather than deriving them from a workspace its
 
 Only the two variables in the first table below are read by the retained carrier's
 runtime code. They request evidence or an explicit acceptance fault; they do not enable
-distributed compilation in the parked CLI.
+distributed compilation in the current CLI.
 
 | Variable | Current behavior |
 |---|---|
@@ -121,7 +123,7 @@ Implementation and tests are in `crates/blaze-dist-local/src/result_gate.rs`,
 
 The retained end-to-end harness still supplies the previous compiler bridge's input
 contract. These variables are present in `harness/distv2.py`; the deleted daemon bridge
-was their compiler-side reader, so setting them on the current parked CLI is not a
+was their compiler-side reader, so setting them on the current CLI is not a
 working setup procedure:
 
 | Harness variable | Contract to restore with compiler integration |
@@ -439,8 +441,9 @@ damaged packs, coordinator loss and explicit local policies. It verifies actual 
 and compilation provenance. `harness/distv2/selfcheck.py` checks the evidence oracles with
 planted faults; those checks are not a substitute for running the compiler cases.
 
-The distributed jobs in `.github/workflows/blaze-platform.yaml` still require a verified
-compiler built from the current source and complete dev/release acceptance receipts.
-The library suite is useful partial validation while the command layer is parked.
+The required jobs in `.github/workflows/blaze.yaml` separate workspace and protocol tests,
+source-compiler smoke checks, and production distributed acceptance. They require a
+verified compiler built from the current source and complete dev/release acceptance
+receipts. The library suite provides partial validation while the compiler bridge is absent.
 It does not satisfy the compiler build or distributed acceptance requirements, and an
 absent receipt, skipped job or failed subprocess is not a pass.

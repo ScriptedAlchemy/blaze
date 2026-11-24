@@ -187,9 +187,9 @@ fn committed_get_head(method: &str, reply: &[u8]) -> bool {
 
 fn read_failure(method: &str, path: &str, reply: &[u8], error: std::io::Error) -> Error {
     if committed_get_head(method, reply) {
-        Error::Committed(blaze_mem::format_in!(
+        Error::Committed(blaze_mem::text::into_std_boxed_str(blaze_mem::format_in!(
             Global, "{method} {path}: interrupted committed HTTP 200 reply: {error}"
-        ).into_boxed_str().into_string())
+        )).into_string())
     } else {
         Error::Io(error)
     }
@@ -267,9 +267,9 @@ fn decode_head(method: &str, path: &str, reply: &[u8]) -> Result<ResponseHead, E
     let invalid = |why: &str| Error::Protocol(format!("{method} {path}: {why}"));
     let end = reply.windows(4).position(|it| it == b"\r\n\r\n").ok_or_else(|| {
         if committed_get_head(method, reply) {
-            Error::Committed(blaze_mem::format_in!(
+            Error::Committed(blaze_mem::text::into_std_boxed_str(blaze_mem::format_in!(
                 Global, "{method} {path}: truncated committed HTTP 200 headers"
-            ).into_boxed_str().into_string())
+            )).into_string())
         } else {
             invalid("no HTTP head")
         }
@@ -284,9 +284,9 @@ fn decode_head(method: &str, path: &str, reply: &[u8]) -> Result<ResponseHead, E
     }
     let head = std::str::from_utf8(&reply[..end]).map_err(|_| {
         if committed_get_head(method, reply) {
-            Error::Committed(blaze_mem::format_in!(
+            Error::Committed(blaze_mem::text::into_std_boxed_str(blaze_mem::format_in!(
                 Global, "{method} {path}: committed HTTP 200 headers are not text"
-            ).into_boxed_str().into_string())
+            )).into_string())
         } else {
             invalid("the head is not text")
         }

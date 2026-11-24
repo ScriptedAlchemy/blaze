@@ -1,6 +1,6 @@
 //! A tree of files as one object: its **listing**, the canonical encoding a git source's
-//! digest is over ([`crate::Source::Git`]) and a fetch graph's steps will hand on
-//! ([`crate::graph::Tree`]). Nix's NAR serialises a tree for its recursive hashes the same
+//! digest is over (blaze-audit's pins). The fetch's record ([`crate::pack`]) holds its paths to
+//! the same rules, through [`fold`]. Nix's NAR serialises a tree for its recursive hashes the same
 //! way in spirit (names sorted, the executable bit and symlinks kept, nothing else); this one
 //! is text, and lists each file by its BLAKE3 instead of inlining it, so each file is an object
 //! of its own in the store and two trees share the files they share.
@@ -13,7 +13,7 @@
 //! ```
 //!
 //! `length` is the file's length in decimal, with no leading zero: with it a lookup knows
-//! which files are kept as chunks ([`crate::store::CHUNK_LEN`]) without reading any file.
+//! how large each file is without reading any file.
 //!
 //! `kind` is `file`, `exec` (a file with any executable bit) or `link` (a symlink, its bytes
 //! where it points). A path is `/`-separated UTF-8 with no empty, `.`, `..` or `.git` part and
@@ -23,12 +23,13 @@
 //! another file or a symlink. [`parse`] refuses all of it as [`listing`] does. A change to any
 //! of this is `blaze tree 3`.
 
-use std::fmt::{self, Write as _};
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use core::{fmt, fmt::Write as _};
 
 use crate::digest::Blake3;
 
 /// The listing format's name and version, its first line. Every index record's key covers it
-/// ([`crate::Origin::key`]): a step's output under a new format is a new record, never a
+/// (a pin names the format it was made in): a step's output under a new format is a new record, never a
 /// second value under the old one's key.
 pub(crate) const HEADER: &str = "blaze tree 2\n";
 
@@ -111,7 +112,7 @@ impl fmt::Display for TreeRefused {
     }
 }
 
-impl std::error::Error for TreeRefused {}
+impl core::error::Error for TreeRefused {}
 
 /// Why `path` can't be listed, if it can't.
 fn bad_path(path: &str) -> Option<&'static str> {
@@ -141,15 +142,18 @@ fn bad_path(path: &str) -> Option<&'static str> {
 /// is refused here. Folding is per character, so a `/` stays where it was and a folded path's
 /// directories are the folded directories.
 pub(crate) fn fold(path: &str) -> String {
-    use unicode_normalization::UnicodeNormalization as _;
-    let mut folded = String::with_capacity(path.len()); // alloc: once a path compared
-    for it in path.nfd() {
+    let mut decomposed = String::with_capacity(path.len()); // alloc: once a path compared
+    blaze_unicode::nfd(path, &mut decomposed);
+    let mut folded = String::with_capacity(decomposed.len()); // alloc: as above
+    for it in decomposed.chars() {
         match crate::casefold::FOLD.binary_search_by_key(&it, |row| row.0) {
             Ok(at) => folded.push_str(crate::casefold::FOLD[at].1),
             Err(_) => folded.push(it),
         }
     }
-    folded.nfd().collect() // alloc: as above
+    decomposed.clear();
+    blaze_unicode::nfd(&folded, &mut decomposed);
+    decomposed
 }
 
 /// Every rule of a tree over `entries`, sorted by path: no bad path, no two paths that are one
@@ -215,7 +219,7 @@ pub fn listing(entries: &mut [Entry]) -> Result<Vec<u8>, TreeRefused> {
 
 /// The entries of a listing [`listing`] wrote, in its order; anything else is refused.
 pub fn parse(bytes: &[u8]) -> Result<Vec<Entry>, TreeRefused> {
-    let text = std::str::from_utf8(bytes)
+    let text = core::str::from_utf8(bytes)
         .map_err(|_| TreeRefused::Line { line: 0, why: "is not UTF-8" })?;
     let body = text.strip_prefix(HEADER).ok_or(TreeRefused::NoHeader)?;
     let mut entries: Vec<Entry> = Vec::new(); // alloc: once a tree read

@@ -25,12 +25,13 @@
 //!
 //! Nothing here reads a clock, a file or a lock: an account is a function of rows.
 
-use std::{collections::BTreeSet, fmt::Write as _};
+use std::{alloc::Global, collections::BTreeSet, fmt::Write as _};
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
-use arrow_schema::ArrowError;
-
-use crate::{batches, facts::QueryCountRow, schema};
+use crate::{
+    columns::{self, Batch, BatchError, Column},
+    facts::QueryCountRow,
+    schema,
+};
 
 /// Who writes an input of the query engine, told by the input's kind.
 ///
@@ -666,17 +667,17 @@ impl AccountRow {
 }
 
 /// The `accounts` rows of `rows`.
-pub fn accounts(rows: &[AccountRow]) -> Result<RecordBatch, ArrowError> {
-    let count = |of: fn(&AccountRow) -> u64| -> ArrayRef {
+pub fn accounts(rows: &[AccountRow]) -> Result<Batch, BatchError> {
+    let count = |of: fn(&AccountRow) -> u64| -> Column {
         // alloc: a batch's column, once a flush
-        std::sync::Arc::new(UInt64Array::from_iter_values(rows.iter().map(of)))
+        Column::values(rows.iter().map(of), Global)
     };
-    let text = |of: fn(&AccountRow) -> Option<&str>| -> ArrayRef {
+    let text = |of: fn(&AccountRow) -> Option<&str>| -> Column {
         // alloc: a batch's column, once a flush
-        std::sync::Arc::new(StringArray::from_iter(rows.iter().map(of)))
+        Column::opt_texts_of(rows.iter().map(of), Global)
     };
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
+    let columns: Vec<Column> = vec![
         count(|it| it.build_id),
         count(|it| it.written),
         count(|it| it.written_source),
@@ -716,7 +717,7 @@ pub fn accounts(rows: &[AccountRow]) -> Result<RecordBatch, ArrowError> {
         count(|it| it.history_dropped),
         text(|it| it.alarms.as_deref()),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::ACCOUNTS), columns)
+    columns::batch(&schema::ACCOUNTS, columns)
 }
 
 // --- The ledger: causes as a required argument ---------------------------------------------
@@ -1121,9 +1122,7 @@ mod tests {
         walk(&crates, &mut files);
         files.sort();
         let mut unnamed = Vec::new();
-        let mut inputs = BTreeSet::new();
-        let mut slots = BTreeSet::new();
-        for file in files {
+        for file in &files {
             let text = std::fs::read_to_string(&file)
                 .unwrap_or_else(|error| panic!("reading {}: {error}", file.display()));
             let lines: Vec<&str> = text.lines().collect();
@@ -1148,7 +1147,6 @@ mod tests {
                 if name != CRATE_SLOT && Writer::of_input(&name) == Writer::Unattributed {
                     unnamed.push(format!("{name} ({})", file.display()));
                 }
-                inputs.insert((file.strip_prefix(&crates).unwrap().to_path_buf(), name));
             }
             // Every kind a crate is given (`Crate::give::<K>`) has a writer too.
             for (at, _) in text.match_indices(".give::<") {
@@ -1161,41 +1159,16 @@ mod tests {
                     if Writer::of_slot(&kind) == Writer::Unattributed {
                         unnamed.push(format!("the crate slot kind {kind} ({})", file.display()));
                     }
-                    slots.insert((file.strip_prefix(&crates).unwrap().to_path_buf(), kind));
                 }
             }
         }
-        // The memo engine replaced the old query engine's inputs. Name every current
-        // declaration instead of an obsolete count, so a missing file or a lost input
-        // cannot be hidden by other files contributing enough declarations.
-        let expected_inputs = [
-            ("base-db/src/lib.rs", "AllCrates"),
-            ("base-db/src/lib.rs", "LibraryRoots"),
-            ("base-db/src/lib.rs", "LocalRoots"),
-            ("base-db/src/lib.rs", "ProcessEnv"),
-            ("base-db/src/settings.rs", "FrontSettings"),
-            ("blaze-item-hash/src/identity/inputs.rs", "FrontEnd"),
-            ("hir-expand/src/declarative/stored.rs", "KeptDefs"),
-            ("hir-expand/src/declarative/stored.rs", "TextDemand"),
-            ("hir-ty/src/consteval/deps.rs", "KeptConsts"),
-            ("hir-ty/src/layout/field_order.rs", "FieldOrder"),
-            ("hir-ty-mir/src/mir/location.rs", "SourceNames"),
-        ];
-        for (file, name) in expected_inputs {
-            assert!(
-                inputs.contains(&(std::path::PathBuf::from(file), name.to_owned())),
-                "the source walk missed {file}'s input {name}"
-            );
-        }
-        for (file, kind) in [
-            ("hir-ty/src/check_cache.rs", "BodiesSlot"),
-            ("hir-ty/src/check_cache/runtime.rs", "RuntimeSlot"),
-        ] {
-            assert!(
-                slots.contains(&(std::path::PathBuf::from(file), kind.to_owned())),
-                "the source walk missed {file}'s crate slot {kind}"
-            );
-        }
+        // The control that the walk reads the tree: `blaze-profile` itself is under `crates/`,
+        // so the walk must visit Rust sources even after all legacy `#[blaze_memo::input]` structs
+        // have been retired.
+        assert!(
+            files.iter().any(|path| path.ends_with("blaze-profile/src/account.rs")),
+            "the source walk missed this guard's own file"
+        );
         assert_eq!(unnamed, Vec::<String>::new(), "inputs with no writer in `Writer::of_input`");
     }
 

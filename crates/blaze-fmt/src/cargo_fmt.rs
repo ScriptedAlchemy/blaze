@@ -106,17 +106,18 @@ fn parse_opts(args: Vec<String>) -> Parsed {
     let mut args = args.into_iter().peekable();
     let is_flag = |a: &str| a.starts_with('-') && a.len() > 1;
     while let Some(arg) = args.next() {
-        let (name, attached) = match arg.split_once('=') {
-            Some((n, v)) if n.starts_with("--") => (n.to_owned(), Some(v.to_owned())),
-            _ => (arg.clone(), None),
+        let (name, mut attached) = match arg.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n, Some(v)),
+            _ => (arg.as_str(), None),
         };
-        let mut value = |what: &str| match attached.clone().or_else(|| args.next()) {
+        let had_attached = attached.is_some();
+        let mut value = |what: &str| match attached.take().map(str::to_owned).or_else(|| args.next()) {
             Some(v) => Ok(v),
             None => Err(format!(
                 "a value is required for '{what}' but none was supplied"
             )),
         };
-        match name.as_str() {
+        match name {
             "--" => {
                 opts.rustfmt_options.extend(args.by_ref());
                 break;
@@ -132,7 +133,7 @@ fn parse_opts(args: Vec<String>) -> Parsed {
                     Ok(v) => opts.packages.push(v),
                     Err(e) => return Parsed::Error(e),
                 }
-                if attached.is_none() {
+                if !had_attached {
                     while let Some(more) = args.next_if(|a| !is_flag(a)) {
                         opts.packages.push(more);
                     }
@@ -339,8 +340,8 @@ pub struct Target {
 impl Target {
     /// `None` for a metabuild script, which has no source file.
     pub fn from_target(target: &blaze_manifest::targets::Target) -> Option<Self> {
-        let path = target.src_path.clone()?;
-        let canonicalized = fs::canonicalize(&path).unwrap_or(path);
+        let path = target.src_path.as_deref()?;
+        let canonicalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
         Some(Target {
             path: canonicalized,
@@ -444,7 +445,7 @@ struct Package {
 /// The workspace root and member packages of the workspace `manifest_path` (or the working
 /// directory) is in: what rustfmt reads from `cargo metadata --no-deps`.
 fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<(PathBuf, Vec<Package>), io::Error> {
-    let load = || -> anyhow::Result<(PathBuf, Vec<Package>)> {
+    let load = || -> Result<(PathBuf, Vec<Package>), crate::FmtError> {
         let ctx = Context::new(Config::from_process()?);
         let ws = Workspace::new(&root_manifest(manifest_path, &ctx)?, &ctx)?;
         let packages = ws
@@ -462,7 +463,7 @@ fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<(PathBuf, Vec<Pack
             .collect();
         Ok((ws.root().to_owned(), packages))
     };
-    load().map_err(|e| io::Error::other(format!("{e:#}")))
+    load().map_err(io::Error::other)
 }
 
 fn get_targets_root_only(
@@ -513,11 +514,11 @@ fn get_targets_recursive(
     targets: &mut BTreeSet<Target>,
     visited: &mut BTreeSet<String>,
 ) -> Result<(), io::Error> {
-    let (_, packages) = get_cargo_metadata(manifest_path)?;
-    let manifests: Vec<PathBuf> = packages.iter().map(|p| p.manifest_path.clone()).collect();
-    for package in packages {
-        targets.extend(package.targets);
-
+    let (_, mut packages) = get_cargo_metadata(manifest_path)?;
+    for package in &mut packages {
+        targets.extend(core::mem::take(&mut package.targets));
+    }
+    for package in &packages {
         // Look for local dependencies using information available since cargo v1.51
         // It's theoretically possible someone could use a newer version of rustfmt with
         // a much older version of `cargo`, but we don't try to explicitly support that scenario.
@@ -530,7 +531,8 @@ fn get_targets_recursive(
             }
 
             let manifest_path = path.join("Cargo.toml");
-            if manifest_path.exists() && !manifests.iter().any(|p| p.eq(&manifest_path)) {
+            if manifest_path.exists() && !packages.iter().any(|p| p.manifest_path == manifest_path)
+            {
                 visited.insert(name.to_owned());
                 get_targets_recursive(Some(&manifest_path), targets, visited)?;
             }
@@ -618,21 +620,19 @@ impl StdoutToNull {
     #[cfg(unix)]
     fn new() -> Option<StdoutToNull> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use blaze_sys::{
+            posix::{io::dup, proc::STDOUT_FILENO},
+            Fd,
+        };
         let null = fs::OpenOptions::new().write(true).open("/dev/null").ok()?;
         let _ = io::stdout().flush();
-        // SAFETY: `dup` and `dup2` on the process's standard output and a file it owns;
-        // the duplicate is owned by `saved` and restored on drop.
-        unsafe {
-            let saved = libc::dup(libc::STDOUT_FILENO);
-            if saved < 0 {
-                return None;
-            }
-            let saved = OwnedFd::from_raw_fd(saved);
-            if libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO) < 0 {
-                return None;
-            }
-            Some(StdoutToNull { saved })
+        let saved = dup(Fd::new(STDOUT_FILENO)).ok()?.into_raw();
+        // SAFETY: `dup` returned a fresh descriptor owned by this value.
+        let saved = unsafe { OwnedFd::from_raw_fd(saved) };
+        if blaze_sys::posix::io::dup2(Fd::new(null.as_raw_fd()), Fd::new(STDOUT_FILENO)).is_err() {
+            return None;
         }
+        Some(StdoutToNull { saved })
     }
 
     #[cfg(not(unix))]
@@ -647,10 +647,10 @@ impl Drop for StdoutToNull {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            // SAFETY: puts back the standard output `new` saved.
-            unsafe {
-                libc::dup2(self.saved.as_raw_fd(), libc::STDOUT_FILENO);
-            }
+            let _ = blaze_sys::posix::io::dup2(
+                blaze_sys::Fd::new(self.saved.as_raw_fd()),
+                blaze_sys::Fd::new(blaze_sys::posix::proc::STDOUT_FILENO),
+            );
         }
     }
 }

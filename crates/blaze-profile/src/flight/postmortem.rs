@@ -88,7 +88,7 @@ use std::{
     },
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_core::lock::{Lock, LockGuard};
 use std::alloc::Global;
 use stdx::file_lock::Locked;
@@ -882,7 +882,12 @@ pub struct RunningBuild<'a> {
 mod sys {
     use std::{fs::File, io, os::fd::AsRawFd as _, ptr::NonNull};
 
+    use blaze_sys::{Fd, posix::{io::{MapFlags, Prot, mmap}, types::off_t}};
+
     pub(super) fn page_size() -> usize {
+        #[cfg(target_os = "macos")]
+        let page = blaze_sys::posix::thread::sysconf(blaze_sys::posix::thread::_SC_PAGESIZE);
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: `sysconf` reads a constant of the system.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         usize::try_from(page).unwrap_or(0)
@@ -891,25 +896,21 @@ mod sys {
     /// Maps `len` bytes of `file` from `at`, shared, to read and write.
     pub(super) fn map(file: &File, at: u64, len: usize) -> io::Result<NonNull<u8>> {
         let offset =
-            libc::off_t::try_from(at).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            off_t::try_from(at).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: a fresh mapping at an address the kernel picks: it aliases no Rust object.
         // The file is open to read and write, and `at` is a multiple of the page (the caller's
         // layout is in 64 KiB parts, which the page divides).
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
+        unsafe {
+            mmap(
+                None,
                 len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                offset,
+                Prot::READ | Prot::WRITE,
+                MapFlags::SHARED,
+                Some(Fd::new(file.as_raw_fd())),
+                offset as u64,
             )
-        };
-        if base == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
         }
-        NonNull::new(base.cast::<u8>())
-            .ok_or_else(|| io::Error::from(io::ErrorKind::AddrNotAvailable))
+        .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))
     }
 
     /// Reserves `from..to` of `file` on disk, and makes the file that long: a page of a shared
@@ -919,54 +920,43 @@ mod sys {
     pub(super) fn reserve(file: &File, from: u64, to: u64) -> io::Result<()> {
         let invalid = |_| io::Error::from(io::ErrorKind::InvalidInput);
         let (offset, len) = (
-            libc::off_t::try_from(from).map_err(invalid)?,
-            libc::off_t::try_from(to - from).map_err(invalid)?,
+            off_t::try_from(from).map_err(invalid)?,
+            off_t::try_from(to - from).map_err(invalid)?,
         );
-        // SAFETY: `posix_fallocate` on an open file descriptor; it returns its error.
-        let failed = unsafe { libc::posix_fallocate(file.as_raw_fd(), offset, len) };
-        match failed {
-            0 => Ok(()),
-            errno => Err(io::Error::from_raw_os_error(errno)),
-        }
+        blaze_sys::posix::proc::allocate(Fd::new(file.as_raw_fd()), offset, len)
+            .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))
     }
 
     #[cfg(target_vendor = "apple")]
     pub(super) fn reserve(file: &File, from: u64, to: u64) -> io::Result<()> {
-        let len = libc::off_t::try_from(to - from)
+        use blaze_sys::posix::io::{AllocateFlags, Fstore, PosMode, preallocate};
+
+        let len = off_t::try_from(to - from)
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // All of it or an error (`F_ALLOCATEALL`), in one run when there is one
         // (`F_ALLOCATECONTIG`). `F_ALLOCATECONTIG` alone succeeds with whatever run it found:
         // until 2026-11-11 this asked that way, and a 3.4 MiB ask came back as 20 KiB taken
         // for the whole (APFS, a nearly full volume), the rest of the mapping a hole.
-        let mut store = libc::fstore_t {
-            fst_flags: libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
-            fst_posmode: libc::F_PEOFPOSMODE,
-            fst_offset: 0,
-            fst_length: len,
-            fst_bytesalloc: 0,
+        let mut store = Fstore {
+            flags: AllocateFlags::CONTIGUOUS | AllocateFlags::ALL,
+            posmode: PosMode::PHYSICAL_END,
+            offset: 0,
+            length: len,
+            bytes_alloc: 0,
         };
-        // SAFETY: `F_PREALLOCATE` reads and writes the `fstore_t` given, which lives across the
-        // call.
-        if unsafe {
-            libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, std::ptr::from_mut(&mut store))
-        } == -1
-        {
+        let fd = Fd::new(file.as_raw_fd());
+        if preallocate(fd, &mut store).is_err() {
             // No contiguous run that long: any runs.
-            store.fst_flags = libc::F_ALLOCATEALL;
-            store.fst_bytesalloc = 0;
-            // SAFETY: as above.
-            if unsafe {
-                libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, std::ptr::from_mut(&mut store))
-            } == -1
-            {
-                return Err(io::Error::last_os_error());
-            }
+            store.flags = AllocateFlags::ALL;
+            store.bytes_alloc = 0;
+            preallocate(fd, &mut store)
+                .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))?;
         }
-        if store.fst_bytesalloc < len {
+        if store.bytes_alloc < len {
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
                 // alloc: an error
-                format!("the file system reserved {} of the {len} bytes asked for", store.fst_bytesalloc),
+                format!("the file system reserved {} of the {len} bytes asked for", store.bytes_alloc),
             ));
         }
         file.set_len(to)
@@ -1014,14 +1004,14 @@ pub(super) fn persist(dir: &Path, blaze: &str, process: &str) -> Result<(), Post
         return Err(PostmortemError::AlreadyPersisted { path: mapping.path.clone() });
     }
     let counting_copies = super::FRAME_COPIED.get().is_some();
-    let made = Mapping::create(dir, std::process::id(), blaze, process, counting_copies)?;
+    let mut made = Mapping::create(dir, std::process::id(), blaze, process, counting_copies)?;
     made.set_clock(&clock::Scale::now());
     {
         // Under `RINGS`'s lock no thread makes a ring: every ring made so far gets its store
         // before any made from here on (`store_for`) can take one.
         let rings = lock(&RINGS);
         if rings.len() > MAPPED_RINGS {
-            let path = made.path.clone(); // alloc: an error
+            let path = core::mem::take(&mut made.path);
             drop(made);
             _ = fs::remove_file(&path);
             return Err(PostmortemError::Full {
@@ -1033,16 +1023,15 @@ pub(super) fn persist(dir: &Path, blaze: &str, process: &str) -> Result<(), Post
         // A store for each ring made so far, before any ring moves: a full disk fails the
         // whole of it here, with no ring left half way between the heap and the file.
         if let Err(error) = made.reserve(rings.len()) {
-            let path = made.path.clone(); // alloc: an error
+            let path = core::mem::take(&mut made.path);
             drop(made);
             _ = fs::remove_file(&path);
             return Err(error);
         }
-        if let Err(made) = MAPPING.set(made) {
+        if let Err(mut made) = MAPPING.set(made) {
             // Another thread persisted meanwhile (its lock on the one file of this pid would
             // have refused this one's `create` first): the file is the winner's, left as it is.
-            // alloc: an error
-            return Err(PostmortemError::AlreadyPersisted { path: made.path.clone() });
+            return Err(PostmortemError::AlreadyPersisted { path: core::mem::take(&mut made.path) });
         }
         let Some(mapping) = MAPPING.get() else { return Ok(()) };
         // One no thread holds has no writer and moves here; one a thread holds moves as its
@@ -1449,7 +1438,7 @@ impl Found {
             streams,
             kept: &kept,
             // alloc: once a postmortem, a kept name its rows hold
-            kept_syms: HashMap::new_in(Global),
+            kept_syms: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             lost: 0,
             failed: false,
         };
@@ -1531,9 +1520,9 @@ impl Found {
 
     /// The names the logs hold, newest first winning: a [`Sym`] given again after its
     /// generation came round names what it named last.
-    fn names(&self, header: &[u8]) -> Result<HashMap<Sym, String, Global>, PostmortemError> {
+    fn names(&self, header: &[u8]) -> Result<Map<Sym, String, FixedState, Global>, PostmortemError> {
         // alloc: once a postmortem, a name a dead process gave
-        let mut names = HashMap::new_in(Global);
+        let mut names = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for log in 0..LOGS {
             let head = word(header, (H_LOG_HEADS + log) * 8);
             if head == 0 {
@@ -1683,7 +1672,7 @@ impl Found {
         recovered: &mut Recovered,
     ) -> Result<(), PostmortemError> {
         // alloc: once a postmortem, a site its rows hold
-        let mut site_of: HashMap<u16, u16, Global> = HashMap::new_in(Global);
+        let mut site_of: Map<u16, u16, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut sites_lost = 0;
         let mut sites_failed = false;
         let mut site = |old: u16| -> u16 {
@@ -1751,8 +1740,8 @@ fn row_at(store: &[u8], i: u64) -> [u64; WORDS] {
 /// kept log, each as [`super::recovered`] numbers it for the postmortem's session.
 struct DeadNamer<'a> {
     streams: names::Streams,
-    kept: &'a HashMap<Sym, String, Global>,
-    kept_syms: HashMap<Sym, Sym, Global>,
+    kept: &'a Map<Sym, String, FixedState, Global>,
+    kept_syms: Map<Sym, Sym, FixedState, Global>,
     /// Kept names the log no longer held.
     lost: u64,
     /// Past [`super::RECOVERED_MAX`] names.

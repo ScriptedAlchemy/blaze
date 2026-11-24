@@ -395,7 +395,6 @@ fn finish(sim: &mut Sim, effect: Effect) -> Completion {
 #[derive(Default)]
 struct Attempt {
     ack: bool,
-    renamed: bool,
     directory_synced: bool,
     failed: Option<Step>,
 }
@@ -438,9 +437,12 @@ fn publish(sim: &mut Sim, bytes: &[u8], plan: u8, plant: Plant) -> Attempt {
         if fail {
             match &effect {
                 Effect::Sync { file, .. } => sim.fail_syncs(file.clone()),
+                Effect::SyncDir { dir, .. } => {
+                    sim.fail_syncs(dir.name().expect("the publication's named directory").clone());
+                }
                 // Sim has no targeted rename-error switch. Removing its source makes
-                // the actual Rename effect fail before it can change the published name.
-                Effect::Rename { from, .. } => sim.delete(from),
+                // the actual rename effect fail before it can change the published name.
+                Effect::RenameUnsynced { from, .. } => sim.delete(from),
                 _ => unreachable!(),
             }
         }
@@ -453,9 +455,7 @@ fn publish(sim: &mut Sim, bytes: &[u8], plan: u8, plant: Plant) -> Attempt {
         }
         let completion = finish(sim, effect);
         let succeeded = !matches!(&completion.done, Done::Failed(_));
-        if step == Step::Rename && succeeded {
-            attempt.renamed = true;
-        }
+        assert!(!fail || !succeeded, "the injected {step:?} failure did not reach its effect");
         if step == Step::DirectorySync && succeeded {
             attempt.directory_synced = true;
         }
@@ -548,13 +548,10 @@ fn scenario(ops: &[u16], seed: u64, plant: Plant) -> Result<(), String> {
                     {
                         return Err("failed file sync or rename replaced the old record".to_owned()); // alloc: oracle failure
                     }
-                    // Sim retains a completed rename's namespace but still tears unsynced
-                    // Append data. Also explore a kernel losing the rename before directory
-                    // sync. This is a crash model extension, never another publication path.
+                    // The driver tears unsynced bytes and may undo an unsynced rename.
+                    // Never replace its outcome in the fixture: the same effects must
+                    // establish the production and simulated durability boundaries.
                     sim.crash();
-                    if plan >= 36 && attempt.renamed && !attempt.directory_synced {
-                        sim.change(&published, &model);
-                    }
                     let surviving = sim.contents(&published);
                     if surviving != model && surviving != replacement {
                         return Err(format!("torn reopened record at operation {raw}, seed {seed}"));
@@ -754,9 +751,6 @@ fn native_partition_scenario(
             return Err("partition oracle: response disagrees with durability".to_owned()); // alloc: oracle failure
         }
         sim.crash();
-        if plan >= 36 && attempt.renamed && !attempt.directory_synced {
-            sim.change(&published, &before);
-        }
         let surviving = sim.contents(&published);
         if surviving != before && surviving != new {
             return Err("partition oracle: torn reopened manifest".to_owned()); // alloc: oracle failure
@@ -802,7 +796,7 @@ fn native_partitions_preserve_values_through_publication_faults_and_reopen(tc: h
         2 if count >= 3 => PublicationKind::RepairSurviving,
         _ => PublicationKind::RepairMissing,
     };
-    let plan = tc.draw(gs::integers::<u8>().max_value(71));
+    let plan = tc.draw(gs::integers::<u8>().max_value(35));
     let seed = tc.draw(gs::integers::<u64>());
     native_partition_scenario(count, conflict, kind, plan, seed, Plant::None).unwrap();
 }
@@ -869,7 +863,7 @@ fn the_oracle_catches_the_comparison_bypass_plant() {
 fn a_lost_repair_response_preserves_the_reopened_cas_winner_and_comparison() {
     // Actor 1 repairs A to B. Lose B's pack and let delayed actor 0 try C under A's
     // comparison: it may win only if the simulated power loss really restored A.
-    for plan in [0, 3, 12, 16, 20, 52] {
+    for plan in [0, 3, 12, 16, 20] {
         scenario(&[4, (plan << 8) | 11, 12, 18], 0, Plant::None).unwrap();
     }
 }
@@ -879,10 +873,8 @@ fn failed_syncs_rename_and_every_crash_boundary_reopen_authorized_whole_lists() 
     for seed in 0..4 {
         for fault in 0..4 {
             for cut in 0..9 {
-                for lose_rename in [0, 36] {
-                    let plan = fault + 4 * cut + lose_rename;
-                    scenario(&[4, (plan << 8) | 10], seed, Plant::None).unwrap();
-                }
+                let plan = fault + 4 * cut;
+                scenario(&[4, (plan << 8) | 10], seed, Plant::None).unwrap();
             }
         }
     }
@@ -890,7 +882,7 @@ fn failed_syncs_rename_and_every_crash_boundary_reopen_authorized_whole_lists() 
 
 #[test]
 fn the_oracle_catches_missing_file_sync_with_torn_appends() {
-    // Keep the completed rename (Sim's default), crash before the directory sync.
+    // Crash before the directory sync; seeds explore both keeping and losing the rename.
     // The missing file sync must be exposed by Sim's torn data, not a phase assertion.
     let found = (0..64).any(|seed| {
         scenario(&[4, (16 << 8) | 10], seed, Plant::Publication(publication::Plant::NoFileSync))
@@ -901,8 +893,8 @@ fn the_oracle_catches_missing_file_sync_with_torn_appends() {
 
 #[test]
 fn the_oracle_catches_acknowledgement_before_directory_sync() {
-    // A directory sync would fail. Skipping it and returning success must be caught even
-    // though Sim retains the whole new record after the completed rename.
+    // A directory sync would fail. Skipping it and returning success must be caught
+    // before its uncommitted namespace change can be lost at a crash.
     let result = scenario(&[4, (3 << 8) | 10], 0, Plant::Publication(publication::Plant::EarlyAck));
     assert!(result.is_err_and(|why| why.contains("directory durability boundary")));
 }
