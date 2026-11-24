@@ -9,8 +9,8 @@
   "class": "a source inventory follows logical module names without their explicit source paths",
   "prevention": "Carry the literal path attached to the module declaration through shared source classification. Follow test-only reach to the actual file while keeping files and descendants also reachable from production counted. A source exclusion needs a certain declaration or a whole-file test cfg; unknown module-directory ownership never supplies that proof. Preserve production roots declared by Cargo, including a physical source used as both a root and an ordinary module.",
   "workaround": "None. Keep the signal and panic controls and existing policy ceilings; do not hide the helper behind an extra test-file exemption.",
-  "fix": "The shared classifier carries typed module paths, reads attributes lexically outside strings and comments, and proves test-only files before revoking candidates reachable from production. Cargo roots use the existing TOML reader; fixture manifests retain the existing test-directory policy. The duplicate scanner consumes the same classifier. The first hosted run compiled the scripts but found a flawed selftest oracle: an orphan signals/tests.rs was expected to count despite the existing test-file naming convention. The corrected fixture gives that file an explicit production parent; later default-path controls use checks.rs and remove only its cfg to prove the cause. The measured two new allocator-fixing signatures are removed by reusing the existing lossy text reader and accepting directory views instead of a concrete owned manifest cache. Independent review confirms that the additional file-items and ladder sites are unchanged helpers reached by unconditional production example imports: they remain counted as real debt. Unsupported module contexts remain conservative, no policy ceiling is raised, and full hosted scanner execution plus fresh canonical inventories remain required.",
-  "state": "open",
+  "fix": "The shared classifier carries typed module paths, reads attributes lexically outside strings and comments, and proves test-only files before revoking candidates reachable from production. Cargo roots use the existing TOML reader; fixture manifests retain the existing test-directory policy. The duplicate scanner consumes the same classifier. The first hosted run compiled the scripts but found a flawed selftest oracle: an orphan signals/tests.rs was expected to count despite the existing test-file naming convention. The corrected fixture gives that file an explicit production parent; later default-path controls use checks.rs and remove only its cfg to prove the cause. The measured two new allocator-fixing signatures are removed by reusing the existing lossy text reader and accepting directory views instead of a concrete owned manifest cache. Independent review confirms that the additional file-items and ladder sites are unchanged helpers reached by unconditional production example imports: they remain counted as real debt. Unsupported module contexts remain conservative, no policy ceiling is raised, and the next hosted run passed the full scanner selftest suite. Its canonical inventory confirms blaze-script signatures remain 117. Only measured downward allocation/untyped rows are adopted; the production-example debt remains held to its existing ceilings.",
+  "state": "fixed",
   "evidence": {
     "head": "cf20ef262fe07e8aed3f087d29753a22c01e1bea",
     "tree": "82cc34a97458a3c996a3870546d6cb990386d921",
@@ -24,6 +24,14 @@
       "artifact": 14907309447,
       "sha256": "3622d13d96a0a291da5d534f2ee59daeaa2a835a87b682ba3232e06de097bd6c",
       "log_sha256": "26a3543404917f96eb992588557b89bd90df5e63cff399753285e0d7b0658c62"
+    },
+    "verified": {
+      "head": "d16ce961e8e7fff61ffd4f831025f958a20e19c4",
+      "tree": "a4c569f249cf1d11981a54b1f4ba423586f21c0a",
+      "run": 45373716607,
+      "artifact": 14911060882,
+      "sha256": "780a43b86ca366a241be43e99daacb710cb7c3bd703bd822a2adf8b0c77c40af",
+      "result": "All scanner and gate selftests passed, including the full path-control suite. Canonical blaze-script allocator-fixing signatures remain 117. Overall gate 52/64; broader migration policy debt remains."
     }
   }
 }

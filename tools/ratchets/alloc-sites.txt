@@ -15,9 +15,9 @@ blaze-build	0	0	14	1
 blaze-build-script	0	0	0	11
 blaze-bytes	0	0	0	3
 blaze-cad-out	0	0	0	1
-blaze-cas	10	0	45	69
+blaze-cas	10	0	45	65
 blaze-check	54	0	0	37
-blaze-cli	1	0	324	103
+blaze-cli	1	0	320	49
 blaze-columns	0	0	0	3
 blaze-cond	0	0	0	2
 blaze-consteval	0	0	0	4
@@ -26,10 +26,8 @@ blaze-cunit	0	0	9	0
 blaze-dbsp	12	0	12	4
 blaze-deflate	0	0	0	1
 blaze-dist	0	0	30	0
-blaze-dist-local	0	0	94	0
-blaze-drive	0	0	0	1
+blaze-dist-local	0	0	92	0
 blaze-emit	0	0	29	0
-blaze-engine	0	0	0	2
 blaze-expand	0	0	0	9
 blaze-fetch	17	0	2	11
 blaze-file-items	0	0	28	9
@@ -49,14 +47,14 @@ blaze-keyed	0	0	11	11
 blaze-kit	0	0	0	2
 blaze-ladder	0	0	1137	279
 blaze-launch	0	0	2	2
-blaze-launch-rt	50	0	1	35
+blaze-launch-rt	50	0	1	33
 blaze-launcher	3	0	0	3
 blaze-lex	0	0	0	1
 blaze-lint	4	0	0	5
 blaze-lint-defs	22	0	0	8
-blaze-lir	21	0	41	6
+blaze-lir	21	0	8	6
 blaze-lower	0	0	0	2
-blaze-manifest	8	0	115	184
+blaze-manifest	8	0	115	183
 blaze-mem	31	0	0	4
 blaze-memchr	0	0	3	0
 blaze-memo	0	0	86	6
@@ -65,7 +63,7 @@ blaze-native	0	0	5	0
 blaze-new	0	0	12	7
 blaze-own	0	0	49	8
 blaze-pack	41	0	0	36
-blaze-proc-macro	0	0	35	199
+blaze-proc-macro	0	0	33	189
 blaze-profile	1065	6	287	393
 blaze-protocol	69	0	4	26
 blaze-queue	0	0	8	0
@@ -74,7 +72,7 @@ blaze-real	0	0	0	63
 blaze-reclaim	3	0	0	0
 blaze-record	4	0	0	2
 blaze-remote	1	0	57	117
-blaze-report	42	0	1	45
+blaze-report	42	0	1	43
 blaze-resolve	5	0	103	64
 blaze-scope	0	0	0	47
 blaze-screen	254	0	0	37
@@ -86,7 +84,7 @@ blaze-source	2	0	4	8
 blaze-sql	0	0	1	0
 blaze-sqlite	0	0	15	5
 blaze-squeeze	0	0	10	16
-blaze-std	200	0	43	80
+blaze-std	200	0	43	77
 blaze-store-check	6	0	2	3
 blaze-text	0	0	0	1
 blaze-trace	0	0	0	2
@@ -130,7 +128,7 @@ harness/vendor/hyperion-ecs	0	0	0	13
 harness/vendor/hyperion-manifest-types	0	0	0	3
 intern	8	0	0	0
 ix-prof	46	0	73	170
-parser	32	0	0	23
+parser	32	0	0	18
 paths	0	0	0	1
 rustc_abi	0	0	0	5
 stdx	23	0	0	21
