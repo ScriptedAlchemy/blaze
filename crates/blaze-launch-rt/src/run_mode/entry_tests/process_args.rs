@@ -1,0 +1,181 @@
+//! Process-global C environment behavior runs in a child, isolated from parallel test readers.
+//! The child exits from its atexit callback only after checking pointers escaped from main.
+
+use core::ffi::{CStr, c_char, c_int};
+use core::sync::atomic::{AtomicPtr, Ordering};
+use core::time::Duration;
+use std::process::{Child, Command, Stdio};
+
+use blaze_core::wait::{Clock, Deadline, Monotonic};
+
+use super::{Loaded, ProcessArgs};
+
+const CASE: &str = "BLAZE_ARGS_CHILD";
+const CHILD: &str = "run_mode::entry_tests::process_args::child";
+const PREFIX: &[u8] = b"BLAZE_ARGS_PROBE=";
+static ESCAPED_ARGV: AtomicPtr<*const c_char> = AtomicPtr::new(core::ptr::null_mut());
+static ESCAPED_ENV: AtomicPtr<c_char> = AtomicPtr::new(core::ptr::null_mut());
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" { static mut environ: *mut *mut c_char; }
+
+/// This child is the only caller, with no other test running or guest thread started.
+fn environment() -> *mut *mut c_char {
+    #[cfg(target_os = "linux")]
+    // SAFETY: libc's environment word, read only in the isolated child's setup.
+    unsafe { environ }
+    #[cfg(target_os = "macos")]
+    // SAFETY: the C runtime's environment word, read only in the isolated child's setup.
+    unsafe { *blaze_sys::posix::proc::_NSGetEnviron() }
+}
+
+fn restore_environment(saved: *mut *mut c_char) {
+    // SAFETY: the child's pre-capture list remains allocated; replacing the global word does
+    // not free it. This is the planted omission of installation, before any guest thread.
+    #[cfg(target_os = "linux")]
+    unsafe { environ = saved; }
+    #[cfg(target_os = "macos")]
+    unsafe { *blaze_sys::posix::proc::_NSGetEnviron() = saved; }
+}
+
+extern "C" fn edit_environment(argc: c_int, argv: *const *const c_char, envp: *const *const c_char) {
+    if argc < 1 { return; }
+    // SAFETY: the child was launched with exactly CASE and PROBE, then removed its temporary
+    // third key before capture. Both strings/arrays and argv[0] are writable process copies.
+    unsafe {
+        argv.read().cast_mut().write(b'Q' as c_char);
+        for index in 0..2 {
+            let text = envp.add(index).read();
+            if CStr::from_ptr(text).to_bytes().starts_with(PREFIX) {
+                text.cast_mut().add(PREFIX.len()).write(b'B' as c_char);
+            }
+        }
+    }
+}
+
+extern "C" fn escaped_at_exit() {
+    let argv = ESCAPED_ARGV.load(Ordering::Acquire);
+    let env = ESCAPED_ENV.load(Ordering::Acquire);
+    // SAFETY: capture's original arrays and strings live through process exit. These pointers
+    // were saved before libc replaced environ; no saved pointer refers to a later libc-owned
+    // replacement string, whose lifetime would instead follow setenv/unsetenv's rules.
+    let intact = unsafe {
+        !argv.is_null() && !env.is_null()
+            && argv.read().read() == b'Q' as c_char
+            && CStr::from_ptr(env).to_bytes() == b"BLAZE_ARGS_PROBE=Before"
+    };
+    // SAFETY: this ends only the isolated child. A distinctive success proves atexit ran;
+    // ordinary exit(0) or a skipped callback cannot pass the parent assertion.
+    unsafe { libc::_exit(if intact { 42 } else { 86 }) }
+}
+
+/// The dispatcher does nothing in the ordinary parent run; the enclosing test launches it
+/// by its exact name with a named case and checks a status only that case can produce.
+#[test]
+fn child() {
+    let Some(case) = std::env::var_os(CASE) else { return; };
+    assert!(case == "installed" || case == "old-environ", "unknown argument case: {case:?}");
+    // SAFETY: this isolated child has one test; it alone changes its environment. Force libc
+    // to own an array before capture, then remove a launcher-like variable, as run setup does.
+    unsafe {
+        assert_eq!(libc::setenv(c"BLAZE_ARGS_TEMP".as_ptr(), c"temporary".as_ptr(), 1), 0);
+        assert_eq!(libc::unsetenv(c"BLAZE_ARGS_TEMP".as_ptr()), 0);
+    }
+    let original = environment();
+    {
+        let args = ProcessArgs::capture(blaze_own::testing::heap().alloc()).expect("the process argument capture");
+        if case == "old-environ" { restore_environment(original); }
+        let inits = [edit_environment as usize as u64];
+        crate::native_lib::run_inits(Loaded {
+            record: blaze_launch::wire::RecordId([0x73; 32]), base: 0,
+            inits_at: inits.as_ptr() as u64, inits: 1,
+        }, &args).expect("the C initializer");
+        // SAFETY: this key is supplied by the parent and remains present after the initializer.
+        let value = unsafe { libc::getenv(c"BLAZE_ARGS_PROBE".as_ptr()) };
+        assert!(!value.is_null());
+        // SAFETY: getenv returned the live value of the child's key; no concurrent mutation.
+        let text = unsafe { CStr::from_ptr(value) }.to_bytes();
+        if case == "old-environ" {
+            assert_eq!(text, b"before", "without installation, envp edits fail to reach getenv");
+            std::process::exit(43);
+        }
+        assert_eq!(text, b"Before", "the constructor's envp edit reaches getenv");
+        assert_eq!(environment().cast_const().cast::<*const c_char>(), args.envp());
+        let mut saved = core::ptr::null_mut();
+        // SAFETY: the child's two captured environment entries and null are still live.
+        unsafe {
+            assert!(args.envp().add(2).read().is_null());
+            for index in 0..2 {
+                let text = args.envp().add(index).read();
+                if CStr::from_ptr(text).to_bytes().starts_with(PREFIX) {
+                    saved = text.cast_mut();
+                }
+            }
+        }
+        assert!(!saved.is_null());
+        ESCAPED_ARGV.store(args.argv().cast_mut(), Ordering::Release);
+        ESCAPED_ENV.store(saved, Ordering::Release);
+        // SAFETY: this child's next libc environment growth copies our externally owned
+        // array. Removing the key afterwards must not free the original process-owned bytes.
+        unsafe {
+            assert_eq!(libc::setenv(c"BLAZE_ARGS_ADDED".as_ptr(), c"added".as_ptr(), 1), 0);
+            assert_ne!(environment().cast_const().cast::<*const c_char>(), args.envp());
+            assert_eq!(libc::unsetenv(c"BLAZE_ARGS_PROBE".as_ptr()), 0);
+            assert!(libc::getenv(c"BLAZE_ARGS_PROBE".as_ptr()).is_null());
+            assert_eq!(CStr::from_ptr(saved).to_bytes(), b"BLAZE_ARGS_PROBE=Before");
+            assert_eq!(libc::atexit(escaped_at_exit), 0);
+        }
+    }
+    // ProcessArgs metadata has ended before the callback reads its escaped pointers.
+    std::process::exit(0);
+}
+
+/// Even a failed control owns its child until reap. SIGKILL is followed by named polls to a
+/// separate finite deadline; the caller reports this failure beside its original diagnostic.
+fn kill_and_reap(child: &mut Child, clock: &Monotonic) -> std::io::Result<()> {
+    child.kill()?;
+    let deadline = Deadline::after(clock.now(), Duration::from_secs(5));
+    loop {
+        if child.try_wait()?.is_some() { return Ok(()); }
+        let now = clock.now();
+        if deadline.passed(now) {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut,
+                "the argument/environment child was not reaped within five seconds after SIGKILL"));
+        }
+        let next = Deadline::at((now + Duration::from_millis(5)).min(deadline.get()));
+        blaze_core::wait::sleep_until("reaping the killed argument/environment child", next, clock)
+            .map_err(std::io::Error::other)?;
+    }
+}
+
+fn run(case: &str) -> i32 {
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let mut child = Command::new(exe)
+        .args([CHILD, "--exact", "--nocapture", "--test-threads=1"])
+        .env_clear().env(CASE, case).env("BLAZE_ARGS_PROBE", "before")
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit())
+        .spawn().expect("the argument/environment child starts");
+    let clock = Monotonic::new();
+    let deadline = Deadline::after(clock.now(), Duration::from_secs(30));
+    loop {
+        if let Some(status) = child.try_wait().expect("the child's status") {
+            return status.code().expect("the child exited without a signal");
+        }
+        let now = clock.now();
+        if deadline.passed(now) {
+            let cleanup = kill_and_reap(&mut child, &clock);
+            panic!("argument/environment case {case} did not exit within 30 seconds; kill/reap: {cleanup:?}");
+        }
+        let next = Deadline::at((now + Duration::from_millis(5)).min(deadline.get()));
+        if let Err(why) = blaze_core::wait::sleep_until("the argument/environment child's exit", next, &clock) {
+            let cleanup = kill_and_reap(&mut child, &clock);
+            panic!("argument/environment case {case}: {why}; kill/reap: {cleanup:?}");
+        }
+    }
+}
+
+#[test]
+fn installed_environment_aliases_getenv_and_escaped_arguments_survive_atexit() {
+    assert_eq!(run("installed"), 42, "the atexit observer checked the original process-owned storage");
+    assert_eq!(run("old-environ"), 43, "restoring the old environ removes the constructor/getenv alias");
+}

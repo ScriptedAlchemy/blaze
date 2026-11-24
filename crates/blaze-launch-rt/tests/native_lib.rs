@@ -16,7 +16,7 @@ use blaze_launch::wire::List;
 use blaze_launch_rt::code_unwind::Step;
 use blaze_launch_rt::native_lib::{
     self, DESCRIPTOR_LEN, Descriptor, Loaded, MAGIC, MAGIC_BNL1, NativeError, Natives, PATH_MOST, POINTER_ROW_LEN,
-    PointerRow,
+    PointerRow, ThreadData,
 };
 use blaze_launch_rt::run_mode::{Act, Event, Memory, Outside, Placing, Room, RunMode, RunModeError, ThreadKey};
 use blaze_own::{AVec, Alloc, Vec};
@@ -92,6 +92,7 @@ struct FakeNatives {
     opened: u32,
     writes: AVec<'static, (u64, u64)>,
     names: &'static [(&'static str, u64)],
+    thread_data: Option<ThreadData>,
 }
 
 impl Natives for FakeNatives {
@@ -102,6 +103,9 @@ impl Natives for FakeNatives {
     }
     fn descriptor(&mut self, _record: RecordId) -> Result<Descriptor, NativeError> {
         Ok(self.descriptor)
+    }
+    fn thread_data(&self) -> Option<ThreadData> {
+        self.thread_data
     }
     fn pointer_row(&mut self, address: u64) -> PointerRow {
         let row = (address - BASE - self.descriptor.pointer_at) / POINTER_ROW_LEN;
@@ -124,7 +128,7 @@ fn descriptor(words: u32, pointers: u32) -> Descriptor {
 }
 
 fn fake(descriptor: Descriptor, rows: &'static [PointerRow]) -> FakeNatives {
-    FakeNatives { descriptor, rows, opened: 0, writes: Vec::new_in(alloc()), names: &[("write", 0x1234_5678)] }
+    FakeNatives { descriptor, rows, opened: 0, writes: Vec::new_in(alloc()), names: &[("write", 0x1234_5678)], thread_data: None }
 }
 
 /// A run mode with the entry numbered (slot 0) and the parent's `Native { LIBRARY, pairs }`
@@ -178,7 +182,7 @@ fn fills_words_with_thunks() {
 
 /// The image's word count must equal the parent's pairs; a BNL1 descriptor is an old record,
 /// refused by its tag, never read beside BNL2; a pointer row naming a word past the count is
-/// refused before any pointer cell is written. Prints "native_lib: Words { .., image: 2,
+/// refused before any native cell is written. Prints "native_lib: Words { .., image: 2,
 /// declared: 1 }; Old { tag: 0x424e4c31 }; PointerWord { row: 0, word: 3, words: 1 }".
 #[test]
 fn refuses_word_count_mismatch() {
@@ -207,12 +211,52 @@ fn refuses_word_count_mismatch() {
     let mut past = fake(descriptor(1, 1), &PAST);
     let got = mode.load_native(&mut past, &mut memory);
     assert_eq!(got, Err(RunModeError::Native(NativeError::PointerWord { record: LIBRARY, row: 0, word: 3, words: 1 })));
-    assert_eq!(past.writes.len(), 1, "the word only: no pointer cell written for a refused row");
+    assert!(past.writes.is_empty(), "neither Rust words nor pointer cells are written for a refused row");
     assert_eq!(DESCRIPTOR_LEN, core::mem::size_of::<Descriptor>() as u64, "BNL2 is 48 bytes");
     assert_eq!(POINTER_ROW_LEN, core::mem::size_of::<PointerRow>() as u64);
     println!(
         "native_lib: Words {{ .., image: {image}, declared: {count} }}; Old {{ tag: {MAGIC_BNL1:#x} }}; PointerWord {{ row: 0, word: 3, words: 1 }}"
     );
+}
+
+/// An eight-byte Rust pointer must not touch any part of the loader's PT_TLS memory range,
+/// including its zero-fill tail. Adjacent cells remain supported. Removing only the TLS fact
+/// makes the same rejected row writable, so the refusal depends on that geometry.
+#[test]
+fn refuses_every_pointer_cell_overlapping_the_tls_template() {
+    static ROWS: [[PointerRow; 1]; 5] = [
+        [PointerRow { at: 0x8ff8, word: 0, pad: 0 }],
+        [PointerRow { at: 0x8ff9, word: 0, pad: 0 }],
+        [PointerRow { at: 0x9000, word: 0, pad: 0 }],
+        [PointerRow { at: 0x901f, word: 0, pad: 0 }],
+        [PointerRow { at: 0x9020, word: 0, pad: 0 }],
+    ];
+    let pairs = [Declared { symbol: A, slot: Slot(5) }];
+    for (index, rows) in ROWS.iter().enumerate() {
+        let mut mode = RunMode::new(alloc());
+        declared(&mut mode, &pairs);
+        let mut natives = fake(descriptor(1, 1), rows);
+        // The loader gives p_memsz, not p_filesz: [0x9008, 0x9020) may be zero-fill.
+        natives.thread_data = Some(ThreadData { at: 0x9000, len: 0x20 });
+        let mut memory = FakeMemory { stubbed: Vec::new_in(alloc()) };
+        let loaded = mode.load_native(&mut natives, &mut memory);
+        if matches!(index, 1..=3) {
+            assert_eq!(loaded, Err(RunModeError::Native(NativeError::ThreadLocalPointer {
+                record: LIBRARY, row: 0, at: rows[0].at,
+            })));
+            assert!(natives.writes.is_empty(), "no cell is published before TLS refusal");
+            assert_eq!(mode.native(), None, "no initializer list is handed to the caller");
+        } else {
+            assert!(loaded.is_ok(), "the adjacent cell is outside TLS: {loaded:?}");
+            assert_eq!(natives.writes.len(), 2, "the Rust word and ordinary pointer are filled");
+        }
+    }
+    let mut mode = RunMode::new(alloc());
+    declared(&mut mode, &pairs);
+    let mut without_tls = fake(descriptor(1, 1), &ROWS[2]);
+    let mut memory = FakeMemory { stubbed: Vec::new_in(alloc()) };
+    mode.load_native(&mut without_tls, &mut memory).expect("the control omits only the TLS fact");
+    assert_eq!(without_tls.writes.len(), 2, "the omitted geometry loses the refusal");
 }
 
 /// A C name before the library is loaded is `NoNativeLibrary` naming the symbol; after, a name
@@ -249,7 +293,7 @@ fn record_path_is_folder_slash_hex() {
     println!("native_lib: record path /s/abab..abab ({len} bytes)");
 }
 
-/// The symbols run_inits reads the process's arguments through exist and answer (rule 45's
+/// The C runtime's argument/environment symbols exist and answer (rule 45's
 /// check, though they are in the SDK's public <crt_externs.h>). Prints "native_lib:
 /// _NSGetArgc/_NSGetArgv/_NSGetEnviron answer (argc >= 1)".
 #[cfg(target_os = "macos")]

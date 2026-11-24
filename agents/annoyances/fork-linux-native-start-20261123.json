@@ -1,0 +1,26 @@
+{
+  "id": "fork-linux-native-start-20261123",
+  "date": "2026-11-23",
+  "who": "GPT-6 Astra Pro, continuation coordinator",
+  "where": "crates/blaze-launch-rt/src/run_mode.rs and native_lib.rs; source job 138285396707",
+  "what": "The first real Linux ARM64 source hello exited 125 after six seconds because the launcher unconditionally refused a program native library. The CLI and retained services had built, five binaries were sealed, and the canonical shelf pin had passed strict verification.",
+  "cost": "The cold phase prevented every subsequent source CLI smoke phase and production acceptance from running.",
+  "cause": "The ELF producer, descriptor reader and Linux dlopen driver existed, but run-mode integration and native constructor invocation remained guarded as unimplemented. Real native-load tests were restricted to macOS ARM64, so format tests did not exercise the missing Linux start path.",
+  "whys": [
+    "A source program that needs its native image reaches a Linux NotBuilt branch before Down::Native is read.",
+    "Removing that branch alone would expose another NotBuilt branch for nonempty initializer lists.",
+    "The existing initializer-error return could also leave the control thread running during a scoped join."
+  ],
+  "class": "a platform's native record producer and reader exist without an executed launcher contract",
+  "prevention": "Complete the existing shared-object path with one owned process-argument view, binding before ordered constructors, and explicit control-thread shutdown on refusal. Exercise real generated ELF images through DlNatives on Linux ARM64, retain named failures and the source smoke, and refuse TLS templates with post-load Rust-pointer patches until those pointers can be bound before TLS copies are made.",
+  "workaround": "None. The native-image requirement and smoke failure remain visible until the implementation executes successfully.",
+  "fix": "Implemented the shared-object startup path, process-owned constructor/main arguments and libc environment alias, stop/join on initializer refusal, and loader-metadata validation that refuses Rust pointer cells in TLS. Added real Linux ELF loading, constructor, binding and TLS controls plus argument/atexit and planted cleanup-hang tests. A focused hosted CI step publishes execution evidence before the full workspace build; source smoke and native execution are still required, and no Linux startup success is claimed yet.",
+  "state": "open",
+  "evidence": {
+    "head": "841e7b8c8df7010fcafc1bd1205372290f02ce6a",
+    "tree": "e525abcbfcaa6f0754db8374893f457a501feae6",
+    "run": 45347130082,
+    "artifact": 14899034030,
+    "sha256": "f6fd94d5a4ea887a8b936492c71a41b7ee967c28bc502f05f1a71858c813f33e"
+  }
+}

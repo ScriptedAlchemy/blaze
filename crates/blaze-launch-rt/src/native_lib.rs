@@ -9,8 +9,8 @@
 //!    and leads to its stub, so C may call it before its body is placed;
 //! 2. the record is opened (`dlopen(<store>/<64 hex>, RTLD_NOW | RTLD_LOCAL)`): dyld or ld.so
 //!    maps it, binds its imports by flat lookup among the libraries it loads, and runs only
-//!    those libraries' initializers (the image's own are in `__blaze_inits`, not
-//!    `__mod_init_func`);
+//!    those libraries' initializers (the image's own are in `__blaze_inits` or
+//!    `.data.blaze_inits`, outside the system loader's initializer list);
 //! 3. the descriptor `__blaze_native_v1` is read and checked ([`Descriptor`], tag `BNL2`);
 //! 4. word `i` gets the entry thunk of `words[i]`'s slot, then each pointer row's cell gets the
 //!    entry thunk of its word's slot: a function has one address, its slot's thunk, whether code
@@ -28,9 +28,9 @@
 //! [`record_path`], the [`Natives`] seam), tested with a fake (tests/native_lib.rs, no dylib),
 //! and the driver ([`DlNatives`], [`run_inits`]), which only performs the effects.
 //!
-//! macOS private APIs (rule 45): none. `dlopen`, `dlsym`, `dlerror` are POSIX; `_NSGetArgc`,
-//! `_NSGetArgv`, `_NSGetEnviron` are declared in the SDK's public `<crt_externs.h>` (the test
-//! `ns_get_args_exist` still checks they answer, since this file leans on them).
+//! macOS private APIs (rule 45): none. `dlopen`, `dlsym`, `dlerror` are POSIX; `_NSGetEnviron`
+//! is declared in the SDK's public `<crt_externs.h>` (the test `ns_get_args_exist` checks it
+//! and the C runtime's argument accessors). Process arguments are captured once by the run edge.
 
 use core::ffi::c_void;
 use core::fmt;
@@ -43,6 +43,11 @@ use blaze_run::SlotId;
 use blaze_sys::posix::thread::{self as dyld, RtldFlags};
 
 use crate::run_mode::{CName, Memory, RunModeError};
+
+mod args;
+#[cfg(target_os = "linux")]
+mod linux;
+pub use args::{ArgsError, ArgumentList, ProcessArgs, ProcessArgsOpts};
 
 /// The descriptor's form has one home, blaze-native's descriptor.rs (BNL2: words, pointer rows,
 /// the names table; BNL1 refused by its tag, never read beside it).
@@ -78,6 +83,12 @@ pub enum NativeError {
     /// Pointer row `row`'s reserved field is not zero: written by another form than this
     /// reader's.
     Reserved { record: RecordId, row: u32 },
+    /// A pointer to a Rust function is in the ELF TLS template. ld.so may have copied that
+    /// template before the launcher can fill the word, so that shape is refused before any
+    /// program initializer or entry runs.
+    ThreadLocalPointer { record: RecordId, row: u32, at: u64 },
+    /// The loaded ELF image did not expose the program-header facts needed to validate it.
+    Layout { record: RecordId, what: &'static str },
     /// The parent sent a second `Native` (this one naming `record`): a run has one library.
     Twice { record: RecordId },
     /// The parent sent no `Native` within `bound_ms` of the launcher's start, or ended first:
@@ -189,6 +200,16 @@ impl fmt::Display for NativeError {
                 hex(f, record)?;
                 write!(f, "'s pointer row {row} has a non-zero reserved field (blaze-native descriptor.rs, BNL2)")
             }
+            NativeError::ThreadLocalPointer { record, row, at } => {
+                f.write_str("the native library record ")?;
+                hex(f, record)?;
+                write!(f, "'s pointer row {row} at {at:#x} stores a Rust function in ELF thread-local data: ld.so may already have copied its unbound template; binding Rust pointers in native TLS is not implemented")
+            }
+            NativeError::Layout { record, what } => {
+                f.write_str("the native library record ")?;
+                hex(f, record)?;
+                write!(f, "'s loaded ELF layout could not be checked: {what}")
+            }
             NativeError::Twice { record } => {
                 f.write_str("the parent sent a second native library, ")?;
                 hex(f, record)?;
@@ -224,6 +245,9 @@ pub trait Natives {
     fn open(&mut self, record: RecordId) -> Result<u64, NativeError>;
     /// The opened image's descriptor.
     fn descriptor(&mut self, record: RecordId) -> Result<Descriptor, NativeError>;
+    /// The loaded ELF image's PT_TLS range, image-relative. None for an image without TLS or
+    /// a platform whose native TLS is not described by an ELF template.
+    fn thread_data(&self) -> Option<ThreadData> { None }
     /// Pointer row `row` of the opened image, at `address` (`base + pointer_at + 16 * row`).
     fn pointer_row(&mut self, address: u64) -> PointerRow;
     /// Stores `value` in the 8-byte cell at `address` (a word or a pointer row's cell).
@@ -231,6 +255,20 @@ pub trait Natives {
     /// The address of C name `name` in the image or a library it loaded; `None` when none has
     /// it. `name` is shorter than [`NAME_MOST`] and holds no NUL ([`bind`] checks).
     fn lookup(&mut self, name: &str) -> Option<u64>;
+}
+
+/// The program-header fact the load core needs before writing Rust pointer cells. Includes
+/// zero-fill, so no cell of a native thread-local can be mistaken for ordinary shared data.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ThreadData {
+    pub at: u64,
+    pub len: u64,
+}
+
+impl ThreadData {
+    fn overlaps_cell(self, at: u64) -> bool {
+        self.len != 0 && if at >= self.at { at - self.at < self.len } else { self.at - at < 8 }
+    }
 }
 
 /// What run mode keeps once the library is loaded: the base and the init list the first thread
@@ -272,11 +310,9 @@ impl NativeLoad {
         if d.words != declared {
             return refuse(NativeError::Words { record, image: d.words, declared });
         }
-        for (index, &slot) in slots.iter().enumerate() {
-            natives.write_word(base + d.word_at + 8 * index as u64, memory.thunk(slot));
-        }
         // Checked whole before the first cell is written: a refused row leaves no half-filled
         // data behind (the process stops on the error anyway, but nothing ran with it).
+        let thread_data = natives.thread_data();
         for row in 0..d.pointers {
             let r = natives.pointer_row(base + d.pointer_at + POINTER_ROW_LEN * u64::from(row));
             if r.pad != 0 {
@@ -285,6 +321,12 @@ impl NativeLoad {
             if r.word >= d.words {
                 return refuse(NativeError::PointerWord { record, row, word: r.word, words: d.words });
             }
+            if thread_data.is_some_and(|tls| tls.overlaps_cell(r.at)) {
+                return refuse(NativeError::ThreadLocalPointer { record, row, at: r.at });
+            }
+        }
+        for (index, &slot) in slots.iter().enumerate() {
+            natives.write_word(base + d.word_at + 8 * index as u64, memory.thunk(slot));
         }
         for row in 0..d.pointers {
             let r = natives.pointer_row(base + d.pointer_at + POINTER_ROW_LEN * u64::from(row));
@@ -347,6 +389,7 @@ pub struct DlNatives {
     /// The open image, once [`Natives::open`] succeeded. Never closed: the program's code runs
     /// from it until the process ends.
     handle: *mut c_void,
+    thread_data: Option<ThreadData>,
     said: [u8; SAID_MOST],
     said_len: usize,
 }
@@ -361,7 +404,7 @@ impl DlNatives {
         }
         let mut copy = [0u8; PATH_MOST];
         copy[..folder.len()].copy_from_slice(folder);
-        Ok(DlNatives { folder: copy, folder_len: folder.len(), handle: core::ptr::null_mut(), said: [0; SAID_MOST], said_len: 0 })
+        Ok(DlNatives { folder: copy, folder_len: folder.len(), handle: core::ptr::null_mut(), thread_data: None, said: [0; SAID_MOST], said_len: 0 })
     }
 
     /// The `dlerror` text of the last failed `dlopen`, for the driver's message.
@@ -451,6 +494,8 @@ impl Natives for DlNatives {
         if info.dli_fbase.is_null() {
             return Err(NativeError::NoDescriptor { record });
         }
+        #[cfg(target_os = "linux")]
+        { self.thread_data = linux::thread_data(record, info.dli_fbase as u64)?; }
         Ok(info.dli_fbase as u64)
     }
 
@@ -480,6 +525,8 @@ impl Natives for DlNatives {
         unsafe { (address as *const PointerRow).read_unaligned() }
     }
 
+    fn thread_data(&self) -> Option<ThreadData> { self.thread_data }
+
     fn write_word(&mut self, address: u64, value: u64) {
         // SAFETY: `address` is a word cell (`base + word_at + 8 * i`, `i < words`) or a pointer
         // row's cell (`base + at`), both in the image's writable `__DATA` (W4: `__blaze_words`
@@ -507,43 +554,32 @@ impl Natives for DlNatives {
 }
 
 /// Runs the library's initializers in order on the calling thread: the process's first thread,
-/// after the entry is numbered and before it is called (NATIVE.md 3.4, 3.7).
-#[cfg(target_os = "macos")]
-pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
-    use blaze_sys::posix::proc::{_NSGetArgc, _NSGetArgv, _NSGetEnviron};
+/// after the entry is numbered and before it is called. `args` is the same process-lived
+/// argument list C main receives; its environment is a copy unaffected by libc reallocating
+/// `environ`. Both writers keep the program's init list out of the system loader's init array.
+pub fn run_inits(loaded: Loaded, args: &ProcessArgs) -> Result<(), RunModeError> {
     use core::ffi::{c_char, c_int};
     type Init = extern "C" fn(c_int, *const *const c_char, *const *const c_char);
-    // SAFETY: `_NSGetArgc`, `_NSGetArgv`, `_NSGetEnviron` (<crt_externs.h>) return the
-    // process's own argc, argv and environ, set up by dyld before any code ran; the program
-    // runs in this process, so they are its arguments (the entry's `argv` is the same list).
-    let (argc, argv, envp) = unsafe { (*_NSGetArgc(), *_NSGetArgv(), *_NSGetEnviron()) };
     for index in 0..loaded.inits {
         let cell = loaded.inits_at + 8 * u64::from(index);
-        // SAFETY: init cell `index < inits` of the image's `__blaze_inits`, 8-aligned and
-        // readable for the image's life; dyld rebased it at `dlopen` (W3 makes every init cell
-        // a rebase fixup), so it holds an absolute address in the image's text.
+        // SAFETY: init cell `index < inits` of __blaze_inits / .data.blaze_inits, 8-aligned
+        // and readable for the image's life. dlopen applied each rebase (ELF: RELATIVE), so
+        // the cell holds an absolute function address, after every Rust word has been bound.
         let address = unsafe { (cell as *const u64).read_volatile() };
         if address == 0 {
             return Err(RunModeError::Native(NativeError::NullInit { record: loaded.record, index }));
         }
         // SAFETY: a C initializer of a member the program's link pulled (`__mod_init_func`'s
-        // entry, moved to `__blaze_inits`). dyld calls these as `void (int argc, char **argv,
+        // entry, moved to __blaze_inits / .data.blaze_inits). dyld calls these as `void (int argc, char **argv,
         // char **envp, char **apple, const struct ProgramVars *)`; the first three are passed
         // here, `apple` and `vars` are not (only libSystem's own initializers read them, and
         // libSystem is never a member); an initializer declared `void (void)` ignores the
-        // arguments (AAPCS64: arguments are registers the callee may ignore).
+        // arguments (AAPCS64: arguments are registers the callee may ignore). On Linux glibc
+        // elf/dl-init.c calls dl_init_t as (argc, argv, envp), also for DT_INIT_ARRAY:
+        // sourceware.org/pipermail/glibc-cvs/2021q1/072013.html. These copied strings and
+        // arrays are writable and survive main and atexit (ProcessArgs' contract).
         let init: Init = unsafe { core::mem::transmute(address as usize) };
-        init(argc, argv.cast_const().cast(), envp.cast_const().cast());
+        init(args.argc(), args.argv(), args.envp());
     }
     Ok(())
-}
-
-/// Linux: the native library is ELF (W5, not built), so an image with initializers is refused
-/// by name rather than called with arguments this driver has not checked.
-#[cfg(not(target_os = "macos"))]
-pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
-    match loaded.inits {
-        0 => Ok(()),
-        _ => Err(RunModeError::NotBuilt { what: "a native library's initializers on Linux (NATIVE.md W5)" }),
-    }
 }

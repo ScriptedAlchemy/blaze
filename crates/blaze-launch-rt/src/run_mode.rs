@@ -413,6 +413,8 @@ pub enum RunModeError {
     NoNativeLibrary { symbol: CodeSymbol },
     /// The program's native library could not be loaded (native_lib.rs).
     Native(NativeError),
+    /// The process's C arguments could not be copied for initializers, main and atexit.
+    Arguments(crate::native_lib::ArgsError),
     /// The parent sent a second `ThreadLocals`: a run has one descriptor and one key.
     ThreadLocalsTwice,
     /// Record `record` names thread-local `symbol` before the parent's `ThreadLocals`.
@@ -535,6 +537,7 @@ impl fmt::Display for RunModeError {
                 "the C name of symbol {symbol} is asked before the program's native library was loaded (NATIVE.md 3.7: the parent's `Native` comes first)"
             ),
             RunModeError::Native(why) => write!(f, "{why}"),
+            RunModeError::Arguments(why) => write!(f, "{why}"),
             RunModeError::ThreadLocalsTwice => write!(
                 f,
                 "the parent named the thread-local descriptor a second time: a run has one descriptor and one key (run wire, `ThreadLocals`)"
@@ -1500,6 +1503,34 @@ pub enum Handed {
     Comptime(ComptimeArgs),
 }
 
+/// What the entry actually receives. Ordinary starts capture one process-lived argument
+/// list before the run's threads start; a compile-time start keeps only its host's arguments.
+enum PreparedEntry {
+    Unit(crate::native_lib::ProcessArgs),
+    CMain(crate::native_lib::ProcessArgs),
+    Hosted { table: HostTableAt, args: crate::native_lib::ProcessArgs },
+    Comptime(ComptimeArgs),
+}
+
+impl PreparedEntry {
+    fn capture(handed: Handed, alloc: Alloc<'static>) -> Result<PreparedEntry, RunModeError> {
+        let args = || crate::native_lib::ProcessArgs::capture(alloc).map_err(RunModeError::Arguments);
+        Ok(match handed {
+            Handed::Unit => Self::Unit(args()?),
+            Handed::CMain => Self::CMain(args()?),
+            Handed::Hosted(table) => Self::Hosted { table, args: args()? },
+            Handed::Comptime(args) => Self::Comptime(args),
+        })
+    }
+
+    fn initialize(&self, loaded: crate::native_lib::Loaded) -> Result<(), RunModeError> {
+        match self {
+            Self::Unit(args) | Self::CMain(args) | Self::Hosted { args, .. } => crate::native_lib::run_inits(loaded, args),
+            Self::Comptime(_) => Err(RunModeError::NotBuilt { what: "a compile-time program with a native library: its host provides every outside name" }),
+        }
+    }
+}
+
 /// Why `BLAZE_LAUNCH_ENTRY`'s text names no entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EntryRefused {
@@ -2236,6 +2267,10 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
     if cfg!(not(target_arch = "aarch64")) {
         return Err(RunModeError::NotBuilt { what: "run mode on x86-64: code records are AArch64 (blaze-code a64)" });
     }
+    if native.is_some() && matches!(handed, Handed::Comptime(_)) {
+        return Err(RunModeError::NotBuilt { what: "a compile-time program with a native library: its host provides every outside name" });
+    }
+    let entry_call = PreparedEntry::capture(handed, alloc.local())?;
     let raw = fd.as_raw_fd();
     let ready: crate::sys::Handoff<Ready> = crate::sys::Handoff::new();
     std::thread::scope(|scope| {
@@ -2255,12 +2290,10 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
         // The native library's initializers, on this first thread, after the entry is numbered
         // and before it is called (native_lib.rs step 5): an executable's order. They may call
         // Rust words: each is a slot's thunk, served by the control thread, already in its loop.
-        if let Some(loaded) = loaded {
-            crate::native_lib::run_inits(loaded)?;
-        }
-        let status = call_entry(thunk, handed);
-        match end {
-            End::Exit => {
+        let result = loaded.map_or(Ok(()), |loaded| entry_call.initialize(loaded))
+            .map(|()| call_entry(thunk, &entry_call));
+        match (end, result) {
+            (End::Exit, Ok(status)) => {
                 // The main thread stays a mutator to the end: `exit` runs the program's
                 // `atexit` functions, which are its code.
                 core::mem::forget(me);
@@ -2268,35 +2301,44 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
                 // every mapping end with it.
                 unsafe { libc::exit(status) }
             }
-            End::Return => {
+            (_, result) => {
                 // The control thread's loop ends at `Stop` (no code is placed after it: the
                 // program's one thread has returned). The wait "run mode: the control thread
                 // stops" is the join; it is bounded by the loop's next event, at most the
                 // reader's tick away. The mappings stay: the process's owner ends it.
+                // An initializer refusal takes this same cleanup path: the control loop is
+                // already serving, so returning through `?` would leave scope waiting forever.
                 // The thread's end is told first, so the loop sees it before `Stop`.
                 drop(me);
-                shared.stop();
-                if control.join().is_err() {
-                    return Err(RunModeError::Thread { what: "control (it panicked while stopping)" });
-                }
-                Ok(status)
+                finish_control(&shared, control, result)
             }
         }
     })
 }
 
-/// Calls the entry's thunk on this thread with what `handed` holds: the `i32` the process
+/// Wakes and joins the run's control loop, both after an entry returns and when a native
+/// initializer is refused. Its normal wait is on this same Shared, so Stop releases it.
+fn finish_control(
+    shared: &crate::table::Shared,
+    control: std::thread::ScopedJoinHandle<'_, ()>,
+    result: Result<i32, RunModeError>,
+) -> Result<i32, RunModeError> {
+    shared.stop();
+    control.join().map_err(|_| RunModeError::Thread { what: "control (it panicked while stopping)" })?;
+    result
+}
+
+/// Calls the entry's thunk on this thread with what `prepared` holds: the `i32` the process
 /// exits with. Every form's status is the same rule (the in-process runner's, blaze-ladder
 /// place.rs `Placed::call`): `fn()` gives 0, and an `i32`-returning entry's value is handed to
 /// `exit` whole, whose status the parent sees as its low 8 bits. A hosted program that calls its
 /// table's `exit` never returns here: the host's `exit` (bstd hosting.rs) writes what its
 /// streams hold and ends the process with that status, the same low 8 bits.
-fn call_entry(thunk: u64, handed: Handed) -> i32 {
+fn call_entry(thunk: u64, prepared: &PreparedEntry) -> i32 {
     use core::ffi::{c_char, c_int, c_void};
-    use std::os::unix::ffi::OsStringExt;
 
-    match handed {
-        Handed::Hosted(table) => {
+    match prepared {
+        PreparedEntry::Hosted { table, .. } => {
             // SAFETY: `thunk` is the entry slot's thunk, in a mapping never unmapped (or, in a
             // test, a function of this form); the function there is bstd's hosted entry,
             // `extern "C" fn(*const HostTable) -> i32` (the form the parent named, `hosted:`),
@@ -2305,7 +2347,7 @@ fn call_entry(thunk: u64, handed: Handed) -> i32 {
             let entry: extern "C" fn(*const c_void) -> c_int = unsafe { core::mem::transmute(thunk as usize) };
             entry(table.0.as_ptr().cast_const())
         }
-        Handed::Unit => {
+        PreparedEntry::Unit(_) => {
             // SAFETY: `thunk` is the entry slot's thunk, in a mapping never unmapped; the
             // function there is `extern "C" fn()` (the form the parent named), compiled when
             // this first call fires its stub.
@@ -2313,24 +2355,13 @@ fn call_entry(thunk: u64, handed: Handed) -> i32 {
             entry();
             0
         }
-        Handed::CMain => {
-            // The program's `argv`, leaked for its life (it is the process's).
-            let mut args: std::vec::Vec<*const c_char> = std::vec::Vec::new_in(blaze_launch::KEPT);
-            for arg in std::env::args_os() {
-                match std::ffi::CString::new(arg.into_vec()) {
-                    Ok(it) => args.push(it.into_raw().cast_const()),
-                    Err(_) => stop_with(format_args!("blaze: an argument of this process has a NUL in it")),
-                }
-            }
-            args.push(core::ptr::null());
-            let argc = (args.len() - 1) as c_int;
-            let argv = args.leak().as_ptr();
+        PreparedEntry::CMain(args) => {
             // SAFETY: as above, for `extern "C" fn(c_int, *const *const c_char) -> c_int`.
             let entry: extern "C" fn(c_int, *const *const c_char) -> c_int =
                 unsafe { core::mem::transmute(thunk as usize) };
-            entry(argc, argv)
+            entry(args.argc(), args.argv())
         }
-        Handed::Comptime(args) => {
+        PreparedEntry::Comptime(args) => {
             // SAFETY: as for `CMain` (the form the parent named, `comptime:`); `args` holds the
             // host's arguments, live for the process (`ComptimeArgs::new`'s contract).
             let entry: extern "C" fn(c_int, *const *const c_char) -> c_int =
@@ -2424,11 +2455,6 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
     let mut owed: Option<(RecordId, Nanos)> = None;
     match native {
         None => ready.put(Ok((memory.thunk(entry), std::sync::Arc::clone(&shared), None))),
-        // Linux: the load is not built (NATIVE.md W5: the ELF image's initializers and its
-        // loader's checks); refused by name, never skipped.
-        Some(_) if cfg!(not(target_os = "macos")) => {
-            return ready.put(Err(RunModeError::NotBuilt { what: "a program's native library on Linux (NATIVE.md W5)" }));
-        }
         Some(record) => owed = Some((record, now())),
     }
     // Threads waiting in a stub: the slot, the thread, and the stub waiters' row its answer

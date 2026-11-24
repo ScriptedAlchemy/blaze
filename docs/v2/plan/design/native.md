@@ -1,7 +1,7 @@
 ---
 status: plan
 summary: Native code in a blaze program (C, C++ and assembly from -sys crates); an inventory of tempo's lock, native objects as records made behind an abstract ToolRun effect, and blaze's own in-process loader that places one native image from a pure load plan (crates/blaze-native-load), binding TLS, unwind, initializers and system libraries.
-date: 2026-11-18
+date: 2026-11-23
 ---
 # Native code: records, one image, our own loader
 
@@ -17,7 +17,39 @@ task". What exists in the tree today:
 | Unwind rows, the BNL2 descriptor, install names | `crates/blaze-native/src/{unwind,descriptor,libraries}.rs` |
 | The image written as a dylib or .so | `crates/blaze-export/src/native_{dylib,so,merge}.rs` |
 | `dlopen` of that file in the launcher | `crates/blaze-launch-rt/src/native_lib.rs` |
-| **The load plan and its binding (this doc's new piece)** | `crates/blaze-native-load/` |
+
+The proposed `blaze-native-load` crate was removed when no live crate reached it
+([parked.md](../parked.md)). The `LoadPlan`, `plan` and `bind` interfaces below describe a
+future loader, not code the launcher currently uses. Completing the existing shared-object
+path does not depend on rebuilding that proposal.
+
+## The current launcher's shared-object contract
+
+The source smoke on tree `e525abcbfcaa6f0754db8374893f457a501feae6` built its Linux ARM64
+CLI and verified the source shelf, then its first hello run exited 125: run mode refused the
+program's native image before reading `Down::Native`. The ELF writer and Linux `DlNatives`
+driver already existed; the start guard and constructor invocation were unfinished.
+
+Completing this path has one contract on macOS and Linux:
+
+- Read the parent's native record under the existing deadline, require its exact identity,
+  and make every Rust slot's thunk before filling native words and pointer cells.
+- Keep the program's constructors out of the system loader's automatic initializer list.
+  Run them in link order on the program's first thread, after binding and before entry.
+- Capture the process arguments once, with explicit ownership. Constructors and C `main`
+  share the same argument storage, including constructor changes to its strings and pointers.
+  The copied environment initially backs libc's `environ`, so initializer edits are visible
+  to `getenv`; the original argument storage stays valid through `atexit`, even if a later
+  environment update replaces libc's pointer array. Compile-time entries retain their
+  separate host-supplied arguments.
+- A null initializer or another startup refusal stops and joins the control thread; a
+  failed start must not turn into an unbounded scoped-thread join.
+- A Linux TLS template containing a Rust-function pointer needs binding before the system
+  loader copies it into existing threads. Until that binding exists, refuse that image
+  shape by name before running it. Ordinary native TLS values remain supported.
+- Verify the real writer-to-loader path on Linux ARM64, including declared system imports,
+  pointer identity, deferred constructors, argument identity, and named refusals. The real
+  source CLI smoke stays required; a format reader or fake loader is not its receipt.
 
 ## Inventory: tempo's Cargo.lock
 

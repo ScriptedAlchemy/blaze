@@ -3,12 +3,20 @@
 //! unknown form by name; and a hosted entry is called with the host's table, its `i32` the
 //! status the process exits with.
 
-use core::ffi::{c_int, c_void};
+use core::ffi::{CStr, c_char, c_int, c_void};
 use core::ptr::NonNull;
 
 use blaze_code::record::Symbol as CodeSymbol;
 
-use super::{EntryForm, Handed, HostTableAt, Start, call_entry};
+use super::{EntryForm, HostTableAt, PreparedEntry, RunModeError, Start, call_entry, finish_control};
+use crate::native_lib::{ArgumentList, ArgsError, Loaded, NativeError, ProcessArgs, ProcessArgsOpts};
+
+mod process_args;
+
+fn args(words: &[&[u8]], env: &[&[u8]]) -> ProcessArgs {
+    ProcessArgs::new(ProcessArgsOpts { args: words, env, alloc: blaze_own::testing::heap().alloc() })
+        .expect("the fixture's C arguments")
+}
 
 const HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899AABBCCDDEEFF";
 
@@ -68,11 +76,11 @@ fn a_comptime_entry_is_called_with_the_hosts_arguments() {
     let words: [*const core::ffi::c_char; 3] = [c"macro".as_ptr(), c"--derive".as_ptr(), core::ptr::null()];
     // SAFETY: two C-string literals (static) and a null, alive across the call.
     let two = unsafe { ComptimeArgs::new(2, words.as_ptr()) };
-    assert_eq!(call_entry(count as usize as u64, Handed::Comptime(two)), 2);
+    assert_eq!(call_entry(count as usize as u64, &PreparedEntry::Comptime(two)), 2);
     let empty: [*const core::ffi::c_char; 1] = [core::ptr::null()];
     // SAFETY: as above.
     let none = unsafe { ComptimeArgs::new(0, empty.as_ptr()) };
-    assert_eq!(call_entry(count as usize as u64, Handed::Comptime(none)), 0);
+    assert_eq!(call_entry(count as usize as u64, &PreparedEntry::Comptime(none)), 0);
 }
 
 /// A stand-in for bstd's host table: only its address is compared, never read.
@@ -91,9 +99,160 @@ fn a_hosted_entry_returning_seven_ends_with_seven() {
     // SAFETY: the stand-in is never read (`hosted_seven` compares its address only), and the
     // static outlives the call.
     let table = unsafe { HostTableAt::new(NonNull::from(&TABLE).cast::<c_void>()) };
-    assert_eq!(call_entry(hosted_seven as usize as u64, Handed::Hosted(table)), 7);
+    assert_eq!(call_entry(hosted_seven as usize as u64, &PreparedEntry::Hosted { table, args: args(&[], &[]) }), 7);
     static OTHER: [u64; 4] = [0; 4];
     // SAFETY: as above.
     let other = unsafe { HostTableAt::new(NonNull::from(&OTHER).cast::<c_void>()) };
-    assert_eq!(call_entry(hosted_seven as usize as u64, Handed::Hosted(other)), 1);
+    assert_eq!(call_entry(hosted_seven as usize as u64, &PreparedEntry::Hosted { table: other, args: args(&[], &[]) }), 1);
+}
+
+/// The constructor mutates both a string and the argv array, and puts that array's address
+/// into its second string. Main checks that exact identity as well as both edits.
+extern "C" fn edit_arguments(argc: c_int, argv: *const *const c_char, envp: *const *const c_char) {
+    if argc != 3 { return; }
+    // SAFETY: this fixture's three writable strings and null, with 16 bytes in the second
+    // string; one writable environment string and null. No Rust reference crosses this call.
+    unsafe {
+        let second = argv.add(1).read().cast_mut();
+        second.cast::<usize>().write_unaligned(argv as usize);
+        second.add(size_of::<usize>()).write(b'X' as c_char);
+        core::ptr::swap(argv.cast_mut(), argv.add(2).cast_mut());
+        envp.read().cast_mut().add(6).write(b'Z' as c_char);
+    }
+}
+
+extern "C" fn reads_edited_arguments(argc: c_int, argv: *const *const c_char) -> c_int {
+    if argc != 3 { return 1; }
+    // SAFETY: the same three fixture strings and null as edit_arguments; the second remains
+    // at least size_of::<usize>() + 1 bytes even after the first word becomes pointer bytes.
+    unsafe {
+        let second = argv.add(1).read();
+        if second.cast::<usize>().read_unaligned() != argv as usize { return 2; }
+        if second.add(size_of::<usize>()).read() != b'X' as c_char { return 3; }
+        if CStr::from_ptr(argv.read()).to_bytes() != b"tail" { return 4; }
+        if CStr::from_ptr(argv.add(2).read()).to_bytes() != b"program" { return 5; }
+        if !argv.add(3).read().is_null() { return 6; }
+    }
+    37
+}
+
+/// C constructors and C main share writable argv strings AND cells. Removing initialization
+/// leaves main's identity check false; running it changes the result to 37. An envp edit is
+/// retained as well, and all escaped pointers remain valid after PreparedEntry is gone.
+#[test]
+fn constructors_and_main_share_process_lived_arguments() {
+    let (argv, envp) = {
+        let args = args(&[b"program", b"abcdefghijklmnop", b"tail"], &[b"PROBE=value"]);
+        let (argv, envp) = (args.argv(), args.envp());
+        let prepared = PreparedEntry::CMain(args);
+        assert_eq!(call_entry(reads_edited_arguments as usize as u64, &prepared), 2, "no constructor, no identity word");
+        let inits = [edit_arguments as usize as u64];
+        prepared.initialize(Loaded {
+            record: blaze_launch::wire::RecordId([0x71; 32]), base: 0,
+            inits_at: inits.as_ptr() as u64, inits: 1,
+        }).expect("the constructor runs");
+        assert_eq!(call_entry(reads_edited_arguments as usize as u64, &prepared), 37);
+        (argv, envp)
+    };
+    assert_eq!(reads_edited_arguments(3, argv), 37, "escaped argv outlives the entry's metadata");
+    // SAFETY: ProcessArgs owns these writable strings until process exit, also after main.
+    unsafe {
+        assert_eq!(CStr::from_ptr(envp.read()).to_bytes(), b"PROBE=Zalue");
+        assert!(envp.add(1).read().is_null());
+    }
+}
+
+/// The C copies borrow neither the caller's strings nor its pointer lists. Both source lists
+/// can change and leave scope; an interior NUL is instead a typed refusal naming its list/row.
+#[test]
+fn process_arguments_copy_inputs_and_refuse_interior_nuls() {
+    let args = {
+        let mut word = *b"program";
+        let mut env = *b"KEY=value";
+        let copied = args(&[&word], &[&env, b"bare-entry", &[0xff]]);
+        word.fill(b'x');
+        env.fill(b'x');
+        copied
+    };
+    // SAFETY: the complete copied lists are process-lived and terminated by null cells.
+    unsafe {
+        assert_eq!(CStr::from_ptr(args.argv().read()).to_bytes(), b"program");
+        assert!(args.argv().add(1).read().is_null());
+        assert_eq!(CStr::from_ptr(args.envp().read()).to_bytes(), b"KEY=value");
+        assert_eq!(CStr::from_ptr(args.envp().add(1).read()).to_bytes(), b"bare-entry");
+        assert_eq!(CStr::from_ptr(args.envp().add(2).read()).to_bytes(), &[0xff]);
+        assert!(args.envp().add(3).read().is_null());
+    }
+    let alloc = blaze_own::testing::heap().alloc();
+    assert_eq!(ProcessArgs::new(ProcessArgsOpts { args: &[b"a\0b"], env: &[], alloc }).err(),
+        Some(ArgsError::Nul { list: ArgumentList::Arguments, index: 0 }));
+    assert_eq!(ProcessArgs::new(ProcessArgsOpts { args: &[], env: &[b"ok", b"a\0b"], alloc }).err(),
+        Some(ArgsError::Nul { list: ArgumentList::Environment, index: 1 }));
+}
+
+#[derive(Clone, Copy)]
+enum Cleanup { Run, OmitStop }
+
+/// Runs the real refused-initializer cleanup against Shared's waiting control loop. The
+/// watchdog only rescues the planted missing Stop (or a regression), so neither can hang CI.
+fn refused_initializer_cleanup(cleanup: Cleanup) -> bool {
+    use core::num::NonZeroU32;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::time::Duration;
+    use blaze_core::wait::{Clock, Deadline, Monotonic, Waited};
+
+    let waiters = crate::stub_wait::Waiters::reserve(NonZeroU32::new(1).expect("one waiter")).expect("the waiter mapping");
+    let shared = crate::table::Shared::new(0, 0, 0, 0, 0..0, waiters);
+    let completed = AtomicU64::new(0);
+    let prepared = PreparedEntry::CMain(args(&[], &[]));
+    let inits = [0u64];
+    let record = blaze_launch::wire::RecordId([0x72; 32]);
+    std::thread::scope(|scope| {
+        let control = scope.spawn(|| {
+            assert!(matches!(shared.wait(), crate::table::Event::Stop), "cleanup stops the real control wait");
+        });
+        let watchdog = scope.spawn(|| {
+            let clock = Monotonic::new();
+            let deadline = Deadline::after(clock.now(), Duration::from_secs(2));
+            while completed.load(Ordering::Acquire) == 0 {
+                let waited = blaze_core::wait::wait_shared(
+                    "native initializer refusal: control cleanup finishes", &completed, 0, deadline, &clock,
+                );
+                match waited {
+                    Ok(Waited::Ready(())) => {}
+                    Ok(Waited::Deadline) => {
+                        shared.stop();
+                        return true;
+                    }
+                    Err(why) => {
+                        shared.stop();
+                        panic!("the cleanup watchdog's wait failed: {why}");
+                    }
+                }
+            }
+            false
+        });
+        let refused = prepared.initialize(Loaded { record, base: 0, inits_at: inits.as_ptr() as u64, inits: 1 }).map(|()| 0);
+        let result = match cleanup {
+            Cleanup::Run => finish_control(&shared, control, refused),
+            Cleanup::OmitStop => {
+                control.join().expect("the watchdog rescues the planted missing Stop");
+                refused
+            }
+        };
+        completed.store(1, Ordering::Release);
+        blaze_core::wait::wake_shared(&completed);
+        assert_eq!(result, Err(RunModeError::Native(NativeError::NullInit { record, index: 0 })));
+        watchdog.join().expect("the cleanup watchdog ends")
+    })
+}
+
+#[test]
+fn a_refused_initializer_stops_and_joins_control() {
+    assert!(!refused_initializer_cleanup(Cleanup::Run), "normal cleanup must not need the watchdog");
+}
+
+#[test]
+fn the_cleanup_oracle_catches_an_omitted_stop() {
+    assert!(refused_initializer_cleanup(Cleanup::OmitStop), "removing Stop must be observed as a stuck control loop");
 }
