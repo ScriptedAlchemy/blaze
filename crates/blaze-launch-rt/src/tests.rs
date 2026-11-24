@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write as _};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -124,6 +124,7 @@ impl Records for Table {
 
 /// A driver of a few slots and 64 pages of area.
 fn driver(slots: u32) -> Driver {
+    crate::driver_tests::init();
     let page = sys::page().expect("a page size") as u64;
     Driver::new(Config { slots, area: 64 * page }).expect("a driver")
 }
@@ -531,6 +532,7 @@ fn a_stub_asks_the_daemon_and_its_caller_resumes_in_the_code_it_sent() {
 /// static holds its value where this process has them.
 #[test]
 fn a_launcher_starts_from_an_image_of_placed_code() {
+    crate::driver_tests::init();
     use blaze_launch::image::{Bases, Input, lay};
     use blaze_launch::record::{Record, What};
 
@@ -630,6 +632,7 @@ fn a_launcher_starts_from_an_image_of_placed_code() {
 /// that waits to run the program is told why: nothing of it is used.
 #[test]
 fn an_image_of_another_geometry_is_refused() {
+    crate::driver_tests::init();
     use blaze_launch::image::{Bases, Input, lay};
 
     let (ours, mut daemon) = UnixStream::pair().expect("a socket pair");

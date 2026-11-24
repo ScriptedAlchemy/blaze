@@ -1,7 +1,6 @@
 //! The launcher's fault handler, installed and chained (signals.rs). A fault ends or redirects
-//! a process, so each case runs in a child: the parent re-runs this test binary with
-//! `BLAZE_SIGNALS_CASE` naming the case and the filter naming [`child`], and reads the child's
-//! exit and its stderr under a deadline.
+//! a process, so each case runs in the shared test driver's child process, whose exit and
+//! stderr the parent reads under a deadline.
 //!
 //! The rule the cases rest on, LIB std/src/sys/pal/unix/stack_overflow/handler_signal.rs
 //! `init` (lines 117-145): "if action.sa_sigaction == SIG_DFL { .. sigaction(signal, &action,
@@ -14,23 +13,14 @@
 
 use core::ffi::{c_int, c_void};
 use core::ptr;
-use std::io::Read;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
 
 use blaze_launch::Slot;
 use blaze_sys::posix::{io, signal as os, types::sighandler_t};
 
 use super::{Path, ProgramAction, install, own, sigaction};
+use crate::driver_tests::{Case, ChildOutput, SignalCase};
 use crate::retired::{Retired, Table};
-
-/// The environment variable naming the case a child runs.
-const CASE: &str = "BLAZE_SIGNALS_CASE";
-/// The full name of [`child`], as the test binary's filter takes it.
-const CHILD: &str = "signals::tests::child";
-/// How long a child may take (rule 18): each case is one fault.
-const DEADLINE: Duration = Duration::from_secs(60);
 
 /// The program's handler of cases `handler` and `retired`: ends the process with 42.
 extern "C" fn exit_42(_sig: c_int, _info: *mut os::siginfo_t, _ctx: *mut c_void) {
@@ -87,22 +77,18 @@ fn program_handler() {
     }
 }
 
-/// The case a child runs; in the parent's own run (no `BLAZE_SIGNALS_CASE`) it does nothing.
-#[test]
-fn child() {
-    let Some(case) = std::env::var_os(CASE) else {
-        return;
-    };
+/// The shared driver dispatches a typed signal case in an isolated process.
+pub(crate) fn child_case(case: SignalCase) -> i32 {
     static TABLE: Table<4> = Table::new();
-    match case.to_str() {
-        Some("handler") => {
+    match case {
+        SignalCase::Handler => {
             // SAFETY: the child's first install; no other thread installs an action.
             unsafe { install(&TABLE, area()) }.expect("install");
             program_handler();
             read(no_access_page());
             panic!("the read of a PROT_NONE page returned");
         }
-        Some("retired") => {
+        SignalCase::Retired => {
             let at = no_access_page();
             let mut appender = TABLE.appender().expect("the table's appender");
             appender.append(Retired { start: at, len: page(), function: Slot(7), version: 3 }).expect("append");
@@ -112,41 +98,13 @@ fn child() {
             read(at);
             panic!("the read of a retired page returned");
         }
-        Some("default") => {
+        SignalCase::Default => {
             // SAFETY: as above.
             unsafe { install(&TABLE, area()) }.expect("install");
             read(unmapped_page());
             panic!("the read of an unmapped page returned");
         }
-        _ => panic!("{CASE} names no case: {case:?}"),
     }
-}
-
-/// Runs `case` in a child; its exit and its stderr.
-fn run(case: &str) -> (ExitStatus, String) {
-    let exe = std::env::current_exe().expect("this test binary's path");
-    let mut child = Command::new(exe)
-        .args([CHILD, "--exact", "--nocapture", "--test-threads=1"])
-        .env(CASE, case)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the child starts");
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("the child's status") {
-            break status;
-        }
-        if started.elapsed() > DEADLINE {
-            let _ = child.kill();
-            panic!("case {case}: the child did not end within {DEADLINE:?} (rule 18)");
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    let mut err = String::new();
-    child.stderr.take().expect("the child's stderr").read_to_string(&mut err).expect("the child's stderr reads");
-    (status, err)
 }
 
 /// The program's SIGSEGV handler runs behind the launcher's: after `install`, the launcher's
@@ -155,7 +113,7 @@ fn run(case: &str) -> (ExitStatus, String) {
 /// Prints `test signals::tests::the_programs_handler_runs_behind_the_launchers ... ok`.
 #[test]
 fn the_programs_handler_runs_behind_the_launchers() {
-    let (status, err) = run("handler");
+    let ChildOutput { status, stderr: err } = crate::driver_tests::run(Case::Signal(SignalCase::Handler));
     assert_eq!(status.code(), Some(42), "the child ended {status:?}; its stderr:\n{err}");
 }
 
@@ -164,7 +122,7 @@ fn the_programs_handler_runs_behind_the_launchers() {
 /// Prints `test signals::tests::a_retired_address_reports_and_skips_the_program ... ok`.
 #[test]
 fn a_retired_address_reports_and_skips_the_program() {
-    let (status, err) = run("retired");
+    let ChildOutput { status, stderr: err } = crate::driver_tests::run(Case::Signal(SignalCase::Retired));
     assert!(
         err.starts_with("stopped: a call reached retired code of function 7 version 3 at 0x"),
         "the child's stderr does not start with the retired-code report ({status:?}):\n{err}"
@@ -177,7 +135,7 @@ fn a_retired_address_reports_and_skips_the_program() {
 /// Prints `test signals::tests::with_no_program_handler_a_fault_ends_by_sigsegv ... ok`.
 #[test]
 fn with_no_program_handler_a_fault_ends_by_sigsegv() {
-    let (status, err) = run("default");
+    let ChildOutput { status, stderr: err } = crate::driver_tests::run(Case::Signal(SignalCase::Default));
     assert_eq!(status.signal(), Some(os::SIGSEGV), "the child ended {status:?}; its stderr:\n{err}");
 }
 

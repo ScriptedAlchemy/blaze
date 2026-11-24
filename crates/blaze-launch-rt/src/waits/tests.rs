@@ -4,8 +4,8 @@
 //! bug's control, which shows the check is what the first result rests on).
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 

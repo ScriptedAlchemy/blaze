@@ -11,7 +11,7 @@ use blaze_code::record::Symbol as CodeSymbol;
 use super::{EntryForm, HostTableAt, PreparedEntry, RunModeError, Start, call_entry, finish_control};
 use crate::native_lib::{ArgumentList, ArgsError, Loaded, NativeError, ProcessArgs, ProcessArgsOpts};
 
-mod process_args;
+pub(crate) mod process_args_tests;
 
 fn args(words: &[&[u8]], env: &[&[u8]]) -> ProcessArgs {
     ProcessArgs::new(ProcessArgsOpts { args: words, env, alloc: blaze_own::testing::heap().alloc() })
@@ -207,7 +207,7 @@ fn refused_initializer_cleanup(cleanup: Cleanup) -> bool {
     let prepared = PreparedEntry::CMain(args(&[], &[]));
     let inits = [0u64];
     let record = blaze_launch::wire::RecordId([0x72; 32]);
-    std::thread::scope(|scope| {
+    crate::driver_tests::scope(|scope| {
         let control = scope.spawn(|| {
             assert!(matches!(shared.wait(), crate::table::Event::Stop), "cleanup stops the real control wait");
         });

@@ -2,15 +2,13 @@
 //! allocation count of the stub's path (THREADS.md D6). The claim, ring and answer under the
 //! interleaving checker are stub_wait_model.rs.
 //!
-//! Run: `cargo test -p blaze-launch-rt --lib stub_wait` (by name: on Linux this binary's waits
-//! are given to blaze-core's direct driver by the first of these tests, which `choose` refuses
-//! once another test of the same process has waited on the ring).
+//! The shared test driver chooses Linux's direct waits before any kernel-waiting test starts,
+//! so these controls also run beside the rest of the library's tests.
 
 use core::cell::Cell;
 use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
-use std::sync::Once;
 
 use blaze_core::wait::{Clock, Deadline, Monotonic};
 
@@ -20,21 +18,12 @@ use super::{Answer, Overran, Waiters, Waiting};
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
-/// The launcher's start chooses blaze-core's direct driver (a program thread has no wait
-/// ring); this binary does the same, once, before its first wait.
-fn direct() {
-    static CHOSEN: Once = Once::new();
-    CHOSEN.call_once(|| {
-        #[cfg(target_os = "linux")]
-        blaze_core::wait::choose(blaze_core::wait::Waits::Direct);
-    });
-}
-
 /// The longest any wait of these tests is given: far past what each needs, so only a hang
 /// reaches it (rule 18).
 const LONG: Duration = Duration::from_secs(20);
 
 fn rows(most: u32) -> Waiters {
+    crate::driver_tests::init();
     Waiters::reserve(NonZeroU32::new(most).expect("a nonzero row count")).expect("the waiters' mapping")
 }
 
@@ -67,9 +56,8 @@ fn pop_all<const N: usize>(waiters: &Waiters) -> [Waiting; N] {
 #[test]
 fn eight_waiters_on_one_slot_eight_answers_none_lost() {
     const SLOT: u32 = 41;
-    direct();
     let waiters = rows(8);
-    let answers: [Result<Answer, Overran>; 8] = std::thread::scope(|scope| {
+    let answers: [Result<Answer, Overran>; 8] = crate::driver_tests::scope(|scope| {
         let handles: [_; 8] = core::array::from_fn(|index| {
             let waiters = &waiters;
             scope.spawn(move || {
@@ -123,7 +111,6 @@ impl Clock for Steps {
 #[test]
 fn an_unanswered_stub_overruns_its_deadline() {
     const SLOT: u32 = 3;
-    direct();
     let waiters = rows(2);
     let clock = Steps(Cell::new(0));
     let row = waiters.claim(SLOT, 0).expect("a free row");
@@ -143,11 +130,10 @@ fn an_unanswered_stub_overruns_its_deadline() {
 #[test]
 fn the_stub_path_allocates_nothing() {
     const SLOT: u32 = 9;
-    direct();
     assert!(blaze_alloc_count::installed(), "the counting allocator is not this binary's: the count would be vacuous");
     let waiters = rows(4);
     let claimed = AtomicBool::new(false);
-    let (answer, used) = std::thread::scope(|scope| {
+    let (answer, used) = crate::driver_tests::scope(|scope| {
         let waiter = scope.spawn(|| {
             blaze_alloc_count::measure(|| {
                 let clock = Monotonic::new();

@@ -3,15 +3,9 @@
 
 use core::ffi::{CStr, c_char, c_int};
 use core::sync::atomic::{AtomicPtr, Ordering};
-use core::time::Duration;
-use std::process::{Child, Command, Stdio};
-
-use blaze_core::wait::{Clock, Deadline, Monotonic};
-
 use super::{Loaded, ProcessArgs};
+use crate::driver_tests::{ArgumentCase, Case};
 
-const CASE: &str = "BLAZE_ARGS_CHILD";
-const CHILD: &str = "run_mode::entry_tests::process_args::child";
 const PREFIX: &[u8] = b"BLAZE_ARGS_PROBE=";
 static ESCAPED_ARGV: AtomicPtr<*const c_char> = AtomicPtr::new(core::ptr::null_mut());
 static ESCAPED_ENV: AtomicPtr<c_char> = AtomicPtr::new(core::ptr::null_mut());
@@ -69,12 +63,9 @@ extern "C" fn escaped_at_exit() {
     unsafe { libc::_exit(if intact { 42 } else { 86 }) }
 }
 
-/// The dispatcher does nothing in the ordinary parent run; the enclosing test launches it
-/// by its exact name with a named case and checks a status only that case can produce.
-#[test]
-fn child() {
-    let Some(case) = std::env::var_os(CASE) else { return; };
-    assert!(case == "installed" || case == "old-environ", "unknown argument case: {case:?}");
+/// The shared process dispatcher invokes this body in an isolated child with exactly the
+/// case selector and PROBE environment entries. Its status is checked by the parent.
+pub(crate) fn child_case(case: ArgumentCase) -> i32 {
     // SAFETY: this isolated child has one test; it alone changes its environment. Force libc
     // to own an array before capture, then remove a launcher-like variable, as run setup does.
     unsafe {
@@ -84,7 +75,7 @@ fn child() {
     let original = environment();
     {
         let args = ProcessArgs::capture(blaze_own::testing::heap().alloc()).expect("the process argument capture");
-        if case == "old-environ" { restore_environment(original); }
+        if case == ArgumentCase::OldEnvironment { restore_environment(original); }
         let inits = [edit_environment as usize as u64];
         crate::native_lib::run_inits(Loaded {
             record: blaze_launch::wire::RecordId([0x73; 32]), base: 0,
@@ -95,9 +86,9 @@ fn child() {
         assert!(!value.is_null());
         // SAFETY: getenv returned the live value of the child's key; no concurrent mutation.
         let text = unsafe { CStr::from_ptr(value) }.to_bytes();
-        if case == "old-environ" {
+        if case == ArgumentCase::OldEnvironment {
             assert_eq!(text, b"before", "without installation, envp edits fail to reach getenv");
-            std::process::exit(43);
+            return 43;
         }
         assert_eq!(text, b"Before", "the constructor's envp edit reaches getenv");
         assert_eq!(environment().cast_const().cast::<*const c_char>(), args.envp());
@@ -127,55 +118,13 @@ fn child() {
         }
     }
     // ProcessArgs metadata has ended before the callback reads its escaped pointers.
-    std::process::exit(0);
-}
-
-/// Even a failed control owns its child until reap. SIGKILL is followed by named polls to a
-/// separate finite deadline; the caller reports this failure beside its original diagnostic.
-fn kill_and_reap(child: &mut Child, clock: &Monotonic) -> std::io::Result<()> {
-    child.kill()?;
-    let deadline = Deadline::after(clock.now(), Duration::from_secs(5));
-    loop {
-        if child.try_wait()?.is_some() { return Ok(()); }
-        let now = clock.now();
-        if deadline.passed(now) {
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut,
-                "the argument/environment child was not reaped within five seconds after SIGKILL"));
-        }
-        let next = Deadline::at((now + Duration::from_millis(5)).min(deadline.get()));
-        blaze_core::wait::sleep_until("reaping the killed argument/environment child", next, clock)
-            .map_err(std::io::Error::other)?;
-    }
-}
-
-fn run(case: &str) -> i32 {
-    let exe = std::env::current_exe().expect("the test binary's path");
-    let mut child = Command::new(exe)
-        .args([CHILD, "--exact", "--nocapture", "--test-threads=1"])
-        .env_clear().env(CASE, case).env("BLAZE_ARGS_PROBE", "before")
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit())
-        .spawn().expect("the argument/environment child starts");
-    let clock = Monotonic::new();
-    let deadline = Deadline::after(clock.now(), Duration::from_secs(30));
-    loop {
-        if let Some(status) = child.try_wait().expect("the child's status") {
-            return status.code().expect("the child exited without a signal");
-        }
-        let now = clock.now();
-        if deadline.passed(now) {
-            let cleanup = kill_and_reap(&mut child, &clock);
-            panic!("argument/environment case {case} did not exit within 30 seconds; kill/reap: {cleanup:?}");
-        }
-        let next = Deadline::at((now + Duration::from_millis(5)).min(deadline.get()));
-        if let Err(why) = blaze_core::wait::sleep_until("the argument/environment child's exit", next, &clock) {
-            let cleanup = kill_and_reap(&mut child, &clock);
-            panic!("argument/environment case {case}: {why}; kill/reap: {cleanup:?}");
-        }
-    }
+    0
 }
 
 #[test]
 fn installed_environment_aliases_getenv_and_escaped_arguments_survive_atexit() {
-    assert_eq!(run("installed"), 42, "the atexit observer checked the original process-owned storage");
-    assert_eq!(run("old-environ"), 43, "restoring the old environ removes the constructor/getenv alias");
+    let installed = crate::driver_tests::run(Case::Arguments(ArgumentCase::Installed));
+    assert_eq!(installed.status.code(), Some(42), "the atexit observer checked the original process-owned storage: {}", installed.stderr);
+    let restored = crate::driver_tests::run(Case::Arguments(ArgumentCase::OldEnvironment));
+    assert_eq!(restored.status.code(), Some(43), "restoring the old environ removes the constructor/getenv alias: {}", restored.stderr);
 }

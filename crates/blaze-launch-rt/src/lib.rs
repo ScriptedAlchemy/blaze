@@ -83,6 +83,8 @@ pub mod zygote;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod driver_tests;
+#[cfg(test)]
 mod poll_tests;
 #[cfg(test)]
 mod unwind_pairs_tests;

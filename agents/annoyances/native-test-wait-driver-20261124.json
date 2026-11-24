@@ -1,0 +1,21 @@
+{
+  "id": "native-test-wait-driver-20261124",
+  "date": "2026-11-24",
+  "who": "GPT-6 Astra Pro, continuation coordinator",
+  "where": "crates/blaze-launch-rt/src/stub_wait_tests.rs and driver_tests.rs; CI run 45354438642",
+  "what": "The focused launcher run compiled and passed all new constructor, environment, cleanup and real ELF controls, but three existing stub-wait tests failed when selecting Direct after another test had already used the process-wide Ring driver. The first panic poisoned their private Once and caused the other two failures.",
+  "cost": "The focused launcher receipt ended 101 with 135 tests passed and three failed, despite the seven real native-load and five native-load-core controls passing.",
+  "cause": "Stub-wait tests initialized a process-global driver inside their own private helper. Other native tests could enter a kernel wait first, so parallel test order decided which driver froze. Separate child-process runners also duplicated environment reads and cleanup paths.",
+  "class": "independent native test fixtures configure shared process state",
+  "prevention": "One cfg(test) driver chooses Direct once before kernel-waiting setup, owns scoped-thread startup, and dispatches typed signal and argument cases through one bounded child-process runner. Run the complete launcher library with the real ELF integration tests together, retaining allocation-free stub, signal, constructor, environment/atexit and omitted-stop controls. Keep test modules in the established test-file naming convention so fixture variables are not classified as user settings.",
+  "workaround": "None. No test is skipped or serialized, and no test, cast, or ambient-effect ceiling is increased.",
+  "fix": "The shared driver and consolidated controls have been implemented and independently reviewed; exact-tree hosted execution and ratchet checks remain required.",
+  "state": "open",
+  "evidence": {
+    "head": "2fa426d1436597fed55b8decb437db5e54480495",
+    "tree": "57c5ea0b381a9e0ecdf1cd86953f45db76ebb86f",
+    "run": 45354438642,
+    "artifact": 14902365818,
+    "sha256": "9369f6ca3b4a9caa19c49e9580e60500d6271bb2d0e5cbcedb6fcc6e0ceafdf0"
+  }
+}

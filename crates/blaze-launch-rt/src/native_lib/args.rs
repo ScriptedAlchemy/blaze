@@ -121,7 +121,7 @@ impl ProcessArgs {
         if !source.is_null() {
             // The C array is NUL-terminated. The address-space limit also bounds the walk;
             // it introduces no quota smaller than a process can represent.
-            let most = isize::MAX as usize / size_of::<*const c_char>();
+            let most = isize::MAX.unsigned_abs() / size_of::<*const c_char>();
             let mut ended = false;
             for index in 0..most {
                 // SAFETY: libc's live array contains each pointer up to its first null.

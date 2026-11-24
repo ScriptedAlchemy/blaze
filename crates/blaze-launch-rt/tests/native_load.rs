@@ -302,7 +302,7 @@ fn filed(test: &str, fixture: Fixture) -> std::path::PathBuf {
     std::fs::create_dir_all(&folder).unwrap_or_else(|e| panic!("{}: {e}", folder.display()));
     let mut path = [0u8; PATH_MOST];
     let len = native_lib::record_path(folder.as_os_str().as_encoded_bytes(), LIBRARY, &mut path).expect("a record path");
-    let at = std::path::PathBuf::from(std::str::from_utf8(&path[..len]).expect("a UTF-8 path"));
+    let at = std::path::PathBuf::from(core::str::from_utf8(&path[..len]).expect("a UTF-8 path"));
     std::fs::write(&at, file.as_slice()).unwrap_or_else(|e| panic!("{}: {e}", at.display()));
     folder
 }

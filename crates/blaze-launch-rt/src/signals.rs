@@ -51,7 +51,7 @@ mod row_model;
 
 #[cfg(all(test, not(blaze_check)))]
 #[path = "signals_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 use row::{Busy, Plant, Row, Value};
 

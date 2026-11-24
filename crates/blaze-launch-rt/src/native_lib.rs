@@ -494,9 +494,10 @@ impl Natives for DlNatives {
         if info.dli_fbase.is_null() {
             return Err(NativeError::NoDescriptor { record });
         }
+        let base = info.dli_fbase as u64;
         #[cfg(target_os = "linux")]
-        { self.thread_data = linux::thread_data(record, info.dli_fbase as u64)?; }
-        Ok(info.dli_fbase as u64)
+        { self.thread_data = linux::thread_data(record, base)?; }
+        Ok(base)
     }
 
     fn descriptor(&mut self, record: RecordId) -> Result<Descriptor, NativeError> {

@@ -2624,7 +2624,7 @@ pub use thread_locals::ThreadKey;
 #[cfg(test)]
 mod bind_tests;
 #[cfg(test)]
-mod entry_tests;
+pub(crate) mod entry_tests;
 #[cfg(test)]
 mod fault_code_window_tests;
 #[cfg(test)]
