@@ -60,17 +60,23 @@ fn digest(values: &[u128]) -> u128 {
 
 /// The same operation as `digest`, written as a source body: casts preserve the signed
 /// argument's bits, and the different shifts make every argument and both halves count.
-fn digest_body(b: &mut BodyBuf, args: &[ExprId], output: PNode) -> ExprId {
+/// Each written read and cast has its own ExprId: the checker's body is a tree, even when
+/// two occurrences read the same parameter. Sharing a cast below both XOR and shift would
+/// give the promotion walk more occurrences than the body's node-count bound permits.
+fn digest_body(b: &mut BodyBuf, params: &[PatId], output: PNode) -> ExprId {
     let wide = b.types.intern(U128).expect("u128 interns");
     let mut out = b.int(0, Some(IntSuffix::Uint(UintTy::U128)));
-    for (i, &arg) in args.iter().enumerate() {
+    for (i, &param) in params.iter().enumerate() {
+        let arg = b.local(param);
         let value = b.e(Expr::Cast { operand: arg, ty: wide });
         let shift = (u32::try_from(i).expect("at most eleven arguments") * 17) % 128;
         let mixed = if shift == 0 {
             value
         } else {
             let left = b.int(u128::from(shift), Some(IntSuffix::Uint(UintTy::U32)));
-            let shifted = b.bin(BinOp::Shl, value, left);
+            let arg = b.local(param);
+            let shifted_value = b.e(Expr::Cast { operand: arg, ty: wide });
+            let shifted = b.bin(BinOp::Shl, shifted_value, left);
             b.bin(BinOp::BitXor, value, shifted)
         };
         out = b.bin(BinOp::BitXor, out, mixed);
@@ -90,13 +96,13 @@ fn callee(shape: Shape, alloc: Alloc<'static>) -> Built<Alloc<'static>> {
     world.c_abi.push(MAIN);
     let mut body = BodyBuf::new();
     let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"];
-    let mut args = [ExprId(0); 11];
+    let mut params = [PatId(0); 11];
     for (i, name) in names[..shape.inputs().len()].iter().enumerate() {
         let param = body.bind(name);
         body.params.push(param);
-        args[i] = body.local(param);
+        params[i] = param;
     }
-    let root = digest_body(&mut body, &args[..shape.inputs().len()], shape.output());
+    let root = digest_body(&mut body, &params[..shape.inputs().len()], shape.output());
     build_fixture(&world, &body, root, alloc).unwrap_or_else(|error| panic!("{shape:?} callee: {error}"))
 }
 
