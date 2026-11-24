@@ -304,6 +304,36 @@ jobs:
           name: native-launcher-evidence
           path: ${{ runner.temp }}/native-launcher-evidence
           if-no-files-found: warn
+      # This instance-selection regression must execute even when the complete workspace's
+      # later test-binary build finds another blocker. A filter matching no test is a failure.
+      - name: owner field-bound instance selection
+        if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
+        run: |
+          evidence="$RUNNER_TEMP/owner-field-bound-evidence"
+          mkdir -p "$evidence"
+          git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
+          git status --short >> "$evidence/source.txt"
+          git diff HEAD --binary > "$evidence/source.patch"
+          export BLAZE_NO_DAEMON=1 TMPDIR="$HOME"
+          case_name='suite::instance_holes::owner_field_bounds_select_only_the_matching_impl'
+          if timeout -k 30 1200 cargo +"$(cat pins/toolchain)" test --locked -p blaze-typeck --lib "$case_name" -- --exact --nocapture 2>&1 | tee "$evidence/tests.log"; then
+            result=0
+          else
+            result=$?
+          fi
+          if [ "$result" -eq 0 ] && ! grep -Fxq "test $case_name ... ok" "$evidence/tests.log"; then
+            echo '::error::owner field-bound regression did not execute and pass'
+            result=1
+          fi
+          printf '%s\n' "$result" > "$evidence/exit-code.txt"
+          exit "$result"
+      - name: keep owner field-bound execution evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: owner-field-bound-evidence
+          path: ${{ runner.temp }}/owner-field-bound-evidence
+          if-no-files-found: warn
       - name: cargo check --workspace --exclude blaze-std --all-targets
         if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
         run: timeout -k 30 3600 cargo +"$(cat pins/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short

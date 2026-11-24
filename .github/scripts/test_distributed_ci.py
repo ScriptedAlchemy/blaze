@@ -251,6 +251,34 @@ class AcceptanceGateTests(unittest.TestCase):
                                     {**env,"NATIVE_LOG":str(log),"NATIVE_EXIT":str(code)})
                 self.assertEqual(done.returncode == 0, omit is None and code == 0, done.stdout+done.stderr)
 
+    def test_owner_field_bound_receipt_requires_its_executed_case_and_cargo_success(self):
+        case = "suite::instance_holes::owner_field_bounds_select_only_the_matching_impl"
+        passed = f"test {case} ... ok\n"
+        for log, code in ((passed, 0), ("running 0 tests\n", 0),
+                          (passed.replace(case, "unrelated"), 0), (passed, 23),
+                          (passed.replace("ok", "FAILED"), 0)):
+            with self.subTest(log=log, code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                env = self.fixture(root)
+                saved = root / "tests.txt"
+                saved.write_text(log)
+                cargo = root / "commands/cargo"
+                cargo.write_text(
+                    '#!/bin/sh\nprintf "%s\\n" "$@" > "$CASE_ARGV"\n'
+                    'cat "$CASE_LOG"\nexit "$CASE_EXIT"\n')
+                cargo.chmod(0o700)
+                done = self.run_shell("owner field-bound instance selection", {
+                    **env, "CASE_ARGV":str(root / "argv.txt"), "CASE_LOG":str(saved), "CASE_EXIT":str(code),
+                })
+                wanted = log == passed and code == 0
+                self.assertEqual(done.returncode == 0, wanted, done.stdout + done.stderr)
+                self.assertEqual((root / "argv.txt").read_text().splitlines(), [
+                    "+" + (ROOT / "pins/toolchain").read_text().strip(), "test", "--locked",
+                    "-p", "blaze-typeck", "--lib", case, "--", "--exact", "--nocapture",
+                ])
+                self.assertEqual(int((root / "owner-field-bound-evidence/exit-code.txt").read_text()),
+                                 0 if wanted else code or 1)
+
     def test_source_smoke_failure_or_absent_completion_cannot_issue_receipt(self):
         for code, said, identity_code in ((0,"source CLI: every check passed",0),
                                           (23,"source CLI: every check passed",0),
