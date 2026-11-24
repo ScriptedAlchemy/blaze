@@ -31,9 +31,11 @@ if command == "check":
         print("error: could not open toolchain shelf", file=sys.stderr)
         sys.exit(1)
     if invalid and not config.get("accept_invalid"):
-        print(json.dumps({"severity":"error","code":"E0425","path":"src/main.rs","line":2,
-                          "col":5,"message":"cannot find function `missing_source_body` in this scope (segment 0)"}))
-    print(json.dumps({"errors":int(invalid),"warnings":0,"fixes":[],"command":"blaze check",
+        print(json.dumps({"severity":"error","code":"types","path":"src/main.rs","line":2,
+                          "col":5,"end_line":2,"end_col":24,
+                          "message":"cannot find function `missing_source_body` in this scope (segment 0) (E0425 UnresolvedPath)",
+                          "fix":None}))
+    print(json.dumps({"errors":int(invalid),"warnings":0,"fixes":0,"command":"blaze check",
                       "not_checked":["body"] if config.get("incomplete") else [],
                       "failures":1 if config.get("task_failure") else 0}))
     sys.exit(0 if config.get("accept_invalid") or not invalid else config.get("rejection_exit",1))
@@ -79,6 +81,50 @@ class SourceSmokeTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             smoke.main(self.given)
         return json.loads((self.root / "run/results.json").read_text())
+
+    def rejected_check(self, finding=None, summary=None, **status):
+        """The source CLI's observed JSON shape, independent of the matcher implementation."""
+        detail = {"id":"q88tn", "severity":"error", "code":"types", "path":"src/main.rs",
+                  "line":2, "col":5, "end_line":2, "end_col":24,
+                  "message":"cannot find function `missing_source_body` in this scope (segment 0) (E0425 UnresolvedPath)",
+                  "fix":None}
+        verdict = {"errors":1, "warnings":0, "fixes":0, "command":"blaze check", "not_checked":[]}
+        detail.update(finding or {})
+        verdict.update(summary or {})
+        return {"returncode":1, "timed_out":False, "stderr":"",
+                "stdout":json.dumps(detail) + "\n" + json.dumps(verdict) + "\n", **status}
+
+    def test_canonical_types_diagnostic_proves_the_planted_rejection(self):
+        record = self.rejected_check()
+        self.assertIsNone(smoke.require(record, "invalid", None, rejects=True))
+        findings, summary = smoke.check_reply(record)
+        self.assertEqual(findings[0]["code"], "types")
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["not_checked"], [])
+
+    def test_arbitrary_types_errors_cannot_replace_the_planted_finding(self):
+        prefix = "cannot find function `missing_source_body` in this scope (segment 0) "
+        controls = ({"code":"E0425"}, {"severity":"warning"}, {"path":"src/other.rs"},
+                    {"line":3}, {"col":6}, {"end_line":3}, {"end_col":23},
+                    {"message":None}, {"message":prefix.rstrip()},
+                    {"message":prefix + "(E0308 TypeMismatch)"},
+                    {"message":prefix + "(E0425 TypeMismatch)"},
+                    {"message":prefix + "(E0433 UnresolvedPath)"},
+                    {"message":"mismatched type of `missing_source_body` (E0308 TypeMismatch)"},
+                    {"message":"unrelated type error mentioning `missing_source_body` (E0425 UnresolvedPath)"},
+                    {"message":"cannot find function `another_body` in this scope (segment 0) (E0425 UnresolvedPath)"})
+        for finding in controls:
+            with self.subTest(finding=finding), self.assertRaises(smoke.Failed):
+                smoke.require(self.rejected_check(finding=finding), "invalid", None, rejects=True)
+
+    def test_the_rejection_requires_a_complete_failed_check_verdict(self):
+        for summary in ({"errors":0}, {"errors":2}, {"errors":True}, {"failures":1},
+                        {"not_checked":["body"]}, {"not_checked":None}, {"command":"blaze run"}):
+            with self.subTest(summary=summary), self.assertRaises(smoke.Failed):
+                smoke.require(self.rejected_check(summary=summary), "invalid", None, rejects=True)
+        for status in ({"returncode":0}, {"returncode":3}, {"timed_out":True}):
+            with self.subTest(status=status), self.assertRaises(smoke.Failed):
+                smoke.require(self.rejected_check(**status), "invalid", None, rejects=True)
 
     def test_every_source_phase_runs_and_exported_program_is_executed(self):
         result = self.exercise()

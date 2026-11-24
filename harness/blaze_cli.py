@@ -110,11 +110,14 @@ def require(record: dict, name: str, expected: str | None, *, rejects: bool = Fa
         raise Failed(f"{name}: command timed out")
     if rejects:
         findings, summary = check_reply(record)
-        if (record["returncode"] != 1 or summary["errors"] < 1
-                or not any(finding.get("severity") == "error" and finding.get("code") == "E0425"
+        if (record["returncode"] != 1 or summary["errors"] != 1 or summary.get("not_checked") != []
+                or not any(finding.get("severity") == "error" and finding.get("code") == "types"
                            and finding.get("path") == "src/main.rs" and finding.get("line") == 2
+                           and finding.get("col") == 5 and finding.get("end_line") == 2
+                           and finding.get("end_col") == 24
                            and isinstance(finding.get("message"), str)
-                           and "`missing_source_body`" in finding["message"]
+                           and finding["message"].startswith("cannot find function `missing_source_body` in this scope ")
+                           and finding["message"].endswith("(E0425 UnresolvedPath)")
                            for finding in findings)):
             raise Failed(f"{name}: missing the planted undefined-body finding and failed check verdict")
     elif record["returncode"] != 0:

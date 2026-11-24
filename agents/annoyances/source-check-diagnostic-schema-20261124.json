@@ -1,0 +1,21 @@
+{
+  "id": "source-check-diagnostic-schema-20261124",
+  "date": "2026-11-24",
+  "who": "GPT-6 Astra Pro, continuation coordinator",
+  "where": "harness/blaze_cli.py require; .github/scripts/test_blaze_cli.py",
+  "what": "After cold, warm and edited source hello passed, the smoke harness rejected the compiler's correct invalid-source response: exit 1, one error at the planted function, and no unchecked items.",
+  "cost": "The false failure prevented restored-source, complete-check, export and standalone-executable smoke phases from running in CI run 45354438642.",
+  "cause": "The harness expected the JSON code field to contain E0425, and its fake CLI repeated that assumption. The source body pipeline intentionally emits the rule category types as code and preserves E0425 UnresolvedPath in the detailed message.",
+  "class": "a receipt matcher and its stand-in agree on a stale producer schema",
+  "prevention": "Anchor the positive fixture to the observed source JSON and canonical body-finding/report-printer contract. Require the types category plus the specific unresolved-path detail, planted function and source location, error severity, exit 1, exactly one error and no unchecked items. Keep negative controls for unrelated errors and incomplete or failed checks.",
+  "workaround": "None. The real invalid program must still fail for the planted undefined function; a generic types error or nonzero exit cannot satisfy the control.",
+  "fix": "Aligned the matcher and process fixture with the source schema. The exact saved CI invalid receipt fails the old matcher and passes the revised one; all nine local smoke-harness controls pass, including independent wrong-code, detail, symbol, span, severity, summary and status controls. The complete exact-tree source smoke remains required.",
+  "state": "open",
+  "evidence": {
+    "head": "2fa426d1436597fed55b8decb437db5e54480495",
+    "tree": "57c5ea0b381a9e0ecdf1cd86953f45db76ebb86f",
+    "run": 45354438642,
+    "artifact": 14903146677,
+    "sha256": "e1e9e3c6c39683b7992abd371643ec8a2c3b1eb3960d1ff8802c1eb10f132946"
+  }
+}
