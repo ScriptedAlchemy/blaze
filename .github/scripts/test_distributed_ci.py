@@ -395,10 +395,26 @@ class AcceptanceGateTests(unittest.TestCase):
 
 
 class WorkerBridgeTests(unittest.TestCase):
-    def test_real_capability_reply_decides_whether_worker_acceptance_can_start(self):
+    def load_harness(self):
         sys.path.insert(0,str(ROOT/"harness"))
         spec=importlib.util.spec_from_file_location("worker_acceptance",ROOT/"harness/distv2.py")
         worker=importlib.util.module_from_spec(spec);sys.modules[spec.name]=worker;spec.loader.exec_module(worker)
+        return worker
+
+    def test_build_failure_includes_root_cause_and_final_diagnostic(self):
+        worker = self.load_harness()
+        root = "MacroModule: no build-script module of shapes"
+        final = "the answer holds no CrateScope row for shapes"
+        with self.assertRaises(worker.Failed) as failure:
+            worker.require_build(1, f"{root}\n" + "x" * 10000 + f"\n{final}",
+                                 "solo builds", Path("logs/solo.1.log"))
+        message = str(failure.exception)
+        for text in (root, final, "exit 1", "logs/solo.1.log", "see full build log"):
+            self.assertIn(text, message)
+        self.assertLess(len(message), 8500)
+
+    def test_real_capability_reply_decides_whether_worker_acceptance_can_start(self):
+        worker = self.load_harness()
         for code,stdout,works in ((0,'{"host":"aarch64-unknown-linux-gnu"}',True),
                                   (0,"Rust nightly-2026-11-11\n",False),
                                   (1,"unknown command",False),(0,'{"host":null}',False),

@@ -7,7 +7,7 @@ Input, one JSON value (`python3 harness/distv2.py '{...}'`):
     serve        the `blaze-serve` binary (cache server)
     scratch      a new directory for homes, stores, sockets and retained evidence
     project      (optional) the workspace to build; default harness/distv2/fixture
-    args         (optional) arguments of `blaze build`
+    args         (optional) additional arguments of `blaze export`
     program      (optional) the path of the program, relative to its build directory's debug/;
                  default "app"
     run          (optional) the arguments it is run with; default ["11"]
@@ -125,6 +125,18 @@ def check(ok: bool, what: str) -> None:
     print(("ok   " if ok else "FAIL ") + what, flush=True)
     if not ok:
         raise Failed(what)
+
+
+def require_build(code: int, output: str, phase: str, log: Path) -> None:
+    """Keep the first task failure as well as the final diagnostic in the CI summary."""
+    if code == 0:
+        check(True, phase)
+        return
+    limit = 4096
+    excerpt = output.strip()
+    if len(excerpt) > 2 * limit:
+        excerpt = excerpt[:limit] + "\n... (see full build log) ...\n" + excerpt[-limit:]
+    raise Failed(f"{phase}: exit {code}; full log: {log}\n{excerpt}")
 
 
 def free_port() -> int:
@@ -669,7 +681,7 @@ def main(given: Input) -> None:
         run.host = host_triple(given.blaze, resource_env, given.command_timeout, run.root / "logs")
         run.start_services()
         code, text = run.build("solo", dist=False)
-        check(code == 0, f"solo builds: {text[-400:] if code else ''}")
+        require_build(code, text, "solo builds", run.root / "logs" / f"solo.{run.sequence}.log")
         solo = run.behaviour("solo")
         print("     solo:", solo[0].strip().replace("\n", " | "), solo[1][:16], flush=True)
         n = int(given.run[0])
@@ -683,8 +695,8 @@ def main(given: Input) -> None:
         a, a_log = run.build("a", wait=False)
         b, b_log = run.build("b", wait=False)
         code_a, code_b = run.wait(a), run.wait(b)
-        check(code_a == 0, f"worker a builds: {Path(a_log).read_text()[-800:] if code_a else ''}")
-        check(code_b == 0, f"worker b builds: {Path(b_log).read_text()[-800:] if code_b else ''}")
+        require_build(code_a, Path(a_log).read_text() if code_a else "", "worker a builds", Path(a_log))
+        require_build(code_b, Path(b_log).read_text() if code_b else "", "worker b builds", Path(b_log))
         rows_a, rows_b = run.report("a"), run.report("b")
         check(bool(rows_a) and bool(rows_b), f"both report units: {len(rows_a)} and {len(rows_b)}")
         compiled_a, compiled_b = sums(rows_a, "compiled_for_work"), sums(rows_b, "compiled_for_work")
