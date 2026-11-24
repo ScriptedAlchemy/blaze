@@ -66,3 +66,46 @@ fn a_drop_impl_through_an_unmade_bucket_names_the_bucket() {
     // Control: the bucket answered, empty: no `Drop` impl.
     assert_eq!(crate::drop_impl::adt_drop_impl(&world(None), TRAIT, struct_key(0), Alloc::global()), Ok(None));
 }
+
+/// `impl<T, U> Wanted<U> for T where for<F in fields(T)> F: Field<U>` is selectable
+/// inside an owner with the same field bound. A missing bound, another container, or another
+/// argument cannot justify the impl; the successful selection preserves the owner's parameters.
+#[test]
+fn owner_field_bounds_select_only_the_matching_impl() {
+    use crate::fixture::Fx;
+    use crate::infer::InferCtx;
+    use crate::world::{PClause, Reads};
+
+    let mut fx = Fx::new();
+    let t = fx.param(0);
+    let u = fx.param(1);
+    let v = fx.param(2);
+    let unit = fx.unit();
+    let field = fx.tr("Field", 2, std::vec![], &[]);
+    let wanted = fx.tr("Wanted", 2, std::vec![], &[]);
+    let bound = PClause::ForFields { container: t, trait_: field, args: fx.list(&[u]) };
+    let other_container = PClause::ForFields { container: v, trait_: field, args: fx.list(&[u]) };
+    let other_arg = PClause::ForFields { container: t, trait_: field, args: fx.list(&[v]) };
+    let imp = fx.imp("field-bounded impl", 2, t, Some((wanted, &[u])), &[], std::vec![bound]);
+    let matching = fx.func("matching", 3, &[], unit, std::vec![bound]);
+    let absent = fx.func("absent", 3, &[], unit, std::vec![]);
+    let wrong_container = fx.func("wrong_container", 3, &[], unit, std::vec![other_container]);
+    let wrong_arg = fx.func("wrong_arg", 3, &[], unit, std::vec![other_arg]);
+    fx.finish();
+
+    for (owner, expected) in [(matching, Some(imp)), (absent, None), (wrong_container, None), (wrong_arg, None)] {
+        let alloc = Alloc::global();
+        let mut ground = PortableTys::new_in(alloc);
+        let t = ground.intern(PNode::Param(0)).expect("owner T");
+        let u = ground.intern(PNode::Param(1)).expect("owner U");
+        let mut cx = InferCtx::post_analysis_in(alloc);
+        let mut reads = Reads::new_in(&fx, alloc);
+        let selected = crate::instance::select_owning_owner(
+            &mut cx, &mut reads, owner, None, wanted, &[t, u], &mut ground,
+        ).expect("the owner-bound selection is decided");
+        assert_eq!(selected.map(|(chosen, _)| chosen), expected, "owner {owner:?}");
+        if let Some((_, args)) = selected {
+            assert_eq!(ground.view().list(args).expect("the selected arguments"), &[t, u]);
+        }
+    }
+}
