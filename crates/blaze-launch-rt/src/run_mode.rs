@@ -2472,7 +2472,14 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
             }
             Queued::Frame(bytes) if bytes.is_empty() => mode.on(Event::Tick(now), &mut acts),
             Queued::Frame(bytes) => mode.on(Event::Frame(&bytes), &mut acts),
-            Queued::Closed(_) => mode.on(Event::Closed, &mut acts),
+            Queued::Closed(_) => {
+                // The reader has exited and will not deliver any more ticks. Before the
+                // native handoff there is no program thread to wake or report this to.
+                if let Some((record, _)) = owed {
+                    return ready.put(Err(RunModeError::Native(NativeError::ParentGone { record })));
+                }
+                mode.on(Event::Closed, &mut acts)
+            }
             Queued::Thread(_) => {
                 THREAD_EVENTS.fetch_add(1, Ordering::Relaxed);
                 Ok(())

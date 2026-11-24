@@ -40,6 +40,8 @@ pub(crate) enum Case {
     #[cfg(not(blaze_check))]
     Signal(SignalCase),
     Arguments(ArgumentCase),
+    #[cfg(target_arch = "aarch64")]
+    NativeParentClosed,
 }
 
 impl Case {
@@ -53,6 +55,8 @@ impl Case {
             Self::Signal(SignalCase::Default) => "signal-default",
             Self::Arguments(ArgumentCase::Installed) => "arguments-installed",
             Self::Arguments(ArgumentCase::OldEnvironment) => "arguments-old-environment",
+            #[cfg(target_arch = "aarch64")]
+            Self::NativeParentClosed => "native-parent-closed",
         }
     }
 
@@ -66,6 +70,8 @@ impl Case {
             "signal-default" => Self::Signal(SignalCase::Default),
             "arguments-installed" => Self::Arguments(ArgumentCase::Installed),
             "arguments-old-environment" => Self::Arguments(ArgumentCase::OldEnvironment),
+            #[cfg(target_arch = "aarch64")]
+            "native-parent-closed" => Self::NativeParentClosed,
             _ => return None,
         })
     }
@@ -75,6 +81,8 @@ impl Case {
             #[cfg(not(blaze_check))]
             Self::Signal(_) => Duration::from_secs(60),
             Self::Arguments(_) => Duration::from_secs(30),
+            #[cfg(target_arch = "aarch64")]
+            Self::NativeParentClosed => Duration::from_secs(5),
         }
     }
 }
@@ -93,6 +101,8 @@ fn child() {
         #[cfg(not(blaze_check))]
         Case::Signal(signal) => crate::signals::tests::child_case(signal),
         Case::Arguments(arguments) => crate::run_mode::entry_tests::process_args_tests::child_case(arguments),
+        #[cfg(target_arch = "aarch64")]
+        Case::NativeParentClosed => crate::run_mode::entry_tests::native_parent_closed(),
     };
     // C exit, so the argument case's atexit observer actually executes after its body returns.
     std::process::exit(status);

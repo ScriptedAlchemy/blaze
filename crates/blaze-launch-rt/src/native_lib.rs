@@ -91,9 +91,10 @@ pub enum NativeError {
     Layout { record: RecordId, what: &'static str },
     /// The parent sent a second `Native` (this one naming `record`): a run has one library.
     Twice { record: RecordId },
-    /// The parent sent no `Native` within `bound_ms` of the launcher's start, or ended first:
-    /// the entry cannot run before the library's initializers (NATIVE.md 3.7).
+    /// The parent sent no `Native` within `bound_ms` of the launcher's start.
     NotSent { bound_ms: u64 },
+    /// The parent's socket ended before the named native library arrived.
+    ParentGone { record: RecordId },
     /// Init cell `index` of `record` holds address 0: nothing to call, and calling it would
     /// fault at 0.
     NullInit { record: RecordId, index: u32 },
@@ -219,6 +220,11 @@ impl fmt::Display for NativeError {
                 f,
                 "the parent sent no native library within {bound_ms} ms: the entry cannot run before its initializers (NATIVE.md 3.7, rule 18)"
             ),
+            NativeError::ParentGone { record } => {
+                f.write_str("the parent's socket closed before it sent native library ")?;
+                hex(f, record)?;
+                f.write_str(": the entry cannot run before its initializers (NATIVE.md 3.7)")
+            }
             NativeError::NullInit { record, index } => {
                 f.write_str("the native library record ")?;
                 hex(f, record)?;

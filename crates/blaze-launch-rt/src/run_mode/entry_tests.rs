@@ -256,3 +256,37 @@ fn a_refused_initializer_stops_and_joins_control() {
 fn the_cleanup_oracle_catches_an_omitted_stop() {
     assert!(refused_initializer_cleanup(Cleanup::OmitStop), "removing Stop must be observed as a stuck control loop");
 }
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn native_parent_closed() -> i32 {
+    use std::os::unix::net::UnixStream;
+
+    use blaze_launch::wire::RecordId;
+
+    use super::{Dlsym, End, Folder, Handed, run};
+
+    let (parent, launcher) = UnixStream::pair().expect("launch socket pair");
+    drop(parent);
+    let record = RecordId([0x5c; 32]);
+    let result = run(
+        launcher.into(),
+        &Folder::new(b"."),
+        symbol(),
+        Some(record),
+        Handed::Unit,
+        Dlsym,
+        End::Return,
+        blaze_own::testing::heap().shared(),
+    );
+    assert_eq!(result, Err(RunModeError::Native(NativeError::ParentGone { record })));
+    75
+}
+
+/// EOF must return before the native wait expires: the terminal read supplies the reader's
+/// last event, so no later tick can drive the usual startup timeout.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn a_parent_that_closes_before_native_does_not_strand_startup() {
+    let child = crate::driver_tests::run(crate::driver_tests::Case::NativeParentClosed);
+    assert_eq!(child.status.code(), Some(75), "{}", child.stderr);
+}
