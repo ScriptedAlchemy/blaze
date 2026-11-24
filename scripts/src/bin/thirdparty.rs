@@ -42,8 +42,9 @@ count above 0, by its package name, sorted, then `(all)`, the workspace's, each 
   dev      the third-party packages named in its `[dev-dependencies]` and not in `direct`; for
            `(all)`, the ones no crate names in `direct`: what only tests and benches need
   closure  the third-party packages its normal and build dependencies reach: through the
-           workspace's crates by their manifests (their normal and build dependencies again,
-           never dev), and through each third-party package by its entry in Cargo.lock
+           repository's crates, including vendored path packages, by their manifests (their
+           normal and build dependencies again, never dev), and through registry and git
+           packages by their entries in Cargo.lock
 A package is a name and a version: two versions of one name count twice.
 
 A workspace crate is a package whose manifest is in the repository and not under vendor/: a
@@ -60,7 +61,8 @@ through the root's `[workspace.dependencies]` for `workspace = true`, to the man
 (where the crate has two versions of it, by its requirement: `=x.y.z`, `^x.y.z` or `x.y.z`).
 An optional dependency Cargo.lock does not list (no feature anywhere turns it on) is in no
 build and not counted; one it lists counts, whichever crate's features turn it on. A crate that
-is not a member has no dev-dependencies read: cargo resolves none for it.
+is not a member has no dev-dependencies read; a vendored path package's locked dev-dependencies
+do not enter another crate's closure.
 
 The manifests and Cargo.lock are read as TOML 1.0 by blaze-toml, which refuses what is not TOML
 naming the file, line and column. A key whose value is not of the shape it must be is refused
@@ -867,19 +869,27 @@ impl<'w> Graph<'w> {
         let manifests = self.manifests;
         let lock = self.lock;
         let mut out = BTreeSet::new();
-        match node {
-            Node::Ours(name) => {
-                let Some(m) = manifests.get(name) else { return Err(DepsError::UnknownPath { name: name.clone() }) };
-                for dep in m.deps.iter().filter(|it| it.kind != DepKind::Dev) {
-                    if let Some(next) = self.node_of_dep(m, dep)? {
-                        out.extend(self.reach(&next)?);
-                    }
-                }
-            }
+        let manifest = match node {
+            Node::Ours(name) => Some(name),
             Node::Third(at) => {
                 out.insert(self.pkg(*at));
-                for text in &lock[*at].deps {
-                    let next = self.node_of_lock(lock_index(lock, text, &lock[*at].name)?)?;
+                if lock[*at].source.is_none() {
+                    // A vendored path package's lock entry can include its test dependencies.
+                    // Its manifest keeps their kinds, just as a workspace crate's does.
+                    Some(&lock[*at].name)
+                } else {
+                    for text in &lock[*at].deps {
+                        let next = self.node_of_lock(lock_index(lock, text, &lock[*at].name)?)?;
+                        out.extend(self.reach(&next)?);
+                    }
+                    None
+                }
+            }
+        };
+        if let Some(name) = manifest {
+            let Some(m) = manifests.get(name) else { return Err(DepsError::UnknownPath { name: name.clone() }) };
+            for dep in m.deps.iter().filter(|it| it.kind != DepKind::Dev) {
+                if let Some(next) = self.node_of_dep(m, dep)? {
                     out.extend(self.reach(&next)?);
                 }
             }
@@ -1708,6 +1718,63 @@ fn selftest() {
     expect(written.ends_with("a\t4\t1\t7\nb\t2\t0\t2\nt\t1\t0\t8\n(all)\t7\t1\t8\n"), &format!("the list: {written}"));
     let rows = parse_rows(&written).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
     expect(problems(&now, &rows, Some(&rows), None).is_empty(), "the tree as recorded is right");
+    // A historical lock can retain a vendored path package's dev dependencies. The manifest
+    // knows their kinds: `proc-macro-test` is not part of the consumer's normal/build closure.
+    let vendored = |kind| {
+        let mut tree = fixture(&[(
+            LOCK,
+            "name = \"forked\"\nversion = \"1.0.0\"\ndependencies = [\n \"libc\",\n]\n",
+            "name = \"forked\"\nversion = \"1.0.0\"\ndependencies = [\n \"libc\",\n \"proc-macro-test\",\n]\n\n\
+             [[package]]\nname = \"proc-macro-test\"\nversion = \"1.0.0\"\ndependencies = [\"test-leaf\"]\n\n\
+             [[package]]\nname = \"test-leaf\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        )]);
+        let section = match kind {
+            DepKind::Normal => "",
+            DepKind::Build => "\n[build-dependencies]\n",
+            DepKind::Dev => "\n[dev-dependencies]\n",
+        };
+        tree.files.insert(
+            "vendor/forked/Cargo.toml".to_owned(),
+            format!("{FIXTURE_FORKED}{section}proc-macro-test = {{ path = \"proc-macro-test\" }}\n"),
+        );
+        tree.files.insert(
+            "vendor/forked/proc-macro-test/Cargo.toml".to_owned(),
+            "[package]\nname = \"proc-macro-test\"\nversion = \"1.0.0\"\n\n[dependencies]\ntest-leaf = \"1\"\n".to_owned(),
+        );
+        tree
+    };
+    let historical = census(&vendored(DepKind::Dev)).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
+    expect(historical == now, "a vendored package's locked test dependency changes no consumer's count");
+    // The missing historical ratchet changes no current ceiling, and a present base still
+    // holds its rows. Both paths keep reporting the real overage after reading that tree.
+    for base_rows in [None, Some(&rows)] {
+        let said = problems(&moved, &rows, base_rows, Some(&historical));
+        expect(
+            said.len() == 7 && said.iter().any(|it| it.contains("over its row's `direct` 4") && it.contains("new: `moved 1.0.0`")),
+            &format!("a historical vendored test edge does not hide current violations: {said:?}"),
+        );
+    }
+    // Controls: the same edge as normal or build counts both the vendored package and its
+    // registry dependency. A missing manifest on that reachable path is still a refusal.
+    for kind in [DepKind::Normal, DepKind::Build] {
+        let mut tree = vendored(kind);
+        let counted = census(&tree).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
+        let closure = column(&counted, "a", Column::Closure);
+        expect(
+            row_of(&counted, "a") == [4, 1, 9]
+                && row_of(&counted, TOTAL) == [7, 1, 10]
+                && closure.contains_key(&pkg("proc-macro-test", "1.0.0"))
+                && closure.contains_key(&pkg("test-leaf", "1.0.0")),
+            &format!("a vendored {kind:?} edge and its transitive dependency count: {counted:?}"),
+        );
+        let path = "vendor/forked/proc-macro-test/Cargo.toml";
+        tree.files.remove(path);
+        let error = census(&tree).err();
+        expect(
+            matches!(&error, Some(DepsError::Missing { path: missing, .. }) if missing == path),
+            &format!("a reachable vendored {kind:?} manifest must exist: {error:?}"),
+        );
+    }
     // Planted: the move from dev to normal, against the list and with the base's census: each
     // count over its row names the new package and the line it came in by.
     let said = problems(&moved, &rows, None, Some(&now));
