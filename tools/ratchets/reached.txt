@@ -24,7 +24,7 @@ crates/blaze-bytes	0	crates/blaze-mem
 crates/blaze-cas	1	crates/blaze-core,crates/blaze-data,crates/blaze-format,crates/blaze-hash,crates/blaze-ids,crates/blaze-json,crates/blaze-keyed,crates/blaze-mem,crates/blaze-own,crates/blaze-trace
 crates/blaze-cbor	0	crates/blaze-data,crates/blaze-own
 crates/blaze-check	0	crates/blaze-rng,crates/blaze-sys
-crates/blaze-cli	0	crates/blaze-answer,crates/blaze-apple-sdk,crates/blaze-blake3,crates/blaze-body,crates/blaze-build-script,crates/blaze-cas,crates/blaze-code,crates/blaze-core,crates/blaze-drive,crates/blaze-emit,crates/blaze-engine,crates/blaze-expand,crates/blaze-export,crates/blaze-fetch,crates/blaze-file-items,crates/blaze-h1,crates/blaze-hash,crates/blaze-http,crates/blaze-id,crates/blaze-ids,crates/blaze-keyed,crates/blaze-ladder,crates/blaze-launch,crates/blaze-lex,crates/blaze-lint,crates/blaze-manifest,crates/blaze-mem,crates/blaze-meter,crates/blaze-native,crates/blaze-own,crates/blaze-proc-macro,crates/blaze-remote,crates/blaze-report,crates/blaze-run,crates/blaze-scope,crates/blaze-screen,crates/blaze-std,crates/blaze-surface,crates/blaze-sys,crates/blaze-text,crates/blaze-toml,crates/blaze-toolchain,crates/blaze-typeck,crates/blaze-unit-graph,crates/blaze-watch,crates/blaze-world,crates/edition,crates/parser
+crates/blaze-cli	0	crates/blaze-answer,crates/blaze-apple-sdk,crates/blaze-blake3,crates/blaze-body,crates/blaze-build-script,crates/blaze-cas,crates/blaze-code,crates/blaze-core,crates/blaze-dist,crates/blaze-dist-local,crates/blaze-drive,crates/blaze-emit,crates/blaze-engine,crates/blaze-expand,crates/blaze-export,crates/blaze-fetch,crates/blaze-file-items,crates/blaze-h1,crates/blaze-hash,crates/blaze-http,crates/blaze-id,crates/blaze-ids,crates/blaze-keyed,crates/blaze-ladder,crates/blaze-launch,crates/blaze-lex,crates/blaze-lint,crates/blaze-manifest,crates/blaze-mem,crates/blaze-meter,crates/blaze-native,crates/blaze-own,crates/blaze-proc-macro,crates/blaze-remote,crates/blaze-report,crates/blaze-run,crates/blaze-scope,crates/blaze-screen,crates/blaze-sha256,crates/blaze-std,crates/blaze-surface,crates/blaze-sys,crates/blaze-text,crates/blaze-toml,crates/blaze-toolchain,crates/blaze-typeck,crates/blaze-unit-graph,crates/blaze-watch,crates/blaze-wire,crates/blaze-world,crates/edition,crates/parser
 crates/blaze-code	0	crates/blaze-ids,crates/blaze-own
 crates/blaze-columns	0	crates/blaze-int,crates/blaze-kit,crates/blaze-own
 crates/blaze-comptime	0	crates/blaze-blake3,crates/blaze-cbor,crates/blaze-own,crates/blaze-roots
@@ -34,6 +34,8 @@ crates/blaze-consteval	0	crates/blaze-build,crates/blaze-hash,crates/blaze-ids,c
 crates/blaze-core	1	crates/blaze-base64,crates/blaze-check,crates/blaze-hash,crates/blaze-mem,crates/blaze-meter,crates/blaze-own,crates/blaze-queue,crates/blaze-radix,crates/blaze-rng,crates/blaze-spin,crates/blaze-sys
 crates/blaze-data	0	crates/blaze-own
 crates/blaze-deflate	0	crates/blaze-own
+crates/blaze-dist	0	crates/blaze-own,crates/blaze-wire
+crates/blaze-dist-local	0	crates/blaze-dist,crates/blaze-int,crates/blaze-own,crates/blaze-sha256,crates/blaze-sys,crates/blaze-wire
 crates/blaze-drive	0	crates/blaze-fetch,crates/blaze-format,crates/blaze-hash,crates/blaze-id,crates/blaze-ids,crates/blaze-manifest,crates/blaze-own,crates/blaze-text,crates/blaze-unit-graph
 crates/blaze-ed25519	0	crates/blaze-int,crates/blaze-own
 crates/blaze-emit	0	crates/blaze-blake3,crates/blaze-code,crates/blaze-lir,crates/blaze-own,crates/blaze-tier
@@ -121,6 +123,7 @@ crates/blaze-units	0	crates/blaze-own,crates/blaze-text
 crates/blaze-url	0	-
 crates/blaze-wasi	1	-
 crates/blaze-watch	0	crates/blaze-cbor,crates/blaze-own,crates/blaze-trace
+crates/blaze-wire	0	crates/blaze-own,crates/blaze-sha256
 crates/blaze-world	0	crates/blaze-build-script,crates/blaze-core,crates/blaze-fetch,crates/blaze-id,crates/blaze-lex,crates/blaze-manifest,crates/blaze-own,crates/blaze-proc-macro,crates/blaze-scope,crates/blaze-surface,crates/blaze-toolchain,crates/blaze-unit-graph,crates/edition
 crates/edition	0	-
 crates/parser	0	crates/blaze-ids,crates/blaze-mem,crates/blaze-phf,crates/blaze-trace,crates/edition,crates/rustc_lexer,crates/stdx

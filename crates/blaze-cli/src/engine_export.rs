@@ -94,6 +94,8 @@ pub enum ExportCliError {
     /// Marking the published file executable (`0o755`) failed.
     #[cfg(unix)]
     Chmod { path: AString<'static>, errno: blaze_sys::Errno },
+    /// Distributed compilation or cache protocol refused the build.
+    Dist(crate::engine_dist::DistError),
 }
 
 struct Hex<'a>(&'a [u8; 32]);
@@ -135,6 +137,7 @@ impl fmt::Display for ExportCliError {
             ExportCliError::WriteOutput(error) => write!(f, "blaze export: writing executable: {error} (engine_export.rs)"),
             #[cfg(unix)]
             ExportCliError::Chmod { path, errno } => write!(f, "blaze export: chmod 0755 `{}` failed: {errno:?} (engine_export.rs)", path.as_str()),
+            ExportCliError::Dist(error) => fmt::Display::fmt(error, f),
         }
     }
 }
@@ -187,6 +190,25 @@ fn check_export_flags(flags: &crate::Flags<'_>) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Resident-daemon entry point for `blaze export` (dispatched from `daemon_server.rs`).
+#[expect(clippy::too_many_arguments, reason = "top-level command entry: each argument one capability extracted at daemon")]
+pub(crate) fn command_in_daemon(
+    cx: &Cx,
+    args: &bstd::args::Args,
+    fs: &Fs,
+    env: Option<&bstd::env::Env>,
+    net: Option<&bstd::net::Net>,
+    host: &bstd::host::Host,
+    clock: &bstd::clock::Clock,
+    rng: &mut bstd::rng::Rng,
+    out: &Out,
+    err: &Out,
+    phases: &mut Phases,
+    heap: &'static blaze_own::Heap,
+) -> Result<Status, CliError> {
+    command(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap)
+}
+
 /// Top-level `blaze export` command entry point, dispatched from `main.rs`.
 #[expect(clippy::too_many_arguments, reason = "top-level command entry: each argument one capability extracted at main")]
 pub(crate) fn command(
@@ -208,9 +230,12 @@ pub(crate) fn command(
     let mut flags = crate::parse_flags_with(args, |name| packages.push(name), |feat| features.push(feat))?;
     flags.features = features.as_slice();
     check_export_flags(&flags)?;
+    let dist = crate::engine_dist::DistConfig::from_env(env, crate::graph::TRIPLE, heap)
+        .map_err(|error| box_err(ExportCliError::Dist(error), heap))?;
     let select = run_package::Select { test_packages: packages.as_slice(), ..flags.select };
     let started_ns = phases.now();
     let stats = flags.stats;
+    let release = flags.release;
     let output_flag = flags.output;
     let view = flags.view.unwrap_or(blaze_report::frame::plain::View::Person);
     let line = crate::run_line::LineOpts::from_env(env, err, flags.color, blaze_screen::Command::Run, view, false);
@@ -221,7 +246,7 @@ pub(crate) fn command(
             let (root, frame) = (standing.checkout, standing.frame);
             let select = run_package::Select { member: standing.member, ..select };
             let picked = run_package::pick(cx, root, select, frame)?;
-            let summary = export_program(cx, standing, &picked, fs, output_flag, phases, watch)?;
+            let summary = export_program(cx, standing, &picked, fs, output_flag, release, dist.as_ref(), phases, watch)?;
             write_start_profile(cx, root, phases, frame)?;
             let wall_ns = phases.since(started_ns);
             print_summary(cx, &summary, wall_ns, stats, out, err, frame)?;
@@ -519,12 +544,15 @@ fn code_touches_tls(view: &CodeView<'_>, getter: CodeSymbol, descriptor: CodeSym
 }
 
 /// Core whole-program reachability closure + `blaze_export::export` + atomic write + chmod.
+#[expect(clippy::too_many_arguments, reason = "export pipeline: explicit capabilities, release profile, and optional distributed config")]
 fn export_program<'f>(
     cx: &Cx,
     mut standing: Standing<'f, '_>,
     picked: &run_package::Program<'f>,
     fs: &Fs,
     output_flag: Option<&str>,
+    release: bool,
+    dist: Option<&crate::engine_dist::DistConfig>,
     phases: &mut Phases,
     watch: &dyn blaze_screen::Watch,
 ) -> Result<ExportSummary<'f>, CliError> {
@@ -575,7 +603,11 @@ fn export_program<'f>(
     let ids_ns = phases.since(began_ids);
     let ids_line = ids.line(&asked, ids_ns);
 
-    let overflow = program::dev_overflow(cx, root, frame)?;
+    let overflow = if release {
+        blaze_ladder::run::OverflowChecks::Off
+    } else {
+        program::dev_overflow(cx, root, frame)?
+    };
     let panic_profile = program::dev_profile_panic(cx, root, frame)?;
     let panic_ladder = blaze_ladder::panic_strategy::of_profile(panic_profile);
     let export_panic = match panic_profile {
@@ -622,6 +654,61 @@ fn export_program<'f>(
     };
     let mut maker = Maker::of_roots(names, maker_entry, &roots, ByKind::new(typed.over(ids)), &builder, heap.alloc());
     let mut codes = HomeCodeStore::new(lent);
+
+    // Optional distributed compilation pass over workspace crates (D11).
+    let mut dist_fp: Option<blaze_wire::Digest> = None;
+    if let Some(dist_cfg) = dist {
+        let mut dist_store = crate::engine_dist::DistStore::new(&mut codes, dist_cfg.wire_alloc);
+        let (outcome, fp) = crate::engine_dist::run_distributed(
+            dist_cfg,
+            names,
+            closure.as_slice(),
+            picked.bin,
+            &ids,
+            &builder,
+            &mut maker,
+            &mut dist_store,
+            &roots,
+            release,
+            output_path,
+            alloc,
+            frame,
+            heap,
+        )
+        .map_err(|error| box_err(ExportCliError::Dist(error), heap))?;
+        drop(dist_store);
+        match outcome {
+            crate::engine_dist::DistExportOutcome::NoOp => {
+                end_procs(cx, &maker_procs, standing.err, "export")?;
+                return Ok(ExportSummary {
+                    output: output_path,
+                    exported: Exported {
+                        platform,
+                        functions: 0,
+                        folded: 0,
+                        fast: 0,
+                        optimized: 0,
+                        made: 0,
+                        imports: 0,
+                        len: 0,
+                        identity: [0u8; 16],
+                        profile: None,
+                        panics: blaze_export::Panics::Abort { functions: 0 },
+                    },
+                    data_count: 0,
+                    tls_count: 0,
+                    compiled: 0,
+                    cached: 0,
+                    unkeyed: 0,
+                    stubs: 0,
+                });
+            }
+            crate::engine_dist::DistExportOutcome::Completed { .. } => {
+                dist_fp = Some(fp);
+            }
+            crate::engine_dist::DistExportOutcome::FallbackLocal => {}
+        }
+    }
 
     // Whole-program reachability closure from all roots.
     let mut walk = Walk::new_in(alloc);
@@ -867,6 +954,9 @@ fn export_program<'f>(
     }
 
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
+    if let (Some(dist_cfg), Some(fp)) = (dist, dist_fp) {
+        crate::engine_dist::write_output_fingerprint(output_path, &fp, dist_cfg.wire_alloc);
+    }
     Ok(ExportSummary {
         output: output_path,
         exported,

@@ -593,6 +593,12 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<(), IoError> {
     write_all_fd(fd.fd(), bytes).map_err(IoError::from_errno)
 }
 
+/// Appends all of `bytes` to `path`, creating it if absent.
+pub fn append_file(path: &str, bytes: &[u8]) -> Result<(), IoError> {
+    let fd = open_create_append(path).map_err(IoError::from_errno)?;
+    write_all_fd(fd.fd(), bytes).map_err(IoError::from_errno)
+}
+
 /// Atomically renames `from` to `to`.
 pub(crate) fn rename_path(from: &str, to: &str) -> Result<(), Errno> {
     let mut from_buf = [0u8; PATH_BUF_CAP];

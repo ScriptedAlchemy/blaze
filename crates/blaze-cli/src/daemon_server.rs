@@ -79,6 +79,15 @@ pub(crate) fn socket_beneath_blaze<'f>(key: &CheckoutKey, frame: &'f Frame) -> R
     Ok(Path::new(full.as_str())?)
 }
 
+/// Formats the daemon's PID file path relative to `<HOME>/.blaze`: `v2/daemon/<16-hex>.pid`.
+fn pid_beneath_blaze<'f>(key: &CheckoutKey, frame: &'f Frame) -> Result<Path, CliError> {
+    let rel = daemon::socket_path(key);
+    let rel_str = core::str::from_utf8(&rel).map_err(|_| CliError::Text { what: "daemon socket path is not UTF-8" })?;
+    let stem = rel_str.strip_suffix(".sock").unwrap_or(rel_str);
+    let full = bstd::mem::format_in!(frame, "v2/{stem}.pid");
+    Ok(Path::new(full.as_str())?)
+}
+
 /// Checks whether `<HOME>/.blaze/v2/daemon/<16-hex>.sock` (including NUL) fits `sun_path`.
 pub(crate) fn socket_fits(home: Option<&str>) -> bool {
     let Some(home) = home else { return false };
@@ -106,11 +115,29 @@ pub(crate) fn run(
     heap: &'static blaze_own::Heap,
 ) -> Result<Status, CliError> {
     let mut dir = None;
-    for word in args.each().skip(2) {
-        if word.starts_with('-') || dir.is_some() {
-            return Err(CliError::Usage("`blaze daemon` takes at most one checkout folder"));
+    let mut mode_status = false;
+    let mut mode_stop = false;
+    let mut at = 2usize;
+    while let Some(word) = args.get(at) {
+        at += 1;
+        match word {
+            "--status" => mode_status = true,
+            "--stop" => mode_stop = true,
+            "--stall-bound" => {
+                if args.get(at).is_none() {
+                    return Err(CliError::Usage("`blaze daemon --stall-bound` takes a count of seconds"));
+                }
+                at += 1;
+            }
+            _ if word.starts_with("--stall-bound=") => {}
+            _ if word.starts_with('-') || dir.is_some() => {
+                return Err(CliError::Usage("`blaze daemon` takes at most one checkout folder"));
+            }
+            _ => dir = Some(word),
         }
-        dir = Some(word);
+    }
+    if mode_status && mode_stop {
+        return Err(CliError::Usage("`blaze daemon`: pass at most one of --status or --stop"));
     }
     let frame = cx.frame();
     let checkout = crate::checkout::checkout(dir, frame)?;
@@ -126,11 +153,28 @@ pub(crate) fn run(
     let Some(home_str) = home_text else {
         return Err(CliError::Text { what: "`blaze daemon`: HOME is not set" });
     };
+    if mode_stop {
+        crate::daemon_client::send_shutdown(home_str, root_abs);
+        return Ok(Status::OK);
+    }
     if !socket_fits(Some(home_str)) {
         return Err(CliError::Text { what: "`blaze daemon`: socket path exceeds sun_path limit" });
     }
     let home = crate::store::Home::of(cx, fs, Some(home_str))?;
     let checkout_key = crate::journal_ask::checkout_key_of(root_abs);
+    let pid_path = pid_beneath_blaze(&checkout_key, frame)?;
+    if mode_status {
+        if crate::daemon_client::probe_daemon_alive(home_str, root_abs)
+            && let Ok(mapping) = home.dir().map_read(cx, &pid_path)
+            && let Ok(text) = core::str::from_utf8(mapping.bytes())
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            out.line(cx, format_args!("{{\"daemon\":{{\"pid\":{pid}}}}}"))?;
+        } else {
+            out.line(cx, format_args!("{{\"daemon\":null}}"))?;
+        }
+        return Ok(Status::OK);
+    }
     let folder_path = Path::new(DAEMON_FOLDER_BENEATH_BLAZE)?;
     let socket_path = socket_beneath_blaze(&checkout_key, frame)?;
 
@@ -199,6 +243,9 @@ pub(crate) fn run(
         .listen(cx, &socket_path)
         .map_err(|_| CliError::Text { what: "`blaze daemon`: failed to bind Unix socket (another daemon may be active)" })?;
 
+    let pid_text = bstd::mem::format_in!(frame, "{}\n", blaze_dist_local::sys::current_pid());
+    let _ = home.dir().publish(cx, &pid_path, bstd::fs::Content::bytes(pid_text.as_bytes()), bstd::fs::Durable::No);
+
     let mut conns = Frame::new(Tag::Other).map_err(|_| CliError::Text { what: "`blaze daemon`: connection frame allocation failed" })?;
     let lived = serve_loop(
         cx,
@@ -218,6 +265,7 @@ pub(crate) fn run(
         err,
     );
 
+    let _ = home.dir().remove(cx, &pid_path, bstd::fs::Durable::No);
     let _ = listener.close(&cx.until(clock.after(END_WAIT)));
     state.watcher.shutdown(cx, &clock);
 
@@ -746,6 +794,16 @@ fn execute_check_request(
             return (Status::FAILED, PostDone { was_phase_rebuild: false, spawn_bg: false });
         }
     };
+    if args.get(1) == Some("export") {
+        let status = match crate::engine_export::command_in_daemon(cx, &args, fs, Some(&env), net, host, clock, rng, &out, &err, phases, state.heap) {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = err.line(cx, format_args!("error: {error}"));
+                Status::FAILED
+            }
+        };
+        return (status, PostDone { was_phase_rebuild: false, spawn_bg: false });
+    }
     let flags = match crate::flags(&args).and_then(|f| {
         crate::check_command::refuse_not_taken(&f)?;
         Ok(f)

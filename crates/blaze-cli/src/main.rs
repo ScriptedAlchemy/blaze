@@ -24,6 +24,7 @@ mod body_types;
 // The code index over the home's store: run_parent.rs `Lazy` finds and keeps a program's code
 // entries there across commands.
 mod code_store;
+mod engine_dist;
 mod item_name;
 mod checkout;
 mod clean;
@@ -434,6 +435,8 @@ struct Flags<'a> {
     all_features: bool,
     /// `--no-default-features`: do not enable `default` on the selected workspace roots.
     no_default_features: bool,
+    /// `--release`: build with release settings (overflow checks off, release/fold codegen).
+    release: bool,
 }
 
 impl<'a> Flags<'a> {
@@ -460,6 +463,7 @@ impl<'a> Flags<'a> {
             features: &[],
             all_features: false,
             no_default_features: false,
+            release: false,
         }
     }
 
@@ -512,6 +516,7 @@ fn parse_flags_with<'a>(args: &'a Args, mut package: impl FnMut(&'a str), mut fe
         match arg {
             "--all-features" => flags.all_features = true,
             "--no-default-features" => flags.no_default_features = true,
+            "--release" => flags.release = true,
             "--view" => flags.view = Some(View::parse(value()?).ok_or(CliError::Usage("--view is person, agent or json"))?),
             _ if arg.starts_with("--view=") => flags.view = Some(View::parse(&arg["--view=".len()..]).ok_or(CliError::Usage("--view is person, agent or json"))?),
             // Every word after `--fix` up to the next flag is a selector: an id or a prefix of
@@ -721,8 +726,18 @@ fn command(
         }
         Some("toolchain") => {
             let tc = include_str!("../../../pins/toolchain").trim();
-            out.line(cx, format_args!("Rust {tc}"))?;
-            Ok(Status::OK)
+            match args.get(2) {
+                Some("--json") => {
+                    let host_triple = crate::graph::TRIPLE;
+                    out.line(cx, format_args!("{{\"host\":\"{host_triple}\",\"toolchain\":\"{tc}\"}}"))?;
+                    Ok(Status::OK)
+                }
+                None => {
+                    out.line(cx, format_args!("Rust {tc}"))?;
+                    Ok(Status::OK)
+                }
+                Some(_) => Err(CliError::Usage("`blaze toolchain` takes at most `--json`")),
+            }
         }
         Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         Some("store") => store::publish_command::run(cx, args, fs, env, &clock, host, rng, out, err, heap),

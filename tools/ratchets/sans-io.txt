@@ -56,6 +56,9 @@ blaze-cunit	0	0	9	1	0	0	0	0	0	0	0	0	0	0	0	0	0	0
 blaze-data	3	4	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-dbsp	15	0	16	0	0	0	20	2	0	0	0	0	1	1	0	0	0	0
 blaze-deflate	11	1	0	0	0	0	5	0	1	1	0	11	0	0	13	1	0	0
+# blaze-dist, blaze-dist-local and blaze-wire are 0 in every sans-IO column (`#![no_std]`, `#![blaze::sans_io]`/`#![blaze::driver]`, 0 third-party deps); `bare = 1` is inherited transitively from `blaze-own` once reached via `blaze-cli`.
+blaze-dist	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
+blaze-dist-local	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-drive	0	0	0	5	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-ed25519	3	0	0	0	0	0	0	0	2	0	0	4	0	0	6	1	0	0
 blaze-emit	0	29	37	194	1	88	0	0	0	0	0	3	0	1	0	1	0	0
@@ -169,6 +172,7 @@ blaze-url	0	3	0	0	0	0	5	0	0	0	0	0	0	0	0	1	0	0
 blaze-v2-proof	12	0	0	0	0	0	27	3	0	1	0	6	1	1	0	0	0	0
 blaze-wasi	0	3	5	0	0	0	12	0	0	0	0	0	0	1	0	0	0	0
 blaze-watch	0	0	0	38	0	0	0	0	0	0	0	0	0	1	0	1	0	0
+blaze-wire	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-world	106	0	3	0	3	0	139	22	12	3	0	116	0	1	0	1	1	1
 const-ast	0	5	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 edition	0	3	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0

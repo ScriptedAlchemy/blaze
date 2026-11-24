@@ -37,7 +37,8 @@ pub(crate) fn try_run() -> ClientOutcome {
     let Some(&cmd) = block.args.get(1) else {
         return ClientOutcome::Fallthrough { spawn_daemon: false };
     };
-    if cmd != "check" && cmd != "engine-check" {
+    let is_export = cmd == "export";
+    if cmd != "check" && cmd != "engine-check" && !is_export {
         return ClientOutcome::Fallthrough { spawn_daemon: false };
     }
 
@@ -109,7 +110,7 @@ pub(crate) fn try_run() -> ClientOutcome {
     };
 
     let Ok(conn) = blaze_sys::posix::net::connect_unix(sock_path) else {
-        return ClientOutcome::Fallthrough { spawn_daemon: true };
+        return ClientOutcome::Fallthrough { spawn_daemon: !is_export };
     };
     // Raise Unix socket buffers above macOS's 8 KiB default so large stdout payloads (e.g. 519 KB)
     // stream in 1-2 syscalls instead of ~65 round-trips.
@@ -124,13 +125,13 @@ pub(crate) fn try_run() -> ClientOutcome {
     // 1. Read Hello frame.
     let mut recv_buf: Vec<u8, &bstd::mem::Frame> = Vec::new_in(&frame);
     let Ok(hello_body) = read_frame_fd(conn.fd(), &mut recv_buf) else {
-        return ClientOutcome::Fallthrough { spawn_daemon: true };
+        return ClientOutcome::Fallthrough { spawn_daemon: !is_export };
     };
     let Ok(hello) = Hello::decode(hello_body) else {
-        return ClientOutcome::Fallthrough { spawn_daemon: true };
+        return ClientOutcome::Fallthrough { spawn_daemon: !is_export };
     };
     if hello.form != FORM {
-        return ClientOutcome::Fallthrough { spawn_daemon: true };
+        return ClientOutcome::Fallthrough { spawn_daemon: !is_export };
     }
 
     // 2. Gather client TTYs, argv, env, monotonic start timestamp and send CheckReq.
@@ -163,7 +164,7 @@ pub(crate) fn try_run() -> ClientOutcome {
     let mut send_buf: Vec<u8, &bstd::mem::Frame> = Vec::new_in(&frame);
     req.encode(&mut send_buf);
     if write_all_fd(conn.fd(), send_buf.as_slice()).is_err() {
-        return ClientOutcome::Fallthrough { spawn_daemon: true };
+        return ClientOutcome::Fallthrough { spawn_daemon: !is_export };
     }
 
     // 3. Stream ServerFrames directly to stdout (fd 1) / stderr (fd 2) until Done or Refused.
@@ -215,7 +216,7 @@ pub(crate) fn try_run() -> ClientOutcome {
             }
             ServerFrame::Refused { why } => {
                 if !wrote_any {
-                    let spawn = matches!(why, CannotServe::OtherVersion | CannotServe::ShuttingDown);
+                    let spawn = !is_export && matches!(why, CannotServe::OtherVersion | CannotServe::ShuttingDown);
                     return ClientOutcome::Fallthrough { spawn_daemon: spawn };
                 }
                 return ClientOutcome::Exit(Status::FAILED);
@@ -227,6 +228,36 @@ pub(crate) fn try_run() -> ClientOutcome {
 #[cfg(not(unix))]
 pub(crate) fn try_run() -> ClientOutcome {
     ClientOutcome::Fallthrough { spawn_daemon: false }
+}
+
+/// Probes whether the resident daemon for `checkout_root_abs` under `home` is accepting
+/// connections and answers with a valid [`Hello`] frame.
+#[cfg(unix)]
+pub(crate) fn probe_daemon_alive(home: &str, checkout_root_abs: &str) -> bool {
+    if !crate::daemon_server::socket_fits(Some(home)) {
+        return false;
+    }
+    let key = crate::journal_ask::checkout_key_of(checkout_root_abs);
+    let mut sock_buf = [0u8; 256];
+    let Some(sock_path) = format_socket_path(home, &key, &mut sock_buf) else {
+        return false;
+    };
+    let Ok(conn) = blaze_sys::posix::net::connect_unix(sock_path) else {
+        return false;
+    };
+    let Ok(frame) = bstd::mem::Frame::new(bstd::mem::Tag::Other) else {
+        return false;
+    };
+    let mut buf: Vec<u8, &bstd::mem::Frame> = Vec::new_in(&frame);
+    let Ok(body) = read_frame_fd(conn.fd(), &mut buf) else {
+        return false;
+    };
+    Hello::decode(body).is_ok_and(|hello| hello.form == FORM)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn probe_daemon_alive(_home: &str, _checkout_root_abs: &str) -> bool {
+    false
 }
 
 /// Sends a best-effort `ClientFrame::Shutdown` to the resident daemon serving `checkout_root_abs`
@@ -346,7 +377,7 @@ fn parse_check_dir<'a>(args: &'a [&'a str]) -> Option<Option<&'a str>> {
             return None;
         }
         match arg {
-            "-p" | "--package" | "--view" | "--grant" | "--bin" | "--workers" | "--status-every" | "--color" | "--origin" | "--origin-key" => {
+            "-p" | "--package" | "-F" | "--features" | "-o" | "--output" | "--view" | "--grant" | "--bin" | "--workers" | "--status-every" | "--color" | "--origin" | "--origin-key" => {
                 // Skip its value; if missing, let standalone print Usage.
                 if args.get(at).is_none() {
                     return None;
@@ -358,7 +389,7 @@ fn parse_check_dir<'a>(args: &'a [&'a str]) -> Option<Option<&'a str>> {
                     at += 1;
                 }
             }
-            "--stats" | "--each" | "--names-oracle" => {}
+            "--stats" | "--each" | "--names-oracle" | "--release" | "--all-features" | "--no-default-features" => {}
             _ if arg.starts_with("--") => {}
             _ => {
                 if dir.is_some() {

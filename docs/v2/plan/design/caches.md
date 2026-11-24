@@ -100,9 +100,11 @@ or overwritten: a changed input makes another key.
 | variable | what it selects | who removes it, when |
 |---|---|---|
 
-The retained protocol's `BLAZE_DIST_EVENTS` enables event telemetry, and
-`BLAZE_DIST_TEST_RESULT_GATE` enables a bounded test rendezvous before a lead submits a
-result. Neither selects a caching path.
+The retained protocol's `BLAZE_DIST_SOCKET`, `BLAZE_DIST_BLOBS`, `BLAZE_DIST_LOCAL`,
+`BLAZE_DIST_REPORT`, `BLAZE_DIST_DEADLINE_SECS`, `BLAZE_DIST_PR`, `BLAZE_DIST_SOURCE`,
+`BLAZE_DIST_EVENTS` and `BLAZE_DIST_TEST_RESULT_GATE` configure the distributed build
+carrier, namespace, report, event telemetry and bounded test rendezvous. None selects a
+different local caching path.
 
 Every `BLAZE_` variable a file of `crates/` names outside tests selects no caching path
 (the `domains` script fails on one that is neither here nor in the table). Other variables: `BLAZE_ALLOC_SAMPLE_BYTES`, `BLAZE_ALLOC_TRACE`, `BLAZE_BACKEND`, `BLAZE_BENCH_MACHINE`, `BLAZE_BIN`, `BLAZE_BSTD_DIGEST`, `BLAZE_CACHE_ACCESS_KEY_ID`, `BLAZE_CACHE_ANCHOR_SEED`, `BLAZE_CACHE_BUCKET`, `BLAZE_CACHE_ENDPOINT`, `BLAZE_CACHE_KEY_LIST`, `BLAZE_CACHE_PUBLIC_ANCHORS`, `BLAZE_CACHE_PUBLIC_URL`, `BLAZE_CACHE_SECRET_ACCESS_KEY`, `BLAZE_CACHE_SIGNING_SEED`, `BLAZE_CACHE_TRANSPORT`, `BLAZE_CC_LADDER`, `BLAZE_CORES`, `BLAZE_EMIT`, `BLAZE_EXPLORE_LOCAL`, `BLAZE_FACT_SHIM_RUN`, `BLAZE_FEATURES`, `BLAZE_FUZZ_RUNS`, `BLAZE_HISTORY_LEVEL`, `BLAZE_HOME`, `BLAZE_HUGE_PAGES`, `BLAZE_LAUNCH_ENTRY`, `BLAZE_LAUNCH_EXPLORE`, `BLAZE_LAUNCH_FD`, `BLAZE_LAUNCH_GRANTS`, `BLAZE_LAUNCH_NATIVE`, `BLAZE_LAUNCH_STORE`, `BLAZE_LAUNCH_TELEMETRY`, `BLAZE_MEMORY_BUDGET`, `BLAZE_NO_COMPTIME_PATCH`, `BLAZE_NO_DAEMON`, `BLAZE_NO_LAN_PEER`, `BLAZE_NO_TELEMETRY`, `BLAZE_OPT`, `BLAZE_PROC_MACRO_SRV`, `BLAZE_PROFILE_CAP_MB`, `BLAZE_PROFILE_DETAIL`, `BLAZE_RELEASE`, `BLAZE_SIM_BOARD`, `BLAZE_SIM_SEED`, `BLAZE_SIM_SEEDS`, `BLAZE_SIM_TAPE`, `BLAZE_SOLVE_COST_SHOW`, `BLAZE_STATS`, `BLAZE_STORE_MAX_BYTES`, `BLAZE_STORE_MAX_GB`, `BLAZE_UI`, `BLAZE_VERIFY_STORE`.
