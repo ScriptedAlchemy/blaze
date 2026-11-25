@@ -8,6 +8,8 @@
 
 #[path = "../src/store/native_pack.rs"]
 mod native_pack;
+#[path = "../src/sys/directory.rs"]
+mod directory;
 
 use core::ffi::c_void;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -185,38 +187,8 @@ fn mkdir_one(path: &str) -> Result<(), Errno> {
     })
 }
 
-fn list_names(dir: &str, alloc: WireAlloc) -> Vec<WireString, WireAlloc> {
-    let mut out = Vec::new_in(alloc.clone());
-    let fd = match with_cpath(dir, |cpath| {
-        openat(CWD, cpath, OpenFlags::READ.with(OpenFlags::DIRECTORY).with(OpenFlags::CLOSE_ON_EXEC), 0)
-    }) {
-        Ok(fd) => fd,
-        Err(_) => return out,
-    };
-    #[cfg(target_os = "linux")]
-    {
-        let mut buf = [0u8; 8192];
-        loop {
-            let mut count = 0usize;
-            if let Ok(entries) = blaze_sys::linux::getdents64(fd.fd(), &mut buf) {
-                for entry in entries {
-                    count = count.saturating_add(1);
-                    if entry.name == b"." || entry.name == b".." {
-                        continue;
-                    }
-                    if let Ok(s) = core::str::from_utf8(entry.name) {
-                        let mut owned = String::with_capacity_in(s.len(), alloc.clone());
-                        owned.push_str(s);
-                        out.push(owned);
-                    }
-                }
-            }
-            if count == 0 {
-                break;
-            }
-        }
-    }
-    out
+fn list_names(dir: &str, alloc: WireAlloc) -> Vec<directory::DirEntry<WireAlloc>, WireAlloc> {
+    directory::list_dir(dir, alloc).unwrap_or_else(|error| panic!("listing {dir}: {}", error.what()))
 }
 
 fn remove_tree(root: &str, alloc: WireAlloc) {
@@ -232,7 +204,7 @@ fn remove_tree(root: &str, alloc: WireAlloc) {
         let entries = list_names(dir.as_str(), alloc.clone());
         stack.push((dir.clone(), true));
         for entry in entries {
-            let child = format_in!(alloc.clone(), "{}/{}", dir.as_str(), entry.as_str());
+            let child = format_in!(alloc.clone(), "{}/{}", dir.as_str(), entry.name.as_str());
             let is_real_dir = with_cpath(child.as_str(), |c| stat_at(CWD, c, AT_SYMLINK_NOFOLLOW))
                 .map(|st| {
                     let kind = st.st_mode & S_IFMT;
@@ -735,6 +707,33 @@ fn a_write_of_a_wrong_hash_is_refused_and_names_nothing() {
 }
 
 #[test]
+fn an_aborted_put_removes_its_staged_pack() {
+    let alloc = blaze_own::testing::heap().shared();
+    let served = Served::start("aborted-put", alloc.clone());
+    let packs = format_in!(alloc.clone(), "{}/packs", served.dir());
+    let mut client = TcpClient::connect(served.port).unwrap_or_else(|e| panic!("connect: {}", e.what()));
+    let request = b"PUT /v1/blob/packs/0101010101010101010101010101010101010101010101010101010101010101.pack HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\nx";
+    assert!(client.write_all(request).is_ok());
+    let wait_for_stage = |present: bool| {
+        for _ in 0..200 {
+            let entries = list_names(packs.as_str(), alloc.clone());
+            if match entries.as_slice() {
+                [] => !present,
+                [entry] if entry.name.as_str().ends_with(".tmp") => present,
+                _ => panic!("unexpected file in {}", packs.as_str()),
+            } {
+                return;
+            }
+            sleep_ms(10);
+        }
+        panic!("timed out waiting for staged pack presence {present} in {}", packs.as_str());
+    };
+    wait_for_stage(true);
+    drop(client);
+    wait_for_stage(false);
+}
+
+#[test]
 fn a_concurrent_write_of_one_blob_leaves_one_whole_blob() {
     let alloc = blaze_own::testing::heap().shared();
     let served = Served::start("concurrent", alloc.clone());
@@ -783,7 +782,11 @@ fn a_concurrent_write_of_one_blob_leaves_one_whole_blob() {
     let left = list_names(packs_dir.as_str(), alloc.clone());
     let expected_file = format_in!(alloc.clone(), "{}.pack", hex_of(&digest(bytes.as_slice()), alloc.clone()).as_str());
     assert_eq!(left.len(), 1);
-    assert_eq!(left.first().map(|s| s.as_str()), Some(expected_file.as_str()));
+    assert_eq!(left.first().map(|entry| entry.name.as_str()), Some(expected_file.as_str()));
+    let root = served.dir.path.clone();
+    drop(served);
+    let after_cleanup = with_cpath(root.as_str(), |path| stat_at(CWD, path, AT_SYMLINK_NOFOLLOW));
+    assert!(matches!(after_cleanup, Err(Errno::NoEnt)), "test directory left at {}", root.as_str());
 }
 
 #[test]
@@ -901,5 +904,5 @@ fn http_reads_reject_symlink_objects_and_oversize_upload_length() {
 
     let packs_dir = format_in!(alloc.clone(), "{}/packs", served.dir());
     let entries = list_names(packs_dir.as_str(), alloc);
-    assert!(entries.iter().all(|e| !e.as_str().starts_with('.')));
+    assert!(entries.iter().all(|entry| !entry.name.as_str().starts_with('.')));
 }
