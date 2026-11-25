@@ -18,7 +18,7 @@
 //! | | `Kernel` and `Trap`: `__open_nocancel` | 10.5 (UNSURE) | `dlsym` |
 //! | fcntl | `Public`: `fcntl`; `Kernel` and `Trap`: `__fcntl_nocancel` | 10.0; 10.5 (UNSURE) | `dlsym` |
 //! | fstat | `Public`'s `fstat` for all three | 10.5 (the 64-bit-inode `struct stat`) | always there |
-//! | the clock | `Public`: `clock_gettime(CLOCK_MONOTONIC)`; `Kernel` and `Trap`: `mach_continuous_time` | 10.12, both | `dlsym` for `mach_continuous_time` |
+//! | the clock | `Public`: `clock_gettime(CLOCK_MONOTONIC_RAW)`; `Kernel` and `Trap`: `mach_continuous_time` | 10.12, both | `dlsym` for `mach_continuous_time` |
 //! | wait, wake | `Public`: `os_sync_wait_on_address_with_deadline`, `os_sync_wake_by_address_any` | 14.4 | the cold table, at first call (and `every_cold_symbol_exists`) |
 //! | | `Kernel` and `Trap`: `__ulock_wait2`, `__ulock_wake` | 11.0 for `__ulock_wait2` (`__ulock_wake` 10.12) | `dlsym`, each a fact |
 //!

@@ -235,12 +235,12 @@ impl Calls for Public {
         crate::posix::io::status_flags(fd)
     }
 
-    /// [`crate::posix::io::clock_gettime`] of `CLOCK_MONOTONIC`, which on macOS is Mach's
+    /// [`crate::posix::io::clock_gettime`] of `CLOCK_MONOTONIC_RAW`, which on macOS is Mach's
     /// continuous time in nanoseconds (it counts sleep).
     #[blaze::noalloc]
     #[blaze::nopanic]
     fn now_ns(&self) -> Result<u64, Errno> {
-        let now = crate::posix::io::clock_gettime(ClockId::Monotonic)?;
+        let now = crate::posix::io::clock_gettime(ClockId::MonotonicRaw)?;
         let (Ok(sec), Ok(nsec)) = (u64::try_from(now.sec), u64::try_from(now.nsec)) else {
             return Err(Errno::Overflow);
         };
@@ -414,7 +414,7 @@ pub const KERNEL_ENTRIES: [Symbol; 10] = [
         name: c"mach_continuous_time",
         api: Api::Public,
         why: "the clock that counts sleep as a commpage read, scaled here by the timebase: \
-              `clock_gettime(CLOCK_MONOTONIC)` reads the same clock behind a switch on the \
+              `clock_gettime(CLOCK_MONOTONIC_RAW)` reads the same clock behind a switch on the \
               clock id and a `timespec`. Apple: public (mach/mach_time.h, macOS 10.12)",
     },
 ];
@@ -943,8 +943,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The clocks: each monotonic, and the three within a millisecond of each other read back
-    /// to back (one clock, Mach's continuous time, read three ways).
+    /// All strategies read the same monotonic timeline, even if the thread is preempted
+    /// between two reads.
     #[test]
     fn the_clocks_agree() {
         let facts = facts();
@@ -953,13 +953,13 @@ mod tests {
         let b = kernel.now_ns().unwrap();
         let c = Public.now_ns().unwrap();
         let d = kernel.now_ns().unwrap();
-        assert!(a <= c && b <= d, "monotonic: {a} {c}, {b} {d}");
-        assert!(b.abs_diff(a) < 1_000_000 && d.abs_diff(c) < 1_000_000, "close: {a} {b} {c} {d}");
+        assert!(a <= b && b <= c && c <= d, "Public {a}, Kernel {b}, Public {c}, Kernel {d}");
         #[cfg(target_arch = "aarch64")]
         {
             let trap = Trap::new(&facts).unwrap();
             let e = trap.now_ns().unwrap();
-            assert!(e >= d && e.abs_diff(Public.now_ns().unwrap()) < 1_000_000);
+            let f = Public.now_ns().unwrap();
+            assert!(d <= e && e <= f, "Kernel {d}, Trap {e}, Public {f}");
         }
     }
 
