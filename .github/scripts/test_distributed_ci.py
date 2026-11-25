@@ -401,6 +401,56 @@ class WorkerBridgeTests(unittest.TestCase):
         worker=importlib.util.module_from_spec(spec);sys.modules[spec.name]=worker;spec.loader.exec_module(worker)
         return worker
 
+    def test_bootstrap_preparation_tracks_source_and_preserves_immutable_records(self):
+        worker = self.load_harness()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            builder = root / "builder"
+            builder.write_bytes(b"explicit sandboxed builder")
+            project = root / "project"
+            for name in ("pm", "shapes"):
+                (project / name).mkdir(parents=True)
+                (project / name / "lib.rs").write_text("original")
+            (project / "Cargo.lock").write_text("fixture lock")
+            (project / "Cargo.toml").write_text("[workspace]")
+            given = worker.Input(blaze="unused", dist_local="unused", serve="unused",
+                                 scratch=str(root / "run"), module_builder=str(builder))
+            with patch.dict(os.environ, {"HOME": str(root / "empty-home")}), \
+                    patch.object(worker, "free_port", return_value=1):
+                run = worker.Run(given)
+            calls = []
+
+            def prepare(argv, **kwargs):
+                supplied = json.loads(argv[1])
+                script = "build_scripts" in supplied
+                request = supplied["build_scripts"] if script else supplied
+                self.assertIs(request["unsandboxed_build_scripts"], False)
+                self.assertTrue(kwargs["start_new_session"])
+                name = request["crates"][0]["name"]
+                calls.append(name)
+                kind = "build-script" if script else "proc-macro"
+                key = Path(request["work"]).name
+                record = Path(request["store"]) / kind / "modules" / key
+                record.mkdir(parents=True)
+                (record / "module.wasm").write_text((project / name / "lib.rs").read_text())
+                class Completed:
+                    def wait(self, timeout):
+                        return 0
+                return Completed()
+
+            with patch.object(worker.subprocess, "Popen", side_effect=prepare):
+                run.prepare_modules("a", project)
+                run.prepare_modules("b", project)
+                self.assertEqual(calls, ["pm", "shapes"])
+                (project / "shapes/lib.rs").write_text("edited script package")
+                run.prepare_modules("a", project)
+                self.assertEqual(calls, ["pm", "shapes", "shapes"])
+                records = list((run.root / "a/.blaze/v2/build-script/modules").glob("*/module.wasm"))
+                self.assertEqual({p.read_text() for p in records}, {"original", "edited script package"})
+                records[0].write_text("planted immutable-record corruption")
+                with self.assertRaisesRegex(worker.Failed, "immutable bootstrap module differs"):
+                    run.prepare_modules("a", project)
+
     def test_build_failure_includes_root_cause_and_final_diagnostic(self):
         worker = self.load_harness()
         root = "MacroModule: no build-script module of shapes"

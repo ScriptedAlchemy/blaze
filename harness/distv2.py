@@ -19,6 +19,8 @@ Input, one JSON value (`python3 harness/distv2.py '{...}'`):
     timeout      (optional) bound in seconds for each build/fault stage; default 3600
     command_timeout (optional) seconds for status, stop and running the program; default 60
     env          (optional) explicit toolchain/runtime environment for every child
+    module_builder (optional) explicit D52 bootstrap proc_macro_modules executable for fixture modules;
+                 runs sandboxed before export, never invoked by blaze
     cores, daemon_memory_gb (optional) per-daemon resource hints; otherwise preserve the caller's
                  explicit BLAZE_CORES / BLAZE_DAEMON_MEMORY_GB; no harness resource cap
 
@@ -81,6 +83,7 @@ class Input:
     env: dict[str, str] = dataclasses.field(default_factory=dict)
     cores: int | None = None
     daemon_memory_gb: int | None = None
+    module_builder: str | None = None
 
 
 def load(text: str) -> Input:
@@ -93,6 +96,13 @@ def load(text: str) -> Input:
                 raise Failed(f"{name} must be a JSON array of strings without NUL bytes")
             raw[name] = tuple(raw[name])
     given = Input(**raw)
+    if given.module_builder is not None:
+        if not isinstance(given.module_builder, str) or not given.module_builder or "\0" in given.module_builder:
+            raise Failed("module_builder must name a nonempty executable path without NUL bytes")
+        builder = Path(given.module_builder).resolve()
+        if not builder.is_file() or not os.access(builder, os.X_OK):
+            raise Failed(f"module_builder is not an executable file: {builder}")
+        given = dataclasses.replace(given, module_builder=str(builder))
     for name in ("blaze", "dist_local", "serve", "scratch", "project"):
         value = getattr(given, name)
         if not isinstance(value, str) or not value or "\0" in value:
@@ -203,6 +213,8 @@ class Run:
         self.services: list[subprocess.Popen] = []
         self.clients: list[tuple[subprocess.Popen, float, str]] = []
         self.client_homes: dict[int, str] = {}
+        self.prepared_modules: set[str] = set()
+        self.builder_hash = file_hash(Path(given.module_builder)) if given.module_builder else None
         self.suspended: set[int] = set()
         self.result_gates: list[Path] = []
         self.lease: list[str] = []
@@ -224,6 +236,9 @@ class Run:
         for name in ("blaze", "dist_local", "serve"):
             path = Path(getattr(self.given, name)).resolve(strict=True)
             identities[name] = {"path": str(path), "sha256": file_hash(path)}
+        if self.given.module_builder is not None:
+            path = Path(self.given.module_builder).resolve(strict=True)
+            identities["module_builder"] = {"path": str(path), "sha256": self.builder_hash}
         project = Path(self.given.project).resolve()
         files = sorted(project.rglob("*"))
         fixture = hashlib.sha256()
@@ -380,7 +395,72 @@ class Run:
         self.daemons[home] = daemon
         self.until(f"{home} daemon becomes ready", lambda: daemon_pid(self, home, project) == daemon.pid, [daemon], timeout=300)
 
+    def prepare_modules(self, home: str, project: Path) -> None:
+        """Explicit D52 fixture setup, keyed per package revision, outside the compiler."""
+        builder = self.given.module_builder
+        if builder is None:
+            return
+        lock = project / "Cargo.lock"
+        if not lock.is_file():
+            raise Failed(f"module preparation requires the fixture lock: {lock}")
+        staging = self.root / "bootstrap"
+        store = staging / "records"
+        for package, script in (("pm", False), ("shapes", True)):
+            source = project / package
+            digest = hashlib.sha256(bytes.fromhex(self.builder_hash) + bytes.fromhex(file_hash(lock)))
+            digest.update(bytes.fromhex(file_hash(project / "Cargo.toml")))
+            digest.update(package.encode())
+            for path in sorted(source.rglob("*")):
+                if path.is_symlink():
+                    raise Failed(f"module preparation refuses a fixture symlink: {path}")
+                if path.is_file():
+                    relative = path.relative_to(source).as_posix().encode()
+                    content = path.read_bytes()
+                    digest.update(len(relative).to_bytes(8, "little") + relative)
+                    digest.update(len(content).to_bytes(8, "little") + content)
+            key = digest.hexdigest()
+            if key in self.prepared_modules:
+                continue
+            work = staging / "work" / key
+            request = {"checkout": str(project), "store": str(store), "work": str(work),
+                       "tree": str(HERE.parent), "crates": [{"name": package, "version": "0.1.0", "features": []}],
+                       "unsandboxed_build_scripts": False, "build_seconds": self.given.timeout}
+            payload = {"build_scripts": request} if script else request
+            log_path = self.root / "logs" / f"bootstrap-{package}-{key}.log"
+            print(f"bootstrap D52 {package}: {key}; sandbox required; log {log_path}", flush=True)
+            with log_path.open("w") as log:
+                process = subprocess.Popen([builder, json.dumps(payload)], cwd=HERE.parent,
+                                           env={**os.environ, **self.given.env}, stdout=log,
+                                           stderr=subprocess.STDOUT, start_new_session=True)
+                self.services.append(process)
+                try:
+                    code = process.wait(timeout=self.given.timeout)
+                except subprocess.TimeoutExpired as why:
+                    self.terminate(process, timeout=self.given.command_timeout)
+                    raise Failed(f"module preparation {package} exceeded {self.given.timeout}s; log {log_path}") from why
+                self.services.remove(process)
+            require_build(code, log_path.read_text(), f"module preparation {package}", log_path)
+            self.prepared_modules.add(key)
+        destination = self._prepare_home(home) / ".blaze" / "v2"
+        for kind in ("proc-macro", "build-script"):
+            records = store / kind / "modules"
+            if not records.is_dir():
+                raise Failed(f"module preparation produced no records: {records}")
+            for path in sorted(records.rglob("*")):
+                if path.is_symlink():
+                    raise Failed(f"module preparation produced a symlink: {path}")
+                target = destination / kind / "modules" / path.relative_to(records)
+                if path.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif target.exists():
+                    if path.read_bytes() != target.read_bytes():
+                        raise Failed(f"immutable bootstrap module differs at {target}")
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(path, target)
+
     def build(self, home: str, dist: bool = True, wait: bool = True, project: Path | None = None, **extra):
+        self.prepare_modules(home, project or self.project)
         self.daemon(home, project=project)
         self.sequence += 1
         log = open(self.root / "logs" / f"{home}.{self.sequence}.log", "w")
