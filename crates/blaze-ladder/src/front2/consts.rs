@@ -54,6 +54,38 @@ pub const MOST_NEEDS: u32 = 256;
 /// the needs do not settle (rule 18).
 pub const MOST_STEPS: u32 = 4096;
 
+/// The operand of an explicit promoted borrow, or the unadjusted receiver of a promoted autoref.
+pub(crate) struct PromotedOperand<'a> {
+    pub(crate) root: ExprId,
+    pub(crate) adjusts: Option<tc::Adjusts<'a>>,
+}
+
+pub(crate) fn promoted_operand<'a>(owner: ItemKey, borrow: ExprId, exprs: &[tc::Expr], checked: &Checked<'_>, alloc: Alloc<'a>) -> Result<PromotedOperand<'a>, ConstFail> {
+    let refused = || ConstFail::NotPromoted { owner, borrow };
+    if checked.promoted.binary_search_by_key(&borrow.0, |x| x.0).is_err() {
+        return Err(refused());
+    }
+    if let tc::Expr::Ref { mutbl: tc::Mutbl::Not, operand } = exprs.get(borrow.0 as usize).ok_or_else(refused)? {
+        return Ok(PromotedOperand { root: *operand, adjusts: None });
+    }
+    let exprs = checked.adjusts.column::<0>();
+    let start = exprs.partition_point(|e| e.0 < borrow.0);
+    if exprs.get(start) != Some(&borrow)
+        || !matches!(checked.adjusts.column::<1>().get(start), Some(tc::AdjustKind::Borrow { mutbl: tc::Mutbl::Not, raw: false, .. }))
+    {
+        return Err(refused());
+    }
+    // Evaluate the receiver before its borrow and subsequent coercions. Its children's
+    // adjustments still apply.
+    let mut stripped = tc::Adjusts::new_in(alloc);
+    for (i, &expr) in exprs.iter().enumerate() {
+        if expr != borrow {
+            stripped.push((expr, checked.adjusts.column::<1>()[i], checked.adjusts.column::<2>()[i]));
+        }
+    }
+    Ok(PromotedOperand { root: borrow, adjusts: Some(stripped) })
+}
+
 /// The first failure encountered while preparing a body for interpretation.
 pub enum RequiredBodyCause {
     Lower(BodyError),
@@ -1144,46 +1176,11 @@ impl<'n> Consts<'n> {
             // The operand is evaluated; the builder borrows its row. Only a borrow THIS check
             // promoted: one it did not is a runtime temporary, never a constant.
             Some(BodyRoot::Promoted(borrow)) => {
-                if checked.promoted.binary_search_by_key(&borrow.0, |x| x.0).is_err() {
-                    return Err(ConstFail::NotPromoted { owner: item, borrow });
+                let input = promoted_operand(item, borrow, &lowered.typeck.exprs, &checked, r.store.tys.alloc())?;
+                if let Some(adjusts) = input.adjusts {
+                    checked.adjusts = adjusts;
                 }
-                match lowered.typeck.exprs.get(borrow.0 as usize) {
-                    Some(&tc::Expr::Ref { mutbl: tc::Mutbl::Not, operand }) => Some(operand),
-                    Some(_) => {
-                        // A promoted shared autoref (`AdjustKind::Borrow { mutbl: Not, raw: false }`
-                        // at index 0 on `borrow`): the promoted value is `borrow`'s unadjusted
-                        // value before its leading borrow and any coercions after it. Strip
-                        // `borrow`'s own adjustment rows from this `ConstBody`'s `checked` so the
-                        // evaluator produces `borrow`'s value directly.
-                        let adj_e = checked.adjusts.column::<0>();
-                        let start = adj_e.partition_point(|e| e.0 < borrow.0);
-                        let end = adj_e.partition_point(|e| e.0 <= borrow.0);
-                        if start == end
-                            || !matches!(
-                                checked.adjusts.column::<1>().get(start),
-                                Some(tc::AdjustKind::Borrow { mutbl: tc::Mutbl::Not, raw: false, .. })
-                            )
-                        {
-                            return Err(ConstFail::NotPromoted { owner: item, borrow });
-                        }
-                        let mut stripped = blaze_own::Soa::new_in(r.store.tys.alloc());
-                        for (i, ((&e, &k), &t)) in checked
-                            .adjusts
-                            .column::<0>()
-                            .iter()
-                            .zip(checked.adjusts.column::<1>().iter())
-                            .zip(checked.adjusts.column::<2>().iter())
-                            .enumerate()
-                        {
-                            if i < start || i >= end {
-                                stripped.push((e, k, t));
-                            }
-                        }
-                        checked.adjusts = stripped;
-                        Some(borrow)
-                    }
-                    None => return Err(ConstFail::NotPromoted { owner: item, borrow }),
-                }
+                Some(input.root)
             }
         };
         let text = match (r.store.locals.head(item), r.keys.library_in(r.names, item)) {

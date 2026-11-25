@@ -294,12 +294,14 @@ pub fn plain_needs_of<A: Allocator + Copy>(done: &Checked<'_>, out: &mut Needs<A
 /// read by the builder's `Adts` during it.
 pub struct ConstTable<A: Allocator + Copy> {
     rows: SortedMap<(u8, u128, u32), Vec<(Vec<PTy, A>, DataRecord<Global>), A>, A>,
+    /// Fn relocations of values evaluated directly in the build's own ground type table.
+    pub(crate) ground_fns: SortedMap<blaze_build::InstanceKey, blaze_build::Instance, A>,
     alloc: A,
 }
 
 impl<A: Allocator + Copy> ConstTable<A> {
     pub fn new_in(alloc: A) -> ConstTable<A> {
-        ConstTable { rows: SortedMap::new_in(alloc), alloc }
+        ConstTable { rows: SortedMap::new_in(alloc), ground_fns: SortedMap::new_in(alloc), alloc }
     }
 
     /// The value of `need` at `args`, if pulled.
@@ -307,7 +309,7 @@ impl<A: Allocator + Copy> ConstTable<A> {
         self.rows.get(&need.order())?.iter().find(|(a, _)| a[..] == *args).map(|(_, record)| record)
     }
 
-    fn insert(&mut self, need: ConstNeed, args: &[PTy], record: DataRecord<Global>) {
+    pub(crate) fn insert(&mut self, need: ConstNeed, args: &[PTy], record: DataRecord<Global>) {
         let alloc = self.alloc;
         let at = self.rows.get_or_insert_with(&need.order(), |&k| (k, Vec::new_in(alloc)));
         let mut kept = Vec::new_in(alloc);

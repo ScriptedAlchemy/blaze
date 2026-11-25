@@ -9,7 +9,7 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 use std::alloc::Global;
 
-use blaze_build::data::{DataAlloc, DataError, DataRecord, DataTarget, ImageTarget, StaticImage};
+use blaze_build::data::{DataError, DataRecord, DataTarget, ImageTarget, StaticImage};
 use blaze_build::tls::{self, TlsError};
 use blaze_build::layout::{LayoutCx, LayoutFacts, Layouts, Missing, ReprAttrs, ValidRange};
 use blaze_build::vtable::{Shape, Vtable, VtableRef, VtableTarget};
@@ -612,6 +612,7 @@ struct FrontConsts<'a, P> {
     program: &'a P,
     checked: &'a [Option<Checked<'static>>],
     store: Vec<ConstRecord<Alloc<'static>>, Global>,
+    promoted: Option<(ItemKey, Typed<'a>)>,
 }
 
 /// As [`FrontAdts`]'s facts: the front end's ADTs and reprs.
@@ -644,14 +645,14 @@ impl<P: FrontEnd> LayoutFacts for FrontConsts<'_, P> {
 
 impl<P: FrontEnd> ConstWorld for FrontConsts<'_, P> {
     fn body(&self, item: ItemKey) -> Fetch<Option<Typed<'_>>> {
+        if let Some((key, typed)) = self.promoted && key == item {
+            return Ok(Some(typed));
+        }
         let Some(i) = self.program.fn_index(item) else { return Ok(None) };
-        let function = self.program.function(i);
-        let Some((body, l)) = function.body else { return Ok(None) };
+        if self.program.function(i).body.is_none() { return Ok(None) }
         // Not checked yet: the evaluator stops with `NeedKind::Body` (`condition_holds`).
         let Some(checked) = self.checked[i].as_ref() else { return Err(blaze_typeck::Missing) };
-        let lits = Lits { text: &l.text, exprs: (&l.exprs, &l.expr_ranges), pats: (&l.pats, &l.pat_ranges) };
-        let view = body.view(self.program.body_types(i));
-        Ok(Some(Typed::new(view, checked, function.text, lits, self.program.code_of(i))))
+        Ok(typed_const_body(self.program, i, checked))
     }
 
     /// A tuple constructor builds its value and a `const fn` is interpreted; every other fn is
@@ -696,6 +697,75 @@ impl<P: FrontEnd> ConstWorld for FrontConsts<'_, P> {
     }
 }
 
+fn typed_const_body<'a, P: FrontEnd>(program: &'a P, i: usize, checked: &'a Checked<'_>) -> Option<Typed<'a>> {
+    let function = program.function(i);
+    let (body, l) = function.body?;
+    let lits = Lits { text: &l.text, exprs: (&l.exprs, &l.expr_ranges), pats: (&l.pats, &l.pat_ranges) };
+    Some(Typed::new(body.view(program.body_types(i)), checked, function.text, lits, program.code_of(i)))
+}
+
+impl<P: FrontEnd> FrontConsts<'_, P> {
+    fn evaluate(&mut self, function: &crate::seam::FnFacts<'_>, item: ItemKey, args: List, ground: &mut PortableTys<'_>, layout: &mut Layouts<Alloc<'static>>, codes: &mut Codes<Alloc<'static>>, alloc: Alloc<'static>) -> Result<&ConstRecord<Alloc<'static>>, RunError> {
+        let mut settle = Settle::new(Need { kind: NeedKind::Value, item, args }, 64, alloc);
+        let mut last = None;
+        while let Some(n) = settle.next() {
+            let step = match value_of(self, layout, codes, n.item, n.args, ground, Limits::DEFAULT, alloc) {
+                Ok(Answer::Done(record)) => {
+                    last = Some(record.key);
+                    if !self.store.iter().any(|r| r.key == record.key) {
+                        self.store.push(record);
+                    }
+                    settle.done();
+                    Ok(())
+                }
+                Ok(Answer::Need(need)) => settle.need(need),
+                Err(error) => Err(error),
+            };
+            step.map_err(|error| RunError::Const { constant: function.named(), error })?;
+        }
+        last.and_then(|key| self.store.iter().find(|record| record.key == key)).ok_or_else(|| RunError::Build {
+            function: function.named(), error: BuildError::Malformed { what: "a settled constant left no record" }, range: None,
+        })
+    }
+}
+
+/// The file frontend has already checked every body. Evaluate its promoted operands at
+/// this instance's arguments from those bodies, using the same operand as the item frontend.
+fn eval_promotions<P: FrontEnd>(program: &P, i: usize, instance: Instance, checked: &[Option<Checked<'static>>], done: &Checked<'_>, ground: &mut PortableTys<'_>, table: &mut crate::front2::const_at::ConstTable<Global>, alloc: Alloc<'static>) -> Result<(), RunError> {
+    use crate::front2::const_at::{ConstAtRefusal, ConstAtWhy, ConstNeed, data_record, promoted_key};
+    let function = program.function(i);
+    let body = typed_const_body(program, i, done).ok_or_else(|| RunError::Build {
+        function: function.named(), error: BuildError::Malformed { what: "a promotion without its owner's body" }, range: None,
+    })?;
+    let mut layout = Layouts::new_in(alloc);
+    let mut codes = Codes::new_in(alloc);
+    let mut store = Vec::new_in(Global);
+    for &borrow in done.promoted.iter() {
+        let need = ConstNeed::Promoted { owner: function.key, borrow };
+        let arguments = ground.view().list(instance.args).map_err(|_| RunError::Build {
+            function: function.named(), error: BuildError::Malformed { what: "promoted arguments past the ground table" }, range: None,
+        })?;
+        if table.get(need, arguments).is_some() { continue; }
+        let input = crate::front2::consts::promoted_operand(function.key, borrow, body.body.exprs, done, alloc)
+            .map_err(|why| RunError::ConstAt { function: function.named(), refusal: ConstAtRefusal { need, why: ConstAtWhy::Eval(why) }, path: program.item_named(function.key) })?;
+        let mut typed = body;
+        typed.body.root = input.root;
+        typed.body.params = &[];
+        if let Some(rows) = &input.adjusts {
+            typed.adjusts = (rows.column::<0>(), rows.column::<1>(), rows.column::<2>());
+        }
+        let key = promoted_key(function.key, borrow, function.text);
+        let mut world = FrontConsts { program, checked, store, promoted: Some((key, typed)) };
+        let record = world.evaluate(&function, key, instance.args, ground, &mut layout, &mut codes, alloc)?;
+        for named in record.fns.iter() {
+            table.ground_fns.insert(named.key, named.instance);
+        }
+        table.insert(need, ground.view().list(instance.args).expect("ground rows only grow"), data_record(record));
+        store = world.store;
+    }
+    Ok(())
+}
+
 /// Every `const` item's value, evaluated once each with what it reads settled first, as the
 /// build reads it: the record's bytes in the build's allocator.
 fn eval_consts<P: FrontEnd>(
@@ -705,7 +775,7 @@ fn eval_consts<P: FrontEnd>(
     static_instances: &mut blaze_hash::HashMap<InstanceKey, Instance, Alloc<'static>>,
     alloc: Alloc<'static>,
 ) -> Result<Vec<(ItemKey, DataRecord<Global>), Global>, RunError> {
-    let mut world = FrontConsts { program, checked, store: Vec::new_in(Global) };
+    let mut world = FrontConsts { program, checked, store: Vec::new_in(Global), promoted: None };
     let mut layout = Layouts::new_in(alloc);
     let mut codes = Codes::new_in(alloc);
     let mut out = Vec::new_in(Global);
@@ -716,42 +786,11 @@ fn eval_consts<P: FrontEnd>(
         if !matches!(function.kind, FnKind::Const | FnKind::Static) || function.body.is_none() || function.condition {
             continue;
         }
-        let mut settle = Settle::new(Need { kind: NeedKind::Value, item: function.key, args: List::EMPTY }, 64, alloc);
-        let mut last = None;
-        while let Some(n) = settle.next() {
-            let step = match value_of(&world, &mut layout, &mut codes, n.item, n.args, ground, Limits::DEFAULT, alloc) {
-                Ok(Answer::Done(record)) => {
-                    last = Some(record.key);
-                    if !world.store.iter().any(|r| r.key == record.key) {
-                        world.store.push(record);
-                    }
-                    settle.done();
-                    Ok(())
-                }
-                Ok(Answer::Need(need)) => settle.need(need),
-                Err(error) => Err(error),
-            };
-            step.map_err(|error| RunError::Const { constant: function.named(), error })?;
-        }
-        let Some(record) = last.and_then(|key| world.store.iter().find(|r| r.key == key)) else {
-            return Err(RunError::Build {
-                function: function.named(),
-                error: BuildError::Malformed { what: "a settled constant left no record" },
-                range: None,
-            });
-        };
+        let record = world.evaluate(&function, function.key, List::EMPTY, ground, &mut layout, &mut codes, alloc)?;
         if matches!(function.kind, FnKind::Static) {
             static_instances.extend(record.fns.iter().map(|named| (named.key, named.instance)));
         }
-        let mut allocs = Vec::with_capacity_in(record.data.allocs.len(), Global);
-        for a in record.data.allocs.iter() {
-            let mut bytes = Vec::with_capacity_in(a.bytes.len(), Global);
-            bytes.extend_from_slice(&a.bytes);
-            let mut relocs = Vec::with_capacity_in(a.relocs.len(), Global);
-            relocs.extend_from_slice(&a.relocs);
-            allocs.push(DataAlloc { bytes, align: a.align, mutable: a.mutable, relocs });
-        }
-        out.push((function.key, DataRecord { allocs }));
+        out.push((function.key, crate::front2::const_at::data_record(record)));
     }
     Ok(out)
 }
@@ -790,7 +829,7 @@ fn settle_condition(program: &Front<'_>, cond: ItemKey, args: &[PTy], types: PTy
         if steps > CONDITION_STEPS {
             return None;
         }
-        let world = FrontConsts { program, checked: &checked, store: core::mem::replace(&mut store, Vec::new_in(Global)) };
+        let world = FrontConsts { program, checked: &checked, store: core::mem::replace(&mut store, Vec::new_in(Global)), promoted: None };
         let answer = value_of(&world, &mut layout, &mut codes, n.item, n.args, &mut ground, Limits::DEFAULT, alloc);
         store = world.store;
         match answer.ok()? {
@@ -1202,7 +1241,11 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     /// that finds the record by key never asks again. `None` (refused by the walk as
     /// `BuildError::NoConstFnInstance`): no record of the front end names the key.
     fn const_fn_instance(&self, key: InstanceKey, ground: &mut PortableTys<'_>) -> Option<Instance> {
-        self.0.const_fn_instance(key, ground, self.4.alloc)
+        if self.0.evaluates_at_args() {
+            self.0.const_fn_instance(key, ground, self.4.alloc)
+        } else {
+            self.4.const_at.ground_fns.get(&key).copied()
+        }
     }
 
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {
@@ -2426,6 +2469,12 @@ fn build_from<P: FrontEnd>(
         // built at its owner's arguments, and the owner's instance, built first (it is what
         // reaches them), pulled them. A need the evaluator refuses is this instance's refusal.
         const_needs.clear();
+        if is_own_instance && !program.evaluates_at_args() && let Some(done) = done && !done.promoted.is_empty()
+            && let Err(refusal) = eval_promotions(program, i, instance, &checked, done, &mut ground, &mut checked_bodies.const_at, alloc)
+        {
+            filed(&mut survey, refusal)?;
+            continue;
+        }
         if is_own_instance
             && program.evaluates_at_args()
             && let (Some(body), Some(done)) = (body, done)

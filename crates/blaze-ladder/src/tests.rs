@@ -160,12 +160,17 @@ fn blaze_attributes_are_inert_and_unknown_ones_advice() {
 /// so the finding is `NoMethod` (it does not carry the condition's reason yet). Never true.
 #[test]
 fn a_where_const_condition_is_evaluated_at_the_impl_arguments() {
-    for (value, body, holds) in [("true", "const fn", true), ("false", "const fn", false), ("true", "fn", false)] {
+    for (value, body, call, holds) in [
+        ("true", "const fn", "0u8.flat()", true),
+        ("true", "const fn", "{ let value = 0u8; value.flat() }", true),
+        ("false", "const fn", "0u8.flat()", false),
+        ("true", "fn", "0u8.flat()", false),
+    ] {
         let text = std::format!(
             "#![feature(no_core, lang_items, blaze_comptime)]\n#![no_core]\n#[lang = \"sized\"] trait Sized {{}}\n\
              {body} small<T>() -> bool {{ {value} }}\n\
              trait Flat {{ fn flat(&self) -> i32 {{ 42 }} }}\nimpl<T> Flat for T where const {{ small::<T>() }} {{}}\n\
-             fn main() {{ let _ = 0u8.flat(); }}"
+             fn main() {{ let _ = {call}; }}"
         );
         let files = [SourceFile { path: "src/main.rs", text: &text }];
         let all = refusals(&files, "src/main.rs", OverflowChecks::On, Alloc::global());

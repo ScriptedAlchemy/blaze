@@ -8,10 +8,9 @@
 //!   (`Region::Param(i)`, declaration order: an ADT has no container and elides nothing, E0106),
 //!   or `'static`; a lifetime a fn pointer's binder binds is `Region::Late`; each type parameter
 //!   it names stands for every position of that argument. The column is in the one counter's
-//!   pre-order (blaze-typeck regions.rs `region_arity`), which is the lowering's position order
-//!   (`npos`) at every node the lowering gives positions to; a trait object's one position is
-//!   its own slot, and the slots of its traits (and a fn item's arguments) are no position of
-//!   the lowering's, so [`field_row`] steps over them by the same counter. A column that does
+//!   pre-order (blaze-typeck regions.rs `region_arity`), which the lowering's `RegionSlots`
+//!   grain uses: a trait object's lifetime comes before its predicates' slots, and a fn item's
+//!   arguments contribute their slots in order. A column that does
 //!   not line up with the walk of the field's erased type is refused by name, never indexed.
 //! - [`copy_args_of`]: which type arguments the ADT's one `Copy` impl needs to be `Copy`
 //!   (`Facts::copy_args`), read from the impl's own clauses: `T: Copy` asks it; `T: Sized`
@@ -191,9 +190,7 @@ fn take<'a>(col: &[Region], taken: &mut usize, lifetimes: u32, late: &mut AVec<'
 /// own positions before its children's, children left to right; an ADT's lifetimes before its
 /// arguments), the order the column `col` is laid in: each node's own slots (the one counter,
 /// `region_arity`) become its positions' regions, each type parameter `p` pushes `Arg(p)`,
-/// onto `out`. A trait object's one position is its own slot; its traits' slots and a fn
-/// item's arguments' are no position of the lowering's and are stepped over by the counter
-/// (`slots`). Every slot must be taken, none past the column.
+/// onto `out`. Every slot must be taken, none past the column.
 fn field_row<'a, F: Arity + ?Sized>(tys: tc::PTys<'_>, root: tc::PTy, arity: &F, col: &[Region], lifetimes: u32, out: &mut AVec<'a, FieldRegion>, alloc: Alloc<'a>) -> Result<(), Unlaid> {
     let mut stack: AVec<'a, tc::PTy> = AVec::new_in(alloc);
     let mut late: AVec<'a, (u32, u32)> = AVec::new_in(alloc);
@@ -960,8 +957,7 @@ mod field_row_tests {
     }
 
     /// `&'a (dyn Tr<'b> + 'c)` in `struct D<'a, 'b, 'c>`: the column is `['a, 'c, 'b]` (the
-    /// object's own slot before its trait's); the row is the reference's and the object's
-    /// positions, `['a, 'c]`, the trait's slot stepped over.
+    /// object's own slot before its trait's). The row preserves all three lifetime bindings.
     #[test]
     fn a_trait_objects_position_is_its_own_slot() {
         let mut t = PortableTys::new_in(a());
@@ -969,7 +965,7 @@ mod field_row_tests {
         let d = t.dynamic(&[principal]).unwrap();
         let r = t.intern(PNode::Ref(Mutbl::Not, d)).unwrap();
         let col = [Region::Param(0), Region::Param(2), Region::Param(1)];
-        assert_eq!(row(&t, r, &col, 3), Ok(std::vec![FieldRegion::Lifetime(0), FieldRegion::Lifetime(2)]));
+        assert_eq!(row(&t, r, &col, 3), Ok(std::vec![FieldRegion::Lifetime(0), FieldRegion::Lifetime(2), FieldRegion::Lifetime(1)]));
     }
 
     /// `fn(&u8, fn(&u8))`: two binders' variables are two bound regions, not one; a type
