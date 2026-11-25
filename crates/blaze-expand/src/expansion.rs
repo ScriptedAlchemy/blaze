@@ -490,7 +490,7 @@ impl<'a> Expansion<'a> {
         let mut rec = Recorder::new(RecorderOpts { cx, reads: &mut self.reads, edition, scratch: alloc });
         let mut holes = self.holes.iter().peekable();
         self.tokens = self.tokens.refilled(&mut |at, token, out| -> Result<bool, ExpandError> {
-            let Some(hole) = holes.next_if(|hole| hole.token as usize == at) else { return Ok(false) };
+            let Some(hole) = holes.next_if(|hole| hole.token == crate::tokens::index(at)) else { return Ok(false) };
             let mut text = Buf::new_in(alloc);
             let kind = hole.of.literal(&mut rec, &mut text)?;
             out.push(kind, text.as_str(), token.ctx)?;
