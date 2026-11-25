@@ -467,7 +467,7 @@ fn timespec(left: Duration) -> libc::timespec {
 }
 
 fn os_of(error: &io::Error) -> i32 {
-    error.raw_os_error().unwrap_or(0)
+    super::spawn::raw_os_error(error).unwrap_or(0)
 }
 
 fn wait_os(error: &crate::wait::WaitError) -> i32 {

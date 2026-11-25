@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-370 invariants, 45 refinements, 12 reference models.
-By level: 293 tested, 106 simulated, 1 model-checked, 15 proved.
+371 invariants, 45 refinements, 12 reference models.
+By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -109,6 +109,8 @@ By level: 293 tested, 106 simulated, 1 model-checked, 15 proved.
   Controls: `a_hot_lock_on_the_turn_loop`, `an_oldest_that_follows_the_row_order`.
 - **`a_convoys_oldest_is_the_same_whatever_order_its_rows_came_in`** *simulated* (`crates/blaze-core/src/lock/tests.rs`): a convoy's oldest wait does not depend on the order its rows were taken in (rule 25). Two waiters that began at one instant, given in either order, name the lower thread. The control is in the assertion's other half: the two orders are different inputs (the first rows differ), so a tie broken by arrival would name two different threads.
   Controls: `a_hot_lock_on_the_turn_loop`, `an_oldest_that_follows_the_row_order`.
+- **`child_errors_keep_their_step_kind_and_errno`** *tested* (`crates/blaze-core/src/process/spawn/tests.rs`): annotating a child's OS error with its spawn step preserves its code, kind and diagnostic. This conversion is pure; the linked-spawn test covers the kernel.
+  Controls: `a_formatted_child_error_losing_its_errno`.
 - **`the_first_process_stamps_the_header_and_others_see_it`** *tested* (`crates/blaze-core/src/shared.rs`): the first process stamps the header and zeros the rest, and a second mapping of the file sees it and the first's writes.
   Controls: `a_shared_wait_with_no_wake`.
 - **`a_file_of_another_length_is_refused_and_left_whole`** *tested* (`crates/blaze-core/src/shared.rs`): a file of another length is refused naming it, and left as it is.

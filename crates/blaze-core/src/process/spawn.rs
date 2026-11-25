@@ -59,6 +59,44 @@ impl From<io::Error> for StartError {
     }
 }
 
+/// A child's system-call failure retains its errno when a diagnostic adds the spawn step.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ChildError {
+    what: &'static str,
+    source: io::Error,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for ChildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.what, self.source)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for ChildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn child_error(what: &'static str, errno: libc::c_int) -> io::Error {
+    let source = io::Error::from_raw_os_error(errno);
+    // alloc: the failed child's diagnostic retains both its step and its OS error.
+    io::Error::new(source.kind(), ChildError { what, source })
+}
+
+/// The OS code of a spawn error, including a child's error annotated with its failed step.
+pub(in crate::process) fn raw_os_error(error: &io::Error) -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    if let Some(child) = error.get_ref().and_then(|source| source.downcast_ref::<ChildError>()) {
+        return child.source.raw_os_error();
+    }
+    error.raw_os_error()
+}
+
 /// What the child of a `clone` is asked besides its program and streams.
 #[cfg(target_os = "linux")]
 pub(super) struct ChildAsk<'a> {
@@ -542,9 +580,7 @@ unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<
         10 => "making it the leader of a session of its own (setsid)",
         _ => "running its program",
     };
-    let error = io::Error::from_raw_os_error(failed);
-    // alloc: an error path.
-    Err(io::Error::new(error.kind(), format!("{what}: {error}")))
+    Err(child_error(what, failed))
 }
 
 /// The child, between `clone` and its program: system calls alone, nothing that allocates,

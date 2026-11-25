@@ -1,5 +1,36 @@
 use crate::busy;
 
+#[cfg(target_os = "linux")]
+mod child_errors {
+    use super::super::{child_error, raw_os_error};
+
+    fn check(error: &std::io::Error, what: &str, errno: i32) {
+        assert_eq!(raw_os_error(error), Some(errno), "spawn step lost its errno: {error}");
+        assert_eq!(error.kind(), std::io::Error::from_raw_os_error(errno).kind());
+        assert!(error.to_string().contains(what), "spawn error lost its step: {error}");
+    }
+
+    /// The invariant: annotating a child's OS error with its spawn step preserves its code,
+    /// kind and diagnostic. This conversion is pure; the linked-spawn test covers the kernel.
+    #[test]
+    fn child_errors_keep_their_step_kind_and_errno() {
+        for what in ["running its program", "changing to its directory", "giving it its input and output"] {
+            for errno in [libc::ENOENT, libc::EACCES, libc::ENOTDIR, libc::EBADF, libc::ETXTBSY] {
+                check(&child_error(what, errno), what, errno);
+                assert_eq!(raw_os_error(&std::io::Error::from_raw_os_error(errno)), Some(errno));
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "spawn step lost its errno")]
+    fn the_oracle_catches_a_formatted_child_error_losing_its_errno() {
+        let error = child_error("running its program", libc::ENOENT);
+        let flattened = std::io::Error::new(error.kind(), error.to_string());
+        check(&flattened, "running its program", libc::ENOENT);
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod path {
     use std::{
