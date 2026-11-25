@@ -176,6 +176,8 @@ fn line_in_eager_input_is_placed_at_the_written_call() {
     assert!(written.contains("(lit \"src/lib.rs:1025\")"), "twin: {written}");
     let column = placed_dump(&[], "fn f() -> &'static str { concat!(column!()) }");
     assert!(column.contains("(lit \"25\")"), "twin: {column}");
+    let direct = placed_dump(&[], "const LINE: u32 = line!();");
+    assert!(direct.contains("(lit 1018u32)"), "the const initializer's call is at byte 18: {direct}");
     assert_expands(&[], "fn f() -> &'static str { concat!(\"a\", line!()) }", &["(lit \"a1\")"]);
 }
 

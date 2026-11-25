@@ -7,9 +7,10 @@ use blaze_own::{AVec, Alloc, Vec};
 use blaze_id::{ContentId, Portable};
 
 use crate::{
-    cx::{ExpandCx, HostError, Place, PlaceOf},
-    error::{StreamError, Table},
-    tokens::{Edition, Sink, Text, TokenHygiene, TokenStream, Transparency, lex, push_text},
+    cx::{ExpandCx, HostAsk, HostError, HostWhy, Place, PlaceOf, Recorder, RecorderOpts},
+    error::{ExpandError, StreamError, Table},
+    literal::{Buf, escape_str},
+    tokens::{Edition, LitKind, Sink, Spacing, Text, TokenHygiene, TokenKind, TokenStream, Transparency, lex, push_text},
 };
 
 /// Where a token of an expansion came from: an index into one of the call's or the
@@ -129,6 +130,30 @@ pub enum HoleOf {
     File,
     /// `module_path!()`: the `""` token becomes the path of the module the call is in.
     ModulePath,
+}
+
+impl HoleOf {
+    /// The Rust literal for this place, recording the value used by its consumer.
+    pub(crate) fn literal(self, rec: &mut Recorder<'_, '_, impl ExpandCx>, text: &mut Buf<'_>) -> Result<TokenKind, ExpandError> {
+        let what = match self {
+            Self::Line => PlaceOf::Line,
+            Self::Column => PlaceOf::Column,
+            Self::File => PlaceOf::File,
+            Self::ModulePath => PlaceOf::ModulePath,
+        };
+        let (kind, suffix_len) = match (self, rec.place(what)?) {
+            (Self::Line | Self::Column, Place::Number(value)) => {
+                fmt::Write::write_fmt(text, format_args!("{value}u32")).expect("a `Buf` takes any text");
+                (LitKind::Integer, 3)
+            }
+            (Self::File | Self::ModulePath, Place::Text(value)) => {
+                escape_str(value, text);
+                (LitKind::Str, 0)
+            }
+            _ => return Err(HostError { ask: HostAsk::Place, why: HostWhy::Unreadable }.into()),
+        };
+        Ok(TokenKind::Literal { kind, suffix_len, spacing: Spacing::Alone })
+    }
 }
 
 /// A placeholder token of the expansion and what fills it.
@@ -455,6 +480,26 @@ pub struct Expansion<'a> {
 }
 
 impl<'a> Expansion<'a> {
+    /// Places the tokens for a consumer that needs literal values. Each substitution keeps
+    /// the placeholder's syntax context and records its read at the caller.
+    pub fn fill_holes(&mut self, cx: &impl ExpandCx, edition: Edition) -> Result<(), ExpandError> {
+        if self.holes.is_empty() {
+            return Ok(());
+        }
+        let alloc = self.tokens.allocator();
+        let mut rec = Recorder::new(RecorderOpts { cx, reads: &mut self.reads, edition, scratch: alloc });
+        let mut holes = self.holes.iter().peekable();
+        self.tokens = self.tokens.refilled(&mut |at, token, out| -> Result<bool, ExpandError> {
+            let Some(hole) = holes.next_if(|hole| hole.token as usize == at) else { return Ok(false) };
+            let mut text = Buf::new_in(alloc);
+            let kind = hole.of.literal(&mut rec, &mut text)?;
+            out.push(kind, text.as_str(), token.ctx)?;
+            Ok(true)
+        })?;
+        self.holes.clear();
+        Ok(())
+    }
+
     pub(crate) fn new_in(alloc: Alloc<'a>) -> Expansion<'a> {
         Expansion {
             tokens: TokenStream::new_in(alloc),

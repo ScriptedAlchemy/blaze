@@ -735,10 +735,14 @@ fn expand_with<'a>(
     cx: &impl ExpandCx,
     alloc: Alloc<'a>,
 ) -> Result<Expanded<'a>, blaze_expand::ExpandError> {
-    match prepared {
+    let mut result = match prepared {
         Some(prepared) => expand_prepared(prepared, call, cx, alloc),
         None => expand(def, call, cx, alloc),
+    }?;
+    if let Expanded::Expansion(exp) = &mut result {
+        exp.fill_holes(cx, call.site.edition)?;
     }
+    Ok(result)
 }
 
 /// The host of one body call: its `cfg!` answered by the set the body is lowered under

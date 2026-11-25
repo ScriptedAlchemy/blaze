@@ -11,7 +11,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::{
     call::Inside,
     cfg::CfgPredicateError,
-    cx::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, Place, PlaceOf, Recorder, RecorderOpts},
+    cx::{ExpandCx, IncludeAs, Included, Recorder, RecorderOpts},
     def::BuiltinFn,
     error::{ExpandError, Stream, Unbuilt},
     expand::Out,
@@ -1170,32 +1170,9 @@ fn place(
         out.exp.holes.push(Hole { token, of });
         return Ok(());
     }
-    let ask = match of {
-        HoleOf::Line => PlaceOf::Line,
-        HoleOf::Column => PlaceOf::Column,
-        HoleOf::File => PlaceOf::File,
-        HoleOf::ModulePath => PlaceOf::ModulePath,
-    };
-    let wrong = HostError { ask: HostAsk::Place, why: HostWhy::Unreadable };
-    // Recorded by now; an answer of the wrong kind stops the expansion, its reads with it.
-    match (rec.place(ask)?, number) {
-        (Place::Number(value), true) => {
-            let mut text = Buf::new_in(out.alloc);
-            core::fmt::Write::write_fmt(&mut text, format_args!("{value}u32"))
-                .expect("a `Buf` takes any text");
-            let kind = TokenKind::Literal {
-                kind: LitKind::Integer,
-                suffix_len: 3,
-                spacing: Spacing::Alone,
-            };
-            out.made(kind, text.as_str(), MADE)
-        }
-        (Place::Text(value), false) => {
-            push_str_literal(out, value)
-        }
-        // The context answered a number for a path or a path for a number.
-        (Place::Number(_), false) | (Place::Text(_), true) => Err(wrong.into()),
-    }
+    let mut text = Buf::new_in(out.alloc);
+    let kind = of.literal(rec, &mut text)?;
+    out.made(kind, text.as_str(), MADE)
 }
 
 /// `panic!(..)` as `$crate::panic::panic_2021!(..)` or `panic_2015!`, by the call's panic

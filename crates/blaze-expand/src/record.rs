@@ -856,6 +856,9 @@ impl<'a> Expansion<'a> {
         while holes.more() {
             let token = holes.u32()?;
             let token = token_at(&*holes, token)?;
+            if exp.holes.last().is_some_and(|last| last.token >= token) {
+                return Err(holes.bad("position holes must name distinct tokens in order"));
+            }
             let of = match holes.byte()? {
                 0 => HoleOf::Line,
                 1 => HoleOf::Column,
