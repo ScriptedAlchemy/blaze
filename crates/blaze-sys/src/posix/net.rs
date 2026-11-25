@@ -1796,6 +1796,8 @@ mod tests {
         let _: unsafe extern "C" fn(c_int, c_int, c_int) -> c_int = libc::socket;
         let _: unsafe extern "C" fn(c_int, c_int) -> c_int = c::listen;
         let _: unsafe extern "C" fn(c_int, c_int) -> c_int = libc::listen;
+        let _: unsafe extern "C" fn(c_int, c_int) -> c_int = c::shutdown;
+        let _: unsafe extern "C" fn(c_int, c_int) -> c_int = libc::shutdown;
         let _: unsafe extern "C" fn(c_int, *const sockaddr, socklen_t) -> c_int = c::bind;
         let _: unsafe extern "C" fn(c_int, *const sockaddr, socklen_t) -> c_int = c::connect;
         let _: unsafe extern "C" fn(c_int, *const msghdr, c_int) -> isize = c::sendmsg;

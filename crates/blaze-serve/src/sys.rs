@@ -9,9 +9,11 @@ use core::time::Duration;
 use blaze_own::{String, Vec};
 pub(crate) use blaze_sys::posix::io::{OwnedFd, PollEvents, PollFd};
 use blaze_sys::posix::io::{
-    CWD, ClockId, OpenFlags, PipeFlags, clock_gettime as sys_read_clock, dup_at_least, fsync,
-    openat, pipe2, poll as sys_poll, pread, read as sys_read, write as sys_write,
+    CWD, ClockId, OpenFlags, clock_gettime as sys_read_clock, dup_at_least, fsync,
+    openat, poll as sys_poll, pread, read as sys_read, write as sys_write,
 };
+#[cfg(target_os = "linux")]
+use blaze_sys::posix::io::{PipeFlags, pipe2};
 #[cfg(target_os = "macos")]
 use blaze_sys::posix::io::{nanosleep, set_close_on_exec, set_nonblocking};
 use blaze_sys::posix::net::{
@@ -199,8 +201,9 @@ pub(crate) fn create_dir(path: &str, mode: u32) -> Result<(), Errno> {
         #[cfg(target_os = "macos")]
         {
             let m = u16::try_from(mode).map_err(|_| Errno::Inval)?;
-            // SAFETY: `cpath` is a live NUL-terminated path the kernel reads and does not keep.
-            let rc = unsafe { blaze_sys::macos::cold::mkdir(cpath.as_ptr().cast(), m) };
+            // SAFETY: `Path` keeps its NUL immediately after `bytes()`, in the same live
+            // backing buffer. `mkdir` reads that C string and keeps no pointer.
+            let rc = unsafe { blaze_sys::macos::cold::mkdir(cpath.bytes().as_ptr().cast(), m) };
             if rc < 0 {
                 Err(blaze_sys::posix::signal::errno())
             } else {
@@ -452,7 +455,7 @@ pub(crate) fn list_dir<A: Allocator + Clone>(path: &str, alloc: A) -> Result<Vec
     #[cfg(target_os = "macos")]
     {
         use blaze_sys::posix::proc::{ATTR_CMN_NAME, ATTR_CMN_RETURNED_ATTRS, attrlist, getattrlistbulk};
-        let list = attrlist {
+        let mut list = attrlist {
             bitmapcount: 5,
             reserved: 0,
             commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME,
@@ -463,7 +466,16 @@ pub(crate) fn list_dir<A: Allocator + Clone>(path: &str, alloc: A) -> Result<Vec
         };
         let mut buf = [0u8; 8192];
         loop {
-            let count = getattrlistbulk(dir_fd.fd(), &list, &mut buf, 0)?;
+            // SAFETY: the descriptor is open, `list` is a live attrlist, and `buf` has
+            // `buf.len()` writable bytes. The call keeps none of these pointers.
+            let count = unsafe {
+                getattrlistbulk(
+                    dir_fd.fd().raw(), (&raw mut list).cast(), buf.as_mut_ptr().cast(), buf.len(), 0,
+                )
+            };
+            if count < 0 {
+                return Err(blaze_sys::posix::signal::errno());
+            }
             if count == 0 {
                 break;
             }
@@ -695,7 +707,19 @@ pub(crate) fn shutdown_write(fd: Fd) -> Result<(), Errno> {
 
 /// Creates a non-blocking, close-on-exec wakeup pipe `(read_end, write_end)`.
 pub(crate) fn wakeup_pipe() -> Result<(OwnedFd, OwnedFd), Errno> {
-    pipe2(PipeFlags::NONBLOCK.with(PipeFlags::CLOSE_ON_EXEC))
+    #[cfg(target_os = "linux")]
+    {
+        pipe2(PipeFlags::NONBLOCK.with(PipeFlags::CLOSE_ON_EXEC))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (read, write) = blaze_sys::posix::io::pipe()?;
+        for fd in [read.fd(), write.fd()] {
+            set_close_on_exec(fd, true)?;
+            set_nonblocking(fd, true)?;
+        }
+        Ok((read, write))
+    }
 }
 
 /// Polls `fds` for up to `timeout` (retrying `EINTR` up to a bounded cap).

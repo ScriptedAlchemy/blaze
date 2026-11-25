@@ -131,7 +131,7 @@ impl<T: Send + 'static> Worker<T> {
         {
             // SAFETY: `self.handle` is a live joinable pthread.
             let rc = unsafe {
-                blaze_sys::posix::thread::pthread_join(self.handle, core::ptr::null_mut())
+                blaze_sys::macos::cold::pthread_join(self.handle, core::ptr::null_mut())
             };
             assert_eq!(rc, 0, "pthread_join failed with {rc}");
         }
@@ -177,8 +177,9 @@ fn mkdir_one(path: &str) -> Result<(), Errno> {
         }
         #[cfg(target_os = "macos")]
         {
-            // SAFETY: `cpath` is a live NUL-terminated path.
-            let rc = unsafe { blaze_sys::macos::cold::mkdir(cpath.as_ptr().cast(), 0o755) };
+            // SAFETY: `Path` keeps its NUL immediately after `bytes()` in the same live
+            // backing buffer. `mkdir` reads it and keeps no pointer.
+            let rc = unsafe { blaze_sys::macos::cold::mkdir(cpath.bytes().as_ptr().cast(), 0o755) };
             if rc < 0 { Err(blaze_sys::posix::signal::errno()) } else { Ok(()) }
         }
     })
@@ -321,8 +322,11 @@ fn make_symlink(target: &str, link: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        // SAFETY: `tc` and `lc` are live NUL-terminated paths.
-        let rc = unsafe { blaze_sys::macos::cold::symlink(tc.as_ptr().cast(), lc.as_ptr().cast()) };
+        // SAFETY: each `Path` keeps its NUL immediately after `bytes()` in its live
+        // backing buffer. `symlink` reads both strings and keeps neither pointer.
+        let rc = unsafe {
+            blaze_sys::macos::cold::symlink(tc.bytes().as_ptr().cast(), lc.bytes().as_ptr().cast())
+        };
         assert_eq!(rc, 0, "symlink failed");
     }
 }

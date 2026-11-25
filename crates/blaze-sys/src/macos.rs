@@ -415,6 +415,8 @@ pub mod cold {
         /// sys/stat.h.
         fn stat(path: *const c_char, stat: *mut c_void) -> c_int;
         /// unistd.h.
+        fn symlink(target: *const c_char, link: *const c_char) -> c_int;
+        /// unistd.h.
         fn unlink(path: *const c_char) -> c_int;
         /// unistd.h.
         fn unlinkat(dir: c_int, path: *const c_char, flags: c_int) -> c_int;
@@ -754,6 +756,12 @@ mod tests {
             assert!(!found.is_null(), "libSystem has no `{}` on this macOS", name.to_string_lossy());
         }
         assert!(cold::SYMBOLS.len() >= 70);
+    }
+
+    #[test]
+    fn symlinks_signature_is_libcs() {
+        let _: unsafe extern "C" fn(*const c_char, *const c_char) -> c_int = cold::symlink;
+        let _: unsafe extern "C" fn(*const c_char, *const c_char) -> c_int = libc::symlink;
     }
 
     /// The program's references reach the table, not libSystem: the first definition of

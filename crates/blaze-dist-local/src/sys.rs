@@ -46,6 +46,8 @@ use blaze_sys::linux::{
 #[cfg(target_os = "linux")]
 use blaze_sys::posix::net::{SOCK_CLOEXEC, SOCK_NONBLOCK};
 #[cfg(target_os = "macos")]
+use blaze_sys::posix::io::set_close_on_exec as sys_set_close_on_exec;
+#[cfg(target_os = "macos")]
 use blaze_sys::posix::net::SO_NOSIGPIPE;
 
 /// Maximum path buffer length (including NUL terminator) for stack-allocated syscall paths.
@@ -628,8 +630,9 @@ pub fn create_dir(path: &str, mode: u32) -> Result<(), Errno> {
         #[cfg(target_os = "macos")]
         {
             let m = u16::try_from(mode).map_err(|_| Errno::Inval)?;
-            // SAFETY: `cpath` is a live NUL-terminated path the kernel reads and does not keep.
-            let rc = unsafe { blaze_sys::macos::cold::mkdir(cpath.as_ptr().cast(), m) };
+            // SAFETY: `Path` keeps its NUL immediately after `bytes()`, in the same live
+            // backing buffer. `mkdir` reads that C string and keeps no pointer.
+            let rc = unsafe { blaze_sys::macos::cold::mkdir(cpath.bytes().as_ptr().cast(), m) };
             if rc < 0 { Err(blaze_sys::posix::signal::errno()) } else { Ok(()) }
         }
     })
@@ -702,7 +705,7 @@ fn list_dir<A: Allocator + Clone>(path: &str, alloc: A) -> Result<Vec<String<A>,
         use blaze_sys::posix::proc::{
             ATTR_CMN_NAME, ATTR_CMN_RETURNED_ATTRS, attrlist, getattrlistbulk,
         };
-        let list = attrlist {
+        let mut list = attrlist {
             bitmapcount: 5,
             reserved: 0,
             commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME,
@@ -713,7 +716,16 @@ fn list_dir<A: Allocator + Clone>(path: &str, alloc: A) -> Result<Vec<String<A>,
         };
         let mut buf = [0u8; 8192];
         loop {
-            let count = getattrlistbulk(dir_fd.fd(), &list, &mut buf, 0)?;
+            // SAFETY: the descriptor is open, `list` is a live attrlist, and `buf` has
+            // `buf.len()` writable bytes. The call keeps none of these pointers.
+            let count = unsafe {
+                getattrlistbulk(
+                    dir_fd.fd().raw(), (&raw mut list).cast(), buf.as_mut_ptr().cast(), buf.len(), 0,
+                )
+            };
+            if count < 0 {
+                return Err(blaze_sys::posix::signal::errno());
+            }
             if count == 0 {
                 break;
             }
@@ -865,29 +877,29 @@ pub(crate) fn unix_sockaddr(path: &[u8]) -> Result<(sockaddr_storage, socklen_t)
 
 /// Applies `SO_RCVTIMEO` or `SO_SNDTIMEO` to a socket descriptor.
 fn set_socket_timeout(fd: Fd, optname: i32, timeout: Option<Duration>) -> Result<(), Errno> {
-    let tv = match timeout {
-        Some(d) => {
-            let mut secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
-            let mut usecs = i64::from(d.subsec_micros());
-            if secs == 0 && usecs == 0 && !d.is_zero() {
-                usecs = 1;
-            }
-            if secs == 0 && usecs == 0 {
-                // Zero Duration is invalid as a timeout; clamp to 1 microsecond.
-                secs = 0;
-                usecs = 1;
-            }
-            #[cfg(target_os = "linux")]
-            {
-                Timeval { sec: secs, usec: usecs }
-            }
-            #[cfg(target_os = "macos")]
-            {
-                Timeval { sec: secs, usec: i32::try_from(usecs).unwrap_or(i32::MAX) }
-            }
+    // Default initializes macOS's explicit private padding as well as both time fields.
+    let mut tv = Timeval::default();
+    if let Some(d) = timeout {
+        let mut secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+        let mut usecs = i64::from(d.subsec_micros());
+        if secs == 0 && usecs == 0 && !d.is_zero() {
+            usecs = 1;
         }
-        None => Timeval { sec: 0, usec: 0 },
-    };
+        if secs == 0 && usecs == 0 {
+            // Zero Duration is invalid as a timeout; clamp to 1 microsecond.
+            secs = 0;
+            usecs = 1;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            tv.usec = usecs;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            tv.usec = i32::try_from(usecs).unwrap_or(i32::MAX);
+        }
+        tv.sec = secs;
+    }
     let size = size_of::<Timeval>();
     // SAFETY: `tv` is a live `Timeval` with no uninitialized padding bytes.
     let raw = unsafe { core::slice::from_raw_parts(core::ptr::from_ref(&tv).cast::<u8>(), size) };
@@ -1109,9 +1121,10 @@ impl UnixListener {
         if let Some(m) = mode {
             let m16 = u16::try_from(m).map_err(|_| IoError::from_errno(Errno::Inval))?;
             with_cpath(path, |cpath| {
-                // SAFETY: `cpath` is a live NUL-terminated path the kernel reads and does not keep.
+                // SAFETY: `Path` keeps its NUL immediately after `bytes()` in the same
+                // live backing buffer. `fchmodat` reads it and keeps no pointer.
                 let rc = unsafe {
-                    blaze_sys::posix::proc::fchmodat(CWD.raw(), cpath.as_ptr().cast(), m16, 0)
+                    blaze_sys::posix::proc::fchmodat(CWD.raw(), cpath.bytes().as_ptr().cast(), m16, 0)
                 };
                 if rc < 0 { Err(blaze_sys::posix::signal::errno()) } else { Ok(()) }
             })
@@ -1834,7 +1847,7 @@ impl<T> JoinHandle<'_, T> {
         {
             // SAFETY: `self.handle` is a live joinable pthread joined at most once.
             let _ = unsafe {
-                blaze_sys::posix::thread::pthread_join(self.handle, core::ptr::null_mut())
+                blaze_sys::macos::cold::pthread_join(self.handle, core::ptr::null_mut())
             };
         }
     }
@@ -2063,7 +2076,7 @@ impl Child {
                 // SAFETY: `prog_ptr` and `argv` are null-terminated C strings.
                 unsafe {
                     let _ = blaze_sys::posix::proc::execv(prog_ptr, argv.as_ptr());
-                    blaze_sys::posix::proc::_exit(127);
+                    blaze_sys::posix::signal::exit_now(127);
                 }
             }
             pid
