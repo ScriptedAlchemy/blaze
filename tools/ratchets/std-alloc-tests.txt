@@ -48,7 +48,7 @@ blaze-comptime	2	0	0	26	0	0	0	0	0	0
 blaze-comptime-sys	2	0	0	15	0	0	0	0	0	0
 blaze-cond	1	0	0	0	0	0	0	0	0	0
 blaze-consteval	85	0	0	14	0	0	0	0	0	0
-blaze-core	690	0	3	967	402	103	34	5	0	0
+blaze-core	690	0	3	966	402	103	34	5	0	0
 blaze-cunit	2	0	0	0	0	0	0	0	0	0
 blaze-data	3	0	0	1	0	0	1	0	0	0
 blaze-dbsp	1	0	0	43	0	0	0	0	0	0

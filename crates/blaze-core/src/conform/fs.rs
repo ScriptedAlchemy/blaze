@@ -26,16 +26,12 @@ use std::path::PathBuf;
 
 use crate::{DirName, Done, Driver, Effect, FileName, Tag, run_until_idle, sim::{Faults, Sim}};
 
-/// The systems a case's expectation may differ by.
+/// How the service treats an alternate spelling of a directory name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Platform {
-    /// The simulated disk.
-    Model,
-    /// macOS's native driver on the temporary folder's volume: APFS, which folds case as
-    /// formatted by default.
-    MacOs,
-    /// Linux's native driver: a file system that keeps case (ext4, btrfs, xfs, tmpfs).
-    Linux,
+pub(super) enum CaseRule {
+    RefuseCollision,
+    Fold,
+    Distinguish,
 }
 
 /// One answer of the service, as a kind: what it is, never the text of a failure (which
@@ -58,20 +54,19 @@ pub(super) enum Answer {
     Read(Vec<u8>),
 }
 
-/// What a case expects: one value everywhere, or one per platform where systems legitimately
-/// differ. Never "skipped".
+/// A case's expectation, including the independently observed rule where it matters.
 pub(super) enum Expect {
     Everywhere(Vec<Answer>),
-    ByPlatform { model: Vec<Answer>, macos: Vec<Answer>, linux: Vec<Answer> },
+    ByCase(CaseRule),
 }
 
 impl Expect {
-    fn on(self, platform: Platform) -> Vec<Answer> {
-        match (self, platform) {
-            (Expect::Everywhere(it), _) => it,
-            (Expect::ByPlatform { model, .. }, Platform::Model) => model,
-            (Expect::ByPlatform { macos, .. }, Platform::MacOs) => macos,
-            (Expect::ByPlatform { linux, .. }, Platform::Linux) => linux,
+    fn answers(self) -> Vec<Answer> {
+        match self {
+            Expect::Everywhere(it) => it,
+            Expect::ByCase(CaseRule::RefuseCollision) => vec![Refused, Missing, Missing],
+            Expect::ByCase(CaseRule::Fold) => vec![Did, File(1), File(1)],
+            Expect::ByCase(CaseRule::Distinguish) => vec![Did, Missing, File(1)],
         }
     }
 }
@@ -85,7 +80,8 @@ pub(super) trait Service {
     fn put(&mut self, file: &str, bytes: &[u8]);
     /// `file` made from outside a symbolic link to `target`, with its folders, durably.
     fn link(&mut self, file: &str, target: &str);
-    fn platform(&self) -> Platform;
+    /// `alternate` spells a directory created by the fixture with different case.
+    fn case_rule(&self, alternate: &str) -> CaseRule;
 }
 
 /// The simulated disk, with no faults: what it answers is the model's rule, not a drawn fault.
@@ -112,8 +108,8 @@ impl Service for Model {
         self.sim.symlink(&name(file), target);
     }
 
-    fn platform(&self) -> Platform {
-        Platform::Model
+    fn case_rule(&self, _: &str) -> CaseRule {
+        CaseRule::RefuseCollision
     }
 }
 
@@ -165,10 +161,11 @@ impl Service for Real {
         std::os::unix::fs::symlink(target, &path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     }
 
-    fn platform(&self) -> Platform {
-        match cfg!(target_os = "macos") {
-            true => Platform::MacOs,
-            false => Platform::Linux,
+    fn case_rule(&self, alternate: &str) -> CaseRule {
+        let path = self.path(alternate);
+        match path.try_exists().unwrap_or_else(|error| panic!("{}: {error}", path.display())) {
+            true => CaseRule::Fold,
+            false => CaseRule::Distinguish,
         }
     }
 }
@@ -255,9 +252,8 @@ type Case = fn(&mut dyn Service) -> (Vec<Answer>, Expect);
 
 /// The one assert of a case on a service.
 fn held(case: Case, s: &mut dyn Service) {
-    let platform = s.platform();
     let (seen, expect) = case(s);
-    assert_eq!(seen, expect.on(platform), "on {platform:?}");
+    assert_eq!(seen, expect.answers());
 }
 
 use Answer::{Dir, Did, File, Missing, Refused};
@@ -380,17 +376,13 @@ fn a_link_is_followed_by_stat_alone(s: &mut dyn Service) -> (Vec<Answer>, Expect
 }
 
 /// A name spelled two ways: on a disk that folds case (macOS's default APFS) the second
-/// spelling is the first name, on one that keeps case (Linux) they are two, and the model,
+/// spelling is the first name, on one that keeps case they are two, and the model,
 /// stricter than both, refuses to make the second (what blaze-fetch's tree refuses for the
 /// same reason, `tree.rs`).
 fn a_name_spelled_two_ways(s: &mut dyn Service) -> (Vec<Answer>, Expect) {
     s.put("Case/a", b"x");
+    let expect = Expect::ByCase(s.case_rule("case"));
     let seen = vec![write(s, "case/b", b"y"), stat(s, "Case/b"), stat(s, "case/b")];
-    let expect = Expect::ByPlatform {
-        model: vec![Refused, Missing, Missing],
-        macos: vec![Did, File(1), File(1)],
-        linux: vec![Did, Missing, File(1)],
-    };
     (seen, expect)
 }
 
