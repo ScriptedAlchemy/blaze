@@ -340,11 +340,19 @@ fn ambiguous_framing_is_refused() {
     let mut r = parser(small, Method::Other);
     let got = r.feed(b"HTTP/1.1 200 OK\r\nX-Long: aaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n", &mut Vec::new_in(heap()));
     assert_eq!(got.map_err(|e| e.why), Err(Why::HeadOver { most: 32 }));
+    assert!(!r.has_head());
     let small = Limits { most_body: 4, ..LIMITS };
     // The deprecated constructor still answers as `new` does.
     let mut r = Response::new_in(small, false, heap());
-    let got = r.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", &mut Vec::new_in(heap()));
+    let mut body = Vec::new_in(heap());
+    let got = r.feed(b"HTTP/1.1 404 Missing\r\nContent-Length: 5\r\n\r\nabcde", &mut body);
     assert_eq!(got.map_err(|e| e.why), Err(Why::BodyOver { most: 4 }));
+    assert!(r.has_head());
+    assert_eq!(r.status(), 404);
+    assert_eq!(r.content_length(), Some(5));
+    assert!(!r.reusable());
+    assert_eq!(r.feed(b"a", &mut body).map_err(|e| e.why), Err(Why::BodyOver { most: 4 }));
+    assert!(body.is_empty());
     let small = Limits { most_chunk_line: 8, ..LIMITS };
     let mut r = parser(small, Method::Other);
     let got = r.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;abcdefgh\r\n", &mut Vec::new_in(heap()));

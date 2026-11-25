@@ -740,8 +740,7 @@ fn read_answer(cx: &Cx, conn: &Conn, request: &Request<'_>, line: &Line, into: &
         // is named by what it answered.
         // blaze-h1 refuses a `Content-Length` past the bound as its head ends: the status and
         // headers are read by then, so the range is checked first.
-        let head_over = matches!(&fed, Err(blaze_h1::Error { why: blaze_h1::Why::BodyOver { .. }, .. }));
-        if !checked && (answer.has_head() || head_over) {
+        if !checked && answer.has_head() {
             checked = true;
             if let Some(asked) = request.range
                 && !blaze_h1::is_redirect(answer.status())

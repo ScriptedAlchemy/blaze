@@ -160,6 +160,8 @@ enum Framing {
 enum State {
     /// The head is not yet whole; the line being read starts at `line_start` of the head's bytes.
     Head { line_start: usize },
+    /// The head is valid, but its declared body length exceeds the configured bound.
+    BodyOver { whole: Whole, length: u64 },
     /// The head is whole, and the body is being read as `framing` says.
     Body { whole: Whole, framing: Framing },
     /// The response has ended; `framing` is how its body was read, where it stopped.
@@ -230,6 +232,9 @@ impl<A: Allocator> Response<A> {
     /// starts: for a client that reads a body only as fast as its asker takes it. `consumed`
     /// is all of `input` until the head is whole.
     pub fn feed_head(&mut self, input: &[u8]) -> Result<Fed, Error> {
+        if matches!(self.state, State::BodyOver { .. }) {
+            return Err(Error { at: self.taken, why: Why::BodyOver { most: self.limits.most_body } });
+        }
         let mut at = 0;
         let mut ran = Ok(());
         while let State::Head { line_start } = self.state {
@@ -252,6 +257,7 @@ impl<A: Allocator> Response<A> {
     fn framed(&self) -> Option<(Whole, Framing)> {
         match self.state {
             State::Head { .. } => None,
+            State::BodyOver { whole, length } => Some((whole, Framing::Length { left: length })),
             State::Body { whole, framing } | State::Ended { whole, framing } => Some((whole, framing)),
         }
     }
@@ -269,6 +275,9 @@ impl<A: Allocator> Response<A> {
     /// with no `Connection: close`, or HTTP/1.0 with `Connection: keep-alive`, and a body not
     /// ended by the close (RFC 9112 section 9.3).
     pub fn reusable(&self) -> bool {
+        if matches!(self.state, State::BodyOver { .. }) {
+            return false;
+        }
         let Some((whole, framing)) = self.framed() else {
             return false;
         };
@@ -294,6 +303,7 @@ impl<A: Allocator> Response<A> {
     pub fn closed(&mut self) -> Result<(), Error> {
         match self.state {
             State::Ended { .. } => Ok(()),
+            State::BodyOver { .. } => Err(Error { at: self.taken, why: Why::BodyOver { most: self.limits.most_body } }),
             State::Body { whole, framing: Framing::Close } => {
                 self.state = State::Ended { whole, framing: Framing::Close };
                 Ok(())
@@ -396,6 +406,7 @@ impl<A: Allocator> Response<A> {
             let rest = &input[*at..];
             match self.state {
                 State::Ended { .. } => return Ok(()),
+                State::BodyOver { .. } => return Err(Why::BodyOver { most: self.limits.most_body }),
                 State::Head { line_start } => {
                     if !self.head_line(line_start, input, at)? {
                         return Ok(());
@@ -580,6 +591,10 @@ impl<A: Allocator> Response<A> {
         let (framing, length) = self.framing(status)?;
         let whole = Whole { status, version, length };
         self.state = match framing {
+            Framing::Length { left } if left > self.limits.most_body => {
+                self.state = State::BodyOver { whole, length: left };
+                return Err(Why::BodyOver { most: self.limits.most_body });
+            }
             Framing::Empty | Framing::Length { left: 0 } => State::Ended { whole, framing },
             _ => State::Body { whole, framing },
         };
@@ -610,12 +625,7 @@ impl<A: Allocator> Response<A> {
             _ if empty => Framing::Empty,
             (Some(coding), None) if coding.eq_ignore_ascii_case(b"chunked") => Framing::Chunked(NEW_CHUNK),
             (Some(_), None) => return Err(Why::TransferEncoding),
-            (None, Some(n)) => {
-                if n > self.limits.most_body {
-                    return Err(Why::BodyOver { most: self.limits.most_body });
-                }
-                Framing::Length { left: n }
-            }
+            (None, Some(n)) => Framing::Length { left: n },
             (None, None) => Framing::Close,
         };
         Ok((framing, length))
