@@ -78,9 +78,9 @@ pub(crate) fn promoted_operand<'a>(owner: ItemKey, borrow: ExprId, exprs: &[tc::
     // Evaluate the receiver before its borrow and subsequent coercions. Its children's
     // adjustments still apply.
     let mut stripped = tc::Adjusts::new_in(alloc);
-    for (i, &expr) in exprs.iter().enumerate() {
+    for (&expr, &kind, &ty) in checked.adjusts.iter() {
         if expr != borrow {
-            stripped.push((expr, checked.adjusts.column::<1>()[i], checked.adjusts.column::<2>()[i]));
+            stripped.push((expr, kind, ty));
         }
     }
     Ok(PromotedOperand { root: borrow, adjusts: Some(stripped) })

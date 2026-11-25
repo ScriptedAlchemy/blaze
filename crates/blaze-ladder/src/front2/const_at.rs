@@ -309,12 +309,15 @@ impl<A: Allocator + Copy> ConstTable<A> {
         self.rows.get(&need.order())?.iter().find(|(a, _)| a[..] == *args).map(|(_, record)| record)
     }
 
-    pub(crate) fn insert(&mut self, need: ConstNeed, args: &[PTy], record: DataRecord<Global>) {
+    /// Keep the key's arguments on a miss, before evaluation can grow the ground table.
+    pub(crate) fn missing_args(&self, need: ConstNeed, args: &[PTy]) -> Option<Vec<PTy, A>> {
+        self.get(need, args).is_none().then(|| Vec::from_slice_in(args, self.alloc))
+    }
+
+    pub(crate) fn insert(&mut self, need: ConstNeed, args: Vec<PTy, A>, record: DataRecord<Global>) {
         let alloc = self.alloc;
         let at = self.rows.get_or_insert_with(&need.order(), |&k| (k, Vec::new_in(alloc)));
-        let mut kept = Vec::new_in(alloc);
-        kept.extend_from_slice(args);
-        at.push((kept, record));
+        at.push((args, record));
     }
 }
 
@@ -324,11 +327,9 @@ impl<A: Allocator + Copy> ConstTable<A> {
 /// out from ([`FrontEnd::const_at`]).
 pub fn pull<P: FrontEnd, A: Allocator + Copy>(program: &mut P, needs: &Needs<A>, from: PTys<'_>, table: &mut ConstTable<A>, closures: &crate::run::ClosureTable) -> Result<(), ConstAtRefusal> {
     for (need, args) in needs.iter() {
-        if table.get(need, args).is_some() {
-            continue;
-        }
+        let Some(kept) = table.missing_args(need, args) else { continue };
         let record = program.const_at(need, from, args, closures).map_err(|why| ConstAtRefusal { need, why })?;
-        table.insert(need, args, record);
+        table.insert(need, kept, record);
     }
     Ok(())
 }

@@ -745,7 +745,7 @@ fn eval_promotions<P: FrontEnd>(program: &P, i: usize, instance: Instance, check
         let arguments = ground.view().list(instance.args).map_err(|_| RunError::Build {
             function: function.named(), error: BuildError::Malformed { what: "promoted arguments past the ground table" }, range: None,
         })?;
-        if table.get(need, arguments).is_some() { continue; }
+        let Some(kept) = table.missing_args(need, arguments) else { continue };
         let input = crate::front2::consts::promoted_operand(function.key, borrow, body.body.exprs, done, alloc)
             .map_err(|why| RunError::ConstAt { function: function.named(), refusal: ConstAtRefusal { need, why: ConstAtWhy::Eval(why) }, path: program.item_named(function.key) })?;
         let mut typed = body;
@@ -760,7 +760,7 @@ fn eval_promotions<P: FrontEnd>(program: &P, i: usize, instance: Instance, check
         for named in record.fns.iter() {
             table.ground_fns.insert(named.key, named.instance);
         }
-        table.insert(need, ground.view().list(instance.args).expect("ground rows only grow"), data_record(record));
+        table.insert(need, kept, data_record(record));
         store = world.store;
     }
     Ok(())

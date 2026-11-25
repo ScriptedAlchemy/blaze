@@ -226,7 +226,8 @@ impl Tasks<'_, '_> {
         let Ok(at) = self.outlined.binary_search_by(|one| one.name.cmp(&task.planned.name)) else {
             return failed(task, alloc);
         };
-        let Ok(record) = &self.outlined[at].made else {
+        let outlined = &self.outlined[at];
+        let Ok(record) = &outlined.made else {
             return failed(task, alloc);
         };
         let mut defines = SVec::new_in(alloc);
@@ -236,8 +237,8 @@ impl Tasks<'_, '_> {
             let payload = record.payload_bytes().unwrap_or_else(|error| panic!("outline {:?} has no item payload: {error:?}", record.name));
             let view = blaze_surface::FileItemsView::read(payload).unwrap_or_else(|error| panic!("outline {:?} has an invalid item payload: {error:?}", record.name));
             defines.push((DATA, view.file()));
-            item_cells(crate::signature::SignatureFile::new(&self.outlined[at].path), view, &mut defines, alloc);
-        } else if let Some(surface) = self.outlined[at].module_surface() {
+            item_cells(crate::signature::SignatureFile::new(&outlined.path), view, &mut defines, alloc);
+        } else if let Some(surface) = outlined.module_surface() {
             defines.push((SURFACE, surface));
         }
         defines.push((HEADS, heads_of(record)));
