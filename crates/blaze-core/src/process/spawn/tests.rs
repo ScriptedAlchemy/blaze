@@ -2,11 +2,11 @@ use crate::busy;
 
 #[cfg(target_os = "linux")]
 mod child_errors {
-    use super::super::{child_error, raw_os_error};
+    use super::super::{child_error, io, raw_os_error};
 
-    fn check(error: &std::io::Error, what: &str, errno: i32) {
+    fn check(error: &io::Error, what: &str, errno: i32) {
         assert_eq!(raw_os_error(error), Some(errno), "spawn step lost its errno: {error}");
-        assert_eq!(error.kind(), std::io::Error::from_raw_os_error(errno).kind());
+        assert_eq!(error.kind(), io::Error::from_raw_os_error(errno).kind());
         assert!(error.to_string().contains(what), "spawn error lost its step: {error}");
     }
 
@@ -17,7 +17,7 @@ mod child_errors {
         for what in ["running its program", "changing to its directory", "giving it its input and output"] {
             for errno in [libc::ENOENT, libc::EACCES, libc::ENOTDIR, libc::EBADF, libc::ETXTBSY] {
                 check(&child_error(what, errno), what, errno);
-                assert_eq!(raw_os_error(&std::io::Error::from_raw_os_error(errno)), Some(errno));
+                assert_eq!(raw_os_error(&io::Error::from_raw_os_error(errno)), Some(errno));
             }
         }
     }
@@ -26,7 +26,7 @@ mod child_errors {
     #[should_panic(expected = "spawn step lost its errno")]
     fn the_oracle_catches_a_formatted_child_error_losing_its_errno() {
         let error = child_error("running its program", libc::ENOENT);
-        let flattened = std::io::Error::new(error.kind(), error.to_string());
+        let flattened = io::Error::new(error.kind(), error.to_string());
         check(&flattened, "running its program", libc::ENOENT);
     }
 }

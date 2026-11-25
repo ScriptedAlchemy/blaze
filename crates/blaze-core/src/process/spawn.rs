@@ -68,21 +68,21 @@ struct ChildError {
 }
 
 #[cfg(target_os = "linux")]
-impl std::fmt::Display for ChildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ChildError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}: {}", self.what, self.source)
     }
 }
 
 #[cfg(target_os = "linux")]
-impl std::error::Error for ChildError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for ChildError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         Some(&self.source)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn child_error(what: &'static str, errno: libc::c_int) -> io::Error {
+fn child_error(what: &'static str, errno: core::ffi::c_int) -> io::Error {
     let source = io::Error::from_raw_os_error(errno);
     // alloc: the failed child's diagnostic retains both its step and its OS error.
     io::Error::new(source.kind(), ChildError { what, source })
