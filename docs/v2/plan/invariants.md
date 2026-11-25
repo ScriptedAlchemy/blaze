@@ -636,9 +636,9 @@ By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
   Controls: `skipped_crc32c`.
 - **`property_sse_chunked_round_trip`** *tested* (`crates/blaze-std/src/sse.rs`): chunked SSE parsing matches whole-buffer parsing and strips leading event field spaces.
   Controls: `missing_space_strip`.
-- **`property_natural_cmp_strict_total_order`** *tested* (`crates/blaze-std/src/strx.rs`): `natural_cmp` is a strict total order (reflexive, antisymmetric, transitive) and orders embedded decimal integers numerically.
+- **`property_natural_cmp_strict_total_order`** *tested* (`crates/blaze-std/src/strx/tests.rs`): `natural_cmp` is a strict total order (reflexive, antisymmetric, transitive) and orders embedded decimal integers numerically.
   Controls: `lexicographic_digit_bug`.
-- **`property_truncate_width_respects_bound`** *tested* (`crates/blaze-std/src/strx.rs`): `truncate_width_in` always produces a string with `visible_width <= max_width` and closes any ANSI style emitted before truncating.
+- **`property_truncate_width_respects_bound`** *tested* (`crates/blaze-std/src/strx/tests.rs`): `truncate_width_in` always produces a string with `visible_width <= max_width` and closes any ANSI style emitted before truncating.
   Controls: `lexicographic_digit_bug`.
 - **`property_wrap_ansi_matches_plain_and_respects_width`** *tested* (`crates/blaze-std/src/table.rs`): ANSI-styled line wrapping matches plain wrapping and respects visible column width.
   Controls: `byte_len_table_misalignment_and_lost_wrap_style`.
