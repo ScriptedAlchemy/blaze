@@ -6791,6 +6791,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
             mem.allocating = "the body's left-package warnings";
             let package = group.crates.world_at(0).map(|at| group.list.shown_from(at));
             for &(from, at, shape, call, path) in &opened.sources.0.left.borrow()[left_at..] {
+                findings = findings.saturating_add(1);
                 found.push(left_found((from, at, shape, call, path), package, one.place.item, item_text, sc));
             }
             // A scope crate opened by need whose record did not open (front_load.rs

@@ -152,7 +152,7 @@ fn target_name(path: &[u8], source: &str) -> blaze_drive::Name {
     work::body_name(blaze_drive::Name::file(path), &outline, target, source)
 }
 
-fn stored(io: &Io) -> blaze_engine::pages::Kept<'static> {
+pub(super) fn stored(io: &Io) -> blaze_engine::pages::Kept<'static> {
     super::engine_answer_rows_tests::with_store(io, |cx, store, opts, _| {
         let root = crate::engine_answer::root_name(opts.place.checkout, cx.frame());
         let pointer = crate::engine_answer::load_pointer(cx, store, &root).expect("read pointer").expect("answer filed").expect("valid pointer");

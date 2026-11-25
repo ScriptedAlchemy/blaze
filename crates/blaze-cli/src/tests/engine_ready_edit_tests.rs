@@ -865,15 +865,17 @@ impl crate::engine_scripts::ScriptRunner for StaticScriptReadRunner {
 
 static SCRIPT_READ_RUNNER: StaticScriptReadRunner = StaticScriptReadRunner;
 
-/// Monster #3: a moved `Given` checkout read (e.g. a computed `include_str!`) whose woken readers
-/// contain 0 `Script` tasks stays on `Driver::Ready` and matches `Driver::Phases` byte-for-byte
-/// (both for a pure data-file edit and for a `.rs` body edit of a file that is ALSO read via
-/// `include_str!`, like Tempo's `crates/chainspec/src/spec.rs`). When a `Script` task wakes from
-/// the `Given`, `Driver::Ready` refuses with `PhasesWhy::ScriptRead` and `Driver::Auto` falls back
-/// cleanly to `Phases`.
+/// A computed include of an unplanned data file wakes its body readers through a `Given`.
+/// An included Rust module wakes them through its outline's `DATA` cell. Both edits stay on
+/// `Ready` and match `Phases` byte-for-byte. A build script reading a moved `Given` requires
+/// `Phases`, with a typed refusal on strict `Ready` and a fallback on `Auto`.
 #[test]
 fn given_edit_with_body_readers_stays_on_ready_and_script_reader_refuses_to_phases() {
+    use super::engine_body_memory_tests::stored;
     use crate::engine_ready_edit::{PhasesWhy, ReadyRefused};
+    use crate::engine_script_reads::{ReadKind, cell_name};
+    use blaze_drive::{Kind, Name};
+    use blaze_engine::{Cause, CellId};
 
     // Part A: `Given` read only by `BodyCheck` (0 `Script` readers).
     let setup_body_given = |seed: u64| -> Io {
@@ -895,6 +897,25 @@ fn given_edit_with_body_readers_stays_on_ready_and_script_reader_refuses_to_phas
     let ready_io = setup_body_given(91);
     let phases_io = setup_body_given(91);
 
+    // The computed JSON path has no outline. The module already defines its raw bytes on DATA.
+    // Both unit rows of read_data observe both cells, including in the persisted cold answer.
+    let json = CellId { of: cell_name(ReadKind::File, "a/assets/g.json"), cell: crate::engine_tasks::WHOLE };
+    let module = CellId { of: Name::file(b"a/src/spec.rs"), cell: crate::engine_tasks::DATA };
+    let cold = stored(&ready_io);
+    let readers = &cold.answer.readers[&json];
+    assert_eq!(readers.len(), 2);
+    assert!(readers.iter().all(|name| name.kind == Kind::BodyCheck));
+    assert_eq!(readers, &cold.answer.readers[&module]);
+    let assert_woke = |cell, keys: &StoredKeys| {
+        let kept = stored(&ready_io);
+        println!("{cell:?} woke {readers:?}: {keys}");
+        for reader in readers {
+            let (serial, cause) = kept.causes[reader];
+            assert_eq!(serial, kept.answer.serial, "{reader} must enter on this edit");
+            assert!(matches!(cause, Cause::ReadMoved { read, .. } if read == cell), "{reader} woke on {cause:?}, expected {cell:?}");
+        }
+    };
+
     // 1. Pure `Given` data-file edit (`a/assets/g.json`): stays on `ready` and equals `Phases`.
     write(&ready_io, "a/assets/g.json", "{\"v\":2}\n");
     write(&phases_io, "a/assets/g.json", "{\"v\":2}\n");
@@ -907,22 +928,24 @@ fn given_edit_with_body_readers_stays_on_ready_and_script_reader_refuses_to_phas
     assert_eq!(r1_stored.pages, p1_stored.pages, "pure Given edit pages equal Phases");
     let r1_prof = profile(&ready_io);
     assert!(r1_prof.contains("driver: ready"), "profile names ready:\n{r1_prof}");
-    assert!(r1_prof.contains("2 Given"), "profile counts both discovered Given tasks on first edit after cold:\n{r1_prof}");
+    assert_woke(json, &r1_stored);
+    assert!(r1_prof.contains("ready tasks entered by kind: 0 FileItems, 1 Given, 0 Lint, 2 BodyCheck"), "only the JSON Given enters on the first edit:\n{r1_prof}");
     assert!(r1_prof.contains("bodies memory: 2 bodies"), "each woken body ran once (Tick-1 Given peek):\n{r1_prof}");
 
-    // 2. `.rs` body edit in `a/src/spec.rs` (both `Slot` AND `Given` move): stays on `ready`!
+    // 2. `.rs` body edit in `a/src/spec.rs` (both its body and its raw bytes move): stays on `ready`!
     write(&ready_io, "a/src/spec.rs", "pub fn spec_val() -> u32 {\n    2\n}\n");
     write(&phases_io, "a/src/spec.rs", "pub fn spec_val() -> u32 {\n    2\n}\n");
-    let r2 = checked_on(&ready_io, Driver::Ready).expect("Slot+Given body edit stays on ready");
-    let p2 = checked_on(&phases_io, Driver::Phases).expect("Slot+Given body edit on phases");
+    let r2 = checked_on(&ready_io, Driver::Ready).expect("module edit stays on ready");
+    let p2 = checked_on(&phases_io, Driver::Phases).expect("module edit on phases");
     let r2_stored = r2.stored.expect("r2 stored");
     let p2_stored = p2.stored.expect("p2 stored");
-    assert_eq!(r2_stored.header_shards_read, 0, "Slot+Given body edit took ready");
-    assert_eq!(r2_stored.root, p2_stored.root, "Slot+Given body edit root equals Phases");
-    assert_eq!(r2_stored.pages, p2_stored.pages, "Slot+Given body edit pages equal Phases");
+    assert_eq!(r2_stored.header_shards_read, 0, "module edit took ready");
+    assert_eq!(r2_stored.root, p2_stored.root, "module edit root equals Phases");
+    assert_eq!(r2_stored.pages, p2_stored.pages, "module edit pages equal Phases");
     let r2_prof = profile(&ready_io);
-    assert!(r2_prof.contains("driver: ready"), "Slot+Given profile names ready:\n{r2_prof}");
-    assert!(r2_prof.contains("1 Given"), "only the edited spec.rs Given entered:\n{r2_prof}");
+    assert!(r2_prof.contains("driver: ready"), "module edit profile names ready:\n{r2_prof}");
+    assert_woke(module, &r2_stored);
+    assert!(r2_prof.contains("ready tasks entered by kind: 1 FileItems, 1 Lint, 4 BodyCheck"), "the edited module defines its own DATA cell:\n{r2_prof}");
 
     // Part B: `Given` read by a `Script` (build.rs) refuses `ready` with `PhasesWhy::ScriptRead`
     // and falls back cleanly on `Driver::Auto`.
