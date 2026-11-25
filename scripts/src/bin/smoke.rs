@@ -12,7 +12,7 @@
 //! format is defined here once: `land.py` asks this script (`verify`) and never reads it itself.
 //!
 //! Each project is built in a copy of its fixture (harness/v2/versus/<name>: the manifest and
-//! lock files; the source is written here) under a fresh `BLAZE_HOME`, and each step is one
+//! lock files; the source is written here) under a fresh `HOME`, and each step is one
 //! child process run with an environment built from nothing, under a deadline at which its
 //! whole process group is killed (`blaze_script::child`): a hang ends as `TIMEOUT`, never as a
 //! hang of this script. A step that fails is reported with what makes it debuggable without a
@@ -34,16 +34,15 @@ A run (the quote on standard output and in <work>/quote.txt; what went wrong on 
     projects  which fixtures of harness/v2/versus, of "hello" and "six" (["hello"])
     tree      the checkout the binary was built from, whose tree the quote names (".")
 
-Per project, in a fresh BLAZE_HOME, each step one child under a deadline (cold 180 s, the rest
-60 s; the whole process group is killed at it), with only HOME, PATH, TERM=dumb, LANG=C.UTF-8
-and BLAZE_HOME set:
+Per project, in a fresh HOME seeded with the pinned toolchain shelf, each step one child under
+a deadline (cold 180 s, the rest 60 s; the whole process group is killed at it), with only
+HOME, PATH, TERM=dumb and LANG=C.UTF-8 set:
 
     cold       `blaze run`: exit 0 and the program's line
     no-op      `blaze run` again, nothing changed: the same line
     body-edit  the printed number changed, `blaze run`: the new line
     comment    a comment line added at the top, `blaze run`: the line of the body edit
-    check      `blaze check`: exit 3 and its "incomplete" closing line while a stage `check` is
-               defined to run is not built (blaze-cli work.rs `CHECK_STAGES`); exit 0 once all are
+    check      `blaze check`: exit 0 and the completed check's zero-error summary
     test       `blaze test`: exit 0 and a summary reporting one test ran and passed
 
 The four `run` steps are a chain: after one fails, the rest of the chain is skipped (each is an
@@ -127,14 +126,6 @@ enum Step {
 }
 
 /// Every step, in the order each project runs them and its quote lists them.
-/// `blaze check`'s exit status while a stage it is defined to run is not built: 3, "incomplete"
-/// (blaze-cli main.rs `INCOMPLETE`, `blaze explain 3`). The stages are blaze-cli work.rs
-/// `CHECK_STAGES`, which this script cannot reach; the day every one is `true`, `check` exits 0
-/// and this turns 0 with it, so the smoke run never passes a check that said less than it did.
-const CHECK_STATUS: i32 = 3;
-/// The word of `check`'s closing line while stages are missing ("incomplete · NOT checked: ..").
-const CHECK_SAYS: &str = "incomplete";
-
 const STEPS: [Step; 6] = [Step::Cold, Step::NoOp, Step::BodyEdit, Step::Comment, Step::Check, Step::Test];
 
 impl Step {
@@ -554,22 +545,39 @@ struct Smoke {
     blaze: PathBuf,
     work: PathBuf,
     root: PathBuf,
-    /// This script's own HOME and PATH, the only variables handed on.
+    /// The home containing the source toolchain shelf.
     home_dir: OsString,
     path: OsString,
 }
 
 impl Smoke {
-    /// A child's whole environment: nothing inherited but HOME (the toolchain blaze fetched is
-    /// the machine's) and PATH (the C driver).
-    fn env<'a>(&'a self, home: &'a Path) -> [(&'static str, &'a OsStr); 5] {
+    /// Only PATH is inherited. Each project owns its store and previous test results.
+    fn env<'a>(&'a self, home: &'a Path) -> [(&'static str, &'a OsStr); 4] {
         [
-            ("HOME", self.home_dir.as_os_str()),
+            ("HOME", home.as_os_str()),
             ("PATH", self.path.as_os_str()),
             ("TERM", OsStr::new("dumb")),
             ("LANG", OsStr::new("C.UTF-8")),
-            ("BLAZE_HOME", home.as_os_str()),
         ]
+    }
+
+    fn prepare_home(&self, home: &Path) -> Result<(), String> {
+        use blaze_toolchain::{PINNED, ToolchainView};
+        let shelf = Path::new(".blaze/v2/toolchain");
+        let source = Path::new(&self.home_dir).join(shelf);
+        let dest = home.join(shelf);
+        std::fs::create_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+        let manifest_name = PINNED.to_string();
+        let manifest_path = source.join(&manifest_name);
+        let bytes = std::fs::read(&manifest_path).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+        let view = ToolchainView::open(&bytes, PINNED).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+        for krate in view.crates() {
+            let name = hex(&krate.pack);
+            let from = source.join(&name);
+            std::fs::copy(&from, dest.join(&name)).map_err(|e| format!("copying {} to {}: {e}", from.display(), dest.display()))?;
+        }
+        let manifest = dest.join(manifest_name);
+        std::fs::write(&manifest, bytes).map_err(|e| format!("{}: {e}", manifest.display()))
     }
 
     fn argv(&self, words: &[&str]) -> Vec<String, Global> {
@@ -615,12 +623,10 @@ impl Smoke {
             Ok(Ended::Exited(measured)) => measured,
         };
         let wall = Duration::from_nanos(measured.wall_ns);
-        let outcome = match (step, measured.status) {
-            (Step::Check, CHECK_STATUS) => Outcome::Ok,
-            (Step::Check, status) => Outcome::Failed(format!("exited {status}, where `check` exits {CHECK_STATUS} while stages are missing")),
-            (_, 0) => Outcome::Ok,
-            (_, -1) => Outcome::Failed("was ended by a signal".to_owned()),
-            (_, status) => Outcome::Failed(format!("exited {status}")),
+        let outcome = match measured.status {
+            0 => Outcome::Ok,
+            -1 => Outcome::Failed("was ended by a signal".to_owned()),
+            status => Outcome::Failed(format!("exited {status}")),
         };
         if !matches!(outcome, Outcome::Ok) {
             return (outcome, Some(wall));
@@ -629,11 +635,8 @@ impl Smoke {
             let out = log.with_extension("out");
             let outcome = match read_text_lossy(&out) {
                 Err(e) => Outcome::Failed(format!("its output {}: {e}", out.display())),
-                Ok(text) if text.lines().any(|it| it.contains(CHECK_SAYS)) => Outcome::Ok,
-                Ok(text) => Outcome::Failed(format!(
-                    "exited {CHECK_STATUS} and printed no `{CHECK_SAYS}` line (its last line: `{}`)",
-                    text.lines().last().unwrap_or("").trim_end()
-                )),
+                Ok(text) if text.trim_end() == "0 errors: blaze check" => Outcome::Ok,
+                Ok(text) => Outcome::Failed(format!("expected a completed zero-error check, got: {}", text.trim_end())),
             };
             return (outcome, Some(wall));
         }
@@ -692,7 +695,7 @@ impl Smoke {
     fn project(&self, project: &str, lines: &mut Vec<Line, Global>, failures: &mut Vec<String, Global>) {
         let dir = self.work.join(project);
         let home = self.work.join(format!("{project}-home"));
-        if let Err(why) = std::fs::create_dir_all(&home).map_err(|e| format!("{}: {e}", home.display())).and_then(|()| self.make(project, &dir)) {
+        if let Err(why) = self.prepare_home(&home).and_then(|()| self.make(project, &dir)) {
             fail(SCRIPT, &format!("{project}: the project could not be made: {why}"));
         }
         // The chain step that failed, when one has: the chain's later steps are skipped.
@@ -838,9 +841,9 @@ fn smoke(it: &Run) -> ! {
         fail(SCRIPT, &format!("the work directory {}: {e}", work.display()));
     }
     let work = canon("work", &it.work);
-    #[allow(clippy::disallowed_methods, reason = "a script hands its own HOME and PATH to the blaze it runs, and nothing else")]
+    #[allow(clippy::disallowed_methods, reason = "the script locates its toolchain shelf in HOME and forwards PATH to the child")]
     let (home_dir, path) = (std::env::var_os("HOME"), std::env::var_os("PATH"));
-    let (Some(home_dir), Some(path)) = (home_dir, path) else { fail(SCRIPT, "HOME and PATH are set: the blaze under test gets both and nothing else") };
+    let (Some(home_dir), Some(path)) = (home_dir, path) else { fail(SCRIPT, "smoke needs HOME for the toolchain shelf and PATH for the C driver") };
     let (tree, dirty) = named_tree(&root).unwrap_or_else(|why| fail(SCRIPT, &why));
     let binary = hex(&sha256_file(&blaze).unwrap_or_else(|why| fail(SCRIPT, &why)));
     let cores = std::thread::available_parallelism().map_or(0, |it| u32::try_from(it.get()).unwrap_or(u32::MAX));
