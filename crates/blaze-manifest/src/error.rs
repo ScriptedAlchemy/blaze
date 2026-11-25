@@ -221,7 +221,7 @@ impl fmt::Display for ManifestError {
         match self {
             ManifestError::Read { path, .. } => write!(f, "failed to read `{}`", path.display()),
             ManifestError::Canonicalize { path, .. } => {
-                write!(f, "the workspace manifest `{}` could not be canonicalized", path.display())
+                write!(f, "the workspace manifest {} could not be canonicalized", blaze_text::Code(&path.display()))
             }
             ManifestError::NotUtf8 { path } => {
                 write!(f, "path at `{}` was not valid utf-8", path.display())
@@ -342,6 +342,19 @@ impl<T, E: Into<ManifestError>> ResultExt<T> for Result<T, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_path_error_preserves_the_path_and_reader_error() {
+        let error = MetadataPathError {
+            dependency: blaze_resolve::InternedString::new("helper"),
+            path: PathBuf::from("a directory/helper"),
+            source: io::Error::other("missing from view"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "the path dependency `helper` at `a directory/helper` could not be canonicalized: missing from view"
+        );
+    }
 
     #[test]
     fn alternate_display_joins_the_chain_as_anyhow_did() {

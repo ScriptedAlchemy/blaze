@@ -842,7 +842,7 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
         for export in table.exports.iter() {
             let checker = blaze_ladder::front2::keys::checker_of(export.item);
             let symbol = blaze_ladder::symbols::fn_symbol(checker, blaze_typeck::List::EMPTY, blaze_typeck::PTys::EMPTY, alloc)
-                .map_err(|why| NativeError::Send { words: held(bstd::mem::format_in!(out_frame, "export `{}` symbol: {why:?}", export.name).as_str(), ask) })?;
+                .map_err(|why| NativeError::Send { words: held(bstd::mem::format_in!(out_frame, "export {} symbol: {why:?}", bstd::report::Code(export.name)).as_str(), ask) })?;
             let name = export.name.as_bytes();
             exports.push(blaze_export::CExport { name, symbol });
             let needed_by_word = image.words.iter().any(|word| {

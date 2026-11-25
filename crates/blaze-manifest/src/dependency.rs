@@ -30,8 +30,8 @@ pub struct MetadataPathError {
 impl fmt::Display for MetadataPathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f,
-            "the path dependency `{}` at `{}` could not be canonicalized: {}",
-            self.dependency, self.path.display(), self.source,
+            "the path dependency {} at {} could not be canonicalized: {}",
+            blaze_text::Code(&self.dependency), blaze_text::Code(&self.path.display()), self.source,
         )
     }
 }

@@ -26,6 +26,7 @@ cargo = [
     "dep:blaze-ids",
     "dep:blaze-resolve",
     "dep:blaze-source",
+    "dep:blaze-text",
     "dep:serde",
     "dep:serde_json",
     "dep:stdx",
@@ -56,6 +57,7 @@ blaze-hash = { workspace = true, optional = true }
 blaze-ids = { workspace = true, optional = true }
 blaze-resolve = { workspace = true, optional = true }
 blaze-source = { workspace = true, optional = true }
+blaze-text = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 stdx = { workspace = true, optional = true }

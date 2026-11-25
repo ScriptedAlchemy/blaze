@@ -94,7 +94,7 @@ impl Files for Disk {
             let native = blaze_source::file_url(path)
                 .and_then(|url| url.to_file_path())
                 .map_err(|()| io::Error::new(io::ErrorKind::InvalidInput, format!(
-                    "`{}` is not a native Windows drive path", path.display()
+                    "{} is not a native Windows drive path", blaze_text::Code(&path.display())
                 )))?;
             return native.canonicalize();
         }

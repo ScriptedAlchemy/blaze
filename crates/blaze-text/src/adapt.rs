@@ -10,6 +10,18 @@ use crate::parse::ParseError;
 use crate::put::{Count, Put};
 use crate::show::Show;
 
+/// A literal spelling in a diagnostic. Its plain rendering delimits the value,
+/// including native paths borrowed through their Display adapter.
+pub struct Code<'a, T: ?Sized = str>(pub &'a T);
+
+impl<T: fmt::Display + ?Sized> fmt::Display for Code<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("`")?;
+        self.0.fmt(f)?;
+        f.write_str("`")
+    }
+}
+
 /// A [`Show`] as a `Display`: `format!("{}", Shown(&x))`.
 #[derive(Clone, Copy)]
 pub struct Shown<T>(pub T);

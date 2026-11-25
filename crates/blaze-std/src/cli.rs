@@ -22,6 +22,7 @@ use blaze_own::{AllocFailure, String, Vec};
 
 use crate::ansi::{Color, Style};
 use crate::diff::{DiffError, edit_distance};
+use crate::report::Code;
 
 /// Maximum Myers edit distance for typo suggestions.
 const MAX_SUGGESTION_DISTANCE: usize = 2;
@@ -144,40 +145,40 @@ impl fmt::Display for CliError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             CliError::UnknownFlag { flag, suggestion: Some(suggest) } => {
-                write!(f, "bstd::cli: unknown option `--{flag}`; did you mean `--{suggest}`?")
+                write!(f, "bstd::cli: unknown option {}; did you mean {}?", Code(&format_args!("--{flag}")), Code(&format_args!("--{suggest}")))
             }
             CliError::UnknownFlag { flag, suggestion: None } => {
-                write!(f, "bstd::cli: unknown option `--{flag}`")
+                write!(f, "bstd::cli: unknown option {}", Code(&format_args!("--{flag}")))
             }
             CliError::UnknownShort { flag } => {
-                write!(f, "bstd::cli: unknown short flag `-{flag}`")
+                write!(f, "bstd::cli: unknown short flag {}", Code(&format_args!("-{flag}")))
             }
             CliError::UnknownSubcommand { name, suggestion: Some(suggest) } => {
-                write!(f, "bstd::cli: unknown subcommand `{name}`; did you mean `{suggest}`?")
+                write!(f, "bstd::cli: unknown subcommand {}; did you mean {}?", Code(name), Code(suggest))
             }
             CliError::UnknownSubcommand { name, suggestion: None } => {
-                write!(f, "bstd::cli: unknown subcommand `{name}`")
+                write!(f, "bstd::cli: unknown subcommand {}", Code(name))
             }
             CliError::MissingValue { opt } => {
-                write!(f, "bstd::cli: option `--{opt}` requires a value")
+                write!(f, "bstd::cli: option {} requires a value", Code(&format_args!("--{opt}")))
             }
             CliError::MissingRequiredOpt { opt } => {
-                write!(f, "bstd::cli: missing required option `--{opt}`")
+                write!(f, "bstd::cli: missing required option {}", Code(&format_args!("--{opt}")))
             }
             CliError::MissingRequiredPositional { name } => {
-                write!(f, "bstd::cli: missing required argument `<{name}>`")
+                write!(f, "bstd::cli: missing required argument {}", Code(&format_args!("<{name}>")))
             }
             CliError::DuplicateOpt { opt } => {
-                write!(f, "bstd::cli: option `--{opt}` may only be passed once")
+                write!(f, "bstd::cli: option {} may only be passed once", Code(&format_args!("--{opt}")))
             }
             CliError::UnexpectedValue { flag } => {
-                write!(f, "bstd::cli: flag `--{flag}` does not take a value")
+                write!(f, "bstd::cli: flag {} does not take a value", Code(&format_args!("--{flag}")))
             }
             CliError::UnexpectedPositional { value } => {
-                write!(f, "bstd::cli: unexpected argument `{value}`")
+                write!(f, "bstd::cli: unexpected argument {}", Code(value))
             }
             CliError::InvalidValue { opt, value } => {
-                write!(f, "bstd::cli: invalid value `{value}` for option `--{opt}`")
+                write!(f, "bstd::cli: invalid value {} for option {}", Code(value), Code(&format_args!("--{opt}")))
             }
             CliError::Alloc(err) => write!(f, "bstd::cli: allocation failed ({err})"),
         }

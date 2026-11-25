@@ -6389,7 +6389,7 @@ pub fn use_named<'a>(a: NamedActor<'a>) -> &'a str { a.name }
                     found = Some(key);
                 }
             });
-            found.unwrap_or_else(|| panic!("`{wanted}` in fixture"))
+            found.unwrap_or_else(|| panic!("fixture has no item named {wanted:?}"))
         };
         let sized = Some(find("Sized"));
         let mut store = Store::new(sized, &frame, g);
@@ -6397,7 +6397,7 @@ pub fn use_named<'a>(a: NamedActor<'a>) -> &'a str { a.name }
 
         for name in ["Actor", "FlatActor", "Boss", "FlatBoss", "NamedActor"] {
             let lib = find(name);
-            store.ensure(names, &mut keys, Want::Head(lib)).unwrap_or_else(|e| panic!("ensure `{name}`: {e:?}"));
+            store.ensure(names, &mut keys, Want::Head(lib)).unwrap_or_else(|e| panic!("could not load the head of {name:?}: {e:?}"));
         }
         let use_named_key = find("use_named");
         store.ensure(names, &mut keys, Want::Fn(use_named_key)).unwrap_or_else(|e| panic!("ensure `use_named`: {e:?}"));

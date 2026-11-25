@@ -348,9 +348,8 @@ impl Text {
             match span {
                 Span::Plain(words) => out.push_str(words),
                 Span::Code(code) | Span::Var(code) | Span::Command(code) => {
-                    out.push('`');
-                    out.push_str(code);
-                    out.push('`');
+                    use core::fmt::Write as _;
+                    let _ = write!(out, "{}", say::Code(code));
                 }
                 Span::Path(it) | Span::Version(it) | Span::Hash(it) | Span::Strong(it) => out.push_str(it),
                 Span::Package { name, version } => {

@@ -812,6 +812,7 @@ pub mod report {
         Blocks, Caps, Fact, Fix, NAMED, Report, Roots, Severity, Span, Text, json, json_message,
         render, render_into, terminal,
     };
+    pub use blaze_text::Code;
 }
 
 /// HTTP/1.1 as a sans-IO core: blaze-http's [`http::Client`], bytes and completions in, IO to

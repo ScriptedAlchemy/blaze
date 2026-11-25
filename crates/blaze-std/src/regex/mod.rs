@@ -135,8 +135,9 @@ impl fmt::Display for RegexError {
             RegexErrorKind::InvalidClassRange { start, end } => {
                 write!(
                     f,
-                    "bstd::regex: byte {}: invalid character class range `{start}-{end}`",
-                    self.offset
+                    "bstd::regex: byte {}: invalid character class range {}",
+                    self.offset,
+                    crate::report::Code(&format_args!("{start}-{end}"))
                 )
             }
             RegexErrorKind::InvalidEscape => {

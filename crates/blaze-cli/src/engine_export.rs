@@ -38,6 +38,7 @@ use bstd::fs::{Content, Durable, Fs, FsError, HomeError};
 use bstd::mem::Frame;
 use bstd::out::Out;
 use bstd::path::{Path, PathError};
+use bstd::report::Code;
 
 use crate::body_types::{SyncPackDirs, TreesSeen};
 use crate::code_store::HomeCodeStore;
@@ -131,12 +132,12 @@ impl fmt::Display for ExportCliError {
             ExportCliError::Position { symbol, shown } => write!(f, "blaze export: resolving source position in {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::Materialize { symbol, shown } => write!(f, "blaze export: materializing position-free record {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::Export(error) => write!(f, "blaze export: {error}"),
-            ExportCliError::BadOutputPath { path, why } => write!(f, "blaze export: invalid output path `{}`: {why} (engine_export.rs)", path.as_str()),
+            ExportCliError::BadOutputPath { path, why } => write!(f, "blaze export: invalid output path {}: {why} (engine_export.rs)", Code(path.as_str())),
             ExportCliError::OutputHome(error) => write!(f, "blaze export: output directory: {error} (engine_export.rs)"),
             ExportCliError::OutputPath(error) => write!(f, "blaze export: output path: {error} (engine_export.rs)"),
             ExportCliError::WriteOutput(error) => write!(f, "blaze export: writing executable: {error} (engine_export.rs)"),
             #[cfg(unix)]
-            ExportCliError::Chmod { path, errno } => write!(f, "blaze export: chmod 0755 `{}` failed: {errno:?} (engine_export.rs)", path.as_str()),
+            ExportCliError::Chmod { path, errno } => write!(f, "blaze export: chmod 0755 {} failed: {errno:?} (engine_export.rs)", Code(path.as_str())),
             ExportCliError::Dist(error) => fmt::Display::fmt(error, f),
         }
     }

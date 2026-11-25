@@ -16,6 +16,7 @@
 use std::time::Duration;
 
 use crate::{Span, Text};
+pub use blaze_text::Code;
 
 /// What can be a part of a [`Text`].
 pub trait Part {
@@ -37,8 +38,6 @@ impl Part for Span {
 
 /// Prose known only at run time: another program's words, a message carried as it came.
 pub struct Words<'a>(pub &'a str);
-/// Code or an identifier.
-pub struct Code<'a>(pub &'a str);
 /// A command the reader can run as it is.
 pub struct Cmd<'a>(pub &'a str);
 /// A file or directory.
@@ -56,9 +55,9 @@ impl Part for Words<'_> {
     }
 }
 
-impl Part for Code<'_> {
+impl<T: core::fmt::Display + ?Sized> Part for Code<'_, T> {
     fn span(self) -> Span {
-        Span::Code(self.0.to_owned()) // alloc: as above
+        Span::Code(self.0.to_string()) // alloc: as above
     }
 }
 
@@ -143,6 +142,10 @@ mod tests {
             text.flat(),
             "`hello::add` recompiled in 0.70s · run `blaze explain why:input` · 3 warnings in /w/src/main.rs"
         );
+        let count = 81;
+        let spelling = format_args!("units[{count}]");
+        assert_eq!(Code(&spelling).to_string(), "`units[81]`");
+        assert!(matches!(say!(Code(&spelling)).0.as_slice(), [Span::Code(raw)] if raw == "units[81]"));
         let mut drawn = String::new();
         let roots = Roots { workspace: Some("/w"), home: None };
         text_into(&mut drawn, &text, Caps { color: true, links: false, width: None }, &roots);

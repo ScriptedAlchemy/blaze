@@ -1491,6 +1491,7 @@ dependencies = [
  "blaze-semver",
  "blaze-sim",
  "blaze-source",
+ "blaze-text",
  "blaze-toml",
  "edition",
  "serde",

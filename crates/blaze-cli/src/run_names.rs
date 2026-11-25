@@ -560,7 +560,8 @@ impl fmt::Display for RunNamesError {
             RunNamesError::Store(error) => write!(f, "the program's names records: {error}"),
             RunNamesError::WorldNotMade => write!(f, "the `UnitGraph` record holds no crate list: the crates' world could not be made (its finding says why; {at})"),
             RunNamesError::RequiredFeatures { target, package, features } => {
-                write!(f, "target `{}` in package `{}` requires the features: {}", target.as_str(), package.as_str(), features.as_str())
+                use bstd::report::Code;
+                write!(f, "target {} in package {} requires the features: {}", Code(target.as_str()), Code(package.as_str()), features.as_str())
             }
             RunNamesError::NoProgramCrate { root } => write!(f, "no binary unit's member crate has its root at `{root}`, the program `blaze run` starts ({at})"),
             RunNamesError::TwoProgramCrates { root, first, second } => write!(f, "two binary units' crates, `{first}` and `{second}`, have their root at `{root}` ({at})"),

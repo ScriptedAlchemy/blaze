@@ -64,6 +64,7 @@ use blaze_world::Side;
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::Frame;
+use bstd::report::Code;
 
 use crate::CliError;
 use crate::fetch::FetchEnv;
@@ -764,13 +765,13 @@ fn tree_of(files: &Files<'_>, checkout: crate::engine_script_reads::Served<'_>, 
                 let pkg_path = if dir.is_empty() { checkout.path().to_path_buf() } else { checkout.path().join(dir) };
                 match blaze_proc_macro::script_sandbox::RealRoot::resolve(&pkg_path) {
                     Ok(root) => Ok((dir_tree(&root), ScriptRoot::package())),
-                    Err(error) => Err(failed("an external package folder a script cannot see", format_args!("the build script of {package}: its external folder `{dir}`: {error}"), false)),
+                    Err(error) => Err(failed("an external package folder a script cannot see", format_args!("the build script of {package}: its external folder {}: {error}", Code(dir)), false)),
                 }
             }
             (Ok(_), crate::engine_script_reads::Served::Simulated) => {
-                Err(failed("an external package's script with no served checkout", format_args!("the build script of {package}: its external folder `{dir}`: a simulated world serves no checkout on disk"), false))
+                Err(failed("an external package's script with no served checkout", format_args!("the build script of {package}: its external folder {}: a simulated world serves no checkout on disk", Code(dir)), false))
             }
-            (Err(error), _) => Err(failed("an external package folder a script cannot see", format_args!("the build script of {package}: its external folder `{dir}`: {error}"), false)),
+            (Err(error), _) => Err(failed("an external package folder a script cannot see", format_args!("the build script of {package}: its external folder {}: {error}", Code(dir)), false)),
         },
         Files::Pack { view, dir, git } => Ok((mem_tree(view.files().map(|f| (f.path, f.bytes)), dir, *git), ScriptRoot::package())),
     }

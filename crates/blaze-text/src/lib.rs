@@ -179,7 +179,7 @@ mod plant;
 #[cfg(test)]
 mod tests;
 
-pub use adapt::{PutDisplay, Shown};
+pub use adapt::{Code, PutDisplay, Shown};
 pub use plant::TextPlant;
 pub use debug::DebugForm;
 pub use float::Float;
