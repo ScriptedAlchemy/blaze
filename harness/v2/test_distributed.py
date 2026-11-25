@@ -242,9 +242,13 @@ class DistributedLedgerTests(unittest.TestCase):
         self.assertEqual(observed, {"argv": self.probe_reply().args, "returncode": 0,
                                     "stdout": self.probe_reply().stdout, "stderr": ""})
         self.assertEqual(result["counts"], {"fail": 1, "error": 1})
-        self.assertIn("solo builds: controlled build failure", result["outcomes"][0]["detail"])
+        detail = result["outcomes"][0]["detail"]
+        self.assertIn("solo builds: exit 23; full log:", detail)
+        self.assertIn("logs/solo.0.log", detail)
+        self.assertIn("controlled build failure", detail)
         log = Path(result["outcomes"][0]["numbers"]["log"]).read_text()
-        self.assertIn("FAIL solo builds: controlled build failure", log)
+        self.assertIn("Failed: solo builds: exit 23; full log:", log)
+        self.assertIn("controlled build failure", log)
 
     def test_real_distv2_finally_failure_and_post_cleanup_identity_failure_are_both_reported(self) -> None:
         original_stop: Callable[[Any], None] = d.distv2.Run.stop
