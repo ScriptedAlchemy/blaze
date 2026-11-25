@@ -116,7 +116,7 @@ def cleanup_step(proc: subprocess.Popen) -> bool:
         remaining = live_group(proc, CLEANUP_SECONDS)
         if remaining:
             raise StepError(f"owned step group {proc.pid} still has live processes {remaining} after SIGKILL")
-    except BaseException:
+    except BaseException as observation_error:
         # A failed observation must not abandon the owned processes. Keep the
         # original cleanup error, but still attempt the final kill and bounded reap.
         observed_exit(proc)
@@ -124,6 +124,10 @@ def cleanup_step(proc: subprocess.Popen) -> bool:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except OSError as signal_error:
+            raise StepError(
+                f"{observation_error}; emergency SIGKILL of owned step group {proc.pid} failed: {signal_error}"
+            ) from observation_error
         raise
     finally:
         proc.wait(timeout=CLEANUP_SECONDS)

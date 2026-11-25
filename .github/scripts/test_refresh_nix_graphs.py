@@ -283,6 +283,13 @@ class GraphProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("cleanup failed: injected ps failure", diagnostics.getvalue())
         self.assert_reaped()
 
+    async def test_emergency_signal_failure_preserves_the_census_error(self):
+        with patch.object(graph, "live_group", side_effect=subprocess.TimeoutExpired(["ps"], 0.25)), \
+                patch.object(graph.os, "killpg", side_effect=PermissionError("signal denied")):
+            with self.assertRaisesRegex(graph.StepError, r"cleanup failed:.*timed out.*SIGKILL.*signal denied"):
+                await graph.run_step("census", self.command("pass"), 5, self.directory)
+        self.assert_reaped()
+
     async def test_group_exit_between_snapshot_and_signal_is_reaped(self):
         release = self.directory / "release"
         process = self.capture(self.command("import pathlib,sys,time; path=pathlib.Path(sys.argv[1]);\n"
