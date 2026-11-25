@@ -17,7 +17,7 @@ const DOC: &str = r#"ci_test: builds and runs workspace cargo test binaries in p
     timeout_s  per-binary timeout in seconds, process-group killed (600)
     doc        also run `cargo test --doc --no-fail-fast` (true)
     root       workspace root (".")
-    evidence   directory for raw Cargo build JSON and completed test executables, also on failure ("")
+    evidence   directory for Cargo build JSON, executable inventory and per-binary test logs, also on failure ("")
 "#;
 
 use std::{
@@ -238,7 +238,12 @@ fn main_with(args: &Args) {
         default_jobs(cpus)
     };
     let limit = Duration::from_secs(args.timeout_s);
-    let log_dir = &tmp.0;
+    let retained_logs = (!args.evidence.is_empty()).then(|| Path::new(&args.evidence).join("tests"));
+    if let Some(directory) = &retained_logs {
+        std::fs::create_dir_all(directory)
+            .unwrap_or_else(|e| fail(SCRIPT, &format!("test logs {}: {e}", directory.display())));
+    }
+    let log_dir = retained_logs.as_ref().unwrap_or(&tmp.0);
     let base_env = &base_env;
 
     let mut passed = 0usize;
@@ -268,8 +273,10 @@ fn main_with(args: &Args) {
                 }
                 Err(why) => RunOutcome { name, failed: Some(format!("did not start: {why}")), output: String::new() },
             };
-            let _ = std::fs::remove_file(&out_path);
-            let _ = std::fs::remove_file(&err_path);
+            if retained_logs.is_none() {
+                let _ = std::fs::remove_file(&out_path);
+                let _ = std::fs::remove_file(&err_path);
+            }
             outcome
         },
         |outcome| match outcome.failed {
@@ -319,8 +326,10 @@ fn main_with(args: &Args) {
                 failed.push("doctests".to_owned());
             }
         }
-        let _ = std::fs::remove_file(&doc_out);
-        let _ = std::fs::remove_file(&doc_err);
+        if retained_logs.is_none() {
+            let _ = std::fs::remove_file(&doc_out);
+            let _ = std::fs::remove_file(&doc_err);
+        }
     }
 
     println!("{SCRIPT}: {passed} passed, {} failed (jobs={jobs})", failed.len());
