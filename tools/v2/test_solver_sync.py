@@ -21,6 +21,8 @@ import typed_input  # noqa: E402
 OLD = "ab" * 20
 NEW = "cd" * 20
 MANIFEST = '[package]\nname = "x"\n'
+# Leave enough leading context for Git to relocate a hunk after an upstream insertion.
+PRELUDE = "fn prelude() {}\n\nfn a() {}\n\n"
 
 
 def write(root: Path, files: dict[str, str]) -> None:
@@ -98,9 +100,9 @@ class SeriesTest(unittest.TestCase):
 
 
 class ReplayTest(unittest.TestCase):
-    BASE = {"lib.rs": "fn a() {}\n\nfn b() {}\n\nfn c() {}\n"}
-    ONE = {"lib.rs": "fn a() {}\n\nfn b() { one() }\n\nfn c() {}\n"}
-    TWO = {"lib.rs": "fn a() {}\n\nfn b() { one() }\n\nfn c() { two() }\n", "new.rs": "x\n"}
+    BASE = {"lib.rs": PRELUDE + "fn b() {}\n\nfn c() {}\n"}
+    ONE = {"lib.rs": PRELUDE + "fn b() { one() }\n\nfn c() {}\n"}
+    TWO = {"lib.rs": PRELUDE + "fn b() { one() }\n\nfn c() { two() }\n", "new.rs": "x\n"}
 
     def series(self) -> dict[str, bytes]:
         return {"0001-one": patch_between(self.BASE, self.ONE), "0002-two": patch_between(self.ONE, self.TWO)}
@@ -117,6 +119,7 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual((src / "lib.rs").read_text(), "fn z() {}\n\n" + self.TWO["lib.rs"])
             self.assertEqual((src / "new.rs").read_text(), "x\n")
             self.assertEqual(len(regenerated), 2)
+            self.assertNotEqual(regenerated[0], self.series()["0001-one"])
             self.assertIn(b"+fn b() { one() }", regenerated[0])
             self.assertIn(b"--- a/src/lib.rs", regenerated[0])
             self.assertIn(b"+++ b/src/new.rs", regenerated[1])
@@ -125,7 +128,7 @@ class ReplayTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             path = crate(root, "c", self.TWO, self.series())
-            repo = upstream(root, {"c": {"lib.rs": "fn a() {}\n\nfn b() { changed() }\n\nfn c() {}\n"}})
+            repo = upstream(root, {"c": {"lib.rs": PRELUDE + "fn b() { changed() }\n\nfn c() {}\n"}})
             with self.assertRaisesRegex(solver_sync.Failed, r"c: patch 0001-one no longer applies at cdcdcdcdc\. Port"):
                 solver_sync.replay(
                     "c", repo / "compiler" / "c", solver_sync.read_series(path), path / "patches", root / "work", NEW
@@ -153,15 +156,15 @@ class ReplayTest(unittest.TestCase):
 
 class SyncTest(unittest.TestCase):
     def tree(self, root: Path, *, broken: str = "") -> tuple[Path, str]:
-        base = {"lib.rs": "fn a() {}\n\nfn b() {}\n"}
-        after = {"lib.rs": "fn a() {}\n\nfn b() { blaze() }\n"}
+        base = {"lib.rs": PRELUDE + "fn b() {}\n"}
+        after = {"lib.rs": PRELUDE + "fn b() { blaze() }\n"}
         for name in solver_sync.CRATES:
             crate(root, name, after, {"0001-blaze": patch_between(base, after)})
         write(root, {"pins/toolchain": "nightly-2026-10-28\n"})
         moved = {"lib.rs": "fn new() {}\n\n" + base["lib.rs"]}
         files = {name: moved for name in solver_sync.CRATES}
         if broken:
-            files[broken] = {"lib.rs": "fn a() {}\n\nfn b() { other() }\n"}
+            files[broken] = {"lib.rs": PRELUDE + "fn b() { other() }\n"}
         repo = upstream(root, files)
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
         subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
@@ -183,7 +186,7 @@ class SyncTest(unittest.TestCase):
             self.run_sync(root, repo, head)
             for name in solver_sync.CRATES:
                 path = root / "vendor" / name
-                self.assertEqual((path / "src" / "lib.rs").read_text(), "fn new() {}\n\nfn a() {}\n\nfn b() { blaze() }\n")
+                self.assertEqual((path / "src" / "lib.rs").read_text(), "fn new() {}\n\n" + PRELUDE + "fn b() { blaze() }\n")
                 self.assertEqual(solver_sync.read_series(path).commit, head)
                 self.assertEqual(solver_sync.read_series(path).nightly, "nightly-2026-10-28")
 
@@ -195,7 +198,7 @@ class SyncTest(unittest.TestCase):
                 self.run_sync(root, repo, head)
             for name in solver_sync.CRATES:
                 path = root / "vendor" / name
-                self.assertEqual((path / "src" / "lib.rs").read_text(), "fn a() {}\n\nfn b() { blaze() }\n")
+                self.assertEqual((path / "src" / "lib.rs").read_text(), PRELUDE + "fn b() { blaze() }\n")
                 self.assertEqual(solver_sync.read_series(path).commit, OLD)
 
     def test_a_checkout_at_another_commit_stops(self) -> None:
