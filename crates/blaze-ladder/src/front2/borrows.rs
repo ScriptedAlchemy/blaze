@@ -474,6 +474,12 @@ impl BorrowLangs {
             pointee,
         }
     }
+
+    /// A linked program without the `Drop` lang item cannot have a user destructor.
+    /// With a declared trait, its impl records must answer for this ADT.
+    fn has_drop_impl<'n, S: NamesSource<'n>>(&self, r: &mut Records<'_, 'n, S>, adt: tc::ItemKey) -> Result<bool, ImplsUnknown> {
+        self.drop.map_or(Ok(false), |trait_| has_impl(r, trait_, adt))
+    }
 }
 
 /// The facts of one body, gathered before it is lowered (blaze-flow-lower's [`Facts`]): every
@@ -1102,7 +1108,7 @@ fn auto_copy_of<'n, 'a, S: NamesSource<'n>>(
                     }
                     Ok(CopyImpl::None)
                         if r.store.is_auto_copy_pub(r.names, r.keys, nested_k)
-                            && matches!(has_impl(r, langs.drop, nested_k), Ok(false) | Err(ImplsUnknown::NoLangItem))
+                            && matches!(langs.has_drop_impl(r, nested_k), Ok(false))
                             && !matches!(copy_impl_state(r, langs.clone, nested_k, alloc), Ok(CopyImpl::Negative)) =>
                     {
                         let env_id = envs.len();
@@ -1138,9 +1144,8 @@ fn auto_copy_of<'n, 'a, S: NamesSource<'n>>(
 }
 
 /// Whether `trait_` has an impl for the ADT `adt`: refused when the question could not be
-/// answered (no such lang item, or the selection could not be made), with why.
-fn has_impl<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, trait_: Option<tc::ItemKey>, adt: tc::ItemKey) -> Result<bool, ImplsUnknown> {
-    let trait_ = trait_.ok_or(ImplsUnknown::NoLangItem)?;
+/// answered, with why.
+fn has_impl<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, trait_: tc::ItemKey, adt: tc::ItemKey) -> Result<bool, ImplsUnknown> {
     let shape = tc::Shape::Adt(adt);
     if let Some(v) = answer_impls(r, trait_, shape) {
         return Ok(!v.is_empty());
@@ -1756,7 +1761,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         // `Copy` is NO to `Drop` without asking (an unread candidate cannot be its `Drop`).
         let drop_impl = match copy_state {
             Ok(CopyImpl::Positive) => Ok(false),
-            _ => has_impl(r, langs.drop, key),
+            _ => langs.has_drop_impl(r, key),
         };
         if let Err(why) = copy_state {
             g.unknown.push((k, "Copy"));
@@ -1766,7 +1771,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             g.unknown.push((k, "Drop"));
             g.unknown_why.push(why);
         }
-        let no_drop = matches!(drop_impl, Ok(false) | Err(ImplsUnknown::NoLangItem));
+        let no_drop = matches!(drop_impl, Ok(false));
         let (copy, copy_need) = match copy_state {
             Ok(CopyImpl::Positive) => {
                 let copy = Some(true);

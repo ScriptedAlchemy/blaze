@@ -622,7 +622,7 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
         } else if inert {
             false
         } else {
-            let copy_impl = super::has_impl(r, langs.copy, key).ok();
+            let copy_impl = langs.copy.and_then(|trait_| super::has_impl(r, trait_, key).ok());
             is_uncond_copy(r, langs, key, copy_impl, &mut copy_scratch, alloc)
         };
         let drop_impl = if is_root {
@@ -630,7 +630,7 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
         } else if inert || uncond_copy {
             Some(false)
         } else {
-            super::has_impl(r, langs.drop, key).ok()
+            langs.has_drop_impl(r, key).ok()
         };
         let row_opt = BodyHeadFacts::new(&*r.store, r.names).adt(key);
         let (made, union, generics) = match row_opt {
