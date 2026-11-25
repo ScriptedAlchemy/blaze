@@ -2,11 +2,14 @@
 """Check the install archive's userspace and mount boundary without building or using Docker."""
 
 from dataclasses import replace
+import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -145,15 +148,30 @@ class ArchiveTests(unittest.TestCase):
                     archive.build(config)
                 run.assert_not_called()
 
-    def test_workflow_uses_new_kernel_and_prepares_reflink_before_archive(self):
-        workflow = SCRIPT.parents[1] / "workflows" / "install.yaml"
-        text = workflow.read_text()
-        job = text.split("\n  archive:\n", 1)[1].split("\n  no-rust:\n", 1)[0]
-        self.assertIn("runs-on: ubuntu-24.04\n", job)
-        self.assertIn('reflink: "true"', job)
-        self.assertLess(job.index('reflink: "true"'), job.index("python .github/scripts/install_archive.py"))
-        self.assertIn("name: archive", job)
-        self.assertIn("blaze-commit-x86_64-unknown-linux-gnu.tar.gz", job)
+    def test_release_packages_the_installer_programs_with_matching_checksums(self):
+        workflow = SCRIPT.parents[1] / "workflows/release.yaml"
+        self.assertIn("run: bash .github/scripts/package-release.sh", workflow.read_text())
+        name = "blaze-v0.1.2-x86_64-unknown-linux-gnu"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binaries = root / "target/release"
+            binaries.mkdir(parents=True)
+            for doc in ["LICENSE-APACHE", "LICENSE-MIT", "README.md"]:
+                (root / doc).write_text(doc)
+            programs = ["blaze", "blaze-launcher", "blaze-fact-shim"]
+            for program in programs:
+                (binaries / program).write_text(f"#!/bin/sh\necho {program}\n")
+            subprocess.run(["bash", SCRIPT.with_name("package-release.sh")], cwd=root,
+                           env={**os.environ, "NAME": name}, check=True, capture_output=True, timeout=30)
+            for suffix in [".tar.gz", ".tar.xz"]:
+                package = root / (name + suffix)
+                self.assertEqual((root / (package.name + ".sha256")).read_text().split(),
+                                 [hashlib.sha256(package.read_bytes()).hexdigest(), package.name])
+                with tarfile.open(package) as tar:
+                    for program in programs:
+                        member = tar.getmember(f"{name}/{program}")
+                        self.assertEqual(member.mode & 0o111, 0o111)
+                        self.assertEqual(tar.extractfile(member).read(), (binaries / program).read_bytes())
 
 
 if __name__ == "__main__":

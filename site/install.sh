@@ -30,10 +30,6 @@ set -eu
 REPO=indexable-inc/blaze
 RELEASES="${BLAZE_RELEASES:-https://blaze-releases.ix.dev}"
 RELEASES="${RELEASES%/}"
-case "$RELEASES" in
-    https://*) ;;
-    *) fail "BLAZE_RELEASES is $RELEASES, which is not an https:// address." "A release and its checksums come from there together, so they are fetched over HTTPS only." ;;
-esac
 # The pinned nightly is not copied here: its one home is the repository's pins/toolchain, which
 # the installed blaze knows (`blaze toolchain`) and which is published at this address.
 PINNED_TOOLCHAIN="https://raw.githubusercontent.com/$REPO/main/pins/toolchain"
@@ -51,6 +47,11 @@ fail() {
     if [ $# -gt 1 ] && [ -n "$2" ]; then printf '%s\n' "$2" | sed 's/^/  /' >&2; fi
     exit 1
 }
+
+case "$RELEASES" in
+    https://*) ;;
+    *) fail "BLAZE_RELEASES is $RELEASES, which is not an https:// address." "A release and its checksums come from there together, so they are fetched over HTTPS only." ;;
+esac
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -177,11 +178,10 @@ else
             fail "which release is blaze's $CHANNEL could not be read; is the network up?" \
                 "$(cat "$tmp/error")
 $releases/channels/$CHANNEL"
-        named=$(tr -d ' \r\n' < "$tmp/channel")
-        case "$named" in
-            [0-9]*.[0-9]*.[0-9]*) tag="v$named" ;;
-            *) fail "blaze's $CHANNEL channel names $named, which is not a version." "$releases/channels/$CHANNEL" ;;
-        esac
+        named=$(awk 'NR == 1 && /^[0-9]+[.][0-9]+[.][0-9]+\r?$/ { sub(/\r$/, ""); version = $0 }
+                     END { if (NR != 1 || version == "") exit 1; print version }' "$tmp/channel") ||
+            fail "blaze's $CHANNEL channel does not name a release version." "$releases/channels/$CHANNEL"
+        tag="v$named"
     fi
     step "release $tag from $releases ($CHANNEL)"
 

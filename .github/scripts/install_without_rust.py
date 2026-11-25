@@ -84,7 +84,8 @@ printf '#[derive(serde::Serialize)]\nstruct Point {\n    x: i32,\n}\n\nfn serial
 blaze run > out.txt 2> err.txt || { cat err.txt; exit 1; }
 cat err.txt out.txt
 grep -Fx "derived 1" out.txt
-sed -i 's/serializable(&Point { x: 1 }), 1)/serializable(\&Point { x: 2 }), 2)/' src/main.rs
+sed 's/serializable(&Point { x: 1 }), 1)/serializable(\&Point { x: 2 }), 2)/' src/main.rs > src/main.rs.new
+mv src/main.rs.new src/main.rs
 blaze run > out.txt 2>> err.txt || { cat err.txt; exit 1; }
 cat err.txt out.txt
 grep -Fx "derived 2" out.txt
