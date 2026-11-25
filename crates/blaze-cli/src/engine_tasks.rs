@@ -187,6 +187,17 @@ pub(crate) struct Outlined<'h> {
     pub(crate) made: Result<Record<SharedAlloc<'h>>, Why>,
 }
 
+impl Outlined<'_> {
+    /// What a module reader observes. A non-text source has no parsed items, but a names
+    /// failure can cite its invalid byte offset, so its read must move with the source.
+    pub(crate) fn module_surface(&self) -> Option<ContentId> {
+        let record = self.made.as_ref().ok()?;
+        surface_of(record).or_else(|| {
+            record.findings.iter().any(|finding| finding.0 == work::FILE_NOT_TEXT).then_some(self.outline_source)
+        })
+    }
+}
+
 /// What every task reads besides the tables: the planner's outlines, sorted by name.
 pub(crate) struct Tasks<'p, 'h> {
     pub(crate) outlined: &'p [Outlined<'h>],
@@ -226,6 +237,8 @@ impl Tasks<'_, '_> {
             let view = blaze_surface::FileItemsView::read(payload).unwrap_or_else(|error| panic!("outline {:?} has an invalid item payload: {error:?}", record.name));
             defines.push((DATA, view.file()));
             item_cells(crate::signature::SignatureFile::new(&self.outlined[at].path), view, &mut defines, alloc);
+        } else if let Some(surface) = self.outlined[at].module_surface() {
+            defines.push((SURFACE, surface));
         }
         defines.push((HEADS, heads_of(record)));
         for part in &record.parts {
