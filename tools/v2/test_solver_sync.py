@@ -9,14 +9,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "typed-input" / "src"))
 
-import solver_sync  # noqa: E402
-import typed_input  # noqa: E402
+import solver_sync
+import typed_input
 
 OLD = "ab" * 20
 NEW = "cd" * 20
@@ -100,9 +101,9 @@ class SeriesTest(unittest.TestCase):
 
 
 class ReplayTest(unittest.TestCase):
-    BASE = {"lib.rs": PRELUDE + "fn b() {}\n\nfn c() {}\n"}
-    ONE = {"lib.rs": PRELUDE + "fn b() { one() }\n\nfn c() {}\n"}
-    TWO = {"lib.rs": PRELUDE + "fn b() { one() }\n\nfn c() { two() }\n", "new.rs": "x\n"}
+    BASE: ClassVar = {"lib.rs": PRELUDE + "fn b() {}\n\nfn c() {}\n"}
+    ONE: ClassVar = {"lib.rs": PRELUDE + "fn b() { one() }\n\nfn c() {}\n"}
+    TWO: ClassVar = {"lib.rs": PRELUDE + "fn b() { one() }\n\nfn c() { two() }\n", "new.rs": "x\n"}
 
     def series(self) -> dict[str, bytes]:
         return {"0001-one": patch_between(self.BASE, self.ONE), "0002-two": patch_between(self.ONE, self.TWO)}
@@ -111,7 +112,8 @@ class ReplayTest(unittest.TestCase):
         moved = {"lib.rs": "fn z() {}\n\n" + self.BASE["lib.rs"]}
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
-            path = crate(root, "c", self.TWO, self.series())
+            series = self.series()
+            path = crate(root, "c", self.TWO, series)
             repo = upstream(root, {"c": moved})
             src, regenerated = solver_sync.replay(
                 "c", repo / "compiler" / "c", solver_sync.read_series(path), path / "patches", root / "work", NEW
@@ -119,7 +121,7 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual((src / "lib.rs").read_text(), "fn z() {}\n\n" + self.TWO["lib.rs"])
             self.assertEqual((src / "new.rs").read_text(), "x\n")
             self.assertEqual(len(regenerated), 2)
-            self.assertNotEqual(regenerated[0], self.series()["0001-one"])
+            self.assertNotEqual(regenerated[0], series["0001-one"])
             self.assertIn(b"+fn b() { one() }", regenerated[0])
             self.assertIn(b"--- a/src/lib.rs", regenerated[0])
             self.assertIn(b"+++ b/src/new.rs", regenerated[1])
