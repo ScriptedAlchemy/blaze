@@ -213,6 +213,8 @@ class AcceptanceGateTests(unittest.TestCase):
         python.write_text(
             "#!/bin/sh\ncase \"$1\" in\n"
             " .github/scripts/dist_build_identity.py) exit \"${IDENTITY_EXIT:-0}\" ;;\n"
+            " harness/distv2.py) case \"$2\" in */dev-input.json) exit \"$DEV_EXIT\" ;;"
+            " */release-input.json) exit \"$RELEASE_EXIT\" ;; *) exit 98 ;; esac ;;\n"
             " harness/blaze_cli.py) printf '%s\\n' \"${SMOKE_SAYS:-source CLI: every check passed}\"; exit \"${SMOKE_EXIT:-0}\" ;;\n"
             f" *) exec {shlex.quote(sys.executable)} \"$@\" ;;\nesac\n")
         python.chmod(0o700)
@@ -339,6 +341,17 @@ class AcceptanceGateTests(unittest.TestCase):
                 self.assertEqual(done.returncode == 0,wanted,done.stdout+done.stderr)
                 output=root/"output"
                 self.assertEqual(output.read_text() if output.exists() else "", "accepted=true\n" if wanted else "")
+
+    def test_fault_profiles_both_run_and_preserve_the_first_failure(self):
+        for dev, release in ((0, 0), (19, 0), (0, 23), (19, 23)):
+            with self.subTest(dev=dev, release=release), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                env = {**self.fixture(root), "DEV_EXIT": str(dev), "RELEASE_EXIT": str(release),
+                       "BLAZE_SCRIPTS": str(root / "commands")}
+                done = self.run_shell("full distributed worker and fault acceptance", env)
+                self.assertEqual(done.returncode, dev or release, done.stdout + done.stderr)
+                for profile in ("dev", "release"):
+                    self.assertTrue((root / "dist-evidence" / f"{profile}.log").is_file())
 
     def test_every_full_fault_profile_and_unchanged_source_is_required(self):
         for dev,release,identity_code in ((PASSED,PASSED,0),(None,PASSED,0),

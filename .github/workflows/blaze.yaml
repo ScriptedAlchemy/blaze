@@ -647,6 +647,7 @@ jobs:
           name: source-compiler
           path: ${{ runner.temp }}/source-package
       - name: verify the source compiler handoff
+        id: handoff
         run: |
           mkdir "$RUNNER_TEMP/source-binaries"
           tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries"
@@ -659,6 +660,7 @@ jobs:
       - name: full distributed worker and fault acceptance
         timeout-minutes: 240
         run: |
+          first_failure=0
           for profile in dev release; do
             jq -n --arg bin "$RUNNER_TEMP/source-binaries" --arg scratch "$RUNNER_TEMP/blaze-fs/dist-$profile" --arg profile "$profile" --arg modules "$BLAZE_SCRIPTS/proc_macro_modules" \
               '{blaze:($bin+"/blaze"),dist_local:($bin+"/blaze-dist-local"),serve:($bin+"/blaze-serve"),module_builder:$modules,scratch:$scratch,faults:true,cores:2,daemon_memory_gb:2,timeout:1800,command_timeout:60,stall_bound:300,args:(if $profile=="release" then ["--release"] else [] end),profile:(if $profile=="release" then "release" else "debug" end),release_fold:($profile=="release")}' \
@@ -668,8 +670,11 @@ jobs:
             timeout -k 30 7200 python3 harness/distv2.py "$RUNNER_TEMP/dist-evidence/$profile-input.json" \
               2>&1 | tee "$RUNNER_TEMP/dist-evidence/$profile.log" || status=$?
             python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-            [ "$status" = 0 ] || exit "$status"
+            if [ "$status" != 0 ] && [ "$first_failure" = 0 ]; then
+              first_failure=$status
+            fi
           done
+          exit "$first_failure"
       - name: both complete fault runs used unchanged binaries and source
         id: distributed
         run: |
@@ -681,8 +686,10 @@ jobs:
           echo 'accepted=true' >> "$GITHUB_OUTPUT"
       - name: every retained compiler migration fixture
         id: forkfixes
+        if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
         timeout-minutes: 60
         run: |
+          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
           scratch="$RUNNER_TEMP/blaze-fs/forkfixes"
           timeout -k 30 3300 python3 harness/forkfixes.py "{\"blaze\":\"$RUNNER_TEMP/source-binaries/blaze\",\"scratch\":\"$scratch\",\"source\":\"$GITHUB_WORKSPACE\",\"timeout\":900,\"stall_bound\":300}" \
             2>&1 | tee "$RUNNER_TEMP/dist-evidence/forkfixes.log"
@@ -690,14 +697,18 @@ jobs:
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
           echo 'accepted=true' >> "$GITHUB_OUTPUT"
       - name: source protocol tests and complete execution observation
+        id: observed
+        if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
         timeout-minutes: 60
         run: |
+          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
           jq -n --arg blaze "$RUNNER_TEMP/source-binaries/blaze" --arg cwd "$GITHUB_WORKSPACE" --arg home "$RUNNER_TEMP/blaze-fs/protocol-home" --arg out "$RUNNER_TEMP/dist-evidence/exec" --arg shelf "$HOME/.blaze/v2/toolchain" \
             '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:3300,commands:(["blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"] | map({name:.,args:["test","-p",.,"--view","json","--","--run-all","--format","json"]}))}' \
             > "$RUNNER_TEMP/dist-evidence/exec-input.json"
           timeout -k 30 3500 python3 harness/v2/exec_observer.py "$RUNNER_TEMP/dist-evidence/exec-input.json"
       - name: complete source protocol receipt with unchanged executables
         id: protocol
+        if: ${{ !cancelled() && steps.observed.outcome == 'success' }}
         run: |
           python3 - <<'PY'
           import json, os
