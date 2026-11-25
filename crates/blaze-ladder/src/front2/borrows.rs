@@ -505,6 +505,10 @@ pub struct BorrowFacts<'a> {
     /// arguments' drop flags are in `drop_need` (borrow_fields.rs `drop_facts_of`; `Facts::drop_args`).
     drop_args: AVec<'a, (u128, u32, u32)>,
     drop_need: AVec<'a, bool>,
+    /// Per ADT whose strict-drop summary was read (RFC 1327 `#[may_dangle]`), sorted by checker
+    /// key: where its arguments' strict flags are in `drop_strict_need` (`Facts::drop_strict`).
+    drop_strict: AVec<'a, (u128, u32, u32)>,
+    drop_strict_need: AVec<'a, bool>,
     /// The body owner's type parameters bounded by `Copy` in its clauses (own and inherited:
     /// `Preds::clauses`), sorted, each once (`Facts::param_copy`).
     param_copy: AVec<'a, u32>,
@@ -575,6 +579,7 @@ pub struct BorrowFacts<'a> {
     /// the toolchain's library (its key covers them).
     relates_nothing: [Option<tc::ItemKey>; 4],
     fn_traits: [Option<tc::ItemKey>; 3],
+    future_trait: Option<tc::ItemKey>,
     discriminant_kind: Option<tc::ItemKey>,
     pointee: Option<tc::ItemKey>,
     /// Unique `Deref` impl per ADT, sorted by ADT key (`Facts::deref_impl`).
@@ -630,6 +635,8 @@ impl<'a> BorrowFacts<'a> {
             copy_need: AVec::new_in(alloc),
             drop_args: AVec::new_in(alloc),
             drop_need: AVec::new_in(alloc),
+            drop_strict: AVec::new_in(alloc),
+            drop_strict_need: AVec::new_in(alloc),
             param_copy: AVec::new_in(alloc),
             callees: AVec::new_in(alloc),
             calls: super::call_generics::CallBoundsTable::new_in(alloc),
@@ -652,6 +659,7 @@ impl<'a> BorrowFacts<'a> {
             constant_initializer: false,
             relates_nothing: [None; 4],
             fn_traits: [None; 3],
+            future_trait: None,
             discriminant_kind: None,
             pointee: None,
             deref_impls: AVec::new_in(alloc),
@@ -765,6 +773,13 @@ impl Facts for ReadBy<'_, '_> {
         let end = start.checked_add(usize::try_from(len).ok()?)?;
         self.facts.drop_need.get(start..end)
     }
+    fn drop_strict(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        let at = self.facts.drop_strict.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
+        let &(_, start, len) = self.facts.drop_strict.get(at)?;
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.facts.drop_strict_need.get(start..end)
+    }
     fn param_copy(&self, index: u32) -> bool {
         self.facts.param_copy.binary_search(&index).is_ok()
     }
@@ -791,6 +806,9 @@ impl Facts for ReadBy<'_, '_> {
     }
     fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.fn_traits.contains(&Some(trait_))
+    }
+    fn future_trait(&self) -> Option<tc::ItemKey> {
+        self.facts.future_trait
     }
     fn assoc_item(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<tc::ItemKey> {
         let at = self.facts.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, n, _)| (k, n)).ok()?;
@@ -1308,6 +1326,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     g.fn_binders = plant != FactsPlant::FnBindersFree;
     g.relates_nothing = langs.relates_nothing;
     g.fn_traits = langs.fn_traits;
+    let future = r.index.lang("future_trait");
+    g.future_trait = future.map(checker_of);
     g.discriminant_kind = langs.discriminant_kind;
     g.pointee = langs.pointee;
     // A `const` or `static` item's body (module-level, local in a fn/macro, associated, or
@@ -1820,9 +1840,25 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let e = s.saturating_add(len as usize);
             g.copy_need.get(s..e).is_some_and(|need| need.iter().all(|&b| !b))
         });
-        let (needs_drop, drop_need) = fields::drop_facts_of(r, langs, key, drop_impl, adt_uncond_copy, &mut g.drop_need, &mut g.reads, alloc);
+        let drop_summary = fields::drop_facts_of(
+            r,
+            langs,
+            key,
+            drop_impl,
+            adt_uncond_copy,
+            &mut g.drop_need,
+            &mut g.drop_strict_need,
+            &mut g.reads,
+            alloc,
+        );
+        let needs_drop = drop_summary.needs_drop;
+        let drop_need = drop_summary.drop_args;
+        let drop_strict_span = drop_summary.drop_strict;
         if let Some((start, len)) = drop_need {
             g.drop_args.push((k, start, len));
+        }
+        if let Some((start, len)) = drop_strict_span {
+            g.drop_strict.push((k, start, len));
         }
         let deref_impl = if let Some(deref_tr) = langs.deref
             && let Some(impls) = answer_impls(r, deref_tr, tc::Shape::Adt(key))
@@ -1858,6 +1894,11 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let e = s.checked_add(usize::try_from(len).ok()?)?;
             g.drop_need.get(s..e)
         });
+        let drop_strict = drop_strict_span.and_then(|(start, len)| {
+            let s = usize::try_from(start).ok()?;
+            let e = s.checked_add(usize::try_from(len).ok()?)?;
+            g.drop_strict_need.get(s..e)
+        });
         let variances = variances.and_then(|(lo, hi)| {
             let s = usize::try_from(lo).ok()?;
             let e = usize::try_from(hi).ok()?;
@@ -1884,6 +1925,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 region_list: &regions.list,
                 copy_args,
                 drop_args,
+                drop_strict,
                 deref_impl,
                 variances,
             },
@@ -1990,7 +2032,6 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         // Each head's declared outlives and trait-lifetime ties, from its clauses
         // (`Preds::clauses`, own and inherited) and its head record's regions (front2
         // call_generics.rs, borrows_ties.rs; piece L4), and their read rows (rule 21).
-        let future = r.index.lang("future_trait");
         for &k in items.iter() {
             let key = tc::ItemKey(k);
             let head = r.store.fns.get(&key);

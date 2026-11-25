@@ -287,12 +287,27 @@ pub struct ClauseView<'a> {
     pub nth: u32,
     pub binders: u32,
     pub col: ColView<'a>,
+    /// For a `TypeOutlives` clause (`T: 'r`), the right-hand region `'r` in the item's numbering;
+    /// `None` for trait/projection clauses.
+    pub outlives: Option<Region>,
 }
 
 impl<'a> ClauseView<'a> {
     /// The view of `clause`.
     pub fn of<A: Allocator + 'a>(clause: &'a ClauseRegions<A>) -> ClauseView<'a> {
-        ClauseView { nth: clause.nth, binders: clause.binders, col: ColView::of(&clause.col) }
+        ClauseView { nth: clause.nth, binders: clause.binders, col: ColView::of(&clause.col), outlives: None }
+    }
+
+    /// Pair type-outlives bounds with their subject columns, in the head's clause order.
+    pub fn bind_outlives(views: &mut [Self], outlives: &[Outlives]) {
+        for &bound in outlives {
+            if let Outlives::Type { clause, region } = bound
+                && let Ok(at) = views.binary_search_by_key(&clause, |v| v.nth)
+                && let Some(view) = views.get_mut(at)
+            {
+                view.outlives = Some(region);
+            }
+        }
     }
 }
 

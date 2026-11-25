@@ -330,6 +330,30 @@ fn control_drop_after_maybe_move(c: bool) -> Vec<u8> {
     out
 }
 
+fn drop_writer_on_both_paths(c: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let w = std::io::BufWriter::new(&mut out);
+    if c { drop(w); } else { drop(w); }
+    out
+}
+
+struct OuterWriter<W: std::io::Write>(std::io::BufWriter<W>);
+
+fn transitive_strict_drop_in_outer(c: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let w = OuterWriter(std::io::BufWriter::new(&mut out));
+    if c { drop(w); }
+    out
+}
+
+fn may_dangle_after_maybe_move(c: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut refs = Vec::new();
+    refs.push(&mut out);
+    if c { drop(refs); }
+    out
+}
+
 fn make() -> Vec<u8> {
     Vec::new()
 }
@@ -491,6 +515,9 @@ const EXPECTED: &[(&str, &[&str])] = &[
     // place holds the loan, `returned`).
     ("make", &[]),
     ("control_drop_after_maybe_move", &["E0505"]),
+    ("drop_writer_on_both_paths", &[]),
+    ("transitive_strict_drop_in_outer", &["E0505"]),
+    ("may_dangle_after_maybe_move", &[]),
     ("control_autoref_of_temporary", &["E0515"]),
     // BX case 4: a reference to a local returned is E0515 too (the stored-local controls above
     // stay E0597: their loan is held by a local, not the return place); a promoted constant's
@@ -581,7 +608,8 @@ fn tempo_classes_and_controls() {
                 [] => v.refused.is_none() && v.findings.is_empty(),
                 codes => {
                     (v.refused.is_none() && codes.iter().all(|c| v.findings.iter().any(|d| d.code == *c)))
-                        || matches!(v.refused, Some(blaze_ladder::front2::borrows::BorrowRefused::Stricter(_)))
+                        || (!matches!(n.as_str(), "control_drop_after_maybe_move" | "transitive_strict_drop_in_outer")
+                            && matches!(v.refused, Some(blaze_ladder::front2::borrows::BorrowRefused::Stricter(_))))
                 }
             };
         if !ok {

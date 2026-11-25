@@ -4019,6 +4019,7 @@ impl<A: core::alloc::Allocator + Copy> RegionFacts for RegionReader<'_, A> {
         for c in r.regions().clauses.iter() {
             v.push(ClauseView::of(c));
         }
+        ClauseView::bind_outlives(&mut v, &r.regions().outlives);
         self.views.insert(item, v);
         self.views.get(&item).map(|v| &v[..]).ok_or(RegionsUnread { item, why: UnreadWhy::NoHead })
     }

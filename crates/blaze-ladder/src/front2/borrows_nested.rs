@@ -262,6 +262,9 @@ impl Facts for NestedFacts<'_, '_> {
     fn is_zero_slot_builtin_assoc(&self, trait_: tc::ItemKey, name: tc::Name) -> bool {
         self.facts.is_zero_slot_builtin_assoc(trait_, name)
     }
+    fn future_trait(&self) -> Option<tc::ItemKey> {
+        self.facts.future_trait()
+    }
     // Every fact the body's facts answer, forwarded (a nested flow asks what the owner's does).
     fn ties(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Ties<'_>> {
         self.facts.ties(item)
@@ -286,6 +289,9 @@ impl Facts for NestedFacts<'_, '_> {
     }
     fn drop_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         self.facts.drop_args(adt)
+    }
+    fn drop_strict(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        self.facts.drop_strict(adt)
     }
     fn closure_requirements(&self, closure: tc::ExprId) -> &[Requirement] {
         let (lo, hi) = run_of(self.closures, closure);

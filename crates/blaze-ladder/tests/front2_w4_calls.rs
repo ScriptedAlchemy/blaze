@@ -1,7 +1,6 @@
 //! Borrow checking at calls with generic bounds, projections and captured callables.
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
-use blaze_ladder::front2::borrows::BorrowRefused;
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::refusal::SourceFile;
 
@@ -54,6 +53,11 @@ fn captured_static_callback(unused: u8, f: impl Fn(&'static u8)) {
     let g = || { let x = 1u8; f(&x); };
     g();
 }
+
+trait OtherOutput { type Output; }
+impl<F> OtherOutput for F { type Output = &'static u8; }
+fn take_other<F: OtherOutput>(_: F, _: F::Output) {}
+fn short_other_on_future(x: u8) { take_other(async {}, &x); }
 fn main() {}
 "#;
 
@@ -79,12 +83,6 @@ fn check_cases(cases: &[(&str, &str)]) {
         assert!(typed.is_clean() && typed.reads.is_some() && typed.undecided.is_empty(), "{name}: {typed:?}");
         match expected {
             "clean" => assert!(borrows.is_clean(), "{name}: {borrows:?}"),
-            "CallOutlivesUnread" => {
-                assert!(matches!(borrows.refused, Some(BorrowRefused::Lower(blaze_flow_lower::Refusal {
-                    form: blaze_flow_lower::Form::CallOutlivesUnread { param: 0, .. }, ..
-                }))), "{name}: {borrows:?}");
-                assert!(borrows.findings.is_empty(), "{name}: {borrows:?}");
-            }
             code => {
                 assert!(borrows.refused.is_none(), "{name}: {borrows:?}");
                 let [finding] = &borrows.findings[..] else { panic!("{name}: expected one lifetime error: {borrows:?}") };
@@ -106,8 +104,9 @@ fn outlives_bounds_distinguish_captures_and_output() {
         ("short_capture", "outlives"),
         ("short_closure", "E0310"),
         ("short_generic_output", "E0310"),
-        ("short_output", "CallOutlivesUnread"),
-        ("short_other", "CallOutlivesUnread"),
+        ("short_output", "outlives"),
+        ("short_other", "E0597"),
+        ("short_other_on_future", "E0597"),
     ]);
 }
 

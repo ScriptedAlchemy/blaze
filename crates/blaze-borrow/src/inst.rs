@@ -731,6 +731,10 @@ pub trait Selected {
         let _ = (trait_, name);
         false
     }
+    /// The language trait whose `Output` an async block defines.
+    fn future_trait(&self) -> Option<ItemKey> {
+        None
+    }
     /// Whether `trait_` is one of the `Fn` / `FnMut` / `FnOnce` language traits.
     fn is_fn_trait(&self, trait_: ItemKey) -> bool {
         let _ = trait_;

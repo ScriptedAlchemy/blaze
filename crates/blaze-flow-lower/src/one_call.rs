@@ -497,6 +497,9 @@ impl<F: Facts> Selected for CallSel<'_, F> {
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
         self.facts.is_zero_slot_builtin_assoc(trait_, name)
     }
+    fn future_trait(&self) -> Option<ItemKey> {
+        self.facts.future_trait()
+    }
     fn is_fn_trait(&self, trait_: ItemKey) -> bool {
         self.facts.is_fn_trait(trait_)
     }
