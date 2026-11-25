@@ -111,6 +111,32 @@ pub struct CheckoutDir {
     pub id: LockId,
     pub dir: blaze_unit_graph::Text<'static>,
     pub kind: blaze_world::PathKind,
+    pub script: Option<Result<ScriptSource, ScriptSourceError>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ScriptSource {
+    pub files: [u8; 64],
+    pub deps: [u8; 64],
+}
+
+#[derive(Clone, Debug)]
+pub enum ScriptSourceError {
+    MissingSnapshot,
+    Digest,
+    PathClosure(blaze_manifest::bootstrap::lock::Refused),
+}
+
+impl blaze_own::Share for ScriptSourceError {}
+
+impl core::fmt::Display for ScriptSourceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingSnapshot => f.write_str("no captured source digest for the build-script module"),
+            Self::Digest => f.write_str("the captured script source or closure digest is not 64 hexadecimal bytes"),
+            Self::PathClosure(why) => write!(f, "the captured script dependency closure was refused: {why:?}"),
+        }
+    }
 }
 
 /// The members (and non-member checkout path packages) as the layout read them, before the lock
@@ -172,7 +198,7 @@ impl Members {
                 (Some(id), None) => {
                     used.push(id);
                     members.push((id, package));
-                    dirs.push(CheckoutDir { id, dir, kind: blaze_world::PathKind::Member });
+                    dirs.push(CheckoutDir { id, dir, kind: blaze_world::PathKind::Member, script: None });
                 }
                 _ => return Err(Unlocked::Member { name: std::string::String::from(package.name.as_str()) }),
             }
@@ -206,7 +232,7 @@ impl Members {
             if let (Some(id), 1) = (matched, count) {
                 used.push(id);
                 path_packages.push((id, package));
-                dirs.push(CheckoutDir { id, dir, kind: blaze_world::PathKind::External });
+                dirs.push(CheckoutDir { id, dir, kind: blaze_world::PathKind::External, script: None });
             }
         }
         Ok(Parts { members, path_packages, dirs, resolver })
@@ -241,9 +267,47 @@ pub struct Parts {
     dirs: Vec<CheckoutDir, Alloc<'static>>,
     resolver: Resolver,
 }
-
 impl Parts {
-    /// Each checkout path package's lock entry, directory (anchor-relative), and kind.
+    /// Only scripts and their reached dependencies need source snapshots for bootstrap keys.
+    pub fn script_inputs(&self, lock: &Lock<'_>) -> Result<Vec<LockId, Alloc<'static>>, blaze_manifest::bootstrap::lock::Refused> {
+        let alloc = *self.dirs.allocator();
+        let mut inputs = Vec::new_in(alloc);
+        for (id, package) in self.members.iter().chain(self.path_packages.iter()) {
+            if package.build.is_none() { continue; }
+            let mut roots = Vec::new_in(alloc);
+            roots.extend(package.deps.iter().filter(|dep| dep.kind == layout::DepKind::Build).map(|dep| dep.package.as_str()));
+            inputs.extend(blaze_manifest::bootstrap::lock::closure_packages(lock, *id, Some(&roots), alloc)?);
+        }
+        inputs.sort_unstable();
+        inputs.dedup();
+        Ok(inputs)
+    }
+
+    pub fn pin_scripts(&mut self, lock: &Lock<'_>, rows: &crate::sweep::Rows<'_>, inherited: &[(&str, &[u8])]) {
+        let locked = blaze_proc_macro::module::LockedPackages::of(lock);
+        let alloc = *self.dirs.allocator();
+        let mut paths = Vec::new_in(alloc);
+        for entry in &self.dirs {
+            let Some(files) = crate::macro_files::member_hex(rows, entry.dir.as_str()) else { continue };
+            let Some(files) = blaze_proc_macro::script_module::HexDigest::parse(&files) else { continue };
+            let workspace = inherited.iter().find(|(dir, _)| *dir == entry.dir.as_str()).map(|(_, bytes)| *bytes);
+            let files = files.with_workspace(workspace);
+            paths.push(blaze_manifest::bootstrap::lock::PathPin { package: entry.id, files });
+        }
+        for entry in self.dirs.iter_mut() {
+            let Some((_, package)) = self.members.iter().chain(self.path_packages.iter()).find(|(id, _)| *id == entry.id) else { continue };
+            if package.build.is_none() { continue; }
+            let mut roots = Vec::new_in(alloc);
+            roots.extend(package.deps.iter().filter(|dep| dep.kind == layout::DepKind::Build).map(|dep| dep.package.as_str()));
+            entry.script = Some((|| {
+                let files = paths.iter().find(|pin| pin.package == entry.id).ok_or(ScriptSourceError::MissingSnapshot)?.files;
+                let deps = locked.script_closure_at(entry.id, &roots, &paths).map_err(ScriptSourceError::PathClosure)?;
+                Ok(ScriptSource { files: files.as_str().as_bytes().try_into().map_err(|_| ScriptSourceError::Digest)?, deps: deps.as_str().as_bytes().try_into().map_err(|_| ScriptSourceError::Digest)? })
+            })());
+        }
+    }
+
+    /// Each checkout path package matched to this lock.
     pub fn member_dirs(&self) -> &[CheckoutDir] {
         &self.dirs
     }

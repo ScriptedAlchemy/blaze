@@ -561,6 +561,15 @@ pub const WORDINGS: &[Wording] = &[
         kind: Kind::Warning,
     },
     Wording {
+        area: Area::Cli,
+        number: 49,
+        name: "E0252",
+        headline: "the name {code:0} is imported more than once",
+        label: "{code:0} is imported again here",
+        args: 1,
+        kind: Kind::Error,
+    },
+    Wording {
         area: Area::Drive,
         number: 0xC0F6,
         name: "too-many-configurations",

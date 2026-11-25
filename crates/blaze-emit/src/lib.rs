@@ -196,6 +196,7 @@ mod compose;
 mod enc;
 mod enc_probe;
 mod enc_tls;
+pub mod llvm;
 mod pass;
 mod record;
 mod record_check;

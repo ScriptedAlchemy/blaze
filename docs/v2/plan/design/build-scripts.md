@@ -5,6 +5,46 @@ date: 2026-11-16
 ---
 # Build scripts
 
+## Source-aware bootstrap module identity
+
+The module lookup names source pin (registry checksum, git commit plus package folder, or
+package files digest), build-dependency lock closure, unified features, pinned toolchain,
+runner target or process shim, and bootstrap builder. The writer and reader share the closure
+algorithm; `blaze-manifest::bootstrap` defines the compatibility test and its canonical
+text for task subjects. The complete producer key also covers runtime patches and native tools
+that the consumer does not reconstruct. Several compatible producer variants are refused.
+Old and edited modules coexist under different keys. The module task returns the selected key,
+runner and module digest in a fixed-size payload; the script run takes that proof and checks its
+bytes, without a weaker second lookup.
+
+Path-package source digests join existing `MacroFiles` snapshot rows for packages with build
+scripts. Those rows and the lock are lookup-task inputs. Build-dependency roots come from the
+resolved manifest, including renamed dependencies. Closures capture every reached local
+dependency under its exact lock package ID. Each local
+pin is `files <sha256>` over its package snapshot and any inherited workspace manifest; only
+reached packages are walked. Producer and reader use the same closure algorithm, and native
+bootstrap grants and path remaps include those captured dependency folders.
+For a non-root path package inheriting workspace settings, writer and
+reader combine the package-file digest with the captured workspace `Cargo.toml` bytes through
+the shared `path_source` rule. The whole root manifest is included because both package metadata
+and target-specific dependency tables can supply inherited inputs; selecting individual fields
+would duplicate the manifest resolver and risk omitting an input as inheritance evolves. A root
+package already covers that manifest, and a package with explicit settings retains its old
+source pin. Inherited modules need rebuilding under the complete key; the workspace remains
+supported. Missing source facts are a named refusal. Native placement uses the same compatibility
+test and propagates lookup errors.
+
+CI may explicitly prepare modules through the existing D52 sandboxed bootstrap before invoking
+blaze, per source revision, recording its inputs and output identities. Blaze never invokes that
+bootstrap. Every isolated acceptance home receives only immutable module records, never cached
+script outputs. This is bootstrap-backed acceptance, not proof of Blaze-native macro compilation.
+
+The correctness check keeps old and new modules together, independently edits script source and
+dependency pins, checks the proof codec, and requires the new key or a missing-module refusal. A
+planted stale-source selection must fail its oracle. The lookup floor is hashing changed source
+inputs plus one record lookup. The compatibility scan remains an interim cost until a producer
+index can locate candidates directly; no measured performance claim is made here.
+
 A build script decides which `cfg`s its crate is compiled with, writes Rust files the crate
 `include!`s, and sets values the crate reads with `env!`. Without its outputs, `check` cannot
 resolve names in that crate. Code: `crates/blaze-build-script` (sans-IO: the instruction parser,

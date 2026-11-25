@@ -18,7 +18,7 @@
 //! the expansion that wrote the `extern crate`, as `Ambiguous`.
 
 use blaze_id::ItemKey;
-use blaze_own::{ABTreeMap, AVec, Alloc};
+use blaze_own::{AVec, Alloc};
 use blaze_surface::{AnonImport, Binding, GlobEdge, Path, ScopeBuilder, ScopeEntry, ScopeError, Site, TextualDef, TextualMark, Unresolved, UseSite};
 
 use super::{CellPlant, Cells, FragId, ItemId, NAMESPACES, Outcome, Slot, ns_at};
@@ -179,14 +179,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         out.bindings = w.bindings;
         out.globs = w.globs;
         let mut unknown = w.unknown;
-        // The non-glob bindings met so far in tree order: a second target is `Duplicate`.
-        let mut seen: ABTreeMap<'o, (Namespace, N), Def> = ABTreeMap::new_in(alloc);
-        let mut bind = |ns: Namespace, name: N, def: Def, errors: &mut AVec<'o, ScopeError<N, Path<'o, N>>>| {
-            let first = *seen.entry((ns, name)).or_insert(def);
-            if first != def {
-                errors.push(ScopeError::Duplicate { ns, name, first, second: def });
-            }
-        };
+        let mut bindings = crate::finish::BindingConflicts::new_in(alloc);
         let path = |i: ItemId| {
             let it = &self.items[i as usize];
             Path { kind: it.kind, segments: AVec::from_slice_in(&it.segments, alloc) }
@@ -205,7 +198,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         let text = self.modules[m as usize].text;
         stack.push((text, 0, 0, true));
         for &(ns, name, def) in ix.explicit[text as usize].iter() {
-            bind(ns, name, def, &mut out.errors);
+            bindings.bind(ns, name, def, None, &mut out.errors);
         }
         while let Some(&(f, si, ui, own)) = stack.last() {
             let frag = &self.frags[f as usize];
@@ -251,7 +244,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         for ns in NAMESPACES {
                             let Some((def, vis)) = b[ns_at(ns)] else { continue };
                             if let Some(name) = it.binds {
-                                bind(ns, name, def, &mut out.errors);
+                                bindings.bind(ns, name, def, Some(site), &mut out.errors);
                             }
                             if vis != it.vis
                                 && self.plant != CellPlant::NoWiderReexport
@@ -340,7 +333,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         stack.push((e, 0, 0, own));
                         if own {
                             for &(ns, name, def) in ix.explicit[e as usize].iter() {
-                                bind(ns, name, def, &mut out.errors);
+                                bindings.bind(ns, name, def, None, &mut out.errors);
                             }
                             // R8: a root `extern crate .. as n;` this expansion wrote beside a
                             // dependency's `n`, at the call that wrote it.

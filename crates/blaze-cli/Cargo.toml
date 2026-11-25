@@ -25,6 +25,7 @@ doctest = false
 required-features = ["sandbox"]
 
 [dependencies]
+blaze-int.workspace = true
 # The request machine, its records and keys, the line table and the profile.
 blaze-drive.workspace = true
 # The execution engine (engine.md, D131): `blaze engine-check` drives a request through it

@@ -19,6 +19,7 @@
 //! unversioned reference binds to glibc's default version of the name; a one-bucket SysV hash
 //! with every chain empty is a valid table for an executable that exports nothing.
 
+use blaze_code::record::{Space, Target};
 use blaze_ids::Hasher;
 use blaze_native::image::{Image, Region};
 use blaze_own::{AString, AVec, Alloc, Vec};
@@ -26,6 +27,7 @@ use blaze_own::{AString, AVec, Alloc, Vec};
 use crate::bytes;
 use crate::eh_out::EhSections;
 use crate::error::ExportError;
+use crate::input::CExport;
 use crate::layout::{FixTo, Laid, Plan};
 use crate::native_merge::{ElfRelaKind, MergeError, MergedElf};
 
@@ -74,6 +76,8 @@ pub(crate) const DT_RELASZ: u64 = 8;
 pub(crate) const DT_RELAENT: u64 = 9;
 pub(crate) const DT_STRSZ: u64 = 10;
 pub(crate) const DT_SYMENT: u64 = 11;
+const DT_INIT: u64 = 12;
+const DT_SONAME: u64 = 14;
 const DT_DEBUG: u64 = 21;
 const DT_INIT_ARRAY: u64 = 25;
 const DT_INIT_ARRAYSZ: u64 = 27;
@@ -81,9 +85,11 @@ pub(crate) const DT_FLAGS: u64 = 30;
 pub(crate) const DT_RELACOUNT: u64 = 0x6FFF_FFF9;
 pub(crate) const DT_FLAGS_1: u64 = 0x6FFF_FFFB;
 pub(crate) const DF_BIND_NOW: u64 = 0x8;
-const DF_STATIC_TLS: u64 = 0x10;
+pub(crate) const DF_STATIC_TLS: u64 = 0x10;
+pub(crate) const DF_1_NOW: u64 = 0x1;
+const DF_1_PIE: u64 = 0x0800_0000;
 /// `DF_1_NOW | DF_1_PIE`.
-const DF_1: u64 = 0x1 | 0x0800_0000;
+const DF_1: u64 = DF_1_NOW | DF_1_PIE;
 /// The base dynamic section's entries (excluding extra native `DT_NEEDED` and `DT_INIT_ARRAY`).
 const DYN_COUNT: u64 = 14;
 /// Room for auto-added standard Linux libraries (`libgcc_s.so.1`, `libm.so.6`) when program
@@ -101,9 +107,21 @@ const R_AARCH64_TLS_TPREL64: u64 = 1030;
 const R_AARCH64_TLSDESC: u64 = 1031;
 /// `STB_GLOBAL << 4 | STT_FUNC`.
 const GLOBAL_FUNC: u8 = 0x12;
-const STB_GLOBAL: u8 = 1;
-const STB_WEAK: u8 = 2;
-const STT_NOTYPE: u8 = 0;
+pub(crate) const STB_GLOBAL: u8 = 1;
+pub(crate) const STB_WEAK: u8 = 2;
+pub(crate) const STT_NOTYPE: u8 = 0;
+pub(crate) const STT_FUNC: u8 = 2;
+
+pub(crate) const SHT_NULL: u32 = 0;
+pub(crate) const SHT_PROGBITS: u32 = 1;
+pub(crate) const SHT_STRTAB: u32 = 3;
+pub(crate) const SHT_RELA: u32 = 4;
+pub(crate) const SHT_HASH: u32 = 5;
+pub(crate) const SHT_DYNAMIC: u32 = 6;
+pub(crate) const SHT_DYNSYM: u32 = 11;
+pub(crate) const SHF_WRITE: u64 = 1;
+pub(crate) const SHF_ALLOC: u64 = 2;
+pub(crate) const SHF_EXECINSTR: u64 = 4;
 
 pub(crate) const LIBC: &str = "libc.so.6";
 const LIBGCC_S: &str = "libgcc_s.so.1";
@@ -159,6 +177,18 @@ pub fn plan_for(native_libraries: Option<&[AString<'_>]>, has_inits: bool) -> Pl
     let init_entries = if has_inits { 2u64 } else { 0u64 };
     let dyn_count = DYN_COUNT + extra_libs + AUTO_NEEDED_ROOM + init_entries;
     Plan { page: PAGE, text_at: TEXT_AT, const_head: dyn_count * 16 + DSO_HANDLE_ROOM }
+}
+
+/// The layout plan for a loadable ELF shared object. `has_inits` covers either Rust's TLS
+/// initializer (`DT_INIT`) or native constructors (`DT_INIT_ARRAY` pair); three entries are
+/// reserved so both forms may coexist. The fixed text start intentionally remains [`TEXT_AT`]:
+/// shared objects merely leave the interpreter gap unused, keeping one layout rule for both forms.
+pub fn plan_library_for(native_libraries: Option<&[AString<'_>]>, has_inits: bool) -> Plan {
+    let mut plan = plan_for(native_libraries, has_inits);
+    if has_inits {
+        plan.const_head += 16; // One DT_INIT may precede the native DT_INIT_ARRAY pair.
+    }
+    plan
 }
 
 /// Computes the `tpidr_el0`-relative byte offset of Rust's 8-byte `ROOT` pointer in the
@@ -232,6 +262,61 @@ struct TlsPhdr {
     align: u64,
 }
 
+fn intern(table: &mut AVec<'_, u8>, s: &[u8]) -> Result<u32, ExportError> {
+    let at = u32_of(table.len(), "a string-table offset")?;
+    table.extend_from_slice(s);
+    table.push(0);
+    Ok(at)
+}
+
+fn elf_hash(name: &[u8]) -> u32 {
+    let mut h = 0u32;
+    for &c in name {
+        h = (h << 4).wrapping_add(u32::from(c));
+        let g = h & 0xF000_0000;
+        if g != 0 {
+            h ^= g >> 24;
+        }
+        h &= !g;
+    }
+    h
+}
+
+fn sym(out: &mut AVec<'_, u8>, name: u32, info: u8, shndx: u16, value: u64, size: u64) {
+    bytes::u32(out, name);
+    out.push(info);
+    out.push(0); // st_other: default visibility
+    bytes::u16(out, shndx);
+    bytes::u64(out, value);
+    bytes::u64(out, size);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shdr(
+    out: &mut AVec<'_, u8>,
+    name: u32,
+    kind: u32,
+    flags: u64,
+    addr: u64,
+    offset: u64,
+    size: u64,
+    link: u32,
+    info: u32,
+    align: u64,
+    entsize: u64,
+) {
+    bytes::u32(out, name);
+    bytes::u32(out, kind);
+    bytes::u64(out, flags);
+    bytes::u64(out, addr);
+    bytes::u64(out, offset);
+    bytes::u64(out, size);
+    bytes::u32(out, link);
+    bytes::u32(out, info);
+    bytes::u64(out, align);
+    bytes::u64(out, entsize);
+}
+
 /// Writes `laid` as an ELF executable into `out` (its contents replaced). `seed` joins the
 /// content in the build id (the profile's digest, or zeros). Returns the build id.
 pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, seed: &[u8; 32], out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<[u8; 16], ExportError> {
@@ -250,9 +335,50 @@ pub fn write_native<'a>(
     out: &mut AVec<'a, u8>,
     alloc: Alloc<'a>,
 ) -> Result<[u8; 16], ExportError> {
-    // Program imports defined by the native image, or the linker-synthetic `__dso_handle`
-    // (placed at `laid.got_at - 8` inside RELRO, self-relocated so both `&__dso_handle` and
-    // `*(&__dso_handle)` equal `load_bias + dso_handle_at`), become R_AARCH64_RELATIVE and leave `.dynsym`.
+    write_image(laid, eh, native, None, seed, out, alloc)
+}
+
+/// Writes `laid` as a genuine `dlopen`-able AArch64 ELF shared object into `out` (its contents
+/// replaced), with the C names in `exports` defined in `.dynsym` and the SysV hash. `name` becomes
+/// `DT_SONAME` as `lib{name}.so`. Unlike [`write_native`], the file has no `PT_INTERP`, no entry,
+/// no `DF_1_PIE`, and it carries section headers because dynamic symbols must name `.text`.
+///
+/// Rust TLS is initialized by ld.so rather than hard-coding an executable TLS offset: the writer
+/// applies `R_AARCH64_TLS_TPREL64` directly to the descriptor's `root` cell. Its addend is the
+/// root's offset inside this module's `PT_TLS` template, so ld.so writes the correct TP-relative
+/// offset before running `DT_INIT`; the library initializer then sets `ROOT_OWN`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_library_native<'a>(
+    laid: &Laid<'_, '_>,
+    eh: &EhSections<'_>,
+    native: Option<&MergedElf<'_, '_>>,
+    exports: &[CExport<'_>],
+    name: &str,
+    seed: &[u8; 32],
+    out: &mut AVec<'a, u8>,
+    alloc: Alloc<'a>,
+) -> Result<[u8; 16], ExportError> {
+    write_image(laid, eh, native, Some(Library { name, exports }), seed, out, alloc)
+}
+
+#[derive(Clone, Copy)]
+struct Library<'a> {
+    name: &'a str,
+    exports: &'a [CExport<'a>],
+}
+
+/// Serialize the shared ELF load layout. Executables additionally name their interpreter and
+/// entry point. Libraries publish dynamic symbols and let the loader initialize Rust TLS.
+fn write_image<'a>(
+    laid: &Laid<'_, '_>,
+    eh: &EhSections<'_>,
+    native: Option<&MergedElf<'_, '_>>,
+    library: Option<Library<'_>>,
+    seed: &[u8; 32],
+    out: &mut AVec<'a, u8>,
+    alloc: Alloc<'a>,
+) -> Result<[u8; 16], ExportError> {
+    let exports = library.map_or(&[][..], |lib| lib.exports);
     let dso_handle_at = laid.got_at.checked_sub(8);
     let direct = |import: u32| -> Option<u64> {
         if let Some(target) = native.and_then(|m| {
@@ -314,15 +440,22 @@ pub fn write_native<'a>(
     let meta_off = file_end;
     let meta_at = vm_end;
 
-    // The meta load: symbols, names, hash, relocations, and (if needed for alignment) TLS `.tdata`.
+    // Dynamic symbols, dynamic strings, SysV hash and relocations live in the read-only meta load.
     let mut meta: AVec<'_, u8> = Vec::new_in(alloc);
     let dynsym_at = 0u64;
     meta.extend_from_slice(&[0u8; 24]);
     let mut dynstr: AVec<'_, u8> = Vec::new_in(alloc);
     dynstr.push(0);
-    let needed_libc = u32_of(dynstr.len(), "DT_STRTAB offset")?;
-    dynstr.extend_from_slice(LIBC.as_bytes());
-    dynstr.push(0);
+    let soname = if let Some(lib) = library {
+        let offset = u32_of(dynstr.len(), "DT_SONAME offset")?;
+        dynstr.extend_from_slice(b"lib");
+        dynstr.extend_from_slice(lib.name.as_bytes());
+        dynstr.extend_from_slice(b".so\0");
+        Some(offset)
+    } else {
+        None
+    };
+    let needed_libc = intern(&mut dynstr, LIBC.as_bytes())?;
     let mut extra_needed: AVec<'_, u32> = Vec::new_in(alloc);
     let mut has_libm = false;
     let mut has_gcc_s = false;
@@ -333,69 +466,78 @@ pub fn write_native<'a>(
             } else if lib.as_str() == LIBGCC_S {
                 has_gcc_s = true;
             }
-            extra_needed.push(u32_of(dynstr.len(), "DT_STRTAB offset")?);
-            dynstr.extend_from_slice(lib.as_str().as_bytes());
-            dynstr.push(0);
+            extra_needed.push(intern(&mut dynstr, lib.as_str().as_bytes())?);
         }
     }
     if needs_libm && !has_libm {
-        extra_needed.push(u32_of(dynstr.len(), "DT_STRTAB offset")?);
-        dynstr.extend_from_slice(LIBM.as_bytes());
-        dynstr.push(0);
+        extra_needed.push(intern(&mut dynstr, LIBM.as_bytes())?);
     }
     if needs_gcc_s && !has_gcc_s {
-        extra_needed.push(u32_of(dynstr.len(), "DT_STRTAB offset")?);
-        dynstr.extend_from_slice(LIBGCC_S.as_bytes());
-        dynstr.push(0);
+        extra_needed.push(intern(&mut dynstr, LIBGCC_S.as_bytes())?);
     }
     for &idx in kept.iter() {
         let imp_idx = usize::try_from(idx).map_err(|_| ExportError::TooLarge { what: "a program import index", len: u64::from(idx) })?;
         let Some(import) = laid.imports.get(imp_idx) else {
             return Err(ExportError::TooLarge { what: "a program import index", len: u64::from(idx) });
         };
-        // `Elf64_Sym`: st_name, st_info, st_other, st_shndx (SHN_UNDEF), st_value, st_size.
         let (sym_name, weak) = split_weak(import.name);
         let info = if weak { (STB_WEAK << 4) | STT_NOTYPE } else { GLOBAL_FUNC };
-        bytes::u32(&mut meta, u32_of(dynstr.len(), "DT_STRTAB offset")?);
-        bytes::u8(&mut meta, info);
-        bytes::u8(&mut meta, 0);
-        bytes::u16(&mut meta, 0);
-        bytes::u64(&mut meta, 0);
-        bytes::u64(&mut meta, 0);
-        dynstr.extend_from_slice(sym_name.as_bytes());
-        dynstr.push(0);
+        sym(&mut meta, intern(&mut dynstr, sym_name.as_bytes())?, info, 0, 0, 0);
     }
     let native_sym_base = 1u64 + u64_of(kept.len(), "ELF symbol count")?;
     if let Some(m) = native {
         for imp in m.imports.iter() {
             let bind = if imp.weak { STB_WEAK } else { STB_GLOBAL };
-            bytes::u32(&mut meta, u32_of(dynstr.len(), "DT_STRTAB offset")?);
-            bytes::u8(&mut meta, (bind << 4) | STT_NOTYPE);
-            bytes::u8(&mut meta, 0);
-            bytes::u16(&mut meta, 0);
-            bytes::u64(&mut meta, 0);
-            bytes::u64(&mut meta, 0);
-            dynstr.extend_from_slice(imp.name);
-            dynstr.push(0);
+            sym(&mut meta, intern(&mut dynstr, imp.name)?, (bind << 4) | STT_NOTYPE, 0, 0, 0);
         }
     }
+
+    // Defined dynamic symbols follow every undefined import. They name `.text` (section index 1),
+    // not SHN_ABS: section headers below make the definition's place explicit to ld.so and tools.
+    const SHNDX_TEXT: u16 = 1;
+    let export_sym_base = 1usize + kept.len() + native.map_or(0, |m| m.imports.len());
+    for x in exports {
+        let Some(placed) = laid.placed.iter().find(|p| p.symbol == x.symbol) else {
+            return Err(ExportError::OutOfReach {
+                from: x.symbol,
+                target: Target { space: Space::Func, symbol: x.symbol },
+            });
+        };
+        let name_at = intern(&mut dynstr, x.name)?;
+        sym(&mut meta, name_at, (STB_GLOBAL << 4) | STT_FUNC, SHNDX_TEXT, placed.at, placed.len);
+    }
+
     let dynstr_at = u64_of(meta.len(), "meta offset")?;
+    let dynsym_len = dynstr_at;
     meta.extend_from_slice(&dynstr);
     bytes::pad(&mut meta, 8);
     let hash_at = u64_of(meta.len(), "meta offset")?;
-    let total_syms = 1usize + kept.len() + native.map_or(0, |m| m.imports.len());
+    let total_syms = export_sym_base + exports.len();
     let nsyms = u32_of(total_syms, "DT_HASH nchain")?;
-    bytes::u32(&mut meta, 1); // nbucket
-    bytes::u32(&mut meta, nsyms); // nchain
-    bytes::u32(&mut meta, 0); // bucket[0]: no symbol is defined here
-    for _ in 0..nsyms {
-        bytes::u32(&mut meta, 0);
+    let nbucket = u32_of(exports.len().max(1), "DT_HASH nbucket")?;
+    bytes::u32(&mut meta, nbucket);
+    bytes::u32(&mut meta, nsyms);
+    // Fill SysV bucket and chain words directly in their on-disk slots. Undefined imports
+    // have zero chain words. Only exported definitions participate in symbol lookup.
+    let buckets = hash_at + 8;
+    let chains = buckets + 4 * u64::from(nbucket);
+    let hash_end = chains + 4 * u64::from(nsyms);
+    if meta_at + hash_end > 1 << 32 {
+        return Err(ExportError::TooLarge { what: "the image's 4 GiB", len: meta_at + hash_end });
     }
+    meta.resize(usize_of(hash_end, "DT_HASH end")?, 0);
+    for (index, export) in exports.iter().enumerate() {
+        let row = u32_of(export_sym_base + index, "an exported ELF symbol index")?;
+        let bucket = usize_of(buckets + 4 * u64::from(elf_hash(export.name) % nbucket), "DT_HASH bucket")?;
+        let previous = bytes::get32(&meta, bucket);
+        bytes::set32(&mut meta, usize_of(chains + 4 * u64::from(row), "DT_HASH chain")?, previous);
+        bytes::set32(&mut meta, bucket, row);
+    }
+    let hash_len = hash_end - hash_at;
     bytes::pad(&mut meta, 8);
     let rela_at = u64_of(meta.len(), "meta offset")?;
     let got_end = laid.got_at + 8 * u64_of(laid.imports.len(), "program GOT length")?;
     let mut relative = 0u64;
-    // All `R_AARCH64_RELATIVE` entries first (`DT_RELACOUNT`), program then native (sorted).
     for f in laid.fixups.iter() {
         match f.to {
             FixTo::Rebase { target } => {
@@ -428,7 +570,6 @@ pub fn write_native<'a>(
             relative += 1;
         }
     }
-    // Non-relative relocations: program's remaining binds, then native's imports & TLS relocs.
     for f in laid.fixups.iter() {
         if let FixTo::Bind { import } = f.to
             && direct(import).is_none()
@@ -465,10 +606,25 @@ pub fn write_native<'a>(
             }
         }
     }
+
+    // Rust's descriptor root is one local-exec cell in this module's TLS template. Dynamic
+    // relocation (symbol 0, addend = template offset) supplies the load-time TP-relative offset;
+    // hard-coding it would only be correct for a main executable.
+    let rust_tls = if library.is_some() && laid.has_tls {
+        let Some(desc) = laid.tls_desc_at else {
+            return Err(ExportError::Remeasured { what: "the Rust TLS descriptor address", measured: 1, written: 0 });
+        };
+        let root_at = desc + u64::try_from(blaze_code::tls::DESC_ROOT).map_err(|_| ExportError::TooLarge { what: "the TLS descriptor root", len: u64::MAX })?;
+        let root_off = native.and_then(|m| m.tls).map_or(0, |t| up(t.memsz, 8));
+        bytes::u64(&mut meta, root_at);
+        bytes::u64(&mut meta, R_AARCH64_TLS_TPREL64);
+        bytes::u64(&mut meta, root_off);
+        Some(root_at)
+    } else {
+        None
+    };
     let rela_len = u64_of(meta.len(), "meta offset")? - rela_at;
 
-    // Single `PT_TLS` combining optional native C TLS (`[0, c_memsz)`) and optional Rust
-    // `Space::Tls` 8-byte zero-initialized `ROOT` at `up(c_memsz, 8)`.
     let tls_phdr = match (laid.has_tls, native.and_then(|m| m.tls.map(|t| (m, t)))) {
         (false, None) => None,
         (true, None) => Some(TlsPhdr {
@@ -487,8 +643,6 @@ pub fn write_native<'a>(
             } else if c_tls.vaddr.is_multiple_of(align) {
                 (m.file_of(c_tls.vaddr, native_file), c_tls.vaddr)
             } else {
-                // Copy `.tdata` into read-only `meta` at an `align`-aligned offset so
-                // `p_vaddr % p_align == 0` and `p_offset % p_align == 0` always hold.
                 let align_usize = usize_of(align, "PT_TLS alignment")?;
                 bytes::pad(&mut meta, align_usize);
                 let in_meta = u64_of(meta.len(), "meta offset")?;
@@ -509,17 +663,38 @@ pub fn write_native<'a>(
         return Err(ExportError::TooLarge { what: "the image's 4 GiB", len: meta_at + meta_len });
     }
 
-    // Dynamic section entries (written into the reserved head of `laid.konst`).
-    let mut dyn_entries: AVec<'_, (u64, u64)> = Vec::with_capacity_in(16 + extra_needed.len(), alloc);
+    // Rust TLS initialization must precede native constructors. `mod_init_at` is a slot holding
+    // the synthesized initializer; its rebase target is the function address used for DT_INIT.
+    let rust_init = if rust_tls.is_some() {
+        let Some(slot) = laid.mod_init_at else {
+            return Err(ExportError::Remeasured { what: "the Rust TLS initializer slot", measured: 1, written: 0 });
+        };
+        let target = laid.fixups.iter().find_map(|fixup| match fixup.to {
+            FixTo::Rebase { target } if fixup.at == slot => Some(target),
+            _ => None,
+        }).ok_or(ExportError::Remeasured { what: "the Rust TLS initializer relocation", measured: 1, written: 0 })?;
+        Some(target)
+    } else {
+        None
+    };
+
+    let mut dyn_entries: AVec<'_, (u64, u64)> = Vec::with_capacity_in(18 + extra_needed.len(), alloc);
     dyn_entries.push((DT_NEEDED, u64::from(needed_libc)));
     for &at in extra_needed.iter() {
         dyn_entries.push((DT_NEEDED, u64::from(at)));
+    }
+    if let Some(soname) = soname {
+        dyn_entries.push((DT_SONAME, u64::from(soname)));
+    }
+    if let Some(init) = rust_init {
+        dyn_entries.push((DT_INIT, init));
     }
     if let Some(inits) = native.and_then(|m| m.inits) {
         dyn_entries.push((DT_INIT_ARRAY, inits.vaddr));
         dyn_entries.push((DT_INIT_ARRAYSZ, inits.len));
     }
-    let dt_flags = if native.is_some_and(|m| m.static_tls) { DF_BIND_NOW | DF_STATIC_TLS } else { DF_BIND_NOW };
+    let static_tls = native.is_some_and(|m| m.static_tls) || rust_tls.is_some();
+    let dt_flags = if static_tls { DF_BIND_NOW | DF_STATIC_TLS } else { DF_BIND_NOW };
     dyn_entries.extend_from_slice(&[
         (DT_HASH, meta_at + hash_at),
         (DT_STRTAB, meta_at + dynstr_at),
@@ -531,10 +706,12 @@ pub fn write_native<'a>(
         (DT_RELAENT, 24),
         (DT_RELACOUNT, relative),
         (DT_FLAGS, dt_flags),
-        (DT_FLAGS_1, DF_1),
-        (DT_DEBUG, 0),
-        (DT_NULL, 0),
+        (DT_FLAGS_1, if library.is_some() { DF_1_NOW } else { DF_1 }),
     ]);
+    if library.is_none() {
+        dyn_entries.push((DT_DEBUG, 0));
+    }
+    dyn_entries.push((DT_NULL, 0));
     let dyn_bytes = u64_of(dyn_entries.len(), "PT_DYNAMIC entry count")? * 16;
     let dyn_limit = if needs_dso_handle { dso_handle_at.unwrap_or(laid.got_at) } else { laid.got_at };
     let dyn_room = dyn_limit.saturating_sub(laid.const_at);
@@ -542,30 +719,32 @@ pub fn write_native<'a>(
         return Err(ExportError::HeaderRoom { what: "the ELF dynamic section", need: dyn_bytes, room: dyn_room });
     }
 
-    // The ELF header and program headers.
+    // ELF header/program headers. `phnum` is exact even though TEXT_AT reserves the historical
+    // maximum header room; the unused interpreter slot is simply zero bytes before the note.
     out.clear();
     out.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     let native_missing = if native.is_some() { 0u64 } else { 2u64 };
-    let phnum = MAX_PHDRS - u64::from(!has_data) - u64::from(tls_phdr.is_none()) - native_missing;
+    let phnum = MAX_PHDRS - u64::from(library.is_some()) - u64::from(!has_data) - u64::from(tls_phdr.is_none()) - native_missing;
     let phnum16 = u16::try_from(phnum).map_err(|_| ExportError::TooLarge { what: "e_phnum", len: phnum })?;
     bytes::u16(out, 3); // ET_DYN
     bytes::u16(out, 183); // EM_AARCH64
     bytes::u32(out, 1); // EV_CURRENT
-    bytes::u64(out, laid.entry);
+    bytes::u64(out, if library.is_some() { 0 } else { laid.entry });
     bytes::u64(out, EHDR); // e_phoff
-    bytes::u64(out, 0); // e_shoff
+    bytes::u64(out, 0); // e_shoff, patched after the section headers are written
     bytes::u32(out, 0); // e_flags
     bytes::u16(out, 64); // e_ehsize
     bytes::u16(out, 56); // e_phentsize
     bytes::u16(out, phnum16);
     bytes::u16(out, 64); // e_shentsize
-    bytes::u16(out, 0); // e_shnum
-    bytes::u16(out, 0); // e_shstrndx
+    bytes::u16(out, if library.is_some() { 8 } else { 0 }); // e_shnum
+    bytes::u16(out, if library.is_some() { 7 } else { 0 }); // e_shstrndx
     phdr(out, PT_PHDR, PF_R, EHDR, EHDR, PHDR * phnum, PHDR * phnum, 8);
-    let interp_len = u64_of(INTERP.len(), "PT_INTERP")? + 1;
-    phdr(out, PT_INTERP, PF_R, INTERP_AT, INTERP_AT, interp_len, interp_len, 1);
+    if library.is_none() {
+        let len = u64_of(INTERP.len(), "PT_INTERP")? + 1;
+        phdr(out, PT_INTERP, PF_R, INTERP_AT, INTERP_AT, len, len, 1);
+    }
     phdr(out, PT_NOTE, PF_R, NOTE_AT, NOTE_AT, NOTE_LEN, NOTE_LEN, 4);
-    // The executable load holds the code and, after it, the unwind tables (eh_out.rs).
     phdr(out, PT_LOAD, PF_R | PF_X, 0, 0, eh.end(), eh.end(), PAGE);
     phdr(out, PT_LOAD, PF_R | PF_W, laid.const_at, laid.const_at, konst_len, const_mem, PAGE);
     if has_data {
@@ -588,9 +767,11 @@ pub fn write_native<'a>(
     if ph_written != EHDR + phnum * PHDR {
         return Err(ExportError::Remeasured { what: "the ELF program headers", measured: EHDR + phnum * PHDR, written: ph_written });
     }
-    out.resize(usize_of(INTERP_AT, "INTERP_AT")?, 0);
-    out.extend_from_slice(INTERP.as_bytes());
-    out.push(0);
+    if library.is_none() {
+        out.resize(usize_of(INTERP_AT, "INTERP_AT")?, 0);
+        out.extend_from_slice(INTERP.as_bytes());
+        out.push(0);
+    }
     out.resize(usize_of(NOTE_AT, "NOTE_AT")?, 0);
     bytes::u32(out, 4); // namesz
     bytes::u32(out, 16); // descsz
@@ -599,7 +780,6 @@ pub fn write_native<'a>(
     let id_at = out.len();
     out.extend_from_slice(&[0u8; 16]);
 
-    // The loads' bytes at their offsets.
     out.resize(usize_of(laid.text_at, "text_at")?, 0);
     out.extend_from_slice(&laid.text);
     out.resize(usize_of(eh.eh_frame_at, "eh_frame_at")?, 0);
@@ -621,6 +801,13 @@ pub fn write_native<'a>(
         out.resize(usize_of(laid.data_at, "data_at")?, 0);
         out.extend_from_slice(&laid.data);
     }
+    if let Some(root_at) = rust_tls {
+        let off = usize_of(root_at, "the Rust TLS root cell")?;
+        if off + 8 > out.len() {
+            return Err(ExportError::Remeasured { what: "the Rust TLS root cell", measured: u64_of(out.len(), "the file length")?, written: root_at + 8 });
+        }
+        bytes::set64(out, off, 0);
+    }
     if let Some(m) = native {
         let native_file_usize = usize_of(native_file, "native_file")?;
         out.resize(native_file_usize, 0);
@@ -629,7 +816,6 @@ pub fn write_native<'a>(
         if out.len() < native_end {
             out.resize(native_end, 0);
         }
-        // RELA convention: every relocated native cell holds 0 in the file (addend is in Elf64_Rela).
         for &(at, _) in m.relative.iter() {
             let off = usize_of(m.file_of(at, native_file), "native relative slot")?;
             bytes::set64(out, off, 0);
@@ -644,6 +830,36 @@ pub fn write_native<'a>(
     }
     out.resize(usize_of(meta_off, "meta_off")?, 0);
     out.extend_from_slice(&meta);
+
+    if library.is_some() {
+        // Minimal allocated section headers. Dynamic linking itself uses program headers and dynamic
+        // tags, but defined `Elf64_Sym` values need a real section index; `.text` is therefore exact
+        // and the tables the dynamic tags name are exposed for independent ELF inspection.
+        let mut shstr: AVec<'_, u8> = Vec::new_in(alloc);
+        shstr.push(0);
+        let text_name = intern(&mut shstr, b".text")?;
+        let dynamic_name = intern(&mut shstr, b".dynamic")?;
+        let dynsym_name = intern(&mut shstr, b".dynsym")?;
+        let dynstr_name = intern(&mut shstr, b".dynstr")?;
+        let hash_name = intern(&mut shstr, b".hash")?;
+        let rela_name = intern(&mut shstr, b".rela.dyn")?;
+        let shstr_name = intern(&mut shstr, b".shstrtab")?;
+        let shstr_off = u64_of(out.len(), ".shstrtab offset")?;
+        out.extend_from_slice(&shstr);
+        while out.len() % 8 != 0 {
+            out.push(0);
+        }
+        let shoff = u64_of(out.len(), "section header offset")?;
+        shdr(out, 0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0);
+        shdr(out, text_name, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, laid.text_at, laid.text_at, u64_of(laid.text.len(), "the text section")?, 0, 0, 16, 0);
+        shdr(out, dynamic_name, SHT_DYNAMIC, SHF_ALLOC | SHF_WRITE, laid.const_at, laid.const_at, dyn_bytes, 4, 0, 8, 16);
+        shdr(out, dynsym_name, SHT_DYNSYM, SHF_ALLOC, meta_at + dynsym_at, meta_off + dynsym_at, dynsym_len, 4, 1, 8, 24);
+        shdr(out, dynstr_name, SHT_STRTAB, SHF_ALLOC, meta_at + dynstr_at, meta_off + dynstr_at, u64_of(dynstr.len(), "the dynamic string table")?, 0, 0, 1, 0);
+        shdr(out, hash_name, SHT_HASH, SHF_ALLOC, meta_at + hash_at, meta_off + hash_at, hash_len, 3, 0, 4, 4);
+        shdr(out, rela_name, SHT_RELA, SHF_ALLOC, meta_at + rela_at, meta_off + rela_at, rela_len, 3, 0, 8, 24);
+        shdr(out, shstr_name, SHT_STRTAB, 0, 0, shstr_off, u64_of(shstr.len(), "the section string table")?, 0, 0, 1, 0);
+        bytes::set64(out, 40, shoff);
+    }
 
     let mut hasher = Hasher::new(ID_DOMAIN);
     hasher.update(seed);

@@ -41,6 +41,7 @@ pub mod features;
 pub mod files;
 #[cfg(feature = "cargo")]
 pub mod home;
+pub mod bootstrap;
 pub mod layout;
 pub mod lock;
 // cargo's `build.rustflags` rule: the `--cfg`s a unit's cfg takes (sans-IO, no serde).

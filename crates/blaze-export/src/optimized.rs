@@ -230,8 +230,9 @@ pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: 
     if platform == Platform::Wasm64 {
         return Err(ExportError::Wasm64RequiresWasmProgram);
     }
+    // ProgramIn02 has no export names; cdylibs use ProgramIn.
+    let main = main_of(program.entry).ok_or(ExportError::OptimizedLibraryRequiresExports)?;
     let has = |symbol: Symbol| program.functions.iter().any(|f| f.symbol == symbol);
-    let main = main_of(program.entry);
     if !matches!(program.entry, Entry::Hosted { .. }) && !has(main) {
         return Err(ExportError::NoEntry { symbol: main });
     }
@@ -269,7 +270,8 @@ pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: 
     let rows = rows_of(&members, alloc);
     let unwinds = unwinds(&members, &rows, alloc)?;
     let room = eh_room_rows(&unwinds, program.personality, platform, alloc)?;
-    let laid = lay_out_records_with_tls(&members, program.data, start.entry, program.profile, plan, room, tls_plan, alloc)?;
+    let entry = start.entry.ok_or(ExportError::OptimizedLibraryRequiresExports)?;
+    let laid = lay_out_records_with_tls(&members, program.data, entry, program.profile, plan, room, tls_plan, alloc)?;
     let eh = eh_sections_rows(&laid, &unwinds, program.personality, platform, alloc)?;
     let panics = match program.panic {
         Panic::Unwind => Panics::Unwind { functions: eh.functions },
@@ -961,5 +963,5 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
         }
     }
 
-    regions.finish(members, &by_symbol, &order, &rep, &home, data, &by_target, entry_member, plan, tail, text, imports, fixups, placed)
+    regions.finish(members, &by_symbol, &order, &rep, &home, data, &by_target, Some(entry_member), plan, tail, text, imports, fixups, placed)
 }

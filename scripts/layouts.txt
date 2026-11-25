@@ -49,6 +49,7 @@ crates/blaze-cli/src/engine_answer.rs	BASES_MAGIC	none
 crates/blaze-cli/src/engine_answer.rs	LAYOUT_DOMAIN	none
 crates/blaze-cli/src/engine_answer.rs	POINTER_MAGIC	none
 crates/blaze-cli/src/engine_body_facts.rs	MAGIC	none
+crates/blaze-cli/src/engine_dist/fingerprint.rs	MAGIC	test previous_fingerprint_layout_is_a_miss
 crates/blaze-cli/src/engine_lines.rs	LINES_MAGIC	none
 crates/blaze-cli/src/engine_lines.rs	LINES_PLACED_MAGIC	none
 crates/blaze-cli/src/engine_listing_record.rs	JOIN_MAGIC	none

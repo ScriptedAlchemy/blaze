@@ -910,7 +910,7 @@ fn count(c: &CrateNames<'static>, std_absent: bool) -> Counts {
     for m in c.made.values() {
         tally(&m.decls);
     }
-    let use_loc = |fragment: ItemKey, index: u32| c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(index as usize).copied());
+    let use_loc = |fragment: ItemKey, index: u32| c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(index as usize).map(|span| span.start()));
     for r in c.done.values() {
         let mpath = c.path_of(r.scope.module).unwrap_or_default().to_string();
         for error in r.scope.errors.iter() {

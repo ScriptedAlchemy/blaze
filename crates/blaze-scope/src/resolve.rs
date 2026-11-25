@@ -57,7 +57,7 @@ use crate::graph::{CrateGraph, CrateId, ExternGone, GraphCrate, GraphDep, GraphE
 use crate::names::{PathError, Unheld, VariantHit, Why, World, Written, variant_in};
 use crate::task::{
     CallSrc, Cfg, Fill, FillEnv, FillReport, Files, First, Fragment, Held, ImplSrc,
-    ItemText, LangSrc, Loc, LowerCx, LowerNote, Lowered, MacroBody, MacroSrc, Member, ModMade, Par,
+    FileSpan, ItemText, LangSrc, Loc, LowerCx, LowerNote, Lowered, MacroBody, MacroSrc, Member, ModMade, Par,
     PreludeImport, RootInput, RootNote, RootPlan, TaskError, Tree, Variant, Where,
     crate_root, crate_tools, file_attrs, lower, walk,
 };
@@ -327,7 +327,7 @@ pub struct Tables<'a> {
     pub impls: AVec<'a, ImplSrc<'a>>,
     pub langs: AVec<'a, LangSrc<'a>>,
     /// Each fragment's `use` items' places, by the fragment's key (a module's, a call's).
-    pub use_locs: HashMap<ItemKey, AVec<'a, Loc>, Alloc<'a>>,
+    pub use_locs: HashMap<ItemKey, AVec<'a, FileSpan>, Alloc<'a>>,
     /// Each item's text, and which text it is in.
     pub texts: HashMap<ItemKey, (ItemText<'a>, At), Alloc<'a>>,
     /// The other way: the item at an entry of a text's outline.

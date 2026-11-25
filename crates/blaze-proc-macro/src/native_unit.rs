@@ -35,7 +35,6 @@ use crate::{
         NOT_A_FILE, Read, Tree, TreeRead, answer_now,
         dep_mount::{self, DepProducer, native::LayError},
     },
-    script_unit::module_of_native,
 };
 
 /// The deployment target every native script compiles for: its one home is blaze-build-script
@@ -56,51 +55,6 @@ pub use blaze_build_script::toolchain::MACOS_MIN;
 /// refused by name ([`NativeUnitError::NoNativeSetting`]); it is never tried as wasm (rule 3).
 pub fn placed(graph: &UnitGraph<'_>, script: UnitId, mode: Mode, alloc: Alloc<'_>) -> Runner {
     toolchain::placement(native::closure(graph, script, alloc), mode, graph.units[script.index()].name.as_str())
-}
-
-/// Like [`placed`], but honors the D175 zero-Wasm fast path: whenever `store` holds a native
-/// host binary record (`script.bin`, `target <host>`) for `script` and does not hold a legacy
-/// `module.wasm` record, places `script` on [`Runner::Native`] so it runs confined under
-/// `bstd::procs::hermetic` (macOS Seatbelt / Linux Landlock + seccomp) with zero Wasm.
-pub fn placed_in_store(
-    store: &Path,
-    graph: &UnitGraph<'_>,
-    script: UnitId,
-    mode: Mode,
-    host: &str,
-    alloc: Alloc<'_>,
-) -> Runner {
-    let base = placed(graph, script, mode, alloc);
-    if matches!(base, Runner::Native { .. }) {
-        return base;
-    }
-    let Some(unit) = graph.units.get(script.index()) else { return base };
-    let features: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-    let has_native = crate::script_unit::module_of_native(
-        store,
-        unit.name.as_str(),
-        unit.version.as_str(),
-        &features,
-        host,
-    )
-    .ok()
-    .flatten()
-    .is_some();
-    if has_native {
-        let has_wasm = crate::script_unit::module_of(
-            store,
-            unit.name.as_str(),
-            unit.version.as_str(),
-            &features,
-        )
-        .ok()
-        .flatten()
-        .is_some();
-        if !has_wasm {
-            return Runner::Native { because: script };
-        }
-    }
-    base
 }
 
 /// What a command gives its native scripts. Every path absolute and canonical (Seatbelt matches
@@ -305,17 +259,21 @@ pub fn native_outputs<'a>(
     };
 
     // The host binary the interim builder made with exactly the unit's features.
-    let features: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-    let module = module_of_native(setting.store, name, version, &features, setting.host).map_err(NativeUnitError::Lookup)?.ok_or_else(|| NativeUnitError::NoModule {
+    let selected = setting.module.filter(|selected| selected.native()).ok_or_else(|| NativeUnitError::NoModule {
         package: pkg(),
-        features: features.iter().map(|f| (*f).to_owned()).collect(),
+        features: unit.features.iter().map(|f| f.as_str().to_owned()).collect(),
         store: setting.store.display().to_string(),
     })?;
+    let module = setting.store.join("build-script/modules").join(selected.key());
     // Seatbelt matches resolved paths: the store may be named through a link.
     let module = std::fs::canonicalize(&module).map_err(|e| NativeUnitError::Read { path: module.display().to_string(), why: e.to_string() })?;
     let module = module.to_str().ok_or_else(|| NativeUnitError::Read { path: module.display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
     let program = format!("{module}/script.bin");
-    let module_digest = blaze_sha256::digest(&read_file(&module, "script.bin")?);
+    let binary = read_file(&module, "script.bin")?;
+    if crate::module::sha256_hex(&binary) != selected.digest() {
+        return Err(NativeUnitError::Read { path: program, why: "binary differs from the selected module task's digest".to_owned() });
+    }
+    let module_digest = blaze_sha256::digest(&binary);
 
     // The same environment as the wasm path: the unit's features, the served unit's cfg.
     let serves_unit = &graph.units[serves.index()];

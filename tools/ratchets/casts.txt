@@ -35,8 +35,8 @@ blaze-cast	40
 blaze-cc	17
 blaze-cert	14
 blaze-check	107
-blaze-cli	633
-blaze-code	139
+blaze-cli	631
+blaze-code	138
 blaze-columns	2
 blaze-comptime-sys	150
 blaze-cond	13

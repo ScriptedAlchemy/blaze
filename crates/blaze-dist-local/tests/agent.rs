@@ -13,7 +13,7 @@ use blaze_dist::holder::HolderConfig;
 use blaze_dist::jobs::{CompletionMode, ExecutionConfig, Jobs};
 use blaze_dist::work::WorkConfig;
 use blaze_dist_local::Error;
-use blaze_dist_local::agent::{self, Grant, Granted, NEED, Source, Unit};
+use blaze_dist_local::agent::{self, Emission, Grant, Granted, NEED, Source, Unit};
 use blaze_dist_local::blobs::Blobs;
 use blaze_dist_local::client::Client;
 use blaze_dist_local::coordinator::Config as CarrierConfig;
@@ -229,16 +229,16 @@ impl Granted for Compiler {
             assert!(log.insert(*at, self.who).is_none(), "{at} was compiled twice");
         }
         let mut values = Vec::with_capacity_in(names.len(), alloc);
-        let mut compiled_keys = Vec::with_capacity_in(names.len(), alloc);
+        let mut emissions = Vec::with_capacity_in(names.len(), alloc);
         for at in names {
             values.push(value_of(&self.names[*at], alloc));
-            compiled_keys.push(self.names[*at]);
+            emissions.push(Emission { key: self.names[*at], backend: None });
         }
         Ok(Grant {
             values,
             compiled: u64::try_from(names.len()).unwrap(),
             stored: 0,
-            compiled_keys,
+            emissions,
         })
     }
 }
@@ -435,6 +435,69 @@ fn a_committed_pack_the_server_lost_refuses_without_compiling() {
     assert_eq!(compiler.entered.load(Ordering::SeqCst), 0);
 }
 
+fn blob_proxy(listener: &TcpListener, world: &World, stop: &AtomicBool, mut inspect: impl FnMut(&[u8], Option<&mut WireVec<u8>>)) {
+    let clock = SystemClock;
+    let alloc = world.alloc;
+    let start_ns = clock.monotonic_nanos().unwrap();
+    let bound_ns = start_ns.saturating_add(120_000_000_000);
+    while !stop.load(Ordering::Acquire)
+        && clock.monotonic_nanos().unwrap() < bound_ns
+    {
+        let mut client = match listener.accept() {
+            Ok(value) => value,
+            Err(why) if why.is_would_block() => {
+                sleep_ms(1);
+                continue;
+            }
+            Err(why) => panic!("proxy accept: {why}"),
+        };
+        client.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        client.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut request = Vec::new_in(alloc);
+        let mut buffer = [0u8; 4096];
+        let end = loop {
+            let n = client.read(&mut buffer).unwrap();
+            assert_ne!(n, 0);
+            request.extend_from_slice(&buffer[..n]);
+            assert!(request.len() < 1 << 20);
+            if let Some(at) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        let headers = core::str::from_utf8(&request[..end]).unwrap();
+        let length: usize = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map_or(0, |(_, value)| value.trim().parse().unwrap());
+        assert!(end + length < 1 << 20);
+        while request.len() < end + length {
+            let n = client.read(&mut buffer).unwrap();
+            assert_ne!(n, 0);
+            request.extend_from_slice(&buffer[..n]);
+        }
+        inspect(&request, None);
+        let mut upstream =
+            TcpStream::connect_timeout(world.blobs.address, Duration::from_secs(30))
+                .unwrap();
+        upstream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        upstream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+        upstream.write_all(&request).unwrap();
+        let mut relay = [0u8; 8192];
+        let mut response = Vec::new_in(alloc);
+        loop {
+            let n = upstream.read(&mut relay).unwrap();
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&relay[..n]);
+            assert!(response.len() < 1 << 20);
+        }
+        inspect(&request, Some(&mut response));
+        client.write_all(&response).unwrap();
+    }
+}
+
 #[test]
 fn a_slow_phase_pack_download_keeps_the_original_lead_alive() {
     let world = world(1, WorkConfig::default());
@@ -456,72 +519,13 @@ fn a_slow_phase_pack_download_keeps_the_original_lead_alive() {
     };
     let mut cfg = config(world.socket.as_str(), &world.blobs);
     cfg.blobs.address = address;
-    let clock = SystemClock;
     let result = scope(alloc, |s| {
-        let proxy = s
-            .spawn(|| {
-                let start_ns = clock.monotonic_nanos().unwrap();
-                let bound_ns = start_ns.saturating_add(120_000_000_000);
-                while !world.stop.load(Ordering::Acquire)
-                    && clock.monotonic_nanos().unwrap() < bound_ns
-                {
-                    let mut client = match listener.accept() {
-                        Ok(value) => value,
-                        Err(why) if why.is_would_block() => {
-                            sleep_ms(1);
-                            continue;
-                        }
-                        Err(why) => panic!("proxy accept: {why}"),
-                    };
-                    client.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-                    client.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
-                    let mut request = Vec::new_in(alloc);
-                    let mut buffer = [0u8; 4096];
-                    let end = loop {
-                        let n = client.read(&mut buffer).unwrap();
-                        assert_ne!(n, 0);
-                        request.extend_from_slice(&buffer[..n]);
-                        assert!(request.len() < 1 << 20);
-                        if let Some(at) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                            break at + 4;
-                        }
-                    };
-                    let headers = core::str::from_utf8(&request[..end]).unwrap();
-                    let length: usize = headers
-                        .lines()
-                        .filter_map(|line| line.split_once(':'))
-                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                        .map_or(0, |(_, value)| value.trim().parse().unwrap());
-                    assert!(end + length < 1 << 20);
-                    while request.len() < end + length {
-                        let n = client.read(&mut buffer).unwrap();
-                        assert_ne!(n, 0);
-                        request.extend_from_slice(&buffer[..n]);
-                    }
-                    if request.starts_with(b"GET /v1/blob/packs/")
-                        && !delayed.swap(true, Ordering::AcqRel)
-                    {
-                        // Cache IO is held beyond the actual default lead-loss window;
-                        // the independent Unix coordinator remains available to heartbeats.
-                        sleep(delay);
-                    }
-                    let mut upstream =
-                        TcpStream::connect_timeout(world.blobs.address, Duration::from_secs(30))
-                            .unwrap();
-                    upstream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-                    upstream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
-                    upstream.write_all(&request).unwrap();
-                    let mut relay = [0u8; 8192];
-                    loop {
-                        let n = upstream.read(&mut relay).unwrap();
-                        if n == 0 {
-                            break;
-                        }
-                        client.write_all(&relay[..n]).unwrap();
-                    }
-                }
-            })
-            .unwrap();
+        let proxy = s.spawn(|| blob_proxy(&listener, &world, &world.stop, |request, response| {
+            if response.is_none() && request.starts_with(b"GET /v1/blob/packs/") && !delayed.swap(true, Ordering::AcqRel) {
+                // The real pack GET is held beyond the default lead-loss window.
+                sleep(delay);
+            }
+        })).unwrap();
         let result = agent::run(&cfg, &unit, &mut compiler, &AtomicBool::new(false));
         world.stop.store(true, Ordering::Release);
         proxy.join().unwrap();
@@ -548,15 +552,15 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
             for name in &self.0 {
                 values.push(value_of(name, alloc));
             }
-            let mut compiled_keys = Vec::with_capacity_in(names.len(), alloc);
+            let mut emissions = Vec::with_capacity_in(names.len(), alloc);
             for at in names {
-                compiled_keys.push(self.0[*at]);
+                emissions.push(Emission { key: self.0[*at], backend: None });
             }
             Ok(Grant {
                 values,
                 compiled: u64::try_from(names.len()).unwrap(),
                 stored: 0,
-                compiled_keys,
+                emissions,
             })
         }
     }
@@ -668,16 +672,16 @@ impl Granted for Holding {
             self.release.take().unwrap().recv_timeout(Duration::from_secs(20)).unwrap();
         }
         let mut values = Vec::with_capacity_in(names.len(), alloc);
-        let mut compiled_keys = Vec::with_capacity_in(names.len(), alloc);
+        let mut emissions = Vec::with_capacity_in(names.len(), alloc);
         for at in names {
             values.push(value_of(&self.names[*at], alloc));
-            compiled_keys.push(self.names[*at]);
+            emissions.push(Emission { key: self.names[*at], backend: None });
         }
         Ok(Grant {
             values,
             compiled: u64::try_from(names.len()).unwrap(),
             stored: 0,
-            compiled_keys,
+            emissions,
         })
     }
 }
@@ -1324,73 +1328,144 @@ fn a_late_subscriber_waits_for_the_one_leads_full_tail() {
     }
     struct Reader;
     impl Granted for Reader {
-        type Error = Infallible;
+        type Error = TestError;
 
         fn compile(&mut self, _: &[usize]) -> Result<Grant, Self::Error> {
-            panic!("late subscriber compiled")
+            Err(TestError(WireString::from_str_in("late subscriber compiled", test_alloc())))
         }
         fn complete(
             &mut self,
             _: &mut dyn Iterator<Item = ValueRef<'_>>,
             _: &mut dyn FnMut(Value),
         ) -> Result<(), Self::Error> {
-            panic!("late subscriber ran a second tail")
+            Err(TestError(WireString::from_str_in("late subscriber ran a second tail", test_alloc())))
         }
     }
-    let world = world(2, WorkConfig::default());
-    let alloc = world.alloc;
-    let unit = Unit { spec: [82; 32], names: Vec::new_in(alloc) };
-    let extra = value_of(&[83; 32], alloc);
-    let tails = Arc::new_in(AtomicUsize::new(0), alloc);
-    let (entered, completing) = channel(alloc);
-    let (release, gate) = channel(alloc);
-    let never = AtomicBool::new(false);
-    scope(alloc, |s| {
-        let (world, unit, never) = (&world, &unit, &never);
-        let mut compiler =
-            Paused { entered, release: gate, tails: tails.clone(), extra: extra.clone() };
-        let lead = s
-            .spawn(move || {
-                agent::run(
-                    &config(world.socket.as_str(), &world.blobs),
-                    unit,
-                    &mut compiler,
-                    never,
-                )
-                .unwrap()
-            })
-            .unwrap();
-        completing.recv_timeout(Duration::from_secs(20)).unwrap();
-        // Force a submission in the formerly racy interval: phase done, tail still paused.
-        let mut observer =
-            Client::connect(world.socket.as_str(), random_id().unwrap(), alloc).unwrap();
-        let request = blaze_wire::JobRequest {
-            unit: unit.spec,
-            platform: agent::platform(TRIPLE),
-            namespace: Namespace::Main,
-            source: [0; 32],
-            deadline_ms: observer.welcome.now_ms + 120_000,
-            local: LocalPolicy::Never,
-        };
-        let Answer::Binding(joined) =
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Arrival { Live, Delivered, Superseded, LostPack, FailedLiveRead }
+
+    for arrival in [Arrival::Live, Arrival::Delivered, Arrival::Superseded, Arrival::LostPack, Arrival::FailedLiveRead] {
+        let live = matches!(arrival, Arrival::Live | Arrival::FailedLiveRead);
+        let namespace = Namespace::Pr(PrNamespace { n: 1 });
+        let world = world_with(&[namespace.clone(), namespace.clone()], WorkConfig::default(), CarrierConfig::default());
+        let alloc = world.alloc;
+        let unit = Unit { spec: [82; 32], names: Vec::new_in(alloc) };
+        let extra = value_of(&[83; 32], alloc);
+        let tails = Arc::new_in(AtomicUsize::new(0), alloc);
+        let (entered, completing) = channel(alloc);
+        let (release, gate) = channel(alloc);
+        let (observed, probes) = channel(alloc);
+        let (resume, pause) = channel(alloc);
+        let never = AtomicBool::new(false);
+        let stop_proxy = AtomicBool::new(false);
+        let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut lead_config = config(world.socket.as_str(), &world.blobs);
+        lead_config.namespace = namespace.clone();
+        let mut reader_config = config(world.socket.as_str(), &world.blobs);
+        reader_config.namespace = namespace.clone();
+        reader_config.blobs.address = listener.local_addr();
+        let mut observer = Client::connect(world.socket.as_str(), random_id().unwrap(), alloc).unwrap();
+        let submit = |observer: &mut Client, spec, source| {
+            let request = blaze_wire::JobRequest {
+                unit: spec, source, namespace: namespace.clone(), platform: agent::platform(TRIPLE),
+                deadline_ms: observer.welcome.now_ms + 120_000, local: LocalPolicy::Never,
+            };
             observer.call(Command::Submit(submission(&request, NEED, alloc))).unwrap()
-        else {
-            panic!()
         };
-        let reader = s
-            .spawn(move || {
-                agent::run(&config(world.socket.as_str(), &world.blobs), unit, &mut Reader, never)
-                    .unwrap()
-            })
-            .unwrap();
-        release.send(()).unwrap();
-        let first = lead.join().unwrap();
-        let second = reader.join().unwrap();
-        assert_eq!(first.execution, Some(joined.subscription.execution.0));
-        assert_eq!(second.values, first.values);
-        assert_eq!(second.values.get(&extra.key), Some(&(extra.kind, extra.bytes.clone())));
-        assert_eq!(second.compiled_here, 0);
-        assert_eq!(tails.load(Ordering::SeqCst), 1);
-        let _ = observer.release();
-    });
+        scope(alloc, |s| {
+            let (unit, never) = (&unit, &never);
+            let mut compiler = Paused { entered, release: gate, tails: tails.clone(), extra: extra.clone() };
+            let lead = s.spawn(move || agent::run(&lead_config, unit, &mut compiler, never).unwrap()).unwrap();
+            completing.recv_timeout(Duration::from_secs(20)).unwrap();
+            // The first response is a real miss. The second request can start only after
+            // this reader's Submit returned a binding.
+            let proxy = s.spawn(|| {
+                let mut remaining = 2;
+                blob_proxy(&listener, &world, &stop_proxy, |request, response| {
+                    if remaining > 0 && request.starts_with(b"GET /v1/list/manifests/") {
+                        let Some(response) = response else {
+                            if remaining == 1 && live {
+                                observed.send(None).unwrap();
+                                pause.recv_timeout(Duration::from_secs(20)).unwrap();
+                            }
+                            return;
+                        };
+                        remaining -= 1;
+                        let status = core::str::from_utf8(response.split(|&b| b == b'\n').next().unwrap()).unwrap();
+                        let code = status.split_whitespace().nth(1).unwrap().parse::<u16>().unwrap();
+                        observed.send(Some(code)).unwrap();
+                        pause.recv_timeout(Duration::from_secs(20)).unwrap();
+                        if remaining == 0 && arrival == Arrival::FailedLiveRead {
+                            response.clear();
+                            response.extend_from_slice(b"HTTP/1.1 503 Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+                        }
+                    }
+                });
+            }).unwrap();
+            let reader = s.spawn(move || agent::run(&reader_config, unit, &mut Reader, never)).unwrap();
+            let response = || probes.recv_timeout(Duration::from_secs(20)).unwrap();
+            assert_eq!(response(), Some(404), "the reader observed a real miss");
+            if live {
+                resume.send(()).unwrap();
+                assert_eq!(response(), None, "the reader subscribed before the lead published");
+            }
+            release.send(()).unwrap();
+            let first = lead.join().unwrap();
+            let mut withdrawing = None;
+            resume.send(()).unwrap();
+            assert_eq!(response(), Some(200), "the bound reader found the delivered manifest");
+            if !live {
+                if arrival == Arrival::Superseded {
+                    // The new revision cancels the sole subscriber of the old one.
+                    let Answer::Binding(newer) = submit(&mut observer, [84; 32], [1; 32]) else { panic!() };
+                    assert!(matches!(observer.call(Command::Cancel(newer)), Ok(Answer::Ack(_))));
+                } else {
+                    // Observe the reader's new execution and leave it as the sole interest.
+                    let Answer::Binding(joined) = submit(&mut observer, unit.spec, [0; 32]) else { panic!() };
+                    withdrawing = Some(joined.subscription.execution);
+                    assert!(matches!(observer.call(Command::Cancel(joined)), Ok(Answer::Ack(_))));
+                }
+                if arrival == Arrival::LostPack {
+                    let pack = &first.packs.first().unwrap().pack;
+                    let file = format_in!(alloc, "blobs/packs/{}.pack", blaze_wire::json::hex(pack));
+                    unlink_path(world.dir.join(file.as_str()).as_str()).unwrap();
+                }
+            }
+            resume.send(()).unwrap();
+            let result = reader.join().unwrap();
+            stop_proxy.store(true, Ordering::Release);
+            proxy.join().unwrap();
+            match arrival {
+                Arrival::Live | Arrival::Delivered => {
+                    let got = result.unwrap();
+                    assert_eq!(got.values, first.values);
+                    assert_eq!(got.values.get(&extra.key), Some(&(extra.kind, extra.bytes.clone())));
+                    assert_eq!((got.compiled_here, got.stored_here, got.grants), (0, 0, 0));
+                    assert!(got.compiled_keys.is_empty());
+                    if arrival == Arrival::Live {
+                        assert_eq!(got.source, Source::Executed);
+                        assert_eq!((got.execution, got.publication_attempt), (first.execution, first.publication_attempt));
+                    } else {
+                        assert_eq!(got.source, Source::Published);
+                        assert_eq!((got.execution, got.attempt, got.publication_attempt, got.joined), (None, None, None, false));
+                        let no_carrier = config("there-is-no-carrier-here", &world.blobs);
+                        let warm = agent::run(&no_carrier, unit, &mut Reader, never).unwrap();
+                        assert_eq!((warm.source, warm.values), (Source::Published, first.values));
+                    }
+                }
+                Arrival::Superseded => assert!(matches!(result, Err(Error::Ended(t)) if t.outcome == blaze_wire::Outcome::Cancelled)),
+                Arrival::LostPack | Arrival::FailedLiveRead => {
+                    assert!(matches!(agent::decide(&LocalPolicy::Fallback, result.unwrap_err(), alloc), Err(Error::Committed(_))));
+                }
+            }
+            if let Some(old) = withdrawing {
+                let Answer::Binding(fresh) = submit(&mut observer, unit.spec, [0; 32]) else { panic!() };
+                assert_ne!(fresh.subscription.execution, old, "the reader left its sole subscription");
+                assert!(matches!(observer.call(Command::Cancel(fresh)), Ok(Answer::Ack(_))));
+            }
+            assert_eq!(tails.load(Ordering::SeqCst), 1);
+        });
+        observer.release().unwrap();
+    }
 }

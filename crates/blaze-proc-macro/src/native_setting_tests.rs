@@ -141,6 +141,7 @@ fn unit(name: &str, kind: UnitKind<'static>, deps: &[u32], build_script: Option<
 fn setting<'s>(store: &'s Path, native: Option<NativeSetting<'s>>) -> Setting<'s> {
     Setting {
         store,
+        module: None,
         target: HOST,
         host: HOST,
         table: Arc::new(Vec::new()),

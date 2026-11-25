@@ -877,6 +877,7 @@ fn edge_at<'l, R>(
         driver: flags.driver,
         ready_plant: crate::engine_ready_edit::CommitPlant::None,
         features: flags.feature_ask(),
+        profile: blaze_manifest::layout::profile::BuiltinProfile::Dev,
     };
     // `requests` is `&'static` (the handlers' one board), so the guard moves into the edge.
     let edge = Edge {
@@ -1000,12 +1001,14 @@ pub(crate) fn check_for_start<R>(
     heap: &'static blaze_own::Heap,
     flags: &crate::Flags<'_>,
     quiet_when_clean: bool,
+    profile: blaze_manifest::layout::profile::BuiltinProfile,
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
     start: impl for<'r, 'm> FnOnce(Standing<'r, 'm>, &mut Phases, &mut bstd::rng::Rng) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
     check_and_open(
         cx, args, fs, env, net, host, rng, out, err, phases, heap, flags,
         OpenMode::Start { quiet_when_clean },
+        profile,
         live,
         |ci, phases, rng| {
             let standing = ci.standing.ok_or(EngineCheckError::StartNoGraph)?;
@@ -1037,6 +1040,7 @@ pub(crate) fn check_for_ci<R>(
     check_and_open(
         cx, args, fs, env, net, host, rng, out, err, phases, heap, flags,
         OpenMode::Ci { apply_fixes },
+        blaze_manifest::layout::profile::BuiltinProfile::Dev,
         None,
         then,
     )
@@ -1058,6 +1062,7 @@ fn check_and_open<R>(
     heap: &'static blaze_own::Heap,
     flags: &crate::Flags<'_>,
     mode: OpenMode,
+    profile: blaze_manifest::layout::profile::BuiltinProfile,
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
     then: impl for<'r, 'm, 'f> FnOnce(CiContext<'r, 'm, 'f>, &mut Phases, &mut bstd::rng::Rng) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
@@ -1093,7 +1098,7 @@ fn check_and_open<R>(
                 false
             }
         };
-        let opts = opts();
+        let opts = Opts { profile, ..opts() };
         let toolchain = opts.toolchain;
         let checked = check_live(cx, fs, host, rng, args, net, root, opts, &mut shown, phases, out, err, live)?;
         // The check has answered: its signals go back before the start, which takes the
@@ -1110,7 +1115,7 @@ fn check_and_open<R>(
         let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
         let request_mem = crate::engine_phase_mem::RequestMem::new()?;
         let alloc = request_mem.shared();
-        let answer_root = crate::engine_answer::root_name_for(place.checkout, flags.feature_ask(), frame);
+        let answer_root = crate::engine_answer::root_name_for_profile(place.checkout, flags.feature_ask(), profile, frame);
         let pointer = match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {
             Some(Ok(pointer)) => Some(pointer),
             Some(Err(why)) if require_graph => return Err(EngineCheckError::StartNoAnswer { why: Some(why) }.into()),
@@ -1343,6 +1348,8 @@ pub(crate) struct Opts<'f> {
     pub(crate) ready_plant: crate::engine_ready_edit::CommitPlant,
     /// Feature selection passed into the unit graph and the answer root key (rule 21).
     pub(crate) features: crate::graph::FeatureAsk<'f>,
+    /// Selected built-in profile: partitions certificates and selects the graph's panic cfg.
+    pub(crate) profile: blaze_manifest::layout::profile::BuiltinProfile,
 }
 
 /// The most one request's frame takes: its blocks are taken as it is used (blaze-mem
@@ -1586,7 +1593,7 @@ fn checking<'f, 'd>(
 ) -> Result<BoxedChecked, CliError> {
     #[cfg(test)]
     stack_probe::at("checking");
-    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, features } = opts;
+    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, features, profile } = opts;
     // The oracle compares every crate's names, so every crate is entered: no stored answer read.
     let fresh = fresh || names_oracle.on();
     let began = phases.now();
@@ -1619,7 +1626,7 @@ fn checking<'f, 'd>(
     phases.mark_cx(cx, "store open", frame);
     // 0. The stored answer (engine_answer.rs): its pointer, then the sweep of what it read.
     // Nothing moved, nothing owed and no findings kept: the certificate, from the pointer alone.
-    let answer_root = crate::engine_answer::root_name_for(place.checkout, features, frame);
+    let answer_root = crate::engine_answer::root_name_for_profile(place.checkout, features, profile, frame);
     let view_slot = crate::engine_lines::ViewSlot::load(&opened.lent, answer_root.as_str(), fresh, shown, &tools, frame)?;
     // The pointer and the last request's lines, in a frame of their own ([`own_frame`]).
     let (mut unreadable, pointer, last_lines, other_checkout) = own_frame(|| -> Result<_, CliError> {
@@ -2037,7 +2044,7 @@ fn checking<'f, 'd>(
             phases.mark_cx(cx, "layout", frame);
             let units = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
             if let (Some(lockfile), Some(parts)) = (laid_here.lock.as_ref(), laid_here.parts.take()) {
-                let program = crate::program::dev_profile_panic(cx, root, frame)?;
+                let program = crate::program::profile_panic(cx, root, profile, frame)?;
                 // Each with the rustflags cargo gives its unit (graph.rs `target_of`): a `--cfg`
                 // of the checkout's `.cargo/config.toml` reaches every unit's cfg.
                 let target = crate::graph::target_of(cx, &env, &laid_here.rustflags, program, &blaze_unit_graph::UnitKind::Lib, frame)?;

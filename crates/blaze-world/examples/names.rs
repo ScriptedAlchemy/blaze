@@ -1413,7 +1413,7 @@ fn count(names: &blaze_scope::resolve::Names<'static>, inners: Option<&[blaze_sc
         n.imports += m.decls.uses.len();
         n.macro_paths += m.decls.calls.len();
     }
-    let use_loc = |fragment, index: u32| c.tables.use_locs.get(&fragment).and_then(|locs: &AVec<'_, Loc>| locs.get(index as usize).copied());
+    let use_loc = |fragment, index: u32| c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(index as usize).map(|span| span.start()));
     for r in c.done.values() {
         let mpath = c.path_of(r.scope.module).unwrap_or_default().to_string();
         for error in r.scope.errors.iter() {

@@ -17,6 +17,9 @@
 //!
 //! Without the piece: "unresolved import `blaze_export::native_so`".
 
+#[path = "native_so/rust_cdylib.rs"]
+mod rust_cdylib;
+
 use blaze_export::native_so::{SoError, write};
 use blaze_native::Platform;
 use blaze_native::image::{FixTo, Fixup, Image, Import, Placed, Region, TlsReloc};

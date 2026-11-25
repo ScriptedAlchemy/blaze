@@ -14,6 +14,7 @@
 #![feature(thread_local)]
 
 pub mod argv;
+pub mod backend_plan;
 pub mod body_ids;
 mod class_chain;
 pub mod code_records;

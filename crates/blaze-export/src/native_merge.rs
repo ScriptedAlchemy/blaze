@@ -404,6 +404,10 @@ fn resolve_direct<'a>(
     let mut mangled: AVec<'_, u8> = Vec::new_in(alloc);
     for (k, import) in laid.imports.iter().enumerate() {
         let raw_name = import.name.strip_prefix('\x02').unwrap_or(import.name);
+        if add_underscore && laid.entry == 0 && import.is_dso_handle() {
+            direct.push((u32_of_usize(k, "a program import row")?, 0));
+            continue;
+        }
         let needle: &[u8] = if add_underscore {
             mangled.clear();
             mangled.push(b'_');
@@ -470,7 +474,12 @@ pub fn merge<'a, 'i>(
     for f in image.fixups.iter() {
         let to = match f.to {
             // The tag stays; the image address moves by `shift`.
-            NativeFix::Rebase { address, high8 } => Chain::Rebase { target: target36(address.get() + shift)?, high8 },
+            NativeFix::Rebase { address, high8 } => {
+                // A merged library's native linker-header symbol names this whole image,
+                // not the unmapped gap before the appended native text.
+                let target = if laid.entry == 0 && address.get() == 0 { 0 } else { address.get() + shift };
+                Chain::Rebase { target: target36(target)?, high8 }
+            },
             NativeFix::Import { index, addend } => {
                 let k = rows.binary_search(&(index, addend)).map_err(|_| MergeError::TooLarge { what: "an import row of the native image", len: u64::from(index) })?;
                 Chain::Bind { import: first_row + u32_of_usize(k, "an import row")? }
@@ -833,8 +842,25 @@ mod tests {
             tables_room: 0x8000 - START,
             mod_init_at: None,
             has_tls: false,
+            tls_desc_at: None,
             tls_count: 0,
         }
+    }
+
+    #[test]
+    fn library_native_header_rebase_names_the_whole_loaded_image() {
+        let mut img = image(true);
+        img.fixups.iter_mut().find(|f| f.at == 0xC028).unwrap().to = FixTo::rebase(0);
+        let mut program = laid(&[(Symbol::of_name("rust_six"), 0x5000)]);
+        program.entry = 0;
+        let libraries = super::libraries(&img, alloc()).unwrap();
+        let m = merge(&program, &img, &exports(), libraries, alloc()).unwrap();
+        assert!(m.fixups.iter().any(|&(at, to)| at == 0xC028 + SHIFT && to == Chain::untagged(0).unwrap()));
+        // Control: the executable merge preserves its historical target translation.
+        program.entry = START;
+        let libraries = super::libraries(&img, alloc()).unwrap();
+        let m = merge(&program, &img, &exports(), libraries, alloc()).unwrap();
+        assert!(m.fixups.iter().any(|&(at, to)| at == 0xC028 + SHIFT && to == Chain::untagged(SHIFT).unwrap()));
     }
 
     fn exports() -> [CExport<'static>; 1] {

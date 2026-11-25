@@ -17,6 +17,8 @@
 //!   records costs a root of one key; renewed by a run of that program from any checkout, let
 //!   go of when no checkout runs it for blaze-cas `ROOT_LIFE_NS`. It names the certificate's
 //!   run tables too (`run_ids`, `run_names`: [`start_list::Today::tables`]).
+//!   Exports use the same indexed reach writer under an artifact/profile root (`keep_export`),
+//!   without a start list; renewing it replaces the previous revision's reachable code.
 //! - [`Toolchain`]: the toolchain's records for every project on it, by the root `tool.<id>`
 //!   ([`keep_toolchain`]): std's compiled code (`CodeClass::Toolchain` writes), and from the
 //!   engine's answer std's names records with the expansion records beside them; renewed by
@@ -132,6 +134,20 @@ impl RootName {
         RootName::of(b"code.", &list.id().0)
     }
 
+    /// An exported artifact's mutable reach root, stable across source/body edits. Its profile
+    /// and target kind are separate lifetimes; no answer certificate or entry symbol enters it.
+    pub(crate) fn export(artifact: ExportArtifact<'_>) -> RootName {
+        let mut hash = blaze_ids::Hasher::new("blaze-cli export artifact root 1");
+        for part in [artifact.checkout, artifact.manifest, artifact.target, artifact.profile.name()] {
+            hash.part(part.as_bytes());
+        }
+        hash.part(match artifact.kind {
+            crate::run_package::ExportKind::Binary => b"bin",
+            crate::run_package::ExportKind::Cdylib => b"cdylib",
+        });
+        RootName::of(b"expt.", &hash.finish().0)
+    }
+
     /// The toolchain root of `toolchain`: `tool.` and the 64 hex of its id. Every project on one
     /// toolchain shares it, so std's compiled code made for one is found by the next.
     pub(crate) fn toolchain(toolchain: ToolchainId) -> RootName {
@@ -166,6 +182,15 @@ impl RootName {
     pub(crate) fn as_str(&self) -> &str {
         core::str::from_utf8(&self.0).expect("a root's name is ASCII by construction")
     }
+}
+
+/// The stable artifact identity whose current code an export keeps alive.
+pub(crate) struct ExportArtifact<'a> {
+    pub(crate) checkout: &'a str,
+    pub(crate) manifest: &'a str,
+    pub(crate) target: &'a str,
+    pub(crate) profile: blaze_manifest::layout::profile::BuiltinProfile,
+    pub(crate) kind: crate::run_package::ExportKind,
 }
 
 /// Why a root could not be set, by class and name (rule 19).
@@ -218,11 +243,23 @@ pub(crate) fn keep_program<D: Driver>(lent: &Lent<D, StoreAlloc>, today: &start_
     if let Some(bytes) = list {
         kept.stale_rows = start_list::rooted_keys(lent, &today.name, bytes, &mut keys).map_err(RootError::List)?;
     }
+    Ok((keep_program_keys(lent, root, &keys)?, kept))
+}
+
+/// The exported program has no start list. Every successful code read/write is already in
+/// `walked`, including pointers and targets, across all library entry roots. No table or list
+/// key is invented: only persisted records reached through HomeCodeStore are named.
+pub(crate) fn keep_export<D: Driver>(lent: &Lent<D, StoreAlloc>, artifact: ExportArtifact<'_>, walked: &[CasKey]) -> Result<Rooted<Program>, RootError> {
+    keep_program_keys(lent, RootName::export(artifact), walked)
+}
+
+/// The one indexed root writer for run lists and exported artifacts.
+fn keep_program_keys<D: Driver>(lent: &Lent<D, StoreAlloc>, root: RootName, keys: &[CasKey]) -> Result<Rooted<Program>, RootError> {
     // The index sorts and dedups (blaze-cas `Plain::index`); its cap is the store's refusal.
     let store = |why| RootError::Store { class: Program::WHAT, root, why };
-    let index = lent.index(&keys).map_err(store)?;
+    let index = lent.index(keys).map_err(store)?;
     let at = lent.root_through(root.as_str(), &[index], ROOT_LIFE_NS).map_err(store)?;
-    Ok((Rooted::new(at), kept))
+    Ok(Rooted::new(at))
 }
 
 /// Pins a test suite's kept incremental state (pointer, state record, head, postings, result

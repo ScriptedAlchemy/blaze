@@ -1181,6 +1181,7 @@ mod tests {
             (Area::Cli, crate::work::MODULE_AT_BOTH),
             (Area::Cli, crate::work::FILE_NOT_TEXT),
             (Area::Cli, crate::names::UNRESOLVED),
+            (Area::Cli, crate::names::DUPLICATE_IMPORT),
             (Area::Cli, crate::names::UNRESOLVED_PRIVATE),
             (Area::Cli, crate::names::UNRESOLVED_AMBIGUOUS),
             (Area::Cli, crate::names::UNRESOLVED_NOT_A_MODULE),

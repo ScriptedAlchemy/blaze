@@ -1056,7 +1056,7 @@ pub fn file_attrs<'t, 'a>(cfg: &Cfg<'_, '_>, outline: &Outline<'_>, text: &'t st
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PTok<'t> {
-    Ident(&'t str),
+    Ident(&'t str, Range),
     Colons,
     Open,
     Close,
@@ -1124,7 +1124,8 @@ impl<'t> Iterator for PLex<'t> {
                     {
                         self.at += 1;
                     }
-                    return Some(Ok(PTok::Ident(unraw(&text[at..self.at]))));
+                    let (Ok(start), Ok(end)) = (u32::try_from(at), u32::try_from(self.at)) else { return Some(Err(())) };
+                    return Some(Ok(PTok::Ident(unraw(&text[at..self.at]), Range::new(start, end))));
                 }
                 _ => {
                     self.at = bytes.len();
@@ -1204,7 +1205,7 @@ pub fn parse_path_marked<'t, 'a>(
         tokens.next();
     }
     loop {
-        let Some(Ok(PTok::Ident(name))) = tokens.next() else { return None };
+        let Some(Ok(PTok::Ident(name, _))) = tokens.next() else { return None };
         segments.push(name);
         match tokens.next() {
             None => break,
@@ -1223,6 +1224,8 @@ pub struct UseLeaf<'t, 'a> {
     pub abs: bool,
     pub segments: AVec<'a, &'t str>,
     pub form: UseForm<&'t str>,
+    /// The token binding this name, relative to the use tree, including a raw identifier's prefix.
+    pub binding: Option<Range>,
 }
 
 /// The leaves of a `use` tree, in the order written; `None` when it does not read.
@@ -1248,15 +1251,17 @@ pub fn use_leaves<'t, 'a>(text: &'t str, alloc: Alloc<'a>) -> Option<AVec<'a, Us
         }
         // Whether the tree ends in a named leaf (not a glob or an empty group).
         let mut named = true;
+        let mut binding = None;
         loop {
             match t.get(at).copied() {
-                Some(PTok::Ident(name)) => {
+                Some(PTok::Ident(name, range)) => {
                     segments.push(name);
                     at += 1;
                     if t.get(at) == Some(&PTok::Colons) {
                         at += 1;
                         continue;
                     }
+                    binding = Some(range);
                     break;
                 }
                 Some(PTok::Open) => {
@@ -1271,7 +1276,7 @@ pub fn use_leaves<'t, 'a>(text: &'t str, alloc: Alloc<'a>) -> Option<AVec<'a, Us
                 }
                 Some(PTok::Star) => {
                     at += 1;
-                    out.push(UseLeaf { abs, segments: AVec::from_slice_in(&segments, alloc), form: UseForm::Glob });
+                    out.push(UseLeaf { abs, segments: AVec::from_slice_in(&segments, alloc), form: UseForm::Glob, binding: None });
                     named = false;
                     break;
                 }
@@ -1280,11 +1285,17 @@ pub fn use_leaves<'t, 'a>(text: &'t str, alloc: Alloc<'a>) -> Option<AVec<'a, Us
         }
         if named {
             let mut rename = Rename::Same;
-            if t.get(at) == Some(&PTok::Ident("as")) {
+            if matches!(t.get(at), Some(PTok::Ident("as", _))) {
                 at += 1;
                 rename = match t.get(at).copied() {
-                    Some(PTok::Ident("_")) => Rename::Underscore,
-                    Some(PTok::Ident(name)) => Rename::To(name),
+                    Some(PTok::Ident("_", _)) => {
+                        binding = None;
+                        Rename::Underscore
+                    }
+                    Some(PTok::Ident(name, range)) => {
+                        binding = Some(range);
+                        Rename::To(name)
+                    }
                     _ => return None,
                 };
                 at += 1;
@@ -1295,7 +1306,7 @@ pub fn use_leaves<'t, 'a>(text: &'t str, alloc: Alloc<'a>) -> Option<AVec<'a, Us
                 written.pop();
                 types_only = true;
             }
-            out.push(UseLeaf { abs, segments: written, form: UseForm::Named { rename, types_only } });
+            out.push(UseLeaf { abs, segments: written, form: UseForm::Named { rename, types_only }, binding });
         }
         // A tree is read: close the groups it ends.
         loop {
@@ -1327,6 +1338,25 @@ pub fn use_leaves<'t, 'a>(text: &'t str, alloc: Alloc<'a>) -> Option<AVec<'a, Us
 pub struct Loc {
     pub file: u32,
     pub offset: u32,
+}
+
+/// A written token in a source file, or the point of the call that generated it.
+#[derive(Clone, Copy, Debug)]
+pub struct FileSpan {
+    pub file: u32,
+    pub range: Range,
+}
+
+impl FileSpan {
+    pub fn start(self) -> Loc {
+        Loc { file: self.file, offset: self.range.start }
+    }
+}
+
+impl From<Loc> for FileSpan {
+    fn from(loc: Loc) -> Self {
+        Self { file: loc.file, range: Range::new(loc.offset, loc.offset) }
+    }
 }
 
 /// Where a fragment's text is: a source file, or an expansion (whose places are its call's).
@@ -2008,7 +2038,7 @@ pub struct Lowered<'t, 'a> {
     pub impls: AVec<'a, ImplSrc<'t>>,
     pub langs: AVec<'a, LangSrc<'t>>,
     /// Where each of `decls.uses` is written, by index.
-    pub use_locs: AVec<'a, Loc>,
+    pub use_locs: AVec<'a, FileSpan>,
     pub prelude: Option<PreludeImport<'t, 'a>>,
     /// The crates of `#[macro_use] extern crate x;` items, by the name written.
     pub macro_use: AVec<'a, &'t str>,
@@ -2733,7 +2763,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                 };
                 if attrs.prelude_import {
                     match leaves.as_slice() {
-                        [UseLeaf { abs, segments, form: UseForm::Glob }] => {
+                        [UseLeaf { abs, segments, form: UseForm::Glob, .. }] => {
                             let loc = self.loc(at);
                             self.out.prelude = Some(PreludeImport { abs: *abs, segments: segments.clone_in(self.alloc), loc });
                         }
@@ -2743,10 +2773,19 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                 }
                 for leaf in leaves {
                     let pos = self.next_pos();
+                    let loc = match (self.at, leaf.binding) {
+                        (Where::File(file), Some(token)) => {
+                            let Some(range) = token.checked_shifted(tree.start).and_then(|range| item.checked_in_file(range)) else {
+                                self.note(LowerNoteKind::UseTreeNotRead, at, tree_text);
+                                return false;
+                            };
+                            FileSpan { file, range }
+                        }
+                        _ => self.loc(at).into(),
+                    };
                     let first_mark = leaf.segments.first().and_then(|s| self.mark_of(s));
                     let path = to_path_marked(leaf.abs, &leaf.segments, first_mark, self.krate, self.alloc);
                     self.out.decls.uses.push(UseDecl { path, leaf: leaf.form, vis: vis.clone(), pos });
-                    let loc = self.loc(at);
                     self.out.use_locs.push(loc);
                 }
             }

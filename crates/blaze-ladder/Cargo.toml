@@ -48,6 +48,7 @@ blaze-own = { workspace = true, features = ["std"] }
 # Signatures and bodies lowered from text, and bodies converted to the checker's form.
 blaze-lower.workspace = true
 blaze-hash.workspace = true
+blaze-int.workspace = true
 # The command's frame: a body's local items are kept in it for the command (front2/locals.rs).
 blaze-mem.workspace = true
 # A checked body to LIR, and LIR to AArch64 code (the baseline tier).

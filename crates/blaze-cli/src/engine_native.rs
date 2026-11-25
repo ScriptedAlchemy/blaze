@@ -199,7 +199,9 @@ pub(crate) struct ProgramImage<'w> {
 /// The program's laid-out native image and Rust C exports for `blaze export`
 /// (`engine_export.rs`, `blaze_export::ProgramIn::natives` and `exports`).
 pub(crate) struct ExportNative<'a> {
-    pub(crate) image: blaze_native::image::Image<'a>,
+    /// Identity of the link tables, build-script outputs, platform, SDK and native producer.
+    pub(crate) key: Key,
+    pub(crate) image: Option<blaze_native::image::Image<'a>>,
     /// Sorted by `name`, for `blaze_export::ProgramIn::exports`.
     pub(crate) exports: AVec<'a, blaze_export::CExport<'a>>,
     /// The library items of the Rust functions the native image's C words call, for `run_roots`.
@@ -775,21 +777,23 @@ pub(crate) fn image_for<'r>(
 }
 
 /// The laid-out native image (`blaze_native::image::Image`) and sorted Rust C exports for
-/// `blaze export`, allocated in `out_bump`. Returns `Ok(None)` when the program links no native
-/// objects, initializers, Rust words, or libraries beyond libSystem/libc.
+/// `blaze export`, allocated in `out_bump`. The optional image is absent when there are no
+/// native objects, initializers, Rust words, or extra libraries; a cdylib still has C exports.
 pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     cx: &Cx,
     standing: &mut Standing<'r, 'm>,
     closure: &[CrateAt],
+    kind: crate::run_package::ExportKind,
     watch: &dyn blaze_screen::Watch,
     out_frame: &'s Frame,
     out_bump: blaze_own::Bump<'s>,
-) -> Result<Option<ExportNative<'s>>, NativeError<'r>> {
+) -> Result<ExportNative<'s>, NativeError<'r>> {
     let cx = cx.span("native: layout for export");
     let prepared = prepare_crates(&cx, standing, closure, watch, out_frame)?;
     let ask = &standing.native;
     let alloc = out_bump.alloc();
     let crates = &prepared.crates;
+    let key = image_key(prepared.program, prepared.platform, &ask.producer, crates, prepared.sdk.map(|sdk| sdk.identity()));
     let mut tables = Vec::with_capacity_in(crates.len(), out_frame);
     let mut outputs = Vec::with_capacity_in(crates.len(), out_frame);
     for c in crates.iter() {
@@ -828,8 +832,9 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     };
     let has_text = image.region(blaze_native::image::Region::Text).is_some_and(|r| r.len > 0);
     let has_extra_lib = image.libraries.iter().any(|l| l.install().as_bytes() != LIB_SYSTEM && l.install().as_bytes() != LIBC_LINUX);
-    if !has_text && image.words.is_empty() && image.inits == 0 && image.tls.is_empty() && !has_extra_lib {
-        return Ok(None);
+    let has_image = has_text || !image.words.is_empty() || image.inits != 0 || !image.tls.is_empty() || has_extra_lib;
+    if !has_image && kind == crate::run_package::ExportKind::Binary {
+        return Ok(ExportNative { key, image: None, exports: Vec::new_in(alloc), items: Vec::new_in(alloc) });
     }
     // Collect every Rust C export (unmangled name -> fn symbol), sorted by name for `native_merge`.
     // Only exports actually referenced by `image.words` become mandatory `run_roots` items
@@ -838,24 +843,27 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     let mut exports: AVec<'s, blaze_export::CExport<'s>> = Vec::new_in(alloc);
     let mut items: AVec<'s, blaze_id::ItemKey> = Vec::new_in(alloc);
     let strip_underscore = matches!(prepared.platform, blaze_native::Platform::MacosArm64);
-    for table in tables.iter() {
+    for (index, table) in tables.iter().enumerate() {
         for export in table.exports.iter() {
             let checker = blaze_ladder::front2::keys::checker_of(export.item);
             let symbol = blaze_ladder::symbols::fn_symbol(checker, blaze_typeck::List::EMPTY, blaze_typeck::PTys::EMPTY, alloc)
                 .map_err(|why| NativeError::Send { words: held(bstd::mem::format_in!(out_frame, "export {} symbol: {why:?}", bstd::report::Code(export.name)).as_str(), ask) })?;
             let name = export.name.as_bytes();
-            exports.push(blaze_export::CExport { name, symbol });
             let needed_by_word = image.words.iter().any(|word| {
                 let unmangled = if strip_underscore { word.strip_prefix(b"_") } else { Some(*word) };
                 unmangled == Some(name)
             });
-            if needed_by_word && items.scan_for(&export.item).is_none() {
+            let public = kind == crate::run_package::ExportKind::Cdylib && index == 0;
+            if kind == crate::run_package::ExportKind::Binary || public || needed_by_word {
+                exports.push(blaze_export::CExport { name, symbol });
+            }
+            if (public || needed_by_word) && items.scan_for(&export.item).is_none() {
                 items.push(export.item);
             }
         }
     }
     exports.sort_unstable_by(|a, b| a.name.cmp(b.name));
-    Ok(Some(ExportNative { image, exports, items }))
+    Ok(ExportNative { key, image: has_image.then_some(image), exports, items })
 }
 
 /// The link table of the crate whose `CrateScope` record `scope` names: that record's `links`

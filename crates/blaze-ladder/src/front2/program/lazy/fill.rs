@@ -245,6 +245,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         use crate::front2::start::{Entry2, rust_start};
         use crate::run::special::{MakerStart, RootsError};
         let names = self.front.names;
+        if start == MakerStart::Library {
+            self.start = None;
+            return Ok(());
+        }
         if let MakerStart::Direct(entry) = start {
             self.start = Some(Entry2::Direct(entry));
             return Ok(());

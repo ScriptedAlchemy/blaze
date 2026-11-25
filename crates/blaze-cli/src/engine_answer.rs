@@ -92,6 +92,12 @@ pub(crate) fn root_name<'f>(checkout: &str, frame: &'f Frame) -> blaze_own::Stri
 }
 
 pub(crate) fn root_name_for<'f>(checkout: &str, features: crate::graph::FeatureAsk<'_>, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
+    root_name_for_profile(checkout, features, blaze_manifest::layout::profile::BuiltinProfile::Dev, frame)
+}
+
+/// The profile is a request input even when no source file changed. Keep its certificate,
+/// journal and ready pages under a distinct root; cross-checkout bases still replan the graph.
+pub(crate) fn root_name_for_profile<'f>(checkout: &str, features: crate::graph::FeatureAsk<'_>, profile: blaze_manifest::layout::profile::BuiltinProfile, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
     let id = ContentId::of("blaze-cli engine-check root 2", checkout.as_bytes());
     let mut name = blaze_own::String::new_in(frame);
     name.push_str("engine.");
@@ -104,6 +110,9 @@ pub(crate) fn root_name_for<'f>(checkout: &str, features: crate::graph::FeatureA
         // A frame string's write fails only when the frame is full: the name is then short and
         // names no root, so the request answers in full.
         let _ = write!(name, "{byte:02x}");
+    }
+    if profile == blaze_manifest::layout::profile::BuiltinProfile::Release {
+        name.push_str(".release");
     }
     if !features.is_default() {
         let mut tokens = blaze_own::Vec::new_in(frame);

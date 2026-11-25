@@ -140,6 +140,8 @@ pub struct Target<'a> {
     /// Found by its file (`src/lib.rs`, `src/main.rs`, `src/bin/..`), not written.
     pub found: bool,
     pub proc_macro: bool,
+    /// Explicit library products; empty means the ordinary Rust library default.
+    pub crate_types: Vec<Text<'a>, Alloc<'a>>,
     /// A `[[bin]]`'s `required-features`, as written; empty for every other target (a library
     /// or build script has none). The Cargo Book, "Cargo Targets", "The `required-features`
     /// field": "The `required-features` field specifies which features the target needs in
@@ -972,6 +974,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                 span: *span,
                 found: false,
                 proc_macro: false,
+                crate_types: Vec::new_in(alloc),
                 required_features: Vec::new_in(alloc),
             }),
             RawBuild::Auto => match self.list(&found.dir) {
@@ -983,6 +986,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                         span: package.span,
                         found: true,
                         proc_macro: false,
+                        crate_types: Vec::new_in(alloc),
                         required_features: Vec::new_in(alloc),
                     }),
                     false => None,
@@ -1145,6 +1149,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                     span: lib.span,
                     found: false,
                     proc_macro: lib.proc_macro,
+                    crate_types: lib.crate_types.clone_in(alloc),
                     required_features: Vec::new_in(alloc),
                 })
             }
@@ -1154,6 +1159,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                 span: package.span,
                 found: true,
                 proc_macro: false,
+                crate_types: Vec::new_in(alloc),
                 required_features: Vec::new_in(alloc),
             }),
             None => None,
@@ -1173,6 +1179,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                         span: package.span,
                         found: true,
                         proc_macro: false,
+                        crate_types: Vec::new_in(alloc),
                         required_features: Vec::new_in(alloc),
                     });
                 }
@@ -1202,6 +1209,7 @@ impl<'l, 'a> Passing<'l, 'a> {
             span: bin.span,
             found: false,
             proc_macro: false,
+            crate_types: Vec::new_in(alloc),
             required_features: bin.required_features.clone_in(alloc),
         })
     }

@@ -673,12 +673,12 @@ fn read_members(checkout: &Path, alloc: blaze_own::Alloc<'_>) -> Result<Vec<Path
     use blaze_manifest::layout::{Entry, Layout, Need, Pass};
     let absent = |error: &std::io::Error| matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory);
     let root = checkout.join("Cargo.toml");
-    let mut reader = Layout::new("", alloc).map_err(|why| Failure::Manifest { path: root.clone(), why: why.to_string() })?;
+    let mut reader = Layout::new("", alloc).map_err(|why| Failure::Manifest { path: root.clone(), why: why.to_string() })?.with_path_packages();
     for _ in 0..LAYOUT_PASSES {
         let needs = match reader.pass().map_err(|why| Failure::Manifest { path: root.clone(), why: why.to_string() })? {
             Pass::Done(units) => {
                 let mut out = Vec::with_capacity(units.members.len());
-                for member in units.members.iter() {
+                for member in units.members.iter().chain(units.path_packages.iter()) {
                     let dir = member.dir.as_str();
                     out.push(PathPackage {
                         name: member.name.as_str().to_owned(),
@@ -747,7 +747,7 @@ enum Origin {
     Registry { checksum: String },
     /// A workspace or path package of the checkout: its folder, [`files_digest`] of it, and its
     /// manifest with what it inherits written in ([`inherit`]).
-    Path { dir: PathBuf, files: String, manifest: String },
+    Path { dir: PathBuf, files: String, manifest: String, workspace: Option<String> },
     /// A package of a git commit the lock pins: the commit, the package's folder in it (`.` at
     /// the root), the commit's files as the fetch store's verified pack holds them written out
     /// under `<work>/git/<commit>` (`dir` is the package's folder there), and its manifest with
@@ -837,8 +837,11 @@ impl Origin {
             None => {
                 let dir = members.find(wanted, alloc)?;
                 let path = dir.join("Cargo.toml");
-                let manifest = inherit(&read(&path)?, &read(&checkout.join("Cargo.toml"))?, checkout, &path)?;
-                Ok(Origin::Path { files: files_digest(&dir)?, dir, manifest })
+                let raw = read(&path)?;
+                let root = read(&checkout.join("Cargo.toml"))?;
+                let manifest = inherit(&raw, &root, checkout, &path)?;
+                let workspace = (dir != *checkout && !blaze_manifest::bootstrap::standalone_manifest(&raw, alloc)).then_some(root);
+                Ok(Origin::Path { files: files_digest(&dir)?, dir, manifest, workspace })
             }
         }
     }
@@ -850,6 +853,16 @@ impl Origin {
             Origin::Registry { checksum } => format!("checksum {checksum}"),
             Origin::Path { files, .. } => format!("files {files}"),
             Origin::Git { commit, path, .. } => format!("git {commit} {path}"),
+        }
+    }
+
+    fn script_identity_line(&self) -> String {
+        match self {
+            Origin::Path { files, workspace, .. } => {
+                let source = blaze_manifest::bootstrap::path_source(files.as_bytes().try_into().expect("package SHA-256"), workspace.as_ref().map(|text| text.as_bytes()));
+                format!("files {}", core::str::from_utf8(&source).expect("hexadecimal source pin"))
+            }
+            _ => self.identity_line(),
         }
     }
 }

@@ -526,13 +526,16 @@ class ReleaseFoldEvidence(unittest.TestCase):
         grants = [grant(pid=pid, holder=str(pid), seq=pid, work=[key])
                   for pid, key in ((123, KEY), (124, OTHER))]
         events = [*grants, *[{**g, "event": "result_accepted"} for g in grants]]
-        for g in grants:
-            events.append({"event": "backend_work", "pid": g["pid"], "unit_digest": UNIT,
-                           "work": g["work"], "compiled_keys": g["work"],
-                           "release_keys": g["work"], "folded_keys": g["work"]})
-        rows = [row(compiled_for_work=2, work_compiled_keys=[KEY, OTHER])]
+        outputs = []
+        for g, folded in zip(grants, ("44" * 32, "55" * 32), strict=True):
+            made = [*g["work"], folded]
+            events.append({**g, "event": "backend_work", "compiled_keys": made,
+                           "release_keys": g["work"], "folded_keys": [folded]})
+            outputs.extend(made)
+        rows = [row(compiled_for_work=len(outputs), work_compiled_keys=outputs)]
         e.release_fold(rows, events)
-        for plant in ("one_holder", "no_accept", "planned_only", "unreported"):
+        for plant in ("one_holder", "no_accept", "planned_only", "unreported", "same_key",
+                      "wrong_execution", "expired_lease", "other_batch", "different_result"):
             changed = json.loads(json.dumps(events))
             if plant == "one_holder":
                 changed = [event for event in changed if event.get("pid") != 124 and event.get("holder") != "124"]
@@ -540,8 +543,14 @@ class ReleaseFoldEvidence(unittest.TestCase):
                 changed = [event for event in changed if event["event"] != "result_accepted"]
             elif plant == "planned_only":
                 changed[-1]["compiled_keys"] = []
-            else:
+            elif plant == "unreported":
                 changed[-1]["compiled_keys"].append("ff" * 32)
+            elif plant == "same_key":
+                changed[-1]["folded_keys"] = changed[-1]["release_keys"]
+            elif plant == "different_result":
+                next(ev for ev in changed if ev["event"] == "result_accepted")["work"] = []
+            else:
+                changed[-1][{"wrong_execution": "execution", "expired_lease": "generation", "other_batch": "seq"}[plant]] += 1
             with self.subTest(plant=plant), self.assertRaises(e.Failed):
                 e.release_fold(rows, changed)
 

@@ -20,6 +20,8 @@
 // links no Wasmtime.
 pub mod comptime_patch;
 pub mod module;
+pub mod script_module;
+pub mod script_root;
 pub mod package_env;
 pub mod parts;
 pub mod record;

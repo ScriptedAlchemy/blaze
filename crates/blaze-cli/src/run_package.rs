@@ -103,6 +103,9 @@ pub struct Program<'f> {
     pub edition: &'f str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExportKind { Binary, Cdylib }
+
 impl<'f> Program<'f> {
     /// The units of the program's package: where `run`'s closure starts (units.rs names each
     /// member's units by its manifest's path).
@@ -126,6 +129,8 @@ type Owneds = std::vec::Vec<Owned, std::alloc::Global>;
 /// Why no program was chosen: each names what was asked and what the workspace has.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PickError {
+    NoCdylib { package: Owned },
+    WhichLibrary { packages: Owneds },
     /// `-p <asked>` names no member: the members' packages, in the layout's order.
     NoSuchPackage { asked: Owned, packages: Owneds },
     /// The package has no binary target (a library alone).
@@ -183,6 +188,11 @@ impl core::fmt::Display for PickError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let rule = "run_package.rs";
         match self {
+            PickError::NoCdylib { package } => write!(f, "package `{package}` has no library with `crate-type = [\"cdylib\"]` ({rule})"),
+            PickError::WhichLibrary { packages } => {
+                write!(f, "select one shared library with `blaze export -p <name> --lib`; available packages: ")?;
+                listed(f, packages)
+            }
             PickError::NoSuchPackage { asked, packages } => {
                 write!(f, "`-p {asked}`: the workspace has no package `{asked}`; its packages: ")?;
                 listed(f, packages)?;
@@ -290,12 +300,16 @@ fn at_dir<'u, 'a>(members: &'u [Member<'a>], dir: &str) -> Result<Option<&'u Mem
 
 /// The package and binary `select` chooses from the workspace's layout, the root's manifest
 /// text beside it (for `default-members`).
-fn choose<'u, 'a>(units: &'u Units<'a>, root_text: &str, select: Select<'_>, frame: &Frame) -> Result<(&'u Member<'a>, &'u Target<'a>), PickError> {
+fn choose_export<'u, 'a>(units: &'u Units<'a>, root_text: &str, select: Select<'_>, kind: ExportKind, frame: &Frame) -> Result<(&'u Member<'a>, &'u Target<'a>), PickError> {
     let members = units.members.as_slice();
     if select.test_packages.len() > 1 {
         return Err(PickError::SeveralPackages { asked: select.test_packages.iter().map(|asked| owned(asked)).collect() });
     }
     let with_bins = || -> Owneds { members.iter().filter(|member| !member.bins.is_empty()).map(|member| owned(member.name.as_str())).collect() };
+    let has_product = |member: &&Member<'_>| match kind {
+        ExportKind::Binary => !member.bins.is_empty(),
+        ExportKind::Cdylib => member.lib.as_ref().is_some_and(|lib| !lib.proc_macro && lib.crate_types.iter().any(|ty| ty.as_str() == "cdylib")),
+    };
     let here = at_dir(members, select.member)?;
     let member = match (select.package, select.bin, here) {
         (Some(asked), _, _) => named(members, asked)?,
@@ -324,20 +338,25 @@ fn choose<'u, 'a>(units: &'u Units<'a>, root_text: &str, select: Select<'_>, fra
                 // written, every member.
                 let mut programs: Vec<&Member<'_>, &Frame> = Vec::new_in(frame);
                 let defaults = for_defaults(root_text, members, frame, |member| {
-                    if !member.bins.is_empty() && !programs.iter().any(|seen| core::ptr::eq(*seen, member)) {
+                    if has_product(&member) && !programs.iter().any(|seen| core::ptr::eq(*seen, member)) {
                         programs.push(member);
                     }
                 })?;
                 if defaults != DefaultPaths::Listed {
-                    programs.extend(members.iter().filter(|member| !member.bins.is_empty()));
+                    programs.extend(members.iter().filter(has_product));
                 }
                 match programs.as_slice() {
                     [member] => *member,
+                    _ if kind == ExportKind::Cdylib => return Err(PickError::WhichLibrary { packages: members.iter().filter(has_product).map(|member| owned(member.name.as_str())).collect() }),
                     _ => return Err(PickError::WhichPackage { packages: with_bins() }),
                 }
             }
         },
     };
+    if kind == ExportKind::Cdylib {
+        return member.lib.as_ref().filter(|lib| !lib.proc_macro && lib.crate_types.iter().any(|ty| ty.as_str() == "cdylib"))
+            .map(|lib| (member, lib)).ok_or_else(|| PickError::NoCdylib { package: owned(member.name.as_str()) });
+    }
     let bin = match select.bin {
         Some(asked) => match member.bins.iter().find(|bin| bin.name.as_str() == asked) {
             Some(bin) => bin,
@@ -636,9 +655,13 @@ fn beneath(path: &str, entry: &str) -> bool {
 /// read by the workspace's manifest reader (blaze-manifest `Layout`) through `root`, every text
 /// kept in `frame`.
 pub(crate) fn pick<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame: &'f Frame) -> Result<Program<'f>, CliError> {
+    pick_export(cx, root, select, ExportKind::Binary, frame)
+}
+
+pub(crate) fn pick_export<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, kind: ExportKind, frame: &'f Frame) -> Result<Program<'f>, CliError> {
     let cx = cx.span("blaze run: which program");
     with_layout(&cx, root, "", frame, |units, root_text| {
-        let (member, bin) = choose(units, root_text, select, frame).map_err(CliError::RunPackage)?;
+        let (member, bin) = choose_export(units, root_text, select, kind, frame).map_err(CliError::RunPackage)?;
         let manifest = units.manifests.get(member.manifest.0 as usize).ok_or(CliError::Text { what: "the layout names a manifest it did not read (run_package.rs)" })?;
         let edition = match member.edition.blaze {
             Some(blaze) => blaze.manifest(),
@@ -809,6 +832,25 @@ mod tests {
     }
 
     const THREE: &str = "[workspace]\nmembers = [\"app\", \"tool\", \"lib\"]\n";
+
+    #[test]
+    fn export_selects_only_the_requested_product() {
+        let files = [
+            ("Cargo.toml", "[workspace]\nmembers = ['app', 'exported']\n"),
+            ("app/Cargo.toml", "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2021'\n"),
+            ("app/src/main.rs", "fn main() {}"),
+            ("exported/Cargo.toml", "[package]\nname = 'exported'\nversion = '0.1.0'\nedition = '2021'\n[lib]\ncrate-type = ['cdylib']\n"),
+            ("exported/src/lib.rs", "pub extern \"C\" fn exported_len() -> usize { 12 }"),
+        ];
+        checkout(&files, |cx, root| {
+            let app = pick_export(cx, root, Select { package: Some("app"), ..Select::NONE }, ExportKind::Binary, cx.frame()).unwrap();
+            assert_eq!(app.root, "app/src/main.rs");
+            let library = pick_export(cx, root, Select { package: Some("exported"), ..Select::NONE }, ExportKind::Cdylib, cx.frame()).unwrap();
+            assert_eq!(library.root, "exported/src/lib.rs");
+            assert!(matches!(pick_export(cx, root, Select { package: Some("app"), ..Select::NONE }, ExportKind::Cdylib, cx.frame()), Err(CliError::RunPackage(PickError::NoCdylib { .. }))));
+            assert!(matches!(pick_export(cx, root, Select { package: Some("exported"), ..Select::NONE }, ExportKind::Binary, cx.frame()), Err(CliError::RunPackage(PickError::NoBinary { .. }))));
+        });
+    }
 
     #[test]
     fn test_selection_honors_workspace_defaults_before_the_root_package() {

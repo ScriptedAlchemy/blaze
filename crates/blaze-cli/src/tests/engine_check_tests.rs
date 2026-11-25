@@ -7,8 +7,59 @@
 
 use super::*;
 
-/// A crate root, two modules (one nested), and a stray `}` in `src/a/b.rs`: a file-level
-/// syntax error in a file the walk reaches two `mod`s down.
+/// Switching profiles without editing sources must leave the old certificate and select the
+/// new panic cfg. Both explicit overflow values are read from the same selected table.
+fn selected_profile_case(use_dev_for_release: bool, force_overflow_off: bool) {
+    use blaze_manifest::layout::profile::BuiltinProfile::{Dev, Release};
+    let io = Io::simulated(SimWorld::new(901, Limits::USUAL));
+    typed_crates(&io, Typed::Plain);
+    write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n[profile.dev]\npanic = \"unwind\"\noverflow-checks = false\n[profile.release]\npanic = \"abort\"\noverflow-checks = true\n");
+    write(&io, "a/src/lib.rs", "#[cfg(panic = \"unwind\")]\npub fn one() -> u8 { 1 }\n");
+    let run = |profile| engine_opts(&io, engine_check::Opts { profile, ..opts(&io, 1, false) });
+    let (dev_ids, dev) = run(Dev);
+    assert_eq!(dev.status.0, 0, "dev selects the unwind function: {dev_ids:?}");
+    let (_, dev_warm) = run(Dev);
+    assert!(dev_warm.certified && dev_warm.entered == 0, "unchanged dev has its certificate");
+    let selected = if use_dev_for_release { Dev } else { Release };
+    let (release_ids, release) = run(selected);
+    assert_ne!(release.status.0, 0, "release removes the unwind-only function: {release_ids:?}");
+    assert!(!release.certified, "a dev certificate cannot answer release");
+    let (_, dev_again) = run(Dev);
+    assert!(dev_again.certified && dev_again.entered == 0, "release leaves the dev answer intact");
+
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("context");
+    let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("path")).expect("root");
+    assert!(!crate::program::profile_overflow(&cx, &root, Dev, cx.frame()).expect("dev overflow").on());
+    let overflow = crate::program::profile_overflow(&cx, &root, selected, cx.frame()).expect("release overflow");
+    let overflow = if force_overflow_off { blaze_ladder::run::OverflowChecks::Off } else { overflow };
+    assert!(overflow.on(), "release honors explicit overflow checks");
+    assert_eq!(crate::program::profile_panic(&cx, &root, selected, cx.frame()).expect("release panic"), blaze_manifest::layout::panic::ProfilePanic::Abort);
+
+    write(&io, "a/src/lib.rs", "#[cfg(panic = \"abort\")]\npub fn one() -> u8 { 1 }\n");
+    let (release_ids, fixed) = run(Release);
+    assert_eq!(fixed.status.0, 0, "release selects the abort function: {release_ids:?}");
+    let (_, warm) = run(Release);
+    assert!(warm.certified && warm.entered == 0, "unchanged release has its own certificate");
+}
+
+#[test]
+fn selected_profile_changes_cfg_and_preserves_warm_answers() {
+    selected_profile_case(false, false);
+}
+
+#[test]
+#[should_panic(expected = "release removes the unwind-only function")]
+fn selected_profile_oracle_catches_dev_settings_for_release() {
+    selected_profile_case(true, false);
+}
+
+#[test]
+#[should_panic(expected = "release honors explicit overflow checks")]
+fn selected_profile_oracle_catches_hardcoded_overflow_off() {
+    selected_profile_case(false, true);
+}
+
+/// A crate root, two nested modules, and a stray `}` two modules down.
 fn workspace(io: &Io) {
     write(io, "Cargo.toml", MANIFEST);
     write(io, "src/lib.rs", "mod a;\n\npub fn top() -> u32 {\n    1\n}\n");
@@ -61,6 +112,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         driver: crate::engine_ready_edit::Driver::Phases,
         ready_plant: crate::engine_ready_edit::CommitPlant::None,
         features: crate::graph::FeatureAsk::DEFAULT,
+        profile: blaze_manifest::layout::profile::BuiltinProfile::Dev,
     }
 }
 

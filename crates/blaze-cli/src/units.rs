@@ -12,6 +12,7 @@
 
 use blaze_drive::{Locate, Name, Part, Task};
 use blaze_ids::ContentId;
+use blaze_int::Int;
 use blaze_manifest::layout::{self, Entry, Layout, LayoutError, Need, Pass, Source, Span};
 use blaze_own::{Alloc, Texts, Vec};
 use blaze_surface::Edition;
@@ -167,6 +168,7 @@ pub fn lay<'f, 'l>(
     let mut members = Vec::new_in(frame);
     let mut path_roots: Vec<(&'f str, u8), &'f Frame> = Vec::new_in(frame);
     let mut member_deps: Vec<crate::unused_deps::MemberDeps<'f>, &'f Frame> = Vec::new_in(frame);
+    let mut inherited_scripts = Vec::new_in(frame);
     let mut root_made = Made::new_in(Name::units(), frame);
     let mut facts = None;
     match laid {
@@ -204,8 +206,11 @@ pub fn lay<'f, 'l>(
                 // A member proc-macro crate's files, whole: its module key holds them, so they are
                 // in the units' source (macro_files.rs, rule 21), each file and folder with its
                 // stamp, so the next sweep proves the crate unchanged by stats alone (rule 77).
-                if member.lib.iter().any(|lib| lib.proc_macro) {
+                if member.build.is_some() || member.lib.iter().any(|lib| lib.proc_macro) {
                     crate::macro_files::read_row(&cx, root, stamps, member.dir.as_str(), rows, frame)?;
+                }
+                if !member.dir.is_empty() && !blaze_proc_macro::script_module::standalone_manifest(texts.text(member.manifest.0.widen_to()), alloc) {
+                    inherited_scripts.push((frame.alloc_str(member.dir.as_str()) as &str, texts.text(units.root.0.widen_to()).as_bytes()));
                 }
             }
             // Non-member path packages: keep each target root's edition for the file walk and
@@ -215,8 +220,11 @@ pub fn lay<'f, 'l>(
                 for target in pkg.lib.iter().chain(pkg.bins.iter()).chain(pkg.build.iter()) {
                     path_roots.push((frame.alloc_str(target.root.as_str()), edition));
                 }
-                if pkg.lib.iter().any(|lib| lib.proc_macro) {
+                if pkg.build.is_some() || pkg.lib.iter().any(|lib| lib.proc_macro) {
                     crate::macro_files::read_row(&cx, root, stamps, pkg.dir.as_str(), rows, frame)?;
+                }
+                if !pkg.dir.is_empty() && !blaze_proc_macro::script_module::standalone_manifest(texts.text(pkg.manifest.0.widen_to()), alloc) {
+                    inherited_scripts.push((frame.alloc_str(pkg.dir.as_str()) as &str, texts.text(units.root.0.widen_to()).as_bytes()));
                 }
             }
         }
@@ -267,7 +275,16 @@ pub fn lay<'f, 'l>(
     };
     let parts = match (facts, &lock) {
         (Some((facts, _)), Some(lockfile)) => match facts.locked(lockfile.lock) {
-            Ok(parts) => Some(parts),
+            Ok(mut parts) => {
+                let inputs = parts.script_inputs(lockfile.lock).map_err(|why| CliError::Program(crate::ManifestRefused::of(&bstd::mem::format_in!(frame, "build-script lock closure: {why:?}"), frame)))?;
+                for entry in parts.member_dirs().iter().filter(|entry| inputs.contains(&entry.id)) {
+                    if crate::macro_files::member_hex(rows, entry.dir.as_str()).is_none() {
+                        crate::macro_files::read_row(&cx, root, stamps, entry.dir.as_str(), rows, frame)?;
+                    }
+                }
+                parts.pin_scripts(lockfile.lock, rows, &inherited_scripts);
+                Some(parts)
+            }
             Err(unlocked) => {
                 let words = bstd::mem::format_in!(frame, "{unlocked}");
                 root_made.find(crate::fetch::LOCK_UNREAD, (0, 0), &[words.as_str()]);

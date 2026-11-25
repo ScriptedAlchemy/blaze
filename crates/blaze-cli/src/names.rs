@@ -95,6 +95,11 @@ pub(crate) const RULE: &str = "names.rs";
 /// Why the names world of a command could not be made.
 #[derive(Debug)]
 pub enum NamesError {
+    ScriptSource { package: &'static str, why: crate::graph::ScriptSourceError },
+    ScriptModule(blaze_proc_macro::script_unit::ModuleLookupError),
+    ScriptChecksum { package: &'static str },
+    ScriptGitPath { package: &'static str, commit: &'static str, found: usize },
+    ScriptClosure(blaze_proc_macro::module::ClosureError),
     /// The unit graph record does not decode.
     Graph(blaze_unit_graph::record::RecordRefused),
     /// No lock was read this command.
@@ -134,6 +139,11 @@ pub enum NamesError {
 impl core::fmt::Display for NamesError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::ScriptSource { package, why } => write!(f, "{package}: {why}"),
+            Self::ScriptModule(why) => write!(f, "{why}"),
+            Self::ScriptChecksum { package } => write!(f, "{package}: the build-script package has no checksum"),
+            Self::ScriptGitPath { package, commit, found } => write!(f, "{package}: expected one bootstrap package path at git {commit}, found {found}"),
+            Self::ScriptClosure(why) => write!(f, "{why}"),
             NamesError::Graph(refused) => write!(f, "the unit graph record at byte {}: {}", refused.at, refused.why),
             NamesError::NoLock => f.write_str("no lock was read this command"),
             NamesError::NoHome => f.write_str("HOME or PWD is not set: the toolchain's shelf is under the home, reached from the start folder"),
@@ -503,6 +513,7 @@ pub(crate) const UNRESOLVED_SUPER_ABOVE_ROOT: u16 = 31;
 pub(crate) const UNRESOLVED_DOLLAR_CRATE: u16 = 32;
 pub(crate) const UNRESOLVED_WRONG_MACRO_KIND: u16 = 33;
 pub(crate) const UNRESOLVED_DERIVE_AFTER_ATTRIBUTE: u16 = 34;
+pub(crate) const DUPLICATE_IMPORT: u16 = 49;
 
 fn rule_of(why: blaze_surface::Unresolved) -> u16 {
     use blaze_surface::Unresolved as Reason;
@@ -524,7 +535,7 @@ pub(crate) fn placed(rule: u16) -> bool {
     matches!(rule,
         UNRESOLVED | UNRESOLVED_PRIVATE | UNRESOLVED_AMBIGUOUS | UNRESOLVED_NOT_A_MODULE |
         UNRESOLVED_SUPER_ABOVE_ROOT | UNRESOLVED_DOLLAR_CRATE | UNRESOLVED_WRONG_MACRO_KIND |
-        UNRESOLVED_DERIVE_AFTER_ATTRIBUTE | include_outside::INCLUDE_OUTSIDE_PACKAGE |
+        UNRESOLVED_DERIVE_AFTER_ATTRIBUTE | DUPLICATE_IMPORT | include_outside::INCLUDE_OUTSIDE_PACKAGE |
         failed_call::FAILED_CALL | test_marks::TEST_REFUSED | test_marks::TEST_DUPLICATED |
         blaze_drive::task::MODULE_FILE_MISSING_RULE | blaze_drive::task::PATH_FILE_MISSING_RULE
     )
@@ -573,7 +584,7 @@ fn find_word(text: &str, word: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// Every `use` and macro path of crate `c` that the resolver refused. The project's own (a
+/// Every repeated import and every `use` or macro path of crate `c` that the resolver refused. The project's own (a
 /// checkout file, `/0/`) are findings in `own`, sorted; the number of the others (a fetched or
 /// toolchain crate's: not the project's to fix) is returned, counted in one note. A path that
 /// waits on a failed dependency (`waits`: written into it, or failing in a scope a glob or
@@ -581,16 +592,26 @@ fn find_word(text: &str, word: &str, from: usize) -> Option<usize> {
 /// reported once, at it (plan row A8, rule 19).
 fn unresolved<'a>(c: &blaze_scope::resolve::CrateNames<'a>, member: bool, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, own: &mut PathFindings) -> u32 {
     use blaze_surface::ScopeError;
+    enum Problem<'r, 'a> {
+        Path(&'r blaze_surface::Path<'a, &'a str>, usize, blaze_surface::Unresolved),
+        DuplicateImport(&'a str),
+    }
     let project = member && c.files.iter().any(|file| file.path.starts_with("/0/"));
     let mut elsewhere = 0u32;
     for r in c.done.values() {
         for error in r.scope.errors.iter() {
-            let (loc, path, segment, why) = match error {
+            let use_loc = |site: blaze_surface::UseSite| {
+                let fragment = site.expansion.unwrap_or(r.scope.module);
+                c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(site.index as usize)).copied()
+            };
+            let (loc, problem) = match error {
                 ScopeError::Import { site, path, segment, why } => {
-                    let fragment = site.expansion.unwrap_or(r.scope.module);
-                    (c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(site.index as usize).copied()), path, *segment as usize, *why)
+                    (use_loc(*site), Problem::Path(path, *segment as usize, *why))
                 }
-                ScopeError::Macro { call, path, segment, why } => (c.tables.calls.get(call).map(|src| src.loc), path, *segment as usize, *why),
+                ScopeError::Duplicate { name, repeated_import: Some(site), .. } => {
+                    (use_loc(*site), Problem::DuplicateImport(*name))
+                }
+                ScopeError::Macro { call, path, segment, why } => (c.tables.calls.get(call).map(|src| src.loc.into()), Problem::Path(path, *segment as usize, *why)),
                 _ => continue,
             };
             let into_failed = waits.waits_on(r.scope.module, error).is_some();
@@ -601,18 +622,22 @@ fn unresolved<'a>(c: &blaze_scope::resolve::CrateNames<'a>, member: bool, waits:
             let mut message = blaze_own::Vec::new_in(*own.allocator());
             let mut at = (0u32, 0u32);
             let file = loc.and_then(|loc| c.files.get(loc.file as usize).map(|file| (loc, *file)));
-            match file.and_then(|(loc, file)| Some((loc, file, crate::work::item_holding(&file.outline, loc.offset)?))) {
-                Some((_, file, item)) => {
+            match file.and_then(|(loc, file)| Some((loc, file, crate::work::item_holding(&file.outline, loc.range.start)?))) {
+                Some((loc, file, item)) => {
                     let text = file.text;
                     let entry = item.range.of(text);
-                    // The failing segment: the path's segments found in order in the item's text.
-                    let mut from = 0usize;
-                    let mut found = None;
-                    for seg in path.segments.iter().take(segment + 1) {
-                        found = find_word(entry, seg, from).map(|start| (start, start + seg.len()));
-                        from = found.map_or(from, |(_, end)| end);
-                    }
-                    at = found.map_or((0, 0), |(s, e)| (s as u32, e as u32));
+                    at = match problem {
+                        Problem::Path(path, segment, _) => {
+                            let mut from = 0usize;
+                            let mut found = None;
+                            for seg in path.segments.iter().take(segment + 1) {
+                                found = find_word(entry, seg, from).map(|start| (start, start + seg.len()));
+                                from = found.map_or(from, |(_, end)| end);
+                            }
+                            found.map_or((0, 0), |(s, e)| (s as u32, e as u32))
+                        }
+                        Problem::DuplicateImport(_) => (loc.range.start - item.range.start, loc.range.end - item.range.start),
+                    };
                     message.extend_from_slice(file.path.trim_start_matches("/0/").as_bytes());
                     message.push(0x1F);
                     let chain = crate::work::item_chain(&file.outline, item, text);
@@ -625,12 +650,23 @@ fn unresolved<'a>(c: &blaze_scope::resolve::CrateNames<'a>, member: bool, waits:
             message.push(0x1F);
             message.push(b'0' + c.edition.byte());
             message.push(0x1F);
-            unresolved_args(&mut message, why, path.kind, &path.segments, segment);
-            own.push((rule_of(why), PathFinding { at, message }));
+            let rule = match problem {
+                Problem::Path(path, segment, why) => {
+                    unresolved_args(&mut message, why, path.kind, &path.segments, segment);
+                    rule_of(why)
+                }
+                Problem::DuplicateImport(name) => {
+                    message.extend_from_slice(name.as_bytes());
+                    DUPLICATE_IMPORT
+                }
+            };
+            own.push((rule, PathFinding { at, message }));
         }
     }
     // The scopes are a map: its order reaches the record only sorted (rule 25).
     own.sort_unstable_by(|(ra, a), (rb, b)| (ra, &a.message[..], a.at).cmp(&(rb, &b.message[..], b.at)));
+    // A struct with a constructor binds in two namespaces at the same use leaf.
+    own.dedup_by(|(ra, a), (rb, b)| *ra == DUPLICATE_IMPORT && ra == rb && a.at == b.at && a.message == b.message);
     elsewhere
 }
 
@@ -766,6 +802,7 @@ pub(crate) struct Maker<'f> {
     out: ContentId,
     lock: &'f Lock<'static>,
     members: &'f [blaze_world::CheckoutPath<'f>],
+    script_sources: &'f [(LockId, Result<crate::graph::ScriptSource, crate::graph::ScriptSourceError>)],
 }
 
 impl<'f> Maker<'f> {
@@ -775,7 +812,9 @@ impl<'f> Maker<'f> {
         for entry in members.iter() {
             held.push(blaze_world::CheckoutPath { id: entry.id, dir: crate::work::held_str(entry.dir.as_str(), frame), kind: entry.kind });
         }
-        Maker { record, out, lock, members: held.into_bump_slice() }
+        let mut script_sources = blaze_own::Vec::new_in(frame);
+        script_sources.extend(members.iter().filter_map(|entry| entry.script.as_ref().map(|source| (entry.id, source.as_ref().copied().map_err(blaze_own::Share::share)))));
+        Maker { record, out, lock, members: held.into_bump_slice(), script_sources: script_sources.into_bump_slice() }
     }
 }
 
@@ -1062,7 +1101,7 @@ impl<'f> Names<'f> {
         if view.out != maker.out {
             return refused(WorldWhy::Back(crate::engine_units::BackRefused::Out { key: maker.record }));
         }
-        let made = match make_world(&cx, root, sections.graph, maker.lock, maker.members, env, Some(self.list)) {
+        let made = match make_world(&cx, root, sections.graph, maker.lock, maker.members, &maker.script_sources, env, Some(self.list)) {
             Ok(made) => made,
             Err(why) => return refused(WorldWhy::Make(why)),
         };
@@ -1344,7 +1383,9 @@ pub(crate) fn world<'f>(
     let heap: Alloc<'static> = env.heap.alloc();
     let mut dirs: blaze_own::Vec<blaze_world::CheckoutPath<'_>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(members.len(), heap);
     dirs.extend(members.iter().map(|entry| blaze_world::CheckoutPath { id: entry.id, dir: entry.dir.as_str(), kind: entry.kind }));
-    let made = make_world(cx, root, graph_record, lock, &dirs, env, None)?;
+    let mut script_sources = blaze_own::Vec::new_in(heap);
+    script_sources.extend(members.iter().filter_map(|entry| entry.script.as_ref().map(|source| (entry.id, source.as_ref().copied().map_err(blaze_own::Share::share)))));
+    let made = make_world(cx, root, graph_record, lock, &dirs, &script_sources, env, None)?;
     let list: &'static [u8] = {
         let _cx = cx.span("names: the crate list written");
         blaze_world::crate_list::encode_with(&made.world, &made, heap).map_err(NamesError::List)?.leak_static()
@@ -1392,6 +1433,7 @@ fn make_world<'f>(
     graph_record: &[u8],
     lock_whole: &'f Lock<'static>,
     members: &[blaze_world::CheckoutPath<'_>],
+    script_sources: &[(LockId, Result<crate::graph::ScriptSource, crate::graph::ScriptSourceError>)],
     env: &FetchEnv<'_>,
     stored_list: Option<CrateList<'static>>,
 ) -> Result<NamesWorld<'f>, NamesError> {
@@ -1500,15 +1542,61 @@ fn make_world<'f>(
     let mut script_roots = std::vec::Vec::new_in(Global);
     let mut script_modules = std::vec::Vec::new_in(Global);
     let mut placements = std::vec::Vec::new_in(Global);
+    let locked_modules = blaze_proc_macro::module::LockedPackages::of(lock);
+    let module_store = std::path::Path::new(home).join(".blaze/v2");
     for (at, script) in script_units(world.crates.iter().map(|krate| krate.origin), |unit| graph.units[unit.index()].build_script) {
-        let ran_as = crate::scripts::placement(Some(home), graph, script, heap);
-        placements.push((at, ran_as));
+        let base = blaze_proc_macro::native_unit::placed(graph, script, crate::scripts::MODE, heap);
         let script = &graph.units[script.index()];
         script_roots.push((at, script.root.as_str()));
         let mut features = std::vec::Vec::new_in(Global);
         features.extend(script.features.iter().map(|feature| feature.as_str()));
-        let subject = crate::script_modules::subject(ran_as, script.name.as_str(), script.version.as_str(), &features);
-        script_modules.push(crate::script_modules::ScriptModule { subject, crate_at: at, ran_as, package: script.name.as_str(), version: script.version.as_str(), features });
+        let locked_package = lock.package(script.package);
+        use blaze_proc_macro::module::Source;
+        let (source, deps) = match &locked_package.source {
+            LockSource::Path => {
+                let source = script_sources.iter().find(|(id, _)| *id == script.package)
+                    .ok_or(NamesError::ScriptSource { package: script.name.as_str(), why: crate::graph::ScriptSourceError::MissingSnapshot })?.1.as_ref()
+                    .map_err(|why| NamesError::ScriptSource { package: script.name.as_str(), why: blaze_own::Share::share(why) })?;
+                let text = |bytes: &[u8; 64]| core::str::from_utf8(bytes).map(|text| frame.alloc_str(text) as &str)
+                    .map_err(|_| NamesError::ScriptSource { package: script.name.as_str(), why: crate::graph::ScriptSourceError::Digest });
+                (Source::Path { files_sha256: text(&source.files)? }, text(&source.deps)?)
+            }
+            LockSource::Registry { .. } => {
+                let blaze_manifest::lock::Checksum::Sha256(checksum) = &locked_package.checksum else {
+                    return Err(NamesError::ScriptChecksum { package: script.name.as_str() });
+                };
+                let deps = locked_modules.closure(script.name.as_str(), script.version.as_str()).map_err(NamesError::ScriptClosure)?;
+                (Source::Registry { checksum: frame.alloc_str(checksum.as_str()) }, frame.alloc_str(&deps) as &str)
+            }
+            LockSource::Git { commit, .. } => {
+                // The lock pins the repository; the bootstrap record names its package path.
+                // Several distinct paths for the same package are an explicit ambiguity.
+                let records = blaze_proc_macro::script_unit::records_named(&module_store, script.name.as_str(), script.version.as_str())
+                    .map_err(NamesError::ScriptModule)?;
+                let prefix = bstd::mem::format_in!(frame, "git {} ", commit.as_str());
+                let mut paths = blaze_own::Vec::new_in(frame);
+                paths.extend(records.iter().flat_map(|(_, identity)| identity.lines().filter_map(|line| line.strip_prefix(prefix.as_str()))));
+                paths.sort_unstable(); paths.dedup();
+                let [path] = paths.as_slice() else { return Err(NamesError::ScriptGitPath { package: script.name.as_str(), commit: frame.alloc_str(commit.as_str()), found: paths.len() }); };
+                let mut roots = blaze_own::Vec::new_in(frame);
+                for dep in &script.deps {
+                    let unit = graph.units.get(dep.unit.index()).ok_or(NamesError::ScriptSource { package: script.name.as_str(), why: crate::graph::ScriptSourceError::MissingSnapshot })?;
+                    roots.push(unit.name.as_str());
+                }
+                let deps = locked_modules.script_closure(script.name.as_str(), script.version.as_str(), &roots).map_err(NamesError::ScriptClosure)?;
+                (Source::Git { commit: frame.alloc_str(commit.as_str()), path: frame.alloc_str(path) }, frame.alloc_str(deps.as_str()) as &str)
+            }
+        };
+        let mut ran_as = crate::scripts::RanAs::of(&base);
+        if ran_as == crate::scripts::RanAs::Wasm {
+            let ask = |ran_as| crate::script_modules::Wanted { ran_as, package: script.name.as_str(), version: script.version.as_str(), features: &features, source, deps }.select(&module_store);
+            let native = ask(crate::scripts::RanAs::Native).map_err(NamesError::ScriptModule)?;
+            let wasm = ask(crate::scripts::RanAs::Wasm).map_err(NamesError::ScriptModule)?;
+            if native.is_some() && wasm.is_none() { ran_as = crate::scripts::RanAs::Native; }
+        }
+        placements.push((at, ran_as));
+        let subject = crate::script_modules::Wanted { ran_as, package: script.name.as_str(), version: script.version.as_str(), features: &features, source, deps }.subject(frame);
+        script_modules.push(crate::script_modules::ScriptModule { subject, crate_at: at, ran_as, package: script.name.as_str(), version: script.version.as_str(), features, source, deps });
     }
     script_modules.sort_unstable_by_key(|module| (module.subject, module.crate_at));
     for (at, _) in scripts.iter() {

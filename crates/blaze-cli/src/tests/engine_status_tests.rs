@@ -104,6 +104,20 @@ fn a_planted_stop_stops_after_exactly_that_many_bodies() {
     assert_eq!(on_stderr(&control, "stopped at "), 0);
 }
 
+#[test]
+fn a_stop_during_body_setup_leaves_every_body_unstarted() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    six_bodies(&io);
+    let plant = Plant::StopAfter { stage: Stage::Bodies, done: 0, by: By::Terminate };
+    assert!(matches!(checked(&io, Asking { requests: None, every: None, plant }),
+        Err(CliError::EngineCheck(engine_check::EngineCheckError::Stopped { by: By::Terminate, stage: Some(Stage::Bodies), .. }))));
+    with_profile(&io, |text| {
+        let (done, started, known) = counts(text, Stage::Bodies);
+        assert!(known >= 6, "{text}");
+        assert_eq!((done, started), (0, 0), "{text}");
+    });
+}
+
 /// (b) A status asked after the first body changes nothing: the status, the entries, the puts,
 /// the records' digest and the body notes equal a run never asked; the asked run wrote the
 /// status (`status at … (asked by SIGUSR1)`) and the end profile carries the stages' rows.

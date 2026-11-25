@@ -32,6 +32,14 @@ pub enum ExportError {
     ZeroedWithBytes { target: Target },
     /// The entry's function is not among the functions given.
     NoEntry { symbol: Symbol },
+    /// A public C symbol is not in the reached function records.
+    ExportNotPlaced { symbol: Symbol },
+    /// C names must be nonempty, NUL-free and strictly sorted.
+    ExportName { symbol: Symbol },
+    /// A Mach-O fixup names a program import row absent from the layout.
+    MachBind { at: u64, import: u32 },
+    /// This input form lacks the C exports required by a library.
+    OptimizedLibraryRequiresExports,
     /// bstd's hosted entry needs the launcher's host table, which an exported file has none of.
     Hosted { start: Symbol },
     /// A function's site or word names a target that no function or datum given places: an
@@ -130,6 +138,10 @@ impl fmt::Display for ExportError {
             ExportError::ZeroedWithBytes { target } => {
                 write!(f, "export: {:?} {} is zeroed and is given bytes or words", target.space, target.symbol)
             }
+            ExportError::ExportNotPlaced { symbol } => write!(f, "export: public C symbol {symbol} is not among the reached functions"),
+            ExportError::ExportName { symbol } => write!(f, "export: C name of {symbol} is empty, contains a NUL, duplicated or out of order"),
+            ExportError::MachBind { at, import } => write!(f, "export: Mach-O fixup at {at:#x} names absent program import row {import}"),
+            ExportError::OptimizedLibraryRequiresExports => write!(f, "export: optimized library input requires public C exports (use ProgramIn)"),
             ExportError::NoEntry { symbol } => write!(f, "export: the entry {symbol} is not among the functions given"),
             ExportError::Hosted { start } => write!(
                 f,

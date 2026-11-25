@@ -70,6 +70,7 @@ pub(super) struct RawTarget<'a> {
     pub name: Option<Text<'a>>,
     pub path: Option<Text<'a>>,
     pub proc_macro: bool,
+    pub crate_types: Vec<Text<'a>, Alloc<'a>>,
     /// `required-features`; empty when not written (the Cargo Book, "Cargo Targets", "The
     /// `required-features` field": "specifies which features the target needs in order to be
     /// built"; it has an effect on `[[bin]]`, `[[example]]`, `[[test]]` and `[[bench]]`).
@@ -517,6 +518,10 @@ impl<'s, 'a> Reader<'s, 'a> {
             name: self.opt_text(table, "name")?,
             path: self.opt_text(table, "path")?,
             proc_macro,
+            crate_types: match table.get("crate-type").or_else(|| table.get("crate_type")) {
+                Some(item) => self.texts(item, "crate-type")?,
+                None => Vec::new_in(self.alloc),
+            },
             required_features,
             span: self.line(table),
         })

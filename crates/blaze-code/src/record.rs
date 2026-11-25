@@ -100,6 +100,11 @@ pub enum Space {
 }
 
 impl Space {
+    /// Its discriminant in a code record's target table.
+    pub const fn byte(self) -> u8 {
+        self as u8
+    }
+
     const ALL: [Space; 5] = [Space::Func, Space::Static, Space::Vtable, Space::Tls, Space::Outside];
 
     fn from_byte(byte: u8) -> Option<Space> {
@@ -777,7 +782,7 @@ impl<'a> Sealed<'a> {
         out.extend_from_slice(&r.relro);
         pad8(out, start);
         for t in r.targets.iter() {
-            out.push(t.space as u8);
+            out.push(t.space.byte());
             out.extend_from_slice(&[0; 7]);
             out.extend_from_slice(&t.symbol.0);
         }

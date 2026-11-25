@@ -74,6 +74,8 @@ pub struct Data<'r> {
 /// the same three forms for a run).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Entry {
+    /// A loader-owned shared library: exported functions, no process entry.
+    Cdylib,
     /// `fn main()` with the Rust ABI, called as a run calls it today: no `lang_start`. The start
     /// stub calls it and returns 0.
     RustMain { main: Symbol },
@@ -178,7 +180,7 @@ pub struct ProgramIn<'r> {
     /// `#[link]` libraries and build scripts pull), merged into the file (native_merge.rs);
     /// `None`: the program links no C.
     pub natives: Option<&'r Image<'r>>,
-    /// Every C name the program exports, sorted by name, each once (two exporters of one name
-    /// are refused by name). The front end gives it; only `natives`' words read it.
+    /// Every C name the program exports, sorted by name, each once. These are the public
+    /// loader symbols for Cdylib and also resolve native words calling Rust.
     pub exports: &'r [CExport<'r>],
 }

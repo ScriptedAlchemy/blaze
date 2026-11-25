@@ -33,10 +33,10 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use std::os::unix::fs::PermissionsExt;
+mod host;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
-use std::time::{Duration, Instant};
+use std::process::{Command, ExitStatus};
+use std::time::Duration;
 
 use blaze_build_script::toolchain::clang_pin;
 use blaze_pins::CLANG_JSON as PIN;
@@ -63,7 +63,6 @@ const MOV_W0_42: u32 = 0x5280_0540;
 /// The host's row in the pin table (pins/clang.json).
 const HOST: &str = "aarch64-apple-darwin";
 const CLANG_DEADLINE: Duration = Duration::from_secs(60);
-const RUN_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Test 1's native code. No header: `-c` needs no SDK.
 const THROW_CATCH: &str = r#"extern "C" __attribute__((noinline)) void native_throw(int value) { throw value; }
@@ -138,22 +137,6 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// Waits for `child` until `deadline`; past it the child is killed and the test fails naming
-/// `what` (a hang is a bug, rule 69).
-fn wait(mut child: Child, what: &str, deadline: Duration) -> ExitStatus {
-    let until = Instant::now() + deadline;
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return status;
-        }
-        if Instant::now() > until {
-            child.kill().unwrap();
-            panic!("{what} did not exit within {} s: a hang is a bug", deadline.as_secs());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// The pinned clang++ on blaze's shelf: `$HOME/.blaze/v2/toolchain/clang/<sha256 hex>/bin/clang++`.
 fn clangxx() -> PathBuf {
     let pin = clang_pin(PIN, HOST).unwrap_or_else(|e| panic!("{e}"));
@@ -179,7 +162,7 @@ fn compile(source: &str, name: &str, dir: &Path) -> std::vec::Vec<u8> {
         .arg(&cpp)
         .spawn()
         .unwrap_or_else(|e| panic!("the pinned clang++: {e}"));
-    let status = wait(child, "the pinned clang++", CLANG_DEADLINE);
+    let status = host::wait(child, "the pinned clang++", CLANG_DEADLINE);
     assert!(status.success(), "the pinned clang++ refused {}: {status}", cpp.display());
     std::fs::read(&object).unwrap_or_else(|e| panic!("{}: {e}", object.display()))
 }
@@ -193,16 +176,12 @@ fn native<'a>(object: &'a [u8], file: &'a str, wanted: Wanted<'a>) -> Image<'a> 
     lay(&planned, &inputs, Layout::MACOS_ARM64, a).unwrap_or_else(|e| panic!("lay {file}: {e:?}"))
 }
 
-/// `program` exported for this Mac, written to `dir`, marked executable and run: its status.
-fn export_and_run(program: &ProgramIn<'_>, dir: &Path) -> ExitStatus {
+/// Export and execute the program on this Mac.
+fn export_and_run(program: &ProgramIn<'_>) -> ExitStatus {
     let a = alloc();
     let mut file = Vec::new_in(a);
     export(program, Platform::MacosArm64, &mut file, a).unwrap_or_else(|e| panic!("export {}: {e}", program.name));
-    let path = dir.join(program.name);
-    std::fs::write(&path, &file[..]).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let child = Command::new(&path).spawn().unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    wait(child, &format!("the exported program at {}", path.display()), RUN_DEADLINE)
+    host::run(program.name, &file, |path| Command::new(path))
 }
 
 /// Prints `native_run: the C++ throw was caught inside the native code and main exited 42`.
@@ -238,7 +217,7 @@ fn cxx_throw_is_caught_inside_the_native_code() {
         natives: Some(&image),
         exports: &[],
     };
-    let status = export_and_run(&program, &dir);
+    let status = export_and_run(&program);
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(status.code(), Some(42), "the exported program ended with {status}, not by the C++ catch's value");
     println!("native_run: the C++ throw was caught inside the native code and main exited 42");
@@ -347,7 +326,7 @@ fn run_callback_program(name: &str, without_rows: bool) -> ExitStatus {
         natives: Some(&image),
         exports: &exports,
     };
-    let status = export_and_run(&program, &dir);
+    let status = export_and_run(&program);
     std::fs::remove_dir_all(&dir).unwrap();
     status
 }

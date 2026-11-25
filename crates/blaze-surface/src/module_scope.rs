@@ -211,8 +211,9 @@ pub enum ScopeError<N, P> {
     ExternCrate { name: N },
     /// A `pub(in path)` whose path is not an ancestor of the module.
     RestrictedNotAncestor { path: P },
-    /// Two different non-glob bindings of one name (rustc E0252, E0254, E0255, E0428).
-    Duplicate { ns: Namespace, name: N, first: Def, second: Def },
+    /// Two non-glob bindings of one name. When both are imports (E0252), `repeated_import`
+    /// points to the second leaf, including when it imports the same definition again.
+    Duplicate { ns: Namespace, name: N, first: Def, second: Def, repeated_import: Option<UseSite> },
     /// A `use` re-exports a binding wider than the binding itself is visible (E0364, E0365).
     WiderReexport { site: UseSite, ns: Namespace, name: N, def: Def },
     /// An early resolution (an import's or a macro path's first segment) that the final scope
@@ -237,7 +238,7 @@ impl<N, P> ScopeError<N, P> {
             E::Macro { call, path, segment, why } => E::Macro { call, path: f(path), segment, why },
             E::ExternCrate { name } => E::ExternCrate { name },
             E::RestrictedNotAncestor { path } => E::RestrictedNotAncestor { path: f(path) },
-            E::Duplicate { ns, name, first, second } => E::Duplicate { ns, name, first, second },
+            E::Duplicate { ns, name, first, second, repeated_import } => E::Duplicate { ns, name, first, second, repeated_import },
             E::WiderReexport { site, ns, name, def } => E::WiderReexport { site, ns, name, def },
             E::Ambiguous { site, ns, name, kind, first, second } => E::Ambiguous { site, ns, name, kind, first, second },
             E::Inconsistent { site, ns, name, early, last } => E::Inconsistent { site, ns, name, early, last },
@@ -354,7 +355,7 @@ impl<N, P> ScopeError<N, P> {
             E::Macro { call, segment, why, .. } => E::Macro { call: *call, path: (), segment: *segment, why: *why },
             E::ExternCrate { name } => E::ExternCrate { name },
             E::RestrictedNotAncestor { .. } => E::RestrictedNotAncestor { path: () },
-            E::Duplicate { ns, name, first, second } => E::Duplicate { ns: *ns, name, first: *first, second: *second },
+            E::Duplicate { ns, name, first, second, repeated_import } => E::Duplicate { ns: *ns, name, first: *first, second: *second, repeated_import: *repeated_import },
             E::WiderReexport { site, ns, name, def } => E::WiderReexport { site: *site, ns: *ns, name, def: *def },
             E::Ambiguous { site, ns, name, kind, first, second } => {
                 E::Ambiguous { site: *site, ns: *ns, name, kind: *kind, first: *first, second: *second }
@@ -717,8 +718,8 @@ fn error_row<N: AsRef<str>>(
         E::Macro { call, why, .. } => (ErrorTag::Macro, Some(Site::Call(*call)), None, Namespace::Types, Some(*why), None, None, None),
         E::ExternCrate { name } => (ErrorTag::ExternCrate, None, Some(name), Namespace::Types, None, None, None, None),
         E::RestrictedNotAncestor { .. } => (ErrorTag::RestrictedNotAncestor, None, None, Namespace::Types, None, None, None, None),
-        E::Duplicate { ns, name, first, second } => {
-            (ErrorTag::Duplicate, None, Some(name), *ns, None, None, Some(*first), Some(*second))
+        E::Duplicate { ns, name, first, second, repeated_import } => {
+            (ErrorTag::Duplicate, repeated_import.map(Site::Import), Some(name), *ns, None, None, Some(*first), Some(*second))
         }
         E::WiderReexport { site, ns, name, def } => {
             (ErrorTag::WiderReexport, Some(Site::Import(*site)), Some(name), *ns, None, None, Some(*def), None)
@@ -927,7 +928,7 @@ impl<'a> ScopeView<'a> {
                 ErrorTag::Macro => E::Macro { call: ItemKey(row.site_key), path: paths.get(row.path), segment: row.segment, why },
                 ErrorTag::ExternCrate => E::ExternCrate { name },
                 ErrorTag::RestrictedNotAncestor => E::RestrictedNotAncestor { path: paths.get(row.path) },
-                ErrorTag::Duplicate => E::Duplicate { ns: row.ns, name, first, second },
+                ErrorTag::Duplicate => E::Duplicate { ns: row.ns, name, first, second, repeated_import: (row.site == SiteTag::Import).then(|| use_site_of(row)) },
                 ErrorTag::WiderReexport => E::WiderReexport { site: use_site_of(row), ns: row.ns, name, def: first },
                 ErrorTag::Ambiguous => E::Ambiguous { site, ns: row.ns, name, kind: row.ambiguity, first, second },
                 ErrorTag::Inconsistent => E::Inconsistent { site, ns: row.ns, name, early: first, last: second },

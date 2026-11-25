@@ -100,7 +100,7 @@ blaze-parquet	114
 blaze-pg	10
 blaze-phf	40
 blaze-pins	1
-blaze-proc-macro	470
+blaze-proc-macro	466
 blaze-producers	24
 blaze-profile	735
 blaze-protocol	134

@@ -10,6 +10,39 @@ use blaze_surface::{DefKind, ItemKind, ItemKey, Namespace, PathKind};
 use super::*;
 use crate::names::sections::{HEAD, Section, SectionsError, WATCHED, sections};
 
+#[test]
+fn repeated_imports_are_reported_in_their_module_and_namespace() {
+    const BAD: &str = "mod a { pub fn x() {} }\nmod b { pub fn x() {} }\nuse a::r#x;\nuse b::x;\nfn main() { x(); }\n";
+    let io = Io::simulated(SimWorld::new(252, Limits::USUAL));
+    write(&io, "Cargo.toml", MANIFEST);
+    let renamed = BAD.replace("use b::x;", "use b::x as other;");
+    let cases = [
+        (BAD, Some((4, 8, 9))),
+        (renamed.as_str(), None),
+        (BAD, Some((4, 8, 9))),
+        ("mod a { pub struct S; }\nuse a::{S, S};\n", Some((2, 12, 13))),
+        ("mod a { pub mod x {} }\nuse a::x::{self, self};\n", Some((2, 18, 22))),
+        ("mod a { pub fn x() {} }\nuse a::{x, r#x};\n", Some((2, 12, 15))),
+        ("mod a { pub fn x() {} }\nuse crate::a::{x as alias, x as r#alias};\n", Some((2, 33, 40))),
+        ("mod a { pub fn x() {} }\nmacro_rules! x { () => { use crate::a::{x, x}; }; }\nx!();\n", Some((3, 1, 1))),
+        ("mod a { pub fn x() {} }\nmod left { use crate::a::x; }\nmod right { use crate::a::x; }\n", None),
+        ("mod a { pub type X = u8; }\nmod b { pub fn X() {} }\nuse a::X;\nuse b::X;\n", None),
+    ];
+    for (source, duplicate) in cases {
+        write(&io, "src/lib.rs", source);
+        let before = stdout(&io).len();
+        let got = check_view::<fix::Atomic>(&io, View::Json, None);
+        let output = stdout(&io);
+        let said = &output[before..];
+        assert_eq!(got.failures, 0, "{source}\n{said}");
+        assert_eq!(got.errors, u32::from(duplicate.is_some()), "{source}\n{said}");
+        assert_eq!(got.status, Some(u8::from(duplicate.is_some())), "{source}\n{said}");
+        if let Some((line, col, end)) = duplicate {
+            assert!(said.contains(&format!("\"severity\":\"error\",\"code\":\"E0252\",\"path\":\"src/lib.rs\",\"line\":{line},\"col\":{col},\"end_line\":{line},\"end_col\":{end},")), "{source}\n{said}");
+        }
+    }
+}
+
 /// The one crate's names record, 16-aligned.
 struct OneNames(&'static [u8]);
 

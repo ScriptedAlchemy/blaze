@@ -133,7 +133,7 @@ struct MacroInputs<'a> {
 }
 
 enum ModuleAnswer {
-    Found(ContentId),
+    Found(ContentId, blaze_own::Vec<u8, SharedAlloc<'static>>),
     Failed(TaskFailure, Option<blaze_own::String<SharedAlloc<'static>>>, bool),
 }
 
@@ -188,7 +188,7 @@ impl ModuleJob<'_> {
         let (did, crates) = match self {
             Self::Build { wanted, home } => (crate::script_modules::run(cx, home, wanted, &drive(Vec::new_in(alloc)), frame)?, None),
             #[cfg(test)]
-            Self::Fixture => return Ok(WorkerOutput::Module(ModuleAnswer::Found(name.subject), None)),
+            Self::Fixture => return Ok(WorkerOutput::Module(ModuleAnswer::Found(name.subject, blaze_own::Vec::new_in(heap.shared())), None)),
             Self::Proc { mut crates, home, checkout, graph, initial } => {
                 let mut handed = LookupStore { name, graph: initial.zip(graph).map(|(input, graph)| (graph.at, input.graph)) };
                 let mut inputs = Vec::new_in(alloc);
@@ -198,7 +198,7 @@ impl ModuleJob<'_> {
                 let lock = match initial {
                     Some(input) => {
                         for &(id, dir, kind, digest) in input.members {
-                            members.push(crate::graph::CheckoutDir { id, dir: blaze_unit_graph::Text::from_str_in(dir, heap.alloc()), kind });
+                            members.push(crate::graph::CheckoutDir { id, dir: blaze_unit_graph::Text::from_str_in(dir, heap.alloc()), kind, script: None });
                             rows.push(crate::sweep::LeafKind::MacroFiles, 0, dir, None, digest);
                         }
                         match crate::fetch::Lockfile::read(input.lock, heap, frame) {
@@ -218,7 +218,7 @@ impl ModuleJob<'_> {
             }
         };
         let answer = match did {
-            Did::Done(made) => ModuleAnswer::Found(made.out),
+            Did::Done(made) => ModuleAnswer::Found(made.out, blaze_own::Vec::from_slice_in(&made.payload, heap.shared())),
             Did::Failed(failed) => ModuleAnswer::Failed(failed, None, false),
             Did::FailedSaying(failed, words) => ModuleAnswer::Failed(failed, Some(blaze_own::String::from_str_in(words, heap.shared())), false),
             Did::Hole(failed, words) => ModuleAnswer::Failed(failed, Some(blaze_own::String::from_str_in(words, heap.shared())), true),
@@ -1123,9 +1123,10 @@ impl<'f> ScriptsStage<'f> {
             WorkerOutput::Module(answer, crates) => {
                 if lane == ScriptLane::ProcLookup { self.macros = crates; }
                 let did = match answer {
-                    ModuleAnswer::Found(out) => {
+                    ModuleAnswer::Found(out, payload) => {
                         let mut made = work::Made::new_in(name, frame);
                         made.out = out;
+                        made.payload.extend_from_slice(&payload);
                         Did::Done(made)
                     }
                     ModuleAnswer::Failed(failed, Some(words), hole) => {
@@ -1298,6 +1299,7 @@ impl<'f> ScriptsStage<'f> {
             let wanted = crate::script_modules::Wanted {
                 ran_as: module.ran_as, package: module.package, version: module.version,
                 features: queue.jobs.alloc_slice_copy(&module.features),
+                source: module.source, deps: module.deps,
             };
             return Ok(Dispatch::Run(ScriptWork::Module(ModuleJob::Build { wanted, home: handles.env.home }), drive));
         }

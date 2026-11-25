@@ -11,7 +11,7 @@ use blaze_id::ItemKey;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::{
     AnonImport, Binding, Def, DefKind, GlobEdge, Namespace, Origin, Path, ScopeBuilder,
-    ScopeEntry, ScopeError, Site, TextualDef, TextualMark, Unresolved, Visibility, globs_digest,
+    ScopeEntry, ScopeError, Site, TextualDef, TextualMark, Unresolved, UseSite, Visibility, globs_digest,
     textual_digest,
 };
 
@@ -39,15 +39,31 @@ fn len32(n: usize) -> u32 {
 /// far for `Duplicate`.
 struct Errors<'a, N> {
     list: AVec<'a, ScopeError<N, Path<'a, N>>>,
-    seen: HashMap<(Namespace, N), Def, Alloc<'a>>,
+    bindings: BindingConflicts<'a, N>,
 }
 
-impl<N: Name> Errors<'_, N> {
-    /// A non-glob binding of `(ns, name)`: a second one with another target is `Duplicate`.
-    fn bind(&mut self, ns: Namespace, name: N, def: Def) {
-        let first = *self.seen.entry((ns, name)).or_insert(def);
-        if first != def {
-            self.list.push(ScopeError::Duplicate { ns, name, first, second: def });
+/// The first explicit binding of each name in one module and namespace. Two named imports
+/// conflict even when both resolved to the same definition.
+pub(crate) struct BindingConflicts<'a, N> {
+    seen: HashMap<(Namespace, N), (Def, bool), Alloc<'a>>,
+}
+
+impl<'a, N: Name> BindingConflicts<'a, N> {
+    pub(crate) fn new_in(alloc: Alloc<'a>) -> Self {
+        Self { seen: HashMap::new_in(alloc) }
+    }
+
+    pub(crate) fn bind<P>(&mut self, ns: Namespace, name: N, def: Def, import: Option<UseSite>, errors: &mut AVec<'_, ScopeError<N, P>>) {
+        use blaze_hash::hash_map::Entry;
+        match self.seen.entry((ns, name)) {
+            Entry::Vacant(entry) => { entry.insert((def, import.is_some())); }
+            Entry::Occupied(entry) => {
+                let &(first, first_imported) = entry.get();
+                let repeated_import = import.filter(|_| first_imported);
+                if first != def || repeated_import.is_some() {
+                    errors.push(ScopeError::Duplicate { ns, name, first, second: def, repeated_import });
+                }
+            }
         }
     }
 }
@@ -69,7 +85,7 @@ impl<'a, N: Name> Resolver<'a, N> {
             sink.forget_negative = self.plant == Plant::ForgetNegativeReads;
             sink.forget_probes = self.plant == Plant::ForgetGlobProbes;
         }
-        let mut errors = Errors { list: Vec::new_in(a), seen: HashMap::new_in(a) };
+        let mut errors = Errors { list: Vec::new_in(a), bindings: BindingConflicts::new_in(a) };
         self.finish_frag(0, facts, env, &mut sink, &mut errors)?;
 
         let mut names = Vec::new_in(a);
@@ -194,7 +210,7 @@ impl<'a, N: Name> Resolver<'a, N> {
             if !*entered {
                 *entered = true;
                 for &(ns, name, e) in f.items.iter() {
-                    errors.bind(ns, name, e.def);
+                    errors.bindings.bind(ns, name, e.def, None, &mut errors.list);
                 }
                 for path in f.bad_vis.iter() {
                     errors.list.push(ScopeError::RestrictedNotAncestor { path: path.copy_in(self.alloc) });
@@ -310,7 +326,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         for ns in Namespace::ALL {
             let NsRes::Found(hit) = imp.ns[ns.index()] else { continue };
             if let Some(name) = imp.bound {
-                errors.bind(ns, name, hit.def);
+                errors.bindings.bind(ns, name, hit.def, Some(site), &mut errors.list);
             }
             // E0364/E0365: a `use` may not make a binding more visible than it is.
             if hit.through_import(imp.vis, self.asker()) != imp.vis {

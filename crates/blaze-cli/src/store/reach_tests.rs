@@ -44,6 +44,77 @@ use crate::start_list::{self, Certificate, HEAD, ListName, ROW, Today};
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const MINUTE: Duration = Duration::from_secs(60);
+
+fn artifact(profile: blaze_manifest::layout::profile::BuiltinProfile) -> super::roots::ExportArtifact<'static> {
+    super::roots::ExportArtifact { checkout: "/project", manifest: "lib/Cargo.toml", target: "library", profile, kind: crate::run_package::ExportKind::Cdylib }
+}
+
+/// Two library entry roots, sharing some code with an older artifact revision. Each export
+/// reopens the store and only its HomeCodeStore read/write ledger supplies the retained keys.
+fn export_once(sim: Sim, n: u64, roots: [core::ops::Range<u32>; 2], profile: blaze_manifest::layout::profile::BuiltinProfile, keep: bool) -> (Sim, u32) {
+    let lent = process(sim, n);
+    let mut codes = HomeCodeStore::new(&lent);
+    let mut made = 0;
+    for i in roots.into_iter().flatten() {
+        let hit = match codes.pointed(code(i)).expect("code pointer") {
+            Some(at) => codes.get(at).expect("code entry") == Some(entry(i).as_slice()),
+            None => false,
+        };
+        if !hit {
+            codes.put(CodeClass::Program, content(i), &entry(i)).expect("entry write");
+            codes.point(CodeClass::Program, code(i), content(i)).expect("pointer write");
+            made += 1;
+        }
+    }
+    let walked = codes.reached();
+    drop(codes);
+    // Every key rooted by export must name a persisted record; no synthetic start list.
+    for key in &walked {
+        match lent.get(key) {
+            Ok(Some(_)) => {}
+            Err(blaze_cas::plain::LentError::PointerTag { .. }) => {
+                assert!(lent.pointed(blaze_keyed::kind::ReservedTag::Code.tag(), key).expect("persisted pointer").is_some());
+            }
+            other => panic!("export rooted an unpersisted key: {other:?}"),
+        }
+    }
+    if keep { super::roots::keep_export(&lent, artifact(profile), &walked).expect("export root"); }
+    after_answer(&test_cx(), &lent, 1).expect("export commit");
+    (back(lent), made)
+}
+
+fn export_gc_history(keep: bool) {
+    use blaze_manifest::layout::profile::BuiltinProfile::{Dev, Release};
+    let (sim, _) = export_once(Sim::new(113, Faults::default()), 1, [0..16, 40..48], Release, keep);
+    let (mut sim, _) = export_once(sim, 2, [60..64, 64..68], Dev, keep);
+    sim.advance(8 * DAY);
+    // An edit changes one library root's closure; the other entry's code remains useful.
+    let (sim, _) = export_once(sim, 3, [16..32, 40..48], Release, keep);
+    let (mut sim, _) = export_once(sim, 4, [60..64, 64..68], Dev, keep);
+    sim.advance(Duration::from_nanos(ROOT_LIFE_NS) - 8 * DAY + MINUTE);
+    for n in 5..9 { sim = idle(sim, n); sim.advance(Duration::from_secs(1)); }
+    sim.advance(Duration::from_nanos(LEASE_NS.max(GRACE_NS)) + MINUTE);
+    for n in 9..13 { sim = idle(sim, n); sim.advance(Duration::from_secs(1)); }
+    sim.advance(Duration::from_nanos(GRACE_NS) + MINUTE);
+    for n in 13..15 { sim = idle(sim, n); }
+    let lent = process(sim, 15);
+    for i in 0..16 {
+        assert!(lent.get(&CasKey(content(i).0)).expect("retired entry").is_none(), "an old source revision kept a separate export root");
+    }
+    after_answer(&test_cx(), &lent, 0).expect("read commit");
+    let (sim, made) = export_once(back(lent), 16, [16..32, 40..48], Release, keep);
+    assert_eq!(made, 0, "export rebuilds after reached GC");
+    let (_, made) = export_once(sim, 17, [60..64, 64..68], Dev, keep);
+    assert_eq!(made, 0, "release renewal dropped another profile's code");
+}
+
+#[test]
+fn export_roots_keep_all_library_entries_and_retire_old_revisions() { export_gc_history(true); }
+
+#[test]
+#[should_panic(expected = "export rebuilds after reached GC")]
+fn export_gc_oracle_catches_an_omitted_root() { export_gc_history(false); }
+
 /// A listing tag no store owns.
 const OWN: u64 = 1 << 60;
 

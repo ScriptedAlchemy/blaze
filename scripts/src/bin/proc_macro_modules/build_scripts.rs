@@ -318,46 +318,67 @@ pub(super) fn build_dep_names(manifest: &str) -> Vec<String> {
 /// registry or git package's whole closure (the proc-macro mode's); a path package's is its
 /// build-dependencies' closures, since its other dependencies (path packages of the
 /// workspace, which the lock pins nothing of) are not the script's.
-fn script_closure(lock: &str, wanted: &Wanted, origin: &Origin, manifest: &str) -> Result<Vec<String>, Failure> {
-    let (Origin::Path { .. } | Origin::Git { .. }) = origin else { return closure_lines(lock, &wanted.name, &wanted.version) };
-    let names = build_dep_names(manifest);
-    let entry = lock
-        .split("[[package]]")
-        .skip(1)
-        .find(|entry| entry.lines().any(|l| l.trim() == format!("name = {:?}", wanted.name)) && entry.lines().any(|l| l.trim() == format!("version = {:?}", wanted.version)))
-        .ok_or_else(|| Failure::NotLocked { name: wanted.name.clone(), version: wanted.version.clone() })?;
-    let list = entry.find("dependencies = [").map_or("", |at| {
-        let list = &entry[at + "dependencies = [".len()..];
-        &list[..list.find(']').unwrap_or(list.len())]
-    });
-    let mut lines = Vec::new();
-    for dep in list.split(',').map(|it| it.trim().trim_matches('"')).filter(|it| !it.is_empty()) {
-        let mut parts = dep.split(' ');
-        let dep_name = parts.next().unwrap_or("");
-        if !names.iter().any(|it| it == dep_name) {
-            continue;
+struct PathInput {
+    dir: PathBuf,
+    mapped: String,
+    workspace: Option<PathBuf>,
+}
+
+struct ScriptClosure {
+    pins: Vec<String>,
+    sources: Vec<PathInput>,
+}
+
+fn script_closure(lock: &str, wanted: &Wanted, origin: &Origin, manifest: &str, checkout: &Path, alloc: blaze_own::Alloc<'_>) -> Result<ScriptClosure, Failure> {
+    use blaze_manifest::lock::{Checksum, LockSource};
+    use blaze_manifest::bootstrap::{HexDigest, lock::{closure_at, closure_packages, PathPin}};
+    let refused = |why: String| Failure::NoModule { name: wanted.name.clone(), version: wanted.version.clone(), why };
+    let lock = blaze_manifest::lock::Lock::read(lock.as_bytes(), alloc).map_err(|why| refused(why.to_string()))?;
+    let mut candidates = lock.named(&wanted.name).filter(|id| {
+        let package = lock.package(*id);
+        package.version.to_string() == wanted.version && match (origin, &package.source, &package.checksum) {
+            (Origin::Path { .. }, LockSource::Path, _) => true,
+            (Origin::Registry { checksum }, LockSource::Registry { .. }, Checksum::Sha256(sum)) => checksum == sum.as_str(),
+            (Origin::Git { commit, .. }, LockSource::Git { commit: held, .. }, _) => commit == held.as_str(),
+            _ => false,
         }
-        let version = match parts.next() {
-            Some(version) => version.to_owned(),
-            None => {
-                let versions: Vec<String> = lock
-                    .split("[[package]]")
-                    .filter(|e| e.lines().any(|l| l.trim() == format!("name = {dep_name:?}")))
-                    .filter_map(|e| e.lines().find_map(|l| l.trim().strip_prefix("version = ")).map(|v| v.trim_matches('"').to_owned()))
-                    .collect();
-                match &versions[..] {
-                    [one] => one.clone(),
-                    _ => return Err(Failure::NotLocked { name: dep_name.to_owned(), version: "(one version)".to_owned() }),
+    });
+    let root = match (candidates.next(), candidates.next()) {
+        (Some(id), None) => id,
+        _ => return Err(refused("the source does not identify exactly one package in Cargo.lock".to_owned())),
+    };
+    let document = blaze_toml::Document::parse_in(manifest, blaze_toml::Limits::CARGO, alloc).map_err(|why| refused(why.to_string()))?;
+    let mut names = Vec::new();
+    for table in core::iter::once(document.root()).chain(document.root().get("target").into_iter().flat_map(|target| target.children())) {
+        for spelling in ["build-dependencies", "build_dependencies"] {
+            if let Some(deps) = table.get(spelling) {
+                for dep in deps.children() {
+                    names.push(dep.get("package").and_then(|package| package.as_str()).unwrap_or_else(|| dep.key()));
                 }
             }
-        };
-        let pin = checksum(lock, dep_name, &version).ok_or_else(|| Failure::NotLocked { name: dep_name.to_owned(), version: version.clone() })?;
-        lines.push(format!("{dep_name} {version} {pin}"));
-        lines.extend(closure_lines(lock, dep_name, &version)?);
+        }
     }
-    lines.sort();
-    lines.dedup();
-    Ok(lines)
+    let roots = (!matches!(origin, Origin::Registry { .. })).then_some(names.as_slice());
+    let inputs = closure_packages(&lock, root, roots, alloc).map_err(|why| refused(format!("lock closure: {why:?}")))?;
+    let members = Members::new(checkout);
+    let mut paths = Vec::new();
+    let mut sources = Vec::new();
+    for id in inputs {
+        if id == root || !matches!(lock.package(id).source, LockSource::Path) { continue; }
+        let package = lock.package(id);
+        let dependency = Wanted { name: package.name.as_str().to_owned(), version: package.version.to_string(), features: None };
+        let dir = members.find(&dependency, alloc)?;
+        let files = HexDigest::parse(&files_digest(&dir)?).ok_or_else(|| refused(format!("{}: invalid source digest", dir.display())))?;
+        let raw = read(&dir.join("Cargo.toml"))?;
+        let workspace = if dir != checkout && !blaze_manifest::bootstrap::standalone_manifest(&raw, alloc) { Some(read(&checkout.join("Cargo.toml"))?) } else { None };
+        paths.push(PathPin { package: id, files: files.with_workspace(workspace.as_deref().map(str::as_bytes)) });
+        sources.push(PathInput { dir, mapped: format!("/build/path/{}-{}", package.name, package.version), workspace: workspace.map(|_| checkout.join("Cargo.toml")) });
+    }
+    let corrections = corrections();
+    let pins = closure_at(&lock, root, roots, &paths, alloc, |name, version, pin| corrections.pin(name, version, pin))
+        .map(|lines| lines.iter().map(|line| line.as_str().to_owned()).collect())
+        .map_err(|why| refused(format!("lock closure: {why:?}")))?;
+    Ok(ScriptClosure { pins, sources })
 }
 
 /// One built module.
@@ -382,7 +403,7 @@ impl Plan<'_> {
         let (wanted, origin) = (&self.args.crates[at], self.origin(at)?);
         let no_module = |why: String| Failure::NoModule { name: wanted.name.clone(), version: wanted.version.clone(), why };
         let original = self.manifest_of(at)?;
-        let closure = script_closure(&self.lock, wanted, origin, &original)?;
+        let ScriptClosure { pins: closure, sources: path_sources } = script_closure(&self.lock, wanted, origin, &original, &self.args.checkout, alloc)?;
         // cargo compiles a script with `--cfg feature="x"` for each feature of its unit, so a
         // script's `cfg!(feature = ...)` is fixed in its module: one module per feature set.
         let mut features = wanted.features.clone().ok_or_else(|| {
@@ -400,7 +421,7 @@ impl Plan<'_> {
             "blaze build-script module 3\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\n{runner}builder bootstrap\n",
             wanted.name,
             wanted.version,
-            origin.identity_line(),
+            origin.script_identity_line(),
             sha256(closure.join("\n").as_bytes()),
             features.join(","),
             self.tool.name,
@@ -474,6 +495,8 @@ impl Plan<'_> {
                 let vendor = self.work.join("vendor");
                 let mut reads: Vec<&Path> = vec![vendor.as_path(), self.tool.sysroot.as_path(), native.clang.as_path(), native.sdk.as_path()];
                 reads.extend(own_source);
+                reads.extend(path_sources.iter().map(|source| source.dir.as_path()));
+                reads.extend(path_sources.iter().filter_map(|source| source.workspace.as_deref()));
                 // The interim builder's own start-up config: the LibreSSL cargo links reads it
                 // when it starts and stops if refused. One file, read-only, no secret in it; the
                 // scripts cargo starts inherit the grant, as they inherit this whole profile (the
@@ -502,6 +525,7 @@ impl Plan<'_> {
         let mut env = self.env(&self.work.join("cargo-home"));
         env.push(("SOURCE_DATE_EPOCH".to_owned(), "0".into()));
         let mut flags = vec![format!("--remap-path-prefix={}=/build", self.work.display()), "-Cdebuginfo=0".to_owned()];
+        flags.extend(path_sources.iter().map(|source| format!("--remap-path-prefix={}={}", source.dir.display(), source.mapped)));
         if let Origin::Path { dir, .. } = origin {
             flags.push(format!("--remap-path-prefix={}=/build/path/{}-{}", dir.display(), wanted.name, wanted.version));
         }
@@ -587,7 +611,7 @@ pub(super) fn main_with(text: &str, heap: &blaze_own::Heap) -> i32 {
     // given empty), so its other dependencies are never resolved. A registry package is
     // vendored whole, its manifest already normalized.
     let cut = |origin: Origin| match origin {
-        Origin::Path { dir, files, manifest } => Origin::Path { dir, files, manifest: script_only(&manifest) },
+        Origin::Path { dir, files, manifest, workspace } => Origin::Path { dir, files, manifest: script_only(&manifest), workspace },
         Origin::Git { commit, path, dir, manifest } => Origin::Git { commit, path, dir, manifest: script_only(&manifest) },
         origin => origin,
     };
@@ -753,5 +777,60 @@ mod native_builder_tests {
         assert!(read_canary.as_ref().is_err_and(|e| e.contains("Operation not permitted")), "canary: {read_canary:?}");
         assert_eq!(old.as_deref(), Ok("canary"), "the planted control: the old profile reads the canary");
         _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod source_identity_tests {
+    use super::*;
+
+    fn local_path_closure_case(omit_source_edit: bool) {
+        const ROOT: &str = "[workspace]\nmembers = [\"app\", \"cc\"]\nresolver = \"2\"\n[workspace.package]\nedition = \"2021\"\n";
+        const APP: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[build-dependencies]\ncompiler = { package = \"cc\", path = \"../cc\" }\n";
+        const CC: &str = "[package]\nname = \"cc\"\nversion = \"0.1.0\"\nedition.workspace = true\n";
+        const LOCK: &str = "version = 4\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"cc\"]\n[[package]]\nname = \"cc\"\nversion = \"0.1.0\"\n";
+        let alloc = blaze_own::testing::heap().alloc();
+        let dirs = ["left", "right"].map(|side| std::env::temp_dir().join(format!("blaze-script-path-pins-{side}-{}-{omit_source_edit}", std::process::id())));
+        let wanted = Wanted { name: "app".to_owned(), version: "0.1.0".to_owned(), features: Some(Vec::new()) };
+        for dir in &dirs {
+            for (path, bytes) in [("Cargo.toml", ROOT), ("app/Cargo.toml", APP), ("app/src/lib.rs", ""), ("cc/Cargo.toml", CC), ("cc/src/lib.rs", "pub fn compile() {}\n")] {
+                write(&dir.join(path), bytes).unwrap_or_else(|why| panic!("{why}"));
+            }
+        }
+        let closure = |dir: &Path| {
+            let origin = Origin::Path { dir: dir.join("app"), files: "unused".to_owned(), manifest: APP.to_owned(), workspace: None };
+            script_closure(LOCK, &wanted, &origin, APP, dir, alloc).unwrap_or_else(|why| panic!("{why}")).pins
+        };
+        let original = closure(&dirs[0]);
+        let relocated = closure(&dirs[1]);
+        write(&dirs[0].join("cc/src/lib.rs"), "pub fn compile() { let _changed = 1; }\n").unwrap_or_else(|why| panic!("{why}"));
+        let edited = if omit_source_edit { original.clone() } else { closure(&dirs[0]) };
+        write(&dirs[1].join("Cargo.toml"), ROOT.replace("2021", "2024")).unwrap_or_else(|why| panic!("{why}"));
+        let inherited = closure(&dirs[1]);
+        for dir in dirs { std::fs::remove_dir_all(dir).expect("remove path pin fixture"); }
+        assert_eq!(original, relocated, "absolute checkout paths do not enter dependency pins");
+        assert_ne!(original, edited, "a local build dependency source edit must change its closure");
+        assert_ne!(original, inherited, "inherited workspace settings enter a path dependency pin");
+        assert!(original.iter().any(|line| line.starts_with("cc 0.1.0 files ")), "the renamed dependency pins cc by content");
+    }
+
+    #[test]
+    fn local_path_dependencies_pin_sources_and_workspace_portably() { local_path_closure_case(false); }
+
+    #[test]
+    #[should_panic(expected = "a local build dependency source edit must change its closure")]
+    fn path_source_oracle_catches_an_omitted_edit() { local_path_closure_case(true); }
+
+    #[test]
+    fn renamed_build_dependencies_are_pinned_without_normal_path_dependencies() {
+        let checksum = "a".repeat(64);
+        let lock = format!("version = 4\n[[package]]\nname = \"shapes\"\nversion = \"0.1.0\"\ndependencies = [\"pm\", \"cc\"]\n[[package]]\nname = \"pm\"\nversion = \"0.1.0\"\n[[package]]\nname = \"cc\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n");
+        let manifest = "[build-dependencies]\ncompiler = { package = \"cc\", version = \"1.0.0\" }\n";
+        let origin = Origin::Path { dir: PathBuf::from("shapes"), files: "source".to_owned(), manifest: manifest.to_owned(), workspace: None };
+        let wanted = Wanted { name: "shapes".to_owned(), version: "0.1.0".to_owned(), features: Some(Vec::new()) };
+        let alloc = blaze_own::testing::heap().alloc();
+        let expected = sha256(format!("cc 1.0.0 {checksum}").as_bytes());
+        assert_eq!(sha256(script_closure(&lock, &wanted, &origin, manifest, Path::new("."), alloc).unwrap_or_else(|why| panic!("{why}")).pins.join("\n").as_bytes()), expected);
+        assert!(script_closure(&lock, &wanted, &origin, "", Path::new("."), alloc).unwrap_or_else(|why| panic!("{why}")).pins.is_empty());
     }
 }

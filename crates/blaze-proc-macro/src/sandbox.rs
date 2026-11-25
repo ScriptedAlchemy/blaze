@@ -39,7 +39,7 @@ pub enum Files {
     Listed(std::sync::Arc<[(String, &'static [u8])]>),
     /// A workspace member's (D96 (3)): its workspace's folder on disk, served at `/workspace`
     /// with the member at `root`'s dir in it; paths are from the workspace's folder.
-    Member { workspace: PathBuf, root: crate::script_sandbox::ScriptRoot },
+    Member { workspace: PathBuf, root: crate::script_root::ScriptRoot },
 }
 
 impl std::fmt::Debug for Files {
@@ -561,7 +561,7 @@ mod seen_tests {
 
     use super::{Files, Package, Sandbox};
     use crate::package_env::PackageEnv;
-    use crate::script_sandbox::ScriptRoot;
+    use crate::script_root::ScriptRoot;
 
     /// D96 (3): a member's macro runs in `/workspace/<dir>` and opens its workspace's files by
     /// their path from the workspace's folder; `/package` is not its tree. A dependency's runs

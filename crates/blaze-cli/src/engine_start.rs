@@ -247,7 +247,7 @@ pub(crate) fn command(
     let lined = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
         let bg_live = if line.live { Some(bg) } else { None };
-        check_for_start(cx, Some(args), fs, env, net, host, rng, words, err, phases, heap, &flags, command == Command::Run, bg_live, |standing, phases, rng| {
+        check_for_start(cx, Some(args), fs, env, net, host, rng, words, err, phases, heap, &flags, command == Command::Run, blaze_manifest::layout::profile::BuiltinProfile::Dev, bg_live, |standing, phases, rng| {
             let (root, frame) = (standing.checkout, standing.frame);
             // The member's folder the command was given selects when no `-p` does (R3).
             let select = run_package::Select { member: standing.member, ..launch.select };

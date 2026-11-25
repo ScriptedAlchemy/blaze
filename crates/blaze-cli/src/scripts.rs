@@ -54,7 +54,7 @@ use blaze_drive::{Input, Kind, Name, Task, Want};
 use blaze_ids::ContentId;
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, Erased};
-use blaze_proc_macro::native_unit::{NativeSetting, placed};
+use blaze_proc_macro::native_unit::NativeSetting;
 use blaze_proc_macro::script::ScriptRuntime;
 use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree};
 use blaze_proc_macro::script_unit::{self, Setting, links_closure};
@@ -108,18 +108,6 @@ impl RanAs {
 /// reading it, stays this machine's (D112's "local records only").
 pub(crate) fn run_is_public(crate_public: bool, ran_as: RanAs) -> bool {
     crate_public && ran_as == RanAs::Wasm
-}
-
-/// How the run of build-script unit `script` is placed: D112 / D175 zero-Wasm choice point,
-/// made before anything runs; the same function the job asks (`job`), so the key and the run agree.
-pub(crate) fn placement(home: Option<&str>, graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> RanAs {
-    match home {
-        Some(home) => {
-            let store = Path::new(home).join(STORE_UNDER_HOME);
-            RanAs::of(&blaze_proc_macro::native_unit::placed_in_store(&store, graph, script, MODE, crate::graph::TRIPLE, alloc))
-        }
-        None => RanAs::of(&placed(graph, script, MODE, alloc)),
-    }
 }
 
 /// A `Script` record's payload split into how it ran and its outputs record (`bzbsout`, read
@@ -657,6 +645,7 @@ pub(crate) struct ScriptJob<'j> {
     name: Name,
     shared: &'j Shared<'j>,
     script: UnitId,
+    module: blaze_proc_macro::script_module::Selected,
     /// The side of the crates that read it: a macro-side run has TARGET [`MACRO_TARGET`].
     side: Side,
     /// The cfg of the crate of the list that reads this run (its world row's, sorted): a
@@ -939,6 +928,11 @@ pub(crate) fn job<'f: 'j, 'j>(
     if !wants.is_empty() {
         return Ok(Prepared::Need(wants));
     }
+    let handed = task.inputs.iter().find(|input| input.name == module).ok_or(CliError::Text { what: "a ready script has no module proof" })?;
+    let payload = crate::work::payload(&cx, store, handed, jobs)?;
+    let Some(module) = blaze_proc_macro::script_module::Selected::from_task(payload.payload()) else {
+        return Ok(Prepared::Said { what: "a build-script module record has no selection proof", words: "the module lookup did not return a selected producer key", hole: false });
+    };
     let files = match files_of(&mut scripts.sources, &mut scripts.files, members, lock, unit, frame, jobs) {
         Ok(files) => files,
         Err(refused) => return Ok(refused),
@@ -949,7 +943,7 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(shared) => shared,
         Err(words) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true }),
     };
-    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole }))
+    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, module, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole }))
 }
 
 /// What a script's run gave on its worker, in `Global` (its task frame ends with it): the
@@ -1044,7 +1038,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     };
     // The one choice point (D112 / D175 zero-Wasm), before anything runs: a script placed native
     // needs the command's native setting, or fails naming why it has none.
-    let runner = blaze_proc_macro::native_unit::placed_in_store(&shared.store, graph, job.script, MODE, crate::graph::TRIPLE, alloc);
+    let runner = if job.module.native() { Runner::Native { because: job.script } } else { Runner::Wasm };
     let ran_as = RanAs::of(&runner);
     let native = match (runner, &shared.native) {
         // No SDK: a function of the run's key, which holds "no SDK" ([`Shared::no_sdk`]), so
@@ -1056,6 +1050,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     };
     let setting = Setting {
         store: &shared.store,
+        module: Some(&job.module),
         // Its crates' side's target (ruling D115 (2)); native zero-Wasm macro scripts run for host.
         target: match (job.side, ran_as) {
             (Side::Target, _) | (Side::Macro, RanAs::Native) => crate::graph::TRIPLE,

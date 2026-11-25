@@ -46,6 +46,8 @@ use crate::protocol::{self as carrier, Answer, Binding, Command};
 use crate::server::random_id;
 use crate::sys::{SystemClock, ThreadFailed, current_pid, env_is_set, scope, sleep};
 
+mod grant_events;
+
 /// What every executor of a machine reserves: one holder's bookkeeping, not its compile, which
 /// the daemon's own budget admits.
 pub const NEED: Reservation = Reservation { memory: 1, cpus: 1, disk: 1 };
@@ -126,13 +128,27 @@ pub struct Grant {
     /// How many it found in its own store.
     pub stored: u64,
     /// Actual emitted store keys, in emission order, including repeated compiles.
-    pub compiled_keys: WireVec<Digest>,
+    pub emissions: WireVec<Emission>,
+}
+
+/// A store write observed by the compiler. Only the backend that produced a specialized
+/// output can identify its kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Emission {
+    pub key: Digest,
+    pub backend: Option<BackendKind>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendKind {
+    ReleaseBlob,
+    FoldedOutput,
 }
 
 /// How a unit's values arrived.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
-    /// A list published by an earlier build: nothing was scheduled.
+    /// Values from the published list, without taking a grant or running the tail.
     Published,
     /// This build's execution.
     Executed,
@@ -281,6 +297,7 @@ struct Batches<'a, G: Granted + ?Sized> {
 enum BatchError {
     NoncanonicalRoots { unit: Digest },
     RootIndex { unit: Digest, index: u64 },
+    ConflictingEmission { unit: Digest, key: Digest },
     Pack { unit: Digest, source: crate::pack::PackError },
     Upload { unit: Digest, source: Error },
 }
@@ -294,6 +311,7 @@ impl fmt::Display for BatchError {
             Self::RootIndex { unit, index } => {
                 write!(f, "unit {}: granted root {index} is outside the root set", hex(unit))
             }
+            Self::ConflictingEmission { unit, key } => write!(f, "unit {}: output {} has two backend kinds in one grant", hex(unit), hex(key)),
             Self::Pack { unit, source } => {
                 write!(f, "unit {}: cannot pack the granted values: {source}", hex(unit))
             }
@@ -328,43 +346,26 @@ impl<G: Granted + ?Sized> BatchCompiler for Batches<'_, G> {
             let at = usize::try_from(*index).ok().filter(|at| *at < self.unit.names.len());
             names.push(at.ok_or(BatchError::RootIndex { unit: self.unit.spec, index: *index })?);
         }
-        if env_is_set("BLAZE_DIST_EVENTS", alloc) {
-            let mut work = Vec::with_capacity_in(names.len().saturating_add(plan.grant.names.len()), alloc);
-            for at in &names {
-                if let Some(name) = self.unit.names.get(*at) {
-                    work.push(wire_name(&self.unit.spec, name, alloc).0);
-                }
-            }
-            for name in plan.grant.names.iter() {
-                work.push(name.0);
-            }
-            let pid = current_pid();
-            crate::telemetry::emit(
-                "grant",
-                &[
-                    ("pid", crate::telemetry::json(&pid, alloc)),
-                    ("unit_digest", crate::telemetry::json(&self.unit.spec, alloc)),
-                    ("execution", crate::telemetry::json(&plan.grant.lease.execution.0, alloc)),
-                    ("attempt", crate::telemetry::json(&plan.grant.lease.attempt.0, alloc)),
-                    ("holder", crate::telemetry::json(&plan.grant.lease.holder, alloc)),
-                    ("generation", crate::telemetry::json(&plan.grant.lease.generation, alloc)),
-                    ("seq", crate::telemetry::json(&plan.seq, alloc)),
-                    ("work", crate::telemetry::json(&work, alloc)),
-                ],
-                alloc,
-            );
-        }
+        let events = if env_is_set("BLAZE_DIST_EVENTS", alloc) {
+            let fields = grant_events::issued(self.unit, plan, &names, current_pid(), alloc)?;
+            crate::telemetry::emit("grant", &fields, alloc);
+            Some(fields)
+        } else { None };
         self.grants = self.grants.saturating_add(1);
         let (exported, packs): (bool, WireVec<PackRef>) = match self.granted.compile(&names) {
             Ok(grant) => {
+                let packs = Pack::batches(grant.values, alloc)
+                    .map_err(|source| BatchError::Pack { unit: self.unit.spec, source })?;
+                if let Some(mut fields) = events {
+                    grant_events::backend(&mut fields, self.unit.spec, &grant.emissions, alloc)?;
+                    crate::telemetry::emit("backend_work", &fields, alloc);
+                }
                 self.compiled = self.compiled.saturating_add(grant.compiled);
                 self.stored = self.stored.saturating_add(grant.stored);
-                self.compiled_keys.extend(grant.compiled_keys);
-                let mut references = Vec::new_in(alloc);
+                self.compiled_keys.extend(grant.emissions.into_iter().map(|output| output.key));
+                let mut references = Vec::with_capacity_in(packs.len(), alloc);
                 // Every pack is uploaded before this grant's result is posted.
-                for pack in Pack::batches(grant.values, alloc)
-                    .map_err(|source| BatchError::Pack { unit: self.unit.spec, source })?
-                {
+                for pack in packs {
                     self.blobs
                         .put_pack(&pack, alloc)
                         .map_err(|source| BatchError::Upload { unit: self.unit.spec, source })?;
@@ -510,6 +511,63 @@ fn published_packs<A: Allocator>(
     })
 }
 
+fn take_published(config: &Config, unit: &Unit, list: &[u8], cancelled: &AtomicBool) -> Result<Arrived, Error> {
+    let alloc = config.blobs.alloc;
+    let packs = published_packs(unit, list, alloc, alloc)?;
+    let values = after_publication(unit, import(&config.blobs, &packs, alloc), alloc)?;
+    ensure_not_cancelled(unit, cancelled, alloc)?;
+    Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None, alloc) })
+}
+
+/// A miss can precede an earlier execution's delivery even when this submission follows it.
+/// Check under the binding, before claiming any work. A publication of this execution still
+/// goes through its normal delivery and terminal acknowledgment in `execute`.
+fn published_after_submit(
+    config: &Config,
+    unit: &Unit,
+    cancelled: &AtomicBool,
+    binding: &Binding,
+    client: &mut Client,
+) -> Result<Option<Arrived>, Error> {
+    let alloc = config.blobs.alloc;
+    let sub = &binding.subscription;
+    let list = match config.blobs.published(&unit.spec, alloc) {
+        Ok(None) => return Ok(None),
+        Ok(Some(list)) => list,
+        Err(read) => return match publication(client, sub.content, sub.execution, alloc) {
+            Ok(own) if own.packs.is_some() => after_publication(unit, Err(read), alloc),
+            Ok(_) => Err(read),
+            Err(lookup) => Err(Error::Committed(format_in!(
+                alloc, "unit {}: manifest read failed ({read}) and its publication status is unknown: {lookup}", hex(&unit.spec)
+            ))),
+        },
+    };
+    let own = after_publication(unit, publication(client, sub.content, sub.execution, alloc), alloc)?;
+    if own.packs.is_some() {
+        return Ok(None);
+    }
+    let arrived = take_published(config, unit, &list, cancelled)?;
+    // The verified values can satisfy this still-attached interest at this observation.
+    // A superseded or expired subscriber must see its own terminal even on a cache hit.
+    match after_publication(unit, terminal(client, binding, alloc), alloc)?.value {
+        None => {
+            after_publication(unit, withdraw(client, binding, alloc), alloc)?;
+            Ok(Some(arrived))
+        }
+        Some(value) if value.termination.is_valid() && value.termination.outcome == Outcome::Passed => Ok(None),
+        Some(value) => Err(Error::Ended(value.termination)),
+    }
+}
+
+/// Give up only this subscription, using its current attempt even after a lead replacement.
+fn withdraw(client: &mut Client, binding: &Binding, alloc: WireAlloc) -> Result<(), Error> {
+    let current = resume(client, binding, alloc)?;
+    match answer(client, Command::Cancel(current), "withdrawing the cached subscriber", alloc)? {
+        Answer::Ack(_) => Ok(()),
+        other => Err(Error::Protocol(format_in!(alloc, "withdrawing the cached subscriber answered {other:?}"))),
+    }
+}
+
 /// How long an agent waits between asks at most, however long it has waited: what it asks is a
 /// state of the coordinator's that a wait of this does not miss by much.
 const POLL_MOST: Duration = Duration::from_millis(250);
@@ -541,10 +599,7 @@ pub fn run(
     let alloc = config.blobs.alloc;
     ensure_not_cancelled(unit, cancelled, alloc)?;
     if let Some(list) = config.blobs.published(&unit.spec, alloc)? {
-        let packs = published_packs(unit, &list, alloc, alloc)?;
-        let values = import(&config.blobs, &packs, alloc)?;
-        ensure_not_cancelled(unit, cancelled, alloc)?;
-        return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None, alloc) });
+        return take_published(config, unit, &list, cancelled);
     }
     let clock = SystemClock;
     let started_ns = clock.monotonic_nanos()?;
@@ -576,22 +631,17 @@ pub fn run(
         }
     };
     let mut assignments = BTreeSet::new_in(alloc);
-    let result = execute(
-        config,
-        unit,
-        granted,
-        cancelled,
-        clock,
-        started_ns,
-        &now_ms,
-        &binding,
-        &mut client,
-        &mut assignments,
-        alloc,
-    );
+    let result = match published_after_submit(config, unit, cancelled, &binding, &mut client) {
+        Ok(Some(arrived)) => Ok(arrived),
+        Ok(None) => execute(
+            config, unit, granted, cancelled, clock, started_ns, &now_ms, &binding,
+            &mut client, &mut assignments, alloc,
+        ),
+        Err(error) => Err(error),
+    };
     let result = ensure_not_cancelled(unit, cancelled, alloc).and(result);
     if result.is_err() {
-        leave(&mut client, &binding);
+        leave(&mut client, &binding, alloc);
     }
     // execute has joined every compiler/heartbeat scope. Only its recorded slots
     // can be cleaned up. An owned lookup observes a promotion that cancellation
@@ -1038,20 +1088,29 @@ fn heartbeat_during<T>(
 
 /// This build no longer waits for its execution: when nobody else does, it ends, and its
 /// executors go back. A failure here costs what the coordinator's own deadline takes back.
-fn leave(client: &mut Client, binding: &Binding) {
-    let current = match client.call(Command::Resume(binding.subscription.clone())) {
-        Ok(Answer::Binding(current)) => current,
-        _ => binding.clone(),
-    };
+fn leave(client: &mut Client, binding: &Binding, alloc: WireAlloc) {
+    let current = resume(client, binding, alloc).unwrap_or_else(|_| binding.clone());
     let _ = client.call(Command::Cancel(current));
+}
+
+fn resume(client: &mut Client, binding: &Binding, alloc: WireAlloc) -> Result<Binding, Error> {
+    match answer(client, Command::Resume(binding.subscription.clone()), "resuming the subscriber", alloc)? {
+        Answer::Binding(current) => Ok(current),
+        other => Err(Error::Protocol(format_in!(alloc, "resuming the subscriber answered {other:?}"))),
+    }
+}
+
+fn terminal(client: &mut Client, binding: &Binding, alloc: WireAlloc) -> Result<carrier::Terminal, Error> {
+    match answer(client, Command::Terminal(binding.subscription.clone()), "reading the subscriber's terminal", alloc)? {
+        Answer::Terminal(terminal) => Ok(terminal),
+        other => Err(Error::Protocol(format_in!(alloc, "reading the subscriber's terminal answered {other:?}"))),
+    }
 }
 
 /// Why the execution ended with nothing committed: its terminal for this subscription.
 fn ended(client: &mut Client, binding: &Binding, alloc: WireAlloc) -> Error {
-    match client.call(Command::Terminal(binding.subscription.clone())) {
-        Ok(Answer::Terminal(carrier::Terminal { value: Some(value), .. })) => {
-            Error::Ended(value.termination)
-        }
+    match terminal(client, binding, alloc) {
+        Ok(carrier::Terminal { value: Some(value), .. }) => Error::Ended(value.termination),
         Ok(other) => Error::Protocol(format_in!(
             alloc,
             "the execution ended and its terminal says {other:?}"

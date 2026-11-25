@@ -463,7 +463,7 @@ fn main() -> ExitCode {
                 },
             }
         };
-        let use_loc = |fragment, index: u32| c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(index as usize).copied());
+        let use_loc = |fragment, index: u32| c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(index as usize).map(|span| span.start()));
         for r in c.done.values() {
             let mpath = c.path_of(r.scope.module).unwrap_or_default().to_string();
             for error in r.scope.errors.iter() {

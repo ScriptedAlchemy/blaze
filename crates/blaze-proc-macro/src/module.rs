@@ -22,44 +22,21 @@ use std::path::{Path, PathBuf};
 
 use blaze_build_script::served::{InPackage, in_package};
 use blaze_expand::ProcKind;
-use blaze_manifest::lock::{Checksum, Lock, LockSource};
+use blaze_manifest::lock::Lock;
 
 /// The target a module is built for.
 pub const TARGET_JSON: &[u8] = include_bytes!("../guest/wasm32-wasip1-macro.json");
 /// The shim linked into each module.
 pub const SHIM: &[u8] = include_bytes!("../guest/shim.rs");
 
-/// A proc-macro crate as the lock and the unit graph name it.
-#[derive(Clone, Debug)]
-pub struct CrateId<'s> {
-    pub name: &'s str,
-    pub version: &'s str,
-    /// Where its sources are, as what pins their bytes.
-    pub source: Source<'s>,
-    /// [`LockedPackages::closure`] of it: the dependencies the lock pins under it.
-    pub deps: &'s str,
-    /// The features the host side of the graph unifies to.
-    pub features: &'s [&'s str],
-}
-
-/// What pins a proc-macro crate's sources: the line of [`identity`] that names them.
-#[derive(Clone, Copy, Debug)]
-pub enum Source<'s> {
-    /// From a registry: the lock's `checksum` of the package (`checksum <hex>`).
-    Registry { checksum: &'s str },
-    /// From a git repository: the commit the lock pins and the package's folder in it, `.` at
-    /// the root (`git <commit> <path>`).
-    Git { commit: &'s str, path: &'s str },
-    /// A workspace or path package: [`files_digest`] of its folder as it is
-    /// (`files <hex>`), so an edit to the macro crate makes a new module.
-    Path { files_sha256: &'s str },
-}
+pub use blaze_manifest::bootstrap::{CrateId, Source};
 
 /// Why a macro crate's dependency closure could not be read from a lock. A malformed lock never
 /// reaches here: blaze-manifest's one reader ([`Lock::read`]) refuses it first, naming the line
 /// of the entry (rule 30: one lock reader; rule 3: never a package named "").
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ClosureError {
+    InvalidDependency { package: usize },
     /// The lock has no package of this name and version.
     NotLocked { name: String, version: String },
     /// A path package in the closure: its sources are pinned by nothing in the lock.
@@ -69,6 +46,7 @@ pub enum ClosureError {
 impl std::fmt::Display for ClosureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ClosureError::InvalidDependency { package } => write!(f, "dependency index {package} is outside the parsed lock"),
             ClosureError::NotLocked { name, version } => write!(f, "the lock has no package {name} {version}"),
             ClosureError::Unpinned { name, version } => {
                 write!(f, "{name} {version} is a path package under a proc-macro crate: the lock pins nothing of its sources")
@@ -108,42 +86,33 @@ impl<'l, 'a> LockedPackages<'l, 'a> {
     /// sources): the first in the file's order is the root, as it was before (`Lock::named`
     /// keeps the file's order within a name).
     pub fn closure(&self, name: &str, version: &str) -> Result<String, ClosureError> {
-        let lock = self.lock;
-        let root = lock
-            .named(name)
-            .find(|id| lock.package(*id).version.to_string() == version)
-            .ok_or_else(|| ClosureError::NotLocked { name: name.to_owned(), version: version.to_owned() })?;
-        let mut seen = vec![false; lock.packages.len()];
-        seen[root.index()] = true;
-        let mut stack = vec![root];
-        while let Some(at) = stack.pop() {
-            for dep in lock.package(at).deps.iter() {
-                if !seen[dep.index()] {
-                    seen[dep.index()] = true;
-                    stack.push(*dep);
-                }
-            }
-        }
-        let mut lines = Vec::new();
-        for (at, package) in lock.packages.iter().enumerate() {
-            if !seen[at] || at == root.index() {
-                continue;
-            }
-            // The version as the lock writes it: a parsed semver prints as its text (no
-            // leading zero, nothing dropped), so the line is the text the old reader cut out.
-            let version = package.version.to_string();
-            let pin = match (&package.checksum, &package.source) {
-                (Checksum::Sha256(sum), _) => sum.as_str(),
-                (Checksum::Absent, LockSource::Path) => {
-                    return Err(ClosureError::Unpinned { name: package.name.as_str().to_owned(), version });
-                }
-                (Checksum::Absent, LockSource::Registry { .. } | LockSource::Git { .. }) => package.source_text.as_str(),
-            };
-            let pin = self.corrections.pin(package.name.as_str(), &version, pin);
-            lines.push(format!("{} {version} {pin}", package.name));
-        }
-        lines.sort();
-        Ok(sha256_hex(lines.join("\n").as_bytes()))
+        self.closure_lines(name, version, None, *self.lock.packages.allocator()).map(|lines| blaze_manifest::bootstrap::lock::digest(&lines).as_str().to_owned())
+    }
+
+    /// The script's lock closure: only declared build-dependency roots, then all packages
+    /// reachable from those roots. Normal path dependencies do not enter a script's key.
+    pub fn script_closure(&self, name: &str, version: &str, build_dependencies: &[&str]) -> Result<crate::script_module::HexDigest, ClosureError> {
+        self.closure_lines(name, version, Some(build_dependencies), *self.lock.packages.allocator()).map(|lines| blaze_manifest::bootstrap::lock::digest(&lines))
+    }
+
+    /// A checkout script whose local dependencies have captured portable source pins.
+    pub fn script_closure_at(&self, root: blaze_manifest::lock::LockId, build_dependencies: &[&str], paths: &[blaze_manifest::bootstrap::lock::PathPin]) -> Result<crate::script_module::HexDigest, blaze_manifest::bootstrap::lock::Refused> {
+        blaze_manifest::bootstrap::lock::closure_at(self.lock, root, Some(build_dependencies), paths, *self.lock.packages.allocator(), |name, version, pin| self.corrections.pin(name, version, pin))
+            .map(|lines| blaze_manifest::bootstrap::lock::digest(&lines))
+    }
+
+    /// The same closure as inspectable pin lines, so a bootstrap can verify what its compiler
+    /// actually linked before publishing the module record.
+    pub fn closure_lines<'s>(&self, name: &str, version: &str, build_dependencies: Option<&[&str]>, alloc: blaze_own::Alloc<'s>) -> Result<blaze_own::AVec<'s, blaze_own::AString<'s>>, ClosureError> {
+        blaze_manifest::bootstrap::lock::closure_lines(self.lock, name, version, build_dependencies, alloc, |name, version, pin| self.corrections.pin(name, version, pin))
+            .map_err(|why| match why {
+                blaze_manifest::bootstrap::lock::Refused::NotLocked => ClosureError::NotLocked { name: name.to_owned(), version: version.to_owned() },
+                blaze_manifest::bootstrap::lock::Refused::Unpinned { package } => match self.lock.packages.get(package) {
+                    Some(package) => ClosureError::Unpinned { name: package.name.as_str().to_owned(), version: package.version.to_string() },
+                    None => ClosureError::InvalidDependency { package },
+                },
+                blaze_manifest::bootstrap::lock::Refused::OutsideLock { package } => ClosureError::InvalidDependency { package },
+            })
     }
 }
 

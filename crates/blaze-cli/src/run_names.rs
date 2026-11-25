@@ -705,6 +705,20 @@ pub(crate) fn program_row<'f, 'm>(
     heap: &'static blaze_own::Heap,
     frame: &'f Frame,
 ) -> Result<usize, RunNamesError> {
+    export_row(cx, root, answered, store, facts, picked, crate::run_package::ExportKind::Binary, heap, frame)
+}
+
+pub(crate) fn export_row<'f, 'm>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    answered: &dyn Answered,
+    store: &mut dyn Store<'m>,
+    facts: &mut crate::work::Facts<'f, impl crate::sweep::Stamps>,
+    picked: &crate::run_package::Program<'_>,
+    kind: crate::run_package::ExportKind,
+    heap: &'static blaze_own::Heap,
+    frame: &'f Frame,
+) -> Result<usize, RunNamesError> {
     let _cx = cx.span("run names: the program's unit");
     let program_root = picked.root;
     let graph = answered.graph().ok_or(RunNamesError::NoGraph)?;
@@ -725,7 +739,11 @@ pub(crate) fn program_row<'f, 'm>(
     }
     let mut owner: Option<usize> = None;
     for (index, unit) in units.iter().enumerate() {
-        if unit.for_host || !matches!(unit.kind, blaze_unit_graph::UnitKind::Bin(_)) {
+        let selected = match kind {
+            crate::run_package::ExportKind::Binary => matches!(unit.kind, blaze_unit_graph::UnitKind::Bin(_)),
+            crate::run_package::ExportKind::Cdylib => matches!(unit.kind, blaze_unit_graph::UnitKind::Lib),
+        };
+        if unit.for_host || !selected {
             continue;
         }
         let at = u32_at(mapping, index * 4) as usize;

@@ -55,7 +55,11 @@ fn workspace(dir: &Path) {
         ("app/build.rs", BUILD),
         ("app/src/main.rs", MAIN),
     ];
-    for (path, text) in files {
+    write_files(dir, &files);
+}
+
+fn write_files(dir: &Path, files: &[(&str, &str)]) {
+    for &(path, text) in files {
         let at = dir.join(path);
         std::fs::create_dir_all(at.parent().expect("a file's folder")).unwrap_or_else(|error| panic!("making the folder of {}: {error}", at.display()));
         std::fs::write(&at, text).unwrap_or_else(|error| panic!("writing {}: {error}", at.display()));
@@ -124,11 +128,18 @@ fn module(line: &[u8]) -> Vec<u8> {
 }
 
 /// The module record of `app 0.1.0` with no features in `home`'s module store.
-fn put_module(home: &Path) {
-    let record = home.join(".blaze/v2/build-script/modules/app-0.1.0-test");
+fn put_module(home: &Path, workspace: &Path) {
+    use blaze_proc_macro::{module, script_module};
+    let files = module::files_digest(&mut module::package_files(&workspace.join("app")).expect("the package's source snapshot"));
+    let deps = module::sha256_hex(b"");
+    let shim = module::sha256_hex(script_module::SHIM);
+    let wanted = script_module::Wanted {
+        krate: module::CrateId { name: "app", version: "0.1.0", source: module::Source::Path { files_sha256: &files }, deps: &deps, features: &[] },
+        toolchain: script_module::TOOLCHAIN.trim(), runner: script_module::Runner::Wasm { shim: &shim },
+    };
+    let identity = format!("{wanted}patches test-runtime\n");
+    let record = home.join(".blaze/v2/build-script/modules").join(module::sha256_hex(identity.as_bytes()));
     std::fs::create_dir_all(&record).unwrap_or_else(|error| panic!("making {}: {error}", record.display()));
-    // A wasm module names the process shim it was built with; the host runs only its own.
-    let identity = format!("name app\nversion 0.1.0\nfeatures \n{}\n", blaze_proc_macro::script_unit::shim_line());
     std::fs::write(record.join("identity"), identity).expect("the module's identity");
     let bytes = module(LINE);
     // The record's digest (script_modules.rs reads it as the lookup's out): the module's SHA-256.
@@ -200,7 +211,7 @@ fn a_scripts_cfg_reaches_a_cfg_item() {
     let base = fresh_home("build_scripts_cfg", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
-    put_module(&home);
+    put_module(&home, &at);
     let (_, said) = check(&at, &home);
     assert!(!said.contains("the build script of app"), "the script did not run:\n{said}");
     // The status is not read: while the borrow check's findings stay notes, every check ends
@@ -266,7 +277,7 @@ fn engine_check_runs_the_script_and_lists_what_check_lists() {
     let base = fresh_home("build_scripts_engine", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
-    put_module(&home);
+    put_module(&home, &at);
     let (_, said) = check(&at, &home);
     // Not the status: every check ends "incomplete: NOT checked: borrows" for now.
     assert!(said.contains("0 errors: blaze check") && !said.contains("not checked because"), "check of the fixture failed:\n{said}");
@@ -369,15 +380,32 @@ name = \"sha3-asm\"
 version = \"0.1.0\"
 dependencies = [\"cc\"]
 ").unwrap();
-        std::fs::write(ws.join("cc/Cargo.toml"), "[package]\nname = \"cc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
-        std::fs::write(ws.join("cc/src/lib.rs"), "").unwrap();
-        std::fs::write(ws.join("src/lib.rs"), "").unwrap();
-        std::fs::write(ws.join("build.rs"), "fn main() {}\n").unwrap();
+        write_files(&ws, &[
+            ("cc/Cargo.toml", "[package]\nname = \"cc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+            ("cc/src/lib.rs", ""),
+            ("src/lib.rs", ""),
+            ("build.rs", "fn main() {}\n"),
+        ]);
 
         let store = home.join(".blaze/v2");
-        let module = store.join("build-script/modules/sha3-asm-jobs");
+        use blaze_proc_macro::{module, script_module};
+        let files = module::files_digest(&mut module::package_files(&ws).expect("script source snapshot"));
+        let cc = module::files_digest(&mut module::package_files(&ws.join("cc")).expect("cc source snapshot"));
+        let alloc = blaze_own::testing::heap().alloc();
+        let lock_text = std::fs::read(ws.join("Cargo.lock")).expect("fixture lock");
+        let lock = blaze_manifest::lock::Lock::read(&lock_text, alloc).expect("fixture lock parses");
+        let cc_id = lock.named("cc").next().expect("cc's path lock entry");
+        let root_id = lock.named("sha3-asm").next().expect("script's path lock entry");
+        let pins = [blaze_manifest::bootstrap::lock::PathPin { package: cc_id, files: script_module::HexDigest::parse(&cc).expect("cc digest") }];
+        let deps = module::LockedPackages::of(&lock).script_closure_at(root_id, &["cc"], &pins).expect("captured local dependency closure");
+        let wanted = script_module::Wanted {
+            krate: module::CrateId { name: "sha3-asm", version: "0.1.0", source: module::Source::Path { files_sha256: &files }, deps: deps.as_str(), features: &[] },
+            toolchain: script_module::TOOLCHAIN.trim(), runner: script_module::Runner::Native { target: "aarch64-apple-darwin" },
+        };
+        let identity = format!("{wanted}patches test-jobserver-probe\n");
+        let module = store.join("build-script/modules").join(module::sha256_hex(identity.as_bytes()));
         std::fs::create_dir_all(&module).unwrap();
-        std::fs::write(module.join("identity"), "name sha3-asm\nversion 0.1.0\nfeatures \ntarget aarch64-apple-darwin\n").unwrap();
+        std::fs::write(module.join("identity"), identity).unwrap();
         let program = module.join("script.bin");
         std::fs::write(&program, PROBE).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -397,6 +425,12 @@ dependencies = [\"cc\"]
         assert_eq!(live, expected, "{word}: the child's environment and available tokens");
         assert_ne!(dropped, expected, "{word}: the oracle accepted the dropped jobserver");
         assert_eq!(dropped, "16|unset|unset|", "{word}: the count alone gave the control no FIFO");
+        write_files(&ws, &[("cc/src/lib.rs", "// edited local build dependency\n")]);
+        let (_, ok, changed) = run_with_args(&ws, &home, word, &["--workers", "16"]);
+        assert!(!ok && changed.contains("no build-script module of sha3-asm 0.1.0"), "{word}: an edited local dependency reused the old module:\n{changed}");
+        write_files(&ws, &[("cc/src/lib.rs", "")]);
+        let (_, _, restored) = run_with_args(&ws, &home, word, &["--workers", "16"]);
+        assert!(restored.contains("0 errors: blaze check"), "{word}: restoring the source did not reuse its module:\n{restored}");
         std::fs::remove_dir_all(base).expect("remove the temporary checkout and home");
     }
     println!("the native path saw NUM_JOBS=16 and all 15 FIFO tokens, and the dropped jobserver was caught");

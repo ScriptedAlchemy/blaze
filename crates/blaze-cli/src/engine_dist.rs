@@ -11,7 +11,7 @@
 //!   pipeline and returns both the content entry (`KIND_CODE = 0`) and pointer (`KIND_POINTER = 1`)
 //!   records so every peer and cold cache consumer hits the exact same `CodeKey`s without
 //!   recompiling.
-//! - `Granted::complete` runs on the lead executor only, overlays committed values in front of
+//! - `Granted::complete` runs on the lead executor only, imports committed values into
 //!   `HomeCodeStore`, completes any remaining reachability tail for the final program unit, and
 //!   emits every tail-read and tail-compiled value before manifest publication.
 //! - Failures pass through `blaze_dist_local::agent::decide`: committed-pack corruption and
@@ -26,20 +26,18 @@ use core::time::Duration;
 
 use blaze_core::Driver;
 use blaze_dist::holder::HolderConfig;
-use blaze_dist_local::agent::{self, Arrived, Config, Grant, Granted, Source, Unit};
+use blaze_dist_local::agent::{self, Arrived, Config, Emission, Grant, Granted, Source, Unit};
 use blaze_dist_local::blobs::Blobs;
 use blaze_dist_local::pack::{Value, ValueRef};
-use blaze_dist_local::sys::{
-    append_file, current_pid, path_is_file, random_id, read_file, write_file,
-};
-use blaze_dist_local::telemetry;
+use blaze_dist_local::sys::{append_file, random_id};
 use blaze_ids::ContentId;
 use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
+use blaze_ladder::backend_plan::{GrantName, Written};
 use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, StoreError};
 use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::run::RunError;
 use blaze_ladder::run::make_one::{MOST_WALKED, Maker, NamesRecords, RecordsProgram, Typing};
-use blaze_ladder::run::special::Roots;
+use blaze_ladder::run::special::ProductRoots;
 use blaze_ladder::symbols::{encode_instance, fn_symbol_of_name};
 use blaze_own::{AString, AVec, Alloc, BTreeMap, BTreeSet, String, Vec};
 use blaze_scope::items_record::{ItemsRecord, TextSpan};
@@ -100,12 +98,14 @@ pub(crate) enum DistError {
     SourceWithoutPr { value: AString<'static> },
     /// Could not draw a random claimant identifier.
     Claimant { shown: AString<'static> },
+    /// Reading the distributed export sidecar or the executable it identifies failed.
+    Fingerprint { path: WireString, errno: blaze_sys::Errno },
     /// A distributed unit failed and `LocalPolicy` (or corruption/compile refusal) stopped the build.
     UnitFailed { unit: AString<'static>, shown: AString<'static> },
     /// Local compilation inside a distributed unit failed.
     Compile { shown: AString<'static> },
-    /// Reading or writing a committed overlay entry failed.
-    Store { shown: AString<'static> },
+    /// Reading, admitting or exporting distributed code records failed.
+    Store(StoreError),
 }
 
 impl fmt::Display for DistError {
@@ -138,6 +138,7 @@ impl fmt::Display for DistError {
             DistError::Claimant { shown } => {
                 write!(f, "the distributed build failed: naming this agent: {}", shown.as_str())
             }
+            DistError::Fingerprint { path, errno } => write!(f, "checking the distributed export fingerprint at {}: {errno}", bstd::report::Code(path.as_str())),
             DistError::UnitFailed { unit, shown } => {
                 write!(
                     f,
@@ -149,8 +150,8 @@ impl fmt::Display for DistError {
             DistError::Compile { shown } => {
                 write!(f, "the distributed build failed: {}", shown.as_str())
             }
-            DistError::Store { shown } => {
-                write!(f, "the distributed build failed: store: {}", shown.as_str())
+            DistError::Store(error) => {
+                write!(f, "the distributed build failed: store: {error}")
             }
         }
     }
@@ -270,112 +271,121 @@ impl DistConfig {
     }
 }
 
-/// Overlay `CodeStore`: committed values from peers/cache sit in front of `HomeCodeStore`, while
-/// recording every read and write so both granted batches and lead tails export complete values.
+/// One received value, with its wire kind and pointer width checked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodeValue<'b> {
+    Entry(&'b [u8]),
+    Pointer(CodeKey),
+}
+
+impl<'b> CodeValue<'b> {
+    fn read(value: ValueRef<'b>) -> Result<Self, StoreError> {
+        let key = CodeKey(ContentId(value.key));
+        match value.kind {
+            KIND_CODE => Ok(Self::Entry(value.bytes)),
+            KIND_POINTER => {
+                let target = value.bytes.try_into().map_err(|_| StoreError::Failed { key, what: "a distributed code pointer must hold exactly one 32-byte key" })?;
+                Ok(Self::Pointer(CodeKey(ContentId(target))))
+            }
+            _ => Err(StoreError::Failed { key, what: "unknown distributed code record kind" }),
+        }
+    }
+}
+
+/// The home store holds both compiled and received values. Only the keys touched by the
+/// current grant or tail are kept alongside it, for exporting that work's records.
 pub(crate) struct DistStore<'s, 'm, D: Driver> {
     local: &'s mut HomeCodeStore<'m, D>,
-    overlay: BTreeMap<Digest, (u8, WireVec<u8>), WireAlloc>,
-    reads: RefCell<BTreeSet<CodeKey, WireAlloc>>,
-    writes: WireVec<Value>,
+    tracked: RefCell<BTreeSet<CodeKey, WireAlloc>>,
     alloc: WireAlloc,
 }
 
 impl<'s, 'm, D: Driver> DistStore<'s, 'm, D> {
     pub(crate) fn new(local: &'s mut HomeCodeStore<'m, D>, alloc: WireAlloc) -> Self {
-        Self {
-            local,
-            overlay: BTreeMap::new_in(alloc),
-            reads: RefCell::new(BTreeSet::new_in(alloc)),
-            writes: WireVec::new_in(alloc),
-            alloc,
-        }
+        Self { local, tracked: RefCell::new(BTreeSet::new_in(alloc)), alloc }
     }
 
     pub(crate) fn clear_tracking(&mut self) {
-        self.reads.borrow_mut().clear();
-        self.writes.clear();
+        self.tracked.get_mut().clear();
     }
 
-    pub(crate) fn insert_overlay(&mut self, key: Digest, kind: u8, bytes: &[u8]) {
-        if !self.overlay.contains_key(&key) {
-            self.overlay.insert(key, (kind, copy_wire_bytes(bytes, self.alloc)));
+    /// Validate the entire batch before admitting any record. A pointer names a plain entry
+    /// in this batch or in the home, and may replace an older pointer after a source edit.
+    pub(crate) fn import<'b>(&mut self, values: impl Iterator<Item = ValueRef<'b>>) -> Result<(), StoreError> {
+        let mut batch = BTreeMap::new_in(self.alloc);
+        for value in values {
+            let key = CodeKey(ContentId(value.key));
+            let record = CodeValue::read(value)?;
+            if let Some(first) = batch.insert(key, record) && first != record {
+                return Err(StoreError::TwoValues { key });
+            }
         }
+        for (&key, &record) in &batch {
+            let held = self.local.get(key)?;
+            match record {
+                CodeValue::Entry(bytes) => {
+                    if held.is_some_and(|prior| prior != bytes) || (held.is_none() && self.local.pointed(key)?.is_some()) {
+                        return Err(StoreError::TwoValues { key });
+                    }
+                }
+                CodeValue::Pointer(target) => {
+                    if held.is_some() {
+                        return Err(StoreError::TwoValues { key });
+                    }
+                    // Check the current pointer's own store errors before any part is written.
+                    let _previous = self.local.pointed(key)?;
+                    let has_entry = match batch.get(&target) {
+                        Some(record) => matches!(record, CodeValue::Entry(_)),
+                        None => self.local.get(target)?.is_some(),
+                    };
+                    if !has_entry {
+                        return Err(StoreError::Failed { key, what: "a distributed pointer must name a plain code entry" });
+                    }
+                }
+            }
+        }
+        for (&key, &record) in &batch {
+            if let CodeValue::Entry(bytes) = record {
+                self.local.put(CodeClass::Program, key, bytes)?;
+            }
+        }
+        for (key, record) in batch {
+            if let CodeValue::Pointer(target) = record {
+                self.local.point(CodeClass::Program, key, target)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn merge_arrived(&mut self, arrived: &Arrived) -> Result<(), DistError> {
-        for (digest, (kind, bytes)) in &arrived.values {
-            let key = CodeKey(ContentId(*digest));
-            if *kind == KIND_CODE {
-                let _ = self.local.put(CodeClass::Program, key, bytes.as_slice());
-            } else if *kind == KIND_POINTER && bytes.len() == 32 {
-                let mut target = [0u8; 32];
-                target.copy_from_slice(bytes.as_slice());
-                let _ = self.local.point(CodeClass::Program, key, CodeKey(ContentId(target)));
-            }
-            self.insert_overlay(*digest, *kind, bytes.as_slice());
-        }
-        Ok(())
+        self.import(arrived.values.iter().map(|(&key, (kind, bytes))| ValueRef { key, kind: *kind, bytes })).map_err(DistError::Store)
     }
 
-    fn export_key(&self, mut key: CodeKey, out: &mut BTreeMap<Digest, Value, WireAlloc>) -> Result<(), StoreError> {
-        for _ in 0..8 {
-            let digest = key.0.0;
-            if out.contains_key(&digest) {
-                return Ok(());
-            }
-            if let Some((kind, bytes)) = self.overlay.get(&digest) {
-                out.insert(
-                    digest,
-                    Value { key: digest, kind: *kind, bytes: copy_wire_bytes(bytes.as_slice(), self.alloc) },
-                );
-                if *kind == KIND_POINTER && bytes.len() == 32 {
-                    let mut target = [0u8; 32];
-                    target.copy_from_slice(bytes.as_slice());
-                    key = CodeKey(ContentId(target));
-                    continue;
-                }
-                return Ok(());
-            }
-            if let Some(target) = self.local.pointed(key)? {
-                out.insert(
-                    digest,
-                    Value { key: digest, kind: KIND_POINTER, bytes: copy_wire_bytes(&target.0.0, self.alloc) },
-                );
-                key = target;
+    /// A code key is either a plain entry or one pointer to a plain entry. Copy each key
+    /// once, and require every tracked hit and every pointer target to still be present.
+    fn drain_tracked_values(&mut self) -> Result<WireVec<Value>, StoreError> {
+        let mut by_key = BTreeMap::new_in(self.alloc);
+        for &key in self.tracked.get_mut().iter() {
+            if by_key.contains_key(&key.0.0) {
                 continue;
             }
-            if let Some(bytes) = self.local.get(key)? {
-                out.insert(
-                    digest,
-                    Value { key: digest, kind: KIND_CODE, bytes: copy_wire_bytes(bytes, self.alloc) },
-                );
-            }
-            return Ok(());
+            let entry = match self.local.pointed(key)? {
+                Some(target) => {
+                    by_key.insert(key.0.0, Value { key: key.0.0, kind: KIND_POINTER, bytes: copy_wire_bytes(&target.0.0, self.alloc) });
+                    if by_key.contains_key(&target.0.0) {
+                        continue;
+                    }
+                    target
+                }
+                None => key,
+            };
+            let bytes = self.local.get(entry)?.ok_or(StoreError::Failed { key: entry, what: "a tracked code entry is missing during distributed export" })?;
+            by_key.insert(entry.0.0, Value { key: entry.0.0, kind: KIND_CODE, bytes: copy_wire_bytes(bytes, self.alloc) });
         }
-        Ok(())
-    }
-
-    fn drain_tracked_values(&mut self) -> Result<WireVec<Value>, StoreError> {
-        let mut by_key: BTreeMap<Digest, Value, WireAlloc> = BTreeMap::new_in(self.alloc);
-        let written = core::mem::replace(&mut self.writes, WireVec::new_in(self.alloc));
-        for val in written {
-            by_key.insert(val.key, val);
-        }
-        let seen: WireVec<CodeKey> = {
-            let set = self.reads.borrow();
-            let mut list = WireVec::with_capacity_in(set.len(), self.alloc);
-            for key in set.iter() {
-                list.push(*key);
-            }
-            list
-        };
-        for key in seen {
-            self.export_key(key, &mut by_key)?;
-        }
-        self.reads.borrow_mut().clear();
+        self.clear_tracking();
         let mut values = WireVec::with_capacity_in(by_key.len(), self.alloc);
-        for (_, val) in by_key {
-            values.push(val);
+        for (_, value) in by_key {
+            values.push(value);
         }
         Ok(values)
     }
@@ -383,71 +393,42 @@ impl<'s, 'm, D: Driver> DistStore<'s, 'm, D> {
 
 impl<D: Driver> CodeStore for DistStore<'_, '_, D> {
     fn get(&self, key: CodeKey) -> Result<Option<&[u8]>, StoreError> {
-        let digest = key.0.0;
-        if let Some((kind, bytes)) = self.overlay.get(&digest) {
-            self.reads.borrow_mut().insert(key);
-            if *kind == KIND_CODE {
-                return Ok(Some(bytes.as_slice()));
-            }
-            return Ok(None);
+        let bytes = self.local.get(key)?;
+        if bytes.is_some() {
+            self.tracked.borrow_mut().insert(key);
         }
-        let res = self.local.get(key)?;
-        if res.is_some() {
-            self.reads.borrow_mut().insert(key);
-        }
-        Ok(res)
+        Ok(bytes)
     }
 
     fn put(&mut self, class: CodeClass, key: CodeKey, bytes: &[u8]) -> Result<(), StoreError> {
         self.local.put(class, key, bytes)?;
-        let digest = key.0.0;
-        self.overlay.insert(digest, (KIND_CODE, copy_wire_bytes(bytes, self.alloc)));
-        self.writes.push(Value {
-            key: digest,
-            kind: KIND_CODE,
-            bytes: copy_wire_bytes(bytes, self.alloc),
-        });
+        self.tracked.get_mut().insert(key);
         Ok(())
     }
 
     fn pointed(&self, key: CodeKey) -> Result<Option<CodeKey>, StoreError> {
-        let digest = key.0.0;
-        if let Some((kind, bytes)) = self.overlay.get(&digest) {
-            self.reads.borrow_mut().insert(key);
-            if *kind == KIND_POINTER && bytes.len() == 32 {
-                let mut target = [0u8; 32];
-                target.copy_from_slice(bytes.as_slice());
-                return Ok(Some(CodeKey(ContentId(target))));
-            }
-            return Ok(None);
+        let target = self.local.pointed(key)?;
+        if target.is_some() {
+            self.tracked.borrow_mut().insert(key);
         }
-        let res = self.local.pointed(key)?;
-        if let Some(target) = res {
-            self.reads.borrow_mut().insert(key);
-            self.reads.borrow_mut().insert(target);
-        }
-        Ok(res)
+        Ok(target)
     }
 
     fn point(&mut self, class: CodeClass, key: CodeKey, content: CodeKey) -> Result<(), StoreError> {
         self.local.point(class, key, content)?;
-        let digest = key.0.0;
-        self.overlay.insert(digest, (KIND_POINTER, copy_wire_bytes(&content.0.0, self.alloc)));
-        self.writes.push(Value {
-            key: digest,
-            kind: KIND_POINTER,
-            bytes: copy_wire_bytes(&content.0.0, self.alloc),
-        });
+        self.tracked.get_mut().insert(key);
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod store_tests;
 
 /// One concrete, pre-keyed function inside a crate's distributed unit.
 struct WorkItem<'a> {
     tabled: ItemKey,
     name: AVec<'a, u8>,
     key: CodeKey,
-    fold_candidate: bool,
 }
 
 /// One workspace crate's distributed unit plan.
@@ -526,6 +507,30 @@ fn unit_digest_of(
     digest_of_encoded_name("blaze/dist-unit", buf.as_slice())
 }
 
+/// The final unit walks the roots of this product. A library exporting the same functions as
+/// an executable, or exporting a symbol under another C name, requests a different product.
+fn product_digest(roots: &ProductRoots<'_>, exports: &[blaze_export::CExport<'_>]) -> Digest {
+    use bstd::int::Int;
+    let mut hash = blaze_sha256::Sha256::new();
+    hash.update(b"blaze/distributed-export-product/1\0");
+    let form = match roots {
+        ProductRoots::Executable(executable) => executable.form.word(),
+        ProductRoots::Library(_) => "cdylib",
+    };
+    hash.update(form.as_bytes());
+    hash.update(&[0]);
+    hash.update(&roots.len().widen_to::<u64>().to_le_bytes());
+    for symbol in roots.symbols() {
+        hash.update(&symbol.0);
+    }
+    for export in exports {
+        hash.update(&export.name.len().widen_to::<u64>().to_le_bytes());
+        hash.update(export.name);
+        hash.update(&export.symbol.0);
+    }
+    hash.finish()
+}
+
 /// Reads a `TextSpan` from `names` for crate `krate` without any lossy casts.
 fn slice_span<'a>(names: &NamesRecords<'a>, krate: usize, span: TextSpan) -> Option<&'a str> {
     let whole = names.records.whole_text(krate, span.at)?;
@@ -548,7 +553,7 @@ fn collect_crate_items<'a, 'b>(
     let tys = PortableTys::new_in(alloc);
     let ground = tys.view();
 
-    let mut try_push = |item_key: ItemKey, fold_candidate: bool| {
+    let mut try_push = |item_key: ItemKey| {
         if ids.runnable(item_key).is_err() {
             return;
         }
@@ -568,7 +573,7 @@ fn collect_crate_items<'a, 'b>(
         ) else {
             return;
         };
-        raw.push(WorkItem { tabled: item_key, name: encoded, key, fold_candidate });
+        raw.push(WorkItem { tabled: item_key, name: encoded, key });
     };
 
     for i in 0..rec.items() {
@@ -581,7 +586,7 @@ fn collect_crate_items<'a, 'b>(
             None => false,
         };
         if nongeneric {
-            try_push(checker_of(item.key), true);
+            try_push(checker_of(item.key));
         }
     }
 
@@ -610,7 +615,7 @@ fn collect_crate_items<'a, 'b>(
                 None => true,
             };
             if member_nongeneric {
-                try_push(checker_of(mkey), true);
+                try_push(checker_of(mkey));
             }
         }
     }
@@ -638,37 +643,6 @@ fn json_digests(digests: &[Digest], alloc: WireAlloc) -> WireString {
     }
     out.push(']');
     out
-}
-
-/// Emits one `backend_work` JSONL event on `BLAZE_DIST_EVENTS` when `--release` is active.
-fn emit_backend_work(
-    unit_digest: &Digest,
-    work: &[Digest],
-    compiled_keys: &[Digest],
-    release_keys: &[Digest],
-    folded_keys: &[Digest],
-    alloc: WireAlloc,
-) {
-    let mut pid_s = WireString::new_in(alloc);
-    let _ = write!(pid_s, "{}", current_pid());
-    let mut ud_s = WireString::new_in(alloc);
-    let _ = write!(ud_s, "\"{}\"", hex(unit_digest));
-    let work_s = json_digests(work, alloc);
-    let compiled_s = json_digests(compiled_keys, alloc);
-    let release_s = json_digests(release_keys, alloc);
-    let folded_s = json_digests(folded_keys, alloc);
-    telemetry::emit(
-        "backend_work",
-        &[
-            ("pid", pid_s.as_str()),
-            ("unit_digest", ud_s.as_str()),
-            ("work", work_s.as_str()),
-            ("compiled_keys", compiled_s.as_str()),
-            ("release_keys", release_s.as_str()),
-            ("folded_keys", folded_s.as_str()),
-        ],
-        alloc,
-    );
 }
 
 /// Appends one JSONL unit report row to `BLAZE_DIST_REPORT`.
@@ -729,39 +703,9 @@ pub(crate) enum DistExportOutcome {
     FallbackLocal,
 }
 
-/// Computes the sidecar fingerprint path `<output>.blaze-dist-fp`.
-fn fingerprint_path(output_path: &str, alloc: WireAlloc) -> WireString {
-    let mut s = WireString::with_capacity_in(output_path.len() + 15, alloc);
-    s.push_str(output_path);
-    s.push_str(".blaze-dist-fp");
-    s
-}
-
-/// Checks if `output_path` already exists with a matching sidecar fingerprint.
-pub(crate) fn matches_output_fingerprint(
-    output_path: &str,
-    fp: &Digest,
-    alloc: WireAlloc,
-) -> bool {
-    if !path_is_file(output_path) {
-        return false;
-    }
-    let fp_path = fingerprint_path(output_path, alloc);
-    let Ok(bytes) = read_file(fp_path.as_str(), alloc) else {
-        return false;
-    };
-    let mut expected = WireString::with_capacity_in(64, alloc);
-    let _ = write!(expected, "{}", hex(fp));
-    bytes.as_slice() == expected.as_bytes()
-}
-
-/// Writes the sidecar fingerprint after `output_path` has been published.
-pub(crate) fn write_output_fingerprint(output_path: &str, fp: &Digest, alloc: WireAlloc) {
-    let fp_path = fingerprint_path(output_path, alloc);
-    let mut expected = WireString::with_capacity_in(64, alloc);
-    let _ = write!(expected, "{}", hex(fp));
-    let _ = write_file(fp_path.as_str(), expected.as_bytes());
-}
+mod fingerprint;
+use fingerprint::matches_output_fingerprint;
+pub(crate) use fingerprint::write_output_fingerprint;
 
 /// `Granted` implementation for one workspace crate unit.
 struct UnitExecutor<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>> {
@@ -770,8 +714,7 @@ struct UnitExecutor<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>> {
     builder: &'a Builder,
     maker: &'a mut Maker<'b, crate::run_ids::Runnable, T>,
     store: &'a mut DistStore<'s, 'm, D>,
-    roots: &'a Roots<'a>,
-    release: bool,
+    roots: &'a ProductRoots<'a>,
     scratch_alloc: Alloc<'a>,
     wire_alloc: WireAlloc,
     heap: &'static blaze_own::Heap,
@@ -786,20 +729,18 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
     type Error = DistError;
 
     fn compile(&mut self, names: &[usize]) -> Result<Grant, DistError> {
-        let mut grant_values: BTreeMap<Digest, Value, WireAlloc> = BTreeMap::new_in(self.wire_alloc);
-        let mut compiled_keys: WireVec<Digest> = WireVec::new_in(self.wire_alloc);
-        let mut release_keys: WireVec<Digest> = WireVec::new_in(self.wire_alloc);
-        let mut folded_keys: WireVec<Digest> = WireVec::new_in(self.wire_alloc);
-        let mut work_digests: WireVec<Digest> = WireVec::with_capacity_in(names.len(), self.wire_alloc);
+        let mut values = WireVec::new_in(self.wire_alloc);
+        let mut emissions = WireVec::new_in(self.wire_alloc);
         let mut compiled = 0u64;
         let mut stored = 0u64;
         let mut scratch = Scratch::new_in(self.scratch_alloc);
 
         for &idx in names {
             let Some(item) = self.plan.items.get(idx) else {
-                continue;
+                let mut shown = String::new_in(self.heap.alloc());
+                let _ = write!(shown, "grant index {idx} is outside unit {} with {} items", self.plan.unit_name.as_str(), self.plan.items.len());
+                return Err(DistError::Compile { shown });
             };
-            work_digests.push(item.key.0.0);
             let proof = self.ids.runnable(item.tabled).map_err(|why| {
                 let mut s = String::new_in(self.heap.alloc());
                 let _ = write!(s, "item not runnable: {why}");
@@ -812,7 +753,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                 let _ = write!(s, "walk root: {why}");
                 DistError::Compile { shown: s }
             })?;
-            match walk.one(
+            let one = walk.one(
                 0,
                 self.ids,
                 self.store,
@@ -823,56 +764,38 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                 &body_ids::EntryForm,
                 MOST_WALKED,
                 &mut scratch,
-            ) {
-                Ok(one) => match one.stepped {
-                    Stepped::Found(_) => {
-                        stored += 1;
-                    }
-                    Stepped::Made(code_key) => {
-                        compiled += 1;
-                        let digest = code_key.0.0;
-                        compiled_keys.push(digest);
-                        if self.release {
-                            release_keys.push(digest);
-                            if item.fold_candidate {
-                                folded_keys.push(digest);
-                            }
-                        }
-                    }
-                    Stepped::Unkeyed(_) => {}
-                },
-                Err(why) => {
-                    let mut s = String::new_in(self.heap.alloc());
-                    let _ = write!(s, "compiling item: {why}");
-                    return Err(DistError::Compile { shown: s });
+            ).map_err(|why| {
+                let mut shown = String::new_in(self.heap.alloc());
+                let _ = write!(shown, "compiling item: {why}");
+                DistError::Compile { shown }
+            })?;
+            let records = self.store.drain_tracked_values().map_err(DistError::Store)?;
+            match one.stepped {
+                Stepped::Found(_) => stored += 1,
+                Stepped::Made(content) => {
+                    let pointer = records.binary_search_by_key(&item.key.0.0, |value| value.key)
+                        .ok().and_then(|index| records.get(index));
+                    let pointed = match pointer {
+                        Some(value) => match CodeValue::read(ValueRef { key: value.key, kind: value.kind, bytes: &value.bytes }).map_err(DistError::Store)? {
+                            CodeValue::Pointer(target) => Some(target),
+                            CodeValue::Entry(_) => None,
+                        },
+                        None => None,
+                    };
+                    let written = Written::check(item.key, pointed, content).map_err(DistError::Store)?;
+                    compiled += 1;
+                    emissions.push(Emission { key: written.content().0.0, backend: None });
+                }
+                Stepped::Unkeyed(why) => {
+                    let mut shown = String::new_in(self.heap.alloc());
+                    let _ = write!(shown, "the granted item {} produced unkeyed code: {why:?}", item.key);
+                    return Err(DistError::Compile { shown });
                 }
             }
-            let tracked = self.store.drain_tracked_values().map_err(|why| {
-                let mut s = String::new_in(self.heap.alloc());
-                let _ = write!(s, "{why}");
-                DistError::Store { shown: s }
-            })?;
-            for val in tracked {
-                grant_values.insert(val.key, val);
-            }
+            // Pack::batches checks all of a grant's values together before uploading any.
+            values.extend(records);
         }
-
-        if self.release && !compiled_keys.is_empty() {
-            emit_backend_work(
-                &self.plan.unit.spec,
-                work_digests.as_slice(),
-                compiled_keys.as_slice(),
-                release_keys.as_slice(),
-                folded_keys.as_slice(),
-                self.wire_alloc,
-            );
-        }
-
-        let mut values = WireVec::with_capacity_in(grant_values.len(), self.wire_alloc);
-        for (_, val) in grant_values {
-            values.push(val);
-        }
-        Ok(Grant { values, compiled, stored, compiled_keys })
+        Ok(Grant { values, compiled, stored, emissions })
     }
 
     fn complete(
@@ -881,9 +804,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
         output: &mut dyn FnMut(Value),
     ) -> Result<(), DistError> {
         self.ran_complete = true;
-        for v in values {
-            self.store.insert_overlay(v.key, v.kind, v.bytes);
-        }
+        self.store.import(values).map_err(DistError::Store)?;
         if !self.plan.is_final {
             return Ok(());
         }
@@ -945,11 +866,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                 }
             }
         }
-        let tracked = self.store.drain_tracked_values().map_err(|why| {
-            let mut s = String::new_in(self.heap.alloc());
-            let _ = write!(s, "{why}");
-            DistError::Store { shown: s }
-        })?;
+        let tracked = self.store.drain_tracked_values().map_err(DistError::Store)?;
         for val in tracked {
             output(val);
         }
@@ -969,7 +886,9 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
     builder: &'a Builder,
     maker: &'a mut Maker<'b, crate::run_ids::Runnable, T>,
     store: &'a mut DistStore<'s, 'm, D>,
-    roots: &'a Roots<'a>,
+    roots: &'a ProductRoots<'a>,
+    native: &crate::engine_native::ExportNative<'_>,
+    checked_answer: ContentId,
     release: bool,
     output_path: &str,
     scratch_alloc: Alloc<'a>,
@@ -981,6 +900,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
 
     let mut plans: AVec<'a, CratePlan<'a>> = Vec::new_in(scratch_alloc);
     let mut prior_digests: AVec<'a, Digest> = Vec::new_in(scratch_alloc);
+    let product = product_digest(roots, native.exports.as_slice());
 
     // Traverse crates in dependency order (records[0] is the program crate, so iterate in reverse
     // so dependencies come before dependents and the program crate is last).
@@ -994,12 +914,13 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         let items = collect_crate_items(names, idx, rec, ids, builder, scratch_alloc);
         let mut work_names = WireVec::with_capacity_in(items.len(), wire_alloc);
         for item in items.iter() {
-            work_names.push(item.key.0.0);
+            work_names.push(GrantName::standalone(item.key).0.0);
         }
-        let is_final = idx == 0 || cname == program_crate_name;
+        let is_final = idx == 0;
         let mut extra: AVec<'a, Digest> = Vec::with_capacity_in(1 + if is_final { prior_digests.len() } else { 0 }, scratch_alloc);
         extra.push(key.0.0);
         if is_final {
+            extra.push(product);
             extra.extend_from_slice(prior_digests.as_slice());
         }
         let spec = unit_digest_of(cname, builder, release, work_names.as_slice(), extra.as_slice(), scratch_alloc);
@@ -1012,9 +933,10 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         });
     }
 
-    // Whole-program output fingerprint covering every unit digest and output path.
-    let fp = unit_digest_of(output_path, builder, release, prior_digests.as_slice(), &[], scratch_alloc);
-    if matches_output_fingerprint(output_path, &fp, wire_alloc) {
+    // The sidecar is local to the destination. A changed checked answer also covers inputs
+    // used only at final assembly, such as source locations materialized in a code record.
+    let fp = unit_digest_of(program_crate_name, builder, release, prior_digests.as_slice(), &[checked_answer.0, product, native.key.0.0], scratch_alloc);
+    if matches_output_fingerprint(output_path, &fp, wire_alloc)? {
         return Ok((DistExportOutcome::NoOp, fp));
     }
 
@@ -1030,7 +952,6 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             maker,
             store,
             roots,
-            release,
             scratch_alloc,
             wire_alloc,
             heap,

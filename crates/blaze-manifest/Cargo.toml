@@ -34,6 +34,8 @@ cargo = [
 ]
 
 [dependencies]
+blaze-int.workspace = true
+blaze-sha256.workspace = true
 blaze-own.workspace = true
 # The pinned cargo's version, as its messages name it (`features`; pins/rust.txt).
 blaze-pins.workspace = true

@@ -29,7 +29,7 @@ use blaze_build_script::key::{CMode, RunLimits};
 use blaze_build_script::git::{self, GitFiles};
 use blaze_build_script::probe::{self, Row, Table};
 use blaze_build_script::probe_ask::{self, Ask, Snippet, Verdict};
-use blaze_expand::seen::{MemberDirError, SeenRoot};
+pub use crate::script_root::ScriptRoot;
 use blaze_ids::ContentId;
 use blaze_own::Alloc;
 use blaze_wasi::{Answer, Dirent, Errno, Filestat, Filetype, Open, ROOT_FD, Stop, System};
@@ -42,40 +42,6 @@ pub const READS_CAP: usize = 1 << 16;
 /// A script's read-only view of its `links` dependencies' files (brief S1).
 pub mod dep_mount;
 use dep_mount::DepViews;
-
-/// What a script sees as its package's root (decision D96), owned for [`Script`]: a
-/// dependency's package is the tree, served at `/package`; a member's workspace is the tree,
-/// served at `/workspace`, the member at its dir in it. Read only through [`ScriptRoot::seen`],
-/// so the mount points keep one home (`blaze_expand::seen`, rule 30) and a dependency is never
-/// mistaken for a workspace's root package (both had the folder `""`; rule 76).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScriptRoot {
-    /// `None`: a dependency; `Some(dir)`: a member at `dir`, checked by `SeenRoot::member`.
-    member: Option<Arc<str>>,
-}
-
-impl blaze_own::Share for ScriptRoot {}
-
-impl ScriptRoot {
-    /// A dependency's (registry, git, toolchain) script: it sees `/package`.
-    pub const fn package() -> ScriptRoot {
-        ScriptRoot { member: None }
-    }
-
-    /// A workspace member's script at `dir` under the workspace (`""`: its root package); a
-    /// `dir` that is not a plain path under it is refused by name.
-    pub fn member(dir: &str) -> Result<ScriptRoot, MemberDirError<'_>> {
-        SeenRoot::member(dir)?;
-        Ok(ScriptRoot { member: Some(Arc::from(dir)) })
-    }
-
-    pub fn seen(&self) -> SeenRoot<'_> {
-        match &self.member {
-            None => SeenRoot::Package,
-            Some(dir) => SeenRoot::Member { dir },
-        }
-    }
-}
 
 /// How much of standard error is kept.
 pub(crate) const STDERR_TAIL: usize = 64 << 10;

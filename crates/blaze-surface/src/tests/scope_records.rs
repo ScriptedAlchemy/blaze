@@ -165,7 +165,7 @@ fn full_scope(tape: &Tape) -> ScopeBuilder<'static, &'static str> {
             },
             2 => ScopeError::ExternCrate { name: name_ },
             3 => ScopeError::RestrictedNotAncestor { path: path(tape) },
-            4 => ScopeError::Duplicate { ns, name: name_, first: def(tape), second: def(tape) },
+            4 => ScopeError::Duplicate { ns, name: name_, first: def(tape), second: def(tape), repeated_import: tape.coin("two imports").then(|| site(tape)) },
             5 => ScopeError::WiderReexport { site: site(tape), ns, name: name_, def: def(tape) },
             6 => ScopeError::Ambiguous { site: Site::Call(key(91)), ns, name: name_, kind: AmbiguityKind::MacroRulesVsModularized, first: def(tape), second: def(tape) },
             7 => ScopeError::Inconsistent { site: Site::Import(site(tape)), ns, name: name_, early: def(tape), last: def(tape) },

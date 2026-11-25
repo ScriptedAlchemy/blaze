@@ -199,7 +199,7 @@ impl Records<'static> for Folder {
 }
 
 /// The module record of `name version`'s script in `store`: its folder.
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let [_, checkout, fetch_store, store, wanted @ ..] = &args[..] else {
         eprintln!(
@@ -315,17 +315,6 @@ fn main() {
         Ok(run) => println!("native: fact shim {}", run.shim),
         Err(why) => println!("native: none ({why}): a script placed native is refused by name"),
     }
-    let setting = Setting {
-        store: &store,
-        target: TARGET,
-        host: TARGET,
-        table: Arc::clone(&setup.table),
-        probes: None,
-        c_mode: CMode::Deferred,
-        mode: blaze_build_script::toolchain::Mode::Check,
-        native: setup.native.as_ref().ok().map(|run| run.setting()),
-        spawn_setting: Arc::clone(&setup.spawn),
-    };
     let units = &graph.units;
     let mut trees: BTreeMap<LockId, (Tree, ScriptRoot)> = BTreeMap::new();
     // `dependents`: for each package named, how many library units of the graph depend on its
@@ -346,7 +335,7 @@ fn main() {
             let all = seen.iter().filter(|s| **s).count();
             println!("{name}: {libs} library units depend on it ({all} units of any kind)");
         }
-        return;
+        return Ok(());
     }
     // No package named: every build script of the graph.
     let every: Vec<String> = if wanted.is_empty() {
@@ -409,11 +398,60 @@ fn main() {
             given.push(GivenRun { script: input, links, outputs, tree: blaze_own::Share::share(tree), root: blaze_own::Share::share(root), direct });
         }
         // The one choice point (D112), made by the run itself: said here for the census.
-        if let Runner::Native { because } = placed(graph, script, setting.mode, alloc) {
+        if let Runner::Native { because } = placed(graph, script, blaze_build_script::toolchain::Mode::Check, alloc) {
             let because = &units[because.index()];
             println!("  native (its closure holds {} {}, D112)", because.name.as_str(), because.version.as_str());
         }
         let started = Instant::now();
+        use blaze_proc_macro::{module, script_module, script_unit};
+        let locked = module::LockedPackages::of(lock);
+        let package_lock = lock.package(unit.package);
+        let mut build_roots = AVec::new_in(alloc);
+        match ws.members.iter().find(|member| member.name.as_str() == unit.name.as_str()) {
+            Some(member) => build_roots.extend(member.dependencies.iter().filter(|dep| dep.kind == blaze_manifest::layout::DepKind::Build).map(|dep| dep.package.as_str())),
+            None => {
+                for dep in &unit.deps {
+                    let dependency = units.get(dep.unit.index()).ok_or("build dependency unit is outside the resolved graph")?;
+                    build_roots.push(dependency.name.as_str());
+                }
+            }
+        }
+        let source_text;
+        let source = match &package_lock.source {
+            LockSource::Path => {
+                let dir = member_dirs.get(&unit.package).ok_or("the path package has no captured directory")?;
+                let mut files = module::package_files(&root.join(dir))?;
+                source_text = module::files_digest(&mut files);
+                module::Source::Path { files_sha256: &source_text }
+            }
+            LockSource::Registry { .. } => {
+                let blaze_manifest::lock::Checksum::Sha256(checksum) = &package_lock.checksum else { return Err(format!("{package}: no checksum").into()); };
+                module::Source::Registry { checksum: checksum.as_str() }
+            }
+            LockSource::Git { commit, .. } => {
+                source_text = sources.files(unit.package).map_err(|why| format!("{why}"))?.1.as_str().to_owned();
+                module::Source::Git { commit: commit.as_str(), path: &source_text }
+            }
+        };
+        let deps = match package_lock.source {
+            LockSource::Registry { .. } => locked.closure(unit.name.as_str(), unit.version.as_str()),
+            _ => locked.script_closure(unit.name.as_str(), unit.version.as_str(), &build_roots).map(|digest| digest.as_str().to_owned()),
+        }.map_err(|why| format!("{why}"))?;
+        let shim = module::sha256_hex(include_bytes!("../guest/script_process.rs"));
+        let select = |runner| script_unit::module_for(&store, &script_module::Wanted {
+            krate: module::CrateId { name: unit.name.as_str(), version: unit.version.as_str(), source, deps: &deps, features: &features },
+            toolchain: script_module::TOOLCHAIN.trim(), runner,
+        });
+        let wasm = select(script_module::Runner::Wasm { shim: &shim })?;
+        let native = select(script_module::Runner::Native { target: TARGET })?;
+        let base = blaze_proc_macro::native_unit::placed(graph, script, blaze_build_script::toolchain::Mode::Check, alloc);
+        let selected = if matches!(base, blaze_build_script::native::Runner::Native { .. }) || (native.is_some() && wasm.is_none()) { native } else { wasm };
+        let setting = Setting {
+            store: &store, module: selected.as_ref(), target: TARGET, host: TARGET,
+            table: Arc::clone(&setup.table), probes: None, c_mode: CMode::Deferred,
+            mode: blaze_build_script::toolchain::Mode::Check,
+            native: setup.native.as_ref().ok().map(|run| run.setting()), spawn_setting: Arc::clone(&setup.spawn),
+        };
         let ran = match outputs_given(&runtime, &setting, graph, script, None, blaze_own::Share::share(&tree), blaze_own::Share::share(&folder), &given, alloc) {
             Ok(ran) => ran,
             Err(error) => {
@@ -469,6 +507,7 @@ fn main() {
     {
         println!("native: {error}");
     }
+    Ok(())
 }
 
 /// `export <dir>`: the run's outputs record written as `<dir>/<name>@<version>@<side>.outputs`

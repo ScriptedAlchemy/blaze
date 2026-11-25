@@ -37,6 +37,8 @@ use crate::{
 pub struct Setting<'s> {
     /// The store holding `build-script/modules` (the bootstrap's module records).
     pub store: &'s Path,
+    /// The module task's selected producer key and binary digest. No runtime lookup by name.
+    pub module: Option<&'s crate::script_module::Selected>,
     pub target: &'s str,
     pub host: &'s str,
     /// The probe table's rows (`probe::pinned_rows`).
@@ -66,6 +68,7 @@ pub struct Prepared<'a> {
 /// Why a unit's script gave no outputs.
 #[derive(Debug)]
 pub enum UnitScriptError {
+    ModuleDigest { path: PathBuf },
     /// The unit is not a build script.
     NotAScript { unit: UnitId },
     /// No unit names it as its build script.
@@ -97,6 +100,7 @@ pub enum UnitScriptError {
 impl std::fmt::Display for UnitScriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            UnitScriptError::ModuleDigest { path } => write!(f, "{}: module bytes differ from the selected module task's digest", path.display()),
             UnitScriptError::NotAScript { unit } => write!(f, "unit {} is not a build script", unit.index()),
             UnitScriptError::ServesNothing { package } => write!(f, "the build script of {package} is no unit's build script"),
             UnitScriptError::NoModule { package, features, store } => write!(
@@ -126,45 +130,25 @@ impl std::fmt::Display for UnitScriptError {
 
 impl std::error::Error for UnitScriptError {}
 
-/// The module record (`<store>/build-script/modules/<key>`) of `name version` compiled with
-/// exactly `features`: the one whose identity names all three. A native script's record (its
-/// identity has a `target` line, D69) is never it: that one holds `script.bin`, not a module.
-/// `Ok(None)`: the store holds no such record (no `modules` folder at all included).
-pub fn module_of(store: &Path, name: &str, version: &str, features: &[&str]) -> Result<Option<PathBuf>, ModuleLookupError> {
-    module_where(store, name, version, features, None)
-}
-
-/// The native binary record (`<store>/build-script/modules/<key>`, holding `script.bin`) of
-/// `name version` built for `host` with exactly `features` (D69: the interim builder's
-/// `native` mode, whose identity adds `target <host>`).
-pub fn module_of_native(store: &Path, name: &str, version: &str, features: &[&str], host: &str) -> Result<Option<PathBuf>, ModuleLookupError> {
-    module_where(store, name, version, features, Some(host))
-}
-
 /// Why the module store could not answer a lookup: each names the path (rule 19), and none is
 /// taken as "no record" (rule 3).
 #[derive(Debug)]
 pub enum ModuleLookupError {
+    Selection { folder: PathBuf, why: crate::script_module::Refused },
+    Digest { path: PathBuf },
     /// The store's `build-script/modules` folder could not be listed (other than absent).
     List { folder: PathBuf, error: std::io::Error },
     /// A record's `identity` could not be read: a record without one is not a record.
     Identity { path: PathBuf, error: std::io::Error },
-    /// Two records answer one ask (a toolchain or closure each, same name, version, features
-    /// and runner): which is meant is not decided by the store's listing order (rules 21, 25).
-    Ambiguous { first: PathBuf, second: PathBuf },
 }
 
 impl std::fmt::Display for ModuleLookupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ModuleLookupError::Selection { folder, why } => write!(f, "{}: build-script module selection refused: {why:?}", folder.display()),
+            ModuleLookupError::Digest { path } => write!(f, "{}: not a SHA-256 module digest", path.display()),
             ModuleLookupError::List { folder, error } => write!(f, "{}: the module store could not be listed: {error}", folder.display()),
             ModuleLookupError::Identity { path, error } => write!(f, "{}: a module record's identity could not be read: {error}", path.display()),
-            ModuleLookupError::Ambiguous { first, second } => write!(
-                f,
-                "{} and {}: two module records answer one ask (name, version, features, runner); remove the stale one",
-                first.display(),
-                second.display()
-            ),
         }
     }
 }
@@ -189,7 +173,7 @@ fn records(store: &Path) -> Result<Vec<(PathBuf, String)>, ModuleLookupError> {
     for entry in entries {
         let entry = entry.map_err(|error| ModuleLookupError::List { folder: folder.clone(), error })?;
         let path = entry.path().join("identity");
-        let identity = std::fs::read_to_string(&path).map_err(|error| ModuleLookupError::Identity { path, error })?;
+        let identity = record_text(&path)?;
         found.push((entry.path(), identity));
     }
     found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -206,41 +190,19 @@ pub fn records_named(store: &Path, name: &str, version: &str) -> Result<Vec<(Pat
     Ok(found)
 }
 
-/// The process shim this binary's build-script host answers (guest/script_process.rs, as built
-/// into it): the bootstrap builder writes `shim <its SHA-256>` into a wasm module's identity
-/// (scripts proc_macro_modules build_scripts.rs `library`), the same digest of the same file.
-const SHIM: &[u8] = include_bytes!("../guest/script_process.rs");
-
-/// The identity line a wasm module must carry to be run by this host: `shim <sha256 hex>`.
-pub fn shim_line() -> String {
-    format!("shim {}", crate::module::sha256_hex(SHIM))
+fn record_text(path: &Path) -> Result<String, ModuleLookupError> {
+    std::fs::read_to_string(path).map_err(|error| ModuleLookupError::Identity { path: path.to_path_buf(), error })
 }
 
-/// The record whose identity names `name`, `version`, `features` and, for `host`, `target
-/// <host>`; for `None`, one with no `target` line and this host's [`shim_line`] (a wasm module).
-/// Two such records are a typed refusal, never the first in the listing's order.
-fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
-    let mut sorted = features.to_vec();
-    sorted.sort_unstable();
-    let lines = [format!("name {name}"), format!("version {version}"), format!("features {}", sorted.join(","))];
-    let target = host.map(|host| format!("target {host}"));
-    let shim = shim_line();
-    let mut fits = records(store)?.into_iter().filter(|(_, identity)| {
-        // A wasm module answers only with the shim this host speaks to: one built with another
-        // is not this ask's record, so a stale module is a named miss (`NoModule`, whose words
-        // show the differing `shim` line), never a run that misreads a reply, and never a second
-        // record beside its rebuild (`Ambiguous`).
-        let runner_fits = match &target {
-            Some(want) => identity.lines().any(|l| l == want),
-            None => !identity.lines().any(|l| l.starts_with("target ")) && identity.lines().any(|l| l == shim),
-        };
-        runner_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
-    });
-    let Some((first, _)) = fits.next() else { return Ok(None) };
-    match fits.next() {
-        Some((second, _)) => Err(ModuleLookupError::Ambiguous { first, second }),
-        None => Ok(Some(first)),
-    }
+/// Select from the captured source/lock identity, returning the complete producer key.
+pub fn module_for(store: &Path, wanted: &crate::script_module::Wanted<'_>) -> Result<Option<crate::script_module::Selected>, ModuleLookupError> {
+    let records = records(store)?;
+    let selected = crate::script_module::select(wanted, records.iter().map(|(path, identity)| (path.file_name().and_then(|name| name.to_str()).unwrap_or(""), identity.as_str())))
+        .map_err(|why| ModuleLookupError::Selection { folder: store.join("build-script/modules"), why })?;
+    let Some(selected) = selected else { return Ok(None) };
+    let path = store.join("build-script/modules").join(selected.key()).join(if selected.native() { "bin-sha256" } else { "wasm-sha256" });
+    let digest = record_text(&path)?;
+    selected.with_digest(digest.trim()).map(Some).ok_or(ModuleLookupError::Digest { path })
 }
 
 /// The unit build-script unit `script` serves: the library (or proc macro) whose
@@ -326,14 +288,18 @@ pub fn prepare_viewing_on<'a>(
     let package = package(unit);
     let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package.clone() })?;
     let serves = &graph.units[serves.index()];
-    let features: Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-    let module = module_of(setting.store, unit.name.as_str(), unit.version.as_str(), &features).map_err(UnitScriptError::Lookup)?.ok_or_else(|| UnitScriptError::NoModule {
+    let selected = setting.module.filter(|selected| !selected.native()).ok_or_else(|| UnitScriptError::NoModule {
         package: package.clone(),
-        features: features.iter().map(|f| (*f).to_owned()).collect(),
+        features: unit.features.iter().map(|f| f.as_str().to_owned()).collect(),
         store: setting.store.to_owned(),
     })?;
+    let module = setting.store.join("build-script/modules").join(selected.key());
     let path = module.join("module.wasm");
-    let wasm = std::fs::read(&path).map_err(|error| UnitScriptError::ReadModule { path, error })?;
+    let wasm = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => return Err(UnitScriptError::ReadModule { path, error }),
+    };
+    if crate::module::sha256_hex(&wasm) != selected.digest() { return Err(UnitScriptError::ModuleDigest { path }); }
     let loaded = runtime.load(&package, &wasm).map_err(UnitScriptError::Script)?;
     let facts = PackageFacts {
         name: unit.name.as_str(),
@@ -385,7 +351,7 @@ pub fn outputs<'a>(
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
-    match crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc) {
+    match selected_runner(setting, graph, script, alloc) {
         Runner::Wasm => {
             let prepared = prepare(runtime, setting, graph, script, tree, root, deps, alloc)?;
             runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
@@ -438,7 +404,7 @@ pub fn outputs_viewing_on<'a>(
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
-    match crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc) {
+    match selected_runner(setting, graph, script, alloc) {
         Runner::Wasm => {
             let viewed = dep_mount::view(&tree, producers, deps, alloc).map_err(|why| UnitScriptError::DepView { package: package(unit), why })?;
             let seen: Vec<DepMetadata<'_>> =
@@ -614,6 +580,14 @@ fn order_after(items: &[UnitId], inputs: &[Vec<UnitId>]) -> Result<Vec<UnitId>, 
     match waiting.iter().position(|w| *w != 0) {
         Some(stuck) => Err(stuck),
         None => Ok(order),
+    }
+}
+
+fn selected_runner(setting: &Setting<'_>, graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> Runner {
+    match setting.module {
+        Some(module) if module.native() => Runner::Native { because: script },
+        Some(_) => Runner::Wasm,
+        None => placed(graph, script, setting.mode, alloc),
     }
 }
 

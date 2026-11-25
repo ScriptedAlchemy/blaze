@@ -28,7 +28,7 @@ use blaze_export::{Data, DataPlace, DataWord, Entry, ExportError, Exported, Func
 use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
 use blaze_ladder::code_records::{CodeKey, entry_of, statics};
 use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker};
-use blaze_ladder::run::special::{EntryForm, Roots, Special, make_special, run_roots};
+use blaze_ladder::run::special::{EntryForm, ProductRoots, Special, library_roots, make_special, run_roots};
 use blaze_ladder::run::RunError;
 use blaze_own::{AString, AVec, Alloc, Box, Bump, Erased, String, Vec};
 use blaze_typeck::ItemKey;
@@ -43,6 +43,11 @@ use bstd::report::Code;
 use crate::body_types::{SyncPackDirs, TreesSeen};
 use crate::code_store::HomeCodeStore;
 use crate::engine_check::{Standing, check_for_start};
+
+fn export_profile(release: bool) -> blaze_manifest::layout::profile::BuiltinProfile {
+    use blaze_manifest::layout::profile::BuiltinProfile;
+    if release { BuiltinProfile::Release } else { BuiltinProfile::Dev }
+}
 use crate::engine_records::EngineRecords;
 use crate::engine_start::{RunProcs, StartError, body_ids, end_procs, start_facts, write_start_profile};
 use crate::phases::Phases;
@@ -84,6 +89,8 @@ pub enum ExportCliError {
     Materialize { symbol: [u8; 32], shown: AString<'static> },
     /// `blaze_export::export` refused the program.
     Export(ExportError),
+    /// Persisting the exported artifact's compiled-code reach root failed.
+    Keep(crate::store::roots::RootError),
     /// Invalid output path supplied via `-o` / `--output`.
     BadOutputPath { path: AString<'static>, why: OutputPathIssue },
     /// Opening the output folder failed.
@@ -132,6 +139,7 @@ impl fmt::Display for ExportCliError {
             ExportCliError::Position { symbol, shown } => write!(f, "blaze export: resolving source position in {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::Materialize { symbol, shown } => write!(f, "blaze export: materializing position-free record {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::Export(error) => write!(f, "blaze export: {error}"),
+            ExportCliError::Keep(error) => write!(f, "blaze export: keeping compiled code: {error}"),
             ExportCliError::BadOutputPath { path, why } => write!(f, "blaze export: invalid output path {}: {why} (engine_export.rs)", Code(path.as_str())),
             ExportCliError::OutputHome(error) => write!(f, "blaze export: output directory: {error} (engine_export.rs)"),
             ExportCliError::OutputPath(error) => write!(f, "blaze export: output path: {error} (engine_export.rs)"),
@@ -173,6 +181,9 @@ fn host_platform() -> Option<Platform> {
 
 /// Validates CLI flags specific to `blaze export`.
 fn check_export_flags(flags: &crate::Flags<'_>) -> Result<(), CliError> {
+    if flags.export_kind == run_package::ExportKind::Cdylib && flags.select.bin.is_some() {
+        return Err(CliError::Usage("blaze export: --lib and --bin select different products; use one"));
+    }
     if flags.fix.is_some() {
         return Err(CliError::Usage("--fix is `blaze check`'s"));
     }
@@ -237,17 +248,18 @@ pub(crate) fn command(
     let started_ns = phases.now();
     let stats = flags.stats;
     let release = flags.release;
+    let profile = export_profile(release);
     let output_flag = flags.output;
     let view = flags.view.unwrap_or(blaze_report::frame::plain::View::Person);
     let line = crate::run_line::LineOpts::from_env(env, err, flags.color, blaze_screen::Command::Run, view, false);
     let line = crate::run_line::LineOpts { live: false, ..line };
     let lined = crate::run_line::watched(cx, err, clock, line, |watch, _bg| {
         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
-        check_for_start(cx, Some(args), fs, env, net, host, rng, err, err, phases, heap, &flags, true, None, |standing, phases, _rng| {
+        check_for_start(cx, Some(args), fs, env, net, host, rng, err, err, phases, heap, &flags, true, profile, None, |standing, phases, _rng| {
             let (root, frame) = (standing.checkout, standing.frame);
             let select = run_package::Select { member: standing.member, ..select };
-            let picked = run_package::pick(cx, root, select, frame)?;
-            let summary = export_program(cx, standing, &picked, fs, output_flag, release, dist.as_ref(), phases, watch)?;
+            let picked = run_package::pick_export(cx, root, select, flags.export_kind, frame)?;
+            let summary = export_program(cx, standing, &picked, flags.export_kind, fs, output_flag, release, dist.as_ref(), phases, watch)?;
             write_start_profile(cx, root, phases, frame)?;
             let wall_ns = phases.since(started_ns);
             print_summary(cx, &summary, wall_ns, stats, out, err, frame)?;
@@ -339,7 +351,8 @@ fn make_unbuilt_stub_record<'a>(
 }
 
 /// Maps `blaze_ladder::run::special::Roots` to `blaze_export::Entry`.
-fn entry_of_roots(roots: &Roots<'_>) -> Entry {
+fn entry_of_roots(product: &ProductRoots<'_>) -> Entry {
+    let ProductRoots::Executable(roots) = product else { return Entry::Cdylib };
     if let Some(shim) = roots.shim() {
         return Entry::LangStart { lang_start: shim.lang_start.symbol, main: shim.main.symbol };
     }
@@ -550,6 +563,7 @@ fn export_program<'f>(
     cx: &Cx,
     mut standing: Standing<'f, '_>,
     picked: &run_package::Program<'f>,
+    kind: run_package::ExportKind,
     fs: &Fs,
     output_flag: Option<&str>,
     release: bool,
@@ -563,6 +577,14 @@ fn export_program<'f>(
     };
     let output_path: &'f str = match output_flag {
         Some(path) => frame.alloc_str(path),
+        None if kind == run_package::ExportKind::Cdylib => {
+            let suffix = match platform {
+                Platform::MacosArm64 => "dylib",
+                Platform::LinuxArm64 => "so",
+                Platform::Wasm64 => return Err(box_err(ExportCliError::UnsupportedHost, heap)),
+            };
+            frame.alloc_str(bstd::mem::format_in!(frame, "lib{}.{}", picked.bin, suffix).as_str())
+        }
         None => picked.bin,
     };
     let export_frame = Frame::with_reserve(EXPORT_FRAME_RESERVE, bstd::mem::Tag::Other).map_err(|_| box_err(ExportCliError::Frame, heap))?;
@@ -581,7 +603,7 @@ fn export_program<'f>(
     let lints = crate::lints::of_root(cx, root, frame)?;
     let mut facts = start_facts(&standing, fs, phases, lints);
     let answered = run_names::FromEngine { graph: standing.graph, names: standing.names };
-    let at = run_names::program_row(cx, root, &answered, &mut *standing.store, &mut facts, picked, heap, frame).map_err(CliError::RunNames)?;
+    let at = run_names::export_row(cx, root, &answered, &mut *standing.store, &mut facts, picked, kind, heap, frame).map_err(CliError::RunNames)?;
     let owner = run_names::Owner::At(at);
     let found = run_names::found_answered(cx, &answered, owner, &mut *standing.store, &mut facts.bodies, &mut read, heap, frame).map_err(CliError::RunNames)?;
     let program_found = found.program().ok_or(CliError::Start(StartError::NoProgram))?;
@@ -589,7 +611,7 @@ fn export_program<'f>(
 
     // Native C image layout & C exports (returns `None` when the program links no C objects or
     // non-system libraries).
-    let native_export = crate::engine_native::export_native_for(cx, &mut standing, &closure, watch, &export_frame, export_bump).map_err(|error| {
+    let native_export = crate::engine_native::export_native_for(cx, &mut standing, &closure, kind, watch, &export_frame, export_bump).map_err(|error| {
         box_err(
             ExportCliError::Native { shown: owned_fmt(format_args!("{error}"), frame, heap.alloc()) },
             heap,
@@ -604,12 +626,9 @@ fn export_program<'f>(
     let ids_ns = phases.since(began_ids);
     let ids_line = ids.line(&asked, ids_ns);
 
-    let overflow = if release {
-        blaze_ladder::run::OverflowChecks::Off
-    } else {
-        program::dev_overflow(cx, root, frame)?
-    };
-    let panic_profile = program::dev_profile_panic(cx, root, frame)?;
+    let profile = export_profile(release);
+    let overflow = program::profile_overflow(cx, root, profile, frame)?;
+    let panic_profile = program::profile_panic(cx, root, profile, frame)?;
     let panic_ladder = blaze_ladder::panic_strategy::of_profile(panic_profile);
     let export_panic = match panic_profile {
         blaze_manifest::layout::panic::ProfilePanic::Unwind => Panic::Unwind,
@@ -639,8 +658,11 @@ fn export_program<'f>(
     let names = run_names::names_of(cx, root, &found, owner, &mut *standing.store, &mut facts.bodies, &mut read, env, &pack_dirs, procs, &seen, frame, heap).map_err(CliError::RunNames)?;
 
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Roots));
-    let export_items: &[blaze_id::ItemKey] = native_export.as_ref().map_or(&[], |n| n.items.as_slice());
-    let roots = run_roots(names.records, names.lang_crates, builder.settings.panic, export_items, names.frame, heap.alloc(), alloc).map_err(|why| {
+    let export_items = native_export.items.as_slice();
+    let roots = match kind {
+        run_package::ExportKind::Binary => run_roots(names.records, names.lang_crates, builder.settings.panic, export_items, names.frame, heap.alloc(), alloc).map(ProductRoots::Executable),
+        run_package::ExportKind::Cdylib => library_roots(names.records, names.lang_crates, builder.settings.panic, export_items, names.frame, heap.alloc(), alloc).map(ProductRoots::Library),
+    }.map_err(|why| {
         box_err(
             ExportCliError::Roots { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
             heap,
@@ -648,12 +670,8 @@ fn export_program<'f>(
     })?;
 
     let entry = entry_of_roots(&roots);
-    let personality = roots.head().personality;
-    let maker_entry = match roots.shim() {
-        Some(shim) => Some(shim.main.tabled),
-        None => (!roots.is_empty()).then(|| roots.root(0).tabled),
-    };
-    let mut maker = Maker::of_roots(names, maker_entry, &roots, ByKind::new(typed.over(ids)), &builder, heap.alloc());
+    let personality = roots.personality();
+    let mut maker = Maker::of_start(names, roots.maker_entry(), roots.maker_start(), ByKind::new(typed.over(ids)), &builder, heap.alloc());
     let mut codes = HomeCodeStore::new(lent);
 
     // Optional distributed compilation pass over workspace crates (D11).
@@ -670,6 +688,8 @@ fn export_program<'f>(
             &mut maker,
             &mut dist_store,
             &roots,
+            &native_export,
+            standing.root,
             release,
             output_path,
             alloc,
@@ -713,10 +733,10 @@ fn export_program<'f>(
 
     // Whole-program reachability closure from all roots.
     let mut walk = Walk::new_in(alloc);
-    for i in 0..roots.len() {
+    for (i, symbol) in roots.symbols().iter().enumerate() {
         walk.root::<RunError>(roots.row(i), MOST_WALKED).map_err(|why| {
             box_err(
-                ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
                 heap,
             )
         })?;
@@ -937,26 +957,37 @@ fn export_program<'f>(
         personality,
         tls: tls_runtime,
         profile: None,
-        natives: native_export.as_ref().map(|n| &n.image),
-        exports: native_export.as_ref().map_or(&[], |n| n.exports.as_slice()),
+        natives: native_export.image.as_ref(),
+        exports: native_export.exports.as_slice(),
     };
 
     let mut exe_bytes: AVec<'_, u8> = Vec::new_in(alloc);
     let exported = blaze_export::export(&program_in, platform, &mut exe_bytes, alloc).map_err(|error| box_err(ExportCliError::Export(error), heap))?;
 
-    // Release immutable borrows of `codes` before persisting toolchain code.
+    // Release immutable borrows before rooting the exact union of code read or written by
+    // every executable/library entry. Export has no start list and persists no run tables.
     drop(functions);
     drop(data);
     drop(seen_data);
+    let walked = codes.reached();
     let toolchain_made = codes.toolchain_made();
     drop(codes);
+    crate::store::roots::keep_export(lent, crate::store::roots::ExportArtifact {
+        checkout: standing.place.checkout,
+        manifest: picked.manifest,
+        target: picked.bin,
+        profile,
+        kind,
+    }, &walked).map_err(|why| box_err(ExportCliError::Keep(why), heap))?;
     if let Err(why) = crate::store::roots::keep_toolchain(lent, builder.toolchain, &toolchain_made, &[]) {
         standing.err.line(cx, format_args!("blaze export: warning: toolchain code was not kept: {why}")).map_err(CliError::Out)?;
     }
 
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
     if let (Some(dist_cfg), Some(fp)) = (dist, dist_fp) {
-        crate::engine_dist::write_output_fingerprint(output_path, &fp, dist_cfg.wire_alloc);
+        crate::engine_dist::write_output_fingerprint(output_path, &fp, exe_bytes.as_slice(), dist_cfg.wire_alloc, |path, bytes| {
+            publish_output(cx, fs, path, bytes, heap)
+        })?;
     }
     Ok(ExportSummary {
         output: output_path,
@@ -1046,6 +1077,15 @@ fn parse_output_target(raw: &str) -> Result<OutputTarget<'_>, OutputPathIssue> {
 /// Atomically publishes `bytes` to `output_path` through `bstd::fs` and marks the resulting file
 /// executable (`0o755`) on real Unix hosts.
 fn write_executable(cx: &Cx, fs: &Fs, output_path: &str, bytes: &[u8], heap: &'static blaze_own::Heap) -> Result<(), CliError> {
+    publish_output(cx, fs, output_path, bytes, heap)?;
+    #[cfg(unix)]
+    if !cx.is_simulated() {
+        chmod_executable(output_path, heap)?;
+    }
+    Ok(())
+}
+
+fn publish_output(cx: &Cx, fs: &Fs, output_path: &str, bytes: &[u8], heap: &'static blaze_own::Heap) -> Result<(), CliError> {
     let target = parse_output_target(output_path).map_err(|why| {
         box_err(ExportCliError::BadOutputPath { path: owned_str(output_path, heap.alloc()), why }, heap)
     })?;
@@ -1064,10 +1104,6 @@ fn write_executable(cx: &Cx, fs: &Fs, output_path: &str, bytes: &[u8], heap: &'s
                 .publish(cx, &file_path, Content::bytes(bytes), Durable::No)
                 .map_err(|e| box_err(ExportCliError::WriteOutput(e), heap))?;
         }
-    }
-    #[cfg(unix)]
-    if !cx.is_simulated() {
-        chmod_executable(output_path, heap)?;
     }
     Ok(())
 }

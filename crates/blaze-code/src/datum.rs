@@ -332,7 +332,7 @@ impl<'a> SealedDatum<'a> {
             out.push(0);
         }
         for t in d.targets.iter() {
-            out.push(t.space as u8);
+            out.push(t.space.byte());
             out.extend_from_slice(&[0; 7]);
             out.extend_from_slice(&t.symbol.0);
         }

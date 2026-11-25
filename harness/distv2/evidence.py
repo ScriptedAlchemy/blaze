@@ -40,15 +40,15 @@ def validate_events(events: list[dict]) -> None:
     for event in events:
         kind = event.get("event")
         require(isinstance(kind, str), "BLAZE_DIST_EVENTS: event needs its type")
-        if kind in ("grant", "result_held", "result_accepted", "result_refused"):
+        if kind in ("grant", "backend_work", "result_held", "result_accepted", "result_refused"):
             lease(event)
-        if kind in ("grant", "result_held", "result_accepted"):
+        if kind in ("grant", "backend_work", "result_held", "result_accepted"):
             work = event.get("work")
             require(isinstance(work, list) and all(digest(k) for k in work), f"{kind}: work must name exact WorkName digests")
             require(len(work) == len(set(work)), f"{kind}: duplicate work names")
-        if kind == "grant":
+        if kind in ("grant", "backend_work"):
             require(type(event.get("pid")) is int and event["pid"] > 0 and digest(event.get("unit_digest")),
-                    "grant: needs the real daemon pid and unit_digest")
+                    f"{kind}: needs the real daemon pid and unit_digest")
         if kind == "result_held":
             require(type(event.get("pid")) is int and event["pid"] > 0 and digest(event.get("command_sha256")),
                     "result_held: needs the real daemon pid and canonical command digest")
@@ -320,12 +320,15 @@ def release_fold(rows: list[dict], events: list[dict]) -> None:
     holders: dict[str, dict[tuple, set[int]]] = {"release_keys": {}, "folded_keys": {}}
     emitted = [event for event in events if event.get("event") == "backend_work"]
     require(bool(emitted), "release/fold acceptance needs backend_work emission evidence")
+    validate_events(events)
+    accepted_work = {(lease(e), frozenset(e["work"])) for e in events if e["event"] == "result_accepted"}
     for event in emitted:
         actual = event.get("compiled_keys")
         require(isinstance(actual, list) and all(digest(key) for key in actual), "backend_work needs raw emitted store keys")
         matching = [grant for grant in events if grant.get("event") == "grant"
                     and grant["pid"] == event.get("pid") and grant["unit_digest"] == event.get("unit_digest")
-                    and sorted(grant["work"]) == sorted(event.get("work", [])) and accepted(events, grant)]
+                    and lease(grant) == lease(event) and set(grant["work"]) == set(event["work"])
+                    and (lease(grant), frozenset(grant["work"])) in accepted_work]
         if not matching:
             continue  # A failed/stale attempt cannot supply successful emission evidence.
         for grant in matching:
@@ -334,10 +337,13 @@ def release_fold(rows: list[dict], events: list[dict]) -> None:
             reported = {key for row in reports for key in row["work_compiled_keys"]}
             require(set(actual) <= reported, "backend emission was absent from final work reports")
             identity = (grant["unit_digest"], grant["execution"], grant["attempt"])
+            classified = set()
             for kind in holders:
                 keys = event.get(kind)
                 require(isinstance(keys, list) and all(digest(key) for key in keys), f"backend_work needs {kind}")
                 require(set(keys) <= set(actual), f"{kind} includes an uncompiled planned key")
+                require(classified.isdisjoint(keys), "release blobs and folded outputs use distinct store keys")
+                classified.update(keys)
                 if keys:
                     holders[kind].setdefault(identity, set()).add(grant["pid"])
     for kind, units in holders.items():

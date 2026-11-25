@@ -21,8 +21,7 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use std::os::unix::fs::PermissionsExt;
-use std::time::{Duration, Instant};
+mod host;
 
 use blaze_code::record::{CodeRecord, CodeView, Site, SiteKind, Space, Symbol, Target};
 use blaze_code::unwind::{self, Action, Frame, Row};
@@ -129,23 +128,7 @@ fn records() -> [AVec<'static, u8>; 3] {
 }
 
 fn run_exported(file: &[u8], name: &str) -> Option<i32> {
-    let path = std::env::temp_dir().join(format!("blaze-export-{name}-{}", std::process::id()));
-    std::fs::write(&path, file).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut child = std::process::Command::new(&path).spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() > deadline {
-            child.kill().unwrap();
-            panic!("the exported program at {} did not exit within 20 s: a hang is a bug", path.display());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    std::fs::remove_file(&path).unwrap();
-    status.code()
+    host::run(name, file, |path| std::process::Command::new(path)).code()
 }
 
 /// Prints `eh_out: the exported program unwound from thrower into main's landing and exited 42`.
