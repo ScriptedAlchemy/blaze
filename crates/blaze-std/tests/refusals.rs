@@ -24,6 +24,7 @@
 //! failed, naming its file.
 
 use std::{
+    env::consts::DLL_EXTENSION,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
@@ -119,12 +120,11 @@ fn crate_dirs(exe: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Whether a unit's `out/` holds a compiled crate (an `.rlib` or `.rmeta`): a build script's or
-/// a binary's unit holds none, and the compiler finds nothing in it.
+/// Proc-macro dependencies live in shared libraries in their own output directories.
 fn holds_a_crate(dir: &Path) -> bool {
     fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display())).any(|entry| {
         let path = entry.unwrap_or_else(|error| panic!("{}: {error}", dir.display())).path();
-        path.extension().is_some_and(|it| it == "rlib" || it == "rmeta")
+        path.extension().is_some_and(|it| it == "rlib" || it == "rmeta" || it == DLL_EXTENSION)
     })
 }
 
