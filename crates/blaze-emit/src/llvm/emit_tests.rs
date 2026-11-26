@@ -1019,6 +1019,53 @@ define i64 @entry() uwtable {{
 }
 
 #[test]
+fn release_record_preserves_an_exact_one_past_relro_address() {
+    use super::{emit::EmitError, object::ReadError};
+    use blaze_code::record::OWN_RELRO;
+
+    const DATA: &str = "@bytes = hidden constant [443 x i8] zeroinitializer, align 1\n";
+    let alloc = blaze_own::testing::heap().alloc();
+    let end = object_fixture(&blaze_own::format_in!(alloc, r#"
+{DATA}define ptr @entry() uwtable {{
+  ret ptr getelementptr inbounds ([443 x i8], ptr @bytes, i64 0, i64 443)
+}}
+"#));
+    for os in [blaze_tier::Os::MacOs, blaze_tier::Os::Linux] {
+        let machine = blaze_tier::Machine { os, ..machine() };
+        let emission = emit_release(ReleaseTask { module: &end, imports: &[], opt: 2, machine }, alloc)
+            .unwrap_or_else(|error| panic!("{os:?}: {error}"));
+        let view = CodeView::read(&emission.record).unwrap();
+        assert_eq!(view.targets(), 0, "{os:?}");
+        assert_eq!(view.relro().len(), 443, "{os:?}");
+        assert_eq!(view.sites(), 2, "{os:?}");
+        assert_eq!([view.site(0).kind, view.site(1).kind], [SiteKind::Page21, SiteKind::AddLo12], "{os:?}");
+        for site in [view.site(0), view.site(1)] {
+            assert_eq!((site.target, site.addend), (OWN_RELRO, 443), "{os:?}");
+        }
+    }
+
+    // Force the ELF relocations in the two refusals. LLVM's normal instruction selector
+    // keeps an object offset beyond its end as separate arithmetic.
+    let machine = blaze_tier::Machine { os: blaze_tier::Os::Linux, ..machine() };
+    for (asm, kind, expected) in [
+        (r"adrp $0, bytes+444", SiteKind::Page21, 444),
+        (r"adrp $0, bytes+443\0Aldrb ${0:w}, [$0, :lo12:bytes+443]", SiteKind::LdstLo12_1, 443),
+    ] {
+        let module = object_fixture(&blaze_own::format_in!(alloc, r#"
+{DATA}define i64 @entry() uwtable {{
+  %result = call i64 asm sideeffect "{asm}", "=r"()
+  ret i64 %result
+}}
+"#));
+        let error = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine }, alloc)
+            .err().expect("the object relocation must be refused");
+        assert!(matches!(error, EmitError::Read(ReadError::LocalRelroBounds {
+            kind: actual, offset, section_len: 443, relro_at, relro_len: 443, ..
+        }) if (actual, offset, relro_at) == (kind, expected, expected)), "unexpected refusal {error:?}");
+    }
+}
+
+#[test]
 fn release_record_keeps_source_positions_from_an_inlined_import() {
     use super::{emit::EmitError, object::ReadError};
     use blaze_code::record::{OWN_RELRO, PositionField, PositionPart};

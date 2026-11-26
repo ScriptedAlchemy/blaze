@@ -6,7 +6,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::a64::{adrp_add_target, adrp_ldr_target};
 use crate::image::{ImageError, Kind, Member, lay_out, lay_out_positions};
 use crate::place::{At, PlaceError, Words, place, place_positions, place_resolved};
-use crate::record::{CodeRecord, CodeView, NO_TARGET, OWN_CODE, PositionField, PositionPart, PositionRow, Site, SiteKind, Space, Symbol, Target, Word};
+use crate::record::{CodeRecord, CodeView, NO_TARGET, OWN_CODE, OWN_RELRO, PositionField, PositionPart, PositionRow, RecordError, Site, SiteKind, Space, Symbol, Target, Word};
 
 const ADRP_X16: u32 = 0x9000_0010;
 const LDR_X16: u32 = 0xF940_0210;
@@ -14,6 +14,36 @@ const BLR_X16: u32 = 0xD63F_0200;
 const ADRP_X0: u32 = 0x9000_0000;
 const ADD_X0: u32 = 0x9100_0000;
 const RET: u32 = 0xD65F_03C0;
+
+#[test]
+fn relro_end_addresses_place_across_a_page_boundary() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut record = CodeRecord::new_in(alloc);
+    for instruction in [ADRP_X0, ADD_X0, RET] {
+        record.code.extend_from_slice(&instruction.to_le_bytes());
+    }
+    record.relro.extend_from_slice(&[42; 16]);
+    record.sites.extend([
+        Site { at: 0, kind: SiteKind::Page21, target: OWN_RELRO, addend: 16 },
+        Site { at: 4, kind: SiteKind::AddLo12, target: OWN_RELRO, addend: 16 },
+    ]);
+    let mut bytes = Vec::new_in(alloc);
+    record.seal().unwrap().encode(&mut bytes);
+    let view = CodeView::read(&bytes).unwrap();
+    let at = At { code: CODE + 0x40, relro: CODE + 0x8ff0 };
+    let (mut code, mut relro) = ([0u8; 12], [0u8; 16]);
+    place(&view, Symbol::of_name("one_past"), at, &mut Table { far: false }, &mut code, &mut relro).unwrap();
+    assert_eq!(adrp_add_target(inst(&code, 0), inst(&code, 4), at.code), Some(at.relro + 16));
+    assert_eq!(relro, [42; 16]);
+
+    for (kind, addend) in [(SiteKind::AddLo12, 17), (SiteKind::LdstLo12_1, 16)] {
+        let mut record = CodeRecord::new_in(alloc);
+        record.code.extend_from_slice(&ADD_X0.to_le_bytes());
+        record.relro.extend_from_slice(&relro);
+        record.sites.push(Site { at: 0, kind, target: OWN_RELRO, addend });
+        assert!(matches!(record.seal(), Err(RecordError::RelroOutside { at: 0, addend: bad, relro: 16 }) if addend == bad));
+    }
+}
 
 #[test]
 fn single_arm64_sites_keep_the_registers_neighbours_scale_and_branch_link() {

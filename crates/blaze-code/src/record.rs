@@ -128,8 +128,8 @@ pub enum SiteKind {
     Load = 0,
     /// A [`SiteKind::Load`] into `x16`, then `blr x16` at `at + 8`: a call of a function.
     Call = 1,
-    /// `adrp xN, r@PAGE` at `at`, `add xN, xN, r@PAGEOFF` at `at + 4`: the address of byte
-    /// `addend` of this record's relro part. Its target is [`NO_TARGET`].
+    /// `adrp xN, r@PAGE` at `at`, `add xN, xN, r@PAGEOFF` at `at + 4`: a relro address,
+    /// including the address just past the last byte. Its target is [`NO_TARGET`].
     Relro = 2,
     /// One ADRP of an own-code or own-relro address, independent of its users.
     Page21 = 3,
@@ -180,9 +180,20 @@ pub struct Site {
     /// The target's index for imports, [`NO_TARGET`] for [`SiteKind::Relro`], or
     /// [`OWN_CODE`]/[`OWN_RELRO`] for a single own-address instruction.
     pub target: u32,
-    /// The byte within an own-address site's code/relro part (also for `Relro`); zero for
-    /// import sites. Signed external pointer addends live in [`Word`].
+    /// The byte offset within an own-address site's code or relro part. Address formation
+    /// may name the end of nonempty relro. Import sites have zero addend.
     pub addend: u32,
+}
+
+impl Site {
+    fn check_part_addend(self, len: u32) -> Result<(), RecordError> {
+        let forms_relro_address = self.kind == SiteKind::Relro
+            || self.target == OWN_RELRO && matches!(self.kind, SiteKind::Page21 | SiteKind::AddLo12);
+        if self.addend < len || (self.addend == len && len != 0 && forms_relro_address) {
+            return Ok(());
+        }
+        Err(RecordError::RelroOutside { at: self.at, addend: self.addend, relro: len })
+    }
 }
 
 /// An 8-byte word of the relro part the image fills: the address of `target` plus `addend` (a
@@ -626,9 +637,7 @@ impl<'a> CodeRecord<'a> {
                     if site.target != NO_TARGET {
                         return Err(RecordError::NoSuchTarget { at: site.at, target: site.target });
                     }
-                    if u64::from(site.addend) >= u64::from(relro_len) {
-                        return Err(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: relro_len });
-                    }
+                    site.check_part_addend(relro_len)?;
                 }
                 kind if kind.own() => {
                     let len = match site.target {
@@ -636,9 +645,7 @@ impl<'a> CodeRecord<'a> {
                         OWN_RELRO if kind != SiteKind::Branch26 => relro_len,
                         _ => return Err(RecordError::NoSuchTarget { at: site.at, target: site.target }),
                     };
-                    if site.addend >= len {
-                        return Err(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: len });
-                    }
+                    site.check_part_addend(len)?;
                 }
                 _ => match renumber.get(blaze_int::idx(site.target)) {
                     Some(&new) => site.target = new,
@@ -1206,7 +1213,7 @@ impl<'b> CodeView<'b> {
                 }
             } else { None };
             if let Some(len) = own {
-                if site.addend >= len { return Err(DecodeError::Site(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: len })); }
+                site.check_part_addend(len).map_err(DecodeError::Site)?;
             } else if blaze_int::idx(site.target) >= view.targets() {
                 return Err(DecodeError::Site(RecordError::NoSuchTarget { at: site.at, target: site.target }));
             }

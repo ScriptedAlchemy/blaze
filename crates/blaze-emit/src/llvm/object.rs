@@ -50,6 +50,17 @@ pub enum ReadError {
     AddressOfCode { at: u64 },
     /// A section the code refers to is writable.
     Writable { section: FixedString<32> },
+    /// The decoded local relocation is outside the laid-out relro bytes.
+    LocalRelroBounds {
+        at: u64,
+        kind: SiteKind,
+        section: FixedString<32>,
+        symbol: FixedString<80>,
+        offset: i64,
+        section_len: u64,
+        relro_at: i64,
+        relro_len: i64,
+    },
     /// A recognized relocation whose operand or target cannot have the required meaning.
     Semantics { at: u64, what: &'static str },
     /// The authoritative unwind information cannot be adopted into a code record.
@@ -74,6 +85,13 @@ impl fmt::Display for ReadError {
             ReadError::TrapTag { at, immediate } => write!(f, "a `brk` at {at} uses temporary trap ID {immediate:#x} without a source in this emission"),
             ReadError::AddressOfCode { at } => write!(f, "a constant at {at} holds an address of the code"),
             ReadError::Writable { section } => write!(f, "the code refers to the writable section {section}"),
+            ReadError::LocalRelroBounds { at, kind, section, symbol, offset, section_len, relro_at, relro_len } => {
+                write!(f, "native object {kind:?} at {at} targets section {section}")?;
+                if !symbol.is_empty() {
+                    write!(f, " via {symbol}")?;
+                }
+                write!(f, " at byte {offset} of {section_len} (record relro byte {relro_at} of {relro_len}) outside the permitted range")
+            }
             ReadError::Semantics { at, what } => write!(f, "native object relocation at {at}: {what}"),
             ReadError::Unwind { at, what } => write!(f, "native object unwind data at {at:#x}: {what}"),
             ReadError::UnwindCfi(error) => fmt::Display::fmt(error, f),
@@ -415,7 +433,32 @@ fn instruction(file: &object::File<'_>, relocation: &object::Relocation, at: u64
             if matches!(kind, SiteKind::GotPage21 | SiteKind::GotLo12) {
                 return Err(ReadError::Semantics { at, what: "GOT relocation to a locally defined symbol" });
             }
-            local(index, offset.checked_add(addend).ok_or(ReadError::CodeOutside)?, placed, text, start, at)?
+            let offset = offset.checked_add(addend).ok_or(ReadError::CodeOutside)?;
+            let (target, relro_at) = local(index, offset, placed, text, start, at)?;
+            let relro_len = i64::try_from(record.relro.len()).map_err(|_| ReadError::CodeOutside)?;
+            if target == OWN_RELRO && relro_at >= relro_len {
+                let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
+                // ADRP/ADD may construct a one-past pointer. The original object section
+                // must end there too, or a bad addend could look like a valid record end.
+                let one_past = relro_len != 0 && relro_at == relro_len
+                    && u64::try_from(offset).ok() == Some(section.size())
+                    && matches!(kind, SiteKind::Page21 | SiteKind::AddLo12);
+                if !one_past {
+                    let mut section_name = FixedString::new();
+                    section_name.try_push_str(section.name().unwrap_or("")).ok();
+                    let mut symbol_name = FixedString::new();
+                    if let RelocationTarget::Symbol(symbol) = relocation.target() {
+                        let symbol = file.symbol_by_index(symbol).map_err(|_| ReadError::Object)?;
+                        let name = symbol.name().map_err(|_| ReadError::Object)?;
+                        symbol_name.try_push_str(plain(file.format() == BinaryFormat::MachO, name)).ok();
+                    }
+                    return Err(ReadError::LocalRelroBounds {
+                        at, kind, section: section_name, symbol: symbol_name, offset,
+                        section_len: section.size(), relro_at, relro_len,
+                    });
+                }
+            }
+            (target, relro_at)
         }
         Destination::Named(target) if kind == SiteKind::Branch26 => {
             if addend != 0 { return Err(ReadError::Semantics { at, what: "external branch with a nonzero addend" }); }
