@@ -2023,8 +2023,8 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// a subset, each `T: 'r` the components rule, each `T: Tr<..>` tied ([`Walk::tie_of`],
     /// nesting bounded by [`MOST_IMPL_NESTING`]). An impl lifetime the header does not name
     /// (`impl<'a, T: Tr<'a>> Other for T`) is the proof's choice: a fresh existential origin.
-    /// A projection-equality clause has no rule yet: refused by name
-    /// ([`NotSelected::WhereProjection`]). The relation's alpha pairs are kept across.
+    /// Projection equalities also bind impl parameters absent from the header. The relation's
+    /// alpha pairs are kept across.
     fn impl_where(&mut self, imp: ItemKey, trait_: ItemKey, node: PTy, env: EnvId, lifetimes: u32) -> Result<(), Refused> {
         let selected: &'c dyn Selected = self.selected;
         let w = selected.impl_where(imp).map_err(|why| Refused::Unselected { item: self.item, node, trait_, name: None, why })?;
@@ -2059,7 +2059,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
             let side = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env } };
             if matches!(self.node(side)?, PNode::ExProj { .. }) {
-                self.proj_of(side, cv.binders)?;
+                self.impl_projection(side, cv.binders, env)?;
             }
         }
         for &(long, short) in w.params {
@@ -2118,15 +2118,33 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// empty where the clause WRITES no region (`T: Marker`, `I: Iterator<Item = T>`, `F:
     /// FnOnce(T) -> U`), while the instance of `T` may hold any.
     fn inert(&self, s: Side<'c>, depth: u32, budget: &mut u32) -> Result<bool, Refused> {
+        self.all_resolved(s, depth, budget, |cur, node| {
+            if self.fits(cur)? != SlotCount::ZERO {
+                return Ok(false);
+            }
+            Ok(match node {
+                // The caller's own parameter (its `ρ_P`), or a type not decided.
+                PNode::Param(_) | PNode::Infer | PNode::Error => false,
+                PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => {
+                    // An outlives component can be a caller parameter without a region slot.
+                    matches!(cur.slots, Slots::Caller(_)) && matches!(self.owner.body_params(cur.ty), Some(p) if p.is_empty())
+                }
+                _ => true,
+            })
+        })
+    }
+
+    /// Walks the written type and its substituted arguments. A body type's children are opaque.
+    fn all_resolved(&self, s: Side<'c>, depth: u32, budget: &mut u32, mut accept: impl FnMut(Side<'c>, PNode) -> Result<bool, Refused>) -> Result<bool, Refused> {
         const MAX_FRAMES: usize = 257; // MOST_WALK_DEPTH (256) + 1
         #[derive(Clone, Copy)]
-        struct InertFrame<'c> {
+        struct Frame<'c> {
             s: Side<'c>,
             rest: Slots<'c>,
             next_k: u32,
             depth: u32,
         }
-        let mut stack: [Option<InertFrame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
+        let mut stack: [Option<Frame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
         let mut sp: usize = 0;
         let mut enter = Some((s, depth));
         loop {
@@ -2137,35 +2155,22 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 *budget -= 1;
                 let cur = match self.resolve(cur)? {
                     Resolved::Side(s) => s,
-                    // An impl parameter no header walk bound: the proof's choice, which may be anything.
                     Resolved::Unbound { .. } => return Ok(false),
                 };
-                if self.fits(cur)? != SlotCount::ZERO {
+                let node = self.node(cur)?;
+                if !accept(cur, node)? {
                     return Ok(false);
                 }
-                match self.node(cur)? {
-                    // The caller's own parameter (its `ρ_P`), or a type not decided.
-                    PNode::Param(_) | PNode::Infer | PNode::Error => return Ok(false),
-                    PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => {
-                        // A body type of the caller with no slot: inert only where its captures hold no
-                        // caller parameter (`Owner::body_params`, the components rule's answer). A body
-                        // type in a declared column is never laid there: not inert.
-                        let Slots::Caller(_) = cur.slots else { return Ok(false) };
-                        let owner: &'c dyn Owner = self.owner;
-                        if !matches!(owner.body_params(cur.ty), Some(p) if p.is_empty()) {
-                            return Ok(false);
-                        }
-                        continue;
-                    }
-                    _ => {}
+                if matches!(node, PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. }) {
+                    continue;
                 }
-                // No slot under `cur` (`fits` above): each child takes none of `rest`.
                 let kids = self.kids_of(cur)?;
                 if kids.len() > 0 {
+                    let (_, rest) = cur.slots.split(self.own(cur)?).ok_or(self.malformed(cur.ty, Bad::StepBound))?;
                     let Some(slot) = stack.get_mut(sp) else {
                         return Err(self.malformed(cur.ty, Bad::StepBound));
                     };
-                    *slot = Some(InertFrame { s: cur, rest: cur.slots, next_k: 0, depth: d });
+                    *slot = Some(Frame { s: cur, rest, next_k: 0, depth: d });
                     sp += 1;
                 }
                 continue;
@@ -2283,6 +2288,50 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
 
     fn proj_of(&mut self, proj: Side<'c>, binders: u32) -> Result<(), Refused> {
         let proj = self.skolemize_side(proj, binders)?;
+        self.prove_projection(proj)
+    }
+
+    fn impl_projection(&mut self, proj: Side<'c>, binders: u32, env: EnvId) -> Result<(), Refused> {
+        let proj = self.skolemize_side(proj, binders)?;
+        self.prove_projection(proj)?;
+        let Some(scope) = Self::env_of(proj).filter(|&scope| scope != env) else { return Ok(()) };
+        // A projection can constrain an impl type parameter that the header never mentions.
+        // Keep the clause's own region instantiation local. Only export a type witness whose
+        // free regions and substituted arguments can be read outside that scope.
+        let count = self.envs.type_params(env).map_err(|w| self.malformed(proj.ty, w))?;
+        let mut budget = MOST_WALK_STEPS;
+        for param in 0..count {
+            let ty = |e| self.envs.type_of(e, param).map_err(|w| self.malformed(proj.ty, w));
+            if let (TypeAt::Unbound { .. }, TypeAt::Bound(witness)) = (ty(env)?, ty(scope)?) {
+                let independent = self.all_resolved(witness, 0, &mut budget, |s, node| {
+                    if matches!(node, PNode::Infer | PNode::Error) {
+                        return Ok(false);
+                    }
+                    self.projection_witness_is_external(s)
+                })?;
+                if !independent {
+                    return Err(Refused::HigherRanked { item: self.item, node: witness.ty, binder: 0 });
+                }
+                self.envs.bind_type(env, param, witness).map_err(|w| self.malformed(proj.ty, w))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn projection_witness_is_external(&self, s: Side<'c>) -> Result<bool, Refused> {
+        self.fits(s)?;
+        for k in 0..self.own(s)?.get() {
+            match self.slot(s, k)? {
+                RegAt::Known(Reg::Static | Reg::Owner(_) | Reg::Slot(_)) => {}
+                // An inference origin can be tied to the local placeholder. A raw late
+                // region can still refer to the callable's binder.
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    fn prove_projection(&mut self, proj: Side<'c>) -> Result<(), Refused> {
         let PNode::ExProj { trait_, name, .. } = self.node(proj)? else { return Err(self.malformed(proj.ty, Bad::NotOfKind)) };
         self.fits(proj)?;
         let own = self.own(proj)?;

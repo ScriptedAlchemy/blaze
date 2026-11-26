@@ -413,6 +413,10 @@ impl<'c, A: Allocator + Copy> Envs<'c, A> {
         })
     }
 
+    pub(crate) fn type_params(&self, e: EnvId) -> Result<u32, Bad> {
+        u32::try_from(self.env(e)?.types.len()).map_err(|_| Bad::StepBound)
+    }
+
     pub(crate) fn bind_reg(&mut self, e: EnvId, param: u32, to: Reg) -> Result<(), Bad> {
         let env = self.envs.get_mut(e.0 as usize).ok_or(Bad::StepBound)?;
         match env.regs.get_mut(param as usize) {

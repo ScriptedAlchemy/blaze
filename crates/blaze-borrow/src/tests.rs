@@ -1313,6 +1313,62 @@ fn an_impls_empty_column_clause_is_tied_where_it_names_a_region() {
     assert!(rec.statics.is_empty() && !rejects(&rec, &[0], &[]), "CONTROL: no where-clause, nothing asked of `'x`: {:?}", rec.statics);
 }
 
+/// `impl<'x, R: 'static> Other for Wrap<'x> where for<'a> Wrap<'x>: Tr<'a, Output = R>`
+/// first infers `R` and then checks `R: 'static`. The projection's `'a` is local to the proof.
+#[test]
+fn higher_ranked_projection_binds_an_impl_output_independent_of_the_binder() {
+    use blaze_typeck::region_facts::{ClauseView, ColView};
+    use blaze_typeck::regions::RegionCol;
+
+    const T_OTHER: ItemKey = ItemKey(0x030a);
+    const IMP_TR: ItemKey = ItemKey(0x0602);
+    const P1: &[Region] = &[Region::Param(1)];
+    const P0_P1: &[Region] = &[Region::Param(0), Region::Param(1)];
+    const L00_P0: &[Region] = &[Region::Late { binder: 0, var: 0 }, Region::Param(0)];
+
+    let mut t = Tys::new();
+    let u8_ = t.u8();
+    let output = t.r(u8_);
+    let unit = t.unit();
+    let p0 = t.param(0);
+    let wrap = t.adt(K_WRAP, &[]);
+    let other = t.extrait(T_OTHER, &[p0]);
+    let other_head = t.extrait(T_OTHER, &[wrap]);
+    let tr_head = t.extrait(T_TR, &[wrap]);
+    let proj = t.exproj(T_TR, OUTPUT, &[wrap], p0);
+    let facts = Facts::default().trait_(T_OTHER, 0).trait_(T_TR, 1).alias(T_TR, OUTPUT, 1).adt(K_WRAP, 1, &[Variance::Co]);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+    let proj_col = RegionCol::lay(t.t.view(), proj, &facts, L00_P0, alloc()).unwrap();
+    let output_col = RegionCol::lay(t.t.view(), p0, &facts, NONE, alloc()).unwrap();
+    let views = [
+        ClauseView { nth: 0, binders: 1, col: ColView::of(&proj_col), outlives: None },
+        ClauseView { nth: 1, binders: 0, col: ColView::of(&output_col), outlives: Some(Region::Static) },
+    ];
+    let outlives = [Outlives::Type { clause: 1, region: Region::Static }];
+    let wh = ImplWhere { params: &[], outlives: &outlives, views: &views };
+    let p = params(0, &[]);
+    let clauses = [ClauseIn::TraitOf { trait_ref: ty(other, NONE), binders: 0 }];
+    let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &[ty(p0, NONE)], output: ty(unit, NONE), clauses: &clauses };
+    let call = |region| {
+        let outer = ImplHead { imp: IMP, lifetimes: 1, types: 1, trait_ref: ty(other_head, P0) };
+        let inner = ImplHead { imp: IMP_TR, lifetimes: 2, types: 0, trait_ref: ty(tr_head, P0_P1) };
+        let value = Some(ImplValue { value: ty(output, region), gat_lifetimes: 0 });
+        let rows = SVec::from([(T_OTHER, None, Selection::Impl { head: outer, value: None }), (T_TR, Some(OUTPUT), Selection::Impl { head: inner, value })]);
+        let selected = WhereSel { sel: Sel { rows }, imp: IMP, wh };
+        let args = [arg(wrap, 0, 1)];
+        let generics = GenericArgs { lifetimes: SlotRange::EMPTY, types: &args };
+        run(&cols, &selected, &Own::default(), 1, Callee::Fn(sig), generics, &args, arg(unit, 1, 0))
+    };
+
+    let (res, rec) = call(P1);
+    assert_eq!(res, Ok(()));
+    assert_eq!(rec.statics, [0], "`R: 'static` must constrain the caller's `'x`");
+    assert!(rejects(&rec, &[0], &[]));
+
+    let (res, _) = call(P0);
+    assert_eq!(res, Err(Refused::HigherRanked { item: METHOD, node: output, binder: 0 }), "`R` must be independent of `'a`");
+}
+
 /// A PROJECTION CLAUSE WITH AN EMPTY COLUMN (relate.rs `proj_of`). Rust's rule (the Reference,
 /// "Associated types"): `T: Tr<Output = U>` holds where `<T as Tr>::Output` normalizes to `U`;
 /// with `U = &'x u8` the selected impl's value fixes `'x` (`I: Iterator<Item = U>` at `I =
