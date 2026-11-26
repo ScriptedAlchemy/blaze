@@ -594,12 +594,14 @@ pub trait Adts {
     /// default implementation with the attribute, then the attribute also applies to override
     /// implementations." Such a fn takes one hidden last parameter, its caller's
     /// `&'static Location<'static>` (walk/track_caller.rs), so the builder of the fn and every
-    /// caller ask this one question and agree. `None`: not said; then no location is passed,
+    /// caller ask this one question and agree. A missing impl selection fact is a
+    /// [`BuildError::Select`] for the maker to fill before building. `Ok(None)`: not said;
+    /// then no location is passed,
     /// and a `caller_location` or a forwarded location that depends on the answer is refused
     /// by name ([`BuildError::TrackCaller`]), never given a wrong place.
-    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Result<Option<bool>, BuildError> {
         let _ = (instance, ground);
-        None
+        Ok(None)
     }
 
     /// Whether the trait declaration gives its vtable slot the hidden caller-location

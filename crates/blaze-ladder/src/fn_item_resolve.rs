@@ -109,7 +109,7 @@ pub(crate) fn vtable_target(
     implementation: Instance,
     ground: &mut PortableTys<'_>,
 ) -> Result<Instance, blaze_build::BuildError> {
-    if implementation.item == declaration || adts.track_caller(implementation, ground) != Some(true) {
+    if implementation.item == declaration || adts.track_caller(implementation, ground)? != Some(true) {
         return Ok(implementation);
     }
     match adts.declared_track_caller(declaration) {

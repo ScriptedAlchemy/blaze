@@ -44,7 +44,7 @@ use blaze_emit::{Isa, Os};
 use blaze_ids::Hasher;
 use blaze_ids::producer::{CodeBuilder, ProducerId, Producers};
 use blaze_ladder::body_ids::{BodyId, BodyIds, Read, Walk};
-use blaze_ladder::code_records::{Builder, CodeStore, MemoryStore, Settings, TierName};
+use blaze_ladder::code_records::{Builder, CodeStore, EntryView, MemoryStore, Settings, TierName};
 use blaze_ladder::crates::{Inputs, Toolchain};
 use blaze_ladder::front2::program::Front2Program;
 use blaze_ladder::front2::program::lazy::LazyProgram;
@@ -284,6 +284,17 @@ fn compare_bytes(program: &str, ww: &Walk<'_>, sw: &MemoryStore<'_>, wl: &Walk<'
             write!(line, ": whole {kw:?} / lazy {kl:?}").expect(WRITES);
             println!("{}", line.as_str());
             firsts.push(line);
+            if let (Some(kw), Some(kl)) = (kw, kl)
+                && let (Ok(Some(x)), Ok(Some(y))) = (sw.get(kw), sl.get(kl))
+            {
+                let x = EntryView::read(x).expect("whole entry");
+                let y = EntryView::read(y).expect("lazy entry");
+                let whole = x.reads().map(|r| Some(r.expect("whole read"))).chain(core::iter::once(None));
+                let lazy = y.reads().map(|r| Some(r.expect("lazy read"))).chain(core::iter::once(None));
+                if let Some((whole, lazy)) = whole.zip(lazy).find(|(a, b)| a != b) {
+                    println!("{program}: first differing code read, whole {whole:?} / lazy {lazy:?}");
+                }
+            }
         }
     }
     b.only_lazy = wl.len() - matched;

@@ -1218,13 +1218,17 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     /// The front end resolves the function's own or inherited caller-tracking attribute.
     /// At a call from an untracked function, the fast emitter records the item-relative
     /// caller site. Placement supplies its current line and column.
-    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Result<Option<bool>, BuildError> {
         let declaration = self.0.track_caller(instance.item);
         if instance.args == List::EMPTY || declaration == Some(true) {
-            return declaration;
+            return Ok(declaration);
         }
-        let (item, _) = self.0.resolve(self.1, instance.item, instance.args, ground).ok()?;
-        self.0.track_caller(item)
+        match self.0.resolve(self.1, instance.item, instance.args, ground) {
+            Ok((item, _)) => Ok(self.0.track_caller(item)),
+            Err(error @ ResolveError::Missing(_)) => Err(BuildError::Select(error)),
+            // Language-provided instances can have no selected impl item (e.g. `Fn*` shims).
+            Err(_) => Ok(None),
+        }
     }
 
     fn declared_track_caller(&self, item: ItemKey) -> Option<bool> {

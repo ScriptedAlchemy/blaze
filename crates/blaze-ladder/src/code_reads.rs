@@ -1029,10 +1029,18 @@ impl Adts for Recorded<'_> {
         self.world.fmt_argument_adt()
     }
 
-    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Result<Option<bool>, BuildError> {
         let answer = self.world.track_caller(instance, ground);
+        let digest = match &answer {
+            Ok(tracked) => Ok(small(*tracked)),
+            Err(BuildError::Select(blaze_typeck::ResolveError::Missing(question))) => {
+                let item = crate::front2::body_reads::question_item(question).unwrap_or(instance.item);
+                Err(Stop::Unmade(item))
+            }
+            Err(_) => Err(Stop::Malformed),
+        };
         match ground.view().list(instance.args) {
-            Ok(args) => self.log.ask(ReadKind::TrackCaller, instance.item, 0, args, Ok(small(answer))),
+            Ok(args) => self.log.ask(ReadKind::TrackCaller, instance.item, 0, args, digest),
             Err(_) => self.log.stop(ReadsError::Malformed { kind: ReadKind::TrackCaller, item: instance.item }),
         }
         answer
@@ -1317,7 +1325,7 @@ pub fn verify_today(
                 recorded.declared_track_caller(item);
             }
             ReadKind::TrackCaller => {
-                recorded.track_caller(Instance { item, args: list }, ground);
+                let _ = recorded.track_caller(Instance { item, args: list }, ground);
             }
             ReadKind::Resolve => {
                 let resolved = beyond.resolve(item, list, ground);

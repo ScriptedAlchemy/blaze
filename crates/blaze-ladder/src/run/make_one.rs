@@ -1687,13 +1687,15 @@ impl<P: FrontEnd> blaze_build::Adts for CachedFront<'_, P> {
     fn abi(&self, item: ItemKey) -> Option<blaze_build::Abi> { self.front.abi(item) }
     fn nounwind(&self, owner: ItemKey) -> Option<bool> { self.front.nounwind(owner) }
     fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs { self.front.fn_attrs(owner) }
-    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Result<Option<bool>, BuildError> {
         if let Some(&hit) = self.cache.borrow().track_caller.get(&instance) {
-            return Some(hit);
+            return Ok(Some(hit));
         }
         let ans = self.front.track_caller(instance, ground)?;
-        self.cache.borrow_mut().track_caller.insert(instance, ans);
-        Some(ans)
+        if let Some(tracked) = ans {
+            self.cache.borrow_mut().track_caller.insert(instance, tracked);
+        }
+        Ok(ans)
     }
     fn declared_track_caller(&self, item: ItemKey) -> Option<bool> { self.front.declared_track_caller(item) }
     fn location_adt(&self) -> Option<ItemKey> { self.front.location_adt() }
