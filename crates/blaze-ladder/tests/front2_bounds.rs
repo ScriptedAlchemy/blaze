@@ -112,6 +112,11 @@ impl Cap for NoBuf { type Buf<const N: usize> = NoCl; }
 fn gat_const_lit<C: Cap<Buf<3>: Clone>>() {}
 fn use_gat_const_lit() { gat_const_lit::<Bytes3>() }
 fn use_gat_const_bad() { gat_const_lit::<NoBuf>() }
+trait SelfBuf {
+    type Buf<const N: usize>;
+    fn pass(value: Self::Buf<3>) -> Self::Buf<3> { value }
+}
+fn use_gat_const_member<C: SelfBuf>(value: C::Buf<3>) -> C::Buf<3> { C::pass(value) }
 struct Count(u8);
 impl Iterator for Count { type Item = u8; fn next(&mut self) -> Option<u8> { None } }
 impl DoubleEndedIterator for Count { fn next_back(&mut self) -> Option<Self::Item> { None } }
@@ -214,6 +219,7 @@ const CLEAN: [(&str, &str); 60] = [
     ("gat_life_bound", "`L: LendT<It<'a, u8>: Clone>`: the lifetime argument erased, `u8` the own argument"),
     ("gat_const_lit", "`C: Cap<Buf<3>: Clone>`: `3` made as a `usize` constant, the GAT's declared const parameter type"),
     ("use_gat_const_lit", "`gat_const_lit::<Bytes3>`: `<Bytes3 as Cap>::Buf<3>` is `u8`, which is `Clone`"),
+    ("use_gat_const_member", "a trait member can name its own const-generic associated type"),
     ("thin", "`T: Thin` (core: `pub trait Thin = Pointee<Metadata = ()> + PointeeSized;`): the trait clause and the projection, so `metadata(p)` is `()`"),
     ("thin_where", "`where P: Thin`"),
     ("conv", "`trait Conv<T> = Into<T> + Copy`: a generic alias, its parameter substituted"),

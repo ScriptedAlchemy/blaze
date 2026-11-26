@@ -197,7 +197,7 @@ pub struct Maps {
     pub(super) static_defaults: Rows<LibKey, blaze_own::Vec<StaticDefaultRegions, Alloc<'static>>>,
     pub traits: Rows<LibKey, TraitHead>,
     /// Each trait's associated type's count of its OWN type and const parameters (`type
-    /// MapStorage<V>`: one), by the trait and the name, filed with the trait's members
+    /// MapStorage<V>`: one), by the trait and the name, filed with the trait's head
     /// ([`Heads::assoc_generics`]): what `<K as Key>::MapStorage<V>` is checked against.
     pub assoc_generics: Rows<(LibKey, Name), u32>,
     /// The outlives where clauses of each trait's associated type that writes one (`type
@@ -205,7 +205,7 @@ pub struct Maps {
     /// (gat.rs [`super::gat::OUTLIVES_NOT_CHECKED`]).
     pub assoc_where: Rows<(LibKey, Name), super::gat::AssocWhere>,
     /// Each trait's associated type's own const parameters (own position, declared type), by
-    /// the trait and the name, filed with the trait's members ([`Heads::assoc_const_params`]):
+    /// the trait and the name, filed with the trait's head ([`Heads::assoc_const_params`]):
     /// the type a constant written in `Tr<Buf<3>: Bound>` is made at (gat_bounds.rs).
     pub assoc_consts: Rows<(LibKey, Name), blaze_own::Vec<(u32, PTy), Alloc<'static>>>,
     /// Each trait's supertraits written as bounds on `Self` (see [`Heads::trait_supers`]):
@@ -2891,6 +2891,12 @@ fn params(tys: &mut PortableTys<'_>, from: u32, to: u32, consts: &[(u32, PTy)]) 
 /// which refuses every other type by name). Their count.
 pub(super) fn own_generics<'n, S: NamesSource<'n>, P: Extend<(Name, u32)>, C: Extend<(u32, PTy)>>(b: &Builder<'_, Maps, S>, tys: &mut PortableTys<'_>, module: LibKey, v: &View<'_>, base: u32, ps: &mut P, consts: &mut C) -> Result<u32, Why> {
     let n = param_names(v, base, ps, Consts::Keep)?;
+    own_const_types(b, tys, module, v, base, consts)?;
+    Ok(n)
+}
+
+/// The declared types of an item's own const parameters, numbered from `base`.
+fn own_const_types<'n, S: NamesSource<'n>, C: Extend<(u32, PTy)>>(b: &Builder<'_, Maps, S>, tys: &mut PortableTys<'_>, module: LibKey, v: &View<'_>, base: u32, consts: &mut C) -> Result<(), Why> {
     let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
     let mut i = base;
     let list = v.list(head::GENERICS);
@@ -2914,7 +2920,7 @@ pub(super) fn own_generics<'n, S: NamesSource<'n>, P: Extend<(Name, u32)>, C: Ex
             }
         }
     }
-    Ok(n)
+    Ok(())
 }
 
 /// The type `t` of a signature, or, where its path names nothing and the names library decided
@@ -4341,14 +4347,12 @@ impl<'n> Store<'n> {
                         if let Some(w) = side.where_ {
                             self.maps.assoc_where.insert((key, side.name), w);
                         }
-                        if let (Some(item), Some(generics)) = (item, side.generics)
+                        if let (Some(item), Some(generics), Some(own)) = (item, side.generics, &side.consts)
                             && generics != 0
                         {
-                            let mut checker = Vec::with_capacity_in(const_params.len() + side.consts.as_ref().map_or(0, |c| c.len()), self.tys.alloc());
+                            let mut checker = Vec::with_capacity_in(const_params.len() + own.len(), self.tys.alloc());
                             checker.extend_from_slice(&const_params);
-                            if let Some(own) = &side.consts {
-                                checker.extend(own.iter().map(|&(i, t)| (trait_generics + i, t)));
-                            }
+                            checker.extend(own.iter().map(|&(i, t)| (trait_generics + i, t)));
                             self.gat_const_params.insert(item, checker);
                         }
                         if let Some(c) = side.consts {
@@ -4862,12 +4866,13 @@ impl<'n> Store<'n> {
         own_defaults(&b, &mut self.tys, &env, v, 1, &mut defaults)?;
         let ck = checker_of(key);
         let mut assoc = blaze_own::Vec::new_in(alloc);
-        let mut assoc_own: blaze_own::Vec<(Name, u32), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let mut assoc_own = blaze_own::Vec::new_in(alloc);
         let mut assoc_lives: blaze_own::Vec<(Name, u32), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         let mut assoc_where: blaze_own::Vec<(Name, super::gat::AssocWhere), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         let mut fns = blaze_own::Vec::new_in(alloc);
         let ms = members(names, key, alloc).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
         let mut members = blaze_own::Vec::new_in(alloc);
+        let why_key = |c: super::keys::KeyClash| Why::Program(format!("{c}").into_boxed_str(), whole);
         for m in &ms {
             with_lowered(names, key, m.text, |mv| -> Result<(), Why> {
                 if mv.cfg_out() {
@@ -4875,7 +4880,7 @@ impl<'n> Store<'n> {
                 }
                 let kind = match m.detail {
                     ItemDetail::Fn { .. } => {
-                        let mk = keys.member(ck, MemberKind::Fn, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
+                        let mk = keys.member(ck, MemberKind::Fn, m.name).map_err(&why_key)?;
                         fns.push((Name::of(m.name), mk));
                         DynMember::Fn
                     }
@@ -4887,16 +4892,37 @@ impl<'n> Store<'n> {
                         // the head, as its name is: a path may name it before the members exist.
                         let mut own_params = 0u32;
                         let mut own_lifetimes = 0u32;
+                        let mut has_const = false;
                         for &row in mv.rows(mv.list(head::GENERICS))? {
-                            if matches!(lf::GenericParam::decode(row)?, lf::GenericParam::Lifetime { .. }) {
-                                own_lifetimes += 1;
-                            } else {
-                                own_params += 1;
+                            match lf::GenericParam::decode(row)? {
+                                lf::GenericParam::Lifetime { .. } => own_lifetimes += 1,
+                                lf::GenericParam::Type { .. } => own_params += 1,
+                                lf::GenericParam::Const { .. } => {
+                                    own_params += 1;
+                                    has_const = true;
+                                }
                             }
                         }
                         // A GAT's own lifetimes: kept for a body-local trait only (below).
                         assoc_lives.push((Name::of(m.name), own_lifetimes));
-                        assoc_own.push((Name::of(m.name), own_params));
+                        // Supertraits and member signatures can name this GAT before the
+                        // trait's members are made. Keep its declared const types with its arity.
+                        let mut const_types = blaze_own::Vec::new_in(alloc);
+                        let consts = if has_const {
+                            let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
+                            let member = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+                            match own_const_types(&member, &mut self.tys, module, mv, 0, &mut const_types) {
+                                Ok(()) => Ok(const_types),
+                                Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
+                                Err(why) => {
+                                    let item = keys.member(ck, MemberKind::Type, m.name).map_err(&why_key)?;
+                                    Err((item, why))
+                                }
+                            }
+                        } else {
+                            Ok(const_types)
+                        };
+                        assoc_own.push((Name::of(m.name), own_params, consts));
                         // Its where clauses: an outlives clause is kept with the head, any
                         // other is refused by name (gat.rs).
                         let kept = super::gat::member_where(mv, m.name)?;
@@ -4914,8 +4940,17 @@ impl<'n> Store<'n> {
             })
             .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))??;
         }
-        for (name, own_params) in assoc_own {
+        for (name, own_params, consts) in assoc_own {
             self.maps.assoc_generics.insert((key, name), own_params);
+            match consts {
+                Ok(consts) => {
+                    self.maps.assoc_consts.insert((key, name), consts);
+                }
+                Err((item, why)) => {
+                    self.fn_gaps.insert(item, why);
+                    self.regions.file_refused(item);
+                }
+            }
         }
         for (name, kept) in assoc_where {
             self.maps.assoc_where.insert((key, name), kept);
@@ -5245,9 +5280,7 @@ impl<'n> Store<'n> {
         self.maps.super_projs.insert(key, super_projs);
         let mut assoc = blaze_own::Vec::new_in(alloc);
         let mut consts: blaze_own::Vec<(Name, ItemKey), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
-        // Each associated type's own const parameters (own position, type): filed after the
-        // loop into `Maps::assoc_consts`.
-        let mut assoc_consts: blaze_own::Vec<(Name, blaze_own::Vec<(u32, PTy), Alloc<'static>>), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let mut gat_consts = blaze_own::Vec::new_in(alloc);
         let mut needs: blaze_own::Vec<LibKey, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         let why_key = |c: super::keys::KeyClash| -> Why {
             let mut s = blaze_own::String::new_in(alloc);
@@ -5293,6 +5326,7 @@ impl<'n> Store<'n> {
                     }
                     ItemDetail::TypeAlias => {
                         let item = keys.member(ck, MemberKind::Type, m.name).map_err(&why_key)?;
+                        let name = Name::of(m.name);
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
                         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
                         let default = match mv.head_opt(head::TY) {
@@ -5301,27 +5335,20 @@ impl<'n> Store<'n> {
                         };
                         let mut own_ps = blaze_own::Vec::new_in(alloc);
                         own_ps.extend_from_slice(&ps);
-                        let mut own_cs = blaze_own::Vec::new_in(alloc);
-                        own_cs.extend_from_slice(&cs);
-                        let of_type = match own_generics(&b, &mut self.tys, module, mv, own + 1, &mut own_ps, &mut own_cs) {
-                            Ok(n) => n,
-                            Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
-                            Err(why) => {
-                                self.preds.remove(&item);
-                                self.fn_gaps.insert(item, why);
-                                self.regions.file_refused(item);
-                                assoc.push(tc::AssocTyDef { name: Name::of(m.name), item, default });
-                                return Ok(());
-                            }
+                        let Some(mine) = self.maps.assoc_consts.get(&(key, name)) else {
+                            self.preds.remove(&item);
+                            self.fn_gaps.insert_absent(item, Why::Unsupported("an associated type whose const parameter declarations are not on record", whole));
+                            self.regions.file_refused(item);
+                            assoc.push(tc::AssocTyDef { name, item, default });
+                            return Ok(());
                         };
-                        let mut mine = blaze_own::Vec::new_in(alloc);
-                        for &(i, t) in own_cs.iter().filter(|(i, _)| *i > own) {
-                            mine.push((i - own - 1, t));
-                        }
-                        assoc_consts.push((Name::of(m.name), mine));
+                        let of_type = param_names(mv, own + 1, &mut own_ps, Consts::Keep)?;
+                        let mut own_cs = blaze_own::Vec::with_capacity_in(cs.len() + mine.len(), alloc);
+                        own_cs.extend_from_slice(&cs);
+                        own_cs.extend(mine.iter().map(|&(i, t)| (own + 1 + i, t)));
                         let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
                         let alias_args = params(&mut self.tys, 0, own + 1 + of_type, &own_cs)?;
-                        let alias = intern(&mut self.tys, PNode::Alias { trait_: ck, name: Name::of(m.name), args: alias_args })?;
+                        let alias = intern(&mut self.tys, PNode::Alias { trait_: ck, name, args: alias_args })?;
                         let assoc_scope = Scope::item(mv, Some(&scope), scope.params(), alloc).map_err(Why::Regions)?;
                         let mut ap = Preds::new_in(assoc_scope.clone_in(alloc));
                         match b.assoc_ty_bounds(&mut self.tys, &own_env, mv, alias, self.sized, &mut ap) {
@@ -5350,7 +5377,10 @@ impl<'n> Store<'n> {
                                 self.regions.file_refused(item);
                             }
                         }
-                        assoc.push(tc::AssocTyDef { name: Name::of(m.name), item, default });
+                        if of_type != 0 {
+                            gat_consts.push((item, own_cs));
+                        }
+                        assoc.push(tc::AssocTyDef { name, item, default });
                     }
                     ItemDetail::Const { .. } => {
                         let Some(mk) = pre_mk else { return Ok(()) };
@@ -5400,15 +5430,8 @@ impl<'n> Store<'n> {
             self.more_needs.extend_from_slice(rest);
             return Err(Why::Need(first));
         }
-        for (name, mine) in assoc_consts {
-            let item = assoc.iter().find(|a| a.name == name).map(|a| a.item);
-            let mut checker = Vec::with_capacity_in(cs.len() + mine.len(), self.tys.alloc());
-            checker.extend_from_slice(&cs);
-            checker.extend(mine.iter().map(|&(i, t)| (own + 1 + i, t)));
-            self.maps.assoc_consts.insert((key, name), mine);
-            if let Some(item) = item {
-                self.gat_const_params.insert(item, checker);
-            }
+        for (item, consts) in gat_consts {
+            self.gat_const_params.insert(item, consts);
         }
         self.trait_defs.insert(ck, TraitExtra { supertraits, assoc, consts });
         self.preds.insert(ck, preds);

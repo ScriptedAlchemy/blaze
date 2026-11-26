@@ -305,8 +305,8 @@ pub trait Heads {
     }
     /// The const parameters of the trait's associated type `name` among its OWN type and
     /// const parameters (position counted from 0 after the trait's, lifetimes not counted;
-    /// declared type), filed with the trait's members: `None` when not on record (the
-    /// default: a source of heads that keeps none; or the members not made yet).
+    /// declared type), filed with the trait's head: `None` when the head or a usable
+    /// declaration is missing. A declared type with no const parameters has an empty row.
     fn assoc_const_params(&self, trait_: LibKey, name: Name) -> Option<&[(u32, PTy)]> {
         let _ = (trait_, name);
         None

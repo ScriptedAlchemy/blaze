@@ -20,7 +20,7 @@
 //! A const argument (`Buf<3>`, `Buf<{ N }>`, or `Buf<N>` with `N` a const parameter in scope)
 //! is made by the one constructor of every const argument ([`Builder::const_term`]); its type
 //! is the associated type's declared const parameter's ([`Heads::assoc_const_params`], filed
-//! with the trait's members). A one-name argument that is not a const parameter in scope is a
+//! with the trait's head). A one-name argument that is not a const parameter in scope is a
 //! type (the Reference, "Generic parameters": "When there is ambiguity if a generic argument
 //! could be resolved as either a type or const argument, it is always resolved as a type").
 
@@ -108,9 +108,8 @@ impl<'b, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> {
     }
 
     /// The declared type of the const parameter at own position `index` of the associated type
-    /// `name` of `owner` ([`Heads::assoc_const_params`]). Not on record while the trait's
-    /// members are not made: their need. Not on record after they are (its head was refused, or
-    /// the bound is inside the trait's own members): refused by name, never guessed.
+    /// `name` of `owner` ([`Heads::assoc_const_params`]). Before the trait's head is made,
+    /// ask for it. A made head with no such row cannot supply the declared type.
     pub(super) fn gat_const_want(&self, owner: LibKey, name: Name, index: u32, r: Range, shown: &str) -> Result<PTy, Why> {
         match self.heads.assoc_const_params(owner, name) {
             Some(consts) => match consts.iter().find(|(i, _)| *i == index) {
@@ -120,9 +119,9 @@ impl<'b, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> {
                     r,
                 )),
             },
-            None if self.heads.trait_supers(owner).is_none() => Err(Why::Need(owner)),
+            None if self.heads.trait_head(owner).is_none() => Err(Why::Need(owner)),
             None => Err(Why::Unsupported(
-                "a constant argument of a generic associated type whose const parameters are not on record (its head is refused, or the bound is inside its own trait's members)",
+                "a constant argument of a generic associated type whose const parameter declaration is not on record",
                 r,
             )),
         }
