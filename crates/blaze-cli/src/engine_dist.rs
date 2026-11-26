@@ -2,7 +2,8 @@
 //!
 //! Connects the source compiler's whole-program code-record walk (`engine_export.rs`) to the
 //! retained coordinator (`blaze-dist-local`) and content-addressed cache server (`blaze-serve`)
-//! when `BLAZE_DIST_SOCKET` is set in the command's environment.
+//! when `BLAZE_DIST_SOCKET` is set in the command's environment. Release export needs an
+//! LLVM and fold pipeline in the worker before it can publish distributed release records.
 //!
 //! Each workspace crate is scheduled as its own content-addressed `Unit` in topological order:
 //! - Concrete non-generic runnable functions of that crate form the canonical sorted `Unit::names`
@@ -29,10 +30,7 @@ use blaze_dist::holder::HolderConfig;
 use blaze_dist_local::agent::{self, Arrived, Config, Grant, Granted, Source, Unit};
 use blaze_dist_local::blobs::Blobs;
 use blaze_dist_local::pack::{Value, ValueRef};
-use blaze_dist_local::sys::{
-    append_file, current_pid, path_is_file, random_id, read_file, write_file,
-};
-use blaze_dist_local::telemetry;
+use blaze_dist_local::sys::{append_file, path_is_file, random_id, read_file, write_file};
 use blaze_ids::ContentId;
 use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
 use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, StoreError};
@@ -82,6 +80,8 @@ pub(crate) const KIND_POINTER: u8 = 1;
 /// Typed refusal from parsing distributed settings or running distributed units.
 #[derive(Debug)]
 pub(crate) enum DistError {
+    /// The worker has no LLVM or fold emitter for distributed release export.
+    ReleaseBackendUnavailable,
     /// A distributed option was supplied without `BLAZE_DIST_SOCKET`.
     OptionWithoutSocket { name: &'static str, value: AString<'static> },
     /// `BLAZE_DIST_SOCKET` was set without `BLAZE_DIST_BLOBS`.
@@ -105,12 +105,15 @@ pub(crate) enum DistError {
     /// Local compilation inside a distributed unit failed.
     Compile { shown: AString<'static> },
     /// Reading or writing a committed overlay entry failed.
-    Store { shown: AString<'static> },
+    Store(StoreError),
 }
 
 impl fmt::Display for DistError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DistError::ReleaseBackendUnavailable => {
+                write!(f, "the distributed build failed: `blaze export --release` requires LLVM emission and folding in the distributed worker (engine_dist.rs)")
+            }
             DistError::OptionWithoutSocket { name, value } => {
                 write!(f, "the distributed build failed: {name} is {}, with no {SOCKET_VAR} to run its units", value.as_str())
             }
@@ -149,8 +152,8 @@ impl fmt::Display for DistError {
             DistError::Compile { shown } => {
                 write!(f, "the distributed build failed: {}", shown.as_str())
             }
-            DistError::Store { shown } => {
-                write!(f, "the distributed build failed: store: {}", shown.as_str())
+            DistError::Store(error) => {
+                write!(f, "the distributed build failed: {error}")
             }
         }
     }
@@ -302,15 +305,25 @@ impl<'s, 'm, D: Driver> DistStore<'s, 'm, D> {
         }
     }
 
-    pub(crate) fn merge_arrived(&mut self, arrived: &Arrived) -> Result<(), DistError> {
-        for (digest, (kind, bytes)) in &arrived.values {
-            let key = CodeKey(ContentId(*digest));
+    pub(crate) fn merge_arrived(&mut self, values: &BTreeMap<Digest, (u8, WireVec<u8>), WireAlloc>) -> Result<(), DistError> {
+        // The wire map is sorted by key. A pointer can sort before its target, which the
+        // home's store requires to be present before it will accept the pointer.
+        for (digest, (kind, bytes)) in values {
             if *kind == KIND_CODE {
-                let _ = self.local.put(CodeClass::Program, key, bytes.as_slice());
-            } else if *kind == KIND_POINTER && bytes.len() == 32 {
-                let mut target = [0u8; 32];
-                target.copy_from_slice(bytes.as_slice());
-                let _ = self.local.point(CodeClass::Program, key, CodeKey(ContentId(target)));
+                self.local.put(CodeClass::Program, CodeKey(ContentId(*digest)), bytes.as_slice()).map_err(DistError::Store)?;
+            }
+        }
+        for (digest, (kind, bytes)) in values {
+            let key = CodeKey(ContentId(*digest));
+            match *kind {
+                KIND_CODE => {}
+                KIND_POINTER => {
+                    let target: Digest = bytes.as_slice().try_into().map_err(|_| {
+                        DistError::Store(StoreError::Failed { key, what: "a distributed pointer must hold a 32-byte content key" })
+                    })?;
+                    self.local.point(CodeClass::Program, key, CodeKey(ContentId(target))).map_err(DistError::Store)?;
+                }
+                _ => return Err(DistError::Store(StoreError::Failed { key, what: "unknown distributed code entry kind" })),
             }
             self.insert_overlay(*digest, *kind, bytes.as_slice());
         }
@@ -447,7 +460,6 @@ struct WorkItem<'a> {
     tabled: ItemKey,
     name: AVec<'a, u8>,
     key: CodeKey,
-    fold_candidate: bool,
 }
 
 /// One workspace crate's distributed unit plan.
@@ -548,7 +560,7 @@ fn collect_crate_items<'a, 'b>(
     let tys = PortableTys::new_in(alloc);
     let ground = tys.view();
 
-    let mut try_push = |item_key: ItemKey, fold_candidate: bool| {
+    let mut try_push = |item_key: ItemKey| {
         if ids.runnable(item_key).is_err() {
             return;
         }
@@ -568,7 +580,7 @@ fn collect_crate_items<'a, 'b>(
         ) else {
             return;
         };
-        raw.push(WorkItem { tabled: item_key, name: encoded, key, fold_candidate });
+        raw.push(WorkItem { tabled: item_key, name: encoded, key });
     };
 
     for i in 0..rec.items() {
@@ -581,7 +593,7 @@ fn collect_crate_items<'a, 'b>(
             None => false,
         };
         if nongeneric {
-            try_push(checker_of(item.key), true);
+            try_push(checker_of(item.key));
         }
     }
 
@@ -610,7 +622,7 @@ fn collect_crate_items<'a, 'b>(
                 None => true,
             };
             if member_nongeneric {
-                try_push(checker_of(mkey), true);
+                try_push(checker_of(mkey));
             }
         }
     }
@@ -638,37 +650,6 @@ fn json_digests(digests: &[Digest], alloc: WireAlloc) -> WireString {
     }
     out.push(']');
     out
-}
-
-/// Emits one `backend_work` JSONL event on `BLAZE_DIST_EVENTS` when `--release` is active.
-fn emit_backend_work(
-    unit_digest: &Digest,
-    work: &[Digest],
-    compiled_keys: &[Digest],
-    release_keys: &[Digest],
-    folded_keys: &[Digest],
-    alloc: WireAlloc,
-) {
-    let mut pid_s = WireString::new_in(alloc);
-    let _ = write!(pid_s, "{}", current_pid());
-    let mut ud_s = WireString::new_in(alloc);
-    let _ = write!(ud_s, "\"{}\"", hex(unit_digest));
-    let work_s = json_digests(work, alloc);
-    let compiled_s = json_digests(compiled_keys, alloc);
-    let release_s = json_digests(release_keys, alloc);
-    let folded_s = json_digests(folded_keys, alloc);
-    telemetry::emit(
-        "backend_work",
-        &[
-            ("pid", pid_s.as_str()),
-            ("unit_digest", ud_s.as_str()),
-            ("work", work_s.as_str()),
-            ("compiled_keys", compiled_s.as_str()),
-            ("release_keys", release_s.as_str()),
-            ("folded_keys", folded_s.as_str()),
-        ],
-        alloc,
-    );
 }
 
 /// Appends one JSONL unit report row to `BLAZE_DIST_REPORT`.
@@ -771,7 +752,6 @@ struct UnitExecutor<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>> {
     maker: &'a mut Maker<'b, crate::run_ids::Runnable, T>,
     store: &'a mut DistStore<'s, 'm, D>,
     roots: &'a Roots<'a>,
-    release: bool,
     scratch_alloc: Alloc<'a>,
     wire_alloc: WireAlloc,
     heap: &'static blaze_own::Heap,
@@ -788,9 +768,6 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
     fn compile(&mut self, names: &[usize]) -> Result<Grant, DistError> {
         let mut grant_values: BTreeMap<Digest, Value, WireAlloc> = BTreeMap::new_in(self.wire_alloc);
         let mut compiled_keys: WireVec<Digest> = WireVec::new_in(self.wire_alloc);
-        let mut release_keys: WireVec<Digest> = WireVec::new_in(self.wire_alloc);
-        let mut folded_keys: WireVec<Digest> = WireVec::new_in(self.wire_alloc);
-        let mut work_digests: WireVec<Digest> = WireVec::with_capacity_in(names.len(), self.wire_alloc);
         let mut compiled = 0u64;
         let mut stored = 0u64;
         let mut scratch = Scratch::new_in(self.scratch_alloc);
@@ -799,7 +776,6 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
             let Some(item) = self.plan.items.get(idx) else {
                 continue;
             };
-            work_digests.push(item.key.0.0);
             let proof = self.ids.runnable(item.tabled).map_err(|why| {
                 let mut s = String::new_in(self.heap.alloc());
                 let _ = write!(s, "item not runnable: {why}");
@@ -830,14 +806,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                     }
                     Stepped::Made(code_key) => {
                         compiled += 1;
-                        let digest = code_key.0.0;
-                        compiled_keys.push(digest);
-                        if self.release {
-                            release_keys.push(digest);
-                            if item.fold_candidate {
-                                folded_keys.push(digest);
-                            }
-                        }
+                        compiled_keys.push(code_key.0.0);
                     }
                     Stepped::Unkeyed(_) => {}
                 },
@@ -847,25 +816,10 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                     return Err(DistError::Compile { shown: s });
                 }
             }
-            let tracked = self.store.drain_tracked_values().map_err(|why| {
-                let mut s = String::new_in(self.heap.alloc());
-                let _ = write!(s, "{why}");
-                DistError::Store { shown: s }
-            })?;
+            let tracked = self.store.drain_tracked_values().map_err(DistError::Store)?;
             for val in tracked {
                 grant_values.insert(val.key, val);
             }
-        }
-
-        if self.release && !compiled_keys.is_empty() {
-            emit_backend_work(
-                &self.plan.unit.spec,
-                work_digests.as_slice(),
-                compiled_keys.as_slice(),
-                release_keys.as_slice(),
-                folded_keys.as_slice(),
-                self.wire_alloc,
-            );
         }
 
         let mut values = WireVec::with_capacity_in(grant_values.len(), self.wire_alloc);
@@ -945,11 +899,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                 }
             }
         }
-        let tracked = self.store.drain_tracked_values().map_err(|why| {
-            let mut s = String::new_in(self.heap.alloc());
-            let _ = write!(s, "{why}");
-            DistError::Store { shown: s }
-        })?;
+        let tracked = self.store.drain_tracked_values().map_err(DistError::Store)?;
         for val in tracked {
             output(val);
         }
@@ -1030,7 +980,6 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             maker,
             store,
             roots,
-            release,
             scratch_alloc,
             wire_alloc,
             heap,
@@ -1062,7 +1011,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         let work_stored = usize::try_from(arrived.stored_here).unwrap_or(0);
         total_compiled += work_compiled + tail_compiled;
         total_cached += work_stored + tail_from_store;
-        store.merge_arrived(&arrived)?;
+        store.merge_arrived(&arrived.values)?;
         append_report_row(
             dist.report.as_ref().map(|s| s.as_str()),
             plan.unit_name.as_str(),

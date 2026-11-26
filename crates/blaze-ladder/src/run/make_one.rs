@@ -1791,8 +1791,9 @@ impl<P: FrontEnd> reads::Beyond for Today<'_, P> {
 
 /// Whether code `entry`, found under an instance key of fn `tabled`, holds today: every row of
 /// its read list asked again of today's program in `tabled`'s world (code_reads.rs
-/// `verify_today`), no body checked but an opaque type's defining fn and the owner of a
-/// coroutine whose state a row reads (laid again: lay_states.rs `relay`). Before the rows are
+/// `verify_today`). A row can require an opaque type's defining fn or a coroutine owner
+/// (lay_states.rs `relay`). An apparent mismatch is checked again if loading the referring
+/// body's own checked columns can supply missing facts. Before the rows are
 /// asked, what a fresh program answers only once made is made, by name, from each row: a fn's
 /// head row (its ABI, unwinding, caller tracking, C symbol), a trait's object table, a static's
 /// value, the constants the rows read (pulled as a make pulls them); an ADT head a row meets
@@ -1805,6 +1806,26 @@ impl<P: FrontEnd> reads::Beyond for Today<'_, P> {
 /// one decode, one front-end answer and one digest; the preparation above is once per item a
 /// run. Answers are kept only from an entry that held.
 pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
+    program: &mut RecordsProgram<'n>,
+    typing: &mut T,
+    state: &mut MakerState,
+    checks: &mut CheckCount,
+    tabled: ItemKey,
+    entry: &[u8],
+) -> Result<Verdict, RunError> {
+    let first = verify_ready(program, typing, state, checks, tabled, entry)?;
+    if first == Verdict::Holds || state.asked.binary_search_by_key(&tabled, |r| r.0).is_ok() {
+        return Ok(first);
+    }
+    // The referring body's checked columns can supply body-local heads and closure
+    // captures. Compare the same reads after loading them, before emitting code again.
+    if state.ensure(program, typing, tabled, checks)?.is_none() {
+        return Ok(first);
+    }
+    verify_ready(program, typing, state, checks, tabled, entry)
+}
+
+fn verify_ready<'n, T: Typing<RecordsProgram<'n>>>(
     program: &mut RecordsProgram<'n>,
     typing: &mut T,
     state: &mut MakerState,

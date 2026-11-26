@@ -16,9 +16,8 @@
 //! 3. that record's READ LIST, each fact with the digest it has today: what the check read
 //!    (crate grain today: each crate scope it asked, with that scope's exports);
 //! 4. the INSTANCE'S FACTS: for every item its name holds (an ADT, a fn item, a `dyn`'s traits,
-//!    a closure's or a coroutine's owner), the crate fact of that item's crate
-//!    ([`BodyIds::crate_fact`]): the layouts and the impls picked at the instance, which no
-//!    body's check read;
+//!    a closure's or a coroutine's owner), its input ([`BodyIds::instance_fact`]). A checked
+//!    callable may supply its own body and observations. Other items use their crate facts;
 //! 5. the target, the tier, the settings, the toolchain and the forms, as code_records.rs
 //!    `code_key` writes them.
 //!
@@ -105,6 +104,11 @@ pub trait BodyIds {
     fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]>;
     /// The crate-grain fact of the crate that defines `item`, with today's digest.
     fn crate_fact(&self, item: ItemKey) -> Option<Read>;
+    /// The current input supplied by an item in an instance name. A checked callable
+    /// may identify its own body and observations, including a closure's owner.
+    fn instance_fact(&self, item: ItemKey) -> Option<Read> {
+        self.crate_fact(item)
+    }
     /// The class of the crate that defines `item` (code_records.rs [`CodeClass`]): an
     /// instance is the toolchain's when every item of its name is. A seam that tells no
     /// toolchain crate from another answers `Program` for all: its code is then kept by the
@@ -151,7 +155,7 @@ pub fn record_key(symbol: Symbol, body: &BodyId<'_>, facts: &[Read], builder: &B
 /// Computes the content-addressed [`CodeKey`] of a previously walked instance `(symbol, tabled, name)`
 /// against today's [`BodyIds`], [`Builder`], and [`ProducerId<CodeBuilder>`], without compiling it.
 /// Returns `None` if `tabled` has no valid body record today, any read moved, or any item in `name`
-/// lacks a crate fact. Uses the exact same inputs as `Walk::start` (rule 30).
+/// lacks an input fact. Uses the exact same inputs as `Walk::start` (rule 30).
 pub fn instance_key(
     symbol: Symbol,
     tabled: ItemKey,
@@ -176,7 +180,7 @@ pub fn instance_key(
     items.dedup();
     let mut facts: AVec<'_, Read> = Vec::with_capacity_in(items.len(), alloc);
     for &item in items.iter() {
-        facts.push(ids.crate_fact(item)?);
+        facts.push(ids.instance_fact(item)?);
     }
     facts.sort_unstable();
     facts.dedup();
@@ -1276,7 +1280,7 @@ impl<'a> Walk<'a> {
                 self.most_name_items = self.most_name_items.max(items.len());
                 facts.clear();
                 for &item in items.iter() {
-                    facts.push(ids.crate_fact(item).ok_or(WalkError::NoCrateFact { tabled, item })?);
+                    facts.push(ids.instance_fact(item).ok_or(WalkError::NoCrateFact { tabled, item })?);
                 }
                 facts.sort_unstable();
                 facts.dedup();

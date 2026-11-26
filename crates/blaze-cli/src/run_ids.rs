@@ -1,7 +1,7 @@
 //! Every body has a key before any check (run.md, "The cut to the lazy parent (D124)", piece I;
 //! stage 5 of "End state (D113)"): the command's [`BodyIds`] for the run path's record walk
 //! (blaze-ladder body_ids.rs `Walk`), so a function instance's code record is found by the
-//! instance's symbol, its fn's [`BodyId`] and the crate facts of the items its name holds, with
+//! instance's symbol, its fn's [`BodyId`] and the input facts of the items its name holds, with
 //! nothing checked, resolved or read of a body.
 //!
 //! THE GRAIN of a body is its crate's, told by the checker key's first 8 bytes (its crate's
@@ -45,7 +45,9 @@
 //! A drive read `(Name, out)` is the 32-byte fact [`fact_of`] (the name hashed) with the out as
 //! its digest. [`BodyIds::crate_fact`] of a workspace crate's item is its `CrateScope` read
 //! today (the crate's exports); of a toolchain item the toolchain fact; of a locked item the
-//! crate's fact.
+//! crate's fact. A workspace callable with a standing BodyCheck contributes its task key and
+//! observed inputs to the instance name, including when it owns a closure in a type argument.
+//! Other items retain their crate fact.
 //!
 //! THE TABLE IS A RECORD (the FORM below): written once per walk at the command's certificate
 //! ([`table_key`]: the certificate, the toolchain and every kind's tool) through the one store
@@ -122,6 +124,7 @@ const LOCKED_FACT_DOMAIN: &str = "blaze-cli run ids locked crate fact 1";
 const LOCKED_DIGEST_DOMAIN: &str = "blaze-cli run ids locked crate digest 1";
 pub(crate) const CHECKOUT_DEP_DIGEST_DOMAIN: &str = "blaze-cli run ids checkout dep digest 1";
 const LOCKED_BODY_DOMAIN: &str = "blaze-cli run ids locked body 1";
+const CALLABLE_INPUT_DOMAIN: &str = "blaze-cli callable input 1";
 const DRIVE_FACT_DOMAIN: &str = "blaze-cli run ids drive read 1";
 const DRIVE_CELL_FACT_DOMAIN: &str = "blaze-cli run ids drive cell read 1";
 const PRODUCERS_DOMAIN: &str = "blaze-cli run ids check producers 1";
@@ -2838,6 +2841,21 @@ impl BodyIds for RunIds<'_> {
             CrateGrain::Locked(read) => Some(read),
             CrateGrain::Workspace(read) => read,
         }
+    }
+
+    fn instance_fact(&self, item: ItemKey) -> Option<Read> {
+        let coarse = self.crate_fact(item)?;
+        let Some(body) = self.body(item) else { return Some(coarse) };
+        if body.check.kind != Kind::BodyCheck || body.checked.runs(item).is_err() {
+            return Some(coarse);
+        }
+        let Ok(proof) = self.proof_of(body.check) else { return Some(coarse) };
+        if proof.today != proof.read.digest {
+            return Some(coarse);
+        }
+        let mut digest = Hasher::new(CALLABLE_INPUT_DOMAIN);
+        digest.id(&body.key).update(&proof.read.digest);
+        Some(Read { fact: proof.read.fact, digest: digest.finish().0 })
     }
 
     /// A crate of the pinned toolchain's shelf is the toolchain's (store/roots.rs

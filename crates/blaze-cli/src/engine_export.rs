@@ -238,6 +238,9 @@ pub(crate) fn command(
     check_export_flags(&flags)?;
     let dist = crate::engine_dist::DistConfig::from_env(env, crate::graph::TRIPLE, heap)
         .map_err(|error| box_err(ExportCliError::Dist(error), heap))?;
+    if flags.release && dist.is_some() {
+        return Err(box_err(ExportCliError::Dist(crate::engine_dist::DistError::ReleaseBackendUnavailable), heap));
+    }
     let select = run_package::Select { test_packages: packages.as_slice(), ..flags.select };
     let started_ns = phases.now();
     let stats = flags.stats;

@@ -148,6 +148,35 @@ fn a_second_walk_over_the_home_store_emits_nothing() {
     assert_eq!((control_first, control), ((2, 0), (2, 0)), "the control kept code across processes: the cause is not the store");
 }
 
+#[test]
+fn a_distributed_pointer_is_imported_when_it_sorts_before_its_target() {
+    use blaze_wire::WireVec;
+
+    use crate::engine_dist::{DistError, DistStore, KIND_CODE, KIND_POINTER};
+
+    let alloc = blaze_own::testing::heap().shared();
+    let lent = process(Sim::new(3, Faults::default()), 1);
+    let mut home = HomeCodeStore::new(&lent);
+    let mut values = blaze_own::BTreeMap::new_in(alloc);
+    let name = [1; 32];
+    let content = [2; 32];
+    let key = CodeKey(ContentId(name));
+    let bytes = b"the distributed code entry";
+    let mut pointer = WireVec::new_in(alloc);
+    pointer.extend_from_slice(&content);
+    values.insert(name, (KIND_POINTER, pointer));
+
+    let mut dist = DistStore::new(&mut home, alloc);
+    assert!(matches!(dist.merge_arrived(&values), Err(DistError::Store(StoreError::Failed { key: refused, .. })) if refused == key));
+    let mut record = WireVec::new_in(alloc);
+    record.extend_from_slice(bytes);
+    values.insert(content, (KIND_CODE, record));
+    dist.merge_arrived(&values).expect("the target is imported before the pointer");
+    drop(dist);
+
+    assert_eq!(blaze_ladder::code_records::entry_of(&home, key).expect("the pointer is in the home"), Some(bytes.as_slice()));
+}
+
 /// THE STALE-ANSWER TEST. The base entry is committed; then each input `code_key` covers is
 /// moved alone and the entry under the moved key must be a miss in the next process: the
 /// body's text, the check's read list (a callee's signature, an ADT's definition, an impl

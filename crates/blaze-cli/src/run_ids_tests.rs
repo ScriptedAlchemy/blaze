@@ -1099,6 +1099,35 @@ impl BodyReads for Counted {
     }
 }
 
+#[test]
+fn instance_inputs_follow_the_callable_proof_and_keep_other_items_at_crate_grain() {
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).unwrap();
+    let crates = table([1; 32]);
+    let toolchain = ToolchainId([7; 32]);
+    let body = main_body();
+    let other = item(APP, 2);
+    let inputs = |scope_byte, proof_reads, missing: bool| {
+        let mut today = outs(true);
+        let app = crates.0.iter().position(|row| row.byte == APP).unwrap();
+        today.push((blaze_drive::key::crate_scope_name(&crates.key(app)), ContentId([scope_byte; 32])));
+        today.sort_by_key(|(name, _)| *name);
+        let previous = ids_with(toolchain, &crates, &today);
+        let ids = RunIds::new(&cx, toolchain, &crates, &tools(), &[body], &[], &mut Cleanly, Some(&previous), Most::USUAL, blaze_own::testing::bump()).unwrap();
+        let mut proof = Counted::new(missing.then_some(body.check));
+        proof.each = proof_reads;
+        let asked = Asked::default();
+        let ids = ids.reading::<ByNeed>(ReadsFrom::new(&proof, &asked, Most::USUAL)).unwrap();
+        (ids.instance_fact(body.item).unwrap(), ids.instance_fact(other).unwrap())
+    };
+    let (body_before, other_before) = inputs(1, 3, false);
+    let (body_after, other_after) = inputs(2, 3, false);
+    assert_eq!(body_before, body_after);
+    assert_ne!(other_before, other_after);
+    assert_ne!(body_after, inputs(2, 4, false).0);
+    assert_eq!(other_after, inputs(2, 3, true).0);
+}
+
 /// The table of `n` members, built with the caps `most`.
 fn members_ids(n: usize, most: Most) -> Result<RunIds<'static>, RunIdsError<'static>> {
     let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
