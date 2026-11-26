@@ -32,7 +32,11 @@ jobs:
       - name: confirm the ARM64 Mac and establish bounded commands
         run: |
           test "$(uname -s -m)" = "Darwin arm64"
-          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          python3 -c 'import subprocess; subprocess.run(["brew", "install", "coreutils"], check=True, timeout=360)'
+          coreutils=$(python3 -c 'import subprocess; print(subprocess.check_output(["brew", "--prefix", "coreutils"], text=True, timeout=15).strip())')
+          test -x "$coreutils/libexec/gnubin/timeout"
+          echo "$coreutils/libexec/gnubin" >> "$GITHUB_PATH"
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/blaze-target" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/mac-evidence"
           git rev-parse HEAD 'HEAD^{tree}' > "$RUNNER_TEMP/mac-evidence/source.txt"
