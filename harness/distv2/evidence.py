@@ -94,9 +94,28 @@ def no_duplicate_compile(rows: list[dict]) -> None:
         seen.update(keys)
 
 
+def unit_plan(path: Path) -> list[dict] | None:
+    """Read one complete plan snapshot. The writer ends it with a newline."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    if not raw.endswith(b"\n"):
+        return None
+    try:
+        rows = json.loads(raw)
+    except (ValueError, UnicodeError) as why:
+        raise Failed(f"{path}: invalid plan evidence: {why}") from why
+    require(isinstance(rows, list) and all(isinstance(row, dict) for row in rows),
+            f"{path}: expected a list of unit plans")
+    return rows
+
+
 def same_unit_plans(left: list[dict], right: list[dict]) -> None:
     """Workers with the same source and profile ask for the same ordered unit inputs."""
     def by_name(rows):
+        require(all(isinstance(row.get("unit"), str) and row["unit"] for row in rows),
+                "unit plans must name the crate")
         units = {row["unit"]: row for row in rows}
         require(len(units) == len(rows), "duplicate unit names in a worker report")
         return units

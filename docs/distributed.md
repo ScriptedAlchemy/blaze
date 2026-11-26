@@ -128,7 +128,7 @@ The dev export command and `harness/distv2.py` use these settings:
 | `BLAZE_DIST_BLOBS` | Pack-server address, `host:port`. |
 | `BLAZE_DIST_LOCAL` | `never` or explicit `fallback` policy. |
 | `BLAZE_DIST_PR`, `BLAZE_DIST_SOURCE` | Pull-request namespace and revision identity. |
-| `BLAZE_DIST_REPORT` | Per-unit JSON provenance. `plan_names` holds the ordered work digests. `plan_inputs` starts with the crate key and adds the prerequisite units and program roots for the final unit. |
+| `BLAZE_DIST_REPORT` | Per-unit JSON provenance and a `.plans` snapshot written before execution. `plan_names` holds the ordered work digests. `plan_inputs` starts with the crate key and adds the prerequisite units and program roots for the final unit. |
 
 The simulation tests in `crates/blaze-dist/tests/sim.rs` run 10,000 deterministic
 seeds per invariant set with `#![no_std]` and no environment reads.

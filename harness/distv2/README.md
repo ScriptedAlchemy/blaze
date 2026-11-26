@@ -47,9 +47,6 @@ The acceptance harness reads these fields from the compiler, worker and coordina
 `BLAZE_DIST_REPORT` retains its existing JSONL fields and adds:
 
 - `unit_digest`: lowercase 64-character digest used for `manifests/<digest>`.
-- `plan_names`, `plan_inputs`: ordered work digests and remaining unit-key inputs as lowercase hex.
-  The inputs start with the crate key. The final unit adds prerequisite unit digests and a digest
-  of the selected entry, ordered roots and panic strategy.
 - `attempt`: final successful attempt number, or `-1` when no execution was joined.
 - `publication_attempt`: the attempt that first accepted the immutable manifest; it can be
   older than `attempt` when a replacement lead delivers that accepted record.
@@ -58,6 +55,13 @@ The acceptance harness reads these fields from the compiler, worker and coordina
   real compile, even a duplicate; do not deduplicate these arrays or include store hits. These let
   the oracle reject work/tail overlap and duplication across daemons for the same unit. They also
   prove every compiled value appears in a real pack of the full published manifest.
+
+Before a worker starts a unit, `<BLAZE_DIST_REPORT>.plans` holds the command's complete JSON
+array of unit names and digests. It includes `plan_names` (ordered work digests) and `plan_inputs`.
+The inputs start with the crate key. The final unit adds prerequisite unit digests and a digest
+of the selected entry, ordered roots and panic strategy. The harness waits for both snapshots
+before testing shared work. Each work row also records its item key, symbol, body key, body
+proof digests and instance fact so a planner difference can be traced to its inputs.
 
 `BLAZE_DIST_EVENTS` names **one shared append-only JSONL file** passed to daemons, clients and the
 coordinator. Each event is a single complete append followed by a newline, visible promptly (not

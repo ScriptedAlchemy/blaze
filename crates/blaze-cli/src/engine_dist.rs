@@ -32,7 +32,7 @@ use blaze_dist_local::blobs::Blobs;
 use blaze_dist_local::pack::{Value, ValueRef};
 use blaze_dist_local::sys::{append_file, path_is_file, random_id, read_file, write_file};
 use blaze_ids::ContentId;
-use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
+use blaze_ladder::body_ids::{self, BodyIds, RowKind, Scratch, Stepped, Walk};
 use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, PanicStrategy, StoreError};
 use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::run::RunError;
@@ -695,6 +695,49 @@ fn json_digests(digests: &[Digest], alloc: WireAlloc) -> WireString {
     out
 }
 
+/// Write the complete plan before a worker can be held or stopped by the coordinator.
+fn write_unit_plans(report_path: Option<&str>, plans: &[CratePlan<'_>], ids: &RunIds<'_>, alloc: WireAlloc) {
+    let Some(path) = report_path else { return };
+    let mut file = WireString::from_str_in(path, alloc);
+    file.push_str(".plans");
+    let mut body = WireString::from_str_in("[", alloc);
+    for (index, plan) in plans.iter().enumerate() {
+        if index != 0 {
+            body.push(',');
+        }
+        let names = json_digests(plan.unit.names.as_slice(), alloc);
+        let inputs = json_digests(plan.inputs.as_slice(), alloc);
+        let _ = write!(body, "{{\"unit\":\"{}\",\"unit_digest\":\"{}\",\"plan_names\":{},\"plan_inputs\":{},\"work\":[",
+            plan.unit_name.as_str(), hex(&plan.unit.spec), names.as_str(), inputs.as_str());
+        for (index, item) in plan.items.iter().enumerate() {
+            if index != 0 {
+                body.push(',');
+            }
+            let symbol = fn_symbol_of_name(item.name.as_slice());
+            let _ = write!(body, "{{\"item\":\"{}\",\"symbol\":\"{}\",\"work_name\":\"{}\"",
+                hex(&item.tabled.0.0), hex(&symbol.0), hex(&item.key.0.0));
+            if let Some(check) = ids.body_check(item.tabled) {
+                let _ = write!(body, ",\"body_key\":\"{}\",\"body_reads\":[", hex(&check.key.0));
+                for (index, read) in check.reads.iter().enumerate() {
+                    if index != 0 {
+                        body.push(',');
+                    }
+                    let _ = write!(body, "[\"{}\",\"{}\"]", hex(&read.fact), hex(&read.digest));
+                }
+                body.push(']');
+            }
+            // Planned work has no generic arguments, so the owner is the name's only item.
+            if let Some(read) = ids.instance_fact(item.tabled) {
+                let _ = write!(body, ",\"instance_fact\":[\"{}\",\"{}\"]", hex(&read.fact), hex(&read.digest));
+            }
+            body.push('}');
+        }
+        body.push_str("]}");
+    }
+    body.push_str("]\n");
+    let _ = write_file(file.as_str(), body.as_bytes());
+}
+
 /// Appends one JSONL unit report row to `BLAZE_DIST_REPORT`.
 #[expect(clippy::too_many_arguments, reason = "explicit report row fields, zero hidden globals")]
 fn append_report_row(
@@ -717,17 +760,13 @@ fn append_report_row(
     let pub_attempt = arrived.publication_attempt.and_then(|v| i64::try_from(v).ok()).unwrap_or(-1);
     let work_keys = json_digests(arrived.compiled_keys.as_slice(), alloc);
     let tail_keys = json_digests(tail_compiled_keys, alloc);
-    let plan_names = json_digests(plan.unit.names.as_slice(), alloc);
-    let plan_inputs = json_digests(plan.inputs.as_slice(), alloc);
-
     let mut line = WireString::new_in(alloc);
     let _ = write!(
         line,
         concat!(
             "{{\"unit\":\"{}\",\"source\":\"{}\",\"execution\":{},\"joined\":{},\"grants\":{},",
             "\"compiled_for_work\":{},\"stored_for_work\":{},\"arrived\":{},\"tail_compiled\":{},\"from_store\":{},\"instances\":{},",
-            "\"unit_digest\":\"{}\",\"attempt\":{},\"publication_attempt\":{},\"work_compiled_keys\":{},\"tail_compiled_keys\":{},",
-            "\"plan_names\":{},\"plan_inputs\":{}}}\n",
+            "\"unit_digest\":\"{}\",\"attempt\":{},\"publication_attempt\":{},\"work_compiled_keys\":{},\"tail_compiled_keys\":{}}}\n",
         ),
         plan.unit_name.as_str(),
         source,
@@ -745,8 +784,6 @@ fn append_report_row(
         pub_attempt,
         work_keys.as_str(),
         tail_keys.as_str(),
-        plan_names.as_str(),
-        plan_inputs.as_str(),
     );
     let _ = append_file(path, line.as_bytes());
 }
@@ -1019,6 +1056,8 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             is_final,
         });
     }
+
+    write_unit_plans(dist.report.as_ref().map(|path| path.as_str()), plans.as_slice(), ids, wire_alloc);
 
     // Whole-program output fingerprint covering every unit digest and output path.
     let fp = unit_digest_of(output_path, builder, release, prior_digests.as_slice(), &[], scratch_alloc);

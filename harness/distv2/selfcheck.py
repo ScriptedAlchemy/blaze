@@ -210,6 +210,18 @@ class ResultGateOracles(unittest.TestCase):
 
 
 class Oracles(unittest.TestCase):
+    def test_unit_plan_waits_for_the_end_of_the_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "worker.plans"
+            self.assertIsNone(e.unit_plan(path))
+            path.write_bytes(b'[{"unit":"mathy"}]')
+            self.assertIsNone(e.unit_plan(path))
+            path.write_bytes(b'[{"unit":"mathy"}]\n')
+            self.assertEqual(e.unit_plan(path), [{"unit": "mathy"}])
+            path.write_bytes(b'{}\n')
+            with self.assertRaisesRegex(e.Failed, "expected a list of unit plans"):
+                e.unit_plan(path)
+
     def test_equal_source_rejects_split_plans(self):
         planned = row(plan_names=[KEY, OTHER], plan_inputs=[OTHER, KEY])
         e.same_unit_plans([planned], [dict(planned)])

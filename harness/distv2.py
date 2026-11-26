@@ -316,6 +316,9 @@ class Run:
         path = self.report_path(home)
         return evidence.jsonl(path)
 
+    def plan(self, home: str) -> list[dict] | None:
+        return evidence.unit_plan(Path(f"{self.report_path(home)}.plans"))
+
     def start_services(self) -> None:
         log = open(self.root / "logs" / "serve.log", "w")
         self.services.append(
@@ -721,6 +724,13 @@ def main(given: Input) -> None:
         mark = len(run.events())
         a, a_log = run.build("a", wait=False, result_gate=overlap, result_unit="mathy")
         b, b_log = run.build("b", wait=False, result_gate=overlap, result_unit="mathy")
+
+        def initial_plans():
+            first, second = run.plan("a"), run.plan("b")
+            return (first, second) if first is not None and second is not None else None
+
+        evidence.same_unit_plans(*run.until("both workers report their initial plans", initial_plans, [a, b]))
+        check(True, "both workers planned the same units")
         run.release_after_peer_result(overlap, a, b, mark)
         code_a, code_b = run.wait(a), run.wait(b)
         require_build(code_a, Path(a_log).read_text() if code_a else "", "worker a builds", Path(a_log))
@@ -853,11 +863,7 @@ def main(given: Input) -> None:
                 evidence.no_local_emission(phase, output)
             except Failed as error:
                 replay_failures.append(str(error))
-        try:
-            evidence.same_unit_plans(rows_a, rows_b)
-        except Failed as error:
-            replay_failures.append(str(error))
-        check(not replay_failures, "\n".join(replay_failures) if replay_failures else "both workers planned the same units and replay emitted no local code")
+        check(not replay_failures, "\n".join(replay_failures) if replay_failures else "cold and warm replay emitted no local code")
         for name, identity in run.identities.items():
             check(file_hash(Path(identity["path"])) == identity["sha256"], f"{name} binary did not change during acceptance")
         provenance = json.loads((run.root / "provenance.json").read_text())
