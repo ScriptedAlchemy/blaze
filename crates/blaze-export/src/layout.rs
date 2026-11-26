@@ -25,6 +25,7 @@ use blaze_code::a64::{ADD64, ADRP, BLR, LDR64, NOP, add_lo12, adrp, bl, expect, 
 use blaze_code::record::{CodeView, NO_TARGET, OWN_CODE, OWN_RELRO, SiteKind, Space, Symbol, Target, Word};
 use blaze_code::tls::{CAP as TLS_CAP, DESC_VARS, ROW_BYTES as TLS_ROW_BYTES, ROW_INIT, descriptor as tls_descriptor, var_row as tls_var_row};
 use blaze_ids::Hasher;
+use blaze_int::{Int, idx};
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::error::ExportError;
@@ -275,8 +276,8 @@ impl ConstAndData<'_> {
     pub(crate) fn import_word(&self, target: Target, from: Symbol, imports: &[Import<'_>], bound: &[Target]) -> Result<u64, ExportError> {
         match target.space {
             Space::Tls => self.tls_index_of(target.symbol).map(|i| self.tls_indices_at + 8 * u64::from(i)),
-            Space::Outside => imports.binary_search_by_key(&target.symbol, |i| i.symbol).ok().map(|i| self.got_at + 8 * i as u64),
-            _ => bound.binary_search(&target).ok().map(|i| self.bound_got_at + 8 * i as u64),
+            Space::Outside => imports.binary_search_by_key(&target.symbol, |i| i.symbol).ok().map(|i| self.got_at + 8 * i.widen_to::<u64>()),
+            _ => bound.binary_search(&target).ok().map(|i| self.bound_got_at + 8 * i.widen_to::<u64>()),
         }.ok_or(ExportError::OutOfReach { from, target })
     }
 
@@ -284,7 +285,7 @@ impl ConstAndData<'_> {
     pub(crate) fn fix_bound_words(&self, bound: &[Target], home: impl Fn(Target) -> Option<u64>, fixups: &mut AVec<'_, Fixup>) -> Result<(), ExportError> {
         for (i, &target) in bound.iter().enumerate() {
             let to = home(target).ok_or(ExportError::OutOfReach { from: target.symbol, target })?;
-            fixups.push(Fixup { at: self.bound_got_at + 8 * i as u64, to: FixTo::Rebase { target: to } });
+            fixups.push(Fixup { at: self.bound_got_at + 8 * i.widen_to::<u64>(), to: FixTo::Rebase { target: to } });
         }
         Ok(())
     }
@@ -364,7 +365,7 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     if bound_got_words != 0 || !tls_targets.is_empty() {
         pad_to(&mut konst, const_at, 16);
     }
-    let bound_got_at = const_at + konst.len() as u64;
+    let bound_got_at = const_at + konst.len().widen_to::<u64>();
     konst.resize(konst.len() + 8 * bound_got_words, 0);
     let tls_indices_at = const_at + u64::try_from(konst.len()).unwrap_or(u64::MAX);
     for k in 0..tls_count {
@@ -381,11 +382,12 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
             relro_at[i as usize] = relro_at[order[r] as usize];
             continue;
         }
-        let relro = members[i as usize].relro();
+        let member = &members[idx(i)];
+        let relro = member.relro();
         if relro.is_empty() {
             continue;
         }
-        pad_to(&mut konst, const_at, (1u64 << members[i as usize].relro_align()).max(16));
+        pad_to(&mut konst, const_at, (1u64 << member.relro_align()).max(16));
         relro_at[i as usize] = const_at + konst.len() as u64;
         konst.extend_from_slice(relro);
     }
@@ -917,7 +919,7 @@ fn lay_out_impl<'a, 'r>(
         for s in 0..m.record.sites() {
             let site = m.record.site(s);
             if matches!(site.kind, SiteKind::GotPage21 | SiteKind::GotLo12) {
-                let target = m.record.target(site.target as usize);
+                let target = m.record.target(idx(site.target));
                 if matches!(target.space, Space::Func | Space::Static | Space::Vtable) {
                     bound_got.push(target);
                 }
@@ -973,22 +975,21 @@ fn lay_out_impl<'a, 'r>(
         }
         let m = &members[i as usize];
         let symbol = m.symbol;
-        let at_home = home[i as usize];
+        let at = blaze_code::place::At { code: home[idx(i)], relro: regions.relro_at[idx(i)] };
         for s in 0..m.record.sites() {
             let site = m.record.site(s);
-            let pc = at_home + u64::from(site.at);
+            let pc = at.code + u64::from(site.at);
             let x = pc - plan.text_at;
             if site.kind.len() == 4 {
-                let at = blaze_code::place::At { code: at_home, relro: regions.relro_at[i as usize] };
                 let to = match at.own(site) {
                     Some(local) => local,
-                    None => regions.import_word(m.record.target(site.target as usize), symbol, &imports, &bound_got)?,
+                    None => regions.import_word(m.record.target(idx(site.target)), symbol, &imports, &bound_got)?,
                 };
                 blaze_code::a64::single_site(&mut text, x, pc, to, site.kind, symbol)?;
                 continue;
             }
             if site.kind == SiteKind::Relro {
-                let to = regions.relro_at[i as usize] + u64::from(site.addend);
+                let to = at.relro + u64::from(site.addend);
                 let first = expect(&text, x, ADRP, symbol, "adrp")?;
                 let second = expect(&text, x + 4, ADD64, symbol, "add")?;
                 write32(&mut text, x, adrp(first, pc, to, symbol)?);

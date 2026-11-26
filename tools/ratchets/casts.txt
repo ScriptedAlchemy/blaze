@@ -36,7 +36,7 @@ blaze-cc	17
 blaze-cert	14
 blaze-check	107
 blaze-cli	631
-blaze-code	138
+blaze-code	134
 blaze-columns	2
 blaze-comptime-sys	150
 blaze-cond	13
@@ -51,7 +51,7 @@ blaze-ed25519	5
 blaze-emit	568
 blaze-engine	92
 blaze-expand	284
-blaze-export	408
+blaze-export	402
 blaze-facts	12
 blaze-fetch	213
 blaze-file-items	94
@@ -123,7 +123,7 @@ blaze-sys	528
 blaze-tar	42
 blaze-test-reach	47
 blaze-text-size	2
-blaze-tier	109
+blaze-tier	106
 blaze-toolchain	24
 blaze-trace	53
 blaze-ty	2

@@ -890,7 +890,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                     write32(&mut text, x, page_offset(inst, scale, to, u64::from(reloc.at), symbol).map_err(ExportError::Place)?);
                 }
                 RelocKind::ImportPage21 | RelocKind::ImportLo12 => {
-                    let word = regions.import_word(r.target(reloc.target as usize), symbol, &imports, &bound_got)?;
+                    let word = regions.import_word(r.target(blaze_int::idx(reloc.target)), symbol, &imports, &bound_got)?;
                     let kind = if reloc.kind == RelocKind::ImportPage21 { blaze_code::record::SiteKind::GotPage21 } else { blaze_code::record::SiteKind::GotLo12 };
                     blaze_code::a64::single_site(&mut text, x, pc, word, kind, symbol)?;
                 }

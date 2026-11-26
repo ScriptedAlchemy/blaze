@@ -1,5 +1,6 @@
 //! Execute the exported C ABI in a fresh process under the host loader's deadline.
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use core::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
@@ -26,9 +27,9 @@ pub(super) fn run(bytes: &[u8], case: &str, test: &str) {
 
 // pthread_key_t is unsigned long on Darwin and unsigned int on glibc.
 #[cfg(target_os = "macos")]
-type ThreadKey = std::ffi::c_ulong;
+type ThreadKey = core::ffi::c_ulong;
 #[cfg(target_os = "linux")]
-type ThreadKey = std::ffi::c_uint;
+type ThreadKey = core::ffi::c_uint;
 
 #[cfg_attr(target_os = "linux", link(name = "dl"))]
 unsafe extern "C" {
@@ -69,11 +70,11 @@ fn verify(path: &Path, case: &str) {
     // with the symbol's exact function ABI while the image remains loaded.
     unsafe {
         if case != "empty_library" {
-            let answer: unsafe extern "C" fn() -> u32 = std::mem::transmute(symbol(c"answer"));
+            let answer: unsafe extern "C" fn() -> u32 = core::mem::transmute(symbol(c"answer"));
             assert_eq!(answer(), 42);
         }
         let pointer = |name: &CStr| {
-            let get: unsafe extern "C" fn() -> *mut c_void = std::mem::transmute(symbol(name));
+            let get: unsafe extern "C" fn() -> *mut c_void = core::mem::transmute(symbol(name));
             let value = get();
             assert!(!value.is_null(), "{name:?} returned null");
             value

@@ -177,9 +177,11 @@ pub struct Site {
     /// The first instruction's offset from the code's first byte (4-aligned).
     pub at: u32,
     pub kind: SiteKind,
-    /// The target's index in the record's targets, or [`NO_TARGET`] for [`SiteKind::Relro`].
+    /// The target's index for imports, [`NO_TARGET`] for [`SiteKind::Relro`], or
+    /// [`OWN_CODE`]/[`OWN_RELRO`] for a single own-address instruction.
     pub target: u32,
-    /// For [`SiteKind::Relro`], the relro byte addressed; 0 otherwise.
+    /// The byte within an own-address site's code/relro part (also for `Relro`); zero for
+    /// import sites. Signed external pointer addends live in [`Word`].
     pub addend: u32,
 }
 
@@ -638,7 +640,7 @@ impl<'a> CodeRecord<'a> {
                         return Err(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: len });
                     }
                 }
-                _ => match renumber.get(site.target as usize) {
+                _ => match renumber.get(blaze_int::idx(site.target)) {
                     Some(&new) => site.target = new,
                     None => return Err(RecordError::NoSuchTarget { at: site.at, target: site.target }),
                 },
@@ -1151,6 +1153,8 @@ impl<'b> CodeView<'b> {
             }
         }
         let view = CodeView { bytes, frame, code_align, relro_align, code, relro, targets, sites, words, pads, traps, subjects, positions, names, text };
+        let code_len = get32(bytes, 16);
+        let relro_len = get32(bytes, 20);
         let mut end = 0u64;
         for i in 0..view.sites() {
             let site = view.site(i);
@@ -1163,17 +1167,17 @@ impl<'b> CodeView<'b> {
             if site.at % 4 != 0 { return Err(DecodeError::Site(RecordError::SiteMisaligned { at: site.at })); }
             if u64::from(site.at) < end { return Err(DecodeError::Site(RecordError::SitesOverlap { at: site.at })); }
             end = u64::from(site.at) + u64::from(site.kind.len());
-            if end > code.len() as u64 { return Err(DecodeError::Site(RecordError::SiteOutside { at: site.at, len: site.kind.len(), code: code.len() as u32 })); }
-            let own = if site.kind == SiteKind::Relro { Some(relro.len()) } else if site.kind.own() {
+            if end > u64::from(code_len) { return Err(DecodeError::Site(RecordError::SiteOutside { at: site.at, len: site.kind.len(), code: code_len })); }
+            let own = if site.kind == SiteKind::Relro { Some(relro_len) } else if site.kind.own() {
                 match site.target {
-                    OWN_CODE => Some(code.len()),
-                    OWN_RELRO if site.kind != SiteKind::Branch26 => Some(relro.len()),
+                    OWN_CODE => Some(code_len),
+                    OWN_RELRO if site.kind != SiteKind::Branch26 => Some(relro_len),
                     _ => return Err(DecodeError::Site(RecordError::NoSuchTarget { at: site.at, target: site.target })),
                 }
             } else { None };
             if let Some(len) = own {
-                if site.addend as usize >= len { return Err(DecodeError::Site(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: len as u32 })); }
-            } else if site.target as usize >= view.targets() {
+                if site.addend >= len { return Err(DecodeError::Site(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: len })); }
+            } else if blaze_int::idx(site.target) >= view.targets() {
                 return Err(DecodeError::Site(RecordError::NoSuchTarget { at: site.at, target: site.target }));
             }
         }

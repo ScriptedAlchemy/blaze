@@ -79,7 +79,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         if !self.env_now.iter().any(|f| !f.is_whole()) {
             return Ok(false);
         }
-        let path = match use_path(self.body, self.ck, e, 0) {
+        let mut path = match use_path(self.body, self.ck, e, 0) {
             Ok(Some(p)) => p,
             Ok(None) => return Ok(false),
             Err(_) => return self.refuse(Form::Malformed, e),
@@ -87,7 +87,28 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         if !self.env_now.iter().any(|f| f.base == path.root && !f.is_whole()) {
             return Ok(false);
         }
-        match cover(self.ck, &self.env_now, &path) {
+        let mut coverage = cover(self.ck, &self.env_now, &path);
+        // A match binding can be a reference to a reference. Its unadjusted root is
+        // above the captured pointee; consume only the leading dereferences required
+        // to reach the environment field, then apply the remaining adjustments once.
+        let (lo, hi) = self.adjust_rows(e);
+        let mut consumed = 0;
+        while matches!(coverage, Cover::Above)
+            && lo + consumed < hi
+            && matches!(self.ck.adjusts.column::<1>()[lo + consumed], blaze_typeck::AdjustKind::Deref { overloaded: None })
+        {
+            consumed += 1;
+            path = match use_path(self.body, self.ck, e, consumed as u32) {
+                Ok(Some(path)) => path,
+                _ => return self.refuse(Form::Malformed, e),
+            };
+            coverage = cover(self.ck, &self.env_now, &path);
+        }
+        if consumed != 0 && matches!(coverage, Cover::Exact(_) | Cover::RefOf(_)) {
+            let Some(crate::Task::Adjust(_, m)) = self.tasks.pop() else { return self.refuse(Form::Malformed, e) };
+            self.tasks.push(crate::Task::AdjustAfter(e, m, consumed));
+        }
+        match coverage {
             Cover::Exact(j) => match self.field_places.get(j).copied().flatten() {
                 Some((place, ty, _)) => {
                     self.push_place(place, ty);

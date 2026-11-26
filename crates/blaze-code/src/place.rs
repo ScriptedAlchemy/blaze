@@ -168,7 +168,7 @@ pub fn place_positions(
             let to = match at.own(site) {
                 Some(local) => local,
                 None => {
-                    let word = words.word(record.target(site.target as usize), false)?;
+                    let word = words.word(record.target(blaze_int::idx(site.target)), false)?;
                     if word % 8 != 0 {
                         return Err(PlaceError::Misaligned { symbol, what: "a target's word", at: word, align: 8 });
                     }

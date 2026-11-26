@@ -8,6 +8,7 @@
 
 use crate::image::ImageError;
 use crate::record::{SiteKind, Symbol};
+use blaze_int::Int;
 
 /// `nop`.
 pub const NOP: u32 = 0xD503_201F;
@@ -122,7 +123,7 @@ pub fn branch26(inst: u32, pc: u64, to: u64, symbol: Symbol) -> Result<u32, Imag
     if delta % 4 != 0 || !(-(1i128 << 27)..(1i128 << 27)).contains(&delta) {
         return Err(ImageError::OutOfReach { symbol, at: pc, what: "b/bl (128 MiB)" });
     }
-    Ok((inst & 0xfc00_0000) | (((delta >> 2) as u32) & 0x03ff_ffff))
+    Ok((inst & 0xfc00_0000) | ((delta >> 2).truncate_to::<u32>() & 0x03ff_ffff))
 }
 
 /// Size of one unsigned-immediate load/store, including SIMD Q loads and stores.
@@ -130,7 +131,7 @@ pub fn access_scale(inst: u32) -> Option<u8> {
     if inst & 0x3b00_0000 != 0x3900_0000 {
         return None;
     }
-    let size = (inst >> 30) as u8;
+    let size = (inst >> 30).truncate_to::<u8>();
     Some(if size == 0 && inst & 0x0480_0000 == 0x0480_0000 { 4 } else { size })
 }
 
@@ -140,6 +141,13 @@ pub fn single_site(code: &mut [u8], off: u64, pc: u64, to: u64, kind: SiteKind, 
     use SiteKind::*;
     let not = |want| ImageError::NotInstruction { symbol, at: off, want };
     let aligned = |inst, scale| lo12(inst, to, scale).ok_or(ImageError::OutOfReach { symbol, at: off, what: "an aligned unsigned page offset" });
+    let load_store = |scale| {
+        let inst = read32(code, off);
+        if access_scale(inst) != Some(scale) {
+            return Err(not("an unsigned-offset load or store of the relocation's width"));
+        }
+        aligned(inst, scale)
+    };
     let word = match kind {
         Page21 | GotPage21 => adrp(expect(code, off, ADRP, symbol, "adrp")?, pc, to, symbol)?,
         AddLo12 => add_lo12(expect(code, off, ADD64, symbol, "add Xd, Xn, #imm12")?, to),
@@ -148,14 +156,11 @@ pub fn single_site(code: &mut [u8], off: u64, pc: u64, to: u64, kind: SiteKind, 
             let original = expect(code, off, (0x7c00_0000, 0x1400_0000), symbol, "b or bl")?;
             branch26(original, pc, to, symbol)?
         }
-        LdstLo12_1 | LdstLo12_2 | LdstLo12_4 | LdstLo12_8 | LdstLo12_16 => {
-            let inst = read32(code, off);
-            let scale = kind as u8 - LdstLo12_1 as u8;
-            if access_scale(inst) != Some(scale) {
-                return Err(not("an unsigned-offset load or store of the relocation's width"));
-            }
-            aligned(inst, scale)?
-        }
+        LdstLo12_1 => load_store(0)?,
+        LdstLo12_2 => load_store(1)?,
+        LdstLo12_4 => load_store(2)?,
+        LdstLo12_8 => load_store(3)?,
+        LdstLo12_16 => load_store(4)?,
         Load | Call | Relro => return Err(not("a single-instruction relocation")),
     };
     write32(code, off, word);

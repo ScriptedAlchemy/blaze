@@ -1,9 +1,9 @@
-//! The object file LLVM wrote for one prepared module, read back as a sealed `bzcode07` record.
+//! The object file LLVM wrote for one prepared module, read back as a sealed code record.
 //!
 //! The function's code is its atom in `__text` (Mach-O has no COMDATs: LLVM marks every Mach-O
 //! object `.subsections_via_symbols`, under which each symbol starts a piece of a section the
 //! linker places on its own). Constants LLVM put in sections of their own (jump tables, float
-//! literals) are laid out after it in the same bytes, so the record is one piece of code that
+//! literals) are laid out in its relro part, so the record is one piece of code that
 //! refers to nothing but what the function asked for. What the code says about where they are is
 //! filled in here; what it says about the outside is a [`Site`] naming its target by
 //! (space, symbol), which the lowering lane's `references` resolves from the symbol's name.
@@ -76,10 +76,10 @@ impl fmt::Display for ReadError {
 impl core::error::Error for ReadError {}
 
 /// The symbol's name as the lowering lane spells it: `blaze_fn_<64 hex>`, without the `@`.
-fn function_name<'a>(module: &LlvmModule<'_>, alloc: Alloc<'a>) -> String<Alloc<'a>> {
+fn function_name<'a>(module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Result<String<Alloc<'a>>, ReadError> {
     let range = module.definition_name.clone();
-    let name = core::str::from_utf8(&module.ir[range]).unwrap_or("");
-    String::from_str_in(name.strip_prefix('@').unwrap_or(name), alloc)
+    let name = core::str::from_utf8(module.ir.get(range).ok_or(ReadError::NoFunction)?).map_err(|_| ReadError::NoFunction)?;
+    Ok(String::from_str_in(name.strip_prefix('@').unwrap_or(name), alloc))
 }
 
 /// Where a relocation leads: a named symbol (an import, or the function's own) or a section.
@@ -88,13 +88,13 @@ enum Destination {
     Section { index: SectionIndex, offset: i64 },
 }
 
-/// Reads `object` (what LLVM wrote for `module`) as a sealed `bzcode07` record in `alloc`.
+/// Reads `object` (what LLVM wrote for `module`) as a sealed code record in `alloc`.
 pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ReadError> {
     let file = object::File::parse(object).map_err(|_| ReadError::Object)?;
     if file.architecture() != object::Architecture::Aarch64 || !file.is_little_endian() {
         return Err(ReadError::Semantics { at: 0, what: "only little-endian AArch64 object code is supported" });
     }
-    let name = function_name(module, alloc);
+    let name = function_name(module, alloc)?;
     let macho = file.format() == BinaryFormat::MachO;
     let mut found: Option<(SectionIndex, u64)> = None;
     for symbol in file.symbols() {
@@ -108,7 +108,9 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
     let (text, address) = found.ok_or(ReadError::NoFunction)?;
     let section = file.section_by_index(text).map_err(|_| ReadError::NoSection)?;
     let range = atom(&file, text, address)?;
-    let code = section.data().map_err(|_| ReadError::CodeOutside)?.get(range.start as usize..range.end as usize).ok_or(ReadError::CodeOutside)?;
+    let start = usize::try_from(range.start).map_err(|_| ReadError::CodeOutside)?;
+    let end = usize::try_from(range.end).map_err(|_| ReadError::CodeOutside)?;
+    let code = section.data().map_err(|_| ReadError::CodeOutside)?.get(start..end).ok_or(ReadError::CodeOutside)?;
 
     let mut record = CodeRecord::new_in(alloc);
     record.code.extend_from_slice(code);
@@ -149,8 +151,8 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
             if !align.is_power_of_two() || align > (1 << blaze_code::record::MOST_PART_ALIGN) {
                 return Err(ReadError::Semantics { at: 0, what: "constant section alignment exceeds the record form" });
             }
-            let start = (record.relro.len() as u64).next_multiple_of(align);
-            record.relro.resize(start as usize, 0);
+            let start = u64::try_from(record.relro.len()).map_err(|_| ReadError::CodeOutside)?.next_multiple_of(align);
+            record.relro.resize(usize::try_from(start).map_err(|_| ReadError::CodeOutside)?, 0);
             record.relro.extend_from_slice(section.data().map_err(|_| ReadError::CodeOutside)?);
             record.relro_align = record.relro_align.max(align_of(align));
             placed.push((index, start));
@@ -194,11 +196,12 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
         if immediate != blaze_code::trap::UNREACHABLE {
             continue;
         }
+        let at = u32::try_from(at).map_err(|_| ReadError::CodeOutside)?;
         let Some(source) = module.traps.get(next_source) else {
-            return Err(ReadError::TrapSource { at: at as u32 });
+            return Err(ReadError::TrapSource { at });
         };
         next_source += 1;
-        record.traps.push(TrapRow { at: at as u32, kind: source.kind, site: source.site, held: Held::Unknown, subject: source.subject });
+        record.traps.push(TrapRow { at, kind: source.kind, site: source.site, held: Held::Unknown, subject: source.subject });
     }
 
     let sealed = record.seal().map_err(ReadError::Seal)?;
@@ -238,7 +241,7 @@ fn destination(file: &object::File<'_>, relocation: &object::Relocation, at: u64
         RelocationTarget::Symbol(index) => {
             let symbol = file.symbol_by_index(index).map_err(|_| ReadError::Object)?;
             let name = plain(file.format() == BinaryFormat::MachO, symbol.name().map_err(|_| ReadError::Object)?);
-            if symbol.kind() == object::SymbolKind::Text && symbol.is_global() && name != function_name(module, alloc) {
+            if symbol.kind() == object::SymbolKind::Text && symbol.is_global() && name != function_name(module, alloc)? {
                 return Ok(Destination::Named(target_of(module, name, alloc)?));
             }
             if let SymbolSection::Section(index) = symbol.section() {
@@ -255,7 +258,7 @@ fn destination(file: &object::File<'_>, relocation: &object::Relocation, at: u64
 
 fn local(index: SectionIndex, offset: i64, placed: &[(SectionIndex, u64)], text: SectionIndex, start: u64, at: u64) -> Result<(u32, i64), ReadError> {
     let base = placed.iter().find(|p| p.0 == index).ok_or(ReadError::Section { at })?.1;
-    let adjustment = if index == text { -(start as i64) } else { base as i64 };
+    let adjustment = if index == text { -i64::try_from(start).map_err(|_| ReadError::CodeOutside)? } else { i64::try_from(base).map_err(|_| ReadError::CodeOutside)? };
     Ok((if index == text { OWN_CODE } else { OWN_RELRO }, offset.checked_add(adjustment).ok_or(ReadError::CodeOutside)?))
 }
 
@@ -328,7 +331,7 @@ fn instruction(file: &object::File<'_>, relocation: &object::Relocation, at: u64
                 return Err(ReadError::Semantics { at, what: "section-relative PAGE21 has no symbol identifying its full address" });
             }
             let address = file.section_by_index(index).map_err(|_| ReadError::NoSection)?.address();
-            addend = addend.checked_sub(address as i64).ok_or(ReadError::CodeOutside)?;
+            addend = addend.checked_sub(i64::try_from(address).map_err(|_| ReadError::CodeOutside)?).ok_or(ReadError::CodeOutside)?;
         }
     }
     let (target, addend) = match dest {
@@ -353,7 +356,8 @@ fn instruction(file: &object::File<'_>, relocation: &object::Relocation, at: u64
     };
     let addend = u32::try_from(addend).map_err(|_| ReadError::Semantics { at, what: "local relocation is outside its record part" })?;
     let offset = u32::try_from(at).map_err(|_| ReadError::CodeOutside)?;
-    record.code[at as usize..at as usize + 4].copy_from_slice(&(original & !mask).to_le_bytes());
+    let slot = usize::try_from(at).map_err(|_| ReadError::CodeOutside)?;
+    record.code.get_mut(slot..slot + 4).ok_or(ReadError::CodeOutside)?.copy_from_slice(&(original & !mask).to_le_bytes());
     record.sites.push(Site { at: offset, kind, target, addend });
     Ok(())
 }
@@ -368,23 +372,24 @@ fn data_relocation(file: &object::File<'_>, relocation: &object::Relocation, at:
     if relocation.has_implicit_addend() {
         addend = addend.checked_add(i64::from_le_bytes(bytes.try_into().map_err(|_| ReadError::CodeOutside)?)).ok_or(ReadError::CodeOutside)?;
         if let RelocationTarget::Section(index) = relocation.target() {
-            addend = addend.checked_sub(file.section_by_index(index).map_err(|_| ReadError::NoSection)?.address() as i64).ok_or(ReadError::CodeOutside)?;
+            let address = file.section_by_index(index).map_err(|_| ReadError::NoSection)?.address();
+            addend = addend.checked_sub(i64::try_from(address).map_err(|_| ReadError::CodeOutside)?).ok_or(ReadError::CodeOutside)?;
         }
     }
     let (target, addend) = match dest {
         Destination::Named(target) => (record.target(target), addend),
         Destination::Section { index, offset } => local(index, offset.checked_add(addend).ok_or(ReadError::CodeOutside)?, placed, text, start, at)?,
     };
-    record.relro[slot..slot + 8].fill(0);
+    record.relro.get_mut(slot..slot + 8).ok_or(ReadError::CodeOutside)?.fill(0);
     record.words.push(Word { at: u32::try_from(at).map_err(|_| ReadError::CodeOutside)?, target, addend });
     Ok(())
 }
 
-fn position_name<'a>(module: &LlvmModule<'_>, row: u32, alloc: Alloc<'a>) -> String<Alloc<'a>> {
+fn position_name<'a>(module: &LlvmModule<'_>, row: u32, alloc: Alloc<'a>) -> Result<String<Alloc<'a>>, ReadError> {
     let mut name = String::from_str_in("blaze_pos_", alloc);
-    name.push_str(&function_name(module, alloc));
+    name.push_str(&function_name(module, alloc)?);
     blaze_own::format_into!(&mut name, "_{row}");
-    name
+    Ok(name)
 }
 
 fn position_section(file: &object::File<'_>, index: SectionIndex, module: &LlvmModule<'_>, alloc: Alloc<'_>) -> Result<bool, ReadError> {
@@ -393,7 +398,11 @@ fn position_section(file: &object::File<'_>, index: SectionIndex, module: &LlvmM
     let mut found = false;
     for symbol in file.symbols().filter(|symbol| symbol.section() == SymbolSection::Section(index) && symbol.kind() == object::SymbolKind::Data) {
         let name = plain(file.format() == BinaryFormat::MachO, symbol.name().map_err(|_| ReadError::Object)?);
-        if !module.positions.iter().any(|(row, _)| name == position_name(module, *row, alloc)) { return Ok(false); }
+        let mut matches = false;
+        for (row, _) in &module.positions {
+            matches |= name == position_name(module, *row, alloc)?;
+        }
+        if !matches { return Ok(false); }
         found = true;
     }
     Ok(found)
@@ -401,7 +410,7 @@ fn position_section(file: &object::File<'_>, index: SectionIndex, module: &LlvmM
 
 fn positions(file: &object::File<'_>, module: &LlvmModule<'_>, placed: &[(SectionIndex, u64)], record: &mut CodeRecord<'_>, alloc: Alloc<'_>) -> Result<(), ReadError> {
     for &(row, patch) in &module.positions {
-        let name = position_name(module, row, alloc);
+        let name = position_name(module, row, alloc)?;
         let symbol = file.symbols().find(|symbol| symbol.name().is_ok_and(|s| plain(file.format() == BinaryFormat::MachO, s) == name));
         // An unused constant can be deleted by LLVM together with all its reads.
         let Some(symbol) = symbol else { continue };

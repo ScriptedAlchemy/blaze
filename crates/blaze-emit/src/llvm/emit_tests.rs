@@ -150,6 +150,47 @@ fn object_fixture(ir: &str) -> super::LlvmModule<'static> {
     module
 }
 
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn native_call_and_tail_branch_execute_with_the_original_return_address() {
+    use blaze_code::image::ImageError;
+    use blaze_code::place::{At, Words, place};
+    use blaze_inproc::exec::Executable;
+    extern "C" fn twice(n: i64) -> i64 { n * 2 }
+    struct Import { slot: u64, target: Target }
+    impl Words for Import {
+        fn word(&mut self, target: Target, call: bool) -> Result<u64, ImageError> {
+            assert_eq!(target, self.target);
+            assert!(!call, "the veneer loads a callable entry, then tail branches");
+            Ok(self.slot)
+        }
+        fn value(&mut self, target: Target) -> Result<u64, ImageError> {
+            assert_eq!(target, self.target);
+            Ok(twice as *const () as usize as u64)
+        }
+    }
+    let target = Target { space: Space::Func, symbol: Symbol([7; 32]) };
+    let outside = std::format!("{}", super::LinkName(target));
+    for tail in [false, true] {
+        let ending = if tail { "ret i64 %v" } else { "%sum = add i64 %v, 7\n ret i64 %sum" };
+        let ir = std::format!("declare i64 @{outside}(i64)\ndefine i64 @entry(i64 %n) {{\n %v = tail call i64 @{outside}(i64 %n)\n {ending}\n}}\n");
+        let mut module = object_fixture(&ir);
+        module.references.push(Some(target));
+        let made = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, Alloc::global()).unwrap();
+        let view = CodeView::read(&made.record).unwrap();
+        let executable = Executable::written(view.code().len(), 8 + view.relro().len(), |code, data| {
+            let slot = data.as_ptr() as usize as u64;
+            data[..8].copy_from_slice(&(twice as *const () as usize as u64).to_le_bytes());
+            let at = At { code: code.as_ptr() as usize as u64, relro: slot + 8 };
+            place(&view, module.symbol, at, &mut Import { slot, target }, code, &mut data[8..]).unwrap();
+        }).unwrap();
+        // SAFETY: this LLVM definition and the Rust callee both have C ABI i64 -> i64;
+        // production placement has filled every relocation before executable publication.
+        let call: unsafe extern "C" fn(i64) -> i64 = unsafe { executable.as_fn() };
+        assert_eq!(unsafe { call(13) }, if tail { 26 } else { 33 });
+    }
+}
+
 /// Real LLVM objects, emitted for both object formats. A volatile read keeps the address
 /// relocation and its nonzero local-symbol offset alive through O2.
 #[test]

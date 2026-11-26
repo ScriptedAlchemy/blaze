@@ -622,7 +622,21 @@ const fn class_byte(class: RegClass) -> u8 {
 }
 
 const fn site_byte(kind: SiteKind) -> u8 {
-    kind as u8
+    match kind {
+        SiteKind::Load => 0,
+        SiteKind::Call => 1,
+        SiteKind::Relro => 2,
+        SiteKind::Page21 => 3,
+        SiteKind::AddLo12 => 4,
+        SiteKind::LdstLo12_1 => 5,
+        SiteKind::LdstLo12_2 => 6,
+        SiteKind::LdstLo12_4 => 7,
+        SiteKind::LdstLo12_8 => 8,
+        SiteKind::LdstLo12_16 => 9,
+        SiteKind::Branch26 => 10,
+        SiteKind::GotPage21 => 11,
+        SiteKind::GotLo12 => 12,
+    }
 }
 
 const SITE_KINDS: [SiteKind; 3] = [SiteKind::Load, SiteKind::Call, SiteKind::Relro];

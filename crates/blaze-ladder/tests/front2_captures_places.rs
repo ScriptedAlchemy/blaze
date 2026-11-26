@@ -119,6 +119,16 @@ fn packed_borrow_whole(mut p: Pk) { let c = || p.a; p.b = 1; let _ = c(); }
 fn unpacked_borrow_field(mut q: Unpk) { let c = || q.a; q.b = 1; let _ = c(); }
 fn packed_move_field(p: PkS) { let c = || take(p.s); take(p.t); c(); }
 
+pub enum Problem { Param { name: &'static str, kind: u32 }, Other }
+fn problem_line(problem: &Problem, out: &mut String) {
+    match problem {
+        Problem::Param { name, kind } => {
+            let fix = |out: &mut String| { out.push_str(name); out.push_str(&kind.to_string()); };
+            fix(out);
+        }
+        Problem::Other => {}
+    }
+}
 fn main() {}
 "#;
 
@@ -250,4 +260,10 @@ fn h9_a_shared_reference_is_captured_as_its_target() {
 fn h10_a_borrow_of_a_packed_field_captures_the_struct() {
     let rows = verdicts(&["unpacked_borrow_field", "packed_move_field", "packed_borrow_whole"]);
     judge(&rows, &["unpacked_borrow_field", "packed_move_field"], &["packed_borrow_whole"], "E0506");
+}
+
+#[test]
+fn a_match_bound_reference_is_captured_by_its_pointee() {
+    let rows = verdicts(&["problem_line"]);
+    judge(&rows, &["problem_line"], &[], "");
 }

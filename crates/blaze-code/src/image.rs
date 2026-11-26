@@ -17,6 +17,7 @@
 use core::fmt;
 
 use blaze_ids::Hasher;
+use blaze_int::Int;
 use blaze_own::{ABTreeMap, AVec, Alloc, BTreeMap, Vec};
 
 use crate::a64::{ADD64, ADRP, BLR, LDR64, NOP, add_lo12, adrp, bl, expect, ldr_lo12, up, write32};
@@ -235,24 +236,24 @@ pub fn lay_out_positions<'a>(
             continue;
         }
         let symbol = m.symbol;
+        let at = crate::place::At { code: code_at[i], relro: relro_at + relro_off[i] };
         for s in 0..m.record.sites() {
             let site = m.record.site(s);
-            let pc = code_at[i] + u64::from(site.at);
+            let pc = at.code + u64::from(site.at);
             if site.kind.len() == 4 {
-                let at = crate::place::At { code: code_at[i], relro: relro_at + relro_off[i] };
                 let to = match at.own(site) {
                     Some(local) => local,
                     None => {
-                        let target = m.record.target(site.target as usize);
+                        let target = m.record.target(blaze_int::idx(site.target));
                         let index = imports.binary_search(&target).map_err(|_| ImageError::Unbound { target })?;
-                        imports_at + 8 * index as u64
+                        imports_at + 8 * index.widen_to::<u64>()
                     }
                 };
                 crate::a64::single_site(&mut code, pc, pc, to, site.kind, symbol)?;
                 continue;
             }
             if site.kind == SiteKind::Relro {
-                let to = relro_at + relro_off[i] + u64::from(site.addend);
+                let to = at.relro + u64::from(site.addend);
                 let first = expect(&code, pc, ADRP, symbol, "adrp")?;
                 let second = expect(&code, pc + 4, ADD64, symbol, "add")?;
                 write32(&mut code, pc, adrp(first, pc, to, symbol)?);
