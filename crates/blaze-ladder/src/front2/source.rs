@@ -333,6 +333,9 @@ pub trait NamesSource<'n>: Copy {
     /// to `each`. `false`: the owner has no member row (a container with no member has none).
     fn each_member(self, owner: ItemKey, each: &mut dyn FnMut(MemberOf<'n>)) -> bool;
 
+    /// Observe an owner's member list when a lookup answers from its already-filed head.
+    fn read_members(self, _owner: ItemKey) {}
+
     /// Filtered [`each_member`]: asks `want(kind, name)` on each member row before reading its
     /// text, skipping `MemberWant::Skip` rows and avoiding text reads for `MemberWant::NameOnly`.
     fn each_member_matching(

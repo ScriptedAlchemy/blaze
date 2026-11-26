@@ -5071,6 +5071,11 @@ impl Score for Pair<u8> {
         self.left
     }
 }
+impl Pair<u8> {
+    fn peek(&self) -> u8 {
+        self.left
+    }
+}
 pub fn use_score<T: Score>(x: &T) -> T::Out {
     x.score()
 }
@@ -5079,6 +5084,7 @@ pub fn base(p: Pair<u8>) -> u8 {
 }
 pub fn alpha() -> u8 {
     let p = Pair { left: 1u8, right: 2u8 };
+    let _ = p.peek();
     base(p)
 }
 pub fn beta_with_local() -> u8 {
@@ -5098,6 +5104,7 @@ pub fn gamma_err() -> u16 {
         let base_frame = BodyFrame { frame: body_frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None, prepared: None, front: None };
         let seed: &'static _ = body_frame.alloc(super::super::seeds::Freezing::new(records, oracle_heads(base_tables, &base_frame)));
         let heads = cells(records);
+        let score = heads.iter().map(|want| want.key()).find(|&key| records.name_of(key) == Some("Score")).expect("fixture trait");
         let names = ["base", "alpha", "beta_with_local", "gamma_err"];
         let mut tasks: blaze_own::Vec<(&str, Task), Alloc<'static>> = blaze_own::Vec::new_in(a());
         for label in names {
@@ -5147,7 +5154,13 @@ pub fn gamma_err() -> u16 {
         };
         let mut fresh_results = blaze_own::Vec::new_in(a());
         for &(label, ref task) in tasks.iter() {
-            fresh_results.push((label, check_once(records, &unused, &frame, task, &mut scratch, None)));
+            let result = check_once(records, &unused, &frame, task, &mut scratch, None);
+            if label == "alpha" {
+                assert!(!result.1 && result.2 == 0, "the inherent method call checks cleanly");
+                assert!(result.3.contains(&TableRead::Names(NameCell::Members { owner: score })),
+                    "the inherent call probes the in-scope Score trait for a member named peek");
+            }
+            fresh_results.push((label, result));
         }
 
         // Forward reuse across all 4 bodies (including one with a body-local fn).

@@ -967,6 +967,11 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
 
     fn assoc_item_once(&self, container: ItemKey, name: Name) -> Fetch<Option<AssocItem>> {
         if let Some((i, provisional)) = self.store.impl_or_provisional(container) {
+            if self.keys.local_kind(container).is_none()
+                && let Some(Origin::Item(lib)) = self.keys.origin(container)
+            {
+                self.names.read_members(*lib);
+            }
             if provisional {
                 self.store.note_provisional_read(container);
             }
@@ -999,6 +1004,11 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 _ => Ok(None),
             };
         };
+        if self.keys.local_kind(container).is_none() {
+            // A cold lookup observes the member list through `may_declare`. Preserve that
+            // observation when an earlier body in the stretch has already imported the head.
+            self.names.read_members(lib);
+        }
         if let Some(&(_, f)) = t.fns.iter().find(|(n, _)| *n == name) {
             let row = self.fn_row(f)?;
             return Ok(Some(AssocItem { container, item: f, kind: AssocKind::Fn { self_param: row.self_param } }));

@@ -457,8 +457,12 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
     }
 
     fn each_member(self, owner: ItemKey, each: &mut dyn FnMut(MemberOf<'n>)) -> bool {
-        self.cell(NameCell::Members { owner });
+        self.read_members(owner);
         self.records.each_member(owner, each)
+    }
+
+    fn read_members(self, owner: ItemKey) {
+        self.cell(NameCell::Members { owner });
     }
 
     fn each_member_matching(
@@ -467,7 +471,7 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         want: &mut dyn FnMut(ItemKind, Option<&'n str>) -> crate::front2::source::MemberWant,
         each: &mut dyn FnMut(MemberOf<'n>),
     ) -> bool {
-        self.cell(NameCell::Members { owner });
+        self.read_members(owner);
         self.records.each_member_matching(owner, want, each)
     }
 
