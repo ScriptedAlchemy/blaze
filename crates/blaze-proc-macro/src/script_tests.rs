@@ -65,6 +65,55 @@ fn checkout_script_revisions_with_identical_verified_wasm_share_one_answer() {
     std::fs::remove_dir_all(store).unwrap();
 }
 
+#[test]
+fn exact_script_module_reopens_the_selected_executable_bytes() {
+    use blaze_build_script::{
+        module_record::{Digest, Executable, Identity, Request, Runner, Selected, Source},
+        wasi_std,
+    };
+
+    use crate::module::sha256_hex;
+    use crate::script_unit::{ModuleLookupError, module_for, read_selected_module};
+
+    let store = folder("exact-module-revision");
+    let executable = Executable::Wasm;
+    let recipe = sha256_hex(wasi_std::PATCH_RECIPE);
+    let request = |files, dependencies| Request {
+        identity: Identity { name: "shapes", version: "0.1.0", source: Source::Checkout { files }, dependencies, features: &[], toolchain: "nightly" },
+        runner: Runner::Wasi { shim: "shim", recipe: &recipe },
+    };
+    let owner = sha256_hex(b"build.rs");
+    let before = Digest::parse(&sha256_hex(b"old dependency sources")).unwrap();
+    let after = Digest::parse(&sha256_hex(b"new dependency sources")).unwrap();
+    let publish = |request: &Request<'_>, bytes: &[u8], extra: &str| {
+        let identity = format!("{}shim shim\n{} {recipe}\nbuilder bootstrap\n{extra}", request.identity, wasi_std::IDENTITY_FIELD);
+        let key = sha256_hex(identity.as_bytes());
+        let record = store.join("build-script/modules").join(&key);
+        std::fs::create_dir_all(&record).unwrap();
+        std::fs::write(record.join("identity"), identity).unwrap();
+        std::fs::write(record.join(executable.filename()), bytes).unwrap();
+        std::fs::write(record.join(executable.digest_filename()), sha256_hex(bytes)).unwrap();
+        (key, record)
+    };
+
+    let (old_key, _) = publish(&request(&owner, before), b"old wasm", "");
+    let wanted = request(&owner, after);
+    assert_eq!(module_for(&store, &wanted).unwrap(), None);
+    let (new_key, new_record) = publish(&wanted, b"new wasm", "");
+    let selected = module_for(&store, &wanted).unwrap().unwrap();
+    assert_eq!(selected.key(), new_key);
+    assert_eq!(module_for(&store, &request(&owner, before)).unwrap().unwrap().key(), old_key);
+    assert_eq!(read_selected_module(&store, Selected::decode(&selected.encode()).unwrap()).unwrap(), b"new wasm");
+
+    std::fs::write(new_record.join(executable.filename()), b"substituted wasm").unwrap();
+    std::fs::write(new_record.join(executable.digest_filename()), sha256_hex(b"substituted wasm")).unwrap();
+    assert!(matches!(read_selected_module(&store, selected), Err(ModuleLookupError::Digest { .. })));
+
+    publish(&wanted, b"another wasm", "patches different\n");
+    assert!(matches!(module_for(&store, &wanted), Err(ModuleLookupError::Ambiguous { .. })));
+    std::fs::remove_dir_all(store).unwrap();
+}
+
 fn uleb(mut value: u64, out: &mut Vec<u8>) {
     loop {
         let byte = (value & 0x7f) as u8;

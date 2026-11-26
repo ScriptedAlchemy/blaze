@@ -39,6 +39,7 @@ pub mod host_tools;
 pub mod instr;
 pub mod key;
 pub mod metadata_ask;
+pub mod module_record;
 pub mod native;
 pub mod outputs;
 pub mod pinned;

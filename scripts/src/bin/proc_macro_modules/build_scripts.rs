@@ -31,7 +31,10 @@
 
 use super::*;
 
-use blaze_build_script::wasi_std::{self, PERM_ANCHOR, PERM_PATCH, RT_ANCHOR, RT_PATCH, UNIX_PATH_LIST_END, UNIX_PATH_LIST_START, WASI_PATHS_ANCHOR, WASI_PATHS_PATCH, WASI_PATH_LIST_HEADER};
+use blaze_build_script::{
+    module_record::{Digest, Executable, Identity, Source},
+    wasi_std::{self, PERM_ANCHOR, PERM_PATCH, RT_ANCHOR, RT_PATCH, UNIX_PATH_LIST_END, UNIX_PATH_LIST_START, WASI_PATHS_ANCHOR, WASI_PATHS_PATCH, WASI_PATH_LIST_HEADER},
+};
 
 /// The input: the proc-macro mode's fields under `build_scripts`, and `native` for scripts
 /// built for the host (D65, D69).
@@ -458,15 +461,16 @@ impl Plan<'_> {
             None => format!("shim {shim_digest}\n{} {}\npatches {patches_digest}\n", wasi_std::IDENTITY_FIELD, sha256(wasi_std::PATCH_RECIPE)),
             Some(native) => native.identity()?,
         };
-        let identity = format!(
-            "blaze build-script module 3\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\n{runner}builder bootstrap\n",
-            wanted.name,
-            wanted.version,
-            origin.identity_line(),
-            sha256(closure.join("\n").as_bytes()),
-            features.join(","),
-            self.tool.name,
-        );
+        let source_pin = match origin {
+            Origin::Path { files, .. } => Source::Checkout { files },
+            Origin::Registry { checksum } => Source::Registry { checksum },
+            Origin::Git { commit, path, .. } => Source::Git { commit, path },
+        };
+        let dependencies = Digest::parse(&sha256(closure.join("\n").as_bytes()))
+            .ok_or_else(|| no_module("the lock closure digest is not hexadecimal SHA-256".to_owned()))?;
+        let feature_names: Vec<_> = features.iter().map(String::as_str).collect();
+        let header = Identity { name: &wanted.name, version: &wanted.version, source: source_pin, dependencies, features: &feature_names, toolchain: &self.tool.name };
+        let identity = format!("{header}{runner}builder bootstrap\n");
         let key = sha256(identity.as_bytes());
         let source = match origin {
             Origin::Registry { .. } => self.work.join("vendor").join(format!("{}-{}", wanted.name, wanted.version)),
@@ -598,10 +602,11 @@ impl Plan<'_> {
         let std_lock = if native.is_none() { read(&library.join("Cargo.lock"))? } else { String::new() };
         check_compiled(&compiled, &closure, &std_lock, library, &wanted.name, &wanted.version)?;
 
-        let (artifact, module_file, digest_file) = match native {
-            None => ("wasm32-wasip1/release/build-script-build.wasm", "module.wasm", "wasm-sha256"),
-            Some(_) => ("aarch64-apple-darwin/release/build-script-build", "script.bin", "bin-sha256"),
+        let (artifact, executable) = match native {
+            None => ("wasm32-wasip1/release/build-script-build.wasm", Executable::Wasm),
+            Some(_) => ("aarch64-apple-darwin/release/build-script-build", Executable::Native),
         };
+        let (module_file, digest_file) = (executable.filename(), executable.digest_filename());
         let wasm_path = target.join(artifact);
         let wasm = std::fs::read(&wasm_path).map_err(io(&wasm_path))?;
         let wasm_sha256 = sha256(&wasm);
