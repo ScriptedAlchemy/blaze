@@ -1677,7 +1677,25 @@ impl Job<'_> {
             }
             (env, _) => env,
         };
-        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, member: krate.member, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs.into(), corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
+        let proc_exports = match (self.producers.registration, self.procs) {
+            (Some((record, false)), Some(runner)) => match runner.exports(self.at, record.out) {
+                Ok(exports) => exports.map(|exports| {
+                    let mut registered = blaze_own::Vec::with_capacity_in(exports.len(), cx.frame());
+                    for export in exports {
+                        let mut helpers = blaze_own::String::new_in(cx.frame());
+                        for (i, helper) in export.helpers.iter().enumerate() {
+                            if i > 0 { helpers.push_str(", "); }
+                            helpers.push_str(helper);
+                        }
+                        registered.push(blaze_scope::task::ProcExport { kind: export.kind, name: &export.name, helpers: helpers.into_bump_str() });
+                    }
+                    &*registered.into_bump_slice()
+                }),
+                Err(why) => return Ok(refuse("a proc-macro crate's registration", blaze_own::format_in!(alloc, "crate `{}`: {why}", input.name))),
+            },
+            _ => None,
+        };
+        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, proc_exports, member: krate.member, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs.into(), corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
         let (resolved, ok, unresolved, oracle) = match crate::names::resolve(cx, root, &job, cx.frame()).0 {
             Resolution::Made { resolved, ok, unresolved, oracle } => (resolved, ok, unresolved, oracle),
             Resolution::Need(keys) => return need(&keys),

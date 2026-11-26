@@ -85,6 +85,12 @@ impl<'a: 'n, 'f: 'a, 'n> From<(&'a SyncLazyTrees<'f>, &'a bstd::fs::Fs)> for Pac
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ScopeOwner<'n> {
+    pub(crate) at: usize,
+    pub(crate) exports: Option<&'n [blaze_scope::task::ProcExport<'n>]>,
+}
+
 pub(crate) struct JobTexts<'n> {
     pub(crate) cx: &'n Cx,
     pub(crate) root: &'n Dir<ReadWrite>,
@@ -123,7 +129,7 @@ pub(crate) struct JobTexts<'n> {
     pub(crate) procs: Procs<'n>,
     /// The names job's one crate, by its world index: the crate whose runner key is asked.
     /// `None` for a body job (a body reads its dependencies' keys from their items records).
-    pub(crate) own: Option<usize>,
+    pub(crate) own: Option<ScopeOwner<'n>>,
     /// Each crate whose code this job may expand a proc-macro call in, by its `krate` index:
     /// its index in the NAMES world (the runner's key: one per unit, so a package's lib and
     /// bin are two, macro-env-per-unit) and its edition.
@@ -404,7 +410,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
     /// module, so a missing module is refused at each call and named by the `MacroModule` task,
     /// never `NoDefinition` (pm-call-expand).
     fn proc_macro_key(&self, krate: usize) -> Option<blaze_id::CrateItemKey> {
-        if self.own != Some(krate) {
+        if self.own.map(|owner| owner.at) != Some(krate) {
             return None;
         }
         // A maker's refusal gives no key here; each call of the crate is then refused with the
@@ -413,22 +419,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
     }
 
     fn proc_exports(&self, krate: usize) -> Option<&'n [blaze_scope::task::ProcExport<'n>]> {
-        if self.own != Some(krate) {
-            return None;
-        }
-        let exports = self.runner().ok().flatten()?.exports(krate)?;
-        let mut registered = blaze_own::Vec::with_capacity_in(exports.len(), self.frame);
-        for export in exports {
-            let mut helpers = blaze_own::String::new_in(self.frame);
-            for (i, helper) in export.helpers.iter().enumerate() {
-                if i > 0 {
-                    helpers.push_str(", ");
-                }
-                helpers.push_str(helper);
-            }
-            registered.push(blaze_scope::task::ProcExport { kind: export.kind, name: &export.name, helpers: helpers.into_bump_str() });
-        }
-        Some(registered.into_bump_slice())
+        self.own.filter(|owner| owner.at == krate)?.exports
     }
 
     /// A proc-macro call written in the crate `krate`: through the runner's one path
@@ -523,7 +514,7 @@ mod tests {
             data: RefCell::new(std::vec::Vec::new()),
             left: RefCell::new(std::vec::Vec::new()),
             procs,
-            own: Some(0),
+            own: Some(ScopeOwner { at: 0, exports: None }),
             callers: &[],
             by_need: None,
             run_stopped: core::cell::Cell::new(None),

@@ -5,6 +5,49 @@ use blaze_int::Int;
 
 pub const TOOLCHAIN: &str = blaze_pins::TOOLCHAIN;
 
+/// The D52 registration global exported by a core Wasm module. Only section headers
+/// and the export table are read, so this also works on a read-only mapping.
+pub fn proc_macro_decls(wasm: &[u8]) -> Option<&str> {
+    fn byte(bytes: &mut &[u8]) -> Option<u8> {
+        let (&first, rest) = bytes.split_first()?;
+        *bytes = rest;
+        Some(first)
+    }
+    fn uleb32(bytes: &mut &[u8]) -> Option<u32> {
+        let mut value = 0;
+        for shift in [0, 7, 14, 21, 28] {
+            let b = byte(bytes)?;
+            if shift == 28 && b > 0x0f { return None; }
+            value |= u32::from(b & 0x7f) << shift;
+            if b < 0x80 { return Some(value); }
+        }
+        None
+    }
+    fn counted<'a>(bytes: &mut &'a [u8]) -> Option<&'a [u8]> {
+        let len = usize::try_from(uleb32(bytes)?).ok()?;
+        let (field, rest) = bytes.split_at_checked(len)?;
+        *bytes = rest;
+        Some(field)
+    }
+    let mut sections = wasm.strip_prefix(b"\0asm\x01\0\0\0")?;
+    while !sections.is_empty() {
+        let id = byte(&mut sections)?;
+        let mut section = counted(&mut sections)?;
+        if id != 7 { continue; }
+        let mut registration = None;
+        for _ in 0..uleb32(&mut section)? {
+            let name = core::str::from_utf8(counted(&mut section)?).ok()?;
+            let kind = byte(&mut section)?;
+            uleb32(&mut section)?;
+            if kind == 3 && name.strip_prefix("__rustc_proc_macro_decls_").is_some_and(|suffix| !suffix.is_empty()) {
+                if registration.replace(name).is_some() { return None; }
+            }
+        }
+        return section.is_empty().then_some(registration).flatten();
+    }
+    None
+}
+
 /// Whether a package's raw manifest has no input inherited from its enclosing workspace.
 /// A non-root path package that returns false adds that workspace manifest to its source pin.
 pub fn standalone_manifest(text: &str, alloc: blaze_own::Alloc<'_>) -> bool {

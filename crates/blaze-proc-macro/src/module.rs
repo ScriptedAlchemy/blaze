@@ -262,6 +262,34 @@ pub struct ModuleRecord {
 pub const COMPILED_DIR: &str = "proc-macro/compiled";
 
 impl ModuleRecord {
+    /// Every registration input a names task consumes. The producing task verifies the
+    /// Wasm digest and global before publishing this value.
+    pub fn registration_id(&self) -> blaze_ids::ContentId {
+        let mut hash = blaze_ids::Hasher::new("blaze proc-macro registration 1");
+        hash.update(&[u8::from(self.native_dylib.is_some())]).part(self.key.as_bytes()).part(self.wasm_sha256.as_bytes()).part(self.decls.as_bytes());
+        for export in &self.macros {
+            hash.update(&export.index.to_le_bytes()).update(&[export.kind.byte()]).part(export.name.as_bytes());
+            hash.update(&(export.helpers.len() as u64).to_le_bytes());
+            for helper in &export.helpers { hash.part(helper.as_bytes()); }
+        }
+        hash.finish()
+    }
+
+    pub fn verify_registration(&self) -> Result<blaze_ids::ContentId, ModuleError> {
+        if self.native_dylib.is_none() {
+            let path = self.dir.join("module.wasm");
+            let wasm = blaze_core::Mapping::map_file(&path).map_err(|error| ModuleError::Io { path, error })?;
+            let found = sha256_hex(wasm.bytes());
+            if found != self.wasm_sha256 {
+                return Err(ModuleError::Digest { key: self.key.clone(), held: self.wasm_sha256.clone(), found });
+            }
+            if blaze_manifest::bootstrap::proc_macro_decls(wasm.bytes()) != Some(self.decls.as_str()) {
+                return Err(ModuleError::Registration { path: self.dir.join("decls"), why: "the D52 module does not export the recorded proc-macro registration global" });
+            }
+        }
+        Ok(self.registration_id())
+    }
+
     /// The macro `name` of `kind`.
     pub fn find(&self, kind: ProcKind, name: &str) -> Option<&Exported> {
         self.macros.iter().find(|it| it.kind == kind && it.name == name)
@@ -321,25 +349,6 @@ fn native_dylib_filename() -> &'static str {
         "native.dll"
     } else {
         "native.so"
-    }
-}
-
-/// Whether `store` holds `id`'s module, by its key: the native `.dylib`'s digest (zero Wasm!)
-/// when present, else the wasm's digest as the record states it.
-pub fn find_module(store: &Path, id: &CrateId<'_>) -> Result<(String, String), ModuleError> {
-    let key = module_key(id);
-    let dir = store.join("proc-macro/modules").join(&key);
-    let dylib_digest = dir.join("dylib-sha256");
-    if let Ok(held) = std::fs::read(&dylib_digest) {
-        if dir.join(native_dylib_filename()).is_file() {
-            return Ok((key, String::from_utf8_lossy(&held).trim().to_owned()));
-        }
-    }
-    let path = dir.join("wasm-sha256");
-    match std::fs::read(&path) {
-        Ok(held) => Ok((key, String::from_utf8_lossy(&held).trim().to_owned())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ModuleError::Missing { name: id.name.to_owned(), version: id.version.to_owned(), key }),
-        Err(error) => Err(ModuleError::Io { path, error }),
     }
 }
 

@@ -55,6 +55,7 @@ pub(crate) struct ScopeJob<'j> {
     pub(crate) kept: blaze_own::SharedAlloc<'static>,
     /// The crate's index in the world (its texts' `krate`).
     pub(crate) at: usize,
+    pub(crate) proc_exports: Option<&'j [blaze_scope::task::ProcExport<'j>]>,
     /// Whether this crate belongs to a workspace member (only workspace members emit user-facing
     /// unresolved-path, missing-module, failed-call, include-outside, and test-mark findings).
     pub(crate) member: bool,
@@ -333,7 +334,7 @@ fn blocks_differential(
                 data: RefCell::new(std::vec::Vec::new()),
                 left: RefCell::new(std::vec::Vec::new()),
                 procs: crate::job_texts::Procs::of(job.procs),
-                own: Some(job.at),
+                own: Some(crate::job_texts::ScopeOwner { at: job.at, exports: job.proc_exports }),
                 callers,
                 by_need: None,
                 run_stopped: core::cell::Cell::new(None),
@@ -381,7 +382,7 @@ fn blocks_differential(
             data: RefCell::new(std::vec::Vec::new()),
             left: RefCell::new(std::vec::Vec::new()),
             procs: crate::job_texts::Procs::of(job.procs),
-            own: Some(job.at),
+            own: Some(crate::job_texts::ScopeOwner { at: job.at, exports: job.proc_exports }),
             callers,
             by_need: None,
             run_stopped: core::cell::Cell::new(None),
@@ -432,7 +433,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         data: RefCell::new(std::vec::Vec::new()),
         left: RefCell::new(std::vec::Vec::new()),
         procs: crate::job_texts::Procs::of(job.procs),
-        own: Some(job.at),
+        own: Some(crate::job_texts::ScopeOwner { at: job.at, exports: job.proc_exports }),
         callers,
         by_need: None,
         run_stopped: core::cell::Cell::new(None),

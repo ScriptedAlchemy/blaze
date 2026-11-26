@@ -260,9 +260,12 @@ mod with_sandbox {
             Some(self.keys[at].1)
         }
 
-        pub(crate) fn exports(&self, krate: usize) -> Option<&[blaze_proc_macro::module::Exported]> {
-            let module = self.procs.module(self.key_of(krate)?)?;
-            module.native_dylib.is_none().then_some(module.macros.as_slice())
+        pub(crate) fn exports(&self, krate: usize, verified: blaze_ids::ContentId) -> Result<Option<&[blaze_proc_macro::module::Exported]>, &'static str> {
+            let module = self.key_of(krate).and_then(|key| self.procs.module(key)).ok_or("the verified module is missing from the runner")?;
+            if module.registration_id() != verified {
+                return Err("the runner's registration differs from the verified module record");
+            }
+            Ok(module.native_dylib.is_none().then_some(module.macros.as_slice()))
         }
 
         /// Package name of the proc-macro crate that defines `def` (for live status attribution).
@@ -381,7 +384,7 @@ mod without_sandbox {
     }
 
     impl ProcRunner<'_> {
-        pub(crate) fn exports(&self, _krate: usize) -> Option<&[blaze_proc_macro::module::Exported]> {
+        pub(crate) fn exports(&self, _krate: usize, _verified: blaze_ids::ContentId) -> Result<Option<&[blaze_proc_macro::module::Exported]>, &'static str> {
             match self {
                 ProcRunner::Never(never, _) => match *never {},
             }

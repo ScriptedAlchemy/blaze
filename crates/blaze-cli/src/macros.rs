@@ -20,7 +20,7 @@ use blaze_drive::{Input, Kind, Name, Task, TaskFailure, Want, Why};
 use blaze_ids::ContentId;
 use blaze_own::Alloc;
 use blaze_manifest::lock::LockId;
-use blaze_proc_macro::module::{LockedPackages, ModuleError, find_module};
+use blaze_proc_macro::module::{LockedPackages, ModuleError, read_module};
 use blaze_unit_graph::{Unit, UnitKind};
 use blaze_world::procs::{MacroIdentity, Unidentified, git_folders, identify};
 use bstd::cx::Cx;
@@ -31,8 +31,7 @@ use crate::store::Store;
 use crate::work::{Did, Made, held_str};
 
 const SUBJECT_DOMAIN: &str = "blaze-cli macro crate 1";
-const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 1";
-const OUT_DOMAIN: &str = "blaze-cli macro module out 1";
+const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 2";
 /// The rule a refusal of this task names.
 const RULE: &str = "macros.rs";
 /// The module store's folder under blaze's folder in the home (`<home>/.blaze`): its listing
@@ -215,10 +214,10 @@ pub(crate) fn run<'b>(
             return Ok(Did::FailedSaying(refused("a macro crate without a module identity"), held_str(words.as_str(), held)));
         }
     };
-    match identity.with_id(|id| find_module(&modules, id)) {
-        Ok((_key, wasm_sha256)) => {
+    match identity.with_id(|id| read_module(&modules, id)?.verify_registration()) {
+        Ok(registration) => {
             let mut made = Made::new_in(name, held);
-            made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.as_bytes());
+            made.out = registration;
             Ok(Did::Done(made))
         }
         Err(ModuleError::Missing { name: package, version, key }) => {
