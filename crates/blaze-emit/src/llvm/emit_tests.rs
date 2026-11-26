@@ -367,7 +367,8 @@ fn release_record_stores_a_splat_to_every_lane() {
     use blaze_inproc::exec::Executable;
     use blaze_lir::{Op, Scalar, builder::MemAttrs};
 
-    let mut b = Builder::<_, Full>::new_in(64, blaze_own::testing::heap().alloc());
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut b = Builder::<_, Full>::new_in(64, alloc);
     let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::I32)], &[]);
     b.set_signature(sig);
     let entry = b.create_block(BlockKind::Normal);
@@ -378,8 +379,8 @@ fn release_record_stores_a_splat_to_every_lane() {
     b.store(Flags::NONE, vector, output, 0, MemAttrs::aligned(2));
     b.ret(&[]);
     let func = b.finish_verified().unwrap();
-    let module = prepare(Symbol([15; 32]), func.verified(), &ByPlace, Alloc::global()).unwrap();
-    let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, Alloc::global()).unwrap();
+    let module = prepare(Symbol([15; 32]), func.verified(), &ByPlace, alloc).unwrap();
+    let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, alloc).unwrap();
     let view = CodeView::read(&emission.record).unwrap();
     assert_eq!(view.targets(), 0);
     assert_eq!(view.sites(), 0);

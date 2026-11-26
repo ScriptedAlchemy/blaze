@@ -84,7 +84,7 @@ blaze-int	4	0	0	1	0	0	0	0	0	0
 blaze-json	3	0	0	0	0	0	1	0	0	0
 blaze-keyed	6	0	1	124	0	0	0	0	0	0
 blaze-kit	2	0	0	0	0	0	0	0	0	0
-blaze-ladder	733	284	0	2295	62	53	10	252	0	86
+blaze-ladder	733	284	0	2286	62	53	10	252	0	86
 blaze-launch	19	0	0	158	0	0	0	0	0	1
 blaze-launch-rt	116	2	0	99	7	5	18	1	0	0
 blaze-launcher	20	1	0	17	8	0	0	1	0	0

@@ -5563,8 +5563,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 // adjustment already produces the cast result, with the closure's signature
                 // requirements checked. A second aggregate would equate the pointer's regions.
                 let closure_coercion = hi - lo == 1
-                    && self.ck.adjusts.column::<1>()[lo] == AdjustKind::ClosureFnPointer
-                    && self.ck.adjusts.column::<2>()[lo] == ty.ty;
+                    && self.ck.adjusts.column::<1>().get(lo) == Some(&AdjustKind::ClosureFnPointer)
+                    && self.ck.adjusts.column::<2>().get(lo) == Some(&ty.ty);
                 if !closure_coercion {
                     self.tasks.push(Task::OpDone(e));
                 }

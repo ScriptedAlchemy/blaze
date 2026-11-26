@@ -31,7 +31,7 @@
 
 mod support;
 
-use std::fmt::Write as _;
+use core::fmt::Write as _;
 use std::fs::File;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -49,15 +49,15 @@ const BUILD: &str = "fn main() {\n    println!(\"cargo:rustc-cfg=from_script\");
 /// The line the module writes.
 const LINE: &[u8] = b"cargo:rustc-cfg=from_script\n";
 
+const CHECKOUT_INPUTS: [(&str, &str); 4] = [
+    ("Cargo.lock", "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n"),
+    ("Cargo.toml", "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n"),
+    ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    ("app/build.rs", BUILD),
+];
+
 fn workspace(dir: &Path) {
-    let files: [(&str, &str); 5] = [
-        ("Cargo.toml", "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n"),
-        ("Cargo.lock", "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n"),
-        ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
-        ("app/build.rs", BUILD),
-        ("app/src/main.rs", MAIN),
-    ];
-    for (path, text) in files {
+    for (path, text) in CHECKOUT_INPUTS.into_iter().chain([("app/src/main.rs", MAIN)]) {
         let at = dir.join(path);
         std::fs::create_dir_all(at.parent().expect("a file's folder")).unwrap_or_else(|error| panic!("making the folder of {}: {error}", at.display()));
         std::fs::write(&at, text).unwrap_or_else(|error| panic!("writing {}: {error}", at.display()));
@@ -126,13 +126,12 @@ fn module(line: &[u8]) -> Vec<u8> {
 }
 
 /// The module record of `app 0.1.0` with no features in `home`'s module store.
-fn put_module(workspace: &Path, home: &Path) {
+fn put_module(home: &Path) {
     let runner = blaze_proc_macro::script_unit::wasm_runner_lines().join("\n");
     let toolchain = include_str!("../../../pins/toolchain").trim();
     let mut identity = format!("name app\nversion 0.1.0\nfeatures \n{runner}\ntoolchain {toolchain}\ncheckout-package app\n");
-    for path in ["Cargo.lock", "Cargo.toml", "app/Cargo.toml", "app/build.rs"] {
-        let input = std::fs::read(workspace.join(path)).unwrap_or_else(|error| panic!("reading fixture input {path}: {error}"));
-        let read = CheckoutRead { path, content: Digest::checkout_file(&input) };
+    for (path, input) in CHECKOUT_INPUTS {
+        let read = CheckoutRead { path, content: Digest::checkout_file(input.as_bytes()) };
         write!(identity, "{read}").expect("writing the checkout read to the identity");
     }
     let sha256_hex = |bytes: &[u8]| -> String {
@@ -211,7 +210,7 @@ fn a_scripts_cfg_reaches_a_cfg_item() {
     let base = fresh_home("build_scripts_cfg", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
-    put_module(&at, &home);
+    put_module(&home);
     let (_, said) = check(&at, &home);
     assert!(!said.contains("the build script of app"), "the script did not run:\n{said}");
     // The status is not read: while the borrow check's findings stay notes, every check ends
@@ -277,7 +276,7 @@ fn engine_check_runs_the_script_and_lists_what_check_lists() {
     let base = fresh_home("build_scripts_engine", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
-    put_module(&at, &home);
+    put_module(&home);
     let (_, said) = check(&at, &home);
     // Not the status: every check ends "incomplete: NOT checked: borrows" for now.
     assert!(said.contains("0 errors: blaze check") && !said.contains("not checked because"), "check of the fixture failed:\n{said}");
