@@ -166,7 +166,7 @@ fn first_into(xs: impl IntoIterator<Item = impl Into<u64>>) -> u64 { match xs.in
 ";
 
 /// The bodies that must check clean, each with what it proves.
-const CLEAN: [(&str, &str); 60] = [
+const CLEAN: &[(&str, &str)] = &[
     ("call_bound", "`F: Fn(u8) -> u16` on the parameter: `Fn<(u8,)>` and `Output = u16`"),
     ("call_where", "`where F: FnMut(u8)`: the output is `()`"),
     ("call_apit", "`impl FnOnce(u8, bool) -> u16` in argument position"),
@@ -318,7 +318,7 @@ fn bounds_through_front2() {
     let mut failed = Vec::new();
     let mut clean = Vec::new();
         let mut why: Vec<String> = Vec::new();
-    for (name, proves) in CLEAN {
+    for &(name, proves) in CLEAN {
         if let Err(e) = store.ensure(&names, &mut front.keys, Want::Fn(lib(name))) {
             why.push(format!("{name}: no head: {e:?}"));
             failed.push(name);
