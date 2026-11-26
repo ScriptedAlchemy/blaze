@@ -542,11 +542,11 @@ impl<'a> Reader<'a> {
     }
 
     fn mark(&mut self, key: u64) {
-        if let Some(state) = self.map_depth.checked_sub(1).and_then(|i| self.maps.get_mut(i)) {
-            state.remaining = state.remaining.saturating_sub(1);
-            if key < 128 {
-                state.seen |= 1u128 << key;
-            }
+        let Some(index) = self.map_depth.checked_sub(1) else { return };
+        let Some(state) = self.maps.get_mut(index) else { return };
+        state.remaining = state.remaining.saturating_sub(1);
+        if key < 128 {
+            state.seen |= 1u128 << key;
         }
     }
 

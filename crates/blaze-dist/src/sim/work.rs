@@ -844,9 +844,9 @@ impl World {
         Violation::new(self.seed, self.now, invariant, detail, self.alloc)
     }
 
-    fn run(
+    fn run<F: FnMut(fmt::Arguments<'_>)>(
         mut self,
-        mut trace: Option<&mut dyn FnMut(fmt::Arguments<'_>)>,
+        mut trace: Option<&mut F>,
     ) -> Result<Summary, Violation> {
         let mut events = 0u64;
         while let Some(((at, _), kind)) = self.queue.pop_first() {
@@ -1309,7 +1309,7 @@ impl World {
 
 /// Runs the simulation of `seed`.
 pub fn run(seed: u64, alloc: WireAlloc) -> Result<Summary, Violation> {
-    World::new(seed, alloc)?.run(None)
+    World::new(seed, alloc)?.run::<fn(fmt::Arguments<'_>)>(None)
 }
 
 /// Runs the simulation of `seed`, presenting each event to the caller's synchronous writer.
