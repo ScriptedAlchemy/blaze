@@ -1070,6 +1070,27 @@ pub(crate) fn stage_notes(cx: &Cx, not: &[&'static str], shown: &Shown<'_>, fram
     Ok(())
 }
 
+/// End a check's stream. In JSON the machine-readable summary always terminates the
+/// stream, including a check that could not finish. A person sees the incomplete verdict
+/// last and never sees "0 errors" beside it.
+#[expect(clippy::too_many_arguments, reason = "the closing facts and output capabilities")]
+pub(crate) fn check_closing(
+    cx: &Cx, shown: &Shown<'_>, checked: u32, nanos: u64, changed: u32, unchecked: u32,
+    coverage: Option<Coverage<'_>>, frame: &Frame, out: &Out,
+) -> Result<(), CliError> {
+    let incomplete = crate::not_checked::items::summary(unchecked, shown.behind, frame);
+    if shown.view == View::Json && let Some(words) = &incomplete {
+        note(cx, words.as_str(), shown, frame, out)?;
+    }
+    if shown.view == View::Json || incomplete.is_none() || shown.counts.errors > 0 || shown.counts.failures > 0 {
+        closing(cx, shown, checked, nanos, Some(changed), None, coverage, frame, out)?;
+    }
+    if shown.view != View::Json && let Some(words) = &incomplete {
+        note(cx, words.as_str(), shown, frame, out)?;
+    }
+    Ok(())
+}
+
 /// `--fix` refused (fix.rs `Refusal`): one line, `refused: <words>` (JSON: `{"refused": ..}`).
 pub fn refused(cx: &Cx, words: &str, shown: &Shown<'_>, frame: &Frame, out: &Out) -> Result<(), CliError> {
     let erased = blaze_own::Erased::new(frame);

@@ -53,7 +53,7 @@ fn test_code_is_checked_by_its_test_unit_alone() {
 /// `= true` where `u8` is declared is one type error (E0308), at the initializer. One line each:
 /// a free `const`, a `static`, an impl's `const`, a trait's provided `const`; and one of each
 /// that is well typed, which says nothing.
-const VALUES: &str = "pub const C: u8 = true;\npub static S: u8 = true;\npub struct T;\nimpl T {\n    pub const A: u8 = true;\n    pub const A_OK: u8 = 1;\n}\npub trait Tr {\n    const B: u8 = true;\n    const NONE: u8;\n}\npub const C_OK: u8 = 2;\npub static S_OK: u8 = 3;\n";
+const VALUES: &str = "pub const C: u8 = true;\npub static _DECLS: u8 = true;\npub struct T;\nimpl T {\n    pub const A: u8 = true;\n    pub const A_OK: u8 = 1;\n}\npub trait Tr {\n    const B: u8 = true;\n    const NONE: u8;\n}\npub const C_OK: u8 = 2;\npub static S_OK: u8 = 3;\n";
 
 /// Each wrong initializer is an error at its own line, every initializer is checked (no
 /// "a `const` or `static` body" note, nothing left unchecked), and the well-typed ones and the

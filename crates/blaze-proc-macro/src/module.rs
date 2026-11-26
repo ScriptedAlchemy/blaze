@@ -289,6 +289,8 @@ pub enum ModuleError {
     Io { path: PathBuf, error: std::io::Error },
     /// The record's wasm is not the bytes its digest names.
     Digest { key: String, held: String, found: String },
+    /// A D52 registration record does not belong to this crate or does not name its ABI.
+    Registration { path: PathBuf, why: &'static str },
     /// A line of `macros` that is not one.
     Macros { key: String, line: String },
 }
@@ -305,6 +307,7 @@ impl std::fmt::Display for ModuleError {
                 write!(f, "module {key}: its wasm-sha256 says {held}, its module.wasm is {found}")
             }
             ModuleError::Macros { key, line } => write!(f, "module {key}: `macros` has the line {line:?}, which lists no macro"),
+            ModuleError::Registration { path, why } => write!(f, "{}: {why}", path.display()),
         }
     }
 }
@@ -355,6 +358,14 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
     };
     let text = |file: &str| -> Result<String, ModuleError> { Ok(String::from_utf8_lossy(&read(file)?).into_owned()) };
     let held = text(if is_native { "dylib-sha256" } else { "wasm-sha256" })?.trim().to_owned();
+    if !is_native {
+        if sha256_hex(&read("identity")?) != key {
+            return Err(ModuleError::Registration { path: dir.join("identity"), why: "the registration identity differs from the requested D52 module key" });
+        }
+        if blaze_manifest::bootstrap::HexDigest::parse(&held).is_none() {
+            return Err(ModuleError::Registration { path: dir.join("wasm-sha256"), why: "the registered Wasm digest is not a SHA-256" });
+        }
+    }
     let mut macros = Vec::new();
     for line in text("macros")?.lines() {
         let bad = || ModuleError::Macros { key: key.clone(), line: line.to_owned() };
@@ -368,6 +379,9 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
         };
         let name = parts.next().filter(|it| !it.is_empty()).ok_or_else(bad)?.to_owned();
         let helpers = parts.next().unwrap_or("").split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect();
+        if !is_native && (usize::try_from(index).ok() != Some(macros.len()) || parts.next().is_some()) {
+            return Err(bad());
+        }
         macros.push(Exported { index, kind, name, helpers });
     }
     let decls = if is_native {
@@ -379,7 +393,11 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
             .trim()
             .to_owned()
     } else {
-        text("decls")?.trim().to_owned()
+        let name = text("decls")?.trim().to_owned();
+        if !name.strip_prefix("__rustc_proc_macro_decls_").is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')) {
+            return Err(ModuleError::Registration { path: dir.join("decls"), why: "the D52 module record names no exported proc-macro registration global" });
+        }
+        name
     };
     Ok(ModuleRecord {
         key,

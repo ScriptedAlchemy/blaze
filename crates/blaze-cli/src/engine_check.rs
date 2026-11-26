@@ -3124,7 +3124,7 @@ fn print_answer<'m, 'f, 'a>(
     }
     // Types and borrows are checked whole when every body of the answer was: those entered now
     // (engine_bodies.rs `whole`) and those that stand (`standing_bodies_whole`, above).
-    let bodies_whole = names.is_some() && bodies.whole() && *standing_bodies_whole;
+    let bodies_whole = names.is_some() && bodies.whole() && *standing_bodies_whole && unchecked == 0 && shown.behind.items == 0;
     let (ran_stages, not_stages) = crate::check_coverage(names.is_some(), bodies_whole, bodies_whole && tally.borrows == 0, frame);
     let coverage = (!not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
     let silent_clean = shown.quiet_when_clean
@@ -3136,16 +3136,6 @@ fn print_answer<'m, 'f, 'a>(
         && unreadable.is_none();
     if !silent_clean {
         print::stage_notes(cx, &not_stages, shown, frame, out)?;
-        // Never print "0 errors" or "no errors in" beside items blaze could not check
-        // (`check_unchecked_items.rs`).
-        let unchecked_only = (unchecked > 0 || shown.behind.items > 0) && shown.counts.errors == 0 && shown.counts.failures == 0;
-        if !unchecked_only {
-            print::closing(cx, shown, files_checked, phases.since(began), Some(finished.report.entered), None, coverage, frame, out)?;
-        }
-    }
-    // The bodies not checked, under one line beside the closing line, as `check` prints it.
-    if let Some(words) = crate::not_checked::items::summary(unchecked, shown.behind, frame) {
-        print::note(cx, words.as_str(), shown, frame, out)?;
     }
     // `--names-oracle` (D158 step 1): its sums, its first disagreements and the crates it did
     // not compare, last; its finding fails the command, and nothing else of the answer moves.
@@ -3182,6 +3172,9 @@ fn print_answer<'m, 'f, 'a>(
         if let Some(finding) = t.finding() {
             print::note(cx, bstd::mem::format_in!(frame, "{finding}").as_str(), shown, frame, out)?;
         }
+    }
+    if !silent_clean {
+        print::check_closing(cx, shown, files_checked, phases.since(began), finished.report.entered, unchecked, coverage, frame, out)?;
     }
     let status = match oracle.and_then(|t| t.finding()) {
         Some(_) => Status::FAILED,
@@ -3222,7 +3215,7 @@ fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
         Some(tally) => (tally, true),
         None => (view_slot.new_view(cx, root, store, pointer.lines, lines, shown, request, frame, out)?, false),
     };
-    let whole = facts.printed.bodies_whole;
+    let whole = facts.printed.bodies_whole && tally.unchecked == 0 && shown.behind.items == 0;
     let (ran_stages, not_stages) = crate::check_coverage(facts.printed.names, whole, whole && tally.borrows == 0, frame);
     let coverage = (!not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
     let silent_clean = shown.quiet_when_clean
@@ -3232,13 +3225,7 @@ fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
         && shown.behind.items == 0;
     if !silent_clean {
         print::stage_notes(cx, &not_stages, shown, frame, out)?;
-        let unchecked_only = (tally.unchecked > 0 || shown.behind.items > 0) && shown.counts.errors == 0 && shown.counts.failures == 0;
-        if !unchecked_only {
-            print::closing(cx, shown, facts.files, phases.since(began), Some(0), None, coverage, frame, out)?;
-        }
-    }
-    if let Some(words) = crate::not_checked::items::summary(tally.unchecked, shown.behind, frame) {
-        print::note(cx, words.as_str(), shown, frame, out)?;
+        print::check_closing(cx, shown, facts.files, phases.since(began), 0, tally.unchecked, coverage, frame, out)?;
     }
     phases.mark_cx(cx, "answer printed (the certificate)", frame);
     let status = status_of(&tally, 0, shown, coverage.is_some());

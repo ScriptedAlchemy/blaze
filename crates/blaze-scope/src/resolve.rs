@@ -2451,7 +2451,10 @@ fn lower_modules<'a, P: Par>(
                 None => ProcDecls::Text,
                 Some(list) => ProcDecls::Module { here: if i == 0 { list } else { &[] } },
             };
-            lower(LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0, harness: harness && i == 0, order }, fragment, bump)
+            // A D52 module already owns the registration table its builder compiled and
+            // exported. Only a macro program built from these sources needs a table here.
+            let make_harness = harness && i == 0 && listed.is_none();
+            lower(LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0, harness: make_harness, order }, fragment, bump)
         },
         &mut parts,
     );

@@ -8037,16 +8037,9 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             emit_const_u64(&mut words, X17, min_v);
                             words.push(enc::sub(X16, sr, X17));
                         }
-                        // Exhaustive enum niche switch: if `default_block` is `Op::Unreachable`-only,
-                        // skip the `cmp + b.hi` bounds check completely (saves 2 ops + 1 BTB entry)!
-                        let default_is_unreachable = default_argc == 0
-                            && view
-                                .block(Block(default_block))
-                                .find(|&i| view.op(i) != Op::Param)
-                                .is_some_and(|i| view.op(i) == Op::Unreachable);
-                        let b_def = if default_is_unreachable {
-                            None
-                        } else {
+                        // Even an unreachable default must be reached on an invalid
+                        // discriminant: indexing past the table loses the named trap.
+                        let b_def = {
                             words.push(enc::cmp_imm(X16, u32_of(span - 1)));
                             let idx = words.len();
                             words.push(enc::b_cond(Cond::Hi, 0));
@@ -8311,13 +8304,31 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                     words.push(enc::brk(at_u32(view.data, inst)));
                 }
                 Op::Unreachable => {
+                    // Only a first-in-block trap with one argument-free switch-default
+                    // predecessor has a proven discriminant. No instruction or edge move
+                    // ran since the switch. Allocated registers/spills still hold the
+                    // value; reload/rematerialize it because a dense switch normalized
+                    // the scratch register to an index. X16 is never allocated.
+                    let held = if inst == view.block(Block(u32_of(b))).start {
+                        if let Some(value) = blaze_lir::verify::sole_switch_default(&view, Block(u32_of(b))) {
+                            let sr = load_gpr(&mut words, value.0, X16);
+                            if sr != X16 {
+                                words.push(enc::mov(X16, sr));
+                            }
+                            Held::Reg(X16 as u8)
+                        } else {
+                            Held::Unknown
+                        }
+                    } else {
+                        Held::Unknown
+                    };
                     let ord = at_u32(&unreach_ord, inst);
                     if ord != u32::MAX {
                         out.traps.push(TrapRow {
                             at: u32_of(words.len() * 4),
                             kind: TrapKind::Intrinsic,
                             site: Some((0, ord)),
-                            held: Held::Unknown,
+                            held,
                             subject: None,
                         });
                     }

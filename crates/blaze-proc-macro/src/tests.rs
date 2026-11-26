@@ -467,6 +467,37 @@ fn reader_in(dir: &Path) -> ModuleRecord {
     module_in(dir, wasm(&reader_body()), 4)
 }
 
+#[test]
+fn d52_registration_distinguishes_absent_invalid_and_empty_export_tables() {
+    use crate::module::{ModuleError, identity, read_module};
+    let store = folder("d52-registration");
+    let id = CrateId { name: "mac", version: "1.0.0", source: Source::Registry { checksum: "m0" }, deps: "", features: &[] };
+    let read = || read_module(&store, &id);
+    assert!(matches!(read(), Err(ModuleError::Missing { .. })));
+    let dir = store.join("proc-macro/modules").join(module_key(&id));
+    std::fs::create_dir_all(&dir).expect("the registration directory");
+    let put = |file: &str, text: &str| std::fs::write(dir.join(file), text).expect("the registration field");
+    let digest = sha256_hex(&wasm(&reader_body()));
+    put("wasm-sha256", &digest);
+    put("macros", "");
+    let decls = "__rustc_proc_macro_decls_123__";
+    put("decls", decls);
+    put("identity", "a different crate");
+    assert!(matches!(read(), Err(ModuleError::Registration { path, .. }) if path == dir.join("identity")));
+    put("identity", &identity(&id));
+    put("wasm-sha256", "no digest");
+    assert!(matches!(read(), Err(ModuleError::Registration { path, .. }) if path == dir.join("wasm-sha256")));
+    put("wasm-sha256", &digest);
+    put("decls", "_DECLS");
+    assert!(matches!(read(), Err(ModuleError::Registration { path, .. }) if path == dir.join("decls")));
+    put("decls", decls);
+    put("macros", "1 bang go \n");
+    assert!(matches!(read(), Err(ModuleError::Macros { .. })));
+    put("macros", "");
+    assert!(read().expect("an empty registration").macros.is_empty());
+    std::fs::remove_dir_all(store).expect("remove the registration");
+}
+
 /// Each of the reader's four macros run once, its record's bytes.
 fn reader_outputs(setup: &Setup) -> Vec<Vec<u8>> {
     let root = folder("compiled-reads");

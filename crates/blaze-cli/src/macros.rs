@@ -78,11 +78,11 @@ impl Place<'_, '_> {
 
 /// A macro crate's subject: its name and version.
 pub(crate) fn subject(unit: &Unit<'_>) -> ContentId {
-    let mut text = std::vec::Vec::new_in(Global);
-    text.extend_from_slice(unit.name.as_str().as_bytes());
-    text.push(b' ');
-    text.extend_from_slice(unit.version.as_str().as_bytes());
-    ContentId::of(SUBJECT_DOMAIN, &text)
+    subject_of(unit.name.as_str(), unit.version.as_str())
+}
+
+pub(crate) fn subject_of(package: &str, version: &str) -> ContentId {
+    blaze_ids::Hasher::new(SUBJECT_DOMAIN).update(package.as_bytes()).update(b" ").update(version.as_bytes()).finish()
 }
 
 /// The `MacroModule` parts of a graph record `graph_record` made over the graph source

@@ -1197,8 +1197,10 @@ impl<'f> ScriptsStage<'f> {
                     let mut defines = SVec::new_in(alloc);
                     defines.push((WHOLE, record.out));
                     self.mark(name, Some((task.key, record.out)));
-                    if name.kind == Kind::Script {
+                    if matches!(name.kind, Kind::Script | Kind::MacroModule) {
                         names.mark(name, Some((task.key, record.out)));
+                    }
+                    if name.kind == Kind::Script {
                         // Entered again with a stored row: counted, and when it made its stored
                         // bytes again, named with the cell that woke it (the profile's line).
                         let again = self.previous.get(&name).map(|previous| (previous.out == record.out).then(|| self.woke_by(previous)));
@@ -1246,7 +1248,7 @@ impl<'f> ScriptsStage<'f> {
                 }
                 Err(_) => {
                     self.mark(name, None);
-                    if name.kind == Kind::Script {
+                    if matches!(name.kind, Kind::Script | Kind::MacroModule) {
                         names.mark(name, None);
                     }
                     if owed {

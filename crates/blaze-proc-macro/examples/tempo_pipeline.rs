@@ -711,11 +711,11 @@ fn main() {
         }
         // A crate with no module lists no exports here, so a call of it reads as unresolved
         // (its exports are in its source, which this example does not read).
-        let exports = procs.exports(key);
-        if exports.is_empty() {
+        let exports = procs.module(key).map(|module| module.macros.as_slice());
+        if exports.is_none() {
             println!("macro crate {name} {version}: no module");
         }
-        for e in exports {
+        for e in exports.into_iter().flatten() {
             macros.push(Macro { package, krate: key, kind: e.kind, name: e.name.clone(), helpers: e.helpers.clone() });
         }
         labels.insert(key, format!("{name} {version}"));

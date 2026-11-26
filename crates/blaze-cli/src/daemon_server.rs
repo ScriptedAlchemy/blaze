@@ -1066,7 +1066,7 @@ fn try_fast_certified(
     // Presentation miss writes zero bytes and returns `None` -> clean fallthrough.
     let tally = view_slot.certified(cx, hot.lines_key, &mut shown, frame, out).ok()??;
 
-    let whole = hot.facts.printed.bodies_whole;
+    let whole = hot.facts.printed.bodies_whole && tally.unchecked == 0 && shown.behind.items == 0;
     let (ran_stages, not_stages) = crate::check_coverage(hot.facts.printed.names, whole, whole && tally.borrows == 0, frame);
     let coverage = (!not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
     let silent_clean = shown.quiet_when_clean
@@ -1078,17 +1078,9 @@ fn try_fast_certified(
         if crate::print::stage_notes(cx, &not_stages, &shown, frame, out).is_err() {
             return None;
         }
-        let unchecked_only = (tally.unchecked > 0 || shown.behind.items > 0) && shown.counts.errors == 0 && shown.counts.failures == 0;
-        if !unchecked_only
-            && crate::print::closing(cx, &shown, hot.facts.files, phases.since(began), Some(0), None, coverage, frame, out).is_err()
-        {
+        if crate::print::check_closing(cx, &shown, hot.facts.files, phases.since(began), 0, tally.unchecked, coverage, frame, out).is_err() {
             return None;
         }
-    }
-    if let Some(words) = crate::not_checked::items::summary(tally.unchecked, shown.behind, frame)
-        && crate::print::note(cx, words.as_str(), &shown, frame, out).is_err()
-    {
-        return None;
     }
     let status = crate::engine_check::status_of(&tally, 0, &shown, coverage.is_some());
 

@@ -412,6 +412,25 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         self.runner().ok().flatten()?.key_of(krate)
     }
 
+    fn proc_exports(&self, krate: usize) -> Option<&'n [blaze_scope::task::ProcExport<'n>]> {
+        if self.own != Some(krate) {
+            return None;
+        }
+        let exports = self.runner().ok().flatten()?.exports(krate)?;
+        let mut registered = blaze_own::Vec::with_capacity_in(exports.len(), self.frame);
+        for export in exports {
+            let mut helpers = blaze_own::String::new_in(self.frame);
+            for (i, helper) in export.helpers.iter().enumerate() {
+                if i > 0 {
+                    helpers.push_str(", ");
+                }
+                helpers.push_str(helper);
+            }
+            registered.push(blaze_scope::task::ProcExport { kind: export.kind, name: &export.name, helpers: helpers.into_bump_str() });
+        }
+        Some(registered.into_bump_slice())
+    }
+
     /// A proc-macro call written in the crate `krate`: through the runner's one path
     /// (`ProcMacros::run`), shown the crate's own package at its edition. No runner, or a crate
     /// this job was not given as a caller, is refused with the expander's typed `HostError`.

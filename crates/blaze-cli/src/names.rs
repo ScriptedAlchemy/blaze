@@ -1191,6 +1191,12 @@ impl Names<'_> {
         self.scripts.binary_search_by_key(&at, |(krate, _)| *krate).ok().map(|i| self.scripts[i].1)
     }
 
+    /// The lookup that determines whether this proc-macro crate uses D52's registration.
+    pub(crate) fn proc_module_of(&self, at: usize) -> Option<Name> {
+        self.list.proc_macro(at).then(|| Name::new(Kind::MacroModule,
+            crate::macros::subject_of(self.list.package(at), self.list.version(at))))
+    }
+
     /// The world index of the crate whose `CrateScope` subject is `subject`.
     pub(crate) fn crate_at(&self, subject: ContentId) -> Option<usize> {
         self.by_subject.binary_search_by_key(&subject, |(subject, _)| *subject).ok().map(|i| self.by_subject[i].1)
