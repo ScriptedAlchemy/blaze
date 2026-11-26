@@ -15,11 +15,13 @@ doctest = false
 
 [features]
 default = ["cargo"]
+# The std-only path helpers (`paths`), without the cargo-compatible reader.
+std = []
 # The cargo-compatible reader (`Config`, `Workspace`, `metadata`, the profiles, the schema),
-# which still rests on serde, serde_json and url. Without it the crate is `layout` alone, the
-# sans-IO workspace reader the new `blaze` takes, on blaze's own crates only
-# (`default-features = false`).
+# which still rests on std, serde, serde_json and url. Without it the crate is the sans-IO
+# workspace reader the new `blaze` takes, plus `paths` when `std` is on.
 cargo = [
+    "std",
     "dep:blaze-data",
     "dep:blaze-core",
     "dep:blaze-hash",

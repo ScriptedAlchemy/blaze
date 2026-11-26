@@ -257,4 +257,24 @@ test-utils = [\"dep:serde\", \"dep:serde_json\", \"serde_json\", \"rpc\"]\n";
         assert_eq!(super::optional_build_deps(BOTH), Vec::<String>::new());
         assert_eq!(super::optional_build_deps(PACKAGE), vec!["cc".to_owned()]);
     }
+
+    #[test]
+    fn script_manifest_anchors_relative_build_dependency_paths_before_copying() {
+        const PATHS: &str = "[package]\nname = \"sys\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+[build-dependencies]\nhostdep = { package = \"real-hostdep\", path = \"../hostdep\", version = \"0.1.0\", features = [\"extra\"], default-features = false }\n\n\
+[target.'cfg(unix)'.build-dependencies.dep]\npath = \"../dep\"\nversion = \"0.1.0\"\nfeatures = [\"extra\"]\n\n\
+[features]\nrender = [\"hostdep/extra\"]\n";
+        let manifest = made(PATHS, "sys", "0.1.0", &["render"]);
+        for kept in [
+            format!("hostdep = {{ package = \"real-hostdep\", path = \"/build/vendor/hostdep\", version = \"0.1.0\", features = [\"extra\"], default-features = false }}"),
+            format!("[target.'cfg(unix)'.dependencies.dep]\npath = \"/build/vendor/dep\"\nversion = \"0.1.0\"\nfeatures = [\"extra\"]"),
+            "\"render\" = [\"hostdep/extra\"]".to_owned(),
+        ] {
+            assert!(manifest.contains(kept.as_str()), "missing {kept:?}:\n{manifest}");
+        }
+        assert!(manifest.contains("\n[dependencies]\n"), "{manifest}");
+        for verbatim in ["path = \"../hostdep\"", "path = \"../dep\""] {
+            assert!(!manifest.contains(verbatim), "{verbatim} remained:\n{manifest}");
+        }
+    }
 }

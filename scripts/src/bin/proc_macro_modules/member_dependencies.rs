@@ -301,6 +301,30 @@ fn corresponding<'d, 't, 'a>(source: Node<'_, '_, '_>, root: Node<'d, 't, 'a>) -
     }
 }
 
+pub(super) fn anchor_path_dependencies<'a>(text: &str, path: &Path, alloc: Alloc<'a>) -> Result<AString<'a>, Failure> {
+    let doc = parse(text, path, alloc)?;
+    let mut edit = Edit::new_in(&doc, alloc);
+    let refuse = |why: blaze_toml::EditError<Alloc<'a>>| Failure::Manifest { path: path.to_owned(), why: why.to_string() };
+    let manifest_dir = path.parent().unwrap_or_else(|| Path::new(""));
+    let targets = doc.root().get("target").into_iter().flat_map(|table| table.children());
+    for scope in std::iter::once(doc.root()).chain(targets) {
+        for kind in ["dependencies", "build-dependencies", "dev-dependencies", "build_dependencies", "dev_dependencies"] {
+            let Some(table) = scope.get(kind) else { continue };
+            for dep in table.children() {
+                let Some(node) = dep.get("path") else { continue };
+                let Some(relative) = node.as_str() else { continue };
+                if Path::new(relative).is_absolute() {
+                    continue;
+                }
+                let anchored = blaze_manifest::paths::normalize_path(&manifest_dir.join(relative)).display().to_string();
+                let value = blaze_data::Value::Text(AString::from_str_in(&anchored, alloc));
+                edit.replace(node, &value).map_err(refuse)?;
+            }
+        }
+    }
+    edit.finish().map_err(refuse)
+}
+
 /// Apply the same selection used by the store. TOML node removal covers the complete
 /// declaration, including multi-line arrays, inline tables and dotted keys.
 pub(super) fn filtered_manifest<'a>(text: &str, path: &Path, requested: &[String], alloc: Alloc<'a>) -> Result<AString<'a>, Failure> {
@@ -387,6 +411,28 @@ fn written<'d, 't, 'a>(doc: &'d Document<'t, Alloc<'a>>, selected: &MemberDepend
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_path_dependencies_are_anchored_to_their_own_manifest() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ndep = { package = \"real-dep\", path = \"../dep\", version = \"0.1.0\", features = [\"extra\"], default-features = false }\nabsolute = { path = \"/already/there\" }\n\n[build-dependencies.hostdep]\npath = '../hostdep'\nversion = \"0.1.0\"\nfeatures = [\"extra\"]\n\n[target.'cfg(unix)'.dependencies]\ntargeted = { path = \"../../targeted\", optional = true }\n\n[target.'cfg(windows)'.build-dependencies.windep]\npath = \"../windep\"\n\n[dev-dependencies]\ndevdep = { path = \"../devdep\" }\n\n[dependencies.dotted]\npath = \"../dotted\"\n";
+        let alloc = blaze_own::testing::heap().alloc();
+        let made = anchor_path_dependencies(manifest, Path::new("/checkout/app/Cargo.toml"), alloc).unwrap_or_else(|failure| panic!("{failure}"));
+        parse(made.as_str(), Path::new("/checkout/app/Cargo.toml"), alloc).unwrap_or_else(|failure| panic!("generated: {failure}\n{}", made.as_str()));
+        for kept in [
+            "dep = { package = \"real-dep\", path = \"/checkout/dep\", version = \"0.1.0\", features = [\"extra\"], default-features = false }",
+            "absolute = { path = \"/already/there\" }",
+            "path = \"/checkout/hostdep\"",
+            "version = \"0.1.0\"\nfeatures = [\"extra\"]",
+            "targeted = { path = \"/targeted\", optional = true }",
+            "path = \"/checkout/windep\"",
+            "devdep = { path = \"/checkout/devdep\" }",
+            "[dependencies.dotted]\npath = \"/checkout/dotted\"",
+        ] {
+            assert!(made.contains(kept), "missing {kept:?}:\n{}", made.as_str());
+        }
+        assert!(!made.contains("path = \"../"), "{}", made.as_str());
+        assert!(!made.contains("path = '../"), "{}", made.as_str());
+    }
 
     /// A dependency U (not the member) with an optional dependency in the inline form that only
     /// its feature `include-exclude` turns on.
