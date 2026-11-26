@@ -25,18 +25,16 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AVec, Alloc, CollectIn};
 use blaze_pins::{LLVM_COMMIT, LLVM_VERSION};
 use blaze_tier::{Arch, Machine, Os};
-use llvm_sys::{
-    core::{LLVMContextCreate, LLVMContextDispose, LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMDisposeMemoryBuffer, LLVMDisposeMessage, LLVMDisposeModule, LLVMGetBufferStart, LLVMGetBufferSize},
-    error::{LLVMDisposeErrorMessage, LLVMGetErrorMessage},
-    ir_reader::LLVMParseIRInContext2,
-    linker::LLVMLinkModules2,
-    prelude::{LLVMContextRef, LLVMModuleRef},
-    target_machine::LLVMTargetMachineRef,
-    target::{LLVMInitializeAArch64Target, LLVMInitializeAArch64TargetInfo, LLVMInitializeAArch64TargetMC},
-    target_machine::{
+use blaze_llvm_abi::{
+    LLVMContextCreate, LLVMContextDispose, LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMDisposeMemoryBuffer, LLVMDisposeMessage, LLVMDisposeModule, LLVMGetBufferStart, LLVMGetBufferSize,
+    LLVMDisposeErrorMessage, LLVMGetErrorMessage,
+    LLVMParseIRInContext2,
+    LLVMLinkModules2,
+    LLVMContextRef, LLVMModuleRef,
+    LLVMTargetMachineRef,
+    LLVMInitializeAArch64Target, LLVMInitializeAArch64TargetInfo, LLVMInitializeAArch64TargetMC,
         LLVMCodeGenFileType, LLVMCodeGenOptLevel, LLVMCodeModel, LLVMCreateTargetMachine, LLVMDisposeTargetMachine, LLVMGetTargetFromTriple, LLVMRelocMode, LLVMTargetMachineEmitToMemoryBuffer,
-    },
-    transforms::pass_builder::{LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazePassesRef, LLVMBlazeRunPasses},
+    LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazePassesRef, LLVMBlazeRunPasses,
 };
 
 use super::LlvmModule;
