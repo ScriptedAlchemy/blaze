@@ -4,14 +4,14 @@
 
 use core::{alloc::Allocator, mem::MaybeUninit};
 use std::{
-    alloc::Global,
     fs::{self, File},
     io,
     path::Path,
     sync::Arc,
 };
+use std::alloc::Global;
 
-use blaze_own::Share as _;
+use blaze_own::{Share as _, Vec};
 
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd};
@@ -24,7 +24,7 @@ use crate::{DirName, FileName, IoError, Listing, threads::inline::LentRead};
 #[derive(Clone)]
 pub struct ConfinedFiles {
     root: Arc<Path>,
-    dir: Arc<RootDir>,
+    dir: blaze_own::Arc<RootDir, Global>,
 }
 
 /// What a confined directory listing found.
@@ -38,7 +38,7 @@ pub enum ConfinedEntries {
 
 impl ConfinedFiles {
     pub(crate) fn new(root: &Path) -> Self {
-        let dir = Arc::new_in(RootDir::open(root), Global);
+        let dir = blaze_own::Arc::new_in(RootDir::open(root), Global);
         Self { root: Arc::from(root), dir }
     }
 

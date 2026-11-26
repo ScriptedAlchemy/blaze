@@ -205,7 +205,7 @@ impl Inline {
     /// Zero-memset [`Effect::ReadAll`] straight into `into`'s uninitialized spare capacity:
     /// `open`, `fstat`, `try_reserve(len + 1)` (NO zero-fill), `pread` into `spare_capacity_mut`,
     /// `set_len(old + len)`.
-    pub fn read_all_into_vec<A: Allocator>(&self, file: &FileName, into: &mut Vec<u8, A>) -> LentRead {
+    pub fn read_all_into_vec<A: Allocator>(&self, file: &FileName, into: &mut blaze_own::Vec<u8, A>) -> LentRead {
         let done = crate::lock::io_wait("read all", file.as_str(), || {
             super::at(&self.root, file, |path| crate::fs::beneath::read_whole_into_vec(path, into))
         });

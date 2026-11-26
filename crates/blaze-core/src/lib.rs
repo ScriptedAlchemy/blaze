@@ -2018,6 +2018,15 @@ impl Done {
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub struct IoError(pub String);
 
+impl IoError {
+    #[cfg(target_os = "linux")]
+    fn from_display(why: &impl fmt::Display) -> Self {
+        let mut bytes = Vec::new_in(std::alloc::Global);
+        std::io::Write::write_fmt(&mut bytes, format_args!("{why}")).expect("writing a diagnostic to memory");
+        Self(String::from_utf8(bytes).expect("formatting writes UTF-8"))
+    }
+}
+
 impl fmt::Display for IoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)

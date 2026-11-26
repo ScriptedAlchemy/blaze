@@ -1913,6 +1913,10 @@ impl crate::host::Sink for HostSink {
 /// [`crate::fs::temporary_next_to`]'s, which count from 0.
 static TEMPORARY: AtomicU64 = AtomicU64::new(1 << 63);
 
+// The driver's legacy effect boundary is shared by its deferred entry point.
+type EffectQueue = Vec<Effect>;
+type CompletionQueue = Vec<Completion>;
+
 impl Uring {
     /// A driver whose files are under `root`, or why this kernel has no ring for it.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Uring> {
@@ -1920,6 +1924,7 @@ impl Uring {
     }
 
     fn open_ring(root: &Path, start: Instant, boot: Result<crate::Boot, crate::NoBoot>) -> io::Result<Uring> {
+        let alloc = Global;
         let ring = Ring::new(ENTRIES, COMPLETIONS)?;
         let offload = Offload::new()?;
         let table = Table::new(&ring.fd)?;
@@ -1937,9 +1942,9 @@ impl Uring {
             table,
             provided,
             kept: slab(KEPT)?,
-            names: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
-            positional: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
-            batches: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            names: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            positional: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            batches: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             // alloc: setup, once per driver: an empty table, which nothing reads through.
             descriptors: Arc::new(crate::descriptors::Descriptors::new()),
             ops: ManuallyDrop::new(ops::Ops::new(PENDING).map_err(io::Error::other)?),
@@ -1956,25 +1961,25 @@ impl Uring {
             slots_held: 0,
             zero_copy_sends: 0,
             ready: Vec::new(), // alloc: empty, nothing allocated; reused after.
-            watches: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            watches: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             watchings: ManuallyDrop::new(slab(WATCHES)?),
-            listens: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            listens: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             listeners: slab(LISTENS)?,
             connectings: ManuallyDrop::new(slab(CONNS)?),
             spawns: slab(SPAWNS)?,
-            spawning: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            spawning: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             conns: slab(CONNS)?,
             timers: Wheel::new(),
             confine: None,
             spawn_dirs,
             buffers: Vec::with_capacity(SPARES), // alloc: setup, once per driver.
             trees: Vec::with_capacity(SPARES),   // alloc: setup, once per driver.
-            starting: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(STARTS) }),
-            held: Vec::new_in(Global),
-            started: Vec::with_capacity_in(STARTS, Global),
-            grown: Vec::with_capacity_in(STARTS, Global),
+            starting: Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(STARTS) }),
+            held: Vec::new_in(alloc),
+            started: Vec::with_capacity_in(STARTS, alloc),
+            grown: Vec::with_capacity_in(STARTS, alloc),
             grows_out: 0,
-            ungrown: Vec::with_capacity_in(STARTS, Global),
+            ungrown: Vec::with_capacity_in(STARTS, alloc),
             walker: None,
             #[cfg(test)]
             walk_gate: None,
@@ -2411,7 +2416,7 @@ impl Uring {
     /// held again. Then each grow the walker is done with is merged ([`Uring::merge`]).
     fn put_in_place(&mut self) {
         if !self.grown.is_empty() {
-            let mut grown = std::mem::take(&mut self.grown);
+            let mut grown = core::mem::take(&mut self.grown);
             for it in grown.drain(..) {
                 self.merge(it);
             }
@@ -2420,7 +2425,7 @@ impl Uring {
         if self.started.is_empty() {
             return;
         }
-        let mut started = std::mem::take(&mut self.started);
+        let mut started = core::mem::take(&mut self.started);
         for Started { tag, tree } in started.drain(..) {
             let Some(mut start) = self.starting.remove(&tag) else {
                 unreachable!("the start of {tag:?}, which no watch is starting")
@@ -2445,7 +2450,7 @@ impl Uring {
         if self.held.is_empty() {
             return;
         }
-        let mut held = std::mem::take(&mut self.held);
+        let mut held = core::mem::take(&mut self.held);
         // Counted in flight as they were held; `submit` counts each again.
         self.in_flight -= held.len();
         self.submit(&mut held);
@@ -2694,7 +2699,7 @@ impl Uring {
 }
 
 impl Driver for Uring {
-    fn submit(&mut self, effects: &mut Vec<Effect>) {
+    fn submit(&mut self, effects: &mut EffectQueue) {
         // The one now of every timer in this submit: each one's `after` counts from when it was
         // asked, which is this call, so timers asked together fire in the order of their
         // `after`s whatever the thread is kept from running between two of them. With a clock
@@ -2992,7 +2997,7 @@ impl Driver for Uring {
         self.submit_ring();
     }
 
-    fn poll(&mut self, out: &mut Vec<Completion>, until: Deadline) -> usize {
+    fn poll(&mut self, out: &mut CompletionQueue, until: Deadline) -> usize {
         let before = out.len();
         self.reap();
         self.fire_timers();
