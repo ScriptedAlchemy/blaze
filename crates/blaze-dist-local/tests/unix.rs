@@ -1385,10 +1385,12 @@ fn the_coordinator_owns_and_removes_its_actual_socket() {
         .expect("coordinator closed stdout before writing readiness");
     assert!(ready.starts_with("ready "));
     let mut c = Client::connect(path.as_str(), random_id().unwrap(), alloc).unwrap();
-    let deadline = c.welcome.now_ms + 1000;
+    // Exercise startup and shutdown with a live subscriber. Cold Blaze calls on the
+    // client can still be compiling while the real coordinator's clock advances.
+    let deadline = c.welcome.now_ms.saturating_add(60_000);
     let b = submit(&mut c, deadline, alloc);
     let Answer::Terminal(t) = c.call(Command::Terminal(b.subscription)).unwrap() else { panic!() };
-    assert!(t.value.is_none()); // No executor: nothing can claim Passed.
+    assert!(t.value.is_none(), "a live job without an executor was terminated: {:?}", t.value);
     child.write_stdin_and_close(b"stop\n").unwrap();
     assert!(child.wait().unwrap().success());
     assert!(!path_exists(path.as_str()));
@@ -2368,7 +2370,8 @@ fn the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls(
                 }
                 assert!(
                     clock_sys.monotonic_nanos().unwrap() < deadline_ns,
-                    "the real Holder never produced its gated result"
+                    "the real Holder never produced its gated result; coordinator effects: {:?}",
+                    &*f.effects.lock()
                 );
                 sleep_ms(1);
             }
