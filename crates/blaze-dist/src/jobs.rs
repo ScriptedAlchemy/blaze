@@ -1560,11 +1560,10 @@ impl Jobs {
             let namespace = e.namespace.clone();
             let mut except = Vec::new_in(out.allocator().clone());
             except.extend(e.executors().chain(e.lost.iter().map(WireString::as_str)));
-            let Some(helper) = self.admission.idle_for(&namespace, &platform, &need, &except)
+            let Some(helper) = self.admission.offer(now, &namespace, &platform, &need, &except, self.alloc)
             else {
                 continue;
             };
-            let helper = WireString::from_str_in(helper, self.alloc);
             drop(except);
             let Some(e) = self.executions.get_mut(&id) else { continue };
             let Ok(attempt) = e.add_helper(now, helper.as_str()) else { continue };
@@ -1658,8 +1657,7 @@ impl Jobs {
                     .map(|name| String::from_str_in(name.as_str(), out.allocator().clone()))
                     .or_else(|| {
                         self.admission
-                            .idle_for(&namespace, &platform, &need, &except)
-                            .map(|name| String::from_str_in(name, out.allocator().clone()))
+                            .offer(now, &namespace, &platform, &need, &except, out.allocator().clone())
                     });
                 drop(except);
                 let mut more = Vec::new_in(out.allocator().clone());

@@ -105,3 +105,36 @@ fn an_old_attempts_completion_does_not_release_the_current_assignment() {
     a.finished(2, &builder, ExecutionId(1), Attempt(2));
     assert_eq!(a.executor(&builder).unwrap().busy, None);
 }
+
+#[test]
+fn pull_workers_share_one_capacity_across_main_and_distinct_prs() {
+    let alloc = heap();
+    let mut a = Admission::for_pull_workers(AdmissionConfig::default(), alloc);
+    a.add_machine("machine", [1; 32], reservation(4));
+    let pr = |n| Namespace::Pr(PrNamespace { n });
+    a.enqueue(job(2, pr(17))).unwrap();
+    a.enqueue(job(1, Namespace::Main)).unwrap();
+    let main = a.admit(1, alloc);
+    assert_eq!(main.len(), 1);
+    assert_eq!(main[0].execution, ExecutionId(1));
+    let first = &main[0].executor;
+    a.finished(2, first, ExecutionId(2), Attempt(1));
+    assert!(a.admit(2, alloc).is_empty());
+    assert_eq!(a.used("machine"), reservation(4));
+    a.finished(3, first, ExecutionId(1), Attempt(1));
+    let second = a.admit(3, alloc);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].namespace, pr(17));
+    assert_ne!(*first, second[0].executor);
+    assert!(a.executor(first).is_none());
+    a.enqueue(job(3, pr(19))).unwrap();
+    assert!(a.admit(4, alloc).is_empty());
+    a.lost(4, &second[0].executor);
+    assert_eq!(a.admit(4, alloc)[0].namespace, pr(19));
+    assert_eq!(a.executors().count(), 1);
+    assert_eq!(a.close_pr(19, alloc).len(), 1);
+    assert_eq!(a.executors().count(), 0);
+    a.enqueue(job(4, Namespace::Main)).unwrap();
+    assert_eq!(a.admit(5, alloc)[0].namespace, Namespace::Main);
+    a.check().unwrap();
+}
