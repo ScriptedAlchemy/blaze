@@ -542,19 +542,26 @@ fn publication_replaces_a_pointer_swept_from_the_current_generation() {
         let target_bytes = b"replacement target";
         writer.store.put(target, Namespace::LOCAL, TAG, target_bytes).expect("stage replacement target");
         let bytes = &target.0.0;
-        if streamed {
-            writer.store.put(pointer, Namespace::LOCAL, pointer_tag, bytes).expect("stage replacement pointer");
-        }
+        let mut batch = Batch::new(Namespace::LOCAL);
+        batch.put(pointer, pointer_tag, bytes).expect("stage replacement pointer");
         let answer = writer.store.root("answer", &[pointer, target]).expect("stage answer root");
         writer.store.release_lease();
-        if streamed {
-            writer.store.commit(&[], sim.wall_ns(), &mut writer.effects).expect("start streamed publication");
-        } else {
-            let mut batch = Batch::new(Namespace::LOCAL);
-            batch.put(pointer, pointer_tag, bytes).expect("stage replacement pointer");
-            writer.store.commit(&[&batch], sim.wall_ns(), &mut writer.effects).expect("start batch publication");
+        writer.store.set_stream_commits(streamed);
+        let batches = [&batch];
+        writer.store.commit(&batches, sim.wall_ns(), &mut writer.effects).expect("start publication");
+        let mut done = Default::default();
+        for _ in 0..10_000 {
+            sim.submit(&mut writer.effects);
+            if sim.in_flight() == 0 {
+                break;
+            }
+            sim.poll(&mut done, Deadline::after(sim.now(), Duration::from_secs(1)));
+            let wall = sim.wall_ns();
+            for completion in done.drain(..) {
+                writer.store.complete_with(completion, wall, &batches, &[], &mut writer.effects);
+            }
         }
-        settle(&mut sim, core::slice::from_mut(&mut writer));
+        assert!(writer.store.ready(), "publication did not settle");
         let published = writer.store.take_committed().expect("publication verdict");
         assert!(published.is_ok(), "replacement publication failed with streamed={streamed}: {published:?}");
 
