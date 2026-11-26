@@ -76,6 +76,8 @@ crates/blaze-cli/src/store/published.rs	FLOOR_MAGIC	none
 crates/blaze-cli/src/store/record_codec.rs	MAGIC	test previous_bzr1_layout_is_refused_by_name
 crates/blaze-cli/src/store/record_codec.rs	VERSION	test previous_bzr1_layout_is_refused_by_name
 crates/blaze-cli/src/sweep.rs	LEAVES_MAGIC	none
+crates/blaze-cli/src/test_bins.rs	MH_MAGIC_64	not persisted: Mach-O image magic defined by the platform
+crates/blaze-cli/src/test_bins.rs	STUB_SLOT_MAGIC	none
 crates/blaze-cli/src/test_cache.rs	STATE_MAGIC	none
 crates/blaze-cli/src/test_cache.rs	STATE_VERSION	test decode_state_refuses_previous_v2_layout
 crates/blaze-cli/src/unused_deps.rs	FILE_REFS_MAGIC	none
@@ -158,6 +160,7 @@ crates/blaze-launch/src/telemetry.rs	MAGIC	not persisted: shared-memory ring for
 crates/blaze-launch/src/telemetry.rs	VERSION	not persisted: shared-memory ring for a live run
 crates/blaze-launch/src/wire.rs	SCHEMA	not persisted: the launcher's messages
 crates/blaze-launch/src/wire/run.rs	RUN_SCHEMA	none
+crates/blaze-launcher/src/main.rs	STUB_SLOT_MAGIC	none
 crates/blaze-lint/src/engine.rs	FORMAT_MACROS	none
 crates/blaze-lir/src/legalize/mod.rs	VERSION	none
 crates/blaze-lir/src/lib.rs	VERSION	none
@@ -327,6 +330,8 @@ crates/blaze-unicode/src/lib.rs	UNICODE_VERSION	none
 crates/blaze-unicode/src/tables.rs	UNICODE_VERSION	none
 crates/blaze-unit-graph/src/record.rs	MAGIC	none
 crates/blaze-unit-graph/src/sources.rs	LAYOUT_PASSES	none
+crates/blaze-vt/src/input/mouse.rs	FORMATS	not persisted: simulation choices for mouse encodings
+crates/blaze-vt/src/kitty/glyph/mod.rs	SUPPORTED_FORMATS	not persisted: capabilities returned by a live terminal query
 crates/blaze-wasi/src/seed.rs	VERSION	not persisted: the ABI's version
 crates/blaze-watch/src/frame.rs	VERSION	none
 crates/blaze-watch/src/pack.rs	MAGIC	none
