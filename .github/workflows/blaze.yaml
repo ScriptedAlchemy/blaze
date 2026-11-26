@@ -1,5 +1,15 @@
 name: PR 81 isolate later source protocol suites
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Exact compiler source commit
+        type: string
+        required: true
+      source_run:
+        description: Workflow run that sealed the exact source compiler
+        type: string
+        required: true
 permissions:
   actions: read
   contents: read
@@ -21,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 43c10c9b6fcce584b71cc3dbdf2a1cdd7c97ee68
+          ref: ${{ inputs.source }}
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
@@ -37,7 +47,7 @@ jobs:
         with:
           name: source-compiler
           path: ${{ runner.temp }}/source-package
-          run-id: 45840194107
+          run-id: ${{ inputs.source_run }}
           github-token: ${{ github.token }}
       - name: Verify exact source and execute its protocol tests
         env:
