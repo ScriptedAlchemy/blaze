@@ -341,7 +341,10 @@ fn verify_executables<'a>(shelf: &AString<'a>, members: &[&str], alloc: Alloc<'a
     use std::os::unix::fs::PermissionsExt as _;
     for member in members.iter().filter(|member| member.starts_with("bin/") || **member == "runtime/ld-linux-aarch64.so.1") {
         let path = text(&[shelf.as_str(), "/", member], alloc);
-        let metadata = fs::metadata(path.as_str()).map_err(|error| NativeSettingError::Tree { path: path.clone(), error })?;
+        let metadata = match fs::metadata(path.as_str()) {
+            Ok(metadata) => metadata,
+            Err(error) => return Err(NativeSettingError::Tree { path, error }),
+        };
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
             return Err(NativeSettingError::Tree { path, error: io::Error::new(io::ErrorKind::PermissionDenied, "required pinned tool is not an executable regular file") });
         }
