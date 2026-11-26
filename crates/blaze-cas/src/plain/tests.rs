@@ -500,6 +500,73 @@ fn publication_keeps_a_reused_key_after_the_old_root_is_retargeted() {
     assert_eq!(reader.store.get(&old).map(|record| record.bytes), Some(old_bytes.as_slice()), "published root lost its reused record after retarget and sweep");
 }
 
+/// Staging a replacement pointer and its target publishes both even if the old pointer was
+/// swept after this writer opened its view.
+#[test]
+fn publication_replaces_a_pointer_swept_from_the_current_generation() {
+    use blaze_keyed::kind::ReservedTag;
+    use super::core::{Batch, LentRecord};
+
+    for streamed in [true, false] {
+        let root = test_root();
+        let reached = |n| {
+            let mut config = cfg(n, 1, false, &root);
+            config.liveness = super::Liveness::Reached;
+            config
+        };
+        let mut sim = Sim::new(164, Faults::default());
+        let mut owner = Actor::new(reached(1), &root, Plant::None);
+        settle(&mut sim, core::slice::from_mut(&mut owner));
+        let pointer = key(83);
+        let pointer_tag = ReservedTag::Pointer.tag();
+        let old_target = key(84);
+        owner.store.put(old_target, Namespace::LOCAL, TAG, b"old target").expect("put old target");
+        owner.store.put(pointer, Namespace::LOCAL, pointer_tag, &old_target.0.0).expect("put old pointer");
+        owner.store.release_lease();
+        owner.store.commit(&[], sim.wall_ns(), &mut owner.effects).expect("commit old pointer");
+        settle(&mut sim, core::slice::from_mut(&mut owner));
+        assert!(matches!(owner.store.take_committed(), Some(Ok(_))));
+
+        let mut writer = Actor::new(reached(2), &root, Plant::None);
+        settle(&mut sim, core::slice::from_mut(&mut writer));
+        assert!(writer.store.newest_mapped(Namespace::LOCAL, &pointer).is_some());
+
+        let mut gc = Actor::new(reached(3), &root, Plant::None);
+        settle(&mut sim, core::slice::from_mut(&mut gc));
+        assert!(gc.store.compact(&mut gc.effects));
+        settle(&mut sim, core::slice::from_mut(&mut gc));
+        assert!(!gc.store.take_sliced().expect("compaction verdict").aborted);
+        assert!(gc.store.newest_mapped(Namespace::LOCAL, &pointer).is_none(), "compaction kept the old unrooted pointer");
+
+        let target = key(85);
+        let target_bytes = b"replacement target";
+        writer.store.put(target, Namespace::LOCAL, TAG, target_bytes).expect("stage replacement target");
+        let answer = writer.store.root("answer", &[pointer, target]).expect("stage answer root");
+        writer.store.release_lease();
+        let bytes = &target.0.0;
+        if streamed {
+            writer.store.set_stream_commits(true);
+            let record = LentRecord { key: pointer, namespace: Namespace::LOCAL, tag: pointer_tag, bytes, crc: format::record_crc(&pointer.0, pointer_tag, bytes) };
+            writer.store.commit_records(&[], &[record], sim.wall_ns(), &mut writer.effects).expect("start streamed publication");
+        } else {
+            let mut batch = Batch::new(Namespace::LOCAL);
+            batch.put(pointer, pointer_tag, bytes).expect("stage replacement pointer");
+            writer.store.commit(&[&batch], sim.wall_ns(), &mut writer.effects).expect("start batch publication");
+        }
+        settle(&mut sim, core::slice::from_mut(&mut writer));
+        let published = writer.store.take_committed().expect("publication verdict");
+        assert!(published.is_ok(), "replacement publication failed with streamed={streamed}: {published:?}");
+
+        let mut reader = Actor::new(reached(4), &root, Plant::None);
+        settle(&mut sim, core::slice::from_mut(&mut reader));
+        let (at, entry) = reader.store.newest_mapped(Namespace::LOCAL, &pointer).expect("reopened pointer");
+        assert_eq!(entry.tag, pointer_tag);
+        assert_eq!(reader.store.mapped_at(at).payload(&entry), bytes);
+        assert_eq!(reader.store.get(&target).expect("reopened target").bytes, target_bytes);
+        assert_eq!(reader.store.root_named("answer"), Some(answer));
+    }
+}
+
 /// One effect of the test's own, run to its completion.
 fn ask(sim: &mut Sim, effect: Effect) -> Done {
     let mut effects = vec![effect];

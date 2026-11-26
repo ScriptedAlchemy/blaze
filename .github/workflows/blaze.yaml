@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source }}
+          fetch-depth: 2
           persist-credentials: false
       - uses: ./.github/actions/toolchain
       - name: Reproduce the retained-root compaction race in the CAS simulator
@@ -28,6 +29,17 @@ jobs:
         run: |
           timeout 15 git rev-parse HEAD 'HEAD^{tree}'
           tc=$(timeout 10 cat pins/toolchain)
+          test_name=plain::tests::publication_replaces_a_pointer_swept_from_the_current_generation
+          timeout 15 git restore --source=HEAD^ -- crates/blaze-cas/src/plain/core.rs
+          baseline=0
+          timeout -k 15 750 cargo +"$tc" test --locked -p blaze-cas --lib "$test_name" -- --exact --nocapture \
+            > "$RUNNER_TEMP/baseline.log" 2>&1 || baseline=$?
+          timeout 10 tail -40 "$RUNNER_TEMP/baseline.log"
+          test "$baseline" = 101
+          timeout 10 grep -F 'replacement publication failed with streamed=true: Err(SweptUnder' "$RUNNER_TEMP/baseline.log"
+          timeout 15 git restore -- crates/blaze-cas/src/plain/core.rs
+          timeout 15 git diff --exit-code
+          timeout -k 15 750 cargo +"$tc" test --locked -p blaze-cas --lib "$test_name" -- --exact --nocapture
           timeout -k 15 800 cargo +"$tc" test --locked -p blaze-cas --lib \
             plain::tests::publication_keeps_a_reused_key_after_the_old_root_is_retargeted -- --exact --nocapture
           timeout -k 15 800 cargo +"$tc" test --locked -p blaze-cas --lib
