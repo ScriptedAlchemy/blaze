@@ -712,8 +712,20 @@ impl WorkSet {
         req: &WorkLeaseRequest,
         out: &mut Vec<Effect, impl Allocator>,
     ) -> Result<WorkLeaseAnswer, Refusal> {
+        self.lease_among(now, from, req, 1, out)
+    }
+
+    /// Lease across the current assignment, including helpers that may still be joining.
+    pub(crate) fn lease_among(
+        &mut self,
+        now: Millis,
+        from: &str,
+        req: &WorkLeaseRequest,
+        executors: usize,
+        out: &mut Vec<Effect, impl Allocator>,
+    ) -> Result<WorkLeaseAnswer, Refusal> {
         self.tick(now, out);
-        let answer = self.lease_inner(now, from, req, out);
+        let answer = self.lease_inner(now, from, req, executors, out);
         if let Err(refusal) = &answer {
             out.push(Effect::Refused {
                 holder: WireString::from_str_in(from, self.alloc),
@@ -728,6 +740,7 @@ impl WorkSet {
         now: Millis,
         from: &str,
         req: &WorkLeaseRequest,
+        executors: usize,
         out: &mut Vec<Effect, impl Allocator>,
     ) -> Result<WorkLeaseAnswer, Refusal> {
         if req.execution != self.execution {
@@ -752,13 +765,14 @@ impl WorkSet {
         if self.phase == Phase::Done {
             return Ok(WorkLeaseAnswer { grant: None });
         }
-        Ok(WorkLeaseAnswer { grant: self.grant(now, from, out) })
+        Ok(WorkLeaseAnswer { grant: self.grant(now, from, executors, out) })
     }
 
     fn grant(
         &mut self,
         now: Millis,
         holder: &str,
+        executors: usize,
         out: &mut Vec<Effect, impl Allocator>,
     ) -> Option<Grant> {
         let holder_slot = self.holders.get(holder)?;
@@ -778,7 +792,17 @@ impl WorkSet {
                 .copied(),
             self.alloc,
         );
-        let roots = self.pool.take_front(self.config.grant_roots);
+        // Share ready roots among idle joined holders and allow one more share for a
+        // helper still joining. A reservation alone is no evidence of running workers.
+        // Every unleased share stays in the pool for whichever holder asks next.
+        let joined = self.holders.len();
+        let prospective = usize::from(executors > joined);
+        let idle = (joined - self.live.len() + prospective).min(executors);
+        let mut limit = self.config.grant_roots;
+        if idle > 1 {
+            limit = limit.min(self.pool.len().div_ceil(u64::try_from(idle).unwrap_or(u64::MAX)));
+        }
+        let roots = self.pool.take_front(limit);
         if names.is_empty() && roots.is_empty() {
             return None;
         }
