@@ -16,6 +16,7 @@ use blaze_build_script::{
     Outputs, OutputsRef,
     env::{DepMetadata, Given, PackageFacts},
     key::{CMode, RunLimits},
+    module_record::{Digest, Executable, Request, Selected},
     native::Runner,
     probe::Row,
     toolchain::Mode,
@@ -153,8 +154,11 @@ pub enum ModuleLookupError {
     ReadModule { path: PathBuf, error: std::io::Error },
     /// A module's bytes differ from the digest its record names.
     Digest { path: PathBuf, expected: String, actual: String },
-    /// Two records answer one ask (a toolchain or closure each, same name, version, features
-    /// and runner): which is meant is not decided by the store's listing order (rules 21, 25).
+    /// An exact answer sits under a directory that does not name its identity.
+    RecordKey { folder: PathBuf, expected: String },
+    /// The producer's executable digest is not a SHA-256.
+    InvalidDigest { path: PathBuf },
+    /// Two records answer the same request.
     Ambiguous { first: PathBuf, second: PathBuf },
 }
 
@@ -165,9 +169,11 @@ impl std::fmt::Display for ModuleLookupError {
             ModuleLookupError::Identity { path, error } => write!(f, "{}: a module record's identity could not be read: {error}", path.display()),
             ModuleLookupError::ReadModule { path, error } => write!(f, "{}: the build-script module record could not be read: {error}", path.display()),
             ModuleLookupError::Digest { path, expected, actual } => write!(f, "{}: the build-script module names SHA-256 {expected}, but its bytes have SHA-256 {actual}", path.display()),
+            ModuleLookupError::RecordKey { folder, expected } => write!(f, "{}: the build-script module identity has SHA-256 {expected}", folder.display()),
+            ModuleLookupError::InvalidDigest { path } => write!(f, "{}: the build-script module digest is not a lower-case SHA-256", path.display()),
             ModuleLookupError::Ambiguous { first, second } => write!(
                 f,
-                "{} and {}: two module records answer one ask (name, version, features, runner); remove the stale one",
+                "{} and {}: two build-script module records answer the same request",
                 first.display(),
                 second.display()
             ),
@@ -263,15 +269,45 @@ fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host
 }
 
 fn read_verified_wasm(record: &Path) -> Result<Vec<u8>, ModuleLookupError> {
-    let digest_path = record.join("wasm-sha256");
+    let digest_path = record.join(Executable::Wasm.digest_filename());
     let expected = std::fs::read_to_string(&digest_path).map_err(|error| ModuleLookupError::ReadModule { path: digest_path, error })?;
-    let path = record.join("module.wasm");
+    read_verified_module(record, Executable::Wasm, expected.trim())
+}
+
+fn read_verified_module(record: &Path, executable: Executable, expected: &str) -> Result<Vec<u8>, ModuleLookupError> {
+    let path = record.join(executable.filename());
     let bytes = std::fs::read(&path).map_err(|error| ModuleLookupError::ReadModule { path: path.clone(), error })?;
     let actual = crate::module::sha256_hex(&bytes);
-    if expected.trim() != actual {
-        return Err(ModuleLookupError::Digest { path, expected: expected.trim().to_owned(), actual });
+    if expected != actual {
+        return Err(ModuleLookupError::Digest { path, expected: expected.to_owned(), actual });
     }
     Ok(bytes)
+}
+
+/// Select the record for a complete bootstrap request. The caller supplies the identities
+/// of the source and resolved dependencies used to compile the module.
+pub fn module_for(store: &Path, request: &Request<'_>) -> Result<Option<Selected>, ModuleLookupError> {
+    let mut matching = records(store)?.into_iter().filter(|(_, identity)| request.accepts(identity));
+    let Some((folder, identity)) = matching.next() else { return Ok(None) };
+    let expected = crate::module::sha256_hex(identity.as_bytes());
+    if folder.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        return Err(ModuleLookupError::RecordKey { folder, expected });
+    }
+    if let Some((second, _)) = matching.next() {
+        return Err(ModuleLookupError::Ambiguous { first: folder, second });
+    }
+    let key = Digest::parse(&expected).expect("sha256_hex writes lower-case SHA-256");
+    let executable = request.executable();
+    let path = folder.join(executable.digest_filename());
+    let digest = std::fs::read_to_string(&path).map_err(|error| ModuleLookupError::ReadModule { path: path.clone(), error })?;
+    let bytes = Digest::parse(digest.trim()).ok_or(ModuleLookupError::InvalidDigest { path })?;
+    Ok(Some(Selected::from_lookup(key, executable, bytes)))
+}
+
+/// Return the proven executable bytes from the selected record for the script runner.
+pub fn read_selected_module(store: &Path, selected: Selected) -> Result<Vec<u8>, ModuleLookupError> {
+    let record = store.join("build-script/modules").join(selected.key());
+    read_verified_module(&record, selected.executable(), selected.digest())
 }
 
 /// The unit build-script unit `script` serves: the library (or proc macro) whose
