@@ -6,6 +6,11 @@ on:
         description: Exact compiler commit
         type: string
         required: true
+      profile:
+        description: Distributed profiles to exercise
+        type: choice
+        options: [both, release]
+        default: both
 permissions:
   contents: read
 defaults:
@@ -61,6 +66,7 @@ jobs:
           echo "LLVM_SYS_231_PREFIX=$prefix" >> "$GITHUB_ENV"
       - name: Check the source CLI in both feature configurations
         id: source_check
+        if: ${{ inputs.profile == 'both' }}
         run: |
           evidence="$RUNNER_TEMP/plan-evidence"
           mkdir -p "$evidence"
@@ -73,6 +79,7 @@ jobs:
             2>&1 | tee "$evidence/check-llvm.log" || status=$?
           exit "$status"
       - name: Build and seal the exact source binaries
+        id: binaries
         run: |
           evidence="$RUNNER_TEMP/plan-evidence"
           mkdir -p "$evidence"
@@ -85,21 +92,27 @@ jobs:
             install -m 755 "$CARGO_TARGET_DIR/release/$binary" "$RUNNER_TEMP/source-binaries/$binary"
           done
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"seal\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-      - name: Execute the native release splat regression
-        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
+      - name: Execute the native release record regressions
+        if: ${{ !cancelled() && steps.binaries.outcome == 'success' }}
         run: |
           evidence="$RUNNER_TEMP/plan-evidence"
           tc="$(cat pins/toolchain)"
           timeout -k 30 1200 cargo +"$tc" test --locked --release -p blaze-emit --features llvm --lib \
-            release_record_stores_a_splat_to_every_lane 2>&1 | tee "$evidence/llvm-splat.log"
-          grep -Fq 'release_record_stores_a_splat_to_every_lane ... ok' "$evidence/llvm-splat.log"
-      - name: Exercise the unchanged distributed fault harness in both profiles
-        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
+            release_record 2>&1 | tee "$evidence/llvm-records.log"
+          grep -Fq 'release_record_stores_a_splat_to_every_lane ... ok' "$evidence/llvm-records.log"
+      - name: Exercise the unchanged distributed fault harness
+        if: ${{ !cancelled() && steps.binaries.outcome == 'success' }}
+        env:
+          QUALIFICATION_PROFILE: ${{ inputs.profile }}
         run: |
           bin="$RUNNER_TEMP/source-binaries"
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$bin\",\"services\":true}"
           failed=0
-          for profile in debug release; do
+          profiles=(release)
+          if [ "$QUALIFICATION_PROFILE" = both ]; then
+            profiles=(debug release)
+          fi
+          for profile in "${profiles[@]}"; do
             scratch="$RUNNER_TEMP/blaze-fs/dist-$profile"
             input="$RUNNER_TEMP/plan-evidence/$profile-input.json"
             # shellcheck disable=SC2016
@@ -110,7 +123,7 @@ jobs:
           done
           exit "$failed"
       - name: Verify LLVM binding regeneration
-        if: ${{ !cancelled() && env.LLVM_SYS_231_PREFIX != '' }}
+        if: ${{ !cancelled() && inputs.profile == 'both' && env.LLVM_SYS_231_PREFIX != '' }}
         run: |
           prefix="$LLVM_SYS_231_PREFIX"
           # shellcheck disable=SC2016
@@ -118,7 +131,7 @@ jobs:
           timeout -k 20 1200 cargo +"$(cat pins/toolchain)" run --release --locked -p scripts --bin llvm_abi -- "$input" \
             2>&1 | tee "$RUNNER_TEMP/plan-evidence/llvm-generator.log"
       - name: Verify focused compiler regressions
-        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
+        if: ${{ !cancelled() && inputs.profile == 'both' && steps.source_check.outcome == 'success' }}
         run: |
           evidence="$RUNNER_TEMP/plan-evidence"
           tc="$(cat pins/toolchain)"
