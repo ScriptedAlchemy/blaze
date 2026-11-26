@@ -82,6 +82,11 @@ fn world(executors: u32, work: WorkConfig) -> World {
 }
 
 fn world_with(namespaces: &[Namespace], work: WorkConfig, carrier: CarrierConfig) -> World {
+    let execution = ExecutionConfig { work, completion: CompletionMode::PublishedWork, ..Default::default() };
+    world_for_execution(namespaces, execution, carrier)
+}
+
+fn world_for_execution(namespaces: &[Namespace], execution: ExecutionConfig, carrier: CarrierConfig) -> World {
     let alloc = test_alloc();
     let dir = TempDir::new("ba", alloc).unwrap();
     let store = dir.join("blobs");
@@ -140,11 +145,7 @@ fn world_with(namespaces: &[Namespace], work: WorkConfig, carrier: CarrierConfig
     }
     assert_eq!(admission.used("machine"), capacity);
     admission.check().unwrap();
-    let jobs = Jobs::new(
-        admission,
-        ExecutionConfig { work, completion: CompletionMode::PublishedWork, ..Default::default() },
-        alloc,
-    );
+    let jobs = Jobs::new(admission, execution, alloc);
     let socket = dir.join("a.sock");
     let server = Server::bind(
         socket.as_str(),
@@ -957,12 +958,19 @@ fn a_final_compiler_or_output_refusal_cannot_fall_back() {
 
     for malformed_output in [false, true] {
         for policy in [LocalPolicy::Never, LocalPolicy::Fallback] {
-            let world = world(1, WorkConfig::default());
+            // The refusal comes from the real compiler callback. Give a cold Blaze
+            // test time to enter that callback before the coordinator can lose its lead.
+            let execution = ExecutionConfig {
+                heartbeat_ms: 30_000,
+                completion: CompletionMode::PublishedWork,
+                ..Default::default()
+            };
+            let world = world_for_execution(&[Namespace::Main], execution, CarrierConfig::default());
             let alloc = world.alloc;
             let unit = unit(93, 0, alloc);
             let mut cfg = config(world.socket.as_str(), &world.blobs);
             cfg.local = policy.clone();
-            cfg.deadline = Duration::from_secs(2);
+            cfg.deadline = Duration::from_secs(45);
             let mut compiler = Refuses { malformed_output, succeeds: false, calls: 0, alloc };
             let mut observer =
                 Client::connect(world.socket.as_str(), random_id().unwrap(), alloc).unwrap();
@@ -990,7 +998,8 @@ fn a_final_compiler_or_output_refusal_cannot_fall_back() {
                         } else {
                             "fixture::tail: output export refused conflicting immutable bytes"
                         })),
-                "{failure}"
+                "{failure}; observer terminal: {:?}",
+                observer.call(Command::Terminal(observing.subscription.clone()))
             );
             assert!(matches!(agent::decide(&policy, failure, alloc), Err(Error::Refused(_))));
             assert_eq!(compiler.calls, 1);

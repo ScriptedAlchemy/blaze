@@ -33,11 +33,28 @@ fn test_alloc() -> WireAlloc {
 // fixture IO only. The coordinator's lease and subscriber tests advance TestClock.
 const FIXTURE_IO_DEADLINE: Duration = Duration::from_secs(20);
 
+fn fixture_deadline_ns(clock: &SystemClock) -> u64 {
+    let wait_ns = u64::try_from(FIXTURE_IO_DEADLINE.as_nanos()).unwrap();
+    clock.monotonic_nanos().unwrap().saturating_add(wait_ns)
+}
+
 #[derive(Default)]
-struct TestClock(AtomicU64);
+struct TestClock {
+    now: AtomicU64,
+    sampled: AtomicU64,
+}
+
+impl TestClock {
+    fn current(&self) -> u64 {
+        self.now.load(Ordering::Acquire)
+    }
+}
+
 impl Clock for TestClock {
     fn now_ms(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
+        let now = self.current();
+        self.sampled.store(now, Ordering::Release);
+        now
     }
 }
 
@@ -167,8 +184,15 @@ impl Fixture {
     }
 
     fn at(&self, now: u64) {
-        self.clock.0.store(now, Ordering::Release);
-        sleep_ms(10);
+        self.clock.now.store(now, Ordering::Release);
+        let clock = SystemClock;
+        let deadline = fixture_deadline_ns(&clock);
+        // Once the server samples this value, it ticks before handling any request
+        // sent after this acknowledgment.
+        while self.clock.sampled.load(Ordering::Acquire) != now {
+            assert!(clock.monotonic_nanos().unwrap() < deadline, "the coordinator did not sample clock {now}");
+            sleep_ms(1);
+        }
     }
 }
 
@@ -2358,7 +2382,7 @@ fn the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls(
                         content,
                         executor,
                         config,
-                        || clock.now_ms(),
+                        || clock.current(),
                         &mut Compiler(alloc),
                         leave,
                     );
@@ -2366,8 +2390,7 @@ fn the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls(
                     result
                 })
                 .unwrap();
-            let wait_ns = u64::try_from(FIXTURE_IO_DEADLINE.as_nanos()).unwrap();
-            let deadline_ns = clock_sys.monotonic_nanos().unwrap().saturating_add(wait_ns);
+            let deadline_ns = fixture_deadline_ns(&clock_sys);
             let ready_file = directory.join("ready.json");
             while !path_is_file(ready_file.as_str()) {
                 if finished.load(Ordering::Acquire) {
