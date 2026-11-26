@@ -151,6 +151,8 @@ blaze-sha256.workspace = true
 
 [features]
 default = ["fetch", "sandbox"]
+# The pinned native optimizer for release export.
+llvm = ["blaze-ladder/llvm"]
 # The network: the `Fetch` task asks for each lock entry's sources over HTTPS. Without it the
 # binary opens no socket, and a lock entry whose sources the store lacks is a finding.
 fetch = ["dep:blaze-http"]
