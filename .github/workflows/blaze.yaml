@@ -1,4 +1,4 @@
-name: PR 81 store pointer relocation proof
+name: PR 81 shared publish staging proof
 on:
   workflow_dispatch:
     inputs:
@@ -7,7 +7,7 @@ on:
         type: string
         required: true
       baseline:
-        description: Parent commit containing the original store implementation
+        description: Test-only control containing the original publisher
         type: string
         required: true
 permissions:
@@ -16,7 +16,7 @@ defaults:
   run:
     shell: bash
 jobs:
-  cas:
+  publish:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     steps:
@@ -26,32 +26,33 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
       - uses: ./.github/actions/toolchain
-      - name: Reproduce the conflict and execute the repaired store suite
+      - name: Reproduce the staging conflict and execute the repaired bstd suite
         env:
           BASELINE: ${{ inputs.baseline }}
-          CARGO_TARGET_DIR: ${{ runner.temp }}/cas-target
+          CARGO_TARGET_DIR: ${{ runner.temp }}/publish-target
         run: |
-          test "$(timeout 10 git rev-parse HEAD^)" = "$BASELINE"
+          timeout 20 git fetch --depth=2 origin "$BASELINE"
+          test "$(timeout 10 git rev-parse HEAD^)" = "$(timeout 10 git rev-parse "$BASELINE^")"
           tc=$(timeout 10 cat pins/toolchain)
-          test_name=plain::phase_commit_tests::publication_preserves_the_newest_pointer_moved_by_compaction
-          mkdir -p "$RUNNER_TEMP/cas-proof"
-          timeout 10 git rev-parse HEAD HEAD^{tree} "$BASELINE" > "$RUNNER_TEMP/cas-proof/revisions"
-          timeout 15 git restore --source="$BASELINE" -- crates/blaze-cas/src/plain/core.rs
+          test_name=fs::overlapping_publishes_from_two_worlds_keep_their_bytes
+          mkdir -p "$RUNNER_TEMP/publish-proof"
+          timeout 10 git rev-parse HEAD HEAD^{tree} "$BASELINE" > "$RUNNER_TEMP/publish-proof/revisions"
+          timeout 15 git restore --source="$BASELINE" -- crates/blaze-std/src/{fs,io}.rs
           status=0
-          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-cas --lib "$test_name" -- --exact \
-            > "$RUNNER_TEMP/cas-proof/baseline.log" 2>&1 || status=$?
-          timeout 10 tail -45 "$RUNNER_TEMP/cas-proof/baseline.log"
+          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-std --lib "$test_name" -- --exact \
+            > "$RUNNER_TEMP/publish-proof/baseline.log" 2>&1 || status=$?
+          timeout 10 tail -45 "$RUNNER_TEMP/publish-proof/baseline.log"
           test "$status" -eq 101
-          timeout 10 grep -F 'closing commit must keep the relocated pointer: Err(SweptUnder' "$RUNNER_TEMP/cas-proof/baseline.log"
-          timeout 15 git restore -- crates/blaze-cas/src/plain/core.rs
+          timeout 10 grep -F 'the second world overwrote the first stage' "$RUNNER_TEMP/publish-proof/baseline.log"
+          timeout 15 git restore -- crates/blaze-std/src/{fs,io}.rs
           timeout 10 git diff --exit-code
-          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-cas --lib "$test_name" -- --exact \
-            2>&1 | tee "$RUNNER_TEMP/cas-proof/focused.log"
-          timeout 10 grep -F '1 passed; 0 failed' "$RUNNER_TEMP/cas-proof/focused.log"
-          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-cas --lib \
-            2>&1 | tee "$RUNNER_TEMP/cas-proof/suite.log"
+          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-std --lib "$test_name" -- --exact \
+            2>&1 | tee "$RUNNER_TEMP/publish-proof/focused.log"
+          timeout 10 grep -F '1 passed; 0 failed' "$RUNNER_TEMP/publish-proof/focused.log"
+          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-std --lib \
+            2>&1 | tee "$RUNNER_TEMP/publish-proof/suite.log"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: cas-pointer-relocation-evidence
-          path: ${{ runner.temp }}/cas-proof
+          name: shared-publish-staging-evidence
+          path: ${{ runner.temp }}/publish-proof
